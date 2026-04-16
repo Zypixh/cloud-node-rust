@@ -1,0 +1,9 @@
+user_agent_parsers:
+  - family: "Generic Browser"
+    regex: "(.*)"
+os_parsers:
+  - family: "Generic OS"
+    regex: "(.*)"
+device_parsers:
+  - family: "Generic Device"
+    regex: "(.*)"

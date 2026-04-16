@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_node_task.proto";
+
+option go_package = "./pb";
+
+service NodeTaskService {
+    rpc findNodeTasks(FindNodeTasksRequest) returns (FindNodeTasksResponse);
+    rpc reportNodeTaskDone(ReportNodeTaskDoneRequest) returns (RPCSuccess);
+    rpc findNodeClusterTasks(FindNodeClusterTasksRequest) returns (FindNodeClusterTasksResponse);
+    rpc existsNodeTasks(ExistsNodeTasksRequest) returns (ExistsNodeTasksResponse);
+    rpc deleteNodeTask(DeleteNodeTaskRequest) returns (RPCSuccess);
+    rpc deleteNodeTasks(DeleteNodeTasksRequest) returns (RPCSuccess);
+    rpc deleteAllNodeTasks(DeleteAllNodeTasksRequest) returns (RPCSuccess);
+    rpc countDoingNodeTasks(CountDoingNodeTasksRequest) returns (RPCCountResponse);
+    rpc findNotifyingNodeTasks(FindNotifyingNodeTasksRequest) returns (FindNotifyingNodeTasksResponse);
+    rpc updateNodeTasksNotified(UpdateNodeTasksNotifiedRequest) returns (RPCSuccess);
+}
+
+message FindNodeTasksRequest {
+    int64 version = 1;
+}
+
+message FindNodeTasksResponse {
+    repeated NodeTask nodeTasks = 1;
+}
+
+message ReportNodeTaskDoneRequest {
+    int64 nodeTaskId = 1;
+    bool isOk = 2;
+    string error = 3;
+}
+
+message FindNodeClusterTasksRequest {
+    
+}
+
+message FindNodeClusterTasksResponse {
+    repeated ClusterTask clusterTasks = 1;
+}
+
+message ClusterTask {
+    int64 clusterId = 1;
+    string clusterName = 2;
+    repeated NodeTask nodeTasks = 3;
+}
+
+message ExistsNodeTasksRequest {
+    repeated string excludeTypes = 1;
+}
+
+message ExistsNodeTasksResponse {
+    bool existTasks = 1;
+    bool existError = 2;
+}
+
+message DeleteNodeTaskRequest {
+    int64 nodeTaskId = 1;
+}
+
+message DeleteNodeTasksRequest {
+    repeated int64 nodeTaskIds = 1;
+}
+
+message DeleteAllNodeTasksRequest {
+    
+}
+
+message CountDoingNodeTasksRequest {
+    
+}
+
+message FindNotifyingNodeTasksRequest {
+    int64 size = 1;
+}
+
+message FindNotifyingNodeTasksResponse {
+    repeated NodeTask nodeTasks = 1;
+}
+
+message UpdateNodeTasksNotifiedRequest {
+    repeated int64 nodeTaskIds = 1;
+}

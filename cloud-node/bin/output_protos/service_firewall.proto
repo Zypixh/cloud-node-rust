@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_http_firewall_rule_group.proto";
+
+option go_package = "./pb";
+
+service FirewallService {
+    rpc composeFirewallGlobalBoard(ComposeFirewallGlobalBoardRequest) returns (ComposeFirewallGlobalBoardResponse);
+    rpc notifyHTTPFirewallEvent(NotifyHTTPFirewallEventRequest) returns (RPCSuccess);
+    rpc countFirewallDailyBlocks(CountFirewallDailyBlocksRequest) returns (CountFirewallDailyBlocksResponse);
+}
+
+message ComposeFirewallGlobalBoardRequest {
+    
+}
+
+message ComposeFirewallGlobalBoardResponse {
+    int64 countDailyLogs = 1;
+    int64 countDailyBlocks = 2;
+    int64 countDailyCaptcha = 3;
+    int64 countWeeklyBlocks = 4;
+    
+    repeated HTTPFirewallRuleGroupStat httpFirewallRuleGroups = 30;
+    message HTTPFirewallRuleGroupStat {
+        HTTPFirewallRuleGroup httpFirewallRuleGroup = 1;
+        int64 count = 2;
+    }
+    
+    repeated DailyStat dailyStats = 31;
+    message DailyStat {
+        string day = 1;
+        int64 countLogs = 2;
+        int64 countCaptcha = 3;
+        int64 countBlocks = 4;
+    }
+    
+    repeated HourlyStat hourlyStats = 32;
+    message HourlyStat {
+        string hour = 1;
+        int64 countLogs = 2;
+        int64 countCaptcha = 3;
+        int64 countBlocks = 4;
+    }
+    
+    repeated NodeStat topNodeStats = 33;
+    message NodeStat {
+        int64 nodeId = 1;
+        string nodeName = 2;
+        int64 countRequests = 3;
+        int64 bytes = 4;
+        int64 countAttackRequests = 6;
+        int64 attackBytes = 7;
+    }
+    
+    repeated DomainStat topDomainStats = 34;
+    message DomainStat {
+        int64 serverId = 1;
+        string domain = 2;
+        int64 countRequests = 3;
+        int64 bytes = 4;
+        int64 countAttackRequests = 6;
+        int64 attackBytes = 7;
+    }
+    
+    repeated CountryStat topCountryStats = 35;
+    message CountryStat {
+        string countryName = 1;
+        int64 bytes = 2;
+        int64 countRequests = 3;
+        float percent = 4;
+        int64 countAttackRequests = 6;
+        int64 attackBytes = 7;
+    }
+}
+
+message NotifyHTTPFirewallEventRequest {
+    int64 serverId = 1;
+    int64 httpFirewallPolicyId = 2;
+    int64 httpFirewallRuleGroupId = 3;
+    int64 httpFirewallRuleSetId = 4;
+    int64 createdAt = 5;
+}
+
+message CountFirewallDailyBlocksRequest {
+    
+}
+
+message CountFirewallDailyBlocksResponse {
+    int64 countBlocks = 1;
+}

@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "./pb";
+
+message UserFeature {
+    string code = 1;
+    string name = 2;
+    string description = 3;
+    string warning = 5;
+    bool supportPlan = 4;
+}

@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/model_node_cluster.proto";
+import "models/model_user_feature.proto";
+import "models/model_login.proto";
+
+option go_package = "./pb";
+
+message User {
+    int64 id = 1;
+    string username = 2;
+    string fullname = 3;
+    string mobile = 4;
+    string tel = 5;
+    string email = 6;
+    string verifiedEmail = 20;
+    string verifiedMobile = 23;
+    string remark = 7;
+    bool isOn = 8;
+    int64 createdAt = 9;
+    string registeredIP = 12;
+    bool isVerified = 13;
+    bool isRejected = 14;
+    string rejectReason = 15;
+    bool isDeleted = 16;
+    bool isIndividualIdentified = 17;
+    bool isEnterpriseIdentified = 18;
+    string bandwidthAlgo = 21;
+    string lang = 22;
+    bool enableInstantMessage = 24;
+    Login otpLogin = 19;
+    NodeCluster nodeCluster = 10;
+    repeated UserFeature features = 11;
+}

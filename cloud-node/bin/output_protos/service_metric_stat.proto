@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/model_metric_stat.proto";
+import "models/rpc_messages.proto";
+
+option go_package = "./pb";
+
+service MetricStatService {
+    rpc uploadMetricStats(UploadMetricStatsRequest) returns (RPCSuccess);
+    rpc countMetricStats(CountMetricStatsRequest) returns (RPCCountResponse);
+    rpc listMetricStats(ListMetricStatsRequest) returns (ListMetricStatsResponse);
+}
+
+message UploadMetricStatsRequest {
+    int64 serverId = 1;
+    string time = 2;
+    int64 count = 3;
+    float total = 4;
+    int32 version = 5;
+    int64 itemId = 6;
+    repeated UploadingMetricStat metricStats = 7;
+    repeated string keepKeys = 8;
+}
+
+message CountMetricStatsRequest {
+    int64 metricItemId = 1;
+}
+
+message ListMetricStatsRequest {
+    int64 metricItemId = 1;
+    int64 offset = 2;
+    int64 size = 3;
+}
+
+message ListMetricStatsResponse {
+    repeated MetricStat metricStats = 1;
+}

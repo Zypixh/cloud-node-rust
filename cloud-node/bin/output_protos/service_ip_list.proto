@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_ip_list.proto";
+
+option go_package = "./pb";
+
+service IPListService {
+    rpc createIPList(CreateIPListRequest) returns (CreateIPListResponse);
+    rpc updateIPList(UpdateIPListRequest) returns (RPCSuccess);
+    rpc findEnabledIPList(FindEnabledIPListRequest) returns (FindEnabledIPListResponse);
+    rpc countAllEnabledIPLists(CountAllEnabledIPListsRequest) returns (RPCCountResponse);
+    rpc listEnabledIPLists(ListEnabledIPListsRequest) returns (ListEnabledIPListsResponse);
+    rpc deleteIPList(DeleteIPListRequest) returns (RPCSuccess);
+    rpc existsEnabledIPList(ExistsEnabledIPListRequest) returns (ExistsEnabledIPListResponse);
+    rpc findEnabledIPListContainsIP(FindEnabledIPListContainsIPRequest) returns (FindEnabledIPListContainsIPResponse);
+    rpc findServerIdWithIPListId(FindServerIdWithIPListIdRequest) returns (FindServerIdWithIPListIdResponse);
+    rpc findIPListIdWithCode(FindIPListIdWithCodeRequest) returns (FindIPListIdWithCodeResponse);
+}
+
+message CreateIPListRequest {
+    string type = 1;
+    string name = 2;
+    string code = 3;
+    bytes timeoutJSON = 4;
+    bool isPublic = 5;
+    string description = 6;
+    bool isGlobal = 7;
+    int64 serverId = 8;
+}
+
+message CreateIPListResponse {
+    int64 ipListId = 1;
+}
+
+message UpdateIPListRequest {
+    int64 ipListId = 1;
+    string name = 2;
+    string code = 3;
+    bytes timeoutJSON = 4;
+    string description = 5;
+}
+
+message FindEnabledIPListRequest {
+    int64 ipListId = 1;
+}
+
+message FindEnabledIPListResponse {
+    IPList ipList = 1;
+}
+
+message CountAllEnabledIPListsRequest {
+    string type = 1;
+    bool isPublic = 2;
+    string keyword = 3;
+}
+
+message ListEnabledIPListsRequest {
+    string type = 1;
+    bool isPublic = 2;
+    string keyword = 3;
+    int64 offset = 4;
+    int64 size = 5;
+}
+
+message ListEnabledIPListsResponse {
+    repeated IPList ipLists = 1;
+}
+
+message DeleteIPListRequest {
+    int64 ipListId = 1;
+}
+
+message ExistsEnabledIPListRequest {
+    int64 ipListId = 1;
+}
+
+message ExistsEnabledIPListResponse {
+    bool exists = 1;
+}
+
+message FindEnabledIPListContainsIPRequest {
+    string ip = 1;
+}
+
+message FindEnabledIPListContainsIPResponse {
+    repeated IPList ipLists = 1;
+}
+
+message FindServerIdWithIPListIdRequest {
+    int64 ipListId = 1;
+}
+
+message FindServerIdWithIPListIdResponse {
+    int64 serverId = 1;
+}
+
+message FindIPListIdWithCodeRequest {
+    string code = 1;
+}
+
+message FindIPListIdWithCodeResponse {
+    int64 ipListId = 1;
+}

@@ -1,0 +1,3 @@
+rpc.endpoints: [ "" ]
+nodeId: ""
+secret: ""

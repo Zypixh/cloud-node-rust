@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "./pb";
+
+message HTTPFirewallRuleSet {
+    int64 id = 1;
+    string name = 2;
+    bool isOn = 3;
+    string description = 4;
+    string code = 5;
+}

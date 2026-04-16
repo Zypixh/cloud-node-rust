@@ -1,0 +1,57 @@
+[package]
+name = "cloud-node-rust"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.8.2"
+anyhow = "1.0.102"
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+bytes = "1"
+cfb-mode = "0.8.2"
+dashmap = "6.1.0"
+clap = { version = "4", features = ["derive"] }
+http = "1.4.0"
+ipnet = "2.11.0"
+lazy_static = "1.5.0"
+md-5 = "0.11.0"
+pingora = { path = "./pingora-main/pingora", features = ["proxy", "cache", "boringssl"] }
+pingora-core = { path = "./pingora-main/pingora-core" }
+pingora-load-balancing = { path = "./pingora-main/pingora-load-balancing" }
+pingora-proxy = { path = "./pingora-main/pingora-proxy" }
+pingora-http = { path = "./pingora-main/pingora-http" }
+pingora-cache = { path = "./pingora-main/pingora-cache" }
+prost = "0.13.5"
+regex = "1.12.3"
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9.34"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+flate2 = "1.0"
+md5_legacy = { package = "md5", version = "0.7" }
+brotli = "7.0"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1.18"
+tonic = "0.12.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+urlencoding = "2.1.3"
+uuid = { version = "1.15.1", features = ["v4"] }
+sysinfo = "0.33.1"
+once_cell = "1"
+governor = "0.8.1"
+maxminddb = "0.25.0"
+zstd = "0.13.2"
+chrono = "0.4.39"
+hex = "0.4.3"
+woothee = "0.13.0"
+rocksdb = { version = "0.23.0", features = ["lz4"] }
+openssl = "0.10.70"
+rand = "0.8"
+
+[build-dependencies]
+tonic-build = "0.12.3"

@@ -1,0 +1,110 @@
+                    match message.code.as_str() {
+                        "newNodeTask" | "NewNodeTask" | "configChanged" => {
+                            info!("Received node config/task notification. Pulling updated state...");
+                            fetch_and_apply_config(
+                                &mut node_service,
+                                &config_store,
+                                &api_config,
+                                &ip_list_manager,
+                                &health_manager,
+                                &cert_selector,
+                                &mut task_version,
+                                &mut deleted_content_version,
+                                &mut config_version,
+                            )
+                            .await;
+
+                            let _ = tx.send(pb::NodeStreamMessage {
+                                node_id: config_store.get_node_id().await,
+                                request_id: message.request_id,
+                                is_ok: true,
+                                message: "ok".to_string(),
+                                ..Default::default()
+                            }).await;
+                        }
+                        "testCacheWrite" => {
+                            info!("Received cache write test command");
+                            let cache_dir = "data/cache"; 
+                            let test_file = format!("{}/test_{}.tmp", cache_dir, message.request_id);
+                            let result = std::fs::write(&test_file, "test");
+                            let _ = std::fs::remove_file(&test_file);
+                            
+                            let _ = tx.send(pb::NodeStreamMessage {
+                                node_id: config_store.get_node_id().await,
+                                request_id: message.request_id,
+                                is_ok: result.is_ok(),
+                                message: if result.is_ok() { "ok".to_string() } else { format!("Error: {:?}", result.err()) },
+                                ..Default::default()
+                            }).await;
+                        }
+                        "testCacheRead" => {
+                            info!("Received cache read test command");
+                            let result = std::fs::read_dir("data/cache");
+                            let _ = tx.send(pb::NodeStreamMessage {
+                                node_id: config_store.get_node_id().await,
+                                request_id: message.request_id,
+                                is_ok: result.is_ok(),
+                                message: if result.is_ok() { "ok".to_string() } else { "read failed".to_string() },
+                                ..Default::default()
+                            }).await;
+                        }
+                        "getStat" => {
+                            let mut sys = sysinfo::System::new_all();
+                            sys.refresh_cpu_all();
+                            sys.refresh_memory();
+                            let (traffic_out, traffic_in, connections) = crate::metrics::METRICS.get_node_totals();
+                            let stat = serde_json::json!({
+                                "cpuUsage": sys.global_cpu_usage() / 100.0,
+                                "memUsage": sys.used_memory() as f64 / sys.total_memory() as f64,
+                                "trafficIn": traffic_in,
+                                "trafficOut": traffic_out,
+                                "connections": connections,
+                            });
+                            
+                            let _ = tx.send(pb::NodeStreamMessage {
+                                node_id: config_store.get_node_id().await,
+                                request_id: message.request_id,
+                                is_ok: true,
+                                data_json: stat.to_string().into_bytes(),
+                                ..Default::default()
+                            }).await;
+                        }
+                        "tieredOriginBypass" => {
+                            let bypass = String::from_utf8_lossy(&message.data_json) == "true";
+                            info!("Received Tiered Origin Bypass command: {}", bypass);
+                            config_store.set_tiered_origin_bypass(bypass).await;
+
+                            let _ = tx.send(pb::NodeStreamMessage {
+                                node_id: config_store.get_node_id().await,
+                                request_id: message.request_id,
+                                is_ok: true,
+                                message: "ok".to_string(),
+                                ..Default::default()
+                            }).await;
+                        }
+                        "connectedAPINode" => {
+                            if let Ok(mut guard) = CONNECTED_API_NODE_IDS.write() {
+                                if let Ok(val) =
+                                    String::from_utf8_lossy(&message.data_json).parse::<i64>()
+                                {
+                                    guard.insert(val);
+                                }
+                            }
+                            let _ = tx.send(pb::NodeStreamMessage {
+                                node_id: config_store.get_node_id().await,
+                                request_id: message.request_id,
+                                is_ok: true,
+                                message: "ok".to_string(),
+                                ..Default::default()
+                            }).await;
+                        }
+                        _ => {
+                            let _ = tx.send(pb::NodeStreamMessage {
+                                node_id: config_store.get_node_id().await,
+                                request_id: message.request_id,
+                                is_ok: true,
+                                message: "accepted".to_string(),
+                                ..Default::default()
+                            }).await;
+                        }
+                    }

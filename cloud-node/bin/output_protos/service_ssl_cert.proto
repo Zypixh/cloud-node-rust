@@ -1,0 +1,199 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_ssl_cert.proto";
+import "models/model_user.proto";
+
+option go_package = "./pb";
+
+service SSLCertService {
+    rpc createSSLCert(CreateSSLCertRequest) returns (CreateSSLCertResponse);
+    rpc createSSLCerts(CreateSSLCertsRequest) returns (CreateSSLCertsResponse);
+    rpc updateSSLCert(UpdateSSLCertRequest) returns (RPCSuccess);
+    rpc deleteSSLCert(DeleteSSLCertRequest) returns (RPCSuccess);
+    rpc findEnabledSSLCertConfig(FindEnabledSSLCertConfigRequest) returns (FindEnabledSSLCertConfigResponse);
+    rpc countSSLCerts(CountSSLCertRequest) returns (RPCCountResponse);
+    rpc listSSLCerts(ListSSLCertsRequest) returns (ListSSLCertsResponse);
+    rpc countAllSSLCertsWithOCSPError(CountAllSSLCertsWithOCSPErrorRequest) returns (RPCCountResponse);
+    rpc listSSLCertsWithOCSPError(ListSSLCertsWithOCSPErrorRequest) returns (ListSSLCertsWithOCSPErrorResponse);
+    rpc ignoreSSLCertsWithOCSPError(IgnoreSSLCertsWithOCSPErrorRequest) returns (RPCSuccess);
+    rpc resetSSLCertsWithOCSPError(ResetSSLCertsWithOCSPErrorRequest) returns (RPCSuccess);
+    rpc resetAllSSLCertsWithOCSPError(ResetAllSSLCertsWithOCSPErrorRequest) returns (RPCSuccess);
+    rpc listUpdatedSSLCertOCSP(ListUpdatedSSLCertOCSPRequest) returns (ListUpdatedSSLCertOCSPResponse);
+    rpc findSSLCertUser(FindSSLCertUserRequest) returns (FindSSLCertUserResponse);
+    rpc parseSSLCert(ParseSSLCertRequest) returns (ParseSSLCertResponse);
+    rpc generateSelfSignedCertificate(GenerateSelfSignedCertificateRequest) returns (GenerateSelfSignedCertificateResponse);
+}
+
+message CreateSSLCertRequest {
+    bool isOn = 1;
+    int64 userId = 12;
+    string name = 2;
+    string description = 3;
+    string serverName = 4;
+    bool isCA = 5;
+    bytes certData = 6;
+    bytes keyData = 7;
+    int64 timeBeginAt = 8;
+    int64 timeEndAt = 9;
+    repeated string dnsNames = 10;
+    repeated string commonNames = 11;
+    bool isSelfSigned = 13;
+}
+
+message CreateSSLCertResponse {
+    int64 sslCertId = 1;
+}
+
+message CreateSSLCertsRequest {
+    repeated SSLCert SSLCerts = 1;
+    message SSLCert {
+        bool isOn = 1;
+        string name = 2;
+        string description = 3;
+        string serverName = 4;
+        bool isCA = 5;
+        bytes certData = 6;
+        bytes keyData = 7;
+        int64 timeBeginAt = 8;
+        int64 timeEndAt = 9;
+        repeated string dnsNames = 10;
+        repeated string commonNames = 11;
+    }
+    
+    int64 userId = 2;
+}
+
+message CreateSSLCertsResponse {
+    repeated int64 sslCertIds = 1;
+}
+
+message UpdateSSLCertRequest {
+    int64 sslCertId = 1;
+    bool isOn = 2;
+    string name = 3;
+    string description = 4;
+    string serverName = 5;
+    bool isCA = 6;
+    bytes certData = 7;
+    bytes keyData = 8;
+    int64 timeBeginAt = 9;
+    int64 timeEndAt = 10;
+    repeated string dnsNames = 11;
+    repeated string commonNames = 12;
+}
+
+message FindEnabledSSLCertConfigRequest {
+    int64 sslCertId = 1;
+}
+
+message FindEnabledSSLCertConfigResponse {
+    bytes sslCertJSON = 1;
+}
+
+message DeleteSSLCertRequest {
+    int64 sslCertId = 1;
+}
+
+message CountSSLCertRequest {
+    bool isCA = 1;
+    bool isAvailable = 2;
+    bool isExpired = 3;
+    int32 expiringDays = 4;
+    string keyword = 5;
+    int64 userId = 6;
+    repeated string domains = 7;
+    bool userOnly = 8;
+}
+
+message ListSSLCertsRequest {
+    bool isCA = 1;
+    bool isAvailable = 2;
+    bool isExpired = 3;
+    int32 expiringDays = 4;
+    string keyword = 5;
+    int64 userId = 8;
+    repeated string domains = 9;
+    int64 offset = 6;
+    int64 size = 7;
+    bool userOnly = 10;
+}
+
+message ListSSLCertsResponse {
+    bytes sslCertsJSON = 1;
+}
+
+message CountAllSSLCertsWithOCSPErrorRequest {
+    string keyword = 1;
+}
+
+message ListSSLCertsWithOCSPErrorRequest {
+    string keyword = 1;
+    int64 offset = 2;
+    int64 size = 3;
+}
+
+message ListSSLCertsWithOCSPErrorResponse {
+    repeated SSLCert sslCerts = 1;
+}
+
+message IgnoreSSLCertsWithOCSPErrorRequest {
+    repeated int64 sslCertIds = 1;
+}
+
+message ResetSSLCertsWithOCSPErrorRequest {
+    repeated int64 sslCertIds = 1;
+}
+
+message ResetAllSSLCertsWithOCSPErrorRequest {
+    
+}
+
+message ListUpdatedSSLCertOCSPRequest {
+    int64 version = 1;
+    int32 size = 2;
+}
+
+message ListUpdatedSSLCertOCSPResponse {
+    repeated SSLCertOCSP sslCertOCSP = 1;
+    message SSLCertOCSP {
+        int64 sslCertId = 1;
+        bytes data = 2;
+        int64 version = 3;
+        int64 expiresAt = 4;
+    }
+}
+
+message FindSSLCertUserRequest {
+    int64 sslCertId = 1;
+}
+
+message FindSSLCertUserResponse {
+    User user = 1;
+}
+
+message ParseSSLCertRequest {
+    bool isCA = 1;
+    bytes certData = 2;
+    bytes keyData = 3;
+}
+
+message ParseSSLCertResponse {
+    repeated string dnsNames = 1;
+    repeated string commonNames = 2;
+    int64 timeBeginAt = 3;
+    int64 timeEndAt = 4;
+}
+
+message GenerateSelfSignedCertificateRequest {
+    repeated string dnsNames = 1;
+    string organizationName = 2;
+    int64 timeEndAt = 3;
+}
+
+message GenerateSelfSignedCertificateResponse {
+    bytes certData = 1;
+    bytes keyData = 2;
+}
