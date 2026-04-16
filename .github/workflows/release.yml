@@ -37,6 +37,11 @@ jobs:
         with:
           targets: ${{ matrix.platform.target }}
 
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
