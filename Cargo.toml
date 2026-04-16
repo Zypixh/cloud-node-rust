@@ -50,7 +50,7 @@ chrono = "0.4.39"
 hex = "0.4.3"
 woothee = "0.13.0"
 rocksdb = { version = "0.23.0", features = ["lz4"] }
-openssl = "0.10.70"
+openssl = { version = "0.10.70", features = ["vendored"] }
 rand = "0.8"
 
 [build-dependencies]
