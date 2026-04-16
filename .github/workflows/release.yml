@@ -8,7 +8,8 @@ on:
 jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
-    runs-on: ${{ matrix.platform.os }}
+    # 全部运行在您的自托管服务器上，彻底解决账单问题
+    runs-on: self-hosted
     strategy:
       matrix:
         platform:
@@ -18,9 +19,6 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             name: linux-arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: macos-arm64
 
     steps:
       - name: Checkout code
@@ -42,17 +40,12 @@ jobs:
           key: ${{ matrix.platform.target }}
 
       - name: Install dependencies (Linux)
-        if: matrix.platform.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential golang-go
           if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           fi
-
-      - name: Install dependencies (macOS)
-        if: matrix.platform.os == 'macos-latest'
-        run: brew install cmake go
 
       - name: Build
         shell: bash
