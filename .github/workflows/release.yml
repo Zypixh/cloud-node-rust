@@ -37,6 +37,11 @@ jobs:
         with:
           targets: ${{ matrix.platform.target }}
 
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform.target }}
+
       - name: Install dependencies (Linux)
         if: matrix.platform.os == 'ubuntu-latest'
         run: |
