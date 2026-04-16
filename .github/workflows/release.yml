@@ -8,7 +8,6 @@ on:
 jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
-    # 全部运行在您的自托管服务器上，彻底解决账单问题
     runs-on: self-hosted
     strategy:
       matrix:
