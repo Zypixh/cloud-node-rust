@@ -8,8 +8,10 @@ on:
 jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
-    # 兼容 Codeberg Actions 和 GitHub Actions
-    runs-on: [ubuntu-latest, self-hosted, linux/amd64]
+    # 增加 guard 检查，仅在 GitHub 平台运行此 workflow
+    # 这样 Codeberg Actions 就会直接忽略它
+    if: github.server_url == 'https://github.com'
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       matrix:
         platform:
@@ -19,6 +21,9 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             name: linux-arm64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
 
     steps:
       - name: Checkout code
@@ -40,6 +45,7 @@ jobs:
           key: ${{ matrix.platform.target }}
 
       - name: Install dependencies (Linux)
+        if: matrix.platform.os == 'ubuntu-latest'
         run: |
           sudo apt-get update || true
           sudo apt-get install -y cmake build-essential golang-go
@@ -73,7 +79,8 @@ jobs:
   release:
     name: Create Release
     needs: build
-    runs-on: [ubuntu-latest, linux/amd64]
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -82,7 +89,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create GitHub/Codeberg Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
