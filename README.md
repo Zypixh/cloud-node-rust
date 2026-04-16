@@ -55,5 +55,10 @@ cargo build --release
 ## 自动化发布
 本项目已集成 GitHub Actions。每当推送以 `v` 开头的 Git Tag（例如 `v1.1.5`）到仓库时，系统会自动构建适用于 **Linux (x64)**, **macOS (Intel/M1)** 和 **Windows (x64)** 的多平台版本并发布。
 
-## 开源协议
-本项目遵循与原项目一致的开源协议。欢迎提交 Issue 和 Pull Request 进行贡献！
+## 技术致谢 (Credits)
+本项目基于 [Cloudflare Pingora](https://github.com/cloudflare/pingora) 框架构建。我们对 Cloudflare 开源这一卓越的高性能网络框架表示由衷的感谢。
+*   Pingora 采用 [Apache License 2.0](https://github.com/cloudflare/pingora/blob/main/LICENSE) 授权。
+*   本项目同样遵循 Apache License 2.0 协议。
+
+## 开源协议 (License)
+本项目遵循 Apache License 2.0 协议。详情请参阅 [LICENSE](LICENSE) 文件。
