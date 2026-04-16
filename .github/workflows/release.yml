@@ -6,35 +6,16 @@ on:
       - 'v*'
 
 jobs:
-  # 1. 前置检查任务，用于判定平台
-  check:
-    runs-on: ubuntu-latest
-    # 如果是在 Codeberg 上，这个 job 也会卡住，但它只有一个
-    # 所以我们通过 if 条件让它直接从定义上消失
-    if: github.server_url == 'https://github.com'
-    outputs:
-      is_github: ${{ steps.check.outputs.is_github }}
-    steps:
-      - id: check
-        run: echo "is_github=true" >> $GITHUB_OUTPUT
-
+  # 将所有逻辑合并，并使用动态矩阵彻底消除非 GitHub 环境下的运行器请求
   build:
     name: Build - ${{ matrix.platform.name }}
-    needs: check
-    if: needs.check.result == 'success'
+    if: github.server_url == 'https://github.com'
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            name: linux-x64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            name: linux-arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: macos-arm64
+        # 只有在 GitHub 域名下才会生成平台列表，否则为空数组 []
+        # 空数组会导致此 Job 不产生任何实例，从而不触发运行器申请
+        platform: ${{ fromJSON((github.server_url == 'https://github.com') && '[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","name":"linux-x64"},{"os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","name":"linux-arm64"},{"os":"macos-latest","target":"aarch64-apple-darwin","name":"macos-arm64"}]' || '[]') }}
 
     runs-on: ${{ matrix.platform.os }}
     steps:
@@ -88,10 +69,15 @@ jobs:
           name: cloud-node-rust-${{ matrix.platform.name }}
           path: cloud-node-rust-${{ matrix.platform.name }}.tar.gz
 
+  # 同样的技巧应用到 release 任务
   release:
     name: Create Release
-    needs: [check, build]
-    if: needs.check.result == 'success'
+    needs: build
+    if: github.server_url == 'https://github.com'
+    strategy:
+      matrix:
+        # 确保只有在 GitHub 且 build 成功后才产生 1 个任务实例
+        env: ${{ fromJSON((github.server_url == 'https://github.com') && '["github"]' || '[]') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
