@@ -1,0 +1,39 @@
+kind: pipeline
+name: release
+
+steps:
+  build-linux-x64:
+    image: rust:1.81-bookworm
+    commands:
+      - apt-get update && apt-get install -y cmake golang-go protobuf-compiler
+      - cargo build --release
+      - cd target/release
+      - tar -czf ../../cloud-node-rust-linux-x64.tar.gz cloud-node-rust
+    when:
+      event: tag
+
+  build-linux-arm64:
+    image: rust:1.81-bookworm
+    commands:
+      - apt-get update && apt-get install -y cmake golang-go protobuf-compiler gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - rustup target add aarch64-unknown-linux-gnu
+      - export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+      - export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+      - export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+      - cargo build --release --target aarch64-unknown-linux-gnu
+      - cd target/aarch64-unknown-linux-gnu/release
+      - tar -czf ../../../cloud-node-rust-linux-arm64.tar.gz cloud-node-rust
+    when:
+      event: tag
+
+  publish:
+    image: woodpeckerci/plugin-release
+    settings:
+      api_key:
+        from_secret: codeberg_token
+      files:
+        - cloud-node-rust-linux-x64.tar.gz
+        - cloud-node-rust-linux-arm64.tar.gz
+      base_url: https://codeberg.org
+    when:
+      event: tag
