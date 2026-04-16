@@ -2,29 +2,21 @@ name: Release
 
 on:
   push:
-    # 依然监听标签推送
     tags:
       - 'v*'
 
 jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
-    # 核心技巧：只有在真正推送到 Zypixh/cloud-node-rust (GitHub 地址) 时才启用这些任务
-    # Codeberg 的仓库名通常不包含这个路径，或者 server_url 不同
-    if: github.repository == 'Zypixh/cloud-node-rust' && github.server_url == 'https://github.com'
-    runs-on: ${{ matrix.platform.os }}
+    # 核心逻辑：只有在 GitHub 环境下才生成构建矩阵
+    # 在 Codeberg 下，platform 列表为空，任务将直接跳过，不会产生“等待运行器”的提示
     strategy:
+      fail-fast: false
       matrix:
-        platform:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            name: linux-x64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            name: linux-arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: macos-arm64
+        platform: ${{ fromJSON((github.server_url == 'https://github.com') && '[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","name":"linux-x64"},{"os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","name":"linux-arm64"},{"os":"macos-latest","target":"aarch64-apple-darwin","name":"macos-arm64"}]' || '[]') }}
+
+    runs-on: ${{ matrix.platform.os }}
+    if: github.server_url == 'https://github.com'
 
     steps:
       - name: Checkout code
@@ -80,8 +72,8 @@ jobs:
   release:
     name: Create Release
     needs: build
-    # 同样在这里增加 guard
-    if: github.repository == 'Zypixh/cloud-node-rust' && github.server_url == 'https://github.com'
+    # release 任务也增加环境检查
+    if: github.server_url == 'https://github.com' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
