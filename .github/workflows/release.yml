@@ -2,15 +2,16 @@ name: Release
 
 on:
   push:
+    # 依然监听标签推送
     tags:
       - 'v*'
 
 jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
-    # 增加 guard 检查，仅在 GitHub 平台运行此 workflow
-    # 这样 Codeberg Actions 就会直接忽略它
-    if: github.server_url == 'https://github.com'
+    # 核心技巧：只有在真正推送到 Zypixh/cloud-node-rust (GitHub 地址) 时才启用这些任务
+    # Codeberg 的仓库名通常不包含这个路径，或者 server_url 不同
+    if: github.repository == 'Zypixh/cloud-node-rust' && github.server_url == 'https://github.com'
     runs-on: ${{ matrix.platform.os }}
     strategy:
       matrix:
@@ -79,7 +80,8 @@ jobs:
   release:
     name: Create Release
     needs: build
-    if: github.server_url == 'https://github.com'
+    # 同样在这里增加 guard
+    if: github.repository == 'Zypixh/cloud-node-rust' && github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     permissions:
       contents: write
