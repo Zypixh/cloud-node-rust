@@ -8,8 +8,8 @@ on:
 jobs:
   build:
     name: Build - ${{ matrix.platform.name }}
-    # 还原为官方提供的免费运行环境
-    runs-on: ${{ matrix.platform.os }}
+    # 兼容 Codeberg Actions 和 GitHub Actions
+    runs-on: [ubuntu-latest, self-hosted, linux/amd64]
     strategy:
       matrix:
         platform:
@@ -19,9 +19,6 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             name: linux-arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: macos-arm64
 
     steps:
       - name: Checkout code
@@ -43,9 +40,8 @@ jobs:
           key: ${{ matrix.platform.target }}
 
       - name: Install dependencies (Linux)
-        if: matrix.platform.os == 'ubuntu-latest'
         run: |
-          sudo apt-get update
+          sudo apt-get update || true
           sudo apt-get install -y cmake build-essential golang-go
           if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
@@ -77,7 +73,7 @@ jobs:
   release:
     name: Create Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [ubuntu-latest, linux/amd64]
     permissions:
       contents: write
     steps:
@@ -86,7 +82,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create GitHub Release
+      - name: Create GitHub/Codeberg Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
