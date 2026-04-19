@@ -17,20 +17,30 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             cpu: x86-64-v2
             name: linux-x64-v2-sse4.2
+            rustflags: "-C target-cpu=x86-64-v2 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes -C target-feature=+pclmulqdq"
+            cxxflags: "-mpclmul -msse4.2"
           - target: x86_64-unknown-linux-gnu
             cpu: x86-64-v3
             name: linux-x64-v3-avx2
+            rustflags: "-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes -C target-feature=+pclmulqdq"
+            cxxflags: "-mpclmul -msse4.2"
           - target: x86_64-unknown-linux-gnu
             cpu: x86-64-v4
             name: linux-x64-v4-avx512
+            rustflags: "-C target-cpu=x86-64-v4 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes -C target-feature=+pclmulqdq"
+            cxxflags: "-mpclmul -msse4.2"
 
           # --- ARM64 Variants ---
           - target: aarch64-unknown-linux-gnu
             cpu: generic
             name: linux-arm64-generic
+            rustflags: "-C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+neon,+crypto,+crc -C embed-bitcode=yes"
+            cxxflags: ""
           - target: aarch64-unknown-linux-gnu
             cpu: neoverse-n1
             name: linux-arm64-neoverse-n1
+            rustflags: "-C target-cpu=neoverse-n1 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes"
+            cxxflags: ""
 
     steps:
       - name: Checkout code
@@ -57,10 +67,16 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
+          # Important: Include the unique variant name and flags in the cache key
+          key: ${{ matrix.name }}-${{ matrix.target }}
+          env-vars: "RUSTFLAGS CXXFLAGS CFLAGS"
 
       - name: Build
         shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          CXXFLAGS: ${{ matrix.cxxflags }}
+          CFLAGS: ${{ matrix.cxxflags }}
         run: |
           # 1. Handle ARM Linkers
           if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
@@ -69,23 +85,6 @@ jobs:
             export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           fi
           
-          # 2. Set Optimization Flags
-          # LTO=fat for maximum performance. embed-bitcode=yes for LTO compatibility.
-          export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }} -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes"
-          
-          # 3. Fix RocksDB SIMD Issues (x86_64 specific)
-          if [ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]; then
-             # v2 and above almost always have pclmulqdq, and RocksDB requires it for CRC32
-             export RUSTFLAGS="$RUSTFLAGS -C target-feature=+pclmulqdq"
-             export CXXFLAGS="-mpclmul -msse4.2"
-             export CFLAGS="-mpclmul -msse4.2"
-          fi
-
-          # 4. Special handling for ARM generic
-          if [ "${{ matrix.cpu }}" == "generic" ] && [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
-             export RUSTFLAGS="-C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+neon,+crypto,+crc -C embed-bitcode=yes"
-          fi
-
           cargo build --release --target ${{ matrix.target }}
 
       - name: Package
