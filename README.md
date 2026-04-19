@@ -1,64 +1,85 @@
-# CloudNode Rust Implementation
+# CloudNode Rust
 
-[![Release](https://github.com/Zypixh/cloud-node-rust/actions/workflows/release.yml/badge.svg)](https://github.com/Zypixh/cloud-node-rust/actions/workflows/release.yml)
+本项目基于 Cloudflare Pingora 框架构建。我们对 Cloudflare 开源这一卓越的高性能网络框架表示由衷的感谢。
 
-这是一个基于 Rust 语言重新实现的 `cloud-node` (EdgeNode) 边缘节点程序。本项目利用 [Pingora](https://github.com/cloudflare/pingora) 框架，实现了高性能、低内存占用的边缘计算与安全防御能力。
+**CloudNode Rust** 是一款基于 Cloudflare [Pingora](https://github.com/cloudflare/pingora) 框架构建的高性能 CDN 边缘节点。它旨在提供超越原版 Go 实现的吞吐能力、更低的延迟以及更智能的集群自愈机制。
 
-## 项目主页
-GitHub: [https://github.com/Zypixh/cloud-node-rust](https://github.com/Zypixh/cloud-node-rust)
+## 🚀 核心特性
 
-## 核心功能
+### 1. 极致转发性能
+*   **多协议支持**：原生支持 HTTP/1.1、HTTP/2、gRPC、WebSocket、TCP、TCP-TLS 及 UDP 转发。
+*   **网络栈优化**：全链路强制开启 `TCP_NODELAY`，支持基于 `libc` 定制的 `SO_KEEPALIVE` 探测，在 Linux 环境下自动激活 **BBR 拥塞控制算法**。
+*   **硬件加速**：支持针对 x86_64 (AVX2, AVX-512) 和 ARM64 (NEON, LSE) 的指令集深度优化。
 
-### 1. 高性能缓存系统
-*   **多层级策略**：完美对齐“网站规则 > 全局策略”的匹配逻辑，支持 `disablePolicyRefs` 开关。
-*   **动态 Key 生成**：支持基于 `${host}`, `${requestPath}`, `${cookie:NAME}`, `${arg:NAME}` 等 20+ 种变量的自定义 Key 模板。
-*   **分片内容缓存**：支持 `206 Partial Content` 状态码的缓存与读取。
-*   **智能过期控制**：实现了 `Expires` 和 `Cache-Control` Header 的自动计算与注入。
-*   **高级回源控制**：支持强制 Range 回源、客户端 `no-cache` 刷新及 MISS 时自动剥离条件请求 Header。
+### 2. 智能感知型分发 (Smart Tiered-Origin)
+*   **负载避让**：通过私有协议头 `X-Cloud-Node-Pressure` 实时感知 L2 父节点的 CPU 和连接压力。当节点过载（>0.9）时，自动执行哈希漂移寻找空闲节点。
+*   **一致性哈希**：支持 `urlMapping`（Ketama 算法），显著提升集群 L2 缓存命中率。
+*   **强制 Ln 模式**：支持集群级配置，可强制所有或仅可缓存请求通过 L2 分发。
 
-### 2. 实战级 WAF 防御体系
-*   **12 种执行动作**：完整实现 Block, Page, Captcha, JS Cookie, Redirect, Allow (三级作用域), Log, Tag, Notify, Get302, Post307, GoGroup/GoSet。
-*   **高性能规则引擎**：基于正则实现的 `Group -> Set -> Rule` 匹配架构，支持 `in`, `matches`, `wildcard`, `version` 等全量操作符。
-*   **预制防御集**：内置 SQL 注入（普通/严格）、XSS、命令注入、恶意 UA 等实战规则。
-*   **精细化封禁**：支持**随机封禁时长**、**C 段网段封禁**、**局域网/搜索引擎旁路**以及白名单秒级放行。
-*   **特殊防御**：强制执行空连接泛滥防御、TLS 资源耗尽防御及 CC 攻击频率限制。
+### 3. 电信级混合缓存 (Hybrid Cache)
+*   **二级存储**：Memory (L1) + Disk (L2) 混合架构，热点数据秒级内存响应。
+*   **流式压缩**：根据内容类型自动执行异步 Zstd 压缩存储，大幅节省磁盘 IO 和空间。
+*   **原子更新**：基于 **RocksDB** 的元数据持久化，支持单机千万级文件索引与热启动。
+*   **安全保护**：内置磁盘水位预警，自动防止缓存撑爆文件系统。
 
-### 3. 配置与同步
-*   **协议对齐**：完全适配 `cloud-node` 最新的 gRPC PB 协议，支持 `httpCachePolicies` 和 `httpFirewallPolicies` 数组解析。
-*   **自动发现**：支持节点 ID 的自动注册与动态 endpoint 切换。
+### 4. 全球配置与安全
+*   **PB 协议同步**：深度对接官方 Protobuf 协议，支持配置热更新与动态证书同步。
+*   **安全风控**：内置 WAF 引擎、IP 名单同步、局域网源站拦截、XFF 长度限制及非法 HTTP 版本过滤。
+*   **身份还原**：支持 `X-Cloud-Real-Ip` 穿透，确保多级分发下 L2 节点的统计与安全策略 100% 准确。
 
-## 部署说明
+---
 
-### 配置优先级
-程序启动时会按照以下顺序探测配置文件 `api_node.yaml`：
-1. `../configs/api_node.yaml` （**推荐**，适用于 `bin/` + `configs/` 部署结构）
-2. `configs/api_node.yaml`
-3. `api_node.yaml` （程序当前目录）
+## 🛠 编译指南
 
-### 快速开始
+为了获得最佳性能，建议根据目标机器的 CPU 架构进行编译。
 
-#### 安装构建依赖 (Linux)
+### x86_64 (Intel / AMD)
 ```bash
-sudo apt-get update
-sudo apt-get install cmake golang-go build-essential
+# 主流服务器 (支持 AVX2)
+RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat" cargo build --release
+
+# 高端服务器 (支持 AVX-512)
+RUSTFLAGS="-C target-cpu=x86-64-v4 -C opt-level=3 -C lto=fat" cargo build --release
 ```
 
-#### 编译与运行
+### ARM64 (鲲鹏 / 倚天 / Graviton)
 ```bash
-# 编译高性能发布版本
-cargo build --release
-
-# 启动程序
-./target/release/cloud-node-rust
+# 开启 NEON 与 LSE 锁优化
+RUSTFLAGS="-C target-cpu=neoverse-n1 -C opt-level=3 -C lto=fat" cargo build --release
 ```
 
-## 自动化发布
-本项目已集成 GitHub Actions。每当推送以 `v` 开头的 Git Tag（例如 `v1.1.5`）到仓库时，系统会自动构建适用于 **Linux (x64)**, **macOS (Intel/M1)** 和 **Windows (x64)** 的多平台版本并发布。
+---
 
-## 技术致谢 (Credits)
-本项目基于 [Cloudflare Pingora](https://github.com/cloudflare/pingora) 框架构建。我们对 Cloudflare 开源这一卓越的高性能网络框架表示由衷的感谢。
-*   Pingora 采用 [Apache License 2.0](https://github.com/cloudflare/pingora/blob/main/LICENSE) 授权。
-*   本项目同样遵循 Apache License 2.0 协议。
+## 📦 部署与管理
 
-## 开源协议 (License)
-本项目遵循 Apache License 2.0 协议。详情请参阅 [LICENSE](LICENSE) 文件。
+### 1. 快速安装
+将编译好的二进制文件上传至服务器，运行以下命令完成系统集成：
+```bash
+sudo ./cloud-node install
+```
+该命令会自动：
+*   在 `/usr/bin/cloud-node` 创建全局命令。
+*   注册并启用 `systemd` 服务。
+
+### 2. 常用命令
+```bash
+cloud-node start    # 后台启动
+cloud-node status   # 查看状态
+cloud-node stop     # 停止服务
+cloud-node restart  # 重启
+cloud-node test     # 检查配置文件 (api_node.yaml)
+```
+
+---
+
+## ⚙️ 系统要求
+*   **OS**: Linux (推荐 Debian 12+, Ubuntu 20.04+, CentOS 7+)。
+*   **内核**: 建议 5.0+ 以获得最佳 BBR 性能。
+*   **内存**: 建议 4GB+，针对千万级缓存切片建议 64GB+。
+
+## 📜 开源协议
+本项目基于 Apache License 2.0 协议开源。
+
+---
+
+**注意**：请确保在生产环境部署前，已根据业务规模调优系统 `ulimit -n` 限制（建议 1,048,576）。
