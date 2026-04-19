@@ -70,11 +70,18 @@ jobs:
           fi
           
           # 2. Set Optimization Flags
-          # LTO=fat is used for maximum cross-crate performance (Pingora/BoringSSL)
-          # embed-bitcode=yes is required for LTO to work properly
+          # LTO=fat for maximum performance. embed-bitcode=yes for LTO compatibility.
           export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }} -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes"
           
-          # 3. Special handling for ARM generic
+          # 3. Fix RocksDB SIMD Issues (x86_64 specific)
+          if [ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]; then
+             # v2 and above almost always have pclmul, and RocksDB requires it for CRC32
+             export RUSTFLAGS="$RUSTFLAGS -C target-feature=+pclmul"
+             export CXXFLAGS="-mpclmul -msse4.2"
+             export CFLAGS="-mpclmul -msse4.2"
+          fi
+
+          # 4. Special handling for ARM generic
           if [ "${{ matrix.cpu }}" == "generic" ] && [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
              export RUSTFLAGS="-C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+neon,+crypto,+crc -C embed-bitcode=yes"
           fi
