@@ -70,11 +70,13 @@ jobs:
           fi
           
           # 2. Set Optimization Flags
-          export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }} -C opt-level=3 -C lto=fat -C codegen-units=1"
+          # LTO=fat is used for maximum cross-crate performance (Pingora/BoringSSL)
+          # embed-bitcode=yes is required for LTO to work properly
+          export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }} -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes"
           
           # 3. Special handling for ARM generic
           if [ "${{ matrix.cpu }}" == "generic" ] && [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
-             export RUSTFLAGS="-C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+neon,+crypto,+crc"
+             export RUSTFLAGS="-C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+neon,+crypto,+crc -C embed-bitcode=yes"
           fi
 
           cargo build --release --target ${{ matrix.target }}
