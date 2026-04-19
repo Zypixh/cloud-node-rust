@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 type Aes256CfbEnc = Encryptor<Aes256>;
 
 /// Generates the base64 AES256-CFB encrypted token required by GoEdge API Node
-pub fn generate_token(node_id: &str, secret: &str) -> anyhow::Result<String> {
+pub fn generate_token(node_id: &str, secret: &str, _node_type: &str) -> anyhow::Result<String> {
     let mut key = [b' '; 32];
     let secret_bytes = secret.as_bytes();
     let len = secret_bytes.len().min(32);

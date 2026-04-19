@@ -53,13 +53,14 @@ pub fn should_cache_response(
     if let Some(cc) = headers.get("cache-control") {
         let cc_lower = cc.to_lowercase();
         for skip in &cache_ref.skip_cache_control_values {
-            if cc_lower.contains(&skip.to_lowercase()) {
+            if !skip.is_empty() && cc_lower.contains(&skip.to_lowercase()) {
                 return false;
             }
         }
     }
 
     // 5. Check Set-Cookie
+    // Only skip if the rule explicitly says to skip Set-Cookie
     if cache_ref.skip_set_cookie && headers.contains_key("set-cookie") {
         return false;
     }

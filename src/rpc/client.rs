@@ -6,6 +6,8 @@ use crate::pb;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 
+use std::time::Duration;
+
 #[derive(Clone)]
 pub struct RpcClient {
     channel: Channel,
@@ -19,10 +21,16 @@ impl RpcClient {
             .first()
             .cloned()
             .unwrap_or_default();
+        
         let channel = Channel::from_shared(api_endpoint)
             .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Some(Duration::from_secs(15)))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_while_idle(true)
             .connect()
             .await?;
+            
         Ok(Self {
             channel,
             api_config: api_config.clone(),
@@ -35,18 +43,26 @@ impl RpcClient {
 
     fn interceptor(
         api_config: &ApiConfig,
-        with_type: bool,
+        node_type: Option<&'static str>,
     ) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + 'static {
         let node_id = api_config.node_id.clone();
         let secret = api_config.secret.clone();
+        let type_str = node_type.unwrap_or("node");
         move |mut req: Request<()>| {
-            let token = generate_token(&node_id, &secret).unwrap_or_default();
-            if with_type {
-                req.metadata_mut().insert("type", "node".parse().unwrap());
+            let token = generate_token(&node_id, &secret, type_str).unwrap_or_default();
+            
+            let val = node_id.parse().unwrap_or(tonic::metadata::MetadataValue::from_static("0"));
+            
+            // Standard lowercase keys (canonical gRPC)
+            req.metadata_mut().insert("nodeid", val.clone());
+            req.metadata_mut().insert("type", tonic::metadata::MetadataValue::from_static(type_str));
+            
+            // Go-style CamelCase key
+            if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(b"nodeId") {
+                req.metadata_mut().insert(key, val);
             }
-            req.metadata_mut()
-                .insert("nodeid", node_id.parse().unwrap());
-            req.metadata_mut().insert("token", token.parse().unwrap());
+            
+            req.metadata_mut().insert("token", token.parse().unwrap_or(tonic::metadata::MetadataValue::from_static("")));
             Ok(req)
         }
     }
@@ -61,7 +77,7 @@ impl RpcClient {
     > {
         pb::node_service_client::NodeServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, false),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -75,7 +91,7 @@ impl RpcClient {
     > {
         pb::node_service_client::NodeServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, Some("edge")),
         )
     }
 
@@ -89,7 +105,7 @@ impl RpcClient {
     > {
         pb::server_service_client::ServerServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -103,7 +119,7 @@ impl RpcClient {
     > {
         pb::node_task_service_client::NodeTaskServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -117,7 +133,7 @@ impl RpcClient {
     > {
         pb::user_service_client::UserServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -131,7 +147,21 @@ impl RpcClient {
     > {
         pb::node_value_service_client::NodeValueServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
+        )
+    }
+
+    pub fn node_value_service_with_type(
+        &self,
+    ) -> pb::node_value_service_client::NodeValueServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            Channel,
+            impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + 'static,
+        >,
+    > {
+        pb::node_value_service_client::NodeValueServiceClient::with_interceptor(
+            self.channel.clone(),
+            Self::interceptor(&self.api_config, Some("edge")),
         )
     }
 
@@ -145,7 +175,7 @@ impl RpcClient {
     > {
         pb::node_log_service_client::NodeLogServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, false),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -159,7 +189,7 @@ impl RpcClient {
     > {
         pb::server_bandwidth_stat_service_client::ServerBandwidthStatServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, false),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -173,7 +203,7 @@ impl RpcClient {
     > {
         pb::server_daily_stat_service_client::ServerDailyStatServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -187,7 +217,7 @@ impl RpcClient {
     > {
         pb::metric_stat_service_client::MetricStatServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -201,7 +231,7 @@ impl RpcClient {
     > {
         pb::ip_item_service_client::IpItemServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, false),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -215,7 +245,7 @@ impl RpcClient {
     > {
         pb::ip_item_service_client::IpItemServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, Some("edge")),
         )
     }
 
@@ -229,7 +259,7 @@ impl RpcClient {
     > {
         pb::ip_list_service_client::IpListServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -241,7 +271,7 @@ impl RpcClient {
             impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + 'static,
         >,
     > {
-        pb::server_deleted_content_service_client::ServerDeletedContentServiceClient::with_interceptor(self.channel.clone(), Self::interceptor(&self.api_config, true))
+        pb::server_deleted_content_service_client::ServerDeletedContentServiceClient::with_interceptor(self.channel.clone(), Self::interceptor(&self.api_config, None))
     }
 
     pub fn api_node_service(
@@ -254,7 +284,7 @@ impl RpcClient {
     > {
         pb::api_node_service_client::ApiNodeServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -268,7 +298,7 @@ impl RpcClient {
     > {
         pb::firewall_service_client::FirewallServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -282,7 +312,7 @@ impl RpcClient {
     > {
         pb::acme_authentication_service_client::AcmeAuthenticationServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, false),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -296,7 +326,7 @@ impl RpcClient {
     > {
         pb::ip_library_artifact_service_client::IpLibraryArtifactServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -310,7 +340,7 @@ impl RpcClient {
     > {
         pb::file_chunk_service_client::FileChunkServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -324,7 +354,7 @@ impl RpcClient {
     > {
         pb::ssl_cert_service_client::SslCertServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -338,7 +368,7 @@ impl RpcClient {
     > {
         pb::http_cache_task_key_service_client::HttpCacheTaskKeyServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, false),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -352,7 +382,7 @@ impl RpcClient {
     > {
         pb::ping_service_client::PingServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, false),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -366,7 +396,7 @@ impl RpcClient {
     > {
         pb::plan_service_client::PlanServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -380,7 +410,7 @@ impl RpcClient {
     > {
         pb::updating_server_list_service_client::UpdatingServerListServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -394,7 +424,7 @@ impl RpcClient {
     > {
         pb::authority_key_service_client::AuthorityKeyServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -408,7 +438,7 @@ impl RpcClient {
     > {
         pb::client_agent_ip_service_client::ClientAgentIpServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -422,7 +452,7 @@ impl RpcClient {
     > {
         pb::file_service_client::FileServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -436,7 +466,7 @@ impl RpcClient {
     > {
         pb::script_service_client::ScriptServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -454,7 +484,7 @@ impl RpcClient {
     > {
         pb::server_event_service_client::ServerEventServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 
@@ -468,7 +498,7 @@ impl RpcClient {
     > {
         pb::server_top_ip_stat_service_client::ServerTopIpStatServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, true),
+            Self::interceptor(&self.api_config, None),
         )
     }
 }

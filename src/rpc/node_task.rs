@@ -8,6 +8,19 @@ use crate::rpc::ip_list::sync_ip_items_incremental;
 use crate::rpc::scripts::sync_script_configs;
 use crate::rpc::server::{sync_single_server_config, sync_user_servers_state};
 use tracing::{debug, info, warn};
+use tokio::sync::Notify;
+use once_cell::sync::Lazy;
+
+static TASK_SYNC_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
+
+pub fn trigger_task_sync() {
+    info!("Triggering immediate task sync...");
+    TASK_SYNC_NOTIFY.notify_one();
+}
+
+pub async fn wait_for_task_sync() {
+    TASK_SYNC_NOTIFY.notified().await;
+}
 
 pub async fn sync_node_tasks(
     api_config: &ApiConfig,

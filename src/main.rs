@@ -2,44 +2,23 @@ use clap::{Parser, Subcommand};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
+use std::fs;
+use std::process::Command;
 
-pub mod pb {
-    tonic::include_proto!("pb");
-}
+use cloud_node_rust::api_config::ApiConfig;
+use cloud_node_rust::config::ConfigStore;
+use cloud_node_rust::firewall::state::WafStateManager;
+use cloud_node_rust::health_manager::GlobalHealthManager;
+use cloud_node_rust::proxy::EdgeProxy;
+use cloud_node_rust::ssl::DynamicCertSelector;
+use cloud_node_rust::{rpc, logging, log_uploader, udp_proxy, tcp_proxy, firewall};
 
-pub mod api_config;
-pub mod auth;
-pub mod cache;
-pub mod cache_hybrid;
-pub mod cache_manager;
-pub mod client_agent;
-pub mod config;
-pub mod config_models;
-pub mod firewall;
-pub mod headers;
-pub mod health_manager;
-pub mod lb_factory;
-pub mod log_uploader;
-pub mod logging;
-pub mod metrics;
-pub mod proxy;
-pub mod rewrite;
-pub mod rpc;
-pub mod ssl;
-pub mod tcp_proxy;
-pub mod udp_proxy;
-pub mod utils;
-
-use crate::api_config::ApiConfig;
-use crate::config::ConfigStore;
-use crate::firewall::state::WafStateManager;
-use crate::health_manager::GlobalHealthManager;
-use crate::proxy::EdgeProxy;
-use crate::ssl::DynamicCertSelector;
+const PID_FILE: &str = "data/cloud-node.pid";
 
 #[derive(Parser)]
-#[command(name = "cloud-node")]
+#[command(name = "cloud-node-rust")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "CloudNode - High Performance Edge Node written in Rust", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -48,12 +27,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the edge node
+    /// Start the edge node in background
     Start,
+    /// Stop the background edge node
+    Stop,
+    /// Check the status of the edge node
+    Status,
+    /// Restart the background edge node
+    Restart,
+    /// Install the edge node as a systemd service and global command
+    Install,
     /// Test the configuration
     Test,
-    /// Reload the configuration
-    Reload,
+    /// Internal use only
+    #[command(hide = true)]
+    _StartInternal,
 }
 
 fn spawn_staggered<F>(rt: &tokio::runtime::Runtime, delay: Duration, task: F)
@@ -68,227 +56,314 @@ where
     });
 }
 
-fn main() -> anyhow::Result<()> {
-    // 0. Ensure single instance
-    if let Err(e) = crate::utils::ensure_single_instance("data/cloud-node.pid") {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+fn check_running() -> Option<u32> {
+    if let Ok(content) = fs::read_to_string(PID_FILE) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            // Check if process exists (Linux/Unix specific)
+            if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                return Some(pid);
+            }
+        }
     }
+    None
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        None => {
+            // Default: Foreground
+            run_node()?;
+        }
+        Some(Commands::Start) => {
+            if let Some(pid) = check_running() {
+                println!("CloudNode is already running (PID: {})", pid);
+                return Ok(());
+            }
+
+            let executable = std::env::current_exe()?;
+            let child = Command::new(executable)
+                .arg("_start-internal")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            
+            println!("CloudNode started in background (PID: {})", child.id());
+        }
+        Some(Commands::_StartInternal) => {
+            run_node()?;
+        }
+        Some(Commands::Stop) => {
+            if let Some(pid) = check_running() {
+                println!("Stopping CloudNode (PID: {})...", pid);
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+                let _ = fs::remove_file(PID_FILE);
+            } else {
+                println!("CloudNode is not running.");
+            }
+        }
+        Some(Commands::Status) => {
+            if let Some(pid) = check_running() {
+                println!("CloudNode is running (PID: {})", pid);
+            } else {
+                println!("CloudNode is stopped.");
+            }
+        }
+        Some(Commands::Restart) => {
+            let _ = Command::new(std::env::current_exe()?).arg("stop").status();
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = Command::new(std::env::current_exe()?).arg("start").status();
+        }
+        Some(Commands::Install) => {
+            #[cfg(target_os = "linux")]
+            {
+                let exe_path = std::env::current_exe()?.canonicalize()?;
+                let work_dir = std::env::current_dir()?.canonicalize()?;
+                
+                // 1. Create global command wrapper
+                let bin_path = "/usr/bin/cloud-node";
+                let wrapper_script = format!(
+                    "#!/bin/bash\ncd {}\n{} \"$@\"\n",
+                    work_dir.display(),
+                    exe_path.display()
+                );
+                
+                if let Err(e) = fs::write(bin_path, wrapper_script) {
+                    eprintln!("Failed to create global command at {}. Please run with sudo. Error: {}", bin_path, e);
+                    std::process::exit(1);
+                }
+                
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = fs::metadata(bin_path) {
+                    let mut perms = metadata.permissions();
+                    perms.set_mode(0o755);
+                    let _ = fs::set_permissions(bin_path, perms);
+                }
+                
+                println!("Successfully registered global command: cloud-node");
+
+                // 2. Create Systemd service
+                let service_path = "/etc/systemd/system/cloud-node.service";
+                let service_content = format!(
+                    "[Unit]\n\
+                     Description=CloudNode High Performance Edge Node\n\
+                     After=network.target\n\n\
+                     [Service]\n\
+                     Type=forking\n\
+                     PIDFile={}/data/cloud-node.pid\n\
+                     WorkingDirectory={}\n\
+                     ExecStart={} start\n\
+                     ExecStop={} stop\n\
+                     ExecReload={} restart\n\
+                     Restart=always\n\
+                     RestartSec=10\n\
+                     LimitNOFILE=1048576\n\n\
+                     [Install]\n\
+                     WantedBy=multi-user.target\n",
+                    work_dir.display(),
+                    work_dir.display(),
+                    exe_path.display(),
+                    exe_path.display(),
+                    exe_path.display()
+                );
+
+                if let Err(e) = fs::write(service_path, service_content) {
+                    eprintln!("Failed to create systemd service at {}. Error: {}", service_path, e);
+                } else {
+                    let _ = Command::new("systemctl").arg("daemon-reload").status();
+                    let _ = Command::new("systemctl").arg("enable").arg("cloud-node").status();
+                    println!("Successfully registered systemd service. You can now use: systemctl start cloud-node");
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                println!("Install command is currently only supported on Linux.");
+            }
+        }
+        Some(Commands::Test) => {
+            println!("Testing configuration...");
+            let _ = ApiConfig::load_default()?;
+            println!("Configuration is valid.");
+        }
+    }
+    Ok(())
+}
+
+fn run_node() -> anyhow::Result<()> {
+    // Ensure data directory exists
+    fs::create_dir_all("data").ok();
+
+    // 0. Ensure single instance and write PID
+    let pid = std::process::id();
+    if let Some(existing_pid) = check_running() {
+        if existing_pid != pid {
+            eprintln!("Error: Another instance is already running (PID: {})", existing_pid);
+            std::process::exit(1);
+        }
+    }
+    fs::write(PID_FILE, pid.to_string())?;
 
     // Initialize logging
     tracing_subscriber::fmt::init();
+    info!("Starting CloudNode Rust v{}...", env!("CARGO_PKG_VERSION"));
 
-    let cli = Cli::parse();
-
-    match cli.command.unwrap_or(Commands::Start) {
-        Commands::Start => {
-            info!("Starting CloudNode Rust...");
-
-            // Create the runtime to spawn background tasks
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            let _guard = rt.enter();
-
-            // 1. Load API Config
-            let api_config = ApiConfig::load_default().expect("Failed to load api_node.yaml");
-            let api_config_arc = Arc::new(api_config.clone());
-
-            // 2. Initialize Managers
-            let config_store = Arc::new(ConfigStore::new());
-            let waf_state = Arc::new(WafStateManager::new());
-            let ip_list_manager = Arc::new(crate::firewall::lists::GlobalIpListManager::new(waf_state.clone()));
-            let health_manager = GlobalHealthManager::new(16);
-            let cert_selector = Arc::new(DynamicCertSelector::new());
-
-            let hm_start = health_manager.clone();
-            spawn_staggered(&rt, Duration::from_secs(2), async move {
-                hm_start.start().await;
-            });
-
-            // 3. Start Background Syncers (Phase 1)
-            let cs = config_store.clone();
-            let ac = api_config.clone();
-            let il = ip_list_manager.clone();
-            let hm = health_manager.clone();
-            let ds = cert_selector.clone();
-            spawn_staggered(&rt, Duration::ZERO, async move {
-                crate::rpc::start_config_syncer(cs, ac, il, hm, ds).await;
-            });
-            info!("Background config_syncer task spawned");
-
-            let ac_i = api_config.clone();
-            let il_i = ip_list_manager.clone();
-            spawn_staggered(&rt, Duration::from_secs(5), async move {
-                crate::rpc::start_ip_list_syncer(ac_i, il_i).await;
-            });
-
-            let ac_a = api_config.clone();
-            spawn_staggered(&rt, Duration::from_secs(8), async move {
-                crate::rpc::start_api_node_syncer(ac_a).await;
-            });
-
-            // Start Updating Server List Syncer
-            let ac_ul = api_config.clone();
-            let cs_ul = config_store.clone();
-            spawn_staggered(&rt, Duration::from_secs(12), async move {
-                crate::rpc::start_updating_server_list_syncer(ac_ul, cs_ul).await;
-            });
-
-            // Start Metrics & Bandwidth Reporters (Phase 1.2)
-            let ac_m = api_config.clone();
-            spawn_staggered(&rt, Duration::from_secs(16), async move {
-                crate::rpc::start_metrics_aggregator_reporter(ac_m).await;
-            });
-
-            let ac_s = api_config.clone();
-            let cs_s = config_store.clone();
-            spawn_staggered(&rt, Duration::from_secs(20), async move {
-                crate::rpc::start_metrics_reporter(cs_s, ac_s).await;
-            });
-
-            let ac_b = api_config.clone();
-            spawn_staggered(&rt, Duration::from_secs(24), async move {
-                crate::rpc::start_bandwidth_reporter(ac_b).await;
-            });
-
-            let ac_d = api_config.clone();
-            spawn_staggered(&rt, Duration::from_secs(28), async move {
-                crate::rpc::start_daily_stat_reporter(ac_d).await;
-            });
-
-            let ac_v = api_config.clone();
-            let cs_v = config_store.clone();
-            spawn_staggered(&rt, Duration::from_secs(32), async move {
-                crate::rpc::start_node_value_reporter(cs_v, ac_v).await;
-            });
-
-            spawn_staggered(&rt, Duration::from_secs(36), async move {
-                crate::metrics::start_persistence_flusher().await;
-            });
-
-            spawn_staggered(&rt, Duration::from_secs(40), async move {
-                crate::cache_hybrid::start_cache_purger(crate::cache_manager::CACHE.storage, std::path::PathBuf::from("data/cache")).await;
-            });
-
-            let ac_ms = api_config.clone();
-            let cs_ms = config_store.as_ref().clone();
-            spawn_staggered(&rt, Duration::from_secs(44), async move {
-                crate::rpc::start_metric_stat_reporter(ac_ms, cs_ms).await;
-            });
-
-            let ac_ti = api_config.clone();
-            spawn_staggered(&rt, Duration::from_secs(48), async move {
-                crate::rpc::start_top_ip_stat_reporter(ac_ti).await;
-            });
-
-            let ac_sc = api_config.clone();
-            spawn_staggered(&rt, Duration::from_secs(52), async move {
-                crate::rpc::start_script_syncer(ac_sc).await;
-            });
-
-            // Start OCSP Syncer (Phase 1.4)
-            let ac_o = api_config.clone();
-            let ds_o = cert_selector.clone();
-            spawn_staggered(&rt, Duration::from_secs(56), async move {
-                crate::rpc::start_ocsp_syncer(ac_o, ds_o).await;
-            });
-
-            // Start IP Library Syncer (Phase 3.1)
-            let ac_il = api_config.clone();
-            spawn_staggered(&rt, Duration::from_secs(60), async move {
-                crate::rpc::start_ip_library_syncer(ac_il).await;
-            });
-
-            // Start Log Uploader (Phase 1.3)
-            let (log_tx, log_rx) = tokio::sync::mpsc::channel(10000);
-            let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(1000);
-            crate::logging::init_global_log_bus(log_tx, node_log_tx);
-
-            let uploader = crate::log_uploader::LogUploader::new(
-                log_rx,
-                api_config.clone(),
-                100,
-                Duration::from_secs(5),
-            );
-            spawn_staggered(&rt, Duration::from_secs(10), async move {
-                uploader.start().await;
-            });
-
-            let node_uploader = crate::log_uploader::NodeLogUploader::new(
-                node_log_rx,
-                api_config.clone(),
-                50,
-                Duration::from_secs(10),
-            );
-            spawn_staggered(&rt, Duration::from_secs(14), async move {
-                node_uploader.start().await;
-            });
-
-            // 4. Initialize Pingora Server
-            let mut my_server = pingora_core::server::Server::new(None).unwrap();
-            my_server.bootstrap();
-
-            // 5. Setup HTTP/HTTPS Proxy Service
-            let mut proxy_service = pingora_proxy::http_proxy_service(
-                &my_server.configuration,
-                EdgeProxy {
-                    config: config_store.clone(),
-                    waf_state: waf_state.clone(),
-                    api_config: api_config_arc.clone(),
-                },
-            );
-
-            // Add TCP listeners (HTTP on 80, HTTPS on 443)
-            proxy_service.add_tcp("0.0.0.0:80");
-
-            // Phase 6: TLS/SSL Support
-            let mut tls_settings = pingora_core::listeners::tls::TlsSettings::with_callbacks(
-                Box::new((*cert_selector).clone()),
-            )
-            .unwrap();
-            let _ = &mut tls_settings;
-            proxy_service.add_tls_with_settings("0.0.0.0:443", None, tls_settings);
-
-            my_server.add_service(proxy_service);
-
-            // LoadBalancer active health checks are already driven by GlobalHealthManager.
-
-            // Phase 7: UDP Proxy Service
-            let udp_manager = crate::udp_proxy::UdpProxyManager::new((*config_store).clone());
-            spawn_staggered(&rt, Duration::from_secs(18), async move {
-                udp_manager.start_listeners().await;
-            });
-
-            // Phase 8: TCP/TLS Proxy Service
-            let tcp_manager = crate::tcp_proxy::TcpProxyManager::new(
-                (*config_store).clone(),
-                cert_selector.clone(),
-            );
-            spawn_staggered(&rt, Duration::from_secs(22), async move {
-                tcp_manager.start_listeners().await;
-            });
-
-            // Start WAF State flusher
-            let ws_f = waf_state.clone();
-            spawn_staggered(&rt, Duration::from_secs(26), async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    interval.tick().await;
-                    ws_f.flush_to_disk();
+    #[cfg(target_family = "unix")]
+    {
+        unsafe {
+            let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+                let target = 1048576;
+                let old_cur = rlim.rlim_cur;
+                
+                if rlim.rlim_max < target {
+                    rlim.rlim_max = target;
                 }
-            });
-
-            info!("CloudNode is ready and listening on 0.0.0.0:80/443");
-            my_server.run_forever();
-        }
-        Commands::Test => {
-            info!("Testing configuration...");
-        }
-        Commands::Reload => {
-            info!("Reloading configuration...");
+                if rlim.rlim_cur < target {
+                    rlim.rlim_cur = target;
+                }
+                
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
+                    if old_cur < target {
+                        info!("Successfully raised RLIMIT_NOFILE (file descriptor limit) from {} to {}", old_cur, target);
+                    } else {
+                        info!("RLIMIT_NOFILE (file descriptor limit) is already {} (>= {})", old_cur, target);
+                    }
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    warn!("Failed to raise RLIMIT_NOFILE to {}. Current limit: cur={}, max={}. Error: {}. (You may need 'ulimit -n 1048576' or root privileges)", target, rlim.rlim_cur, rlim.rlim_max, err);
+                }
+            } else {
+                warn!("Failed to get RLIMIT_NOFILE");
+            }
         }
     }
 
+    // Create the runtime to spawn background tasks
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let _guard = rt.enter();
+
+    // 1. Load API Config
+    let api_config = ApiConfig::load_default().expect("Failed to load api_node.yaml");
+    let api_config_arc = Arc::new(api_config.clone());
+
+    // 2. Initialize Managers
+    let config_store = Arc::new(ConfigStore::new());
+    let waf_state = Arc::new(WafStateManager::new());
+    let ip_list_manager = Arc::new(firewall::lists::GlobalIpListManager::new(waf_state.clone()));
+    let health_manager = GlobalHealthManager::new(16);
+    let cert_selector = Arc::new(DynamicCertSelector::new());
+
+    let hm_start = health_manager.clone();
+    spawn_staggered(&rt, Duration::from_secs(2), async move {
+        hm_start.start().await;
+    });
+
+    // 3. Start Background Syncers
+    let cs = config_store.clone();
+    let ac = api_config.clone();
+    let il = ip_list_manager.clone();
+    let hm = health_manager.clone();
+    let ds = cert_selector.clone();
+    spawn_staggered(&rt, Duration::ZERO, async move {
+        rpc::start_config_syncer(cs, ac, il, hm, ds).await;
+    });
+
+    let ac_ns = api_config.clone();
+    let cs_ns = config_store.clone();
+    spawn_staggered(&rt, Duration::from_secs(1), async move {
+        rpc::start_node_stream(ac_ns, cs_ns).await;
+    });
+
+    let ac_i = api_config.clone();
+    let cs_i = config_store.clone();
+    let il_i = ip_list_manager.clone();
+    spawn_staggered(&rt, Duration::from_secs(5), async move {
+        rpc::start_ip_list_syncer(ac_i, cs_i, il_i).await;
+    });
+
+    let ac_a = api_config.clone();
+    spawn_staggered(&rt, Duration::from_secs(8), async move {
+        rpc::start_api_node_syncer(ac_a).await;
+    });
+
+    // Reporters
+    let ac_s = api_config.clone();
+    let cs_s = config_store.clone();
+    spawn_staggered(&rt, Duration::from_secs(5), async move {
+        rpc::start_metrics_reporter(cs_s, ac_s).await;
+    });
+
+    let ac_nv = api_config.clone();
+    let cs_nv = config_store.clone();
+    spawn_staggered(&rt, Duration::from_secs(7), async move {
+        rpc::start_node_value_reporter(cs_nv, ac_nv).await;
+    });
+
+    let ac_bw = api_config.clone();
+    spawn_staggered(&rt, Duration::from_secs(10), async move {
+        rpc::start_bandwidth_reporter(ac_bw).await;
+    });
+
+    let ac_ms = api_config.clone();
+    let cs_ms = config_store.clone();
+    spawn_staggered(&rt, Duration::from_secs(12), async move {
+        rpc::start_metric_stat_reporter(cs_ms, ac_ms).await;
+    });
+
+    let ac_ti = api_config.clone();
+    spawn_staggered(&rt, Duration::from_secs(14), async move {
+        rpc::start_top_ip_stat_reporter(ac_ti).await;
+    });
+
+    let ac_ma = api_config.clone();
+    spawn_staggered(&rt, Duration::from_secs(15), async move {
+        rpc::start_metrics_aggregator_reporter(ac_ma).await;
+    });
+
+    let ac_ir = api_config.clone();
+    spawn_staggered(&rt, Duration::from_secs(20), async move {
+        rpc::start_ip_report_service(ac_ir).await;
+    });
+
+    // Log Uploader
+    let (log_tx, log_rx) = tokio::sync::mpsc::channel(10000);
+    let (node_log_tx, _node_log_rx) = tokio::sync::mpsc::channel(1000);
+    logging::init_global_log_bus(log_tx, node_log_tx);
+
+    let uploader = log_uploader::LogUploader::new(log_rx, api_config.clone(), 100, Duration::from_secs(5));
+    spawn_staggered(&rt, Duration::from_secs(10), async move { uploader.start().await; });
+
+    // 4. Initialize Pingora Server
+    let mut my_server = pingora_core::server::Server::new(None).unwrap();
+    my_server.bootstrap();
+
+    // 5. Setup Dynamic HTTP/HTTPS Proxy Manager
+    let http_manager = cloud_node_rust::http_proxy_manager::HttpProxyManager::new(
+        (*config_store).clone(),
+        cert_selector.clone(),
+        EdgeProxy {
+            config: config_store.clone(),
+            waf_state: waf_state.clone(),
+            api_config: api_config_arc.clone(),
+            cert_selector: cert_selector.clone(),
+        },
+        my_server.configuration.clone(),
+    );
+    spawn_staggered(&rt, Duration::from_secs(5), async move { http_manager.start_listeners().await; });
+
+    // UDP & TCP
+    let udp_manager = udp_proxy::UdpProxyManager::new((*config_store).clone());
+    spawn_staggered(&rt, Duration::from_secs(6), async move { udp_manager.start_listeners().await; });
+
+    let tcp_manager = tcp_proxy::TcpProxyManager::new((*config_store).clone(), cert_selector.clone());
+    spawn_staggered(&rt, Duration::from_secs(7), async move { tcp_manager.start_listeners().await; });
+
+    info!("CloudNode (PID {}) is ready.", pid);
+    my_server.run_forever();
+    #[allow(unreachable_code)]
     Ok(())
 }

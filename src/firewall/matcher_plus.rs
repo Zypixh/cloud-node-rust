@@ -325,6 +325,8 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8]) -> Stri
         "geoProvinceName" => geo_info(session).map(|g| g.region).unwrap_or_default(),
         "geoCityName" => geo_info(session).map(|g| g.city).unwrap_or_default(),
         "ispName" => geo_info(session).map(|g| g.provider).unwrap_or_else(|| analyzer::lookup_isp_name(parse_remote_ip(session))),
+        "serverAddr" => get_local_addr(session),
+        "serverPort" => get_local_port(session),
         "refererBlock" | "cname" => String::new(),
         "isCNAME" => "0".to_string(),
         _ => {
@@ -378,6 +380,24 @@ fn get_remote_port(session: &Session) -> String {
     }
 }
 
+fn get_local_addr(session: &Session) -> String {
+    session.downstream_session.digest()
+        .and_then(|d| d.socket_digest.as_ref())
+        .and_then(|sd| sd.local_addr())
+        .and_then(|addr| addr.as_inet())
+        .map(|inet| inet.ip().to_string())
+        .unwrap_or_default()
+}
+
+fn get_local_port(session: &Session) -> String {
+    session.downstream_session.digest()
+        .and_then(|d| d.socket_digest.as_ref())
+        .and_then(|sd| sd.local_addr())
+        .and_then(|addr| addr.as_inet())
+        .map(|inet| inet.port().to_string())
+        .unwrap_or_default()
+}
+
 fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
     match session.client_addr() {
         Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => addr.ip(),
@@ -396,10 +416,12 @@ fn get_request_uri(session: &Session) -> String {
 }
 
 fn get_scheme(session: &Session) -> String {
-    if session.req_header().uri.scheme_str() == Some("https") {
+    let is_tls = session.downstream_session.digest().and_then(|d| d.ssl_digest.as_ref()).is_some();
+    if is_tls || session.req_header().uri.scheme_str() == Some("https") {
         "https".to_string()
     } else {
-        header_value(session, "x-forwarded-proto").to_string()
+        let xfp = header_value(session, "x-forwarded-proto");
+        if !xfp.is_empty() { xfp } else { "http".to_string() }
     }
 }
 

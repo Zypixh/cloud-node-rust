@@ -11,7 +11,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use std::io::{Read, Write};
 use tracing::{info, warn};
 
 use tokio::sync::RwLock;
@@ -60,40 +60,15 @@ impl FileStorage {
         }
     }
     
-    // Helper to get or open a file (Task 10)
-    fn get_file_handle(&self, path: &PathBuf) -> Result<Arc<std::fs::File>> {
-        if self.enable_file_cache.load(Ordering::Relaxed) {
-            if let Some(f) = OPEN_FILE_CACHE.get(path) {
-                let handle: Arc<std::fs::File> = f.clone();
-                return Ok(handle);
-            }
-        }
 
-        let f = std::fs::File::open(path).map_err(|_| Error::new(ErrorType::InternalError))?;
-        
-        // Task 7: Linux Optimization - Hint sequential access
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            unsafe {
-                libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
-                libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
-            }
-        }
-
-        let shared_f = Arc::new(f);
-        if self.enable_file_cache.load(Ordering::Relaxed) {
-            if OPEN_FILE_CACHE.len() < 10000 { // Cap handle cache size
-                OPEN_FILE_CACHE.insert(path.clone(), shared_f.clone());
-            }
-        }
-        Ok(shared_f)
+    fn get_hash(&self, key: &CacheKey) -> String {
+        let k_str = key.primary_key_str().unwrap_or("unknown");
+        format!("{:x}", md5_legacy::compute(k_str))
     }
 
     pub async fn get_path(&self, key: &CacheKey) -> PathBuf {
         let lock = self.inner.read().await;
-        let k_str = key.primary_key_str().unwrap_or("unknown");
-        let hash = hex::encode(k_str);
+        let hash = self.get_hash(key);
         
         lock.main_root.join(&hash[0..2]).join(&hash[2..4]).join(hash)
     }
@@ -106,8 +81,7 @@ impl Storage for FileStorage {
         key: &CacheKey,
         _trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<Option<(CacheMeta, HitHandler)>> {
-        let k_str = key.primary_key_str().unwrap_or("unknown");
-        let hash = hex::encode(k_str);
+        let hash = self.get_hash(key);
         
         let meta_val = match crate::metrics::storage::STORAGE.get_cache_meta(&hash) {
             Some(m) => m,
@@ -115,12 +89,25 @@ impl Storage for FileStorage {
         };
 
         let now = chrono::Utc::now().timestamp();
-        if let Some(expires) = meta_val["e"].as_i64() {
-            if now > expires {
-                crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                return Ok(None);
+        let (headers, ttl_remaining, compressed) = if let Some(meta) = meta_val.as_object() {
+            let expires = meta.get("e").and_then(|v| v.as_i64()).unwrap_or(0);
+            let ttl = (expires - now).max(0) as u64;
+            let status = meta.get("st").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
+            let compressed = meta.get("c").and_then(|v| v.as_bool()).unwrap_or(false);
+            
+            let mut header = pingora_http::ResponseHeader::build(status, None).unwrap();
+            if let Some(h_val) = meta.get("h") && let Some(h_obj) = h_val.as_object() {
+                for (name, val) in h_obj {
+                    if let Some(s) = val.as_str() {
+                        let _ = header.insert_header(name.to_string(), s);
+                    }
+                }
             }
-        }
+            tracing::debug!("CACHE_HIT: status: {}, compressed: {}, headers: {:?}", status, compressed, header);
+            (header, ttl, compressed)
+        } else {
+            (pingora_http::ResponseHeader::build(200, None).unwrap(), 3600, false)
+        };
 
         let path = self.get_path(key).await;
         if !path.exists() {
@@ -128,20 +115,24 @@ impl Storage for FileStorage {
             return Ok(None);
         }
 
-        let file = self.get_file_handle(&path)?;
-
+        let file = std::fs::File::open(&path).map_err(|_| Error::new(ErrorType::InternalError))?;
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
-        let header = pingora_http::ResponseHeader::build(200, None).unwrap();
         let meta = CacheMeta::new(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+            std::time::SystemTime::now() + std::time::Duration::from_secs(ttl_remaining),
             std::time::SystemTime::now(),
             0,
             0,
-            header,
+            headers,
         );
 
-        let handler = Box::new(FileHitHandler { file, offset: 0 });
+        let reader: Box<dyn std::io::Read + Send> = if compressed {
+            Box::new(zstd::stream::read::Decoder::new(file).map_err(|_| Error::new(ErrorType::InternalError))?)
+        } else {
+            Box::new(file)
+        };
+
+        let handler = Box::new(FileHitHandler { reader: std::sync::Mutex::new(reader) });
         Ok(Some((meta, handler)))
     }
 
@@ -153,28 +144,54 @@ impl Storage for FileStorage {
     ) -> Result<MissHandler> {
         let path = self.get_path(key).await;
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent).await;
+            let _ = tokio::fs::create_dir_all(parent).await;
         }
-        
         let temp_path = path.with_extension("tmp");
-        let file = fs::File::create(&temp_path)
-            .await
+        
+        // Spawn blocking to keep std::fs::File for the synchronous zstd encoder
+        let std_file = tokio::task::spawn_blocking({
+            let p = temp_path.clone();
+            move || std::fs::File::create(&p)
+        }).await.unwrap_or_else(|_| Err(std::io::Error::from(std::io::ErrorKind::Other)))
             .map_err(|_| Error::new(ErrorType::InternalError))?;
-            
+
         let k_str = key.primary_key_str().unwrap_or("unknown").to_string();
-        let hash = hex::encode(&k_str);
+        let hash = self.get_hash(key);
         let ttl = meta.fresh_until().duration_since(meta.created()).map(|d| d.as_secs()).unwrap_or(3600);
 
-        Ok(Box::new(FileMissHandler { 
-            file, 
-            written: 0, 
-            final_path: path, 
+        // Smart Compression Decision (Synchronized with HIT path via metadata)
+        let resp_headers = meta.response_header();
+        let status = resp_headers.status.as_u16();
+        let content_type = resp_headers.headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let content_encoding = resp_headers.headers.get("content-encoding").and_then(|v| v.to_str().ok()).unwrap_or("");
+
+        let should_compress = (content_type.contains("text/") || content_type.contains("json") || 
+                     content_type.contains("javascript") || content_type.contains("xml")) && content_encoding.is_empty();
+
+        let mut headers_json = serde_json::Map::new();
+        let hop_by_hop = ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "content-length"];
+
+        for (name, value) in resp_headers.headers.iter() {
+            let name_s = name.to_string().to_lowercase();
+            if hop_by_hop.contains(&name_s.as_str()) {
+                continue;
+            }
+            headers_json.insert(name.to_string(), serde_json::Value::String(value.to_str().unwrap_or("").to_string()));
+        }
+
+        Ok(Box::new(FileMissHandler {
+            file: Some(std_file),
+            encoder: None,
+            written: 0,
+            final_path: path,
             temp_path,
             hash,
-            ttl,
             key_str: k_str,
-        }))
-    }
+            ttl,
+            status,
+            headers: serde_json::Value::Object(headers_json),
+            compressed: should_compress,
+        }))    }
 
     async fn purge(
         &'static self,
@@ -187,10 +204,36 @@ impl Storage for FileStorage {
 
     async fn update_meta(
         &'static self,
-        _key: &CacheKey,
-        _meta: &CacheMeta,
+        key: &CacheKey,
+        meta: &CacheMeta,
         _trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<bool> {
+        let hash = self.get_hash(key);
+        let k_str = key.primary_key_str().unwrap_or("unknown").to_string();
+        let ttl = meta.fresh_until().duration_since(meta.created()).map(|d| d.as_secs()).unwrap_or(3600);
+        let resp_headers = meta.response_header();
+        let status = resp_headers.status.as_u16();
+        
+        // Use the same header filtering logic as miss handler
+        let mut headers_json = serde_json::Map::new();
+        let hop_by_hop = ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade", "content-length"];
+        for (name, value) in resp_headers.headers.iter() {
+            let name_s = name.to_string().to_lowercase();
+            if hop_by_hop.contains(&name_s.as_str()) { continue; }
+            headers_json.insert(name.to_string(), serde_json::Value::String(value.to_str().unwrap_or("").to_string()));
+        }
+
+        // We need to know if the file was compressed. For now, we can check the Content-Type
+        // logic again, or store it in a way update_meta can see. 
+        // Simplest: re-run the same policy.
+        let content_type = resp_headers.headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let content_encoding = resp_headers.headers.get("content-encoding").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let compressed = (content_type.contains("text/") || content_type.contains("json") || 
+                         content_type.contains("javascript") || content_type.contains("xml")) && content_encoding.is_empty();
+
+        tracing::info!("CACHE_UPDATE_META: hash: {}, status: {}, compressed: {}, headers_len: {}", hash, status, compressed, headers_json.len());
+        crate::metrics::storage::STORAGE.update_cache_meta(&hash, &k_str, 0, ttl, Some(serde_json::Value::Object(headers_json)), compressed, status);
+        
         Ok(true)
     }
 
@@ -200,29 +243,29 @@ impl Storage for FileStorage {
 }
 
 struct FileHitHandler {
-    file: Arc<std::fs::File>,
-    offset: u64,
+    reader: std::sync::Mutex<Box<dyn std::io::Read + Send>>,
 }
 
 #[async_trait]
 impl HandleHit for FileHitHandler {
     async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut buf = vec![0u8; 128 * 1024]; 
-        let file = self.file.clone();
-        let offset = self.offset;
-
-        let n = tokio::task::block_in_place(|| {
-            let mut f = &*file;
-            f.seek(SeekFrom::Start(offset)).map_err(|_| Error::new(ErrorType::InternalError))?;
-            f.read(&mut buf).map_err(|_| Error::new(ErrorType::InternalError))
+        let mut buf = vec![0u8; 32768]; // Use 32KB chunks for high performance
+        let res = tokio::task::block_in_place(|| {
+            let mut r = self.reader.lock().map_err(|e| {
+                tracing::error!("CACHE_HIT: Failed to lock direct reader: {:?}", e);
+                Error::new(ErrorType::InternalError)
+            })?;
+            r.read(&mut buf).map_err(|e| {
+                tracing::error!("CACHE_HIT: Streaming read error (possibly corrupted zstd): {:?}", e);
+                Error::new(ErrorType::InternalError)
+            })
         })?;
 
-        if n == 0 {
+        if res == 0 {
             Ok(None)
         } else {
-            self.offset += n as u64;
-            Ok(Some(bytes::Bytes::from(buf[..n].to_vec())))
+            buf.truncate(res);
+            Ok(Some(bytes::Bytes::from(buf)))
         }
     }
 
@@ -244,42 +287,87 @@ impl HandleHit for FileHitHandler {
 }
 
 struct FileMissHandler {
-    file: fs::File,
+    file: Option<std::fs::File>,
+    encoder: Option<zstd::stream::write::Encoder<'static, std::fs::File>>,
     written: usize,
     final_path: PathBuf,
     temp_path: PathBuf,
     hash: String,
     key_str: String,
     ttl: u64,
+    status: u16,
+    headers: serde_json::Value,
+    compressed: bool,
 }
 
 #[async_trait]
 impl HandleMiss for FileMissHandler {
     async fn write_body(&mut self, data: bytes::Bytes, _eof: bool) -> Result<()> {
-        let compressed = if data.len() > 512 {
-            zstd::encode_all(data.as_ref(), 3).unwrap_or_else(|_| data.to_vec())
-        } else {
-            data.to_vec()
-        };
+        if data.is_empty() { return Ok(()); }
+        
+        // Initialize encoder only if policy says so
+        if self.compressed && self.encoder.is_none() {
+            if let Some(f) = self.file.take() {
+                let mut enc = zstd::stream::write::Encoder::new(f, 3).map_err(|_| Error::new(ErrorType::InternalError))?;
+                enc.include_contentsize(false).map_err(|_| Error::new(ErrorType::InternalError))?;
+                self.encoder = Some(enc);
+            }
+        }
 
-        self.file
-            .write_all(&compressed)
-            .await
-            .map_err(|_| Error::new(ErrorType::InternalError))?;
-        self.written += data.len();
+        let len = data.len();
+        tokio::task::block_in_place(|| {
+            if let Some(enc) = &mut self.encoder {
+                enc.write_all(&data).map_err(|_| Error::new(ErrorType::InternalError))
+            } else if let Some(f) = &mut self.file {
+                f.write_all(&data).map_err(|_| Error::new(ErrorType::InternalError))
+            } else {
+                Err(Error::new(ErrorType::InternalError))
+            }
+        })?;
+
+        self.written += len;
         Ok(())
     }
 
-    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
-        drop(self.file);
+    async fn finish(mut self: Box<Self>) -> Result<MissFinishType> {
+        let written = self.written;
         
-        fs::rename(&self.temp_path, &self.final_path)
-            .await
-            .map_err(|_| Error::new(ErrorType::InternalError))?;
+        tokio::task::block_in_place(|| {
+            if let Some(enc) = self.encoder.take() {
+                let _ = enc.finish().map_err(|_| Error::new(ErrorType::InternalError))?;
+            } else {
+                let _ = self.file.take();
+            }
+            Ok::<(), Box<Error>>(())
+        })?;
+        
+        // Use non-blocking async rename
+        if let Err(_e) = tokio::fs::rename(&self.temp_path, &self.final_path).await {
+            // Concurrent cache writes might cause rename failures if another thread already finished.
+            // As long as the file exists, we consider it a success.
+            let path_exists = tokio::task::spawn_blocking({
+                let p = self.final_path.clone();
+                move || p.exists()
+            }).await.unwrap_or(false);
+            
+            if !path_exists {
+                return Err(Error::new(ErrorType::InternalError));
+            }
+            // Cleanup the temporary file if another thread won the race
+            let _ = tokio::fs::remove_file(&self.temp_path).await;
+        }
 
-        crate::metrics::storage::STORAGE.update_cache_meta(&self.hash, &self.key_str, self.written as u64, self.ttl);
+        crate::metrics::storage::STORAGE.update_cache_meta(
+            &self.hash, 
+            &self.key_str, 
+            written as u64, 
+            self.ttl, 
+            Some(self.headers.clone()), 
+            self.compressed, 
+            self.status
+        );
 
-        Ok(MissFinishType::Created(self.written))
+        Ok(MissFinishType::Created(written))
     }
 }
 
@@ -357,7 +445,10 @@ impl HybridStorage {
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(PathBuf::from).collect::<Vec<_>>());
             
             let enable_sendfile = options.get("enableSendfile").and_then(|v| v.as_bool()).unwrap_or(true);
-            let enable_file_cache = options.get("enableOpenFileCache").and_then(|v| v.as_bool()).unwrap_or(true);
+            let enable_file_cache = options.get("openFileCache")
+                .and_then(|v| v.get("isOn"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false); // Default to false for 10M+ files safety, matching GoEdge typical behavior unless explicitly ON
 
             if let Some(main) = main_dir {
                 info!("RPC_CACHE: Updating cache configuration (Sendfile: {}, HandleCache: {})", enable_sendfile, enable_file_cache);
@@ -367,7 +458,7 @@ impl HybridStorage {
     }
 
     pub async fn purge_by_key(&self, key: &str) -> bool {
-        let hash = hex::encode(key);
+        let hash = format!("{:x}", md5_legacy::compute(key));
         let lock = self.l2.inner.read().await;
         let path = lock.main_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
         let _ = fs::remove_file(&path).await;
@@ -386,18 +477,15 @@ impl HybridStorage {
         let clean_prefix = prefix.trim_end_matches('*');
         let mut deleted_count = 0;
         
-        let iter = crate::metrics::storage::STORAGE.scan_prefix("CMETA_");
-        for (meta_key, _val) in iter {
-            let hash = meta_key.strip_prefix("CMETA_").unwrap_or(&meta_key);
-            if let Some(meta) = crate::metrics::storage::STORAGE.get_cache_meta(hash) {
-                if let Some(k) = meta["k"].as_str() {
-                    if k.starts_with(clean_prefix) {
-                        let lock = self.l2.inner.read().await;
-                        let path = lock.main_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
-                        let _ = fs::remove_file(&path).await;
-                        crate::metrics::storage::STORAGE.delete_cache_meta(hash);
-                        deleted_count += 1;
-                    }
+        let all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
+        for (hash, meta) in all_meta {
+            if let Some(k) = meta["k"].as_str() {
+                if k.starts_with(clean_prefix) {
+                    let lock = self.l2.inner.read().await;
+                    let path = lock.main_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
+                    let _ = fs::remove_file(&path).await;
+                    crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                    deleted_count += 1;
                 }
             }
         }
@@ -416,7 +504,6 @@ impl Storage for HybridStorage {
         let p_type = self.policy_type.read().await;
         
         let k_str = key.primary_key_str().unwrap_or("unknown");
-        let hash = hex::encode(k_str);
 
         if *p_type == "memory" {
             return self.l1.lookup(key, trace).await;
@@ -429,6 +516,7 @@ impl Storage for HybridStorage {
         if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
             let threshold = self.hot_threshold.load(std::sync::atomic::Ordering::Relaxed);
             let mut is_hot = false;
+            let hash = format!("{:x}", md5_legacy::compute(k_str));
             self.hot_counts.entry(hash.clone())
                 .and_modify(|c| {
                     *c += 1;
@@ -455,9 +543,9 @@ impl Storage for HybridStorage {
                                         0,
                                         header,
                                     );
-                                    let trace = pingora_cache::trace::Span::inactive().handle();
+                                    let _trace = pingora_cache::trace::Span::inactive().handle();
                                     // Use Global CACHE to bypass E0597
-                                    let _ = crate::cache_manager::CACHE.storage.l1.get_miss_handler(&cache_key_cloned, &new_meta, &trace).await;
+                                    let _ = crate::cache_manager::CACHE.storage.l1.get_miss_handler(&cache_key_cloned, &new_meta, &_trace).await;
                                 }
                             }
                         }
@@ -534,15 +622,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
         let now = chrono::Utc::now().timestamp();
         let max_bytes = storage.max_disk_bytes.load(std::sync::atomic::Ordering::Relaxed);
         
-        let mut all_meta = Vec::new();
-        let iter = crate::metrics::storage::STORAGE.scan_prefix("CMETA_");
-        for (key, _val) in iter {
-            let hash = key.strip_prefix("CMETA_").unwrap_or(&key);
-            if let Some(meta) = crate::metrics::storage::STORAGE.get_cache_meta(hash) {
-                all_meta.push((hash.to_string(), meta));
-            }
-        }
-
+        let mut all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
         all_meta.sort_by_key(|m| m.1["a"].as_i64().unwrap_or(0));
 
         let mut current_size: u64 = all_meta.iter().map(|m| m.1["s"].as_u64().unwrap_or(0)).sum();

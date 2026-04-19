@@ -1,0 +1,5 @@
+rpc.endpoints:
+- http://10.88.0.1:8001
+rpc.disableUpdate: true
+nodeId: a6b263dad815926a80cee3d7fa15b187
+secret: Xhypx4EWoOVIShSt5igUFdiz1ljzneLA

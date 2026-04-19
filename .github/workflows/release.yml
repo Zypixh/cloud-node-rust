@@ -7,20 +7,30 @@ on:
 
 jobs:
   build:
-    name: Build - ${{ matrix.platform.name }}
-    runs-on: ${{ matrix.platform.os }}
+    name: Build - ${{ matrix.name }}
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        platform:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            name: linux-x64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            name: linux-arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: macos-arm64
+        include:
+          # --- x86_64 Variants ---
+          - target: x86_64-unknown-linux-gnu
+            cpu: x86-64-v2
+            name: linux-x64-v2-sse4.2
+          - target: x86_64-unknown-linux-gnu
+            cpu: x86-64-v3
+            name: linux-x64-v3-avx2
+          - target: x86_64-unknown-linux-gnu
+            cpu: x86-64-v4
+            name: linux-x64-v4-avx512
+
+          # --- ARM64 Variants ---
+          - target: aarch64-unknown-linux-gnu
+            cpu: generic
+            name: linux-arm64-generic
+          - target: aarch64-unknown-linux-gnu
+            cpu: neoverse-n1
+            name: linux-arm64-neoverse-n1
 
     steps:
       - name: Checkout code
@@ -29,7 +39,15 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform.target }}
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies & Cross-Linkers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential golang-go
+          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          fi
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -39,39 +57,46 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.platform.target }}
-
-      - name: Install dependencies (Linux)
-        if: matrix.platform.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential golang-go
-          if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          fi
+          key: ${{ matrix.name }}
 
       - name: Build
         shell: bash
         run: |
-          if [ "${{ matrix.platform.target }}" == "aarch64-unknown-linux-gnu" ]; then
+          # 1. Handle ARM Linkers
+          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
             export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
             export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           fi
-          cargo build --release --target ${{ matrix.platform.target }}
+          
+          # 2. Set Optimization Flags
+          export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }} -C opt-level=3 -C lto=fat -C codegen-units=1"
+          
+          # 3. Special handling for ARM generic
+          if [ "${{ matrix.cpu }}" == "generic" ] && [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
+             export RUSTFLAGS="-C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+neon,+crypto,+crc"
+          fi
+
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
-          cd target/${{ matrix.platform.target }}/release
-          tar -czf ../../../cloud-node-rust-${{ matrix.platform.name }}.tar.gz cloud-node-rust
-          cd ../../../
+          ORIGINAL_BINARY="cloud-node-rust"
+          TARGET_BINARY="cloud-node"
+          PACKAGE_NAME="cloud-node-rust-${{ matrix.name }}"
+          
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/$ORIGINAL_BINARY dist/$TARGET_BINARY
+          cd dist
+          tar -czf ../$PACKAGE_NAME.tar.gz $TARGET_BINARY
+          cd ..
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cloud-node-rust-${{ matrix.platform.name }}
-          path: cloud-node-rust-${{ matrix.platform.name }}.tar.gz
+          name: ${{ matrix.name }}
+          path: cloud-node-rust-${{ matrix.name }}.tar.gz
 
   release:
     name: Create Release
@@ -80,7 +105,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download Artifacts
+      - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -88,6 +113,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          files: |
+            artifacts/**/*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -7,12 +7,20 @@ use tracing::debug;
 
 pub async fn start_ip_list_syncer(
     api_config: ApiConfig,
+    config_store: Arc<crate::config::ConfigStore>,
     ip_list_manager: Arc<crate::firewall::lists::GlobalIpListManager>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut last_meta_sync = Instant::now() - Duration::from_secs(300);
     loop {
         interval.tick().await;
+
+        // Check if IP list sync is enabled in global config
+        if !config_store.get_node_enable_ip_lists_sync() {
+            debug!("IP list sync is DISABLED in node settings. Skipping...");
+            continue;
+        }
+
         if last_meta_sync.elapsed() >= Duration::from_secs(300) {
             let _ = sync_ip_list_metadata(&api_config, ip_list_manager.as_ref()).await;
             last_meta_sync = Instant::now();
@@ -100,6 +108,7 @@ pub async fn sync_ip_list_metadata(
     loop {
         match service
             .list_enabled_ip_lists(pb::ListEnabledIpListsRequest {
+                r#type: "cluster".to_string(),
                 offset,
                 size,
                 ..Default::default()

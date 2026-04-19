@@ -101,11 +101,11 @@ impl LogUploader {
             pb::http_access_log_service_client::HttpAccessLogServiceClient::with_interceptor(
                 channel.clone(),
                 move |mut req: tonic::Request<()>| {
-                    let token = generate_token(&node_id, &secret).unwrap_or_default();
+                    let token = generate_token(&node_id, &secret, "edge").unwrap_or_default();
                     req.metadata_mut()
-                        .insert("x-edge-access-token", token.parse().unwrap());
+                        .insert("token", token.parse().unwrap());
                     req.metadata_mut()
-                        .insert("node-id", node_id.parse().unwrap());
+                        .insert("nodeid", node_id.parse().unwrap());
                     Ok(req)
                 },
             );
@@ -207,7 +207,7 @@ impl NodeLogUploader {
         let mut client = pb::node_log_service_client::NodeLogServiceClient::with_interceptor(
             channel.clone(),
             move |mut req: tonic::Request<()>| {
-                let token = generate_token(&node_id, &secret).unwrap_or_default();
+                let token = generate_token(&node_id, &secret, "edge").unwrap_or_default();
                 req.metadata_mut().insert("token", token.parse().unwrap());
                 req.metadata_mut()
                     .insert("nodeid", node_id.parse().unwrap());

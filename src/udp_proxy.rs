@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
@@ -33,37 +33,44 @@ impl UdpProxyManager {
     }
 
     pub async fn start_listeners(self: Arc<Self>) {
-        info!("Starting UDP Proxy Manager for v{}...", env!("CARGO_PKG_VERSION"));
+        debug!("Starting UDP Proxy Manager for v{}...", env!("CARGO_PKG_VERSION"));
         let mut handled_ports = std::collections::HashSet::new();
 
         loop {
             // Check for new servers or port changes
             let servers = self.config_store.get_all_servers().await;
+            debug!("UDP Proxy Manager: Found {} servers in config store", servers.len());
             for server in servers {
                 if let Some(udp_cfg) = &server.udp {
-                    if !udp_cfg.is_on {
-                        continue;
-                    }
-                    for addr_cfg in &udp_cfg.listen {
-                        if let Ok(port) = addr_cfg
-                            .port_range
-                            .clone()
-                            .unwrap_or_default()
-                            .parse::<u16>()
-                        {
-                            if handled_ports.contains(&port) {
-                                continue;
-                            }
-
-                            handled_ports.insert(port);
-                            let manager = self.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = manager.run_listener(port).await {
-                                    error!("UDP listener on port {} failed: {}", port, e);
-                                }
-                            });
+                    if udp_cfg.is_on {
+                        if udp_cfg.listen.is_empty() {
+                            warn!("UDP Proxy Manager: Server {} has UDP ON but NO listen addresses", server.numeric_id());
                         }
+                        for addr_cfg in &udp_cfg.listen {
+                            if let Ok(port) = addr_cfg
+                                .port_range
+                                .clone()
+                                .unwrap_or_default()
+                                .parse::<u16>()
+                            {
+                                if handled_ports.contains(&port) {
+                                    continue;
+                                }
+
+                                handled_ports.insert(port);
+                                let manager = self.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = manager.run_listener(port).await {
+                                        error!("UDP listener on port {} failed: {}", port, e);
+                                    }
+                                });
+                            }
+                        }
+                    } else {
+                        debug!("UDP Proxy Manager: Server {} UDP is OFF", server.numeric_id());
                     }
+                } else {
+                    debug!("UDP Proxy Manager: Server {} has NO UDP config", server.numeric_id());
                 }
             }
 
@@ -120,7 +127,7 @@ impl UdpProxyManager {
 
                 // Hash based on client IP for sticky session if needed,
                 // but for UDP (ClientAddr, Port) is already the session key.
-                let peer = match lb.select(b"", 0) {
+                let peer = match lb.select(b"", 128) {
                     Some(p) => p,
                     None => {
                         error!("No healthy backends for UDP server {}", sid);

@@ -3,7 +3,8 @@ use crate::pb;
 use crate::rpc::client::RpcClient;
 use chrono::Timelike;
 use std::collections::HashMap;
-use tracing::{error, info};
+use std::sync::Arc;
+use tracing::{debug, error, info};
 
 pub async fn start_bandwidth_reporter(api_config: ApiConfig) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -27,6 +28,7 @@ pub async fn start_bandwidth_reporter(api_config: ApiConfig) {
                 day: day.clone(),
                 time_at: time_at.clone(),
                 bytes: snap.bytes_sent as i64,
+                bits: (snap.bytes_sent * 8) as i64,
                 total_bytes: snap.total_bytes() as i64,
                 cached_bytes: snap.cached_bytes as i64,
                 attack_bytes: snap.attack_bytes as i64,
@@ -151,8 +153,8 @@ fn get_period_time(period: i32, unit: &str) -> String {
 }
 
 pub async fn start_metric_stat_reporter(
+    config_store: Arc<crate::config::ConfigStore>,
     api_config: ApiConfig,
-    config_store: crate::config::ConfigStore,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut values_cache: HashMap<String, f32> = HashMap::new();
@@ -212,9 +214,9 @@ pub async fn start_metric_stat_reporter(
                     count += value.count;
 
                     let val = match item.value.as_str() {
-                        "${bytesSent}" => value.bytes_sent as f32,
-                        "${countRequest}" => value.count as f32,
-                        "${countAttackRequest}" => value.count_attack as f32,
+                        Some("${bytesSent}") => value.bytes_sent as f32,
+                        Some("${countRequest}") => value.count as f32,
+                        Some("${countAttackRequest}") => value.count_attack as f32,
                         _ => value.count as f32,
                     };
                     total += val;
@@ -284,6 +286,11 @@ pub async fn start_metric_stat_reporter(
     }
 }
 
+use std::sync::atomic::{AtomicI32, AtomicBool, Ordering};
+
+static LAST_NODE_LEVEL: AtomicI32 = AtomicI32::new(-1);
+static LAST_HAS_PARENTS: AtomicBool = AtomicBool::new(false);
+
 pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
 
@@ -306,11 +313,23 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
         {
             Ok(resp) => {
                 let info = resp.into_inner();
-                info!(
-                    "Node Level identified: {}, Parents: {}",
-                    info.level,
-                    !info.parent_nodes_map_json.is_empty()
-                );
+                let has_parents = !info.parent_nodes_map_json.is_empty();
+                
+                if info.level != LAST_NODE_LEVEL.load(Ordering::Relaxed) || has_parents != LAST_HAS_PARENTS.load(Ordering::Relaxed) {
+                    LAST_NODE_LEVEL.store(info.level, Ordering::Relaxed);
+                    LAST_HAS_PARENTS.store(has_parents, Ordering::Relaxed);
+                    info!(
+                        "Node Level identified: {}, Parents: {}",
+                        info.level,
+                        has_parents
+                    );
+                } else {
+                    debug!(
+                        "Node Level verified: {}, Parents: {}",
+                        info.level,
+                        has_parents
+                    );
+                }
             }
             Err(e) => {
                 error!("Failed to fetch node level info: {}", e);

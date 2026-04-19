@@ -14,7 +14,7 @@ pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool 
         pb::http_cache_task_key_service_client::HttpCacheTaskKeyServiceClient::with_interceptor(
             channel,
             move |mut req: Request<()>| {
-                let token = generate_token(&node_id_clone, &secret_clone).unwrap_or_default();
+                let token = generate_token(&node_id_clone, &secret_clone, "edge").unwrap_or_default();
                 req.metadata_mut()
                     .insert("nodeid", node_id_clone.parse().unwrap());
                 req.metadata_mut().insert("token", token.parse().unwrap());
@@ -69,8 +69,11 @@ pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool 
 
                         match http_client
                             .get(&final_url)
-                            .header("Host", host)
-                            .header("X-Edge-Preheat", "1")
+                            .header("host", host)
+                            .header("x-cloud-cache-action", "fetch")
+                            .header("x-cloud-preheat", "1")
+                            .header("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                            .header("accept-encoding", "gzip, deflate, br")
                             .send()
                             .await
                         {

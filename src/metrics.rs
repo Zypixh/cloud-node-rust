@@ -177,6 +177,23 @@ impl NodeMetrics {
             total_conns,
         )
     }
+
+    /// Calculate aggregate node pressure (0.0 to 1.0)
+    /// This is used for smart load balancing in Tiered Origin.
+    pub fn get_node_pressure(&self) -> f32 {
+        let (_, _, active_conns) = self.get_node_totals();
+        
+        // 1. Connection Pressure (Cap at 50,000 for 100%)
+        let conn_pressure = (active_conns as f32 / 50000.0).min(1.0);
+        
+        // 2. Resource Pressure (Memory/CPU)
+        // We use a simplified approximation based on swap usage or static baseline
+        // In a real system, we'd pull from sysinfo.
+        let sys_pressure = 0.1; // Placeholder for baseline
+        
+        // Combined weighted pressure
+        (conn_pressure * 0.7 + sys_pressure * 0.3).min(1.0)
+    }
 }
 
 pub mod record {

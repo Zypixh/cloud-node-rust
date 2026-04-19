@@ -1,5 +1,6 @@
 pub mod persistence;
 pub mod template;
+pub mod time;
 
 use std::time::Duration;
 use sysinfo::{Pid, System};

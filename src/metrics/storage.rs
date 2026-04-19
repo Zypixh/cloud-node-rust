@@ -97,7 +97,7 @@ impl MetricStorage {
     }
 
     /// Cache Metadata Management
-    pub fn update_cache_meta(&self, hash: &str, key_str: &str, size: u64, ttl_secs: u64) {
+    pub fn update_cache_meta(&self, hash: &str, key_str: &str, size: u64, ttl_secs: u64, headers: Option<serde_json::Value>, compressed: bool, status: u16) {
         let Some(db) = &self.db else {
             return;
         };
@@ -107,7 +107,10 @@ impl MetricStorage {
             "s": size,
             "e": now + ttl_secs as i64,
             "a": now,
-            "f": 1
+            "f": 1,
+            "st": status,
+            "h": headers.unwrap_or(serde_json::json!({})),
+            "c": compressed
         });
         let _ = db.put(format!("CMETA_{}", hash).as_bytes(), meta.to_string().as_bytes());
     }
@@ -143,12 +146,47 @@ impl MetricStorage {
         let _ = db.delete(format!("CMETA_{}", hash).as_bytes());
     }
 
+    /// WAF Token Persistence
+    pub fn save_waf_token(&self, token: &str, ip: &str, ua_hash: &str, expired_at: u64) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let val = serde_json::json!({
+            "ip": ip,
+            "ua": ua_hash,
+            "exp": expired_at
+        });
+        let _ = db.put(format!("WAFTOK_{}", token).as_bytes(), val.to_string().as_bytes());
+    }
+
+    pub fn get_waf_token(&self, token: &str) -> Option<serde_json::Value> {
+        let db = self.db.as_ref()?;
+        db.get(format!("WAFTOK_{}", token).as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_slice(&v).ok())
+    }
+
+    pub fn delete_waf_token(&self, token: &str) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let _ = db.delete(format!("WAFTOK_{}", token).as_bytes());
+    }
+
     pub fn total_cache_size(&self) -> u64 {
         let mut total = 0u64;
-        let iter = self.scan_prefix("CMETA_");
-        for (key, _val) in iter {
-            let hash = key.strip_prefix("CMETA_").unwrap_or(&key);
-            if let Some(meta) = self.get_cache_meta(hash) {
+        let Some(db) = &self.db else {
+            return 0;
+        };
+        
+        let iter = db.prefix_iterator("CMETA_".as_bytes());
+        for (key, val) in iter.flatten() {
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with("CMETA_") {
+                break;
+            }
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
                 total += meta["s"].as_u64().unwrap_or(0);
             }
         }
@@ -195,6 +233,26 @@ impl MetricStorage {
             return;
         };
         let _ = db.delete(key.as_bytes());
+    }
+
+    /// Scans all cache metadata, returning a vector of (hash, metadata_json)
+    pub fn scan_all_cache_meta(&self) -> Vec<(String, serde_json::Value)> {
+        let Some(db) = &self.db else {
+            return Vec::new();
+        };
+        let mut results = Vec::new();
+        let iter = db.prefix_iterator("CMETA_".as_bytes());
+        for (key, val) in iter.flatten() {
+            let key_str = String::from_utf8_lossy(&key).to_string();
+            if !key_str.starts_with("CMETA_") {
+                break;
+            }
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
+                let hash = key_str.strip_prefix("CMETA_").unwrap_or(&key_str).to_string();
+                results.push((hash, meta));
+            }
+        }
+        results
     }
 
     /// Scans keys with a prefix, useful for extracting metrics for a specific server or period.

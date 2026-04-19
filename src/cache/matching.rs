@@ -120,8 +120,31 @@ pub fn get_variable_value(session: &Session, param: &str) -> String {
                 .map(|ext| format!(".{}", ext.to_lowercase()))
                 .unwrap_or_default()
         }
-        "${host}" | "${requestHost}" => session.req_header().uri.host().unwrap_or("").to_string(),
-        "${scheme}" => "http".to_string(),
+        "${host}" | "${requestHost}" => {
+            session.req_header().headers.get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(':').next().unwrap_or(v)) // Remove port if present
+                .or_else(|| session.req_header().uri.host())
+                .unwrap_or("")
+                .to_string()
+        }
+        "${scheme}" => {
+            // 1. Check if it's a real TLS connection
+            let is_tls = session.downstream_session.digest().and_then(|d| d.ssl_digest.as_ref()).is_some();
+            if is_tls {
+                "https".to_string()
+            } else {
+                // 2. Fallback to X-Forwarded-Proto or URI scheme
+                let xfp = session.get_header("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("");
+                if xfp.to_lowercase() == "https" || session.req_header().uri.scheme_str() == Some("https") {
+                    "https".to_string()
+                } else {
+                    "http".to_string()
+                }
+            }
+        },
+        "${isArgs}" => if session.req_header().uri.query().is_some() { "?".to_string() } else { "".to_string() },
+        "${args}" => session.req_header().uri.query().unwrap_or("").to_string(),
         "${requestURI}" => {
             let path = session.req_header().uri.path();
             let query = session.req_header().uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
@@ -164,6 +187,9 @@ pub fn get_variable_value(session: &Session, param: &str) -> String {
 }
 
 pub fn format_variables(session: &Session, template: &str) -> String {
+    if !template.contains("${") {
+        return template.to_string();
+    }
     let re = Regex::new(r"\$\{[^}]+\}").unwrap();
     let result = re.replace_all(template, |caps: &regex::Captures| {
         get_variable_value(session, &caps[0])
