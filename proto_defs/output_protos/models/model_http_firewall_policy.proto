@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "./pb";
+
+message HTTPFirewallPolicy {
+    int64 id = 1;
+    string name = 2;
+    string mode = 7;
+    bool isOn = 3;
+    string description = 4;
+    bytes inboundJSON = 5;
+    bytes outboundJSON = 6;
+    int64 serverId = 8;
+    bool useLocalFirewall = 9;
+    bytes synFloodJSON = 10;
+    bytes emptyConnectionFloodJSON = 15;
+    bytes tlsExhaustionAttackJSON = 16;
+    bytes blockOptionsJSON = 11;
+    bytes pageOptionsJSON = 13;
+    bytes captchaOptionsJSON = 12;
+    bytes jsCookieOptionsJSON = 14;
+}

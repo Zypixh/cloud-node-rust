@@ -1,0 +1,140 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/model_plan.proto";
+import "models/rpc_messages.proto";
+
+option go_package = "./pb";
+
+service PlanService {
+    rpc createPlan(CreatePlanRequest) returns (CreatePlanResponse);
+    rpc updatePlan(UpdatePlanRequest) returns (RPCSuccess);
+    rpc deletePlan(DeletePlanRequest) returns (RPCSuccess);
+    rpc findEnabledPlan(FindEnabledPlanRequest) returns (FindEnabledPlanResponse);
+    rpc findBasicPlan(FindBasicPlanRequest) returns (FindBasicPlanResponse);
+    rpc countAllEnabledPlans(CountAllEnabledPlansRequest) returns (RPCCountResponse);
+    rpc listEnabledPlans(ListEnabledPlansRequest) returns (ListEnabledPlansResponse);
+    rpc findAllAvailablePlans(FindAllAvailablePlansRequest) returns (FindAllAvailablePlansResponse);
+    rpc findAllAvailableBasicPlans(FindAllAvailableBasicPlansRequest) returns (FindAllAvailableBasicPlansResponse);
+    rpc sortPlans(SortPlansRequest) returns (RPCSuccess);
+    rpc updatePlanCanBuy(UpdatePlanCanBuyRequest) returns (RPCSuccess);
+}
+
+message CreatePlanRequest {
+    string name = 1;
+    string description = 19;
+    int64 clusterId = 2;
+    bytes trafficLimitJSON = 3;
+    bytes bandwidthLimitPerNodeJSON = 20;
+    bool hasFullFeatures = 18;
+    bytes featuresJSON = 4;
+    string priceType = 5;
+    bytes trafficPriceJSON = 6;
+    bytes bandwidthPriceJSON = 10;
+    float monthlyPrice = 7;
+    float seasonallyPrice = 8;
+    float yearlyPrice = 9;
+    int32 totalServers = 11;
+    int32 totalServerNamesPerServer = 12;
+    int32 totalServerNames = 13;
+    int64 dailyRequests = 14;
+    int64 monthlyRequests = 15;
+    int64 dailyWebsocketConnections = 16;
+    int64 monthlyWebsocketConnections = 17;
+    bytes maxUploadSizeJSON = 21;
+    bool canBuy = 22;
+    string lbMode = 23;
+}
+
+message CreatePlanResponse {
+    int64 planId = 1;
+}
+
+message UpdatePlanRequest {
+    int64 planId = 1;
+    string name = 2;
+    string description = 21;
+    bool isOn = 3;
+    int64 clusterId = 4;
+    bytes trafficLimitJSON = 5;
+    bytes bandwidthLimitPerNodeJSON = 22;
+    bool hasFullFeatures = 20;
+    bytes featuresJSON = 6;
+    string priceType = 7;
+    bytes trafficPriceJSON = 8;
+    bytes bandwidthPriceJSON = 12;
+    float monthlyPrice = 9;
+    float seasonallyPrice = 10;
+    float yearlyPrice = 11;
+    int32 totalServers = 13;
+    int32 totalServerNamesPerServer = 14;
+    int32 totalServerNames = 15;
+    int64 dailyRequests = 16;
+    int64 monthlyRequests = 17;
+    int64 dailyWebsocketConnections = 18;
+    int64 monthlyWebsocketConnections = 19;
+    bytes maxUploadSizeJSON = 23;
+    bool canBuy = 24;
+    string lbMode = 25;
+}
+
+message DeletePlanRequest {
+    int64 planId = 1;
+}
+
+message FindEnabledPlanRequest {
+    int64 planId = 1;
+}
+
+message FindEnabledPlanResponse {
+    Plan plan = 1;
+}
+
+message FindBasicPlanRequest {
+    int64 planId = 1;
+}
+
+message FindBasicPlanResponse {
+    Plan plan = 1;
+}
+
+message CountAllEnabledPlansRequest {
+    
+}
+
+message ListEnabledPlansRequest {
+    int64 offset = 1;
+    int64 size = 2;
+}
+
+message ListEnabledPlansResponse {
+    repeated Plan plans = 1;
+}
+
+message FindAllAvailablePlansRequest {
+    bool canBuyOnly = 1;
+    string priceType = 2;
+}
+
+message FindAllAvailablePlansResponse {
+    repeated Plan plans = 1;
+}
+
+message FindAllAvailableBasicPlansRequest {
+    
+}
+
+message FindAllAvailableBasicPlansResponse {
+    bool enablePlans = 2;
+    repeated Plan plans = 1;
+}
+
+message SortPlansRequest {
+    repeated int64 planIds = 1;
+}
+
+message UpdatePlanCanBuyRequest {
+    int64 planId = 1;
+    bool canBuy = 2;
+}

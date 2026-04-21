@@ -1,0 +1,155 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/model_api_node.proto";
+import "models/rpc_messages.proto";
+
+option go_package = "./pb";
+
+service APINodeService {
+    rpc createAPINode(CreateAPINodeRequest) returns (CreateAPINodeResponse);
+    rpc updateAPINode(UpdateAPINodeRequest) returns (RPCSuccess);
+    rpc deleteAPINode(DeleteAPINodeRequest) returns (RPCSuccess);
+    rpc findAllEnabledAPINodes(FindAllEnabledAPINodesRequest) returns (FindAllEnabledAPINodesResponse);
+    rpc countAllEnabledAPINodes(CountAllEnabledAPINodesRequest) returns (RPCCountResponse);
+    rpc countAllEnabledAndOnAPINodes(CountAllEnabledAndOnAPINodesRequest) returns (RPCCountResponse);
+    rpc listEnabledAPINodes(ListEnabledAPINodesRequest) returns (ListEnabledAPINodesResponse);
+    rpc findEnabledAPINode(FindEnabledAPINodeRequest) returns (FindEnabledAPINodeResponse);
+    rpc findCurrentAPINodeVersion(FindCurrentAPINodeVersionRequest) returns (FindCurrentAPINodeVersionResponse);
+    rpc findCurrentAPINode(FindCurrentAPINodeRequest) returns (FindCurrentAPINodeResponse);
+    rpc countAllEnabledAPINodesWithSSLCertId(CountAllEnabledAPINodesWithSSLCertIdRequest) returns (RPCCountResponse);
+    rpc debugAPINode(DebugAPINodeRequest) returns (RPCSuccess);
+    rpc uploadAPINodeFile(UploadAPINodeFileRequest) returns (UploadAPINodeFileResponse);
+    rpc uploadDeployFileToAPINode(UploadDeployFileToAPINodeRequest) returns (RPCSuccess);
+    rpc findLatestDeployFiles(FindLatestDeployFilesRequest) returns (FindLatestDeployFilesResponse);
+}
+
+message CreateAPINodeRequest {
+    string name = 1;
+    string description = 2;
+    bytes httpJSON = 3;
+    bytes httpsJSON = 4;
+    bytes accessAddrsJSON = 5;
+    bool isOn = 6;
+    bool restIsOn = 7;
+    bytes restHTTPJSON = 8;
+    bytes restHTTPSJSON = 9;
+}
+
+message CreateAPINodeResponse {
+    int64 apiNodeId = 1;
+}
+
+message UpdateAPINodeRequest {
+    int64 apiNodeId = 1;
+    string name = 2;
+    string description = 3;
+    bytes httpJSON = 4;
+    bytes httpsJSON = 5;
+    bytes accessAddrsJSON = 6;
+    bool isOn = 7;
+    bool restIsOn = 8;
+    bytes restHTTPJSON = 9;
+    bytes restHTTPSJSON = 10;
+    bool isPrimary = 11;
+}
+
+message DeleteAPINodeRequest {
+    int64 apiNodeId = 1;
+}
+
+message FindAllEnabledAPINodesRequest {
+    
+}
+
+message FindAllEnabledAPINodesResponse {
+    repeated APINode apiNodes = 1;
+}
+
+message CountAllEnabledAPINodesRequest {
+    
+}
+
+message CountAllEnabledAndOnAPINodesRequest {
+    
+}
+
+message ListEnabledAPINodesRequest {
+    int64 offset = 1;
+    int64 size = 2;
+}
+
+message ListEnabledAPINodesResponse {
+    repeated APINode apiNodes = 1;
+}
+
+message FindEnabledAPINodeRequest {
+    int64 apiNodeId = 1;
+}
+
+message FindEnabledAPINodeResponse {
+    APINode apiNode = 1;
+}
+
+message FindCurrentAPINodeVersionRequest {
+    
+}
+
+message FindCurrentAPINodeVersionResponse {
+    string version = 1;
+    string os = 2;
+    string arch = 3;
+    string role = 4;
+}
+
+message FindCurrentAPINodeRequest {
+    
+}
+
+message FindCurrentAPINodeResponse {
+    APINode apiNode = 1;
+}
+
+message CountAllEnabledAPINodesWithSSLCertIdRequest {
+    int64 sslCertId = 1;
+}
+
+message DebugAPINodeRequest {
+    bool debug = 1;
+}
+
+message UploadAPINodeFileRequest {
+    string filename = 1;
+    string sum = 2;
+    bytes chunkData = 3;
+    bool isFirstChunk = 4;
+    bool isLastChunk = 5;
+}
+
+message UploadAPINodeFileResponse {
+    
+}
+
+message UploadDeployFileToAPINodeRequest {
+    string filename = 1;
+    string sum = 2;
+    bytes chunkData = 3;
+    bool isFirstChunk = 4;
+    bool isLastChunk = 5;
+}
+
+message FindLatestDeployFilesRequest {
+    
+}
+
+message FindLatestDeployFilesResponse {
+    repeated DeployFile nodeDeployFiles = 1;
+    message DeployFile {
+        string os = 1;
+        string arch = 2;
+        string version = 3;
+    }
+    
+    repeated DeployFile nsNodeDeployFiles = 2;
+}

@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_server_event.proto";
+
+option go_package = "./pb";
+
+service ServerEventService {
+    rpc createServerEvent(CreateServerEventRequest) returns (RPCSuccess);
+    rpc listServerEvents(ListServerEventsRequest) returns (ListServerEventsResponse);
+    rpc updateServerEventsRead(UpdateServerEventsReadRequest) returns (RPCSuccess);
+    rpc countServerEvents(CountServerEventsRequest) returns (RPCCountResponse);
+    rpc listAllServerEvents(ListAllServerEventsRequest) returns (ListAllServerEventsResponse);
+}
+
+message CreateServerEventRequest {
+    int64 serverId = 1;
+    string type = 2;
+    bytes paramsJSON = 3;
+}
+
+message ListServerEventsRequest {
+    int64 serverId = 1;
+    string type = 2;
+    int64 size = 3;
+}
+
+message ListServerEventsResponse {
+    repeated ServerEvent serverEvents = 1;
+}
+
+message UpdateServerEventsReadRequest {
+    int64 serverId = 1;
+    string type = 2;
+}
+
+message CountServerEventsRequest {
+    string type = 1;
+    string dayFrom = 2;
+    int64 fromServerEventId = 3;
+}
+
+message ListAllServerEventsRequest {
+    string type = 1;
+    string dayFrom = 2;
+    int64 offset = 3;
+    int64 size = 4;
+}
+
+message ListAllServerEventsResponse {
+    repeated ServerEvent serverEvents = 1;
+}

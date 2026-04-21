@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_node_log.proto";
+
+option go_package = "./pb";
+
+service NodeLogService {
+    rpc createNodeLogs(CreateNodeLogsRequest) returns (CreateNodeLogsResponse);
+    rpc countNodeLogs(CountNodeLogsRequest) returns (RPCCountResponse);
+    rpc listNodeLogs(ListNodeLogsRequest) returns (ListNodeLogsResponse);
+    rpc fixNodeLogs(FixNodeLogsRequest) returns (RPCSuccess);
+    rpc fixAllNodeLogs(FixAllNodeLogsRequest) returns (RPCSuccess);
+    rpc countAllUnreadNodeLogs(CountAllUnreadNodeLogsRequest) returns (RPCCountResponse);
+    rpc updateNodeLogsRead(UpdateNodeLogsReadRequest) returns (RPCSuccess);
+    rpc updateAllNodeLogsRead(UpdateAllNodeLogsReadRequest) returns (RPCSuccess);
+    rpc deleteNodeLogs(DeleteNodeLogsRequest) returns (RPCSuccess);
+}
+
+message CreateNodeLogsRequest {
+    repeated NodeLog nodeLogs = 1;
+}
+
+message CreateNodeLogsResponse {
+    
+}
+
+message CountNodeLogsRequest {
+    int64 nodeClusterId = 11;
+    int64 nodeId = 1;
+    string role = 2;
+    string dayFrom = 3;
+    string dayTo = 4;
+    string keyword = 5;
+    string level = 6;
+    int64 serverId = 7;
+    int64 originId = 8;
+    bool isUnread = 9;
+    string tag = 10;
+    int32 fixedState = 12;
+    bool allServers = 13;
+}
+
+message ListNodeLogsRequest {
+    int64 nodeClusterId = 15;
+    int64 nodeId = 1;
+    string role = 2;
+    int64 offset = 3;
+    int64 size = 4;
+    string dayFrom = 5;
+    string dayTo = 6;
+    string keyword = 7;
+    string level = 8;
+    int64 serverId = 9;
+    int32 fixedState = 10;
+    bool allServers = 11;
+    int64 originId = 12;
+    bool isUnread = 13;
+    string tag = 14;
+}
+
+message ListNodeLogsResponse {
+    repeated NodeLog nodeLogs = 1;
+}
+
+message FixNodeLogsRequest {
+    repeated int64 nodeLogIds = 1;
+}
+
+message FixAllNodeLogsRequest {
+    
+}
+
+message CountAllUnreadNodeLogsRequest {
+    
+}
+
+message UpdateNodeLogsReadRequest {
+    repeated int64 nodeLogIds = 1;
+    int64 nodeId = 2;
+    string role = 3;
+}
+
+message UpdateAllNodeLogsReadRequest {
+    
+}
+
+message DeleteNodeLogsRequest {
+    int64 nodeClusterId = 15;
+    int64 nodeId = 1;
+    string role = 2;
+    int64 offset = 3;
+    int64 size = 4;
+    string dayFrom = 5;
+    string dayTo = 6;
+    string keyword = 7;
+    string level = 8;
+    int64 serverId = 9;
+    int32 fixedState = 10;
+    bool allServers = 11;
+    int64 originId = 12;
+    bool isUnread = 13;
+    string tag = 14;
+}

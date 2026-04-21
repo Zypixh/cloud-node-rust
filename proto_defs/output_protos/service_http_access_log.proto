@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/model_http_access_log.proto";
+
+option go_package = "./pb";
+
+service HTTPAccessLogService {
+    rpc createHTTPAccessLogs(CreateHTTPAccessLogsRequest) returns (CreateHTTPAccessLogsResponse);
+    rpc listHTTPAccessLogs(ListHTTPAccessLogsRequest) returns (ListHTTPAccessLogsResponse);
+    rpc findHTTPAccessLog(FindHTTPAccessLogRequest) returns (FindHTTPAccessLogResponse);
+    rpc findHTTPAccessLogPartitions(FindHTTPAccessLogPartitionsRequest) returns (FindHTTPAccessLogPartitionsResponse);
+}
+
+message CreateHTTPAccessLogsRequest {
+    repeated HTTPAccessLog httpAccessLogs = 1;
+}
+
+message CreateHTTPAccessLogsResponse {
+    
+}
+
+message ListHTTPAccessLogsRequest {
+    string requestId = 1;
+    int64 serverId = 2;
+    int64 size = 3;
+    string day = 4;
+    string hourFrom = 17;
+    string hourTo = 18;
+    bool reverse = 5;
+    bool hasError = 6;
+    int64 firewallPolicyId = 7;
+    int64 firewallRuleGroupId = 8;
+    int64 firewallRuleSetId = 9;
+    int64 userId = 10;
+    bool hasFirewallPolicy = 11;
+    string keyword = 12;
+    string ip = 13;
+    string domain = 14;
+    int64 nodeClusterId = 15;
+    int64 nodeId = 16;
+    int32 partition = 19;
+}
+
+message ListHTTPAccessLogsResponse {
+    repeated HTTPAccessLog httpAccessLogs = 4;
+    string requestId = 2;
+    bool hasMore = 3;
+}
+
+message FindHTTPAccessLogRequest {
+    string requestId = 1;
+}
+
+message FindHTTPAccessLogResponse {
+    HTTPAccessLog httpAccessLog = 1;
+}
+
+message FindHTTPAccessLogPartitionsRequest {
+    string day = 1;
+}
+
+message FindHTTPAccessLogPartitionsResponse {
+    repeated int32 partitions = 1;
+    repeated int32 reversePartitions = 2;
+}

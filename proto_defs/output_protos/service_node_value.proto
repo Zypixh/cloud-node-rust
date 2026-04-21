@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_node_value.proto";
+
+option go_package = "./pb";
+
+service NodeValueService {
+    rpc createNodeValue(CreateNodeValueRequest) returns (RPCSuccess);
+    rpc createNodeValues(CreateNodeValuesRequest) returns (RPCSuccess);
+    rpc listNodeValues(ListNodeValuesRequest) returns (ListNodeValuesResponse);
+    rpc sumAllNodeValueStats(SumAllNodeValueStatsRequest) returns (SumAllNodeValueStatsResponse);
+}
+
+message CreateNodeValueRequest {
+    string item = 1;
+    bytes valueJSON = 2;
+    int64 createdAt = 3;
+}
+
+message CreateNodeValuesRequest {
+    repeated NodeValueItem nodeValueItems = 1;
+    message NodeValueItem {
+        string item = 1;
+        bytes valueJSON = 2;
+        int64 createdAt = 3;
+    }
+}
+
+message ListNodeValuesRequest {
+    string role = 1;
+    int64 nodeId = 2;
+    string item = 3;
+    string range = 10;
+}
+
+message ListNodeValuesResponse {
+    repeated NodeValue nodeValues = 1;
+}
+
+message SumAllNodeValueStatsRequest {
+    
+}
+
+message SumAllNodeValueStatsResponse {
+    int64 totalTrafficBytesPerSecond = 1;
+    float avgCPUUsage = 2;
+    float maxCPUUsage = 3;
+    int32 totalCPUCores = 4;
+    float avgMemoryUsage = 5;
+    float maxMemoryUsage = 6;
+    int64 totalMemoryBytes = 7;
+    float avgLoad1min = 8;
+    float maxLoad1min = 9;
+    float avgLoad5min = 10;
+}

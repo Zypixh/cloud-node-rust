@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_client_agent_ip.proto";
+
+option go_package = "./pb";
+
+service ClientAgentIPService {
+    rpc createClientAgentIPs(CreateClientAgentIPsRequest) returns (RPCSuccess);
+    rpc listClientAgentIPsAfterId(ListClientAgentIPsAfterIdRequest) returns (ListClientAgentIPsAfterIdResponse);
+}
+
+message CreateClientAgentIPsRequest {
+    repeated AgentIPInfo agentIPs = 1;
+    message AgentIPInfo {
+        string agentCode = 1;
+        string ip = 2;
+        string ptr = 3;
+    }
+}
+
+message ListClientAgentIPsAfterIdRequest {
+    int64 id = 1;
+    int64 size = 2;
+}
+
+message ListClientAgentIPsAfterIdResponse {
+    repeated ClientAgentIP clientAgentIPs = 1;
+}

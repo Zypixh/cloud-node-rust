@@ -1,0 +1,662 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/model_server.proto";
+import "models/model_dns_domain.proto";
+import "models/model_server_name_auditing_result.proto";
+import "models/rpc_messages.proto";
+import "models/model_user_plan.proto";
+
+option go_package = "./pb";
+
+service ServerService {
+    rpc createServer(CreateServerRequest) returns (CreateServerResponse);
+    rpc createBasicHTTPServer(CreateBasicHTTPServerRequest) returns (CreateBasicHTTPServerResponse);
+    rpc createBasicTCPServer(CreateBasicTCPServerRequest) returns (CreateBasicTCPServerResponse);
+    rpc addServerOrigin(AddServerOriginRequest) returns (RPCSuccess);
+    rpc deleteServerOrigin(DeleteServerOriginRequest) returns (RPCSuccess);
+    rpc updateServerBasic(UpdateServerBasicRequest) returns (RPCSuccess);
+    rpc updateServerGroupIds(UpdateServerGroupIdsRequest) returns (RPCSuccess);
+    rpc updateServerIsOn(UpdateServerIsOnRequest) returns (RPCSuccess);
+    rpc updateServerHTTP(UpdateServerHTTPRequest) returns (RPCSuccess);
+    rpc updateServerHTTPS(UpdateServerHTTPSRequest) returns (RPCSuccess);
+    rpc updateServerTCP(UpdateServerTCPRequest) returns (RPCSuccess);
+    rpc updateServerTLS(UpdateServerTLSRequest) returns (RPCSuccess);
+    rpc updateServerUDP(UpdateServerUDPRequest) returns (RPCSuccess);
+    rpc updateServerWeb(UpdateServerWebRequest) returns (RPCSuccess);
+    rpc updateServerReverseProxy(UpdateServerReverseProxyRequest) returns (RPCSuccess);
+    rpc findServerNames(FindServerNamesRequest) returns (FindServerNamesResponse);
+    rpc updateServerNames(UpdateServerNamesRequest) returns (RPCSuccess);
+    rpc updateServerNamesAuditing(UpdateServerNamesAuditingRequest) returns (RPCSuccess);
+    rpc updateServerDNS(UpdateServerDNSRequest) returns (RPCSuccess);
+    rpc regenerateServerDNSName(RegenerateServerDNSNameRequest) returns (RPCSuccess);
+    rpc updateServerDNSName(UpdateServerDNSNameRequest) returns (RPCSuccess);
+    rpc findServerIdWithDNSName(FindServerIdWithDNSNameRequest) returns (FindServerIdWithDNSNameResponse);
+    rpc countAllEnabledServersMatch(CountAllEnabledServersMatchRequest) returns (RPCCountResponse);
+    rpc listEnabledServersMatch(ListEnabledServersMatchRequest) returns (ListEnabledServersMatchResponse);
+    rpc deleteServer(DeleteServerRequest) returns (RPCSuccess);
+    rpc deleteServers(DeleteServersRequest) returns (RPCSuccess);
+    rpc findEnabledServer(FindEnabledServerRequest) returns (FindEnabledServerResponse);
+    rpc findEnabledServerConfig(FindEnabledServerConfigRequest) returns (FindEnabledServerConfigResponse);
+    rpc findEnabledServerType(FindEnabledServerTypeRequest) returns (FindEnabledServerTypeResponse);
+    rpc findAndInitServerReverseProxyConfig(FindAndInitServerReverseProxyConfigRequest) returns (FindAndInitServerReverseProxyConfigResponse);
+    rpc findAndInitServerWebConfig(FindAndInitServerWebConfigRequest) returns (FindAndInitServerWebConfigResponse);
+    rpc findServerWebId(FindServerWebIdRequest) returns (FindServerWebIdResponse);
+    rpc countAllEnabledServersWithSSLCertId(CountAllEnabledServersWithSSLCertIdRequest) returns (RPCCountResponse);
+    rpc findAllEnabledServersWithSSLCertId(FindAllEnabledServersWithSSLCertIdRequest) returns (FindAllEnabledServersWithSSLCertIdResponse);
+    rpc countAllEnabledServersWithNodeClusterId(CountAllEnabledServersWithNodeClusterIdRequest) returns (RPCCountResponse);
+    rpc countAllEnabledServersWithServerGroupId(CountAllEnabledServersWithServerGroupIdRequest) returns (RPCCountResponse);
+    rpc notifyServersChange(NotifyServersChangeRequest) returns (NotifyServersChangeResponse);
+    rpc findAllEnabledServersDNSWithNodeClusterId(FindAllEnabledServersDNSWithNodeClusterIdRequest) returns (FindAllEnabledServersDNSWithNodeClusterIdResponse);
+    rpc findEnabledServerDNS(FindEnabledServerDNSRequest) returns (FindEnabledServerDNSResponse);
+    rpc checkUserServer(CheckUserServerRequest) returns (RPCSuccess);
+    rpc findAllEnabledServerNamesWithUserId(FindAllEnabledServerNamesWithUserIdRequest) returns (FindAllEnabledServerNamesWithUserIdResponse);
+    rpc countAllServerNamesWithUserId(CountAllServerNamesWithUserIdRequest) returns (RPCCountResponse);
+    rpc countServerNames(CountServerNamesRequest) returns (RPCCountResponse);
+    rpc findAllUserServers(FindAllUserServersRequest) returns (FindAllUserServersResponse);
+    rpc countAllUserServers(CountAllUserServersRequest) returns (RPCCountResponse);
+    rpc composeAllUserServersConfig(ComposeAllUserServersConfigRequest) returns (ComposeAllUserServersConfigResponse);
+    rpc findEnabledUserServerBasic(FindEnabledUserServerBasicRequest) returns (FindEnabledUserServerBasicResponse);
+    rpc updateEnabledUserServerBasic(UpdateEnabledUserServerBasicRequest) returns (RPCSuccess);
+    rpc uploadServerHTTPRequestStat(UploadServerHTTPRequestStatRequest) returns (RPCSuccess);
+    rpc checkServerNameDuplicationInNodeCluster(CheckServerNameDuplicationInNodeClusterRequest) returns (CheckServerNameDuplicationInNodeClusterResponse);
+    rpc checkServerNameInServer(CheckServerNameInServerRequest) returns (CheckServerNameInServerResponse);
+    rpc findLatestServers(FindLatestServersRequest) returns (FindLatestServersResponse);
+    rpc findNearbyServers(FindNearbyServersRequest) returns (FindNearbyServersResponse);
+    rpc purgeServerCache(PurgeServerCacheRequest) returns (PurgeServerCacheResponse);
+    rpc findEnabledServerTrafficLimit(FindEnabledServerTrafficLimitRequest) returns (FindEnabledServerTrafficLimitResponse);
+    rpc updateServerTrafficLimit(UpdateServerTrafficLimitRequest) returns (RPCSuccess);
+    rpc updateServerUserPlan(UpdateServerUserPlanRequest) returns (RPCSuccess);
+    rpc findServerUserPlan(FindServerUserPlanRequest) returns (FindServerUserPlanResponse);
+    rpc composeServerConfig(ComposeServerConfigRequest) returns (ComposeServerConfigResponse);
+    rpc updateServerUAM(UpdateServerUAMRequest) returns (RPCSuccess);
+    rpc findEnabledServerUAM(FindEnabledServerUAMRequest) returns (FindEnabledServerUAMResponse);
+    rpc findServerGRPC(FindServerGRPCRequest) returns (FindServerGRPCResponse);
+    rpc updateServerGRPC(UpdateServerGRPCRequest) returns (RPCSuccess);
+    rpc updateServerUser(UpdateServerUserRequest) returns (RPCSuccess);
+    rpc updateServerName(UpdateServerNameRequest) returns (RPCSuccess);
+    rpc copyServerConfig(CopyServerConfigRequest) returns (RPCSuccess);
+    rpc findServerAuditingPrompt(FindServerAuditingPromptRequest) returns (FindServerAuditingPromptResponse);
+    rpc findServerTCPPortsWithNodeCluster(FindServerTCPPortsWithNodeClusterRequest) returns (FindServerTCPPortsWithNodeClusterResponse);
+    rpc findServerUDPPortsWithNodeCluster(FindServerUDPPortsWithNodeClusterRequest) returns (FindServerUDPPortsWithNodeClusterResponse);
+    rpc findAvailableServerIdsWithServerName(FindAvailableServerIdsWithServerNameRequest) returns (FindAvailableServerIdsWithServerNameResponse);
+}
+
+message CreateServerRequest {
+    int64 userId = 1;
+    int64 adminId = 2;
+    string type = 3;
+    string name = 4;
+    string description = 5;
+    bytes serverNamesJSON = 8;
+    bytes httpJSON = 9;
+    bytes httpsJSON = 10;
+    bytes tcpJSON = 11;
+    bytes tlsJSON = 12;
+    bytes udpJSON = 14;
+    int64 webId = 15;
+    bytes reverseProxyJSON = 16;
+    repeated int64 serverGroupIds = 17;
+    int64 userPlanId = 18;
+    int64 nodeClusterId = 30;
+    bytes includeNodesJSON = 31;
+    bytes excludeNodesJSON = 32;
+}
+
+message CreateServerResponse {
+    int64 serverId = 1;
+}
+
+message CreateBasicHTTPServerRequest {
+    int64 nodeClusterId = 1;
+    int64 userId = 2;
+    repeated string domains = 3;
+    repeated int64 sslCertIds = 4;
+    repeated string originAddrs = 5;
+    bool enableWebsocket = 6;
+}
+
+message CreateBasicHTTPServerResponse {
+    int64 serverId = 1;
+}
+
+message CreateBasicTCPServerRequest {
+    int64 nodeClusterId = 1;
+    int64 userId = 2;
+    repeated int32 tcpPorts = 3;
+    repeated int32 tlsPorts = 4;
+    repeated int64 sslCertIds = 5;
+    repeated string originAddrs = 6;
+}
+
+message CreateBasicTCPServerResponse {
+    int64 serverId = 1;
+}
+
+message AddServerOriginRequest {
+    int64 serverId = 1;
+    int64 originId = 2;
+    bool isPrimary = 3;
+}
+
+message DeleteServerOriginRequest {
+    int64 serverId = 1;
+    int64 originId = 2;
+}
+
+message UpdateServerBasicRequest {
+    int64 serverId = 1;
+    string name = 2;
+    string description = 3;
+    int64 nodeClusterId = 4;
+    bool keepOldConfigs = 7;
+    bool isOn = 5;
+    repeated int64 serverGroupIds = 6;
+}
+
+message UpdateServerGroupIdsRequest {
+    int64 serverId = 1;
+    repeated int64 serverGroupIds = 2;
+}
+
+message UpdateServerIsOnRequest {
+    int64 serverId = 1;
+    bool isOn = 2;
+}
+
+message UpdateServerHTTPRequest {
+    int64 serverId = 1;
+    bytes httpJSON = 2;
+}
+
+message UpdateServerHTTPSRequest {
+    int64 serverId = 1;
+    bytes httpsJSON = 2;
+}
+
+message UpdateServerTCPRequest {
+    int64 serverId = 1;
+    bytes tcpJSON = 2;
+}
+
+message UpdateServerTLSRequest {
+    int64 serverId = 1;
+    bytes tlsJSON = 2;
+}
+
+message UpdateServerUDPRequest {
+    int64 serverId = 1;
+    bytes udpJSON = 2;
+}
+
+message UpdateServerWebRequest {
+    int64 serverId = 1;
+    int64 httpWebId = 2;
+}
+
+message UpdateServerReverseProxyRequest {
+    int64 serverId = 1;
+    bytes reverseProxyJSON = 2;
+}
+
+message FindServerNamesRequest {
+    int64 serverId = 1;
+}
+
+message FindServerNamesResponse {
+    bytes serverNamesJSON = 1;
+    bool isAuditing = 2;
+    int64 auditingAt = 5;
+    bytes auditingServerNamesJSON = 3;
+    ServerNameAuditingResult auditingResult = 4;
+}
+
+message UpdateServerNamesRequest {
+    int64 serverId = 1;
+    bytes serverNamesJSON = 2;
+}
+
+message UpdateServerNamesAuditingRequest {
+    int64 serverId = 1;
+    ServerNameAuditingResult auditingResult = 2;
+}
+
+message UpdateServerDNSRequest {
+    int64 serverId = 1;
+    bool supportCNAME = 2;
+}
+
+message RegenerateServerDNSNameRequest {
+    int64 serverId = 1;
+}
+
+message UpdateServerDNSNameRequest {
+    int64 serverId = 1;
+    string dnsName = 2;
+}
+
+message FindServerIdWithDNSNameRequest {
+    int64 nodeClusterId = 1;
+    string dnsName = 2;
+}
+
+message FindServerIdWithDNSNameResponse {
+    int64 serverId = 1;
+}
+
+message CountAllEnabledServersMatchRequest {
+    int64 serverGroupId = 1;
+    string keyword = 2;
+    int64 userId = 3;
+    int64 nodeClusterId = 4;
+    int32 auditingFlag = 5;
+    string protocolFamily = 6;
+    int64 userPlanId = 7;
+}
+
+message ListEnabledServersMatchRequest {
+    int64 offset = 1;
+    int64 size = 2;
+    int64 serverGroupId = 3;
+    string keyword = 4;
+    int64 userId = 5;
+    int64 nodeClusterId = 6;
+    int32 auditingFlag = 7;
+    string protocolFamily = 8;
+    bool trafficOutAsc = 9;
+    bool trafficOutDesc = 10;
+    bool requestsAsc = 13;
+    bool requestsDesc = 14;
+    bool attackRequestsAsc = 15;
+    bool attackRequestsDesc = 16;
+    bool ignoreServerNames = 11;
+    bool ignoreSSLCerts = 12;
+}
+
+message ListEnabledServersMatchResponse {
+    repeated Server servers = 1;
+}
+
+message DeleteServerRequest {
+    int64 serverId = 1;
+}
+
+message DeleteServersRequest {
+    repeated int64 serverIds = 1;
+}
+
+message FindEnabledServerRequest {
+    int64 serverId = 1;
+    bool ignoreSSLCerts = 2;
+}
+
+message FindEnabledServerResponse {
+    Server server = 1;
+}
+
+message FindEnabledServerConfigRequest {
+    int64 serverId = 1;
+}
+
+message FindEnabledServerConfigResponse {
+    bytes serverJSON = 1;
+}
+
+message FindEnabledServerTypeRequest {
+    int64 serverId = 1;
+}
+
+message FindEnabledServerTypeResponse {
+    string type = 1;
+}
+
+message FindAndInitServerReverseProxyConfigRequest {
+    int64 serverId = 1;
+}
+
+message FindAndInitServerReverseProxyConfigResponse {
+    bytes reverseProxyJSON = 1;
+    bytes reverseProxyRefJSON = 2;
+}
+
+message FindAndInitServerWebConfigRequest {
+    int64 serverId = 1;
+}
+
+message FindAndInitServerWebConfigResponse {
+    bytes webJSON = 1;
+}
+
+message FindServerWebIdRequest {
+    int64 serverId = 1;
+}
+
+message FindServerWebIdResponse {
+    int64 httpWebId = 1;
+}
+
+message CountAllEnabledServersWithSSLCertIdRequest {
+    int64 sslCertId = 1;
+}
+
+message FindAllEnabledServersWithSSLCertIdRequest {
+    int64 sslCertId = 1;
+}
+
+message FindAllEnabledServersWithSSLCertIdResponse {
+    repeated Server servers = 1;
+}
+
+message CountAllEnabledServersWithNodeClusterIdRequest {
+    int64 nodeClusterId = 1;
+}
+
+message CountAllEnabledServersWithServerGroupIdRequest {
+    int64 serverGroupId = 1;
+}
+
+message NotifyServersChangeRequest {
+    
+}
+
+message NotifyServersChangeResponse {
+    
+}
+
+message FindAllEnabledServersDNSWithNodeClusterIdRequest {
+    int64 nodeClusterId = 1;
+}
+
+message FindAllEnabledServersDNSWithNodeClusterIdResponse {
+    repeated ServerDNSInfo servers = 1;
+}
+
+message ServerDNSInfo {
+    int64 id = 1;
+    string name = 2;
+    string dnsName = 3;
+    bool isShared = 4;
+}
+
+message FindEnabledServerDNSRequest {
+    int64 serverId = 1;
+}
+
+message FindEnabledServerDNSResponse {
+    string dnsName = 1;
+    DNSDomain domain = 2;
+    bool supportCNAME = 3;
+    bool isShared = 4;
+}
+
+message CheckUserServerRequest {
+    int64 serverId = 1;
+}
+
+message FindAllEnabledServerNamesWithUserIdRequest {
+    int64 userId = 1;
+}
+
+message FindAllEnabledServerNamesWithUserIdResponse {
+    repeated string serverNames = 1;
+}
+
+message CountAllServerNamesWithUserIdRequest {
+    int64 userId = 1;
+    int64 userPlanId = 2;
+}
+
+message CountServerNamesRequest {
+    int64 serverId = 1;
+}
+
+message FindAllUserServersRequest {
+    int64 userId = 1;
+}
+
+message FindAllUserServersResponse {
+    repeated Server servers = 1;
+}
+
+message CountAllUserServersRequest {
+    int64 userId = 1;
+    int64 userPlanId = 2;
+}
+
+message ComposeAllUserServersConfigRequest {
+    int64 userId = 1;
+}
+
+message ComposeAllUserServersConfigResponse {
+    bytes serversConfigJSON = 1;
+}
+
+message FindEnabledUserServerBasicRequest {
+    int64 serverId = 1;
+}
+
+message FindEnabledUserServerBasicResponse {
+    Server server = 1;
+}
+
+message UpdateEnabledUserServerBasicRequest {
+    int64 serverId = 1;
+    string name = 2;
+}
+
+message UploadServerHTTPRequestStatRequest {
+    string month = 1;
+    string day = 2;
+    
+    repeated RegionCity regionCities = 3;
+    message RegionCity {
+        int64 serverId = 1;
+        int64 countRequests = 5;
+        int64 bytes = 6;
+        int64 countAttackRequests = 7;
+        int64 attackBytes = 8;
+        int64 regionCountryId = 9;
+        int64 regionProvinceId = 10;
+        int64 regionCityId = 11;
+    }
+    
+    repeated RegionProvider regionProviders = 4;
+    message RegionProvider {
+        int64 serverId = 1;
+        int64 count = 3;
+        int64 regionProviderId = 4;
+    }
+    
+    repeated System systems = 5;
+    message System {
+        int64 serverId = 1;
+        string name = 2;
+        string version = 3;
+        int64 count = 4;
+    }
+    
+    repeated Browser browsers = 6;
+    message Browser {
+        int64 serverId = 1;
+        string name = 2;
+        string version = 3;
+        int64 count = 4;
+    }
+    
+    repeated HTTPFirewallRuleGroup httpFirewallRuleGroups = 7;
+    message HTTPFirewallRuleGroup {
+        int64 serverId = 1;
+        int64 httpFirewallRuleGroupId = 2;
+        string action = 3;
+        int64 count = 4;
+    }
+}
+
+message CheckServerNameDuplicationInNodeClusterRequest {
+    int64 nodeClusterId = 1;
+    repeated string serverNames = 2;
+    int64 excludeServerId = 3;
+    bool supportWildcard = 4;
+}
+
+message CheckServerNameDuplicationInNodeClusterResponse {
+    repeated string duplicatedServerNames = 1;
+}
+
+message CheckServerNameInServerRequest {
+    int64 serverId = 1;
+    string serverName = 2;
+}
+
+message CheckServerNameInServerResponse {
+    bool exists = 1;
+}
+
+message FindLatestServersRequest {
+    int64 size = 1;
+}
+
+message FindLatestServersResponse {
+    repeated Server servers = 1;
+}
+
+message FindNearbyServersRequest {
+    int64 serverId = 1;
+}
+
+message FindNearbyServersResponse {
+    string scope = 1;
+    
+    repeated GroupInfo groups = 2;
+    message GroupInfo {
+        string name = 1;
+        repeated Server servers = 2;
+    }
+}
+
+message PurgeServerCacheRequest {
+    repeated string keys = 2;
+    repeated string prefixes = 3;
+    string description = 4;
+}
+
+message PurgeServerCacheResponse {
+    bool isOk = 1;
+    string message = 2;
+}
+
+message FindEnabledServerTrafficLimitRequest {
+    int64 serverId = 1;
+}
+
+message FindEnabledServerTrafficLimitResponse {
+    bytes trafficLimitJSON = 1;
+}
+
+message UpdateServerTrafficLimitRequest {
+    int64 serverId = 1;
+    bytes trafficLimitJSON = 2;
+}
+
+message UpdateServerUserPlanRequest {
+    int64 serverId = 1;
+    int64 userPlanId = 2;
+}
+
+message FindServerUserPlanRequest {
+    int64 serverId = 1;
+}
+
+message FindServerUserPlanResponse {
+    UserPlan userPlan = 1;
+}
+
+message ComposeServerConfigRequest {
+    int64 serverId = 1;
+}
+
+message ComposeServerConfigResponse {
+    bytes serverConfigJSON = 1;
+}
+
+message UpdateServerUAMRequest {
+    int64 serverId = 1;
+    bytes uamJSON = 2;
+}
+
+message FindEnabledServerUAMRequest {
+    int64 serverId = 1;
+}
+
+message FindEnabledServerUAMResponse {
+    bytes uamJSON = 1;
+}
+
+message FindServerGRPCRequest {
+    int64 serverId = 1;
+}
+
+message FindServerGRPCResponse {
+    bytes grpcJSON = 1;
+    bool policyIsOn = 2;
+}
+
+message UpdateServerGRPCRequest {
+    int64 serverId = 1;
+    bytes grpcJSON = 2;
+}
+
+message UpdateServerUserRequest {
+    int64 serverId = 1;
+    int64 userId = 2;
+}
+
+message UpdateServerNameRequest {
+    int64 serverId = 1;
+    string name = 2;
+}
+
+message CopyServerConfigRequest {
+    int64 serverId = 1;
+    string configCode = 2;
+    string targetType = 3;
+    repeated int64 targetServerIds = 4;
+    repeated int64 targetServerGroupIds = 5;
+    int64 targetClusterId = 6;
+    int64 targetUserId = 7;
+    bool wafCopyRegions = 30;
+}
+
+message FindServerAuditingPromptRequest {
+    int64 serverId = 1;
+}
+
+message FindServerAuditingPromptResponse {
+    string promptText = 1;
+}
+
+message FindServerTCPPortsWithNodeClusterRequest {
+    int64 nodeClusterId = 1;
+    bool ignoreCommonPorts = 2;
+}
+
+message FindServerTCPPortsWithNodeClusterResponse {
+    repeated int32 ports = 1;
+}
+
+message FindServerUDPPortsWithNodeClusterRequest {
+    int64 nodeClusterId = 1;
+}
+
+message FindServerUDPPortsWithNodeClusterResponse {
+    repeated int32 ports = 1;
+}
+
+message FindAvailableServerIdsWithServerNameRequest {
+    string serverName = 1;
+}
+
+message FindAvailableServerIdsWithServerNameResponse {
+    repeated int64 serverIds = 1;
+}

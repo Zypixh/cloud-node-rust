@@ -15,8 +15,8 @@ fn find_protos(dir: &str) -> Result<Vec<String>, std::io::Error> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_dir = "cloud-node/bin/output_protos";
-    let models_dir = "cloud-node/bin/output_protos/models";
+    let proto_dir = "proto_defs/output_protos";
+    let models_dir = "proto_defs/output_protos/models";
 
     if std::path::Path::new(proto_dir).exists() {
         let protos = find_protos(proto_dir)?;

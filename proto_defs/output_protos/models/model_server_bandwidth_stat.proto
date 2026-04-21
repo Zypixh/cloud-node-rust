@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "./pb";
+
+message ServerBandwidthStat {
+    int64 id = 1;
+    int64 userId = 2;
+    int64 serverId = 3;
+    string day = 4;
+    string timeAt = 5;
+    int64 bytes = 6;
+    int64 totalBytes = 9;
+    int64 bits = 7;
+    int64 nodeRegionId = 8;
+    int64 cachedBytes = 10;
+    int64 attackBytes = 11;
+    int64 countRequests = 12;
+    int64 countCachedRequests = 13;
+    int64 countAttackRequests = 14;
+    int64 userPlanId = 15;
+    int64 countWebsocketConnections = 16;
+    int64 countIPs = 17;
+    int64 originTotalBytes = 18;
+    int64 originAvgBytes = 19;
+    int64 originAvgBits = 20;
+}

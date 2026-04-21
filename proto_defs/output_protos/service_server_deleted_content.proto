@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_server_deleted_content.proto";
+
+option go_package = "./pb";
+
+service ServerDeletedContentService {
+    rpc createServerDeletedContent(CreateServerDeletedContentRequest) returns (CreateServerDeletedContentResponse);
+    rpc deleteServerDeletedContent(DeleteServerDeletedContentRequest) returns (RPCSuccess);
+    rpc countServerDeletedContents(CountServerDeletedContentsRequest) returns (RPCCountResponse);
+    rpc listServerDeletedContents(ListServerDeletedContentsRequest) returns (ListServerDeletedContentsResponse);
+    rpc listServerDeletedContentsAfterVersion(ListServerDeletedContentsAfterVersionRequest) returns (ListServerDeletedContentsAfterVersionResponse);
+}
+
+message CreateServerDeletedContentRequest {
+    string url = 1;
+    int64 serverId = 2;
+    string reasonType = 3;
+}
+
+message CreateServerDeletedContentResponse {
+    int64 serverDeletedContentId = 1;
+}
+
+message DeleteServerDeletedContentRequest {
+    int64 serverDeletedContentId = 1;
+}
+
+message CountServerDeletedContentsRequest {
+    int64 serverId = 1;
+}
+
+message ListServerDeletedContentsRequest {
+    int64 serverId = 1;
+    int64 offset = 2;
+    int64 size = 3;
+}
+
+message ListServerDeletedContentsResponse {
+    repeated ServerDeletedContent serverDeletedContents = 1;
+}
+
+message ListServerDeletedContentsAfterVersionRequest {
+    int64 version = 1;
+    int64 size = 3;
+}
+
+message ListServerDeletedContentsAfterVersionResponse {
+    repeated ServerDeletedContent serverDeletedContents = 1;
+}

@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "./pb";
+
+service ACMEAuthenticationService {
+    rpc findACMEAuthenticationKeyWithToken(FindACMEAuthenticationKeyWithTokenRequest) returns (FindACMEAuthenticationKeyWithTokenResponse);
+}
+
+message FindACMEAuthenticationKeyWithTokenRequest {
+    string token = 1;
+}
+
+message FindACMEAuthenticationKeyWithTokenResponse {
+    string key = 1;
+}

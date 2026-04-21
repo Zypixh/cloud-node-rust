@@ -1,0 +1,321 @@
+syntax = "proto3";
+
+package pb;
+
+import "models/rpc_messages.proto";
+import "models/model_user.proto";
+import "models/model_user_feature.proto";
+import "models/model_node_value.proto";
+
+option go_package = "./pb";
+
+service UserService {
+    rpc createUser(CreateUserRequest) returns (CreateUserResponse);
+    rpc registerUser(RegisterUserRequest) returns (RegisterUserResponse);
+    rpc verifyUser(VerifyUserRequest) returns (RPCSuccess);
+    rpc updateUser(UpdateUserRequest) returns (RPCSuccess);
+    rpc deleteUser(DeleteUserRequest) returns (RPCSuccess);
+    rpc countAllEnabledUsers(CountAllEnabledUsersRequest) returns (RPCCountResponse);
+    rpc listEnabledUsers(ListEnabledUsersRequest) returns (ListEnabledUsersResponse);
+    rpc findEnabledUser(FindEnabledUserRequest) returns (FindEnabledUserResponse);
+    rpc checkUserUsername(CheckUserUsernameRequest) returns (CheckUserUsernameResponse);
+    rpc loginUser(LoginUserRequest) returns (LoginUserResponse);
+    rpc updateUserInfo(UpdateUserInfoRequest) returns (RPCSuccess);
+    rpc updateUserLogin(UpdateUserLoginRequest) returns (RPCSuccess);
+    rpc composeUserDashboard(ComposeUserDashboardRequest) returns (ComposeUserDashboardResponse);
+    rpc findUserNodeClusterId(FindUserNodeClusterIdRequest) returns (FindUserNodeClusterIdResponse);
+    rpc updateUserFeatures(UpdateUserFeaturesRequest) returns (RPCSuccess);
+    rpc updateAllUsersFeatures(UpdateAllUsersFeaturesRequest) returns (RPCSuccess);
+    rpc findUserFeatures(FindUserFeaturesRequest) returns (FindUserFeaturesResponse);
+    rpc findAllUserFeatureDefinitions(FindAllUserFeatureDefinitionsRequest) returns (FindAllUserFeatureDefinitionsResponse);
+    rpc composeUserGlobalBoard(ComposeUserGlobalBoardRequest) returns (ComposeUserGlobalBoardResponse);
+    rpc checkUserOTPWithUsername(CheckUserOTPWithUsernameRequest) returns (CheckUserOTPWithUsernameResponse);
+    rpc findUserPriceInfo(FindUserPriceInfoRequest) returns (FindUserPriceInfoResponse);
+    rpc updateUserPriceType(UpdateUserPriceTypeRequest) returns (RPCSuccess);
+    rpc updateUserPricePeriod(UpdateUserPricePeriodRequest) returns (RPCSuccess);
+    rpc checkUserServersState(CheckUserServersStateRequest) returns (CheckUserServersStateResponse);
+    rpc renewUserServersState(RenewUserServersStateRequest) returns (RenewUserServersStateResponse);
+    rpc checkUserEmail(CheckUserEmailRequest) returns (CheckUserEmailResponse);
+    rpc checkUserMobile(CheckUserMobileRequest) returns (CheckUserMobileResponse);
+    rpc findUserVerifiedEmailWithUsername(FindUserVerifiedEmailWithUsernameRequest) returns (FindUserVerifiedEmailWithUsernameResponse);
+}
+
+message CreateUserRequest {
+    string username = 1;
+    string password = 2;
+    string fullname = 3;
+    string mobile = 4;
+    string tel = 5;
+    string email = 6;
+    string remark = 7;
+    string source = 8;
+    int64 nodeClusterId = 9;
+}
+
+message CreateUserResponse {
+    int64 userId = 1;
+}
+
+message RegisterUserRequest {
+    string username = 1;
+    string password = 2;
+    string mobile = 3;
+    string email = 4;
+    string fullname = 5;
+    string ip = 6;
+    string source = 7;
+}
+
+message RegisterUserResponse {
+    int64 userId = 1;
+    bool requireEmailVerification = 2;
+}
+
+message VerifyUserRequest {
+    int64 userId = 1;
+    bool isRejected = 2;
+    string rejectReason = 3;
+}
+
+message UpdateUserRequest {
+    int64 userId = 1;
+    string username = 2;
+    string password = 3;
+    string fullname = 4;
+    string mobile = 5;
+    string tel = 6;
+    string email = 7;
+    string remark = 8;
+    bool isOn = 9;
+    int64 nodeClusterId = 10;
+    bool updateServersCluster = 12;
+    string bandwidthAlgo = 11;
+}
+
+message DeleteUserRequest {
+    int64 userId = 1;
+}
+
+message CountAllEnabledUsersRequest {
+    string keyword = 1;
+    bool isVerifying = 2;
+    int32 mobileIsVerified = 3;
+}
+
+message ListEnabledUsersRequest {
+    string keyword = 1;
+    bool isVerifying = 4;
+    int32 mobileIsVerified = 5;
+    int64 offset = 2;
+    int64 size = 3;
+}
+
+message ListEnabledUsersResponse {
+    repeated User users = 1;
+}
+
+message FindEnabledUserRequest {
+    int64 userId = 1;
+}
+
+message FindEnabledUserResponse {
+    User user = 1;
+}
+
+message CheckUserUsernameRequest {
+    int64 userId = 1;
+    string username = 2;
+}
+
+message CheckUserUsernameResponse {
+    bool exists = 1;
+}
+
+message LoginUserRequest {
+    string username = 1;
+    string password = 2;
+}
+
+message LoginUserResponse {
+    int64 userId = 1;
+    bool isOk = 2;
+    string message = 3;
+}
+
+message UpdateUserInfoRequest {
+    int64 userId = 1;
+    string fullname = 2;
+    string mobile = 3;
+    string email = 4;
+    bool enableInstantMessage = 5;
+}
+
+message UpdateUserLoginRequest {
+    int64 userId = 1;
+    string username = 2;
+    string password = 3;
+}
+
+message ComposeUserDashboardRequest {
+    int64 userId = 1;
+}
+
+message ComposeUserDashboardResponse {
+    int64 countServers = 1;
+    int64 monthlyTrafficBytes = 2;
+    int64 monthlyPeekBandwidthBytes = 3;
+    int64 dailyTrafficBytes = 4;
+    int64 dailyPeekBandwidthBytes = 5;
+    
+    repeated DailyTrafficStat dailyTrafficStats = 6;
+    message DailyTrafficStat {
+        string day = 1;
+        int64 bytes = 2;
+        int64 cachedBytes = 3;
+        int64 attackBytes = 4;
+        int64 countRequests = 5;
+        int64 countCachedRequests = 6;
+        int64 countAttackRequests = 7;
+    }
+    
+    repeated DailyPeekBandwidthStat dailyPeekBandwidthStats = 7;
+    message DailyPeekBandwidthStat {
+        string day = 1;
+        int64 bytes = 2;
+    }
+    
+    int32 bandwidthPercentile = 8;
+    int64 bandwidthPercentileBits = 9;
+}
+
+message FindUserNodeClusterIdRequest {
+    int64 userId = 1;
+}
+
+message FindUserNodeClusterIdResponse {
+    int64 nodeClusterId = 1;
+}
+
+message UpdateUserFeaturesRequest {
+    int64 userId = 1;
+    repeated string featureCodes = 2;
+}
+
+message UpdateAllUsersFeaturesRequest {
+    repeated string featureCodes = 1;
+    bool overwrite = 2;
+}
+
+message FindUserFeaturesRequest {
+    int64 userId = 1;
+}
+
+message FindUserFeaturesResponse {
+    repeated UserFeature features = 1;
+}
+
+message FindAllUserFeatureDefinitionsRequest {
+    
+}
+
+message FindAllUserFeatureDefinitionsResponse {
+    repeated UserFeature features = 1;
+}
+
+message ComposeUserGlobalBoardRequest {
+    
+}
+
+message ComposeUserGlobalBoardResponse {
+    int64 totalUsers = 1;
+    int64 countTodayUsers = 2;
+    int64 countWeeklyUsers = 3;
+    int64 countUserNodes = 4;
+    int64 countOfflineUserNodes = 5;
+    int64 countVerifyingUsers = 6;
+    
+    repeated DailyStat dailyStats = 30;
+    message DailyStat {
+        string day = 1;
+        int64 count = 2;
+    }
+    
+    repeated NodeValue cpuNodeValues = 31;
+    repeated NodeValue memoryNodeValues = 32;
+    repeated NodeValue loadNodeValues = 33;
+    
+    repeated TrafficStat topTrafficStats = 34;
+    message TrafficStat {
+        int64 userId = 1;
+        string userName = 2;
+        int64 countRequests = 3;
+        int64 bytes = 4;
+    }
+}
+
+message CheckUserOTPWithUsernameRequest {
+    string username = 1;
+}
+
+message CheckUserOTPWithUsernameResponse {
+    bool requireOTP = 1;
+}
+
+message FindUserPriceInfoRequest {
+    int64 userId = 1;
+}
+
+message FindUserPriceInfoResponse {
+    string priceType = 1;
+    string pricePeriod = 2;
+}
+
+message UpdateUserPriceTypeRequest {
+    int64 userId = 1;
+    string priceType = 2;
+}
+
+message UpdateUserPricePeriodRequest {
+    int64 userId = 1;
+    string pricePeriod = 2;
+}
+
+message CheckUserServersStateRequest {
+    int64 userId = 1;
+}
+
+message CheckUserServersStateResponse {
+    bool isEnabled = 1;
+}
+
+message RenewUserServersStateRequest {
+    int64 userId = 1;
+}
+
+message RenewUserServersStateResponse {
+    bool isEnabled = 1;
+}
+
+message CheckUserEmailRequest {
+    string email = 1;
+}
+
+message CheckUserEmailResponse {
+    bool exists = 1;
+}
+
+message CheckUserMobileRequest {
+    string mobile = 1;
+}
+
+message CheckUserMobileResponse {
+    bool exists = 1;
+}
+
+message FindUserVerifiedEmailWithUsernameRequest {
+    string username = 1;
+}
+
+message FindUserVerifiedEmailWithUsernameResponse {
+    string email = 1;
+}
