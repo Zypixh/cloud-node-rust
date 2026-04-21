@@ -171,18 +171,64 @@ pub struct HTTP3Policy {
 pub struct HTTPCCPolicy {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(rename = "maxQPS", default)]
+    pub max_qps: i32,
+    #[serde(rename = "perIPMaxQPS", default)]
+    pub per_ip_max_qps: i32,
+    #[serde(rename = "maxBandwidth", default)]
+    pub max_bandwidth: f64,
+    #[serde(rename = "showPage", default)]
+    pub show_page: bool,
+    #[serde(rename = "blockIP", default)]
+    pub block_ip: bool,
+    #[serde(rename = "pageDuration", default)]
+    pub page_duration: i32,
+    #[serde(rename = "blockIPDuration", default)]
+    pub block_ip_duration: i32,
+    #[serde(rename = "noLog", default)]
+    pub no_log: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct WebPImagePolicy {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(rename = "requireCache", default)]
+    pub require_cache: bool,
+    #[serde(rename = "quality", default = "default_webp_quality")]
+    pub quality: i32,
+    #[serde(rename = "minLength", default)]
+    pub min_length: Option<Value>,
+    #[serde(rename = "maxLength", default)]
+    pub max_length: Option<Value>,
+}
+
+fn default_webp_quality() -> i32 {
+    80
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct WebPConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
+    #[serde(rename = "mimeTypes", default, deserialize_with = "deserialize_null_default")]
+    pub mime_types: Vec<String>,
+    #[serde(rename = "fileExtensions", alias = "extensions", default, deserialize_with = "deserialize_null_default")]
+    pub file_extensions: Vec<String>,
+    #[serde(rename = "minLength", default)]
+    pub min_length: Option<Value>,
+    #[serde(rename = "maxLength", default)]
+    pub max_length: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HTTPPagesPolicy {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub pages: Vec<HTTPPageConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -322,6 +368,8 @@ impl NetworkAddressConfig {
 pub struct ServerConfig {
     #[serde(alias = "Id", default, deserialize_with = "deserialize_flexible_i64_opt")]
     pub id: Option<i64>,
+    #[serde(rename = "description", alias = "Description", default, deserialize_with = "deserialize_null_default")]
+    pub description: String,
     #[serde(rename = "userId", alias = "UserId", default, deserialize_with = "deserialize_flexible_i64")]
     pub user_id: i64,
     #[serde(rename = "isOn", alias = "IsOn", default)]
@@ -342,6 +390,12 @@ pub struct ServerConfig {
     pub reverse_proxy: Option<ReverseProxyConfig>,
     #[serde(rename = "grpc", alias = "grpcJSON", alias = "GRPC")]
     pub grpc: Option<GRPCConfig>,
+    #[serde(rename = "uam", alias = "UAM", default)]
+    pub uam: Option<UAMConfig>,
+    #[serde(rename = "trafficLimit", default)]
+    pub traffic_limit: Option<TrafficLimitConfig>,
+    #[serde(rename = "trafficLimitStatus", default)]
+    pub traffic_limit_status: Option<TrafficLimitStatus>,
     #[serde(rename = "userPlanId", alias = "UserPlanId", default, deserialize_with = "deserialize_flexible_i64")]
     pub user_plan_id: i64,
 }
@@ -368,6 +422,67 @@ impl ServerConfig {
 
     pub fn get_first_host(&self) -> String {
         self.server_names.first().map(|sn| sn.name.clone()).unwrap_or_else(|| "localhost".to_string())
+    }
+
+    pub fn has_valid_traffic_limit(&self) -> bool {
+        self.traffic_limit_status
+            .as_ref()
+            .map(TrafficLimitStatus::is_valid)
+            .unwrap_or(false)
+    }
+
+    pub fn is_sni_passthrough(&self) -> bool {
+        self.description
+            .to_ascii_lowercase()
+            .contains("@sni_passthrough")
+    }
+
+    pub fn listens_on_https_port(&self, port: u16) -> bool {
+        self.https
+            .as_ref()
+            .filter(|https| https.is_on)
+            .map(|https| {
+                https.listen.iter().any(|addr| {
+                    addr.port_range
+                        .as_deref()
+                        .and_then(|range| range.split('-').next())
+                        .and_then(|value| value.parse::<u16>().ok())
+                        == Some(port)
+                })
+            })
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct TrafficLimitConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "dailySize", default)]
+    pub daily_size: Option<Value>,
+    #[serde(rename = "monthlySize", default)]
+    pub monthly_size: Option<Value>,
+    #[serde(rename = "totalSize", default)]
+    pub total_size: Option<Value>,
+    #[serde(rename = "noticePageBody", default, deserialize_with = "deserialize_null_default")]
+    pub notice_page_body: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct TrafficLimitStatus {
+    #[serde(rename = "untilDay", default, deserialize_with = "deserialize_null_default")]
+    pub until_day: String,
+    #[serde(rename = "planId", default, deserialize_with = "deserialize_flexible_i64")]
+    pub plan_id: i64,
+    #[serde(rename = "dateType", default, deserialize_with = "deserialize_null_default")]
+    pub date_type: String,
+    #[serde(rename = "targetType", default, deserialize_with = "deserialize_null_default")]
+    pub target_type: String,
+}
+
+impl TrafficLimitStatus {
+    pub fn is_valid(&self) -> bool {
+        !self.until_day.is_empty() && self.until_day >= chrono::Local::now().format("%Y%m%d").to_string()
     }
 }
 
@@ -400,6 +515,14 @@ pub struct HTTPSConfig {
     pub listen: Vec<NetworkAddressConfig>,
     #[serde(rename = "sslPolicy", alias = "ssl", alias = "SSLPolicy")]
     pub ssl_policy: Option<SSLPolicyConfig>,
+    #[serde(rename = "supportsHTTP3", alias = "http3Enabled", alias = "enableHTTP3", alias = "enableHttp3", default)]
+    pub supports_http3: Option<bool>,
+}
+
+impl HTTPSConfig {
+    pub fn http3_enabled(&self) -> bool {
+        self.supports_http3.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -423,6 +546,12 @@ pub struct UDPConfig {
 pub struct WebConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(rename = "redirectToHttps")]
+    pub redirect_to_https: Option<HTTPRedirectToHttpsConfig>,
+    #[serde(rename = "remoteAddr")]
+    pub remote_addr: Option<HTTPRemoteAddrConfig>,
+    #[serde(rename = "requestLimit")]
+    pub request_limit: Option<HTTPRequestLimitConfig>,
     pub cache: Option<WebCacheConfig>,
     #[serde(rename = "firewallRef")]
     pub firewall_ref: Option<HTTPFirewallRef>,
@@ -431,6 +560,9 @@ pub struct WebConfig {
     pub compression: Option<HTTPCompressionConfig>,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub pages: Vec<HTTPPageConfig>,
+    #[serde(rename = "enableGlobalPages", default)]
+    pub enable_global_pages: bool,
+    pub shutdown: Option<HTTPShutdownConfig>,
     pub auth: Option<HTTPAuthConfig>,
     pub websocket: Option<WebSocketConfig>,
     #[serde(rename = "maxQPS", default)]
@@ -438,6 +570,8 @@ pub struct WebConfig {
     pub uam: Option<UAMConfig>,
     #[serde(rename = "ccPolicy")]
     pub cc_policy: Option<CCPolicy>,
+    #[serde(rename = "webP", alias = "webp")]
+    pub webp: Option<WebPConfig>,
     #[serde(rename = "userAgentConfig")]
     pub user_agent_config: Option<UserAgentConfig>,
     #[serde(rename = "refererConfig")]
@@ -454,6 +588,14 @@ pub struct WebConfig {
     pub response_header_policy: Option<HTTPHeaderPolicy>,
     #[serde(rename = "accessLogRef")]
     pub access_log_ref: Option<HTTPAccessLogRef>,
+    #[serde(rename = "charset")]
+    pub charset: Option<HTTPCharsetConfig>,
+    #[serde(rename = "statRef")]
+    pub stat_ref: Option<HTTPStatRef>,
+    #[serde(rename = "optimization")]
+    pub optimization: Option<HTTPPageOptimizationConfig>,
+    #[serde(rename = "hls")]
+    pub hls: Option<HLSConfig>,
     pub root: Option<Value>, // Root can be RootConfig object in Go
 }
 
@@ -461,6 +603,300 @@ pub struct WebConfig {
 pub struct WebSocketConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPRedirectToHttpsConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub host: String,
+    #[serde(default)]
+    pub port: i32,
+    #[serde(default)]
+    pub status: i32,
+    #[serde(rename = "domains", default, deserialize_with = "deserialize_null_default")]
+    pub domains: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPShutdownConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
+    #[serde(rename = "bodyType", default, deserialize_with = "deserialize_null_default")]
+    pub body_type: String,
+    #[serde(rename = "url", default, deserialize_with = "deserialize_null_default")]
+    pub url: String,
+    #[serde(rename = "body", default, deserialize_with = "deserialize_null_default")]
+    pub body: String,
+    #[serde(default)]
+    pub status: i32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPRemoteAddrConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "type", default, deserialize_with = "deserialize_null_default")]
+    pub type_name: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub value: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub values: Vec<String>,
+}
+
+impl HTTPRemoteAddrConfig {
+    pub fn configured_values(&self) -> Vec<String> {
+        if !self.values.is_empty() {
+            self.values.clone()
+        } else if !self.value.is_empty() {
+            vec![self.value.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn is_request_header_type(&self) -> bool {
+        self.type_name.eq_ignore_ascii_case("requestHeader")
+            || self.type_name.eq_ignore_ascii_case("request-header")
+            || self.type_name.eq_ignore_ascii_case("header")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.configured_values().is_empty()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPRequestLimitConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
+    #[serde(rename = "maxBodyBytes", default)]
+    pub max_body_bytes: Option<Value>,
+    #[serde(rename = "maxConns", default)]
+    pub max_conns: i32,
+    #[serde(rename = "maxConnsPerIP", default)]
+    pub max_conns_per_ip: i32,
+    #[serde(rename = "outBandwidthPerConnBytes", default)]
+    pub out_bandwidth_per_conn_bytes: Option<Value>,
+}
+
+impl HTTPRequestLimitConfig {
+    pub fn max_body_bytes_value(&self) -> i64 {
+        self.max_body_bytes
+            .as_ref()
+            .map(SizeCapacity::from_json)
+            .map(|v| v.to_bytes())
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    pub fn out_bandwidth_per_conn_bytes_value(&self) -> i64 {
+        self.out_bandwidth_per_conn_bytes
+            .as_ref()
+            .map(SizeCapacity::from_json)
+            .map(|v| v.to_bytes())
+            .unwrap_or(0)
+            .max(0)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPCharsetConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
+    #[serde(rename = "charset", default, deserialize_with = "deserialize_null_default")]
+    pub charset: String,
+    #[serde(rename = "force", default)]
+    pub force: bool,
+    #[serde(rename = "isUpper", default)]
+    pub is_upper: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPStatRef {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPPageOptimizationConfig {
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
+    pub html: Option<HTTPHTMLOptimizationConfig>,
+    pub javascript: Option<HTTPJavascriptOptimizationConfig>,
+    pub css: Option<HTTPCSSOptimizationConfig>,
+}
+
+impl HTTPPageOptimizationConfig {
+    pub fn is_on(&self) -> bool {
+        self.html.as_ref().map(|v| v.is_on).unwrap_or(false)
+            || self.javascript.as_ref().map(|v| v.is_on).unwrap_or(false)
+            || self.css.as_ref().map(|v| v.is_on).unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPBaseOptimizationConfig {
+    #[serde(rename = "onlyURLPatterns", default, deserialize_with = "deserialize_null_default")]
+    pub only_url_patterns: Vec<URLPattern>,
+    #[serde(rename = "exceptURLPatterns", default, deserialize_with = "deserialize_null_default")]
+    pub except_url_patterns: Vec<URLPattern>,
+}
+
+impl HTTPBaseOptimizationConfig {
+    pub fn matches_url(&self, url: &str) -> bool {
+        let path = url.split('?').next().unwrap_or(url);
+        if !self.except_url_patterns.is_empty()
+            && self.except_url_patterns.iter().any(|pattern| pattern.matches(path))
+        {
+            return false;
+        }
+        if self.only_url_patterns.is_empty() {
+            return true;
+        }
+        self.only_url_patterns.iter().any(|pattern| pattern.matches(path))
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPHTMLOptimizationConfig {
+    #[serde(flatten)]
+    pub base: HTTPBaseOptimizationConfig,
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "keepComments", default)]
+    pub keep_comments: bool,
+    #[serde(rename = "keepConditionalComments", default)]
+    pub keep_conditional_comments: bool,
+    #[serde(rename = "keepDefaultAttrVals", default)]
+    pub keep_default_attr_vals: bool,
+    #[serde(rename = "keepDocumentTags", default)]
+    pub keep_document_tags: bool,
+    #[serde(rename = "keepEndTags", default)]
+    pub keep_end_tags: bool,
+    #[serde(rename = "keepQuotes", default)]
+    pub keep_quotes: bool,
+    #[serde(rename = "keepWhitespace", default)]
+    pub keep_whitespace: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPJavascriptOptimizationConfig {
+    #[serde(flatten)]
+    pub base: HTTPBaseOptimizationConfig,
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "precision", default)]
+    pub precision: i32,
+    #[serde(rename = "version", default)]
+    pub version: i32,
+    #[serde(rename = "keepVarNames", default)]
+    pub keep_var_names: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPCSSOptimizationConfig {
+    #[serde(flatten)]
+    pub base: HTTPBaseOptimizationConfig,
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "precision", default)]
+    pub precision: i32,
+    #[serde(rename = "keepCSS2", default)]
+    pub keep_css2: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HLSConfig {
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
+    pub encrypting: Option<HLSEncryptingConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HLSEncryptingConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "onlyURLPatterns", default, deserialize_with = "deserialize_null_default")]
+    pub only_url_patterns: Vec<URLPattern>,
+    #[serde(rename = "exceptURLPatterns", default, deserialize_with = "deserialize_null_default")]
+    pub except_url_patterns: Vec<URLPattern>,
+}
+
+impl HLSEncryptingConfig {
+    pub fn matches_url(&self, url: &str) -> bool {
+        let path = url.split('?').next().unwrap_or(url);
+        if !self.except_url_patterns.is_empty()
+            && self.except_url_patterns.iter().any(|pattern| pattern.matches(path))
+        {
+            return false;
+        }
+        if self.only_url_patterns.is_empty() {
+            return true;
+        }
+        self.only_url_patterns.iter().any(|pattern| pattern.matches(path))
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct URLPattern {
+    #[serde(rename = "type", default, deserialize_with = "deserialize_null_default")]
+    pub type_name: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub pattern: String,
+}
+
+impl URLPattern {
+    pub fn matches(&self, url: &str) -> bool {
+        let url = url.to_ascii_lowercase();
+        match self.type_name.as_str() {
+            "images" => [".apng", ".avif", ".gif", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp", ".png", ".svg", ".webp", ".bmp", ".ico", ".cur", ".tif", ".tiff"]
+                .iter()
+                .any(|ext| url.ends_with(ext)),
+            "audios" => [".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".m3u8"]
+                .iter()
+                .any(|ext| url.ends_with(ext)),
+            "videos" => [".mp4", ".avi", ".mkv", ".mov", ".wmv", ".mpeg", ".3gp", ".webm", ".ts", ".m3u8"]
+                .iter()
+                .any(|ext| url.ends_with(ext)),
+            "regexp" => {
+                let pattern = if self.pattern.starts_with("(?i)") {
+                    self.pattern.clone()
+                } else {
+                    format!("(?i){}", self.pattern)
+                };
+                regex::Regex::new(&pattern)
+                    .map(|re| re.is_match(url.as_str()))
+                    .unwrap_or(false)
+            }
+            _ => {
+                if self.pattern.is_empty() {
+                    return url.is_empty();
+                }
+                let escaped = regex::escape(&self.pattern);
+                let wildcard = escaped.replace("\\*", "(.*)");
+                let pattern = if wildcard.starts_with('/') {
+                    format!("(?i)^(http|https)://[\\w.-]+{}$", wildcard)
+                } else {
+                    format!("(?i)^{}$", wildcard)
+                };
+                regex::Regex::new(&pattern)
+                    .map(|re| re.is_match(url.as_str()))
+                    .unwrap_or(false)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -839,6 +1275,31 @@ pub struct HTTPPageConfig {
     pub url: Option<String>,
     #[serde(rename = "newStatus", default)]
     pub new_status: i32,
+}
+
+impl HTTPPageConfig {
+    pub fn matches_status(&self, status: u16) -> bool {
+        let Some(value) = self.status.as_ref() else {
+            return true;
+        };
+
+        match value {
+            Value::Number(n) => n.as_u64() == Some(status as u64),
+            Value::String(s) => {
+                if s.trim().is_empty() || s == "*" {
+                    true
+                } else {
+                    s.parse::<u16>() == Ok(status)
+                }
+            }
+            Value::Array(values) => values.iter().any(|item| match item {
+                Value::Number(n) => n.as_u64() == Some(status as u64),
+                Value::String(s) => s.parse::<u16>() == Ok(status),
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

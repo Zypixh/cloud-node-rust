@@ -290,6 +290,12 @@ fn run_node() -> anyhow::Result<()> {
         rpc::start_api_node_syncer(ac_a).await;
     });
 
+    let ac_us = api_config.clone();
+    let cs_us = config_store.clone();
+    spawn_staggered(&rt, Duration::from_secs(9), async move {
+        rpc::start_updating_server_list_syncer(ac_us, cs_us).await;
+    });
+
     // Reporters
     let ac_s = api_config.clone();
     let cs_s = config_store.clone();
@@ -306,6 +312,12 @@ fn run_node() -> anyhow::Result<()> {
     let ac_bw = api_config.clone();
     spawn_staggered(&rt, Duration::from_secs(10), async move {
         rpc::start_bandwidth_reporter(ac_bw).await;
+    });
+
+    let ac_ds = api_config.clone();
+    let cs_ds = (*config_store).clone();
+    spawn_staggered(&rt, Duration::from_secs(11), async move {
+        rpc::start_daily_stat_reporter(cs_ds, ac_ds).await;
     });
 
     let ac_ms = api_config.clone();
@@ -329,13 +341,23 @@ fn run_node() -> anyhow::Result<()> {
         rpc::start_ip_report_service(ac_ir).await;
     });
 
+    let ac_ocsp = api_config.clone();
+    let ds_ocsp = cert_selector.clone();
+    spawn_staggered(&rt, Duration::from_secs(22), async move {
+        rpc::start_ocsp_syncer(ac_ocsp, ds_ocsp).await;
+    });
+
     // Log Uploader
     let (log_tx, log_rx) = tokio::sync::mpsc::channel(10000);
-    let (node_log_tx, _node_log_rx) = tokio::sync::mpsc::channel(1000);
+    let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(1000);
     logging::init_global_log_bus(log_tx, node_log_tx);
 
     let uploader = log_uploader::LogUploader::new(log_rx, api_config.clone(), 100, Duration::from_secs(5));
     spawn_staggered(&rt, Duration::from_secs(10), async move { uploader.start().await; });
+
+    let node_uploader =
+        log_uploader::NodeLogUploader::new(node_log_rx, api_config.clone(), 100, Duration::from_secs(5));
+    spawn_staggered(&rt, Duration::from_secs(12), async move { node_uploader.start().await; });
 
     // 4. Initialize Pingora Server
     let mut my_server = pingora_core::server::Server::new(None).unwrap();
@@ -354,6 +376,12 @@ fn run_node() -> anyhow::Result<()> {
         my_server.configuration.clone(),
     );
     spawn_staggered(&rt, Duration::from_secs(5), async move { http_manager.start_listeners().await; });
+
+    let http3_manager = cloud_node_rust::http3_proxy_manager::Http3ProxyManager::new(
+        (*config_store).clone(),
+        cert_selector.clone(),
+    );
+    spawn_staggered(&rt, Duration::from_secs(5), async move { http3_manager.start_listeners().await; });
 
     // UDP & TCP
     let udp_manager = udp_proxy::UdpProxyManager::new((*config_store).clone());

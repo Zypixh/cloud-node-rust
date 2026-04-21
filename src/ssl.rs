@@ -22,8 +22,11 @@ pub struct DynamicCertSelector {
 
 #[derive(Clone)]
 pub struct CertPair {
+    pub id: i64,
     pub cert: X509,
     pub key: PKey<Private>,
+    pub chain: Vec<X509>,
+    pub ocsp: Arc<std::sync::RwLock<Vec<u8>>>,
 }
 
 impl DynamicCertSelector {
@@ -39,7 +42,90 @@ impl DynamicCertSelector {
     pub async fn update_config(&self, _servers: &[crate::config_models::ServerConfig]) {
     }
 
-    pub async fn update_ocsp(&self, _cert_id: i64, _data: Vec<u8>) {
+    pub async fn update_ocsp(&self, cert_id: i64, data: Vec<u8>) {
+        let cache = self.cache.read().await;
+        for (_, pair) in cache.values() {
+            if pair.id == cert_id {
+                if let Ok(mut ocsp) = pair.ocsp.write() {
+                    *ocsp = data.clone();
+                }
+            }
+        }
+    }
+
+    pub async fn export_default_pem(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let default = self.default.read().await;
+        let pair = default.as_ref()?.clone();
+        let cert_pem = pair.cert.to_pem().ok()?;
+        let key_pem = pair.key.private_key_to_pem_pkcs8().ok()?;
+        Some((cert_pem, key_pem))
+    }
+
+    pub async fn export_snapshot_pem(
+        &self,
+    ) -> Option<(
+        std::collections::HashMap<String, (Vec<u8>, Vec<u8>, Vec<u8>)>,
+        std::collections::HashMap<String, (Vec<u8>, Vec<u8>, Vec<u8>)>,
+        (Vec<u8>, Vec<u8>, Vec<u8>),
+    )> {
+        let exact = self.exact.read().await;
+        let wildcard = self.wildcard.read().await;
+        let default = self.default.read().await;
+
+        let serialize = |pair: &Arc<CertPair>| -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            Some((
+                pair.cert.to_pem().ok()?,
+                pair.key.private_key_to_pem_pkcs8().ok()?,
+                pair.ocsp.read().ok().map(|v| v.clone()).unwrap_or_default(),
+            ))
+        };
+
+        let mut exact_out = std::collections::HashMap::new();
+        for (name, pair) in exact.iter() {
+            if let Some(serialized) = serialize(pair) {
+                exact_out.insert(name.clone(), serialized);
+            }
+        }
+
+        let mut wildcard_out = std::collections::HashMap::new();
+        for (name, pair) in wildcard.iter() {
+            if let Some(serialized) = serialize(pair) {
+                wildcard_out.insert(name.clone(), serialized);
+            }
+        }
+
+        let default_pair = serialize(default.as_ref()?)?;
+        Some((exact_out, wildcard_out, default_pair))
+    }
+
+    pub fn apply_ocsp_for_ssl_blocking(&self, ssl: &mut SslRef) {
+        let host = ssl.servername(NameType::HOST_NAME).unwrap_or("").to_lowercase();
+        if let Some(pair) = self.find_pair_blocking(&host) {
+            if let Ok(ocsp) = pair.ocsp.read() && !ocsp.is_empty() {
+                let _ = ssl.set_ocsp_status(&ocsp);
+            }
+        }
+    }
+
+    fn find_pair_blocking(&self, host: &str) -> Option<Arc<CertPair>> {
+        if !host.is_empty() {
+            let exact = self.exact.blocking_read();
+            if let Some(pair) = exact.get(host) {
+                return Some(pair.clone());
+            }
+            drop(exact);
+
+            if let Some(pos) = host.find('.') {
+                let suffix = &host[pos..];
+                let wildcard_key = format!("*{}", suffix);
+                let wildcard = self.wildcard.blocking_read();
+                if let Some(pair) = wildcard.get(&wildcard_key) {
+                    return Some(pair.clone());
+                }
+            }
+        }
+
+        self.default.blocking_read().clone()
     }
 }
 
@@ -99,11 +185,18 @@ pub async fn sync_certs(
                         let cert_bytes = clean_pem(cert_pem_raw);
                         let key_bytes = clean_pem(key_pem_raw);
 
+                        let cert_chain = X509::stack_from_pem(&cert_bytes).ok();
                         let cert_res = X509::from_pem(&cert_bytes);
                         let key_res = PKey::private_key_from_pem(&key_bytes);
 
                         match (cert_res, key_res) {
-                            (Ok(cert), Ok(key)) => Arc::new(CertPair { cert, key }),
+                            (Ok(cert), Ok(key)) => Arc::new(CertPair {
+                                id: cert_id,
+                                cert,
+                                key,
+                                chain: cert_chain.unwrap_or_default(),
+                                ocsp: Arc::new(std::sync::RwLock::new(Vec::new())),
+                            }),
                             _ => {
                                 tracing::error!("SSL Parse Error for ID {}: Cert data invalid", cert_id);
                                 continue;
@@ -168,6 +261,12 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
                 if let Some(pair) = exact.get(&host) {
                     let _ = ext::ssl_use_certificate(ssl, &pair.cert);
                     let _ = ext::ssl_use_private_key(ssl, &pair.key);
+                    for cert in pair.chain.iter().skip(1) {
+                        let _ = ext::ssl_add_chain_cert(ssl, cert);
+                    }
+                    if let Ok(ocsp) = pair.ocsp.read() && !ocsp.is_empty() {
+                        let _ = ssl.set_ocsp_status(&ocsp);
+                    }
                     return;
                 }
             }
@@ -182,6 +281,12 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
                     if let Some(pair) = wildcard.get(&wildcard_key) {
                         let _ = ext::ssl_use_certificate(ssl, &pair.cert);
                         let _ = ext::ssl_use_private_key(ssl, &pair.key);
+                        for cert in pair.chain.iter().skip(1) {
+                            let _ = ext::ssl_add_chain_cert(ssl, cert);
+                        }
+                        if let Ok(ocsp) = pair.ocsp.read() && !ocsp.is_empty() {
+                            let _ = ssl.set_ocsp_status(&ocsp);
+                        }
                         return;
                     }
                 }
@@ -197,6 +302,12 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
             if let Some(pair) = &*default {
                 let _ = ext::ssl_use_certificate(ssl, &pair.cert);
                 let _ = ext::ssl_use_private_key(ssl, &pair.key);
+                for cert in pair.chain.iter().skip(1) {
+                    let _ = ext::ssl_add_chain_cert(ssl, cert);
+                }
+                if let Ok(ocsp) = pair.ocsp.read() && !ocsp.is_empty() {
+                    let _ = ssl.set_ocsp_status(&ocsp);
+                }
             } else {
                 tracing::error!("No default certificate available for request (SNI: {})", host);
             }

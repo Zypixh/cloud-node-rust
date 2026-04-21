@@ -399,6 +399,13 @@ fn get_local_port(session: &Session) -> String {
 }
 
 fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
+    if let Some(value) = session
+        .get_header("x-cloud-resolved-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+    {
+        return value;
+    }
     match session.client_addr() {
         Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => addr.ip(),
         _ => std::net::IpAddr::from([127, 0, 0, 1]),

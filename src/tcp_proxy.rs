@@ -1,18 +1,29 @@
+use base64::Engine;
 use crate::config::ConfigStore;
+use crate::config_models::SSLCertConfig;
 use crate::config_models::ServerConfig;
 use crate::ssl::DynamicCertSelector;
 use dashmap::DashMap;
+use pingora_core::tls::ext;
+use pingora_core::tls::pkey::PKey;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use pingora_core::tls::ssl::{SslMethod, SslConnector};
+use pingora_core::tls::x509::X509;
+
+struct ListenerHandle {
+    is_tls: bool,
+    shutdown_tx: watch::Sender<bool>,
+}
 
 pub struct TcpProxyManager {
     config_store: ConfigStore,
     _cert_selector: Arc<DynamicCertSelector>,
-    handled_ports: DashMap<u16, ()>,
+    handled_ports: DashMap<u16, ListenerHandle>,
 }
 
 impl TcpProxyManager {
@@ -29,6 +40,7 @@ impl TcpProxyManager {
         loop {
             let servers = self.config_store.get_all_servers().await;
             debug!("TCP Proxy Manager: Found {} servers in config store", servers.len());
+            let mut desired_ports = std::collections::HashMap::new();
             for server in servers {
                 // Handle TCP
                 if let Some(tcp_cfg) = &server.tcp {
@@ -37,6 +49,9 @@ impl TcpProxyManager {
                             warn!("TCP Proxy Manager: Server {} has TCP ON but NO listen addresses", server.numeric_id());
                         }
                         for addr_cfg in &tcp_cfg.listen {
+                            if let Ok(port) = addr_cfg.port_range.clone().unwrap_or_default().parse::<u16>() {
+                                desired_ports.insert(port, false);
+                            }
                             self.spawn_listener(&server, addr_cfg, false).await;
                         }
                     } else {
@@ -52,6 +67,9 @@ impl TcpProxyManager {
                             warn!("TCP-TLS Proxy Manager: Server {} has TLS ON but NO listen addresses", server.numeric_id());
                         }
                         for addr_cfg in &tls_cfg.listen {
+                            if let Ok(port) = addr_cfg.port_range.clone().unwrap_or_default().parse::<u16>() {
+                                desired_ports.insert(port, true);
+                            }
                             self.spawn_listener(&server, addr_cfg, true).await;
                         }
                     } else {
@@ -59,6 +77,7 @@ impl TcpProxyManager {
                     }
                 }
             }
+            self.reconcile_listeners(&desired_ports);
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     }
@@ -75,17 +94,24 @@ impl TcpProxyManager {
             .unwrap_or_default()
             .parse::<u16>()
         {
-            if self.handled_ports.contains_key(&port) {
-                return;
+            if let Some(existing) = self.handled_ports.get(&port) {
+                if existing.is_tls == is_tls {
+                    return;
+                }
+                let _ = existing.shutdown_tx.send(true);
+                drop(existing);
+                self.handled_ports.remove(&port);
             }
-            self.handled_ports.insert(port, ());
+
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            self.handled_ports.insert(port, ListenerHandle { is_tls, shutdown_tx });
 
             let manager = self.clone();
             let server_clone = server.clone();
             tokio::spawn(async move {
                 if let Err(e) = manager
                     .clone()
-                    .run_tcp_listener(port, server_clone, is_tls)
+                    .run_tcp_listener(port, server_clone, is_tls, shutdown_rx)
                     .await
                 {
                     error!("TCP listener on port {} failed: {}", port, e);
@@ -95,18 +121,46 @@ impl TcpProxyManager {
         }
     }
 
+    fn reconcile_listeners(&self, desired_ports: &std::collections::HashMap<u16, bool>) {
+        let active_ports: Vec<(u16, bool)> = self
+            .handled_ports
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().is_tls))
+            .collect();
+
+        for (port, is_tls) in active_ports {
+            match desired_ports.get(&port) {
+                Some(desired_tls) if *desired_tls == is_tls => {}
+                _ => {
+                    if let Some((_, handle)) = self.handled_ports.remove(&port) {
+                        info!("TCP Proxy Manager: Stopping listener on port {} (TLS={})", port, is_tls);
+                        let _ = handle.shutdown_tx.send(true);
+                    }
+                }
+            }
+        }
+    }
+
     async fn run_tcp_listener(
         self: Arc<Self>,
         port: u16,
         server: ServerConfig,
         is_tls: bool,
+        mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let addr = format!("0.0.0.0:{}", port);
         let listener = TcpListener::bind(&addr).await?;
         info!("TCP Proxy (TLS={}) listening on {}", is_tls, addr);
 
         loop {
-            let (client_stream, client_addr) = listener.accept().await?;
+            let accept_result = tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    info!("TCP listener on port {} shutting down", port);
+                    return Ok(());
+                }
+                res = listener.accept() => res,
+            };
+            let (client_stream, client_addr) = accept_result?;
             
             // --- OPTIMIZATION: Downstream TCP ---
             let _ = client_stream.set_nodelay(true);
@@ -142,6 +196,15 @@ impl TcpProxyManager {
         server: ServerConfig,
         is_tls: bool,
     ) -> anyhow::Result<()> {
+        if server.has_valid_traffic_limit() {
+            debug!(
+                "TCP Proxy: rejecting connection from {} for traffic-limited server {}",
+                client_addr,
+                server.numeric_id()
+            );
+            return Ok(());
+        }
+
         let _sid = server.id.unwrap_or(0);
         
         let l4_stream = pingora_core::protocols::l4::stream::Stream::from(client_stream);
@@ -152,6 +215,11 @@ impl TcpProxyManager {
             let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
                 pingora_core::tls::ssl::SslMethod::tls()
             ).expect("Failed to create SSL acceptor builder");
+            let selector_for_ocsp = selector.clone();
+            let _ = builder.set_status_callback(move |ssl| {
+                selector_for_ocsp.apply_ocsp_for_ssl_blocking(ssl);
+                Ok(ssl.ocsp_status().is_some())
+            });
             
             // Set ALPN for H2
             builder.set_alpn_select_callback(|_, client_alpn| {
@@ -184,6 +252,16 @@ impl TcpProxyManager {
             error!("TCP Proxy: Server has NO ID (parsed as 0), cannot find LB. Server config: {:?}", server);
             return Err(anyhow::anyhow!("Server ID missing"));
         }
+        let user_id = server.user_id;
+        let user_plan_id = server.user_plan_id;
+        let plan_id = if user_plan_id > 0 {
+            self.config_store
+                .get_user_plan_sync(user_plan_id)
+                .map(|user_plan| user_plan.plan_id)
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         let lb = self
             .config_store
@@ -228,7 +306,9 @@ impl TcpProxyManager {
                 conn_config.set_verify(pingora_core::tls::ssl::SslVerifyMode::PEER);
             }
 
-            // TODO: Apply ext.client_cert if provided (needs parsing SSLCertConfig to OpenSSL types)
+            if let Some(client_cert) = &ext.client_cert {
+                apply_client_cert(&mut conn_config, client_cert)?;
+            }
 
             let backend_stream = TcpStream::connect(&backend_addr).await
                 .map_err(|e| {
@@ -274,14 +354,18 @@ impl TcpProxyManager {
 
             // Metrics: Start connection
             let client_ip = _client_addr.ip().to_string();
-            crate::metrics::record::request_start(sid, client_ip);
+            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
 
             let res = Self::proxy_bidirectional(sid, client_stream, backend_stream).await;
             if let Err(ref e) = res {
                 debug!("TCP Proxy: Bidirectional copy (TLS upstream) finished with error: {}", e);
             }
-            crate::metrics::record::request_end(sid, 0, 0, false, false, false);
-            res
+            if let Ok((c_to_b, b_to_c)) = &res {
+                crate::metrics::record::request_end(sid, *b_to_c, *c_to_b, false, false, false);
+            } else {
+                crate::metrics::record::request_end(sid, 0, 0, false, false, false);
+            }
+            res.map(|_| ())
         } else {
             let backend_stream = match TcpStream::connect(&backend_addr).await {
                 Ok(s) => s,
@@ -321,14 +405,18 @@ impl TcpProxyManager {
 
             // Metrics: Start connection
             let client_ip = _client_addr.ip().to_string();
-            crate::metrics::record::request_start(sid, client_ip);
+            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
 
             let res = Self::proxy_bidirectional(sid, client_stream, backend_stream).await;
             if let Err(ref e) = res {
                 debug!("TCP Proxy: Bidirectional copy finished with error: {}", e);
             }
-            crate::metrics::record::request_end(sid, 0, 0, false, false, false);
-            res
+            if let Ok((c_to_b, b_to_c)) = &res {
+                crate::metrics::record::request_end(sid, *b_to_c, *c_to_b, false, false, false);
+            } else {
+                crate::metrics::record::request_end(sid, 0, 0, false, false, false);
+            }
+            res.map(|_| ())
         }
     }
 
@@ -336,7 +424,7 @@ impl TcpProxyManager {
         server_id: i64,
         mut client: C,
         mut backend: B,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<(u64, u64)>
     where
         C: AsyncRead + AsyncWrite + Unpin,
         B: AsyncRead + AsyncWrite + Unpin,
@@ -351,9 +439,44 @@ impl TcpProxyManager {
         // Origin Sent = c_to_b
         // Origin Received = b_to_c
         crate::metrics::record::record_origin_traffic(server_id, c_to_b, b_to_c);
-        // Note: request_end currently only records downstream bytes_sent.
-        // We might need to adjust it or call a new record method for total L4 stats.
-
-        Ok(())
+        Ok((c_to_b, b_to_c))
     }
+}
+
+fn apply_client_cert(
+    conn_config: &mut pingora_core::tls::ssl::ConnectConfiguration,
+    client_cert: &SSLCertConfig,
+) -> anyhow::Result<()> {
+    let cert_pem_raw = client_cert
+        .cert_data_json
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing client certificate PEM"))?;
+    let key_pem_raw = client_cert
+        .key_data_json
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing client key PEM"))?;
+
+    let cert_bytes = clean_pem_value(cert_pem_raw);
+    let key_bytes = clean_pem_value(key_pem_raw);
+    let cert_chain = X509::stack_from_pem(&cert_bytes)?;
+    let leaf = cert_chain
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("client certificate chain is empty"))?;
+    let key = PKey::private_key_from_pem(&key_bytes)?;
+
+    ext::ssl_use_certificate(conn_config, leaf)?;
+    ext::ssl_use_private_key(conn_config, &key)?;
+    for cert in cert_chain.iter().skip(1) {
+        ext::ssl_add_chain_cert(conn_config, cert)?;
+    }
+    Ok(())
+}
+
+fn clean_pem_value(raw: &str) -> Vec<u8> {
+    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(raw.trim()) {
+        return decoded;
+    }
+    raw.replace("\\n", "\n").into_bytes()
 }

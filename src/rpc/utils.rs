@@ -59,8 +59,52 @@ pub fn build_runtime_maps(
 }
 
 pub async fn sync_deleted_contents(
-    _api_config: &ApiConfig,
-    _config_store: &crate::config::ConfigStore,
-    _version: &mut i64,
+    api_config: &ApiConfig,
+    config_store: &crate::config::ConfigStore,
+    version: &mut i64,
 ) {
+    let client = match crate::rpc::client::RpcClient::new(api_config).await {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::debug!("Failed to connect for deleted content sync: {}", err);
+            return;
+        }
+    };
+
+    let mut service = client.deleted_content_service();
+    match service
+        .list_server_deleted_contents_after_version(
+            crate::pb::ListServerDeletedContentsAfterVersionRequest {
+                version: *version,
+                size: 5000,
+            },
+        )
+        .await
+    {
+        Ok(resp) => {
+            let items = resp.into_inner().server_deleted_contents;
+            if items.is_empty() {
+                return;
+            }
+
+            let mut deleted_contents = config_store.get_deleted_contents().await;
+            for item in items {
+                if item.is_deleted {
+                    deleted_contents.retain(|url| url != &item.url);
+                } else if !item.url.is_empty() && !deleted_contents.iter().any(|url| url == &item.url)
+                {
+                    deleted_contents.push(item.url.clone());
+                }
+
+                if item.version > *version {
+                    *version = item.version;
+                }
+            }
+
+            config_store.set_deleted_contents(deleted_contents).await;
+        }
+        Err(err) => {
+            tracing::debug!("Failed to sync deleted contents: {}", err);
+        }
+    }
 }

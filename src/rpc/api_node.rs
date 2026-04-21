@@ -183,8 +183,34 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
         return;
     }
 
+    let mut healthy_endpoints = Vec::new();
+    for endpoint in &endpoints {
+        if RpcClient::ping_endpoint(api_config, endpoint).await {
+            healthy_endpoints.push(endpoint.clone());
+        }
+    }
+
+    if healthy_endpoints.is_empty() {
+        debug!("Skipping api-node endpoint update because none of the discovered endpoints passed PingService health check");
+        report_node_log_with_context(
+            api_config,
+            "warn",
+            "API_NODE",
+            "discovered api-node endpoints failed PingService health check",
+            None,
+            Some("apiNodePingFailed"),
+            Some(serde_json::json!({ "endpoints": endpoints })),
+        )
+        .await;
+        return;
+    }
+
+    if healthy_endpoints == current_endpoints {
+        return;
+    }
+
     let mut new_config = api_config.clone();
-    new_config.rpc_endpoints = endpoints.clone();
+    new_config.rpc_endpoints = healthy_endpoints.clone();
     if let Err(e) = new_config.write_default() {
         debug!("Failed to write updated api_node config: {}", e);
         report_node_log_with_context(
@@ -198,5 +224,5 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
         )
         .await;
     }
-    ApiConfig::set_runtime_rpc_endpoints(endpoints);
+    ApiConfig::set_runtime_rpc_endpoints(healthy_endpoints);
 }

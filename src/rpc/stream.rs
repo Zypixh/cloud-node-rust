@@ -70,6 +70,7 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
 }
 
 async fn run_stream(client: RpcClient, api_config: &ApiConfig, config_store: Arc<ConfigStore>) -> anyhow::Result<()> {
+    let connected_endpoints = api_config.effective_rpc_endpoints();
     let (tx, rx) = mpsc::channel(100);
     let rx_stream = ReceiverStream::new(rx);
 
@@ -81,6 +82,7 @@ async fn run_stream(client: RpcClient, api_config: &ApiConfig, config_store: Arc
 
     let mut current_api_node_id = None;
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
+    let mut endpoint_check_interval = tokio::time::interval(Duration::from_secs(15));
 
     loop {
         tokio::select! {
@@ -143,6 +145,17 @@ async fn run_stream(client: RpcClient, api_config: &ApiConfig, config_store: Arc
                         ..Default::default()
                     };
                     let _ = tx.try_send(ping);
+                }
+            }
+            _ = endpoint_check_interval.tick() => {
+                let latest_endpoints = api_config.effective_rpc_endpoints();
+                if latest_endpoints != connected_endpoints {
+                    info!(
+                        "Detected runtime API endpoint change for node stream. Reconnecting from {:?} to {:?}",
+                        connected_endpoints,
+                        latest_endpoints
+                    );
+                    break;
                 }
             }
         }

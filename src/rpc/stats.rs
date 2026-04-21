@@ -1,4 +1,5 @@
 use crate::api_config::ApiConfig;
+use crate::config::ConfigStore;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use chrono::Timelike;
@@ -24,6 +25,7 @@ pub async fn start_bandwidth_reporter(api_config: ApiConfig) {
         let mut stats = vec![];
         for snap in snapshots {
             stats.push(pb::ServerBandwidthStat {
+                user_id: snap.user_id,
                 server_id: snap.server_id,
                 day: day.clone(),
                 time_at: time_at.clone(),
@@ -35,6 +37,7 @@ pub async fn start_bandwidth_reporter(api_config: ApiConfig) {
                 count_requests: snap.total_requests as i64,
                 count_cached_requests: snap.count_cached_requests as i64,
                 count_attack_requests: snap.count_attack_requests as i64,
+                user_plan_id: snap.user_plan_id,
                 count_websocket_connections: snap.count_websocket_connections as i64,
                 origin_total_bytes: (snap.origin_bytes_received + snap.origin_bytes_sent) as i64,
                 count_i_ps: snap.count_ips as i64,
@@ -68,7 +71,7 @@ pub async fn start_bandwidth_reporter(api_config: ApiConfig) {
     }
 }
 
-pub async fn start_daily_stat_reporter(api_config: ApiConfig) {
+pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: ApiConfig) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
 
     loop {
@@ -86,24 +89,35 @@ pub async fn start_daily_stat_reporter(api_config: ApiConfig) {
         let time_from = format!("{:02}{:02}", now.hour(), minute_floor);
         let time_to = format!("{:02}{:02}", now.hour(), (minute_floor + 4).min(59));
 
-        let stats = snapshots
-            .into_iter()
-            .map(|snap| pb::ServerDailyStat {
+        let mut stats = Vec::with_capacity(snapshots.len());
+        for snap in snapshots {
+            let check_traffic_limiting = config_store
+                .get_server_by_id(snap.server_id)
+                .await
+                .map(|server| server.has_valid_traffic_limit())
+                .unwrap_or(false);
+
+            stats.push(pb::ServerDailyStat {
                 server_id: snap.server_id,
-                bytes: snap.bytes_sent as i64,
+                user_id: snap.user_id,
+                bytes: (snap.bytes_sent + snap.origin_bytes_sent + snap.origin_bytes_received)
+                    as i64,
                 cached_bytes: snap.cached_bytes as i64,
                 count_requests: snap.total_requests as i64,
                 count_cached_requests: snap.count_cached_requests as i64,
                 created_at,
                 count_attack_requests: snap.count_attack_requests as i64,
                 attack_bytes: snap.attack_bytes as i64,
+                check_traffic_limiting,
+                plan_id: snap.plan_id,
                 day: day.clone(),
                 hour: hour.clone(),
                 time_from: time_from.clone(),
                 time_to: time_to.clone(),
+                count_i_ps: snap.count_ips as i64,
                 ..Default::default()
-            })
-            .collect();
+            });
+        }
 
         let client = match RpcClient::new(&api_config).await {
             Ok(c) => c,

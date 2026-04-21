@@ -14,6 +14,7 @@ pub mod firewall;
 pub mod headers;
 pub mod health_manager;
 pub mod http_proxy_manager;
+pub mod http3_proxy_manager;
 pub mod lb_factory;
 pub mod log_uploader;
 pub mod logging;

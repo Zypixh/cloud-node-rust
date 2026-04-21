@@ -235,6 +235,25 @@ impl MetricStorage {
         let _ = db.delete(key.as_bytes());
     }
 
+    /// Iterates over all cache metadata efficiently using a closure.
+    pub fn for_each_cache_meta<F>(&self, mut f: F) 
+    where F: FnMut(String, serde_json::Value) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let iter = db.prefix_iterator("CMETA_".as_bytes());
+        for (key, val) in iter.flatten() {
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with("CMETA_") {
+                break;
+            }
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
+                let hash = key_str.strip_prefix("CMETA_").unwrap_or(&key_str).to_string();
+                f(hash, meta);
+            }
+        }
+    }
+
     /// Scans all cache metadata, returning a vector of (hash, metadata_json)
     pub fn scan_all_cache_meta(&self) -> Vec<(String, serde_json::Value)> {
         let Some(db) = &self.db else {

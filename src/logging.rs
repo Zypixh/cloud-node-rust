@@ -85,12 +85,16 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         .map(|v| v.split(':').next().unwrap_or(v))
         .unwrap_or_else(|| req.uri.host().unwrap_or("-"));
 
-    let proto = match req.version {
-        pingora::http::Version::HTTP_10 => "HTTP/1.0",
-        pingora::http::Version::HTTP_11 => "HTTP/1.1",
-        pingora::http::Version::HTTP_2 => "HTTP/2.0",
-        pingora::http::Version::HTTP_3 => "HTTP/3.0",
-        _ => "HTTP/1.1",
+    let proto = if ctx.is_http3_bridge {
+        "HTTP/3.0"
+    } else {
+        match req.version {
+            pingora::http::Version::HTTP_10 => "HTTP/1.0",
+            pingora::http::Version::HTTP_11 => "HTTP/1.1",
+            pingora::http::Version::HTTP_2 => "HTTP/2.0",
+            pingora::http::Version::HTTP_3 => "HTTP/3.0",
+            _ => "HTTP/1.1",
+        }
     };
 
     let request_line = format!("{} {} {}", req.method, req.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"), proto);
@@ -101,14 +105,12 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     let bytes_sent = session.body_bytes_sent() as i64 + ctx.response_headers_size as i64 + 20;
 
     // Real IP resolution
-    let raw_socket_addr = session.client_addr().map(|a| a.to_string()).unwrap_or_default();
-    let mut real_ip_str = raw_socket_addr.split(':').next().unwrap_or("").trim_matches(|c| c == '[' || c == ']').to_string();
-    
-    if let Some(xff) = session.get_header("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() { real_ip_str = first.trim().to_string(); }
-    } else if let Some(rip) = session.get_header("x-real-ip").and_then(|v| v.to_str().ok()) {
-        real_ip_str = rip.trim().to_string();
-    }
+    let raw_socket_addr = if ctx.raw_remote_addr.is_empty() {
+        session.client_addr().map(|a| a.to_string()).unwrap_or_default()
+    } else {
+        ctx.raw_remote_addr.clone()
+    };
+    let real_ip_str = ctx.client_ip.to_string();
 
     let client_ip = real_ip_str.parse::<IpAddr>().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
     let user_agent = req.headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
@@ -122,8 +124,8 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
             server_id,
             node_id: NUMERIC_NODE_ID.load(Ordering::Relaxed),
             remote_addr: real_ip_str,
-            raw_remote_addr: raw_socket_addr.split(':').next().unwrap_or("").trim_matches(|c| c == '[' || c == ']').to_string(),
-            remote_port: match session.client_addr() { Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => addr.port() as i32, _ => 0 },
+            raw_remote_addr: raw_socket_addr,
+            remote_port: ctx.client_port as i32,
             request_uri: req.uri.path_and_query().map(|pq| pq.as_str().to_string()).unwrap_or_else(|| "/".to_string()),
             request_path: req.uri.path().to_string(),
             request_method: req.method.to_string(),
@@ -186,6 +188,20 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     }
     log.attrs.insert("browser".to_string(), analyzed.browser.clone());
     log.attrs.insert("os".to_string(), analyzed.os.clone());
+    if ctx.is_http3_bridge {
+        log.attrs.insert("transport".to_string(), "http3".to_string());
+        log.tags.push("HTTP3".to_string());
+    }
+    if let Some(cache_status) = ctx
+        .response_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-cache"))
+        .map(|(_, v)| v.clone())
+    {
+        log.attrs
+            .insert("cacheStatus".to_string(), cache_status.clone());
+        log.tags.push(format!("X_CACHE_{}", cache_status));
+    }
 
     if ctx.cache_hit.unwrap_or(false) { log.tags.push("CACHE_HIT".to_string()); }
     if let Some(waf) = &ctx.waf_action { 

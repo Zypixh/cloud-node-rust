@@ -10,6 +10,9 @@ pub mod top_ip;
 
 /// Metrics for a specific server (site)
 pub struct ServerMetrics {
+    pub user_id: AtomicI64,
+    pub user_plan_id: AtomicI64,
+    pub plan_id: AtomicI64,
     pub total_requests: AtomicU64,
     pub active_connections: AtomicI64,
     pub bytes_sent: AtomicU64,
@@ -33,6 +36,9 @@ impl Default for ServerMetrics {
 impl ServerMetrics {
     pub fn new() -> Self {
         Self {
+            user_id: AtomicI64::new(0),
+            user_plan_id: AtomicI64::new(0),
+            plan_id: AtomicI64::new(0),
             total_requests: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
             bytes_sent: AtomicU64::new(0),
@@ -52,6 +58,9 @@ impl ServerMetrics {
         let count_ips = self.distinct_ips.len() as u64;
         ServerStatusSnapshot {
             server_id: 0, // placeholder
+            user_id: self.user_id.load(Ordering::Relaxed),
+            user_plan_id: self.user_plan_id.load(Ordering::Relaxed),
+            plan_id: self.plan_id.load(Ordering::Relaxed),
             total_requests: self.total_requests.load(Ordering::Relaxed),
             active_connections: self.active_connections.load(Ordering::Relaxed),
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
@@ -75,6 +84,9 @@ impl ServerMetrics {
 #[derive(serde::Serialize)]
 pub struct ServerStatusSnapshot {
     pub server_id: i64,
+    pub user_id: i64,
+    pub user_plan_id: i64,
+    pub plan_id: i64,
     pub total_requests: u64,
     pub active_connections: i64,
     pub bytes_sent: u64,
@@ -199,8 +211,23 @@ impl NodeMetrics {
 pub mod record {
     use super::*;
 
-    pub fn request_start(server_id: i64, remote_ip: String) {
+    pub fn request_start(
+        server_id: i64,
+        remote_ip: String,
+        user_id: i64,
+        user_plan_id: i64,
+        plan_id: i64,
+    ) {
         let m = get_or_create(server_id);
+        if user_id > 0 {
+            m.user_id.store(user_id, Ordering::Relaxed);
+        }
+        if user_plan_id > 0 {
+            m.user_plan_id.store(user_plan_id, Ordering::Relaxed);
+        }
+        if plan_id > 0 {
+            m.plan_id.store(plan_id, Ordering::Relaxed);
+        }
         m.total_requests.fetch_add(1, Ordering::Relaxed);
         m.active_connections.fetch_add(1, Ordering::Relaxed);
         m.distinct_ips.insert(remote_ip);
@@ -291,6 +318,9 @@ pub async fn start_persistence_flusher() {
             let current = entry.value().snapshot();
             let last = last_values.entry(server_id).or_insert_with(|| ServerStatusSnapshot {
                 server_id,
+                user_id: 0,
+                user_plan_id: 0,
+                plan_id: 0,
                 total_requests: 0,
                 active_connections: 0,
                 bytes_sent: 0,

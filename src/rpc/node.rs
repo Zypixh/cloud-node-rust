@@ -12,6 +12,7 @@ use crate::config::ConfigStore;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use crate::rpc::node_task::sync_node_tasks;
+use crate::rpc::plan::sync_active_plans;
 use crate::rpc::utils::sync_deleted_contents;
 use std::collections::HashSet;
 
@@ -27,6 +28,15 @@ pub fn trigger_api_node_report() {
 static LAST_CONFIG_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 static LAST_WAF_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 static LAST_GLOBAL_CONFIG_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
+
+fn parse_i64_keyed_map<T>(raw: &std::collections::HashMap<String, T>) -> std::collections::HashMap<i64, T>
+where
+    T: Clone,
+{
+    raw.iter()
+        .filter_map(|(key, value)| key.parse::<i64>().ok().map(|id| (id, value.clone())))
+        .collect()
+}
 
 async fn report_connected_api_nodes(api_config: &ApiConfig) {
     let api_node_ids = CONNECTED_API_NODE_IDS.read().ok()
@@ -589,8 +599,16 @@ pub async fn fetch_and_apply_config<F>(
                                 allow_lan_ip,
                                 payload.http_cache_policies.first().cloned(),
                                 payload.http_firewall_policies.clone(),
-                                payload.waf_actions.clone()
+                                payload.waf_actions.clone(),
+                                parse_i64_keyed_map(&payload.uam_policies),
+                                parse_i64_keyed_map(&payload.http_cc_policies),
+                                parse_i64_keyed_map(&payload.http3_policies),
+                                parse_i64_keyed_map(&payload.http_pages_policies),
+                                parse_i64_keyed_map(&payload.webp_image_policies),
+                                payload.toa.clone(),
                             ).await;
+
+                            let _ = sync_active_plans(api_config, config_store).await;
 
                         }
                         Err(e) => error!("Error parsing NodeConfigPayload: {}", e),

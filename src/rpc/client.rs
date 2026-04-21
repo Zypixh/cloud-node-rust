@@ -16,25 +16,69 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub async fn new(api_config: &ApiConfig) -> anyhow::Result<Self> {
-        let api_endpoint = api_config
-            .effective_rpc_endpoints()
-            .first()
-            .cloned()
-            .unwrap_or_default();
-        
-        let channel = Channel::from_shared(api_endpoint)
-            .map_err(|e| anyhow::anyhow!("Invalid URI: {}", e))?
-            .connect_timeout(Duration::from_secs(10))
+        let mut last_err = None;
+        let endpoints = api_config.effective_rpc_endpoints();
+        if endpoints.is_empty() {
+            anyhow::bail!("No RPC endpoints configured");
+        }
+
+        for api_endpoint in endpoints {
+            let endpoint = match Channel::from_shared(api_endpoint.clone()) {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    last_err = Some(anyhow::anyhow!("Invalid URI {}: {}", api_endpoint, e));
+                    continue;
+                }
+            };
+
+            let channel = endpoint
+                .connect_timeout(Duration::from_secs(10))
+                .tcp_keepalive(Some(Duration::from_secs(15)))
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .keep_alive_while_idle(true)
+                .connect()
+                .await;
+
+            match channel {
+                Ok(channel) => {
+                    return Ok(Self {
+                        channel,
+                        api_config: api_config.clone(),
+                    });
+                }
+                Err(err) => {
+                    last_err = Some(anyhow::anyhow!("Failed to connect to {}: {}", api_endpoint, err));
+                }
+            }
+        }
+            
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Unable to connect to any RPC endpoint")))
+    }
+
+    pub async fn ping_endpoint(api_config: &ApiConfig, endpoint: &str) -> bool {
+        let endpoint = match Channel::from_shared(endpoint.to_string()) {
+            Ok(endpoint) => endpoint,
+            Err(_) => return false,
+        };
+
+        let channel = match endpoint
+            .connect_timeout(Duration::from_secs(5))
             .tcp_keepalive(Some(Duration::from_secs(15)))
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_while_idle(true)
             .connect()
-            .await?;
-            
-        Ok(Self {
+            .await
+        {
+            Ok(channel) => channel,
+            Err(_) => return false,
+        };
+
+        let mut service = pb::ping_service_client::PingServiceClient::with_interceptor(
             channel,
-            api_config: api_config.clone(),
-        })
+            Self::interceptor(api_config, None),
+        );
+
+        service.ping(pb::PingRequest {}).await.is_ok()
     }
 
     pub fn channel(&self) -> Channel {

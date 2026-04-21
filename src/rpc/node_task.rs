@@ -5,7 +5,7 @@ use crate::rpc::api_node::sync_updating_server_list_once;
 use crate::rpc::cache::sync_cache_tasks;
 use crate::rpc::client::RpcClient;
 use crate::rpc::ip_list::sync_ip_items_incremental;
-use crate::rpc::scripts::sync_script_configs;
+use crate::rpc::plan::sync_active_plans;
 use crate::rpc::server::{sync_single_server_config, sync_user_servers_state};
 use tracing::{debug, info, warn};
 use tokio::sync::Notify;
@@ -64,13 +64,14 @@ pub async fn sync_node_tasks(
                             )
                             .await
                         } else {
+                            trigger_task_sync();
                             true
                         }
                     }
-                    "nodeLevelChanged" | "planChanged" => {
-                        crate::rpc::find_node_level_info(api_config).await;
-                        true
+                    "nodeLevelChanged" => {
+                        crate::rpc::find_node_level_info(api_config, config_store).await
                     }
+                    "planChanged" => sync_active_plans(api_config, config_store).await,
                     "purgeServerCache" | "purgePathCache" | "preheatCache" => {
                         sync_cache_tasks(client.channel(), api_config).await
                     }
@@ -119,7 +120,10 @@ pub async fn sync_node_tasks(
                                 .is_ok()
                         }
                     }
-                    "scriptsChanged" => sync_script_configs(api_config).await,
+                    "scriptsChanged" => {
+                        warn!("Ignoring unsupported task 'scriptsChanged': edge script runtime is not implemented in Rust node");
+                        true
+                    }
                     "plusChanged" | "nodeVersionChanged" => true,
                     _ => true,
                 };

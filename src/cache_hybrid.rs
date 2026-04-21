@@ -614,6 +614,25 @@ impl Storage for HybridStorage {
     }
 }
 
+#[derive(Eq, PartialEq)]
+struct EvictCandidate {
+    access_time: i64,
+    size: u64,
+    hash: String,
+}
+
+impl Ord for EvictCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.access_time.cmp(&other.access_time)
+    }
+}
+
+impl PartialOrd for EvictCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: PathBuf) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
 
@@ -622,22 +641,80 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
         let now = chrono::Utc::now().timestamp();
         let max_bytes = storage.max_disk_bytes.load(std::sync::atomic::Ordering::Relaxed);
         
-        let mut all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
-        all_meta.sort_by_key(|m| m.1["a"].as_i64().unwrap_or(0));
+        let mut current_size: u64 = 0;
+        let mut expired_hashes = Vec::new();
 
-        let mut current_size: u64 = all_meta.iter().map(|m| m.1["s"].as_u64().unwrap_or(0)).sum();
-
-        for (hash, meta) in all_meta {
-            let expires = meta["e"].as_i64().unwrap_or(0);
-            let size = meta["s"].as_u64().unwrap_or(0);
-
-            if now > expires || (max_bytes > 0 && current_size > max_bytes) {
-                let hash_hex = hash.clone();
-                let path = disk_root.join(&hash_hex[0..2]).join(&hash_hex[2..4]).join(&hash_hex);
+        // Pass 1: Stream metadata, instantly collect expired, calculate current size
+        tokio::task::block_in_place(|| {
+            crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
+                let expires = meta["e"].as_i64().unwrap_or(0);
+                let size = meta["s"].as_u64().unwrap_or(0);
                 
-                let _ = fs::remove_file(&path).await;
+                if now > expires {
+                    expired_hashes.push(hash);
+                } else {
+                    current_size += size;
+                }
+            });
+        });
+
+        // Execute: Delete expired files
+        for hash in expired_hashes {
+            let path = disk_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
+            let _ = tokio::fs::remove_file(&path).await;
+            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+        }
+
+        // Pass 2: Capacity eviction using Max-Heap if disk exceeds limits
+        if max_bytes > 0 && current_size > max_bytes {
+            let bytes_to_free = current_size - max_bytes;
+            
+            let mut heap = std::collections::BinaryHeap::new();
+            let mut heap_bytes: u64 = 0;
+            
+            tokio::task::block_in_place(|| {
+                crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
+                    let expires = meta["e"].as_i64().unwrap_or(0);
+                    // Only process active files
+                    if now <= expires {
+                        let size = meta["s"].as_u64().unwrap_or(0);
+                        let access_time = meta["a"].as_i64().unwrap_or(0);
+                        
+                        heap.push(EvictCandidate {
+                            access_time,
+                            size,
+                            hash,
+                        });
+                        heap_bytes += size;
+                        
+                        // Maintain the heap size just enough to free the required bytes
+                        // Since it's a Max-Heap, peek() returns the NEWEST file in the candidate pool.
+                        // We safely discard it if the remaining pool is still big enough.
+                        while heap_bytes > bytes_to_free {
+                            if let Some(top) = heap.peek() {
+                                if heap_bytes - top.size >= bytes_to_free {
+                                    heap_bytes -= top.size;
+                                    heap.pop();
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                });
+            });
+
+            // Execute: Delete oldest files
+            let candidates_count = heap.len();
+            tracing::info!("CACHE_PURGER: Capacity reached. Evicting {} oldest files to free {} bytes.", candidates_count, heap_bytes);
+            
+            for candidate in heap {
+                let hash = candidate.hash;
+                let path = disk_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
+                let _ = tokio::fs::remove_file(&path).await;
                 crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                current_size = current_size.saturating_sub(size);
             }
         }
     }

@@ -4,6 +4,7 @@ use crate::config_models::ServerConfig;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use crate::rpc::logs::report_node_log_with_context;
+use crate::rpc::plan::sync_active_plans;
 use crate::rpc::utils::build_runtime_maps;
 use tracing::{debug, error};
 
@@ -39,6 +40,8 @@ pub async fn sync_single_server_config(
         Ok(resp) => {
             let payload = resp.into_inner();
             if payload.server_config_json.is_empty() {
+                config_store.remove_server(server_id).await;
+                let _ = sync_active_plans(api_config, config_store).await;
                 return true;
             }
             match serde_json::from_slice::<ServerConfig>(&payload.server_config_json) {
@@ -54,6 +57,7 @@ pub async fn sync_single_server_config(
                             .replace_server(server_id, servers, routes)
                             .await;
                     }
+                    let _ = sync_active_plans(api_config, config_store).await;
                     true
                 }
                 Err(e) => {
@@ -145,6 +149,7 @@ pub async fn sync_user_servers_state(
 
     if !is_enabled {
         config_store.remove_user_servers(user_id).await;
+        let _ = sync_active_plans(api_config, config_store).await;
         return true;
     }
 
@@ -156,6 +161,7 @@ pub async fn sync_user_servers_state(
             let payload = resp.into_inner();
             if payload.servers_config_json.is_empty() {
                 config_store.remove_user_servers(user_id).await;
+                let _ = sync_active_plans(api_config, config_store).await;
                 return true;
             }
             match serde_json::from_slice::<Vec<ServerConfig>>(&payload.servers_config_json) {
@@ -164,6 +170,7 @@ pub async fn sync_user_servers_state(
                     config_store
                         .replace_user_servers(user_id, servers_map, routes_map)
                         .await;
+                    let _ = sync_active_plans(api_config, config_store).await;
                     true
                 }
                 Err(e) => {

@@ -2,7 +2,11 @@ use pingora_load_balancing::{LoadBalancer, selection::{RoundRobin, Consistent}};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::config_models::{HTTPPageConfig, MetricItemConfig, ParentNodeConfig, ServerConfig, HTTPCachePolicy, HTTPFirewallPolicy};
+use crate::config_models::{
+    HTTP3Policy, HTTPCCPolicy, HTTPFirewallPolicy, HTTPPageConfig, HTTPPagesPolicy,
+    HTTPCachePolicy, MetricItemConfig, ParentNodeConfig, ServerConfig, TOAConfig, UAMPolicy,
+    WebPImagePolicy,
+};
 
 /// Configuration for the local EdgeNode.
 #[derive(Clone)]
@@ -61,6 +65,22 @@ pub struct NodeConfig {
     pub firewall_policies: Vec<HTTPFirewallPolicy>,
     /// Global WAF action defaults
     pub waf_actions: Vec<crate::config_models::WAFActionConfig>,
+    /// Global UAM policies keyed by cluster id
+    pub uam_policies: HashMap<i64, UAMPolicy>,
+    /// Global HTTP CC policies keyed by cluster id
+    pub http_cc_policies: HashMap<i64, HTTPCCPolicy>,
+    /// Global HTTP/3 policies keyed by cluster id
+    pub http3_policies: HashMap<i64, HTTP3Policy>,
+    /// Global HTTP page policies keyed by cluster id
+    pub http_pages_policies: HashMap<i64, HTTPPagesPolicy>,
+    /// Global WebP image policies keyed by cluster id
+    pub webp_image_policies: HashMap<i64, WebPImagePolicy>,
+    /// Global TOA config
+    pub toa: Option<TOAConfig>,
+    /// Cached plans referenced by current runtime servers
+    pub plans: HashMap<i64, crate::pb::Plan>,
+    /// Cached user plans referenced by current runtime servers
+    pub user_plans: HashMap<i64, crate::pb::UserPlan>,
 }
 
 impl Default for NodeConfig {
@@ -95,6 +115,14 @@ impl Default for NodeConfig {
             cache_policy: None,
             firewall_policies: Vec::new(),
             waf_actions: Vec::new(),
+            uam_policies: HashMap::new(),
+            http_cc_policies: HashMap::new(),
+            http3_policies: HashMap::new(),
+            http_pages_policies: HashMap::new(),
+            webp_image_policies: HashMap::new(),
+            toa: None,
+            plans: HashMap::new(),
+            user_plans: HashMap::new(),
         }
     }
 }
@@ -129,6 +157,21 @@ impl ConfigStore {
         lock.servers.get(host).cloned()
     }
 
+    pub fn get_server_for_tls_name_sync(&self, host: &str) -> Option<ServerConfig> {
+        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+        let lock = self.inner.read().unwrap();
+        if let Some(server) = lock.servers.get(&normalized) {
+            return Some(server.clone());
+        }
+        if let Some(pos) = normalized.find('.') {
+            let wildcard = format!("*{}", &normalized[pos..]);
+            if let Some(server) = lock.servers.get(&wildcard) {
+                return Some(server.clone());
+            }
+        }
+        None
+    }
+
     pub fn get_cache_policy_sync(&self) -> Option<HTTPCachePolicy> {
         let lock = self.inner.read().unwrap();
         lock.cache_policy.clone()
@@ -142,6 +185,45 @@ impl ConfigStore {
     pub fn get_waf_actions_sync(&self) -> Vec<crate::config_models::WAFActionConfig> {
         let lock = self.inner.read().unwrap();
         lock.waf_actions.clone()
+    }
+
+    pub fn get_global_pages_sync(&self) -> Vec<HTTPPageConfig> {
+        let lock = self.inner.read().unwrap();
+        lock.global_pages.clone()
+    }
+
+    fn pick_global_policy<T: Clone>(map: &HashMap<i64, T>) -> Option<T> {
+        map.get(&0).cloned().or_else(|| map.values().next().cloned())
+    }
+
+    pub fn get_global_uam_policy_sync(&self) -> Option<UAMPolicy> {
+        let lock = self.inner.read().unwrap();
+        Self::pick_global_policy(&lock.uam_policies)
+    }
+
+    pub fn get_global_http_cc_policy_sync(&self) -> Option<HTTPCCPolicy> {
+        let lock = self.inner.read().unwrap();
+        Self::pick_global_policy(&lock.http_cc_policies)
+    }
+
+    pub fn get_global_http3_policy_sync(&self) -> Option<HTTP3Policy> {
+        let lock = self.inner.read().unwrap();
+        Self::pick_global_policy(&lock.http3_policies)
+    }
+
+    pub fn get_global_http_pages_policy_sync(&self) -> Option<HTTPPagesPolicy> {
+        let lock = self.inner.read().unwrap();
+        Self::pick_global_policy(&lock.http_pages_policies)
+    }
+
+    pub fn get_global_webp_policy_sync(&self) -> Option<WebPImagePolicy> {
+        let lock = self.inner.read().unwrap();
+        Self::pick_global_policy(&lock.webp_image_policies)
+    }
+
+    pub fn get_toa_config_sync(&self) -> Option<TOAConfig> {
+        let lock = self.inner.read().unwrap();
+        lock.toa.clone()
     }
 
     pub fn get_parent_upstream_sync(&self, cluster_id: i64) -> Option<Arc<LoadBalancer<Consistent>>> {
@@ -194,6 +276,16 @@ impl ConfigStore {
         lock.grpc_policy.clone()
     }
 
+    pub fn get_plan_sync(&self, plan_id: i64) -> Option<crate::pb::Plan> {
+        let lock = self.inner.read().unwrap();
+        lock.plans.get(&plan_id).cloned()
+    }
+
+    pub fn get_user_plan_sync(&self, user_plan_id: i64) -> Option<crate::pb::UserPlan> {
+        let lock = self.inner.read().unwrap();
+        lock.user_plans.get(&user_plan_id).cloned()
+    }
+
     pub fn update_parent_pressure(&self, addr: &str, pressure: f32) {
         let mut lock = self.inner.write().unwrap();
         lock.parent_pressure.insert(addr.to_string(), (pressure, std::time::Instant::now()));
@@ -217,6 +309,14 @@ impl ConfigStore {
 
     pub async fn get_server(&self, host: &str) -> Option<ServerConfig> {
         self.get_server_sync(host)
+    }
+
+    pub async fn get_server_by_id(&self, server_id: i64) -> Option<ServerConfig> {
+        let lock = self.inner.read().unwrap();
+        lock.servers
+            .values()
+            .find(|server| server.id == Some(server_id))
+            .cloned()
     }
 
     pub async fn get_all_servers(&self) -> Vec<ServerConfig> {
@@ -268,6 +368,19 @@ impl ConfigStore {
     pub async fn get_metric_items(&self) -> Vec<MetricItemConfig> {
         let lock = self.inner.read().unwrap();
         lock.metric_items.clone()
+    }
+
+    pub async fn get_plan_ids(&self) -> Vec<i64> {
+        let lock = self.inner.read().unwrap();
+        let mut plan_ids = lock
+            .servers
+            .values()
+            .filter_map(|server| (server.user_plan_id > 0).then_some(server.user_plan_id))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        plan_ids.sort_unstable();
+        plan_ids
     }
 
     pub async fn get_tiered_origin_info(&self) -> (i32, HashMap<i64, Vec<ParentNodeConfig>>) {
@@ -340,6 +453,12 @@ impl ConfigStore {
         cache_policy: Option<HTTPCachePolicy>,
         firewall_policies: Vec<HTTPFirewallPolicy>,
         waf_actions: Vec<crate::config_models::WAFActionConfig>,
+        uam_policies: HashMap<i64, UAMPolicy>,
+        http_cc_policies: HashMap<i64, HTTPCCPolicy>,
+        http3_policies: HashMap<i64, HTTP3Policy>,
+        http_pages_policies: HashMap<i64, HTTPPagesPolicy>,
+        webp_image_policies: HashMap<i64, WebPImagePolicy>,
+        toa: Option<TOAConfig>,
     ) {
         let mut lock = self.inner.write().unwrap();
         lock.id = id;
@@ -369,6 +488,12 @@ impl ConfigStore {
         lock.cache_policy = cache_policy;
         lock.firewall_policies = firewall_policies;
         lock.waf_actions = waf_actions;
+        lock.uam_policies = uam_policies;
+        lock.http_cc_policies = http_cc_policies;
+        lock.http3_policies = http3_policies;
+        lock.http_pages_policies = http_pages_policies;
+        lock.webp_image_policies = webp_image_policies;
+        lock.toa = toa;
     }
 
 
@@ -379,6 +504,20 @@ impl ConfigStore {
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>
     ) {
         let mut lock = self.inner.write().unwrap();
+        let stale_hosts = lock
+            .servers
+            .iter()
+            .filter_map(|(host, server)| (server.numeric_id() == server_id).then_some(host.clone()))
+            .collect::<Vec<_>>();
+
+        for host in &stale_hosts {
+            lock.servers.remove(host);
+            lock.routes.remove(host);
+        }
+        if server_id > 0 {
+            lock.id_to_lb.remove(&server_id);
+        }
+
         for (host, config) in servers {
             lock.servers.insert(host, config);
         }
@@ -392,11 +531,32 @@ impl ConfigStore {
 
     pub async fn replace_user_servers(
         &self, 
-        _user_id: i64, 
+        user_id: i64, 
         servers: HashMap<String, ServerConfig>, 
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>
     ) {
         let mut lock = self.inner.write().unwrap();
+        let stale_hosts = lock
+            .servers
+            .iter()
+            .filter_map(|(host, server)| (server.user_id == user_id).then_some(host.clone()))
+            .collect::<Vec<_>>();
+        let stale_server_ids = lock
+            .servers
+            .values()
+            .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
+            .collect::<std::collections::HashSet<_>>();
+
+        for host in &stale_hosts {
+            lock.servers.remove(host);
+            lock.routes.remove(host);
+        }
+        for server_id in stale_server_ids {
+            if server_id > 0 {
+                lock.id_to_lb.remove(&server_id);
+            }
+        }
+
         for (host, config) in servers {
             if let Some(sid) = config.id {
                 if let Some(lb) = routes.get(&host) {
@@ -412,11 +572,94 @@ impl ConfigStore {
 
     pub async fn remove_user_servers(&self, user_id: i64) {
         let mut lock = self.inner.write().unwrap();
-        lock.servers.retain(|_, s| s.user_id != user_id);
+        let stale_hosts = lock
+            .servers
+            .iter()
+            .filter_map(|(host, server)| (server.user_id == user_id).then_some(host.clone()))
+            .collect::<Vec<_>>();
+        let stale_server_ids = lock
+            .servers
+            .values()
+            .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
+            .collect::<std::collections::HashSet<_>>();
+
+        for host in stale_hosts {
+            lock.servers.remove(&host);
+            lock.routes.remove(&host);
+        }
+        for server_id in stale_server_ids {
+            if server_id > 0 {
+                lock.id_to_lb.remove(&server_id);
+            }
+        }
+    }
+
+    pub async fn remove_server(&self, server_id: i64) {
+        let mut lock = self.inner.write().unwrap();
+        let stale_hosts = lock
+            .servers
+            .iter()
+            .filter_map(|(host, server)| (server.numeric_id() == server_id).then_some(host.clone()))
+            .collect::<Vec<_>>();
+
+        for host in stale_hosts {
+            lock.servers.remove(&host);
+            lock.routes.remove(&host);
+        }
+        if server_id > 0 {
+            lock.id_to_lb.remove(&server_id);
+        }
+    }
+
+    pub async fn cache_server_route(
+        &self,
+        host: String,
+        server: ServerConfig,
+        lb: Arc<LoadBalancer<RoundRobin>>,
+    ) {
+        let mut lock = self.inner.write().unwrap();
+        let server_id = server.numeric_id();
+        if server_id > 0 {
+            lock.id_to_lb.insert(server_id, lb.clone());
+        }
+        lock.servers.insert(host.clone(), server);
+        lock.routes.insert(host, lb);
     }
 
     pub async fn set_deleted_contents(&self, deleted_contents: Vec<String>) {
         let mut lock = self.inner.write().unwrap();
         lock.deleted_contents = deleted_contents;
+    }
+
+    pub async fn set_plans(&self, plans: HashMap<i64, crate::pb::Plan>) {
+        let mut lock = self.inner.write().unwrap();
+        lock.plans = plans;
+    }
+
+    pub async fn set_user_plans(&self, user_plans: HashMap<i64, crate::pb::UserPlan>) {
+        let mut lock = self.inner.write().unwrap();
+        lock.user_plans = user_plans;
+    }
+
+    pub async fn update_node_level_info(
+        &self,
+        level: i32,
+        parent_nodes: HashMap<i64, Vec<ParentNodeConfig>>,
+    ) {
+        let allow_lan_ip = {
+            let lock = self.inner.read().unwrap();
+            lock.allow_lan_ip
+        };
+
+        let mut parent_routes = HashMap::new();
+        for (cluster_id, nodes) in &parent_nodes {
+            let lb = crate::lb_factory::build_parent_lb(*cluster_id, nodes, allow_lan_ip);
+            parent_routes.insert(*cluster_id, lb);
+        }
+
+        let mut lock = self.inner.write().unwrap();
+        lock.level = level;
+        lock.parent_nodes = parent_nodes;
+        lock.parent_routes = parent_routes;
     }
 }
