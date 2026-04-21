@@ -113,14 +113,32 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
+      - name: Prepare Release Notes
+        shell: bash
+        run: |
+          mkdir -p .github/release-body
+          if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
+            cp "release-notes/${GITHUB_REF_NAME}.md" .github/release-body/body.md
+          else
+            {
+              echo "# ${GITHUB_REF_NAME}"
+              echo
+              echo "未找到对应的发布说明文件：release-notes/${GITHUB_REF_NAME}.md"
+            } > .github/release-body/body.md
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: .github/release-body/body.md
           files: |
             artifacts/**/*.tar.gz
         env:
