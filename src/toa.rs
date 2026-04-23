@@ -14,7 +14,7 @@ mod imp {
         neli_enum,
         nl::NlPayload,
         router::synchronous::NlRouter,
-        types::GenlBuffer,
+        types::{Buffer, GenlBuffer},
         utils::Groups,
     };
     use std::{
@@ -44,7 +44,6 @@ mod imp {
     impl neli::consts::genl::Cmd for CloudToaSenderCmd {}
 
     #[neli_enum(serialized_type = "u16")]
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum CloudToaSenderAttr {
         Unspec = 0,
         LocalPort = 1,
@@ -160,7 +159,7 @@ mod imp {
 
         fn add(&self, mapping: &Mapping) -> Result<()> {
             let attrs = build_mapping_attrs(mapping);
-            let msg = GenlmsghdrBuilder::default()
+            let msg: Genlmsghdr<CloudToaSenderCmd, CloudToaSenderAttr> = GenlmsghdrBuilder::default()
                 .cmd(CloudToaSenderCmd::Add)
                 .version(1)
                 .attrs(attrs)
@@ -194,7 +193,7 @@ mod imp {
             )
             .collect::<GenlBuffer<_, _>>();
 
-            let msg = GenlmsghdrBuilder::default()
+            let msg: Genlmsghdr<CloudToaSenderCmd, CloudToaSenderAttr> = GenlmsghdrBuilder::default()
                 .cmd(CloudToaSenderCmd::Del)
                 .version(1)
                 .attrs(attrs)
@@ -214,10 +213,10 @@ mod imp {
         }
 
         fn flush(&self) -> Result<()> {
-            let msg = GenlmsghdrBuilder::default()
+            let msg: Genlmsghdr<CloudToaSenderCmd, CloudToaSenderAttr> = GenlmsghdrBuilder::default()
                 .cmd(CloudToaSenderCmd::Flush)
                 .version(1)
-                .attrs(std::iter::empty().collect::<GenlBuffer<_, _>>())
+                .attrs(std::iter::empty().collect::<GenlBuffer<CloudToaSenderAttr, Buffer>>())
                 .build()
                 .context("failed to build TOA sender FLUSH request")?;
 
@@ -234,7 +233,7 @@ mod imp {
         }
     }
 
-    fn build_mapping_attrs(mapping: &Mapping) -> GenlBuffer<CloudToaSenderAttr, Vec<u8>> {
+    fn build_mapping_attrs(mapping: &Mapping) -> GenlBuffer<CloudToaSenderAttr, Buffer> {
         let client_family = match mapping.client_addr {
             IpAddr::V4(_) => libc::AF_INET as u16,
             IpAddr::V6(_) => libc::AF_INET6 as u16,
@@ -351,7 +350,7 @@ mod imp {
             ),
         }
 
-        attrs.into_iter().collect::<GenlBuffer<_, _>>()
+        attrs.into_iter().collect::<GenlBuffer<CloudToaSenderAttr, Buffer>>()
     }
 
     fn configured_port_range(config: &TOAConfig) -> (u16, u16) {
