@@ -238,6 +238,16 @@ pub async fn fetch_and_apply_config<F>(
                             // Auto-sync time with the API node
                             crate::utils::time::update_time_offset(config_resp.timestamp);
                             debug!("Successfully parsed NodeConfigPayload. Numeric ID: {}, Server count: {}", numeric_id, payload.servers.len());
+                            if let Some(gsc) = &payload.global_server_config {
+                                debug!("RPC_NODE: Found GlobalServerConfig: {:?}", gsc);
+                                if let Some(http_all) = &gsc.http_all {
+                                    debug!("RPC_NODE: http_all settings found. allow_lan_ip: {}", http_all.allow_lan_ip);
+                                } else {
+                                    debug!("RPC_NODE: http_all (GlobalHTTPAllConfig) is None");
+                                }
+                            } else {
+                                debug!("RPC_NODE: global_server_config is None");
+                            }
                             config_store.update_id(numeric_id).await;
                             crate::logging::set_numeric_node_id(numeric_id);
 
