@@ -1,3 +1,4 @@
 /target
 /data/
 cloud-node-rust
+.DS_Store
