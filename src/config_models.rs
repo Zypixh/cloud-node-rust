@@ -33,6 +33,25 @@ where
     }
 }
 
+fn deserialize_flexible_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Value::deserialize(deserializer)?;
+    match v {
+        Value::Bool(b) => Ok(b),
+        Value::Number(n) => Ok(n.as_i64().unwrap_or(0) != 0),
+        Value::String(s) => {
+            let normalized = s.trim().to_ascii_lowercase();
+            Ok(matches!(
+                normalized.as_str(),
+                "1" | "true" | "yes" | "on" | "enabled"
+            ))
+        }
+        _ => Ok(false),
+    }
+}
+
 fn default_connector() -> String {
     "or".to_string()
 }
@@ -268,7 +287,14 @@ pub struct GlobalHTTPAllConfig {
     pub request_origins_with_encodings: bool,
     #[serde(rename = "xffMaxAddresses", default)]
     pub xff_max_addresses: i32,
-    #[serde(rename = "allowLANIP", default)]
+    #[serde(
+        rename = "allowLANIP",
+        alias = "allowLanIP",
+        alias = "allowLanIp",
+        alias = "allow_lan_ip",
+        default,
+        deserialize_with = "deserialize_flexible_bool"
+    )]
     pub allow_lan_ip: bool,
 }
 
