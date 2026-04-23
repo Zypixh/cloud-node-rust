@@ -239,7 +239,13 @@ pub async fn fetch_and_apply_config<F>(
                             crate::utils::time::update_time_offset(config_resp.timestamp);
                             debug!("Successfully parsed NodeConfigPayload. Numeric ID: {}, Server count: {}", numeric_id, payload.servers.len());
                             if let Some(gsc) = &payload.global_server_config {
-                                debug!("RPC_NODE: Found GlobalServerConfig: {:?}", gsc);
+                                debug!("RPC_NODE: Found GlobalServerConfig struct: {:?}", gsc);
+                                // Deep dive into raw JSON to see what's actually there
+                                if let Ok(full_val) = serde_json::from_slice::<serde_json::Value>(&node_json) {
+                                    if let Some(raw_gsc) = full_val.get("globalServerConfig").or(full_val.get("clusterConfig")) {
+                                        debug!("DIAGNOSTIC (RAW JSON): globalServerConfig content: {}", raw_gsc);
+                                    }
+                                }
                                 if let Some(http_all) = &gsc.http_all {
                                     debug!("RPC_NODE: http_all settings found. allow_lan_ip: {}", http_all.allow_lan_ip);
                                 } else {
