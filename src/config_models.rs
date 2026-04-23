@@ -295,6 +295,7 @@ pub struct GlobalHTTPAllConfig {
         alias = "allowLAN",
         alias = "allowLan",
         alias = "allowLocalIP",
+        alias = "allowLocalOrigins",
         default,
         deserialize_with = "deserialize_flexible_bool"
     )]
