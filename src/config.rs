@@ -133,6 +133,14 @@ pub struct ConfigStore {
     inner: Arc<RwLock<NodeConfig>>,
 }
 
+#[derive(Clone)]
+pub struct HotPathSnapshot {
+    pub is_on: bool,
+    pub global_http: crate::config_models::GlobalHTTPAllConfig,
+    pub firewall_policies: Vec<HTTPFirewallPolicy>,
+    pub grpc_policy: Option<crate::config_models::GRPCConfig>,
+}
+
 impl Default for ConfigStore {
     fn default() -> Self {
         Self::new()
@@ -155,6 +163,34 @@ impl ConfigStore {
     pub fn get_server_sync(&self, host: &str) -> Option<ServerConfig> {
         let lock = self.inner.read().unwrap();
         lock.servers.get(host).cloned()
+    }
+
+    pub fn get_server_and_upstream_sync(
+        &self,
+        host: &str,
+    ) -> (Option<ServerConfig>, Option<Arc<LoadBalancer<RoundRobin>>>) {
+        let lock = self.inner.read().unwrap();
+        (lock.servers.get(host).cloned(), lock.routes.get(host).cloned())
+    }
+
+    pub fn get_hot_path_snapshot_sync(&self) -> HotPathSnapshot {
+        let lock = self.inner.read().unwrap();
+        HotPathSnapshot {
+            is_on: lock.is_on,
+            global_http: crate::config_models::GlobalHTTPAllConfig {
+                force_ln_request: lock.force_ln_request,
+                ln_request_scheduling_method: lock.ln_request_scheduling_method.clone(),
+                supports_low_version_http: lock.supports_low_version_http,
+                match_cert_from_all_servers: lock.match_cert_from_all_servers,
+                server_name: lock.server_name.clone(),
+                enable_server_addr_variable: lock.enable_server_addr_variable,
+                request_origins_with_encodings: lock.request_origins_with_encodings,
+                xff_max_addresses: lock.xff_max_addresses,
+                allow_lan_ip: lock.allow_lan_ip,
+            },
+            firewall_policies: lock.firewall_policies.clone(),
+            grpc_policy: lock.grpc_policy.clone(),
+        }
     }
 
     pub fn get_server_for_tls_name_sync(&self, host: &str) -> Option<ServerConfig> {

@@ -129,9 +129,6 @@ impl DynamicCertSelector {
     }
 }
 
-pub async fn start_ocsp_syncer(_api_config: crate::api_config::ApiConfig, _selector: Arc<DynamicCertSelector>) {
-}
-
 pub async fn sync_certs(
     cert_selector: &DynamicCertSelector,
     certs: &[SSLCertConfig],

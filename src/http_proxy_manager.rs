@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 struct ListenerHandle {
@@ -316,21 +317,24 @@ impl HttpProxyManager {
         let server_id = server.numeric_id();
         anyhow::ensure!(server_id > 0, "SNI passthrough server is missing ID");
 
-        let lb = self
-            .config_store
-            .get_lb_by_id(server_id)
-            .await
-            .with_context(|| format!("missing upstream load balancer for server {}", server_id))?;
-        let peer = lb
-            .select(b"", 128)
-            .with_context(|| format!("no healthy upstream for SNI passthrough server {}", server_id))?;
-        let backend_addr = peer.addr.to_string();
-        let backend_stream = TcpStream::connect(&backend_addr)
-            .await
-            .with_context(|| format!("failed to connect passthrough upstream {}", backend_addr))?;
+        let backend_addr = self.select_passthrough_backend_target(&server).await?;
+        let toa_config = self.config_store.get_toa_config_sync();
+        let backend_stream = crate::toa::connect_with_toa(
+            &backend_addr,
+            client_addr,
+            toa_config.clone(),
+            Duration::from_secs(10),
+        )
+        .await
+        .with_context(|| format!("failed to connect passthrough upstream {}", backend_addr))?;
+        let toa_local_port = backend_stream
+            .local_addr()
+            .ok()
+            .map(|addr| addr.port())
+            .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
 
-        let _ = client_stream.set_nodelay(true);
-        let _ = backend_stream.set_nodelay(true);
+        configure_passthrough_socket(&client_stream);
+        configure_passthrough_socket(&backend_stream);
 
         let user_plan_id = server.user_plan_id;
         let plan_id = if user_plan_id > 0 {
@@ -353,6 +357,11 @@ impl HttpProxyManager {
         let mut client_stream = client_stream;
         let mut backend_stream = backend_stream;
         let result = copy_bidirectional(&mut client_stream, &mut backend_stream).await;
+        if let Some(local_port) = toa_local_port {
+            if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await {
+                debug!("failed to release TOA sender port {}: {}", local_port, err);
+            }
+        }
         match result {
             Ok((client_to_backend, backend_to_client)) => {
                 crate::metrics::record::request_end(
@@ -376,10 +385,89 @@ impl HttpProxyManager {
             }
         }
     }
+
+    async fn select_passthrough_backend_target(
+        &self,
+        server: &ServerConfig,
+    ) -> anyhow::Result<String> {
+        let server_id = server.numeric_id();
+
+        if let Some(lb) = self.config_store.get_lb_by_id(server_id).await
+            && let Some(peer) = lb.select(b"", 128)
+        {
+            return Ok(normalize_passthrough_target(&peer.addr.to_string()));
+        }
+
+        let rp_cfg = server
+            .reverse_proxy
+            .as_ref()
+            .with_context(|| format!("missing reverse proxy config for passthrough server {}", server_id))?;
+        let (level, parents) = self.config_store.get_tiered_origin_info().await;
+        let bypass = self.config_store.is_tiered_origin_bypass().await;
+        let global_cfg = self.config_store.get_global_http_config_sync();
+        let (lb, _) = crate::lb_factory::build_lb(
+            server_id,
+            rp_cfg,
+            level,
+            &parents,
+            bypass,
+            global_cfg.allow_lan_ip,
+        );
+        let peer = lb
+            .select(b"", 128)
+            .with_context(|| format!("no healthy upstream for SNI passthrough server {}", server_id))?;
+        Ok(normalize_passthrough_target(&peer.addr.to_string()))
+    }
+}
+
+fn normalize_passthrough_target(raw: &str) -> String {
+    raw
+        .trim()
+        .trim_start_matches("tls://")
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_string()
+}
+
+fn configure_passthrough_socket(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        let fd = stream.as_raw_fd();
+        let on = 1i32;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        let fd = stream.as_raw_fd();
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                "bbr\0".as_ptr() as *const libc::c_void,
+                4,
+            );
+        }
+    }
 }
 
 async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Option<String>> {
-    let mut peek_buf = vec![0u8; 16 * 1024];
+    let mut peek_buf = [0u8; 16 * 1024];
     let size = client_stream.peek(&mut peek_buf).await?;
     if size == 0 {
         return Ok(None);

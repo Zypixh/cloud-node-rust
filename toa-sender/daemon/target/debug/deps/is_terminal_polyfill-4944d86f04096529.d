@@ -1,0 +1,5 @@
+/Users/moying/Documents/project/cloud-node-rust/toa-sender/daemon/target/debug/deps/is_terminal_polyfill-4944d86f04096529.d: /Users/moying/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/is_terminal_polyfill-1.70.2/src/lib.rs
+
+/Users/moying/Documents/project/cloud-node-rust/toa-sender/daemon/target/debug/deps/libis_terminal_polyfill-4944d86f04096529.rmeta: /Users/moying/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/is_terminal_polyfill-1.70.2/src/lib.rs
+
+/Users/moying/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/is_terminal_polyfill-1.70.2/src/lib.rs:

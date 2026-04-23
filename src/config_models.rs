@@ -149,6 +149,19 @@ pub struct WAFJSCookieOptions {
 pub struct TOAConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(
+        rename = "sockFile",
+        alias = "socketFile",
+        alias = "socketPath",
+        alias = "socket",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub sock_file: String,
+    #[serde(rename = "minPort", default)]
+    pub min_port: Option<u16>,
+    #[serde(rename = "maxPort", default)]
+    pub max_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]

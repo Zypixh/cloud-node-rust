@@ -24,5 +24,6 @@ pub mod rewrite;
 pub mod rpc;
 pub mod ssl;
 pub mod tcp_proxy;
+pub mod toa;
 pub mod udp_proxy;
 pub mod utils;

@@ -198,6 +198,10 @@ struct RequestLimitBinding {
 static REQUEST_LIMIT_BINDINGS: Lazy<DashMap<String, RequestLimitBinding>> =
     Lazy::new(DashMap::new);
 const REQUEST_LIMIT_BINDING_IDLE_SECS: u64 = 180;
+const MAX_OPTIMIZATION_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WEBP_CONVERSION_BODY_BYTES: usize = 10 * 1024 * 1024;
+const MAX_HLS_PLAYLIST_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_HLS_SEGMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 impl EdgeProxy {
     fn cleanup_request_limit_bindings() {
@@ -268,6 +272,14 @@ impl EdgeProxy {
             },
         );
         true
+    }
+
+    fn response_content_length(resp: &pingora::http::ResponseHeader) -> Option<usize> {
+        resp.headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
     }
 
     fn socket_client_ip(session: &Session) -> (std::net::IpAddr, u16, String) {
@@ -640,6 +652,12 @@ impl EdgeProxy {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
+        let Some(content_length_usize) = Self::response_content_length(upstream_response) else {
+            return;
+        };
+        if content_length_usize > MAX_WEBP_CONVERSION_BODY_BYTES {
+            return;
+        }
         let site_min = Self::size_capacity_bytes(&site_webp.min_length);
         let site_max = Self::size_capacity_bytes(&site_webp.max_length);
         let policy_min = Self::size_capacity_bytes(&policy.min_length);
@@ -1382,6 +1400,40 @@ impl EdgeProxy {
         Ok(true)
     }
 
+    async fn maybe_serve_acme_challenge(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+    ) -> Result<bool> {
+        const ACME_PREFIX: &str = "/.well-known/acme-challenge/";
+
+        let path = session.req_header().uri.path();
+        let Some(token) = path.strip_prefix(ACME_PREFIX) else {
+            return Ok(false);
+        };
+        if token.is_empty() || token.contains('/') {
+            ctx.response_status = 404;
+            return self.respond_status_with_pages(session, ctx, 404).await;
+        }
+
+        let Some(key) = crate::rpc::acme::find_acme_key(&self.api_config, token).await else {
+            ctx.response_status = 404;
+            return self.respond_status_with_pages(session, ctx, 404).await;
+        };
+
+        let mut resp = pingora_http::ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "text/plain; charset=utf-8")
+            .unwrap();
+        resp.insert_header("cache-control", "no-store").unwrap();
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(Some(Bytes::from(key)), true)
+            .await?;
+        ctx.response_status = 200;
+        ctx.no_log = true;
+        Ok(true)
+    }
+
     fn normalize_hls_target(base_path: &str, target: &str) -> String {
         if target.starts_with("http://") || target.starts_with("https://") {
             if let Some(idx) = target.find("://")
@@ -1579,6 +1631,12 @@ impl EdgeProxy {
         {
             return;
         }
+        let Some(content_length) = Self::response_content_length(upstream_response) else {
+            return;
+        };
+        if content_length > MAX_OPTIMIZATION_BODY_BYTES {
+            return;
+        }
 
         let Some(server) = ctx.server.as_ref() else {
             return;
@@ -1668,9 +1726,15 @@ impl EdgeProxy {
         if !encrypting.matches_url(&request_url) {
             return;
         }
+        let Some(content_length) = Self::response_content_length(upstream_response) else {
+            return;
+        };
 
         let path = session.req_header().uri.path().to_ascii_lowercase();
         if path.ends_with(".m3u8") {
+            if content_length > MAX_HLS_PLAYLIST_BODY_BYTES {
+                return;
+            }
             ctx.hls_playlist_enabled = true;
             upstream_response.remove_header("content-length");
             let _ = upstream_response.insert_header(
@@ -1689,6 +1753,9 @@ impl EdgeProxy {
                 return;
             };
             if chrono::Utc::now().timestamp() > exp {
+                return;
+            }
+            if content_length > MAX_HLS_SEGMENT_BODY_BYTES {
                 return;
             }
             let (key, iv, _) = self.hls_key_material(server.numeric_id(), &target, &session_id, exp);
@@ -1996,8 +2063,10 @@ impl ProxyHttp for EdgeProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        let hot_path = self.config.get_hot_path_snapshot_sync();
+
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
-        ctx.is_on = self.config.get_node_is_on_sync();
+        ctx.is_on = hot_path.is_on;
         if !ctx.is_on {
             debug!("Node is DISABLED (isOn=false). Rejecting request.");
             return self.respond_status_with_pages(session, ctx, 403).await;
@@ -2012,9 +2081,13 @@ impl ProxyHttp for EdgeProxy {
         if self.maybe_serve_hls_key(session, ctx).await? {
             return Ok(true);
         }
+        if self.maybe_serve_acme_challenge(session, ctx).await? {
+            return Ok(true);
+        }
         
-        ctx.server = self.config.get_server_sync(&host);
-        ctx.lb = self.config.get_upstream_sync(&host);
+        let (server, upstream) = self.config.get_server_and_upstream_sync(&host);
+        ctx.server = server;
+        ctx.lb = upstream;
 
         let _is_loopback = session.client_addr()
             .and_then(|a| a.as_inet())
@@ -2054,6 +2127,18 @@ impl ProxyHttp for EdgeProxy {
         let _ = session
             .req_header_mut()
             .insert_header("X-Cloud-Resolved-Real-Ip", ctx.client_ip.to_string());
+
+        if let Some(user_agent) = session
+            .get_header("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .filter(|ua| !ua.is_empty())
+        {
+            crate::client_agent::maybe_report_client_agent(
+                (*self.api_config).clone(),
+                ctx.client_ip.to_string(),
+                user_agent.to_string(),
+            );
+        }
         
         let ip_str = ctx.client_ip.to_string();
         
@@ -2125,8 +2210,12 @@ impl ProxyHttp for EdgeProxy {
 
             // Apply gRPC message size limits if enabled
             if ctx.is_grpc {
-                let grpc_policy = self.config.get_grpc_policy_sync();
-                let max_recv = grpc_policy.as_ref().and_then(|p| p.max_receive_message_size.as_ref()).map(|s| s.to_bytes()).unwrap_or(0);
+                let max_recv = hot_path
+                    .grpc_policy
+                    .as_ref()
+                    .and_then(|p| p.max_receive_message_size.as_ref())
+                    .map(|s| s.to_bytes())
+                    .unwrap_or(0);
                 let final_max_recv = if max_recv <= 0 { 2 * 1024 * 1024 } else { max_recv };
                 
                 // For gRPC, we increase the inspection limit to allow larger messages
@@ -2136,7 +2225,7 @@ impl ProxyHttp for EdgeProxy {
         }
 
         // --- GLOBAL CLUSTER SETTINGS: Low Version HTTP ---
-        let global_cfg = self.config.get_global_http_config_sync();
+        let global_cfg = hot_path.global_http.clone();
         if !global_cfg.supports_low_version_http {
             if session.req_header().version < pingora_http::Version::HTTP_11 {
                 debug!("Blocking low version HTTP request: {:?}", session.req_header().version);
@@ -2182,7 +2271,6 @@ impl ProxyHttp for EdgeProxy {
                 };
 
                 let server_id = server.numeric_id();
-                let global_cfg = self.config.get_global_http_config_sync();
                 let (lb_arc, _has_hc) = crate::lb_factory::build_lb(server_id, rp_cfg, level, &parents, bypass, global_cfg.allow_lan_ip);
                 ctx.lb = Some(lb_arc.clone());
                 
@@ -2237,8 +2325,8 @@ impl ProxyHttp for EdgeProxy {
         }
 
         // 1. Mandatory Global Special Defenses
-        let global_policies = self.config.get_firewall_policies_sync();
-        for gp in &global_policies {
+        let global_policies = &hot_path.firewall_policies;
+        for gp in global_policies {
             if !gp.is_on { continue; }
             
             // 1.1 Empty Connection Flood
@@ -2353,7 +2441,7 @@ impl ProxyHttp for EdgeProxy {
 
                 // 2.2 Global Policies (if not ignored)
                 if waf_action.is_none() && !firewall_ref.ignore_global_rules {
-                    for gp in &global_policies {
+                    for gp in global_policies {
                         if gp.is_on {
                             if let Some(action) = crate::firewall::evaluate_policy(gp, session, &ctx.request_body) {
                                 waf_action = Some(action);

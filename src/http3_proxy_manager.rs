@@ -13,10 +13,14 @@ use h3::server::RequestResolver;
 use quinn::Endpoint;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::watch;
+use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 
 use crate::config::ConfigStore;
 use crate::ssl::DynamicCertSelector;
+
+const MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HTTP3_BRIDGE_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 struct ListenerHandle {
     cert_hash: u64,
@@ -290,7 +294,7 @@ impl Http3ProxyManager {
     ) -> Result<()>
     where
         C: h3::quic::Connection<Bytes> + Send + 'static,
-        <C as OpenStreams<Bytes>>::BidiStream: Send + 'static,
+        <C as OpenStreams<Bytes>>::BidiStream: h3::quic::BidiStream<Bytes> + Send + 'static,
     {
         let (request, mut stream) = resolver.resolve_request().await?;
         let host = Self::request_host(&request, listen_port)
@@ -317,10 +321,48 @@ impl Http3ProxyManager {
             .map(|value| value.as_str())
             .unwrap_or("/");
 
-        let mut body = Vec::new();
+        let declared_request_len = request
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
+        if declared_request_len
+            .is_some_and(|value| value > MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES)
+        {
+            warn!(
+                "HTTP/3 bridge request body exceeded declared limit for host {} on port {}",
+                host, listen_port
+            );
+            Self::send_simple_response(
+                &mut stream,
+                413,
+                b"Request Entity Too Large".as_slice(),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let mut body = Vec::with_capacity(
+            declared_request_len
+                .unwrap_or(0)
+                .min(MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES),
+        );
         while let Some(mut chunk) = stream.recv_data().await? {
             while chunk.has_remaining() {
                 let bytes = chunk.copy_to_bytes(chunk.remaining());
+                if body.len().saturating_add(bytes.len()) > MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES {
+                    warn!(
+                        "HTTP/3 bridge request body exceeded limit for host {} on port {}",
+                        host, listen_port
+                    );
+                    Self::send_simple_response(
+                        &mut stream,
+                        413,
+                        b"Request Entity Too Large".as_slice(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 body.extend_from_slice(&bytes);
             }
         }
@@ -369,10 +411,27 @@ impl Http3ProxyManager {
         }
 
         match outbound.send().await {
-            Ok(response) => {
-                let status = response.status();
-                let headers = response.headers().clone();
-                let response_body = response.bytes().await.unwrap_or_default();
+            Ok(upstream_response) => {
+                let status = upstream_response.status();
+                let headers = upstream_response.headers().clone();
+                if headers
+                    .get("content-length")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .is_some_and(|value| value > MAX_HTTP3_BRIDGE_RESPONSE_BODY_BYTES)
+                {
+                    warn!(
+                        "HTTP/3 bridge upstream response body exceeded declared limit for host {} on port {}",
+                        host, listen_port
+                    );
+                    Self::send_simple_response(
+                        &mut stream,
+                        502,
+                        b"Upstream Response Too Large".as_slice(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
 
                 let mut builder = http::Response::builder().status(status);
                 for (name, value) in &headers {
@@ -381,10 +440,28 @@ impl Http3ProxyManager {
                     }
                     builder = builder.header(name, value);
                 }
-                let response = builder.body(())?;
-                stream.send_response(response).await?;
-                if !response_body.is_empty() {
-                    stream.send_data(response_body).await?;
+                let downstream_response = builder.body(())?;
+                stream.send_response(downstream_response).await?;
+
+                let mut total_sent = 0usize;
+                let mut response_stream = upstream_response.bytes_stream();
+                while let Some(chunk_result) = response_stream.next().await {
+                    let chunk = match chunk_result {
+                        Ok(chunk) => chunk,
+                        Err(err) => {
+                            warn!("HTTP/3 bridge failed while streaming upstream response: {}", err);
+                            break;
+                        }
+                    };
+                    total_sent = total_sent.saturating_add(chunk.len());
+                    if total_sent > MAX_HTTP3_BRIDGE_RESPONSE_BODY_BYTES {
+                        warn!(
+                            "HTTP/3 bridge streamed response exceeded limit for host {} on port {}",
+                            host, listen_port
+                        );
+                        break;
+                    }
+                    stream.send_data(chunk).await?;
                 }
                 stream.finish().await?;
             }
@@ -399,6 +476,23 @@ impl Http3ProxyManager {
             }
         }
 
+        Ok(())
+    }
+
+    async fn send_simple_response<S>(
+        stream: &mut h3::server::RequestStream<S, Bytes>,
+        status: u16,
+        body: &[u8],
+    ) -> Result<()>
+    where
+        S: h3::quic::BidiStream<Bytes>,
+    {
+        let response = http::Response::builder().status(status).body(())?;
+        stream.send_response(response).await?;
+        if !body.is_empty() {
+            stream.send_data(Bytes::copy_from_slice(body)).await?;
+        }
+        stream.finish().await?;
         Ok(())
     }
 

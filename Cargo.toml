@@ -1,6 +1,6 @@
 [package]
 name = "cloud-node-rust"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 
 [dependencies]
@@ -28,7 +28,7 @@ pingora-http = { path = "./pingora-main/pingora-http" }
 pingora-cache = { path = "./pingora-main/pingora-cache" }
 prost = "0.13.5"
 regex = "1.12.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 quinn = "0.11.9"
 rustls = { version = "0.23.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
@@ -62,6 +62,9 @@ rocksdb = { version = "0.23.0", features = ["lz4"] }
 rand = "0.8"
 libc = "0.2"
 aes-gcm = "0.10.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+neli = "0.7.4"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
