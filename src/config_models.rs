@@ -289,12 +289,6 @@ pub struct GlobalHTTPAllConfig {
     pub xff_max_addresses: i32,
     #[serde(
         rename = "allowLANIP",
-        alias = "allowLanIP",
-        alias = "allowLanIp",
-        alias = "allow_lan_ip",
-        alias = "allowLAN",
-        alias = "allowLan",
-        alias = "allowLocalIP",
         alias = "allowLocalOrigins",
         default,
         deserialize_with = "deserialize_flexible_bool"
@@ -304,7 +298,7 @@ pub struct GlobalHTTPAllConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct GlobalServerConfig {
-    #[serde(rename = "httpAll", alias = "http")]
+    #[serde(rename = "httpAll")]
     pub http_all: Option<GlobalHTTPAllConfig>,
 }
 
@@ -337,7 +331,7 @@ pub struct NodeConfigPayload {
     pub is_center: bool,
     #[serde(rename = "parentNodes", alias = "ParentNodes", default, deserialize_with = "deserialize_null_default")]
     pub parent_nodes: std::collections::HashMap<String, Vec<ParentNodeConfig>>, // Map keys in JSON are always strings
-    #[serde(rename = "globalServerConfig", alias = "clusterConfig", alias = "globalConfig", default)]
+    #[serde(rename = "globalServerConfig", default)]
     pub global_server_config: Option<GlobalServerConfig>,
     #[serde(rename = "grpcPolicies", default, deserialize_with = "deserialize_null_default")]
     pub grpc_policies: std::collections::HashMap<String, GRPCConfig>,
