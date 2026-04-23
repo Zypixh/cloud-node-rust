@@ -608,6 +608,15 @@ pub async fn fetch_and_apply_config<F>(
                                 payload.toa.clone(),
                             ).await;
 
+                            if payload.toa.as_ref().map(|toa| toa.is_on).unwrap_or(false) {
+                                let toa_config = payload.toa.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = crate::toa::maybe_prepare_runtime(toa_config).await {
+                                        warn!("Failed to auto-prepare TOA runtime after config sync: {}", err);
+                                    }
+                                });
+                            }
+
                             let _ = sync_active_plans(api_config, config_store).await;
 
                         }

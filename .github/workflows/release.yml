@@ -135,11 +135,19 @@ jobs:
             } > .github/release-body/body.md
           fi
 
+      - name: Package TOA Sources
+        shell: bash
+        run: |
+          tar -czf cloud-node-rust-toa-main-source.tar.gz toa-main
+          tar -czf cloud-node-rust-toa-sender-source.tar.gz toa-sender
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           body_path: .github/release-body/body.md
           files: |
             artifacts/**/*.tar.gz
+            cloud-node-rust-toa-main-source.tar.gz
+            cloud-node-rust-toa-sender-source.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
