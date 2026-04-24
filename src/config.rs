@@ -208,6 +208,43 @@ impl ConfigStore {
         None
     }
 
+    pub fn find_sni_passthrough_server_sync(&self, host: &str, port: u16) -> Option<ServerConfig> {
+        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+        let lock = self.inner.read().unwrap();
+
+        let matches_name = |server: &ServerConfig| {
+            server.server_names.iter().any(|sn| {
+                let name = sn.name.trim_end_matches('.').to_ascii_lowercase();
+                if !name.is_empty() && name == normalized {
+                    return true;
+                }
+                if name.starts_with("*.") {
+                    let suffix = &name[1..];
+                    if normalized.ends_with(suffix) {
+                        return true;
+                    }
+                }
+
+                sn.sub_names.iter().any(|sub| {
+                    let sub = sub.trim_end_matches('.').to_ascii_lowercase();
+                    if !sub.is_empty() && sub == normalized {
+                        return true;
+                    }
+                    sub.starts_with("*.") && normalized.ends_with(&sub[1..])
+                })
+            })
+        };
+
+        lock.servers
+            .values()
+            .find(|server| {
+                server.is_sni_passthrough()
+                    && server.listens_on_https_port(port)
+                    && matches_name(server)
+            })
+            .cloned()
+    }
+
     pub fn get_cache_policy_sync(&self) -> Option<HTTPCachePolicy> {
         let lock = self.inner.read().unwrap();
         lock.cache_policy.clone()

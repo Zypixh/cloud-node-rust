@@ -290,12 +290,12 @@ impl HttpProxyManager {
             return Ok(None);
         };
 
-        let Some(server) = self.config_store.get_server_for_tls_name_sync(&host) else {
+        let Some(server) = self
+            .config_store
+            .find_sni_passthrough_server_sync(&host, port)
+        else {
             return Ok(None);
         };
-        if !server.is_sni_passthrough() || !server.listens_on_https_port(port) {
-            return Ok(None);
-        }
         Ok(Some(server))
     }
 
