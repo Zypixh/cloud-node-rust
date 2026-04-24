@@ -438,7 +438,7 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    fn normalize_runtime_server_name(name: &str) -> String {
+    pub(crate) fn normalize_runtime_server_name(name: &str) -> String {
         let trimmed = name.trim();
         let lower = trimmed.to_ascii_lowercase();
         if let Some(stripped) = lower.strip_suffix("@sni_passthrough") {

@@ -217,7 +217,7 @@ impl ConfigStore {
 
         let matches_name = |server: &ServerConfig| {
             server.server_names.iter().any(|sn| {
-                let name = sn.name.trim_end_matches('.').to_ascii_lowercase();
+                let name = ServerConfig::normalize_runtime_server_name(sn.name.trim_end_matches('.'));
                 if !name.is_empty() && name == normalized {
                     return true;
                 }
@@ -229,7 +229,7 @@ impl ConfigStore {
                 }
 
                 sn.sub_names.iter().any(|sub| {
-                    let sub = sub.trim_end_matches('.').to_ascii_lowercase();
+                    let sub = ServerConfig::normalize_runtime_server_name(sub.trim_end_matches('.'));
                     if !sub.is_empty() && sub == normalized {
                         return true;
                     }

@@ -55,9 +55,16 @@ pub fn build_runtime_maps(
             }
         }
 
-        for name in server.get_plain_server_names() {
-            new_servers.insert(name.clone(), server.clone());
-            new_routes.insert(name.clone(), lb_arc.clone());
+        let names = server.get_plain_server_names();
+        if names.is_empty() {
+            let synthetic = format!("__id_{}", server.numeric_id());
+            new_servers.insert(synthetic.clone(), server.clone());
+            new_routes.insert(synthetic, lb_arc.clone());
+        } else {
+            for name in names {
+                new_servers.insert(name.clone(), server.clone());
+                new_routes.insert(name.clone(), lb_arc.clone());
+            }
         }
     }
 

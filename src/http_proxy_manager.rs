@@ -187,6 +187,12 @@ impl HttpProxyManager {
                         .await
                     {
                         Ok(Some(server)) => {
+                            info!(
+                                "SNI passthrough matched host={} port={} server_id={}",
+                                server.get_first_host(),
+                                port,
+                                server.numeric_id()
+                            );
                             if let Err(err) = manager
                                 .handle_sni_passthrough(client_stream, client_addr, server)
                                 .await
