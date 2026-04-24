@@ -2,13 +2,44 @@ use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
 use crate::pb;
 use crate::rpc::client::RpcClient;
+use crate::metrics::ServerStatusSnapshot;
 use chrono::Timelike;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
+const BANDWIDTH_REPORT_INTERVAL_SECS: u64 = 300;
+
+fn snapshot_delta(current: &ServerStatusSnapshot, last: Option<&ServerStatusSnapshot>) -> ServerStatusSnapshot {
+    let delta = |field: fn(&ServerStatusSnapshot) -> u64| -> u64 {
+        let current_value = field(current);
+        let last_value = last.map(field).unwrap_or(0);
+        current_value.saturating_sub(last_value)
+    };
+
+    ServerStatusSnapshot {
+        server_id: current.server_id,
+        user_id: current.user_id,
+        user_plan_id: current.user_plan_id,
+        plan_id: current.plan_id,
+        total_requests: delta(|s| s.total_requests),
+        active_connections: current.active_connections,
+        bytes_sent: delta(|s| s.bytes_sent),
+        bytes_received: delta(|s| s.bytes_received),
+        cached_bytes: delta(|s| s.cached_bytes),
+        attack_bytes: delta(|s| s.attack_bytes),
+        count_cached_requests: delta(|s| s.count_cached_requests),
+        count_attack_requests: delta(|s| s.count_attack_requests),
+        count_websocket_connections: delta(|s| s.count_websocket_connections),
+        origin_bytes_sent: delta(|s| s.origin_bytes_sent),
+        origin_bytes_received: delta(|s| s.origin_bytes_received),
+        count_ips: current.count_ips,
+    }
+}
+
 pub async fn start_bandwidth_reporter(api_config: ApiConfig) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(BANDWIDTH_REPORT_INTERVAL_SECS));
+    let mut last_snapshots: HashMap<i64, ServerStatusSnapshot> = HashMap::new();
 
     loop {
         interval.tick().await;
@@ -24,27 +55,36 @@ pub async fn start_bandwidth_reporter(api_config: ApiConfig) {
 
         let mut stats = vec![];
         for snap in snapshots {
+            let delta = snapshot_delta(&snap, last_snapshots.get(&snap.server_id));
+            last_snapshots.insert(snap.server_id, snap);
+
+            let origin_total_bytes = delta.origin_bytes_received + delta.origin_bytes_sent;
+            let avg_bits = ((delta.bytes_sent * 8) / BANDWIDTH_REPORT_INTERVAL_SECS) as i64;
+            let origin_avg_bytes = (origin_total_bytes / BANDWIDTH_REPORT_INTERVAL_SECS) as i64;
+            let origin_avg_bits = ((origin_total_bytes * 8) / BANDWIDTH_REPORT_INTERVAL_SECS) as i64;
             stats.push(pb::ServerBandwidthStat {
-                user_id: snap.user_id,
-                server_id: snap.server_id,
+                user_id: delta.user_id,
+                server_id: delta.server_id,
                 day: day.clone(),
                 time_at: time_at.clone(),
-                bytes: snap.bytes_sent as i64,
-                bits: (snap.bytes_sent * 8) as i64,
-                total_bytes: snap.total_bytes() as i64,
-                cached_bytes: snap.cached_bytes as i64,
-                attack_bytes: snap.attack_bytes as i64,
-                count_requests: snap.total_requests as i64,
-                count_cached_requests: snap.count_cached_requests as i64,
-                count_attack_requests: snap.count_attack_requests as i64,
-                user_plan_id: snap.user_plan_id,
-                count_websocket_connections: snap.count_websocket_connections as i64,
-                origin_total_bytes: (snap.origin_bytes_received + snap.origin_bytes_sent) as i64,
-                count_i_ps: snap.count_ips as i64,
+                bytes: delta.bytes_sent as i64,
+                bits: avg_bits,
+                total_bytes: delta.total_bytes() as i64,
+                cached_bytes: delta.cached_bytes as i64,
+                attack_bytes: delta.attack_bytes as i64,
+                count_requests: delta.total_requests as i64,
+                count_cached_requests: delta.count_cached_requests as i64,
+                count_attack_requests: delta.count_attack_requests as i64,
+                user_plan_id: delta.user_plan_id,
+                count_websocket_connections: delta.count_websocket_connections as i64,
+                origin_total_bytes: origin_total_bytes as i64,
+                origin_avg_bytes,
+                origin_avg_bits,
+                count_i_ps: delta.count_ips as i64,
                 ..Default::default()
             });
             // Clear UV set after reporting
-            if let Some(m) = crate::metrics::METRICS.servers.get(&snap.server_id) {
+            if let Some(m) = crate::metrics::METRICS.servers.get(&delta.server_id) {
                 m.clear_ips();
             }
         }
@@ -72,7 +112,8 @@ pub async fn start_bandwidth_reporter(api_config: ApiConfig) {
 }
 
 pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: ApiConfig) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(BANDWIDTH_REPORT_INTERVAL_SECS));
+    let mut last_snapshots: HashMap<i64, ServerStatusSnapshot> = HashMap::new();
 
     loop {
         interval.tick().await;
@@ -91,30 +132,32 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
 
         let mut stats = Vec::with_capacity(snapshots.len());
         for snap in snapshots {
+            let delta = snapshot_delta(&snap, last_snapshots.get(&snap.server_id));
+            last_snapshots.insert(snap.server_id, snap);
             let check_traffic_limiting = config_store
-                .get_server_by_id(snap.server_id)
+                .get_server_by_id(delta.server_id)
                 .await
                 .map(|server| server.has_valid_traffic_limit())
                 .unwrap_or(false);
 
             stats.push(pb::ServerDailyStat {
-                server_id: snap.server_id,
-                user_id: snap.user_id,
-                bytes: (snap.bytes_sent + snap.origin_bytes_sent + snap.origin_bytes_received)
+                server_id: delta.server_id,
+                user_id: delta.user_id,
+                bytes: (delta.bytes_sent + delta.origin_bytes_sent + delta.origin_bytes_received)
                     as i64,
-                cached_bytes: snap.cached_bytes as i64,
-                count_requests: snap.total_requests as i64,
-                count_cached_requests: snap.count_cached_requests as i64,
+                cached_bytes: delta.cached_bytes as i64,
+                count_requests: delta.total_requests as i64,
+                count_cached_requests: delta.count_cached_requests as i64,
                 created_at,
-                count_attack_requests: snap.count_attack_requests as i64,
-                attack_bytes: snap.attack_bytes as i64,
+                count_attack_requests: delta.count_attack_requests as i64,
+                attack_bytes: delta.attack_bytes as i64,
                 check_traffic_limiting,
-                plan_id: snap.plan_id,
+                plan_id: delta.plan_id,
                 day: day.clone(),
                 hour: hour.clone(),
                 time_from: time_from.clone(),
                 time_to: time_to.clone(),
-                count_i_ps: snap.count_ips as i64,
+                count_i_ps: delta.count_ips as i64,
                 ..Default::default()
             });
         }

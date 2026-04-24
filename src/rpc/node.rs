@@ -805,6 +805,11 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
     let mut sys = sysinfo::System::new_all();
     sys.refresh_all();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut last_traffic_out = 0u64;
+    let mut last_traffic_in = 0u64;
+    let mut last_requests = 0u64;
+    let mut last_attack_requests = 0u64;
+    let mut last_tick = std::time::Instant::now();
 
     loop {
         interval.tick().await;
@@ -867,6 +872,16 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         let snapshots = crate::metrics::METRICS.take_snapshots();
         let requests: u64 = snapshots.iter().map(|s| s.total_requests).sum();
         let attack_requests: u64 = snapshots.iter().map(|s| s.count_attack_requests).sum();
+        let elapsed = last_tick.elapsed().as_secs().max(1);
+        let traffic_in_bps = traffic_in.saturating_sub(last_traffic_in) / elapsed;
+        let traffic_out_bps = traffic_out.saturating_sub(last_traffic_out) / elapsed;
+        let requests_per_second = requests.saturating_sub(last_requests) / elapsed;
+        let attack_requests_per_second = attack_requests.saturating_sub(last_attack_requests) / elapsed;
+        last_traffic_in = traffic_in;
+        last_traffic_out = traffic_out;
+        last_requests = requests;
+        last_attack_requests = attack_requests;
+        last_tick = std::time::Instant::now();
 
         let mut value_map = std::collections::HashMap::new();
         value_map.insert(
@@ -904,13 +919,15 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         value_map.insert(
             "trafficIn".to_string(),
             serde_json::json!({
-                "total": traffic_in
+                "total": traffic_in,
+                "bytesPerSecond": traffic_in_bps
             }),
         );
         value_map.insert(
             "trafficOut".to_string(),
             serde_json::json!({
-                "total": traffic_out
+                "total": traffic_out,
+                "bytesPerSecond": traffic_out_bps
             }),
         );
         value_map.insert(
@@ -918,19 +935,24 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
             serde_json::json!({
                 "inBytes": traffic_in,
                 "outBytes": traffic_out,
+                "inBytesPerSecond": traffic_in_bps,
+                "outBytesPerSecond": traffic_out_bps,
+                "bytesPerSecond": traffic_in_bps + traffic_out_bps,
                 "total": traffic_in + traffic_out
             }),
         );
         value_map.insert(
             "requests".to_string(),
             serde_json::json!({
-                "total": requests
+                "total": requests,
+                "countPerSecond": requests_per_second
             }),
         );
         value_map.insert(
             "attackRequests".to_string(),
             serde_json::json!({
-                "total": attack_requests
+                "total": attack_requests,
+                "countPerSecond": attack_requests_per_second
             }),
         );
         value_map.insert(
@@ -949,6 +971,9 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
             serde_json::json!({
                 "in": traffic_in,
                 "out": traffic_out,
+                "inBytesPerSecond": traffic_in_bps,
+                "outBytesPerSecond": traffic_out_bps,
+                "bytesPerSecond": traffic_in_bps + traffic_out_bps,
                 "total": traffic_in + traffic_out
             }),
         );
