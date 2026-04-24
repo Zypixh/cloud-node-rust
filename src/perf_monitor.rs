@@ -441,21 +441,25 @@ const INDEX_HTML: &str = r#"<!doctype html>
     body { margin:0; color:var(--ink); font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at 18% -10%, #1d4b39 0, transparent 38%), radial-gradient(circle at 100% 0, #263a1e 0, transparent 34%), #080b0a; }
     main { max-width:1440px; margin:0 auto; padding:28px; }
     header { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; margin-bottom:20px; }
-    h1 { margin:0; font-size:34px; letter-spacing:-.05em; line-height:1; }
+    h1 { margin:0; font-size:34px; letter-spacing:0; line-height:1; }
     .sub { color:var(--muted); margin-top:8px; font-size:14px; }
     .toolbar { display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
     button, select { background:rgba(17,25,22,.9); color:var(--ink); border:1px solid var(--line); border-radius:999px; padding:10px 14px; }
     button:hover, select:hover { border-color:var(--green); cursor:pointer; }
     .grid { display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:14px; }
-    .card { background:linear-gradient(180deg, rgba(23,36,31,.92), rgba(14,21,18,.94)); border:1px solid var(--line); border-radius:22px; padding:16px; box-shadow:0 24px 70px rgba(0,0,0,.28); }
+    .card { background:linear-gradient(180deg, rgba(23,36,31,.92), rgba(14,21,18,.94)); border:1px solid var(--line); border-radius:8px; padding:16px; box-shadow:0 24px 70px rgba(0,0,0,.28); }
     .metric { min-height:112px; }
     .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
-    .value { font-size:28px; font-weight:750; margin-top:10px; letter-spacing:-.04em; white-space:nowrap; }
+    .value { font-size:28px; font-weight:750; margin-top:10px; letter-spacing:0; white-space:nowrap; }
     .hint { color:var(--muted); font-size:12px; margin-top:6px; }
     .wide { grid-column:span 3; }
     .full { grid-column:span 6; }
-    .chart { height:280px; margin-top:12px; }
+    .chart { height:280px; margin-top:12px; position:relative; }
     canvas { width:100%; height:100%; display:block; }
+    .chart-tooltip { position:absolute; z-index:5; min-width:150px; pointer-events:none; transform:translate(-50%,-112%); background:rgba(8,11,10,.94); border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:0 18px 50px rgba(0,0,0,.42); font-size:12px; color:var(--ink); display:none; }
+    .chart-tooltip strong { display:block; margin-bottom:6px; font-size:12px; color:var(--muted); font-weight:600; }
+    .chart-tooltip div { display:flex; justify-content:space-between; gap:16px; line-height:1.7; }
+    .chart-tooltip i { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:7px; }
     table { width:100%; border-collapse:collapse; font-size:13px; }
     th, td { padding:10px 8px; border-bottom:1px solid var(--line); text-align:right; }
     th:first-child, td:first-child { text-align:left; }
@@ -500,13 +504,111 @@ const INDEX_HTML: &str = r#"<!doctype html>
 const $ = id => document.getElementById(id);
 const fmtBytes = n => n >= 1073741824 ? (n/1073741824).toFixed(2)+' GB' : n >= 1048576 ? (n/1048576).toFixed(2)+' MB' : n >= 1024 ? (n/1024).toFixed(1)+' KB' : Math.round(n)+' B';
 const pct = n => (n*100).toFixed(1)+'%';
-function draw(canvas, series, colors) {
+const chartState = new Map();
+const formatters = {
+  bytes: v => fmtBytes(v) + '/s',
+  percent: v => v.toFixed(1) + '%',
+  number: v => v >= 1000 ? Math.round(v).toLocaleString() : v.toFixed(v >= 10 ? 0 : 1)
+};
+function tooltipFor(canvas) {
+  let tip = canvas.parentElement.querySelector('.chart-tooltip');
+  if (!tip) {
+    tip = document.createElement('div');
+    tip.className = 'chart-tooltip';
+    canvas.parentElement.appendChild(tip);
+  }
+  return tip;
+}
+function bindChart(canvas) {
+  if (canvas.dataset.bound) return;
+  canvas.dataset.bound = '1';
+  canvas.addEventListener('mousemove', ev => {
+    const state = chartState.get(canvas);
+    if (!state || !state.data.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = ev.clientX - rect.left;
+    const plotW = Math.max(1, rect.width - state.pad.left - state.pad.right);
+    const ratio = Math.max(0, Math.min(1, (x - state.pad.left) / plotW));
+    state.hoverIndex = Math.round(ratio * (state.data.length - 1));
+    chartState.set(canvas, state);
+    drawChart(canvas, state.series, state.options);
+  });
+  canvas.addEventListener('mouseleave', () => {
+    const state = chartState.get(canvas);
+    if (!state) return;
+    state.hoverIndex = null;
+    tooltipFor(canvas).style.display = 'none';
+    chartState.set(canvas, state);
+    drawChart(canvas, state.series, state.options);
+  });
+}
+function drawChart(canvas, series, options) {
+  bindChart(canvas);
   const ctx = canvas.getContext('2d'), dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
-  canvas.width = Math.max(1,w*dpr); canvas.height = Math.max(1,h*dpr); ctx.scale(dpr,dpr); ctx.clearRect(0,0,w,h);
-  const max = Math.max(1, ...series.flatMap(s => s));
-  ctx.strokeStyle = '#26362f'; ctx.lineWidth = 1;
-  for (let i=0;i<4;i++){ const y=h*i/3; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
-  series.forEach((data, idx) => { ctx.strokeStyle = colors[idx]; ctx.lineWidth = 2.2; ctx.beginPath(); data.forEach((v,i)=>{ const x = data.length <= 1 ? 0 : i*(w/(data.length-1)); const y = h - (v/max)*(h-8) - 4; i ? ctx.lineTo(x,y) : ctx.moveTo(x,y); }); ctx.stroke(); });
+  canvas.width = Math.max(1, w*dpr); canvas.height = Math.max(1, h*dpr); ctx.scale(dpr,dpr); ctx.clearRect(0,0,w,h);
+  const pad = { left: 68, right: 18, top: 28, bottom: 28 };
+  const plotW = Math.max(1, w - pad.left - pad.right), plotH = Math.max(1, h - pad.top - pad.bottom);
+  const all = series.flatMap(s => s.data);
+  const maxRaw = Math.max(1, ...all);
+  const max = options.max ? Math.max(options.max, maxRaw) : niceMax(maxRaw);
+  const formatter = formatters[options.format] || formatters.number;
+  const state = chartState.get(canvas) || {};
+  const hoverIndex = state.hoverIndex;
+  const count = Math.max(1, series[0]?.data.length || 0);
+  ctx.font = '12px ui-sans-serif, system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = '#26362f';
+  ctx.fillStyle = '#91a49a';
+  for (let i=0;i<=4;i++) {
+    const value = max - (max * i / 4);
+    const y = pad.top + plotH * i / 4;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke();
+    ctx.textAlign = 'right'; ctx.fillText(formatter(value), pad.left - 10, y);
+  }
+  ctx.fillStyle = '#91a49a';
+  ctx.textAlign = 'left';
+  ctx.fillText(options.unit, pad.left, 13);
+  let legendX = pad.left + 92;
+  series.forEach(s => {
+    ctx.fillStyle = s.color; ctx.fillRect(legendX, 9, 16, 3);
+    ctx.fillStyle = '#edf7f1'; ctx.fillText(s.name, legendX + 22, 11);
+    legendX += ctx.measureText(s.name).width + 54;
+  });
+  series.forEach(s => {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 2.2; ctx.beginPath();
+    s.data.forEach((v,i) => {
+      const x = pad.left + (count <= 1 ? 0 : i * plotW / (count - 1));
+      const y = pad.top + plotH - (v / max) * plotH;
+      i ? ctx.lineTo(x,y) : ctx.moveTo(x,y);
+    });
+    ctx.stroke();
+  });
+  if (hoverIndex !== null && hoverIndex !== undefined && count > 0) {
+    const idx = Math.max(0, Math.min(count - 1, hoverIndex));
+    const x = pad.left + (count <= 1 ? 0 : idx * plotW / (count - 1));
+    ctx.strokeStyle = 'rgba(237,247,241,.55)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + plotH); ctx.stroke();
+    series.forEach(s => {
+      const y = pad.top + plotH - (s.data[idx] / max) * plotH;
+      ctx.fillStyle = s.color; ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#080b0a'; ctx.lineWidth = 2; ctx.stroke();
+    });
+    const tip = tooltipFor(canvas);
+    const sample = options.samples[idx];
+    const time = sample ? new Date(sample.timestamp * 1000).toLocaleTimeString() : '';
+    tip.innerHTML = `<strong>${time}</strong>` + series.map(s => `<div><span><i style="background:${s.color}"></i>${s.name}</span><b>${formatter(s.data[idx] || 0)}</b></div>`).join('');
+    tip.style.display = 'block';
+    tip.style.left = `${Math.max(86, Math.min(w - 86, x))}px`;
+    tip.style.top = `${pad.top + 8}px`;
+  }
+  chartState.set(canvas, { series, options, data: series[0]?.data || [], hoverIndex, pad });
+}
+function niceMax(value) {
+  const exp = Math.pow(10, Math.floor(Math.log10(value)));
+  const fraction = value / exp;
+  const nice = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+  return nice * exp;
 }
 function renderAdvice(items) {
   $('advice').innerHTML = (items || []).map(x => `<div class="pill ${x.level}"><h3>${x.title}</h3><p>${x.detail}</p></div>`).join('');
@@ -527,10 +629,10 @@ async function refresh() {
   $('totalReq').textContent = `total ${last.total_requests}`;
   $('conn').textContent = last.active_connections;
   $('servers').textContent = `${last.server_count} servers · uptime ${Math.floor(last.uptime_seconds/60)}m`;
-  draw($('traffic'), [data.map(x=>x.traffic_out_bps), data.map(x=>x.traffic_in_bps)], ['#56d68f','#f5bd68']);
-  draw($('resource'), [data.map(x=>x.cpu_usage), data.map(x=>x.memory_usage*100), data.map(x=>x.disk_usage*100)], ['#56d68f','#79b7ff','#f5bd68']);
-  draw($('requests'), [data.map(x=>x.request_per_sec)], ['#f5bd68']);
-  draw($('connections'), [data.map(x=>x.active_connections)], ['#56d68f']);
+  drawChart($('traffic'), [{name:'Out', color:'#56d68f', data:data.map(x=>x.traffic_out_bps)}, {name:'In', color:'#f5bd68', data:data.map(x=>x.traffic_in_bps)}], {unit:'Bytes/s', format:'bytes', samples:data});
+  drawChart($('resource'), [{name:'CPU', color:'#56d68f', data:data.map(x=>x.cpu_usage)}, {name:'Memory', color:'#79b7ff', data:data.map(x=>x.memory_usage*100)}, {name:'Disk', color:'#f5bd68', data:data.map(x=>x.disk_usage*100)}], {unit:'Percent', format:'percent', max:100, samples:data});
+  drawChart($('requests'), [{name:'Requests/s', color:'#f5bd68', data:data.map(x=>x.request_per_sec)}], {unit:'Requests/s', format:'number', samples:data});
+  drawChart($('connections'), [{name:'Connections', color:'#56d68f', data:data.map(x=>x.active_connections)}], {unit:'Connections', format:'number', samples:data});
   renderAdvice(last.advice);
   renderTop(last.top_servers);
 }
