@@ -480,6 +480,22 @@ pub async fn fetch_and_apply_config<F>(
                                      info!("RPC_NODE: Skipping server {} because it is OFF", server.numeric_id());
                                      continue; 
                                  }
+
+                                 if server.is_sni_passthrough() {
+                                     match serde_json::to_string(server) {
+                                         Ok(raw) => info!(
+                                             "RPC_NODE: SNI passthrough server loaded. id={} names={:?} raw_json={}",
+                                             server.numeric_id(),
+                                             server.get_plain_server_names(),
+                                             raw
+                                         ),
+                                         Err(err) => warn!(
+                                             "RPC_NODE: Failed to serialize SNI passthrough server {} for debug logging: {}",
+                                             server.numeric_id(),
+                                             err
+                                         ),
+                                     }
+                                 }
                                  
                                  let server_id = server.numeric_id();
                                  let names = server.get_plain_server_names();
@@ -522,6 +538,16 @@ pub async fn fetch_and_apply_config<F>(
                                  } else {
                                      debug!("RPC_NODE: Server {} has names: {:?}", server.numeric_id(), names);
                                      for name in names {
+                                         if let Some(existing) = new_servers.get(&name) {
+                                             warn!(
+                                                 "RPC_NODE: Host mapping overwrite detected for {}. existing_server_id={} existing_description={:?} new_server_id={} new_description={:?}",
+                                                 name,
+                                                 existing.numeric_id(),
+                                                 existing.description,
+                                                 server.numeric_id(),
+                                                 server.description
+                                             );
+                                         }
                                          new_servers.insert(name.clone(), server.clone());
                                          new_routes.insert(name.clone(), lb_arc.clone());
                                      }
