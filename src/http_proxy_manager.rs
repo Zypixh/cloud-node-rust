@@ -472,8 +472,10 @@ fn configure_passthrough_socket(stream: &TcpStream) {
 }
 
 async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Option<String>> {
-    let mut peek_buf = [0u8; 16 * 1024];
-    for _ in 0..20 {
+    let mut peek_buf = [0u8; 64 * 1024];
+    let mut last_size = 0usize;
+    for _ in 0..50 {
+        let _ = tokio::time::timeout(Duration::from_millis(50), client_stream.readable()).await;
         let size = client_stream.peek(&mut peek_buf).await?;
         if size == 0 {
             return Ok(None);
@@ -481,7 +483,10 @@ async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Opti
         match parse_tls_client_hello_sni(&peek_buf[..size]) {
             ClientHelloParse::Found(host) => return Ok(Some(host)),
             ClientHelloParse::NeedMore => {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                if size == last_size {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                last_size = size;
             }
             ClientHelloParse::NotClientHello => return Ok(None),
         }
