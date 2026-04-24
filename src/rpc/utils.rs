@@ -1,3 +1,4 @@
+use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
@@ -40,7 +41,12 @@ pub fn build_runtime_maps(
              let mut set = std::collections::BTreeSet::new();
              set.insert(b);
              let backends = pingora_load_balancing::Backends::new(pingora_load_balancing::discovery::Static::new(set));
-             (Arc::new(LoadBalancer::from_backends(backends)), false)
+             let lb = LoadBalancer::from_backends(backends);
+             lb.update()
+                 .now_or_never()
+                 .expect("static fallback load balancer update should not block")
+                 .expect("static fallback load balancer update should not fail");
+             (Arc::new(lb), false)
         };
         
         if let Some(id) = server.id {

@@ -1,4 +1,5 @@
 use crate::config_models::{ParentNodeConfig, ReverseProxyConfig};
+use futures_util::FutureExt;
 use pingora_load_balancing::{LoadBalancer, health_check, selection::{RoundRobin, Consistent}, Backend, Backends, discovery::Static};
 use http::Extensions;
 use http;
@@ -121,6 +122,10 @@ pub fn build_lb(
     }
     let backends = Backends::new(Static::new(set));
     let mut lb = LoadBalancer::from_backends(backends);
+    lb.update()
+        .now_or_never()
+        .expect("static load balancer update should not block")
+        .expect("static load balancer update should not fail");
 
     // Skip health check if we are in fallback mode
     if is_fallback {
@@ -249,7 +254,12 @@ pub fn build_parent_lb(
         set.insert(e);
     }
     let backends = Backends::new(Static::new(set));
-    Arc::new(LoadBalancer::from_backends(backends))
+    let lb = LoadBalancer::from_backends(backends);
+    lb.update()
+        .now_or_never()
+        .expect("static parent load balancer update should not block")
+        .expect("static parent load balancer update should not fail");
+    Arc::new(lb)
 }
 
 fn is_local_addr(addr: &str) -> bool {

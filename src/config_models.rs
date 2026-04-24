@@ -438,6 +438,16 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    fn normalize_runtime_server_name(name: &str) -> String {
+        let trimmed = name.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(stripped) = lower.strip_suffix("@sni_passthrough") {
+            let prefix_len = stripped.len();
+            return trimmed[..prefix_len].trim_end_matches('@').to_ascii_lowercase();
+        }
+        lower
+    }
+
     pub fn numeric_id(&self) -> i64 {
         self.id.unwrap_or(0)
     }
@@ -446,11 +456,17 @@ impl ServerConfig {
         let mut results = Vec::new();
         for sn in &self.server_names {
             if !sn.name.is_empty() {
-                results.push(sn.name.to_lowercase());
+                let normalized = Self::normalize_runtime_server_name(&sn.name);
+                if !normalized.is_empty() {
+                    results.push(normalized);
+                }
             }
             for ssn in &sn.sub_names {
                 if !ssn.is_empty() {
-                    results.push(ssn.to_lowercase());
+                    let normalized = Self::normalize_runtime_server_name(ssn);
+                    if !normalized.is_empty() {
+                        results.push(normalized);
+                    }
                 }
             }
         }
@@ -458,7 +474,11 @@ impl ServerConfig {
     }
 
     pub fn get_first_host(&self) -> String {
-        self.server_names.first().map(|sn| sn.name.clone()).unwrap_or_else(|| "localhost".to_string())
+        self.server_names
+            .first()
+            .map(|sn| Self::normalize_runtime_server_name(&sn.name))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "localhost".to_string())
     }
 
     pub fn has_valid_traffic_limit(&self) -> bool {
@@ -472,6 +492,13 @@ impl ServerConfig {
         self.description
             .to_ascii_lowercase()
             .contains("@sni_passthrough")
+            || self.server_names.iter().any(|sn| {
+                sn.name.to_ascii_lowercase().contains("@sni_passthrough")
+                    || sn
+                        .sub_names
+                        .iter()
+                        .any(|sub| sub.to_ascii_lowercase().contains("@sni_passthrough"))
+            })
     }
 
     pub fn listens_on_https_port(&self, port: u16) -> bool {

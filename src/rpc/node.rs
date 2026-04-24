@@ -6,6 +6,7 @@ use tonic::transport::Channel;
 use tonic::{Request, Status};
 use tracing::{debug, error, info, warn};
 use std::io::Read;
+use futures_util::FutureExt;
 
 use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
@@ -534,7 +535,12 @@ pub async fn fetch_and_apply_config<F>(
                                         let mut set = std::collections::BTreeSet::new();
                                         set.insert(b);
                                         let backends = pingora_load_balancing::Backends::new(pingora_load_balancing::discovery::Static::new(set));
-                                        (std::sync::Arc::new(pingora_load_balancing::LoadBalancer::from_backends(backends)), false)
+                                        let lb = pingora_load_balancing::LoadBalancer::from_backends(backends);
+                                        lb.update()
+                                            .now_or_never()
+                                            .expect("static fallback load balancer update should not block")
+                                            .expect("static fallback load balancer update should not fail");
+                                        (std::sync::Arc::new(lb), false)
                                     }
                                 };
                                 let server_id = server.numeric_id();

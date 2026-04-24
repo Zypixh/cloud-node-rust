@@ -619,6 +619,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "flate2",
+ "futures-util",
  "governor",
  "h3",
  "h3-quinn",
