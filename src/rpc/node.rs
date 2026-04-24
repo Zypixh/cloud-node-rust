@@ -744,6 +744,9 @@ pub async fn fetch_and_apply_config<F>(
                                 }
                             }
 
+                            let mut loaded_domain_names = std::collections::BTreeSet::new();
+                            let mut port_only_server_count = 0usize;
+
                             for server in &payload.servers {
                                 if !server.is_on {
                                     info!(
@@ -823,6 +826,7 @@ pub async fn fetch_and_apply_config<F>(
                                 }
 
                                 if names.is_empty() {
+                                    port_only_server_count += 1;
                                     if server.http.is_some() || server.https.is_some() {
                                         warn!(
                                             "RPC_NODE: HTTP/HTTPS Server {} has NO server names, only routable via direct port",
@@ -849,6 +853,7 @@ pub async fn fetch_and_apply_config<F>(
                                         names
                                     );
                                     for name in names {
+                                        loaded_domain_names.insert(name.clone());
                                         if let Some(existing) = new_servers.get(&name) {
                                             warn!(
                                                 "RPC_NODE: Host mapping overwrite detected for {}. existing_server_id={} existing_description={:?} new_server_id={} new_description={:?}",
@@ -910,6 +915,24 @@ pub async fn fetch_and_apply_config<F>(
                                         "RPC_NODE: Server {} has NO HTTP config",
                                         server.numeric_id()
                                     );
+                                }
+                            }
+
+                            if loaded_domain_names.is_empty() {
+                                info!(
+                                    "RPC_NODE: Loaded 0 named domains. Port-only servers: {}",
+                                    port_only_server_count
+                                );
+                            } else {
+                                let loaded_names: Vec<_> =
+                                    loaded_domain_names.into_iter().collect();
+                                info!(
+                                    "RPC_NODE: Loaded {} named domains. Port-only servers: {}",
+                                    loaded_names.len(),
+                                    port_only_server_count
+                                );
+                                for chunk in loaded_names.chunks(20) {
+                                    info!("RPC_NODE: Domains => {}", chunk.join(", "));
                                 }
                             }
 

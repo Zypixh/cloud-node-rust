@@ -2310,10 +2310,6 @@ impl ProxyHttp for EdgeProxy {
             &ctx.raw_remote_addr,
             ctx.client_port,
         );
-        let _ = session
-            .req_header_mut()
-            .insert_header("X-Cloud-Resolved-Real-Ip", ctx.client_ip.to_string());
-
         if let Some(user_agent) = session
             .get_header("user-agent")
             .and_then(|v| v.to_str().ok())
@@ -3505,7 +3501,7 @@ impl ProxyHttp for EdgeProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         let global_cfg = self.config.get_global_http_config_sync();
-        upstream_request.headers.remove("x-cloud-resolved-real-ip");
+        upstream_request.remove_header("x-cloud-resolved-real-ip");
 
         // 1. Automatic Gzip Back to Origin
         if global_cfg.request_origins_with_encodings {

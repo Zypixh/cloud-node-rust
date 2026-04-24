@@ -293,7 +293,11 @@ impl HttpProxyManager {
                             (Box::new(s), alpn)
                         }
                         Err(e) => {
-                            error!("TLS handshake failed: {}", e);
+                            if is_benign_tls_accept_error(&e.to_string()) {
+                                debug!("TLS handshake closed early: {}", e);
+                            } else {
+                                error!("TLS handshake failed: {}", e);
+                            }
                             return;
                         }
                     }
@@ -318,13 +322,23 @@ impl HttpProxyManager {
                                     }
                                     Ok(None) => break, // Connection closed
                                     Err(e) => {
-                                        error!("HTTP/2 session error: {}", e);
+                                        if is_benign_h2_error(&e.to_string()) {
+                                            debug!("HTTP/2 session ended early: {}", e);
+                                        } else {
+                                            error!("HTTP/2 session error: {}", e);
+                                        }
                                         break;
                                     }
                                 }
                             }
                         }
-                        Err(e) => error!("HTTP/2 handshake error: {}", e),
+                        Err(e) => {
+                            if is_benign_h2_error(&e.to_string()) {
+                                debug!("HTTP/2 handshake ended early: {}", e);
+                            } else {
+                                error!("HTTP/2 handshake error: {}", e);
+                            }
+                        }
                     }
                 } else {
                     // HTTP/1.1 Logic
@@ -566,6 +580,20 @@ impl HttpProxyManager {
         })?;
         Ok(normalize_passthrough_target(&peer.addr.to_string()))
     }
+}
+
+fn is_benign_tls_accept_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unexpected eof")
+        || lower.contains("connection closed")
+        || lower.contains("tls accept() failed: unexpected eof")
+}
+
+fn is_benign_h2_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("closed before reading preface")
+        || lower.contains("connection reset")
+        || lower.contains("unexpected frame type")
 }
 
 fn normalize_passthrough_target(raw: &str) -> String {
