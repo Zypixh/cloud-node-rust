@@ -473,59 +473,73 @@ fn configure_passthrough_socket(stream: &TcpStream) {
 
 async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Option<String>> {
     let mut peek_buf = [0u8; 16 * 1024];
-    for _ in 0..5 {
+    for _ in 0..20 {
         let size = client_stream.peek(&mut peek_buf).await?;
         if size == 0 {
             return Ok(None);
         }
-        if let Some(host) = parse_tls_client_hello_sni(&peek_buf[..size]) {
-            return Ok(Some(host));
-        }
-
-        if let Some(expected) = expected_tls_record_len(&peek_buf[..size]) {
-            if size >= expected {
-                return Ok(None);
+        match parse_tls_client_hello_sni(&peek_buf[..size]) {
+            ClientHelloParse::Found(host) => return Ok(Some(host)),
+            ClientHelloParse::NeedMore => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        } else {
-            return Ok(None);
+            ClientHelloParse::NotClientHello => return Ok(None),
         }
-
-        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     Ok(None)
 }
 
-fn expected_tls_record_len(buf: &[u8]) -> Option<usize> {
-    if buf.is_empty() {
-        return Some(1);
-    }
-    if buf.len() < 5 {
-        return Some(5);
-    }
-    if buf[0] != 22 {
-        return None;
-    }
-    let record_len = usize::from(u16::from_be_bytes([buf[3], buf[4]]));
-    Some(5 + record_len)
+enum ClientHelloParse {
+    Found(String),
+    NeedMore,
+    NotClientHello,
 }
 
-fn parse_tls_client_hello_sni(buf: &[u8]) -> Option<String> {
-    if buf.len() < 5 || buf[0] != 22 {
-        return None;
-    }
-    let record_len = usize::from(u16::from_be_bytes([buf[3], buf[4]]));
-    if buf.len() < 5 + record_len || record_len < 4 {
-        return None;
+fn parse_tls_client_hello_sni(buf: &[u8]) -> ClientHelloParse {
+    if buf.len() < 5 {
+        return ClientHelloParse::NeedMore;
     }
 
-    let handshake = &buf[5..5 + record_len];
-    if handshake.first().copied()? != 1 {
-        return None;
+    let mut pos = 0usize;
+    let mut handshake = Vec::new();
+    let mut hello_len = None;
+
+    while pos + 5 <= buf.len() {
+        if buf[pos] != 22 {
+            return if handshake.is_empty() {
+                ClientHelloParse::NotClientHello
+            } else {
+                ClientHelloParse::NeedMore
+            };
+        }
+
+        let record_len = usize::from(u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]));
+        if buf.len() < pos + 5 + record_len {
+            return ClientHelloParse::NeedMore;
+        }
+
+        handshake.extend_from_slice(&buf[pos + 5..pos + 5 + record_len]);
+        pos += 5 + record_len;
+
+        if handshake.len() >= 4 {
+            if handshake[0] != 1 {
+                return ClientHelloParse::NotClientHello;
+            }
+            let parsed_len = ((usize::from(handshake[1])) << 16)
+                | ((usize::from(handshake[2])) << 8)
+                | usize::from(handshake[3]);
+            hello_len = Some(parsed_len);
+            if handshake.len() >= 4 + parsed_len {
+                break;
+            }
+        }
     }
-    let hello_len =
-        ((usize::from(handshake[1])) << 16) | ((usize::from(handshake[2])) << 8) | usize::from(handshake[3]);
+
+    let Some(hello_len) = hello_len else {
+        return ClientHelloParse::NeedMore;
+    };
     if handshake.len() < 4 + hello_len {
-        return None;
+        return ClientHelloParse::NeedMore;
     }
 
     let hello = &handshake[4..4 + hello_len];
@@ -534,27 +548,27 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> Option<String> {
     pos += 2; // legacy_version
     pos += 32; // random
     if hello.len() < pos + 1 {
-        return None;
+        return ClientHelloParse::NotClientHello;
     }
     let session_len = usize::from(hello[pos]);
     pos += 1 + session_len;
     if hello.len() < pos + 2 {
-        return None;
+        return ClientHelloParse::NotClientHello;
     }
     let cipher_len = usize::from(u16::from_be_bytes([hello[pos], hello[pos + 1]]));
     pos += 2 + cipher_len;
     if hello.len() < pos + 1 {
-        return None;
+        return ClientHelloParse::NotClientHello;
     }
     let compression_len = usize::from(hello[pos]);
     pos += 1 + compression_len;
     if hello.len() < pos + 2 {
-        return None;
+        return ClientHelloParse::NotClientHello;
     }
     let extensions_len = usize::from(u16::from_be_bytes([hello[pos], hello[pos + 1]]));
     pos += 2;
     if hello.len() < pos + extensions_len {
-        return None;
+        return ClientHelloParse::NotClientHello;
     }
 
     let extensions = &hello[pos..pos + extensions_len];
@@ -567,16 +581,16 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> Option<String> {
         ]));
         ext_pos += 4;
         if extensions.len() < ext_pos + ext_len {
-            return None;
+            return ClientHelloParse::NotClientHello;
         }
         if ext_type == 0 {
             let ext = &extensions[ext_pos..ext_pos + ext_len];
             if ext.len() < 2 {
-                return None;
+                return ClientHelloParse::NotClientHello;
             }
             let list_len = usize::from(u16::from_be_bytes([ext[0], ext[1]]));
             if ext.len() < 2 + list_len {
-                return None;
+                return ClientHelloParse::NotClientHello;
             }
             let mut name_pos = 2usize;
             while name_pos + 3 <= 2 + list_len {
@@ -587,16 +601,21 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> Option<String> {
                 ]));
                 name_pos += 3;
                 if ext.len() < name_pos + name_len {
-                    return None;
+                    return ClientHelloParse::NotClientHello;
                 }
                 if name_type == 0 {
-                    let host = std::str::from_utf8(&ext[name_pos..name_pos + name_len]).ok()?;
-                    return Some(host.to_ascii_lowercase());
+                    let Some(host) = std::str::from_utf8(&ext[name_pos..name_pos + name_len])
+                        .ok()
+                        .map(|host| host.to_ascii_lowercase())
+                    else {
+                        return ClientHelloParse::NotClientHello;
+                    };
+                    return ClientHelloParse::Found(host);
                 }
                 name_pos += name_len;
             }
         }
         ext_pos += ext_len;
     }
-    None
+    ClientHelloParse::NotClientHello
 }

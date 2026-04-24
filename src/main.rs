@@ -240,6 +240,9 @@ fn run_node() -> anyhow::Result<()> {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    auto_tune_kernel_params();
+
     // Create the runtime to spawn background tasks
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -394,4 +397,79 @@ fn run_node() -> anyhow::Result<()> {
     my_server.run_forever();
     #[allow(unreachable_code)]
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn auto_tune_kernel_params() {
+    info!("Starting automatic kernel parameter tuning...");
+
+    let params = [
+        ("net.core.somaxconn", "32768"),
+        ("net.ipv4.tcp_max_syn_backlog", "16384"),
+        ("net.core.netdev_max_backlog", "16384"),
+        ("net.ipv4.ip_local_port_range", "1024 65535"),
+        ("net.ipv4.tcp_tw_reuse", "1"),
+        ("net.ipv4.tcp_fin_timeout", "15"),
+        ("net.ipv4.tcp_slow_start_after_idle", "0"),
+        ("net.ipv4.tcp_mtu_probing", "1"),
+    ];
+
+    for (key, target) in params {
+        tune_kernel_param(key, target);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tune_kernel_param(key: &str, target: &str) {
+    let path = format!("/proc/sys/{}", key.replace('.', "/"));
+    let path_ref = std::path::Path::new(&path);
+
+    if !path_ref.exists() {
+        info!("Kernel tuning skipped: {} is not available on this system", key);
+        return;
+    }
+
+    let current = match fs::read_to_string(path_ref) {
+        Ok(value) => value.trim().to_string(),
+        Err(err) => {
+            warn!("Kernel tuning failed to read {}: {}", key, err);
+            return;
+        }
+    };
+
+    if current == target {
+        info!("Kernel tuning already satisfied: {}={}", key, current);
+        return;
+    }
+
+    match fs::write(path_ref, target) {
+        Ok(_) => match fs::read_to_string(path_ref) {
+            Ok(updated) => {
+                let updated = updated.trim().to_string();
+                if updated == target {
+                    info!(
+                        "Kernel tuning applied successfully: {} {} -> {}",
+                        key, current, updated
+                    );
+                } else {
+                    warn!(
+                        "Kernel tuning wrote {} but value is {} (expected {})",
+                        key, updated, target
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "Kernel tuning wrote {} but failed to verify new value: {}",
+                    key, err
+                );
+            }
+        },
+        Err(err) => {
+            warn!(
+                "Kernel tuning failed for {} (current={}, target={}): {}",
+                key, current, target, err
+            );
+        }
+    }
 }
