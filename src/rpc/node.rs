@@ -635,7 +635,7 @@ pub async fn fetch_and_apply_config<F>(
                             }
 
                             config_store.update_config(
-                                numeric_id, config_resp.timestamp, new_servers, new_routes, new_id_to_lb,
+                                numeric_id, config_resp.timestamp, payload.servers.clone(), new_servers, new_routes, new_id_to_lb,
                                 vec![], vec![], payload.metric_items.clone(),
                                 node_level, 
                                 payload.is_on,

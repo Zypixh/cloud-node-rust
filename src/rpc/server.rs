@@ -64,14 +64,15 @@ pub async fn sync_single_server_config(
             match serde_json::from_slice::<ServerConfig>(&payload.server_config_json) {
                 Ok(server) => {
                     let user_id = server.user_id;
-                    let (servers, routes) = build_runtime_maps(vec![server], health_manager);
+                    let runtime_servers = vec![server];
+                    let (servers, routes) = build_runtime_maps(runtime_servers.clone(), health_manager);
                     if user_id > 0 {
                         config_store
-                            .replace_user_servers(user_id, servers, routes)
+                            .replace_user_servers(user_id, runtime_servers, servers, routes)
                             .await;
                     } else {
                         config_store
-                            .replace_server(server_id, servers, routes)
+                            .replace_server(server_id, runtime_servers, servers, routes)
                             .await;
                     }
                     let _ = sync_active_plans(api_config, config_store).await;
@@ -184,9 +185,10 @@ pub async fn sync_user_servers_state(
             log_server_json_hints("servers_config_json", &payload.servers_config_json);
             match serde_json::from_slice::<Vec<ServerConfig>>(&payload.servers_config_json) {
                 Ok(servers) => {
-                    let (servers_map, routes_map) = build_runtime_maps(servers, health_manager);
+                    let runtime_servers = servers;
+                    let (servers_map, routes_map) = build_runtime_maps(runtime_servers.clone(), health_manager);
                     config_store
-                        .replace_user_servers(user_id, servers_map, routes_map)
+                        .replace_user_servers(user_id, runtime_servers, servers_map, routes_map)
                         .await;
                     let _ = sync_active_plans(api_config, config_store).await;
                     true

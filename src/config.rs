@@ -17,6 +17,8 @@ pub struct NodeConfig {
     pub version: i64,
     /// Mapping of Host domain to its server configuration
     pub servers: HashMap<String, ServerConfig>,
+    /// Unique runtime server list preserved independently from host routing map
+    pub all_servers: Vec<ServerConfig>,
     /// Mapping of Host domain to an upstream load balancer
     pub routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
     /// Direct mapping from Server ID to Load Balancer
@@ -89,6 +91,7 @@ impl Default for NodeConfig {
             id: 0,
             version: 0,
             servers: HashMap::new(),
+            all_servers: Vec::new(),
             routes: HashMap::new(),
             id_to_lb: HashMap::new(),
             deleted_contents: Vec::new(),
@@ -235,8 +238,8 @@ impl ConfigStore {
             })
         };
 
-        lock.servers
-            .values()
+        lock.all_servers
+            .iter()
             .find(|server| {
                 server.is_sni_passthrough()
                     && server.listens_on_https_port(port)
@@ -386,15 +389,15 @@ impl ConfigStore {
 
     pub async fn get_server_by_id(&self, server_id: i64) -> Option<ServerConfig> {
         let lock = self.inner.read().unwrap();
-        lock.servers
-            .values()
+        lock.all_servers
+            .iter()
             .find(|server| server.id == Some(server_id))
             .cloned()
     }
 
     pub async fn get_all_servers(&self) -> Vec<ServerConfig> {
         let lock = self.inner.read().unwrap();
-        lock.servers.values().cloned().collect()
+        lock.all_servers.clone()
     }
 
     pub fn get_all_hosts_sync(&self) -> Vec<String> {
@@ -500,6 +503,7 @@ impl ConfigStore {
         &self,
         id: i64,
         version: i64,
+        all_servers: Vec<ServerConfig>,
         servers: HashMap<String, ServerConfig>,
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
         id_to_lb: HashMap<i64, Arc<LoadBalancer<RoundRobin>>>,
@@ -536,6 +540,7 @@ impl ConfigStore {
         let mut lock = self.inner.write().unwrap();
         lock.id = id;
         lock.version = version;
+        lock.all_servers = all_servers;
         lock.servers = servers;
         lock.routes = routes;
         lock.id_to_lb = id_to_lb;
@@ -573,10 +578,13 @@ impl ConfigStore {
     pub async fn replace_server(
         &self, 
         server_id: i64, 
+        all_servers: Vec<ServerConfig>,
         servers: HashMap<String, ServerConfig>, 
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>
     ) {
         let mut lock = self.inner.write().unwrap();
+        lock.all_servers
+            .retain(|server| server.numeric_id() != server_id);
         let stale_hosts = lock
             .servers
             .iter()
@@ -591,6 +599,7 @@ impl ConfigStore {
             lock.id_to_lb.remove(&server_id);
         }
 
+        lock.all_servers.extend(all_servers);
         for (host, config) in servers {
             lock.servers.insert(host, config);
         }
@@ -605,10 +614,12 @@ impl ConfigStore {
     pub async fn replace_user_servers(
         &self, 
         user_id: i64, 
+        all_servers: Vec<ServerConfig>,
         servers: HashMap<String, ServerConfig>, 
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>
     ) {
         let mut lock = self.inner.write().unwrap();
+        lock.all_servers.retain(|server| server.user_id != user_id);
         let stale_hosts = lock
             .servers
             .iter()
@@ -630,6 +641,7 @@ impl ConfigStore {
             }
         }
 
+        lock.all_servers.extend(all_servers);
         for (host, config) in servers {
             if let Some(sid) = config.id {
                 if let Some(lb) = routes.get(&host) {
@@ -645,6 +657,7 @@ impl ConfigStore {
 
     pub async fn remove_user_servers(&self, user_id: i64) {
         let mut lock = self.inner.write().unwrap();
+        lock.all_servers.retain(|server| server.user_id != user_id);
         let stale_hosts = lock
             .servers
             .iter()
@@ -669,6 +682,8 @@ impl ConfigStore {
 
     pub async fn remove_server(&self, server_id: i64) {
         let mut lock = self.inner.write().unwrap();
+        lock.all_servers
+            .retain(|server| server.numeric_id() != server_id);
         let stale_hosts = lock
             .servers
             .iter()
@@ -694,7 +709,10 @@ impl ConfigStore {
         let server_id = server.numeric_id();
         if server_id > 0 {
             lock.id_to_lb.insert(server_id, lb.clone());
+            lock.all_servers
+                .retain(|existing| existing.numeric_id() != server_id);
         }
+        lock.all_servers.push(server.clone());
         lock.servers.insert(host.clone(), server);
         lock.routes.insert(host, lb);
     }
