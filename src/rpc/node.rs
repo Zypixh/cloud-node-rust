@@ -988,21 +988,29 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
             })
             .collect();
 
+        let baseline_items = [
+            "cpu",
+            "memory",
+            "load",
+            "trafficIn",
+            "trafficOut",
+            "allTraffic",
+            "connections",
+            "requests",
+            "attackRequests",
+            "disk",
+        ];
         if selected_items.is_empty() {
-            selected_items = vec![
-                "cpu".to_string(),
-                "memory".to_string(),
-                "load".to_string(),
-                "trafficIn".to_string(),
-                "trafficOut".to_string(),
-                "allTraffic".to_string(),
-                "connections".to_string(),
-                "requests".to_string(),
-                "attackRequests".to_string(),
-                "disk".to_string(),
-            ];
+            selected_items = baseline_items.iter().map(|s| (*s).to_string()).collect();
+        } else {
+            for item in baseline_items {
+                if !selected_items.iter().any(|existing| existing == item) {
+                    selected_items.push(item.to_string());
+                }
+            }
         }
 
+        selected_items.sort();
         selected_items.dedup();
         let created_at = chrono::Utc::now().timestamp();
         let node_value_items: Vec<pb::create_node_values_request::NodeValueItem> = selected_items

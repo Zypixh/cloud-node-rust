@@ -167,74 +167,98 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
 }
 
 pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: ApiConfig) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(BANDWIDTH_REPORT_INTERVAL_SECS));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(BANDWIDTH_SAMPLE_INTERVAL_SECS));
     let mut last_snapshots: HashMap<i64, ServerStatusSnapshot> = HashMap::new();
+    let mut current_window = String::new();
+    let mut window_stats: HashMap<i64, pb::ServerDailyStat> = HashMap::new();
 
     loop {
         interval.tick().await;
         let snapshots = crate::metrics::METRICS.take_snapshots();
-        if snapshots.is_empty() {
-            continue;
-        }
-
         let now = chrono::Local::now();
-        let created_at = now.timestamp();
         let day = now.format("%Y%m%d").to_string();
         let hour = now.format("%H").to_string();
         let minute_floor = (now.minute() / 5) * 5;
         let time_from = format!("{:02}{:02}", now.hour(), minute_floor);
         let time_to = format!("{:02}{:02}", now.hour(), (minute_floor + 4).min(59));
+        let created_at = now
+            .with_second(0)
+            .and_then(|dt| dt.with_minute(minute_floor))
+            .map(|dt| dt.timestamp())
+            .unwrap_or_else(|| now.timestamp());
         let node_region_id = config_store.get_node_region_id().await;
+        let window_key = format!("{}@{}", day, time_from);
 
-        let mut stats = Vec::with_capacity(snapshots.len());
+        if current_window.is_empty() {
+            current_window = window_key.clone();
+        } else if current_window != window_key {
+            let stats: Vec<_> = window_stats.drain().map(|(_, stat)| stat).collect();
+            if !stats.is_empty() {
+                let client = match RpcClient::new(&api_config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Daily stat reporter failed to connect: {}", e);
+                        current_window = window_key;
+                        continue;
+                    }
+                };
+                let mut service = client.daily_stat_service();
+
+                if let Err(e) = service
+                    .upload_server_daily_stats(pb::UploadServerDailyStatsRequest {
+                        stats,
+                        domain_stats: vec![],
+                    })
+                    .await
+                {
+                    error!("Failed to upload daily stats: {}", e);
+                }
+            }
+            current_window = window_key.clone();
+        }
+
         for snap in snapshots {
             let delta = snapshot_delta(&snap, last_snapshots.get(&snap.server_id));
             last_snapshots.insert(snap.server_id, snap);
+            if delta.server_id <= 0 {
+                continue;
+            }
+
             let check_traffic_limiting = config_store
                 .get_server_by_id(delta.server_id)
                 .await
                 .map(|server| server.has_valid_traffic_limit())
                 .unwrap_or(false);
 
-            stats.push(pb::ServerDailyStat {
+            let stat = window_stats.entry(delta.server_id).or_insert_with(|| pb::ServerDailyStat {
                 server_id: delta.server_id,
                 user_id: delta.user_id,
                 node_region_id,
-                bytes: delta.bytes_sent as i64,
-                cached_bytes: delta.cached_bytes as i64,
-                count_requests: delta.total_requests as i64,
-                count_cached_requests: delta.count_cached_requests as i64,
                 created_at,
-                count_attack_requests: delta.count_attack_requests as i64,
-                attack_bytes: delta.attack_bytes as i64,
                 check_traffic_limiting,
                 plan_id: delta.plan_id,
                 day: day.clone(),
                 hour: hour.clone(),
                 time_from: time_from.clone(),
                 time_to: time_to.clone(),
-                count_i_ps: delta.count_ips as i64,
                 ..Default::default()
             });
-        }
-
-        let client = match RpcClient::new(&api_config).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Daily stat reporter failed to connect: {}", e);
-                continue;
-            }
-        };
-        let mut service = client.daily_stat_service();
-
-        if let Err(e) = service
-            .upload_server_daily_stats(pb::UploadServerDailyStatsRequest {
-                stats,
-                domain_stats: vec![],
-            })
-            .await
-        {
-            error!("Failed to upload daily stats: {}", e);
+            stat.user_id = delta.user_id;
+            stat.node_region_id = node_region_id;
+            stat.created_at = created_at;
+            stat.check_traffic_limiting = check_traffic_limiting;
+            stat.plan_id = delta.plan_id;
+            stat.day = day.clone();
+            stat.hour = hour.clone();
+            stat.time_from = time_from.clone();
+            stat.time_to = time_to.clone();
+            stat.bytes += delta.bytes_sent as i64;
+            stat.cached_bytes += delta.cached_bytes as i64;
+            stat.count_requests += delta.total_requests as i64;
+            stat.count_cached_requests += delta.count_cached_requests as i64;
+            stat.count_attack_requests += delta.count_attack_requests as i64;
+            stat.attack_bytes += delta.attack_bytes as i64;
+            stat.count_i_ps = stat.count_i_ps.max(delta.count_ips as i64);
         }
     }
 }
