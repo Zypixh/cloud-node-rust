@@ -59,6 +59,13 @@ struct PerfSample {
     active_connections: i64,
     server_count: usize,
     cache_disk_bytes: u64,
+    cache_disk_count: usize,
+    cache_memory_bytes: u64,
+    cache_memory_count: usize,
+    cache_open_file_handles: usize,
+    cache_policy_type: String,
+    cache_disk_limit_bytes: u64,
+    cache_min_free_bytes: u64,
     top_servers: Vec<TopServer>,
     advice: Vec<Advice>,
 }
@@ -150,7 +157,7 @@ async fn sample_loop(store: SharedStore) {
         } else {
             0.0
         };
-        let cache_disk_bytes = crate::metrics::storage::STORAGE.total_cache_size();
+        let cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
         let cpu_usage = sys.global_cpu_usage() as f64;
         let memory_usage = if memory_total > 0 {
             memory_used as f64 / memory_total as f64
@@ -187,7 +194,14 @@ async fn sample_loop(store: SharedStore) {
             request_per_sec,
             active_connections,
             server_count: snapshots.len(),
-            cache_disk_bytes,
+            cache_disk_bytes: cache_stats.disk_bytes,
+            cache_disk_count: cache_stats.disk_count,
+            cache_memory_bytes: cache_stats.memory_bytes,
+            cache_memory_count: cache_stats.memory_count,
+            cache_open_file_handles: cache_stats.open_file_cache_count,
+            cache_policy_type: cache_stats.policy_type,
+            cache_disk_limit_bytes: cache_stats.max_disk_bytes,
+            cache_min_free_bytes: cache_stats.min_free_bytes,
             top_servers,
             advice: build_advice(
                 cpu_usage,
@@ -198,7 +212,7 @@ async fn sample_loop(store: SharedStore) {
                 active_connections,
                 request_per_sec,
                 traffic_in_bps + traffic_out_bps,
-                cache_disk_bytes,
+                cache_stats.disk_bytes,
                 disk_total,
             ),
         };
@@ -452,6 +466,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
     .value { font-size:28px; font-weight:750; margin-top:10px; letter-spacing:0; white-space:nowrap; }
     .hint { color:var(--muted); font-size:12px; margin-top:6px; }
+    .mini-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:10px; }
+    .mini { border:1px solid var(--line); border-radius:8px; padding:12px; background:rgba(255,255,255,.03); min-height:78px; }
+    .mini .label { font-size:11px; }
+    .mini .value { font-size:20px; margin-top:6px; }
     .wide { grid-column:span 3; }
     .full { grid-column:span 6; }
     .chart { height:280px; margin-top:12px; position:relative; }
@@ -470,7 +488,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .pill.critical { border-color:rgba(255,122,122,.65); }
     .pill h3 { margin:0 0 6px; font-size:14px; }
     .pill p { margin:0; color:var(--muted); font-size:12px; line-height:1.5; }
-    @media (max-width: 1000px) { .grid { grid-template-columns:1fr; } .wide,.full { grid-column:span 1; } header { flex-direction:column; } .advice { grid-template-columns:1fr; } }
+    @media (max-width: 1000px) { .grid { grid-template-columns:1fr; } .wide,.full { grid-column:span 1; } header { flex-direction:column; } .advice { grid-template-columns:1fr; } .mini-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   </style>
 </head>
 <body>
@@ -496,6 +514,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div class="card wide"><div class="label">CPU / 内存 / 磁盘 %</div><div class="chart"><canvas id="resource"></canvas></div></div>
     <div class="card wide"><div class="label">请求/s</div><div class="chart"><canvas id="requests"></canvas></div></div>
     <div class="card wide"><div class="label">连接数</div><div class="chart"><canvas id="connections"></canvas></div></div>
+    <div class="card full"><div class="label">缓存概览</div><div class="mini-grid">
+      <div class="mini"><div class="label">Disk Cache Files</div><div class="value" id="cacheDiskCount">-</div><div class="hint" id="cacheDiskSize">-</div></div>
+      <div class="mini"><div class="label">Memory Cache Items</div><div class="value" id="cacheMemoryCount">-</div><div class="hint" id="cacheMemorySize">-</div></div>
+      <div class="mini"><div class="label">Open File Cache</div><div class="value" id="cacheOpenFiles">-</div><div class="hint" id="cachePolicy">-</div></div>
+      <div class="mini"><div class="label">Disk Cache Limit</div><div class="value" id="cacheLimit">-</div><div class="hint" id="cacheMinFree">-</div></div>
+    </div></div>
     <div class="card full"><div class="label">优化建议</div><div class="advice" id="advice"></div></div>
     <div class="card full"><div class="label">Top Server</div><table><thead><tr><th>Server</th><th>Requests</th><th>Total</th><th>Out</th><th>In</th><th>Origin</th><th>Conns</th><th>Cache Hits</th><th>Attacks</th></tr></thead><tbody id="topServers"></tbody></table></div>
   </section>
@@ -622,13 +646,21 @@ async function refresh() {
   $('cpu').textContent = last.cpu_usage.toFixed(1)+'%';
   $('load').textContent = `load ${last.load1m.toFixed(2)} / ${last.load5m.toFixed(2)} / ${last.load15m.toFixed(2)} · ${last.cpu_count} cores`;
   $('mem').textContent = pct(last.memory_usage);
-  $('memBytes').textContent = `${fmtBytes(last.memory_used)} / ${fmtBytes(last.memory_total)} · cache ${fmtBytes(last.cache_disk_bytes)}`;
+  $('memBytes').textContent = `${fmtBytes(last.memory_used)} / ${fmtBytes(last.memory_total)} · cache ${fmtBytes(last.cache_disk_bytes + last.cache_memory_bytes)}`;
   $('out').textContent = fmtBytes(last.traffic_out_bps)+'/s';
   $('in').textContent = fmtBytes(last.traffic_in_bps)+'/s';
   $('rps').textContent = last.request_per_sec.toFixed(1)+'/s';
   $('totalReq').textContent = `total ${last.total_requests}`;
   $('conn').textContent = last.active_connections;
   $('servers').textContent = `${last.server_count} servers · uptime ${Math.floor(last.uptime_seconds/60)}m`;
+  $('cacheDiskCount').textContent = last.cache_disk_count.toLocaleString();
+  $('cacheDiskSize').textContent = fmtBytes(last.cache_disk_bytes);
+  $('cacheMemoryCount').textContent = last.cache_memory_count.toLocaleString();
+  $('cacheMemorySize').textContent = fmtBytes(last.cache_memory_bytes);
+  $('cacheOpenFiles').textContent = last.cache_open_file_handles.toLocaleString();
+  $('cachePolicy').textContent = `policy ${last.cache_policy_type || '-'}`;
+  $('cacheLimit').textContent = fmtBytes(last.cache_disk_limit_bytes);
+  $('cacheMinFree').textContent = `min free ${fmtBytes(last.cache_min_free_bytes)}`;
   drawChart($('traffic'), [{name:'Out', color:'#56d68f', data:data.map(x=>x.traffic_out_bps)}, {name:'In', color:'#f5bd68', data:data.map(x=>x.traffic_in_bps)}], {unit:'Bytes/s', format:'bytes', samples:data});
   drawChart($('resource'), [{name:'CPU', color:'#56d68f', data:data.map(x=>x.cpu_usage)}, {name:'Memory', color:'#79b7ff', data:data.map(x=>x.memory_usage*100)}, {name:'Disk', color:'#f5bd68', data:data.map(x=>x.disk_usage*100)}], {unit:'Percent', format:'percent', max:100, samples:data});
   drawChart($('requests'), [{name:'Requests/s', color:'#f5bd68', data:data.map(x=>x.request_per_sec)}], {unit:'Requests/s', format:'number', samples:data});

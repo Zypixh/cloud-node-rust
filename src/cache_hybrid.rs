@@ -484,6 +484,17 @@ pub struct HybridStorage {
     pub policy_type: Arc<RwLock<String>>,
 }
 
+pub struct CacheRuntimeStats {
+    pub policy_type: String,
+    pub memory_count: usize,
+    pub memory_bytes: u64,
+    pub disk_count: usize,
+    pub disk_bytes: u64,
+    pub open_file_cache_count: usize,
+    pub max_disk_bytes: u64,
+    pub min_free_bytes: u64,
+}
+
 impl HybridStorage {
     pub fn new(_max_mem_bytes: usize, disk_root: impl Into<PathBuf>) -> Self {
         let l1 = MemCache::new();
@@ -646,6 +657,25 @@ impl HybridStorage {
             deleted_count, prefix
         );
         true
+    }
+
+    pub async fn runtime_stats(&self) -> CacheRuntimeStats {
+        let (memory_count, memory_bytes) = self.l1.stats();
+        let (disk_count, disk_bytes) = crate::metrics::storage::STORAGE.cache_summary();
+        CacheRuntimeStats {
+            policy_type: self.policy_type.read().await.clone(),
+            memory_count,
+            memory_bytes: memory_bytes as u64,
+            disk_count,
+            disk_bytes,
+            open_file_cache_count: OPEN_FILE_CACHE.len(),
+            max_disk_bytes: self
+                .max_disk_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            min_free_bytes: self
+                .min_free_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 }
 

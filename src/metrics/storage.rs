@@ -201,9 +201,18 @@ impl MetricStorage {
     }
 
     pub fn total_cache_size(&self) -> u64 {
-        let mut total = 0u64;
+        self.cache_summary().1
+    }
+
+    pub fn total_cache_count(&self) -> usize {
+        self.cache_summary().0
+    }
+
+    pub fn cache_summary(&self) -> (usize, u64) {
+        let mut count = 0usize;
+        let mut size = 0u64;
         let Some(db) = &self.db else {
-            return 0;
+            return (0, 0);
         };
 
         let iter = db.prefix_iterator("CMETA_".as_bytes());
@@ -213,26 +222,11 @@ impl MetricStorage {
                 break;
             }
             if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
-                total += meta["s"].as_u64().unwrap_or(0);
+                count += 1;
+                size += meta["s"].as_u64().unwrap_or(0);
             }
         }
-        total
-    }
-
-    pub fn total_cache_count(&self) -> usize {
-        let mut count = 0usize;
-        let Some(db) = &self.db else {
-            return 0;
-        };
-        let iter = db.prefix_iterator("CMETA_".as_bytes());
-        for (key, _) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key).to_string();
-            if !key_str.starts_with("CMETA_") {
-                break;
-            }
-            count += 1;
-        }
-        count
+        (count, size)
     }
 
     pub fn get_value(&self, key: &str) -> u64 {

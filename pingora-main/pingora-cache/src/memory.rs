@@ -20,7 +20,7 @@
 
 use super::*;
 use crate::key::CompactCacheKey;
-use crate::storage::{streaming_write::U64WriteId, HandleHit, HandleMiss};
+use crate::storage::{HandleHit, HandleMiss, streaming_write::U64WriteId};
 use crate::trace::SpanHandle;
 
 use async_trait::async_trait;
@@ -29,8 +29,8 @@ use parking_lot::RwLock;
 use pingora_error::*;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 
 type BinaryMeta = (Vec<u8>, Vec<u8>);
@@ -81,6 +81,13 @@ impl MemCache {
             temp: Arc::new(RwLock::new(HashMap::new())),
             last_temp_id: AtomicU64::new(0),
         }
+    }
+
+    /// Return the number of completed in-memory cache entries and their body bytes.
+    pub fn stats(&self) -> (usize, usize) {
+        let cached = self.cached.read();
+        let bytes = cached.values().map(|obj| obj.body.len()).sum();
+        (cached.len(), bytes)
     }
 }
 
