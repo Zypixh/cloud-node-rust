@@ -119,23 +119,27 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     let request_started_local: DateTime<FixedOffset> =
         crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
 
-        let is_tls = session.downstream_session.digest().and_then(|d| d.ssl_digest.as_ref()).is_some();
-        let scheme = if is_tls || req.uri.scheme_str() == Some("https") { "https".to_string() } else { "http".to_string() };
-        
-        let mut log = pb::HttpAccessLog {
-            request_id: ctx.request_id.clone(),
-            server_id,
-            node_id: NUMERIC_NODE_ID.load(Ordering::Relaxed),
-            remote_addr: real_ip_str,
-            raw_remote_addr: raw_socket_addr,
-            remote_port: ctx.client_port as i32,
-            request_uri: req.uri.path_and_query().map(|pq| pq.as_str().to_string()).unwrap_or_else(|| "/".to_string()),
-            request_path: req.uri.path().to_string(),
-            request_method: req.method.to_string(),
-            request_length: bytes_received,
-            request_time: ctx.start_time.elapsed().as_secs_f64(),
-            scheme: scheme.clone(),
-            proto: proto.to_string(),
+    let is_cached = ctx.cache_hit.unwrap_or(false);
+    let final_request_line = if is_cached {
+        format!("[cache hit] {}", request_line)
+    } else {
+        request_line
+    };
+
+    let mut log = pb::HttpAccessLog {
+        request_id: ctx.request_id.clone(),
+        server_id,
+        node_id: NUMERIC_NODE_ID.load(Ordering::Relaxed),
+        remote_addr: real_ip_str,
+        raw_remote_addr: raw_socket_addr,
+        remote_port: ctx.client_port as i32,
+        request_uri: req.uri.path_and_query().map(|pq| pq.as_str().to_string()).unwrap_or_else(|| "/".to_string()),
+        request_path: req.uri.path().to_string(),
+        request_method: req.method.to_string(),
+        request_length: bytes_received,
+        request_time: ctx.start_time.elapsed().as_secs_f64(),
+        scheme: scheme.clone(),
+        proto: proto.to_string(),
         status: ctx.response_status as i32,
         status_message: String::new(),
         bytes_sent,
@@ -143,7 +147,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         host: host.to_string(),
         user_agent: user_agent.to_string(),
         referer: req.headers.get("referer").and_then(|v| v.to_str().ok()).unwrap_or("").to_string(),
-        request: request_line,
+        request: final_request_line,
         timestamp: request_started_at,
         msec: request_started_at_millis as f64 / 1000.0,
         time_iso8601: request_started_local.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
@@ -152,6 +156,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         origin_address: ctx.origin_address.clone(),
         origin_status: ctx.origin_status,
         origin_header_response_time: ctx.ttfb.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+        cache_hit: is_cached,
         ..Default::default()
     };
 
