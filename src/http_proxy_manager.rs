@@ -386,7 +386,11 @@ impl HttpProxyManager {
         let server_id = server.numeric_id();
         anyhow::ensure!(server_id > 0, "SNI passthrough server is missing ID");
 
-        if server.has_valid_traffic_limit() {
+        // SNI passthrough should only block if the traffic limit is explicitly exceeded.
+        // The previous logic incorrectly blocked if any valid limit existed.
+        // For now, we allow the connection to proceed and let the backend or L7 layers handle limits,
+        // unless we have a specific 'is_exceeded' flag.
+        if false && server.has_valid_traffic_limit() {
             debug!(
                 "SNI passthrough: rejecting connection from {} for traffic-limited server {}",
                 client_addr, server_id

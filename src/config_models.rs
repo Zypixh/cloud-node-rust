@@ -644,16 +644,15 @@ impl ServerConfig {
     }
 
     pub fn is_sni_passthrough(&self) -> bool {
-        self.description
-            .to_ascii_lowercase()
-            .contains("@sni_passthrough")
-            || self.server_names.iter().any(|sn| {
-                sn.name.to_ascii_lowercase().contains("@sni_passthrough")
-                    || sn
-                        .sub_names
-                        .iter()
-                        .any(|sub| sub.to_ascii_lowercase().contains("@sni_passthrough"))
-            })
+        // ONLY match if domain name specifically ends with @sni_passthrough
+        // DO NOT match description to avoid accidental activation
+        self.server_names.iter().any(|sn| {
+            sn.name.to_ascii_lowercase().ends_with("@sni_passthrough")
+                || sn
+                    .sub_names
+                    .iter()
+                    .any(|sub| sub.to_ascii_lowercase().ends_with("@sni_passthrough"))
+        })
     }
 
     pub fn listens_on_https_port(&self, port: u16) -> bool {
