@@ -187,12 +187,6 @@ impl HttpProxyManager {
                         .await
                     {
                         Ok(Some(server)) => {
-                            info!(
-                                "SNI passthrough matched host={} port={} server_id={}",
-                                server.get_first_host(),
-                                port,
-                                server.numeric_id()
-                            );
                             if let Err(err) = manager
                                 .handle_sni_passthrough(client_stream, client_addr, server)
                                 .await
@@ -474,11 +468,40 @@ fn configure_passthrough_socket(stream: &TcpStream) {
 
 async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Option<String>> {
     let mut peek_buf = [0u8; 16 * 1024];
-    let size = client_stream.peek(&mut peek_buf).await?;
-    if size == 0 {
-        return Ok(None);
+    for _ in 0..5 {
+        let size = client_stream.peek(&mut peek_buf).await?;
+        if size == 0 {
+            return Ok(None);
+        }
+        if let Some(host) = parse_tls_client_hello_sni(&peek_buf[..size]) {
+            return Ok(Some(host));
+        }
+
+        if let Some(expected) = expected_tls_record_len(&peek_buf[..size]) {
+            if size >= expected {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        }
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    Ok(parse_tls_client_hello_sni(&peek_buf[..size]))
+    Ok(None)
+}
+
+fn expected_tls_record_len(buf: &[u8]) -> Option<usize> {
+    if buf.is_empty() {
+        return Some(1);
+    }
+    if buf.len() < 5 {
+        return Some(5);
+    }
+    if buf[0] != 22 {
+        return None;
+    }
+    let record_len = usize::from(u16::from_be_bytes([buf[3], buf[4]]));
+    Some(5 + record_len)
 }
 
 fn parse_tls_client_hello_sni(buf: &[u8]) -> Option<String> {
