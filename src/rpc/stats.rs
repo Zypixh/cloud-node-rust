@@ -1,8 +1,8 @@
 use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
+use crate::metrics::ServerStatusSnapshot;
 use crate::pb;
 use crate::rpc::client::RpcClient;
-use crate::metrics::ServerStatusSnapshot;
 use chrono::{Datelike, Duration as ChronoDuration, Timelike};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,7 +39,10 @@ struct PendingBandwidthStat {
     stat: pb::ServerBandwidthStat,
 }
 
-fn snapshot_delta(current: &ServerStatusSnapshot, last: Option<&ServerStatusSnapshot>) -> ServerStatusSnapshot {
+fn snapshot_delta(
+    current: &ServerStatusSnapshot,
+    last: Option<&ServerStatusSnapshot>,
+) -> ServerStatusSnapshot {
     let delta = |field: fn(&ServerStatusSnapshot) -> u64| -> u64 {
         let current_value = field(current);
         let last_value = last.map(field).unwrap_or(0);
@@ -67,7 +70,9 @@ fn snapshot_delta(current: &ServerStatusSnapshot, last: Option<&ServerStatusSnap
 }
 
 pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: ApiConfig) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(BANDWIDTH_SAMPLE_INTERVAL_SECS));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        BANDWIDTH_SAMPLE_INTERVAL_SECS,
+    ));
     let mut last_snapshots: HashMap<i64, ServerStatusSnapshot> = HashMap::new();
     let mut current_window = String::new();
     let mut window_stats: HashMap<i64, BandwidthWindowStat> = HashMap::new();
@@ -114,7 +119,8 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
                     origin_total_bytes: stat.origin_total_bytes as i64,
                     origin_avg_bytes: stat.origin_avg_bytes as i64,
                     origin_avg_bits: stat.origin_avg_bits as i64,
-                    count_i_ps: crate::metrics::daily::UNIQUE_IP_TRACKER.count(stat.server_id, &stat.day),
+                    count_i_ps:
+                        crate::metrics::daily::UNIQUE_IP_TRACKER.count(stat.server_id, &stat.day),
                     node_region_id,
                     ..Default::default()
                 },
@@ -158,14 +164,16 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
 
             let origin_total_bytes = delta.origin_bytes_received + delta.origin_bytes_sent;
             let peak_bytes_per_sec = delta.bytes_sent / BANDWIDTH_SAMPLE_INTERVAL_SECS;
-            let stat = window_stats.entry(delta.server_id).or_insert_with(|| BandwidthWindowStat {
-                day: day.clone(),
-                time_at: time_at.clone(),
-                user_id: delta.user_id,
-                server_id: delta.server_id,
-                user_plan_id: delta.user_plan_id,
-                ..Default::default()
-            });
+            let stat = window_stats
+                .entry(delta.server_id)
+                .or_insert_with(|| BandwidthWindowStat {
+                    day: day.clone(),
+                    time_at: time_at.clone(),
+                    user_id: delta.user_id,
+                    server_id: delta.server_id,
+                    user_plan_id: delta.user_plan_id,
+                    ..Default::default()
+                });
             stat.user_id = delta.user_id;
             stat.user_plan_id = delta.user_plan_id;
             stat.peak_bytes_per_sec = stat.peak_bytes_per_sec.max(peak_bytes_per_sec);
@@ -185,12 +193,15 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
 }
 
 pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: ApiConfig) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(BANDWIDTH_SAMPLE_INTERVAL_SECS));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        BANDWIDTH_SAMPLE_INTERVAL_SECS,
+    ));
     let mut last_snapshots: HashMap<i64, ServerStatusSnapshot> = HashMap::new();
     let mut current_window = String::new();
     let mut window_stats: HashMap<i64, pb::ServerDailyStat> = HashMap::new();
     let mut pending_stats: Vec<pb::ServerDailyStat> = Vec::new();
-    let mut pending_domain_stats: Vec<pb::upload_server_daily_stats_request::DomainStat> = Vec::new();
+    let mut pending_domain_stats: Vec<pb::upload_server_daily_stats_request::DomainStat> =
+        Vec::new();
 
     loop {
         interval.tick().await;
@@ -215,7 +226,8 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
 
             let now_ts = crate::utils::time::now_timestamp();
             pending_stats.retain(|item| now_ts - item.created_at <= STAT_RETRY_RETENTION_SECS);
-            pending_domain_stats.retain(|item| now_ts - item.created_at <= STAT_RETRY_RETENTION_SECS);
+            pending_domain_stats
+                .retain(|item| now_ts - item.created_at <= STAT_RETRY_RETENTION_SECS);
 
             let mut stats: Vec<_> = pending_stats.clone();
             stats.extend(window_stats.drain().map(|(_, mut stat)| {
@@ -302,15 +314,17 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
                 .map(|server| server.has_valid_traffic_limit())
                 .unwrap_or(false);
 
-            let stat = window_stats.entry(delta.server_id).or_insert_with(|| pb::ServerDailyStat {
-                server_id: delta.server_id,
-                user_id: delta.user_id,
-                node_region_id,
-                created_at,
-                check_traffic_limiting,
-                plan_id: delta.plan_id,
-                ..Default::default()
-            });
+            let stat = window_stats
+                .entry(delta.server_id)
+                .or_insert_with(|| pb::ServerDailyStat {
+                    server_id: delta.server_id,
+                    user_id: delta.user_id,
+                    node_region_id,
+                    created_at,
+                    check_traffic_limiting,
+                    plan_id: delta.plan_id,
+                    ..Default::default()
+                });
             stat.user_id = delta.user_id;
             stat.node_region_id = node_region_id;
             stat.created_at = created_at;
@@ -452,10 +466,11 @@ pub async fn start_metric_stat_reporter(
                     // Check cache for keep_keys optimization
                     let cache_key = format!("{}_{}", item.id, hash);
                     if let Some(&old_val) = values_cache.get(&cache_key)
-                        && (val - old_val).abs() < 0.001 {
-                            keep_keys.push(hash);
-                            continue;
-                        }
+                        && (val - old_val).abs() < 0.001
+                    {
+                        keep_keys.push(hash);
+                        continue;
+                    }
 
                     values_cache.insert(cache_key, val);
 
@@ -490,7 +505,7 @@ pub async fn start_metric_stat_reporter(
     }
 }
 
-use std::sync::atomic::{AtomicI32, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static LAST_NODE_LEVEL: AtomicI32 = AtomicI32::new(-1);
 static LAST_HAS_PARENTS: AtomicBool = AtomicBool::new(false);
@@ -518,20 +533,20 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
             Ok(resp) => {
                 let info = resp.into_inner();
                 let has_parents = !info.parent_nodes_map_json.is_empty();
-                
-                if info.level != LAST_NODE_LEVEL.load(Ordering::Relaxed) || has_parents != LAST_HAS_PARENTS.load(Ordering::Relaxed) {
+
+                if info.level != LAST_NODE_LEVEL.load(Ordering::Relaxed)
+                    || has_parents != LAST_HAS_PARENTS.load(Ordering::Relaxed)
+                {
                     LAST_NODE_LEVEL.store(info.level, Ordering::Relaxed);
                     LAST_HAS_PARENTS.store(has_parents, Ordering::Relaxed);
                     info!(
                         "Node Level identified: {}, Parents: {}",
-                        info.level,
-                        has_parents
+                        info.level, has_parents
                     );
                 } else {
                     debug!(
                         "Node Level verified: {}, Parents: {}",
-                        info.level,
-                        has_parents
+                        info.level, has_parents
                     );
                 }
             }

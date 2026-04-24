@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use chrono::{DateTime, FixedOffset, Local, TimeZone, Utc};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
 // We store the offset in SECONDS for maximum speed (raw integer math)
 pub static TIME_OFFSET_SECONDS: AtomicI64 = AtomicI64::new(0);
@@ -40,7 +40,11 @@ pub fn now_local() -> DateTime<FixedOffset> {
     // Reuse cached TZ offset (default +0800)
     let tz = FixedOffset::east_opt(LOCAL_TZ_OFFSET_SECONDS.load(Ordering::Relaxed))
         .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
-    tz.from_utc_datetime(&DateTime::from_timestamp(now_timestamp(), 0).unwrap().naive_utc())
+    tz.from_utc_datetime(
+        &DateTime::from_timestamp(now_timestamp(), 0)
+            .unwrap()
+            .naive_utc(),
+    )
 }
 
 #[inline]

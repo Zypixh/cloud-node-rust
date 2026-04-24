@@ -34,12 +34,15 @@ impl WriteCacheMessage {
     fn get_value_bytes(&self) -> Vec<u8> {
         match &self.value {
             serde_json::Value::String(s) => {
-                use base64::{engine::general_purpose, Engine as _};
-                general_purpose::STANDARD.decode(s).unwrap_or_else(|_| s.as_bytes().to_vec())
+                use base64::{Engine as _, engine::general_purpose};
+                general_purpose::STANDARD
+                    .decode(s)
+                    .unwrap_or_else(|_| s.as_bytes().to_vec())
             }
-            serde_json::Value::Array(arr) => {
-                arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()
-            }
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                .collect(),
             _ => vec![],
         }
     }
@@ -56,7 +59,10 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
         let client = match RpcClient::new(&api_config).await {
             Ok(c) => c,
             Err(e) => {
-                error!("Failed to connect to API node for stream: {}. Retrying in 10s...", e);
+                error!(
+                    "Failed to connect to API node for stream: {}. Retrying in 10s...",
+                    e
+                );
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
@@ -69,7 +75,11 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
     }
 }
 
-async fn run_stream(client: RpcClient, api_config: &ApiConfig, config_store: Arc<ConfigStore>) -> anyhow::Result<()> {
+async fn run_stream(
+    client: RpcClient,
+    api_config: &ApiConfig,
+    config_store: Arc<ConfigStore>,
+) -> anyhow::Result<()> {
     let connected_endpoints = api_config.effective_rpc_endpoints();
     let (tx, rx) = mpsc::channel(100);
     let rx_stream = ReceiverStream::new(rx);
@@ -176,7 +186,10 @@ async fn handle_message(
     _api_config: &ApiConfig,
     config_store: Arc<ConfigStore>,
 ) -> anyhow::Result<()> {
-    debug!("Received node stream message: code={}, requestId={}", message.code, message.request_id);
+    debug!(
+        "Received node stream message: code={}, requestId={}",
+        message.code, message.request_id
+    );
 
     let mut is_ok = true;
     let mut message_reply = "ok".to_string();
@@ -189,7 +202,10 @@ async fn handle_message(
             crate::rpc::node_task::trigger_task_sync();
         }
         "newNodeTask" | "NewNodeTask" | "configChanged" => {
-            info!("Received notification: {}. Triggering immediate task sync...", message.code);
+            info!(
+                "Received notification: {}. Triggering immediate task sync...",
+                message.code
+            );
             crate::rpc::node_task::trigger_task_sync();
         }
         "writeCache" => {
@@ -198,11 +214,12 @@ async fn handle_message(
                 Ok(msg) => {
                     let key = msg.key.clone();
                     tokio::spawn(async move {
-                        let full_key = if !key.starts_with("http://") && !key.starts_with("https://") {
-                            format!("http://{}", key)
-                        } else {
-                            key.clone()
-                        };
+                        let full_key =
+                            if !key.starts_with("http://") && !key.starts_with("https://") {
+                                format!("http://{}", key)
+                            } else {
+                                key.clone()
+                            };
 
                         if let Ok(url) = full_key.parse::<reqwest::Url>() {
                             let preheat_url = format!("http://127.0.0.1:80{}", url.path());
@@ -213,9 +230,10 @@ async fn handle_message(
                                 .timeout(std::time::Duration::from_secs(10))
                                 .build()
                                 .unwrap_or_default();
-                            
+
                             // Use POST to carry the actual value payload (decoded from Base64 if needed)
-                            let _ = client.post(&final_url)
+                            let _ = client
+                                .post(&final_url)
                                 .header("host", &key)
                                 .header("x-cloud-cache-action", "fetch")
                                 .header("x-cloud-preheat", "1")
@@ -230,14 +248,15 @@ async fn handle_message(
                 }
                 Err(e) => message_reply = format!("decode failed: {:?}", e),
             }
-        }        "readCache" => {
+        }
+        "readCache" => {
             let tx_cloned = tx.clone();
             let msg_cloned = message.clone();
 
             tokio::spawn(async move {
                 let mut is_ok = false;
                 let reply_text;
-                
+
                 match serde_json::from_slice::<ReadCacheMessage>(&msg_cloned.data_json) {
                     Ok(msg) => {
                         let hash = format!("{:x}", md5_legacy::compute(&msg.key));
@@ -271,7 +290,7 @@ async fn handle_message(
             tokio::spawn(async move {
                 let total_size = crate::metrics::storage::STORAGE.total_cache_size();
                 let total_count = crate::metrics::storage::STORAGE.total_cache_count();
-                
+
                 let size_str = if total_size < 1024 {
                     format!("{} Bytes", total_size)
                 } else if total_size < 1024 * 1024 {
@@ -281,7 +300,10 @@ async fn handle_message(
                 } else if total_size < 1024 * 1024 * 1024 * 1024 {
                     format!("{:.2} GB", total_size as f64 / (1024.0 * 1024.0 * 1024.0))
                 } else {
-                    format!("{:.2} TB", total_size as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
+                    format!(
+                        "{:.2} TB",
+                        total_size as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0)
+                    )
                 };
 
                 let reply = pb::NodeStreamMessage {
@@ -299,21 +321,23 @@ async fn handle_message(
         "cleanCache" => {
             let tx_cloned = tx.clone();
             let msg_cloned = message.clone();
-            
+
             tokio::spawn(async move {
                 let all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
                 let mut count = 0;
                 let root = std::path::Path::new("data/cache");
-                
+
                 for (hash, _) in all_meta {
                     let file_path = root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
-                    if file_path.exists() { let _ = std::fs::remove_file(&file_path); }
+                    if file_path.exists() {
+                        let _ = std::fs::remove_file(&file_path);
+                    }
                     crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
                     count += 1;
                 }
-                
+
                 info!("Global cache cleaned: {} items removed.", count);
-                
+
                 let reply = pb::NodeStreamMessage {
                     node_id,
                     request_id: msg_cloned.request_id,
@@ -337,9 +361,14 @@ async fn handle_message(
                 let load = sysinfo::System::load_average();
                 let total_memory = sys.total_memory() as i64;
                 let used_memory = sys.used_memory() as i64;
-                let mem_usage = if total_memory > 0 { used_memory as f64 / total_memory as f64 } else { 0.0 };
+                let mem_usage = if total_memory > 0 {
+                    used_memory as f64 / total_memory as f64
+                } else {
+                    0.0
+                };
 
-                let (traffic_out, traffic_in, connections) = crate::metrics::METRICS.get_node_totals();
+                let (traffic_out, traffic_in, connections) =
+                    crate::metrics::METRICS.get_node_totals();
                 let stat = serde_json::json!({
                     "cpuUsage": sys.global_cpu_usage() / 100.0,
                     "cpuLogicalCount": sys.cpus().len(),
@@ -354,7 +383,7 @@ async fn handle_message(
                     "trafficOut": traffic_out,
                     "connections": connections,
                 });
-                
+
                 let reply = pb::NodeStreamMessage {
                     node_id,
                     request_id: msg_cloned.request_id,
@@ -370,7 +399,10 @@ async fn handle_message(
         }
         "changeAPINode" => {
             if let Ok(msg) = serde_json::from_slice::<ChangeAPINodeMessage>(&message.data_json) {
-                info!("Received request to change API node address to: {}", msg.addr);
+                info!(
+                    "Received request to change API node address to: {}",
+                    msg.addr
+                );
                 ApiConfig::set_runtime_rpc_endpoints(vec![msg.addr]);
             }
         }

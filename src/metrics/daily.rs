@@ -67,7 +67,10 @@ impl DailyDomainTracker {
         entry.attack_bytes += attack_bytes;
     }
 
-    pub fn flush_older_than(&self, current_created_at: i64) -> Vec<(i64, i64, String, DomainStatValue)> {
+    pub fn flush_older_than(
+        &self,
+        current_created_at: i64,
+    ) -> Vec<(i64, i64, String, DomainStatValue)> {
         let keys: Vec<_> = self
             .domains
             .iter()
@@ -105,7 +108,8 @@ impl UniqueIpTracker {
         if server_id <= 0 || day.is_empty() || ip.is_empty() {
             return;
         }
-        self.ips.insert((server_id, day.to_string(), ip.to_string()));
+        self.ips
+            .insert((server_id, day.to_string(), ip.to_string()));
     }
 
     pub fn count(&self, server_id: i64, day: &str) -> i64 {

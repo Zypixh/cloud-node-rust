@@ -1,6 +1,8 @@
-use crate::pb;
 use crate::config_models::ServerConfig;
+use crate::pb;
 use crate::proxy::ProxyCTX;
+use chrono::{DateTime, FixedOffset};
+use once_cell::sync::OnceCell;
 use pingora_proxy::Session;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -8,8 +10,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
-use once_cell::sync::OnceCell;
-use chrono::{DateTime, FixedOffset};
 
 static LOG_SENDER: OnceCell<mpsc::Sender<pb::HttpAccessLog>> = OnceCell::new();
 static NODE_LOG_SENDER: OnceCell<mpsc::Sender<pb::NodeLog>> = OnceCell::new();
@@ -78,8 +78,10 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
 
     let req = session.req_header();
     let server_id = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
-    
-    let host = req.headers.get("host")
+
+    let host = req
+        .headers
+        .get("host")
         .and_then(|h| h.to_str().ok())
         .map(|v| v.split(':').next().unwrap_or(v))
         .unwrap_or_else(|| req.uri.host().unwrap_or("-"));
@@ -96,31 +98,62 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         }
     };
 
-    let request_line = format!("{} {} {}", req.method, req.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"), proto);
+    let request_line = format!(
+        "{} {} {}",
+        req.method,
+        req.uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/"),
+        proto
+    );
 
     // Precise calculation for GoEdge compatibility
-    let req_hdr_size = req.headers.iter().map(|(n, v)| n.as_str().len() + v.len() + 4).sum::<usize>() as i64 + request_line.len() as i64 + 4;
+    let req_hdr_size = req
+        .headers
+        .iter()
+        .map(|(n, v)| n.as_str().len() + v.len() + 4)
+        .sum::<usize>() as i64
+        + request_line.len() as i64
+        + 4;
     let bytes_received = session.body_bytes_read() as i64 + req_hdr_size;
     let bytes_sent = session.body_bytes_sent() as i64 + ctx.response_headers_size as i64 + 20;
 
     // Real IP resolution
     let raw_socket_addr = if ctx.raw_remote_addr.is_empty() {
-        session.client_addr().map(|a| a.to_string()).unwrap_or_default()
+        session
+            .client_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default()
     } else {
         ctx.raw_remote_addr.clone()
     };
     let real_ip_str = ctx.client_ip.to_string();
 
-    let client_ip = real_ip_str.parse::<IpAddr>().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
-    let user_agent = req.headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let client_ip = real_ip_str
+        .parse::<IpAddr>()
+        .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+    let user_agent = req
+        .headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
     let analyzed = crate::metrics::analyzer::analyze_request(client_ip, user_agent);
     let request_started_at_millis = ctx.start_timestamp_millis;
     let request_started_at = request_started_at_millis / 1000;
     let request_started_local: DateTime<FixedOffset> =
         crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
 
-    let is_tls = session.downstream_session.digest().and_then(|d| d.ssl_digest.as_ref()).is_some();
-    let scheme = if is_tls || req.uri.scheme_str() == Some("https") { "https".to_string() } else { "http".to_string() };
+    let is_tls = session
+        .downstream_session
+        .digest()
+        .and_then(|d| d.ssl_digest.as_ref())
+        .is_some();
+    let scheme = if is_tls || req.uri.scheme_str() == Some("https") {
+        "https".to_string()
+    } else {
+        "http".to_string()
+    };
 
     let is_cached = ctx.cache_hit.unwrap_or(false);
     let final_request_line = if is_cached {
@@ -136,7 +169,11 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         remote_addr: real_ip_str,
         raw_remote_addr: raw_socket_addr,
         remote_port: ctx.client_port as i32,
-        request_uri: req.uri.path_and_query().map(|pq| pq.as_str().to_string()).unwrap_or_else(|| "/".to_string()),
+        request_uri: req
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string()),
         request_path: req.uri.path().to_string(),
         request_method: req.method.to_string(),
         request_length: bytes_received,
@@ -149,13 +186,25 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         body_bytes_sent: session.body_bytes_sent() as i64,
         host: host.to_string(),
         user_agent: user_agent.to_string(),
-        referer: req.headers.get("referer").and_then(|v| v.to_str().ok()).unwrap_or("").to_string(),
+        referer: req
+            .headers
+            .get("referer")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string(),
         request: final_request_line,
         timestamp: request_started_at,
         msec: request_started_at_millis as f64 / 1000.0,
-        time_iso8601: request_started_local.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
-        time_local: request_started_local.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
-        hostname: hostname::get().unwrap_or_default().to_string_lossy().to_string(),
+        time_iso8601: request_started_local
+            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+            .to_string(),
+        time_local: request_started_local
+            .format("%d/%b/%Y:%H:%M:%S %z")
+            .to_string(),
+        hostname: hostname::get()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
         origin_address: ctx.origin_address.clone(),
         origin_status: ctx.origin_status,
         origin_header_response_time: ctx.ttfb.map(|d| d.as_secs_f64()).unwrap_or(0.0),
@@ -165,17 +214,30 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     // Correcting Prost field mappings
     let mut req_headers = HashMap::new();
     for (n, v) in req.headers.iter() {
-        req_headers.entry(n.to_string()).or_insert(pb::Strings { values: vec![] }).values.push(v.to_str().unwrap_or("").to_string());
+        req_headers
+            .entry(n.to_string())
+            .or_insert(pb::Strings { values: vec![] })
+            .values
+            .push(v.to_str().unwrap_or("").to_string());
     }
     log.header = req_headers;
 
     let mut res_headers = HashMap::new();
     for (n, v) in &ctx.response_headers {
-        res_headers.insert(n.clone(), pb::Strings { values: vec![v.clone()] });
+        res_headers.insert(
+            n.clone(),
+            pb::Strings {
+                values: vec![v.clone()],
+            },
+        );
     }
     log.sent_header = res_headers;
 
-    if let Some((_, ct)) = ctx.response_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+    if let Some((_, ct)) = ctx
+        .response_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
         log.content_type = ct.clone();
     }
 
@@ -185,8 +247,15 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     }
 
     if let Some(server) = &ctx.server {
-        log.server_name = server.server_names.first().map(|s| s.name.clone()).unwrap_or_default();
-        log.server_port = req.uri.port_u16().unwrap_or(if log.scheme == "https" { 443 } else { 80 }) as i32;
+        log.server_name = server
+            .server_names
+            .first()
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        log.server_port =
+            req.uri
+                .port_u16()
+                .unwrap_or(if log.scheme == "https" { 443 } else { 80 }) as i32;
     }
 
     // Populate Attrs for GeoIP display in GoEdge
@@ -196,10 +265,12 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         log.attrs.insert("isp".to_string(), geo.provider.clone());
         log.attrs.insert("country".to_string(), geo.country.clone());
     }
-    log.attrs.insert("browser".to_string(), analyzed.browser.clone());
+    log.attrs
+        .insert("browser".to_string(), analyzed.browser.clone());
     log.attrs.insert("os".to_string(), analyzed.os.clone());
     if ctx.is_http3_bridge {
-        log.attrs.insert("transport".to_string(), "http3".to_string());
+        log.attrs
+            .insert("transport".to_string(), "http3".to_string());
         log.tags.push("HTTP3".to_string());
     }
     if let Some(cache_status) = ctx
@@ -213,16 +284,24 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         log.tags.push(format!("X_CACHE_{}", cache_status));
     }
 
-    if ctx.cache_hit.unwrap_or(false) { log.tags.push("CACHE_HIT".to_string()); }
-    if let Some(waf) = &ctx.waf_action { 
+    if ctx.cache_hit.unwrap_or(false) {
+        log.tags.push("CACHE_HIT".to_string());
+    }
+    if let Some(waf) = &ctx.waf_action {
         log.firewall_actions.push(waf.clone());
         log.firewall_policy_id = ctx.waf_policy_id;
     }
 
     if server_id == 0 {
-        warn!("Generated log for unconfigured host '{}', skipping report to API.", host);
+        warn!(
+            "Generated log for unconfigured host '{}', skipping report to API.",
+            host
+        );
     } else {
-        debug!("Reporting log: {} {} -> Status {}", log.request_method, log.request_uri, log.status);
+        debug!(
+            "Reporting log: {} {} -> Status {}",
+            log.request_method, log.request_uri, log.status
+        );
         let _ = sender.try_send(log);
     }
 }
@@ -284,27 +363,43 @@ pub fn log_sni_passthrough_access(
         request,
         timestamp: request_started_at,
         msec: request_started_at_millis as f64 / 1000.0,
-        time_iso8601: request_started_local.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
-        time_local: request_started_local.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
-        hostname: hostname::get().unwrap_or_default().to_string_lossy().to_string(),
+        time_iso8601: request_started_local
+            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+            .to_string(),
+        time_local: request_started_local
+            .format("%d/%b/%Y:%H:%M:%S %z")
+            .to_string(),
+        hostname: hostname::get()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
         origin_address: origin_address.to_string(),
         origin_status: status,
-        server_name: server.server_names.first().map(|s| s.name.clone()).unwrap_or_default(),
+        server_name: server
+            .server_names
+            .first()
+            .map(|s| s.name.clone())
+            .unwrap_or_default(),
         server_port: listen_port as i32,
         server_protocol: "SNI_PASSTHROUGH".to_string(),
         ..Default::default()
     };
 
     log.attrs.insert("transport".to_string(), "tcp".to_string());
-    log.attrs.insert("protocol".to_string(), "sni_passthrough".to_string());
+    log.attrs
+        .insert("protocol".to_string(), "sni_passthrough".to_string());
     if !origin_address.is_empty() {
-        log.attrs.insert("backend".to_string(), origin_address.to_string());
+        log.attrs
+            .insert("backend".to_string(), origin_address.to_string());
     }
     log.tags.push("SNI_PASSTHROUGH".to_string());
     if let Some(error) = error.filter(|value| !value.is_empty()) {
         log.errors.push(error.to_string());
     }
 
-    debug!("Reporting SNI passthrough log: {} -> Status {}", log.request_uri, log.status);
+    debug!(
+        "Reporting SNI passthrough log: {} -> Status {}",
+        log.request_uri, log.status
+    );
     let _ = sender.try_send(log);
 }

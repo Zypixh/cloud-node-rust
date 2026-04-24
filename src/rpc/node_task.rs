@@ -7,9 +7,9 @@ use crate::rpc::client::RpcClient;
 use crate::rpc::ip_list::sync_ip_items_incremental;
 use crate::rpc::plan::sync_active_plans;
 use crate::rpc::server::{sync_single_server_config, sync_user_servers_state};
-use tracing::{debug, info, warn};
-use tokio::sync::Notify;
 use once_cell::sync::Lazy;
+use tokio::sync::Notify;
+use tracing::{debug, info, warn};
 
 static TASK_SYNC_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
 
@@ -121,7 +121,9 @@ pub async fn sync_node_tasks(
                         }
                     }
                     "scriptsChanged" => {
-                        warn!("Ignoring unsupported task 'scriptsChanged': edge script runtime is not implemented in Rust node");
+                        warn!(
+                            "Ignoring unsupported task 'scriptsChanged': edge script runtime is not implemented in Rust node"
+                        );
                         true
                     }
                     "plusChanged" | "nodeVersionChanged" => true,
@@ -130,9 +132,10 @@ pub async fn sync_node_tasks(
 
                 if let Some(options) = task_type.strip_prefix("ipListDeleted@")
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(options)
-                        && let Some(list_id) = value.get("listId").and_then(|v| v.as_i64()) {
-                            ip_list_manager.remove_list(list_id);
-                        }
+                    && let Some(list_id) = value.get("listId").and_then(|v| v.as_i64())
+                {
+                    ip_list_manager.remove_list(list_id);
+                }
 
                 let _ = task_service
                     .report_node_task_done(pb::ReportNodeTaskDoneRequest {

@@ -191,7 +191,9 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
     }
 
     if healthy_endpoints.is_empty() {
-        debug!("Skipping api-node endpoint update because none of the discovered endpoints passed PingService health check");
+        debug!(
+            "Skipping api-node endpoint update because none of the discovered endpoints passed PingService health check"
+        );
         report_node_log_with_context(
             api_config,
             "warn",

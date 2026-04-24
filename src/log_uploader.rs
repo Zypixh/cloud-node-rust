@@ -107,8 +107,7 @@ impl LogUploader {
                 channel,
                 move |mut req: tonic::Request<()>| {
                     let token = generate_token(&node_id, &secret, "edge").unwrap_or_default();
-                    req.metadata_mut()
-                        .insert("token", token.parse().unwrap());
+                    req.metadata_mut().insert("token", token.parse().unwrap());
                     req.metadata_mut()
                         .insert("nodeid", node_id.parse().unwrap());
                     Ok(req)

@@ -3,8 +3,8 @@
 use crate::api_config::ApiConfig;
 use crate::auth::generate_token;
 use crate::pb;
-use tonic::transport::Channel;
 use tonic::Request;
+use tonic::transport::Channel;
 use tracing::{error, info};
 
 pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool {
@@ -14,7 +14,8 @@ pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool 
         pb::http_cache_task_key_service_client::HttpCacheTaskKeyServiceClient::with_interceptor(
             channel,
             move |mut req: Request<()>| {
-                let token = generate_token(&node_id_clone, &secret_clone, "edge").unwrap_or_default();
+                let token =
+                    generate_token(&node_id_clone, &secret_clone, "edge").unwrap_or_default();
                 req.metadata_mut()
                     .insert("nodeid", node_id_clone.parse().unwrap());
                 req.metadata_mut().insert("token", token.parse().unwrap());

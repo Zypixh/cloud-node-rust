@@ -2,10 +2,10 @@ pub mod persistence;
 pub mod template;
 pub mod time;
 
-use std::time::Duration;
-use sysinfo::{Pid, System};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
+use sysinfo::{Pid, System};
 
 pub fn ensure_single_instance(pid_file: &str) -> anyhow::Result<()> {
     let path = Path::new(pid_file);
@@ -19,7 +19,7 @@ pub fn ensure_single_instance(pid_file: &str) -> anyhow::Result<()> {
                 let mut sys = System::new();
                 let pid = Pid::from_u32(old_pid_val);
                 sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-                
+
                 if let Some(process) = sys.process(pid) {
                     let exe_name = process.name().to_string_lossy().to_lowercase();
                     if exe_name.contains("cloud-node") || exe_name.contains("rust") {

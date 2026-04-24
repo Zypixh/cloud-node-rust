@@ -16,7 +16,9 @@ pub async fn sync_active_plans(api_config: &ApiConfig, config_store: &ConfigStor
         config_store
             .set_user_plans(std::collections::HashMap::new())
             .await;
-        config_store.set_plans(std::collections::HashMap::new()).await;
+        config_store
+            .set_plans(std::collections::HashMap::new())
+            .await;
         return true;
     }
 
@@ -46,7 +48,10 @@ pub async fn sync_active_plans(api_config: &ApiConfig, config_store: &ConfigStor
                 }
             }
             Err(err) => {
-                debug!("Failed to fetch user plan for server {}: {}", server_id, err);
+                debug!(
+                    "Failed to fetch user plan for server {}: {}",
+                    server_id, err
+                );
             }
         }
     }

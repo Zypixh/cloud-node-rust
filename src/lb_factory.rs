@@ -1,9 +1,14 @@
 use crate::config_models::{ParentNodeConfig, ReverseProxyConfig};
 use futures_util::FutureExt;
-use pingora_load_balancing::{LoadBalancer, health_check, selection::{RoundRobin, Consistent}, Backend, Backends, discovery::Static};
-use http::Extensions;
 use http;
-use std::collections::{HashMap, BTreeSet};
+use http::Extensions;
+use pingora_load_balancing::{
+    Backend, Backends, LoadBalancer,
+    discovery::Static,
+    health_check,
+    selection::{Consistent, RoundRobin},
+};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -34,12 +39,17 @@ pub fn build_lb(
 
     // Build Origin Pool (Direct to primary/backup origins)
     for origin in &rp_cfg.primary_origins {
-        if !origin.is_on { continue; }
+        if !origin.is_on {
+            continue;
+        }
         if let Some(addr) = &origin.addr {
             let target = addr.to_address();
-            
+
             if !allow_lan && is_local_addr(&target) {
-                warn!("LB Builder: Skipping LAN origin {} as it is not allowed in cluster settings.", target);
+                warn!(
+                    "LB Builder: Skipping LAN origin {} as it is not allowed in cluster settings.",
+                    target
+                );
                 continue;
             }
 
@@ -49,11 +59,15 @@ pub fn build_lb(
                 let tls_verify = if let Some(v) = &origin.tls_verify {
                     match v {
                         serde_json::Value::Bool(b) => *b,
-                        serde_json::Value::Object(obj) => obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true),
+                        serde_json::Value::Object(obj) => {
+                            obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true)
+                        }
                         serde_json::Value::Number(n) => n.as_i64().unwrap_or(1) > 0,
                         _ => true,
                     }
-                } else { true };
+                } else {
+                    true
+                };
 
                 ext.insert(BackendExtension {
                     use_tls: addr.is_https(),
@@ -71,12 +85,17 @@ pub fn build_lb(
 
     if endpoints.is_empty() {
         for origin in &rp_cfg.backup_origins {
-            if !origin.is_on { continue; }
+            if !origin.is_on {
+                continue;
+            }
             if let Some(addr) = &origin.addr {
                 let target = addr.to_address();
 
                 if !allow_lan && is_local_addr(&target) {
-                    warn!("LB Builder: Skipping LAN backup origin {} as it is not allowed.", target);
+                    warn!(
+                        "LB Builder: Skipping LAN backup origin {} as it is not allowed.",
+                        target
+                    );
                     continue;
                 }
 
@@ -86,11 +105,15 @@ pub fn build_lb(
                     let tls_verify = if let Some(v) = &origin.tls_verify {
                         match v {
                             serde_json::Value::Bool(b) => *b,
-                            serde_json::Value::Object(obj) => obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true),
+                            serde_json::Value::Object(obj) => {
+                                obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true)
+                            }
                             serde_json::Value::Number(n) => n.as_i64().unwrap_or(1) > 0,
                             _ => true,
                         }
-                    } else { true };
+                    } else {
+                        true
+                    };
 
                     ext.insert(BackendExtension {
                         use_tls: addr.is_https(),
@@ -140,72 +163,68 @@ pub fn build_lb(
                 detected_hc = Some((origin, hc));
                 break;
             } else {
-                debug!("LB Builder: Health check for origin {} is present but OFF", origin.id);
+                debug!(
+                    "LB Builder: Health check for origin {} is present but OFF",
+                    origin.id
+                );
             }
         }
     }
 
     if let Some((origin, hc_cfg)) = detected_hc {
-                has_health_check = true;
-                let use_tcp = hc_cfg.protocol.as_deref() == Some("tcp");
-                
-                if use_tcp {
-                    debug!("LB Builder: Enabling TCP health check for origins.");
-                    let mut hc = health_check::TcpHealthCheck::new();
-                    if let Some(timeout) = &hc_cfg.timeout {
-                        hc.peer_template.options.connection_timeout = Some(crate::utils::to_duration(timeout));
-                    }
-                    // TcpHealthCheck::new() returns a Box<TcpHealthCheck>, so we just need to cast it
-                    let check: Box<dyn health_check::HealthCheck + Send + Sync + 'static> = hc;
-                    lb.set_health_check(check);
-                } else {
-                    debug!("LB Builder: Enabling HTTP health check for origins.");
-                    let host = origin
-                        .addr
-                        .as_ref()
-                        .map(|a| a.host())
-                        .unwrap_or_default();
-                    let use_tls = origin
-                        .addr
-                        .as_ref()
-                        .map(|a| a.is_https())
-                        .unwrap_or(false);
+        has_health_check = true;
+        let use_tcp = hc_cfg.protocol.as_deref() == Some("tcp");
 
-                    let mut hc = health_check::HttpHealthCheck::new(&host, use_tls);
-                    if !hc_cfg.url.is_empty() {
-                        if let Ok(uri) = hc_cfg.url.parse::<http::Uri>() {
-                            if let Some(path_and_query) = uri.path_and_query() {
-                                let mut parts = hc.req.uri.clone().into_parts();
-                                parts.path_and_query = Some(path_and_query.clone());
-                                if let Ok(new_uri) = http::Uri::from_parts(parts) {
-                                    hc.req.uri = new_uri;
-                                }
-                            }
+        if use_tcp {
+            debug!("LB Builder: Enabling TCP health check for origins.");
+            let mut hc = health_check::TcpHealthCheck::new();
+            if let Some(timeout) = &hc_cfg.timeout {
+                hc.peer_template.options.connection_timeout =
+                    Some(crate::utils::to_duration(timeout));
+            }
+            // TcpHealthCheck::new() returns a Box<TcpHealthCheck>, so we just need to cast it
+            let check: Box<dyn health_check::HealthCheck + Send + Sync + 'static> = hc;
+            lb.set_health_check(check);
+        } else {
+            debug!("LB Builder: Enabling HTTP health check for origins.");
+            let host = origin.addr.as_ref().map(|a| a.host()).unwrap_or_default();
+            let use_tls = origin.addr.as_ref().map(|a| a.is_https()).unwrap_or(false);
+
+            let mut hc = health_check::HttpHealthCheck::new(&host, use_tls);
+            if !hc_cfg.url.is_empty() {
+                if let Ok(uri) = hc_cfg.url.parse::<http::Uri>() {
+                    if let Some(path_and_query) = uri.path_and_query() {
+                        let mut parts = hc.req.uri.clone().into_parts();
+                        parts.path_and_query = Some(path_and_query.clone());
+                        if let Ok(new_uri) = http::Uri::from_parts(parts) {
+                            hc.req.uri = new_uri;
                         }
                     }
-
-                    // Apply connection timeout if configured
-                    if let Some(timeout) = &hc_cfg.timeout {
-                        hc.peer_template.options.connection_timeout =
-                            Some(crate::utils::to_duration(timeout));
-                    }
-                    // HttpHealthCheck::new() returns HttpHealthCheck, so we need to Box it
-                    lb.set_health_check(Box::new(hc));
                 }
-
-                lb.health_check_frequency = Some(
-                    hc_cfg
-                        .interval
-                        .as_ref()
-                        .map(crate::utils::to_duration)
-                        .unwrap_or(Duration::from_secs(30)),
-                );
-
-                debug!(
-                    "Enabled health check for upstream pool. Frequency: {:?}",
-                    lb.health_check_frequency
-                );
             }
+
+            // Apply connection timeout if configured
+            if let Some(timeout) = &hc_cfg.timeout {
+                hc.peer_template.options.connection_timeout =
+                    Some(crate::utils::to_duration(timeout));
+            }
+            // HttpHealthCheck::new() returns HttpHealthCheck, so we need to Box it
+            lb.set_health_check(Box::new(hc));
+        }
+
+        lb.health_check_frequency = Some(
+            hc_cfg
+                .interval
+                .as_ref()
+                .map(crate::utils::to_duration)
+                .unwrap_or(Duration::from_secs(30)),
+        );
+
+        debug!(
+            "Enabled health check for upstream pool. Frequency: {:?}",
+            lb.health_check_frequency
+        );
+    }
 
     (Arc::new(lb), has_health_check)
 }
@@ -219,10 +238,15 @@ pub fn build_parent_lb(
     for node in nodes {
         let targets = node.to_addresses();
         for target in targets {
-            if target.is_empty() { continue; }
-            
+            if target.is_empty() {
+                continue;
+            }
+
             if !allow_lan && is_local_addr(&target) {
-                warn!("LB Builder: Skipping LAN parent node address {} as it is not allowed.", target);
+                warn!(
+                    "LB Builder: Skipping LAN parent node address {} as it is not allowed.",
+                    target
+                );
                 continue;
             }
 
@@ -232,7 +256,7 @@ pub fn build_parent_lb(
                     use_tls: true, // L1 -> L2 always TLS by default in GoEdge
                     host: String::new(),
                     follow_host: false,
-                    tls_verify: false, 
+                    tls_verify: false,
                     client_cert: None,
                 });
                 backend.ext = ext;
@@ -248,7 +272,11 @@ pub fn build_parent_lb(
         }
     }
 
-    debug!("LB Builder: Creating Parent LB for cluster {} with {} endpoints", cluster_id, endpoints.len());
+    debug!(
+        "LB Builder: Creating Parent LB for cluster {} with {} endpoints",
+        cluster_id,
+        endpoints.len()
+    );
     let mut set = BTreeSet::new();
     for e in endpoints {
         set.insert(e);

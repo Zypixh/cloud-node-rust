@@ -1,10 +1,10 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
 };
-use sha2::{Digest, Sha256};
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Serialize, Deserialize)]
 struct ChallengePayload {
@@ -50,10 +50,15 @@ impl WafVerifier {
             let mut combined = nonce_bytes.to_vec();
             combined.extend_from_slice(&ciphertext);
             let token_str = general_purpose::URL_SAFE_NO_PAD.encode(combined);
-            
+
             // Persist for node restarts
-            crate::metrics::storage::STORAGE.save_waf_token(&token_str, ip, &payload.ua_hash, ts + 3600);
-            
+            crate::metrics::storage::STORAGE.save_waf_token(
+                &token_str,
+                ip,
+                &payload.ua_hash,
+                ts + 3600,
+            );
+
             return token_str;
         }
         "".to_string()
@@ -75,7 +80,9 @@ impl WafVerifier {
             }
         };
 
-        if decoded.len() < 12 { return self.verify_token_from_storage(ip, &current_ua_hash, token, window_secs); }
+        if decoded.len() < 12 {
+            return self.verify_token_from_storage(ip, &current_ua_hash, token, window_secs);
+        }
         let (nonce_bytes, ciphertext) = decoded.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
 
@@ -90,12 +97,16 @@ impl WafVerifier {
         };
 
         // Context Verification
-        if payload.ip != ip { return false; }
+        if payload.ip != ip {
+            return false;
+        }
 
         let mut hasher = Sha256::new();
         hasher.update(ua.as_bytes());
         let current_ua_hash = hex::encode(hasher.finalize());
-        if payload.ua_hash != current_ua_hash { return false; }
+        if payload.ua_hash != current_ua_hash {
+            return false;
+        }
 
         // Time Window Verification
         let now = crate::utils::time::now_timestamp() as u64;
@@ -106,12 +117,18 @@ impl WafVerifier {
         true
     }
 
-    fn verify_token_from_storage(&self, ip: &str, ua_hash: &str, token: &str, _window_secs: u64) -> bool {
+    fn verify_token_from_storage(
+        &self,
+        ip: &str,
+        ua_hash: &str,
+        token: &str,
+        _window_secs: u64,
+    ) -> bool {
         if let Some(meta) = crate::metrics::storage::STORAGE.get_waf_token(token) {
             let stored_ip = meta["ip"].as_str().unwrap_or("");
             let stored_ua = meta["ua"].as_str().unwrap_or("");
             let exp = meta["exp"].as_u64().unwrap_or(0);
-            
+
             let now = crate::utils::time::now_timestamp() as u64;
             if stored_ip == ip && stored_ua == ua_hash && now < exp {
                 return true;

@@ -43,10 +43,7 @@ impl MetricAggregator {
     }
 
     pub fn record(&self, key: AggregationKey, bytes: i64, is_attack: bool) {
-        let mut entry = self
-            .samples
-            .entry(key)
-            .or_default();
+        let mut entry = self.samples.entry(key).or_default();
         entry.count += 1;
         entry.bytes_sent += bytes;
         if is_attack {

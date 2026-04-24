@@ -43,18 +43,27 @@ impl UdpProxyManager {
     }
 
     pub async fn start_listeners(self: Arc<Self>) {
-        debug!("Starting UDP Proxy Manager for v{}...", env!("CARGO_PKG_VERSION"));
+        debug!(
+            "Starting UDP Proxy Manager for v{}...",
+            env!("CARGO_PKG_VERSION")
+        );
 
         loop {
             // Check for new servers or port changes
             let servers = self.config_store.get_all_servers().await;
-            debug!("UDP Proxy Manager: Found {} servers in config store", servers.len());
+            debug!(
+                "UDP Proxy Manager: Found {} servers in config store",
+                servers.len()
+            );
             let mut desired_ports = std::collections::HashSet::new();
             for server in servers {
                 if let Some(udp_cfg) = &server.udp {
                     if udp_cfg.is_on {
                         if udp_cfg.listen.is_empty() {
-                            warn!("UDP Proxy Manager: Server {} has UDP ON but NO listen addresses", server.numeric_id());
+                            warn!(
+                                "UDP Proxy Manager: Server {} has UDP ON but NO listen addresses",
+                                server.numeric_id()
+                            );
                         }
                         for addr_cfg in &udp_cfg.listen {
                             if let Ok(port) = addr_cfg
@@ -68,10 +77,16 @@ impl UdpProxyManager {
                             }
                         }
                     } else {
-                        debug!("UDP Proxy Manager: Server {} UDP is OFF", server.numeric_id());
+                        debug!(
+                            "UDP Proxy Manager: Server {} UDP is OFF",
+                            server.numeric_id()
+                        );
                     }
                 } else {
-                    debug!("UDP Proxy Manager: Server {} has NO UDP config", server.numeric_id());
+                    debug!(
+                        "UDP Proxy Manager: Server {} has NO UDP config",
+                        server.numeric_id()
+                    );
                 }
             }
 
@@ -103,7 +118,8 @@ impl UdpProxyManager {
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        self.handled_ports.insert(port, ListenerHandle { shutdown_tx });
+        self.handled_ports
+            .insert(port, ListenerHandle { shutdown_tx });
 
         let manager = self.clone();
         tokio::spawn(async move {
@@ -115,14 +131,19 @@ impl UdpProxyManager {
     }
 
     fn reconcile_listeners(&self, desired_ports: &std::collections::HashSet<u16>) {
-        let active_ports: Vec<u16> = self.handled_ports.iter().map(|entry| *entry.key()).collect();
+        let active_ports: Vec<u16> = self
+            .handled_ports
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
         for port in active_ports {
             if !desired_ports.contains(&port) {
                 if let Some((_, handle)) = self.handled_ports.remove(&port) {
                     info!("UDP Proxy Manager: Stopping listener on port {}", port);
                     let _ = handle.shutdown_tx.send(true);
                 }
-                self.sessions.retain(|(_, session_port), _| *session_port != port);
+                self.sessions
+                    .retain(|(_, session_port), _| *session_port != port);
             }
         }
     }

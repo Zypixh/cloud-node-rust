@@ -100,8 +100,13 @@ impl Http3ProxyManager {
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        self.handled_ports
-            .insert(port, ListenerHandle { cert_hash, shutdown_tx });
+        self.handled_ports.insert(
+            port,
+            ListenerHandle {
+                cert_hash,
+                shutdown_tx,
+            },
+        );
         let manager = self.clone();
         tokio::spawn(async move {
             if let Err(err) = manager.clone().run_listener(port, shutdown_rx).await {
@@ -122,7 +127,10 @@ impl Http3ProxyManager {
                 continue;
             }
             if let Some((_, handle)) = self.handled_ports.remove(&port) {
-                info!("HTTP/3 Proxy Manager: Stopping listener on UDP port {}", port);
+                info!(
+                    "HTTP/3 Proxy Manager: Stopping listener on UDP port {}",
+                    port
+                );
                 let _ = handle.shutdown_tx.send(true);
             }
         }
@@ -157,7 +165,10 @@ impl Http3ProxyManager {
             let config_store = self.config_store.clone();
             tokio::spawn(async move {
                 if let Err(err) = Self::serve_connection(connecting, port, config_store).await {
-                    error!("HTTP/3 connection handling failed on port {}: {}", port, err);
+                    error!(
+                        "HTTP/3 connection handling failed on port {}: {}",
+                        port, err
+                    );
                 }
             });
         }
@@ -182,22 +193,24 @@ impl Http3ProxyManager {
             }
         }
 
-        let default_key = Self::build_certified_key(&default_pair.0, &default_pair.1, &default_pair.2)?
-            .context("failed to build default HTTP/3 certified key")?;
+        let default_key =
+            Self::build_certified_key(&default_pair.0, &default_pair.1, &default_pair.2)?
+                .context("failed to build default HTTP/3 certified key")?;
         let mut rustls_config = rustls::ServerConfig::builder_with_provider(
             rustls::crypto::ring::default_provider().into(),
         )
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(FallbackResolver {
-                sni: resolver,
-                default: Arc::new(default_key),
-            }));
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(FallbackResolver {
+            sni: resolver,
+            default: Arc::new(default_key),
+        }));
         rustls_config.alpn_protocols = vec![b"h3".to_vec()];
         rustls_config.max_early_data_size = u32::MAX;
 
-        let mut server_config =
-            quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_config))?));
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_config))?,
+        ));
         let transport = Arc::get_mut(&mut server_config.transport)
             .context("unable to access quinn transport config")?;
         transport.max_concurrent_uni_streams(16_u8.into());
@@ -210,8 +223,8 @@ impl Http3ProxyManager {
         ocsp: &[u8],
     ) -> Result<Option<rustls::sign::CertifiedKey>> {
         let mut cert_reader = std::io::BufReader::new(cert_pem);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<std::result::Result<_, _>>()?;
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_reader).collect::<std::result::Result<_, _>>()?;
         if certs.is_empty() {
             return Ok(None);
         }
@@ -230,7 +243,8 @@ impl Http3ProxyManager {
     }
 
     async fn current_cert_hash(&self) -> u64 {
-        let Some((exact, wildcard, default_pair)) = self.cert_selector.export_snapshot_pem().await else {
+        let Some((exact, wildcard, default_pair)) = self.cert_selector.export_snapshot_pem().await
+        else {
             return 0;
         };
         let mut hasher = DefaultHasher::new();
@@ -272,14 +286,23 @@ impl Http3ProxyManager {
                 Ok(Some(resolver)) => {
                     let config_store = config_store.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = Self::handle_request(resolver, listen_port, remote_addr, config_store).await {
-                            error!("HTTP/3 request handling failed on port {}: {}", listen_port, err);
+                        if let Err(err) =
+                            Self::handle_request(resolver, listen_port, remote_addr, config_store)
+                                .await
+                        {
+                            error!(
+                                "HTTP/3 request handling failed on port {}: {}",
+                                listen_port, err
+                            );
                         }
                     });
                 }
                 Ok(None) => return Ok(()),
                 Err(err) => {
-                    warn!("HTTP/3 accept loop terminated on port {}: {}", listen_port, err);
+                    warn!(
+                        "HTTP/3 accept loop terminated on port {}: {}",
+                        listen_port, err
+                    );
                     return Ok(());
                 }
             }
@@ -311,10 +334,7 @@ impl Http3ProxyManager {
             stream.finish().await?;
             return Ok(());
         }
-        let target_port = request
-            .uri()
-            .port_u16()
-            .unwrap_or(listen_port);
+        let target_port = request.uri().port_u16().unwrap_or(listen_port);
         let path_and_query = request
             .uri()
             .path_and_query()
@@ -326,19 +346,13 @@ impl Http3ProxyManager {
             .get("content-length")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<usize>().ok());
-        if declared_request_len
-            .is_some_and(|value| value > MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES)
-        {
+        if declared_request_len.is_some_and(|value| value > MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES) {
             warn!(
                 "HTTP/3 bridge request body exceeded declared limit for host {} on port {}",
                 host, listen_port
             );
-            Self::send_simple_response(
-                &mut stream,
-                413,
-                b"Request Entity Too Large".as_slice(),
-            )
-            .await?;
+            Self::send_simple_response(&mut stream, 413, b"Request Entity Too Large".as_slice())
+                .await?;
             return Ok(());
         }
 
@@ -376,12 +390,13 @@ impl Http3ProxyManager {
         let mut client_builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(Duration::from_secs(120))
-            .resolve(&host, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), target_port));
-        if target_port == 443 {
-            client_builder = client_builder.resolve(
+            .resolve(
                 &host,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), target_port),
             );
+        if target_port == 443 {
+            client_builder = client_builder
+                .resolve(&host, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443));
         }
         let client = client_builder.build()?;
 
@@ -449,7 +464,10 @@ impl Http3ProxyManager {
                     let chunk = match chunk_result {
                         Ok(chunk) => chunk,
                         Err(err) => {
-                            warn!("HTTP/3 bridge failed while streaming upstream response: {}", err);
+                            warn!(
+                                "HTTP/3 bridge failed while streaming upstream response: {}",
+                                err
+                            );
                             break;
                         }
                     };
@@ -469,9 +487,7 @@ impl Http3ProxyManager {
                 warn!("HTTP/3 bridge upstream request failed: {}", err);
                 let response = http::Response::builder().status(502).body(())?;
                 stream.send_response(response).await?;
-                stream
-                    .send_data(Bytes::from_static(b"Bad Gateway"))
-                    .await?;
+                stream.send_data(Bytes::from_static(b"Bad Gateway")).await?;
                 stream.finish().await?;
             }
         }

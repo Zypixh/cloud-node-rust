@@ -1,7 +1,7 @@
-use rocksdb::{DB, Options, WriteBatch, MergeOperands};
+use once_cell::sync::Lazy;
+use rocksdb::{DB, MergeOperands, Options, WriteBatch};
 use std::path::Path;
 use std::sync::Arc;
-use once_cell::sync::Lazy;
 use tracing::error;
 
 /// A specialized storage engine for metrics based on RocksDB.
@@ -10,7 +10,11 @@ pub struct MetricStorage {
 }
 
 /// A simple sum operator for RocksDB merge
-fn sum_merge_operator(_new_key: &[u8], existing_value: Option<&[u8]>, operands: &MergeOperands) -> Option<Vec<u8>> {
+fn sum_merge_operator(
+    _new_key: &[u8],
+    existing_value: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
     let mut sum = existing_value
         .and_then(|v| {
             if v.len() == 8 {
@@ -42,13 +46,17 @@ impl MetricStorage {
         // Optimize for write-heavy metrics
         opts.set_use_direct_io_for_flush_and_compaction(true);
         opts.set_max_background_jobs(4);
-        
+
         match DB::open(&opts, path) {
-            Ok(db) => Ok(Self { db: Some(Arc::new(db)) }),
+            Ok(db) => Ok(Self {
+                db: Some(Arc::new(db)),
+            }),
             Err(e) => {
                 let err_msg = e.to_string();
                 if err_msg.contains("Resource temporarily unavailable") {
-                    error!("RocksDB LOCK error: The database is already in use by another process.");
+                    error!(
+                        "RocksDB LOCK error: The database is already in use by another process."
+                    );
                     error!("Please run 'pkill -9 cloud-node-rust' and then try again.");
                 }
                 Err(anyhow::anyhow!("Failed to open RocksDB: {}", e))
@@ -86,10 +94,12 @@ impl MetricStorage {
         let iter = db.iterator(rocksdb::IteratorMode::Start);
         for (key, _) in iter.flatten() {
             let key_str = String::from_utf8_lossy(&key);
-            if (key_str.starts_with("S") && &*key_str < end_prefix.as_str()) || 
-               (key_str.starts_with("NODE_T") && &*key_str < format!("NODE_T{}", older_than_timestamp).as_str()) {
+            if (key_str.starts_with("S") && &*key_str < end_prefix.as_str())
+                || (key_str.starts_with("NODE_T")
+                    && &*key_str < format!("NODE_T{}", older_than_timestamp).as_str())
+            {
                 batch.delete(&key);
-            } else if &*key_str >= "Z" { 
+            } else if &*key_str >= "Z" {
                 break;
             }
         }
@@ -97,7 +107,16 @@ impl MetricStorage {
     }
 
     /// Cache Metadata Management
-    pub fn update_cache_meta(&self, hash: &str, key_str: &str, size: u64, ttl_secs: u64, headers: Option<serde_json::Value>, compressed: bool, status: u16) {
+    pub fn update_cache_meta(
+        &self,
+        hash: &str,
+        key_str: &str,
+        size: u64,
+        ttl_secs: u64,
+        headers: Option<serde_json::Value>,
+        compressed: bool,
+        status: u16,
+    ) {
         let Some(db) = &self.db else {
             return;
         };
@@ -112,7 +131,10 @@ impl MetricStorage {
             "h": headers.unwrap_or(serde_json::json!({})),
             "c": compressed
         });
-        let _ = db.put(format!("CMETA_{}", hash).as_bytes(), meta.to_string().as_bytes());
+        let _ = db.put(
+            format!("CMETA_{}", hash).as_bytes(),
+            meta.to_string().as_bytes(),
+        );
     }
 
     pub fn record_cache_access(&self, hash: &str) {
@@ -121,14 +143,15 @@ impl MetricStorage {
         };
         let key = format!("CMETA_{}", hash);
         if let Ok(Some(val)) = db.get(key.as_bytes())
-            && let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&val) {
-                let now = crate::utils::time::now_timestamp();
-                meta["a"] = serde_json::json!(now);
-                if let Some(f) = meta["f"].as_u64() {
-                    meta["f"] = serde_json::json!(f + 1);
-                }
-                let _ = db.put(key.as_bytes(), meta.to_string().as_bytes());
+            && let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&val)
+        {
+            let now = crate::utils::time::now_timestamp();
+            meta["a"] = serde_json::json!(now);
+            if let Some(f) = meta["f"].as_u64() {
+                meta["f"] = serde_json::json!(f + 1);
             }
+            let _ = db.put(key.as_bytes(), meta.to_string().as_bytes());
+        }
     }
 
     pub fn get_cache_meta(&self, hash: &str) -> Option<serde_json::Value> {
@@ -156,7 +179,10 @@ impl MetricStorage {
             "ua": ua_hash,
             "exp": expired_at
         });
-        let _ = db.put(format!("WAFTOK_{}", token).as_bytes(), val.to_string().as_bytes());
+        let _ = db.put(
+            format!("WAFTOK_{}", token).as_bytes(),
+            val.to_string().as_bytes(),
+        );
     }
 
     pub fn get_waf_token(&self, token: &str) -> Option<serde_json::Value> {
@@ -179,7 +205,7 @@ impl MetricStorage {
         let Some(db) = &self.db else {
             return 0;
         };
-        
+
         let iter = db.prefix_iterator("CMETA_".as_bytes());
         for (key, val) in iter.flatten() {
             let key_str = String::from_utf8_lossy(&key);
@@ -236,8 +262,10 @@ impl MetricStorage {
     }
 
     /// Iterates over all cache metadata efficiently using a closure.
-    pub fn for_each_cache_meta<F>(&self, mut f: F) 
-    where F: FnMut(String, serde_json::Value) {
+    pub fn for_each_cache_meta<F>(&self, mut f: F)
+    where
+        F: FnMut(String, serde_json::Value),
+    {
         let Some(db) = &self.db else {
             return;
         };
@@ -248,7 +276,10 @@ impl MetricStorage {
                 break;
             }
             if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
-                let hash = key_str.strip_prefix("CMETA_").unwrap_or(&key_str).to_string();
+                let hash = key_str
+                    .strip_prefix("CMETA_")
+                    .unwrap_or(&key_str)
+                    .to_string();
                 f(hash, meta);
             }
         }
@@ -267,7 +298,10 @@ impl MetricStorage {
                 break;
             }
             if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
-                let hash = key_str.strip_prefix("CMETA_").unwrap_or(&key_str).to_string();
+                let hash = key_str
+                    .strip_prefix("CMETA_")
+                    .unwrap_or(&key_str)
+                    .to_string();
                 results.push((hash, meta));
             }
         }
@@ -301,7 +335,10 @@ pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
     match MetricStorage::open(path) {
         Ok(storage) => storage,
         Err(err) => {
-            error!("Failed to open RocksDB for metrics, metrics storage disabled: {}", err);
+            error!(
+                "Failed to open RocksDB for metrics, metrics storage disabled: {}",
+                err
+            );
             MetricStorage::unavailable()
         }
     }

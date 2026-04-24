@@ -14,9 +14,10 @@ pub fn load_state() -> PersistentState {
     let path = "data/state.json";
     if Path::new(path).exists()
         && let Ok(content) = fs::read_to_string(path)
-            && let Ok(state) = serde_json::from_str(&content) {
-                return state;
-            }
+        && let Ok(state) = serde_json::from_str(&content)
+    {
+        return state;
+    }
     PersistentState::default()
 }
 
@@ -38,8 +39,9 @@ pub fn load_blocked_ips() -> Vec<(String, i64, u64)> {
     let path = "data/blocked_ips.json";
     if Path::new(path).exists()
         && let Ok(content) = fs::read_to_string(path)
-            && let Ok(ips) = serde_json::from_str(&content) {
-                return ips;
-            }
+        && let Ok(ips) = serde_json::from_str(&content)
+    {
+        return ips;
+    }
     vec![]
 }

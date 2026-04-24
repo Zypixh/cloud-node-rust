@@ -1,12 +1,12 @@
 use crate::config_models::{HTTPFirewallRule, HTTPFirewallRuleGroup, HTTPFirewallRuleSet};
 use crate::firewall::OutboundContext;
 use crate::metrics::analyzer;
+use base64::Engine as _;
 use dashmap::DashMap;
-use pingora_proxy::Session;
 use once_cell::sync::Lazy;
+use pingora_proxy::Session;
 use regex::Regex;
 use serde_json::Value;
-use base64::Engine as _;
 
 pub struct MatchResult<'a> {
     pub matched: bool,
@@ -53,14 +53,25 @@ pub fn match_set(set: &HTTPFirewallRuleSet, session: &Session, request_body: &[u
     if set.ignore_local && is_local_ip(&ip) {
         return false;
     }
-    if set.ignore_search_engine && crate::firewall::matcher::evaluate_operator(&header_value(session, "user-agent"), "common bot", "", true) {
+    if set.ignore_search_engine
+        && crate::firewall::matcher::evaluate_operator(
+            &header_value(session, "user-agent"),
+            "common bot",
+            "",
+            true,
+        )
+    {
         return false;
     }
 
     if set.connector == "and" {
-        set.rules.iter().all(|rule| match_rule(rule, session, request_body))
+        set.rules
+            .iter()
+            .all(|rule| match_rule(rule, session, request_body))
     } else {
-        set.rules.iter().any(|rule| match_rule(rule, session, request_body))
+        set.rules
+            .iter()
+            .any(|rule| match_rule(rule, session, request_body))
     }
 }
 
@@ -79,7 +90,14 @@ pub fn match_set_response(
     if set.ignore_local && is_local_ip(&ip) {
         return false;
     }
-    if set.ignore_search_engine && crate::firewall::matcher::evaluate_operator(&header_value(session, "user-agent"), "common bot", "", true) {
+    if set.ignore_search_engine
+        && crate::firewall::matcher::evaluate_operator(
+            &header_value(session, "user-agent"),
+            "common bot",
+            "",
+            true,
+        )
+    {
         return false;
     }
 
@@ -159,11 +177,31 @@ pub fn match_rule_response(
 fn match_preset_group(code: &str, session: &Session, request_body: &[u8]) -> bool {
     let check_str = get_full_request_data(session, request_body);
     match code {
-        "sqlInjection" => crate::firewall::matcher::evaluate_operator(&check_str, "contains sql injection", "", true),
-        "sqlInjectionStrict" => crate::firewall::matcher::evaluate_operator(&check_str, "contains sql injection strictly", "", true),
+        "sqlInjection" => crate::firewall::matcher::evaluate_operator(
+            &check_str,
+            "contains sql injection",
+            "",
+            true,
+        ),
+        "sqlInjectionStrict" => crate::firewall::matcher::evaluate_operator(
+            &check_str,
+            "contains sql injection strictly",
+            "",
+            true,
+        ),
         "xss" => crate::firewall::matcher::evaluate_operator(&check_str, "contains xss", "", true),
-        "xssStrict" => crate::firewall::matcher::evaluate_operator(&check_str, "contains xss strictly", "", true),
-        "cmdInjection" => crate::firewall::matcher::evaluate_operator(&check_str, "contains cmd injection", "", true),
+        "xssStrict" => crate::firewall::matcher::evaluate_operator(
+            &check_str,
+            "contains xss strictly",
+            "",
+            true,
+        ),
+        "cmdInjection" => crate::firewall::matcher::evaluate_operator(
+            &check_str,
+            "contains cmd injection",
+            "",
+            true,
+        ),
         _ => false,
     }
 }
@@ -195,14 +233,21 @@ fn get_variable_value(session: &Session, param: &str, request_body: &[u8]) -> St
     RE_VAR
         .replace_all(param, |caps: &regex::Captures| {
             let inner = &caps[0];
-            let inner = inner.strip_prefix("${").and_then(|s| s.strip_suffix('}')).unwrap_or(inner);
+            let inner = inner
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(inner);
             resolve_variable(session, inner, request_body)
         })
         .to_string()
 }
 
 fn get_rule_value(rule: &HTTPFirewallRule, session: &Session, request_body: &[u8]) -> String {
-    if rule.param.starts_with("${cc.") || rule.param == "${cc}" || rule.param.starts_with("${cc2.") || rule.param == "${cc2}" {
+    if rule.param.starts_with("${cc.")
+        || rule.param == "${cc}"
+        || rule.param.starts_with("${cc2.")
+        || rule.param == "${cc2}"
+    {
         return cc_value(rule, session, request_body, true);
     }
     get_variable_value(session, &rule.param, request_body)
@@ -214,13 +259,22 @@ fn get_response_rule_value(
     request_body: &[u8],
     response: &OutboundContext<'_>,
 ) -> String {
-    if rule.param.starts_with("${cc.") || rule.param == "${cc}" || rule.param.starts_with("${cc2.") || rule.param == "${cc2}" {
+    if rule.param.starts_with("${cc.")
+        || rule.param == "${cc}"
+        || rule.param.starts_with("${cc2.")
+        || rule.param == "${cc2}"
+    {
         return cc_value(rule, session, request_body, true);
     }
     get_response_variable_value(session, &rule.param, request_body, response)
 }
 
-fn cc_value(rule: &HTTPFirewallRule, session: &Session, request_body: &[u8], is_cc2: bool) -> String {
+fn cc_value(
+    rule: &HTTPFirewallRule,
+    session: &Session,
+    request_body: &[u8],
+    is_cc2: bool,
+) -> String {
     let options = rule.checkpoint_options.as_ref();
     let period = options
         .and_then(|v| v.get("period"))
@@ -275,7 +329,10 @@ fn get_response_variable_value(
     RE_VAR
         .replace_all(param, |caps: &regex::Captures| {
             let inner = &caps[0];
-            let inner = inner.strip_prefix("${").and_then(|s| s.strip_suffix('}')).unwrap_or(inner);
+            let inner = inner
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(inner);
             resolve_response_variable(session, inner, request_body, response)
         })
         .to_string()
@@ -285,20 +342,46 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8]) -> Stri
     match inner {
         "remoteAddr" | "rawRemoteAddr" => get_remote_addr(session),
         "remotePort" => get_remote_port(session),
-        "remoteUser" => session.get_header("authorization")
+        "remoteUser" => session
+            .get_header("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Basic "))
-            .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v.trim()).ok())
+            .and_then(|v| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(v.trim())
+                    .ok()
+            })
             .and_then(|v| String::from_utf8(v).ok())
             .and_then(|v| v.split_once(':').map(|(u, _)| u.to_string()))
             .unwrap_or_default(),
         "requestURI" => get_request_uri(session),
         "requestPath" => session.req_header().uri.path().to_string(),
-        "requestURL" => format!("{}://{}{}", get_scheme(session), session.req_header().uri.host().unwrap_or(""), get_request_uri(session)),
-        "requestFileExtension" => session.req_header().uri.path().split('.').last().filter(|ext| !ext.is_empty() && !ext.contains('/')).unwrap_or_default().to_string(),
-        "requestLength" => session.get_header("content-length").and_then(|v| v.to_str().ok()).unwrap_or("").to_string(),
+        "requestURL" => format!(
+            "{}://{}{}",
+            get_scheme(session),
+            session.req_header().uri.host().unwrap_or(""),
+            get_request_uri(session)
+        ),
+        "requestFileExtension" => session
+            .req_header()
+            .uri
+            .path()
+            .split('.')
+            .last()
+            .filter(|ext| !ext.is_empty() && !ext.contains('/'))
+            .unwrap_or_default()
+            .to_string(),
+        "requestLength" => session
+            .get_header("content-length")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string(),
         "requestBody" => String::from_utf8_lossy(request_body).to_string(),
-        "requestAll" => format!("{}{}", get_request_uri(session), String::from_utf8_lossy(request_body)),
+        "requestAll" => format!(
+            "{}{}",
+            get_request_uri(session),
+            String::from_utf8_lossy(request_body)
+        ),
         "requestMethod" => session.req_header().method.as_str().to_string(),
         "scheme" => get_scheme(session),
         "proto" => format!("{:?}", session.req_header().version),
@@ -306,7 +389,12 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8]) -> Stri
         "refererOrigin" => {
             let mut val = header_value(session, "referer");
             let origin = header_value(session, "origin");
-            if !origin.is_empty() { if !val.is_empty() { val.push(' '); } val.push_str(&origin); }
+            if !origin.is_empty() {
+                if !val.is_empty() {
+                    val.push(' ');
+                }
+                val.push_str(&origin);
+            }
             val
         }
         "referer" => header_value(session, "referer"),
@@ -319,26 +407,56 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8]) -> Stri
         "headerMaxLength" => header_max_length(session).to_string(),
         "requestGeneralHeaderLength" => general_header_length(session).to_string(),
         "requestPathLowerExtension" => request_path_lower_extension(session),
-        "commonAIBot" => bool_string(crate::firewall::matcher::evaluate_operator(&header_value(session, "user-agent"), "common ai bot", "", true)),
-        "commonBot" => bool_string(crate::firewall::matcher::evaluate_operator(&header_value(session, "user-agent"), "common bot", "", true)),
+        "commonAIBot" => bool_string(crate::firewall::matcher::evaluate_operator(
+            &header_value(session, "user-agent"),
+            "common ai bot",
+            "",
+            true,
+        )),
+        "commonBot" => bool_string(crate::firewall::matcher::evaluate_operator(
+            &header_value(session, "user-agent"),
+            "common bot",
+            "",
+            true,
+        )),
         "geoCountryName" => geo_info(session).map(|g| g.country).unwrap_or_default(),
         "geoProvinceName" => geo_info(session).map(|g| g.region).unwrap_or_default(),
         "geoCityName" => geo_info(session).map(|g| g.city).unwrap_or_default(),
-        "ispName" => geo_info(session).map(|g| g.provider).unwrap_or_else(|| analyzer::lookup_isp_name(parse_remote_ip(session))),
+        "ispName" => geo_info(session)
+            .map(|g| g.provider)
+            .unwrap_or_else(|| analyzer::lookup_isp_name(parse_remote_ip(session))),
         "serverAddr" => get_local_addr(session),
         "serverPort" => get_local_port(session),
         "refererBlock" | "cname" => String::new(),
         "isCNAME" => "0".to_string(),
         _ => {
-            if let Some(name) = dotted_arg(inner, &["arg", "requestArg"]) { return query_param(session, name); }
-            if let Some(name) = dotted_arg(inner, &["header", "requestHeader"]) { return header_value(session, name); }
-            if let Some(name) = dotted_arg(inner, &["cookie", "requestCookie"]) { return cookie_value(session, name); }
-            if let Some(name) = dotted_arg(inner, &["requestForm", "form"]) { return form_value(request_body, name); }
-            if let Some(path) = dotted_arg(inner, &["requestJSON", "json"]) { return json_value(request_body, path); }
-            if let Some(_field) = dotted_arg(inner, &["requestUpload"]) { return String::new(); }
-            if let Some(name) = colon_arg(inner, &["arg"]) { return query_param(session, name); }
-            if let Some(name) = colon_arg(inner, &["header"]) { return header_value(session, name); }
-            if let Some(name) = colon_arg(inner, &["cookie"]) { return cookie_value(session, name); }
+            if let Some(name) = dotted_arg(inner, &["arg", "requestArg"]) {
+                return query_param(session, name);
+            }
+            if let Some(name) = dotted_arg(inner, &["header", "requestHeader"]) {
+                return header_value(session, name);
+            }
+            if let Some(name) = dotted_arg(inner, &["cookie", "requestCookie"]) {
+                return cookie_value(session, name);
+            }
+            if let Some(name) = dotted_arg(inner, &["requestForm", "form"]) {
+                return form_value(request_body, name);
+            }
+            if let Some(path) = dotted_arg(inner, &["requestJSON", "json"]) {
+                return json_value(request_body, path);
+            }
+            if let Some(_field) = dotted_arg(inner, &["requestUpload"]) {
+                return String::new();
+            }
+            if let Some(name) = colon_arg(inner, &["arg"]) {
+                return query_param(session, name);
+            }
+            if let Some(name) = colon_arg(inner, &["header"]) {
+                return header_value(session, name);
+            }
+            if let Some(name) = colon_arg(inner, &["cookie"]) {
+                return cookie_value(session, name);
+            }
             String::new()
         }
     }
@@ -357,13 +475,22 @@ fn resolve_response_variable(
         "responseGeneralHeaderLength" => response
             .headers
             .iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "set-cookie" | "location" | "content-type" | "content-length"))
+            .filter(|(name, _)| {
+                !matches!(
+                    name.as_str(),
+                    "set-cookie" | "location" | "content-type" | "content-length"
+                )
+            })
             .map(|(name, value)| name.len() + value.len())
             .sum::<usize>()
             .to_string(),
         _ => {
-            if let Some(name) = dotted_arg(inner, &["responseHeader"]) { return response_header_value(response, name); }
-            if let Some(name) = colon_arg(inner, &["responseHeader"]) { return response_header_value(response, name); }
+            if let Some(name) = dotted_arg(inner, &["responseHeader"]) {
+                return response_header_value(response, name);
+            }
+            if let Some(name) = colon_arg(inner, &["responseHeader"]) {
+                return response_header_value(response, name);
+            }
             resolve_variable(session, inner, request_body)
         }
     }
@@ -375,13 +502,17 @@ fn get_remote_addr(session: &Session) -> String {
 
 fn get_remote_port(session: &Session) -> String {
     match session.client_addr() {
-        Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => addr.port().to_string(),
+        Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => {
+            addr.port().to_string()
+        }
         _ => String::new(),
     }
 }
 
 fn get_local_addr(session: &Session) -> String {
-    session.downstream_session.digest()
+    session
+        .downstream_session
+        .digest()
         .and_then(|d| d.socket_digest.as_ref())
         .and_then(|sd| sd.local_addr())
         .and_then(|addr| addr.as_inet())
@@ -390,7 +521,9 @@ fn get_local_addr(session: &Session) -> String {
 }
 
 fn get_local_port(session: &Session) -> String {
-    session.downstream_session.digest()
+    session
+        .downstream_session
+        .digest()
         .and_then(|d| d.socket_digest.as_ref())
         .and_then(|sd| sd.local_addr())
         .and_then(|addr| addr.as_inet())
@@ -418,105 +551,211 @@ fn geo_info(session: &Session) -> Option<analyzer::GeoInfo> {
 
 fn get_request_uri(session: &Session) -> String {
     let path = session.req_header().uri.path();
-    let query = session.req_header().uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+    let query = session
+        .req_header()
+        .uri
+        .query()
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
     format!("{}{}", path, query)
 }
 
 fn get_scheme(session: &Session) -> String {
-    let is_tls = session.downstream_session.digest().and_then(|d| d.ssl_digest.as_ref()).is_some();
+    let is_tls = session
+        .downstream_session
+        .digest()
+        .and_then(|d| d.ssl_digest.as_ref())
+        .is_some();
     if is_tls || session.req_header().uri.scheme_str() == Some("https") {
         "https".to_string()
     } else {
         let xfp = header_value(session, "x-forwarded-proto");
-        if !xfp.is_empty() { xfp } else { "http".to_string() }
+        if !xfp.is_empty() {
+            xfp
+        } else {
+            "http".to_string()
+        }
     }
 }
 
 fn header_value(session: &Session, name: &str) -> String {
-    session.get_header(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+    session
+        .get_header(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn response_header_value(response: &OutboundContext<'_>, name: &str) -> String {
-    response.headers.get(&name.to_ascii_lowercase()).cloned().unwrap_or_default()
+    response
+        .headers
+        .get(&name.to_ascii_lowercase())
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn normalize_cookies(session: &Session) -> String {
-    session.get_header("cookie").and_then(|v| v.to_str().ok()).map(|cookies| {
-            cookies.split(';').map(|part| part.trim()).collect::<Vec<_>>().join("&")
-        }).unwrap_or_default()
+    session
+        .get_header("cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(|cookies| {
+            cookies
+                .split(';')
+                .map(|part| part.trim())
+                .collect::<Vec<_>>()
+                .join("&")
+        })
+        .unwrap_or_default()
 }
 
 fn all_headers(session: &Session) -> String {
-    let mut headers = session.req_header().headers.iter().filter_map(|(name, value)| {
-            value.to_str().ok().map(|v| format!("{}: {}", name.as_str(), v))
-        }).collect::<Vec<_>>();
+    let mut headers = session
+        .req_header()
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| format!("{}: {}", name.as_str(), v))
+        })
+        .collect::<Vec<_>>();
     headers.sort();
     headers.join("\n")
 }
 
 fn header_names(session: &Session) -> String {
-    let mut headers = session.req_header().headers.keys().map(|name| name.as_str().to_string()).collect::<Vec<_>>();
+    let mut headers = session
+        .req_header()
+        .headers
+        .keys()
+        .map(|name| name.as_str().to_string())
+        .collect::<Vec<_>>();
     headers.sort();
     headers.join("\n")
 }
 
 fn header_max_length(session: &Session) -> usize {
-    session.req_header().headers.iter().filter_map(|(name, value)| value.to_str().ok().map(|v| name.as_str().len() + v.len())).max().unwrap_or(0)
+    session
+        .req_header()
+        .headers
+        .iter()
+        .filter_map(|(name, value)| value.to_str().ok().map(|v| name.as_str().len() + v.len()))
+        .max()
+        .unwrap_or(0)
 }
 
 fn general_header_length(session: &Session) -> usize {
-    session.req_header().headers.iter().filter(|(name, _)| {
-            !matches!(name.as_str().to_ascii_lowercase().as_str(), "cookie" | "set-cookie" | "referer" | "origin" | "user-agent")
-        }).filter_map(|(name, value)| value.to_str().ok().map(|v| name.as_str().len() + v.len())).sum()
+    session
+        .req_header()
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str().to_ascii_lowercase().as_str(),
+                "cookie" | "set-cookie" | "referer" | "origin" | "user-agent"
+            )
+        })
+        .filter_map(|(name, value)| value.to_str().ok().map(|v| name.as_str().len() + v.len()))
+        .sum()
 }
 
 fn request_path_lower_extension(session: &Session) -> String {
-    std::path::Path::new(session.req_header().uri.path()).extension().and_then(|ext| ext.to_str()).map(|ext| format!(".{}", ext.to_ascii_lowercase())).unwrap_or_default()
+    std::path::Path::new(session.req_header().uri.path())
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{}", ext.to_ascii_lowercase()))
+        .unwrap_or_default()
 }
 
 fn dotted_arg<'a>(inner: &'a str, prefixes: &[&str]) -> Option<&'a str> {
-    prefixes.iter().find_map(|prefix| inner.strip_prefix(prefix).and_then(|rest| rest.strip_prefix(".")))
+    prefixes.iter().find_map(|prefix| {
+        inner
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix("."))
+    })
 }
 
 fn colon_arg<'a>(inner: &'a str, prefixes: &[&str]) -> Option<&'a str> {
-    prefixes.iter().find_map(|prefix| inner.strip_prefix(&format!("{prefix}:")))
+    prefixes
+        .iter()
+        .find_map(|prefix| inner.strip_prefix(&format!("{prefix}:")))
 }
 
 fn query_param(session: &Session, name: &str) -> String {
-    session.req_header().uri.query().and_then(|q| {
+    session
+        .req_header()
+        .uri
+        .query()
+        .and_then(|q| {
             q.split('&').find_map(|part| {
                 let mut iter = part.splitn(2, '=');
                 let key = iter.next()?;
-                if key == name { Some(iter.next().unwrap_or("").to_string()) } else { None }
+                if key == name {
+                    Some(iter.next().unwrap_or("").to_string())
+                } else {
+                    None
+                }
             })
-        }).unwrap_or_default()
+        })
+        .unwrap_or_default()
 }
 
 fn cookie_value(session: &Session, name: &str) -> String {
-    session.get_header("cookie").and_then(|v| v.to_str().ok()).and_then(|cookies| {
+    session
+        .get_header("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
             cookies.split(';').find_map(|part| {
                 let mut iter = part.trim().splitn(2, '=');
                 let key = iter.next()?;
-                if key == name { Some(iter.next().unwrap_or("").to_string()) } else { None }
+                if key == name {
+                    Some(iter.next().unwrap_or("").to_string())
+                } else {
+                    None
+                }
             })
-        }).unwrap_or_default()
+        })
+        .unwrap_or_default()
 }
 
 fn form_value(request_body: &[u8], name: &str) -> String {
-    String::from_utf8_lossy(request_body).split('&').find_map(|part| {
+    String::from_utf8_lossy(request_body)
+        .split('&')
+        .find_map(|part| {
             let mut iter = part.splitn(2, '=');
             let key = iter.next()?;
-            if key == name { Some(iter.next().unwrap_or("").to_string()) } else { None }
-        }).unwrap_or_default()
+            if key == name {
+                Some(iter.next().unwrap_or("").to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn json_value(request_body: &[u8], path: &str) -> String {
-    let Ok(value) = serde_json::from_slice::<Value>(request_body) else { return String::new(); };
+    let Ok(value) = serde_json::from_slice::<Value>(request_body) else {
+        return String::new();
+    };
     let mut current = &value;
     for segment in path.split('.') {
         match current {
-            Value::Object(map) => { let Some(next) = map.get(segment) else { return String::new(); }; current = next; }
-            Value::Array(items) => { let Ok(index) = segment.parse::<usize>() else { return String::new(); }; let Some(next) = items.get(index) else { return String::new(); }; current = next; }
+            Value::Object(map) => {
+                let Some(next) = map.get(segment) else {
+                    return String::new();
+                };
+                current = next;
+            }
+            Value::Array(items) => {
+                let Ok(index) = segment.parse::<usize>() else {
+                    return String::new();
+                };
+                let Some(next) = items.get(index) else {
+                    return String::new();
+                };
+                current = next;
+            }
             _ => return String::new(),
         }
     }
@@ -538,7 +777,10 @@ pub fn format_variables(session: &Session, template: &str, request_body: &[u8]) 
     RE_VAR
         .replace_all(template, |caps: &regex::Captures| {
             let inner = &caps[0];
-            let inner = inner.strip_prefix("${").and_then(|s| s.strip_suffix('}')).unwrap_or(inner);
+            let inner = inner
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(inner);
             resolve_variable(session, inner, request_body)
         })
         .to_string()

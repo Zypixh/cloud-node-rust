@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
@@ -8,10 +7,12 @@ use crate::rpc::logs::report_node_log_with_context;
 use crate::rpc::plan::sync_active_plans;
 use crate::rpc::utils::build_runtime_maps;
 use once_cell::sync::Lazy;
+use std::sync::Arc;
 use std::sync::RwLock;
 use tracing::{debug, error};
 
-static LAST_SINGLE_SERVER_JSON_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
+static LAST_SINGLE_SERVER_JSON_HASH: Lazy<RwLock<String>> =
+    Lazy::new(|| RwLock::new(String::new()));
 static LAST_MULTI_SERVER_JSON_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 
 fn log_server_json_hints(label: &str, raw: &[u8]) {
@@ -83,14 +84,25 @@ pub async fn sync_single_server_config(
                 Ok(server) => {
                     let user_id = server.user_id;
                     let runtime_servers = vec![server];
-                    let (servers, routes) = build_runtime_maps(runtime_servers.clone(), health_manager);
+                    let (servers, routes) =
+                        build_runtime_maps(runtime_servers.clone(), health_manager);
                     if user_id > 0 {
                         config_store
-                            .replace_user_servers(user_id, runtime_servers.into_iter().map(Arc::new).collect(), servers, routes)
+                            .replace_user_servers(
+                                user_id,
+                                runtime_servers.into_iter().map(Arc::new).collect(),
+                                servers,
+                                routes,
+                            )
                             .await;
                     } else {
                         config_store
-                            .replace_server(server_id, runtime_servers.into_iter().map(Arc::new).collect(), servers, routes)
+                            .replace_server(
+                                server_id,
+                                runtime_servers.into_iter().map(Arc::new).collect(),
+                                servers,
+                                routes,
+                            )
                             .await;
                     }
                     let _ = sync_active_plans(api_config, config_store).await;
@@ -216,9 +228,15 @@ pub async fn sync_user_servers_state(
             match serde_json::from_slice::<Vec<ServerConfig>>(&payload.servers_config_json) {
                 Ok(servers) => {
                     let runtime_servers = servers;
-                    let (servers_map, routes_map) = build_runtime_maps(runtime_servers.clone(), health_manager);
+                    let (servers_map, routes_map) =
+                        build_runtime_maps(runtime_servers.clone(), health_manager);
                     config_store
-                        .replace_user_servers(user_id, runtime_servers.into_iter().map(Arc::new).collect(), servers_map, routes_map)
+                        .replace_user_servers(
+                            user_id,
+                            runtime_servers.into_iter().map(Arc::new).collect(),
+                            servers_map,
+                            routes_map,
+                        )
                         .await;
                     let _ = sync_active_plans(api_config, config_store).await;
                     true

@@ -1,11 +1,19 @@
+use once_cell::sync::Lazy;
 use regex::Regex;
 use std::net::IpAddr;
-use once_cell::sync::Lazy;
 
-static RE_SQLI: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(union\s+select|select\s+.*\s+from|insert\s+into|update\s+.*\s+set|delete\s+from|drop\s+table|truncate\s+table|benchmark\(|sleep\()").unwrap());
-static RE_SQLI_STRICT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)('|--|#|/\*|\*/|\b(and|or)\b\s+\d+=\d+)").unwrap());
-static RE_XSS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(<script|javascript:|onerror=|onload=|eval\(|alert\(|document\.cookie)").unwrap());
-static RE_XSS_STRICT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(<xml|<audio|<video|<svg|<iframe|<img|<link|<style|<form)").unwrap());
+static RE_SQLI: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(union\s+select|select\s+.*\s+from|insert\s+into|update\s+.*\s+set|delete\s+from|drop\s+table|truncate\s+table|benchmark\(|sleep\()").unwrap()
+});
+static RE_SQLI_STRICT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)('|--|#|/\*|\*/|\b(and|or)\b\s+\d+=\d+)").unwrap());
+static RE_XSS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(<script|javascript:|onerror=|onload=|eval\(|alert\(|document\.cookie)")
+        .unwrap()
+});
+static RE_XSS_STRICT: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(<xml|<audio|<video|<svg|<iframe|<img|<link|<style|<form)").unwrap()
+});
 
 pub fn evaluate_operator(
     actual_value: &str,
@@ -138,7 +146,9 @@ pub fn evaluate_operator(
             }
         }
         "gt ip" | "gte ip" | "lt ip" | "lte ip" => {
-            if let (Ok(actual_ip), Ok(expected_ip)) = (actual.parse::<IpAddr>(), expected.parse::<IpAddr>()) {
+            if let (Ok(actual_ip), Ok(expected_ip)) =
+                (actual.parse::<IpAddr>(), expected.parse::<IpAddr>())
+            {
                 let ordering = ip_to_bytes(actual_ip).cmp(&ip_to_bytes(expected_ip));
                 match operator.trim().to_ascii_lowercase().as_str() {
                     "gt ip" => ordering.is_gt(),
@@ -203,7 +213,14 @@ pub fn evaluate_operator(
             None => compare_versions(&actual, &expected).is_some_and(|o| o.is_gt() || o.is_eq()),
         },
         "contains cmd injection" | "contains cmd injection strictly" => {
-            let cmd_keywords = vec!["/bin/sh", "/bin/bash", "cmd.exe", "powershell", "curl ", "wget "];
+            let cmd_keywords = vec![
+                "/bin/sh",
+                "/bin/bash",
+                "cmd.exe",
+                "powershell",
+                "curl ",
+                "wget ",
+            ];
             cmd_keywords
                 .iter()
                 .any(|keyword| actual.to_lowercase().contains(keyword))
@@ -304,11 +321,7 @@ fn parse_version(input: &str) -> Option<Vec<u64>> {
         }
         parts.push(digits.parse().ok()?);
     }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts)
-    }
+    if parts.is_empty() { None } else { Some(parts) }
 }
 
 fn is_common_bot(ua: &str) -> bool {

@@ -1,12 +1,12 @@
 use clap::{Parser, Subcommand};
+use std::fs;
 use std::future::Future;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
-use std::fs;
-use std::process::Command;
 
 use cloud_node_rust::api_config::ApiConfig;
 use cloud_node_rust::config::ConfigStore;
@@ -14,7 +14,7 @@ use cloud_node_rust::firewall::state::WafStateManager;
 use cloud_node_rust::health_manager::GlobalHealthManager;
 use cloud_node_rust::proxy::EdgeProxy;
 use cloud_node_rust::ssl::DynamicCertSelector;
-use cloud_node_rust::{rpc, logging, log_uploader, udp_proxy, tcp_proxy, firewall};
+use cloud_node_rust::{firewall, log_uploader, logging, rpc, tcp_proxy, udp_proxy};
 
 const PID_FILE: &str = "data/cloud-node.pid";
 
@@ -25,8 +25,7 @@ impl FormatTime for LocalLogTimer {
         write!(
             w,
             "{}",
-            cloud_node_rust::utils::time::now_local_millis()
-                .format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+            cloud_node_rust::utils::time::now_local_millis().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
         )
     }
 }
@@ -38,6 +37,20 @@ impl FormatTime for LocalLogTimer {
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Port to start the performance monitor web dashboard"
+    )]
+    monitor_port: Option<u16>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Clear in-memory performance monitor samples on startup"
+    )]
+    monitor_clear: bool,
 }
 
 #[derive(Subcommand)]
@@ -89,7 +102,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         None => {
             // Default: Foreground
-            run_node()?;
+            run_node(cli.monitor_port, cli.monitor_clear)?;
         }
         Some(Commands::Start) => {
             if let Some(pid) = check_running() {
@@ -98,17 +111,24 @@ fn main() -> anyhow::Result<()> {
             }
 
             let executable = std::env::current_exe()?;
-            let child = Command::new(executable)
-                .arg("_start-internal")
+            let mut command = Command::new(executable);
+            command.arg("_start-internal");
+            if let Some(port) = cli.monitor_port {
+                command.arg("--monitor-port").arg(port.to_string());
+            }
+            if cli.monitor_clear {
+                command.arg("--monitor-clear");
+            }
+            let child = command
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()?;
-            
+
             println!("CloudNode started in background (PID: {})", child.id());
         }
         Some(Commands::_StartInternal) => {
-            run_node()?;
+            run_node(cli.monitor_port, cli.monitor_clear)?;
         }
         Some(Commands::Stop) => {
             if let Some(pid) = check_running() {
@@ -136,7 +156,7 @@ fn main() -> anyhow::Result<()> {
             {
                 let exe_path = std::env::current_exe()?.canonicalize()?;
                 let work_dir = std::env::current_dir()?.canonicalize()?;
-                
+
                 // 1. Create global command wrapper
                 let bin_path = "/usr/bin/cloud-node";
                 let wrapper_script = format!(
@@ -144,19 +164,22 @@ fn main() -> anyhow::Result<()> {
                     work_dir.display(),
                     exe_path.display()
                 );
-                
+
                 if let Err(e) = fs::write(bin_path, wrapper_script) {
-                    eprintln!("Failed to create global command at {}. Please run with sudo. Error: {}", bin_path, e);
+                    eprintln!(
+                        "Failed to create global command at {}. Please run with sudo. Error: {}",
+                        bin_path, e
+                    );
                     std::process::exit(1);
                 }
-                
+
                 use std::os::unix::fs::PermissionsExt;
                 if let Ok(metadata) = fs::metadata(bin_path) {
                     let mut perms = metadata.permissions();
                     perms.set_mode(0o755);
                     let _ = fs::set_permissions(bin_path, perms);
                 }
-                
+
                 println!("Successfully registered global command: cloud-node");
 
                 // 2. Create Systemd service
@@ -185,11 +208,19 @@ fn main() -> anyhow::Result<()> {
                 );
 
                 if let Err(e) = fs::write(service_path, service_content) {
-                    eprintln!("Failed to create systemd service at {}. Error: {}", service_path, e);
+                    eprintln!(
+                        "Failed to create systemd service at {}. Error: {}",
+                        service_path, e
+                    );
                 } else {
                     let _ = Command::new("systemctl").arg("daemon-reload").status();
-                    let _ = Command::new("systemctl").arg("enable").arg("cloud-node").status();
-                    println!("Successfully registered systemd service. You can now use: systemctl start cloud-node");
+                    let _ = Command::new("systemctl")
+                        .arg("enable")
+                        .arg("cloud-node")
+                        .status();
+                    println!(
+                        "Successfully registered systemd service. You can now use: systemctl start cloud-node"
+                    );
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -206,7 +237,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_node() -> anyhow::Result<()> {
+fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()> {
     // Ensure data directory exists
     fs::create_dir_all("data").ok();
 
@@ -214,7 +245,10 @@ fn run_node() -> anyhow::Result<()> {
     let pid = std::process::id();
     if let Some(existing_pid) = check_running() {
         if existing_pid != pid {
-            eprintln!("Error: Another instance is already running (PID: {})", existing_pid);
+            eprintln!(
+                "Error: Another instance is already running (PID: {})",
+                existing_pid
+            );
             std::process::exit(1);
         }
     }
@@ -228,27 +262,39 @@ fn run_node() -> anyhow::Result<()> {
     #[cfg(target_family = "unix")]
     {
         unsafe {
-            let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
                 let target = 1048576;
                 let old_cur = rlim.rlim_cur;
-                
+
                 if rlim.rlim_max < target {
                     rlim.rlim_max = target;
                 }
                 if rlim.rlim_cur < target {
                     rlim.rlim_cur = target;
                 }
-                
+
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
                     if old_cur < target {
-                        info!("Successfully raised RLIMIT_NOFILE (file descriptor limit) from {} to {}", old_cur, target);
+                        info!(
+                            "Successfully raised RLIMIT_NOFILE (file descriptor limit) from {} to {}",
+                            old_cur, target
+                        );
                     } else {
-                        info!("RLIMIT_NOFILE (file descriptor limit) is already {} (>= {})", old_cur, target);
+                        info!(
+                            "RLIMIT_NOFILE (file descriptor limit) is already {} (>= {})",
+                            old_cur, target
+                        );
                     }
                 } else {
                     let err = std::io::Error::last_os_error();
-                    warn!("Failed to raise RLIMIT_NOFILE to {}. Current limit: cur={}, max={}. Error: {}. (You may need 'ulimit -n 1048576' or root privileges)", target, rlim.rlim_cur, rlim.rlim_max, err);
+                    warn!(
+                        "Failed to raise RLIMIT_NOFILE to {}. Current limit: cur={}, max={}. Error: {}. (You may need 'ulimit -n 1048576' or root privileges)",
+                        target, rlim.rlim_cur, rlim.rlim_max, err
+                    );
                 }
             } else {
                 warn!("Failed to get RLIMIT_NOFILE");
@@ -264,6 +310,12 @@ fn run_node() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     let _guard = rt.enter();
+
+    if let Some(port) = monitor_port {
+        spawn_staggered(&rt, Duration::ZERO, async move {
+            cloud_node_rust::perf_monitor::start(port, monitor_clear).await;
+        });
+    }
 
     // 1. Load API Config
     let api_config = ApiConfig::load_default().expect("Failed to load api_node.yaml");
@@ -376,12 +428,21 @@ fn run_node() -> anyhow::Result<()> {
     let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(1000);
     logging::init_global_log_bus(log_tx, node_log_tx);
 
-    let uploader = log_uploader::LogUploader::new(log_rx, api_config.clone(), 100, Duration::from_secs(5));
-    spawn_staggered(&rt, Duration::from_secs(10), async move { uploader.start().await; });
+    let uploader =
+        log_uploader::LogUploader::new(log_rx, api_config.clone(), 100, Duration::from_secs(5));
+    spawn_staggered(&rt, Duration::from_secs(10), async move {
+        uploader.start().await;
+    });
 
-    let node_uploader =
-        log_uploader::NodeLogUploader::new(node_log_rx, api_config.clone(), 100, Duration::from_secs(5));
-    spawn_staggered(&rt, Duration::from_secs(12), async move { node_uploader.start().await; });
+    let node_uploader = log_uploader::NodeLogUploader::new(
+        node_log_rx,
+        api_config.clone(),
+        100,
+        Duration::from_secs(5),
+    );
+    spawn_staggered(&rt, Duration::from_secs(12), async move {
+        node_uploader.start().await;
+    });
 
     // 4. Initialize Pingora Server
     let mut my_server = pingora_core::server::Server::new(None).unwrap();
@@ -399,20 +460,29 @@ fn run_node() -> anyhow::Result<()> {
         },
         my_server.configuration.clone(),
     );
-    spawn_staggered(&rt, Duration::from_secs(1), async move { http_manager.start_listeners().await; });
+    spawn_staggered(&rt, Duration::from_secs(1), async move {
+        http_manager.start_listeners().await;
+    });
 
     let http3_manager = cloud_node_rust::http3_proxy_manager::Http3ProxyManager::new(
         (*config_store).clone(),
         cert_selector.clone(),
     );
-    spawn_staggered(&rt, Duration::from_secs(2), async move { http3_manager.start_listeners().await; });
+    spawn_staggered(&rt, Duration::from_secs(2), async move {
+        http3_manager.start_listeners().await;
+    });
 
     // UDP & TCP
     let udp_manager = udp_proxy::UdpProxyManager::new((*config_store).clone());
-    spawn_staggered(&rt, Duration::from_secs(2), async move { udp_manager.start_listeners().await; });
+    spawn_staggered(&rt, Duration::from_secs(2), async move {
+        udp_manager.start_listeners().await;
+    });
 
-    let tcp_manager = tcp_proxy::TcpProxyManager::new((*config_store).clone(), cert_selector.clone());
-    spawn_staggered(&rt, Duration::from_secs(2), async move { tcp_manager.start_listeners().await; });
+    let tcp_manager =
+        tcp_proxy::TcpProxyManager::new((*config_store).clone(), cert_selector.clone());
+    spawn_staggered(&rt, Duration::from_secs(2), async move {
+        tcp_manager.start_listeners().await;
+    });
 
     info!("CloudNode (PID {}) is ready.", pid);
     my_server.run_forever();
@@ -446,7 +516,10 @@ fn tune_kernel_param(key: &str, target: &str) {
     let path_ref = std::path::Path::new(&path);
 
     if !path_ref.exists() {
-        info!("Kernel tuning skipped: {} is not available on this system", key);
+        info!(
+            "Kernel tuning skipped: {} is not available on this system",
+            key
+        );
         return;
     }
 

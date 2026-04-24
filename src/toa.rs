@@ -139,7 +139,8 @@ mod imp {
 
     fn allocator() -> &'static Mutex<AllocatorState> {
         static ALLOCATOR: OnceLock<Mutex<AllocatorState>> = OnceLock::new();
-        ALLOCATOR.get_or_init(|| Mutex::new(AllocatorState::new(DEFAULT_MIN_PORT, DEFAULT_MAX_PORT)))
+        ALLOCATOR
+            .get_or_init(|| Mutex::new(AllocatorState::new(DEFAULT_MIN_PORT, DEFAULT_MAX_PORT)))
     }
 
     struct KernelClient {
@@ -151,20 +152,21 @@ mod imp {
         fn connect() -> Result<Self> {
             let (router, _) = NlRouter::connect(NlFamily::Generic, Some(0), Groups::empty())
                 .context("failed to connect TOA sender generic netlink socket")?;
-            let family_id = router
-                .resolve_genl_family(FAMILY_NAME)
-                .with_context(|| format!("failed to resolve generic netlink family {}", FAMILY_NAME))?;
+            let family_id = router.resolve_genl_family(FAMILY_NAME).with_context(|| {
+                format!("failed to resolve generic netlink family {}", FAMILY_NAME)
+            })?;
             Ok(Self { router, family_id })
         }
 
         fn add(&self, mapping: &Mapping) -> Result<()> {
             let attrs = build_mapping_attrs(mapping);
-            let msg: Genlmsghdr<CloudToaSenderCmd, CloudToaSenderAttr> = GenlmsghdrBuilder::default()
-                .cmd(CloudToaSenderCmd::Add)
-                .version(1)
-                .attrs(attrs)
-                .build()
-                .context("failed to build TOA sender ADD request")?;
+            let msg: Genlmsghdr<CloudToaSenderCmd, CloudToaSenderAttr> =
+                GenlmsghdrBuilder::default()
+                    .cmd(CloudToaSenderCmd::Add)
+                    .version(1)
+                    .attrs(attrs)
+                    .build()
+                    .context("failed to build TOA sender ADD request")?;
 
             let mut recv = self
                 .router
@@ -193,12 +195,13 @@ mod imp {
             )
             .collect::<GenlBuffer<_, _>>();
 
-            let msg: Genlmsghdr<CloudToaSenderCmd, CloudToaSenderAttr> = GenlmsghdrBuilder::default()
-                .cmd(CloudToaSenderCmd::Del)
-                .version(1)
-                .attrs(attrs)
-                .build()
-                .context("failed to build TOA sender DEL request")?;
+            let msg: Genlmsghdr<CloudToaSenderCmd, CloudToaSenderAttr> =
+                GenlmsghdrBuilder::default()
+                    .cmd(CloudToaSenderCmd::Del)
+                    .version(1)
+                    .attrs(attrs)
+                    .build()
+                    .context("failed to build TOA sender DEL request")?;
 
             let mut recv = self
                 .router
@@ -213,12 +216,13 @@ mod imp {
         }
 
         fn flush(&self) -> Result<()> {
-            let msg: Genlmsghdr<CloudToaSenderCmd, CloudToaSenderAttr> = GenlmsghdrBuilder::default()
-                .cmd(CloudToaSenderCmd::Flush)
-                .version(1)
-                .attrs(std::iter::empty().collect::<GenlBuffer<CloudToaSenderAttr, Buffer>>())
-                .build()
-                .context("failed to build TOA sender FLUSH request")?;
+            let msg: Genlmsghdr<CloudToaSenderCmd, CloudToaSenderAttr> =
+                GenlmsghdrBuilder::default()
+                    .cmd(CloudToaSenderCmd::Flush)
+                    .version(1)
+                    .attrs(std::iter::empty().collect::<GenlBuffer<CloudToaSenderAttr, Buffer>>())
+                    .build()
+                    .context("failed to build TOA sender FLUSH request")?;
 
             let mut recv = self
                 .router
@@ -350,7 +354,9 @@ mod imp {
             ),
         }
 
-        attrs.into_iter().collect::<GenlBuffer<CloudToaSenderAttr, Buffer>>()
+        attrs
+            .into_iter()
+            .collect::<GenlBuffer<CloudToaSenderAttr, Buffer>>()
     }
 
     fn configured_port_range(config: &TOAConfig) -> (u16, u16) {
@@ -415,7 +421,9 @@ mod imp {
     }
 
     fn run_command(command: &mut Command, context: &str) -> Result<()> {
-        let output = command.output().with_context(|| format!("failed to spawn {}", context))?;
+        let output = command
+            .output()
+            .with_context(|| format!("failed to spawn {}", context))?;
         if output.status.success() {
             return Ok(());
         }
@@ -433,8 +441,8 @@ mod imp {
             return Ok(());
         }
 
-        let sender_root = find_sender_root()
-            .ok_or_else(|| anyhow!("failed to locate toa-sender directory"))?;
+        let sender_root =
+            find_sender_root().ok_or_else(|| anyhow!("failed to locate toa-sender directory"))?;
 
         if module_binary_exists(&sender_root).is_none() {
             run_command(
@@ -531,7 +539,12 @@ mod imp {
             .await
             .with_context(|| format!("failed to resolve TOA upstream {}", backend_addr))?
             .next()
-            .ok_or_else(|| anyhow!("no socket address resolved for TOA upstream {}", backend_addr))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "no socket address resolved for TOA upstream {}",
+                    backend_addr
+                )
+            })?;
 
         static FLUSHED: OnceLock<()> = OnceLock::new();
         if FLUSHED.get().is_none() {
@@ -604,7 +617,10 @@ mod imp {
         Ok(())
     }
 
-    pub async fn unregister_toa_port(_toa_config: Option<TOAConfig>, _local_port: u16) -> Result<()> {
+    pub async fn unregister_toa_port(
+        _toa_config: Option<TOAConfig>,
+        _local_port: u16,
+    ) -> Result<()> {
         Ok(())
     }
 

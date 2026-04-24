@@ -1,9 +1,9 @@
 use dashmap::DashMap;
+use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
+use ipnet::IpNet;
 use std::net::IpAddr;
-use governor::{Quota, RateLimiter, state::keyed::DashMapStateStore, clock::DefaultClock};
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use ipnet::IpNet;
 
 pub struct WafStateManager {
     pub blocks: DashMap<(i64, IpAddr), i64>,
@@ -11,7 +11,8 @@ pub struct WafStateManager {
     pub whitelists: DashMap<(i64, IpAddr), i64>,
     cache_miss_limiters: Arc<RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>>,
     server_limiters: DashMap<i64, Arc<RateLimiter<i64, DashMapStateStore<i64>, DefaultClock>>>,
-    ip_limiters: DashMap<(i64, IpAddr), Arc<RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>>>,
+    ip_limiters:
+        DashMap<(i64, IpAddr), Arc<RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>>>,
     counters: DashMap<String, Vec<i64>>,
 }
 
@@ -37,17 +38,21 @@ impl WafStateManager {
 
     pub fn is_whitelisted(&self, ip: IpAddr, server_id: i64) -> bool {
         if let Some(expiry) = self.whitelists.get(&(0, ip)) {
-            if crate::utils::time::now_timestamp() < *expiry { return true; }
+            if crate::utils::time::now_timestamp() < *expiry {
+                return true;
+            }
         }
         if let Some(expiry) = self.whitelists.get(&(server_id, ip)) {
-            if crate::utils::time::now_timestamp() < *expiry { return true; }
+            if crate::utils::time::now_timestamp() < *expiry {
+                return true;
+            }
         }
         false
     }
 
     pub fn is_blocked(&self, ip: IpAddr, server_id: i64) -> bool {
         let now = crate::utils::time::now_timestamp();
-        
+
         // 1. Check IP-level blocks (Global and Site)
         if self.check_block_expiry(0, ip, now) || self.check_block_expiry(server_id, ip, now) {
             return true;
@@ -66,23 +71,41 @@ impl WafStateManager {
 
     fn check_block_expiry(&self, server_id: i64, ip: IpAddr, now: i64) -> bool {
         if let Some(expiry) = self.blocks.get(&(server_id, ip)) {
-            if now < *expiry { return true; }
+            if now < *expiry {
+                return true;
+            }
         }
         false
     }
 
-    pub fn block_ip(&self, ip: IpAddr, server_id: i64, timeout_secs: i64, scope: Option<&str>, block_c_class: bool, use_local_firewall: bool) {
+    pub fn block_ip(
+        &self,
+        ip: IpAddr,
+        server_id: i64,
+        timeout_secs: i64,
+        scope: Option<&str>,
+        block_c_class: bool,
+        use_local_firewall: bool,
+    ) {
         let expiry = crate::utils::time::now_timestamp() + timeout_secs;
-        let key_server_id = if matches!(scope, Some("global")) { 0 } else { server_id };
+        let key_server_id = if matches!(scope, Some("global")) {
+            0
+        } else {
+            server_id
+        };
 
         if block_c_class {
             if let Ok(net) = self.get_c_class_net(ip) {
                 self.block_networks.insert((key_server_id, net), expiry);
-                if use_local_firewall { self.exec_local_firewall(net.to_string(), timeout_secs); }
+                if use_local_firewall {
+                    self.exec_local_firewall(net.to_string(), timeout_secs);
+                }
             }
         } else {
             self.blocks.insert((key_server_id, ip), expiry);
-            if use_local_firewall { self.exec_local_firewall(ip.to_string(), timeout_secs); }
+            if use_local_firewall {
+                self.exec_local_firewall(ip.to_string(), timeout_secs);
+            }
         }
     }
 
@@ -91,12 +114,23 @@ impl WafStateManager {
         #[cfg(target_os = "linux")]
         {
             let _ = std::process::Command::new("ipset")
-                .args(&["add", "edge_waf_block", &target, "timeout", &timeout.to_string(), "-exist"])
+                .args(&[
+                    "add",
+                    "edge_waf_block",
+                    &target,
+                    "timeout",
+                    &timeout.to_string(),
+                    "-exist",
+                ])
                 .spawn();
         }
         #[cfg(not(target_os = "linux"))]
         {
-            tracing::info!("Local firewall simulation: blocking {} for {}s", target, timeout);
+            tracing::info!(
+                "Local firewall simulation: blocking {} for {}s",
+                target,
+                timeout
+            );
         }
     }
 
@@ -107,10 +141,20 @@ impl WafStateManager {
         }
     }
 
-    pub fn unblock_ip(&self, ip: IpAddr, server_id: i64, scope: Option<&str>, use_local_firewall: bool) {
-        let key_server_id = if matches!(scope, Some("global")) { 0 } else { server_id };
+    pub fn unblock_ip(
+        &self,
+        ip: IpAddr,
+        server_id: i64,
+        scope: Option<&str>,
+        use_local_firewall: bool,
+    ) {
+        let key_server_id = if matches!(scope, Some("global")) {
+            0
+        } else {
+            server_id
+        };
         self.blocks.remove(&(key_server_id, ip));
-        
+
         // Remove from network blocks as well (C-Class)
         if let Ok(net) = self.get_c_class_net(ip) {
             self.block_networks.remove(&(key_server_id, net));
@@ -142,7 +186,9 @@ impl WafStateManager {
     }
 
     pub fn check_rate_limit(&self, server_id: i64, max_qps: u32) -> bool {
-        if max_qps == 0 { return true; }
+        if max_qps == 0 {
+            return true;
+        }
         let limiter = self.server_limiters.entry(server_id).or_insert_with(|| {
             let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
             Arc::new(RateLimiter::dashmap(quota))
@@ -151,7 +197,9 @@ impl WafStateManager {
     }
 
     pub fn check_ip_rate_limit(&self, server_id: i64, ip: IpAddr, max_qps: u32) -> bool {
-        if max_qps == 0 { return true; }
+        if max_qps == 0 {
+            return true;
+        }
         let limiter = self.ip_limiters.entry((server_id, ip)).or_insert_with(|| {
             let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
             Arc::new(RateLimiter::dashmap(quota))
@@ -159,7 +207,9 @@ impl WafStateManager {
         limiter.check_key(&ip).is_ok()
     }
 
-    pub fn check_cache_limit(&self, ip: IpAddr) -> bool { self.cache_miss_limiters.check_key(&ip).is_ok() }
+    pub fn check_cache_limit(&self, ip: IpAddr) -> bool {
+        self.cache_miss_limiters.check_key(&ip).is_ok()
+    }
 
     pub fn record_failure(&self, key: String) -> u64 {
         self.increase_counter(format!("FAIL:{}", key), 3600)

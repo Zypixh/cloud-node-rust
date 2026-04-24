@@ -95,7 +95,9 @@ pub fn apply_response_header_policy_to_map(
         if !h.is_on {
             continue;
         }
-        headers.entry(h.name.to_lowercase()).or_insert_with(|| h.value.clone());
+        headers
+            .entry(h.name.to_lowercase())
+            .or_insert_with(|| h.value.clone());
     }
 
     // Replace header values

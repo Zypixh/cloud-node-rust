@@ -47,11 +47,15 @@ impl RpcClient {
                     });
                 }
                 Err(err) => {
-                    last_err = Some(anyhow::anyhow!("Failed to connect to {}: {}", api_endpoint, err));
+                    last_err = Some(anyhow::anyhow!(
+                        "Failed to connect to {}: {}",
+                        api_endpoint,
+                        err
+                    ));
                 }
             }
         }
-            
+
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Unable to connect to any RPC endpoint")))
     }
 
@@ -94,19 +98,29 @@ impl RpcClient {
         let type_str = node_type.unwrap_or("node");
         move |mut req: Request<()>| {
             let token = generate_token(&node_id, &secret, type_str).unwrap_or_default();
-            
-            let val = node_id.parse().unwrap_or(tonic::metadata::MetadataValue::from_static("0"));
-            
+
+            let val = node_id
+                .parse()
+                .unwrap_or(tonic::metadata::MetadataValue::from_static("0"));
+
             // Standard lowercase keys (canonical gRPC)
             req.metadata_mut().insert("nodeid", val.clone());
-            req.metadata_mut().insert("type", tonic::metadata::MetadataValue::from_static(type_str));
-            
+            req.metadata_mut().insert(
+                "type",
+                tonic::metadata::MetadataValue::from_static(type_str),
+            );
+
             // Go-style CamelCase key
             if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(b"nodeId") {
                 req.metadata_mut().insert(key, val);
             }
-            
-            req.metadata_mut().insert("token", token.parse().unwrap_or(tonic::metadata::MetadataValue::from_static("")));
+
+            req.metadata_mut().insert(
+                "token",
+                token
+                    .parse()
+                    .unwrap_or(tonic::metadata::MetadataValue::from_static("")),
+            );
             Ok(req)
         }
     }

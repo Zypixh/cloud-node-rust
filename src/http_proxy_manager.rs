@@ -53,7 +53,10 @@ impl HttpProxyManager {
             let servers = self.config_store.get_all_servers().await;
             let mut desired_ports = HashMap::new();
             if !servers.is_empty() {
-                debug!("HTTP/HTTPS Proxy Manager: Found {} servers in config store", servers.len());
+                debug!(
+                    "HTTP/HTTPS Proxy Manager: Found {} servers in config store",
+                    servers.len()
+                );
             }
 
             for server in servers {
@@ -61,11 +64,18 @@ impl HttpProxyManager {
                 if let Some(http_cfg) = &server.http {
                     if http_cfg.is_on {
                         if http_cfg.listen.is_empty() {
-                            warn!("HTTP Proxy Manager: Server {} has HTTP ON but NO listen addresses", server.numeric_id());
+                            warn!(
+                                "HTTP Proxy Manager: Server {} has HTTP ON but NO listen addresses",
+                                server.numeric_id()
+                            );
                         }
                         for addr_cfg in &http_cfg.listen {
                             if let Some(port_str) = &addr_cfg.port_range {
-                                let port = port_str.split('-').next().unwrap_or(port_str).parse::<u16>();
+                                let port = port_str
+                                    .split('-')
+                                    .next()
+                                    .unwrap_or(port_str)
+                                    .parse::<u16>();
                                 if let Ok(p) = port {
                                     desired_ports.insert(p, false);
                                     self.spawn_listener(p, false).await;
@@ -75,20 +85,33 @@ impl HttpProxyManager {
                             }
                         }
                     } else {
-                        debug!("HTTP Proxy Manager: Server {} HTTP is OFF", server.numeric_id());
+                        debug!(
+                            "HTTP Proxy Manager: Server {} HTTP is OFF",
+                            server.numeric_id()
+                        );
                     }
                 } else {
-                    debug!("HTTP Proxy Manager: Server {} has NO HTTP config", server.numeric_id());
+                    debug!(
+                        "HTTP Proxy Manager: Server {} has NO HTTP config",
+                        server.numeric_id()
+                    );
                 }
                 // 2. Handle HTTPS Ports
                 if let Some(https_cfg) = &server.https {
                     if https_cfg.is_on {
                         if https_cfg.listen.is_empty() {
-                            warn!("HTTPS Proxy Manager: Server {} has HTTPS ON but NO listen addresses", server.numeric_id());
+                            warn!(
+                                "HTTPS Proxy Manager: Server {} has HTTPS ON but NO listen addresses",
+                                server.numeric_id()
+                            );
                         }
                         for addr_cfg in &https_cfg.listen {
                             if let Some(port_str) = &addr_cfg.port_range {
-                                let port = port_str.split('-').next().unwrap_or(port_str).parse::<u16>();
+                                let port = port_str
+                                    .split('-')
+                                    .next()
+                                    .unwrap_or(port_str)
+                                    .parse::<u16>();
                                 if let Ok(p) = port {
                                     desired_ports.insert(p, true);
                                     self.spawn_listener(p, true).await;
@@ -98,10 +121,16 @@ impl HttpProxyManager {
                             }
                         }
                     } else {
-                        debug!("HTTPS Proxy Manager: Server {} HTTPS is OFF", server.numeric_id());
+                        debug!(
+                            "HTTPS Proxy Manager: Server {} HTTPS is OFF",
+                            server.numeric_id()
+                        );
                     }
                 } else {
-                    debug!("HTTPS Proxy Manager: Server {} has NO HTTPS config", server.numeric_id());
+                    debug!(
+                        "HTTPS Proxy Manager: Server {} has NO HTTPS config",
+                        server.numeric_id()
+                    );
                 }
             }
 
@@ -126,12 +155,25 @@ impl HttpProxyManager {
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        self.handled_ports.insert(port, ListenerHandle { is_tls, shutdown_tx });
-        info!("HTTP/HTTPS Proxy Manager: Initializing listener on port {} (TLS={})", port, is_tls);
+        self.handled_ports.insert(
+            port,
+            ListenerHandle {
+                is_tls,
+                shutdown_tx,
+            },
+        );
+        info!(
+            "HTTP/HTTPS Proxy Manager: Initializing listener on port {} (TLS={})",
+            port, is_tls
+        );
 
         let manager = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = manager.clone().run_http_listener(port, is_tls, shutdown_rx).await {
+            if let Err(e) = manager
+                .clone()
+                .run_http_listener(port, is_tls, shutdown_rx)
+                .await
+            {
                 error!("HTTP/HTTPS listener on port {} failed: {}", port, e);
                 manager.handled_ports.remove(&port);
             }
@@ -150,7 +192,10 @@ impl HttpProxyManager {
                 Some(desired_tls) if *desired_tls == is_tls => {}
                 _ => {
                     if let Some((_, handle)) = self.handled_ports.remove(&port) {
-                        info!("HTTP/HTTPS Proxy Manager: Stopping listener on port {} (TLS={})", port, is_tls);
+                        info!(
+                            "HTTP/HTTPS Proxy Manager: Stopping listener on port {} (TLS={})",
+                            port, is_tls
+                        );
                         let _ = handle.shutdown_tx.send(true);
                     }
                 }
@@ -193,14 +238,18 @@ impl HttpProxyManager {
                     {
                         Ok(Some((server, sni_host))) => {
                             if let Err(err) = manager
-                                .handle_sni_passthrough(client_stream, client_addr, port, sni_host, server)
+                                .handle_sni_passthrough(
+                                    client_stream,
+                                    client_addr,
+                                    port,
+                                    sni_host,
+                                    server,
+                                )
                                 .await
                             {
                                 debug!(
                                     "SNI passthrough connection from {} on port {} failed: {}",
-                                    client_addr,
-                                    port,
-                                    err
+                                    client_addr, port, err
                                 );
                             }
                             return;
@@ -209,9 +258,7 @@ impl HttpProxyManager {
                         Err(err) => {
                             debug!(
                                 "Failed to inspect SNI for {} on port {}: {}",
-                                client_addr,
-                                port,
-                                err
+                                client_addr, port, err
                             );
                         }
                     }
@@ -220,26 +267,31 @@ impl HttpProxyManager {
                 let l4_stream = pingora_core::protocols::l4::stream::Stream::from(client_stream);
                 let (stream, alpn): (pingora_core::protocols::Stream, Option<Vec<u8>>) = if is_tls {
                     let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
-                        pingora_core::tls::ssl::SslMethod::tls()
-                    ).expect("Failed to create SSL acceptor builder");
+                        pingora_core::tls::ssl::SslMethod::tls(),
+                    )
+                    .expect("Failed to create SSL acceptor builder");
                     let selector_for_ocsp = selector.clone();
                     let _ = builder.set_status_callback(move |ssl| {
                         selector_for_ocsp.apply_ocsp_for_ssl_blocking(ssl);
                         Ok(ssl.ocsp_status().is_some())
                     });
-                    
+
                     builder.set_alpn_select_callback(|_, client_alpn| {
-                        pingora_core::tls::ssl::select_next_proto(b"\x02h2\x08http/1.1", client_alpn)
-                            .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
+                        pingora_core::tls::ssl::select_next_proto(
+                            b"\x02h2\x08http/1.1",
+                            client_alpn,
+                        )
+                        .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
                     });
                     let ssl_acceptor = builder.build();
-                    
-                    let callbacks: pingora_core::listeners::TlsAcceptCallbacks = Box::new((*selector).clone());
+
+                    let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+                        Box::new((*selector).clone());
                     match handshake_with_callback(&ssl_acceptor, l4_stream, &callbacks).await {
                         Ok(s) => {
                             let alpn = s.ssl().selected_alpn_protocol().map(|v| v.to_vec());
                             (Box::new(s), alpn)
-                        },
+                        }
                         Err(e) => {
                             error!("TLS handshake failed: {}", e);
                             return;
@@ -277,7 +329,9 @@ impl HttpProxyManager {
                 } else {
                     // HTTP/1.1 Logic
                     let server_session = ServerSession::new_http1(stream);
-                    proxy_inner.process_new_http(server_session, &shutdown_inner).await;
+                    proxy_inner
+                        .process_new_http(server_session, &shutdown_inner)
+                        .await;
                 }
             });
         }
@@ -321,8 +375,7 @@ impl HttpProxyManager {
         if server.has_valid_traffic_limit() {
             debug!(
                 "SNI passthrough: rejecting connection from {} for traffic-limited server {}",
-                client_addr,
-                server_id
+                client_addr, server_id
             );
             crate::logging::log_sni_passthrough_access(
                 request_id,
@@ -383,7 +436,10 @@ impl HttpProxyManager {
                     0,
                     0,
                     502,
-                    Some(&format!("failed to connect passthrough upstream {}: {}", backend_addr, err)),
+                    Some(&format!(
+                        "failed to connect passthrough upstream {}: {}",
+                        backend_addr, err
+                    )),
                 );
                 crate::metrics::record::record_http_dimensions(
                     server_id,
@@ -396,8 +452,9 @@ impl HttpProxyManager {
                     None,
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false);
-                return Err(err)
-                    .with_context(|| format!("failed to connect passthrough upstream {}", backend_addr));
+                return Err(err).with_context(|| {
+                    format!("failed to connect passthrough upstream {}", backend_addr)
+                });
             }
         };
 
@@ -410,10 +467,15 @@ impl HttpProxyManager {
         configure_passthrough_socket(&client_stream);
         configure_passthrough_socket(&backend_stream);
 
-        let result =
-            crate::tcp_proxy::stream_bidirectional_with_metrics(server_id, client_stream, backend_stream).await;
+        let result = crate::tcp_proxy::stream_bidirectional_with_metrics(
+            server_id,
+            client_stream,
+            backend_stream,
+        )
+        .await;
         if let Some(local_port) = toa_local_port {
-            if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await {
+            if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
+            {
                 debug!("failed to release TOA sender port {}: {}", local_port, err);
             }
         }
@@ -479,10 +541,12 @@ impl HttpProxyManager {
             return Ok(normalize_passthrough_target(&peer.addr.to_string()));
         }
 
-        let rp_cfg = server
-            .reverse_proxy
-            .as_ref()
-            .with_context(|| format!("missing reverse proxy config for passthrough server {}", server_id))?;
+        let rp_cfg = server.reverse_proxy.as_ref().with_context(|| {
+            format!(
+                "missing reverse proxy config for passthrough server {}",
+                server_id
+            )
+        })?;
         let (level, parents) = self.config_store.get_tiered_origin_info().await;
         let bypass = self.config_store.is_tiered_origin_bypass().await;
         let global_cfg = self.config_store.get_global_http_config_sync();
@@ -494,16 +558,18 @@ impl HttpProxyManager {
             bypass,
             global_cfg.allow_lan_ip,
         );
-        let peer = lb
-            .select(b"", 128)
-            .with_context(|| format!("no healthy upstream for SNI passthrough server {}", server_id))?;
+        let peer = lb.select(b"", 128).with_context(|| {
+            format!(
+                "no healthy upstream for SNI passthrough server {}",
+                server_id
+            )
+        })?;
         Ok(normalize_passthrough_target(&peer.addr.to_string()))
     }
 }
 
 fn normalize_passthrough_target(raw: &str) -> String {
-    raw
-        .trim()
+    raw.trim()
         .trim_start_matches("tls://")
         .trim_start_matches("https://")
         .trim_start_matches("http://")
@@ -689,10 +755,8 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> ClientHelloParse {
             let mut name_pos = 2usize;
             while name_pos + 3 <= 2 + list_len {
                 let name_type = ext[name_pos];
-                let name_len = usize::from(u16::from_be_bytes([
-                    ext[name_pos + 1],
-                    ext[name_pos + 2],
-                ]));
+                let name_len =
+                    usize::from(u16::from_be_bytes([ext[name_pos + 1], ext[name_pos + 2]]));
                 name_pos += 3;
                 if ext.len() < name_pos + name_len {
                     return ClientHelloParse::NotClientHello;

@@ -195,15 +195,15 @@ impl NodeMetrics {
     /// This is used for smart load balancing in Tiered Origin.
     pub fn get_node_pressure(&self) -> f32 {
         let (_, _, active_conns) = self.get_node_totals();
-        
+
         // 1. Connection Pressure (Cap at 50,000 for 100%)
         let conn_pressure = (active_conns as f32 / 50000.0).min(1.0);
-        
+
         // 2. Resource Pressure (Memory/CPU)
         // We use a simplified approximation based on swap usage or static baseline
         // In a real system, we'd pull from sysinfo.
         let sys_pressure = 0.1; // Placeholder for baseline
-        
+
         // Combined weighted pressure
         (conn_pressure * 0.7 + sys_pressure * 0.3).min(1.0)
     }
@@ -367,10 +367,12 @@ pub mod record {
         };
         let is_attack = waf_action.is_some();
 
-        crate::metrics::aggregator::METRIC_STAT_AGGREGATOR
-            .record(key.clone(), bytes_sent, is_attack);
-        crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR
-            .record(key, bytes_sent, is_attack);
+        crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.record(
+            key.clone(),
+            bytes_sent,
+            is_attack,
+        );
+        crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.record(key, bytes_sent, is_attack);
         crate::metrics::top_ip::TOP_IP_TRACKER.record(server_id, &client_ip.to_string());
 
         let now = crate::utils::time::now_local();
@@ -415,29 +417,31 @@ pub async fn start_persistence_flusher() {
         let mut updates = Vec::new();
         let now = crate::utils::time::now_timestamp();
         let period = (now / 300) * 300;
-        
+
         // 1. Flush individual servers
         for entry in METRICS.servers.iter() {
             let server_id = *entry.key();
             let current = entry.value().snapshot();
-            let last = last_values.entry(server_id).or_insert_with(|| ServerStatusSnapshot {
-                server_id,
-                user_id: 0,
-                user_plan_id: 0,
-                plan_id: 0,
-                total_requests: 0,
-                active_connections: 0,
-                bytes_sent: 0,
-                bytes_received: 0,
-                cached_bytes: 0,
-                attack_bytes: 0,
-                count_cached_requests: 0,
-                count_attack_requests: 0,
-                count_websocket_connections: 0,
-                origin_bytes_sent: 0,
-                origin_bytes_received: 0,
-                count_ips: 0,
-            });
+            let last = last_values
+                .entry(server_id)
+                .or_insert_with(|| ServerStatusSnapshot {
+                    server_id,
+                    user_id: 0,
+                    user_plan_id: 0,
+                    plan_id: 0,
+                    total_requests: 0,
+                    active_connections: 0,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    cached_bytes: 0,
+                    attack_bytes: 0,
+                    count_cached_requests: 0,
+                    count_attack_requests: 0,
+                    count_websocket_connections: 0,
+                    origin_bytes_sent: 0,
+                    origin_bytes_received: 0,
+                    count_ips: 0,
+                });
 
             // Calculate deltas and add to batch
             macro_rules! add_delta {
@@ -465,11 +469,17 @@ pub async fn start_persistence_flusher() {
         // 2. Flush Node totals
         let (node_sent, node_recv, _) = METRICS.get_node_totals();
         if node_sent > last_node_sent {
-            updates.push((format!("NODE_T{}_bytes_sent", period), node_sent - last_node_sent));
+            updates.push((
+                format!("NODE_T{}_bytes_sent", period),
+                node_sent - last_node_sent,
+            ));
             last_node_sent = node_sent;
         }
         if node_recv > last_node_recv {
-            updates.push((format!("NODE_T{}_bytes_received", period), node_recv - last_node_recv));
+            updates.push((
+                format!("NODE_T{}_bytes_received", period),
+                node_recv - last_node_recv,
+            ));
             last_node_recv = node_recv;
         }
 
@@ -479,7 +489,8 @@ pub async fn start_persistence_flusher() {
         }
 
         // 4. Periodically clean old stats (older than 24 hours)
-        if now % 3600 < 30 { // Roughly every hour
+        if now % 3600 < 30 {
+            // Roughly every hour
             storage::STORAGE.cleanup_old_stats(now - 86400);
         }
     }

@@ -1,8 +1,8 @@
-use dashmap::DashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
-use ipnet::IpNet;
 use crate::firewall::state::WafStateManager;
+use dashmap::DashMap;
+use ipnet::IpNet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 pub struct GlobalIpListManager {
     pub lists: DashMap<i64, Vec<IpNet>>,
@@ -34,7 +34,8 @@ impl GlobalIpListManager {
                     list.retain(|x| x != &net);
                 });
                 // Sync Unblock to WAF State and System Firewall
-                self.waf_state.unblock_ip(net.addr(), 0, Some("global"), true);
+                self.waf_state
+                    .unblock_ip(net.addr(), 0, Some("global"), true);
             } else {
                 self.lists.entry(list_id).or_default().push(net);
                 // If it's a black list, we might want to block it immediately (optional based on list type)
@@ -54,8 +55,7 @@ impl GlobalIpListManager {
     /// This clears existing lists (by ID not present) and updates present ones.
     pub fn replace_metadata(&self, ip_lists: Vec<crate::pb::IpList>) {
         // Collect all current list IDs
-        let new_ids: std::collections::HashSet<i64> =
-            ip_lists.iter().map(|l| l.id).collect();
+        let new_ids: std::collections::HashSet<i64> = ip_lists.iter().map(|l| l.id).collect();
         // Remove lists not present in new data
         self.lists.retain(|id, _| new_ids.contains(id));
         // Ensure all new list IDs exist (empty if not already populated)

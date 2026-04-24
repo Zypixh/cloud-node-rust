@@ -1,19 +1,19 @@
-use base64::Engine;
 use crate::config::ConfigStore;
 use crate::config_models::SSLCertConfig;
 use crate::config_models::ServerConfig;
 use crate::ssl::DynamicCertSelector;
+use base64::Engine;
 use dashmap::DashMap;
 use pingora_core::tls::ext;
 use pingora_core::tls::pkey::PKey;
+use pingora_core::tls::ssl::{SslConnector, SslMethod};
+use pingora_core::tls::x509::X509;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
-use pingora_core::tls::ssl::{SslMethod, SslConnector};
-use pingora_core::tls::x509::X509;
 
 struct ListenerHandle {
     is_tls: bool,
@@ -39,41 +39,69 @@ impl TcpProxyManager {
         debug!("Starting TCP/TLS Proxy Manager...");
         loop {
             let servers = self.config_store.get_all_servers().await;
-            debug!("TCP Proxy Manager: Found {} servers in config store", servers.len());
+            debug!(
+                "TCP Proxy Manager: Found {} servers in config store",
+                servers.len()
+            );
             let mut desired_ports = std::collections::HashMap::new();
             for server in servers {
                 // Handle TCP
                 if let Some(tcp_cfg) = &server.tcp {
                     if tcp_cfg.is_on {
                         if tcp_cfg.listen.is_empty() {
-                            warn!("TCP Proxy Manager: Server {} has TCP ON but NO listen addresses", server.numeric_id());
+                            warn!(
+                                "TCP Proxy Manager: Server {} has TCP ON but NO listen addresses",
+                                server.numeric_id()
+                            );
                         }
                         for addr_cfg in &tcp_cfg.listen {
-                            if let Ok(port) = addr_cfg.port_range.clone().unwrap_or_default().parse::<u16>() {
+                            if let Ok(port) = addr_cfg
+                                .port_range
+                                .clone()
+                                .unwrap_or_default()
+                                .parse::<u16>()
+                            {
                                 desired_ports.insert(port, false);
                             }
                             self.spawn_listener(&server, addr_cfg, false).await;
                         }
                     } else {
-                        debug!("TCP Proxy Manager: Server {} TCP is OFF", server.numeric_id());
+                        debug!(
+                            "TCP Proxy Manager: Server {} TCP is OFF",
+                            server.numeric_id()
+                        );
                     }
                 } else {
-                    debug!("TCP Proxy Manager: Server {} has NO TCP config", server.numeric_id());
+                    debug!(
+                        "TCP Proxy Manager: Server {} has NO TCP config",
+                        server.numeric_id()
+                    );
                 }
                 // Handle TLS (TCP-TLS) — accessed via tcp.tls
                 if let Some(tls_cfg) = server.tcp.as_ref().and_then(|t| t.tls.as_ref()) {
                     if tls_cfg.is_on {
                         if tls_cfg.listen.is_empty() {
-                            warn!("TCP-TLS Proxy Manager: Server {} has TLS ON but NO listen addresses", server.numeric_id());
+                            warn!(
+                                "TCP-TLS Proxy Manager: Server {} has TLS ON but NO listen addresses",
+                                server.numeric_id()
+                            );
                         }
                         for addr_cfg in &tls_cfg.listen {
-                            if let Ok(port) = addr_cfg.port_range.clone().unwrap_or_default().parse::<u16>() {
+                            if let Ok(port) = addr_cfg
+                                .port_range
+                                .clone()
+                                .unwrap_or_default()
+                                .parse::<u16>()
+                            {
                                 desired_ports.insert(port, true);
                             }
                             self.spawn_listener(&server, addr_cfg, true).await;
                         }
                     } else {
-                        debug!("TCP-TLS Proxy Manager: Server {} TLS is OFF", server.numeric_id());
+                        debug!(
+                            "TCP-TLS Proxy Manager: Server {} TLS is OFF",
+                            server.numeric_id()
+                        );
                     }
                 }
             }
@@ -109,7 +137,13 @@ impl TcpProxyManager {
             }
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            self.handled_ports.insert(port, ListenerHandle { is_tls, shutdown_tx });
+            self.handled_ports.insert(
+                port,
+                ListenerHandle {
+                    is_tls,
+                    shutdown_tx,
+                },
+            );
 
             let manager = self.clone();
             let server_clone = server.clone();
@@ -138,7 +172,10 @@ impl TcpProxyManager {
                 Some(desired_tls) if *desired_tls == is_tls => {}
                 _ => {
                     if let Some((_, handle)) = self.handled_ports.remove(&port) {
-                        info!("TCP Proxy Manager: Stopping listener on port {} (TLS={})", port, is_tls);
+                        info!(
+                            "TCP Proxy Manager: Stopping listener on port {} (TLS={})",
+                            port, is_tls
+                        );
                         let _ = handle.shutdown_tx.send(true);
                     }
                 }
@@ -166,17 +203,23 @@ impl TcpProxyManager {
                 res = listener.accept() => res,
             };
             let (client_stream, client_addr) = accept_result?;
-            
+
             // --- OPTIMIZATION: Downstream TCP ---
             let _ = client_stream.set_nodelay(true);
-            
+
             #[cfg(unix)]
             {
                 use std::os::unix::io::AsRawFd;
                 let fd = client_stream.as_raw_fd();
                 let on = 1i32;
                 unsafe {
-                    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &on as *const _ as *const libc::c_void, std::mem::size_of::<i32>() as libc::socklen_t);
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_KEEPALIVE,
+                        &on as *const _ as *const libc::c_void,
+                        std::mem::size_of::<i32>() as libc::socklen_t,
+                    );
                 }
             }
 
@@ -211,36 +254,45 @@ impl TcpProxyManager {
         }
 
         let _sid = server.id.unwrap_or(0);
-        
+
         let l4_stream = pingora_core::protocols::l4::stream::Stream::from(client_stream);
 
         // 1. Handle TLS Termination if needed
         if is_tls {
             let selector = self._cert_selector.clone();
             let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
-                pingora_core::tls::ssl::SslMethod::tls()
-            ).expect("Failed to create SSL acceptor builder");
+                pingora_core::tls::ssl::SslMethod::tls(),
+            )
+            .expect("Failed to create SSL acceptor builder");
             let selector_for_ocsp = selector.clone();
             let _ = builder.set_status_callback(move |ssl| {
                 selector_for_ocsp.apply_ocsp_for_ssl_blocking(ssl);
                 Ok(ssl.ocsp_status().is_some())
             });
-            
+
             // Set ALPN for H2
             builder.set_alpn_select_callback(|_, client_alpn| {
                 pingora_core::tls::ssl::select_next_proto(b"\x02h2\x08http/1.1", client_alpn)
                     .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
             });
             let ssl_acceptor = builder.build();
-            
-            let callbacks: pingora_core::listeners::TlsAcceptCallbacks = Box::new((*selector).clone());
-            let res = pingora_core::protocols::tls::server::handshake_with_callback(&ssl_acceptor, l4_stream, &callbacks).await;
+
+            let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+                Box::new((*selector).clone());
+            let res = pingora_core::protocols::tls::server::handshake_with_callback(
+                &ssl_acceptor,
+                l4_stream,
+                &callbacks,
+            )
+            .await;
 
             let tls_stream = res.map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
-            
-            self.continue_handle_connection(tls_stream, client_addr, server).await
+
+            self.continue_handle_connection(tls_stream, client_addr, server)
+                .await
         } else {
-            self.continue_handle_connection(l4_stream, client_addr, server).await
+            self.continue_handle_connection(l4_stream, client_addr, server)
+                .await
         }
     }
 
@@ -249,12 +301,16 @@ impl TcpProxyManager {
         client_stream: S,
         client_addr: SocketAddr,
         server: ServerConfig,
-    ) -> anyhow::Result<()> 
-    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let sid = server.id.unwrap_or(0);
         if sid == 0 {
-            error!("TCP Proxy: Server has NO ID (parsed as 0), cannot find LB. Server config: {:?}", server);
+            error!(
+                "TCP Proxy: Server has NO ID (parsed as 0), cannot find LB. Server config: {:?}",
+                server
+            );
             return Err(anyhow::anyhow!("Server ID missing"));
         }
         let user_id = server.user_id;
@@ -268,15 +324,11 @@ impl TcpProxyManager {
             0
         };
 
-        let lb = self
-            .config_store
-            .get_lb_by_id(sid)
-            .await
-            .ok_or_else(|| {
-                error!("TCP Proxy: No load balancer found for server id {}", sid);
-                anyhow::anyhow!("No LB")
-            })?;
-        
+        let lb = self.config_store.get_lb_by_id(sid).await.ok_or_else(|| {
+            error!("TCP Proxy: No load balancer found for server id {}", sid);
+            anyhow::anyhow!("No LB")
+        })?;
+
         let peer = lb
             .select(b"", 128)
             .ok_or_else(|| {
@@ -288,14 +340,17 @@ impl TcpProxyManager {
                 );
                 anyhow::anyhow!("No backends")
             })?;
-        
+
         let backend_ext = peer.ext.get::<crate::lb_factory::BackendExtension>();
         let use_tls_to_backend = backend_ext.map(|e| e.use_tls).unwrap_or(false);
-        
-        debug!("TCP Proxy: Forwarding connection from {} to {} (Server ID {}, UpstreamTLS={})", client_addr, peer.addr, sid, use_tls_to_backend);
+
+        debug!(
+            "TCP Proxy: Forwarding connection from {} to {} (Server ID {}, UpstreamTLS={})",
+            client_addr, peer.addr, sid, use_tls_to_backend
+        );
 
         let backend_addr = peer.addr.to_string();
-        
+
         if use_tls_to_backend {
             let ext = backend_ext.expect("Checked use_tls above");
             // Determine SNI Host
@@ -308,8 +363,10 @@ impl TcpProxyManager {
             let connector = SslConnector::builder(SslMethod::tls())
                 .expect("Failed to create SSL connector builder")
                 .build();
-            let mut conn_config = connector.configure().expect("Failed to create connect configuration");
-            
+            let mut conn_config = connector
+                .configure()
+                .expect("Failed to create connect configuration");
+
             if !ext.tls_verify {
                 conn_config.set_verify(pingora_core::tls::ssl::SslVerifyMode::NONE);
             } else {
@@ -331,11 +388,19 @@ impl TcpProxyManager {
                 toa_config.clone(),
                 std::time::Duration::from_secs(10),
             )
-            .await {
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("TCP Proxy: Failed to connect to backend {}: {}", backend_addr, e);
-                    let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
+                    error!(
+                        "TCP Proxy: Failed to connect to backend {}: {}",
+                        backend_addr, e
+                    );
+                    let domain = server
+                        .get_plain_server_names()
+                        .first()
+                        .cloned()
+                        .unwrap_or_default();
                     crate::metrics::record::record_http_dimensions(
                         sid,
                         client_addr.ip(),
@@ -358,17 +423,23 @@ impl TcpProxyManager {
 
             // --- OPTIMIZATION: Upstream TCP ---
             let _ = backend_stream.set_nodelay(true);
-            
+
             #[cfg(unix)]
             {
                 use std::os::unix::io::AsRawFd;
                 let fd = backend_stream.as_raw_fd();
                 let on = 1i32;
                 unsafe {
-                    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &on as *const _ as *const libc::c_void, std::mem::size_of::<i32>() as libc::socklen_t);
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_KEEPALIVE,
+                        &on as *const _ as *const libc::c_void,
+                        std::mem::size_of::<i32>() as libc::socklen_t,
+                    );
                 }
             }
-            
+
             #[cfg(target_os = "linux")]
             {
                 use std::os::unix::io::AsRawFd;
@@ -379,47 +450,72 @@ impl TcpProxyManager {
                         libc::IPPROTO_TCP,
                         libc::TCP_CONGESTION,
                         "bbr\0".as_ptr() as *const libc::c_void,
-                        4
+                        4,
                     );
                 }
             }
 
             let backend_stream = pingora_core::protocols::l4::stream::Stream::from(backend_stream);
 
-            let backend_stream = pingora_core::protocols::tls::client::handshake(conn_config, &host, backend_stream, None).await
-                .map_err(|e| {
-                    error!("TCP Proxy: TLS handshake with backend {} (SNI: {}) failed: {}", backend_addr, host, e);
-                    let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
-                    crate::metrics::record::record_http_dimensions(
-                        sid,
-                        client_addr.ip(),
-                        &domain,
-                        "-",
-                        0,
-                        0,
-                        0,
-                        None,
-                    );
-                    crate::metrics::record::request_end(sid, 0, 0, false, false, false);
-                    e
-                })?;
+            let backend_stream = pingora_core::protocols::tls::client::handshake(
+                conn_config,
+                &host,
+                backend_stream,
+                None,
+            )
+            .await
+            .map_err(|e| {
+                error!(
+                    "TCP Proxy: TLS handshake with backend {} (SNI: {}) failed: {}",
+                    backend_addr, host, e
+                );
+                let domain = server
+                    .get_plain_server_names()
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+                crate::metrics::record::record_http_dimensions(
+                    sid,
+                    client_addr.ip(),
+                    &domain,
+                    "-",
+                    0,
+                    0,
+                    0,
+                    None,
+                );
+                crate::metrics::record::request_end(sid, 0, 0, false, false, false);
+                e
+            })?;
 
             let res = stream_bidirectional_with_metrics(sid, client_stream, backend_stream).await;
             if let Some(local_port) = toa_local_port {
-                if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await {
-                    debug!("TCP Proxy: failed to release TOA sender port {}: {}", local_port, err);
+                if let Err(err) =
+                    crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
+                {
+                    debug!(
+                        "TCP Proxy: failed to release TOA sender port {}: {}",
+                        local_port, err
+                    );
                 }
             }
-            
+
             let (_bytes_received, bytes_sent) = match res {
                 Ok((r, s)) => (r, s),
                 Err(ref e) => {
-                    debug!("TCP Proxy: Bidirectional copy (TLS upstream) finished with error: {}", e);
+                    debug!(
+                        "TCP Proxy: Bidirectional copy (TLS upstream) finished with error: {}",
+                        e
+                    );
                     (0, 0)
                 }
             };
 
-            let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
+            let domain = server
+                .get_plain_server_names()
+                .first()
+                .cloned()
+                .unwrap_or_default();
             crate::metrics::record::record_http_dimensions(
                 sid,
                 client_addr.ip(),
@@ -445,11 +541,19 @@ impl TcpProxyManager {
                 toa_config.clone(),
                 std::time::Duration::from_secs(10),
             )
-            .await {
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("TCP Proxy: Failed to connect to backend {}: {}", backend_addr, e);
-                    let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
+                    error!(
+                        "TCP Proxy: Failed to connect to backend {}: {}",
+                        backend_addr, e
+                    );
+                    let domain = server
+                        .get_plain_server_names()
+                        .first()
+                        .cloned()
+                        .unwrap_or_default();
                     crate::metrics::record::record_http_dimensions(
                         sid,
                         client_addr.ip(),
@@ -479,7 +583,13 @@ impl TcpProxyManager {
                 let fd = backend_stream.as_raw_fd();
                 let on = 1i32;
                 unsafe {
-                    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &on as *const _ as *const libc::c_void, std::mem::size_of::<i32>() as libc::socklen_t);
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_KEEPALIVE,
+                        &on as *const _ as *const libc::c_void,
+                        std::mem::size_of::<i32>() as libc::socklen_t,
+                    );
                 }
             }
 
@@ -493,15 +603,20 @@ impl TcpProxyManager {
                         libc::IPPROTO_TCP,
                         libc::TCP_CONGESTION,
                         "bbr\0".as_ptr() as *const libc::c_void,
-                        4
+                        4,
                     );
                 }
             }
 
             let res = stream_bidirectional_with_metrics(sid, client_stream, backend_stream).await;
             if let Some(local_port) = toa_local_port {
-                if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await {
-                    debug!("TCP Proxy: failed to release TOA sender port {}: {}", local_port, err);
+                if let Err(err) =
+                    crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
+                {
+                    debug!(
+                        "TCP Proxy: failed to release TOA sender port {}: {}",
+                        local_port, err
+                    );
                 }
             }
 
@@ -513,7 +628,11 @@ impl TcpProxyManager {
                 }
             };
 
-            let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
+            let domain = server
+                .get_plain_server_names()
+                .first()
+                .cloned()
+                .unwrap_or_default();
             crate::metrics::record::record_http_dimensions(
                 sid,
                 client_addr.ip(),
@@ -527,7 +646,8 @@ impl TcpProxyManager {
 
             crate::metrics::record::request_end(sid, 0, 0, false, false, false);
             res.map(|_| ())
-        }    }
+        }
+    }
 }
 
 pub(crate) async fn stream_bidirectional_with_metrics<C, B>(

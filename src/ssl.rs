@@ -1,12 +1,12 @@
-use base64::{engine::general_purpose, Engine as _};
-use pingora_core::tls::pkey::{PKey, Private};
-use pingora_core::tls::x509::X509;
-use pingora_core::tls::ssl::NameType;
+use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose};
 use pingora_core::protocols::tls::TlsRef as SslRef;
 use pingora_core::tls::ext;
+use pingora_core::tls::pkey::{PKey, Private};
+use pingora_core::tls::ssl::NameType;
+use pingora_core::tls::x509::X509;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use async_trait::async_trait;
 
 use crate::config_models::{SSLCertConfig, SSLPolicyConfig};
 
@@ -38,8 +38,7 @@ impl DynamicCertSelector {
         }
     }
 
-    pub async fn update_config(&self, _servers: &[crate::config_models::ServerConfig]) {
-    }
+    pub async fn update_config(&self, _servers: &[crate::config_models::ServerConfig]) {}
 
     pub async fn update_ocsp(&self, cert_id: i64, data: Vec<u8>) {
         let cache = self.cache.read().unwrap();
@@ -98,9 +97,14 @@ impl DynamicCertSelector {
     }
 
     pub fn apply_ocsp_for_ssl_blocking(&self, ssl: &mut SslRef) {
-        let host = ssl.servername(NameType::HOST_NAME).unwrap_or("").to_lowercase();
+        let host = ssl
+            .servername(NameType::HOST_NAME)
+            .unwrap_or("")
+            .to_lowercase();
         if let Some(pair) = self.find_pair_blocking(&host) {
-            if let Ok(ocsp) = pair.ocsp.read() && !ocsp.is_empty() {
+            if let Ok(ocsp) = pair.ocsp.read()
+                && !ocsp.is_empty()
+            {
                 let _ = ssl.set_ocsp_status(&ocsp);
             }
         }
@@ -134,9 +138,9 @@ pub async fn sync_certs(
     ssl_policy: Option<&SSLPolicyConfig>,
 ) {
     if let Some(policy) = ssl_policy {
-        if !policy.is_on { 
+        if !policy.is_on {
             tracing::warn!("SSL policy is OFF, skipping certificate sync");
-            return; 
+            return;
         }
     }
 
@@ -147,8 +151,8 @@ pub async fn sync_certs(
     // We'll prepare a new cache map based on existing one
     // We'll prepare a new cache map based on existing one
     let mut new_cache = HashMap::new();
-    
-    // Scoped read to avoid holding it during the whole loop if not needed, 
+
+    // Scoped read to avoid holding it during the whole loop if not needed,
     // but we need it for fingerprint comparison.
     // To fix the deadlock, we must ensure old_cache is dropped before write_lock.
     let (stats_parsed, stats_reused) = {
@@ -158,23 +162,30 @@ pub async fn sync_certs(
         let mut reused = 0;
 
         for cert_cfg in certs {
-            if !cert_cfg.is_on { continue; }
+            if !cert_cfg.is_on {
+                continue;
+            }
 
             let cert_id = cert_cfg.id;
 
             if let (Some(c), Some(k)) = (&cert_cfg.cert_data_json, &cert_cfg.key_data_json) {
                 if let (Some(cert_pem_raw), Some(key_pem_raw)) = (c.as_str(), k.as_str()) {
-
                     // --- FINGERPRINT CHECK ---
-                    let current_fingerprint = crate::utils::fnv_hash64(&format!("{}{}", cert_pem_raw, key_pem_raw)).to_string();
+                    let current_fingerprint =
+                        crate::utils::fnv_hash64(&format!("{}{}", cert_pem_raw, key_pem_raw))
+                            .to_string();
 
-                    let pair = if let Some((old_fp, old_pair)) = old_cache.get(&cert_id) && *old_fp == current_fingerprint {
+                    let pair = if let Some((old_fp, old_pair)) = old_cache.get(&cert_id)
+                        && *old_fp == current_fingerprint
+                    {
                         reused += 1;
                         old_pair.clone()
                     } else {
                         // FULL/MISS: Parse the PEM data
                         let clean_pem = |s: &str| -> Vec<u8> {
-                            if let Ok(decoded) = general_purpose::STANDARD.decode(s.trim()) { return decoded; }
+                            if let Ok(decoded) = general_purpose::STANDARD.decode(s.trim()) {
+                                return decoded;
+                            }
                             s.replace("\\n", "\n").into_bytes()
                         };
 
@@ -194,7 +205,10 @@ pub async fn sync_certs(
                                 ocsp: Arc::new(std::sync::RwLock::new(Vec::new())),
                             }),
                             _ => {
-                                tracing::error!("SSL Parse Error for ID {}: Cert data invalid", cert_id);
+                                tracing::error!(
+                                    "SSL Parse Error for ID {}: Cert data invalid",
+                                    cert_id
+                                );
                                 continue;
                             }
                         }
@@ -203,16 +217,27 @@ pub async fn sync_certs(
                     parsed += 1;
                     new_cache.insert(cert_id, (current_fingerprint, pair.clone()));
 
-                    if first_pair.is_none() { first_pair = Some(pair.clone()); }
+                    if first_pair.is_none() {
+                        first_pair = Some(pair.clone());
+                    }
 
                     // Map to domain lookups
                     let mut names = Vec::new();
-                    if let Some(cn) = pair.cert.subject_name().entries_by_nid(pingora_core::tls::nid::Nid::COMMONNAME)
-                        .next().and_then(|e| e.data().as_utf8().ok()) {
+                    if let Some(cn) = pair
+                        .cert
+                        .subject_name()
+                        .entries_by_nid(pingora_core::tls::nid::Nid::COMMONNAME)
+                        .next()
+                        .and_then(|e| e.data().as_utf8().ok())
+                    {
                         names.push(cn.to_string());
                     }
                     if let Some(sans) = pair.cert.subject_alt_names() {
-                        for san in sans { if let Some(dns) = san.dnsname() { names.push(dns.to_string()); } }
+                        for san in sans {
+                            if let Some(dns) = san.dnsname() {
+                                names.push(dns.to_string());
+                            }
+                        }
                     }
 
                     for name in names {
@@ -241,15 +266,23 @@ pub async fn sync_certs(
         *cache_lock = new_cache;
     }
 
-    tracing::info!("SSL Sync Result: {} certs processed (Reused: {}, Parsed: {}). Default Cert present: {}", 
-        stats_parsed, stats_reused, stats_parsed - stats_reused, cert_selector.default.read().unwrap().is_some());
+    tracing::info!(
+        "SSL Sync Result: {} certs processed (Reused: {}, Parsed: {}). Default Cert present: {}",
+        stats_parsed,
+        stats_reused,
+        stats_parsed - stats_reused,
+        cert_selector.default.read().unwrap().is_some()
+    );
 }
 
 #[async_trait]
 impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
     async fn certificate_callback(&self, ssl: &mut SslRef) {
-        let host = ssl.servername(NameType::HOST_NAME).unwrap_or("").to_lowercase();
-        
+        let host = ssl
+            .servername(NameType::HOST_NAME)
+            .unwrap_or("")
+            .to_lowercase();
+
         if !host.is_empty() {
             // 1. Exact Match
             {
@@ -260,7 +293,9 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
                     for cert in pair.chain.iter().skip(1) {
                         let _ = ext::ssl_add_chain_cert(ssl, cert);
                     }
-                    if let Ok(ocsp) = pair.ocsp.read() && !ocsp.is_empty() {
+                    if let Ok(ocsp) = pair.ocsp.read()
+                        && !ocsp.is_empty()
+                    {
                         let _ = ssl.set_ocsp_status(&ocsp);
                     }
                     return;
@@ -272,7 +307,7 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
                 if let Some(pos) = host.find('.') {
                     let suffix = &host[pos..];
                     let wildcard_key = format!("*{}", suffix);
-                    
+
                     let wildcard = self.wildcard.read().unwrap();
                     if let Some(pair) = wildcard.get(&wildcard_key) {
                         let _ = ext::ssl_use_certificate(ssl, &pair.cert);
@@ -280,14 +315,19 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
                         for cert in pair.chain.iter().skip(1) {
                             let _ = ext::ssl_add_chain_cert(ssl, cert);
                         }
-                        if let Ok(ocsp) = pair.ocsp.read() && !ocsp.is_empty() {
+                        if let Ok(ocsp) = pair.ocsp.read()
+                            && !ocsp.is_empty()
+                        {
                             let _ = ssl.set_ocsp_status(&ocsp);
                         }
                         return;
                     }
                 }
             }
-            tracing::warn!("No certificate match for SNI: {}, falling back to default", host);
+            tracing::warn!(
+                "No certificate match for SNI: {}, falling back to default",
+                host
+            );
         } else {
             tracing::debug!("No SNI provided, using default certificate");
         }
@@ -301,11 +341,16 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
                 for cert in pair.chain.iter().skip(1) {
                     let _ = ext::ssl_add_chain_cert(ssl, cert);
                 }
-                if let Ok(ocsp) = pair.ocsp.read() && !ocsp.is_empty() {
+                if let Ok(ocsp) = pair.ocsp.read()
+                    && !ocsp.is_empty()
+                {
                     let _ = ssl.set_ocsp_status(&ocsp);
                 }
             } else {
-                tracing::error!("No default certificate available for request (SNI: {})", host);
+                tracing::error!(
+                    "No default certificate available for request (SNI: {})",
+                    host
+                );
             }
         }
     }

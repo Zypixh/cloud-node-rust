@@ -1,6 +1,6 @@
 use crate::config_models::{HTTPRequestCond, HTTPRequestCondGroup, HTTPRequestCondsConfig};
-use regex::Regex;
 use pingora_proxy::Session;
+use regex::Regex;
 
 pub trait Matcher {
     fn match_request(&self, session: &Session) -> bool;
@@ -44,7 +44,9 @@ impl HTTPRequestCond {
                 } else {
                     self.value.clone()
                 };
-                Regex::new(&pattern).map(|re| re.is_match(&param_value)).unwrap_or(false)
+                Regex::new(&pattern)
+                    .map(|re| re.is_match(&param_value))
+                    .unwrap_or(false)
             }
             "notMatches" | "notRegexp" => {
                 let pattern = if self.is_case_insensitive && !self.value.starts_with("(?i)") {
@@ -52,7 +54,9 @@ impl HTTPRequestCond {
                 } else {
                     self.value.clone()
                 };
-                Regex::new(&pattern).map(|re| !re.is_match(&param_value)).unwrap_or(false)
+                Regex::new(&pattern)
+                    .map(|re| !re.is_match(&param_value))
+                    .unwrap_or(false)
             }
             "eq" | "equals" => {
                 if self.is_case_insensitive {
@@ -70,21 +74,27 @@ impl HTTPRequestCond {
             }
             "prefix" | "hasPrefix" => {
                 if self.is_case_insensitive {
-                    param_value.to_lowercase().starts_with(&self.value.to_lowercase())
+                    param_value
+                        .to_lowercase()
+                        .starts_with(&self.value.to_lowercase())
                 } else {
                     param_value.starts_with(&self.value)
                 }
             }
             "suffix" | "hasSuffix" => {
                 if self.is_case_insensitive {
-                    param_value.to_lowercase().ends_with(&self.value.to_lowercase())
+                    param_value
+                        .to_lowercase()
+                        .ends_with(&self.value.to_lowercase())
                 } else {
                     param_value.ends_with(&self.value)
                 }
             }
             "contains" | "containsString" => {
                 if self.is_case_insensitive {
-                    param_value.to_lowercase().contains(&self.value.to_lowercase())
+                    param_value
+                        .to_lowercase()
+                        .contains(&self.value.to_lowercase())
                 } else {
                     param_value.contains(&self.value)
                 }
@@ -121,7 +131,10 @@ pub fn get_variable_value(session: &Session, param: &str) -> String {
                 .unwrap_or_default()
         }
         "${host}" | "${requestHost}" => {
-            session.req_header().headers.get("host")
+            session
+                .req_header()
+                .headers
+                .get("host")
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.split(':').next().unwrap_or(v)) // Remove port if present
                 .or_else(|| session.req_header().uri.host())
@@ -130,35 +143,58 @@ pub fn get_variable_value(session: &Session, param: &str) -> String {
         }
         "${scheme}" => {
             // 1. Check if it's a real TLS connection
-            let is_tls = session.downstream_session.digest().and_then(|d| d.ssl_digest.as_ref()).is_some();
+            let is_tls = session
+                .downstream_session
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .is_some();
             if is_tls {
                 "https".to_string()
             } else {
                 // 2. Fallback to X-Forwarded-Proto or URI scheme
-                let xfp = session.get_header("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("");
-                if xfp.to_lowercase() == "https" || session.req_header().uri.scheme_str() == Some("https") {
+                let xfp = session
+                    .get_header("x-forwarded-proto")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if xfp.to_lowercase() == "https"
+                    || session.req_header().uri.scheme_str() == Some("https")
+                {
                     "https".to_string()
                 } else {
                     "http".to_string()
                 }
             }
-        },
-        "${isArgs}" => if session.req_header().uri.query().is_some() { "?".to_string() } else { "".to_string() },
+        }
+        "${isArgs}" => {
+            if session.req_header().uri.query().is_some() {
+                "?".to_string()
+            } else {
+                "".to_string()
+            }
+        }
         "${args}" => session.req_header().uri.query().unwrap_or("").to_string(),
         "${requestURI}" => {
             let path = session.req_header().uri.path();
-            let query = session.req_header().uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
+            let query = session
+                .req_header()
+                .uri
+                .query()
+                .map(|q| format!("?{}", q))
+                .unwrap_or_default();
             format!("{}{}", path, query)
         }
-        "${remoteAddr}" => {
-            match session.client_addr() {
-                Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => addr.ip().to_string(),
-                _ => "127.0.0.1".to_string(),
+        "${remoteAddr}" => match session.client_addr() {
+            Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => {
+                addr.ip().to_string()
             }
-        }
+            _ => "127.0.0.1".to_string(),
+        },
         _ if param.starts_with("${arg:") => {
             let key = &param[6..param.len() - 1];
-            session.req_header().uri.query()
+            session
+                .req_header()
+                .uri
+                .query()
                 .and_then(|q| {
                     q.split('&')
                         .find(|p| p.starts_with(key) && p.contains('='))
@@ -168,14 +204,20 @@ pub fn get_variable_value(session: &Session, param: &str) -> String {
         }
         _ if param.starts_with("${header:") => {
             let key = &param[9..param.len() - 1];
-            session.get_header(key).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+            session
+                .get_header(key)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
         }
         _ if param.starts_with("${cookie:") => {
             let key = &param[9..param.len() - 1];
-            session.get_header("cookie")
+            session
+                .get_header("cookie")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|cookies| {
-                    cookies.split(';')
+                    cookies
+                        .split(';')
                         .map(|c| c.trim())
                         .find(|c| c.starts_with(key) && c.contains('='))
                         .map(|c| c.split('=').nth(1).unwrap_or("").to_string())

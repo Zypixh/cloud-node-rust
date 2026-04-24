@@ -1,11 +1,14 @@
-use pingora_load_balancing::{LoadBalancer, selection::{RoundRobin, Consistent}};
+use pingora_load_balancing::{
+    LoadBalancer,
+    selection::{Consistent, RoundRobin},
+};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Notify;
 
 use crate::config_models::{
-    HTTP3Policy, HTTPCCPolicy, HTTPFirewallPolicy, HTTPPageConfig, HTTPPagesPolicy,
-    HTTPCachePolicy, MetricItemConfig, ParentNodeConfig, ServerConfig, TOAConfig, UAMPolicy,
+    HTTP3Policy, HTTPCCPolicy, HTTPCachePolicy, HTTPFirewallPolicy, HTTPPageConfig,
+    HTTPPagesPolicy, MetricItemConfig, ParentNodeConfig, ServerConfig, TOAConfig, UAMPolicy,
     WebPImagePolicy,
 };
 
@@ -185,9 +188,15 @@ impl ConfigStore {
     pub fn get_server_and_upstream_sync(
         &self,
         host: &str,
-    ) -> (Option<Arc<ServerConfig>>, Option<Arc<LoadBalancer<RoundRobin>>>) {
+    ) -> (
+        Option<Arc<ServerConfig>>,
+        Option<Arc<LoadBalancer<RoundRobin>>>,
+    ) {
         let lock = self.inner.read().unwrap();
-        (lock.servers.get(host).cloned(), lock.routes.get(host).cloned())
+        (
+            lock.servers.get(host).cloned(),
+            lock.routes.get(host).cloned(),
+        )
     }
 
     pub fn get_hot_path_snapshot_sync(&self) -> HotPathSnapshot {
@@ -212,7 +221,7 @@ impl ConfigStore {
 
     pub fn get_server_for_tls_name_sync(&self, host: &str) -> Option<Arc<ServerConfig>> {
         let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-        
+
         // 1. Try exact match from the fast index
         {
             let lock = self.inner.read().unwrap();
@@ -235,7 +244,11 @@ impl ConfigStore {
         self.find_sni_passthrough_server_sync(host, 0)
     }
 
-    pub fn find_sni_passthrough_server_sync(&self, host: &str, port: u16) -> Option<Arc<ServerConfig>> {
+    pub fn find_sni_passthrough_server_sync(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Option<Arc<ServerConfig>> {
         let normalized = host.trim_end_matches('.').to_ascii_lowercase();
         let lock = self.inner.read().unwrap();
 
@@ -307,7 +320,9 @@ impl ConfigStore {
     }
 
     fn pick_global_policy<T: Clone>(map: &HashMap<i64, T>) -> Option<T> {
-        map.get(&0).cloned().or_else(|| map.values().next().cloned())
+        map.get(&0)
+            .cloned()
+            .or_else(|| map.values().next().cloned())
     }
 
     pub fn get_global_uam_policy_sync(&self) -> Option<UAMPolicy> {
@@ -340,7 +355,10 @@ impl ConfigStore {
         lock.toa.clone()
     }
 
-    pub fn get_parent_upstream_sync(&self, cluster_id: i64) -> Option<Arc<LoadBalancer<Consistent>>> {
+    pub fn get_parent_upstream_sync(
+        &self,
+        cluster_id: i64,
+    ) -> Option<Arc<LoadBalancer<Consistent>>> {
         let lock = self.inner.read().unwrap();
         lock.parent_routes.get(&cluster_id).cloned()
     }
@@ -402,7 +420,8 @@ impl ConfigStore {
 
     pub fn update_parent_pressure(&self, addr: &str, pressure: f32) {
         let mut lock = self.inner.write().unwrap();
-        lock.parent_pressure.insert(addr.to_string(), (pressure, std::time::Instant::now()));
+        lock.parent_pressure
+            .insert(addr.to_string(), (pressure, std::time::Instant::now()));
     }
 
     pub fn get_parent_pressure(&self, addr: &str) -> f32 {
@@ -475,7 +494,10 @@ impl ConfigStore {
         lock.id_to_lb.get(&server_id).cloned()
     }
 
-    pub async fn find_upstream_by_server_id(&self, server_id: i64) -> Option<Arc<LoadBalancer<RoundRobin>>> {
+    pub async fn find_upstream_by_server_id(
+        &self,
+        server_id: i64,
+    ) -> Option<Arc<LoadBalancer<RoundRobin>>> {
         self.get_lb_by_id(server_id).await
     }
 
@@ -621,13 +643,12 @@ impl ConfigStore {
         self.notify_runtime_reload();
     }
 
-
     pub async fn replace_server(
-        &self, 
-        server_id: i64, 
+        &self,
+        server_id: i64,
         all_servers: Vec<Arc<ServerConfig>>,
-        servers: HashMap<String, Arc<ServerConfig>>, 
-        routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>
+        servers: HashMap<String, Arc<ServerConfig>>,
+        routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
     ) {
         let mut lock = self.inner.write().unwrap();
         lock.all_servers
@@ -661,11 +682,11 @@ impl ConfigStore {
     }
 
     pub async fn replace_user_servers(
-        &self, 
-        user_id: i64, 
+        &self,
+        user_id: i64,
         all_servers: Vec<Arc<ServerConfig>>,
-        servers: HashMap<String, Arc<ServerConfig>>, 
-        routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>
+        servers: HashMap<String, Arc<ServerConfig>>,
+        routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
     ) {
         let mut lock = self.inner.write().unwrap();
         lock.all_servers.retain(|server| server.user_id != user_id);

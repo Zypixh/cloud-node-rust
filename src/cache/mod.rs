@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::config_models::HTTPCacheRef;
+use std::collections::HashMap;
 
 pub mod matching;
 
@@ -19,7 +19,10 @@ pub fn should_cache_response(
     let method_allowed = if cache_ref.methods.is_empty() {
         true // Support all methods by default if not restricted
     } else {
-        cache_ref.methods.iter().any(|m| m.to_uppercase() == method.to_uppercase())
+        cache_ref
+            .methods
+            .iter()
+            .any(|m| m.to_uppercase() == method.to_uppercase())
     };
     if !method_allowed {
         return false;
@@ -29,7 +32,8 @@ pub fn should_cache_response(
     let status_allowed = if cache_ref.status.is_empty() {
         status == 200 || (status == 206 && cache_ref.allow_partial_content)
     } else {
-        cache_ref.status.contains(&(status as i32)) || (status == 206 && cache_ref.allow_partial_content)
+        cache_ref.status.contains(&(status as i32))
+            || (status == 206 && cache_ref.allow_partial_content)
     };
     if !status_allowed {
         return false;
