@@ -8,6 +8,22 @@ use crate::rpc::plan::sync_active_plans;
 use crate::rpc::utils::build_runtime_maps;
 use tracing::{debug, error};
 
+fn log_server_json_hints(label: &str, raw: &[u8]) {
+    let text = String::from_utf8_lossy(raw);
+    for needle in ["@sni_passthrough", "speedtest", "www.speedtest.cn"] {
+        if let Some(pos) = text.find(needle) {
+            let start = pos.saturating_sub(240);
+            let end = (pos + needle.len() + 240).min(text.len());
+            tracing::info!(
+                "RPC_SERVER: Raw {} contains {:?}. snippet={}",
+                label,
+                needle,
+                &text[start..end]
+            );
+        }
+    }
+}
+
 pub async fn sync_single_server_config(
     api_config: &ApiConfig,
     config_store: &ConfigStore,
@@ -44,6 +60,7 @@ pub async fn sync_single_server_config(
                 let _ = sync_active_plans(api_config, config_store).await;
                 return true;
             }
+            log_server_json_hints("server_config_json", &payload.server_config_json);
             match serde_json::from_slice::<ServerConfig>(&payload.server_config_json) {
                 Ok(server) => {
                     let user_id = server.user_id;
@@ -164,6 +181,7 @@ pub async fn sync_user_servers_state(
                 let _ = sync_active_plans(api_config, config_store).await;
                 return true;
             }
+            log_server_json_hints("servers_config_json", &payload.servers_config_json);
             match serde_json::from_slice::<Vec<ServerConfig>>(&payload.servers_config_json) {
                 Ok(servers) => {
                     let (servers_map, routes_map) = build_runtime_maps(servers, health_manager);

@@ -29,6 +29,22 @@ static LAST_CONFIG_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String:
 static LAST_WAF_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 static LAST_GLOBAL_CONFIG_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 
+fn log_raw_json_hints(label: &str, raw: &[u8]) {
+    let text = String::from_utf8_lossy(raw);
+    for needle in ["@sni_passthrough", "speedtest", "www.speedtest.cn"] {
+        if let Some(pos) = text.find(needle) {
+            let start = pos.saturating_sub(240);
+            let end = (pos + needle.len() + 240).min(text.len());
+            info!(
+                "RPC_NODE: Raw {} contains {:?}. snippet={}",
+                label,
+                needle,
+                &text[start..end]
+            );
+        }
+    }
+}
+
 fn parse_i64_keyed_map<T>(raw: &std::collections::HashMap<String, T>) -> std::collections::HashMap<i64, T>
 where
     T: Clone,
@@ -210,6 +226,8 @@ pub async fn fetch_and_apply_config<F>(
                     }
                     node_json = decoded;
                 }
+
+                log_raw_json_hints("node_json", &node_json);
 
                 // Check content hash to avoid redundant reloads
                 let current_hash = format!("{:x}", md5_legacy::compute(&node_json));

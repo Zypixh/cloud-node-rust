@@ -275,7 +275,12 @@ impl TcpProxyManager {
         let peer = lb
             .select(b"", 128)
             .ok_or_else(|| {
-                error!("TCP Proxy: No healthy backends found for server id {}", sid);
+                error!(
+                    "TCP Proxy: No healthy backends found for server id {}. names={:?} reverse_proxy={:?}",
+                    sid,
+                    server.get_plain_server_names(),
+                    server.reverse_proxy
+                );
                 anyhow::anyhow!("No backends")
             })?;
         
