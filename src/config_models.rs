@@ -358,6 +358,14 @@ pub struct NodeConfigPayload {
     pub ssl_certs: Vec<SSLCertConfig>,
     #[serde(rename = "sslPolicy", alias = "SSLPolicy")]
     pub ssl_policy: Option<SSLPolicyConfig>,
+    #[serde(rename = "nodeRegion", alias = "NodeRegion", default)]
+    pub node_region: Option<NodeRegionConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct NodeRegionConfig {
+    #[serde(default, deserialize_with = "deserialize_flexible_i64")]
+    pub id: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

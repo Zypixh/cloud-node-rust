@@ -9,6 +9,28 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 const BANDWIDTH_REPORT_INTERVAL_SECS: u64 = 300;
+const BANDWIDTH_SAMPLE_INTERVAL_SECS: u64 = 2;
+
+#[derive(Clone, Default)]
+struct BandwidthWindowStat {
+    day: String,
+    time_at: String,
+    user_id: i64,
+    server_id: i64,
+    user_plan_id: i64,
+    peak_bytes_per_sec: u64,
+    total_bytes: u64,
+    cached_bytes: u64,
+    attack_bytes: u64,
+    count_requests: u64,
+    count_cached_requests: u64,
+    count_attack_requests: u64,
+    count_websocket_connections: u64,
+    origin_total_bytes: u64,
+    origin_avg_bytes: u64,
+    origin_avg_bits: u64,
+    count_ips: u64,
+}
 
 fn snapshot_delta(current: &ServerStatusSnapshot, last: Option<&ServerStatusSnapshot>) -> ServerStatusSnapshot {
     let delta = |field: fn(&ServerStatusSnapshot) -> u64| -> u64 {
@@ -37,76 +59,109 @@ fn snapshot_delta(current: &ServerStatusSnapshot, last: Option<&ServerStatusSnap
     }
 }
 
-pub async fn start_bandwidth_reporter(api_config: ApiConfig) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(BANDWIDTH_REPORT_INTERVAL_SECS));
+pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: ApiConfig) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(BANDWIDTH_SAMPLE_INTERVAL_SECS));
     let mut last_snapshots: HashMap<i64, ServerStatusSnapshot> = HashMap::new();
+    let mut current_window = String::new();
+    let mut window_stats: HashMap<i64, BandwidthWindowStat> = HashMap::new();
 
     loop {
         interval.tick().await;
         let snapshots = crate::metrics::METRICS.take_snapshots();
-        if snapshots.is_empty() {
-            continue;
-        }
-
         let now = chrono::Local::now();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
         let time_at = format!("{:02}{:02}", now.hour(), minute_floor);
+        let window_key = format!("{}@{}", day, time_at);
 
-        let mut stats = vec![];
+        if current_window.is_empty() {
+            current_window = window_key.clone();
+        } else if current_window != window_key {
+            let node_region_id = config_store.get_node_region_id().await;
+            let req = pb::UploadServerBandwidthStatsRequest {
+                server_bandwidth_stats: window_stats
+                    .drain()
+                    .map(|(_, stat)| pb::ServerBandwidthStat {
+                        user_id: stat.user_id,
+                        server_id: stat.server_id,
+                        day: stat.day,
+                        time_at: stat.time_at,
+                        bytes: stat.peak_bytes_per_sec as i64,
+                        bits: (stat.peak_bytes_per_sec * 8) as i64,
+                        total_bytes: stat.total_bytes as i64,
+                        cached_bytes: stat.cached_bytes as i64,
+                        attack_bytes: stat.attack_bytes as i64,
+                        count_requests: stat.count_requests as i64,
+                        count_cached_requests: stat.count_cached_requests as i64,
+                        count_attack_requests: stat.count_attack_requests as i64,
+                        user_plan_id: stat.user_plan_id,
+                        count_websocket_connections: stat.count_websocket_connections as i64,
+                        origin_total_bytes: stat.origin_total_bytes as i64,
+                        origin_avg_bytes: stat.origin_avg_bytes as i64,
+                        origin_avg_bits: stat.origin_avg_bits as i64,
+                        count_i_ps: stat.count_ips as i64,
+                        node_region_id,
+                        ..Default::default()
+                    })
+                    .collect(),
+            };
+            if !req.server_bandwidth_stats.is_empty() {
+                let client = match RpcClient::new(&api_config).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Bandwidth reporter failed to connect: {}", e);
+                        current_window = window_key;
+                        continue;
+                    }
+                };
+                let mut service = client.bandwidth_stat_service();
+                let start = std::time::Instant::now();
+                let result = service.upload_server_bandwidth_stats(req).await;
+                let cost = start.elapsed().as_millis() as u64;
+                crate::metrics::record::record_rpc_call(result.is_ok(), cost);
+                if let Err(e) = result {
+                    error!("Failed to upload bandwidth stats: {}", e);
+                }
+            }
+            for snap in snapshots.iter() {
+                if let Some(m) = crate::metrics::METRICS.servers.get(&snap.server_id) {
+                    m.clear_ips();
+                }
+            }
+            current_window = window_key.clone();
+        }
+
         for snap in snapshots {
             let delta = snapshot_delta(&snap, last_snapshots.get(&snap.server_id));
             last_snapshots.insert(snap.server_id, snap);
-
-            let origin_total_bytes = delta.origin_bytes_received + delta.origin_bytes_sent;
-            let avg_bits = ((delta.bytes_sent * 8) / BANDWIDTH_REPORT_INTERVAL_SECS) as i64;
-            let origin_avg_bytes = (origin_total_bytes / BANDWIDTH_REPORT_INTERVAL_SECS) as i64;
-            let origin_avg_bits = ((origin_total_bytes * 8) / BANDWIDTH_REPORT_INTERVAL_SECS) as i64;
-            stats.push(pb::ServerBandwidthStat {
-                user_id: delta.user_id,
-                server_id: delta.server_id,
-                day: day.clone(),
-                time_at: time_at.clone(),
-                bytes: delta.bytes_sent as i64,
-                bits: avg_bits,
-                total_bytes: delta.total_bytes() as i64,
-                cached_bytes: delta.cached_bytes as i64,
-                attack_bytes: delta.attack_bytes as i64,
-                count_requests: delta.total_requests as i64,
-                count_cached_requests: delta.count_cached_requests as i64,
-                count_attack_requests: delta.count_attack_requests as i64,
-                user_plan_id: delta.user_plan_id,
-                count_websocket_connections: delta.count_websocket_connections as i64,
-                origin_total_bytes: origin_total_bytes as i64,
-                origin_avg_bytes,
-                origin_avg_bits,
-                count_i_ps: delta.count_ips as i64,
-                ..Default::default()
-            });
-            // Clear UV set after reporting
-            if let Some(m) = crate::metrics::METRICS.servers.get(&delta.server_id) {
-                m.clear_ips();
-            }
-        }
-
-        let req = pb::UploadServerBandwidthStatsRequest {
-            server_bandwidth_stats: stats,
-        };
-        let client = match RpcClient::new(&api_config).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Bandwidth reporter failed to connect: {}", e);
+            if delta.server_id <= 0 {
                 continue;
             }
-        };
-        let mut service = client.bandwidth_stat_service();
-        let start = std::time::Instant::now();
-        let result = service.upload_server_bandwidth_stats(req).await;
-        let cost = start.elapsed().as_millis() as u64;
-        crate::metrics::record::record_rpc_call(result.is_ok(), cost);
 
-        if let Err(e) = result {
-            error!("Failed to upload bandwidth stats: {}", e);
+            let origin_total_bytes = delta.origin_bytes_received + delta.origin_bytes_sent;
+            let peak_bytes_per_sec = delta.bytes_sent / BANDWIDTH_SAMPLE_INTERVAL_SECS;
+            let stat = window_stats.entry(delta.server_id).or_insert_with(|| BandwidthWindowStat {
+                day: day.clone(),
+                time_at: time_at.clone(),
+                user_id: delta.user_id,
+                server_id: delta.server_id,
+                user_plan_id: delta.user_plan_id,
+                ..Default::default()
+            });
+            stat.user_id = delta.user_id;
+            stat.user_plan_id = delta.user_plan_id;
+            stat.peak_bytes_per_sec = stat.peak_bytes_per_sec.max(peak_bytes_per_sec);
+            stat.total_bytes += delta.total_bytes();
+            stat.cached_bytes += delta.cached_bytes;
+            stat.attack_bytes += delta.attack_bytes;
+            stat.count_requests += delta.total_requests;
+            stat.count_cached_requests += delta.count_cached_requests;
+            stat.count_attack_requests += delta.count_attack_requests;
+            stat.count_websocket_connections += delta.count_websocket_connections;
+            stat.origin_total_bytes += origin_total_bytes;
+            stat.origin_avg_bytes = stat.origin_total_bytes / BANDWIDTH_REPORT_INTERVAL_SECS;
+            stat.origin_avg_bits = (stat.origin_total_bytes * 8) / BANDWIDTH_REPORT_INTERVAL_SECS;
+            stat.count_ips = stat.count_ips.max(delta.count_ips);
         }
     }
 }
@@ -129,6 +184,7 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
         let minute_floor = (now.minute() / 5) * 5;
         let time_from = format!("{:02}{:02}", now.hour(), minute_floor);
         let time_to = format!("{:02}{:02}", now.hour(), (minute_floor + 4).min(59));
+        let node_region_id = config_store.get_node_region_id().await;
 
         let mut stats = Vec::with_capacity(snapshots.len());
         for snap in snapshots {
@@ -143,6 +199,7 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
             stats.push(pb::ServerDailyStat {
                 server_id: delta.server_id,
                 user_id: delta.user_id,
+                node_region_id,
                 bytes: (delta.bytes_sent + delta.origin_bytes_sent + delta.origin_bytes_received)
                     as i64,
                 cached_bytes: delta.cached_bytes as i64,

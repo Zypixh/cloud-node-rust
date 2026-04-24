@@ -34,6 +34,8 @@ pub struct NodeConfig {
     pub metric_items: Vec<MetricItemConfig>,
     /// Current node level (1=L1, 2=L2, etc.)
     pub level: i32,
+    /// Region ID used by stats aggregation APIs
+    pub node_region_id: i64,
     /// Whether the node is enabled
     pub is_on: bool,
     /// Whether to sync IP lists
@@ -100,6 +102,7 @@ impl Default for NodeConfig {
             updating_server_ids: std::collections::HashSet::new(),
             metric_items: Vec::new(),
             level: 1, // Default to L1
+            node_region_id: 0,
             is_on: true,
             enable_ip_lists: false,
             parent_nodes: HashMap::new(),
@@ -490,6 +493,11 @@ impl ConfigStore {
         lock.id
     }
 
+    pub async fn get_node_region_id(&self) -> i64 {
+        let lock = self.inner.read().unwrap();
+        lock.node_region_id
+    }
+
     pub async fn update_id(&self, id: i64) {
         let mut lock = self.inner.write().unwrap();
         lock.id = id;
@@ -514,6 +522,7 @@ impl ConfigStore {
         &self,
         id: i64,
         version: i64,
+        node_region_id: i64,
         all_servers: Vec<ServerConfig>,
         servers: HashMap<String, ServerConfig>,
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
@@ -551,6 +560,7 @@ impl ConfigStore {
         let mut lock = self.inner.write().unwrap();
         lock.id = id;
         lock.version = version;
+        lock.node_region_id = node_region_id;
         lock.all_servers = all_servers;
         lock.servers = servers;
         lock.routes = routes;

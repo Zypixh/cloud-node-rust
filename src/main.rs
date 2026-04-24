@@ -313,8 +313,9 @@ fn run_node() -> anyhow::Result<()> {
     });
 
     let ac_bw = api_config.clone();
+    let cs_bw = (*config_store).clone();
     spawn_staggered(&rt, Duration::from_secs(10), async move {
-        rpc::start_bandwidth_reporter(ac_bw).await;
+        rpc::start_bandwidth_reporter(cs_bw, ac_bw).await;
     });
 
     let ac_ds = api_config.clone();
