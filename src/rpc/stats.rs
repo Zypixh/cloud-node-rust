@@ -300,10 +300,11 @@ pub async fn start_metric_stat_reporter(
         interval.tick().await;
         let metric_items = config_store.get_metric_items().await;
         if metric_items.is_empty() {
+            let _ = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.flush();
             continue;
         }
 
-        let samples = crate::metrics::aggregator::AGGREGATOR.flush();
+        let samples = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.flush();
         if samples.is_empty() {
             // Even if no new samples, we might still want to report if we have cached keys
             // But usually we skip
@@ -473,7 +474,7 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
             }
         }
 
-        let samples = crate::metrics::aggregator::AGGREGATOR.flush();
+        let samples = crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.flush();
 
         if samples.is_empty() {
             continue;

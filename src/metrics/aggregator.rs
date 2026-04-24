@@ -68,5 +68,8 @@ impl MetricAggregator {
     }
 }
 
-pub static AGGREGATOR: Lazy<Arc<MetricAggregator>> =
+pub static METRIC_STAT_AGGREGATOR: Lazy<Arc<MetricAggregator>> =
+    Lazy::new(|| Arc::new(MetricAggregator::new()));
+
+pub static HTTP_REQUEST_STAT_AGGREGATOR: Lazy<Arc<MetricAggregator>> =
     Lazy::new(|| Arc::new(MetricAggregator::new()));

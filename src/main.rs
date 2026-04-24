@@ -345,6 +345,10 @@ fn run_node() -> anyhow::Result<()> {
         rpc::start_ip_report_service(ac_ir).await;
     });
 
+    spawn_staggered(&rt, Duration::from_secs(21), async move {
+        cloud_node_rust::metrics::start_persistence_flusher().await;
+    });
+
     let ac_ocsp = api_config.clone();
     let ds_ocsp = cert_selector.clone();
     spawn_staggered(&rt, Duration::from_secs(22), async move {

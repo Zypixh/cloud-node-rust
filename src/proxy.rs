@@ -2681,6 +2681,19 @@ impl ProxyHttp for EdgeProxy {
                         ctx.response_body_len as u64,
                     );
                 }
+
+                let user_agent = session
+                    .get_header("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                crate::metrics::record::record_http_dimensions(
+                    server_id,
+                    ctx.client_ip,
+                    user_agent,
+                    bytes_sent as i64,
+                    ctx.waf_group_id,
+                    ctx.waf_action.as_deref(),
+                );
             }
             ctx.metrics_recorded = true;
         }

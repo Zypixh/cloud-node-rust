@@ -210,6 +210,7 @@ impl NodeMetrics {
 
 pub mod record {
     use super::*;
+    use std::net::IpAddr;
 
     pub fn request_start(
         server_id: i64,
@@ -301,6 +302,67 @@ pub mod record {
             .rpc
             .total_cost_ms
             .fetch_add(cost_ms, Ordering::Relaxed);
+    }
+
+    pub fn record_http_dimensions(
+        server_id: i64,
+        client_ip: IpAddr,
+        user_agent: &str,
+        bytes_sent: i64,
+        waf_group_id: i64,
+        waf_action: Option<&str>,
+    ) {
+        if server_id <= 0 {
+            return;
+        }
+
+        let analyzed = crate::metrics::analyzer::analyze_request(client_ip, user_agent);
+        let (country, country_id, province, province_id, city, city_id, provider) =
+            analyzed.geo.map_or_else(
+                || {
+                    (
+                        String::new(),
+                        0,
+                        String::new(),
+                        0,
+                        String::new(),
+                        0,
+                        "Unknown".to_string(),
+                    )
+                },
+                |geo| {
+                    (
+                        geo.country,
+                        geo.country_id,
+                        geo.region,
+                        geo.region_id,
+                        geo.city,
+                        geo.city_id,
+                        geo.provider,
+                    )
+                },
+            );
+        let key = crate::metrics::aggregator::AggregationKey {
+            server_id,
+            country,
+            country_id,
+            province,
+            province_id,
+            city,
+            city_id,
+            provider,
+            browser: analyzed.browser,
+            os: analyzed.os,
+            waf_group_id,
+            waf_action: waf_action.unwrap_or_default().to_string(),
+        };
+        let is_attack = waf_action.is_some();
+
+        crate::metrics::aggregator::METRIC_STAT_AGGREGATOR
+            .record(key.clone(), bytes_sent, is_attack);
+        crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR
+            .record(key, bytes_sent, is_attack);
+        crate::metrics::top_ip::TOP_IP_TRACKER.record(server_id, &client_ip.to_string());
     }
 
     fn get_or_create(server_id: i64) -> Arc<ServerMetrics> {
