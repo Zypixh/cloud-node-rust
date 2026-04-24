@@ -11,7 +11,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use tracing::{info, warn};
 
 use tokio::sync::RwLock;
@@ -148,12 +148,7 @@ impl Storage for FileStorage {
         }
         let temp_path = path.with_extension("tmp");
         
-        // Spawn blocking to keep std::fs::File for the synchronous zstd encoder
-        let std_file = tokio::task::spawn_blocking({
-            let p = temp_path.clone();
-            move || std::fs::File::create(&p)
-        }).await.unwrap_or_else(|_| Err(std::io::Error::from(std::io::ErrorKind::Other)))
-            .map_err(|_| Error::new(ErrorType::InternalError))?;
+        let std_file = tokio::fs::File::create(&temp_path).await.map_err(|_| Error::new(ErrorType::InternalError))?;
 
         let k_str = key.primary_key_str().unwrap_or("unknown").to_string();
         let hash = self.get_hash(key);
@@ -287,8 +282,8 @@ impl HandleHit for FileHitHandler {
 }
 
 struct FileMissHandler {
-    file: Option<std::fs::File>,
-    encoder: Option<zstd::stream::write::Encoder<'static, std::fs::File>>,
+    file: Option<tokio::fs::File>,
+    encoder: Option<async_compression::tokio::write::ZstdEncoder<tokio::fs::File>>,
     written: usize,
     final_path: PathBuf,
     temp_path: PathBuf,
@@ -308,22 +303,19 @@ impl HandleMiss for FileMissHandler {
         // Initialize encoder only if policy says so
         if self.compressed && self.encoder.is_none() {
             if let Some(f) = self.file.take() {
-                let mut enc = zstd::stream::write::Encoder::new(f, 3).map_err(|_| Error::new(ErrorType::InternalError))?;
-                enc.include_contentsize(false).map_err(|_| Error::new(ErrorType::InternalError))?;
+                let enc = async_compression::tokio::write::ZstdEncoder::new(f);
                 self.encoder = Some(enc);
             }
         }
 
         let len = data.len();
-        tokio::task::block_in_place(|| {
-            if let Some(enc) = &mut self.encoder {
-                enc.write_all(&data).map_err(|_| Error::new(ErrorType::InternalError))
-            } else if let Some(f) = &mut self.file {
-                f.write_all(&data).map_err(|_| Error::new(ErrorType::InternalError))
-            } else {
-                Err(Error::new(ErrorType::InternalError))
-            }
-        })?;
+        if let Some(enc) = &mut self.encoder {
+            tokio::io::AsyncWriteExt::write_all(enc, &data).await.map_err(|_| Error::new(ErrorType::InternalError))?;
+        } else if let Some(f) = &mut self.file {
+            tokio::io::AsyncWriteExt::write_all(f, &data).await.map_err(|_| Error::new(ErrorType::InternalError))?;
+        } else {
+            return Err(Error::new(ErrorType::InternalError));
+        }
 
         self.written += len;
         Ok(())
@@ -332,14 +324,11 @@ impl HandleMiss for FileMissHandler {
     async fn finish(mut self: Box<Self>) -> Result<MissFinishType> {
         let written = self.written;
         
-        tokio::task::block_in_place(|| {
-            if let Some(enc) = self.encoder.take() {
-                let _ = enc.finish().map_err(|_| Error::new(ErrorType::InternalError))?;
-            } else {
-                let _ = self.file.take();
-            }
-            Ok::<(), Box<Error>>(())
-        })?;
+        if let Some(mut enc) = self.encoder.take() {
+            tokio::io::AsyncWriteExt::shutdown(&mut enc).await.map_err(|_| Error::new(ErrorType::InternalError))?;
+        } else if let Some(mut f) = self.file.take() {
+            tokio::io::AsyncWriteExt::flush(&mut f).await.map_err(|_| Error::new(ErrorType::InternalError))?;
+        }
         
         // Use non-blocking async rename
         if let Err(_e) = tokio::fs::rename(&self.temp_path, &self.final_path).await {

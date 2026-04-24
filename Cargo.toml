@@ -63,6 +63,7 @@ rocksdb = { version = "0.23.0", features = ["lz4"] }
 rand = "0.8"
 libc = "0.2"
 aes-gcm = "0.10.3"
+async-compression = { version = "0.4.42", features = ["tokio", "zstd"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 neli = "0.7.4"

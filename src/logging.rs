@@ -119,6 +119,9 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     let request_started_local: DateTime<FixedOffset> =
         crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
 
+    let is_tls = session.downstream_session.digest().and_then(|d| d.ssl_digest.as_ref()).is_some();
+    let scheme = if is_tls || req.uri.scheme_str() == Some("https") { "https".to_string() } else { "http".to_string() };
+
     let is_cached = ctx.cache_hit.unwrap_or(false);
     let final_request_line = if is_cached {
         format!("[cache hit] {}", request_line)
@@ -156,7 +159,6 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         origin_address: ctx.origin_address.clone(),
         origin_status: ctx.origin_status,
         origin_header_response_time: ctx.ttfb.map(|d| d.as_secs_f64()).unwrap_or(0.0),
-        cache_hit: is_cached,
         ..Default::default()
     };
 
