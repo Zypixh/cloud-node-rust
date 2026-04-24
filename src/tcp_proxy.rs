@@ -8,7 +8,7 @@ use pingora_core::tls::ext;
 use pingora_core::tls::pkey::PKey;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -378,7 +378,7 @@ impl TcpProxyManager {
             let client_ip = client_addr.ip().to_string();
             crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
 
-            let res = Self::proxy_bidirectional(sid, client_stream, backend_stream).await;
+            let res = stream_bidirectional_with_metrics(sid, client_stream, backend_stream).await;
             if let Some(local_port) = toa_local_port {
                 if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await {
                     debug!("TCP Proxy: failed to release TOA sender port {}: {}", local_port, err);
@@ -387,11 +387,7 @@ impl TcpProxyManager {
             if let Err(ref e) = res {
                 debug!("TCP Proxy: Bidirectional copy (TLS upstream) finished with error: {}", e);
             }
-            if let Ok((c_to_b, b_to_c)) = &res {
-                crate::metrics::record::request_end(sid, *b_to_c, *c_to_b, false, false, false);
-            } else {
-                crate::metrics::record::request_end(sid, 0, 0, false, false, false);
-            }
+            crate::metrics::record::request_end(sid, 0, 0, false, false, false);
             res.map(|_| ())
         } else {
             let toa_config = self.config_store.get_toa_config_sync();
@@ -446,7 +442,7 @@ impl TcpProxyManager {
             let client_ip = client_addr.ip().to_string();
             crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
 
-            let res = Self::proxy_bidirectional(sid, client_stream, backend_stream).await;
+            let res = stream_bidirectional_with_metrics(sid, client_stream, backend_stream).await;
             if let Some(local_port) = toa_local_port {
                 if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await {
                     debug!("TCP Proxy: failed to release TOA sender port {}: {}", local_port, err);
@@ -455,35 +451,68 @@ impl TcpProxyManager {
             if let Err(ref e) = res {
                 debug!("TCP Proxy: Bidirectional copy finished with error: {}", e);
             }
-            if let Ok((c_to_b, b_to_c)) = &res {
-                crate::metrics::record::request_end(sid, *b_to_c, *c_to_b, false, false, false);
-            } else {
-                crate::metrics::record::request_end(sid, 0, 0, false, false, false);
-            }
+            crate::metrics::record::request_end(sid, 0, 0, false, false, false);
             res.map(|_| ())
         }
     }
+}
 
-    async fn proxy_bidirectional<C, B>(
-        server_id: i64,
-        mut client: C,
-        mut backend: B,
-    ) -> anyhow::Result<(u64, u64)>
-    where
-        C: AsyncRead + AsyncWrite + Unpin,
-        B: AsyncRead + AsyncWrite + Unpin,
-    {
-        // For L4, we track bytes copied in each direction
-        // copy_bidirectional returns (client_to_backend_bytes, backend_to_client_bytes)
-        let (c_to_b, b_to_c) = copy_bidirectional(&mut client, &mut backend).await?;
+pub(crate) async fn stream_bidirectional_with_metrics<C, B>(
+    server_id: i64,
+    client: C,
+    backend: B,
+) -> anyhow::Result<(u64, u64)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (client_reader, client_writer) = tokio::io::split(client);
+    let (backend_reader, backend_writer) = tokio::io::split(backend);
 
-        // Record Traffic:
-        // Downstream Sent = b_to_c (Backend -> Client)
-        // Downstream Received = c_to_b (Client -> Backend)
-        // Origin Sent = c_to_b
-        // Origin Received = b_to_c
-        crate::metrics::record::record_origin_traffic(server_id, c_to_b, b_to_c);
-        Ok((c_to_b, b_to_c))
+    let client_to_backend = async move {
+        copy_stream_and_track(client_reader, backend_writer, |n| {
+            crate::metrics::record::record_transfer(server_id, 0, n);
+            crate::metrics::record::record_origin_traffic(server_id, n, 0);
+        })
+        .await
+    };
+
+    let backend_to_client = async move {
+        copy_stream_and_track(backend_reader, client_writer, |n| {
+            crate::metrics::record::record_transfer(server_id, n, 0);
+            crate::metrics::record::record_origin_traffic(server_id, 0, n);
+        })
+        .await
+    };
+
+    let (c_to_b, b_to_c) = tokio::try_join!(client_to_backend, backend_to_client)?;
+    Ok((c_to_b, b_to_c))
+}
+
+async fn copy_stream_and_track<R, W, F>(
+    mut reader: R,
+    mut writer: W,
+    mut on_chunk: F,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: FnMut(u64),
+{
+    let mut total = 0u64;
+    let mut buf = [0u8; 16 * 1024];
+
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            writer.shutdown().await?;
+            return Ok(total);
+        }
+
+        writer.write_all(&buf[..n]).await?;
+        let n = n as u64;
+        total += n;
+        on_chunk(n);
     }
 }
 

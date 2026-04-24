@@ -271,6 +271,20 @@ pub mod record {
             .fetch_add(bytes_received, Ordering::Relaxed);
     }
 
+    pub fn record_transfer(server_id: i64, bytes_sent: u64, bytes_received: u64) {
+        let m = get_or_create(server_id);
+        m.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
+        m.bytes_received
+            .fetch_add(bytes_received, Ordering::Relaxed);
+
+        METRICS
+            .total_bytes_sent
+            .fetch_add(bytes_sent, Ordering::Relaxed);
+        METRICS
+            .total_bytes_received
+            .fetch_add(bytes_received, Ordering::Relaxed);
+    }
+
     pub fn record_origin_traffic(server_id: i64, sent: u64, received: u64) {
         let m = get_or_create(server_id);
         m.origin_bytes_sent.fetch_add(sent, Ordering::Relaxed);

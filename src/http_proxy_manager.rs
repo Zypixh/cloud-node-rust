@@ -12,7 +12,6 @@ use pingora_proxy::http_proxy;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::Duration;
@@ -359,29 +358,16 @@ impl HttpProxyManager {
             plan_id,
         );
 
-        let mut client_stream = client_stream;
-        let mut backend_stream = backend_stream;
-        let result = copy_bidirectional(&mut client_stream, &mut backend_stream).await;
+        let result =
+            crate::tcp_proxy::stream_bidirectional_with_metrics(server_id, client_stream, backend_stream).await;
         if let Some(local_port) = toa_local_port {
             if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await {
                 debug!("failed to release TOA sender port {}: {}", local_port, err);
             }
         }
         match result {
-            Ok((client_to_backend, backend_to_client)) => {
-                crate::metrics::record::request_end(
-                    server_id,
-                    backend_to_client,
-                    client_to_backend,
-                    false,
-                    false,
-                    false,
-                );
-                crate::metrics::record::record_origin_traffic(
-                    server_id,
-                    client_to_backend,
-                    backend_to_client,
-                );
+            Ok(_) => {
+                crate::metrics::record::request_end(server_id, 0, 0, false, false, false);
                 Ok(())
             }
             Err(err) => {
