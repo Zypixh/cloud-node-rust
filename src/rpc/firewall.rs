@@ -21,7 +21,7 @@ pub async fn notify_firewall_event(
             http_firewall_policy_id: policy_id,
             http_firewall_rule_group_id: group_id,
             http_firewall_rule_set_id: set_id,
-            created_at: chrono::Utc::now().timestamp(),
+            created_at: crate::utils::time::now_timestamp(),
         })
         .await;
 }

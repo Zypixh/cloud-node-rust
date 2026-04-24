@@ -248,7 +248,7 @@ fn cc_value(rule: &HTTPFirewallRule, session: &Session, request_body: &[u8], is_
 }
 
 fn increase_counter(key: String, period_secs: i64) -> u64 {
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::utils::time::now_timestamp();
     let min_ts = now - period_secs.max(1);
     let mut entry = CC_COUNTERS.entry(key).or_default();
     entry.retain(|ts| *ts >= min_ts);

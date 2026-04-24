@@ -3,13 +3,14 @@ use crate::config::ConfigStore;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use crate::metrics::ServerStatusSnapshot;
-use chrono::Timelike;
+use chrono::{Datelike, Duration as ChronoDuration, Timelike};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
 const BANDWIDTH_REPORT_INTERVAL_SECS: u64 = 300;
 const BANDWIDTH_SAMPLE_INTERVAL_SECS: u64 = 2;
+const STAT_RETRY_RETENTION_SECS: i64 = 1200;
 
 #[derive(Clone, Default)]
 struct BandwidthWindowStat {
@@ -30,6 +31,12 @@ struct BandwidthWindowStat {
     origin_avg_bytes: u64,
     origin_avg_bits: u64,
     count_ips: u64,
+}
+
+#[derive(Clone)]
+struct PendingBandwidthStat {
+    queued_at: i64,
+    stat: pb::ServerBandwidthStat,
 }
 
 fn snapshot_delta(current: &ServerStatusSnapshot, last: Option<&ServerStatusSnapshot>) -> ServerStatusSnapshot {
@@ -64,68 +71,79 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
     let mut last_snapshots: HashMap<i64, ServerStatusSnapshot> = HashMap::new();
     let mut current_window = String::new();
     let mut window_stats: HashMap<i64, BandwidthWindowStat> = HashMap::new();
+    let mut pending_stats: Vec<PendingBandwidthStat> = Vec::new();
 
     loop {
         interval.tick().await;
         let snapshots = crate::metrics::METRICS.take_snapshots();
-        let now = chrono::Local::now();
+        let now = crate::utils::time::now_local();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
         let time_at = format!("{:02}{:02}", now.hour(), minute_floor);
+        let window_started_at = now
+            .with_second(0)
+            .and_then(|dt| dt.with_minute(minute_floor))
+            .map(|dt| dt.timestamp())
+            .unwrap_or_else(|| now.timestamp());
         let window_key = format!("{}@{}", day, time_at);
 
         if current_window.is_empty() {
             current_window = window_key.clone();
         } else if current_window != window_key {
             let node_region_id = config_store.get_node_region_id().await;
-            let req = pb::UploadServerBandwidthStatsRequest {
-                server_bandwidth_stats: window_stats
-                    .drain()
-                    .map(|(_, stat)| pb::ServerBandwidthStat {
-                        user_id: stat.user_id,
-                        server_id: stat.server_id,
-                        day: stat.day,
-                        time_at: stat.time_at,
-                        bytes: stat.peak_bytes_per_sec as i64,
-                        bits: (stat.peak_bytes_per_sec * 8) as i64,
-                        total_bytes: stat.total_bytes as i64,
-                        cached_bytes: stat.cached_bytes as i64,
-                        attack_bytes: stat.attack_bytes as i64,
-                        count_requests: stat.count_requests as i64,
-                        count_cached_requests: stat.count_cached_requests as i64,
-                        count_attack_requests: stat.count_attack_requests as i64,
-                        user_plan_id: stat.user_plan_id,
-                        count_websocket_connections: stat.count_websocket_connections as i64,
-                        origin_total_bytes: stat.origin_total_bytes as i64,
-                        origin_avg_bytes: stat.origin_avg_bytes as i64,
-                        origin_avg_bits: stat.origin_avg_bits as i64,
-                        count_i_ps: stat.count_ips as i64,
-                        node_region_id,
-                        ..Default::default()
-                    })
-                    .collect(),
-            };
-            if !req.server_bandwidth_stats.is_empty() {
+            let now_ts = crate::utils::time::now_timestamp();
+            pending_stats.retain(|item| now_ts - item.queued_at <= STAT_RETRY_RETENTION_SECS);
+            let mut upload_items = pending_stats.clone();
+            upload_items.extend(window_stats.drain().map(|(_, stat)| PendingBandwidthStat {
+                queued_at: window_started_at - BANDWIDTH_REPORT_INTERVAL_SECS as i64,
+                stat: pb::ServerBandwidthStat {
+                    user_id: stat.user_id,
+                    server_id: stat.server_id,
+                    day: stat.day.clone(),
+                    time_at: stat.time_at,
+                    bytes: stat.peak_bytes_per_sec as i64,
+                    bits: (stat.peak_bytes_per_sec * 8) as i64,
+                    total_bytes: stat.total_bytes as i64,
+                    cached_bytes: stat.cached_bytes.min(stat.total_bytes) as i64,
+                    attack_bytes: stat.attack_bytes.min(stat.total_bytes) as i64,
+                    count_requests: stat.count_requests as i64,
+                    count_cached_requests: stat.count_cached_requests as i64,
+                    count_attack_requests: stat.count_attack_requests as i64,
+                    user_plan_id: stat.user_plan_id,
+                    count_websocket_connections: stat.count_websocket_connections as i64,
+                    origin_total_bytes: stat.origin_total_bytes as i64,
+                    origin_avg_bytes: stat.origin_avg_bytes as i64,
+                    origin_avg_bits: stat.origin_avg_bits as i64,
+                    count_i_ps: crate::metrics::daily::UNIQUE_IP_TRACKER.count(stat.server_id, &stat.day),
+                    node_region_id,
+                    ..Default::default()
+                },
+            }));
+            if !upload_items.is_empty() {
+                let stats: Vec<_> = upload_items.iter().map(|item| item.stat.clone()).collect();
                 let client = match RpcClient::new(&api_config).await {
                     Ok(c) => c,
                     Err(e) => {
                         error!("Bandwidth reporter failed to connect: {}", e);
+                        pending_stats = upload_items;
                         current_window = window_key;
                         continue;
                     }
                 };
                 let mut service = client.bandwidth_stat_service();
                 let start = std::time::Instant::now();
-                let result = service.upload_server_bandwidth_stats(req).await;
+                let result = service
+                    .upload_server_bandwidth_stats(pb::UploadServerBandwidthStatsRequest {
+                        server_bandwidth_stats: stats.clone(),
+                    })
+                    .await;
                 let cost = start.elapsed().as_millis() as u64;
                 crate::metrics::record::record_rpc_call(result.is_ok(), cost);
                 if let Err(e) = result {
                     error!("Failed to upload bandwidth stats: {}", e);
-                }
-            }
-            for snap in snapshots.iter() {
-                if let Some(m) = crate::metrics::METRICS.servers.get(&snap.server_id) {
-                    m.clear_ips();
+                    pending_stats = upload_items;
+                } else {
+                    pending_stats.clear();
                 }
             }
             current_window = window_key.clone();
@@ -171,16 +189,16 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
     let mut last_snapshots: HashMap<i64, ServerStatusSnapshot> = HashMap::new();
     let mut current_window = String::new();
     let mut window_stats: HashMap<i64, pb::ServerDailyStat> = HashMap::new();
+    let mut pending_stats: Vec<pb::ServerDailyStat> = Vec::new();
+    let mut pending_domain_stats: Vec<pb::upload_server_daily_stats_request::DomainStat> = Vec::new();
 
     loop {
         interval.tick().await;
         let snapshots = crate::metrics::METRICS.take_snapshots();
-        let now = chrono::Local::now();
+        let now = crate::utils::time::now_local();
         let day = now.format("%Y%m%d").to_string();
-        let hour = now.format("%H").to_string();
         let minute_floor = (now.minute() / 5) * 5;
         let time_from = format!("{:02}{:02}", now.hour(), minute_floor);
-        let time_to = format!("{:02}{:02}", now.hour(), (minute_floor + 4).min(59));
         let created_at = now
             .with_second(0)
             .and_then(|dt| dt.with_minute(minute_floor))
@@ -192,12 +210,61 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
         if current_window.is_empty() {
             current_window = window_key.clone();
         } else if current_window != window_key {
-            let stats: Vec<_> = window_stats.drain().map(|(_, stat)| stat).collect();
-            if !stats.is_empty() {
+            let min_day = (now - ChronoDuration::days(2)).format("%Y%m%d").to_string();
+            crate::metrics::daily::UNIQUE_IP_TRACKER.cleanup_before(&min_day);
+
+            let now_ts = crate::utils::time::now_timestamp();
+            pending_stats.retain(|item| now_ts - item.created_at <= STAT_RETRY_RETENTION_SECS);
+            pending_domain_stats.retain(|item| now_ts - item.created_at <= STAT_RETRY_RETENTION_SECS);
+
+            let mut stats: Vec<_> = pending_stats.clone();
+            stats.extend(window_stats.drain().map(|(_, mut stat)| {
+                stat.cached_bytes = stat.cached_bytes.min(stat.bytes);
+                stat.attack_bytes = stat.attack_bytes.min(stat.bytes);
+                stat
+            }));
+
+            let mut domain_stats = pending_domain_stats.clone();
+            let mut domain_rows = crate::metrics::daily::DAILY_DOMAIN_TRACKER
+                .flush_older_than(created_at)
+                .into_iter()
+                .map(|(server_id, created_at, domain, mut value)| {
+                    value.cached_bytes = value.cached_bytes.min(value.bytes);
+                    value.attack_bytes = value.attack_bytes.min(value.bytes);
+                    pb::upload_server_daily_stats_request::DomainStat {
+                        server_id,
+                        domain,
+                        bytes: value.bytes,
+                        cached_bytes: value.cached_bytes,
+                        count_requests: value.count_requests,
+                        count_cached_requests: value.count_cached_requests,
+                        count_attack_requests: value.count_attack_requests,
+                        attack_bytes: value.attack_bytes,
+                        created_at,
+                    }
+                })
+                .collect::<Vec<_>>();
+            domain_rows.sort_by(|a, b| {
+                a.server_id
+                    .cmp(&b.server_id)
+                    .then_with(|| b.count_requests.cmp(&a.count_requests))
+            });
+            let mut per_server_counts: HashMap<i64, usize> = HashMap::new();
+            for item in domain_rows {
+                let count = per_server_counts.entry(item.server_id).or_default();
+                if *count < 20 {
+                    domain_stats.push(item);
+                    *count += 1;
+                }
+            }
+
+            if !stats.is_empty() || !domain_stats.is_empty() {
                 let client = match RpcClient::new(&api_config).await {
                     Ok(c) => c,
                     Err(e) => {
                         error!("Daily stat reporter failed to connect: {}", e);
+                        pending_stats = stats;
+                        pending_domain_stats = domain_stats;
                         current_window = window_key;
                         continue;
                     }
@@ -206,12 +273,17 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
 
                 if let Err(e) = service
                     .upload_server_daily_stats(pb::UploadServerDailyStatsRequest {
-                        stats,
-                        domain_stats: vec![],
+                        stats: stats.clone(),
+                        domain_stats: domain_stats.clone(),
                     })
                     .await
                 {
                     error!("Failed to upload daily stats: {}", e);
+                    pending_stats = stats;
+                    pending_domain_stats = domain_stats;
+                } else {
+                    pending_stats.clear();
+                    pending_domain_stats.clear();
                 }
             }
             current_window = window_key.clone();
@@ -237,10 +309,6 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
                 created_at,
                 check_traffic_limiting,
                 plan_id: delta.plan_id,
-                day: day.clone(),
-                hour: hour.clone(),
-                time_from: time_from.clone(),
-                time_to: time_to.clone(),
                 ..Default::default()
             });
             stat.user_id = delta.user_id;
@@ -248,26 +316,24 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
             stat.created_at = created_at;
             stat.check_traffic_limiting = check_traffic_limiting;
             stat.plan_id = delta.plan_id;
-            stat.day = day.clone();
-            stat.hour = hour.clone();
-            stat.time_from = time_from.clone();
-            stat.time_to = time_to.clone();
             stat.bytes += delta.bytes_sent as i64;
             stat.cached_bytes += delta.cached_bytes as i64;
             stat.count_requests += delta.total_requests as i64;
             stat.count_cached_requests += delta.count_cached_requests as i64;
             stat.count_attack_requests += delta.count_attack_requests as i64;
             stat.attack_bytes += delta.attack_bytes as i64;
-            stat.count_i_ps = stat.count_i_ps.max(delta.count_ips as i64);
         }
     }
 }
 
 fn get_period_time(period: i32, unit: &str) -> String {
-    let now = chrono::Local::now();
+    let now = crate::utils::time::now_local();
     match unit.to_lowercase().as_str() {
         "month" => now.format("%Y%m").to_string(),
-        "week" => now.format("%Y%U").to_string(), // Approximation of YYYYWW
+        "week" => {
+            let week = now.iso_week();
+            format!("{:04}{:02}", week.year(), week.week())
+        }
         "day" => now.format("%Y%m%d").to_string(),
         "hour" => {
             if period > 1 {
@@ -480,7 +546,7 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
             continue;
         }
 
-        let now = chrono::Local::now();
+        let now = crate::utils::time::now_local();
         let month = now.format("%Y%m").to_string();
         let day = now.format("%Y%m%d").to_string();
 
@@ -568,7 +634,7 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
         };
         let mut service = client.server_top_ip_stat_service();
 
-        let now = chrono::Local::now();
+        let now = crate::utils::time::now_local();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
         let time_at = format!("{:02}{:02}", now.hour(), minute_floor);

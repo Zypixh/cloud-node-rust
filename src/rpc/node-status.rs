@@ -46,7 +46,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         let cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
         let mem_usage = if total_memory > 0 { used_memory as f64 / total_memory as f64 } else { 0.0 };
 
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::utils::time::now_timestamp();
         let hostname = hostname::get().ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_default();

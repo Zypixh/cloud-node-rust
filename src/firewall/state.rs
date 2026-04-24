@@ -37,16 +37,16 @@ impl WafStateManager {
 
     pub fn is_whitelisted(&self, ip: IpAddr, server_id: i64) -> bool {
         if let Some(expiry) = self.whitelists.get(&(0, ip)) {
-            if chrono::Utc::now().timestamp() < *expiry { return true; }
+            if crate::utils::time::now_timestamp() < *expiry { return true; }
         }
         if let Some(expiry) = self.whitelists.get(&(server_id, ip)) {
-            if chrono::Utc::now().timestamp() < *expiry { return true; }
+            if crate::utils::time::now_timestamp() < *expiry { return true; }
         }
         false
     }
 
     pub fn is_blocked(&self, ip: IpAddr, server_id: i64) -> bool {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::utils::time::now_timestamp();
         
         // 1. Check IP-level blocks (Global and Site)
         if self.check_block_expiry(0, ip, now) || self.check_block_expiry(server_id, ip, now) {
@@ -72,7 +72,7 @@ impl WafStateManager {
     }
 
     pub fn block_ip(&self, ip: IpAddr, server_id: i64, timeout_secs: i64, scope: Option<&str>, block_c_class: bool, use_local_firewall: bool) {
-        let expiry = chrono::Utc::now().timestamp() + timeout_secs;
+        let expiry = crate::utils::time::now_timestamp() + timeout_secs;
         let key_server_id = if matches!(scope, Some("global")) { 0 } else { server_id };
 
         if block_c_class {
@@ -124,7 +124,7 @@ impl WafStateManager {
         }
 
         // Add to whitelist to prevent immediate re-block
-        let expiry = chrono::Utc::now().timestamp() + 3600;
+        let expiry = crate::utils::time::now_timestamp() + 3600;
         self.whitelists.insert((key_server_id, ip), expiry);
     }
 
@@ -171,7 +171,7 @@ impl WafStateManager {
     }
 
     pub fn increase_counter(&self, key: String, period_secs: i64) -> u64 {
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::utils::time::now_timestamp();
         let min_ts = now - period_secs.max(1);
         let mut entry = self.counters.entry(key).or_default();
         entry.retain(|ts| *ts >= min_ts);

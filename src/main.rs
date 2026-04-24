@@ -3,6 +3,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
 use std::fs;
 use std::process::Command;
 
@@ -15,6 +17,19 @@ use cloud_node_rust::ssl::DynamicCertSelector;
 use cloud_node_rust::{rpc, logging, log_uploader, udp_proxy, tcp_proxy, firewall};
 
 const PID_FILE: &str = "data/cloud-node.pid";
+
+struct LocalLogTimer;
+
+impl FormatTime for LocalLogTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        write!(
+            w,
+            "{}",
+            cloud_node_rust::utils::time::now_local_millis()
+                .format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+        )
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "cloud-node-rust")]
@@ -206,7 +221,8 @@ fn run_node() -> anyhow::Result<()> {
     fs::write(PID_FILE, pid.to_string())?;
 
     // Initialize logging
-    tracing_subscriber::fmt::init();
+    cloud_node_rust::utils::time::init_local_timezone();
+    tracing_subscriber::fmt().with_timer(LocalLogTimer).init();
     info!("Starting CloudNode Rust v{}...", env!("CARGO_PKG_VERSION"));
 
     #[cfg(target_family = "unix")]

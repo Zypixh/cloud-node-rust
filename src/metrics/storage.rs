@@ -101,7 +101,7 @@ impl MetricStorage {
         let Some(db) = &self.db else {
             return;
         };
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::utils::time::now_timestamp();
         let meta = serde_json::json!({
             "k": key_str,
             "s": size,
@@ -122,7 +122,7 @@ impl MetricStorage {
         let key = format!("CMETA_{}", hash);
         if let Ok(Some(val)) = db.get(key.as_bytes())
             && let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&val) {
-                let now = chrono::Utc::now().timestamp();
+                let now = crate::utils::time::now_timestamp();
                 meta["a"] = serde_json::json!(now);
                 if let Some(f) = meta["f"].as_u64() {
                     meta["f"] = serde_json::json!(f + 1);

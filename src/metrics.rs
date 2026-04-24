@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 pub mod aggregator;
 pub mod analyzer;
+pub mod daily;
 pub mod storage;
 pub mod top_ip;
 
@@ -210,6 +211,7 @@ impl NodeMetrics {
 
 pub mod record {
     use super::*;
+    use chrono::Timelike;
     use std::net::IpAddr;
 
     pub fn request_start(
@@ -231,6 +233,11 @@ pub mod record {
         }
         m.total_requests.fetch_add(1, Ordering::Relaxed);
         m.active_connections.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::daily::UNIQUE_IP_TRACKER.record(
+            server_id,
+            &crate::utils::time::now_local().format("%Y%m%d").to_string(),
+            &remote_ip,
+        );
         m.distinct_ips.insert(remote_ip);
     }
 
@@ -307,8 +314,10 @@ pub mod record {
     pub fn record_http_dimensions(
         server_id: i64,
         client_ip: IpAddr,
+        domain: &str,
         user_agent: &str,
         bytes_sent: i64,
+        cached_bytes: i64,
         waf_group_id: i64,
         waf_action: Option<&str>,
     ) {
@@ -363,6 +372,25 @@ pub mod record {
         crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR
             .record(key, bytes_sent, is_attack);
         crate::metrics::top_ip::TOP_IP_TRACKER.record(server_id, &client_ip.to_string());
+
+        let now = crate::utils::time::now_local();
+        let minute_floor = (now.minute() / 5) * 5;
+        let created_at = now
+            .with_second(0)
+            .and_then(|dt| dt.with_minute(minute_floor))
+            .map(|dt| dt.timestamp())
+            .unwrap_or_else(|| now.timestamp());
+        crate::metrics::daily::DAILY_DOMAIN_TRACKER.record(
+            server_id,
+            created_at,
+            domain,
+            bytes_sent,
+            cached_bytes,
+            1,
+            if cached_bytes > 0 { 1 } else { 0 },
+            if is_attack { 1 } else { 0 },
+            if is_attack { bytes_sent } else { 0 },
+        );
     }
 
     fn get_or_create(server_id: i64) -> Arc<ServerMetrics> {
@@ -385,7 +413,7 @@ pub async fn start_persistence_flusher() {
     loop {
         interval.tick().await;
         let mut updates = Vec::new();
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::utils::time::now_timestamp();
         let period = (now / 300) * 300;
         
         // 1. Flush individual servers

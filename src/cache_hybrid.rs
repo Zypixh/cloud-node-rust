@@ -88,7 +88,7 @@ impl Storage for FileStorage {
             None => return Ok(None),
         };
 
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::utils::time::now_timestamp();
         let (headers, ttl_remaining, compressed) = if let Some(meta) = meta_val.as_object() {
             let expires = meta.get("e").and_then(|v| v.as_i64()).unwrap_or(0);
             let ttl = (expires - now).max(0) as u64;
@@ -638,7 +638,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
 
     loop {
         interval.tick().await;
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::utils::time::now_timestamp();
         let max_bytes = storage.max_disk_bytes.load(std::sync::atomic::Ordering::Relaxed);
         
         let mut current_size: u64 = 0;

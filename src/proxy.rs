@@ -10,7 +10,6 @@ use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
 use pingora_proxy::{ProxyHttp, Session};
 use std::sync::Arc;
 use bytes::Bytes;
-use std::time::{SystemTime, UNIX_EPOCH};
 use rand::Rng;
 
 use crate::api_config::ApiConfig;
@@ -30,6 +29,7 @@ use sha2::{Digest, Sha256};
 #[derive(Clone)]
 pub struct ProxyCTX {
     pub start_time: std::time::Instant,
+    pub start_timestamp_millis: i64,
     pub request_id: String,
     pub server: Option<Arc<ServerConfig>>,
     pub lb: Option<Arc<LoadBalancer<RoundRobin>>>,
@@ -90,6 +90,7 @@ impl Default for ProxyCTX {
     fn default() -> Self {
         Self {
             start_time: std::time::Instant::now(),
+            start_timestamp_millis: crate::utils::time::now_timestamp_millis(),
             request_id: String::new(),
             server: None,
             lb: None,
@@ -1307,7 +1308,7 @@ impl EdgeProxy {
 
     fn new_hls_session(&self) -> (String, i64) {
         let session_id = general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>());
-        let exp = chrono::Utc::now().timestamp() + 300;
+        let exp = crate::utils::time::now_timestamp() + 300;
         (session_id, exp)
     }
 
@@ -1352,7 +1353,7 @@ impl EdgeProxy {
             ctx.response_status = 403;
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
-        if chrono::Utc::now().timestamp() > exp {
+        if crate::utils::time::now_timestamp() > exp {
             ctx.response_status = 403;
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
@@ -1752,7 +1753,7 @@ impl EdgeProxy {
             let (Some(session_id), Some(exp)) = (session_id, exp) else {
                 return;
             };
-            if chrono::Utc::now().timestamp() > exp {
+            if crate::utils::time::now_timestamp() > exp {
                 return;
             }
             if content_length > MAX_HLS_SEGMENT_BODY_BYTES {
@@ -1925,7 +1926,7 @@ impl EdgeProxy {
                             value: ip.clone(),
                             ip_from: ip.clone(),
                             ip_to: "".to_string(),
-                            expired_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + final_timeout,
+                            expired_at: crate::utils::time::now_timestamp() + final_timeout,
                             reason: format!("WAF Action: {}", matched.action_code),
                             r#type: "black".to_string(),
                             event_level: matched.event_level,
@@ -2689,8 +2690,14 @@ impl ProxyHttp for EdgeProxy {
                 crate::metrics::record::record_http_dimensions(
                     server_id,
                     ctx.client_ip,
+                    session
+                        .get_header("host")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.split(':').next().unwrap_or(v))
+                        .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("")),
                     user_agent,
                     bytes_sent as i64,
+                    if is_cached { bytes_sent as i64 } else { 0 },
                     ctx.waf_group_id,
                     ctx.waf_action.as_deref(),
                 );
@@ -2893,7 +2900,7 @@ impl ProxyHttp for EdgeProxy {
                 }
 
                 // 3. Set Expires
-                let expires = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+                let expires = crate::utils::time::now_utc() + chrono::Duration::seconds(seconds as i64);
                 let expires_str = expires.to_rfc2822().replace("+0000", "GMT");
                 upstream_response.insert_header("expires", expires_str).unwrap();
             }
@@ -3013,7 +3020,7 @@ impl ProxyHttp for EdgeProxy {
         if let Some(cache_ref) = &ctx.cache_ref && let Some(expires_cfg) = &cache_ref.expires_time && expires_cfg.is_on && expires_cfg.auto_calculate {
             if expires_cfg.overwrite || upstream_response.headers.get("expires").is_none() {
                 let ttl = cache_ref.life.as_ref().map(crate::config_models::parse_life_to_seconds).unwrap_or(3600);
-                let expires = chrono::Utc::now() + chrono::Duration::seconds(ttl as i64);
+                let expires = crate::utils::time::now_utc() + chrono::Duration::seconds(ttl as i64);
                 upstream_response.insert_header("expires", expires.to_rfc2822().replace("+0000", "GMT")).unwrap();
                 upstream_response.insert_header("cache-control", format!("max-age={}", ttl)).unwrap();
             }

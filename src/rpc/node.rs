@@ -253,8 +253,6 @@ pub async fn fetch_and_apply_config<F>(
                         Ok(payload) => {
                             let numeric_id = payload.id.unwrap_or(0);
                             
-                            // Auto-sync time with the API node
-                            crate::utils::time::update_time_offset(config_resp.timestamp);
                             debug!("Successfully parsed NodeConfigPayload. Numeric ID: {}, Server count: {}", numeric_id, payload.servers.len());
                             if let Some(gsc) = &payload.global_server_config {
                                 debug!("RPC_NODE: Found GlobalServerConfig: {:?}", gsc);
@@ -734,7 +732,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         let cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
         let mem_usage = if total_memory > 0 { used_memory as f64 / total_memory as f64 } else { 0.0 };
 
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::utils::time::now_timestamp();
         let hostname = hostname::get().ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_default();
@@ -1012,7 +1010,7 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
 
         selected_items.sort();
         selected_items.dedup();
-        let created_at = chrono::Utc::now().timestamp();
+        let created_at = crate::utils::time::now_timestamp();
         let node_value_items: Vec<pb::create_node_values_request::NodeValueItem> = selected_items
             .iter()
             .filter_map(|item| {

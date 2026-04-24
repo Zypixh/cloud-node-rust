@@ -4,10 +4,10 @@ use pingora_proxy::Session;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use once_cell::sync::OnceCell;
+use chrono::{DateTime, FixedOffset};
 
 static LOG_SENDER: OnceCell<mpsc::Sender<pb::HttpAccessLog>> = OnceCell::new();
 static NODE_LOG_SENDER: OnceCell<mpsc::Sender<pb::NodeLog>> = OnceCell::new();
@@ -29,10 +29,7 @@ pub fn set_numeric_node_id(id: i64) {
 
 pub fn next_request_id() -> String {
     // CRITICAL: Use seconds instead of millis to prevent 20-digit overflow in API Node's int64 parsers
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = crate::utils::time::now_timestamp();
     let last_ts = ATOMIC_REQUEST_TIMESTAMP.load(Ordering::Relaxed);
 
     if now > last_ts {
@@ -61,7 +58,7 @@ pub fn report_node_log(level: &str, tag: &str, message: &str, server_id: i64) {
         role: "node".to_string(),
         node_id: NUMERIC_NODE_ID.load(Ordering::Relaxed),
         server_id,
-        created_at: crate::utils::time::now_utc().timestamp(),
+        created_at: crate::utils::time::now_timestamp(),
         ..Default::default()
     };
 
@@ -115,6 +112,10 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     let client_ip = real_ip_str.parse::<IpAddr>().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
     let user_agent = req.headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-");
     let analyzed = crate::metrics::analyzer::analyze_request(client_ip, user_agent);
+    let request_started_at_millis = ctx.start_timestamp_millis;
+    let request_started_at = request_started_at_millis / 1000;
+    let request_started_local: DateTime<FixedOffset> =
+        crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
 
         let is_tls = session.downstream_session.digest().and_then(|d| d.ssl_digest.as_ref()).is_some();
         let scheme = if is_tls || req.uri.scheme_str() == Some("https") { "https".to_string() } else { "http".to_string() };
@@ -134,17 +135,17 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
             scheme: scheme.clone(),
             proto: proto.to_string(),
         status: ctx.response_status as i32,
-        status_message: http::StatusCode::from_u16(ctx.response_status).map(|s| s.canonical_reason().unwrap_or("")).unwrap_or("").to_string(),
+        status_message: String::new(),
         bytes_sent,
         body_bytes_sent: session.body_bytes_sent() as i64,
         host: host.to_string(),
         user_agent: user_agent.to_string(),
         referer: req.headers.get("referer").and_then(|v| v.to_str().ok()).unwrap_or("").to_string(),
         request: request_line,
-        timestamp: crate::utils::time::now_utc().timestamp(),
-        msec: crate::utils::time::now_utc().timestamp_millis() as f64 / 1000.0,
-        time_iso8601: crate::utils::time::now_local().format("%Y-%m-%dT%H:%M:%S.000%:z").to_string(),
-        time_local: crate::utils::time::now_local().format("%d/%b/%Y:%H:%M:%S %z").to_string(),
+        timestamp: request_started_at,
+        msec: request_started_at_millis as f64 / 1000.0,
+        time_iso8601: request_started_local.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
+        time_local: request_started_local.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
         hostname: hostname::get().unwrap_or_default().to_string_lossy().to_string(),
         origin_address: ctx.origin_address.clone(),
         origin_status: ctx.origin_status,

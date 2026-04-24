@@ -4,7 +4,6 @@ use cfb_mode::Encryptor;
 use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
 use md5::{Digest, Md5};
 use serde_json::json;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 type Aes256CfbEnc = Encryptor<Aes256>;
 
@@ -20,7 +19,7 @@ pub fn generate_token(node_id: &str, secret: &str, _node_type: &str) -> anyhow::
     let ilen = node_id_bytes.len().min(16);
     iv[..ilen].copy_from_slice(&node_id_bytes[..ilen]);
 
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let timestamp = crate::utils::time::now_timestamp();
     let payload = json!({
         "timestamp": timestamp,
         "type": "node",
@@ -68,10 +67,7 @@ fn verify_type_a(path: &str, query: &str, config: &UrlAuthConfig) -> bool {
     let uid = parts[2];
     let md5hash = parts[3];
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = crate::utils::time::now_timestamp();
     if (now - timestamp).abs() > config.life {
         return false;
     }
@@ -95,10 +91,7 @@ fn verify_type_b(path: &str, _query: &str, config: &UrlAuthConfig) -> bool {
     let real_path = &path[timestamp_str.len() + md5hash.len() + 2..];
 
     let timestamp = i64::from_str_radix(timestamp_str, 16).unwrap_or(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = crate::utils::time::now_timestamp();
     if (now - timestamp).abs() > config.life {
         return false;
     }
@@ -139,10 +132,7 @@ fn verify_type_d(path: &str, query: &str, config: &UrlAuthConfig) -> bool {
     }
 
     let timestamp = timestamp_str.parse::<i64>().unwrap_or(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = crate::utils::time::now_timestamp();
     if (now - timestamp).abs() > config.life {
         return false;
     }
@@ -164,10 +154,7 @@ fn verify_type_f(path: &str, query: &str, config: &UrlAuthConfig) -> bool {
     }
 
     let timestamp = timestamp_str.parse::<i64>().unwrap_or(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = crate::utils::time::now_timestamp();
     if (now - timestamp).abs() > config.life {
         return false;
     }
@@ -202,10 +189,7 @@ pub fn generate_waf_challenge_token(ip: &str, timestamp: i64, secret: &str) -> S
 }
 
 pub fn verify_waf_challenge_token(ip: &str, token: &str, secret: &str, _window_secs: i64) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = crate::utils::time::now_timestamp();
     // Check current and previous 10-second windows to allow some clock drift/delay
     for offset in -1..=1 {
         let ts = (now / 10 + offset) * 10;

@@ -45,7 +45,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         let cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
         let mem_usage = if total_memory > 0 { used_memory as f64 / total_memory as f64 } else { 0.0 };
 
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::utils::time::now_timestamp();
         let hostname = hostname::get().ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_default();
@@ -205,7 +205,7 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         let node_value_items: Vec<pb::create_node_values_request::NodeValueItem> = values.into_iter().map(|(item, value)| pb::create_node_values_request::NodeValueItem {
             item: item.to_string(),
             value_json: value.to_string().into_bytes(),
-            created_at: chrono::Utc::now().timestamp(),
+            created_at: crate::utils::time::now_timestamp(),
         }).collect();
 
         let node_value_items_count = node_value_items.len();

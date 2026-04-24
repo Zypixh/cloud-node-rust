@@ -554,7 +554,8 @@ pub struct TrafficLimitStatus {
 
 impl TrafficLimitStatus {
     pub fn is_valid(&self) -> bool {
-        !self.until_day.is_empty() && self.until_day >= chrono::Local::now().format("%Y%m%d").to_string()
+        !self.until_day.is_empty()
+            && self.until_day >= crate::utils::time::now_local().format("%Y%m%d").to_string()
     }
 }
 

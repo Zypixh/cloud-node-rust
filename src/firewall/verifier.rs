@@ -3,7 +3,6 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +37,7 @@ impl WafVerifier {
         hasher.update(ua.as_bytes());
         let ua_hash = hex::encode(hasher.finalize());
 
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let ts = crate::utils::time::now_timestamp() as u64;
         let payload = ChallengePayload {
             ip: ip.to_string(),
             ua_hash,
@@ -99,7 +98,7 @@ impl WafVerifier {
         if payload.ua_hash != current_ua_hash { return false; }
 
         // Time Window Verification
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = crate::utils::time::now_timestamp() as u64;
         if now < payload.ts || now - payload.ts > window_secs {
             return false;
         }
@@ -113,7 +112,7 @@ impl WafVerifier {
             let stored_ua = meta["ua"].as_str().unwrap_or("");
             let exp = meta["exp"].as_u64().unwrap_or(0);
             
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let now = crate::utils::time::now_timestamp() as u64;
             if stored_ip == ip && stored_ua == ua_hash && now < exp {
                 return true;
             }
