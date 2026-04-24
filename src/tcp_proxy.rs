@@ -78,7 +78,12 @@ impl TcpProxyManager {
                 }
             }
             self.reconcile_listeners(&desired_ports);
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::select! {
+                _ = self.config_store.wait_for_runtime_reload() => {
+                    debug!("TCP Proxy Manager: Runtime reload notification received");
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+            }
         }
     }
 

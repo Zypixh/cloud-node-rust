@@ -1,6 +1,7 @@
 use pingora_load_balancing::{LoadBalancer, selection::{RoundRobin, Consistent}};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tokio::sync::Notify;
 
 use crate::config_models::{
     HTTP3Policy, HTTPCCPolicy, HTTPFirewallPolicy, HTTPPageConfig, HTTPPagesPolicy,
@@ -134,6 +135,7 @@ impl Default for NodeConfig {
 #[derive(Clone)]
 pub struct ConfigStore {
     inner: Arc<RwLock<NodeConfig>>,
+    reload_notify: Arc<Notify>,
 }
 
 #[derive(Clone)]
@@ -154,7 +156,16 @@ impl ConfigStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(NodeConfig::default())),
+            reload_notify: Arc::new(Notify::new()),
         }
+    }
+
+    pub async fn wait_for_runtime_reload(&self) {
+        self.reload_notify.notified().await;
+    }
+
+    fn notify_runtime_reload(&self) {
+        self.reload_notify.notify_waiters();
     }
 
     // Sync versions for high-performance path (proxy)
@@ -572,6 +583,8 @@ impl ConfigStore {
         lock.http_pages_policies = http_pages_policies;
         lock.webp_image_policies = webp_image_policies;
         lock.toa = toa;
+        drop(lock);
+        self.notify_runtime_reload();
     }
 
 
@@ -609,6 +622,8 @@ impl ConfigStore {
             }
             lock.routes.insert(host, lb);
         }
+        drop(lock);
+        self.notify_runtime_reload();
     }
 
     pub async fn replace_user_servers(
@@ -653,6 +668,8 @@ impl ConfigStore {
         for (host, lb) in routes {
             lock.routes.insert(host, lb);
         }
+        drop(lock);
+        self.notify_runtime_reload();
     }
 
     pub async fn remove_user_servers(&self, user_id: i64) {
@@ -678,6 +695,8 @@ impl ConfigStore {
                 lock.id_to_lb.remove(&server_id);
             }
         }
+        drop(lock);
+        self.notify_runtime_reload();
     }
 
     pub async fn remove_server(&self, server_id: i64) {
@@ -697,6 +716,8 @@ impl ConfigStore {
         if server_id > 0 {
             lock.id_to_lb.remove(&server_id);
         }
+        drop(lock);
+        self.notify_runtime_reload();
     }
 
     pub async fn cache_server_route(
@@ -715,6 +736,8 @@ impl ConfigStore {
         lock.all_servers.push(server.clone());
         lock.servers.insert(host.clone(), server);
         lock.routes.insert(host, lb);
+        drop(lock);
+        self.notify_runtime_reload();
     }
 
     pub async fn set_deleted_contents(&self, deleted_contents: Vec<String>) {
@@ -752,5 +775,7 @@ impl ConfigStore {
         lock.level = level;
         lock.parent_nodes = parent_nodes;
         lock.parent_routes = parent_routes;
+        drop(lock);
+        self.notify_runtime_reload();
     }
 }

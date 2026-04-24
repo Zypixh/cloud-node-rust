@@ -228,8 +228,6 @@ pub async fn fetch_and_apply_config<F>(
                     node_json = decoded;
                 }
 
-                log_raw_json_hints("node_json", &node_json);
-
                 // Check content hash to avoid redundant reloads
                 let current_hash = format!("{:x}", md5_legacy::compute(&node_json));
                 let mut should_reload = true;
@@ -244,6 +242,7 @@ pub async fn fetch_and_apply_config<F>(
                 *config_version = config_resp.timestamp;
 
                 if should_reload {
+                    log_raw_json_hints("node_json", &node_json);
                     // Content changed, update hash and proceed
                     {
                         let mut last_hash = LAST_CONFIG_HASH.write().unwrap();

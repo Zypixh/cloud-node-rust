@@ -375,20 +375,20 @@ fn run_node() -> anyhow::Result<()> {
         },
         my_server.configuration.clone(),
     );
-    spawn_staggered(&rt, Duration::from_secs(5), async move { http_manager.start_listeners().await; });
+    spawn_staggered(&rt, Duration::from_secs(1), async move { http_manager.start_listeners().await; });
 
     let http3_manager = cloud_node_rust::http3_proxy_manager::Http3ProxyManager::new(
         (*config_store).clone(),
         cert_selector.clone(),
     );
-    spawn_staggered(&rt, Duration::from_secs(5), async move { http3_manager.start_listeners().await; });
+    spawn_staggered(&rt, Duration::from_secs(2), async move { http3_manager.start_listeners().await; });
 
     // UDP & TCP
     let udp_manager = udp_proxy::UdpProxyManager::new((*config_store).clone());
-    spawn_staggered(&rt, Duration::from_secs(6), async move { udp_manager.start_listeners().await; });
+    spawn_staggered(&rt, Duration::from_secs(2), async move { udp_manager.start_listeners().await; });
 
     let tcp_manager = tcp_proxy::TcpProxyManager::new((*config_store).clone(), cert_selector.clone());
-    spawn_staggered(&rt, Duration::from_secs(7), async move { tcp_manager.start_listeners().await; });
+    spawn_staggered(&rt, Duration::from_secs(2), async move { tcp_manager.start_listeners().await; });
 
     info!("CloudNode (PID {}) is ready.", pid);
     my_server.run_forever();
