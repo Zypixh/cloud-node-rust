@@ -151,7 +151,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             stat.user_id = delta.user_id;
             stat.user_plan_id = delta.user_plan_id;
             stat.peak_bytes_per_sec = stat.peak_bytes_per_sec.max(peak_bytes_per_sec);
-            stat.total_bytes += delta.total_bytes();
+            stat.total_bytes += delta.bytes_sent;
             stat.cached_bytes += delta.cached_bytes;
             stat.attack_bytes += delta.attack_bytes;
             stat.count_requests += delta.total_requests;
@@ -200,8 +200,7 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
                 server_id: delta.server_id,
                 user_id: delta.user_id,
                 node_region_id,
-                bytes: (delta.bytes_sent + delta.origin_bytes_sent + delta.origin_bytes_received)
-                    as i64,
+                bytes: delta.bytes_sent as i64,
                 cached_bytes: delta.cached_bytes as i64,
                 count_requests: delta.total_requests as i64,
                 count_cached_requests: delta.count_cached_requests as i64,
