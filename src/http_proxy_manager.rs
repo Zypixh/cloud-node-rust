@@ -472,10 +472,22 @@ fn configure_passthrough_socket(stream: &TcpStream) {
 }
 
 async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Option<String>> {
+    const CLIENT_HELLO_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+    const CLIENT_HELLO_IDLE_TIMEOUT: Duration = Duration::from_millis(200);
+    const CLIENT_HELLO_READ_WAIT: Duration = Duration::from_millis(50);
+
+    let started = tokio::time::Instant::now();
+    let mut last_progress = started;
     let mut peek_buf = [0u8; 64 * 1024];
     let mut last_size = 0usize;
-    for _ in 0..50 {
-        let _ = tokio::time::timeout(Duration::from_millis(50), client_stream.readable()).await;
+    loop {
+        if started.elapsed() >= CLIENT_HELLO_TOTAL_TIMEOUT
+            || last_progress.elapsed() >= CLIENT_HELLO_IDLE_TIMEOUT
+        {
+            return Ok(None);
+        }
+
+        let _ = tokio::time::timeout(CLIENT_HELLO_READ_WAIT, client_stream.readable()).await;
         let size = client_stream.peek(&mut peek_buf).await?;
         if size == 0 {
             return Ok(None);
@@ -483,7 +495,9 @@ async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Opti
         match parse_tls_client_hello_sni(&peek_buf[..size]) {
             ClientHelloParse::Found(host) => return Ok(Some(host)),
             ClientHelloParse::NeedMore => {
-                if size == last_size {
+                if size > last_size {
+                    last_progress = tokio::time::Instant::now();
+                } else {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 last_size = size;
@@ -491,7 +505,6 @@ async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Opti
             ClientHelloParse::NotClientHello => return Ok(None),
         }
     }
-    Ok(None)
 }
 
 enum ClientHelloParse {
