@@ -53,8 +53,8 @@ impl LogUploader {
                 _ = timeout => {
                     if !buffer.is_empty() {
                         self.flush_batch(&mut buffer).await;
-                        last_flush = Instant::now();
                     }
+                    last_flush = Instant::now();
                 }
             }
         }
@@ -174,8 +174,8 @@ impl NodeLogUploader {
                 _ = timeout => {
                     if !buffer.is_empty() {
                         self.flush_batch(&mut buffer).await;
-                        last_flush = Instant::now();
                     }
+                    last_flush = Instant::now();
                 }
             }
         }
