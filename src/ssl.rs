@@ -5,8 +5,7 @@ use pingora_core::tls::ssl::NameType;
 use pingora_core::protocols::tls::TlsRef as SslRef;
 use pingora_core::tls::ext;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 
 use crate::config_models::{SSLCertConfig, SSLPolicyConfig};
@@ -43,7 +42,7 @@ impl DynamicCertSelector {
     }
 
     pub async fn update_ocsp(&self, cert_id: i64, data: Vec<u8>) {
-        let cache = self.cache.read().await;
+        let cache = self.cache.read().unwrap();
         for (_, pair) in cache.values() {
             if pair.id == cert_id {
                 if let Ok(mut ocsp) = pair.ocsp.write() {
@@ -54,7 +53,7 @@ impl DynamicCertSelector {
     }
 
     pub async fn export_default_pem(&self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let default = self.default.read().await;
+        let default = self.default.read().unwrap();
         let pair = default.as_ref()?.clone();
         let cert_pem = pair.cert.to_pem().ok()?;
         let key_pem = pair.key.private_key_to_pem_pkcs8().ok()?;
@@ -68,9 +67,9 @@ impl DynamicCertSelector {
         std::collections::HashMap<String, (Vec<u8>, Vec<u8>, Vec<u8>)>,
         (Vec<u8>, Vec<u8>, Vec<u8>),
     )> {
-        let exact = self.exact.read().await;
-        let wildcard = self.wildcard.read().await;
-        let default = self.default.read().await;
+        let exact = self.exact.read().unwrap();
+        let wildcard = self.wildcard.read().unwrap();
+        let default = self.default.read().unwrap();
 
         let serialize = |pair: &Arc<CertPair>| -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
             Some((
@@ -109,7 +108,7 @@ impl DynamicCertSelector {
 
     fn find_pair_blocking(&self, host: &str) -> Option<Arc<CertPair>> {
         if !host.is_empty() {
-            let exact = self.exact.blocking_read();
+            let exact = self.exact.read().unwrap();
             if let Some(pair) = exact.get(host) {
                 return Some(pair.clone());
             }
@@ -118,14 +117,14 @@ impl DynamicCertSelector {
             if let Some(pos) = host.find('.') {
                 let suffix = &host[pos..];
                 let wildcard_key = format!("*{}", suffix);
-                let wildcard = self.wildcard.blocking_read();
+                let wildcard = self.wildcard.read().unwrap();
                 if let Some(pair) = wildcard.get(&wildcard_key) {
                     return Some(pair.clone());
                 }
             }
         }
 
-        self.default.blocking_read().clone()
+        self.default.read().unwrap().clone()
     }
 }
 
@@ -153,7 +152,7 @@ pub async fn sync_certs(
     // but we need it for fingerprint comparison.
     // To fix the deadlock, we must ensure old_cache is dropped before write_lock.
     let (stats_parsed, stats_reused) = {
-        let old_cache = cert_selector.cache.read().await;
+        let old_cache = cert_selector.cache.read().unwrap();
 
         let mut parsed = 0;
         let mut reused = 0;
@@ -231,10 +230,10 @@ pub async fn sync_certs(
     }; // old_cache dropped here
 
     {
-        let mut exact_lock = cert_selector.exact.write().await;
-        let mut wildcard_lock = cert_selector.wildcard.write().await;
-        let mut default_lock = cert_selector.default.write().await;
-        let mut cache_lock = cert_selector.cache.write().await;
+        let mut exact_lock = cert_selector.exact.write().unwrap();
+        let mut wildcard_lock = cert_selector.wildcard.write().unwrap();
+        let mut default_lock = cert_selector.default.write().unwrap();
+        let mut cache_lock = cert_selector.cache.write().unwrap();
 
         *exact_lock = new_exact;
         *wildcard_lock = new_wildcard;
@@ -243,7 +242,7 @@ pub async fn sync_certs(
     }
 
     tracing::info!("SSL Sync Result: {} certs processed (Reused: {}, Parsed: {}). Default Cert present: {}", 
-        stats_parsed, stats_reused, stats_parsed - stats_reused, cert_selector.default.read().await.is_some());
+        stats_parsed, stats_reused, stats_parsed - stats_reused, cert_selector.default.read().unwrap().is_some());
 }
 
 #[async_trait]
@@ -254,7 +253,7 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
         if !host.is_empty() {
             // 1. Exact Match
             {
-                let exact = self.exact.read().await;
+                let exact = self.exact.read().unwrap();
                 if let Some(pair) = exact.get(&host) {
                     let _ = ext::ssl_use_certificate(ssl, &pair.cert);
                     let _ = ext::ssl_use_private_key(ssl, &pair.key);
@@ -274,7 +273,7 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
                     let suffix = &host[pos..];
                     let wildcard_key = format!("*{}", suffix);
                     
-                    let wildcard = self.wildcard.read().await;
+                    let wildcard = self.wildcard.read().unwrap();
                     if let Some(pair) = wildcard.get(&wildcard_key) {
                         let _ = ext::ssl_use_certificate(ssl, &pair.cert);
                         let _ = ext::ssl_use_private_key(ssl, &pair.key);
@@ -295,7 +294,7 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
 
         // 3. Fallback to Default Certificate
         {
-            let default = self.default.read().await;
+            let default = self.default.read().unwrap();
             if let Some(pair) = &*default {
                 let _ = ext::ssl_use_certificate(ssl, &pair.cert);
                 let _ = ext::ssl_use_private_key(ssl, &pair.key);
