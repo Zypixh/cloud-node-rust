@@ -298,7 +298,7 @@ impl UdpProxyManager {
         Ok(())
     }
 
-    async fn find_server_by_port(&self, port: u16) -> Option<ServerConfig> {
+    async fn find_server_by_port(&self, port: u16) -> Option<Arc<ServerConfig>> {
         let servers = self.config_store.get_all_servers().await;
         for s in servers {
             if let Some(udp) = &s.udp {

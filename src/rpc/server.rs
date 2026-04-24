@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
@@ -85,11 +86,11 @@ pub async fn sync_single_server_config(
                     let (servers, routes) = build_runtime_maps(runtime_servers.clone(), health_manager);
                     if user_id > 0 {
                         config_store
-                            .replace_user_servers(user_id, runtime_servers, servers, routes)
+                            .replace_user_servers(user_id, runtime_servers.into_iter().map(Arc::new).collect(), servers, routes)
                             .await;
                     } else {
                         config_store
-                            .replace_server(server_id, runtime_servers, servers, routes)
+                            .replace_server(server_id, runtime_servers.into_iter().map(Arc::new).collect(), servers, routes)
                             .await;
                     }
                     let _ = sync_active_plans(api_config, config_store).await;
@@ -217,7 +218,7 @@ pub async fn sync_user_servers_state(
                     let runtime_servers = servers;
                     let (servers_map, routes_map) = build_runtime_maps(runtime_servers.clone(), health_manager);
                     config_store
-                        .replace_user_servers(user_id, runtime_servers, servers_map, routes_map)
+                        .replace_user_servers(user_id, runtime_servers.into_iter().map(Arc::new).collect(), servers_map, routes_map)
                         .await;
                     let _ = sync_active_plans(api_config, config_store).await;
                     true

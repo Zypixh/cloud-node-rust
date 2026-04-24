@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 pub struct ProxyCTX {
     pub start_time: std::time::Instant,
     pub request_id: String,
-    pub server: Option<ServerConfig>,
+    pub server: Option<Arc<ServerConfig>>,
     pub lb: Option<Arc<LoadBalancer<RoundRobin>>>,
     pub metrics_recorded: bool,
     pub ttfb: Option<std::time::Duration>,
@@ -797,7 +797,7 @@ impl EdgeProxy {
         ctx: &mut ProxyCTX,
         status: u16,
     ) -> Result<bool> {
-        if let Some(page) = self.find_custom_page(ctx.server.as_ref(), status) {
+        if let Some(page) = self.find_custom_page(ctx.server.as_deref(), status) {
             if let Some(url) = page.url.as_ref().filter(|url| !url.is_empty()) {
                 let redirect_status = u16::try_from(page.new_status).ok().filter(|code| (300..400).contains(code)).unwrap_or(302);
                 ctx.response_status = redirect_status;
@@ -2119,7 +2119,7 @@ impl ProxyHttp for EdgeProxy {
 
         ctx.client_ip = self.resolve_client_ip(
             session,
-            ctx.server.as_ref(),
+            ctx.server.as_ref().map(|v| &**v),
             detected_ip,
             &ctx.raw_remote_addr,
             ctx.client_port,
@@ -2963,7 +2963,7 @@ impl ProxyHttp for EdgeProxy {
             || session.req_header().uri.scheme_str() == Some("https");
         if is_https
             && upstream_response.headers.get("alt-svc").is_none()
-            && let Some(port) = self.resolve_http3_advertisement_port(session, ctx.server.as_ref())
+            && let Some(port) = self.resolve_http3_advertisement_port(session, ctx.server.as_deref())
         {
             upstream_response
                 .insert_header("alt-svc", format!("h3=\":{}\"; ma=86400", port))

@@ -556,7 +556,7 @@ pub async fn fetch_and_apply_config<F>(
                                      } else {
                                          debug!("RPC_NODE: L4 Server {} initialized without names (Port-based routing)", server.numeric_id());
                                      }
-                                     new_servers.insert(format!("__id_{}", server.numeric_id()), server.clone());
+                                     new_servers.insert(format!("__id_{}", server.numeric_id()), Arc::new(server.clone()));
                                      new_routes.insert(format!("__id_{}", server.numeric_id()), lb_arc.clone());
                                  } else {
                                      debug!("RPC_NODE: Server {} has names: {:?}", server.numeric_id(), names);
@@ -571,7 +571,7 @@ pub async fn fetch_and_apply_config<F>(
                                                  server.description
                                              );
                                          }
-                                         new_servers.insert(name.clone(), server.clone());
+                                         new_servers.insert(name.clone(), Arc::new(server.clone()));
                                          new_routes.insert(name.clone(), lb_arc.clone());
                                      }
                                  }
@@ -634,7 +634,7 @@ pub async fn fetch_and_apply_config<F>(
                             }
 
                             config_store.update_config(
-                                numeric_id, config_resp.timestamp, payload.node_region.as_ref().map(|r| r.id).unwrap_or(0), payload.servers.clone(), new_servers, new_routes, new_id_to_lb,
+                                numeric_id, config_resp.timestamp, payload.node_region.as_ref().map(|r| r.id).unwrap_or(0), payload.servers.clone().into_iter().map(Arc::new).collect(), new_servers, new_routes, new_id_to_lb,
                                 vec![], vec![], payload.metric_items.clone(),
                                 node_level, 
                                 payload.is_on,

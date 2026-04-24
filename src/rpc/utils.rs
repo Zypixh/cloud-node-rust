@@ -12,7 +12,7 @@ pub fn build_runtime_maps(
     servers: Vec<ServerConfig>,
     health_manager: &GlobalHealthManager,
 ) -> (
-    HashMap<String, ServerConfig>,
+    HashMap<String, Arc<ServerConfig>>,
     HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
 ) {
     let mut new_servers = HashMap::new();
@@ -56,13 +56,14 @@ pub fn build_runtime_maps(
         }
 
         let names = server.get_plain_server_names();
+        let server_arc = Arc::new(server);
         if names.is_empty() {
-            let synthetic = format!("__id_{}", server.numeric_id());
-            new_servers.insert(synthetic.clone(), server.clone());
+            let synthetic = format!("__id_{}", server_arc.numeric_id());
+            new_servers.insert(synthetic.clone(), server_arc.clone());
             new_routes.insert(synthetic, lb_arc.clone());
         } else {
             for name in names {
-                new_servers.insert(name.clone(), server.clone());
+                new_servers.insert(name.clone(), server_arc.clone());
                 new_routes.insert(name.clone(), lb_arc.clone());
             }
         }

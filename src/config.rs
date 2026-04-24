@@ -17,9 +17,9 @@ pub struct NodeConfig {
     /// Current node config version reported by control plane
     pub version: i64,
     /// Mapping of Host domain to its server configuration
-    pub servers: HashMap<String, ServerConfig>,
+    pub servers: HashMap<String, Arc<ServerConfig>>,
     /// Unique runtime server list preserved independently from host routing map
-    pub all_servers: Vec<ServerConfig>,
+    pub all_servers: Vec<Arc<ServerConfig>>,
     /// Mapping of Host domain to an upstream load balancer
     pub routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
     /// Direct mapping from Server ID to Load Balancer
@@ -177,7 +177,7 @@ impl ConfigStore {
         lock.routes.get(host).cloned()
     }
 
-    pub fn get_server_sync(&self, host: &str) -> Option<ServerConfig> {
+    pub fn get_server_sync(&self, host: &str) -> Option<Arc<ServerConfig>> {
         let lock = self.inner.read().unwrap();
         lock.servers.get(host).cloned()
     }
@@ -185,7 +185,7 @@ impl ConfigStore {
     pub fn get_server_and_upstream_sync(
         &self,
         host: &str,
-    ) -> (Option<ServerConfig>, Option<Arc<LoadBalancer<RoundRobin>>>) {
+    ) -> (Option<Arc<ServerConfig>>, Option<Arc<LoadBalancer<RoundRobin>>>) {
         let lock = self.inner.read().unwrap();
         (lock.servers.get(host).cloned(), lock.routes.get(host).cloned())
     }
@@ -210,7 +210,7 @@ impl ConfigStore {
         }
     }
 
-    pub fn get_server_for_tls_name_sync(&self, host: &str) -> Option<ServerConfig> {
+    pub fn get_server_for_tls_name_sync(&self, host: &str) -> Option<Arc<ServerConfig>> {
         let normalized = host.trim_end_matches('.').to_ascii_lowercase();
         let lock = self.inner.read().unwrap();
         if let Some(server) = lock.servers.get(&normalized) {
@@ -225,7 +225,7 @@ impl ConfigStore {
         None
     }
 
-    pub fn find_sni_passthrough_server_sync(&self, host: &str, port: u16) -> Option<ServerConfig> {
+    pub fn find_sni_passthrough_server_sync(&self, host: &str, port: u16) -> Option<Arc<ServerConfig>> {
         let normalized = host.trim_end_matches('.').to_ascii_lowercase();
         let lock = self.inner.read().unwrap();
 
@@ -397,11 +397,11 @@ impl ConfigStore {
         self.get_upstream_sync(host)
     }
 
-    pub async fn get_server(&self, host: &str) -> Option<ServerConfig> {
+    pub async fn get_server(&self, host: &str) -> Option<Arc<ServerConfig>> {
         self.get_server_sync(host)
     }
 
-    pub async fn get_server_by_id(&self, server_id: i64) -> Option<ServerConfig> {
+    pub async fn get_server_by_id(&self, server_id: i64) -> Option<Arc<ServerConfig>> {
         let lock = self.inner.read().unwrap();
         lock.all_servers
             .iter()
@@ -409,7 +409,7 @@ impl ConfigStore {
             .cloned()
     }
 
-    pub async fn get_all_servers(&self) -> Vec<ServerConfig> {
+    pub async fn get_all_servers(&self) -> Vec<Arc<ServerConfig>> {
         let lock = self.inner.read().unwrap();
         lock.all_servers.clone()
     }
@@ -523,8 +523,8 @@ impl ConfigStore {
         id: i64,
         version: i64,
         node_region_id: i64,
-        all_servers: Vec<ServerConfig>,
-        servers: HashMap<String, ServerConfig>,
+        all_servers: Vec<Arc<ServerConfig>>,
+        servers: HashMap<String, Arc<ServerConfig>>,
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
         id_to_lb: HashMap<i64, Arc<LoadBalancer<RoundRobin>>>,
         deleted_contents: Vec<String>,
@@ -601,8 +601,8 @@ impl ConfigStore {
     pub async fn replace_server(
         &self, 
         server_id: i64, 
-        all_servers: Vec<ServerConfig>,
-        servers: HashMap<String, ServerConfig>, 
+        all_servers: Vec<Arc<ServerConfig>>,
+        servers: HashMap<String, Arc<ServerConfig>>, 
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>
     ) {
         let mut lock = self.inner.write().unwrap();
@@ -639,8 +639,8 @@ impl ConfigStore {
     pub async fn replace_user_servers(
         &self, 
         user_id: i64, 
-        all_servers: Vec<ServerConfig>,
-        servers: HashMap<String, ServerConfig>, 
+        all_servers: Vec<Arc<ServerConfig>>,
+        servers: HashMap<String, Arc<ServerConfig>>, 
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>
     ) {
         let mut lock = self.inner.write().unwrap();
@@ -733,7 +733,7 @@ impl ConfigStore {
     pub async fn cache_server_route(
         &self,
         host: String,
-        server: ServerConfig,
+        server: Arc<ServerConfig>,
         lb: Arc<LoadBalancer<RoundRobin>>,
     ) {
         let mut lock = self.inner.write().unwrap();

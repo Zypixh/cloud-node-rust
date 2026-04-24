@@ -286,7 +286,7 @@ impl HttpProxyManager {
         &self,
         client_stream: &TcpStream,
         port: u16,
-    ) -> anyhow::Result<Option<ServerConfig>> {
+    ) -> anyhow::Result<Option<Arc<ServerConfig>>> {
         let host = peek_client_hello_sni(client_stream)
             .await?
             .map(|value| value.trim_end_matches('.').to_ascii_lowercase());
@@ -307,7 +307,7 @@ impl HttpProxyManager {
         &self,
         client_stream: TcpStream,
         client_addr: SocketAddr,
-        server: ServerConfig,
+        server: Arc<ServerConfig>,
     ) -> anyhow::Result<()> {
         if server.has_valid_traffic_limit() {
             debug!(
