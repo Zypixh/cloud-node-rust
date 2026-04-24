@@ -12,6 +12,7 @@ use pingora_proxy::http_proxy;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::Duration;
@@ -190,9 +191,9 @@ impl HttpProxyManager {
                         .find_sni_passthrough_server(&client_stream, port)
                         .await
                     {
-                        Ok(Some(server)) => {
+                        Ok(Some((server, sni_host))) => {
                             if let Err(err) = manager
-                                .handle_sni_passthrough(client_stream, client_addr, server)
+                                .handle_sni_passthrough(client_stream, client_addr, port, sni_host, server)
                                 .await
                             {
                                 debug!(
@@ -286,7 +287,7 @@ impl HttpProxyManager {
         &self,
         client_stream: &TcpStream,
         port: u16,
-    ) -> anyhow::Result<Option<Arc<ServerConfig>>> {
+    ) -> anyhow::Result<Option<(Arc<ServerConfig>, String)>> {
         let host = peek_client_hello_sni(client_stream)
             .await?
             .map(|value| value.trim_end_matches('.').to_ascii_lowercase());
@@ -300,45 +301,45 @@ impl HttpProxyManager {
         else {
             return Ok(None);
         };
-        Ok(Some(server))
+        Ok(Some((server, host)))
     }
 
     async fn handle_sni_passthrough(
         &self,
         client_stream: TcpStream,
         client_addr: SocketAddr,
+        listen_port: u16,
+        sni_host: String,
         server: Arc<ServerConfig>,
     ) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let started_at_millis = crate::utils::time::now_timestamp_millis();
+        let request_id = crate::logging::next_request_id();
+        let server_id = server.numeric_id();
+        anyhow::ensure!(server_id > 0, "SNI passthrough server is missing ID");
+
         if server.has_valid_traffic_limit() {
             debug!(
                 "SNI passthrough: rejecting connection from {} for traffic-limited server {}",
                 client_addr,
-                server.numeric_id()
+                server_id
+            );
+            crate::logging::log_sni_passthrough_access(
+                request_id,
+                &server,
+                &sni_host,
+                client_addr,
+                listen_port,
+                "",
+                started_at_millis,
+                started.elapsed(),
+                0,
+                0,
+                403,
+                Some("traffic limit exceeded"),
             );
             return Ok(());
         }
-
-        let server_id = server.numeric_id();
-        anyhow::ensure!(server_id > 0, "SNI passthrough server is missing ID");
-
-        let backend_addr = self.select_passthrough_backend_target(&server).await?;
-        let toa_config = self.config_store.get_toa_config_sync();
-        let backend_stream = crate::toa::connect_with_toa(
-            &backend_addr,
-            client_addr,
-            toa_config.clone(),
-            Duration::from_secs(10),
-        )
-        .await
-        .with_context(|| format!("failed to connect passthrough upstream {}", backend_addr))?;
-        let toa_local_port = backend_stream
-            .local_addr()
-            .ok()
-            .map(|addr| addr.port())
-            .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
-
-        configure_passthrough_socket(&client_stream);
-        configure_passthrough_socket(&backend_stream);
 
         let user_plan_id = server.user_plan_id;
         let plan_id = if user_plan_id > 0 {
@@ -358,6 +359,57 @@ impl HttpProxyManager {
             plan_id,
         );
 
+        let backend_addr = self.select_passthrough_backend_target(&server).await?;
+        let toa_config = self.config_store.get_toa_config_sync();
+        let backend_stream = match crate::toa::connect_with_toa(
+            &backend_addr,
+            client_addr,
+            toa_config.clone(),
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                crate::logging::log_sni_passthrough_access(
+                    request_id,
+                    &server,
+                    &sni_host,
+                    client_addr,
+                    listen_port,
+                    &backend_addr,
+                    started_at_millis,
+                    started.elapsed(),
+                    0,
+                    0,
+                    502,
+                    Some(&format!("failed to connect passthrough upstream {}: {}", backend_addr, err)),
+                );
+                crate::metrics::record::record_http_dimensions(
+                    server_id,
+                    client_addr.ip(),
+                    &sni_host,
+                    "-",
+                    0,
+                    0,
+                    0,
+                    None,
+                );
+                crate::metrics::record::request_end(server_id, 0, 0, false, false, false);
+                return Err(err)
+                    .with_context(|| format!("failed to connect passthrough upstream {}", backend_addr));
+            }
+        };
+
+        let toa_local_port = backend_stream
+            .local_addr()
+            .ok()
+            .map(|addr| addr.port())
+            .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
+
+        configure_passthrough_socket(&client_stream);
+        configure_passthrough_socket(&backend_stream);
+
         let result =
             crate::tcp_proxy::stream_bidirectional_with_metrics(server_id, client_stream, backend_stream).await;
         if let Some(local_port) = toa_local_port {
@@ -366,11 +418,49 @@ impl HttpProxyManager {
             }
         }
         match result {
-            Ok(_) => {
+            Ok((bytes_received, bytes_sent)) => {
+                crate::metrics::record::record_http_dimensions(
+                    server_id,
+                    client_addr.ip(),
+                    &sni_host,
+                    "-",
+                    bytes_sent as i64,
+                    0,
+                    0,
+                    None,
+                );
+                crate::logging::log_sni_passthrough_access(
+                    request_id,
+                    &server,
+                    &sni_host,
+                    client_addr,
+                    listen_port,
+                    &backend_addr,
+                    started_at_millis,
+                    started.elapsed(),
+                    bytes_received,
+                    bytes_sent,
+                    200,
+                    None,
+                );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false);
                 Ok(())
             }
             Err(err) => {
+                crate::logging::log_sni_passthrough_access(
+                    request_id,
+                    &server,
+                    &sni_host,
+                    client_addr,
+                    listen_port,
+                    &backend_addr,
+                    started_at_millis,
+                    started.elapsed(),
+                    0,
+                    0,
+                    502,
+                    Some(&err.to_string()),
+                );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false);
                 Err(err.into())
             }

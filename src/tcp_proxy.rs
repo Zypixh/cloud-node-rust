@@ -320,18 +320,36 @@ impl TcpProxyManager {
                 apply_client_cert(&mut conn_config, client_cert)?;
             }
 
+            // Metrics: Start connection
+            let client_ip = client_addr.ip().to_string();
+            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
+
             let toa_config = self.config_store.get_toa_config_sync();
-            let backend_stream = crate::toa::connect_with_toa(
+            let backend_stream = match crate::toa::connect_with_toa(
                 &backend_addr,
                 client_addr,
                 toa_config.clone(),
                 std::time::Duration::from_secs(10),
             )
-            .await
-            .map_err(|e| {
-                error!("TCP Proxy: Failed to connect to backend {}: {}", backend_addr, e);
-                e
-            })?;
+            .await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("TCP Proxy: Failed to connect to backend {}: {}", backend_addr, e);
+                    let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
+                    crate::metrics::record::record_http_dimensions(
+                        sid,
+                        client_addr.ip(),
+                        &domain,
+                        "-",
+                        0,
+                        0,
+                        0,
+                        None,
+                    );
+                    crate::metrics::record::request_end(sid, 0, 0, false, false, false);
+                    return Err(e.into());
+                }
+            };
             let toa_local_port = backend_stream
                 .local_addr()
                 .ok()
@@ -371,12 +389,20 @@ impl TcpProxyManager {
             let backend_stream = pingora_core::protocols::tls::client::handshake(conn_config, &host, backend_stream, None).await
                 .map_err(|e| {
                     error!("TCP Proxy: TLS handshake with backend {} (SNI: {}) failed: {}", backend_addr, host, e);
+                    let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
+                    crate::metrics::record::record_http_dimensions(
+                        sid,
+                        client_addr.ip(),
+                        &domain,
+                        "-",
+                        0,
+                        0,
+                        0,
+                        None,
+                    );
+                    crate::metrics::record::request_end(sid, 0, 0, false, false, false);
                     e
                 })?;
-
-            // Metrics: Start connection
-            let client_ip = client_addr.ip().to_string();
-            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
 
             let res = stream_bidirectional_with_metrics(sid, client_stream, backend_stream).await;
             if let Some(local_port) = toa_local_port {
@@ -384,12 +410,34 @@ impl TcpProxyManager {
                     debug!("TCP Proxy: failed to release TOA sender port {}: {}", local_port, err);
                 }
             }
-            if let Err(ref e) = res {
-                debug!("TCP Proxy: Bidirectional copy (TLS upstream) finished with error: {}", e);
-            }
+            
+            let (_bytes_received, bytes_sent) = match res {
+                Ok((r, s)) => (r, s),
+                Err(ref e) => {
+                    debug!("TCP Proxy: Bidirectional copy (TLS upstream) finished with error: {}", e);
+                    (0, 0)
+                }
+            };
+
+            let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
+            crate::metrics::record::record_http_dimensions(
+                sid,
+                client_addr.ip(),
+                &domain,
+                "-",
+                bytes_sent as i64,
+                0,
+                0,
+                None,
+            );
+
             crate::metrics::record::request_end(sid, 0, 0, false, false, false);
             res.map(|_| ())
         } else {
+            // Metrics: Start connection
+            let client_ip = client_addr.ip().to_string();
+            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
+
             let toa_config = self.config_store.get_toa_config_sync();
             let backend_stream = match crate::toa::connect_with_toa(
                 &backend_addr,
@@ -401,6 +449,18 @@ impl TcpProxyManager {
                 Ok(s) => s,
                 Err(e) => {
                     error!("TCP Proxy: Failed to connect to backend {}: {}", backend_addr, e);
+                    let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
+                    crate::metrics::record::record_http_dimensions(
+                        sid,
+                        client_addr.ip(),
+                        &domain,
+                        "-",
+                        0,
+                        0,
+                        0,
+                        None,
+                    );
+                    crate::metrics::record::request_end(sid, 0, 0, false, false, false);
                     return Err(e.into());
                 }
             };
@@ -412,7 +472,7 @@ impl TcpProxyManager {
 
             // --- OPTIMIZATION: Upstream TCP ---
             let _ = backend_stream.set_nodelay(true);
-            
+
             #[cfg(unix)]
             {
                 use std::os::unix::io::AsRawFd;
@@ -438,23 +498,36 @@ impl TcpProxyManager {
                 }
             }
 
-            // Metrics: Start connection
-            let client_ip = client_addr.ip().to_string();
-            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
-
             let res = stream_bidirectional_with_metrics(sid, client_stream, backend_stream).await;
             if let Some(local_port) = toa_local_port {
                 if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await {
                     debug!("TCP Proxy: failed to release TOA sender port {}: {}", local_port, err);
                 }
             }
-            if let Err(ref e) = res {
-                debug!("TCP Proxy: Bidirectional copy finished with error: {}", e);
-            }
+
+            let (_bytes_received, bytes_sent) = match res {
+                Ok((r, s)) => (r, s),
+                Err(ref e) => {
+                    debug!("TCP Proxy: Bidirectional copy finished with error: {}", e);
+                    (0, 0)
+                }
+            };
+
+            let domain = server.get_plain_server_names().first().cloned().unwrap_or_default();
+            crate::metrics::record::record_http_dimensions(
+                sid,
+                client_addr.ip(),
+                &domain,
+                "-",
+                bytes_sent as i64,
+                0,
+                0,
+                None,
+            );
+
             crate::metrics::record::request_end(sid, 0, 0, false, false, false);
             res.map(|_| ())
-        }
-    }
+        }    }
 }
 
 pub(crate) async fn stream_bidirectional_with_metrics<C, B>(

@@ -1,9 +1,11 @@
 use crate::pb;
+use crate::config_models::ServerConfig;
 use crate::proxy::ProxyCTX;
 use pingora_proxy::Session;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use once_cell::sync::OnceCell;
@@ -216,4 +218,86 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         debug!("Reporting log: {} {} -> Status {}", log.request_method, log.request_uri, log.status);
         let _ = sender.try_send(log);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn log_sni_passthrough_access(
+    request_id: String,
+    server: &ServerConfig,
+    sni_host: &str,
+    client_addr: SocketAddr,
+    listen_port: u16,
+    origin_address: &str,
+    request_started_at_millis: i64,
+    request_time: Duration,
+    bytes_received: u64,
+    bytes_sent: u64,
+    status: i32,
+    error: Option<&str>,
+) {
+    let sender = match LOG_SENDER.get() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let server_id = server.numeric_id();
+    if server_id == 0 {
+        warn!(
+            "Generated SNI passthrough log for unconfigured host '{}', skipping report to API.",
+            sni_host
+        );
+        return;
+    }
+
+    let request_started_at = request_started_at_millis / 1000;
+    let request_started_local: DateTime<FixedOffset> =
+        crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
+    let request = format!("SNI {} TLS", sni_host);
+    let mut log = pb::HttpAccessLog {
+        request_id,
+        server_id,
+        node_id: NUMERIC_NODE_ID.load(Ordering::Relaxed),
+        remote_addr: client_addr.ip().to_string(),
+        raw_remote_addr: client_addr.to_string(),
+        remote_port: client_addr.port() as i32,
+        request_uri: sni_host.to_string(),
+        request_path: String::new(),
+        request_method: "SNI".to_string(),
+        request_length: bytes_received as i64,
+        request_time: request_time.as_secs_f64(),
+        scheme: "tls".to_string(),
+        proto: "TLS".to_string(),
+        status,
+        status_message: String::new(),
+        bytes_sent: bytes_sent as i64,
+        body_bytes_sent: bytes_sent as i64,
+        host: sni_host.to_string(),
+        user_agent: "-".to_string(),
+        referer: String::new(),
+        request,
+        timestamp: request_started_at,
+        msec: request_started_at_millis as f64 / 1000.0,
+        time_iso8601: request_started_local.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
+        time_local: request_started_local.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
+        hostname: hostname::get().unwrap_or_default().to_string_lossy().to_string(),
+        origin_address: origin_address.to_string(),
+        origin_status: status,
+        server_name: server.server_names.first().map(|s| s.name.clone()).unwrap_or_default(),
+        server_port: listen_port as i32,
+        server_protocol: "SNI_PASSTHROUGH".to_string(),
+        ..Default::default()
+    };
+
+    log.attrs.insert("transport".to_string(), "tcp".to_string());
+    log.attrs.insert("protocol".to_string(), "sni_passthrough".to_string());
+    if !origin_address.is_empty() {
+        log.attrs.insert("backend".to_string(), origin_address.to_string());
+    }
+    log.tags.push("SNI_PASSTHROUGH".to_string());
+    if let Some(error) = error.filter(|value| !value.is_empty()) {
+        log.errors.push(error.to_string());
+    }
+
+    debug!("Reporting SNI passthrough log: {} -> Status {}", log.request_uri, log.status);
+    let _ = sender.try_send(log);
 }
