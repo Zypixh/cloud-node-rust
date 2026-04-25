@@ -399,6 +399,14 @@ pub struct NodeConfigPayload {
     #[serde(rename = "globalServerConfig", default)]
     pub global_server_config: Option<GlobalServerConfig>,
     #[serde(
+        rename = "globalPages",
+        alias = "pages",
+        alias = "Pages",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub global_pages: Vec<HTTPPageConfig>,
+    #[serde(
         rename = "grpcPolicies",
         default,
         deserialize_with = "deserialize_null_default"

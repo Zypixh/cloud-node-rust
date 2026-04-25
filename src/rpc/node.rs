@@ -936,6 +936,12 @@ pub async fn fetch_and_apply_config<F>(
                                 }
                             }
 
+                            info!(
+                                "RPC_NODE: Loaded global custom pages: {}. Global page policies: {}",
+                                payload.global_pages.len(),
+                                payload.http_pages_policies.len()
+                            );
+
                             tracing::debug!(
                                 "Received {} certificates from RPC, starting sync...",
                                 all_certs.len()
@@ -986,7 +992,7 @@ pub async fn fetch_and_apply_config<F>(
                                     new_routes,
                                     new_id_to_lb,
                                     vec![],
-                                    vec![],
+                                    payload.global_pages.clone(),
                                     payload.metric_items.clone(),
                                     node_level,
                                     payload.is_on,

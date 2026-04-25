@@ -5,12 +5,12 @@ use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use image::AnimationDecoder;
 use pingora_core::upstreams::peer::HttpPeer;
-use pingora_core::{Error, ErrorType::*, Result};
+use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
-use pingora_proxy::{ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use rand::Rng;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::api_config::ApiConfig;
 use crate::cache::should_cache_response;
@@ -861,8 +861,17 @@ impl EdgeProxy {
                     .filter(|code| (300..400).contains(code))
                     .unwrap_or(302);
                 ctx.response_status = redirect_status;
+                ctx.response_body_len = 0;
+                ctx.response_headers.clear();
+                ctx.response_headers
+                    .insert("location".to_string(), url.clone());
                 let mut resp = pingora_http::ResponseHeader::build(redirect_status, None).unwrap();
                 resp.insert_header("location", url.as_str()).unwrap();
+                ctx.response_headers_size = resp
+                    .headers
+                    .iter()
+                    .map(|(n, v)| n.as_str().len() + v.len() + 4)
+                    .sum();
                 session.write_response_header(Box::new(resp), true).await?;
                 return Ok(true);
             }
@@ -878,9 +887,20 @@ impl EdgeProxy {
                     body,
                     &ctx.request_body,
                 );
+                ctx.response_body_len = resolved_body.len();
+                ctx.response_headers.clear();
+                ctx.response_headers.insert(
+                    "content-type".to_string(),
+                    "text/html; charset=utf-8".to_string(),
+                );
                 let mut resp = pingora_http::ResponseHeader::build(final_status, None).unwrap();
                 resp.insert_header("content-type", "text/html; charset=utf-8")
                     .unwrap();
+                ctx.response_headers_size = resp
+                    .headers
+                    .iter()
+                    .map(|(n, v)| n.as_str().len() + v.len() + 4)
+                    .sum();
                 session.write_response_header(Box::new(resp), false).await?;
                 session
                     .write_response_body(Some(Bytes::from(resolved_body)), true)
@@ -889,7 +909,36 @@ impl EdgeProxy {
             }
         }
 
+        if status >= 500 {
+            let (site_page_count, enable_global_pages) = ctx
+                .server
+                .as_ref()
+                .and_then(|server| server.web.as_ref())
+                .map(|web| {
+                    (
+                        web.pages.iter().filter(|page| page.is_on).count(),
+                        web.enable_global_pages,
+                    )
+                })
+                .unwrap_or((0, false));
+            debug!(
+                "No custom page matched status {} for host {:?}. site_pages={}, enable_global_pages={}, global_pages={}, global_http_page_policy_pages={}",
+                status,
+                session
+                    .get_header("host")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.to_string()),
+                site_page_count,
+                enable_global_pages,
+                self.config.get_global_pages_sync().len(),
+                self.global_http_pages().len(),
+            );
+        }
+
         ctx.response_status = status;
+        ctx.response_body_len = 0;
+        ctx.response_headers.clear();
+        ctx.response_headers_size = 0;
         session.respond_error(status).await?;
         Ok(true)
     }
@@ -2855,6 +2904,43 @@ impl ProxyHttp for EdgeProxy {
         }
 
         Ok(false)
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        let code = match e.etype() {
+            HTTPStatus(code) => *code,
+            _ => match e.esource() {
+                ErrorSource::Upstream => 502,
+                ErrorSource::Downstream => match e.etype() {
+                    WriteError | ReadError | ConnectionClosed => 0,
+                    _ => 400,
+                },
+                ErrorSource::Internal | ErrorSource::Unset => 500,
+            },
+        };
+
+        if code > 0 {
+            ctx.response_status = code;
+            if matches!(e.esource(), ErrorSource::Upstream) {
+                ctx.origin_status = code as i32;
+            }
+            if let Err(write_err) = self.respond_status_with_pages(session, ctx, code).await {
+                error!(
+                    "failed to send custom error response to downstream: {}",
+                    write_err
+                );
+            }
+        }
+
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
     }
 
     async fn upstream_peer(
