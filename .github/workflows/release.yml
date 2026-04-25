@@ -106,9 +106,77 @@ jobs:
           name: ${{ matrix.name }}
           path: cloud-node-rust-${{ matrix.name }}.tar.gz
 
+  build-legacy:
+    name: Build - linux-x64-legacy-glibc217
+    runs-on: ubuntu-22.04
+    container:
+      image: quay.io/pypa/manylinux2014_x86_64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          yum install -y perl-FindBin perl-IPC-Cmd cmake3 make git golang which
+          ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          echo "/root/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install target
+        shell: bash
+        run: |
+          source /root/.cargo/env
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x64-legacy-glibc217-x86_64-unknown-linux-gnu
+          env-vars: "RUSTFLAGS CXXFLAGS CFLAGS"
+
+      - name: Build legacy package
+        shell: bash
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes"
+        run: |
+          source /root/.cargo/env
+          cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        shell: bash
+        run: |
+          ORIGINAL_BINARY="cloud-node-rust"
+          TARGET_BINARY="cloud-node"
+          PACKAGE_NAME="cloud-node-rust-linux-x64-legacy-glibc217"
+
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/$ORIGINAL_BINARY dist/$TARGET_BINARY
+          cd dist
+          tar -czf ../$PACKAGE_NAME.tar.gz $TARGET_BINARY
+          cd ..
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-legacy-glibc217
+          path: cloud-node-rust-linux-x64-legacy-glibc217.tar.gz
+
   release:
     name: Create Release
-    needs: build
+    needs:
+      - build
+      - build-legacy
     runs-on: ubuntu-22.04
     permissions:
       contents: write
