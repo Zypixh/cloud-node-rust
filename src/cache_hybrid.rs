@@ -8,7 +8,6 @@ use pingora_cache::storage::{
 use pingora_cache::{CacheKey, CacheMeta, MemCache};
 use pingora_core::{Error, ErrorType, Result};
 use std::any::Any;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
@@ -134,7 +133,7 @@ impl Storage for FileStorage {
             return Ok(None);
         }
 
-        let file = std::fs::File::open(&path).map_err(|_| Error::new(ErrorType::InternalError))?;
+        let file = tokio::fs::File::open(&path).await.map_err(|_| Error::new(ErrorType::InternalError))?;
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
         let meta = CacheMeta::new(
@@ -145,17 +144,15 @@ impl Storage for FileStorage {
             headers,
         );
 
-        let reader: Box<dyn std::io::Read + Send> = if compressed {
-            Box::new(
-                zstd::stream::read::Decoder::new(file)
-                    .map_err(|_| Error::new(ErrorType::InternalError))?,
-            )
+        let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if compressed {
+            let buf_reader = tokio::io::BufReader::new(file);
+            Box::new(async_compression::tokio::bufread::ZstdDecoder::new(buf_reader))
         } else {
             Box::new(file)
         };
 
         let handler = Box::new(FileHitHandler {
-            reader: std::sync::Mutex::new(reader),
+            reader: tokio::sync::Mutex::new(reader),
         });
         Ok(Some((meta, handler)))
     }
@@ -337,25 +334,21 @@ impl Storage for FileStorage {
 }
 
 struct FileHitHandler {
-    reader: std::sync::Mutex<Box<dyn std::io::Read + Send>>,
+    reader: tokio::sync::Mutex<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
 }
 
 #[async_trait]
 impl HandleHit for FileHitHandler {
     async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
+        use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 32768]; // Use 32KB chunks for high performance
-        let res = tokio::task::block_in_place(|| {
-            let mut r = self.reader.lock().map_err(|e| {
-                tracing::error!("CACHE_HIT: Failed to lock direct reader: {:?}", e);
-                Error::new(ErrorType::InternalError)
-            })?;
-            r.read(&mut buf).map_err(|e| {
-                tracing::error!(
-                    "CACHE_HIT: Streaming read error (possibly corrupted zstd): {:?}",
-                    e
-                );
-                Error::new(ErrorType::InternalError)
-            })
+        let mut r = self.reader.lock().await;
+        let res = r.read(&mut buf).await.map_err(|e| {
+            tracing::error!(
+                "CACHE_HIT: Streaming read error (possibly corrupted zstd): {:?}",
+                e
+            );
+            Error::new(ErrorType::InternalError)
         })?;
 
         if res == 0 {
