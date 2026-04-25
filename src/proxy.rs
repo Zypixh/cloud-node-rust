@@ -3304,6 +3304,10 @@ impl ProxyHttp for EdgeProxy {
                 peer_obj.options.alpn = pingora_core::protocols::ALPN::H2;
             }
 
+            // [DEBUG] DISABLE KEEPALIVE TO TEST CONNECTION REUSE ISSUES
+            // peer_obj.options.set_keepalive(0); // Invalid method
+            peer_obj.options.idle_timeout = Some(std::time::Duration::from_millis(1));
+
             if let Some(ext) = backend_ext {
                 if !ext.tls_verify {
                     peer_obj.options.verify_cert = false;
@@ -3848,6 +3852,10 @@ impl ProxyHttp for EdgeProxy {
     ) -> Result<()> {
         let global_cfg = self.config.get_global_http_config_sync();
         upstream_request.remove_header("x-cloud-resolved-real-ip");
+
+        // [DEBUG] DISABLE KEEPALIVE TO TEST CONNECTION REUSE ISSUES
+        upstream_request.remove_header("connection");
+        upstream_request.insert_header("connection", "close").unwrap();
 
         // 1. Automatic Gzip Back to Origin
         if global_cfg.request_origins_with_encodings {
