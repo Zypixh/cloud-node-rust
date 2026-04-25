@@ -205,6 +205,14 @@ const MAX_HLS_PLAYLIST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HLS_SEGMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 impl EdgeProxy {
+    fn is_grpc_request(session: &Session) -> bool {
+        session
+            .get_header("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_ascii_lowercase().starts_with("application/grpc"))
+            .unwrap_or(false)
+    }
+
     fn raw_remote_ip(raw_remote_addr: &str, fallback: std::net::IpAddr) -> String {
         if raw_remote_addr.is_empty() {
             return fallback.to_string();
@@ -2661,13 +2669,12 @@ impl ProxyHttp for EdgeProxy {
         }
 
         if let Some(server) = &ctx.server {
-            if let Some(web) = &server.web {
-                if let Some(ws) = &web.websocket {
-                    if ws.is_on {
-                        ctx.is_websocket = true;
-                        ctx.is_grpc = true; // Sync enable gRPC if websocket is on
-                    }
-                }
+            if let Some(web) = &server.web
+                && let Some(ws) = &web.websocket
+                && ws.is_on
+            {
+                ctx.is_websocket = true;
+                ctx.is_grpc = true; // Restore coupling: WebSocket on = gRPC support on
             }
             if let Some(grpc) = &server.grpc {
                 if grpc.is_on {
@@ -3107,6 +3114,8 @@ impl ProxyHttp for EdgeProxy {
         e: &Error,
         ctx: &mut Self::CTX,
     ) -> FailToProxy {
+        let is_upstream_http_status = matches!(e.esource(), ErrorSource::Upstream)
+            && matches!(e.etype(), HTTPStatus(_));
         let code = match e.etype() {
             HTTPStatus(code) => *code,
             _ => match e.esource() {
@@ -3124,9 +3133,18 @@ impl ProxyHttp for EdgeProxy {
             if matches!(e.esource(), ErrorSource::Upstream) {
                 ctx.origin_status = code as i32;
             }
-            if let Err(write_err) = self.respond_status_with_pages(session, ctx, code).await {
+            let write_result = if is_upstream_http_status {
+                // Preserve the upstream status code instead of treating a real upstream 5xx
+                // as a transport failure that always maps to our local error page.
+                session.respond_error(code).await
+            } else {
+                self.respond_status_with_pages(session, ctx, code)
+                    .await
+                    .map(|_| ())
+            };
+            if let Err(write_err) = write_result {
                 error!(
-                    "failed to send custom error response to downstream: {}",
+                    "failed to send error response to downstream: {}",
                     write_err
                 );
             }
@@ -3267,8 +3285,8 @@ impl ProxyHttp for EdgeProxy {
             // Connection timeout (L1 -> L2 or L2 -> Origin)
             peer_obj.options.connection_timeout = Some(std::time::Duration::from_secs(10));
 
-            if ctx.is_grpc {
-                // Force ALPN to h2 for gRPC
+            if ctx.is_grpc && Self::is_grpc_request(session) {
+                // Force ALPN to h2 ONLY for actual gRPC requests
                 peer_obj.options.alpn = pingora_core::protocols::ALPN::H2;
             }
 
