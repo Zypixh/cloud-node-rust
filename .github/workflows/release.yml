@@ -143,11 +143,12 @@ jobs:
             quay.io/pypa/manylinux2014_x86_64 \
             /bin/bash -lc '
               set -euo pipefail
-              yum install -y perl perl-core cmake3 make git golang which curl unzip
+              yum install -y perl perl-core cmake3 make git golang which curl unzip llvm-toolset-7.0-clang llvm-toolset-7.0-clang-libs
               ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
               curl -L "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip
               unzip -q /tmp/protoc.zip -d /opt/protoc
               export PATH="/opt/protoc/bin:${PATH}"
+              export LIBCLANG_PATH="/opt/rh/llvm-toolset-7.0/root/usr/lib64"
               curl https://sh.rustup.rs -sSf | sh -s -- -y
               source /root/.cargo/env
               rustup target add x86_64-unknown-linux-gnu
