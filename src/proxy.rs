@@ -281,7 +281,14 @@ impl EdgeProxy {
     }
 
     fn socket_client_ip(session: &Session) -> (std::net::IpAddr, u16, String) {
-        match session.client_addr() {
+        let socket_addr = session
+            .downstream_session
+            .digest()
+            .and_then(|d| d.socket_digest.as_ref())
+            .and_then(|sd| sd.peer_addr().cloned())
+            .or_else(|| session.client_addr().cloned());
+
+        match socket_addr {
             Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => {
                 (addr.ip(), addr.port(), addr.to_string())
             }
@@ -293,6 +300,15 @@ impl EdgeProxy {
         let mut candidate = raw.trim().trim_matches('"').trim_matches('\'');
         if candidate.is_empty() {
             return None;
+        }
+        if let Some(value) = candidate
+            .strip_prefix("for=")
+            .or_else(|| candidate.strip_prefix("For="))
+        {
+            candidate = value.trim();
+        }
+        if let Some((first, _)) = candidate.split_once(';') {
+            candidate = first.trim();
         }
         if let Some((first, _)) = candidate.split_once(',') {
             candidate = first.trim();
@@ -311,7 +327,20 @@ impl EdgeProxy {
     }
 
     fn fallback_client_ip(session: &Session, raw_ip: std::net::IpAddr) -> std::net::IpAddr {
-        for header in ["x-forwarded-for", "x-real-ip", "x-real-ip"] {
+        for header in [
+            "x-cloud-real-ip",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-forwarded-for",
+            "x-real-ip",
+            "x-client-ip",
+            "x-original-forwarded-for",
+            "x-cluster-client-ip",
+            "fastly-client-ip",
+            "ali-cdn-real-ip",
+            "cdn-src-ip",
+            "forwarded",
+        ] {
             let value = Self::header_value_ci(session, header);
             if let Some(ip) = Self::parse_candidate_ip(&value) {
                 return ip;

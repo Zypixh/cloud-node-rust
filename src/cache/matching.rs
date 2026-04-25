@@ -183,12 +183,22 @@ pub fn get_variable_value(session: &Session, param: &str) -> String {
                 .unwrap_or_default();
             format!("{}{}", path, query)
         }
-        "${remoteAddr}" => match session.client_addr() {
-            Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => {
-                addr.ip().to_string()
-            }
-            _ => "127.0.0.1".to_string(),
-        },
+        "${remoteAddr}" => session
+            .downstream_session
+            .digest()
+            .and_then(|d| d.socket_digest.as_ref())
+            .and_then(|sd| sd.peer_addr())
+            .and_then(|addr| addr.as_inet())
+            .map(|inet| inet.ip().to_string())
+            .or_else(|| {
+                session.client_addr().and_then(|addr| match addr {
+                    pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => {
+                        Some(addr.ip().to_string())
+                    }
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
         _ if param.starts_with("${arg:") => {
             let key = &param[6..param.len() - 1];
             session

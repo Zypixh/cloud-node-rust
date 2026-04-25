@@ -501,12 +501,22 @@ fn get_remote_addr(session: &Session) -> String {
 }
 
 fn get_remote_port(session: &Session) -> String {
-    match session.client_addr() {
-        Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => {
-            addr.port().to_string()
-        }
-        _ => String::new(),
-    }
+    session
+        .downstream_session
+        .digest()
+        .and_then(|d| d.socket_digest.as_ref())
+        .and_then(|sd| sd.peer_addr())
+        .and_then(|addr| addr.as_inet())
+        .map(|inet| inet.port().to_string())
+        .or_else(|| {
+            session.client_addr().and_then(|addr| match addr {
+                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => {
+                    Some(addr.port().to_string())
+                }
+                _ => None,
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn get_local_addr(session: &Session) -> String {
@@ -532,17 +542,58 @@ fn get_local_port(session: &Session) -> String {
 }
 
 fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
-    if let Some(value) = session
-        .get_header("x-cloud-resolved-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse().ok())
-    {
-        return value;
+    for header in [
+        "x-cloud-real-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+        "x-forwarded-for",
+        "x-real-ip",
+        "x-client-ip",
+        "x-original-forwarded-for",
+        "x-cluster-client-ip",
+        "fastly-client-ip",
+        "ali-cdn-real-ip",
+        "cdn-src-ip",
+        "forwarded",
+    ] {
+        if let Some(value) = session
+            .get_header(header)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().trim_matches('"').trim_matches('\''))
+        {
+            let mut candidate = value;
+            if let Some(v) = candidate
+                .strip_prefix("for=")
+                .or_else(|| candidate.strip_prefix("For="))
+            {
+                candidate = v.trim();
+            }
+            if let Some((first, _)) = candidate.split_once(';') {
+                candidate = first.trim();
+            }
+            if let Some((first, _)) = candidate.split_once(',') {
+                candidate = first.trim();
+            }
+            let candidate = candidate.trim_matches(|c| c == '[' || c == ']');
+            if let Ok(ip) = candidate.parse() {
+                return ip;
+            }
+        }
     }
-    match session.client_addr() {
-        Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => addr.ip(),
-        _ => std::net::IpAddr::from([127, 0, 0, 1]),
-    }
+    session
+        .downstream_session
+        .digest()
+        .and_then(|d| d.socket_digest.as_ref())
+        .and_then(|sd| sd.peer_addr())
+        .and_then(|addr| addr.as_inet())
+        .map(|inet| inet.ip())
+        .or_else(|| {
+            session.client_addr().and_then(|addr| match addr {
+                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => Some(addr.ip()),
+                _ => None,
+            })
+        })
+        .unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]))
 }
 
 fn geo_info(session: &Session) -> Option<analyzer::GeoInfo> {

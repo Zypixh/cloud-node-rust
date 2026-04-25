@@ -20,10 +20,14 @@ pub fn apply_request_header_policy(session: &mut Session, policy: &HTTPHeaderPol
         .map(|p| p.as_str())
         .unwrap_or("/")
         .to_string();
-    let remote_addr = match session.client_addr() {
-        Some(addr) => addr.to_string(),
-        None => "".to_string(),
-    };
+    let remote_addr = session
+        .downstream_session
+        .digest()
+        .and_then(|d| d.socket_digest.as_ref())
+        .and_then(|sd| sd.peer_addr())
+        .map(|addr| addr.to_string())
+        .or_else(|| session.client_addr().map(|addr| addr.to_string()))
+        .unwrap_or_default();
 
     let resolve = |value: &str| -> String {
         format_template(value, |var_name| match var_name {

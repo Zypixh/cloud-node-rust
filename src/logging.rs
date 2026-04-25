@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 static LOG_SENDER: OnceCell<mpsc::Sender<pb::HttpAccessLog>> = OnceCell::new();
 static NODE_LOG_SENDER: OnceCell<mpsc::Sender<pb::NodeLog>> = OnceCell::new();
@@ -122,8 +122,12 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     // Real IP resolution
     let raw_socket_addr = if ctx.raw_remote_addr.is_empty() {
         session
-            .client_addr()
-            .map(|a| a.to_string())
+            .downstream_session
+            .digest()
+            .and_then(|d| d.socket_digest.as_ref())
+            .and_then(|sd| sd.peer_addr())
+            .map(|addr| addr.to_string())
+            .or_else(|| session.client_addr().map(|a| a.to_string()))
             .unwrap_or_default()
     } else {
         ctx.raw_remote_addr.clone()
@@ -293,10 +297,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     }
 
     if server_id == 0 {
-        warn!(
-            "Generated log for unconfigured host '{}', skipping report to API.",
-            host
-        );
+        debug!("Skipping access log for unconfigured host '{}'", host);
     } else {
         debug!(
             "Reporting log: {} {} -> Status {}",
@@ -328,8 +329,8 @@ pub fn log_sni_passthrough_access(
 
     let server_id = server.numeric_id();
     if server_id == 0 {
-        warn!(
-            "Generated SNI passthrough log for unconfigured host '{}', skipping report to API.",
+        debug!(
+            "Skipping SNI passthrough access log for unconfigured host '{}'",
             sni_host
         );
         return;

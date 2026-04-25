@@ -231,28 +231,33 @@ impl HttpProxyManager {
             let manager = self.clone();
 
             tokio::spawn(async move {
+                let mut configured_tls_host = false;
+
                 if is_tls {
-                    match manager
-                        .find_sni_passthrough_server(&client_stream, port)
-                        .await
-                    {
-                        Ok(Some((server, sni_host))) => {
-                            if let Err(err) = manager
-                                .handle_sni_passthrough(
-                                    client_stream,
-                                    client_addr,
-                                    port,
-                                    sni_host,
-                                    server,
-                                )
-                                .await
-                            {
-                                debug!(
-                                    "SNI passthrough connection from {} on port {} failed: {}",
-                                    client_addr, port, err
-                                );
+                    match manager.inspect_tls_host(&client_stream, port).await {
+                        Ok(Some((host, passthrough_server))) => {
+                            configured_tls_host = manager
+                                .config_store
+                                .get_server_for_tls_name_sync(&host)
+                                .is_some();
+                            if let Some(server) = passthrough_server {
+                                if let Err(err) = manager
+                                    .handle_sni_passthrough(
+                                        client_stream,
+                                        client_addr,
+                                        port,
+                                        host,
+                                        server,
+                                    )
+                                    .await
+                                {
+                                    debug!(
+                                        "SNI passthrough connection from {} on port {} failed: {}",
+                                        client_addr, port, err
+                                    );
+                                }
+                                return;
                             }
-                            return;
                         }
                         Ok(None) => {}
                         Err(err) => {
@@ -293,9 +298,7 @@ impl HttpProxyManager {
                             (Box::new(s), alpn)
                         }
                         Err(e) => {
-                            if is_benign_tls_accept_error(&e.to_string()) {
-                                debug!("TLS handshake closed early: {}", e);
-                            } else {
+                            if !is_benign_tls_accept_error(&e.to_string()) && configured_tls_host {
                                 error!("TLS handshake failed: {}", e);
                             }
                             return;
@@ -322,9 +325,9 @@ impl HttpProxyManager {
                                     }
                                     Ok(None) => break, // Connection closed
                                     Err(e) => {
-                                        if is_benign_h2_error(&e.to_string()) {
-                                            debug!("HTTP/2 session ended early: {}", e);
-                                        } else {
+                                        if !is_benign_h2_error(&e.to_string())
+                                            && configured_tls_host
+                                        {
                                             error!("HTTP/2 session error: {}", e);
                                         }
                                         break;
@@ -333,9 +336,7 @@ impl HttpProxyManager {
                             }
                         }
                         Err(e) => {
-                            if is_benign_h2_error(&e.to_string()) {
-                                debug!("HTTP/2 handshake ended early: {}", e);
-                            } else {
+                            if !is_benign_h2_error(&e.to_string()) && configured_tls_host {
                                 error!("HTTP/2 handshake error: {}", e);
                             }
                         }
@@ -351,11 +352,11 @@ impl HttpProxyManager {
         }
     }
 
-    async fn find_sni_passthrough_server(
+    async fn inspect_tls_host(
         &self,
         client_stream: &TcpStream,
         port: u16,
-    ) -> anyhow::Result<Option<(Arc<ServerConfig>, String)>> {
+    ) -> anyhow::Result<Option<(String, Option<Arc<ServerConfig>>)>> {
         let host = peek_client_hello_sni(client_stream)
             .await?
             .map(|value| value.trim_end_matches('.').to_ascii_lowercase());
@@ -363,13 +364,10 @@ impl HttpProxyManager {
             return Ok(None);
         };
 
-        let Some(server) = self
+        let server = self
             .config_store
-            .find_sni_passthrough_server_sync(&host, port)
-        else {
-            return Ok(None);
-        };
-        Ok(Some((server, host)))
+            .find_sni_passthrough_server_sync(&host, port);
+        Ok(Some((host, server)))
     }
 
     async fn handle_sni_passthrough(
@@ -590,6 +588,10 @@ fn is_benign_tls_accept_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("unexpected eof")
         || lower.contains("connection closed")
+        || lower.contains("connection reset by peer")
+        || lower.contains("no_shared_cipher")
+        || lower.contains("unsupported_protocol")
+        || lower.contains("wrong_version_number")
         || lower.contains("tls accept() failed: unexpected eof")
 }
 

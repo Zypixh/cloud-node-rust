@@ -324,7 +324,7 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
                     }
                 }
             }
-            tracing::warn!(
+            tracing::debug!(
                 "No certificate match for SNI: {}, falling back to default",
                 host
             );
