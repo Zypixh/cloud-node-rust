@@ -24,7 +24,7 @@
                         }
                         "testCacheWrite" => {
                             info!("Received cache write test command");
-                            let cache_dir = "data/cache"; 
+                            let cache_dir = "../data/cache"; 
                             let test_file = format!("{}/test_{}.tmp", cache_dir, message.request_id);
                             let result = std::fs::write(&test_file, "test");
                             let _ = std::fs::remove_file(&test_file);
@@ -39,7 +39,7 @@
                         }
                         "testCacheRead" => {
                             info!("Received cache read test command");
-                            let result = std::fs::read_dir("data/cache");
+                            let result = std::fs::read_dir("../data/cache");
                             let _ = tx.send(pb::NodeStreamMessage {
                                 node_id: config_store.get_node_id().await,
                                 request_id: message.request_id,

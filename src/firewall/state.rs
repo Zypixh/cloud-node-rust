@@ -9,7 +9,6 @@ pub struct WafStateManager {
     pub blocks: DashMap<(i64, IpAddr), i64>,
     pub block_networks: DashMap<(i64, IpNet), i64>, // Support CIDR/C-class blocks
     pub whitelists: DashMap<(i64, IpAddr), i64>,
-    cache_miss_limiters: Arc<RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>>,
     server_limiters: DashMap<i64, Arc<RateLimiter<i64, DashMapStateStore<i64>, DefaultClock>>>,
     ip_limiters:
         DashMap<(i64, IpAddr), Arc<RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>>>,
@@ -24,12 +23,10 @@ impl Default for WafStateManager {
 
 impl WafStateManager {
     pub fn new() -> Self {
-        let quota = Quota::per_second(NonZeroU32::new(10).unwrap());
         Self {
             blocks: DashMap::new(),
             block_networks: DashMap::new(),
             whitelists: DashMap::new(),
-            cache_miss_limiters: Arc::new(RateLimiter::dashmap(quota)),
             server_limiters: DashMap::new(),
             ip_limiters: DashMap::new(),
             counters: DashMap::new(),
@@ -205,10 +202,6 @@ impl WafStateManager {
             Arc::new(RateLimiter::dashmap(quota))
         });
         limiter.check_key(&ip).is_ok()
-    }
-
-    pub fn check_cache_limit(&self, ip: IpAddr) -> bool {
-        self.cache_miss_limiters.check_key(&ip).is_ok()
     }
 
     pub fn record_failure(&self, key: String) -> u64 {

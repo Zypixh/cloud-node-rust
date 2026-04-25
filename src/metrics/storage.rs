@@ -325,7 +325,7 @@ impl MetricStorage {
 }
 
 pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
-    let path = "data/metrics.db";
+    let path = "../data/metrics.db";
     match MetricStorage::open(path) {
         Ok(storage) => storage,
         Err(err) => {

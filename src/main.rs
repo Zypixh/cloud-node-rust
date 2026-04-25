@@ -16,7 +16,7 @@ use cloud_node_rust::proxy::EdgeProxy;
 use cloud_node_rust::ssl::DynamicCertSelector;
 use cloud_node_rust::{firewall, log_uploader, logging, rpc, tcp_proxy, udp_proxy};
 
-const PID_FILE: &str = "data/cloud-node.pid";
+const PID_FILE: &str = "../data/cloud-node.pid";
 
 struct LocalLogTimer;
 
@@ -85,14 +85,27 @@ where
 }
 
 fn check_running() -> Option<u32> {
-    if let Ok(content) = fs::read_to_string(PID_FILE) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            // Check if process exists (Linux/Unix specific)
-            if std::path::Path::new(&format!("/proc/{}", pid)).exists() {
-                return Some(pid);
-            }
+    use std::os::unix::io::AsRawFd;
+    let file = fs::File::open(PID_FILE).ok()?;
+    let fd = file.as_raw_fd();
+
+    // Try to get an exclusive lock without blocking
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        // We got the lock, so it's NOT running
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return None;
+    }
+
+    // If it failed with EWOULDBLOCK, someone else has the lock
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+        // It is running. Read the PID.
+        if let Ok(content) = fs::read_to_string(PID_FILE) {
+            return content.trim().parse::<u32>().ok();
         }
     }
+
     None
 }
 
@@ -134,6 +147,8 @@ fn main() -> anyhow::Result<()> {
             if let Some(pid) = check_running() {
                 println!("Stopping CloudNode (PID: {})...", pid);
                 let _ = Command::new("kill").arg(pid.to_string()).status();
+                // We don't necessarily need to remove the file, flock will handle it, 
+                // but for cleanliness we can try.
                 let _ = fs::remove_file(PID_FILE);
             } else {
                 println!("CloudNode is not running.");
@@ -190,7 +205,7 @@ fn main() -> anyhow::Result<()> {
                      After=network.target\n\n\
                      [Service]\n\
                      Type=forking\n\
-                     PIDFile={}/data/cloud-node.pid\n\
+                     PIDFile={}/../data/cloud-node.pid\n\
                      WorkingDirectory={}\n\
                      ExecStart={} start\n\
                      ExecStop={} stop\n\
@@ -239,25 +254,63 @@ fn main() -> anyhow::Result<()> {
 
 fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()> {
     // Ensure data directory exists
-    fs::create_dir_all("data").ok();
+    fs::create_dir_all("../data").ok();
 
-    // 0. Ensure single instance and write PID
-    let pid = std::process::id();
-    if let Some(existing_pid) = check_running() {
-        if existing_pid != pid {
-            eprintln!(
-                "Error: Another instance is already running (PID: {})",
-                existing_pid
-            );
+    // 0. Ensure single instance and write PID using flock
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    let pid_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(PID_FILE)?;
+    let fd = pid_file.as_raw_fd();
+
+    // Try to get an exclusive lock
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+            if let Ok(content) = fs::read_to_string(PID_FILE) {
+                eprintln!(
+                    "Error: Another instance is already running (PID: {})",
+                    content.trim()
+                );
+            } else {
+                eprintln!("Error: Another instance is already running.");
+            }
             std::process::exit(1);
+        } else {
+            return Err(anyhow::anyhow!("Failed to lock PID file: {}", err));
         }
     }
-    fs::write(PID_FILE, pid.to_string())?;
 
-    // Initialize logging
+    // Write current PID to the file
+    pid_file.set_len(0)?;
+    let mut pid_writer = &pid_file;
+    write!(pid_writer, "{}", std::process::id())?;
+    pid_writer.flush()?;
+
+    // Keep the PID file open to maintain the lock
+    std::mem::forget(pid_file);
+
+    // Initialize logging with custom filter to silence hardcoded frame-level noise
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
     cloud_node_rust::utils::time::init_local_timezone();
-    tracing_subscriber::fmt().with_timer(LocalLogTimer).init();
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,pingora_proxy::proxy_cache=off"));
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer().with_timer(LocalLogTimer))
+        .init();
+
     info!("Starting CloudNode Rust v{}...", env!("CARGO_PKG_VERSION"));
+
 
     #[cfg(target_family = "unix")]
     {
@@ -484,7 +537,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         tcp_manager.start_listeners().await;
     });
 
-    info!("CloudNode (PID {}) is ready.", pid);
+    info!("CloudNode (PID {}) is ready.", std::process::id());
     my_server.run_forever();
     #[allow(unreachable_code)]
     Ok(())
