@@ -130,6 +130,8 @@ jobs:
         env:
           RUSTFLAGS: "-C target-cpu=x86-64 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes"
           PROTOC_VERSION: "25.3"
+          DEVTOOLSET_ROOT: "/opt/rh/devtoolset-10/root/usr"
+          LLVM_TOOLSET_ROOT: "/opt/rh/llvm-toolset-7.0/root/usr"
         run: |
           mkdir -p .cargo-legacy/registry .cargo-legacy/git target-legacy
           docker run --rm \
@@ -140,15 +142,24 @@ jobs:
             -e CARGO_TARGET_DIR=/work/target-legacy \
             -e RUSTFLAGS="$RUSTFLAGS" \
             -e PROTOC_VERSION="$PROTOC_VERSION" \
+            -e DEVTOOLSET_ROOT="$DEVTOOLSET_ROOT" \
+            -e LLVM_TOOLSET_ROOT="$LLVM_TOOLSET_ROOT" \
             quay.io/pypa/manylinux2014_x86_64 \
             /bin/bash -lc '
               set -euo pipefail
-              yum install -y perl perl-core cmake3 make git golang which curl unzip llvm-toolset-7.0-clang llvm-toolset-7.0-clang-libs
+              yum install -y perl perl-core cmake3 make git golang which curl unzip llvm-toolset-7.0 llvm-toolset-7.0-clang llvm-toolset-7.0-clang-libs
               ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
               curl -L "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip
               unzip -q /tmp/protoc.zip -d /opt/protoc
-              export PATH="/opt/protoc/bin:${PATH}"
-              export LIBCLANG_PATH="/opt/rh/llvm-toolset-7.0/root/usr/lib64"
+              export PATH="${DEVTOOLSET_ROOT}/bin:${LLVM_TOOLSET_ROOT}/bin:/opt/protoc/bin:${PATH}"
+              export LD_LIBRARY_PATH="${LLVM_TOOLSET_ROOT}/lib64:${DEVTOOLSET_ROOT}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+              export CC="${DEVTOOLSET_ROOT}/bin/gcc"
+              export CXX="${DEVTOOLSET_ROOT}/bin/g++"
+              export AR="${DEVTOOLSET_ROOT}/bin/ar"
+              export NM="${DEVTOOLSET_ROOT}/bin/nm"
+              export RANLIB="${DEVTOOLSET_ROOT}/bin/ranlib"
+              export LIBCLANG_PATH="${LLVM_TOOLSET_ROOT}/lib64"
+              export BINDGEN_EXTRA_CLANG_ARGS="-I${DEVTOOLSET_ROOT}/include -I/usr/include -I/usr/local/include"
               curl https://sh.rustup.rs -sSf | sh -s -- -y
               source /root/.cargo/env
               rustup target add x86_64-unknown-linux-gnu
