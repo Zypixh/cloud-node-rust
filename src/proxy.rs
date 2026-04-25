@@ -2623,7 +2623,7 @@ impl ProxyHttp for EdgeProxy {
             // 2. Perform direct storage write to ensure Key match and NO PANICS
             // We use the Host header as the raw Key (parity with readCache)
             let hash = format!("{:x}", md5_legacy::compute(&host));
-            let root = std::path::Path::new("data/cache");
+            let root = std::path::Path::new("../data/cache");
             let file_path = root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
 
             if let Some(parent) = file_path.parent() {
@@ -3156,6 +3156,19 @@ impl ProxyHttp for EdgeProxy {
         }
     }
 
+    fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, e: &Error) -> bool {
+        match e.etype() {
+            // Silence common downstream disconnection errors to reduce log noise during load tests
+            pingora::ErrorType::WriteError | pingora::ErrorType::ReadError | pingora::ErrorType::ConnectionClosed => {
+                if matches!(e.esource(), pingora::ErrorSource::Downstream) {
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     async fn upstream_peer(
         &self,
         session: &mut Session,
@@ -3384,11 +3397,6 @@ impl ProxyHttp for EdgeProxy {
             && let Some(cache) = &web.cache
             && cache.is_on
         {
-            if !self.waf_state.check_cache_limit(ctx.client_ip) {
-                tracing::warn!("IP {} exceeded cache-miss frequency limit.", ctx.client_ip);
-                return Ok(());
-            }
-
             let mut matched_ref = None;
             for cache_ref in &cache.cache_refs {
                 if !cache_ref.is_on {
@@ -3657,6 +3665,15 @@ impl ProxyHttp for EdgeProxy {
     ) -> Result<()> {
         ctx.response_status = upstream_response.status.as_u16();
         ctx.ttfb = Some(ctx.start_time.elapsed());
+
+        // Sync all response headers from upstream to context for accurate logging and WAF
+        for (name, value) in upstream_response.headers.iter() {
+            if let Ok(value_str) = value.to_str() {
+                ctx.response_headers
+                    .insert(name.to_string(), value_str.to_string());
+            }
+        }
+
         ctx.response_headers_size = upstream_response
             .headers
             .iter()

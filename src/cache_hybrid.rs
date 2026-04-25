@@ -540,7 +540,7 @@ impl HybridStorage {
                     .get("dir")
                     .and_then(|v| v.as_str())
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("data/cache"));
+                    .unwrap_or_else(|| PathBuf::from("../data/cache"));
 
                 let disks = sysinfo::Disks::new_with_refreshed_list();
                 let disk_size = disks

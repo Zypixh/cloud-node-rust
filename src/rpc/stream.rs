@@ -325,7 +325,7 @@ async fn handle_message(
             tokio::spawn(async move {
                 let all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
                 let mut count = 0;
-                let root = std::path::Path::new("data/cache");
+                let root = std::path::Path::new("../data/cache");
 
                 for (hash, _) in all_meta {
                     let file_path = root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);

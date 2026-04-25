@@ -283,9 +283,15 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         .find(|(k, _)| k.eq_ignore_ascii_case("x-cache"))
         .map(|(_, v)| v.clone())
     {
-        log.attrs
-            .insert("cacheStatus".to_string(), cache_status.clone());
-        log.tags.push(format!("X_CACHE_{}", cache_status));
+        // Only tag if it's hit-related (HIT, STALE, REVALIDATED)
+        if matches!(
+            cache_status.as_str(),
+            "HIT" | "STALE" | "REVALIDATED"
+        ) {
+            log.attrs
+                .insert("cacheStatus".to_string(), cache_status.clone());
+            log.tags.push(format!("X_CACHE_{}", cache_status));
+        }
     }
 
     if ctx.cache_hit.unwrap_or(false) {
