@@ -167,7 +167,10 @@ impl Storage for FileStorage {
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        let temp_path = path.with_extension("tmp");
+        
+        // Use a unique temp path to prevent concurrent cache misses from corrupting the same file
+        let random_id = crate::utils::time::now_timestamp_millis();
+        let temp_path = path.with_extension(format!("tmp.{}", random_id));
 
         let std_file = tokio::fs::File::create(&temp_path)
             .await

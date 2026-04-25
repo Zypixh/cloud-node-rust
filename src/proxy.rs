@@ -204,6 +204,10 @@ const MAX_WEBP_CONVERSION_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HLS_PLAYLIST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HLS_SEGMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+use pingora_cache::lock::CacheLock;
+
+static CACHE_LOCK: once_cell::sync::Lazy<CacheLock> = once_cell::sync::Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(1)));
+
 impl EdgeProxy {
     fn is_grpc_request(session: &Session) -> bool {
         session
@@ -3545,6 +3549,7 @@ impl ProxyHttp for EdgeProxy {
                 }
 
                 session.cache.enable(CACHE.storage, None, None, None, None);
+                session.cache.set_cache_lock(Some(&*CACHE_LOCK), None);
             } else {
                 tracing::debug!(
                     "No cache rule matched for request: {}",
