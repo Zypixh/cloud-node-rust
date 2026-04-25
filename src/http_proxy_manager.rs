@@ -6,7 +6,9 @@ use anyhow::Context;
 use dashmap::DashMap;
 use pingora_core::apps::HttpServerApp;
 use pingora_core::protocols::http::server::Session as ServerSession;
+use pingora_core::protocols::l4::stream::Stream as L4Stream;
 use pingora_core::protocols::tls::server::handshake_with_callback;
+use pingora_core::protocols::{GetSocketDigest, SocketDigest};
 use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy;
 use std::collections::HashMap;
@@ -17,6 +19,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 
 struct ListenerHandle {
     is_tls: bool,
@@ -269,7 +276,8 @@ impl HttpProxyManager {
                     }
                 }
 
-                let l4_stream = pingora_core::protocols::l4::stream::Stream::from(client_stream);
+                let l4_stream = stream_with_socket_digest(client_stream, client_addr);
+                let downstream_socket_digest = l4_stream.get_socket_digest();
                 let (stream, alpn): (pingora_core::protocols::Stream, Option<Vec<u8>>) = if is_tls {
                     let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
                         pingora_core::tls::ssl::SslMethod::tls(),
@@ -310,7 +318,10 @@ impl HttpProxyManager {
 
                 if alpn.as_deref() == Some(b"h2") {
                     // HTTP/2 Logic
-                    let digest = Arc::new(pingora_core::protocols::Digest::default());
+                    let digest = Arc::new(pingora_core::protocols::Digest {
+                        socket_digest: downstream_socket_digest,
+                        ..Default::default()
+                    });
                     match pingora_core::protocols::http::v2::server::handshake(stream, None).await {
                         Ok(mut h2_conn) => {
                             loop {
@@ -593,6 +604,20 @@ fn is_benign_tls_accept_error(message: &str) -> bool {
         || lower.contains("unsupported_protocol")
         || lower.contains("wrong_version_number")
         || lower.contains("tls accept() failed: unexpected eof")
+}
+
+fn stream_with_socket_digest(client_stream: TcpStream, client_addr: SocketAddr) -> L4Stream {
+    let mut stream = L4Stream::from(client_stream);
+    #[cfg(unix)]
+    let digest = SocketDigest::from_raw_fd(stream.as_raw_fd());
+    #[cfg(windows)]
+    let digest = SocketDigest::from_raw_socket(stream.as_raw_socket());
+    digest
+        .peer_addr
+        .set(Some(client_addr.into()))
+        .expect("newly created OnceCell must be empty");
+    stream.set_socket_digest(digest);
+    stream
 }
 
 fn is_benign_h2_error(message: &str) -> bool {
