@@ -109,49 +109,50 @@ jobs:
   build-legacy:
     name: Build - linux-x64-legacy-glibc217
     runs-on: ubuntu-22.04
-    container:
-      image: quay.io/pypa/manylinux2014_x86_64
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          yum install -y perl-FindBin perl-IPC-Cmd cmake3 make git golang which
-          ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
-
-      - name: Install Rust
-        shell: bash
-        run: |
-          curl https://sh.rustup.rs -sSf | sh -s -- -y
-          echo "/root/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Install target
-        shell: bash
-        run: |
-          source /root/.cargo/env
-          rustup target add x86_64-unknown-linux-gnu
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
+      - name: Cache legacy cargo artifacts
+        uses: actions/cache@v4
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: linux-x64-legacy-glibc217-x86_64-unknown-linux-gnu
-          env-vars: "RUSTFLAGS CXXFLAGS CFLAGS"
+          path: |
+            .cargo-legacy/registry
+            .cargo-legacy/git
+            target-legacy
+          key: legacy-glibc217-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            legacy-glibc217-${{ runner.os }}-
 
       - name: Build legacy package
         shell: bash
         env:
           RUSTFLAGS: "-C target-cpu=x86-64 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes"
+          PROTOC_VERSION: "25.3"
         run: |
-          source /root/.cargo/env
-          cargo build --release --target x86_64-unknown-linux-gnu
+          mkdir -p .cargo-legacy/registry .cargo-legacy/git target-legacy
+          docker run --rm \
+            -v "$PWD":/work \
+            -v "$PWD/.cargo-legacy/registry":/root/.cargo/registry \
+            -v "$PWD/.cargo-legacy/git":/root/.cargo/git \
+            -w /work \
+            -e CARGO_TARGET_DIR=/work/target-legacy \
+            -e RUSTFLAGS="$RUSTFLAGS" \
+            -e PROTOC_VERSION="$PROTOC_VERSION" \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              yum install -y perl-FindBin perl-IPC-Cmd cmake3 make git golang which curl unzip
+              ln -sf /usr/bin/cmake3 /usr/local/bin/cmake
+              curl -L "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip
+              unzip -q /tmp/protoc.zip -d /opt/protoc
+              export PATH="/opt/protoc/bin:${PATH}"
+              curl https://sh.rustup.rs -sSf | sh -s -- -y
+              source /root/.cargo/env
+              rustup target add x86_64-unknown-linux-gnu
+              cargo build --release --target x86_64-unknown-linux-gnu
+            '
 
       - name: Package
         shell: bash
@@ -161,7 +162,7 @@ jobs:
           PACKAGE_NAME="cloud-node-rust-linux-x64-legacy-glibc217"
 
           mkdir -p dist
-          cp target/x86_64-unknown-linux-gnu/release/$ORIGINAL_BINARY dist/$TARGET_BINARY
+          cp target-legacy/x86_64-unknown-linux-gnu/release/$ORIGINAL_BINARY dist/$TARGET_BINARY
           cd dist
           tar -czf ../$PACKAGE_NAME.tar.gz $TARGET_BINARY
           cd ..

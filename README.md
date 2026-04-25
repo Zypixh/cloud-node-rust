@@ -1,85 +1,141 @@
 # CloudNode Rust
 
-本项目基于 Cloudflare Pingora 框架构建。我们对 Cloudflare 开源这一卓越的高性能网络框架表示由衷的感谢。
+`CloudNode Rust` 是一个基于 Cloudflare [Pingora](https://github.com/cloudflare/pingora) 构建的高性能 CDN / 边缘节点实现，面向多级分发、缓存加速、站点安全、日志统计和控制面协议对齐场景。
 
-**CloudNode Rust** 是一款基于 Cloudflare [Pingora](https://github.com/cloudflare/pingora) 框架构建的高性能 CDN 边缘节点。它旨在提供超越原版 Go 实现的吞吐能力、更低的延迟以及更智能的集群自愈机制。
+当前仓库已经完成 HTTP、HTTPS、HTTP/2、HTTP/3、gRPC、WebSocket、TCP、UDP、`@sni_passthrough`、混合缓存、访问日志、统计上报、自定义错误页、性能监控页等主链路接入，并持续围绕旧 EdgeNode 的运行时行为做对齐。
 
-## 🚀 核心特性
+## 当前能力
 
-### 1. 极致转发性能
-*   **多协议支持**：原生支持 HTTP/1.1、HTTP/2、gRPC、WebSocket、TCP、TCP-TLS 及 UDP 转发。
-*   **网络栈优化**：全链路强制开启 `TCP_NODELAY`，支持基于 `libc` 定制的 `SO_KEEPALIVE` 探测，在 Linux 环境下自动激活 **BBR 拥塞控制算法**。
-*   **硬件加速**：支持针对 x86_64 (AVX2, AVX-512) 和 ARM64 (NEON, LSE) 的指令集深度优化。
+- 多协议代理
+  - HTTP/1.1、HTTP/2、HTTP/3
+  - gRPC、WebSocket
+  - TCP、TCP-TLS、UDP
+  - 共享 `443` 端口下的 `@sni_passthrough`
 
-### 2. 智能感知型分发 (Smart Tiered-Origin)
-*   **负载避让**：通过私有协议头 `X-Cloud-Node-Pressure` 实时感知 L2 父节点的 CPU 和连接压力。当节点过载（>0.9）时，自动执行哈希漂移寻找空闲节点。
-*   **一致性哈希**：支持 `urlMapping`（Ketama 算法），显著提升集群 L2 缓存命中率。
-*   **强制 Ln 模式**：支持集群级配置，可强制所有或仅可缓存请求通过 L2 分发。
+- 缓存与内容处理
+  - Memory + Disk 混合缓存
+  - RocksDB 元数据持久化
+  - WebP 转换
+  - HLS 播放列表与分片处理
+  - 大文件与高并发切片场景下的全异步磁盘 I/O
 
-### 3. 电信级混合缓存 (Hybrid Cache)
-*   **二级存储**：Memory (L1) + Disk (L2) 混合架构，热点数据秒级内存响应。
-*   **流式压缩**：根据内容类型自动执行异步 Zstd 压缩存储，大幅节省磁盘 IO 和空间。
-*   **原子更新**：基于 **RocksDB** 的元数据持久化，支持单机千万级文件索引与热启动。
-*   **安全保护**：内置磁盘水位预警，自动防止缓存撑爆文件系统。
+- 安全与站点能力
+  - WAF、UAM、CC、防盗链、User-Agent / Referer 规则
+  - 站点关停页、自定义页面、全局页面回退
+  - `redirectToHttps`
+  - 请求限速、带宽限制、流量限制页面
 
-### 4. 全球配置与安全
-*   **PB 协议同步**：深度对接官方 Protobuf 协议，支持配置热更新与动态证书同步。
-*   **安全风控**：内置 WAF 引擎、IP 名单同步、局域网源站拦截、XFF 长度限制及非法 HTTP 版本过滤。
-*   **身份还原**：支持 `X-Cloud-Real-Ip` 穿透，确保多级分发下 L2 节点的统计与安全策略 100% 准确。
+- 统计与日志
+  - 访问日志、节点日志、节点值、IP 上报
+  - 带宽统计、日统计、域名统计、Top IP
+  - L7 / L4 统计对齐
+  - 缓存命中标签、HTTP/3 传输标识
 
----
+- 运维与可观测性
+  - 本地性能监控网页 `--monitor-port`
+  - 动态证书与 OCSP 同步
+  - 配置热更新
+  - 共享 `443` 端口的 TLS / HTTP2 噪音日志收敛
 
-## 🛠 编译指南
+## 构建与发布
 
-为了获得最佳性能，建议根据目标机器的 CPU 架构进行编译。
+### 本地编译
 
-### x86_64 (Intel / AMD)
 ```bash
-# 主流服务器 (支持 AVX2)
-RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat" cargo build --release
-
-# 高端服务器 (支持 AVX-512)
-RUSTFLAGS="-C target-cpu=x86-64-v4 -C opt-level=3 -C lto=fat" cargo build --release
+cargo build --release
 ```
 
-### ARM64 (鲲鹏 / 倚天 / Graviton)
+### 高性能编译示例
+
 ```bash
-# 开启 NEON 与 LSE 锁优化
+# x86_64 v3
+RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat" cargo build --release
+
+# ARM64
 RUSTFLAGS="-C target-cpu=neoverse-n1 -C opt-level=3 -C lto=fat" cargo build --release
 ```
 
----
+### GitHub Release 自动产物
 
-## 📦 部署与管理
+当前 Release workflow 会自动构建以下 Linux 产物：
 
-### 1. 快速安装
-将编译好的二进制文件上传至服务器，运行以下命令完成系统集成：
+- `linux-x64-v2-sse4.2`
+- `linux-x64-v3-avx2`
+- `linux-x64-v4-avx512`
+- `linux-arm64-generic`
+- `linux-arm64-neoverse-n1`
+- `linux-x64-legacy-glibc217`
+
+其中：
+
+- `linux-x64-legacy-glibc217` 面向老系统兼容，目标覆盖 `CentOS 7.6`、`Debian 10` 等较老环境
+- 其余产物偏向性能优先，需要匹配对应 CPU / glibc 条件
+
+## 运行方式
+
+### 安装
+
 ```bash
 sudo ./cloud-node install
 ```
-该命令会自动：
-*   在 `/usr/bin/cloud-node` 创建全局命令。
-*   注册并启用 `systemd` 服务。
 
-### 2. 常用命令
+### 常用命令
+
 ```bash
-cloud-node start    # 后台启动
-cloud-node status   # 查看状态
-cloud-node stop     # 停止服务
-cloud-node restart  # 重启
-cloud-node test     # 检查配置文件 (api_node.yaml)
+cloud-node start
+cloud-node stop
+cloud-node restart
+cloud-node status
+cloud-node test
 ```
 
----
+### 性能监控网页
 
-## ⚙️ 系统要求
-*   **OS**: Linux (推荐 Debian 12+, Ubuntu 20.04+, CentOS 7+)。
-*   **内核**: 建议 5.0+ 以获得最佳 BBR 性能。
-*   **内存**: 建议 4GB+，针对千万级缓存切片建议 64GB+。
+```bash
+cloud-node --monitor-port 8888
+```
 
-## 📜 开源协议
+或：
+
+```bash
+cargo run -- --monitor-port 8888
+```
+
+## 系统要求
+
+- Linux
+- 推荐内核 `5.x+`
+- 若启用大规模磁盘缓存与高并发流媒体分发，建议使用更高的文件句柄上限和更充足的内存
+
+## 项目说明
+
+### 关于协议对齐
+
+本项目并不是只做“能运行”的 Pingora 代理，而是持续对齐旧控制面与旧 EdgeNode 的行为，包括：
+
+- 配置同步字段
+- 页面与变量能力
+- 日志上报格式
+- 统计聚合口径
+- L7 / L4 计费与趋势数据
+
+因此仓库中的很多实现细节，优先目标是运行时兼容，而不是做一个最简代理样例。
+
+### 关于老系统兼容包
+
+为了兼顾新旧环境，Release 同时提供：
+
+- 面向新环境的性能优化包
+- 面向旧环境的 `glibc 2.17` 兼容包
+
+如果部署环境是 `CentOS 7.x`、`Debian 10` 一类老系统，优先使用 `legacy` 包。
+
+## 致谢
+
+感谢 Cloudflare 开源 Pingora，为本项目提供了高质量的网络框架基础。
+
+同时感谢 **FlexCDN** 在协议对齐、运行时行为验证和长期工程实践上的参考与支持。本仓库不少兼容性修正、页面能力、日志字段和统计口径的整理，都直接受益于 FlexCDN 的历史经验。
+
+## 开源协议
+
 本项目基于 Apache License 2.0 协议开源。
-
----
-
-**注意**：请确保在生产环境部署前，已根据业务规模调优系统 `ulimit -n` 限制（建议 1,048,576）。
