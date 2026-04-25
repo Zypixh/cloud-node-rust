@@ -25,6 +25,7 @@ use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 #[derive(Clone)]
 pub struct ProxyCTX {
@@ -204,6 +205,224 @@ const MAX_HLS_PLAYLIST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HLS_SEGMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 impl EdgeProxy {
+    fn raw_remote_ip(raw_remote_addr: &str, fallback: std::net::IpAddr) -> String {
+        if raw_remote_addr.is_empty() {
+            return fallback.to_string();
+        }
+
+        raw_remote_addr
+            .parse::<std::net::SocketAddr>()
+            .map(|addr| addr.ip().to_string())
+            .or_else(|_| {
+                raw_remote_addr
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.to_string())
+            })
+            .unwrap_or_else(|_| fallback.to_string())
+    }
+
+    fn status_message(status: u16) -> String {
+        http::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|code| code.canonical_reason().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    fn apply_template_modifier(value: String, modifier: &str) -> String {
+        match modifier.trim() {
+            "urlEncode" => urlencoding::encode(&value).into_owned(),
+            "urlDecode" => urlencoding::decode(&value)
+                .map(|decoded| decoded.into_owned())
+                .unwrap_or(value),
+            "base64Encode" => base64::engine::general_purpose::STANDARD.encode(value),
+            "base64Decode" => base64::engine::general_purpose::STANDARD
+                .decode(value.as_bytes())
+                .ok()
+                .and_then(|decoded| String::from_utf8(decoded).ok())
+                .unwrap_or_default(),
+            "md5" => format!("{:x}", md5_legacy::compute(value.as_bytes())),
+            "sha1" => {
+                use sha1::{Digest as _, Sha1};
+                let mut hasher = Sha1::new();
+                hasher.update(value.as_bytes());
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{:02x}", byte))
+                    .collect()
+            }
+            "sha256" => {
+                let mut hasher = Sha256::new();
+                hasher.update(value.as_bytes());
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{:02x}", byte))
+                    .collect()
+            }
+            "toLowerCase" => value.to_ascii_lowercase(),
+            "toUpperCase" => value.to_ascii_uppercase(),
+            _ => value,
+        }
+    }
+
+    fn render_page_template(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        template: &str,
+        status: u16,
+    ) -> String {
+        static RE_VAR: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
+
+        RE_VAR
+            .replace_all(template, |caps: &regex::Captures| {
+                let raw = &caps[0];
+                let inner = raw
+                    .strip_prefix("${")
+                    .and_then(|s| s.strip_suffix('}'))
+                    .unwrap_or(raw);
+                let mut parts = inner.split('|');
+                let var_name = parts.next().unwrap_or("").trim();
+
+                let mut value = match var_name {
+                    "requestId" => ctx.request_id.clone(),
+                    "status" => status.to_string(),
+                    "statusMessage" => Self::status_message(status),
+                    "rawRemoteAddr" => Self::raw_remote_ip(&ctx.raw_remote_addr, ctx.client_ip),
+                    "remoteAddr" => ctx.client_ip.to_string(),
+                    "remotePort" => ctx.client_port.to_string(),
+                    "serverAddr" => {
+                        if self
+                            .config
+                            .get_global_http_config_sync()
+                            .enable_server_addr_variable
+                        {
+                            session
+                                .downstream_session
+                                .digest()
+                                .and_then(|d| d.socket_digest.as_ref())
+                                .and_then(|sd| sd.local_addr())
+                                .and_then(|addr| addr.as_inet())
+                                .map(|inet| inet.ip().to_string())
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    "serverPort" => session
+                        .downstream_session
+                        .digest()
+                        .and_then(|d| d.socket_digest.as_ref())
+                        .and_then(|sd| sd.local_addr())
+                        .and_then(|addr| addr.as_inet())
+                        .map(|inet| inet.port().to_string())
+                        .unwrap_or_default(),
+                    "scheme" => {
+                        if session
+                            .downstream_session
+                            .digest()
+                            .and_then(|d| d.ssl_digest.as_ref())
+                            .is_some()
+                            || session.req_header().uri.scheme_str() == Some("https")
+                        {
+                            "https".to_string()
+                        } else {
+                            "http".to_string()
+                        }
+                    }
+                    "proto" => {
+                        if ctx.is_http3_bridge {
+                            "HTTP/3.0".to_string()
+                        } else {
+                            match session.req_header().version {
+                                pingora::http::Version::HTTP_10 => "HTTP/1.0".to_string(),
+                                pingora::http::Version::HTTP_11 => "HTTP/1.1".to_string(),
+                                pingora::http::Version::HTTP_2 => "HTTP/2.0".to_string(),
+                                pingora::http::Version::HTTP_3 => "HTTP/3.0".to_string(),
+                                _ => "HTTP/1.1".to_string(),
+                            }
+                        }
+                    }
+                    "requestTime" => format!("{:.3}", ctx.start_time.elapsed().as_secs_f64()),
+                    "bytesSent" => {
+                        (session.body_bytes_sent() as u64 + ctx.response_headers_size as u64 + 20)
+                            .to_string()
+                    }
+                    "bodyBytesSent" => session.body_bytes_sent().to_string(),
+                    "timestamp" => (ctx.start_timestamp_millis / 1000).to_string(),
+                    "msec" => format!("{:.3}", ctx.start_timestamp_millis as f64 / 1000.0),
+                    "timeISO8601" => {
+                        crate::utils::time::local_from_timestamp_millis(ctx.start_timestamp_millis)
+                            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+                            .to_string()
+                    }
+                    "timeLocal" => {
+                        crate::utils::time::local_from_timestamp_millis(ctx.start_timestamp_millis)
+                            .format("%d/%b/%Y:%H:%M:%S %z")
+                            .to_string()
+                    }
+                    "host" => session
+                        .get_header("host")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.split(':').next().unwrap_or(v).to_string())
+                        .unwrap_or_else(|| {
+                            session
+                                .req_header()
+                                .uri
+                                .host()
+                                .unwrap_or_default()
+                                .to_string()
+                        }),
+                    "requestURI" => session
+                        .req_header()
+                        .uri
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_else(|| "/".to_string()),
+                    "requestPath" => session.req_header().uri.path().to_string(),
+                    "requestMethod" => session.req_header().method.to_string(),
+                    "request" => format!(
+                        "{} {} {}",
+                        session.req_header().method,
+                        session
+                            .req_header()
+                            .uri
+                            .path_and_query()
+                            .map(|pq| pq.as_str())
+                            .unwrap_or("/"),
+                        if ctx.is_http3_bridge {
+                            "HTTP/3.0"
+                        } else {
+                            match session.req_header().version {
+                                pingora::http::Version::HTTP_10 => "HTTP/1.0",
+                                pingora::http::Version::HTTP_11 => "HTTP/1.1",
+                                pingora::http::Version::HTTP_2 => "HTTP/2.0",
+                                pingora::http::Version::HTTP_3 => "HTTP/3.0",
+                                _ => "HTTP/1.1",
+                            }
+                        }
+                    ),
+                    "hostname" => hostname::get()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    _ => crate::firewall::matcher_plus::format_variables(
+                        session,
+                        raw,
+                        &ctx.request_body,
+                    ),
+                };
+
+                for modifier in parts {
+                    value = Self::apply_template_modifier(value, modifier);
+                }
+                value
+            })
+            .to_string()
+    }
+
     fn cleanup_request_limit_bindings() {
         let now = std::time::Instant::now();
         let stale_keys: Vec<String> = REQUEST_LIMIT_BINDINGS
@@ -533,11 +752,7 @@ impl EdgeProxy {
         }
 
         let body = if body_type == "html" {
-            crate::firewall::matcher_plus::format_variables(
-                session,
-                &shutdown.body,
-                &ctx.request_body,
-            )
+            self.render_page_template(session, ctx, &shutdown.body, status)
         } else if shutdown.url.is_empty() {
             "The site have been shutdown.".to_string()
         } else {
@@ -546,11 +761,7 @@ impl EdgeProxy {
                 format!("404 page not found: '{}'", shutdown.url)
             } else {
                 match std::fs::read_to_string(path) {
-                    Ok(content) => crate::firewall::matcher_plus::format_variables(
-                        session,
-                        &content,
-                        &ctx.request_body,
-                    ),
+                    Ok(content) => self.render_page_template(session, ctx, &content, status),
                     Err(_) => format!("404 page not found: '{}'", shutdown.url),
                 }
             }
@@ -882,11 +1093,7 @@ impl EdgeProxy {
                     .filter(|code| *code >= 100)
                     .unwrap_or(status);
                 ctx.response_status = final_status;
-                let resolved_body = crate::firewall::matcher_plus::format_variables(
-                    session,
-                    body,
-                    &ctx.request_body,
-                );
+                let resolved_body = self.render_page_template(session, ctx, body, final_status);
                 ctx.response_body_len = resolved_body.len();
                 ctx.response_headers.clear();
                 ctx.response_headers.insert(
@@ -1963,8 +2170,7 @@ impl EdgeProxy {
             .unwrap_or_else(|| DEFAULT_TRAFFIC_LIMIT_NOTICE_PAGE_BODY.to_string());
 
         ctx.response_status = 509;
-        let resolved_body =
-            crate::firewall::matcher_plus::format_variables(session, &body, &ctx.request_body);
+        let resolved_body = self.render_page_template(session, ctx, &body, 509);
         let mut resp = pingora_http::ResponseHeader::build(509, None).unwrap();
         resp.insert_header("content-type", "text/html; charset=utf-8")
             .unwrap();
@@ -2134,11 +2340,7 @@ impl EdgeProxy {
                     }
                 }
 
-                let resolved_body = crate::firewall::matcher_plus::format_variables(
-                    session,
-                    &body,
-                    &ctx.request_body,
-                );
+                let resolved_body = self.render_page_template(session, ctx, &body, status as u16);
                 let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
                 resp.insert_header("content-type", "text/html; charset=utf-8")
                     .unwrap();
@@ -2175,11 +2377,7 @@ impl EdgeProxy {
                         }
                     }
                 }
-                let resolved_body = crate::firewall::matcher_plus::format_variables(
-                    session,
-                    &body,
-                    &ctx.request_body,
-                );
+                let resolved_body = self.render_page_template(session, ctx, &body, status as u16);
                 let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
                 resp.insert_header("content-type", content_type).unwrap();
                 session.write_response_header(Box::new(resp), false).await?;
@@ -2189,11 +2387,8 @@ impl EdgeProxy {
                 Ok(true)
             }
             crate::firewall::ActionResponse::Redirect { status, location } => {
-                let resolved_url = crate::firewall::matcher_plus::format_variables(
-                    session,
-                    &location,
-                    &ctx.request_body,
-                );
+                let resolved_url =
+                    self.render_page_template(session, ctx, &location, status as u16);
                 let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
                 resp.insert_header("location", resolved_url).unwrap();
                 session.write_response_header(Box::new(resp), true).await?;

@@ -7,6 +7,7 @@ use once_cell::sync::Lazy;
 use pingora_proxy::Session;
 use regex::Regex;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 pub struct MatchResult<'a> {
     pub matched: bool,
@@ -340,7 +341,8 @@ fn get_response_variable_value(
 
 fn resolve_variable(session: &Session, inner: &str, request_body: &[u8]) -> String {
     match inner {
-        "remoteAddr" | "rawRemoteAddr" => get_remote_addr(session),
+        "remoteAddr" => get_remote_addr(session),
+        "rawRemoteAddr" => get_raw_remote_addr(session),
         "remotePort" => get_remote_port(session),
         "remoteUser" => session
             .get_header("authorization")
@@ -611,6 +613,25 @@ fn get_request_uri(session: &Session) -> String {
     format!("{}{}", path, query)
 }
 
+fn get_raw_remote_addr(session: &Session) -> String {
+    session
+        .downstream_session
+        .digest()
+        .and_then(|d| d.socket_digest.as_ref())
+        .and_then(|sd| sd.peer_addr())
+        .and_then(|addr| addr.as_inet())
+        .map(|inet| inet.ip().to_string())
+        .or_else(|| {
+            session.client_addr().and_then(|addr| match addr {
+                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => {
+                    Some(addr.ip().to_string())
+                }
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]).to_string())
+}
+
 fn get_scheme(session: &Session) -> String {
     let is_tls = session
         .downstream_session
@@ -823,6 +844,44 @@ fn bool_string(v: bool) -> String {
     if v { "1".to_string() } else { "0".to_string() }
 }
 
+fn apply_modifier(value: String, modifier: &str) -> String {
+    match modifier.trim() {
+        "urlEncode" => urlencoding::encode(&value).into_owned(),
+        "urlDecode" => urlencoding::decode(&value)
+            .map(|decoded| decoded.into_owned())
+            .unwrap_or(value),
+        "base64Encode" => base64::engine::general_purpose::STANDARD.encode(value),
+        "base64Decode" => base64::engine::general_purpose::STANDARD
+            .decode(value.as_bytes())
+            .ok()
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+            .unwrap_or_default(),
+        "md5" => format!("{:x}", md5_legacy::compute(value.as_bytes())),
+        "sha1" => {
+            use sha1::Sha1;
+            let mut hasher = Sha1::new();
+            hasher.update(value.as_bytes());
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect()
+        }
+        "sha256" => {
+            let mut hasher = Sha256::new();
+            hasher.update(value.as_bytes());
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect()
+        }
+        "toLowerCase" => value.to_ascii_lowercase(),
+        "toUpperCase" => value.to_ascii_uppercase(),
+        _ => value,
+    }
+}
+
 pub fn format_variables(session: &Session, template: &str, request_body: &[u8]) -> String {
     static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
     RE_VAR
@@ -832,7 +891,56 @@ pub fn format_variables(session: &Session, template: &str, request_body: &[u8]) 
                 .strip_prefix("${")
                 .and_then(|s| s.strip_suffix('}'))
                 .unwrap_or(inner);
-            resolve_variable(session, inner, request_body)
+            let mut parts = inner.split('|');
+            let var_name = parts.next().unwrap_or("");
+            let mut value = match var_name {
+                "rawRemoteAddr" => get_raw_remote_addr(session),
+                "requestPathExtension" => std::path::Path::new(session.req_header().uri.path())
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| format!(".{}", ext))
+                    .unwrap_or_default(),
+                "requestFilename" => session.req_header().uri.path().to_string(),
+                _ => resolve_variable(session, var_name, request_body),
+            };
+            for modifier in parts {
+                value = apply_modifier(value, modifier);
+            }
+            value
+        })
+        .to_string()
+}
+
+pub fn format_response_variables(
+    session: &Session,
+    template: &str,
+    request_body: &[u8],
+    response: &OutboundContext<'_>,
+) -> String {
+    static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
+    RE_VAR
+        .replace_all(template, |caps: &regex::Captures| {
+            let inner = &caps[0];
+            let inner = inner
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(inner);
+            let mut parts = inner.split('|');
+            let var_name = parts.next().unwrap_or("");
+            let mut value = match var_name {
+                "rawRemoteAddr" => get_raw_remote_addr(session),
+                "requestPathExtension" => std::path::Path::new(session.req_header().uri.path())
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| format!(".{}", ext))
+                    .unwrap_or_default(),
+                "requestFilename" => session.req_header().uri.path().to_string(),
+                _ => resolve_response_variable(session, var_name, request_body, response),
+            };
+            for modifier in parts {
+                value = apply_modifier(value, modifier);
+            }
+            value
         })
         .to_string()
 }
