@@ -390,8 +390,8 @@ impl HttpProxyManager {
         client_stream: &TcpStream,
         port: u16,
     ) -> anyhow::Result<Option<(String, Option<Arc<ServerConfig>>)>> {
-        // Fast path: if no SNI passthrough servers exist at all, skip the expensive peek
-        if !self.config_store.get_hot_path_snapshot_sync().has_any_sni_passthrough {
+        // Fast path: if no SNI passthrough servers exist, skip the expensive ClientHello peek
+        if !self.config_store.has_any_sni_passthrough_sync() {
             return Ok(None);
         }
 

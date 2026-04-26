@@ -204,6 +204,11 @@ impl ConfigStore {
         )
     }
 
+    /// Lightweight check: avoids full HotPathSnapshot clone, only reads one bool.
+    pub fn has_any_sni_passthrough_sync(&self) -> bool {
+        self.inner.read().unwrap().has_any_sni_passthrough
+    }
+
     pub fn get_hot_path_snapshot_sync(&self) -> HotPathSnapshot {
         let lock = self.inner.read().unwrap();
         Self::build_hot_path_snapshot(&lock)
