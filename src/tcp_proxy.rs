@@ -390,7 +390,7 @@ impl TcpProxyManager {
 
             // Metrics: Start connection
             let client_ip = client_addr.ip().to_string();
-            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
+            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id, None, false);
 
             let toa_config = self.config_store.get_toa_config_sync();
             let backend_stream = match crate::toa::connect_with_toa(
@@ -422,7 +422,7 @@ impl TcpProxyManager {
                         0,
                         None, None,
                     );
-                    crate::metrics::record::request_end(sid, 0, 0, false, false, false);
+                    crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
                     return Err(e.into());
                 }
             };
@@ -495,7 +495,7 @@ impl TcpProxyManager {
                     0,
                     None, None,
                 );
-                crate::metrics::record::request_end(sid, 0, 0, false, false, false);
+                crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
                 e
             })?;
 
@@ -538,12 +538,12 @@ impl TcpProxyManager {
                 None, None,
             );
 
-            crate::metrics::record::request_end(sid, 0, 0, false, false, false);
+            crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
             res.map(|_| ())
         } else {
             // Metrics: Start connection
             let client_ip = client_addr.ip().to_string();
-            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id);
+            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id, None, false);
 
             let toa_config = self.config_store.get_toa_config_sync();
             let backend_stream = match crate::toa::connect_with_toa(
@@ -575,7 +575,7 @@ impl TcpProxyManager {
                         0,
                         None, None,
                     );
-                    crate::metrics::record::request_end(sid, 0, 0, false, false, false);
+                    crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
                     return Err(e.into());
                 }
             };
@@ -655,7 +655,7 @@ impl TcpProxyManager {
                 None, None,
             );
 
-            crate::metrics::record::request_end(sid, 0, 0, false, false, false);
+            crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
             res.map(|_| ())
         }
     }
@@ -675,16 +675,16 @@ where
 
     let client_to_backend = async move {
         copy_stream_and_track(client_reader, backend_writer, |n| {
-            crate::metrics::record::record_transfer(server_id, 0, n);
-            crate::metrics::record::record_origin_traffic(server_id, n, 0);
+            crate::metrics::record::record_transfer(server_id, 0, n, None);
+            crate::metrics::record::record_origin_traffic(server_id, n, 0, None);
         })
         .await
     };
 
     let backend_to_client = async move {
         copy_stream_and_track(backend_reader, client_writer, |n| {
-            crate::metrics::record::record_transfer(server_id, n, 0);
-            crate::metrics::record::record_origin_traffic(server_id, 0, n);
+            crate::metrics::record::record_transfer(server_id, n, 0, None);
+            crate::metrics::record::record_origin_traffic(server_id, 0, n, None);
         })
         .await
     };

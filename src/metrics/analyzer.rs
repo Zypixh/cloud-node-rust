@@ -3,20 +3,20 @@ use once_cell::sync::Lazy;
 use std::net::IpAddr;
 use tracing::warn;
 use woothee::parser::Parser;
-use std::sync::Mutex;
+use std::sync::{Mutex, Arc};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 pub struct GeoInfo {
-    pub country: String,
+    pub country: Arc<str>,
     pub country_id: i64,
-    pub region: String,
+    pub region: Arc<str>,
     pub region_id: i64,
-    pub city: String,
+    pub city: Arc<str>,
     pub city_id: i64,
-    pub provider: String,
+    pub provider: Arc<str>,
 }
 
 impl Clone for GeoInfo {
@@ -35,8 +35,8 @@ impl Clone for GeoInfo {
 
 pub struct RequestStats {
     pub geo: Option<GeoInfo>,
-    pub browser: String,
-    pub os: String,
+    pub browser: Arc<str>,
+    pub os: Arc<str>,
 }
 
 impl Clone for RequestStats {
@@ -105,8 +105,8 @@ static GEO_CACHE: Lazy<ShardedLru<IpAddr, Option<GeoInfo>>> = Lazy::new(|| {
     ShardedLru::new(200) // 64 * 200 = ~12.8k entries
 });
 
-// Cache for User-Agent results (UA string -> (String, String))
-static UA_CACHE: Lazy<ShardedLru<String, (String, String)>> = Lazy::new(|| {
+// Cache for User-Agent results (UA string -> (Arc<str>, Arc<str>))
+static UA_CACHE: Lazy<ShardedLru<String, (Arc<str>, Arc<str>)>> = Lazy::new(|| {
     ShardedLru::new(100) // 64 * 100 = ~6.4k entries
 });
 
@@ -119,27 +119,24 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
         if let Some(cached) = cache.get(&ip) {
             cached.clone()
         } else {
-            let res = lookup_geo(ip);
+            let res = lookup_geo_internal(ip);
             cache.put(ip, res.clone());
             res
         }
     };
 
     let (browser, os) = {
-        // Use string slice for lookup to avoid unnecessary String allocation if hit
-        // but LruCache requires K so we might need a workaround or just accept one allocation
-        let ua_string = ua.to_string();
-        let mutex = UA_CACHE.get_shard(&ua_string);
+        let mutex = UA_CACHE.get_shard(&ua.to_string());
         let mut cache = mutex.lock().unwrap();
-        if let Some(cached) = cache.get(&ua_string) {
+        if let Some(cached) = cache.get(&ua.to_string()) {
             cached.clone()
         } else {
             let parsed_ua = UA_PARSER.parse(ua);
             let res = match parsed_ua {
-                Some(p) => (p.name.to_string(), p.os.to_string()),
-                None => ("Unknown".to_string(), "Unknown".to_string()),
+                Some(p) => (Arc::from(p.name), Arc::from(p.os)),
+                None => (Arc::from("Unknown"), Arc::from("Unknown")),
             };
-            cache.put(ua_string, res.clone());
+            cache.put(ua.to_string(), res.clone());
             res
         }
     };
@@ -162,31 +159,31 @@ fn get_isp_name(ip: IpAddr) -> String {
     }
 }
 
-pub fn lookup_geo(ip: IpAddr) -> Option<GeoInfo> {
+fn lookup_geo_internal(ip: IpAddr) -> Option<GeoInfo> {
     if let Some(reader) = &*GEO_CITY_READER {
         match reader.lookup::<geoip2::City>(ip) {
             Ok(city) => Some(GeoInfo {
-                country: city
+                country: Arc::from(city
                     .country
                     .as_ref()
                     .and_then(|c| c.names.as_ref())
                     .and_then(|n| n.get("en"))
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
+                    .map(|s| s.as_ref())
+                    .unwrap_or_default()),
                 country_id: city
                     .country
                     .as_ref()
                     .and_then(|c| c.geoname_id)
                     .map(|id| id as i64)
                     .unwrap_or(0),
-                region: city
+                region: Arc::from(city
                     .subdivisions
                     .as_ref()
                     .and_then(|s| s.first())
                     .and_then(|sd| sd.names.as_ref())
                     .and_then(|n| n.get("en"))
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
+                    .map(|s| s.as_ref())
+                    .unwrap_or_default()),
                 region_id: city
                     .subdivisions
                     .as_ref()
@@ -194,20 +191,20 @@ pub fn lookup_geo(ip: IpAddr) -> Option<GeoInfo> {
                     .and_then(|sd| sd.geoname_id)
                     .map(|id| id as i64)
                     .unwrap_or(0),
-                city: city
+                city: Arc::from(city
                     .city
                     .as_ref()
                     .and_then(|c| c.names.as_ref())
                     .and_then(|n| n.get("en"))
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
+                    .map(|s| s.as_ref())
+                    .unwrap_or_default()),
                 city_id: city
                     .city
                     .as_ref()
                     .and_then(|c| c.geoname_id)
                     .map(|id| id as i64)
                     .unwrap_or(0),
-                provider: get_isp_name(ip),
+                provider: Arc::from(get_isp_name(ip)),
             }),
             Err(_) => None,
         }
@@ -216,6 +213,10 @@ pub fn lookup_geo(ip: IpAddr) -> Option<GeoInfo> {
     }
 }
 
-pub fn lookup_isp_name(ip: IpAddr) -> String {
-    get_isp_name(ip)
+pub fn lookup_isp_name(ip: IpAddr) -> Arc<str> {
+    Arc::from(get_isp_name(ip))
+}
+
+pub fn lookup_geo(ip: IpAddr) -> Option<GeoInfo> {
+    lookup_geo_internal(ip)
 }

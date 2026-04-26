@@ -459,6 +459,8 @@ impl HttpProxyManager {
             server.user_id,
             user_plan_id,
             plan_id,
+            None,
+            false,
         );
 
         let backend_addr = self.select_passthrough_backend_target(&server).await?;
@@ -501,7 +503,7 @@ impl HttpProxyManager {
                     None,
                     None,
                 );
-                crate::metrics::record::request_end(server_id, 0, 0, false, false, false);
+                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 return Err(err).with_context(|| {
                     format!("failed to connect passthrough upstream {}", backend_addr)
                 });
@@ -556,7 +558,7 @@ impl HttpProxyManager {
                     200,
                     None,
                 );
-                crate::metrics::record::request_end(server_id, 0, 0, false, false, false);
+                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 Ok(())
             }
             Err(err) => {
@@ -574,7 +576,7 @@ impl HttpProxyManager {
                     502,
                     Some(&err.to_string()),
                 );
-                crate::metrics::record::request_end(server_id, 0, 0, false, false, false);
+                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 Err(err.into())
             }
         }

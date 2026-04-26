@@ -144,7 +144,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
                     })
                     .await;
                 let cost = start.elapsed().as_millis() as u64;
-                crate::metrics::record::record_rpc_call(result.is_ok(), cost);
+                crate::metrics::record::record_rpc_call(cost, result.is_err());
                 if let Err(e) = result {
                     error!("Failed to upload bandwidth stats: {}", e);
                     pending_stats = upload_items;
@@ -155,9 +155,10 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             current_window = window_key.clone();
         }
 
-        for snap in snapshots {
-            let delta = snapshot_delta(&snap, last_snapshots.get(&snap.server_id));
-            last_snapshots.insert(snap.server_id, snap);
+        for snap_tuple in snapshots {
+            let snap = &snap_tuple.1;
+            let delta = snapshot_delta(snap, last_snapshots.get(&snap.server_id));
+            last_snapshots.insert(snap.server_id, snap.clone());
             if delta.server_id <= 0 {
                 continue;
             }
@@ -301,9 +302,10 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
             current_window = window_key.clone();
         }
 
-        for snap in snapshots {
-            let delta = snapshot_delta(&snap, last_snapshots.get(&snap.server_id));
-            last_snapshots.insert(snap.server_id, snap);
+        for snap_tuple in snapshots {
+            let snap = &snap_tuple.1;
+            let delta = snapshot_delta(snap, last_snapshots.get(&snap.server_id));
+            last_snapshots.insert(snap.server_id, snap.clone());
             if delta.server_id <= 0 {
                 continue;
             }
@@ -442,14 +444,14 @@ pub async fn start_metric_stat_reporter(
                     let mut keys = Vec::new();
                     for k in &item.keys {
                         let v = match k.as_str() {
-                            "${country}" => key.country.clone(),
-                            "${province}" => key.province.clone(),
-                            "${city}" => key.city.clone(),
-                            "${provider}" => key.provider.clone(),
-                            "${browser}" => key.browser.clone(),
-                            "${os}" => key.os.clone(),
+                            "${country}" => key.country.to_string(),
+                            "${province}" => key.province.to_string(),
+                            "${city}" => key.city.to_string(),
+                            "${provider}" => key.provider.to_string(),
+                            "${browser}" => key.browser.to_string(),
+                            "${os}" => key.os.to_string(),
                             "${wafGroup}" => key.waf_group_id.to_string(),
-                            "${wafAction}" => key.waf_action.clone(),
+                            "${wafAction}" => key.waf_action.to_string(),
                             _ => "".to_string(),
                         };
                         keys.push(v);
@@ -579,7 +581,7 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
             req.systems
                 .push(pb::upload_server_http_request_stat_request::System {
                     server_id: key.server_id,
-                    name: key.os.clone(),
+                    name: key.os.to_string(),
                     version: "".to_string(),
                     count: val.count,
                 });
@@ -587,7 +589,7 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
             req.browsers
                 .push(pb::upload_server_http_request_stat_request::Browser {
                     server_id: key.server_id,
-                    name: key.browser.clone(),
+                    name: key.browser.to_string(),
                     version: "".to_string(),
                     count: val.count,
                 });
@@ -597,7 +599,7 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
                     pb::upload_server_http_request_stat_request::HttpFirewallRuleGroup {
                         server_id: key.server_id,
                         http_firewall_rule_group_id: key.waf_group_id,
-                        action: key.waf_action.clone(),
+                        action: key.waf_action.to_string(),
                         count: val.count_attack,
                     },
                 );

@@ -70,6 +70,8 @@ pub struct ProxyCTX {
     pub raw_remote_addr: String,
     pub analyzed: Option<crate::metrics::analyzer::RequestStats>,
     pub is_http3_bridge: bool,
+    pub server_metrics: Option<Arc<crate::metrics::ServerMetrics>>,
+    pub ip_recorded: bool,
     pub webp_convert_enabled: bool,
     pub webp_source_content_type: Option<String>,
     pub webp_pending_body: Vec<u8>,
@@ -133,6 +135,8 @@ impl Default for ProxyCTX {
             raw_remote_addr: String::new(),
             analyzed: None,
             is_http3_bridge: false,
+            server_metrics: None,
+            ip_recorded: false,
             webp_convert_enabled: false,
             webp_source_content_type: None,
             webp_pending_body: Vec::new(),
@@ -2803,6 +2807,12 @@ impl ProxyHttp for EdgeProxy {
 
         // Record request start for global metrics
         ctx.request_id = crate::logging::next_request_id();
+        
+        let sid = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
+        if sid > 0 && ctx.server_metrics.is_none() {
+            ctx.server_metrics = Some(crate::metrics::record::get_or_create(sid));
+        }
+
         let user_plan_id = ctx.server.as_ref().map(|s| s.user_plan_id).unwrap_or(0);
         let plan_id = if user_plan_id > 0 {
             self.config
@@ -2812,12 +2822,14 @@ impl ProxyHttp for EdgeProxy {
         } else {
             0
         };
-        crate::metrics::record::request_start(
-            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+        ctx.ip_recorded = crate::metrics::record::request_start(
+            sid,
             ctx.client_ip_str.clone(),
             ctx.server.as_ref().map(|s| s.user_id).unwrap_or(0),
             user_plan_id,
             plan_id,
+            ctx.server_metrics.as_ref(),
+            ctx.ip_recorded,
         );
 
         if self.enforce_request_limit(session, ctx).await? {
@@ -3354,6 +3366,7 @@ impl ProxyHttp for EdgeProxy {
                     is_cached,
                     is_attack,
                     ctx.is_websocket,
+                    ctx.server_metrics.as_ref(),
                 );
 
                 if !ctx.origin_address.is_empty() {
@@ -3361,6 +3374,7 @@ impl ProxyHttp for EdgeProxy {
                         server_id,
                         session.body_bytes_read() as u64,
                         ctx.response_body_len as u64,
+                        ctx.server_metrics.as_ref(),
                     );
                 }
 

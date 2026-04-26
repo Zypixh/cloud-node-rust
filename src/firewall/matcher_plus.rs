@@ -421,12 +421,12 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8]) -> Stri
             "",
             true,
         )),
-        "geoCountryName" => geo_info(session).map(|g| g.country).unwrap_or_default(),
-        "geoProvinceName" => geo_info(session).map(|g| g.region).unwrap_or_default(),
-        "geoCityName" => geo_info(session).map(|g| g.city).unwrap_or_default(),
+        "geoCountryName" => geo_info(session).map(|g| g.country.to_string()).unwrap_or_default(),
+        "geoProvinceName" => geo_info(session).map(|g| g.region.to_string()).unwrap_or_default(),
+        "geoCityName" => geo_info(session).map(|g| g.city.to_string()).unwrap_or_default(),
         "ispName" => geo_info(session)
-            .map(|g| g.provider)
-            .unwrap_or_else(|| analyzer::lookup_isp_name(parse_remote_ip(session))),
+            .map(|g| g.provider.to_string())
+            .unwrap_or_else(|| analyzer::lookup_isp_name(parse_remote_ip(session)).to_string()),
         "serverAddr" => get_local_addr(session),
         "serverPort" => get_local_port(session),
         "refererBlock" | "cname" => String::new(),

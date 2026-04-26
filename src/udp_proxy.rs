@@ -242,6 +242,8 @@ impl UdpProxyManager {
                     user_id,
                     user_plan_id,
                     plan_id,
+                    None,
+                    false,
                 );
 
                 // Spawn session task for bidirectional forwarding
@@ -300,7 +302,7 @@ impl UdpProxyManager {
                     backend_socket.send(&data).await?;
                     downstream_received += len;
                     // Client -> Backend: Origin Sent = len, Origin Received = 0
-                    crate::metrics::record::record_origin_traffic(server_id, len, 0);
+                    crate::metrics::record::record_origin_traffic(server_id, len, 0, None);
                 }
                 // Backend -> Client
                 Ok(len) = backend_socket.recv(&mut buf) => {
@@ -308,7 +310,7 @@ impl UdpProxyManager {
                     listen_socket.send_to(&buf[..len], client_addr).await?;
                     downstream_sent += len_u64;
                     // Backend -> Client: Origin Sent = 0, Origin Received = len
-                    crate::metrics::record::record_origin_traffic(server_id, 0, len_u64);
+                    crate::metrics::record::record_origin_traffic(server_id, 0, len_u64, None);
                 }
                 // Timeout or close (rx closed means manager decided to terminate or buffer full/dropped)
                 else => break,
@@ -321,6 +323,7 @@ impl UdpProxyManager {
             false,
             false,
             false,
+            None,
         );
         Ok(())
     }

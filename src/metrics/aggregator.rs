@@ -5,17 +5,17 @@ use std::sync::Arc;
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct AggregationKey {
     pub server_id: i64,
-    pub country: String,
+    pub country: Arc<str>,
     pub country_id: i64,
-    pub province: String,
+    pub province: Arc<str>,
     pub province_id: i64,
-    pub city: String,
+    pub city: Arc<str>,
     pub city_id: i64,
-    pub provider: String,
-    pub browser: String,
-    pub os: String,
+    pub provider: Arc<str>,
+    pub browser: Arc<str>,
+    pub os: Arc<str>,
     pub waf_group_id: i64,
-    pub waf_action: String,
+    pub waf_action: Arc<str>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -26,7 +26,7 @@ pub struct AggregatedValue {
 }
 
 pub struct MetricAggregator {
-    samples: DashMap<AggregationKey, AggregatedValue>,
+    pub data: DashMap<AggregationKey, AggregatedValue>,
 }
 
 impl Default for MetricAggregator {
@@ -38,30 +38,28 @@ impl Default for MetricAggregator {
 impl MetricAggregator {
     pub fn new() -> Self {
         Self {
-            samples: DashMap::new(),
+            data: DashMap::with_shard_amount(64),
         }
     }
 
-    pub fn record(&self, key: AggregationKey, bytes: i64, is_attack: bool) {
-        let mut entry = self.samples.entry(key).or_default();
+    pub fn record(&self, key: AggregationKey, bytes_sent: i64, is_attack: bool) {
+        let mut entry = self.data.entry(key).or_default();
         entry.count += 1;
-        entry.bytes_sent += bytes;
+        entry.bytes_sent += bytes_sent;
         if is_attack {
             entry.count_attack += 1;
         }
     }
 
-    /// Flushes the current samples and returns them as a Vec
     pub fn flush(&self) -> Vec<(AggregationKey, AggregatedValue)> {
-        let mut results = Vec::new();
-        // We use remove_if to drain the map safely
-        let keys: Vec<AggregationKey> = self.samples.iter().map(|kv| kv.key().clone()).collect();
-        for key in keys {
-            if let Some((_, val)) = self.samples.remove(&key) {
-                results.push((key, val));
+        let mut samples = Vec::new();
+        let keys: Vec<_> = self.data.iter().map(|e| e.key().clone()).collect();
+        for k in keys {
+            if let Some((key, val)) = self.data.remove(&k) {
+                samples.push((key, val));
             }
         }
-        results
+        samples
     }
 }
 

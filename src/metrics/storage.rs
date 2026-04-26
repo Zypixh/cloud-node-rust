@@ -68,6 +68,42 @@ impl MetricStorage {
         Self { db: None }
     }
 
+    pub fn record_server_batch(
+        &self,
+        period: i64,
+        updates: Vec<crate::rpc::metrics::ServerMetricUpdate>,
+        node_sent: u64,
+        node_received: u64,
+    ) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let mut batch = WriteBatch::default();
+
+        for u in updates {
+            let prefix = format!("S{}_T{}", u.server_id, period);
+            
+            // Store delta-based counters using merge operator
+            batch.merge(format!("{}_req", prefix).as_bytes(), u.total_requests.to_be_bytes());
+            batch.merge(format!("{}_sent", prefix).as_bytes(), u.bytes_sent.to_be_bytes());
+            batch.merge(format!("{}_recv", prefix).as_bytes(), u.bytes_received.to_be_bytes());
+            batch.merge(format!("{}_cached_sent", prefix).as_bytes(), u.cached_bytes.to_be_bytes());
+            batch.merge(format!("{}_cached_req", prefix).as_bytes(), u.count_cached_requests.to_be_bytes());
+            batch.merge(format!("{}_attack_req", prefix).as_bytes(), u.count_attack_requests.to_be_bytes());
+            batch.merge(format!("{}_attack_sent", prefix).as_bytes(), u.attack_bytes.to_be_bytes());
+            
+            // Store gauge values using put
+            batch.put(format!("{}_conns", prefix).as_bytes(), u.active_connections.to_be_bytes());
+            batch.put(format!("{}_ips", prefix).as_bytes(), u.count_ips.to_be_bytes());
+        }
+
+        let node_prefix = format!("NODE_T{}", period);
+        batch.merge(format!("{}_sent", node_prefix).as_bytes(), node_sent.to_be_bytes());
+        batch.merge(format!("{}_recv", node_prefix).as_bytes(), node_received.to_be_bytes());
+
+        let _ = db.write(batch);
+    }
+
     /// Increments multiple counters in a single atomic batch.
     pub fn increment_batch(&self, updates: Vec<(String, u64)>) {
         let Some(db) = &self.db else {

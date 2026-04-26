@@ -1,0 +1,150 @@
+use aes::Aes128;
+use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose};
+use bytes::Bytes;
+use image::AnimationDecoder;
+use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
+use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
+use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use rand::Rng;
+use std::sync::Arc;
+use tracing::{debug, error};
+
+use crate::api_config::ApiConfig;
+use crate::cache::should_cache_response;
+use crate::cache_manager::CACHE;
+use crate::config::ConfigStore;
+use crate::config_models::{HTTPCachePolicy, HTTPCacheRef, ServerConfig};
+use crate::firewall::state::WafStateManager;
+use crate::rewrite::{RewriteResult, evaluate_host_redirects, evaluate_rewrites};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+#[derive(Clone)]
+pub struct ProxyCTX {
+    pub start_time: std::time::Instant,
+    pub start_timestamp_millis: i64,
+    pub request_id: String,
+    pub server: Option<Arc<ServerConfig>>,
+    pub lb: Option<Arc<LoadBalancer<RoundRobin>>>,
+    pub metrics_recorded: bool,
+    pub ttfb: Option<std::time::Duration>,
+    pub response_status: u16,
+    pub cache_policy: Option<HTTPCachePolicy>,
+    pub cache_ref: Option<HTTPCacheRef>,
+    pub cache_key: Option<String>,
+    pub cache_hit: Option<bool>,
+    pub cacheable: bool,
+    pub response_headers: HashMap<String, String>,
+    pub response_body_len: usize,
+    pub response_body_buffer: Vec<u8>,
+    pub request_body: Vec<u8>,
+    pub waf_policy_id: i64,
+    pub waf_group_id: i64,
+    pub waf_set_id: i64,
+    pub waf_action: Option<String>,
+    pub firewall_event_reported: bool,
+    pub compress_zstd: bool,
+    pub compression_type: Option<String>,
+    pub compression_level: i8,
+    pub custom_page_body: Option<String>,
+    pub custom_page_status: u16,
+    pub is_websocket: bool,
+    pub is_grpc: bool,
+    pub max_inspection_size: i64,
+    pub no_log: bool,
+    pub response_headers_size: usize,
+    pub origin_address: String,
+    pub origin_status: i32,
+    pub is_on: bool,
+    pub client_ip: std::net::IpAddr,
+    pub client_ip_str: String,
+    pub client_port: u16,
+    pub raw_remote_addr: String,
+    pub analyzed: Option<crate::metrics::analyzer::RequestStats>,
+    pub is_http3_bridge: bool,
+    pub webp_convert_enabled: bool,
+    pub webp_source_content_type: Option<String>,
+    pub webp_pending_body: Vec<u8>,
+    pub webp_quality: i32,
+    pub optimize_enabled: bool,
+    pub optimize_kind: Option<String>,
+    pub optimize_pending_body: Vec<u8>,
+    pub hls_playlist_enabled: bool,
+    pub hls_segment_encrypt_enabled: bool,
+    pub hls_segment_key: Option<[u8; 16]>,
+    pub hls_segment_iv: Option<[u8; 16]>,
+    pub hls_segment_pending_body: Vec<u8>,
+    pub hls_session_id: Option<String>,
+    pub hls_session_exp: Option<i64>,
+    pub request_limit_out_bandwidth_bytes: i64,
+    pub request_limit_out_bandwidth_sent: i64,
+    pub request_limit_out_bandwidth_window_start: Option<std::time::Instant>,
+}
+
+impl Default for ProxyCTX {
+    fn default() -> Self {
+        Self {
+            start_time: std::time::Instant::now(),
+            start_timestamp_millis: crate::utils::time::now_timestamp_millis(),
+            request_id: String::new(),
+            server: None,
+            lb: None,
+            metrics_recorded: false,
+            ttfb: None,
+            response_status: 0,
+            cache_policy: None,
+            cache_ref: None,
+            cache_key: None,
+            cache_hit: None,
+            cacheable: false,
+            response_headers: HashMap::new(),
+            response_body_len: 0,
+            response_body_buffer: Vec::new(),
+            request_body: Vec::new(),
+            waf_policy_id: 0,
+            waf_group_id: 0,
+            waf_set_id: 0,
+            waf_action: None,
+            firewall_event_reported: false,
+            compress_zstd: false,
+            compression_type: None,
+            compression_level: 0,
+            custom_page_body: None,
+            custom_page_status: 0,
+            is_websocket: false,
+            is_grpc: false,
+            max_inspection_size: 512 * 1024, // Default 512K as per PB requirement
+            no_log: false,
+            response_headers_size: 0,
+            origin_address: String::new(),
+            origin_status: 0,
+            is_on: true,
+            client_ip: "127.0.0.1".parse().unwrap(),
+            client_ip_str: "127.0.0.1".to_string(),
+            client_port: 0,
+            raw_remote_addr: String::new(),
+            analyzed: None,
+            is_http3_bridge: false,
+            webp_convert_enabled: false,
+            webp_source_content_type: None,
+            webp_pending_body: Vec::new(),
+            webp_quality: 80,
+            optimize_enabled: false,
+            optimize_kind: None,
+            optimize_pending_body: Vec::new(),
+            hls_playlist_enabled: false,
+            hls_segment_encrypt_enabled: false,
+            hls_segment_key: None,
+            hls_segment_iv: None,
+            hls_segment_pending_body: Vec::new(),
+            hls_session_id: None,
+            hls_session_exp: None,
+            request_limit_out_bandwidth_bytes: 0,

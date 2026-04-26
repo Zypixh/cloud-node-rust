@@ -1073,7 +1073,17 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
 
         sys.refresh_all(); // Refresh everything
         let (traffic_out, traffic_in, connections) = crate::metrics::METRICS.get_node_totals();
-        let (api_success_percent, api_avg_cost) = crate::metrics::METRICS.rpc.snapshot();
+        let rpc_snap = crate::metrics::METRICS.rpc.snapshot();
+        let api_success_percent = if rpc_snap.total_requests > 0 {
+            (rpc_snap.total_requests - rpc_snap.total_errors) as f64 / rpc_snap.total_requests as f64
+        } else {
+            1.0
+        };
+        let api_avg_cost = if rpc_snap.total_requests > 0 {
+            rpc_snap.total_cost_ms as f64 / rpc_snap.total_requests as f64
+        } else {
+            0.0
+        };
         let load = sysinfo::System::load_average();
 
         #[allow(unused_mut)]
@@ -1293,8 +1303,8 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         };
 
         let snapshots = crate::metrics::METRICS.take_snapshots();
-        let requests: u64 = snapshots.iter().map(|s| s.total_requests).sum();
-        let attack_requests: u64 = snapshots.iter().map(|s| s.count_attack_requests).sum();
+        let requests: u64 = snapshots.iter().map(|s| s.1.total_requests).sum();
+        let attack_requests: u64 = snapshots.iter().map(|s| s.1.count_attack_requests).sum();
         let elapsed = last_tick.elapsed().as_secs().max(1);
         let traffic_in_delta = traffic_in.saturating_sub(last_traffic_in);
         let traffic_out_delta = traffic_out.saturating_sub(last_traffic_out);

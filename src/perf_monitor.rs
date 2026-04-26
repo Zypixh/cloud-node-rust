@@ -143,7 +143,7 @@ async fn sample_loop(store: SharedStore) {
             crate::metrics::METRICS.get_node_totals();
         let total_requests = snapshots
             .iter()
-            .map(|snap| snap.total_requests)
+            .map(|snap| snap.1.total_requests)
             .sum::<u64>();
         let request_delta = total_requests.saturating_sub(last_requests);
         let traffic_in_delta = traffic_in.saturating_sub(last_traffic_in);
@@ -164,7 +164,8 @@ async fn sample_loop(store: SharedStore) {
         } else {
             0.0
         };
-        let top_servers = top_servers(&snapshots);
+        let snapshot_list: Vec<_> = snapshots.iter().map(|s| s.1.clone()).collect();
+        let top_servers = top_servers(&snapshot_list);
         let request_per_sec = request_delta as f64 / elapsed as f64;
         let traffic_in_bps = traffic_in_delta / elapsed;
         let traffic_out_bps = traffic_out_delta / elapsed;
