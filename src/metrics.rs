@@ -384,14 +384,22 @@ pub mod record {
         cached_bytes: i64,
         waf_group_id: i64,
         waf_action: Option<&str>,
+        cached_analyzed: Option<&crate::metrics::analyzer::RequestStats>,
     ) {
         if server_id <= 0 {
             return;
         }
 
-        let analyzed = crate::metrics::analyzer::analyze_request(client_ip, user_agent);
+        let analyzed_owned;
+        let analyzed = if let Some(a) = cached_analyzed {
+            a
+        } else {
+            analyzed_owned = crate::metrics::analyzer::analyze_request(client_ip, user_agent);
+            &analyzed_owned
+        };
+
         let (country, country_id, province, province_id, city, city_id, provider) =
-            analyzed.geo.map_or_else(
+            analyzed.geo.as_ref().map_or_else(
                 || {
                     (
                         String::new(),
@@ -405,13 +413,13 @@ pub mod record {
                 },
                 |geo| {
                     (
-                        geo.country,
+                        geo.country.clone(),
                         geo.country_id,
-                        geo.region,
+                        geo.region.clone(),
                         geo.region_id,
-                        geo.city,
+                        geo.city.clone(),
                         geo.city_id,
-                        geo.provider,
+                        geo.provider.clone(),
                     )
                 },
             );
@@ -424,8 +432,8 @@ pub mod record {
             city,
             city_id,
             provider,
-            browser: analyzed.browser,
-            os: analyzed.os,
+            browser: analyzed.browser.clone(),
+            os: analyzed.os.clone(),
             waf_group_id,
             waf_action: waf_action.unwrap_or_default().to_string(),
         };

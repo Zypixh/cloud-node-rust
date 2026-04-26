@@ -420,7 +420,7 @@ impl TcpProxyManager {
                         0,
                         0,
                         0,
-                        None,
+                        None, None,
                     );
                     crate::metrics::record::request_end(sid, 0, 0, false, false, false);
                     return Err(e.into());
@@ -493,7 +493,7 @@ impl TcpProxyManager {
                     0,
                     0,
                     0,
-                    None,
+                    None, None,
                 );
                 crate::metrics::record::request_end(sid, 0, 0, false, false, false);
                 e
@@ -535,7 +535,7 @@ impl TcpProxyManager {
                 bytes_sent as i64,
                 0,
                 0,
-                None,
+                None, None,
             );
 
             crate::metrics::record::request_end(sid, 0, 0, false, false, false);
@@ -573,7 +573,7 @@ impl TcpProxyManager {
                         0,
                         0,
                         0,
-                        None,
+                        None, None,
                     );
                     crate::metrics::record::request_end(sid, 0, 0, false, false, false);
                     return Err(e.into());
@@ -652,7 +652,7 @@ impl TcpProxyManager {
                 bytes_sent as i64,
                 0,
                 0,
-                None,
+                None, None,
             );
 
             crate::metrics::record::request_end(sid, 0, 0, false, false, false);

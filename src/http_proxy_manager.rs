@@ -499,6 +499,7 @@ impl HttpProxyManager {
                     0,
                     0,
                     None,
+                    None,
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false);
                 return Err(err).with_context(|| {
@@ -538,6 +539,7 @@ impl HttpProxyManager {
                     bytes_sent as i64,
                     0,
                     0,
+                    None,
                     None,
                 );
                 crate::logging::log_sni_passthrough_access(

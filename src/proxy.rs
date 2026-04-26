@@ -65,8 +65,10 @@ pub struct ProxyCTX {
     pub origin_status: i32,
     pub is_on: bool,
     pub client_ip: std::net::IpAddr,
+    pub client_ip_str: String,
     pub client_port: u16,
     pub raw_remote_addr: String,
+    pub analyzed: Option<crate::metrics::analyzer::RequestStats>,
     pub is_http3_bridge: bool,
     pub webp_convert_enabled: bool,
     pub webp_source_content_type: Option<String>,
@@ -126,8 +128,10 @@ impl Default for ProxyCTX {
             origin_status: 0,
             is_on: true,
             client_ip: "127.0.0.1".parse().unwrap(),
+            client_ip_str: "127.0.0.1".to_string(),
             client_port: 0,
             raw_remote_addr: String::new(),
+            analyzed: None,
             is_http3_bridge: false,
             webp_convert_enabled: false,
             webp_source_content_type: None,
@@ -2595,19 +2599,21 @@ impl ProxyHttp for EdgeProxy {
             &ctx.raw_remote_addr,
             ctx.client_port,
         );
-        if let Some(user_agent) = session
+        ctx.client_ip_str = ctx.client_ip.to_string();
+
+        let user_agent = session
             .get_header("user-agent")
             .and_then(|v| v.to_str().ok())
-            .filter(|ua| !ua.is_empty())
-        {
+            .unwrap_or("");
+
+        if !user_agent.is_empty() {
+            ctx.analyzed = Some(crate::metrics::analyzer::analyze_request(ctx.client_ip, user_agent));
             crate::client_agent::maybe_report_client_agent(
                 (*self.api_config).clone(),
-                ctx.client_ip.to_string(),
+                ctx.client_ip_str.clone(),
                 user_agent.to_string(),
             );
         }
-
-        let ip_str = ctx.client_ip.to_string();
 
         let is_test = session.get_header("x-cloud-preheat").is_some();
 
@@ -2791,7 +2797,7 @@ impl ProxyHttp for EdgeProxy {
             .get_header("user-agent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if self.check_waf_challenge(session, &ip_str, ua, ctx) {
+        if self.check_waf_challenge(session, &ctx.client_ip_str, ua, ctx) {
             return Ok(false);
         }
 
@@ -2808,7 +2814,7 @@ impl ProxyHttp for EdgeProxy {
         };
         crate::metrics::record::request_start(
             ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-            ip_str.clone(),
+            ctx.client_ip_str.clone(),
             ctx.server.as_ref().map(|s| s.user_id).unwrap_or(0),
             user_plan_id,
             plan_id,
@@ -2856,7 +2862,7 @@ impl ProxyHttp for EdgeProxy {
                     };
 
                     if !self.waf_state.check_special_defense(
-                        format!("ECF:{}", ip_str),
+                        format!("ECF:{}", ctx.client_ip_str),
                         threshold,
                         period,
                     ) {
@@ -2894,7 +2900,7 @@ impl ProxyHttp for EdgeProxy {
                     };
 
                     if !self.waf_state.check_special_defense(
-                        format!("TLS:{}", ip_str),
+                        format!("TLS:{}", ctx.client_ip_str),
                         threshold,
                         period,
                     ) {
@@ -2912,7 +2918,7 @@ impl ProxyHttp for EdgeProxy {
             }
         }
 
-        if self.enforce_uam(session, ctx, &ip_str).await? {
+        if self.enforce_uam(session, ctx, &ctx.client_ip_str.clone()).await? {
             return Ok(true);
         }
 
@@ -3055,7 +3061,7 @@ impl ProxyHttp for EdgeProxy {
                 );
             }
             if self
-                .respond_waf_action(session, ctx, matched.clone(), ip_str.clone())
+                .respond_waf_action(session, ctx, matched.clone(), ctx.client_ip_str.clone())
                 .await?
             {
                 return Ok(true);
@@ -3375,6 +3381,7 @@ impl ProxyHttp for EdgeProxy {
                     if is_cached { bytes_sent as i64 } else { 0 },
                     ctx.waf_group_id,
                     ctx.waf_action.as_deref(),
+                    ctx.analyzed.as_ref(),
                 );
             }
             ctx.metrics_recorded = true;

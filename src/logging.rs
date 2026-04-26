@@ -5,7 +5,7 @@ use chrono::{DateTime, FixedOffset};
 use once_cell::sync::OnceCell;
 use pingora_proxy::Session;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -132,17 +132,22 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     } else {
         ctx.raw_remote_addr.clone()
     };
-    let real_ip_str = ctx.client_ip.to_string();
+    let real_ip_str = ctx.client_ip_str.clone();
 
-    let client_ip = real_ip_str
-        .parse::<IpAddr>()
-        .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
     let user_agent = req
         .headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
-    let analyzed = crate::metrics::analyzer::analyze_request(client_ip, user_agent);
+
+    let analyzed_owned;
+    let analyzed = if let Some(a) = &ctx.analyzed {
+        a
+    } else {
+        analyzed_owned = crate::metrics::analyzer::analyze_request(ctx.client_ip, user_agent);
+        &analyzed_owned
+    };
+
     let request_started_at_millis = ctx.start_timestamp_millis;
     let request_started_at = request_started_at_millis / 1000;
     let request_started_local: DateTime<FixedOffset> =
