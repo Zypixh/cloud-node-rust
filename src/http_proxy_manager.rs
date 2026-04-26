@@ -252,6 +252,10 @@ impl HttpProxyManager {
                 res = listener.accept() => res,
             };
             let (client_stream, client_addr) = accept_result?;
+            
+            // Optimization: TCP_NODELAY for small file performance
+            let _ = client_stream.set_nodelay(true);
+
             let proxy_inner = proxy_arc.clone();
             let selector = self.cert_selector.clone();
             let shutdown_inner = shutdown_rx.clone();

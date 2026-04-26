@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use chrono::Timelike;
 
 pub mod aggregator;
 pub mod analyzer;
@@ -209,6 +210,48 @@ impl NodeMetrics {
     }
 }
 
+use std::sync::Mutex;
+
+lazy_static! {
+    static ref CURRENT_DAY: Mutex<(i64, String)> = Mutex::new((0, String::new()));
+    static ref CURRENT_5MIN: Mutex<(i64, i64)> = Mutex::new((0, 0));
+}
+
+fn get_current_day() -> String {
+    let now = crate::utils::time::now_timestamp();
+    let now_day = now / 86400;
+    
+    let mut cache = CURRENT_DAY.lock().unwrap();
+    if cache.0 == now_day && !cache.1.is_empty() {
+        return cache.1.clone();
+    }
+    
+    let day_str = crate::utils::time::now_local().format("%Y%m%d").to_string();
+    *cache = (now_day, day_str.clone());
+    day_str
+}
+
+fn get_current_5min_ts() -> i64 {
+    let now = crate::utils::time::now_timestamp();
+    let now_5min = now / 300;
+
+    let mut cache = CURRENT_5MIN.lock().unwrap();
+    if cache.0 == now_5min && cache.1 > 0 {
+        return cache.1;
+    }
+
+    let dt = crate::utils::time::now_local();
+    let minute_floor = (dt.minute() / 5) * 5;
+    let ts = dt
+        .with_second(0)
+        .and_then(|d| d.with_minute(minute_floor))
+        .map(|d| d.timestamp())
+        .unwrap_or(now - (now % 300));
+    
+    *cache = (now_5min, ts);
+    ts
+}
+
 pub mod record {
     use super::*;
     use chrono::Timelike;
@@ -233,9 +276,11 @@ pub mod record {
         }
         m.total_requests.fetch_add(1, Ordering::Relaxed);
         m.active_connections.fetch_add(1, Ordering::Relaxed);
+        
+        let day = get_current_day();
         crate::metrics::daily::UNIQUE_IP_TRACKER.record(
             server_id,
-            &crate::utils::time::now_local().format("%Y%m%d").to_string(),
+            &day,
             &remote_ip,
         );
         m.distinct_ips.insert(remote_ip);
@@ -375,13 +420,7 @@ pub mod record {
         crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.record(key, bytes_sent, is_attack);
         crate::metrics::top_ip::TOP_IP_TRACKER.record(server_id, &client_ip.to_string());
 
-        let now = crate::utils::time::now_local();
-        let minute_floor = (now.minute() / 5) * 5;
-        let created_at = now
-            .with_second(0)
-            .and_then(|dt| dt.with_minute(minute_floor))
-            .map(|dt| dt.timestamp())
-            .unwrap_or_else(|| now.timestamp());
+        let created_at = get_current_5min_ts();
         crate::metrics::daily::DAILY_DOMAIN_TRACKER.record(
             server_id,
             created_at,

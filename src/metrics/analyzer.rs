@@ -3,6 +3,9 @@ use once_cell::sync::Lazy;
 use std::net::IpAddr;
 use tracing::warn;
 use woothee::parser::Parser;
+use std::sync::Mutex;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 
 pub struct GeoInfo {
     pub country: String,
@@ -14,10 +17,34 @@ pub struct GeoInfo {
     pub provider: String,
 }
 
+impl Clone for GeoInfo {
+    fn clone(&self) -> Self {
+        Self {
+            country: self.country.clone(),
+            country_id: self.country_id,
+            region: self.region.clone(),
+            region_id: self.region_id,
+            city: self.city.clone(),
+            city_id: self.city_id,
+            provider: self.provider.clone(),
+        }
+    }
+}
+
 pub struct RequestStats {
     pub geo: Option<GeoInfo>,
     pub browser: String,
     pub os: String,
+}
+
+impl Clone for RequestStats {
+    fn clone(&self) -> Self {
+        Self {
+            geo: self.geo.clone(),
+            browser: self.browser.clone(),
+            os: self.os.clone(),
+        }
+    }
 }
 
 static GEO_CITY_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
@@ -48,15 +75,42 @@ static GEO_ASN_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
     }
 });
 
+// Cache for GeoIP results (IP -> GeoInfo)
+static GEO_CACHE: Lazy<Mutex<LruCache<IpAddr, Option<GeoInfo>>>> = Lazy::new(|| {
+    Mutex::new(LruCache::new(NonZeroUsize::new(10000).unwrap()))
+});
+
+// Cache for User-Agent results (UA string -> (Browser, OS))
+static UA_CACHE: Lazy<Mutex<LruCache<String, (String, String)>>> = Lazy::new(|| {
+    Mutex::new(LruCache::new(NonZeroUsize::new(5000).unwrap()))
+});
+
 pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
-    let geo = lookup_geo(ip);
+    let geo = {
+        let mut cache = GEO_CACHE.lock().unwrap();
+        if let Some(cached) = cache.get(&ip) {
+            cached.clone()
+        } else {
+            let res = lookup_geo(ip);
+            cache.put(ip, res.clone());
+            res
+        }
+    };
 
-    let parser = Parser::new();
-    let parsed_ua = parser.parse(ua);
-
-    let (browser, os) = match parsed_ua {
-        Some(p) => (p.name.to_string(), p.os.to_string()),
-        None => ("Unknown".to_string(), "Unknown".to_string()),
+    let (browser, os) = {
+        let mut cache = UA_CACHE.lock().unwrap();
+        if let Some(cached) = cache.get(ua) {
+            cached.clone()
+        } else {
+            let parser = Parser::new();
+            let parsed_ua = parser.parse(ua);
+            let res = match parsed_ua {
+                Some(p) => (p.name.to_string(), p.os.to_string()),
+                None => ("Unknown".to_string(), "Unknown".to_string()),
+            };
+            cache.put(ua.to_string(), res.clone());
+            res
+        }
     };
 
     RequestStats { geo, browser, os }
