@@ -254,7 +254,6 @@ fn get_current_5min_ts() -> i64 {
 
 pub mod record {
     use super::*;
-    use chrono::Timelike;
     use std::net::IpAddr;
 
     pub fn request_start(
