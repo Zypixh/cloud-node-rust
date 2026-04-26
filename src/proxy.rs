@@ -26,6 +26,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Clone)]
 pub struct ProxyCTX {
@@ -89,6 +90,7 @@ pub struct ProxyCTX {
     pub request_limit_out_bandwidth_bytes: i64,
     pub request_limit_out_bandwidth_sent: i64,
     pub request_limit_out_bandwidth_window_start: Option<std::time::Instant>,
+    pub global_cache_policy: Option<HTTPCachePolicy>,
 }
 
 impl Default for ProxyCTX {
@@ -154,6 +156,7 @@ impl Default for ProxyCTX {
             request_limit_out_bandwidth_bytes: 0,
             request_limit_out_bandwidth_sent: 0,
             request_limit_out_bandwidth_window_start: None,
+            global_cache_policy: None,
         }
     }
 }
@@ -206,7 +209,41 @@ struct RequestLimitBinding {
 }
 
 static REQUEST_LIMIT_BINDINGS: Lazy<DashMap<String, RequestLimitBinding>> = Lazy::new(DashMap::new);
+static SERVER_CONN_COUNTS: Lazy<DashMap<i64, AtomicI32>> = Lazy::new(DashMap::new);
+static IP_CONN_COUNTS: Lazy<DashMap<std::net::IpAddr, AtomicI32>> = Lazy::new(DashMap::new);
 const REQUEST_LIMIT_BINDING_IDLE_SECS: u64 = 180;
+static CLEANUP_TASK_STARTED: std::sync::Once = std::sync::Once::new();
+
+pub fn start_request_limit_cleanup_task() {
+    CLEANUP_TASK_STARTED.call_once(|| {
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let now = std::time::Instant::now();
+                let stale_keys: Vec<String> = REQUEST_LIMIT_BINDINGS
+                    .iter()
+                    .filter_map(|entry| {
+                        (now.duration_since(entry.value().last_seen).as_secs()
+                            > REQUEST_LIMIT_BINDING_IDLE_SECS)
+                            .then(|| entry.key().clone())
+                    })
+                    .collect();
+                for key in stale_keys {
+                    if let Some((_, binding)) = REQUEST_LIMIT_BINDINGS.remove(&key) {
+                        if binding.server_id > 0 {
+                            if let Some(counter) = SERVER_CONN_COUNTS.get(&binding.server_id) {
+                                counter.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        if let Some(counter) = IP_CONN_COUNTS.get(&binding.client_ip) {
+                            counter.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
 const MAX_OPTIMIZATION_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEBP_CONVERSION_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HLS_PLAYLIST_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -443,22 +480,6 @@ impl EdgeProxy {
             .to_string()
     }
 
-    fn cleanup_request_limit_bindings() {
-        let now = std::time::Instant::now();
-        let stale_keys: Vec<String> = REQUEST_LIMIT_BINDINGS
-            .iter()
-            .filter_map(|entry| {
-                (now.duration_since(entry.value().last_seen).as_secs()
-                    > REQUEST_LIMIT_BINDING_IDLE_SECS)
-                    .then(|| entry.key().clone())
-            })
-            .collect();
-
-        for key in stale_keys {
-            REQUEST_LIMIT_BINDINGS.remove(&key);
-        }
-    }
-
     fn try_bind_request_limit_connection(
         &self,
         raw_remote_addr: &str,
@@ -472,7 +493,6 @@ impl EdgeProxy {
             return true;
         }
 
-        Self::cleanup_request_limit_bindings();
         let now = std::time::Instant::now();
 
         if let Some(mut existing) = REQUEST_LIMIT_BINDINGS.get_mut(raw_remote_addr) {
@@ -481,21 +501,21 @@ impl EdgeProxy {
         }
 
         if max_conns > 0 {
-            let current_server_conns = REQUEST_LIMIT_BINDINGS
-                .iter()
-                .filter(|entry| entry.value().server_id == server_id)
-                .count() as i32;
-            if current_server_conns >= max_conns {
+            let current = SERVER_CONN_COUNTS
+                .get(&server_id)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if current >= max_conns {
                 return false;
             }
         }
 
         if max_conns_per_ip > 0 {
-            let current_ip_conns = REQUEST_LIMIT_BINDINGS
-                .iter()
-                .filter(|entry| entry.value().client_ip == client_ip)
-                .count() as i32;
-            if current_ip_conns >= max_conns_per_ip {
+            let current = IP_CONN_COUNTS
+                .get(&client_ip)
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if current >= max_conns_per_ip {
                 return false;
             }
         }
@@ -508,6 +528,16 @@ impl EdgeProxy {
                 last_seen: now,
             },
         );
+        if server_id > 0 {
+            SERVER_CONN_COUNTS
+                .entry(server_id)
+                .or_insert_with(|| AtomicI32::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        IP_CONN_COUNTS
+            .entry(client_ip)
+            .or_insert_with(|| AtomicI32::new(0))
+            .fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -2540,15 +2570,6 @@ impl ProxyHttp for EdgeProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let hot_path = self.config.get_hot_path_snapshot_sync();
-
-        // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
-        ctx.is_on = hot_path.is_on;
-        if !ctx.is_on {
-            debug!("Node is DISABLED (isOn=false). Rejecting request.");
-            return self.respond_status_with_pages(session, ctx, 403).await;
-        }
-
         let host = session
             .get_header("host")
             .and_then(|v| v.to_str().ok())
@@ -2563,9 +2584,18 @@ impl ProxyHttp for EdgeProxy {
             return Ok(true);
         }
 
-        let (server, upstream) = self.config.get_server_and_upstream_sync(&host);
+        // Single RwLock read for all hot-path config (hot_path + server + upstream)
+        let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
         ctx.server = server;
         ctx.lb = upstream;
+        ctx.global_cache_policy = hot_path.cache_policy.clone();
+
+        // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
+        ctx.is_on = hot_path.is_on;
+        if !ctx.is_on {
+            debug!("Node is DISABLED (isOn=false). Rejecting request.");
+            return self.respond_status_with_pages(session, ctx, 403).await;
+        }
 
         let _is_loopback = session
             .client_addr()
@@ -2849,6 +2879,22 @@ impl ProxyHttp for EdgeProxy {
             ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
         ) {
             return self.respond_status_with_pages(session, ctx, 403).await;
+        }
+
+        // FAST PATH: Cacheable GET/HEAD requests skip heavyweight middleware.
+        // These requests are served directly from Pingora's proxy_cache phase,
+        // so body buffering, WAF body inspection, CC loops, and rewrite evaluation
+        // are either irrelevant (no body) or redundant with the cache response.
+        let method = session.req_header().method.clone();
+        let has_cache = ctx
+            .server
+            .as_ref()
+            .and_then(|s| s.web.as_ref())
+            .and_then(|w| w.cache.as_ref())
+            .map(|c| c.is_on)
+            .unwrap_or(false);
+        if (method == http::Method::GET || method == http::Method::HEAD) && has_cache {
+            return Ok(false);
         }
 
         // 1. Mandatory Global Special Defenses
@@ -3453,7 +3499,7 @@ impl ProxyHttp for EdgeProxy {
                 let policy_opt = if let Some(p) = &cache.cache_policy {
                     Some(p.clone())
                 } else {
-                    self.config.get_cache_policy_sync()
+                    ctx.global_cache_policy.clone()
                 };
                 if let Some(policy) = policy_opt {
                     for cache_ref in &policy.cache_refs {

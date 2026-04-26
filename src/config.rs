@@ -89,6 +89,8 @@ pub struct NodeConfig {
     pub plans: HashMap<i64, crate::pb::Plan>,
     /// Cached user plans referenced by current runtime servers
     pub user_plans: HashMap<i64, crate::pb::UserPlan>,
+    /// Whether any SNI passthrough server is configured (fast check for TLS path)
+    pub has_any_sni_passthrough: bool,
 }
 
 impl Default for NodeConfig {
@@ -133,6 +135,7 @@ impl Default for NodeConfig {
             toa: None,
             plans: HashMap::new(),
             user_plans: HashMap::new(),
+            has_any_sni_passthrough: false,
         }
     }
 }
@@ -150,6 +153,8 @@ pub struct HotPathSnapshot {
     pub global_http: crate::config_models::GlobalHTTPAllConfig,
     pub firewall_policies: Vec<HTTPFirewallPolicy>,
     pub grpc_policy: Option<crate::config_models::GRPCConfig>,
+    pub has_any_sni_passthrough: bool,
+    pub cache_policy: Option<HTTPCachePolicy>,
 }
 
 impl Default for ConfigStore {
@@ -201,6 +206,27 @@ impl ConfigStore {
 
     pub fn get_hot_path_snapshot_sync(&self) -> HotPathSnapshot {
         let lock = self.inner.read().unwrap();
+        Self::build_hot_path_snapshot(&lock)
+    }
+
+    /// Combined accessor: returns HotPathSnapshot + server + upstream in one lock acquisition.
+    /// Reduces RwLock atomic overhead by 50% on the request hot path.
+    pub fn get_request_context_sync(
+        &self,
+        host: &str,
+    ) -> (
+        HotPathSnapshot,
+        Option<Arc<ServerConfig>>,
+        Option<Arc<LoadBalancer<RoundRobin>>>,
+    ) {
+        let lock = self.inner.read().unwrap();
+        let hot_path = Self::build_hot_path_snapshot(&lock);
+        let server = lock.servers.get(host).cloned();
+        let upstream = lock.routes.get(host).cloned();
+        (hot_path, server, upstream)
+    }
+
+    fn build_hot_path_snapshot(lock: &NodeConfig) -> HotPathSnapshot {
         HotPathSnapshot {
             is_on: lock.is_on,
             global_http: crate::config_models::GlobalHTTPAllConfig {
@@ -216,6 +242,8 @@ impl ConfigStore {
             },
             firewall_policies: lock.firewall_policies.clone(),
             grpc_policy: lock.grpc_policy.clone(),
+            has_any_sni_passthrough: lock.has_any_sni_passthrough,
+            cache_policy: lock.cache_policy.clone(),
         }
     }
 
@@ -639,6 +667,8 @@ impl ConfigStore {
         lock.http_pages_policies = http_pages_policies;
         lock.webp_image_policies = webp_image_policies;
         lock.toa = toa;
+        // Track whether any SNI passthrough server exists (for fast TLS path)
+        lock.has_any_sni_passthrough = lock.all_servers.iter().any(|s| s.is_sni_passthrough());
         drop(lock);
         self.notify_runtime_reload();
     }
