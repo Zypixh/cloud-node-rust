@@ -259,7 +259,8 @@ impl<S> ConnectionPool<S> {
             match pool.get(&meta.key) {
                 Some(v) => (*v).clone(),
                 None => {
-                    warn!("Fail to get pool node for {:?}", meta);
+                    // Safe to ignore: The empty node might have been cleaned up by a concurrent `get()` or `pop_closed()`
+                    debug!("Fail to get pool node for {:?}", meta);
                     return;
                 } // nothing to pop, should return error?
             }
