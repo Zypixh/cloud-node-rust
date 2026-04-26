@@ -6,6 +6,8 @@ use woothee::parser::Parser;
 use std::sync::Mutex;
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 pub struct GeoInfo {
     pub country: String,
@@ -75,19 +77,45 @@ static GEO_ASN_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
     }
 });
 
+const CACHE_SHARDS: usize = 64;
+
+struct ShardedLru<K, V> {
+    shards: Vec<Mutex<LruCache<K, V>>>,
+}
+
+impl<K: Hash + Eq, V: Clone> ShardedLru<K, V> {
+    fn new(capacity_per_shard: usize) -> Self {
+        let mut shards = Vec::with_capacity(CACHE_SHARDS);
+        for _ in 0..CACHE_SHARDS {
+            shards.push(Mutex::new(LruCache::new(NonZeroUsize::new(capacity_per_shard).unwrap())));
+        }
+        Self { shards }
+    }
+
+    fn get_shard(&self, key: &K) -> &Mutex<LruCache<K, V>> {
+        let mut s = DefaultHasher::new();
+        key.hash(&mut s);
+        let hash = s.finish();
+        &self.shards[(hash as usize) % CACHE_SHARDS]
+    }
+}
+
 // Cache for GeoIP results (IP -> GeoInfo)
-static GEO_CACHE: Lazy<Mutex<LruCache<IpAddr, Option<GeoInfo>>>> = Lazy::new(|| {
-    Mutex::new(LruCache::new(NonZeroUsize::new(10000).unwrap()))
+static GEO_CACHE: Lazy<ShardedLru<IpAddr, Option<GeoInfo>>> = Lazy::new(|| {
+    ShardedLru::new(200) // 64 * 200 = ~12.8k entries
 });
 
-// Cache for User-Agent results (UA string -> (Browser, OS))
-static UA_CACHE: Lazy<Mutex<LruCache<String, (String, String)>>> = Lazy::new(|| {
-    Mutex::new(LruCache::new(NonZeroUsize::new(5000).unwrap()))
+// Cache for User-Agent results (UA string -> (String, String))
+static UA_CACHE: Lazy<ShardedLru<String, (String, String)>> = Lazy::new(|| {
+    ShardedLru::new(100) // 64 * 100 = ~6.4k entries
 });
+
+static UA_PARSER: Lazy<Parser> = Lazy::new(Parser::new);
 
 pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
     let geo = {
-        let mut cache = GEO_CACHE.lock().unwrap();
+        let mutex = GEO_CACHE.get_shard(&ip);
+        let mut cache = mutex.lock().unwrap();
         if let Some(cached) = cache.get(&ip) {
             cached.clone()
         } else {
@@ -98,17 +126,20 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
     };
 
     let (browser, os) = {
-        let mut cache = UA_CACHE.lock().unwrap();
-        if let Some(cached) = cache.get(ua) {
+        // Use string slice for lookup to avoid unnecessary String allocation if hit
+        // but LruCache requires K so we might need a workaround or just accept one allocation
+        let ua_string = ua.to_string();
+        let mutex = UA_CACHE.get_shard(&ua_string);
+        let mut cache = mutex.lock().unwrap();
+        if let Some(cached) = cache.get(&ua_string) {
             cached.clone()
         } else {
-            let parser = Parser::new();
-            let parsed_ua = parser.parse(ua);
+            let parsed_ua = UA_PARSER.parse(ua);
             let res = match parsed_ua {
                 Some(p) => (p.name.to_string(), p.os.to_string()),
                 None => ("Unknown".to_string(), "Unknown".to_string()),
             };
-            cache.put(ua.to_string(), res.clone());
+            cache.put(ua_string, res.clone());
             res
         }
     };

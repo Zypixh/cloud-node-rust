@@ -210,46 +210,66 @@ impl NodeMetrics {
     }
 }
 
-use std::sync::Mutex;
+use std::sync::RwLock;
+
+struct TimeCache<T> {
+    data: RwLock<(i64, T)>,
+}
+
+impl<T: Clone + Default> TimeCache<T> {
+    fn new() -> Self {
+        Self {
+            data: RwLock::new((0, T::default())),
+        }
+    }
+
+    fn get_or_update<F>(&self, current_tick: i64, f: F) -> T 
+    where F: FnOnce() -> T {
+        {
+            let read = self.data.read().unwrap();
+            if read.0 == current_tick {
+                return read.1.clone();
+            }
+        }
+        
+        let mut write = self.data.write().unwrap();
+        // double check
+        if write.0 == current_tick {
+            return write.1.clone();
+        }
+        
+        let new_val = f();
+        *write = (current_tick, new_val.clone());
+        new_val
+    }
+}
 
 lazy_static! {
-    static ref CURRENT_DAY: Mutex<(i64, String)> = Mutex::new((0, String::new()));
-    static ref CURRENT_5MIN: Mutex<(i64, i64)> = Mutex::new((0, 0));
+    static ref DAY_CACHE: TimeCache<String> = TimeCache::new();
+    static ref PERIOD_CACHE: TimeCache<i64> = TimeCache::new();
 }
 
 fn get_current_day() -> String {
     let now = crate::utils::time::now_timestamp();
     let now_day = now / 86400;
     
-    let mut cache = CURRENT_DAY.lock().unwrap();
-    if cache.0 == now_day && !cache.1.is_empty() {
-        return cache.1.clone();
-    }
-    
-    let day_str = crate::utils::time::now_local().format("%Y%m%d").to_string();
-    *cache = (now_day, day_str.clone());
-    day_str
+    DAY_CACHE.get_or_update(now_day, || {
+        crate::utils::time::now_local().format("%Y%m%d").to_string()
+    })
 }
 
 fn get_current_5min_ts() -> i64 {
     let now = crate::utils::time::now_timestamp();
     let now_5min = now / 300;
 
-    let mut cache = CURRENT_5MIN.lock().unwrap();
-    if cache.0 == now_5min && cache.1 > 0 {
-        return cache.1;
-    }
-
-    let dt = crate::utils::time::now_local();
-    let minute_floor = (dt.minute() / 5) * 5;
-    let ts = dt
-        .with_second(0)
-        .and_then(|d| d.with_minute(minute_floor))
-        .map(|d| d.timestamp())
-        .unwrap_or(now - (now % 300));
-    
-    *cache = (now_5min, ts);
-    ts
+    PERIOD_CACHE.get_or_update(now_5min, || {
+        let dt = crate::utils::time::now_local();
+        let minute_floor = (dt.minute() / 5) * 5;
+        dt.with_second(0)
+            .and_then(|d| d.with_minute(minute_floor))
+            .map(|d| d.timestamp())
+            .unwrap_or(now - (now % 300))
+    })
 }
 
 pub mod record {
