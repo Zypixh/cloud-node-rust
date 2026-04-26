@@ -3549,7 +3549,9 @@ impl ProxyHttp for EdgeProxy {
                 }
 
                 session.cache.enable(CACHE.storage, None, None, None, None);
-                session.cache.set_cache_lock(Some(&*CACHE_LOCK), None);
+                if session.cache.enabled() {
+                    session.cache.set_cache_lock(Some(&*CACHE_LOCK), None);
+                }
             } else {
                 tracing::debug!(
                     "No cache rule matched for request: {}",
