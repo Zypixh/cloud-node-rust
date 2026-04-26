@@ -157,7 +157,7 @@ impl UdpProxyManager {
         let listen_socket = Arc::new(UdpSocket::bind(&listen_addr).await?);
         info!("UDP Proxy listening on {}", listen_addr);
 
-        let mut buf = [0u8; 65535];
+        let mut buf = vec![0u8; 65535];
         loop {
             let recv_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -245,13 +245,17 @@ impl UdpProxyManager {
                 );
 
                 // Spawn session task for bidirectional forwarding
-                let session_inner = session.clone();
+                let backend_addr = session.backend_addr;
+                let shutdown_rx_clone = session.shutdown.clone();
+                let server_id = session.server_id;
+                let client_addr = session.client_addr;
+                
                 let listen_socket_inner = listen_socket.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        Self::handle_session(session_inner, listen_socket_inner, rx).await
+                        Self::handle_session(backend_addr, shutdown_rx_clone, server_id, client_addr, listen_socket_inner, rx).await
                     {
-                        debug!("UDP session {} -> {} closed: {}", client_addr, b_addr, e);
+                        debug!("UDP session {} -> {} closed: {}", client_addr, backend_addr, e);
                     }
                 });
 
@@ -272,17 +276,19 @@ impl UdpProxyManager {
     }
 
     async fn handle_session(
-        session: Arc<UdpSession>,
+        backend_addr: SocketAddr,
+        mut shutdown_rx: watch::Receiver<bool>,
+        server_id: i64,
+        client_addr: SocketAddr,
         listen_socket: Arc<UdpSocket>,
         mut rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
         let backend_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        backend_socket.connect(session.backend_addr).await?;
-        let mut shutdown_rx = session.shutdown.clone();
+        backend_socket.connect(backend_addr).await?;
         let mut downstream_sent = 0u64;
         let mut downstream_received = 0u64;
 
-        let mut buf = [0u8; 65535];
+        let mut buf = vec![0u8; 65535];
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -294,22 +300,22 @@ impl UdpProxyManager {
                     backend_socket.send(&data).await?;
                     downstream_received += len;
                     // Client -> Backend: Origin Sent = len, Origin Received = 0
-                    crate::metrics::record::record_origin_traffic(session.server_id, len, 0);
+                    crate::metrics::record::record_origin_traffic(server_id, len, 0);
                 }
                 // Backend -> Client
                 Ok(len) = backend_socket.recv(&mut buf) => {
                     let len_u64 = len as u64;
-                    listen_socket.send_to(&buf[..len], session.client_addr).await?;
+                    listen_socket.send_to(&buf[..len], client_addr).await?;
                     downstream_sent += len_u64;
                     // Backend -> Client: Origin Sent = 0, Origin Received = len
-                    crate::metrics::record::record_origin_traffic(session.server_id, 0, len_u64);
+                    crate::metrics::record::record_origin_traffic(server_id, 0, len_u64);
                 }
                 // Timeout or close (rx closed means manager decided to terminate or buffer full/dropped)
                 else => break,
             }
         }
         crate::metrics::record::request_end(
-            session.server_id,
+            server_id,
             downstream_sent,
             downstream_received,
             false,

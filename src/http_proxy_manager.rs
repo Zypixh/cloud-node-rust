@@ -354,10 +354,26 @@ impl HttpProxyManager {
                     }
                 } else {
                     // HTTP/1.1 Logic
-                    let server_session = ServerSession::new_http1(stream);
-                    proxy_inner
+                    let mut server_session = ServerSession::new_http1(stream);
+                    if *shutdown_inner.borrow() {
+                        server_session.set_keepalive(None);
+                    } else {
+                        server_session.set_keepalive(Some(60));
+                    }
+                    let mut result = proxy_inner
                         .process_new_http(server_session, &shutdown_inner)
                         .await;
+
+                    while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
+                        let mut next_session = ServerSession::new_http1(stream);
+                        if let Some(persistent_settings) = persistent_settings {
+                            persistent_settings.apply_to_session(&mut next_session);
+                        }
+
+                        result = proxy_inner
+                            .process_new_http(next_session, &shutdown_inner)
+                            .await;
+                    }
                 }
             });
         }
@@ -679,7 +695,7 @@ async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Opti
 
     let started = tokio::time::Instant::now();
     let mut last_progress = started;
-    let mut peek_buf = [0u8; 64 * 1024];
+    let mut peek_buf = vec![0u8; 64 * 1024];
     let mut last_size = 0usize;
     loop {
         if started.elapsed() >= CLIENT_HELLO_TOTAL_TIMEOUT

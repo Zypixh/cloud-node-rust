@@ -206,9 +206,26 @@ impl TransportConnector {
                 {
                     let _ = s.lock().await;
                 } // wait for the idle poll to release it
-                match Arc::try_unwrap(s) {
-                    Ok(l) => {
-                        let mut stream = l.into_inner();
+
+                let mut s_opt = Some(s);
+                let mut attempts = 0;
+                let stream_opt = loop {
+                    let s_val = s_opt.take().unwrap();
+                    match Arc::try_unwrap(s_val) {
+                        Ok(l) => break Some(l.into_inner()),
+                        Err(arc) => {
+                            attempts += 1;
+                            if attempts >= 50 {
+                                error!("failed to acquire reusable stream after retries");
+                                break None;
+                            }
+                            s_opt = Some(arc);
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                };
+
+                if let Some(mut stream) = stream_opt {
                         // test_reusable_stream: we assume server would never actively send data
                         // first on an idle stream.
                         #[cfg(unix)]
@@ -234,11 +251,8 @@ impl TransportConnector {
                                 None
                             }
                         }
-                    }
-                    Err(_) => {
-                        error!("failed to acquire reusable stream");
-                        None
-                    }
+                } else {
+                    None
                 }
             }
             None => {
