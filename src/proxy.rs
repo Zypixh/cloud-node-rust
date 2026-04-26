@@ -3619,6 +3619,7 @@ impl ProxyHttp for EdgeProxy {
                 }
 
                 session.cache.enable(CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
+                ctx.cache_hit = Some(true); // optimistic: will be overridden to false if upstream is contacted
             } else {
                 tracing::debug!(
                     "No cache rule matched for request: {}",
@@ -3645,6 +3646,7 @@ impl ProxyHttp for EdgeProxy {
         upstream_response: &mut pingora::http::ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        ctx.cache_hit = Some(false); // contacted upstream, so this is a cache miss
         ctx.origin_status = upstream_response.status.as_u16() as i32;
 
         if let Some(cache_ref) = &ctx.cache_ref {
