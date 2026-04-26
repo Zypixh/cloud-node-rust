@@ -5,7 +5,7 @@ use once_cell::sync::OnceCell;
 use pingora_proxy::Session;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -13,6 +13,8 @@ use tracing::debug;
 pub static LOG_SENDER: OnceCell<mpsc::Sender<pb::HttpAccessLog>> = OnceCell::new();
 pub static NODE_LOG_SENDER: OnceCell<mpsc::Sender<pb::NodeLog>> = OnceCell::new();
 static NUMERIC_NODE_ID: AtomicI64 = AtomicI64::new(0);
+static REQUEST_ID_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
+static REQUEST_ID_COUNTER: AtomicI32 = AtomicI32::new(1_000_000);
 
 pub fn init_global_log_bus(sender: mpsc::Sender<pb::HttpAccessLog>, node_sender: mpsc::Sender<pb::NodeLog>) {
     let _ = LOG_SENDER.set(sender);
@@ -24,7 +26,14 @@ pub fn set_numeric_node_id(id: i64) {
 }
 
 pub fn next_request_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+    let now = crate::utils::time::now_timestamp_millis();
+    let prev = REQUEST_ID_TIMESTAMP.swap(now, Ordering::AcqRel);
+    if now > prev {
+        REQUEST_ID_COUNTER.store(1_000_000, Ordering::Release);
+    }
+    let counter = REQUEST_ID_COUNTER.fetch_add(1, Ordering::AcqRel);
+    let node_id = NUMERIC_NODE_ID.load(Ordering::Relaxed);
+    format!("{now}{node_id}{counter}")
 }
 
 pub fn report_node_log(level: String, tag: String, message: String, server_id: i64) {
