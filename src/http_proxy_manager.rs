@@ -223,6 +223,26 @@ impl HttpProxyManager {
         let proxy = http_proxy(&self.server_conf, self.proxy_logic.clone());
         let proxy_arc = Arc::new(proxy);
 
+        let shared_ssl_acceptor = if is_tls {
+            let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
+                pingora_core::tls::ssl::SslMethod::tls(),
+            )
+            .expect("Failed to create SSL acceptor builder");
+            let selector_for_ocsp = self.cert_selector.clone();
+            let _ = builder.set_status_callback(move |ssl| {
+                selector_for_ocsp.apply_ocsp_for_ssl_blocking(ssl);
+                Ok(ssl.ocsp_status().is_some())
+            });
+
+            builder.set_alpn_select_callback(|_, client_alpn| {
+                pingora_core::tls::ssl::select_next_proto(b"\x02h2\x08http/1.1", client_alpn)
+                    .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
+            });
+            Some(Arc::new(builder.build()))
+        } else {
+            None
+        };
+
         loop {
             let accept_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -236,6 +256,7 @@ impl HttpProxyManager {
             let selector = self.cert_selector.clone();
             let shutdown_inner = shutdown_rx.clone();
             let manager = self.clone();
+            let acceptor_clone = shared_ssl_acceptor.clone();
 
             tokio::spawn(async move {
                 let mut configured_tls_host = false;
@@ -278,29 +299,10 @@ impl HttpProxyManager {
 
                 let l4_stream = stream_with_socket_digest(client_stream, client_addr);
                 let downstream_socket_digest = l4_stream.get_socket_digest();
-                let (stream, alpn): (pingora_core::protocols::Stream, Option<Vec<u8>>) = if is_tls {
-                    let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
-                        pingora_core::tls::ssl::SslMethod::tls(),
-                    )
-                    .expect("Failed to create SSL acceptor builder");
-                    let selector_for_ocsp = selector.clone();
-                    let _ = builder.set_status_callback(move |ssl| {
-                        selector_for_ocsp.apply_ocsp_for_ssl_blocking(ssl);
-                        Ok(ssl.ocsp_status().is_some())
-                    });
-
-                    builder.set_alpn_select_callback(|_, client_alpn| {
-                        pingora_core::tls::ssl::select_next_proto(
-                            b"\x02h2\x08http/1.1",
-                            client_alpn,
-                        )
-                        .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
-                    });
-                    let ssl_acceptor = builder.build();
-
+                let (stream, alpn): (pingora_core::protocols::Stream, Option<Vec<u8>>) = if let Some(ssl_acceptor) = &acceptor_clone {
                     let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
                         Box::new((*selector).clone());
-                    match handshake_with_callback(&ssl_acceptor, l4_stream, &callbacks).await {
+                    match handshake_with_callback(ssl_acceptor, l4_stream, &callbacks).await {
                         Ok(s) => {
                             let alpn = s.ssl().selected_alpn_protocol().map(|v| v.to_vec());
                             (Box::new(s), alpn)

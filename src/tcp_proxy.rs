@@ -194,6 +194,28 @@ impl TcpProxyManager {
         let listener = TcpListener::bind(&addr).await?;
         info!("TCP Proxy (TLS={}) listening on {}", is_tls, addr);
 
+        let shared_ssl_acceptor = if is_tls {
+            let selector = self._cert_selector.clone();
+            let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
+                pingora_core::tls::ssl::SslMethod::tls(),
+            )
+            .expect("Failed to create SSL acceptor builder");
+            let selector_for_ocsp = selector.clone();
+            let _ = builder.set_status_callback(move |ssl| {
+                selector_for_ocsp.apply_ocsp_for_ssl_blocking(ssl);
+                Ok(ssl.ocsp_status().is_some())
+            });
+
+            // Set ALPN for H2
+            builder.set_alpn_select_callback(|_, client_alpn| {
+                pingora_core::tls::ssl::select_next_proto(b"\x02h2\x08http/1.1", client_alpn)
+                    .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
+            });
+            Some(Arc::new(builder.build()))
+        } else {
+            None
+        };
+
         loop {
             let accept_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -225,10 +247,11 @@ impl TcpProxyManager {
 
             let manager = self.clone();
             let server_inner = server.clone();
+            let acceptor_clone = shared_ssl_acceptor.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = manager
-                    .handle_connection(client_stream, client_addr, server_inner, is_tls)
+                    .handle_connection(client_stream, client_addr, server_inner, is_tls, acceptor_clone)
                     .await
                 {
                     debug!("TCP connection from {} failed: {}", client_addr, e);
@@ -243,6 +266,7 @@ impl TcpProxyManager {
         client_addr: SocketAddr,
         server: ServerConfig,
         is_tls: bool,
+        shared_ssl_acceptor: Option<Arc<pingora_core::tls::ssl::SslAcceptor>>,
     ) -> anyhow::Result<()> {
         if server.has_valid_traffic_limit() {
             debug!(
@@ -259,37 +283,24 @@ impl TcpProxyManager {
 
         // 1. Handle TLS Termination if needed
         if is_tls {
-            let selector = self._cert_selector.clone();
-            let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
-                pingora_core::tls::ssl::SslMethod::tls(),
-            )
-            .expect("Failed to create SSL acceptor builder");
-            let selector_for_ocsp = selector.clone();
-            let _ = builder.set_status_callback(move |ssl| {
-                selector_for_ocsp.apply_ocsp_for_ssl_blocking(ssl);
-                Ok(ssl.ocsp_status().is_some())
-            });
+            if let Some(ssl_acceptor) = shared_ssl_acceptor {
+                let selector = self._cert_selector.clone();
+                let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+                    Box::new((*selector).clone());
+                let res = pingora_core::protocols::tls::server::handshake_with_callback(
+                    &ssl_acceptor,
+                    l4_stream,
+                    &callbacks,
+                )
+                .await;
 
-            // Set ALPN for H2
-            builder.set_alpn_select_callback(|_, client_alpn| {
-                pingora_core::tls::ssl::select_next_proto(b"\x02h2\x08http/1.1", client_alpn)
-                    .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
-            });
-            let ssl_acceptor = builder.build();
+                let tls_stream = res.map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
 
-            let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
-                Box::new((*selector).clone());
-            let res = pingora_core::protocols::tls::server::handshake_with_callback(
-                &ssl_acceptor,
-                l4_stream,
-                &callbacks,
-            )
-            .await;
-
-            let tls_stream = res.map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
-
-            self.continue_handle_connection(tls_stream, client_addr, server)
-                .await
+                self.continue_handle_connection(tls_stream, client_addr, server)
+                    .await
+            } else {
+                Err(anyhow::anyhow!("Missing SSL Acceptor for TLS connection"))
+            }
         } else {
             self.continue_handle_connection(l4_stream, client_addr, server)
                 .await
