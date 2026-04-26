@@ -3299,6 +3299,9 @@ impl ProxyHttp for EdgeProxy {
 
             // Default 60s idle timeout for backend connections
             peer_obj.options.idle_timeout = Some(std::time::Duration::from_secs(60));
+            // Read and write timeout (to prevent hanging connections dragging down performance)
+            peer_obj.options.read_timeout = Some(std::time::Duration::from_secs(60));
+            peer_obj.options.write_timeout = Some(std::time::Duration::from_secs(60));
             // Connection timeout (L1 -> L2 or L2 -> Origin)
             peer_obj.options.connection_timeout = Some(std::time::Duration::from_secs(10));
 
