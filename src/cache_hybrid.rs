@@ -156,13 +156,6 @@ impl Storage for FileStorage {
 
         let path = self.get_path(key).await;
 
-        // Check the open-file cache first
-        let std_file = if self.enable_file_cache.load(Ordering::Relaxed) {
-            OPEN_FILE_CACHE.get(&path).map(|r| Arc::clone(r.value()))
-        } else {
-            None
-        };
-
         let meta = CacheMeta::new(
             std::time::SystemTime::now() + std::time::Duration::from_secs(ttl_remaining),
             std::time::SystemTime::now(),
@@ -171,61 +164,9 @@ impl Storage for FileStorage {
             headers,
         );
 
-        // Fast path: combine stat+read+decompress into one spawn_blocking call
-        // to avoid saturating Tokio's blocking thread pool under high concurrency.
-        let path_clone = path.clone();
-        let t0 = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
-            read_file_into_memory(&path_clone, compressed)
-        }).await;
-        let elapsed_us = t0.elapsed().as_micros() as u64;
-        PROF_DISK_READ_US.fetch_add(elapsed_us, Ordering::Relaxed);
-
-        match result {
-            Ok(Some(data)) => {
-                crate::metrics::storage::STORAGE.record_cache_access(&hash);
-                let body = bytes::Bytes::from(data);
-                return Ok(Some((meta, Box::new(MemoryHitHandler { data: body, sent: false }))));
-            }
-            Ok(None) => {
-                // File is >2MB, empty, or metadata failed — fall through to slow path.
-                // Try to use the open-file cache for the streaming slow path.
-            }
-            Err(_) => {
-                // spawn_blocking panicked or was cancelled
-                return Ok(None);
-            }
-        }
-
-        // Slow path for large files: streaming with open file cache.
-        // Open via std::fs::File so we can try_clone() the fd into OPEN_FILE_CACHE.
-        let file = match std_file {
-            Some(f) => {
-                // Duplicate the cached fd for this request
-                let dup = f.try_clone().map_err(|_| Error::new(ErrorType::InternalError))?;
-                tokio::fs::File::from_std(dup)
-            }
-            None => {
-                let path_clone = path.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&path_clone)
-                }).await;
-                match result {
-                    Ok(Ok(std_f)) => {
-                        if self.enable_file_cache.load(Ordering::Relaxed) {
-                            if let Ok(cached) = std_f.try_clone() {
-                                OPEN_FILE_CACHE.insert(path.clone(), Arc::new(cached));
-                            }
-                        }
-                        tokio::fs::File::from_std(std_f)
-                    }
-                    _ => {
-                        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                        return Ok(None);
-                    }
-                }
-            },
-        };
+        // DEBUG: Use old-style direct tokio::fs::File::open without spawn_blocking.
+        let file = tokio::fs::File::open(&path).await
+            .map_err(|_| Error::new(ErrorType::InternalError))?;
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
         let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if compressed {
