@@ -745,6 +745,7 @@ impl HybridStorage {
         // Clear from lock-free L1 cache
         FAST_L1.remove(&hash);
 
+        let full_key = CacheKey::new("edge", key, "");
         let ck = full_key.to_compact();
         // Use Global CACHE to bypass E0597
         tokio::spawn(async move {
