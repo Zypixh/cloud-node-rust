@@ -1,6 +1,8 @@
 use crate::config_models::ServerConfig;
 use crate::pb;
 use crate::proxy::ProxyCTX;
+use base64::Engine as _;
+use base64::engine::general_purpose;
 use once_cell::sync::OnceCell;
 use pingora_proxy::Session;
 use std::net::SocketAddr;
@@ -103,15 +105,140 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         "http"
     };
 
+    // Parse cookies from request header
+    let cookies: std::collections::HashMap<String, String> = req
+        .headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(|cookie_str| {
+            cookie_str
+                .split(';')
+                .filter_map(|p| {
+                    let p = p.trim();
+                    p.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Collect request query args and query string
+    let query_string = req.uri.query().unwrap_or("").to_string();
+    let args = query_string.clone();
+
+    // Collect full request headers
+    let req_headers: std::collections::HashMap<String, pb::Strings> = req
+        .headers
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(name, value)| {
+            (
+                name.to_string(),
+                pb::Strings {
+                    values: vec![value
+                        .to_str()
+                        .unwrap_or("")
+                        .to_string()],
+                },
+            )
+        })
+        .collect();
+
+    // Collect response headers
+    let sent_headers: std::collections::HashMap<String, pb::Strings> = ctx
+        .response_headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                pb::Strings {
+                    values: vec![v.clone()],
+                },
+            )
+        })
+        .collect();
+
+    // Content-Type from response headers
+    let content_type = ctx
+        .response_headers
+        .get("content-type")
+        .cloned()
+        .unwrap_or_default();
+
+    // Format times matching Go: ISO8601 and Apache Common Log Format
+    let start_dt = chrono::DateTime::from_timestamp_millis(request_started_at_millis)
+        .unwrap_or_default();
+    let time_iso8601 = start_dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
+    let time_local = start_dt.format("%d/%b/%Y:%H:%M:%S %z").to_string();
+
+    // Server name — use first configured server name or host
+    let server_name = ctx
+        .server
+        .as_ref()
+        .and_then(|s| s.server_names.first())
+        .map(|n| n.name.clone())
+        .unwrap_or_else(|| host.to_string());
+
+    // Remote user (HTTP basic auth)
+    let remote_user = req
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| {
+            if auth.to_lowercase().starts_with("basic ") {
+                let encoded = auth[6..].trim();
+                general_purpose::STANDARD.decode(encoded.as_bytes())
+                    .ok()
+                    .and_then(|decoded| String::from_utf8(decoded).ok())
+                    .and_then(|creds| creds.split_once(':').map(|(user, _)| user.to_string()))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    // Request line string (e.g., "GET /path?query=val HTTP/1.1")
+    let request_line = format!(
+        "{} {} {}",
+        req.method,
+        req.uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/"),
+        proto
+    );
+
+    // Request filename (cache key or path)
+    let request_filename = ctx
+        .cache_key
+        .clone()
+        .unwrap_or_else(|| req.uri.path().to_string());
+
+    // Origin ID from reverse proxy config
+    let origin_id = ctx
+        .server
+        .as_ref()
+        .and_then(|s| s.reverse_proxy.as_ref())
+        .and_then(|rp| rp.primary_origins.first())
+        .map(|o| o.id)
+        .unwrap_or(0);
+
     let is_cached = ctx.cache_hit.unwrap_or(false);
 
     let mut log = pb::HttpAccessLog {
         request_id: ctx.request_id.clone(),
         server_id,
         node_id: NUMERIC_NODE_ID.load(Ordering::Relaxed),
+        location_id: 0,
+        rewrite_id: 0,
+        origin_id,
         remote_addr: ctx.client_ip_str.clone(),
-        raw_remote_addr: if ctx.raw_remote_addr.is_empty() { ctx.client_ip_str.clone() } else { ctx.raw_remote_addr.clone() },
+        raw_remote_addr: if ctx.raw_remote_addr.is_empty() {
+            ctx.client_ip_str.clone()
+        } else {
+            ctx.raw_remote_addr.clone()
+        },
         remote_port: ctx.client_port as i32,
+        remote_user,
         request_uri: req
             .uri
             .path_and_query()
@@ -119,33 +246,80 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
             .unwrap_or_else(|| "/".to_string()),
         request_path: req.uri.path().to_string(),
         request_method: req.method.to_string(),
+        request_filename,
         request_length: bytes_received,
         request_time: ctx.start_time.elapsed().as_secs_f64(),
+        request: request_line,
+        request_body: {
+            if ctx.request_body.is_empty() {
+                vec![]
+            } else if ctx.request_body.len() > 2_097_152 {
+                ctx.request_body[..2_097_152].to_vec()
+            } else {
+                ctx.request_body.clone()
+            }
+        },
         scheme: scheme.to_string(),
         proto: proto.to_string(),
         status: ctx.response_status as i32,
+        status_message: String::new(),
         bytes_sent,
         body_bytes_sent: session.body_bytes_sent() as i64,
+        content_type,
         host: host.to_string(),
-        user_agent: req.headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string(),
+        user_agent: req
+            .headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string(),
         referer: req
             .headers
             .get("referer")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string(),
+        query_string,
+        args,
+        cookie: cookies,
+        header: req_headers,
+        sent_header: sent_headers,
         timestamp: request_started_at,
         msec: request_started_at_millis as f64 / 1000.0,
+        time_iso8601,
+        time_local,
         hostname: hostname::get()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string(),
+        server_name,
+        server_port: 0,
+        server_protocol: proto.to_string(),
         origin_address: ctx.origin_address.clone(),
         origin_status: ctx.origin_status,
         origin_header_response_time: ctx.ttfb.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+        firewall_policy_id: ctx.waf_policy_id,
+        firewall_rule_group_id: ctx.waf_group_id,
+        firewall_rule_set_id: ctx.waf_set_id,
+        firewall_rule_id: ctx.waf_rule_id,
+        errors: ctx.errors.clone(),
         ..Default::default()
     };
 
+    // Firewall actions
+    if let Some(waf) = &ctx.waf_action {
+        log.firewall_actions.push(waf.clone());
+    }
+
+    // Tags: collect from ctx.tags + cache HIT
+    for tag in &ctx.tags {
+        log.tags.push(tag.clone());
+    }
+    if is_cached {
+        log.tags.push("CACHE_HIT".to_string());
+    }
+
+    // Attrs: geo + browser/OS analysis
     if let Some(analyzed) = &ctx.analyzed {
         if let Some(geo) = &analyzed.geo {
             log.attrs.insert("region".to_string(), geo.region.to_string());
@@ -155,14 +329,6 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         }
         log.attrs.insert("browser".to_string(), analyzed.browser.to_string());
         log.attrs.insert("os".to_string(), analyzed.os.to_string());
-    }
-
-    if is_cached {
-        log.tags.push("CACHE_HIT".to_string());
-    }
-    if let Some(waf) = &ctx.waf_action {
-        log.firewall_actions.push(waf.clone());
-        log.firewall_policy_id = ctx.waf_policy_id;
     }
 
     let _ = sender.try_send(log);
