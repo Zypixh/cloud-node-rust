@@ -3090,6 +3090,7 @@ impl ProxyHttp for EdgeProxy {
             ctx.waf_group_id = matched.group_id;
             ctx.waf_set_id = matched.set_id;
             ctx.waf_action = Some(matched.action_code.clone());
+            ctx.tags.extend(matched.tags.clone());
             self.maybe_report_firewall_event(
                 ctx,
                 matched.policy_id,
@@ -3843,6 +3844,7 @@ impl ProxyHttp for EdgeProxy {
                 ctx.waf_group_id = action.group_id;
                 ctx.waf_set_id = action.set_id;
                 ctx.waf_action = Some(action.action_code.clone());
+                ctx.tags.extend(action.tags.clone());
                 self.maybe_report_firewall_event(
                     ctx,
                     action.policy_id,
