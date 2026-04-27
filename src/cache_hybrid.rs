@@ -6,7 +6,6 @@ use pingora_cache::storage::{
     HandleHit, HandleMiss, HitHandler, MissFinishType, MissHandler, PurgeType, Storage,
 };
 use pingora_cache::{CacheKey, CacheMeta, MemCache};
-use pingora_cache::key::CacheHashKey;
 use pingora_core::{Error, ErrorType, Result};
 use std::any::Any;
 use std::path::PathBuf;
@@ -744,8 +743,7 @@ impl HybridStorage {
         crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
 
         // Clear from lock-free L1 cache
-        let full_key = CacheKey::new("edge", key, "");
-        FAST_L1.remove(&full_key.combined());
+        FAST_L1.remove(&hash);
 
         let ck = full_key.to_compact();
         // Use Global CACHE to bypass E0597
@@ -822,9 +820,11 @@ impl Storage for HybridStorage {
             return self.l1.lookup(key, trace).await;
         }
 
+        // Use the same MD5 hash as FileStorage for consistent cross-layer lookup.
+        let hash = format!("{:x}", md5_legacy::compute(k_str));
+
         // Check lock-free L1 cache first (DashMap, sharded, zero contention)
-        let fast_key = key.combined();
-        if let Some(entry) = FAST_L1.get(&fast_key) {
+        if let Some(entry) = FAST_L1.get(&hash) {
             let now = crate::utils::time::now_timestamp();
             if entry.fresh_until > now {
                 let headers = pingora_http::ResponseHeader::build(200, None).unwrap();
@@ -839,7 +839,7 @@ impl Storage for HybridStorage {
                 return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), sent: false }))));
             }
             // Expired: remove and fall through to L2
-            FAST_L1.remove(&fast_key);
+            FAST_L1.remove(&hash);
         }
 
         // Fallback: try MemCache (for entries promoted before this change)
@@ -859,7 +859,7 @@ impl Storage for HybridStorage {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or(std::time::Duration::from_secs(3600))
                         .as_secs() as i64;
-                    FAST_L1.insert(fast_key, FastL1Entry {
+                    FAST_L1.insert(hash.clone(), FastL1Entry {
                         data: mem_handler.data.clone(),
                         fresh_until,
                         created_at: now,
@@ -874,7 +874,6 @@ impl Storage for HybridStorage {
                 .hot_threshold
                 .load(std::sync::atomic::Ordering::Relaxed);
             let mut is_hot = false;
-            let hash = format!("{:x}", md5_legacy::compute(k_str));
             self.hot_counts
                 .entry(hash.clone())
                 .and_modify(|c| {
@@ -1104,17 +1103,16 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
 use std::sync::atomic::AtomicU64;
 
 /// Public API: ultra-fast cache lookup for direct use in request_filter.
-/// Returns the cached body bytes if a valid entry exists, bypassing all
-/// Pingora cache framework overhead (phases, state machines, locks).
+/// Returns the cached body bytes if a valid entry exists.
+/// Uses the same MD5 hash as FileStorage for key consistency.
 pub fn fast_l1_lookup(key_str: &str) -> Option<bytes::Bytes> {
-    let ck = CacheKey::new("edge", key_str, "");
-    let fast_key = ck.combined();
-    if let Some(entry) = FAST_L1.get(&fast_key) {
+    let hash = format!("{:x}", md5_legacy::compute(key_str));
+    if let Some(entry) = FAST_L1.get(&hash) {
         let now = crate::utils::time::now_timestamp();
         if entry.fresh_until > now {
             return Some(entry.data.clone());
         }
-        FAST_L1.remove(&fast_key);
+        FAST_L1.remove(&hash);
     }
     None
 }
