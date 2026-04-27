@@ -156,13 +156,6 @@ impl Storage for FileStorage {
 
         let path = self.get_path(key).await;
 
-        // Check the open-file cache first
-        let std_file = if self.enable_file_cache.load(Ordering::Relaxed) {
-            OPEN_FILE_CACHE.get(&path).map(|r| Arc::clone(r.value()))
-        } else {
-            None
-        };
-
         let meta = CacheMeta::new(
             std::time::SystemTime::now() + std::time::Duration::from_secs(ttl_remaining),
             std::time::SystemTime::now(),
@@ -171,61 +164,10 @@ impl Storage for FileStorage {
             headers,
         );
 
-        // Fast path: combine stat+read+decompress into one spawn_blocking call
-        // to avoid saturating Tokio's blocking thread pool under high concurrency.
-        let path_clone = path.clone();
-        let t0 = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
-            read_file_into_memory(&path_clone, compressed)
-        }).await;
-        let elapsed_us = t0.elapsed().as_micros() as u64;
-        PROF_DISK_READ_US.fetch_add(elapsed_us, Ordering::Relaxed);
-
-        match result {
-            Ok(Some(data)) => {
-                crate::metrics::storage::STORAGE.record_cache_access(&hash);
-                let body = bytes::Bytes::from(data);
-                return Ok(Some((meta, Box::new(MemoryHitHandler { data: body, sent: false }))));
-            }
-            Ok(None) => {
-                // File is >2MB, empty, or metadata failed — fall through to slow path.
-                // Try to use the open-file cache for the streaming slow path.
-            }
-            Err(_) => {
-                // spawn_blocking panicked or was cancelled
-                return Ok(None);
-            }
-        }
-
-        // Slow path for large files: streaming with open file cache.
-        // Open via std::fs::File so we can try_clone() the fd into OPEN_FILE_CACHE.
-        let file = match std_file {
-            Some(f) => {
-                // Duplicate the cached fd for this request
-                let dup = f.try_clone().map_err(|_| Error::new(ErrorType::InternalError))?;
-                tokio::fs::File::from_std(dup)
-            }
-            None => {
-                let path_clone = path.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&path_clone)
-                }).await;
-                match result {
-                    Ok(Ok(std_f)) => {
-                        if self.enable_file_cache.load(Ordering::Relaxed) {
-                            if let Ok(cached) = std_f.try_clone() {
-                                OPEN_FILE_CACHE.insert(path.clone(), Arc::new(cached));
-                            }
-                        }
-                        tokio::fs::File::from_std(std_f)
-                    }
-                    _ => {
-                        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                        return Ok(None);
-                    }
-                }
-            },
-        };
+        // DEBUG: Bypass spawn_blocking fast path to test if it causes connection leak.
+        // Use old-style direct tokio::fs::File::open without OPEN_FILE_CACHE.
+        let file = tokio::fs::File::open(&path).await
+            .map_err(|_| Error::new(ErrorType::InternalError))?;
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
         let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if compressed {
@@ -820,117 +762,21 @@ impl Storage for HybridStorage {
 
         let k_str = key.primary_key_str().unwrap_or("unknown");
 
+        // DEBUG: Bypass all new cache layers to test if they cause connection leak.
+        // Only use the old MemCache → FileStorage path without FAST_L1, without
+        // MemoryHitHandler, without async promotion.
         if *p_type == "memory" {
             return self.l1.lookup(key, trace).await;
         }
 
-        // Use the same MD5 hash as FileStorage for consistent cross-layer lookup.
-        let hash = format!("{:x}", md5_legacy::compute(k_str));
-
-        // Check lock-free L1 cache first (DashMap, sharded, zero contention)
-        if let Some(entry) = FAST_L1.get(&hash) {
-            let now = crate::utils::time::now_timestamp();
-            if entry.fresh_until > now {
-                let headers = pingora_http::ResponseHeader::build(200, None).unwrap();
-                let meta = CacheMeta::new(
-                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.fresh_until as u64),
-                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.created_at as u64),
-                    0,
-                    0,
-                    headers,
-                );
-                prof_record_l1_hit();
-                return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), sent: false }))));
-            }
-            // Expired: remove and fall through to L2
-            FAST_L1.remove(&hash);
-        }
-
-        // Fallback: try MemCache (for entries promoted before this change)
+        // MemCache lookup first (old behavior)
         if let Some(hit) = self.l1.lookup(key, trace).await? {
-            prof_record_l1_hit();
             return Ok(Some(hit));
         }
 
-        if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
-            prof_record_l2_hit();
-            // Store in lock-free FAST_L1 for subsequent zero-copy hits.
-            // Skip the single-lock MemCache — it's a bottleneck at 1000+ concurrency.
-            if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
-                if !mem_handler.sent && mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
-                    let now = crate::utils::time::now_timestamp();
-                    let fresh_until = meta.fresh_until()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or(std::time::Duration::from_secs(3600))
-                        .as_secs() as i64;
-                    FAST_L1.insert(hash.clone(), FastL1Entry {
-                        data: mem_handler.data.clone(),
-                        fresh_until,
-                        created_at: now,
-                    });
-                    prof_record_l2_mem_promotion();
-                }
-            }
-
-            // Async hot promotion for files that don't fit the memory fast path
-            // (e.g. >2MB or already streamed via FileHitHandler).
-            let threshold = self
-                .hot_threshold
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let mut is_hot = false;
-            self.hot_counts
-                .entry(hash.clone())
-                .and_modify(|c| {
-                    *c += 1;
-                    if *c >= threshold {
-                        is_hot = true;
-                    }
-                })
-                .or_insert(1);
-
-            if is_hot {
-                prof_record_l2_async_promotion();
-                let storage_l2 = self.l2;
-                let cache_key_cloned = key.clone();
-                tokio::spawn(async move {
-                    let path = storage_l2.get_path(&cache_key_cloned).await;
-                    if let Ok(attr) = tokio::fs::metadata(&path).await {
-                        if attr.len() > 0 && attr.len() < MEMORY_SERVE_MAX {
-                            if let Ok(mut file) = tokio::fs::File::open(&path).await {
-                                use tokio::io::AsyncReadExt;
-                                let mut buffer = Vec::with_capacity(attr.len() as usize);
-                                if file.read_to_end(&mut buffer).await.is_ok() {
-                                    let header =
-                                        pingora_http::ResponseHeader::build(200, None).unwrap();
-                                    let new_meta = CacheMeta::new(
-                                        std::time::SystemTime::now()
-                                            + std::time::Duration::from_secs(3600),
-                                        std::time::SystemTime::now(),
-                                        0,
-                                        0,
-                                        header,
-                                    );
-                                    let _trace = pingora_cache::trace::Span::inactive().handle();
-                                    if let Ok(mut miss_handler) =
-                                        crate::cache_manager::CACHE
-                                            .storage
-                                            .l1
-                                            .get_miss_handler(&cache_key_cloned, &new_meta, &_trace)
-                                            .await
-                                    {
-                                        let _ = miss_handler
-                                            .write_body(bytes::Bytes::from(buffer), true)
-                                            .await;
-                                        let _ = miss_handler.finish().await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-
-            return Ok(Some((meta, handler)));
+        // FileStorage lookup (with old-style streaming, no fast path)
+        if let Some((meta, _handler)) = self.l2.lookup(key, trace).await? {
+            return Ok(Some((meta, _handler)));
         }
 
         Ok(None)
