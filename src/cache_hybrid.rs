@@ -985,7 +985,10 @@ impl Storage for HybridStorage {
         meta: &CacheMeta,
         trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<bool> {
-        self.l1.update_meta(key, meta, trace).await?;
+        let p_type = self.policy_type.read().await;
+        if *p_type == "memory" {
+            self.l1.update_meta(key, meta, trace).await?;
+        }
         self.l2.update_meta(key, meta, trace).await
     }
 
