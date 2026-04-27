@@ -2827,27 +2827,44 @@ impl ProxyHttp for EdgeProxy {
             }
         }
 
-        if self.waf_state.is_whitelisted(
-            ctx.client_ip,
-            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-        ) {
-            return Ok(false);
-        }
+        // Determine cacheability and WAF status early — so we can skip WAF checks
+        // entirely for cacheable GET/HEAD requests when no WAF policies are configured.
+        let method = session.req_header().method.clone();
+        let has_cache = ctx
+            .server
+            .as_ref()
+            .and_then(|s| s.web.as_ref())
+            .and_then(|w| w.cache.as_ref())
+            .map(|c| c.is_on)
+            .unwrap_or(false);
+        let is_cacheable_get =
+            (method == http::Method::GET || method == http::Method::HEAD) && has_cache;
+        let has_waf = !hot_path.firewall_policies.is_empty();
 
-        let ua = session
-            .get_header("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if self.check_waf_challenge(session, &ctx.client_ip_str, ua, ctx) {
-            return Ok(false);
-        }
+        // WAF checks: only run when WAF is actually configured.
+        // Cacheable GET/HEAD with no WAF policies skips straight to the fast path.
+        if !is_cacheable_get || has_waf {
+            if self.waf_state.is_whitelisted(
+                ctx.client_ip,
+                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+            ) {
+                return Ok(false);
+            }
 
-        // Security: check if client IP is globally blocked
-        if self.waf_state.is_blocked(
-            ctx.client_ip,
-            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-        ) {
-            return self.respond_status_with_pages(session, ctx, 403).await;
+            let ua = session
+                .get_header("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if self.check_waf_challenge(session, &ctx.client_ip_str, ua, ctx) {
+                return Ok(false);
+            }
+
+            if self.waf_state.is_blocked(
+                ctx.client_ip,
+                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+            ) {
+                return self.respond_status_with_pages(session, ctx, 403).await;
+            }
         }
 
         // Request ID (cheap atomic) + connection limit (DoS protection)
@@ -2860,15 +2877,7 @@ impl ProxyHttp for EdgeProxy {
         // FAST PATH: Cacheable GET/HEAD requests skip ALL remaining middleware,
         // metrics, and limit enforcement. These requests are served from Pingora's
         // proxy_cache phase (memory hit from FAST_L1), so nothing else matters.
-        let method = session.req_header().method.clone();
-        let has_cache = ctx
-            .server
-            .as_ref()
-            .and_then(|s| s.web.as_ref())
-            .and_then(|w| w.cache.as_ref())
-            .map(|c| c.is_on)
-            .unwrap_or(false);
-        if (method == http::Method::GET || method == http::Method::HEAD) && has_cache {
+        if is_cacheable_get {
             // Lightweight request counting — just atomics, no RwLock reads or IP tracking
             let sid = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
             if sid > 0 {
