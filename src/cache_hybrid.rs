@@ -30,6 +30,23 @@ fn zstd_decompress_to_bytes(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+const MEMORY_SERVE_MAX: u64 = 2 * 1024 * 1024; // 2MB
+
+/// Read a small file entirely into memory, with optional zstd decompression.
+/// Designed to run inside spawn_blocking — combines stat+read+decompress into one call.
+fn read_file_into_memory(path: &std::path::Path, compressed: bool) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() == 0 || meta.len() > MEMORY_SERVE_MAX {
+        return None;
+    }
+    let data = std::fs::read(path).ok()?;
+    if compressed {
+        zstd_decompress_to_bytes(&data)
+    } else {
+        Some(data)
+    }
+}
+
 /// Dynamic Disk-based storage for Pingora-cache
 pub struct FileStorage {
     pub inner: Arc<RwLock<FileStorageInner>>,
@@ -154,42 +171,26 @@ impl Storage for FileStorage {
             headers,
         );
 
-        // Read the entire file into memory for small files to eliminate streaming overhead.
-        // Go achieves 0.3ms cache hits by serving from memory; we match that by reading
-        // the full file in one syscall and serving from a Bytes buffer.
-        const MEMORY_SERVE_MAX: u64 = 2 * 1024 * 1024; // 2MB
+        // Fast path: combine stat+read+decompress into one spawn_blocking call
+        // to avoid saturating Tokio's blocking thread pool under high concurrency.
+        let path_clone = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            read_file_into_memory(&path_clone, compressed)
+        }).await;
 
-        let file_size = if let Some(ref f) = std_file {
-            f.metadata().ok().map(|m| m.len())
-        } else {
-            tokio::fs::metadata(&path).await.ok().map(|m| m.len())
-        };
-
-        if let Some(size) = file_size {
-            if size <= MEMORY_SERVE_MAX && size > 0 {
-                // Fast path: read entire file into memory, serve from Bytes
-                let data = match tokio::fs::read(&path).await {
-                    Ok(d) => d,
-                    Err(_) => {
-                        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                        return Ok(None);
-                    }
-                };
+        match result {
+            Ok(Some(data)) => {
                 crate::metrics::storage::STORAGE.record_cache_access(&hash);
-
-                let body = if compressed {
-                    match tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&data)).await {
-                        Ok(Some(d)) => bytes::Bytes::from(d),
-                        _ => {
-                            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                            return Ok(None);
-                        }
-                    }
-                } else {
-                    bytes::Bytes::from(data)
-                };
-
+                let body = bytes::Bytes::from(data);
                 return Ok(Some((meta, Box::new(MemoryHitHandler { data: body, sent: false }))));
+            }
+            Ok(None) => {
+                // File is >2MB, empty, or metadata failed — fall through to slow path.
+                // Try to use the open-file cache for the streaming slow path.
+            }
+            Err(_) => {
+                // spawn_blocking panicked or was cancelled
+                return Ok(None);
             }
         }
 
