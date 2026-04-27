@@ -26,7 +26,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Clone)]
 pub struct ProxyCTX {
@@ -215,41 +214,7 @@ struct RequestLimitBinding {
 }
 
 static REQUEST_LIMIT_BINDINGS: Lazy<DashMap<String, RequestLimitBinding>> = Lazy::new(DashMap::new);
-static SERVER_CONN_COUNTS: Lazy<DashMap<i64, AtomicI32>> = Lazy::new(DashMap::new);
-static IP_CONN_COUNTS: Lazy<DashMap<std::net::IpAddr, AtomicI32>> = Lazy::new(DashMap::new);
 const REQUEST_LIMIT_BINDING_IDLE_SECS: u64 = 180;
-static CLEANUP_TASK_STARTED: std::sync::Once = std::sync::Once::new();
-
-pub fn start_request_limit_cleanup_task() {
-    CLEANUP_TASK_STARTED.call_once(|| {
-        tokio::spawn(async {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let now = std::time::Instant::now();
-                let stale_keys: Vec<String> = REQUEST_LIMIT_BINDINGS
-                    .iter()
-                    .filter_map(|entry| {
-                        (now.duration_since(entry.value().last_seen).as_secs()
-                            > REQUEST_LIMIT_BINDING_IDLE_SECS)
-                            .then(|| entry.key().clone())
-                    })
-                    .collect();
-                for key in stale_keys {
-                    if let Some((_, binding)) = REQUEST_LIMIT_BINDINGS.remove(&key) {
-                        if binding.server_id > 0 {
-                            if let Some(counter) = SERVER_CONN_COUNTS.get(&binding.server_id) {
-                                counter.fetch_sub(1, Ordering::Relaxed);
-                            }
-                        }
-                        if let Some(counter) = IP_CONN_COUNTS.get(&binding.client_ip) {
-                            counter.fetch_sub(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-        });
-    });
-}
 const MAX_OPTIMIZATION_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEBP_CONVERSION_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HLS_PLAYLIST_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -486,6 +451,22 @@ impl EdgeProxy {
             .to_string()
     }
 
+    fn cleanup_request_limit_bindings() {
+        let now = std::time::Instant::now();
+        let stale_keys: Vec<String> = REQUEST_LIMIT_BINDINGS
+            .iter()
+            .filter_map(|entry| {
+                (now.duration_since(entry.value().last_seen).as_secs()
+                    > REQUEST_LIMIT_BINDING_IDLE_SECS)
+                    .then(|| entry.key().clone())
+            })
+            .collect();
+
+        for key in stale_keys {
+            REQUEST_LIMIT_BINDINGS.remove(&key);
+        }
+    }
+
     fn try_bind_request_limit_connection(
         &self,
         raw_remote_addr: &str,
@@ -499,6 +480,7 @@ impl EdgeProxy {
             return true;
         }
 
+        Self::cleanup_request_limit_bindings();
         let now = std::time::Instant::now();
 
         if let Some(mut existing) = REQUEST_LIMIT_BINDINGS.get_mut(raw_remote_addr) {
@@ -506,44 +488,22 @@ impl EdgeProxy {
             return true;
         }
 
-        // Prune stale bindings on each new connection attempt
-        let stale_keys: Vec<String> = REQUEST_LIMIT_BINDINGS
-            .iter()
-            .filter_map(|entry| {
-                (now.duration_since(entry.value().last_seen).as_secs()
-                    > REQUEST_LIMIT_BINDING_IDLE_SECS)
-                    .then(|| entry.key().clone())
-            })
-            .collect();
-        for key in &stale_keys {
-            if let Some((_, binding)) = REQUEST_LIMIT_BINDINGS.remove(key) {
-                if binding.server_id > 0 {
-                    if let Some(counter) = SERVER_CONN_COUNTS.get(&binding.server_id) {
-                        counter.fetch_sub(1, Ordering::Relaxed);
-                    }
-                }
-                if let Some(counter) = IP_CONN_COUNTS.get(&binding.client_ip) {
-                    counter.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
-        }
-
         if max_conns > 0 {
-            let current = SERVER_CONN_COUNTS
-                .get(&server_id)
-                .map(|c| c.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            if current >= max_conns {
+            let current_server_conns = REQUEST_LIMIT_BINDINGS
+                .iter()
+                .filter(|entry| entry.value().server_id == server_id)
+                .count() as i32;
+            if current_server_conns >= max_conns {
                 return false;
             }
         }
 
         if max_conns_per_ip > 0 {
-            let current = IP_CONN_COUNTS
-                .get(&client_ip)
-                .map(|c| c.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            if current >= max_conns_per_ip {
+            let current_ip_conns = REQUEST_LIMIT_BINDINGS
+                .iter()
+                .filter(|entry| entry.value().client_ip == client_ip)
+                .count() as i32;
+            if current_ip_conns >= max_conns_per_ip {
                 return false;
             }
         }
@@ -556,16 +516,6 @@ impl EdgeProxy {
                 last_seen: now,
             },
         );
-        if server_id > 0 {
-            SERVER_CONN_COUNTS
-                .entry(server_id)
-                .or_insert_with(|| AtomicI32::new(0))
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        IP_CONN_COUNTS
-            .entry(client_ip)
-            .or_insert_with(|| AtomicI32::new(0))
-            .fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -2624,7 +2574,6 @@ impl ProxyHttp for EdgeProxy {
         let (server, upstream) = self.config.get_server_and_upstream_sync(&host);
         ctx.server = server;
         ctx.lb = upstream;
-        ctx.global_cache_policy = hot_path.cache_policy.clone();
 
         let _is_loopback = session
             .client_addr()
@@ -2866,7 +2815,7 @@ impl ProxyHttp for EdgeProxy {
 
         // Record request start for global metrics
         ctx.request_id = crate::logging::next_request_id();
-
+        
         let sid = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
         if sid > 0 && ctx.server_metrics.is_none() {
             ctx.server_metrics = Some(crate::metrics::record::get_or_create(sid));
@@ -3097,7 +3046,6 @@ impl ProxyHttp for EdgeProxy {
             ctx.waf_group_id = matched.group_id;
             ctx.waf_set_id = matched.set_id;
             ctx.waf_action = Some(matched.action_code.clone());
-            ctx.tags.extend(matched.tags.clone());
             self.maybe_report_firewall_event(
                 ctx,
                 matched.policy_id,
@@ -3513,7 +3461,7 @@ impl ProxyHttp for EdgeProxy {
                 let policy_opt = if let Some(p) = &cache.cache_policy {
                     Some(p.clone())
                 } else {
-                    ctx.global_cache_policy.clone()
+                    self.config.get_cache_policy_sync()
                 };
                 if let Some(policy) = policy_opt {
                     for cache_ref in &policy.cache_refs {
@@ -3633,7 +3581,6 @@ impl ProxyHttp for EdgeProxy {
                 }
 
                 session.cache.enable(CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
-                ctx.cache_hit = Some(true); // optimistic: will be overridden to false if upstream is contacted
             } else {
                 tracing::debug!(
                     "No cache rule matched for request: {}",
@@ -3660,7 +3607,6 @@ impl ProxyHttp for EdgeProxy {
         upstream_response: &mut pingora::http::ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        ctx.cache_hit = Some(false); // contacted upstream, so this is a cache miss
         ctx.origin_status = upstream_response.status.as_u16() as i32;
 
         if let Some(cache_ref) = &ctx.cache_ref {
@@ -3851,7 +3797,6 @@ impl ProxyHttp for EdgeProxy {
                 ctx.waf_group_id = action.group_id;
                 ctx.waf_set_id = action.set_id;
                 ctx.waf_action = Some(action.action_code.clone());
-                ctx.tags.extend(action.tags.clone());
                 self.maybe_report_firewall_event(
                     ctx,
                     action.policy_id,
