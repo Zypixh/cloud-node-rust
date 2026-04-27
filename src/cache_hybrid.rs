@@ -811,6 +811,20 @@ impl Storage for HybridStorage {
         }
 
         if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
+            // Synchronously promote small memory-backed hits to L1 so the NEXT
+            // request is served from memory at microsecond speed. Bytes::clone
+            // is just an Arc refcount increment — near-zero cost.
+            if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
+                if !mem_handler.sent && mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
+                    if let Ok(mut miss_handler) = self.l1.get_miss_handler(key, &meta, trace).await {
+                        let _ = miss_handler.write_body(mem_handler.data.clone(), true).await;
+                        let _ = miss_handler.finish().await;
+                    }
+                }
+            }
+
+            // Async hot promotion for files that don't fit the memory fast path
+            // (e.g. >2MB or already streamed via FileHitHandler).
             let threshold = self
                 .hot_threshold
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -832,7 +846,7 @@ impl Storage for HybridStorage {
                 tokio::spawn(async move {
                     let path = storage_l2.get_path(&cache_key_cloned).await;
                     if let Ok(attr) = tokio::fs::metadata(&path).await {
-                        if attr.len() > 0 && attr.len() < 2 * 1024 * 1024 {
+                        if attr.len() > 0 && attr.len() < MEMORY_SERVE_MAX {
                             if let Ok(mut file) = tokio::fs::File::open(&path).await {
                                 use tokio::io::AsyncReadExt;
                                 let mut buffer = Vec::with_capacity(attr.len() as usize);
