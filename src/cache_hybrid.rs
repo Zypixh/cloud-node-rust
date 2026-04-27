@@ -395,7 +395,7 @@ impl Storage for FileStorage {
             || content_type.contains("xml"))
             && content_encoding.is_empty();
 
-        tracing::info!(
+        tracing::debug!(
             "CACHE_UPDATE_META: hash: {}, status: {}, compressed: {}, headers_len: {}",
             hash,
             status,

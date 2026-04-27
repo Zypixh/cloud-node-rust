@@ -506,6 +506,28 @@ impl EdgeProxy {
             return true;
         }
 
+        // Prune stale bindings on each new connection attempt
+        let stale_keys: Vec<String> = REQUEST_LIMIT_BINDINGS
+            .iter()
+            .filter_map(|entry| {
+                (now.duration_since(entry.value().last_seen).as_secs()
+                    > REQUEST_LIMIT_BINDING_IDLE_SECS)
+                    .then(|| entry.key().clone())
+            })
+            .collect();
+        for key in &stale_keys {
+            if let Some((_, binding)) = REQUEST_LIMIT_BINDINGS.remove(key) {
+                if binding.server_id > 0 {
+                    if let Some(counter) = SERVER_CONN_COUNTS.get(&binding.server_id) {
+                        counter.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                if let Some(counter) = IP_CONN_COUNTS.get(&binding.client_ip) {
+                    counter.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+
         if max_conns > 0 {
             let current = SERVER_CONN_COUNTS
                 .get(&server_id)
@@ -2576,7 +2598,15 @@ impl ProxyHttp for EdgeProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let _reqfil_start = std::time::Instant::now();
+        let hot_path = self.config.get_hot_path_snapshot_sync();
+
+        // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
+        ctx.is_on = hot_path.is_on;
+        if !ctx.is_on {
+            debug!("Node is DISABLED (isOn=false). Rejecting request.");
+            return self.respond_status_with_pages(session, ctx, 403).await;
+        }
+
         let host = session
             .get_header("host")
             .and_then(|v| v.to_str().ok())
@@ -2591,18 +2621,10 @@ impl ProxyHttp for EdgeProxy {
             return Ok(true);
         }
 
-        // Single RwLock read for all hot-path config (hot_path + server + upstream)
-        let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
+        let (server, upstream) = self.config.get_server_and_upstream_sync(&host);
         ctx.server = server;
         ctx.lb = upstream;
         ctx.global_cache_policy = hot_path.cache_policy.clone();
-
-        // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
-        ctx.is_on = hot_path.is_on;
-        if !ctx.is_on {
-            debug!("Node is DISABLED (isOn=false). Rejecting request.");
-            return self.respond_status_with_pages(session, ctx, 403).await;
-        }
 
         let _is_loopback = session
             .client_addr()
@@ -2827,37 +2849,19 @@ impl ProxyHttp for EdgeProxy {
             }
         }
 
-        // Determine cacheability and WAF status early — so we can skip WAF checks
-        // entirely for cacheable GET/HEAD requests when no WAF policies are configured.
-        let method = session.req_header().method.clone();
-        let has_cache = ctx
-            .server
-            .as_ref()
-            .and_then(|s| s.web.as_ref())
-            .and_then(|w| w.cache.as_ref())
-            .map(|c| c.is_on)
-            .unwrap_or(false);
-        let is_cacheable_get =
-            (method == http::Method::GET || method == http::Method::HEAD) && has_cache;
-        let has_waf = !hot_path.firewall_policies.is_empty();
+        if self.waf_state.is_whitelisted(
+            ctx.client_ip,
+            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+        ) {
+            return Ok(false);
+        }
 
-        // WAF checks: only run when WAF is actually configured.
-        // Cacheable GET/HEAD with no WAF policies skips entirely.
-        if !is_cacheable_get || has_waf {
-            if self.waf_state.is_whitelisted(
-                ctx.client_ip,
-                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-            ) {
-                return Ok(false);
-            }
-
-            let ua = session
-                .get_header("user-agent")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if self.check_waf_challenge(session, &ctx.client_ip_str, ua, ctx) {
-                return Ok(false);
-            }
+        let ua = session
+            .get_header("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if self.check_waf_challenge(session, &ctx.client_ip_str, ua, ctx) {
+            return Ok(false);
         }
 
         // Record request start for global metrics
