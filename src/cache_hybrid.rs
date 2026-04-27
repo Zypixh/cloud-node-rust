@@ -128,12 +128,14 @@ impl Storage for FileStorage {
         };
 
         let path = self.get_path(key).await;
-        if !path.exists() {
-            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-            return Ok(None);
-        }
 
-        let file = tokio::fs::File::open(&path).await.map_err(|_| Error::new(ErrorType::InternalError))?;
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(_) => {
+                crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                return Ok(None);
+            }
+        };
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
         let meta = CacheMeta::new(
@@ -732,12 +734,18 @@ impl Storage for HybridStorage {
                                         header,
                                     );
                                     let _trace = pingora_cache::trace::Span::inactive().handle();
-                                    // Use Global CACHE to bypass E0597
-                                    let _ = crate::cache_manager::CACHE
-                                        .storage
-                                        .l1
-                                        .get_miss_handler(&cache_key_cloned, &new_meta, &_trace)
-                                        .await;
+                                    if let Ok(mut miss_handler) =
+                                        crate::cache_manager::CACHE
+                                            .storage
+                                            .l1
+                                            .get_miss_handler(&cache_key_cloned, &new_meta, &_trace)
+                                            .await
+                                    {
+                                        let _ = miss_handler
+                                            .write_body(bytes::Bytes::from(buffer), true)
+                                            .await;
+                                        let _ = miss_handler.finish().await;
+                                    }
                                 }
                             }
                         }

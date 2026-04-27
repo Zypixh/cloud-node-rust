@@ -1,7 +1,9 @@
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use rocksdb::{DB, MergeOperands, Options, WriteBatch};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tracing::error;
 
 /// A specialized storage engine for metrics based on RocksDB.
@@ -173,21 +175,51 @@ impl MetricStorage {
         );
     }
 
+    /// Records a cache access in memory only — no RocksDB I/O on the hot path.
+    /// Access timestamps and counts are flushed to RocksDB periodically by the background task.
     pub fn record_cache_access(&self, hash: &str) {
+        let now = crate::utils::time::now_timestamp();
+        CACHE_ACCESS_LOG
+            .entry(hash.to_string())
+            .or_insert_with(|| (AtomicI64::new(now), AtomicU64::new(0)));
+        if let Some(entry) = CACHE_ACCESS_LOG.get(hash) {
+            entry.0.store(now, Ordering::Relaxed);
+            entry.1.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Flush in-memory access logs to RocksDB. Called by background task every 30s.
+    pub fn flush_cache_accesses(&self) {
         let Some(db) = &self.db else {
             return;
         };
-        let key = format!("CMETA_{}", hash);
-        if let Ok(Some(val)) = db.get(key.as_bytes())
-            && let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&val)
-        {
-            let now = crate::utils::time::now_timestamp();
-            meta["a"] = serde_json::json!(now);
-            if let Some(f) = meta["f"].as_u64() {
-                meta["f"] = serde_json::json!(f + 1);
-            }
-            let _ = db.put(key.as_bytes(), meta.to_string().as_bytes());
+        if CACHE_ACCESS_LOG.is_empty() {
+            return;
         }
+        let mut batch = WriteBatch::default();
+        for entry in CACHE_ACCESS_LOG.iter() {
+            let hash = entry.key();
+            let (access_ts, access_cnt) = entry.value();
+            let now = crate::utils::time::now_timestamp();
+            let cnt = access_cnt.swap(0, Ordering::Relaxed);
+            let ts = access_ts.load(Ordering::Relaxed);
+            if cnt == 0 {
+                continue;
+            }
+            let db_key = format!("CMETA_{}", hash);
+            if let Ok(Some(val)) = db.get(db_key.as_bytes())
+                && let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&val)
+            {
+                meta["a"] = serde_json::json!(ts);
+                if let Some(f) = meta["f"].as_u64() {
+                    meta["f"] = serde_json::json!(f + cnt);
+                }
+                batch.put(db_key.as_bytes(), meta.to_string().as_bytes());
+            }
+            // Stale entries without backing RocksDB data are silently dropped
+            let _ = now; // suppress unused warning
+        }
+        let _ = db.write(batch);
     }
 
     pub fn get_cache_meta(&self, hash: &str) -> Option<serde_json::Value> {
@@ -373,3 +405,17 @@ pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
         }
     }
 });
+
+/// In-memory cache access tracker: hash → (last_access_timestamp, access_count)
+/// Eliminates synchronous RocksDB I/O from the cache HIT hot path.
+static CACHE_ACCESS_LOG: Lazy<DashMap<String, (AtomicI64, AtomicU64)>> = Lazy::new(DashMap::new);
+
+/// Start a background task that flushes in-memory cache access logs to RocksDB every 30 seconds.
+pub fn start_cache_access_flusher() {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            STORAGE.flush_cache_accesses();
+        }
+    });
+}
