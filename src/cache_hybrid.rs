@@ -6,6 +6,7 @@ use pingora_cache::storage::{
     HandleHit, HandleMiss, HitHandler, MissFinishType, MissHandler, PurgeType, Storage,
 };
 use pingora_cache::{CacheKey, CacheMeta, MemCache};
+use pingora_cache::key::CacheHashKey;
 use pingora_core::{Error, ErrorType, Result};
 use std::any::Any;
 use std::path::PathBuf;
@@ -586,6 +587,17 @@ impl HandleMiss for FileMissHandler {
     }
 }
 
+/// Fast lock-free L1 entry stored in a sharded DashMap.
+/// Bypasses Pingora's single-lock MemCache entirely.
+struct FastL1Entry {
+    data: bytes::Bytes,
+    fresh_until: i64,
+    created_at: i64,
+}
+
+/// Global lock-free L1 cache. Sharded by DashMap, no contention at 1000+ concurrent reads.
+static FAST_L1: Lazy<DashMap<String, FastL1Entry>> = Lazy::new(DashMap::new);
+
 pub struct HybridStorage {
     pub l1: Arc<MemCache>,
     pub l2: &'static FileStorage,
@@ -731,7 +743,11 @@ impl HybridStorage {
         let _ = fs::remove_file(&path).await;
         crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
 
-        let ck = CacheKey::new("edge", key, "").to_compact();
+        // Clear from lock-free L1 cache
+        let full_key = CacheKey::new("edge", key, "");
+        FAST_L1.remove(&full_key.combined());
+
+        let ck = full_key.to_compact();
         // Use Global CACHE to bypass E0597
         tokio::spawn(async move {
             let trace = pingora_cache::trace::Span::inactive().handle();
@@ -806,6 +822,27 @@ impl Storage for HybridStorage {
             return self.l1.lookup(key, trace).await;
         }
 
+        // Check lock-free L1 cache first (DashMap, sharded, zero contention)
+        let fast_key = key.combined();
+        if let Some(entry) = FAST_L1.get(&fast_key) {
+            let now = crate::utils::time::now_timestamp();
+            if entry.fresh_until > now {
+                let headers = pingora_http::ResponseHeader::build(200, None).unwrap();
+                let meta = CacheMeta::new(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.fresh_until as u64),
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.created_at as u64),
+                    0,
+                    0,
+                    headers,
+                );
+                prof_record_l1_hit();
+                return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), sent: false }))));
+            }
+            // Expired: remove and fall through to L2
+            FAST_L1.remove(&fast_key);
+        }
+
+        // Fallback: try MemCache (for entries promoted before this change)
         if let Some(hit) = self.l1.lookup(key, trace).await? {
             prof_record_l1_hit();
             return Ok(Some(hit));
@@ -813,16 +850,21 @@ impl Storage for HybridStorage {
 
         if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
             prof_record_l2_hit();
-            // Synchronously promote small memory-backed hits to L1 so the NEXT
-            // request is served from memory at microsecond speed. Bytes::clone
-            // is just an Arc refcount increment — near-zero cost.
+            // Store in lock-free FAST_L1 for subsequent zero-copy hits.
+            // Skip the single-lock MemCache — it's a bottleneck at 1000+ concurrency.
             if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
                 if !mem_handler.sent && mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
-                    if let Ok(mut miss_handler) = self.l1.get_miss_handler(key, &meta, trace).await {
-                        let _ = miss_handler.write_body(mem_handler.data.clone(), true).await;
-                        let _ = miss_handler.finish().await;
-                        prof_record_l2_mem_promotion();
-                    }
+                    let now = crate::utils::time::now_timestamp();
+                    let fresh_until = meta.fresh_until()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(std::time::Duration::from_secs(3600))
+                        .as_secs() as i64;
+                    FAST_L1.insert(fast_key, FastL1Entry {
+                        data: mem_handler.data.clone(),
+                        fresh_until,
+                        created_at: now,
+                    });
+                    prof_record_l2_mem_promotion();
                 }
             }
 
@@ -1060,6 +1102,22 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
 // ═══════════════════════════════════════════════════════════
 
 use std::sync::atomic::AtomicU64;
+
+/// Public API: ultra-fast cache lookup for direct use in request_filter.
+/// Returns the cached body bytes if a valid entry exists, bypassing all
+/// Pingora cache framework overhead (phases, state machines, locks).
+pub fn fast_l1_lookup(key_str: &str) -> Option<bytes::Bytes> {
+    let ck = CacheKey::new("edge", key_str, "");
+    let fast_key = ck.combined();
+    if let Some(entry) = FAST_L1.get(&fast_key) {
+        let now = crate::utils::time::now_timestamp();
+        if entry.fresh_until > now {
+            return Some(entry.data.clone());
+        }
+        FAST_L1.remove(&fast_key);
+    }
+    None
+}
 
 static PROF_L1_HITS: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_HITS: AtomicU64 = AtomicU64::new(0);
