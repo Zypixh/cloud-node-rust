@@ -155,9 +155,6 @@ impl MetricStorage {
         compressed: bool,
         status: u16,
     ) {
-        let Some(db) = &self.db else {
-            return;
-        };
         let now = crate::utils::time::now_timestamp();
         let meta = serde_json::json!({
             "k": key_str,
@@ -169,6 +166,10 @@ impl MetricStorage {
             "h": headers.unwrap_or(serde_json::json!({})),
             "c": compressed
         });
+        CACHE_META_INDEX.insert(hash.to_string(), meta.clone());
+        let Some(db) = &self.db else {
+            return;
+        };
         let _ = db.put(
             format!("CMETA_{}", hash).as_bytes(),
             meta.to_string().as_bytes(),
@@ -200,37 +201,30 @@ impl MetricStorage {
         for entry in CACHE_ACCESS_LOG.iter() {
             let hash = entry.key();
             let (access_ts, access_cnt) = entry.value();
-            let now = crate::utils::time::now_timestamp();
             let cnt = access_cnt.swap(0, Ordering::Relaxed);
             let ts = access_ts.load(Ordering::Relaxed);
             if cnt == 0 {
                 continue;
             }
-            let db_key = format!("CMETA_{}", hash);
-            if let Ok(Some(val)) = db.get(db_key.as_bytes())
-                && let Ok(mut meta) = serde_json::from_slice::<serde_json::Value>(&val)
-            {
+            // Read from in-memory index, update, write back
+            if let Some(mut meta) = CACHE_META_INDEX.get(hash).map(|v| v.clone()) {
                 meta["a"] = serde_json::json!(ts);
                 if let Some(f) = meta["f"].as_u64() {
                     meta["f"] = serde_json::json!(f + cnt);
                 }
+                let db_key = format!("CMETA_{}", hash);
                 batch.put(db_key.as_bytes(), meta.to_string().as_bytes());
             }
-            // Stale entries without backing RocksDB data are silently dropped
-            let _ = now; // suppress unused warning
         }
         let _ = db.write(batch);
     }
 
     pub fn get_cache_meta(&self, hash: &str) -> Option<serde_json::Value> {
-        let db = self.db.as_ref()?;
-        db.get(format!("CMETA_{}", hash).as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_slice(&v).ok())
+        CACHE_META_INDEX.get(hash).map(|v| v.clone())
     }
 
     pub fn delete_cache_meta(&self, hash: &str) {
+        CACHE_META_INDEX.remove(hash);
         let Some(db) = &self.db else {
             return;
         };
@@ -277,23 +271,11 @@ impl MetricStorage {
     }
 
     pub fn cache_summary(&self) -> (usize, u64) {
-        let mut count = 0usize;
-        let mut size = 0u64;
-        let Some(db) = &self.db else {
-            return (0, 0);
-        };
-
-        let iter = db.prefix_iterator("CMETA_".as_bytes());
-        for (key, val) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
-            if !key_str.starts_with("CMETA_") {
-                break;
-            }
-            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
-                count += 1;
-                size += meta["s"].as_u64().unwrap_or(0);
-            }
-        }
+        let count = CACHE_META_INDEX.len();
+        let size = CACHE_META_INDEX
+            .iter()
+            .map(|entry| entry.value().get("s").and_then(|v| v.as_u64()).unwrap_or(0))
+            .sum();
         (count, size)
     }
 
@@ -328,46 +310,17 @@ impl MetricStorage {
     where
         F: FnMut(String, serde_json::Value),
     {
-        let Some(db) = &self.db else {
-            return;
-        };
-        let iter = db.prefix_iterator("CMETA_".as_bytes());
-        for (key, val) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
-            if !key_str.starts_with("CMETA_") {
-                break;
-            }
-            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
-                let hash = key_str
-                    .strip_prefix("CMETA_")
-                    .unwrap_or(&key_str)
-                    .to_string();
-                f(hash, meta);
-            }
+        for entry in CACHE_META_INDEX.iter() {
+            f(entry.key().clone(), entry.value().clone());
         }
     }
 
     /// Scans all cache metadata, returning a vector of (hash, metadata_json)
     pub fn scan_all_cache_meta(&self) -> Vec<(String, serde_json::Value)> {
-        let Some(db) = &self.db else {
-            return Vec::new();
-        };
-        let mut results = Vec::new();
-        let iter = db.prefix_iterator("CMETA_".as_bytes());
-        for (key, val) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key).to_string();
-            if !key_str.starts_with("CMETA_") {
-                break;
-            }
-            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
-                let hash = key_str
-                    .strip_prefix("CMETA_")
-                    .unwrap_or(&key_str)
-                    .to_string();
-                results.push((hash, meta));
-            }
-        }
-        results
+        CACHE_META_INDEX
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
     }
 
     /// Scans keys with a prefix, useful for extracting metrics for a specific server or period.
@@ -410,8 +363,38 @@ pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
 /// Eliminates synchronous RocksDB I/O from the cache HIT hot path.
 static CACHE_ACCESS_LOG: Lazy<DashMap<String, (AtomicI64, AtomicU64)>> = Lazy::new(DashMap::new);
 
+/// In-memory cache metadata index: hash → metadata JSON.
+/// All cache lookups read from here, eliminating synchronous RocksDB reads on the hot path.
+static CACHE_META_INDEX: Lazy<DashMap<String, serde_json::Value>> = Lazy::new(DashMap::new);
+
+/// Load all existing cache metadata from RocksDB into the in-memory index at startup.
+pub fn load_cache_meta_index() {
+    let Some(db) = &STORAGE.db else {
+        return;
+    };
+    let mut count = 0;
+    let iter = db.prefix_iterator("CMETA_".as_bytes());
+    for (key, val) in iter.flatten() {
+        let key_str = String::from_utf8_lossy(&key);
+        if !key_str.starts_with("CMETA_") {
+            break;
+        }
+        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
+            let hash = key_str
+                .strip_prefix("CMETA_")
+                .unwrap_or(&key_str)
+                .to_string();
+            CACHE_META_INDEX.insert(hash, meta);
+            count += 1;
+        }
+    }
+    tracing::info!("Loaded {} cache metadata entries into memory", count);
+}
+
 /// Start a background task that flushes in-memory cache access logs to RocksDB every 30 seconds.
 pub fn start_cache_access_flusher() {
+    // Load existing metadata into memory first
+    load_cache_meta_index();
     tokio::spawn(async {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;

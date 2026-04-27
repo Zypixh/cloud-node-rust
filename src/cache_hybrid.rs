@@ -849,18 +849,16 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
         let mut current_size: u64 = 0;
         let mut expired_hashes = Vec::new();
 
-        // Pass 1: Stream metadata, instantly collect expired, calculate current size
-        tokio::task::block_in_place(|| {
-            crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
-                let expires = meta["e"].as_i64().unwrap_or(0);
-                let size = meta["s"].as_u64().unwrap_or(0);
+        // Pass 1: Stream metadata from in-memory index, collect expired, calculate size
+        crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
+            let expires = meta["e"].as_i64().unwrap_or(0);
+            let size = meta["s"].as_u64().unwrap_or(0);
 
-                if now > expires {
-                    expired_hashes.push(hash);
-                } else {
-                    current_size += size;
-                }
-            });
+            if now > expires {
+                expired_hashes.push(hash);
+            } else {
+                current_size += size;
+            }
         });
 
         // Execute: Delete expired files
@@ -877,38 +875,34 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
             let mut heap = std::collections::BinaryHeap::new();
             let mut heap_bytes: u64 = 0;
 
-            tokio::task::block_in_place(|| {
-                crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
-                    let expires = meta["e"].as_i64().unwrap_or(0);
-                    // Only process active files
-                    if now <= expires {
-                        let size = meta["s"].as_u64().unwrap_or(0);
-                        let access_time = meta["a"].as_i64().unwrap_or(0);
+            crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
+                let expires = meta["e"].as_i64().unwrap_or(0);
+                // Only process active files
+                if now <= expires {
+                    let size = meta["s"].as_u64().unwrap_or(0);
+                    let access_time = meta["a"].as_i64().unwrap_or(0);
 
-                        heap.push(EvictCandidate {
-                            access_time,
-                            size,
-                            hash,
-                        });
-                        heap_bytes += size;
+                    heap.push(EvictCandidate {
+                        access_time,
+                        size,
+                        hash,
+                    });
+                    heap_bytes += size;
 
-                        // Maintain the heap size just enough to free the required bytes
-                        // Since it's a Max-Heap, peek() returns the NEWEST file in the candidate pool.
-                        // We safely discard it if the remaining pool is still big enough.
-                        while heap_bytes > bytes_to_free {
-                            if let Some(top) = heap.peek() {
-                                if heap_bytes - top.size >= bytes_to_free {
-                                    heap_bytes -= top.size;
-                                    heap.pop();
-                                } else {
-                                    break;
-                                }
+                    // Maintain the heap size just enough to free the required bytes
+                    while heap_bytes > bytes_to_free {
+                        if let Some(top) = heap.peek() {
+                            if heap_bytes - top.size >= bytes_to_free {
+                                heap_bytes -= top.size;
+                                heap.pop();
                             } else {
                                 break;
                             }
+                        } else {
+                            break;
                         }
                     }
-                });
+                }
             });
 
             // Execute: Delete oldest files
