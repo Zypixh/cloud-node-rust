@@ -174,9 +174,12 @@ impl Storage for FileStorage {
         // Fast path: combine stat+read+decompress into one spawn_blocking call
         // to avoid saturating Tokio's blocking thread pool under high concurrency.
         let path_clone = path.clone();
+        let t0 = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             read_file_into_memory(&path_clone, compressed)
         }).await;
+        let elapsed_us = t0.elapsed().as_micros() as u64;
+        PROF_DISK_READ_US.fetch_add(elapsed_us, Ordering::Relaxed);
 
         match result {
             Ok(Some(data)) => {
@@ -1122,6 +1125,14 @@ static PROF_L1_HITS: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_HITS: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_MEM_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_ASYNC_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
+/// Accumulated disk read time in microseconds for the current 10s window.
+static PROF_DISK_READ_US: AtomicU64 = AtomicU64::new(0);
+/// Accumulated request_filter wall time in microseconds for the current 10s window.
+static PROF_REQFILT_US: AtomicU64 = AtomicU64::new(0);
+/// Number of request_filter calls in the current 10s window.
+static PROF_REQFILT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Number of FAST PATH (cacheable GET/HEAD early return) exits in the current 10s window.
+static PROF_FASTPATH_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn prof_record_l1_hit() {
     PROF_L1_HITS.fetch_add(1, Ordering::Relaxed);
@@ -1135,6 +1146,13 @@ pub fn prof_record_l2_mem_promotion() {
 pub fn prof_record_l2_async_promotion() {
     PROF_L2_ASYNC_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
 }
+pub fn prof_record_reqfilter(us: u64) {
+    PROF_REQFILT_US.fetch_add(us, Ordering::Relaxed);
+    PROF_REQFILT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+pub fn prof_record_fastpath() {
+    PROF_FASTPATH_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Start a background task that logs cache performance stats every 10 seconds.
 /// Provides real-time visibility into L1/L2 hit ratios and promotion rates.
@@ -1146,13 +1164,19 @@ pub fn start_cache_profiler() {
             let l2 = PROF_L2_HITS.swap(0, Ordering::Relaxed);
             let sync_prom = PROF_L2_MEM_PROMOTIONS.swap(0, Ordering::Relaxed);
             let async_prom = PROF_L2_ASYNC_PROMOTIONS.swap(0, Ordering::Relaxed);
+            let disk_us = PROF_DISK_READ_US.swap(0, Ordering::Relaxed);
+            let reqfil_us = PROF_REQFILT_US.swap(0, Ordering::Relaxed);
+            let reqfil_cnt = PROF_REQFILT_COUNT.swap(0, Ordering::Relaxed);
+            let fastpath = PROF_FASTPATH_COUNT.swap(0, Ordering::Relaxed);
             let total = l1 + l2;
-            if total == 0 {
+            if total == 0 && reqfil_cnt == 0 {
                 continue;
             }
             let l1_pct = if total > 0 { l1 as f64 / total as f64 * 100.0 } else { 0.0 };
+            let avg_disk_ms = if l2 > 0 { disk_us as f64 / l2 as f64 / 1000.0 } else { 0.0 };
+            let avg_reqfil_ms = if reqfil_cnt > 0 { reqfil_us as f64 / reqfil_cnt as f64 / 1000.0 } else { 0.0 };
             tracing::info!(
-                "CACHE_PROFILE: L1={l1}/s L2={l2}/s L1%={l1_pct:.1} sync_prom={sync_prom}/s async_prom={async_prom}/s total={total}/s"
+                "CACHE_PROFILE: L1={l1}/s L2={l2}/s L1%={l1_pct:.1} sync_prom={sync_prom}/s async_prom={async_prom}/s total={total}/s disk={avg_disk_ms:.1}ms rf={avg_reqfil_ms:.1}ms fp={fastpath}/s"
             );
         }
     });

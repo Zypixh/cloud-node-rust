@@ -2576,6 +2576,7 @@ impl ProxyHttp for EdgeProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        let _reqfil_start = std::time::Instant::now();
         let host = session
             .get_header("host")
             .and_then(|v| v.to_str().ok())
@@ -2841,9 +2842,53 @@ impl ProxyHttp for EdgeProxy {
             return Ok(false);
         }
 
-        // Record request start for global metrics
+        // Security: check if client IP is globally blocked
+        if self.waf_state.is_blocked(
+            ctx.client_ip,
+            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+        ) {
+            return self.respond_status_with_pages(session, ctx, 403).await;
+        }
+
+        // Request ID (cheap atomic) + connection limit (DoS protection)
         ctx.request_id = crate::logging::next_request_id();
-        
+
+        if self.enforce_request_limit(session, ctx).await? {
+            return Ok(true);
+        }
+
+        // FAST PATH: Cacheable GET/HEAD requests skip ALL remaining middleware,
+        // metrics, and limit enforcement. These requests are served from Pingora's
+        // proxy_cache phase (memory hit from FAST_L1), so nothing else matters.
+        let method = session.req_header().method.clone();
+        let has_cache = ctx
+            .server
+            .as_ref()
+            .and_then(|s| s.web.as_ref())
+            .and_then(|w| w.cache.as_ref())
+            .map(|c| c.is_on)
+            .unwrap_or(false);
+        if (method == http::Method::GET || method == http::Method::HEAD) && has_cache {
+            // Lightweight request counting — just atomics, no RwLock reads or IP tracking
+            let sid = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
+            if sid > 0 {
+                if ctx.server_metrics.is_none() {
+                    ctx.server_metrics = Some(crate::metrics::record::get_or_create(sid));
+                }
+                if let Some(m) = &ctx.server_metrics {
+                    m.total_requests.fetch_add(1, Ordering::Relaxed);
+                    m.active_connections.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let elapsed_us = _reqfil_start.elapsed().as_micros() as u64;
+            crate::cache_hybrid::prof_record_reqfilter(elapsed_us);
+            crate::cache_hybrid::prof_record_fastpath();
+            return Ok(false);
+        }
+
+        // --- BELOW: only for non-cacheable (miss / POST / no-cache-config) requests ---
+
+        // Metrics tracking (deferred past cache-hit fast path)
         let sid = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
         if sid > 0 && ctx.server_metrics.is_none() {
             ctx.server_metrics = Some(crate::metrics::record::get_or_create(sid));
@@ -2868,39 +2913,12 @@ impl ProxyHttp for EdgeProxy {
             ctx.ip_recorded,
         );
 
-        if self.enforce_request_limit(session, ctx).await? {
-            return Ok(true);
-        }
-
         if self.enforce_traffic_limit(session, ctx).await? {
             return Ok(true);
         }
 
         if self.enforce_plan_max_upload(session, ctx).await? {
             return Ok(true);
-        }
-
-        if self.waf_state.is_blocked(
-            ctx.client_ip,
-            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-        ) {
-            return self.respond_status_with_pages(session, ctx, 403).await;
-        }
-
-        // FAST PATH: Cacheable GET/HEAD requests skip heavyweight middleware.
-        // These requests are served directly from Pingora's proxy_cache phase,
-        // so body buffering, WAF body inspection, CC loops, and rewrite evaluation
-        // are either irrelevant (no body) or redundant with the cache response.
-        let method = session.req_header().method.clone();
-        let has_cache = ctx
-            .server
-            .as_ref()
-            .and_then(|s| s.web.as_ref())
-            .and_then(|w| w.cache.as_ref())
-            .map(|c| c.is_on)
-            .unwrap_or(false);
-        if (method == http::Method::GET || method == http::Method::HEAD) && has_cache {
-            return Ok(false);
         }
 
         // 1. Mandatory Global Special Defenses
