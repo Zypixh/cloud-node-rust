@@ -17,8 +17,18 @@ use tokio::sync::RwLock;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Global cache for open file handles to reduce open() syscalls (Task 10)
+/// Global cache for open file handles to reduce open() syscalls
 static OPEN_FILE_CACHE: Lazy<DashMap<PathBuf, Arc<std::fs::File>>> = Lazy::new(DashMap::new);
+
+/// Synchronous zstd decompression for serving small files from memory.
+fn zstd_decompress_to_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let decoder = zstd::Decoder::new(data).ok()?;
+    let mut out = Vec::with_capacity(data.len() * 3);
+    let mut reader = std::io::BufReader::new(decoder);
+    reader.read_to_end(&mut out).ok()?;
+    Some(out)
+}
 
 /// Dynamic Disk-based storage for Pingora-cache
 pub struct FileStorage {
@@ -129,14 +139,12 @@ impl Storage for FileStorage {
 
         let path = self.get_path(key).await;
 
-        let file = match tokio::fs::File::open(&path).await {
-            Ok(f) => f,
-            Err(_) => {
-                crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                return Ok(None);
-            }
+        // Check the open-file cache first
+        let std_file = if self.enable_file_cache.load(Ordering::Relaxed) {
+            OPEN_FILE_CACHE.get(&path).map(|r| Arc::clone(r.value()))
+        } else {
+            None
         };
-        crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
         let meta = CacheMeta::new(
             std::time::SystemTime::now() + std::time::Duration::from_secs(ttl_remaining),
@@ -145,6 +153,76 @@ impl Storage for FileStorage {
             0,
             headers,
         );
+
+        // Read the entire file into memory for small files to eliminate streaming overhead.
+        // Go achieves 0.3ms cache hits by serving from memory; we match that by reading
+        // the full file in one syscall and serving from a Bytes buffer.
+        const MEMORY_SERVE_MAX: u64 = 2 * 1024 * 1024; // 2MB
+
+        let file_size = if let Some(ref f) = std_file {
+            f.metadata().ok().map(|m| m.len())
+        } else {
+            tokio::fs::metadata(&path).await.ok().map(|m| m.len())
+        };
+
+        if let Some(size) = file_size {
+            if size <= MEMORY_SERVE_MAX && size > 0 {
+                // Fast path: read entire file into memory, serve from Bytes
+                let data = match tokio::fs::read(&path).await {
+                    Ok(d) => d,
+                    Err(_) => {
+                        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                        return Ok(None);
+                    }
+                };
+                crate::metrics::storage::STORAGE.record_cache_access(&hash);
+
+                let body = if compressed {
+                    match tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&data)).await {
+                        Ok(Some(d)) => bytes::Bytes::from(d),
+                        _ => {
+                            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                            return Ok(None);
+                        }
+                    }
+                } else {
+                    bytes::Bytes::from(data)
+                };
+
+                return Ok(Some((meta, Box::new(MemoryHitHandler { data: body, sent: false }))));
+            }
+        }
+
+        // Slow path for large files: streaming with open file cache.
+        // Open via std::fs::File so we can try_clone() the fd into OPEN_FILE_CACHE.
+        let file = match std_file {
+            Some(f) => {
+                // Duplicate the cached fd for this request
+                let dup = f.try_clone().map_err(|_| Error::new(ErrorType::InternalError))?;
+                tokio::fs::File::from_std(dup)
+            }
+            None => {
+                let path_clone = path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    std::fs::File::open(&path_clone)
+                }).await;
+                match result {
+                    Ok(Ok(std_f)) => {
+                        if self.enable_file_cache.load(Ordering::Relaxed) {
+                            if let Ok(cached) = std_f.try_clone() {
+                                OPEN_FILE_CACHE.insert(path.clone(), Arc::new(cached));
+                            }
+                        }
+                        tokio::fs::File::from_std(std_f)
+                    }
+                    _ => {
+                        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                        return Ok(None);
+                    }
+                }
+            },
+        };
+        crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
         let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if compressed {
             let buf_reader = tokio::io::BufReader::new(file);
@@ -338,6 +416,41 @@ impl Storage for FileStorage {
     }
 }
 
+/// In-memory hit handler that serves from a Bytes buffer.
+/// Eliminates disk I/O on every cache hit by reading the entire file once.
+struct MemoryHitHandler {
+    data: bytes::Bytes,
+    sent: bool,
+}
+
+#[async_trait]
+impl HandleHit for MemoryHitHandler {
+    async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
+        if self.sent {
+            return Ok(None);
+        }
+        self.sent = true;
+        Ok(Some(self.data.clone()))
+    }
+
+    async fn finish(
+        self: Box<Self>,
+        _storage: &'static (dyn Storage + Sync),
+        _key: &CacheKey,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn as_any(&self) -> &(dyn Any + Send + Sync) {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
+        self
+    }
+}
+
+/// Streaming file hit handler for large files that don't fit in the memory budget.
 struct FileHitHandler {
     reader: tokio::sync::Mutex<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
 }
@@ -346,7 +459,7 @@ struct FileHitHandler {
 impl HandleHit for FileHitHandler {
     async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
         use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 32768]; // Use 32KB chunks for high performance
+        let mut buf = vec![0u8; 32768];
         let mut r = self.reader.lock().await;
         let res = r.read(&mut buf).await.map_err(|e| {
             tracing::error!(
