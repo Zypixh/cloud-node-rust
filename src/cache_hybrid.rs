@@ -164,18 +164,34 @@ impl Storage for FileStorage {
             headers,
         );
 
-        // DEBUG: Use old-style direct tokio::fs::File::open without spawn_blocking.
-        let file = tokio::fs::File::open(&path).await
+        // Use async tokio::fs::read instead of spawn_blocking to test if
+        // spawn_blocking is the root cause of the connection leak.
+        let file_data = tokio::fs::read(&path).await
             .map_err(|_| Error::new(ErrorType::InternalError))?;
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
+        if file_data.len() <= MEMORY_SERVE_MAX as usize {
+            let body = if compressed {
+                let result = tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&file_data)).await;
+                match result {
+                    Ok(Some(data)) => bytes::Bytes::from(data),
+                    _ => return Ok(None),
+                }
+            } else {
+                bytes::Bytes::from(file_data)
+            };
+            return Ok(Some((meta, Box::new(MemoryHitHandler { data: body, sent: false }))));
+        }
+
+        // Slow path for large files: streaming via tokio async I/O
+        let file = tokio::fs::File::open(&path).await
+            .map_err(|_| Error::new(ErrorType::InternalError))?;
         let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if compressed {
             let buf_reader = tokio::io::BufReader::new(file);
             Box::new(async_compression::tokio::bufread::ZstdDecoder::new(buf_reader))
         } else {
             Box::new(file)
         };
-
         let handler = Box::new(FileHitHandler {
             reader: tokio::sync::Mutex::new(reader),
         });
