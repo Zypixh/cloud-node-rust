@@ -165,8 +165,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         .unwrap_or_default();
 
     // Format times matching Go: ISO8601 and Apache Common Log Format
-    let start_dt = chrono::DateTime::from_timestamp_millis(request_started_at_millis)
-        .unwrap_or_default();
+    let start_dt = crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
     let time_iso8601 = start_dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
     let time_local = start_dt.format("%d/%b/%Y:%H:%M:%S %z").to_string();
 
