@@ -807,10 +807,12 @@ impl Storage for HybridStorage {
         }
 
         if let Some(hit) = self.l1.lookup(key, trace).await? {
+            prof_record_l1_hit();
             return Ok(Some(hit));
         }
 
         if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
+            prof_record_l2_hit();
             // Synchronously promote small memory-backed hits to L1 so the NEXT
             // request is served from memory at microsecond speed. Bytes::clone
             // is just an Arc refcount increment — near-zero cost.
@@ -819,6 +821,7 @@ impl Storage for HybridStorage {
                     if let Ok(mut miss_handler) = self.l1.get_miss_handler(key, &meta, trace).await {
                         let _ = miss_handler.write_body(mem_handler.data.clone(), true).await;
                         let _ = miss_handler.finish().await;
+                        prof_record_l2_mem_promotion();
                     }
                 }
             }
@@ -841,6 +844,7 @@ impl Storage for HybridStorage {
                 .or_insert(1);
 
             if is_hot {
+                prof_record_l2_async_promotion();
                 let storage_l2 = self.l2;
                 let cache_key_cloned = key.clone();
                 tokio::spawn(async move {
@@ -1049,4 +1053,50 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
             }
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Cache performance profiling — log hit/miss/promotion stats
+// ═══════════════════════════════════════════════════════════
+
+use std::sync::atomic::AtomicU64;
+
+static PROF_L1_HITS: AtomicU64 = AtomicU64::new(0);
+static PROF_L2_HITS: AtomicU64 = AtomicU64::new(0);
+static PROF_L2_MEM_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
+static PROF_L2_ASYNC_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
+
+pub fn prof_record_l1_hit() {
+    PROF_L1_HITS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn prof_record_l2_hit() {
+    PROF_L2_HITS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn prof_record_l2_mem_promotion() {
+    PROF_L2_MEM_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn prof_record_l2_async_promotion() {
+    PROF_L2_ASYNC_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Start a background task that logs cache performance stats every 10 seconds.
+/// Provides real-time visibility into L1/L2 hit ratios and promotion rates.
+pub fn start_cache_profiler() {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let l1 = PROF_L1_HITS.swap(0, Ordering::Relaxed);
+            let l2 = PROF_L2_HITS.swap(0, Ordering::Relaxed);
+            let sync_prom = PROF_L2_MEM_PROMOTIONS.swap(0, Ordering::Relaxed);
+            let async_prom = PROF_L2_ASYNC_PROMOTIONS.swap(0, Ordering::Relaxed);
+            let total = l1 + l2;
+            if total == 0 {
+                continue;
+            }
+            let l1_pct = if total > 0 { l1 as f64 / total as f64 * 100.0 } else { 0.0 };
+            tracing::info!(
+                "CACHE_PROFILE: L1={l1}/s L2={l2}/s L1%={l1_pct:.1} sync_prom={sync_prom}/s async_prom={async_prom}/s total={total}/s"
+            );
+        }
+    });
 }

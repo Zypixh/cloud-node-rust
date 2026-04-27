@@ -517,6 +517,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     );
     cloud_node_rust::proxy::start_request_limit_cleanup_task();
     cloud_node_rust::metrics::storage::start_cache_access_flusher();
+    cloud_node_rust::cache_hybrid::start_cache_profiler();
     spawn_staggered(&rt, Duration::from_secs(1), async move {
         http_manager.start_listeners().await;
     });
