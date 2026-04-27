@@ -2906,17 +2906,6 @@ impl ProxyHttp for EdgeProxy {
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
 
-        // FAST PATH: Cacheable GET/HEAD requests skip heavyweight middleware.
-        // These requests are served directly from Pingora's proxy_cache phase,
-        // so body buffering, WAF body inspection, CC loops, and rewrite evaluation
-        // are either irrelevant (no body) or redundant with the cache response.
-        if is_cacheable_get {
-            let elapsed_us = _reqfil_start.elapsed().as_micros() as u64;
-            crate::cache_hybrid::prof_record_reqfilter(elapsed_us);
-            crate::cache_hybrid::prof_record_fastpath();
-            return Ok(false);
-        }
-
         // 1. Mandatory Global Special Defenses
         let global_policies = &hot_path.firewall_policies;
         for gp in global_policies {
