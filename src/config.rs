@@ -71,7 +71,7 @@ pub struct NodeConfig {
     /// Real-time pressure/load factor for L2 nodes (0.0 - 1.0)
     pub parent_pressure: HashMap<String, (f32, std::time::Instant)>,
     /// Global or node-specific cache policy
-    pub cache_policy: Option<HTTPCachePolicy>,
+    pub cache_policy: Option<Arc<HTTPCachePolicy>>,
     /// Global or node-specific firewall policies
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     /// Global WAF action defaults
@@ -158,7 +158,7 @@ pub struct HotPathSnapshot {
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     pub grpc_policy: Option<crate::config_models::GRPCConfig>,
     pub has_any_sni_passthrough: bool,
-    pub cache_policy: Option<HTTPCachePolicy>,
+    pub cache_policy: Option<Arc<HTTPCachePolicy>>,
 }
 
 impl Default for ConfigStore {
@@ -242,7 +242,7 @@ impl ConfigStore {
             firewall_policies: Arc::clone(&lock.firewall_policies),
             grpc_policy: lock.grpc_policy.clone(),
             has_any_sni_passthrough: lock.has_any_sni_passthrough,
-            cache_policy: lock.cache_policy.clone(),
+            cache_policy: lock.cache_policy.as_ref().map(Arc::clone),
         }
     }
 
@@ -326,7 +326,7 @@ impl ConfigStore {
         None
     }
 
-    pub fn get_cache_policy_sync(&self) -> Option<HTTPCachePolicy> {
+    pub fn get_cache_policy_sync(&self) -> Option<Arc<HTTPCachePolicy>> {
         let lock = self.inner.read();
         lock.cache_policy.clone()
     }
@@ -571,7 +571,7 @@ impl ConfigStore {
         lock.version
     }
 
-    pub async fn get_cache_policy(&self) -> Option<HTTPCachePolicy> {
+    pub async fn get_cache_policy(&self) -> Option<Arc<HTTPCachePolicy>> {
         self.get_cache_policy_sync()
     }
 
@@ -610,7 +610,7 @@ impl ConfigStore {
         request_origins_with_encodings: bool,
         xff_max_addresses: i32,
         allow_lan_ip: bool,
-        cache_policy: Option<HTTPCachePolicy>,
+        cache_policy: Option<Arc<HTTPCachePolicy>>,
         firewall_policies: Vec<HTTPFirewallPolicy>,
         waf_actions: Vec<crate::config_models::WAFActionConfig>,
         uam_policies: HashMap<i64, UAMPolicy>,

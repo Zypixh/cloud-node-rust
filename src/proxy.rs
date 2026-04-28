@@ -93,7 +93,7 @@ pub struct ProxyCTX {
     pub request_limit_out_bandwidth_bytes: i64,
     pub request_limit_out_bandwidth_sent: i64,
     pub request_limit_out_bandwidth_window_start: Option<std::time::Instant>,
-    pub global_cache_policy: Option<HTTPCachePolicy>,
+    pub global_cache_policy: Option<Arc<HTTPCachePolicy>>,
     /// Cached during request_filter to avoid config lock in response_filter/body_filter
     pub global_http_config: Option<Arc<crate::config_models::GlobalHTTPAllConfig>>,
     pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
@@ -3444,8 +3444,8 @@ impl ProxyHttp for EdgeProxy {
             }
 
             if matched_ref.is_none() && !cache.disable_policy_refs {
-                let policy_opt = if let Some(p) = &cache.cache_policy {
-                    Some(p.clone())
+                let policy_opt: Option<Arc<HTTPCachePolicy>> = if let Some(p) = &cache.cache_policy {
+                    Some(Arc::new(p.clone()))
                 } else {
                     ctx.global_cache_policy.clone()
                 };
@@ -3958,11 +3958,19 @@ impl ProxyHttp for EdgeProxy {
 
     fn response_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<std::time::Duration>> {
+        // Cache HIT: skip optimize/webp/hls/outbound WAF — all done when first cached
+        if session.cache.phase() == pingora_cache::CachePhase::Hit {
+            if let Some(chunk) = body {
+                ctx.response_body_len += chunk.len();
+            }
+            return Ok(None);
+        }
+
         if ctx.optimize_enabled {
             if let Some(chunk) = body.take() {
                 ctx.optimize_pending_body.extend_from_slice(&chunk);
@@ -4038,7 +4046,7 @@ impl ProxyHttp for EdgeProxy {
                 let playlist_path = ctx
                     .server
                     .as_ref()
-                    .map(|_| Self::current_request_path_query(_session))
+                    .map(|_| Self::current_request_path_query(session))
                     .unwrap_or_default();
                 let rewritten = ctx
                     .server
@@ -4105,7 +4113,7 @@ impl ProxyHttp for EdgeProxy {
                     }
                     if let Some(action) = crate::firewall::evaluate_outbound_policy(
                         gp,
-                        _session,
+                        session,
                         &ctx.request_body,
                         &outbound_ctx,
                     ) {
@@ -4123,7 +4131,7 @@ impl ProxyHttp for EdgeProxy {
                         if let Some(policy) = &web.firewall_policy {
                             if let Some(action) = crate::firewall::evaluate_outbound_policy(
                                 policy,
-                                _session,
+                                session,
                                 &ctx.request_body,
                                 &outbound_ctx,
                             ) {

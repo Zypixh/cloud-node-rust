@@ -1010,7 +1010,7 @@ pub async fn fetch_and_apply_config<F>(
                                     request_origins_with_encodings,
                                     xff_max_addresses,
                                     allow_lan_ip,
-                                    payload.http_cache_policies.first().cloned(),
+                                    payload.http_cache_policies.first().cloned().map(Arc::new),
                                     payload.http_firewall_policies.clone(),
                                     payload.waf_actions.clone(),
                                     parse_i64_keyed_map(&payload.uam_policies),
