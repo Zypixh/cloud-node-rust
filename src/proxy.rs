@@ -100,6 +100,7 @@ pub struct ProxyCTX {
     pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
     pub node_level: i32,
     pub host: String,
+    pub origin_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl Default for ProxyCTX {
@@ -175,6 +176,7 @@ impl Default for ProxyCTX {
             firewall_policies_snapshot: None,
             node_level: 0,
             host: String::new(),
+            origin_permit: None,
         }
     }
 }
@@ -236,6 +238,8 @@ const MAX_HLS_SEGMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
 use pingora_cache::lock::CacheLock;
 
 static CACHE_LOCK: once_cell::sync::Lazy<CacheLock> = once_cell::sync::Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(5)));
+
+static ORIGIN_SEMAPHORE: Lazy<Arc<tokio::sync::Semaphore>> = Lazy::new(|| Arc::new(tokio::sync::Semaphore::new(256)));
 
 impl EdgeProxy {
     fn is_grpc_request(session: &Session) -> bool {
@@ -3269,6 +3273,13 @@ impl ProxyHttp for EdgeProxy {
                     peer_obj.options.verify_cert = false;
                 }
             }
+
+            if ctx.origin_permit.is_none() {
+                let permit = Arc::clone(&ORIGIN_SEMAPHORE).acquire_owned().await
+                    .map_err(|_| Error::new(InternalError))?;
+                ctx.origin_permit = Some(Arc::new(permit));
+            }
+
             return Ok(Box::new(peer_obj));
         }
 
