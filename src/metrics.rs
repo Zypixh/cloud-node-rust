@@ -10,9 +10,10 @@ static CACHED_PRESSURE: AtomicU32 = AtomicU32::new(0);
 
 pub fn start_pressure_updater() {
     tokio::spawn(async {
+        let mut sys = sysinfo::System::new();
         let mut tick: u64 = 0;
         loop {
-            let pressure = compute_node_pressure();
+            let pressure = compute_node_pressure(&mut sys);
             CACHED_PRESSURE.store(pressure.to_bits(), Ordering::Relaxed);
 
             // Every 5 minutes, cap distinct_ips to prevent unbounded growth
@@ -30,12 +31,11 @@ pub fn start_pressure_updater() {
     });
 }
 
-fn compute_node_pressure() -> f32 {
+fn compute_node_pressure(sys: &mut sysinfo::System) -> f32 {
     let (_, _, total_conns) = METRICS.get_node_totals();
     let cpu_cores = num_cpus::get() as i64;
     let conn_pressure = (total_conns as f64 / (cpu_cores * 2000) as f64).min(1.0);
 
-    let mut sys = sysinfo::System::new();
     sys.refresh_cpu_usage();
     let cpu_load = sys.global_cpu_usage() as f64 / 100.0;
 
