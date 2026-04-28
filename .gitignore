@@ -2,3 +2,6 @@
 /data/
 cloud-node-rust
 .DS_Store
+configs/cache/disk/
+bench-cert.pem
+bench-key.pem

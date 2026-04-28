@@ -1,5 +1,4 @@
 use crate::config_models::HTTPCacheRef;
-use std::collections::HashMap;
 
 pub mod matching;
 
@@ -7,7 +6,7 @@ pub fn should_cache_response(
     status: u16,
     cache_ref: &HTTPCacheRef,
     method: &str,
-    headers: &HashMap<String, String>,
+    headers: &http::HeaderMap,
     _host: &str,
     body_size: usize,
 ) -> bool {
@@ -17,7 +16,7 @@ pub fn should_cache_response(
 
     // 1. Check Method
     let method_allowed = if cache_ref.methods.is_empty() {
-        true // Support all methods by default if not restricted
+        true
     } else {
         cache_ref
             .methods
@@ -54,7 +53,7 @@ pub fn should_cache_response(
     }
 
     // 4. Check Cache-Control
-    if let Some(cc) = headers.get("cache-control") {
+    if let Some(cc) = headers.get("cache-control").and_then(|v| v.to_str().ok()) {
         let cc_lower = cc.to_lowercase();
         for skip in &cache_ref.skip_cache_control_values {
             if !skip.is_empty() && cc_lower.contains(&skip.to_lowercase()) {
@@ -64,7 +63,6 @@ pub fn should_cache_response(
     }
 
     // 5. Check Set-Cookie
-    // Only skip if the rule explicitly says to skip Set-Cookie
     if cache_ref.skip_set_cookie && headers.contains_key("set-cookie") {
         return false;
     }

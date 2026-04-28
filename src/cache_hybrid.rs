@@ -496,10 +496,23 @@ const POLICY_MEMORY: u8 = 1;
 
 #[inline]
 fn fast_hash_key(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
+    // Fast hash for cache keys — fixed seed, no per-call random init.
+    // Processes 8 bytes at a time, good distribution for URL-like strings.
+    let bytes = s.as_bytes();
+    let mut hash: u64 = 0x9ae16a3b2f90404f;
+    for chunk in bytes.chunks(8) {
+        let mut word: u64 = 0;
+        for (i, &b) in chunk.iter().enumerate() {
+            word |= (b as u64) << (i * 8);
+        }
+        hash ^= word;
+        hash = hash.wrapping_mul(0x9e3779b97f4a7c15);
+        hash = hash.rotate_left(31);
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    hash
 }
 
 pub struct HybridStorage {
@@ -727,13 +740,15 @@ impl Storage for HybridStorage {
         if let Some(entry) = FAST_L1.get(&hash) {
             let now = crate::utils::time::now_timestamp();
             if entry.fresh_until > now {
-                let headers = pingora_http::ResponseHeader::build(200, None).unwrap();
+                // Use cached timestamps to avoid redundant SystemTime calls
+                let fresh_until_dur = std::time::Duration::from_secs(entry.fresh_until as u64);
+                let created_at_dur = std::time::Duration::from_secs(entry.created_at as u64);
                 let meta = CacheMeta::new(
-                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.fresh_until as u64),
-                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.created_at as u64),
+                    std::time::UNIX_EPOCH + fresh_until_dur,
+                    std::time::UNIX_EPOCH + created_at_dur,
                     0,
                     0,
-                    headers,
+                    pingora_http::ResponseHeader::build(200, None).unwrap(),
                 );
                 prof_record_l1_hit();
                 return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), offset: 0 }))));

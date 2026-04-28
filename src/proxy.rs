@@ -2872,8 +2872,7 @@ impl ProxyHttp for EdgeProxy {
         }
 
         // --- GLOBAL CLUSTER SETTINGS: Low Version HTTP ---
-        let global_cfg = Arc::clone(&hot_path.global_http);
-        if !global_cfg.supports_low_version_http {
+        if !hot_path.global_http.supports_low_version_http {
             if session.req_header().version < pingora_http::Version::HTTP_11 {
                 debug!(
                     "Blocking low version HTTP request: {:?}",
@@ -2893,7 +2892,7 @@ impl ProxyHttp for EdgeProxy {
         }
 
         if let Some(server) = ctx.server.clone()
-            && let Some(web) = server.web.clone()
+            && let Some(ref web) = server.web
         {
             if let Some((location, status)) = self.should_redirect_to_https(session, &server, &host)
             {
@@ -2904,7 +2903,7 @@ impl ProxyHttp for EdgeProxy {
                 return Ok(true);
             }
 
-            if let Some(shutdown) = web.shutdown.clone()
+            if let Some(ref shutdown) = web.shutdown
                 && self.respond_shutdown(session, ctx, &shutdown).await?
             {
                 return Ok(true);
@@ -2932,7 +2931,7 @@ impl ProxyHttp for EdgeProxy {
                     level,
                     &parents,
                     bypass,
-                    global_cfg.allow_lan_ip,
+                    hot_path.global_http.allow_lan_ip,
                 );
                 ctx.lb = Some(lb_arc.clone());
 
@@ -3026,16 +3025,16 @@ impl ProxyHttp for EdgeProxy {
         if let Some(server) = &ctx.server
             && let Some(web) = &server.web
         {
-            let host_redirects = web.host_redirects.clone();
-            let rewrite_refs = web.rewrite_refs.clone();
-            let rewrite_rules = web.rewrite_rules.clone();
+            let host_redirects = &web.host_redirects;
+            let rewrite_refs = &web.rewrite_refs;
+            let rewrite_rules = &web.rewrite_rules;
 
             let uri_str = session.req_header().uri.path();
             let query = session.req_header().uri.query().unwrap_or("");
 
             if !host_redirects.is_empty() {
                 if let Some((location, status)) =
-                    evaluate_host_redirects(&host, uri_str, &host_redirects)
+                    evaluate_host_redirects(&host, uri_str, host_redirects)
                 {
                     let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
                     resp.insert_header("location", location).unwrap();
@@ -3046,7 +3045,7 @@ impl ProxyHttp for EdgeProxy {
 
             if !rewrite_rules.is_empty()
                 && let RewriteResult::Redirect { location, status } =
-                    evaluate_rewrites(uri_str, query, &rewrite_refs, &rewrite_rules)
+                    evaluate_rewrites(uri_str, query, rewrite_refs, rewrite_rules)
             {
                 let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
                 resp.insert_header("location", location).unwrap();
@@ -3128,7 +3127,8 @@ impl ProxyHttp for EdgeProxy {
         // This ensures WAF only runs on cache MISS, not on every cache HIT.
         if ctx.waf_deferred {
             let hot_path = self.config.get_hot_path_snapshot_sync();
-            let (blocked, _action) = self.run_heavy_waf(session, ctx, &ctx.host.clone(), &hot_path.firewall_policies).await?;
+            let host = ctx.host.clone();
+            let (blocked, _action) = self.run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies).await?;
             if blocked {
                 return Err(Error::new(HTTPStatus(403)));
             }
@@ -4139,13 +4139,6 @@ impl ProxyHttp for EdgeProxy {
         }
 
         if let Some(cache_ref) = &ctx.cache_ref {
-            let mut hm: HashMap<String, String> = HashMap::new();
-            for (k, v) in resp.headers.iter() {
-                hm.insert(
-                    k.to_string().to_lowercase(),
-                    v.to_str().unwrap_or("").to_string(),
-                );
-            }
             let body_size = resp
                 .headers
                 .get("content-length")
@@ -4158,7 +4151,7 @@ impl ProxyHttp for EdgeProxy {
                 resp.status.as_u16(),
                 cache_ref,
                 session.req_header().method.as_str(),
-                &hm,
+                &resp.headers,
                 host,
                 body_size,
             ) {
