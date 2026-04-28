@@ -16,15 +16,33 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub async fn new(api_config: &ApiConfig) -> anyhow::Result<Self> {
-        let mut last_err = None;
         let endpoints = api_config.effective_rpc_endpoints();
+        Self::connect(api_config, &endpoints).await
+    }
+
+    /// Create a client for a stream, attempting all endpoints. If `force` is
+    /// false, uses the exact list given; if true, re-reads from api_config.
+    pub async fn new_with_endpoints(
+        api_config: &ApiConfig,
+        endpoints: &[String],
+        force: bool,
+    ) -> anyhow::Result<Self> {
+        let list: Vec<String> = if force || endpoints.is_empty() {
+            api_config.effective_rpc_endpoints()
+        } else {
+            endpoints.to_vec()
+        };
+        Self::connect(api_config, &list).await
+    }
+
+    async fn connect(api_config: &ApiConfig, endpoints: &[String]) -> anyhow::Result<Self> {
         if endpoints.is_empty() {
             anyhow::bail!("No RPC endpoints configured");
         }
-
+        let mut last_err = None;
         for api_endpoint in endpoints {
             let endpoint = match Channel::from_shared(api_endpoint.clone()) {
-                Ok(endpoint) => endpoint,
+                Ok(e) => e,
                 Err(e) => {
                     last_err = Some(anyhow::anyhow!("Invalid URI {}: {}", api_endpoint, e));
                     continue;
@@ -35,6 +53,7 @@ impl RpcClient {
                 .connect_timeout(Duration::from_secs(10))
                 .tcp_keepalive(Some(Duration::from_secs(15)))
                 .http2_keep_alive_interval(Duration::from_secs(30))
+                .keep_alive_timeout(Duration::from_secs(10))
                 .keep_alive_while_idle(true)
                 .connect()
                 .await;
@@ -69,6 +88,7 @@ impl RpcClient {
             .connect_timeout(Duration::from_secs(5))
             .tcp_keepalive(Some(Duration::from_secs(15)))
             .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
             .connect()
             .await

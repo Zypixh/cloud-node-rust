@@ -55,10 +55,17 @@ struct ReadCacheMessage {
 }
 
 pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigStore>) {
+    // Create a single long-lived Channel — gRPC channels manage connection pools
+    // and automatic reconnection internally. Recreating the channel on every
+    // disconnect defeats HTTP/2 keepalive and triggers unnecessary handshakes.
+    let mut last_endpoints = api_config.effective_rpc_endpoints();
     loop {
-        let client = match RpcClient::new(&api_config).await {
+        let client = match RpcClient::new_with_endpoints(&api_config, &last_endpoints, false).await
+        {
             Ok(c) => c,
             Err(e) => {
+                // Reset endpoints to force a refresh on next attempt
+                last_endpoints = api_config.effective_rpc_endpoints();
                 error!(
                     "Failed to connect to API node for stream: {}. Retrying in 10s...",
                     e
@@ -68,9 +75,17 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
             }
         };
 
-        if let Err(e) = run_stream(client, &api_config, config_store.clone()).await {
-            warn!("Node stream error: {}. Retrying in 10s...", e);
-            tokio::time::sleep(Duration::from_secs(10)).await;
+        match run_stream(client, &api_config, config_store.clone()).await {
+            Ok(()) => {
+                // Stream ended cleanly (server shutdown), brief pause before reconnect
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(e) => {
+                warn!("Node stream error: {}. Reconnecting...", e);
+                // On error, refresh endpoints in case the API node changed
+                last_endpoints = api_config.effective_rpc_endpoints();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
     }
 }
@@ -127,13 +142,7 @@ async fn run_stream(
                         break;
                     }
                     Err(e) => {
-                        // Downgrade common network/H2 errors to avoid excessive noise
-                        let err_msg = e.to_string();
-                        if err_msg.contains("h2 protocol error") || err_msg.contains("Broken pipe") || err_msg.contains("Connection reset") {
-                            warn!("Node stream network interrupt: {}", err_msg);
-                        } else {
-                            error!("Node stream protocol error: {}", e);
-                        }
+                        warn!("Node stream error: {}", e);
 
                         if let Some(id) = current_api_node_id {
                              if let Ok(mut guard) = crate::rpc::node::CONNECTED_API_NODE_IDS.write() {
