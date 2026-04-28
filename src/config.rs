@@ -3,7 +3,8 @@ use pingora_load_balancing::{
     selection::{Consistent, RoundRobin},
 };
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use tokio::sync::Notify;
 
 use crate::config_models::{
@@ -184,12 +185,12 @@ impl ConfigStore {
 
     // Sync versions for high-performance path (proxy)
     pub fn get_upstream_sync(&self, host: &str) -> Option<Arc<LoadBalancer<RoundRobin>>> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.routes.get(host).cloned()
     }
 
     pub fn get_server_sync(&self, host: &str) -> Option<Arc<ServerConfig>> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.servers.get(host).cloned()
     }
 
@@ -200,7 +201,7 @@ impl ConfigStore {
         Option<Arc<ServerConfig>>,
         Option<Arc<LoadBalancer<RoundRobin>>>,
     ) {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         (
             lock.servers.get(host).cloned(),
             lock.routes.get(host).cloned(),
@@ -209,11 +210,11 @@ impl ConfigStore {
 
     /// Lightweight check: avoids full HotPathSnapshot clone, only reads one bool.
     pub fn has_any_sni_passthrough_sync(&self) -> bool {
-        self.inner.read().unwrap().has_any_sni_passthrough
+        self.inner.read().has_any_sni_passthrough
     }
 
     pub fn get_hot_path_snapshot_sync(&self) -> HotPathSnapshot {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         Self::build_hot_path_snapshot(&lock)
     }
 
@@ -227,7 +228,7 @@ impl ConfigStore {
         Option<Arc<ServerConfig>>,
         Option<Arc<LoadBalancer<RoundRobin>>>,
     ) {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         let hot_path = Self::build_hot_path_snapshot(&lock);
         let server = lock.servers.get(host).cloned();
         let upstream = lock.routes.get(host).cloned();
@@ -250,7 +251,7 @@ impl ConfigStore {
 
         // 1. Try exact match from the fast index
         {
-            let lock = self.inner.read().unwrap();
+            let lock = self.inner.read();
             if let Some(server) = lock.servers.get(&normalized) {
                 return Some(server.clone());
             }
@@ -259,7 +260,7 @@ impl ConfigStore {
         // 2. Try wildcard match from the fast index
         if let Some(pos) = normalized.find('.') {
             let wildcard = format!("*{}", &normalized[pos..]);
-            let lock = self.inner.read().unwrap();
+            let lock = self.inner.read();
             if let Some(server) = lock.servers.get(&wildcard) {
                 return Some(server.clone());
             }
@@ -276,7 +277,7 @@ impl ConfigStore {
         port: u16,
     ) -> Option<Arc<ServerConfig>> {
         let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
 
         let matches_name = |server: &ServerConfig| {
             server.server_names.iter().any(|sn| {
@@ -326,22 +327,22 @@ impl ConfigStore {
     }
 
     pub fn get_cache_policy_sync(&self) -> Option<HTTPCachePolicy> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.cache_policy.clone()
     }
 
     pub fn get_firewall_policies_sync(&self) -> Arc<Vec<HTTPFirewallPolicy>> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         Arc::clone(&lock.firewall_policies)
     }
 
     pub fn get_waf_actions_sync(&self) -> Vec<crate::config_models::WAFActionConfig> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.waf_actions.clone()
     }
 
     pub fn get_global_pages_sync(&self) -> Vec<HTTPPageConfig> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.global_pages.clone()
     }
 
@@ -352,32 +353,32 @@ impl ConfigStore {
     }
 
     pub fn get_global_uam_policy_sync(&self) -> Option<UAMPolicy> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         Self::pick_global_policy(&lock.uam_policies)
     }
 
     pub fn get_global_http_cc_policy_sync(&self) -> Option<HTTPCCPolicy> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         Self::pick_global_policy(&lock.http_cc_policies)
     }
 
     pub fn get_global_http3_policy_sync(&self) -> Option<HTTP3Policy> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         Self::pick_global_policy(&lock.http3_policies)
     }
 
     pub fn get_global_http_pages_policy_sync(&self) -> Option<HTTPPagesPolicy> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         Self::pick_global_policy(&lock.http_pages_policies)
     }
 
     pub fn get_global_webp_policy_sync(&self) -> Option<WebPImagePolicy> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         Self::pick_global_policy(&lock.webp_image_policies)
     }
 
     pub fn get_toa_config_sync(&self) -> Option<TOAConfig> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.toa.clone()
     }
 
@@ -385,63 +386,63 @@ impl ConfigStore {
         &self,
         cluster_id: i64,
     ) -> Option<Arc<LoadBalancer<Consistent>>> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.parent_routes.get(&cluster_id).cloned()
     }
 
     pub fn get_force_ln_request_sync(&self) -> bool {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.force_ln_request
     }
 
     pub fn get_ln_method_sync(&self) -> String {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.ln_request_scheduling_method.clone()
     }
 
     pub fn get_node_level_sync(&self) -> i32 {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.level
     }
 
     pub fn get_node_is_on_sync(&self) -> bool {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.is_on
     }
 
     pub fn get_node_enable_ip_lists_sync(&self) -> bool {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.enable_ip_lists
     }
 
     pub fn get_global_http_config_sync(&self) -> Arc<crate::config_models::GlobalHTTPAllConfig> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         Arc::clone(&lock.global_http_config)
     }
 
     pub fn get_grpc_policy_sync(&self) -> Option<crate::config_models::GRPCConfig> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.grpc_policy.clone()
     }
 
     pub fn get_plan_sync(&self, plan_id: i64) -> Option<crate::pb::Plan> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.plans.get(&plan_id).cloned()
     }
 
     pub fn get_user_plan_sync(&self, user_plan_id: i64) -> Option<crate::pb::UserPlan> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.user_plans.get(&user_plan_id).cloned()
     }
 
     pub fn update_parent_pressure(&self, addr: &str, pressure: f32) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.parent_pressure
             .insert(addr.to_string(), (pressure, std::time::Instant::now()));
     }
 
     pub fn get_parent_pressure(&self, addr: &str) -> f32 {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         if let Some((p, ts)) = lock.parent_pressure.get(addr) {
             // Data expires after 60 seconds of no update
             if ts.elapsed().as_secs() < 60 {
@@ -461,7 +462,7 @@ impl ConfigStore {
     }
 
     pub async fn get_server_by_id(&self, server_id: i64) -> Option<Arc<ServerConfig>> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.all_servers
             .iter()
             .find(|server| server.id == Some(server_id))
@@ -469,44 +470,44 @@ impl ConfigStore {
     }
 
     pub async fn get_all_servers(&self) -> Vec<Arc<ServerConfig>> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.all_servers.clone()
     }
 
     pub fn get_all_hosts_sync(&self) -> Vec<String> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.servers.keys().cloned().collect()
     }
 
     pub async fn is_deleted_content(&self, url: &str) -> bool {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.deleted_contents
             .iter()
             .any(|banned| url == banned || url.starts_with(banned))
     }
 
     pub async fn is_updating_server(&self, server_id: i64) -> bool {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.updating_server_ids.contains(&server_id)
     }
 
     pub async fn set_updating_servers(&self, ids: Vec<i64>) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.updating_server_ids = ids.into_iter().collect();
     }
 
     pub async fn get_global_pages(&self) -> Vec<HTTPPageConfig> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.global_pages.clone()
     }
 
     pub async fn get_server_id_by_host(&self, host: &str) -> Option<i64> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.servers.get(host).and_then(|s| s.id)
     }
 
     pub async fn get_lb_by_id(&self, server_id: i64) -> Option<Arc<LoadBalancer<RoundRobin>>> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.id_to_lb.get(&server_id).cloned()
     }
 
@@ -518,12 +519,12 @@ impl ConfigStore {
     }
 
     pub async fn get_metric_items(&self) -> Vec<MetricItemConfig> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.metric_items.clone()
     }
 
     pub async fn get_plan_ids(&self) -> Vec<i64> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         let mut plan_ids = lock
             .servers
             .values()
@@ -536,37 +537,37 @@ impl ConfigStore {
     }
 
     pub async fn get_tiered_origin_info(&self) -> (i32, HashMap<i64, Vec<ParentNodeConfig>>) {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         (lock.level, lock.parent_nodes.clone())
     }
 
     pub async fn is_tiered_origin_bypass(&self) -> bool {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.tiered_origin_bypass
     }
 
     pub async fn set_tiered_origin_bypass(&self, bypass: bool) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.tiered_origin_bypass = bypass;
     }
 
     pub async fn get_node_id(&self) -> i64 {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.id
     }
 
     pub async fn get_node_region_id(&self) -> i64 {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.node_region_id
     }
 
     pub async fn update_id(&self, id: i64) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.id = id;
     }
 
     pub async fn get_config_version(&self) -> i64 {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.version
     }
 
@@ -575,7 +576,7 @@ impl ConfigStore {
     }
 
     pub async fn get_deleted_contents(&self) -> Vec<String> {
-        let lock = self.inner.read().unwrap();
+        let lock = self.inner.read();
         lock.deleted_contents.clone()
     }
 
@@ -619,7 +620,7 @@ impl ConfigStore {
         webp_image_policies: HashMap<i64, WebPImagePolicy>,
         toa: Option<TOAConfig>,
     ) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.id = id;
         lock.version = version;
         lock.node_region_id = node_region_id;
@@ -681,7 +682,7 @@ impl ConfigStore {
         servers: HashMap<String, Arc<ServerConfig>>,
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
     ) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.all_servers
             .retain(|server| server.numeric_id() != server_id);
         let stale_hosts = lock
@@ -719,7 +720,7 @@ impl ConfigStore {
         servers: HashMap<String, Arc<ServerConfig>>,
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
     ) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.all_servers.retain(|server| server.user_id != user_id);
         let stale_hosts = lock
             .servers
@@ -759,7 +760,7 @@ impl ConfigStore {
     }
 
     pub async fn remove_user_servers(&self, user_id: i64) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.all_servers.retain(|server| server.user_id != user_id);
         let stale_hosts = lock
             .servers
@@ -786,7 +787,7 @@ impl ConfigStore {
     }
 
     pub async fn remove_server(&self, server_id: i64) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.all_servers
             .retain(|server| server.numeric_id() != server_id);
         let stale_hosts = lock
@@ -812,7 +813,7 @@ impl ConfigStore {
         server: Arc<ServerConfig>,
         lb: Arc<LoadBalancer<RoundRobin>>,
     ) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         let server_id = server.numeric_id();
         if server_id > 0 {
             lock.id_to_lb.insert(server_id, lb.clone());
@@ -827,17 +828,17 @@ impl ConfigStore {
     }
 
     pub async fn set_deleted_contents(&self, deleted_contents: Vec<String>) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.deleted_contents = deleted_contents;
     }
 
     pub async fn set_plans(&self, plans: HashMap<i64, crate::pb::Plan>) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.plans = plans;
     }
 
     pub async fn set_user_plans(&self, user_plans: HashMap<i64, crate::pb::UserPlan>) {
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.user_plans = user_plans;
     }
 
@@ -847,7 +848,7 @@ impl ConfigStore {
         parent_nodes: HashMap<i64, Vec<ParentNodeConfig>>,
     ) {
         let allow_lan_ip = {
-            let lock = self.inner.read().unwrap();
+            let lock = self.inner.read();
             lock.allow_lan_ip
         };
 
@@ -857,7 +858,7 @@ impl ConfigStore {
             parent_routes.insert(*cluster_id, lb);
         }
 
-        let mut lock = self.inner.write().unwrap();
+        let mut lock = self.inner.write();
         lock.level = level;
         lock.parent_nodes = parent_nodes;
         lock.parent_routes = parent_routes;

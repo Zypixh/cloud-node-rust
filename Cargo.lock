@@ -651,6 +651,7 @@ dependencies = [
  "neli",
  "num_cpus",
  "once_cell",
+ "parking_lot",
  "pingora",
  "pingora-cache",
  "pingora-core",
