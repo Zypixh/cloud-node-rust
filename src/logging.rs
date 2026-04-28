@@ -3,7 +3,7 @@ use crate::pb;
 use crate::proxy::ProxyCTX;
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 use pingora_proxy::Session;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,6 +13,13 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 pub static LOG_SENDER: OnceCell<mpsc::Sender<pb::HttpAccessLog>> = OnceCell::new();
+
+static CACHED_HOSTNAME: Lazy<String> = Lazy::new(|| {
+    hostname::get()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+});
 pub static NODE_LOG_SENDER: OnceCell<mpsc::Sender<pb::NodeLog>> = OnceCell::new();
 static NUMERIC_NODE_ID: AtomicI64 = AtomicI64::new(0);
 static REQUEST_ID_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
@@ -287,10 +294,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         msec: request_started_at_millis as f64 / 1000.0,
         time_iso8601,
         time_local,
-        hostname: hostname::get()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string(),
+        hostname: CACHED_HOSTNAME.clone(),
         server_name,
         server_port: 0,
         server_protocol: proto.to_string(),
@@ -376,10 +380,7 @@ pub fn log_sni_passthrough_access(
         host: sni_host.to_string(),
         timestamp: request_started_at,
         msec: started_at_millis as f64 / 1000.0,
-        hostname: hostname::get()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string(),
+        hostname: CACHED_HOSTNAME.clone(),
         origin_address: backend_addr.to_string(),
         origin_status: status,
         server_port: listen_port as i32,

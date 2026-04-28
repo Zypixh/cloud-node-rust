@@ -2753,6 +2753,7 @@ impl ProxyHttp for EdgeProxy {
         // Cache these in ctx to avoid config lock acquisitions in response_filter / body_filter
         ctx.global_http_config = Some(Arc::clone(&hot_path.global_http));
         ctx.firewall_policies_snapshot = Some(Arc::clone(&hot_path.firewall_policies));
+        ctx.global_cache_policy = hot_path.cache_policy.clone();
 
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
         ctx.is_on = hot_path.is_on;
@@ -3446,7 +3447,7 @@ impl ProxyHttp for EdgeProxy {
                 let policy_opt = if let Some(p) = &cache.cache_policy {
                     Some(p.clone())
                 } else {
-                    self.config.get_cache_policy_sync()
+                    ctx.global_cache_policy.clone()
                 };
                 if let Some(policy) = policy_opt {
                     for cache_ref in &policy.cache_refs {
