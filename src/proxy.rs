@@ -3687,6 +3687,25 @@ impl ProxyHttp for EdgeProxy {
         ctx.response_status = upstream_response.status.as_u16();
         ctx.ttfb = Some(ctx.start_time.elapsed());
 
+        // Fast path for cache HIT: skip header sync, WAF, Alt-Svc, and other
+        // work that was already done when the response was first cached.
+        // This also avoids a config lock in resolve_http3_advertisement_port.
+        if session.cache.phase() == pingora_cache::CachePhase::Hit {
+            ctx.response_headers
+                .insert("x-cache".to_string(), "HIT".to_string());
+            upstream_response
+                .insert_header("x-cache", "HIT")
+                .unwrap();
+            if let Some(global_cfg) = &ctx.global_http_config {
+                if !global_cfg.server_name.is_empty() {
+                    upstream_response
+                        .insert_header("Server", &global_cfg.server_name)
+                        .unwrap();
+                }
+            }
+            return Ok(());
+        }
+
         // Sync all response headers from upstream to context for accurate logging and WAF
         for (name, value) in upstream_response.headers.iter() {
             if let Ok(value_str) = value.to_str() {
