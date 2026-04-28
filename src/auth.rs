@@ -3,21 +3,20 @@ use base64::{Engine as _, engine::general_purpose};
 use cfb_mode::Encryptor;
 use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
 use md5::{Digest, Md5};
+use rand::Rng;
 use serde_json::json;
 
 type Aes256CfbEnc = Encryptor<Aes256>;
 
 /// Generates the base64 AES256-CFB encrypted token required by GoEdge API Node
-pub fn generate_token(node_id: &str, secret: &str, _node_type: &str) -> anyhow::Result<String> {
-    let mut key = [b' '; 32];
-    let secret_bytes = secret.as_bytes();
-    let len = secret_bytes.len().min(32);
-    key[..len].copy_from_slice(&secret_bytes[..len]);
+/// Format: base64(IV || ciphertext), IV is 16 random bytes
+pub fn generate_token(_node_id: &str, secret: &str, _node_type: &str) -> anyhow::Result<String> {
+    // Derive key using SHA256 for proper entropy, matching GoEdge API v2 token format
+    let key: [u8; 32] = sha2::Sha256::digest(secret.as_bytes()).into();
 
-    let mut iv = [b' '; 16];
-    let node_id_bytes = node_id.as_bytes();
-    let ilen = node_id_bytes.len().min(16);
-    iv[..ilen].copy_from_slice(&node_id_bytes[..ilen]);
+    // Random IV per token (standard CFB pattern)
+    let mut iv = [0u8; 16];
+    rand::thread_rng().fill(&mut iv);
 
     let timestamp = crate::utils::time::now_timestamp();
     let payload = json!({
@@ -31,7 +30,11 @@ pub fn generate_token(node_id: &str, secret: &str, _node_type: &str) -> anyhow::
         .map_err(|e| anyhow::anyhow!("Invalid cipher init: {}", e))?;
 
     cipher.encrypt(&mut data);
-    Ok(general_purpose::STANDARD.encode(data))
+
+    // Prepend IV to ciphertext so the receiver can decrypt
+    let mut result = iv.to_vec();
+    result.extend_from_slice(&data);
+    Ok(general_purpose::STANDARD.encode(result))
 }
 
 /// URL Auth Verification (Types A, B, C, D)

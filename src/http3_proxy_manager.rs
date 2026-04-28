@@ -334,7 +334,7 @@ impl Http3ProxyManager {
             stream.finish().await?;
             return Ok(());
         }
-        let target_port = request.uri().port_u16().unwrap_or(listen_port);
+        let target_port = listen_port;
         let path_and_query = request
             .uri()
             .path_and_query()
@@ -387,18 +387,13 @@ impl Http3ProxyManager {
             format!("https://{}:{}{}", host, target_port, path_and_query)
         };
 
-        let mut client_builder = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .resolve(
                 &host,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), target_port),
-            );
-        if target_port == 443 {
-            client_builder = client_builder
-                .resolve(&host, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443));
-        }
-        let client = client_builder.build()?;
+            )
+            .build()?;
 
         let mut outbound = client.request(request.method().clone(), &target_url);
         outbound = outbound.header("host", host.as_str());

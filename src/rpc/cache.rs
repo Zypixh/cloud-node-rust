@@ -33,7 +33,6 @@ pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool 
 
             let http_client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
-                .danger_accept_invalid_certs(true)
                 .build()
                 .unwrap_or_default();
 

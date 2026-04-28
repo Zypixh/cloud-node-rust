@@ -126,6 +126,18 @@ harness = false
 name = "utils_bench"
 harness = false
 
+[[bench]]
+name = "logging_bench"
+harness = false
+
+[[bench]]
+name = "hotpath_bench"
+harness = false
+
+[[bench]]
+name = "config_models_bench"
+harness = false
+
 [build-dependencies]
 tonic-build = "0.12.3"
 

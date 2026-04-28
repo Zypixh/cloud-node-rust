@@ -74,6 +74,7 @@ pub struct ProxyCTX {
     pub raw_remote_addr: String,
     pub analyzed: Option<crate::metrics::analyzer::RequestStats>,
     pub is_http3_bridge: bool,
+    pub is_loopback: bool,
     pub server_metrics: Option<Arc<crate::metrics::ServerMetrics>>,
     pub ip_recorded: bool,
     pub webp_convert_enabled: bool,
@@ -147,6 +148,7 @@ impl Default for ProxyCTX {
             raw_remote_addr: String::new(),
             analyzed: None,
             is_http3_bridge: false,
+            is_loopback: false,
             server_metrics: None,
             ip_recorded: false,
             webp_convert_enabled: false,
@@ -2769,33 +2771,37 @@ impl ProxyHttp for EdgeProxy {
             return Ok(true);
         }
 
-        let _is_loopback = session
+        let is_loopback = session
             .client_addr()
             .and_then(|a| a.as_inet())
             .map(|i| i.ip().is_loopback())
             .unwrap_or(false);
+        ctx.is_loopback = is_loopback;
 
         let (mut detected_ip, detected_port, raw_remote_addr) = Self::socket_client_ip(session);
         ctx.client_ip = detected_ip;
         ctx.client_port = detected_port;
         ctx.raw_remote_addr = raw_remote_addr;
 
-        ctx.is_http3_bridge = session.get_header("X-Cloud-Http3-Bridge").is_some();
+        // Only trust internal L1 headers when request originates from loopback
+        if is_loopback {
+            ctx.is_http3_bridge = session.get_header("X-Cloud-Http3-Bridge").is_some();
 
-        if let Some(edge_ip) = session.get_header("X-Cloud-Real-Ip") {
-            if let Ok(ip_str) = edge_ip.to_str() {
-                if let Ok(parsed_ip) = ip_str.parse::<std::net::IpAddr>() {
-                    debug!("L2: Restoring real client IP {} from L1 header", parsed_ip);
-                    detected_ip = parsed_ip;
-                    ctx.client_ip = parsed_ip;
+            if let Some(edge_ip) = session.get_header("X-Cloud-Real-Ip") {
+                if let Ok(ip_str) = edge_ip.to_str() {
+                    if let Ok(parsed_ip) = ip_str.parse::<std::net::IpAddr>() {
+                        debug!("L2: Restoring real client IP {} from L1 header", parsed_ip);
+                        detected_ip = parsed_ip;
+                        ctx.client_ip = parsed_ip;
+                    }
                 }
             }
-        }
-        if let Some(edge_port) = session.get_header("X-Cloud-Real-Port")
-            && let Ok(port_str) = edge_port.to_str()
-            && let Ok(port) = port_str.parse::<u16>()
-        {
-            ctx.client_port = port;
+            if let Some(edge_port) = session.get_header("X-Cloud-Real-Port")
+                && let Ok(port_str) = edge_port.to_str()
+                && let Ok(port) = port_str.parse::<u16>()
+            {
+                ctx.client_port = port;
+            }
         }
 
         ctx.client_ip = self.resolve_client_ip(
@@ -3670,7 +3676,8 @@ impl ProxyHttp for EdgeProxy {
 
         // --- SMART LOAD BALANCING FEEDBACK ---
         // 1. L2 Node: Announce pressure to L1
-        if session.get_header("X-Cloud-Node-Id").is_some() {
+        // Only announce pressure to internal L1 nodes (loopback), not external clients
+        if ctx.is_loopback && session.get_header("X-Cloud-Node-Id").is_some() {
             let pressure = crate::metrics::METRICS.get_node_pressure();
             upstream_response
                 .insert_header("X-Cloud-Node-Pressure", format!("{:.2}", pressure))
@@ -3837,6 +3844,12 @@ impl ProxyHttp for EdgeProxy {
     ) -> Result<()> {
         let global_cfg = self.config.get_global_http_config_sync();
         upstream_request.remove_header("x-cloud-resolved-real-ip");
+        // Strip internal L1→L2 headers to prevent leaking them to origin servers
+        upstream_request.remove_header("X-Cloud-Access-Token");
+        upstream_request.remove_header("X-Cloud-Node-Id");
+        upstream_request.remove_header("X-Cloud-Real-Ip");
+        upstream_request.remove_header("X-Cloud-Real-Port");
+        upstream_request.remove_header("X-Cloud-Http3-Bridge");
 
         // 1. Automatic Gzip Back to Origin
         if global_cfg.request_origins_with_encodings {

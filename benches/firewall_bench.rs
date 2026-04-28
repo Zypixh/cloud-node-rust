@@ -27,6 +27,70 @@ fn bench_firewall_operators(c: &mut Criterion) {
         })
     });
 
+    group.bench_function("regex_match", |b| {
+        let test_string = "hello world foo bar baz 12345";
+        let pattern = r"foo\s+bar\s+\w+\s+\d+";
+        b.iter(|| {
+            evaluate_operator(black_box(test_string), "match", black_box(pattern), false)
+        })
+    });
+
+    group.bench_function("regex_not_match", |b| {
+        let test_string = "no match here at all folks";
+        let pattern = r"foo\s+bar\s+\w+\s+\d+";
+        b.iter(|| {
+            evaluate_operator(black_box(test_string), "not match", black_box(pattern), false)
+        })
+    });
+
+    group.bench_function("regex_case_insensitive", |b| {
+        let test_string = "HELLO WORLD FOO BAR BAZ 12345";
+        let pattern = r"hello\s+world\s+foo\s+\w+\s+\d+";
+        b.iter(|| {
+            evaluate_operator(black_box(test_string), "match", black_box(pattern), true)
+        })
+    });
+
+    group.bench_function("wildcard_match", |b| {
+        let test_string = "/api/v1/users/123/profile";
+        let pattern = "/api/v1/users/*/profile";
+        b.iter(|| {
+            evaluate_operator(black_box(test_string), "wildcard match", black_box(pattern), false)
+        })
+    });
+
+    group.bench_function("wildcard_not_match", |b| {
+        let test_string = "/api/v1/admin/delete";
+        let pattern = "/api/v1/users/*";
+        b.iter(|| {
+            evaluate_operator(black_box(test_string), "wildcard not match", black_box(pattern), false)
+        })
+    });
+
+    group.bench_function("eq_string", |b| {
+        b.iter(|| {
+            evaluate_operator(black_box("exact-match"), "eq string", black_box("exact-match"), false)
+        })
+    });
+
+    group.bench_function("contains", |b| {
+        b.iter(|| {
+            evaluate_operator(black_box("hello world foo bar"), "contains", black_box("world"), false)
+        })
+    });
+
+    group.bench_function("prefix", |b| {
+        b.iter(|| {
+            evaluate_operator(black_box("/path/to/resource"), "prefix", black_box("/path"), false)
+        })
+    });
+
+    group.bench_function("suffix", |b| {
+        b.iter(|| {
+            evaluate_operator(black_box("file.html"), "suffix", black_box(".html"), false)
+        })
+    });
+
     group.finish();
 }
 

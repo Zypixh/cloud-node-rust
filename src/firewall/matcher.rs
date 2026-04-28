@@ -1,6 +1,9 @@
 use once_cell::sync::Lazy;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use std::net::IpAddr;
+
+/// Limit regex memory usage to 1MB to prevent catastrophic backtracking from user-controlled WAF patterns
+const REGEX_SIZE_LIMIT: usize = 1_048_576;
 
 static RE_SQLI: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(union\s+select|select\s+.*\s+from|insert\s+into|update\s+.*\s+set|delete\s+from|drop\s+table|truncate\s+table|benchmark\(|sleep\()").unwrap()
@@ -33,14 +36,20 @@ pub fn evaluate_operator(
         "eq string" => actual == expected,
         "neq string" => actual != expected,
         "match" | "matches" | "regexp" => {
-            if let Ok(re) = Regex::new(&expected) {
+            if let Ok(re) = RegexBuilder::new(&expected)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .build()
+            {
                 re.is_match(&actual)
             } else {
                 false
             }
         }
         "not match" | "notmatches" | "notregexp" => {
-            if let Ok(re) = Regex::new(&expected) {
+            if let Ok(re) = RegexBuilder::new(&expected)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .build()
+            {
                 !re.is_match(&actual)
             } else {
                 false
@@ -291,7 +300,9 @@ fn split_terms(expected: &str) -> Vec<String> {
 
 fn contains_word(actual: &str, term: &str) -> bool {
     let pattern = format!(r"\b{}\b", regex::escape(term));
-    Regex::new(&pattern)
+    RegexBuilder::new(&pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
         .map(|re| re.is_match(actual))
         .unwrap_or_else(|_| actual.contains(term))
 }
