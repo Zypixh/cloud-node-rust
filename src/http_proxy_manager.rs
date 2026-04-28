@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -217,7 +217,7 @@ impl HttpProxyManager {
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr).await?;
+        let listener = bind_with_backlog(&addr, 4096)?;
         info!("HTTP Proxy (TLS={}) listening on {}", is_tls, addr);
 
         let proxy = http_proxy(&self.server_conf, self.proxy_logic.clone());
@@ -866,4 +866,26 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> ClientHelloParse {
         ext_pos += ext_len;
     }
     ClientHelloParse::NotClientHello
+}
+
+#[cfg(unix)]
+fn bind_with_backlog(addr: &str, backlog: i32) -> anyhow::Result<tokio::net::TcpListener> {
+    use std::os::unix::io::AsRawFd;
+
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    // Re-call listen() with a larger backlog to avoid Connection Refused
+    // under high concurrency (default is 128, capped by net.core.somaxconn).
+    unsafe {
+        libc::listen(std_listener.as_raw_fd(), backlog);
+    }
+    std_listener.set_nonblocking(true)?;
+    Ok(tokio::net::TcpListener::from_std(std_listener)?)
+}
+
+#[cfg(not(unix))]
+fn bind_with_backlog(addr: &str, _backlog: i32) -> anyhow::Result<tokio::net::TcpListener> {
+    // On non-unix platforms, fall back to default bind
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    std_listener.set_nonblocking(true)?;
+    Ok(tokio::net::TcpListener::from_std(std_listener)?)
 }
