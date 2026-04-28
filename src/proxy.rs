@@ -16,7 +16,7 @@ use crate::api_config::ApiConfig;
 use crate::cache::should_cache_response;
 use crate::cache_manager::CACHE;
 use crate::config::ConfigStore;
-use crate::config_models::{HTTPCachePolicy, HTTPCacheRef, ServerConfig};
+use crate::config_models::{HTTPCachePolicy, HTTPCacheRef, HTTPFirewallPolicy, ServerConfig};
 use crate::firewall::state::WafStateManager;
 use crate::rewrite::{RewriteResult, evaluate_host_redirects, evaluate_rewrites};
 use dashmap::DashMap;
@@ -94,6 +94,9 @@ pub struct ProxyCTX {
     pub request_limit_out_bandwidth_sent: i64,
     pub request_limit_out_bandwidth_window_start: Option<std::time::Instant>,
     pub global_cache_policy: Option<HTTPCachePolicy>,
+    /// Cached during request_filter to avoid config lock in response_filter/body_filter
+    pub global_http_config: Option<crate::config_models::GlobalHTTPAllConfig>,
+    pub firewall_policies_snapshot: Option<Vec<HTTPFirewallPolicy>>,
 }
 
 impl Default for ProxyCTX {
@@ -164,6 +167,8 @@ impl Default for ProxyCTX {
             request_limit_out_bandwidth_sent: 0,
             request_limit_out_bandwidth_window_start: None,
             global_cache_policy: None,
+            global_http_config: None,
+            firewall_policies_snapshot: None,
         }
     }
 }
@@ -2745,6 +2750,9 @@ impl ProxyHttp for EdgeProxy {
         let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
         ctx.server = server;
         ctx.lb = upstream;
+        // Cache these in ctx to avoid config lock acquisitions in response_filter / body_filter
+        ctx.global_http_config = Some(hot_path.global_http.clone());
+        ctx.firewall_policies_snapshot = Some(hot_path.firewall_policies.clone());
 
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
         ctx.is_on = hot_path.is_on;
@@ -3714,11 +3722,12 @@ impl ProxyHttp for EdgeProxy {
         }
 
         // --- GLOBAL CLUSTER SETTINGS: Server Flag ---
-        let global_cfg = self.config.get_global_http_config_sync();
-        if !global_cfg.server_name.is_empty() {
-            upstream_response
-                .insert_header("Server", &global_cfg.server_name)
-                .unwrap();
+        if let Some(global_cfg) = &ctx.global_http_config {
+            if !global_cfg.server_name.is_empty() {
+                upstream_response
+                    .insert_header("Server", &global_cfg.server_name)
+                    .unwrap();
+            }
         }
 
         // 1. Initial Outbound WAF (Status & Headers)
@@ -3730,8 +3739,8 @@ impl ProxyHttp for EdgeProxy {
         };
 
         let mut matched_outbound = None;
-        let global_policies = self.config.get_firewall_policies_sync();
-        for gp in &global_policies {
+        if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
+        for gp in global_policies {
             if !gp.is_on {
                 continue;
             }
@@ -3745,6 +3754,7 @@ impl ProxyHttp for EdgeProxy {
                 break;
             }
         }
+        } // end if let Some(ref global_policies)
         if matched_outbound.is_none() {
             if let Some(server) = &ctx.server
                 && let Some(web) = &server.web
@@ -4068,8 +4078,8 @@ impl ProxyHttp for EdgeProxy {
                 };
 
                 let mut matched_outbound = None;
-                let global_policies = self.config.get_firewall_policies_sync();
-                for gp in &global_policies {
+                if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
+                for gp in global_policies {
                     if !gp.is_on {
                         continue;
                     }
@@ -4082,6 +4092,7 @@ impl ProxyHttp for EdgeProxy {
                         matched_outbound = Some(action);
                         break;
                     }
+                }
                 }
                 if matched_outbound.is_none() {
                     if let Some(server) = &ctx.server
