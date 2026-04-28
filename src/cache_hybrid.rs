@@ -732,6 +732,7 @@ impl Storage for HybridStorage {
                 return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), offset: 0 }))));
             }
             // Expired: remove and fall through to L2
+            drop(entry);
             FAST_L1.remove(&hash);
         }
 
@@ -934,6 +935,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
             let path = disk_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
             let _ = tokio::fs::remove_file(&path).await;
             crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+            FAST_L1.remove(&hash);
         }
 
         // Pass 2: Capacity eviction using Max-Heap if disk exceeds limits
@@ -986,6 +988,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
                 let path = disk_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
                 let _ = tokio::fs::remove_file(&path).await;
                 crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                FAST_L1.remove(&hash);
             }
         }
     }
@@ -1007,6 +1010,7 @@ pub fn fast_l1_lookup(key_str: &str) -> Option<bytes::Bytes> {
         if entry.fresh_until > now {
             return Some(entry.data.clone());
         }
+        drop(entry);
         FAST_L1.remove(&hash);
     }
     None
