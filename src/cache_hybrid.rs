@@ -711,15 +711,9 @@ impl Storage for HybridStorage {
         let p_type = self.policy_type.load(Ordering::Relaxed);
 
         let k_str = key.primary_key_str().unwrap_or("unknown");
-
-        if p_type == POLICY_MEMORY {
-            return self.l1.lookup(key, trace).await;
-        }
-
-        // Use the same MD5 hash as FileStorage for consistent cross-layer lookup.
         let hash = format!("{:x}", md5_legacy::compute(k_str));
 
-        // Check lock-free L1 cache first (DashMap, sharded, zero contention)
+        // Check lock-free FAST_L1 first for ALL policy types (DashMap, sharded, zero contention)
         if let Some(entry) = FAST_L1.get(&hash) {
             let now = crate::utils::time::now_timestamp();
             if entry.fresh_until > now {
@@ -734,15 +728,36 @@ impl Storage for HybridStorage {
                 prof_record_l1_hit();
                 return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), offset: 0 }))));
             }
-            // Expired: remove and fall through to L2
+            // Expired: remove and fall through
             drop(entry);
             FAST_L1.remove(&hash);
         }
 
-        // Fallback: try MemCache (for entries promoted before this change)
-        if let Some(hit) = self.l1.lookup(key, trace).await? {
+        // Fallback: try MemCache (for entries not yet in FAST_L1)
+        if let Some((meta, handler)) = self.l1.lookup(key, trace).await? {
             prof_record_l1_hit();
-            return Ok(Some(hit));
+            // Promote to FAST_L1 for subsequent zero-lock hits
+            if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
+                if mem_handler.offset == 0 && mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
+                    let now = crate::utils::time::now_timestamp();
+                    let fresh_until = meta.fresh_until()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(std::time::Duration::from_secs(3600))
+                        .as_secs() as i64;
+                    FAST_L1.insert(hash.clone(), FastL1Entry {
+                        data: mem_handler.data.clone(),
+                        fresh_until,
+                        created_at: now,
+                    });
+                    prof_record_l2_mem_promotion();
+                }
+            }
+            return Ok(Some((meta, handler)));
+        }
+
+        // For memory-only policy, we're done (no L2 disk storage)
+        if p_type == POLICY_MEMORY {
+            return Ok(None);
         }
 
         if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
