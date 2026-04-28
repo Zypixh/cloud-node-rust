@@ -235,7 +235,7 @@ const MAX_HLS_SEGMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 use pingora_cache::lock::CacheLock;
 
-static CACHE_LOCK: once_cell::sync::Lazy<CacheLock> = once_cell::sync::Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(1)));
+static CACHE_LOCK: once_cell::sync::Lazy<CacheLock> = once_cell::sync::Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(5)));
 
 impl EdgeProxy {
     fn is_grpc_request(session: &Session) -> bool {

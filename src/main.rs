@@ -499,7 +499,6 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     // 4. Initialize Pingora Server with multi-threading
     let mut conf = pingora_core::server::configuration::ServerConf::default();
     conf.threads = num_cpus::get();
-    conf.max_retries = 3;
     let mut my_server = pingora_core::server::Server::new_with_opt_and_conf(None, conf);
     info!("Pingora server configured with {} threads.", my_server.configuration.threads);
     my_server.bootstrap();
