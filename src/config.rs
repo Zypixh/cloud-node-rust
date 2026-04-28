@@ -64,6 +64,8 @@ pub struct NodeConfig {
     pub request_origins_with_encodings: bool,
     pub xff_max_addresses: i32,
     pub allow_lan_ip: bool,
+    /// Pre-built global HTTP config to avoid per-request construction inside config lock.
+    pub global_http_config: Arc<crate::config_models::GlobalHTTPAllConfig>,
 
     /// Real-time pressure/load factor for L2 nodes (0.0 - 1.0)
     pub parent_pressure: HashMap<String, (f32, std::time::Instant)>,
@@ -123,6 +125,7 @@ impl Default for NodeConfig {
             request_origins_with_encodings: false,
             xff_max_addresses: 0,
             allow_lan_ip: false,
+            global_http_config: Arc::default(),
             parent_pressure: HashMap::new(),
             cache_policy: None,
             firewall_policies: Arc::new(Vec::new()),
@@ -150,7 +153,7 @@ pub struct ConfigStore {
 #[derive(Clone)]
 pub struct HotPathSnapshot {
     pub is_on: bool,
-    pub global_http: crate::config_models::GlobalHTTPAllConfig,
+    pub global_http: Arc<crate::config_models::GlobalHTTPAllConfig>,
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     pub grpc_policy: Option<crate::config_models::GRPCConfig>,
     pub has_any_sni_passthrough: bool,
@@ -234,17 +237,7 @@ impl ConfigStore {
     fn build_hot_path_snapshot(lock: &NodeConfig) -> HotPathSnapshot {
         HotPathSnapshot {
             is_on: lock.is_on,
-            global_http: crate::config_models::GlobalHTTPAllConfig {
-                force_ln_request: lock.force_ln_request,
-                ln_request_scheduling_method: lock.ln_request_scheduling_method.clone(),
-                supports_low_version_http: lock.supports_low_version_http,
-                match_cert_from_all_servers: lock.match_cert_from_all_servers,
-                server_name: lock.server_name.clone(),
-                enable_server_addr_variable: lock.enable_server_addr_variable,
-                request_origins_with_encodings: lock.request_origins_with_encodings,
-                xff_max_addresses: lock.xff_max_addresses,
-                allow_lan_ip: lock.allow_lan_ip,
-            },
+            global_http: Arc::clone(&lock.global_http_config),
             firewall_policies: Arc::clone(&lock.firewall_policies),
             grpc_policy: lock.grpc_policy.clone(),
             has_any_sni_passthrough: lock.has_any_sni_passthrough,
@@ -421,19 +414,9 @@ impl ConfigStore {
         lock.enable_ip_lists
     }
 
-    pub fn get_global_http_config_sync(&self) -> crate::config_models::GlobalHTTPAllConfig {
+    pub fn get_global_http_config_sync(&self) -> Arc<crate::config_models::GlobalHTTPAllConfig> {
         let lock = self.inner.read().unwrap();
-        crate::config_models::GlobalHTTPAllConfig {
-            force_ln_request: lock.force_ln_request,
-            ln_request_scheduling_method: lock.ln_request_scheduling_method.clone(),
-            supports_low_version_http: lock.supports_low_version_http,
-            match_cert_from_all_servers: lock.match_cert_from_all_servers,
-            server_name: lock.server_name.clone(),
-            enable_server_addr_variable: lock.enable_server_addr_variable,
-            request_origins_with_encodings: lock.request_origins_with_encodings,
-            xff_max_addresses: lock.xff_max_addresses,
-            allow_lan_ip: lock.allow_lan_ip,
-        }
+        Arc::clone(&lock.global_http_config)
     }
 
     pub fn get_grpc_policy_sync(&self) -> Option<crate::config_models::GRPCConfig> {
@@ -653,16 +636,29 @@ impl ConfigStore {
         lock.parent_nodes = parent_nodes;
         lock.tiered_origin_bypass = tiered_origin_bypass;
         lock.force_ln_request = force_ln_request;
-        lock.ln_request_scheduling_method = ln_method;
         lock.parent_routes = parent_routes;
         lock.grpc_policy = grpc_policy;
-        lock.supports_low_version_http = supports_low_version_http;
-        lock.match_cert_from_all_servers = match_cert_from_all_servers;
-        lock.server_name = server_name;
-        lock.enable_server_addr_variable = enable_server_addr_variable;
-        lock.request_origins_with_encodings = request_origins_with_encodings;
-        lock.xff_max_addresses = xff_max_addresses;
-        lock.allow_lan_ip = allow_lan_ip;
+        // Build the pre-computed GlobalHTTPAllConfig Arc before moving individual fields.
+        let global_http = Arc::new(crate::config_models::GlobalHTTPAllConfig {
+            force_ln_request,
+            ln_request_scheduling_method: ln_method,
+            supports_low_version_http,
+            match_cert_from_all_servers,
+            server_name,
+            enable_server_addr_variable,
+            request_origins_with_encodings,
+            xff_max_addresses,
+            allow_lan_ip,
+        });
+        lock.ln_request_scheduling_method = global_http.ln_request_scheduling_method.clone();
+        lock.supports_low_version_http = global_http.supports_low_version_http;
+        lock.match_cert_from_all_servers = global_http.match_cert_from_all_servers;
+        lock.server_name = global_http.server_name.clone();
+        lock.enable_server_addr_variable = global_http.enable_server_addr_variable;
+        lock.request_origins_with_encodings = global_http.request_origins_with_encodings;
+        lock.xff_max_addresses = global_http.xff_max_addresses;
+        lock.allow_lan_ip = global_http.allow_lan_ip;
+        lock.global_http_config = global_http;
         lock.cache_policy = cache_policy;
         lock.firewall_policies = Arc::new(firewall_policies);
         lock.waf_actions = waf_actions;

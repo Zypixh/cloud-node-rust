@@ -95,7 +95,7 @@ pub struct ProxyCTX {
     pub request_limit_out_bandwidth_window_start: Option<std::time::Instant>,
     pub global_cache_policy: Option<HTTPCachePolicy>,
     /// Cached during request_filter to avoid config lock in response_filter/body_filter
-    pub global_http_config: Option<crate::config_models::GlobalHTTPAllConfig>,
+    pub global_http_config: Option<Arc<crate::config_models::GlobalHTTPAllConfig>>,
     pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
 }
 
@@ -2751,7 +2751,7 @@ impl ProxyHttp for EdgeProxy {
         ctx.server = server;
         ctx.lb = upstream;
         // Cache these in ctx to avoid config lock acquisitions in response_filter / body_filter
-        ctx.global_http_config = Some(hot_path.global_http.clone());
+        ctx.global_http_config = Some(Arc::clone(&hot_path.global_http));
         ctx.firewall_policies_snapshot = Some(Arc::clone(&hot_path.firewall_policies));
 
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
@@ -2921,7 +2921,7 @@ impl ProxyHttp for EdgeProxy {
         }
 
         // --- GLOBAL CLUSTER SETTINGS: Low Version HTTP ---
-        let global_cfg = hot_path.global_http.clone();
+        let global_cfg = Arc::clone(&hot_path.global_http);
         if !global_cfg.supports_low_version_http {
             if session.req_header().version < pingora_http::Version::HTTP_11 {
                 debug!(
