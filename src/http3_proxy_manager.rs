@@ -208,12 +208,10 @@ impl Http3ProxyManager {
         rustls_config.alpn_protocols = vec![b"h3".to_vec()];
         rustls_config.max_early_data_size = u32::MAX;
 
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_config))?,
         ));
-        let transport = Arc::get_mut(&mut server_config.transport)
-            .context("unable to access quinn transport config")?;
-        transport.max_concurrent_uni_streams(16_u8.into());
+        // Use Quinn's default max_concurrent_uni_streams (no artificial cap for CDN)
         Ok(server_config)
     }
 

@@ -476,8 +476,8 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     });
 
     // Log Uploader
-    let (log_tx, log_rx) = tokio::sync::mpsc::channel(10000);
-    let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(1000);
+    let (log_tx, log_rx) = tokio::sync::mpsc::channel(100000);
+    let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(10000);
     logging::init_global_log_bus(log_tx, node_log_tx);
 
     let uploader =

@@ -32,7 +32,7 @@ fn zstd_decompress_to_bytes(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-const MEMORY_SERVE_MAX: u64 = 2 * 1024 * 1024; // 2MB
+const MEMORY_SERVE_MAX: u64 = 50 * 1024 * 1024; // 50MB
 
 /// Dynamic Disk-based storage for Pingora-cache
 pub struct FileStorage {
@@ -1118,20 +1118,8 @@ pub fn start_cache_janitor() {
                 tracing::debug!("FAST_L1 janitor: evicted {} expired entries, {} remain", evicted, FAST_L1.len());
             }
 
-            // Cap OPEN_FILE_CACHE at 4096 entries — remove random entries beyond limit
-            const MAX_OPEN_FILES: usize = 4096;
-            if OPEN_FILE_CACHE.len() > MAX_OPEN_FILES {
-                let excess = OPEN_FILE_CACHE.len() - MAX_OPEN_FILES;
-                let keys_to_remove: Vec<_> = OPEN_FILE_CACHE
-                    .iter()
-                    .take(excess)
-                    .map(|entry| entry.key().clone())
-                    .collect();
-                for key in keys_to_remove {
-                    OPEN_FILE_CACHE.remove(&key);
-                }
-                tracing::debug!("OPEN_FILE_CACHE janitor: removed {} excess handles", excess);
-            }
+            // OPEN_FILE_CACHE is naturally bounded by OS file descriptor limit (ulimit).
+            // No artificial cap — random eviction would hurt CDN cache hit rates.
         }
     });
 }
