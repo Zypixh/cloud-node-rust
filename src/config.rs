@@ -70,7 +70,7 @@ pub struct NodeConfig {
     /// Global or node-specific cache policy
     pub cache_policy: Option<HTTPCachePolicy>,
     /// Global or node-specific firewall policies
-    pub firewall_policies: Vec<HTTPFirewallPolicy>,
+    pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     /// Global WAF action defaults
     pub waf_actions: Vec<crate::config_models::WAFActionConfig>,
     /// Global UAM policies keyed by cluster id
@@ -125,7 +125,7 @@ impl Default for NodeConfig {
             allow_lan_ip: false,
             parent_pressure: HashMap::new(),
             cache_policy: None,
-            firewall_policies: Vec::new(),
+            firewall_policies: Arc::new(Vec::new()),
             waf_actions: Vec::new(),
             uam_policies: HashMap::new(),
             http_cc_policies: HashMap::new(),
@@ -151,7 +151,7 @@ pub struct ConfigStore {
 pub struct HotPathSnapshot {
     pub is_on: bool,
     pub global_http: crate::config_models::GlobalHTTPAllConfig,
-    pub firewall_policies: Vec<HTTPFirewallPolicy>,
+    pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     pub grpc_policy: Option<crate::config_models::GRPCConfig>,
     pub has_any_sni_passthrough: bool,
     pub cache_policy: Option<HTTPCachePolicy>,
@@ -245,7 +245,7 @@ impl ConfigStore {
                 xff_max_addresses: lock.xff_max_addresses,
                 allow_lan_ip: lock.allow_lan_ip,
             },
-            firewall_policies: lock.firewall_policies.clone(),
+            firewall_policies: Arc::clone(&lock.firewall_policies),
             grpc_policy: lock.grpc_policy.clone(),
             has_any_sni_passthrough: lock.has_any_sni_passthrough,
             cache_policy: lock.cache_policy.clone(),
@@ -337,9 +337,9 @@ impl ConfigStore {
         lock.cache_policy.clone()
     }
 
-    pub fn get_firewall_policies_sync(&self) -> Vec<HTTPFirewallPolicy> {
+    pub fn get_firewall_policies_sync(&self) -> Arc<Vec<HTTPFirewallPolicy>> {
         let lock = self.inner.read().unwrap();
-        lock.firewall_policies.clone()
+        Arc::clone(&lock.firewall_policies)
     }
 
     pub fn get_waf_actions_sync(&self) -> Vec<crate::config_models::WAFActionConfig> {
@@ -664,7 +664,7 @@ impl ConfigStore {
         lock.xff_max_addresses = xff_max_addresses;
         lock.allow_lan_ip = allow_lan_ip;
         lock.cache_policy = cache_policy;
-        lock.firewall_policies = firewall_policies;
+        lock.firewall_policies = Arc::new(firewall_policies);
         lock.waf_actions = waf_actions;
         lock.uam_policies = uam_policies;
         lock.http_cc_policies = http_cc_policies;

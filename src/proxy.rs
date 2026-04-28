@@ -96,7 +96,7 @@ pub struct ProxyCTX {
     pub global_cache_policy: Option<HTTPCachePolicy>,
     /// Cached during request_filter to avoid config lock in response_filter/body_filter
     pub global_http_config: Option<crate::config_models::GlobalHTTPAllConfig>,
-    pub firewall_policies_snapshot: Option<Vec<HTTPFirewallPolicy>>,
+    pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
 }
 
 impl Default for ProxyCTX {
@@ -2752,7 +2752,7 @@ impl ProxyHttp for EdgeProxy {
         ctx.lb = upstream;
         // Cache these in ctx to avoid config lock acquisitions in response_filter / body_filter
         ctx.global_http_config = Some(hot_path.global_http.clone());
-        ctx.firewall_policies_snapshot = Some(hot_path.firewall_policies.clone());
+        ctx.firewall_policies_snapshot = Some(Arc::clone(&hot_path.firewall_policies));
 
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
         ctx.is_on = hot_path.is_on;
@@ -3740,7 +3740,7 @@ impl ProxyHttp for EdgeProxy {
 
         let mut matched_outbound = None;
         if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
-        for gp in global_policies {
+        for gp in global_policies.iter() {
             if !gp.is_on {
                 continue;
             }
@@ -4079,7 +4079,7 @@ impl ProxyHttp for EdgeProxy {
 
                 let mut matched_outbound = None;
                 if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
-                for gp in global_policies {
+                for gp in global_policies.iter() {
                     if !gp.is_on {
                         continue;
                     }
