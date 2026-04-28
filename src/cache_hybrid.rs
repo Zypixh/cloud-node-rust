@@ -32,21 +32,6 @@ fn zstd_decompress_to_bytes(data: &[u8]) -> Option<Vec<u8>> {
 
 const MEMORY_SERVE_MAX: u64 = 2 * 1024 * 1024; // 2MB
 
-/// Read a small file entirely into memory, with optional zstd decompression.
-/// Designed to run inside spawn_blocking — combines stat+read+decompress into one call.
-fn read_file_into_memory(path: &std::path::Path, compressed: bool) -> Option<Vec<u8>> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() == 0 || meta.len() > MEMORY_SERVE_MAX {
-        return None;
-    }
-    let data = std::fs::read(path).ok()?;
-    if compressed {
-        zstd_decompress_to_bytes(&data)
-    } else {
-        Some(data)
-    }
-}
-
 /// Dynamic Disk-based storage for Pingora-cache
 pub struct FileStorage {
     pub inner: Arc<RwLock<FileStorageInner>>,
@@ -164,36 +149,24 @@ impl Storage for FileStorage {
             headers,
         );
 
-        // Use async tokio::fs::read instead of spawn_blocking to test if
-        // spawn_blocking is the root cause of the connection leak.
+        // Read entire file into memory, serve in 32KB chunks via MemoryHitHandler
         let file_data = tokio::fs::read(&path).await
             .map_err(|_| Error::new(ErrorType::InternalError))?;
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
-        if file_data.len() <= MEMORY_SERVE_MAX as usize {
-            let body = if compressed {
-                let result = tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&file_data)).await;
-                match result {
-                    Ok(Some(data)) => bytes::Bytes::from(data),
-                    _ => return Ok(None),
-                }
-            } else {
-                bytes::Bytes::from(file_data)
-            };
-            return Ok(Some((meta, Box::new(MemoryHitHandler { data: body, sent: false }))));
-        }
-
-        // Slow path for large files: streaming via tokio async I/O
-        let file = tokio::fs::File::open(&path).await
-            .map_err(|_| Error::new(ErrorType::InternalError))?;
-        let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if compressed {
-            let buf_reader = tokio::io::BufReader::new(file);
-            Box::new(async_compression::tokio::bufread::ZstdDecoder::new(buf_reader))
+        let body: bytes::Bytes = if compressed {
+            let result = tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&file_data)).await;
+            match result {
+                Ok(Some(data)) => bytes::Bytes::from(data),
+                _ => return Ok(None),
+            }
         } else {
-            Box::new(file)
+            bytes::Bytes::from(file_data)
         };
-        let handler = Box::new(FileHitHandler {
-            reader: tokio::sync::Mutex::new(reader),
+
+        let handler = Box::new(MemoryHitHandler {
+            data: body,
+            offset: 0,
         });
         Ok(Some((meta, handler)))
     }
@@ -377,65 +350,24 @@ impl Storage for FileStorage {
     }
 }
 
-/// In-memory hit handler that serves from a Bytes buffer.
-/// Eliminates disk I/O on every cache hit by reading the entire file once.
+/// In-memory hit handler that serves from a Bytes buffer in 32KB chunks.
+/// Chunked delivery is required by Pingora's HTTP framing — one-shot delivery
+/// breaks keep-alive and causes connection leaks.
 struct MemoryHitHandler {
     data: bytes::Bytes,
-    sent: bool,
+    offset: usize,
 }
 
 #[async_trait]
 impl HandleHit for MemoryHitHandler {
     async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
-        if self.sent {
+        if self.offset >= self.data.len() {
             return Ok(None);
         }
-        self.sent = true;
-        Ok(Some(self.data.clone()))
-    }
-
-    async fn finish(
-        self: Box<Self>,
-        _storage: &'static (dyn Storage + Sync),
-        _key: &CacheKey,
-        _trace: &pingora_cache::trace::SpanHandle,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn as_any(&self) -> &(dyn Any + Send + Sync) {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
-        self
-    }
-}
-
-/// Streaming file hit handler for large files that don't fit in the memory budget.
-struct FileHitHandler {
-    reader: tokio::sync::Mutex<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
-}
-
-#[async_trait]
-impl HandleHit for FileHitHandler {
-    async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 32768];
-        let mut r = self.reader.lock().await;
-        let res = r.read(&mut buf).await.map_err(|e| {
-            tracing::error!(
-                "CACHE_HIT: Streaming read error (possibly corrupted zstd): {:?}",
-                e
-            );
-            Error::new(ErrorType::InternalError)
-        })?;
-
-        if res == 0 {
-            Ok(None)
-        } else {
-            buf.truncate(res);
-            Ok(Some(bytes::Bytes::from(buf)))
-        }
+        let end = (self.offset + 32768).min(self.data.len());
+        let chunk = self.data.slice(self.offset..end);
+        self.offset = end;
+        Ok(Some(chunk))
     }
 
     async fn finish(
@@ -797,7 +729,7 @@ impl Storage for HybridStorage {
                     headers,
                 );
                 prof_record_l1_hit();
-                return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), sent: false }))));
+                return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), offset: 0 }))));
             }
             // Expired: remove and fall through to L2
             FAST_L1.remove(&hash);
@@ -814,7 +746,7 @@ impl Storage for HybridStorage {
             // Store in lock-free FAST_L1 for subsequent zero-copy hits.
             // Skip the single-lock MemCache — it's a bottleneck at 1000+ concurrency.
             if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
-                if !mem_handler.sent && mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
+                if mem_handler.offset == 0 && mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
                     let now = crate::utils::time::now_timestamp();
                     let fresh_until = meta.fresh_until()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -829,8 +761,7 @@ impl Storage for HybridStorage {
                 }
             }
 
-            // Async hot promotion for files that don't fit the memory fast path
-            // (e.g. >2MB or already streamed via FileHitHandler).
+            // Async hot promotion for files that don't fit the memory fast path (>2MB)
             let threshold = self
                 .hot_threshold
                 .load(std::sync::atomic::Ordering::Relaxed);
