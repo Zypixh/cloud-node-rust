@@ -314,13 +314,15 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         log.firewall_actions.push(waf.clone());
     }
 
-    // Tags: collect from ctx.tags + cache HIT
+    // Tags: collect from ctx.tags
     for tag in &ctx.tags {
         log.tags.push(tag.clone());
     }
-    if is_cached {
-        log.tags.push("CACHE_HIT".to_string());
-    }
+    // Cache status in attrs, matching Go: logAttrs["cache.status"] = "HIT"
+    log.attrs.insert(
+        "cache.status".to_string(),
+        if is_cached { "HIT".to_string() } else { "BYPASS".to_string() },
+    );
 
     // Attrs: geo + browser/OS analysis
     if let Some(analyzed) = &ctx.analyzed {

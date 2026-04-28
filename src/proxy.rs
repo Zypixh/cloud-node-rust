@@ -2821,69 +2821,6 @@ impl ProxyHttp for EdgeProxy {
             );
         }
 
-        let is_test = session.get_header("x-cloud-preheat").is_some();
-
-        // Handle internal cache test (FULL PATH SIMULATION)
-        if is_test {
-            // 1. Buffer the value from API
-            let mut buffered = Vec::new();
-            while let Ok(Some(chunk)) = session.read_request_body().await {
-                buffered.extend_from_slice(&chunk);
-                if buffered.len() >= 2 * 1024 * 1024 {
-                    break;
-                }
-            }
-            ctx.request_body = buffered;
-            ctx.no_log = true;
-
-            // 2. Perform direct storage write to ensure Key match and NO PANICS
-            // We use the Host header as the raw Key (parity with readCache)
-            let hash = format!("{:x}", md5_legacy::compute(&host));
-            let root = std::path::Path::new("../data/cache");
-            let file_path = root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
-
-            if let Some(parent) = file_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::File::create(&file_path) {
-                let _ = file.write_all(&ctx.request_body);
-            }
-
-            let mut headers_json = serde_json::Map::new();
-            headers_json.insert(
-                "content-type".to_string(),
-                serde_json::Value::String("text/plain".to_string()),
-            );
-
-            crate::metrics::storage::STORAGE.update_cache_meta(
-                &hash,
-                &host,
-                ctx.request_body.len() as u64,
-                3600,
-                Some(serde_json::Value::Object(headers_json)),
-                false,
-                200,
-            );
-
-            debug!(
-                "Internal cache test write success: key={}, hash={}, size={}",
-                host,
-                hash,
-                ctx.request_body.len()
-            );
-
-            // 3. Respond and stop to avoid Pingora Phase machine panic
-            let mut resp = pingora_http::ResponseHeader::build(200, None).unwrap();
-            resp.insert_header("x-cloud-test", "1").unwrap();
-            session.write_response_header(Box::new(resp), false).await?;
-            session
-                .write_response_body(Some(bytes::Bytes::from("OK")), true)
-                .await?;
-            return Ok(true);
-        }
-
         if let Some(server) = &ctx.server {
             if let Some(web) = &server.web
                 && let Some(ws) = &web.websocket
@@ -3688,15 +3625,25 @@ impl ProxyHttp for EdgeProxy {
         ctx.response_status = upstream_response.status.as_u16();
         ctx.ttfb = Some(ctx.start_time.elapsed());
 
-        // Fast path for cache HIT: skip header sync, WAF, Alt-Svc, and other
-        // work that was already done when the response was first cached.
-        // This also avoids a config lock in resolve_http3_advertisement_port.
+        // Cache HIT: sync response headers for access log, then skip WAF/Alt-Svc
         if session.cache.phase() == pingora_cache::CachePhase::Hit {
+            ctx.cache_hit = Some(true);
+            for (name, value) in upstream_response.headers.iter() {
+                if let Ok(value_str) = value.to_str() {
+                    ctx.response_headers
+                        .insert(name.to_string(), value_str.to_string());
+                }
+            }
             ctx.response_headers
                 .insert("x-cache".to_string(), "HIT".to_string());
             upstream_response
                 .insert_header("x-cache", "HIT")
                 .unwrap();
+            ctx.response_headers_size = upstream_response
+                .headers
+                .iter()
+                .map(|(n, v)| n.as_str().len() + v.len() + 4)
+                .sum();
             if let Some(global_cfg) = &ctx.global_http_config {
                 if !global_cfg.server_name.is_empty() {
                     upstream_response
@@ -3963,10 +3910,11 @@ impl ProxyHttp for EdgeProxy {
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<std::time::Duration>> {
-        // Cache HIT: skip optimize/webp/hls/outbound WAF — all done when first cached
+        // Cache HIT: skip optimize/webp/hls/outbound WAF — already done when first cached
         if session.cache.phase() == pingora_cache::CachePhase::Hit {
             if let Some(chunk) = body {
                 ctx.response_body_len += chunk.len();
+                return Ok(self.response_bandwidth_delay(chunk.len(), ctx));
             }
             return Ok(None);
         }
