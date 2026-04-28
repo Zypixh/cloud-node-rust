@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use tokio::sync::RwLock;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Global cache for open file handles to reduce open() syscalls
 static OPEN_FILE_CACHE: Lazy<DashMap<PathBuf, Arc<std::fs::File>>> = Lazy::new(DashMap::new);
@@ -489,6 +489,9 @@ struct FastL1Entry {
 /// Global lock-free L1 cache. Sharded by DashMap, no contention at 1000+ concurrent reads.
 static FAST_L1: Lazy<DashMap<String, FastL1Entry>> = Lazy::new(DashMap::new);
 
+const POLICY_FILE: u8 = 0;
+const POLICY_MEMORY: u8 = 1;
+
 pub struct HybridStorage {
     pub l1: Arc<MemCache>,
     pub l2: &'static FileStorage,
@@ -496,7 +499,7 @@ pub struct HybridStorage {
     hot_threshold: std::sync::atomic::AtomicU32,
     pub max_disk_bytes: std::sync::atomic::AtomicU64,
     pub min_free_bytes: std::sync::atomic::AtomicU64,
-    pub policy_type: Arc<RwLock<String>>,
+    pub policy_type: AtomicU8,
 }
 
 pub struct CacheRuntimeStats {
@@ -521,13 +524,13 @@ impl HybridStorage {
             hot_threshold: std::sync::atomic::AtomicU32::new(5),
             max_disk_bytes: std::sync::atomic::AtomicU64::new(10 * 1024 * 1024 * 1024),
             min_free_bytes: std::sync::atomic::AtomicU64::new(2 * 1024 * 1024 * 1024), // 2GB default
-            policy_type: Arc::new(RwLock::new("file".to_string())),
+            policy_type: AtomicU8::new(POLICY_FILE),
         }
     }
 
     pub async fn apply_policy(&self, policy: &crate::config_models::HTTPCachePolicy) {
-        let mut p_type = self.policy_type.write().await;
-        *p_type = policy.r#type.clone();
+        let val = if policy.r#type == "memory" { POLICY_MEMORY } else { POLICY_FILE };
+        self.policy_type.store(val, Ordering::Relaxed);
 
         if let Some(capacity) = &policy.capacity {
             let bytes = crate::config_models::SizeCapacity::from_json(capacity).to_bytes();
@@ -682,7 +685,7 @@ impl HybridStorage {
         let (memory_count, memory_bytes) = self.l1.stats();
         let (disk_count, disk_bytes) = crate::metrics::storage::STORAGE.cache_summary();
         CacheRuntimeStats {
-            policy_type: self.policy_type.read().await.clone(),
+            policy_type: if self.policy_type.load(Ordering::Relaxed) == POLICY_MEMORY { "memory".to_string() } else { "file".to_string() },
             memory_count,
             memory_bytes: memory_bytes as u64,
             disk_count,
@@ -705,11 +708,11 @@ impl Storage for HybridStorage {
         key: &CacheKey,
         trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<Option<(CacheMeta, HitHandler)>> {
-        let p_type = self.policy_type.read().await;
+        let p_type = self.policy_type.load(Ordering::Relaxed);
 
         let k_str = key.primary_key_str().unwrap_or("unknown");
 
-        if *p_type == "memory" {
+        if p_type == POLICY_MEMORY {
             return self.l1.lookup(key, trace).await;
         }
 
@@ -831,9 +834,9 @@ impl Storage for HybridStorage {
         meta: &CacheMeta,
         trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<MissHandler> {
-        let p_type = self.policy_type.read().await;
+        let p_type = self.policy_type.load(Ordering::Relaxed);
 
-        if *p_type == "file" {
+        if p_type == POLICY_FILE {
             let lock = self.l2.inner.read().await;
             let min_free = self
                 .min_free_bytes
@@ -852,7 +855,7 @@ impl Storage for HybridStorage {
             }
         }
 
-        if *p_type == "memory" {
+        if p_type == POLICY_MEMORY {
             return self.l1.get_miss_handler(key, meta, trace).await;
         }
 
@@ -874,8 +877,8 @@ impl Storage for HybridStorage {
         meta: &CacheMeta,
         trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<bool> {
-        let p_type = self.policy_type.read().await;
-        if *p_type == "memory" {
+        let p_type = self.policy_type.load(Ordering::Relaxed);
+        if p_type == POLICY_MEMORY {
             self.l1.update_meta(key, meta, trace).await?;
         }
         self.l2.update_meta(key, meta, trace).await

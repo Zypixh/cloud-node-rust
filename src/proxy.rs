@@ -50,6 +50,7 @@ pub struct ProxyCTX {
     pub waf_group_id: i64,
     pub waf_set_id: i64,
     pub waf_rule_id: i64,
+    pub waf_deferred: bool,
     pub waf_action: Option<String>,
     pub errors: Vec<String>,
     pub tags: Vec<String>,
@@ -119,6 +120,7 @@ impl Default for ProxyCTX {
             waf_group_id: 0,
             waf_set_id: 0,
             waf_rule_id: 0,
+            waf_deferred: false,
             waf_action: None,
             errors: Vec::new(),
             tags: Vec::new(),
@@ -2537,6 +2539,190 @@ impl EdgeProxy {
             }
         }
     }
+
+    /// Heavy WAF checks deferred to cache-miss path. See request_filter for rationale.
+    async fn run_heavy_waf(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        _host: &str,
+        global_policies: &[crate::config_models::HTTPFirewallPolicy],
+    ) -> Result<(bool, Option<String>)> {
+        let mut waf_action: Option<String> = None;
+
+        // Mandatory Global Special Defenses
+        for gp in global_policies {
+            if !gp.is_on {
+                continue;
+            }
+            // Empty Connection Flood
+            if let Some(cfg) = &gp.empty_connection_flood {
+                if cfg.is_on {
+                    let threshold = cfg.threshold.max(10);
+                    let period = if cfg.period > 0 { cfg.period as i64 } else { 60 };
+                    let ban = if cfg.ban_duration > 0 { cfg.ban_duration as i64 } else { 3600 };
+                    if !self.waf_state.check_special_defense(
+                        format!("ECF:{}", ctx.client_ip_str), threshold, period,
+                    ) {
+                        self.waf_state.block_ip(ctx.client_ip, 0, ban, Some("global"), false, gp.use_local_firewall);
+                        self.respond_status_with_pages(session, ctx, 403).await?;
+                        return Ok((true, None));
+                    }
+                }
+            }
+            // TLS Exhaustion Attack
+            if let Some(cfg) = &gp.tls_exhaustion_attack {
+                let is_tls = session.downstream_session.digest()
+                    .and_then(|d| d.ssl_digest.as_ref()).is_some();
+                if cfg.is_on && (is_tls || session.req_header().uri.scheme_str() == Some("https")) {
+                    let threshold = cfg.threshold.max(10);
+                    let period = if cfg.period > 0 { cfg.period as i64 } else { 60 };
+                    let ban = if cfg.ban_duration > 0 { cfg.ban_duration as i64 } else { 3600 };
+                    if !self.waf_state.check_special_defense(
+                        format!("TLS:{}", ctx.client_ip_str), threshold, period,
+                    ) {
+                        self.waf_state.block_ip(ctx.client_ip, 0, ban, Some("global"), true, gp.use_local_firewall);
+                        self.respond_status_with_pages(session, ctx, 403).await?;
+                        return Ok((true, None));
+                    }
+                }
+            }
+        }
+
+        if self.enforce_uam(session, ctx, &ctx.client_ip_str.clone()).await? {
+            return Ok((true, None));
+        }
+
+        let mut waf_match: Option<crate::firewall::MatchedAction> = None;
+
+        if ctx.request_body.is_empty() {
+            let content_length = session
+                .get_header("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if content_length > 0 && content_length <= 2 * 1024 * 1024 {
+                let mut buffered = Vec::with_capacity(content_length);
+                while let Some(chunk) = session.read_request_body().await? {
+                    buffered.extend_from_slice(&chunk);
+                    if buffered.len() >= content_length { break; }
+                }
+                ctx.request_body = buffered;
+            }
+        }
+
+        if self.enforce_plan_max_upload(session, ctx).await? {
+            return Ok((true, None));
+        }
+
+        if let Some(server) = &ctx.server
+            && let Some(web) = &server.web
+            && let Some(firewall_ref) = &web.firewall_ref
+            && firewall_ref.is_on
+        {
+            if let Some(policy) = &web.firewall_policy {
+                if policy.is_on {
+                    if policy.max_request_body_size > 0 {
+                        let content_length = session
+                            .get_header("content-length")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        if content_length > policy.max_request_body_size
+                            || (ctx.request_body.len() as i64) > policy.max_request_body_size
+                        {
+                            waf_match = Some(crate::firewall::MatchedAction {
+                                action: crate::firewall::ActionResponse::Block {
+                                    status: 413,
+                                    body: "Request Entity Too Large".to_string(),
+                                },
+                                policy_id: policy.id, group_id: 0, set_id: 0,
+                                action_code: "block".to_string(),
+                                timeout_secs: Some(3600), max_timeout_secs: None,
+                                life_seconds: None, max_fails: 0, fail_block_timeout: 0,
+                                scope: None, block_c_class: false, use_local_firewall: false,
+                                next_group_id: None, next_set_id: None, allow_scope: None,
+                                tags: vec![], ip_list_id: 0, event_level: "error".to_string(),
+                                block_options: None, page_options: None,
+                                captcha_options: None, js_cookie_options: None,
+                            });
+                        }
+                    }
+                    if waf_match.is_none() {
+                        waf_match = crate::firewall::evaluate_policy(policy, session, &ctx.request_body);
+                    }
+                }
+            }
+            if waf_match.is_none() && !firewall_ref.ignore_global_rules {
+                for gp in global_policies {
+                    if gp.is_on {
+                        if let Some(action) = crate::firewall::evaluate_policy(gp, session, &ctx.request_body) {
+                            waf_match = Some(action);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(matched) = waf_match {
+            ctx.waf_policy_id = matched.policy_id;
+            ctx.waf_group_id = matched.group_id;
+            ctx.waf_set_id = matched.set_id;
+            waf_action = Some(matched.action_code.clone());
+            ctx.waf_action = waf_action.clone();
+            self.maybe_report_firewall_event(ctx, matched.policy_id, matched.group_id, matched.set_id);
+
+            if matched.action_code == "record_ip_white" {
+                self.waf_state.unblock_ip(
+                    ctx.client_ip,
+                    ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+                    matched.scope.as_deref(),
+                    matched.use_local_firewall,
+                );
+                return Ok((false, waf_action));
+            }
+
+            if matches!(matched.action_code.as_str(), "block" | "record_ip") {
+                let mut final_timeout = matched.timeout_secs.unwrap_or(300);
+                if let Some(max_t) = matched.max_timeout_secs {
+                    if max_t > final_timeout {
+                        final_timeout = rand::thread_rng().gen_range(final_timeout..=max_t);
+                    }
+                }
+                self.waf_state.block_ip(
+                    ctx.client_ip,
+                    ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+                    final_timeout,
+                    matched.scope.as_deref(),
+                    matched.block_c_class,
+                    matched.use_local_firewall,
+                );
+            }
+            if self.respond_waf_action(session, ctx, matched.clone(), ctx.client_ip_str.clone()).await? {
+                return Ok((true, waf_action));
+            }
+        }
+
+        // CC Basic Defense & Rate Limit
+        if let Some(server) = &ctx.server
+            && let Some(web) = &server.web
+        {
+            let site_cc_policy = web.cc_policy.clone();
+            let site_server_id = server.id.unwrap_or(0);
+            if let Some(cc) = site_cc_policy.as_ref()
+                && self.apply_cc_policy(session, ctx, cc, site_server_id).await?
+            {
+                return Ok((true, waf_action));
+            }
+        }
+
+        if self.apply_global_cc_policy(session, ctx).await? {
+            return Ok((true, waf_action));
+        }
+
+        Ok((false, waf_action))
+    }
 }
 
 #[async_trait]
@@ -2548,7 +2734,17 @@ impl ProxyHttp for EdgeProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let hot_path = self.config.get_hot_path_snapshot_sync();
+        let host = session
+            .get_header("host")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(':').next().unwrap_or(v))
+            .unwrap_or_else(|| session.req_header().uri.host().unwrap_or(""))
+            .to_lowercase();
+
+        // Single lock acquisition for hot_path + server + upstream
+        let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
+        ctx.server = server;
+        ctx.lb = upstream;
 
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
         ctx.is_on = hot_path.is_on;
@@ -2557,23 +2753,12 @@ impl ProxyHttp for EdgeProxy {
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
 
-        let host = session
-            .get_header("host")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.split(':').next().unwrap_or(v)) // Remove port if present
-            .unwrap_or_else(|| session.req_header().uri.host().unwrap_or(""))
-            .to_lowercase();
-
         if self.maybe_serve_hls_key(session, ctx).await? {
             return Ok(true);
         }
         if self.maybe_serve_acme_challenge(session, ctx).await? {
             return Ok(true);
         }
-
-        let (server, upstream) = self.config.get_server_and_upstream_sync(&host);
-        ctx.server = server;
-        ctx.lb = upstream;
 
         let _is_loopback = session
             .client_addr()
@@ -2859,252 +3044,32 @@ impl ProxyHttp for EdgeProxy {
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
 
-        // 1. Mandatory Global Special Defenses
-        let global_policies = &hot_path.firewall_policies;
-        for gp in global_policies {
-            if !gp.is_on {
-                continue;
-            }
+        // Check if cache is configured for this server — if so, defer heavy WAF
+        // to upstream_peer (runs only on cache MISS, saving ~50 lines of CPU work
+        // on every cache HIT).
+        let cache_configured = ctx.server.as_ref()
+            .and_then(|s| s.web.as_ref())
+            .and_then(|w| w.cache.as_ref())
+            .map(|c| c.is_on)
+            .unwrap_or(false)
+            || hot_path.cache_policy.is_some();
 
-            // 1.1 Empty Connection Flood
-            if let Some(cfg) = &gp.empty_connection_flood {
-                if cfg.is_on {
-                    let threshold = cfg.threshold.max(10);
-                    let period = if cfg.period > 0 {
-                        cfg.period as i64
-                    } else {
-                        60
-                    };
-                    let ban = if cfg.ban_duration > 0 {
-                        cfg.ban_duration as i64
-                    } else {
-                        3600
-                    };
-
-                    if !self.waf_state.check_special_defense(
-                        format!("ECF:{}", ctx.client_ip_str),
-                        threshold,
-                        period,
-                    ) {
-                        self.waf_state.block_ip(
-                            ctx.client_ip,
-                            0,
-                            ban,
-                            Some("global"),
-                            false,
-                            gp.use_local_firewall,
-                        );
-                        return self.respond_status_with_pages(session, ctx, 403).await;
-                    }
-                }
-            }
-
-            // 1.2 TLS Exhaustion Attack
-            if let Some(cfg) = &gp.tls_exhaustion_attack {
-                let is_tls = session
-                    .downstream_session
-                    .digest()
-                    .and_then(|d| d.ssl_digest.as_ref())
-                    .is_some();
-                if cfg.is_on && (is_tls || session.req_header().uri.scheme_str() == Some("https")) {
-                    let threshold = cfg.threshold.max(10);
-                    let period = if cfg.period > 0 {
-                        cfg.period as i64
-                    } else {
-                        60
-                    };
-                    let ban = if cfg.ban_duration > 0 {
-                        cfg.ban_duration as i64
-                    } else {
-                        3600
-                    };
-
-                    if !self.waf_state.check_special_defense(
-                        format!("TLS:{}", ctx.client_ip_str),
-                        threshold,
-                        period,
-                    ) {
-                        self.waf_state.block_ip(
-                            ctx.client_ip,
-                            0,
-                            ban,
-                            Some("global"),
-                            true,
-                            gp.use_local_firewall,
-                        );
-                        return self.respond_status_with_pages(session, ctx, 403).await;
-                    }
-                }
-            }
-        }
-
-        if self.enforce_uam(session, ctx, &ctx.client_ip_str.clone()).await? {
-            return Ok(true);
-        }
-
-        // 2. Evaluate WAF Policies
-        let mut waf_action = None;
-
-        // --- BUFFERING REQUEST BODY (Max 2MB) ---
-        if ctx.request_body.is_empty() {
-            let content_length = session
-                .get_header("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-
-            if content_length > 0 && content_length <= 2 * 1024 * 1024 {
-                let mut buffered = Vec::with_capacity(content_length);
-                while let Some(chunk) = session.read_request_body().await? {
-                    buffered.extend_from_slice(&chunk);
-                    if buffered.len() >= content_length {
-                        break;
-                    }
-                }
-                ctx.request_body = buffered;
-            }
-        }
-        // --- END BUFFERING ---
-
-        if self.enforce_plan_max_upload(session, ctx).await? {
-            return Ok(true);
-        }
-
-        if let Some(server) = &ctx.server
-            && let Some(web) = &server.web
-            && let Some(firewall_ref) = &web.firewall_ref
-            && firewall_ref.is_on
-        {
-            // 2.1 Site-Level Policy
-            if let Some(policy) = &web.firewall_policy {
-                if policy.is_on {
-                    // Check Request Body Size
-                    if policy.max_request_body_size > 0 {
-                        let content_length = session
-                            .get_header("content-length")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-
-                        if content_length > policy.max_request_body_size
-                            || (ctx.request_body.len() as i64) > policy.max_request_body_size
-                        {
-                            waf_action = Some(crate::firewall::MatchedAction {
-                                action: crate::firewall::ActionResponse::Block {
-                                    status: 413,
-                                    body: "Request Entity Too Large".to_string(),
-                                },
-                                policy_id: policy.id,
-                                group_id: 0,
-                                set_id: 0,
-                                action_code: "block".to_string(),
-                                timeout_secs: Some(3600),
-                                max_timeout_secs: None,
-                                life_seconds: None,
-                                max_fails: 0,
-                                fail_block_timeout: 0,
-                                scope: None,
-                                block_c_class: false,
-                                use_local_firewall: false,
-                                next_group_id: None,
-                                next_set_id: None,
-                                allow_scope: None,
-                                tags: vec![],
-                                ip_list_id: 0,
-                                event_level: "error".to_string(),
-                                block_options: None,
-                                page_options: None,
-                                captcha_options: None,
-                                js_cookie_options: None,
-                            });
-                        }
-                    }
-                    if waf_action.is_none() {
-                        waf_action =
-                            crate::firewall::evaluate_policy(policy, session, &ctx.request_body);
-                    }
-                }
-            }
-
-            // 2.2 Global Policies (if not ignored)
-            if waf_action.is_none() && !firewall_ref.ignore_global_rules {
-                for gp in global_policies {
-                    if gp.is_on {
-                        if let Some(action) =
-                            crate::firewall::evaluate_policy(gp, session, &ctx.request_body)
-                        {
-                            waf_action = Some(action);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(matched) = waf_action {
-            ctx.waf_policy_id = matched.policy_id;
-            ctx.waf_group_id = matched.group_id;
-            ctx.waf_set_id = matched.set_id;
-            ctx.waf_action = Some(matched.action_code.clone());
-            self.maybe_report_firewall_event(
-                ctx,
-                matched.policy_id,
-                matched.group_id,
-                matched.set_id,
-            );
-
-            if matched.action_code == "record_ip_white" {
-                self.waf_state.unblock_ip(
-                    ctx.client_ip,
-                    ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-                    matched.scope.as_deref(),
-                    matched.use_local_firewall,
-                );
-                return Ok(false);
-            }
-
-            if matches!(matched.action_code.as_str(), "block" | "record_ip") {
-                let mut final_timeout = matched.timeout_secs.unwrap_or(300);
-                if let Some(max_t) = matched.max_timeout_secs {
-                    if max_t > final_timeout {
-                        final_timeout = rand::thread_rng().gen_range(final_timeout..=max_t);
-                    }
-                }
-
-                self.waf_state.block_ip(
-                    ctx.client_ip,
-                    ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-                    final_timeout,
-                    matched.scope.as_deref(),
-                    matched.block_c_class,
-                    matched.use_local_firewall,
-                );
-            }
-            if self
-                .respond_waf_action(session, ctx, matched.clone(), ctx.client_ip_str.clone())
-                .await?
-            {
+        if cache_configured {
+            ctx.waf_deferred = true;
+        } else {
+            let (blocked, _action) = self.run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies).await?;
+            if blocked {
                 return Ok(true);
             }
         }
 
-        // 3. CC Basic Defense & Rate Limit
+        // Redirect / rewrite checks — routing logic, must always run
         if let Some(server) = &ctx.server
             && let Some(web) = &server.web
         {
-            let site_cc_policy = web.cc_policy.clone();
-            let site_server_id = server.id.unwrap_or(0);
             let host_redirects = web.host_redirects.clone();
             let rewrite_refs = web.rewrite_refs.clone();
             let rewrite_rules = web.rewrite_rules.clone();
-
-            if let Some(cc) = site_cc_policy.as_ref()
-                && self
-                    .apply_cc_policy(session, ctx, cc, site_server_id)
-                    .await?
-            {
-                return Ok(true);
-            }
 
             let uri_str = session.req_header().uri.path();
             let query = session.req_header().uri.query().unwrap_or("");
@@ -3129,10 +3094,6 @@ impl ProxyHttp for EdgeProxy {
                 session.write_response_header(Box::new(resp), true).await?;
                 return Ok(true);
             }
-        }
-
-        if self.apply_global_cc_policy(session, ctx).await? {
-            return Ok(true);
         }
 
         Ok(false)
@@ -3204,6 +3165,22 @@ impl ProxyHttp for EdgeProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        // Run deferred heavy WAF checks (skipped in request_filter when cache was configured).
+        // This ensures WAF only runs on cache MISS, not on every cache HIT.
+        if ctx.waf_deferred {
+            let hot_path = self.config.get_hot_path_snapshot_sync();
+            let host = session
+                .get_header("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(':').next().unwrap_or(v))
+                .unwrap_or_else(|| session.req_header().uri.host().unwrap_or(""))
+                .to_lowercase();
+            let (blocked, _action) = self.run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies).await?;
+            if blocked {
+                return Err(Error::new(HTTPStatus(403)));
+            }
+        }
+
         let node_level = self.config.get_node_level_sync();
         let force_ln = self.config.get_force_ln_request_sync();
         let bypass_l2 = self.config.is_tiered_origin_bypass().await;
