@@ -13,6 +13,7 @@ pub struct LogUploader {
     api_config: ApiConfig,
     batch_size: usize,
     flush_interval: Duration,
+    channel: Option<Channel>,
 }
 
 impl LogUploader {
@@ -27,6 +28,7 @@ impl LogUploader {
             api_config,
             batch_size,
             flush_interval,
+            channel: None,
         }
     }
 
@@ -60,7 +62,11 @@ impl LogUploader {
         }
     }
 
-    async fn connect_channel(&self) -> Option<Channel> {
+    async fn get_or_connect_channel(&mut self) -> Option<&Channel> {
+        if self.channel.is_some() {
+            return self.channel.as_ref();
+        }
+
         let api_endpoint = self
             .api_config
             .effective_rpc_endpoints()
@@ -68,16 +74,21 @@ impl LogUploader {
             .cloned()
             .unwrap_or_default();
 
-        let channel = match Channel::from_shared(api_endpoint) {
-            Ok(channel) => channel,
+        let endpoint = match tonic::transport::Endpoint::from_shared(api_endpoint) {
+            Ok(ep) => ep
+                .keep_alive_timeout(Duration::from_secs(10))
+                .tcp_keepalive(Some(Duration::from_secs(30))),
             Err(err) => {
                 error!("Failed to create gRPC channel for LogUploader: {}", err);
                 return None;
             }
         };
 
-        match channel.connect().await {
-            Ok(channel) => Some(channel),
+        match endpoint.connect().await {
+            Ok(channel) => {
+                self.channel = Some(channel);
+                self.channel.as_ref()
+            }
             Err(err) => {
                 error!("Failed to connect to Master gRPC for LogUploader: {}", err);
                 None
@@ -86,22 +97,19 @@ impl LogUploader {
     }
 
     #[allow(clippy::result_large_err)]
-    async fn flush_batch(&self, buffer: &mut Vec<pb::HttpAccessLog>) {
+    async fn flush_batch(&mut self, buffer: &mut Vec<pb::HttpAccessLog>) {
         let count = buffer.len();
         debug!("Flushing batch of {} logs to Master", count);
 
-        // Take the logs from buffer
         let logs_to_send = std::mem::replace(buffer, Vec::with_capacity(self.batch_size));
 
-        let Some(channel) = self.connect_channel().await else {
+        let Some(channel) = self.get_or_connect_channel().await.cloned() else {
             return;
         };
 
-        // Create gRPC client with interceptor for auth
         let node_id = self.api_config.node_id.clone();
         let secret = self.api_config.secret.clone();
 
-        // We recreate the client here because tonic clients are cheap to clone/recreate from channel
         let mut client =
             pb::http_access_log_service_client::HttpAccessLogServiceClient::with_interceptor(
                 channel,
@@ -124,8 +132,7 @@ impl LogUploader {
             }
             Err(e) => {
                 error!("Failed to upload access logs: {}", e);
-                // Drop logs on error for now to avoid OOM or retry storm.
-                // In production, we might want a small retry buffer.
+                self.channel = None;
             }
         }
     }
@@ -136,6 +143,7 @@ pub struct NodeLogUploader {
     api_config: ApiConfig,
     batch_size: usize,
     flush_interval: Duration,
+    channel: Option<Channel>,
 }
 
 impl NodeLogUploader {
@@ -150,6 +158,7 @@ impl NodeLogUploader {
             api_config,
             batch_size,
             flush_interval,
+            channel: None,
         }
     }
 
@@ -180,7 +189,11 @@ impl NodeLogUploader {
         }
     }
 
-    async fn connect_channel(&self) -> Option<Channel> {
+    async fn get_or_connect_channel(&mut self) -> Option<&Channel> {
+        if self.channel.is_some() {
+            return self.channel.as_ref();
+        }
+
         let api_endpoint = self
             .api_config
             .effective_rpc_endpoints()
@@ -188,16 +201,21 @@ impl NodeLogUploader {
             .cloned()
             .unwrap_or_default();
 
-        let channel = match Channel::from_shared(api_endpoint) {
-            Ok(channel) => channel,
+        let endpoint = match tonic::transport::Endpoint::from_shared(api_endpoint) {
+            Ok(ep) => ep
+                .keep_alive_timeout(Duration::from_secs(10))
+                .tcp_keepalive(Some(Duration::from_secs(30))),
             Err(err) => {
                 error!("Invalid API endpoint for NodeLogUploader: {}", err);
                 return None;
             }
         };
 
-        match channel.connect().await {
-            Ok(channel) => Some(channel),
+        match endpoint.connect().await {
+            Ok(channel) => {
+                self.channel = Some(channel);
+                self.channel.as_ref()
+            }
             Err(err) => {
                 error!("Failed to connect for NodeLogUploader: {}", err);
                 None
@@ -206,11 +224,11 @@ impl NodeLogUploader {
     }
 
     #[allow(clippy::result_large_err)]
-    async fn flush_batch(&self, buffer: &mut Vec<pb::NodeLog>) {
+    async fn flush_batch(&mut self, buffer: &mut Vec<pb::NodeLog>) {
         let count = buffer.len();
         let logs_to_send = std::mem::replace(buffer, Vec::with_capacity(self.batch_size));
 
-        let Some(channel) = self.connect_channel().await else {
+        let Some(channel) = self.get_or_connect_channel().await.cloned() else {
             return;
         };
 
@@ -235,7 +253,10 @@ impl NodeLogUploader {
             .await
         {
             Ok(_) => debug!("Successfully uploaded {} node logs", count),
-            Err(e) => error!("Failed to upload node logs: {}", e),
+            Err(e) => {
+                error!("Failed to upload node logs: {}", e);
+                self.channel = None;
+            }
         }
     }
 }

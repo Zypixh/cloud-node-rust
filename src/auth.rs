@@ -3,20 +3,24 @@ use base64::{Engine as _, engine::general_purpose};
 use cfb_mode::Encryptor;
 use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
 use md5::{Digest, Md5};
-use rand::Rng;
 use serde_json::json;
 
 type Aes256CfbEnc = Encryptor<Aes256>;
 
-/// Generates the base64 AES256-CFB encrypted token required by GoEdge API Node
-/// Format: base64(IV || ciphertext), IV is 16 random bytes
-pub fn generate_token(_node_id: &str, secret: &str, _node_type: &str) -> anyhow::Result<String> {
-    // Derive key using SHA256 for proper entropy, matching GoEdge API v2 token format
-    let key: [u8; 32] = sha2::Sha256::digest(secret.as_bytes()).into();
+/// Generates the base64 AES256-CFB encrypted token required by GoEdge API Node.
+/// Uses deterministic key/IV derivation compatible with the Go master's decodeToken().
+pub fn generate_token(node_id: &str, secret: &str, _node_type: &str) -> anyhow::Result<String> {
+    // Key: secret padded/truncated to 32 bytes (matching Go master)
+    let mut key = [b' '; 32];
+    let secret_bytes = secret.as_bytes();
+    let copy_len = secret_bytes.len().min(32);
+    key[..copy_len].copy_from_slice(&secret_bytes[..copy_len]);
 
-    // Random IV per token (standard CFB pattern)
-    let mut iv = [0u8; 16];
-    rand::thread_rng().fill(&mut iv);
+    // IV: node_id padded/truncated to 16 bytes (matching Go master)
+    let mut iv = [b' '; 16];
+    let id_bytes = node_id.as_bytes();
+    let id_copy_len = id_bytes.len().min(16);
+    iv[..id_copy_len].copy_from_slice(&id_bytes[..id_copy_len]);
 
     let timestamp = crate::utils::time::now_timestamp();
     let payload = json!({
@@ -31,10 +35,7 @@ pub fn generate_token(_node_id: &str, secret: &str, _node_type: &str) -> anyhow:
 
     cipher.encrypt(&mut data);
 
-    // Prepend IV to ciphertext so the receiver can decrypt
-    let mut result = iv.to_vec();
-    result.extend_from_slice(&data);
-    Ok(general_purpose::STANDARD.encode(result))
+    Ok(general_purpose::STANDARD.encode(&data))
 }
 
 /// URL Auth Verification (Types A, B, C, D)

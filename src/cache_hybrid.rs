@@ -15,7 +15,9 @@ use tracing::{info, warn};
 
 use tokio::sync::RwLock;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+
+static CACHED_DISK_AVAILABLE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Global cache for open file handles to reduce open() syscalls
 static OPEN_FILE_CACHE: Lazy<DashMap<PathBuf, Arc<std::fs::File>>> = Lazy::new(DashMap::new);
@@ -487,15 +489,23 @@ struct FastL1Entry {
 }
 
 /// Global lock-free L1 cache. Sharded by DashMap, no contention at 1000+ concurrent reads.
-static FAST_L1: Lazy<DashMap<String, FastL1Entry>> = Lazy::new(DashMap::new);
+static FAST_L1: Lazy<DashMap<u64, FastL1Entry>> = Lazy::new(DashMap::new);
 
 const POLICY_FILE: u8 = 0;
 const POLICY_MEMORY: u8 = 1;
 
+#[inline]
+fn fast_hash_key(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub struct HybridStorage {
     pub l1: Arc<MemCache>,
     pub l2: &'static FileStorage,
-    hot_counts: DashMap<String, u32>,
+    hot_counts: DashMap<u64, u32>,
     hot_threshold: std::sync::atomic::AtomicU32,
     pub max_disk_bytes: std::sync::atomic::AtomicU64,
     pub min_free_bytes: std::sync::atomic::AtomicU64,
@@ -638,7 +648,7 @@ impl HybridStorage {
         crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
 
         // Clear from lock-free L1 cache
-        FAST_L1.remove(&hash);
+        FAST_L1.remove(&fast_hash_key(key));
 
         let full_key = CacheKey::new("edge", key, "");
         let ck = full_key.to_compact();
@@ -711,7 +721,7 @@ impl Storage for HybridStorage {
         let p_type = self.policy_type.load(Ordering::Relaxed);
 
         let k_str = key.primary_key_str().unwrap_or("unknown");
-        let hash = format!("{:x}", md5_legacy::compute(k_str));
+        let hash = fast_hash_key(k_str);
 
         // Check lock-free FAST_L1 first for ALL policy types (DashMap, sharded, zero contention)
         if let Some(entry) = FAST_L1.get(&hash) {
@@ -744,7 +754,7 @@ impl Storage for HybridStorage {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or(std::time::Duration::from_secs(3600))
                         .as_secs() as i64;
-                    FAST_L1.insert(hash.clone(), FastL1Entry {
+                    FAST_L1.insert(hash, FastL1Entry {
                         data: mem_handler.data.clone(),
                         fresh_until,
                         created_at: now,
@@ -771,7 +781,7 @@ impl Storage for HybridStorage {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or(std::time::Duration::from_secs(3600))
                         .as_secs() as i64;
-                    FAST_L1.insert(hash.clone(), FastL1Entry {
+                    FAST_L1.insert(hash, FastL1Entry {
                         data: mem_handler.data.clone(),
                         fresh_until,
                         created_at: now,
@@ -786,7 +796,7 @@ impl Storage for HybridStorage {
                 .load(std::sync::atomic::Ordering::Relaxed);
             let mut is_hot = false;
             self.hot_counts
-                .entry(hash.clone())
+                .entry(hash)
                 .and_modify(|c| {
                     *c += 1;
                     if *c >= threshold {
@@ -852,17 +862,10 @@ impl Storage for HybridStorage {
         let p_type = self.policy_type.load(Ordering::Relaxed);
 
         if p_type == POLICY_FILE {
-            let lock = self.l2.inner.read().await;
             let min_free = self
                 .min_free_bytes
                 .load(std::sync::atomic::Ordering::Relaxed);
-
-            let disks = sysinfo::Disks::new_with_refreshed_list();
-            let available = disks
-                .iter()
-                .find(|d| lock.main_root.starts_with(d.mount_point()))
-                .map(|d| d.available_space())
-                .unwrap_or(u64::MAX);
+            let available = CACHED_DISK_AVAILABLE.load(Ordering::Relaxed);
 
             if available < min_free {
                 warn!("RPC_CACHE: Disk space below threshold. Bypassing disk cache.");
@@ -953,7 +956,6 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
             let path = disk_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
             let _ = tokio::fs::remove_file(&path).await;
             crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-            FAST_L1.remove(&hash);
         }
 
         // Pass 2: Capacity eviction using Max-Heap if disk exceeds limits
@@ -1006,7 +1008,6 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
                 let path = disk_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
                 let _ = tokio::fs::remove_file(&path).await;
                 crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                FAST_L1.remove(&hash);
             }
         }
     }
@@ -1016,13 +1017,10 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
 // Cache performance profiling — log hit/miss/promotion stats
 // ═══════════════════════════════════════════════════════════
 
-use std::sync::atomic::AtomicU64;
-
 /// Public API: ultra-fast cache lookup for direct use in request_filter.
 /// Returns the cached body bytes if a valid entry exists.
-/// Uses the same MD5 hash as FileStorage for key consistency.
 pub fn fast_l1_lookup(key_str: &str) -> Option<bytes::Bytes> {
-    let hash = format!("{:x}", md5_legacy::compute(key_str));
+    let hash = fast_hash_key(key_str);
     if let Some(entry) = FAST_L1.get(&hash) {
         let now = crate::utils::time::now_timestamp();
         if entry.fresh_until > now {
@@ -1091,6 +1089,49 @@ pub fn start_cache_profiler() {
             tracing::info!(
                 "CACHE_PROFILE: L1={l1}/s L2={l2}/s L1%={l1_pct:.1} sync_prom={sync_prom}/s async_prom={async_prom}/s total={total}/s disk={avg_disk_ms:.1}ms rf={avg_reqfil_ms:.1}ms fp={fastpath}/s"
             );
+        }
+    });
+}
+
+/// Periodically evict expired entries from FAST_L1 and cap OPEN_FILE_CACHE size.
+pub fn start_cache_janitor() {
+    tokio::spawn(async {
+        let disk_root = std::path::Path::new("configs/cache/disk");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+            // Refresh cached disk available space
+            let disks = sysinfo::Disks::new_with_refreshed_list();
+            let available = disks
+                .iter()
+                .find(|d| disk_root.starts_with(d.mount_point()))
+                .map(|d| d.available_space())
+                .unwrap_or(u64::MAX);
+            CACHED_DISK_AVAILABLE.store(available, Ordering::Relaxed);
+
+            // Evict expired FAST_L1 entries
+            let now = crate::utils::time::now_timestamp();
+            let before = FAST_L1.len();
+            FAST_L1.retain(|_, entry| entry.fresh_until > now);
+            let evicted = before.saturating_sub(FAST_L1.len());
+            if evicted > 0 {
+                tracing::debug!("FAST_L1 janitor: evicted {} expired entries, {} remain", evicted, FAST_L1.len());
+            }
+
+            // Cap OPEN_FILE_CACHE at 4096 entries — remove random entries beyond limit
+            const MAX_OPEN_FILES: usize = 4096;
+            if OPEN_FILE_CACHE.len() > MAX_OPEN_FILES {
+                let excess = OPEN_FILE_CACHE.len() - MAX_OPEN_FILES;
+                let keys_to_remove: Vec<_> = OPEN_FILE_CACHE
+                    .iter()
+                    .take(excess)
+                    .map(|entry| entry.key().clone())
+                    .collect();
+                for key in keys_to_remove {
+                    OPEN_FILE_CACHE.remove(&key);
+                }
+                tracing::debug!("OPEN_FILE_CACHE janitor: removed {} excess handles", excess);
+            }
         }
     });
 }

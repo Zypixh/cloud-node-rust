@@ -4,6 +4,44 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use chrono::Timelike;
 
+use std::sync::atomic::AtomicU32;
+
+static CACHED_PRESSURE: AtomicU32 = AtomicU32::new(0);
+
+pub fn start_pressure_updater() {
+    tokio::spawn(async {
+        let mut tick: u64 = 0;
+        loop {
+            let pressure = compute_node_pressure();
+            CACHED_PRESSURE.store(pressure.to_bits(), Ordering::Relaxed);
+
+            // Every 5 minutes, cap distinct_ips to prevent unbounded growth
+            tick += 1;
+            if tick % 150 == 0 {
+                for entry in METRICS.servers.iter() {
+                    if entry.value().distinct_ips.len() > 100_000 {
+                        entry.value().distinct_ips.clear();
+                    }
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+fn compute_node_pressure() -> f32 {
+    let (_, _, total_conns) = METRICS.get_node_totals();
+    let cpu_cores = num_cpus::get() as i64;
+    let conn_pressure = (total_conns as f64 / (cpu_cores * 2000) as f64).min(1.0);
+
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_usage();
+    let cpu_load = sys.global_cpu_usage() as f64 / 100.0;
+
+    ((conn_pressure * 0.7 + cpu_load * 0.3).min(1.0)) as f32
+}
+
 pub mod aggregator;
 pub mod analyzer;
 pub mod daily;
@@ -152,16 +190,7 @@ impl NodeMetrics {
     }
 
     pub fn get_node_pressure(&self) -> f64 {
-        let (_, _, total_conns) = self.get_node_totals();
-        
-        let cpu_cores = num_cpus::get() as i64;
-        let conn_pressure = (total_conns as f64 / (cpu_cores * 2000) as f64).min(1.0);
-        
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_cpu_usage();
-        let cpu_load = sys.global_cpu_usage() as f64 / 100.0;
-        
-        (conn_pressure * 0.7 + cpu_load * 0.3).min(1.0)
+        f32::from_bits(CACHED_PRESSURE.load(Ordering::Relaxed)) as f64
     }
 }
 

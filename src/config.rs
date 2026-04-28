@@ -405,6 +405,16 @@ impl ConfigStore {
         lock.level
     }
 
+    pub fn get_upstream_peer_context_sync(&self) -> (i32, bool, bool, String) {
+        let lock = self.inner.read();
+        (
+            lock.level,
+            lock.force_ln_request,
+            lock.tiered_origin_bypass,
+            lock.ln_request_scheduling_method.clone(),
+        )
+    }
+
     pub fn get_node_is_on_sync(&self) -> bool {
         let lock = self.inner.read();
         lock.is_on

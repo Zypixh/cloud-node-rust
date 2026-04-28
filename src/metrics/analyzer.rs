@@ -126,9 +126,10 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
     };
 
     let (browser, os) = {
-        let mutex = UA_CACHE.get_shard(&ua.to_string());
+        let ua_owned = ua.to_string();
+        let mutex = UA_CACHE.get_shard(&ua_owned);
         let mut cache = mutex.lock().unwrap();
-        if let Some(cached) = cache.get(&ua.to_string()) {
+        if let Some(cached) = cache.get(&ua_owned) {
             cached.clone()
         } else {
             let parsed_ua = UA_PARSER.parse(ua);
@@ -136,7 +137,7 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
                 Some(p) => (Arc::from(p.name), Arc::from(p.os)),
                 None => (Arc::from("Unknown"), Arc::from("Unknown")),
             };
-            cache.put(ua.to_string(), res.clone());
+            cache.put(ua_owned, res.clone());
             res
         }
     };

@@ -98,6 +98,8 @@ pub struct ProxyCTX {
     /// Cached during request_filter to avoid config lock in response_filter/body_filter
     pub global_http_config: Option<Arc<crate::config_models::GlobalHTTPAllConfig>>,
     pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
+    pub node_level: i32,
+    pub host: String,
 }
 
 impl Default for ProxyCTX {
@@ -171,6 +173,8 @@ impl Default for ProxyCTX {
             global_cache_policy: None,
             global_http_config: None,
             firewall_policies_snapshot: None,
+            node_level: 0,
+            host: String::new(),
         }
     }
 }
@@ -489,7 +493,6 @@ impl EdgeProxy {
             return true;
         }
 
-        Self::cleanup_request_limit_bindings();
         let now = std::time::Instant::now();
 
         if let Some(mut existing) = REQUEST_LIMIT_BINDINGS.get_mut(raw_remote_addr) {
@@ -1956,10 +1959,13 @@ impl EdgeProxy {
         body: &[u8],
         config: &crate::config_models::HTTPHTMLOptimizationConfig,
     ) -> anyhow::Result<Vec<u8>> {
+        static RE_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<!--[\s\S]*?-->").unwrap());
+        static RE_BETWEEN_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">\s+<").unwrap());
+        static RE_MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t\r\n]{2,}").unwrap());
+
         let mut text = String::from_utf8(body.to_vec())?;
         if !config.keep_comments {
-            let comment_re = Regex::new(r"<!--[\s\S]*?-->").expect("valid html comment regex");
-            text = comment_re
+            text = RE_COMMENT
                 .replace_all(&text, |caps: &regex::Captures| {
                     let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("");
                     if config.keep_conditional_comments
@@ -1973,33 +1979,33 @@ impl EdgeProxy {
                 .to_string();
         }
         if !config.keep_whitespace {
-            let between_tags = Regex::new(r">\s+<").expect("valid html spacing regex");
-            text = between_tags.replace_all(&text, "><").to_string();
-            let multi_space = Regex::new(r"[ \t\r\n]{2,}").expect("valid html multi-space regex");
-            text = multi_space.replace_all(&text, " ").to_string();
+            text = RE_BETWEEN_TAGS.replace_all(&text, "><").to_string();
+            text = RE_MULTI_SPACE.replace_all(&text, " ").to_string();
         }
         Ok(text.into_bytes())
     }
 
     fn minify_css(body: &[u8]) -> anyhow::Result<Vec<u8>> {
+        static RE_COMMENTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
+        static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+        static RE_TOKENS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*([{}:;,>])\s*").unwrap());
+
         let mut text = String::from_utf8(body.to_vec())?;
-        let comments = Regex::new(r"/\*[\s\S]*?\*/").expect("valid css comment regex");
-        text = comments.replace_all(&text, "").to_string();
-        let spaces = Regex::new(r"\s+").expect("valid css whitespace regex");
-        text = spaces.replace_all(&text, " ").to_string();
-        let tokens = Regex::new(r"\s*([{}:;,>])\s*").expect("valid css token regex");
-        text = tokens.replace_all(&text, "$1").to_string();
+        text = RE_COMMENTS.replace_all(&text, "").to_string();
+        text = RE_SPACES.replace_all(&text, " ").to_string();
+        text = RE_TOKENS.replace_all(&text, "$1").to_string();
         Ok(text.trim().as_bytes().to_vec())
     }
 
     fn minify_js(body: &[u8]) -> anyhow::Result<Vec<u8>> {
+        static RE_BLOCK_COMMENTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
+        static RE_LINE_COMMENTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*//.*$").unwrap());
+        static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+
         let mut text = String::from_utf8(body.to_vec())?;
-        let block_comments = Regex::new(r"/\*[\s\S]*?\*/").expect("valid js comment regex");
-        text = block_comments.replace_all(&text, "").to_string();
-        let line_comments = Regex::new(r"(?m)^\s*//.*$").expect("valid js line comment regex");
-        text = line_comments.replace_all(&text, "").to_string();
-        let spaces = Regex::new(r"\s+").expect("valid js whitespace regex");
-        text = spaces.replace_all(&text, " ").to_string();
+        text = RE_BLOCK_COMMENTS.replace_all(&text, "").to_string();
+        text = RE_LINE_COMMENTS.replace_all(&text, "").to_string();
+        text = RE_SPACES.replace_all(&text, " ").to_string();
         Ok(text.trim().as_bytes().to_vec())
     }
 
@@ -2747,6 +2753,7 @@ impl ProxyHttp for EdgeProxy {
             .map(|v| v.split(':').next().unwrap_or(v))
             .unwrap_or_else(|| session.req_header().uri.host().unwrap_or(""))
             .to_lowercase();
+        ctx.host = host.clone();
 
         // Single lock acquisition for hot_path + server + upstream
         let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
@@ -3121,21 +3128,14 @@ impl ProxyHttp for EdgeProxy {
         // This ensures WAF only runs on cache MISS, not on every cache HIT.
         if ctx.waf_deferred {
             let hot_path = self.config.get_hot_path_snapshot_sync();
-            let host = session
-                .get_header("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.split(':').next().unwrap_or(v))
-                .unwrap_or_else(|| session.req_header().uri.host().unwrap_or(""))
-                .to_lowercase();
-            let (blocked, _action) = self.run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies).await?;
+            let (blocked, _action) = self.run_heavy_waf(session, ctx, &ctx.host.clone(), &hot_path.firewall_policies).await?;
             if blocked {
                 return Err(Error::new(HTTPStatus(403)));
             }
         }
 
-        let node_level = self.config.get_node_level_sync();
-        let force_ln = self.config.get_force_ln_request_sync();
-        let bypass_l2 = self.config.is_tiered_origin_bypass().await;
+        let (node_level, force_ln, bypass_l2, ln_method) = self.config.get_upstream_peer_context_sync();
+        ctx.node_level = node_level;
 
         let mut target_peer = None;
 
@@ -3146,8 +3146,6 @@ impl ProxyHttp for EdgeProxy {
                 // Note: We use cluster_id 0 for default cluster if not specifically mapped
                 // In actual GoEdge, cluster_id is more specific.
                 if let Some(parent_lb) = self.config.get_parent_upstream_sync(0) {
-                    let ln_method = self.config.get_ln_method_sync();
-
                     let hash_key = if ln_method == "urlMapping" {
                         // Hash by full URL (Scheme + Host + Path + Query)
                         session.req_header().uri.to_string().into_bytes()
@@ -3634,14 +3632,6 @@ impl ProxyHttp for EdgeProxy {
         // Cache HIT: sync response headers for access log, then skip WAF/Alt-Svc
         if session.cache.phase() == pingora_cache::CachePhase::Hit {
             ctx.cache_hit = Some(true);
-            for (name, value) in upstream_response.headers.iter() {
-                if let Ok(value_str) = value.to_str() {
-                    ctx.response_headers
-                        .insert(name.to_string(), value_str.to_string());
-                }
-            }
-            ctx.response_headers
-                .insert("x-cache".to_string(), "HIT".to_string());
             upstream_response
                 .insert_header("x-cache", "HIT")
                 .unwrap();
@@ -3861,8 +3851,7 @@ impl ProxyHttp for EdgeProxy {
         }
 
         // 2. L1 Logic: Inject Identity headers when talking to L2
-        let (level, _) = self.config.get_tiered_origin_info().await;
-        if level == 1 {
+        if ctx.node_level == 1 {
             let node_id = &self.api_config.node_id;
             let secret = &self.api_config.secret;
 
@@ -4244,4 +4233,13 @@ impl ProxyHttp for EdgeProxy {
             pingora_cache::NoCacheReason::Custom("NoPolicy"),
         ))
     }
+}
+
+pub fn start_request_limit_cleanup_task() {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            EdgeProxy::cleanup_request_limit_bindings();
+        }
+    });
 }
