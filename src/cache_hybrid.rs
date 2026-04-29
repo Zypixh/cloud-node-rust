@@ -544,7 +544,7 @@ impl HybridStorage {
             l1: Arc::new(l1),
             l2: Box::leak(Box::new(FileStorage::new(disk_root))),
             hot_counts: DashMap::new(),
-            hot_threshold: std::sync::atomic::AtomicU32::new(5),
+            hot_threshold: std::sync::atomic::AtomicU32::new(2),
             max_disk_bytes: std::sync::atomic::AtomicU64::new(10 * 1024 * 1024 * 1024),
             min_free_bytes: std::sync::atomic::AtomicU64::new(2 * 1024 * 1024 * 1024),
             max_fast_l1_bytes: std::sync::atomic::AtomicU64::new(0), // 0 = auto-detect
