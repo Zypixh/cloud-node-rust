@@ -2820,20 +2820,6 @@ impl ProxyHttp for EdgeProxy {
         );
         ctx.client_ip_str = ctx.client_ip.to_string();
 
-        let user_agent = session
-            .get_header("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !user_agent.is_empty() {
-            ctx.analyzed = Some(crate::metrics::analyzer::analyze_request(ctx.client_ip, user_agent));
-            crate::client_agent::maybe_report_client_agent(
-                (*self.api_config).clone(),
-                ctx.client_ip_str.clone(),
-                user_agent.to_string(),
-            );
-        }
-
         if let Some(server) = &ctx.server {
             if let Some(web) = &server.web
                 && let Some(ws) = &web.websocket
@@ -3319,6 +3305,17 @@ impl ProxyHttp for EdgeProxy {
                     .get_header("user-agent")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
+
+                // Deferred GeoIP + UA analysis — off hot path, runs after response sent
+                if ctx.analyzed.is_none() && !user_agent.is_empty() {
+                    ctx.analyzed = Some(crate::metrics::analyzer::analyze_request(ctx.client_ip, user_agent));
+                    crate::client_agent::maybe_report_client_agent(
+                        (*self.api_config).clone(),
+                        ctx.client_ip_str.clone(),
+                        user_agent.to_string(),
+                    );
+                }
+
                 crate::metrics::record::record_http_dimensions(
                     server_id,
                     ctx.client_ip,

@@ -238,6 +238,9 @@ impl HttpProxyManager {
                 pingora_core::tls::ssl::select_next_proto(b"\x02h2\x08http/1.1", client_alpn)
                     .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
             });
+            // Enable TLS session caching for faster repeat connections
+            builder.set_session_id_context(b"cloud-node-rust")?;
+            builder.set_session_cache_mode(pingora_core::tls::ssl::SslSessionCacheMode::SERVER);
             Some(Arc::new(builder.build()))
         } else {
             None
