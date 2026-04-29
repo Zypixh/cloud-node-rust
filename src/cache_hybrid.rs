@@ -128,8 +128,10 @@ impl Storage for FileStorage {
         );
 
         // Read entire file into memory, serve in 32KB chunks via MemoryHitHandler
+        let io_start = std::time::Instant::now();
         let file_data = tokio::fs::read(&path).await
             .map_err(|_| Error::new(ErrorType::InternalError))?;
+        PROF_DISK_READ_US.fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
         let body: bytes::Bytes = if meta.compressed {
@@ -470,6 +472,7 @@ struct FastL1Entry {
     fresh_until: i64,
     created_at: i64,
     status: u16,
+    headers: Vec<(String, String)>,
 }
 
 /// Global lock-free L1 cache. Sharded by DashMap, no contention at 1000+ concurrent reads.
@@ -548,6 +551,42 @@ impl HybridStorage {
         // Use 25% of available RAM, capped at 50% of total
         let budget = (available as f64 * 0.25) as u64;
         budget.min((total as f64 * 0.5) as u64)
+    }
+
+    /// Promote to FAST_L1 with capacity check and header extraction from CacheMeta.
+    /// Returns true if inserted, false if skipped (exceeded budget or data too large).
+    fn promote_to_fast_l1(
+        hash: u64,
+        data: bytes::Bytes,
+        meta: &CacheMeta,
+        fresh_until: i64,
+        now: i64,
+    ) -> bool {
+        if data.len() > MEMORY_SERVE_MAX as usize {
+            return false;
+        }
+        let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
+        if max_l1 > 0 {
+            let current: u64 = FAST_L1.iter().map(|e| e.data.len() as u64).sum();
+            if current + data.len() as u64 > max_l1 {
+                return false; // would exceed budget, insertion rejected
+            }
+        }
+        let status = meta.response_header().status.as_u16();
+        let headers: Vec<(String, String)> = meta
+            .response_header()
+            .headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        FAST_L1.insert(hash, FastL1Entry {
+            data,
+            fresh_until,
+            created_at: now,
+            status,
+            headers,
+        });
+        true
     }
 
     pub async fn apply_policy(&self, policy: &crate::config_models::HTTPCachePolicy) {
@@ -749,15 +788,18 @@ impl Storage for HybridStorage {
         if let Some(entry) = FAST_L1.get(&hash) {
             let now = crate::utils::time::now_timestamp();
             if entry.fresh_until > now {
-                // Use cached timestamps to avoid redundant SystemTime calls
                 let fresh_until_dur = std::time::Duration::from_secs(entry.fresh_until as u64);
                 let created_at_dur = std::time::Duration::from_secs(entry.created_at as u64);
+                let mut hdr = pingora_http::ResponseHeader::build(entry.status, None).unwrap();
+                for (name, val) in &entry.headers {
+                    let _ = hdr.insert_header(name.to_string(), val.as_str());
+                }
                 let meta = CacheMeta::new(
                     std::time::UNIX_EPOCH + fresh_until_dur,
                     std::time::UNIX_EPOCH + created_at_dur,
                     0,
                     0,
-                    pingora_http::ResponseHeader::build(entry.status, None).unwrap(),
+                    hdr,
                 );
                 prof_record_l1_hit();
                 return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), offset: 0 }))));
@@ -772,19 +814,12 @@ impl Storage for HybridStorage {
             prof_record_l1_hit();
             // Promote to FAST_L1 for subsequent zero-lock hits
             if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
-                if mem_handler.offset == 0 && mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
-                    let now = crate::utils::time::now_timestamp();
-                    let fresh_until = meta.fresh_until()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or(std::time::Duration::from_secs(3600))
-                        .as_secs() as i64;
-                    let status = meta.response_header().status.as_u16();
-                    FAST_L1.insert(hash, FastL1Entry {
-                        data: mem_handler.data.clone(),
-                        fresh_until,
-                        created_at: now,
-                        status,
-                    });
+                let now = crate::utils::time::now_timestamp();
+                let fresh_until = meta.fresh_until()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or(std::time::Duration::from_secs(3600))
+                    .as_secs() as i64;
+                if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now) {
                     prof_record_l2_mem_promotion();
                 }
             }
@@ -799,26 +834,7 @@ impl Storage for HybridStorage {
         if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
             prof_record_l2_hit();
             // Store in lock-free FAST_L1 for subsequent zero-copy hits.
-            // Skip the single-lock MemCache — it's a bottleneck at 1000+ concurrency.
-            if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
-                if mem_handler.offset == 0 && mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
-                    let now = crate::utils::time::now_timestamp();
-                    let fresh_until = meta.fresh_until()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or(std::time::Duration::from_secs(3600))
-                        .as_secs() as i64;
-                    let status = meta.response_header().status.as_u16();
-                    FAST_L1.insert(hash, FastL1Entry {
-                        data: mem_handler.data.clone(),
-                        fresh_until,
-                        created_at: now,
-                        status,
-                    });
-                    prof_record_l2_mem_promotion();
-                }
-            }
-
-            // Async hot promotion for files that don't fit the memory fast path (>2MB)
+            // Increment hot counter for L2 disk hit — only promote if threshold reached.
             let threshold = self
                 .hot_threshold
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -834,6 +850,17 @@ impl Storage for HybridStorage {
                 .or_insert(1);
 
             if is_hot {
+                // Promote to FAST_L1 from the handler we already have in memory
+                if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
+                    let now = crate::utils::time::now_timestamp();
+                    let fresh_until = meta.fresh_until()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(std::time::Duration::from_secs(3600))
+                        .as_secs() as i64;
+                    if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now) {
+                        prof_record_l2_mem_promotion();
+                    }
+                }
                 prof_record_l2_async_promotion();
                 let storage_l2 = self.l2;
                 let cache_key_cloned = key.clone();
@@ -1125,6 +1152,14 @@ pub fn start_cache_profiler() {
 pub fn start_cache_janitor() {
     tokio::spawn(async {
         let disk_root = std::path::Path::new("configs/cache/disk");
+        // Initialize memory budget immediately — don't wait 60s
+        if FAST_L1_MAX_BYTES.load(Ordering::Relaxed) == 0 {
+            let budget = HybridStorage::compute_memory_budget();
+            if budget > 0 {
+                FAST_L1_MAX_BYTES.store(budget, Ordering::Relaxed);
+                tracing::info!("FAST_L1 auto memory budget: {} bytes", budget);
+            }
+        }
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 

@@ -217,10 +217,13 @@ impl MetricStorage {
             if cnt == 0 {
                 continue;
             }
-            // Read from in-memory index, update, write back
+            // Read from in-memory index, update, write back to both memory and RocksDB
             if let Some(mut meta) = CACHE_META_INDEX.get(hash).map(|v| v.clone()) {
                 meta.access_time = ts;
                 meta.access_count += cnt;
+                // Write back to in-memory index so eviction/stats see updated access time
+                CACHE_META_INDEX.insert(hash.clone(), meta.clone());
+                // Persist to RocksDB
                 let db_key = format!("CMETA_{}", hash);
                 let json_val = serde_json::json!({
                     "k": meta.cache_key,
