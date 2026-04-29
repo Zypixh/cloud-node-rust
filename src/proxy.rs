@@ -3635,6 +3635,15 @@ impl ProxyHttp for EdgeProxy {
         // Cache HIT: sync response headers for access log, then skip WAF/Alt-Svc
         if session.cache.phase() == pingora_cache::CachePhase::Hit {
             ctx.cache_hit = Some(true);
+            // Populate response_headers for access log completeness
+            for (name, value) in upstream_response.headers.iter() {
+                if let Ok(value_str) = value.to_str() {
+                    ctx.response_headers
+                        .insert(name.to_string(), value_str.to_string());
+                }
+            }
+            ctx.response_headers
+                .insert("x-cache".to_string(), "HIT".to_string());
             upstream_response
                 .insert_header("x-cache", "HIT")
                 .unwrap();
