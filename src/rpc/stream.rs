@@ -271,7 +271,7 @@ async fn handle_message(
                         let hash = format!("{:x}", md5_legacy::compute(&msg.key));
                         if let Some(meta) = crate::metrics::storage::STORAGE.get_cache_meta(&hash) {
                             is_ok = true;
-                            reply_text = format!("value {} bytes", meta["s"].as_u64().unwrap_or(0));
+                            reply_text = format!("value {} bytes", meta.size);
                         } else {
                             reply_text = "key not found".to_string();
                         }

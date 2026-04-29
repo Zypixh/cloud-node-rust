@@ -151,28 +151,39 @@ impl MetricStorage {
         key_str: &str,
         size: u64,
         ttl_secs: u64,
-        headers: Option<serde_json::Value>,
+        headers: &[(String, String)],
         compressed: bool,
         status: u16,
     ) {
         let now = crate::utils::time::now_timestamp();
-        let meta = serde_json::json!({
+        let meta = CacheMetaEntry {
+            cache_key: key_str.to_string(),
+            size,
+            expires: now + ttl_secs as i64,
+            access_time: now,
+            access_count: 1,
+            status,
+            headers: headers.to_vec(),
+            compressed,
+        };
+        CACHE_META_INDEX.insert(hash.to_string(), meta);
+        // Persist to RocksDB as JSON for cross-restart durability
+        let json_val = serde_json::json!({
             "k": key_str,
             "s": size,
             "e": now + ttl_secs as i64,
             "a": now,
             "f": 1,
             "st": status,
-            "h": headers.unwrap_or(serde_json::json!({})),
+            "h": headers.iter().map(|(k,v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<_,_>>(),
             "c": compressed
         });
-        CACHE_META_INDEX.insert(hash.to_string(), meta.clone());
         let Some(db) = &self.db else {
             return;
         };
         let _ = db.put(
             format!("CMETA_{}", hash).as_bytes(),
-            meta.to_string().as_bytes(),
+            serde_json::to_string(&json_val).unwrap_or_default().as_bytes(),
         );
     }
 
@@ -208,18 +219,26 @@ impl MetricStorage {
             }
             // Read from in-memory index, update, write back
             if let Some(mut meta) = CACHE_META_INDEX.get(hash).map(|v| v.clone()) {
-                meta["a"] = serde_json::json!(ts);
-                if let Some(f) = meta["f"].as_u64() {
-                    meta["f"] = serde_json::json!(f + cnt);
-                }
+                meta.access_time = ts;
+                meta.access_count += cnt;
                 let db_key = format!("CMETA_{}", hash);
-                batch.put(db_key.as_bytes(), meta.to_string().as_bytes());
+                let json_val = serde_json::json!({
+                    "k": meta.cache_key,
+                    "s": meta.size,
+                    "e": meta.expires,
+                    "a": meta.access_time,
+                    "f": meta.access_count,
+                    "st": meta.status,
+                    "h": meta.headers.iter().map(|(k,v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<_,_>>(),
+                    "c": meta.compressed
+                });
+                batch.put(db_key.as_bytes(), serde_json::to_string(&json_val).unwrap_or_default().as_bytes());
             }
         }
         let _ = db.write(batch);
     }
 
-    pub fn get_cache_meta(&self, hash: &str) -> Option<serde_json::Value> {
+    pub fn get_cache_meta(&self, hash: &str) -> Option<CacheMetaEntry> {
         CACHE_META_INDEX.get(hash).map(|v| v.clone())
     }
 
@@ -274,7 +293,7 @@ impl MetricStorage {
         let count = CACHE_META_INDEX.len();
         let size = CACHE_META_INDEX
             .iter()
-            .map(|entry| entry.value().get("s").and_then(|v| v.as_u64()).unwrap_or(0))
+            .map(|entry| entry.value().size)
             .sum();
         (count, size)
     }
@@ -308,15 +327,15 @@ impl MetricStorage {
     /// Iterates over all cache metadata efficiently using a closure.
     pub fn for_each_cache_meta<F>(&self, mut f: F)
     where
-        F: FnMut(String, serde_json::Value),
+        F: FnMut(String, &CacheMetaEntry),
     {
         for entry in CACHE_META_INDEX.iter() {
-            f(entry.key().clone(), entry.value().clone());
+            f(entry.key().clone(), entry.value());
         }
     }
 
-    /// Scans all cache metadata, returning a vector of (hash, metadata_json)
-    pub fn scan_all_cache_meta(&self) -> Vec<(String, serde_json::Value)> {
+    /// Scans all cache metadata, returning a vector of (hash, metadata)
+    pub fn scan_all_cache_meta(&self) -> Vec<(String, CacheMetaEntry)> {
         CACHE_META_INDEX
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
@@ -363,9 +382,22 @@ pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
 /// Eliminates synchronous RocksDB I/O from the cache HIT hot path.
 static CACHE_ACCESS_LOG: Lazy<DashMap<String, (AtomicI64, AtomicU64)>> = Lazy::new(DashMap::new);
 
-/// In-memory cache metadata index: hash → metadata JSON.
+/// Typed cache metadata — avoids per-lookup JSON clone/parse overhead.
+#[derive(Debug, Clone)]
+pub struct CacheMetaEntry {
+    pub cache_key: String,
+    pub size: u64,
+    pub expires: i64,
+    pub access_time: i64,
+    pub access_count: u64,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub compressed: bool,
+}
+
+/// In-memory cache metadata index: hash → typed metadata.
 /// All cache lookups read from here, eliminating synchronous RocksDB reads on the hot path.
-static CACHE_META_INDEX: Lazy<DashMap<String, serde_json::Value>> = Lazy::new(DashMap::new);
+static CACHE_META_INDEX: Lazy<DashMap<String, CacheMetaEntry>> = Lazy::new(DashMap::new);
 
 /// Load all existing cache metadata from RocksDB into the in-memory index at startup.
 pub fn load_cache_meta_index() {
@@ -379,12 +411,26 @@ pub fn load_cache_meta_index() {
         if !key_str.starts_with("CMETA_") {
             break;
         }
-        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val) {
+        if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&val) {
             let hash = key_str
                 .strip_prefix("CMETA_")
                 .unwrap_or(&key_str)
                 .to_string();
-            CACHE_META_INDEX.insert(hash, meta);
+            let headers: Vec<(String, String)> = raw.get("h")
+                .and_then(|h| h.as_object())
+                .map(|obj| obj.iter().map(|(k,v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+                .unwrap_or_default();
+            let entry = CacheMetaEntry {
+                cache_key: raw.get("k").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                size: raw.get("s").and_then(|v| v.as_u64()).unwrap_or(0),
+                expires: raw.get("e").and_then(|v| v.as_i64()).unwrap_or(0),
+                access_time: raw.get("a").and_then(|v| v.as_i64()).unwrap_or(0),
+                access_count: raw.get("f").and_then(|v| v.as_u64()).unwrap_or(0),
+                status: raw.get("st").and_then(|v| v.as_u64()).unwrap_or(200) as u16,
+                headers,
+                compressed: raw.get("c").and_then(|v| v.as_bool()).unwrap_or(false),
+            };
+            CACHE_META_INDEX.insert(hash, entry);
             count += 1;
         }
     }

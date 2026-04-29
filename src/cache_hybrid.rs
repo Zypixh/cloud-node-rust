@@ -104,51 +104,27 @@ impl Storage for FileStorage {
     ) -> Result<Option<(CacheMeta, HitHandler)>> {
         let hash = self.get_hash(key);
 
-        let meta_val = match crate::metrics::storage::STORAGE.get_cache_meta(&hash) {
+        let meta = match crate::metrics::storage::STORAGE.get_cache_meta(&hash) {
             Some(m) => m,
             None => return Ok(None),
         };
 
         let now = crate::utils::time::now_timestamp();
-        let (headers, ttl_remaining, compressed) = if let Some(meta) = meta_val.as_object() {
-            let expires = meta.get("e").and_then(|v| v.as_i64()).unwrap_or(0);
-            let ttl = (expires - now).max(0) as u64;
-            let status = meta.get("st").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
-            let compressed = meta.get("c").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ttl = (meta.expires - now).max(0) as u64;
 
-            let mut header = pingora_http::ResponseHeader::build(status, None).unwrap();
-            if let Some(h_val) = meta.get("h")
-                && let Some(h_obj) = h_val.as_object()
-            {
-                for (name, val) in h_obj {
-                    if let Some(s) = val.as_str() {
-                        let _ = header.insert_header(name.to_string(), s);
-                    }
-                }
-            }
-            tracing::debug!(
-                "CACHE_HIT: status: {}, compressed: {}, headers: {:?}",
-                status,
-                compressed,
-                header
-            );
-            (header, ttl, compressed)
-        } else {
-            (
-                pingora_http::ResponseHeader::build(200, None).unwrap(),
-                3600,
-                false,
-            )
-        };
+        let mut header = pingora_http::ResponseHeader::build(meta.status, None).unwrap();
+        for (name, val) in &meta.headers {
+            let _ = header.insert_header(name.to_string(), val.as_str());
+        }
 
         let path = self.get_path(key).await;
 
-        let meta = CacheMeta::new(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(ttl_remaining),
+        let cache_meta = CacheMeta::new(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(ttl),
             std::time::SystemTime::now(),
             0,
             0,
-            headers,
+            header,
         );
 
         // Read entire file into memory, serve in 32KB chunks via MemoryHitHandler
@@ -156,7 +132,7 @@ impl Storage for FileStorage {
             .map_err(|_| Error::new(ErrorType::InternalError))?;
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
-        let body: bytes::Bytes = if compressed {
+        let body: bytes::Bytes = if meta.compressed {
             let result = tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&file_data)).await;
             match result {
                 Ok(Some(data)) => bytes::Bytes::from(data),
@@ -170,7 +146,7 @@ impl Storage for FileStorage {
             data: body,
             offset: 0,
         });
-        Ok(Some((meta, handler)))
+        Ok(Some((cache_meta, handler)))
     }
 
     async fn get_miss_handler(
@@ -254,7 +230,10 @@ impl Storage for FileStorage {
             key_str: k_str,
             ttl,
             status,
-            headers: serde_json::Value::Object(headers_json),
+            headers: headers_json
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                .collect(),
             compressed: should_compress,
         }))
     }
@@ -334,12 +313,16 @@ impl Storage for FileStorage {
             compressed,
             headers_json.len()
         );
+        let header_pairs: Vec<(String, String)> = headers_json
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+            .collect();
         crate::metrics::storage::STORAGE.update_cache_meta(
             &hash,
             &k_str,
             0,
             ttl,
-            Some(serde_json::Value::Object(headers_json)),
+            &header_pairs,
             compressed,
             status,
         );
@@ -399,7 +382,7 @@ struct FileMissHandler {
     key_str: String,
     ttl: u64,
     status: u16,
-    headers: serde_json::Value,
+    headers: Vec<(String, String)>,
     compressed: bool,
 }
 
@@ -471,7 +454,7 @@ impl HandleMiss for FileMissHandler {
             &self.key_str,
             written as u64,
             self.ttl,
-            Some(self.headers.clone()),
+            &self.headers,
             self.compressed,
             self.status,
         );
@@ -683,7 +666,8 @@ impl HybridStorage {
 
         let all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
         for (hash, meta) in all_meta {
-            if let Some(k) = meta["k"].as_str() {
+            let k = &meta.cache_key;
+            if !k.is_empty() {
                 if k.starts_with(clean_prefix) {
                     let lock = self.l2.inner.read().await;
                     let path = lock
@@ -956,8 +940,8 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
 
         // Pass 1: Stream metadata from in-memory index, collect expired, calculate size
         crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
-            let expires = meta["e"].as_i64().unwrap_or(0);
-            let size = meta["s"].as_u64().unwrap_or(0);
+            let expires = meta.expires;
+            let size = meta.size;
 
             if now > expires {
                 expired_hashes.push(hash);
@@ -981,11 +965,11 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
             let mut heap_bytes: u64 = 0;
 
             crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
-                let expires = meta["e"].as_i64().unwrap_or(0);
+                let expires = meta.expires;
                 // Only process active files
                 if now <= expires {
-                    let size = meta["s"].as_u64().unwrap_or(0);
-                    let access_time = meta["a"].as_i64().unwrap_or(0);
+                    let size = meta.size;
+                    let access_time = meta.access_time;
 
                     heap.push(EvictCandidate {
                         access_time,
