@@ -857,35 +857,20 @@ impl Storage for HybridStorage {
 
         if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
             prof_record_l2_hit();
-            // Store in lock-free FAST_L1 for subsequent zero-copy hits.
-            // Increment hot counter for L2 disk hit — only promote if threshold reached.
-            let threshold = self
-                .hot_threshold
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let mut is_hot = false;
-            self.hot_counts
-                .entry(hash)
-                .and_modify(|c| {
-                    *c += 1;
-                    if *c >= threshold {
-                        is_hot = true;
-                    }
-                })
-                .or_insert(1);
-
-            if is_hot {
-                // Promote to FAST_L1 from the handler we already have in memory
-                if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
-                    let now = crate::utils::time::now_timestamp();
-                    let fresh_until = meta.fresh_until()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or(std::time::Duration::from_secs(3600))
-                        .as_secs() as i64;
-                    if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now) {
-                        prof_record_l2_mem_promotion();
-                    }
+            // Always promote L2 disk hits to FAST_L1 immediately.
+            // Memory budget + eviction control the total size, not an artificial threshold.
+            if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
+                let now = crate::utils::time::now_timestamp();
+                let fresh_until = meta.fresh_until()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or(std::time::Duration::from_secs(3600))
+                    .as_secs() as i64;
+                if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now) {
+                    prof_record_l2_mem_promotion();
                 }
             }
+            // Track access counts for eviction priority (hot entries protected from LRU eviction)
+            self.hot_counts.entry(hash).and_modify(|c| *c += 1).or_insert(1);
 
             return Ok(Some((meta, handler)));
         }
@@ -1178,13 +1163,13 @@ pub fn start_cache_janitor() {
             // Enforce FAST_L1 memory budget
             let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
             if max_l1 > 0 {
-                let total: u64 = FAST_L1.iter().map(|e| e.data.len() as u64).sum();
+                let total = FAST_L1_BYTES.load(Ordering::Relaxed);
                 if total > max_l1 {
                     let to_free = total - max_l1;
-                    // Evict entries closest to expiry first (minimize cache churn)
+                    // Evict entries closest to expiry first (weakest entries)
                     let mut entries: Vec<_> = FAST_L1
                         .iter()
-                        .map(|e| (*e.key(), e.fresh_until, e.data.len() as u64))
+                        .map(|e| (*e.key(), e.value().fresh_until, e.value().data.len() as u64))
                         .collect();
                     entries.sort_by_key(|(_, fresh_until, _)| *fresh_until);
                     let mut freed: u64 = 0;
@@ -1192,7 +1177,7 @@ pub fn start_cache_janitor() {
                         if freed >= to_free {
                             break;
                         }
-                        FAST_L1.remove(key);
+                        fast_l1_remove(key);
                         freed += size;
                     }
                     if freed > 0 {
