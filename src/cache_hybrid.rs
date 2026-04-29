@@ -563,7 +563,8 @@ impl HybridStorage {
     }
 
     /// Promote to FAST_L1 with capacity check and header extraction from CacheMeta.
-    /// Returns true if inserted, false if skipped (exceeded budget or data too large).
+    /// When budget is exceeded, evicts the entry closest to expiry to make room.
+    /// Returns true if inserted, false if skipped (data too large).
     fn promote_to_fast_l1(
         hash: u64,
         data: bytes::Bytes,
@@ -575,10 +576,23 @@ impl HybridStorage {
             return false;
         }
         let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
+        let len = data.len() as u64;
         if max_l1 > 0 {
-            let current = FAST_L1_BYTES.load(Ordering::Relaxed);
-            if current + data.len() as u64 > max_l1 {
-                return false; // would exceed budget, insertion rejected
+            let mut current = FAST_L1_BYTES.load(Ordering::Relaxed);
+            // Evict entries closest to expiry until there is room (max 100 evictions per insert)
+            let mut evict_attempts = 0;
+            while current + len > max_l1 && evict_attempts < 100 {
+                let victim = FAST_L1
+                    .iter()
+                    .min_by_key(|e| e.value().fresh_until)
+                    .map(|e| *e.key());
+                if let Some(victim_key) = victim {
+                    fast_l1_remove(&victim_key);
+                    current = FAST_L1_BYTES.load(Ordering::Relaxed);
+                    evict_attempts += 1;
+                } else {
+                    break;
+                }
             }
         }
         let status = meta.response_header().status.as_u16();
@@ -588,7 +602,6 @@ impl HybridStorage {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let len = data.len() as u64;
         FAST_L1.insert(hash, FastL1Entry {
             data,
             fresh_until,
