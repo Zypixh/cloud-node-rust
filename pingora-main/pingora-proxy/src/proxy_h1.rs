@@ -679,31 +679,34 @@ where
                     }
                 }
 
-                // TODO: just set version to Version::HTTP_11 unconditionally here,
-                // (with another todo being an option to faithfully proxy the <1.1 responses)
-                // as we are already trying to mutate this for HTTP/1.1 downstream reuse
-
-                /* Convert HTTP 1.0 style response to chunked encoding so that we don't
-                 * have to close the downstream connection */
-                // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = session.req_header().method == http::method::Method::HEAD
-                    || matches!(header.status.as_u16(), 204 | 304);
-                if !no_body
-                    && !header.status.is_informational()
-                    && header
-                        .headers
-                        .get(http::header::TRANSFER_ENCODING)
-                        .is_none()
-                    && header.headers.get(http::header::CONTENT_LENGTH).is_none()
-                    && !end
-                {
-                    // Upgrade the http version to 1.1 because 1.0/0.9 doesn't support chunked
-                    header.set_version(Version::HTTP_11);
-                    header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
-                }
-
                 match self.inner.response_filter(session, &mut header, ctx).await {
-                    Ok(_) => Ok(HttpTask::Header(header, end)),
+                    Ok(_) => {
+                        // TODO: just set version to Version::HTTP_11 unconditionally here,
+                        // (with another todo being an option to faithfully proxy the <1.1 responses)
+                        // as we are already trying to mutate this for HTTP/1.1 downstream reuse
+
+                        /* Convert responses without a known length to chunked encoding so H1
+                         * downstream connections can stay reusable. This must run after
+                         * response_filter because filters may remove content-length when they
+                         * transform the body (HLS, WebP, minification, etc.). */
+                        let no_body = session.req_header().method == http::method::Method::HEAD
+                            || matches!(header.status.as_u16(), 204 | 304);
+                        if !no_body
+                            && !header.status.is_informational()
+                            && header
+                                .headers
+                                .get(http::header::TRANSFER_ENCODING)
+                                .is_none()
+                            && header.headers.get(http::header::CONTENT_LENGTH).is_none()
+                            && !end
+                        {
+                            // Upgrade the http version to 1.1 because 1.0/0.9 doesn't support chunked
+                            header.set_version(Version::HTTP_11);
+                            header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
+                        }
+
+                        Ok(HttpTask::Header(header, end))
+                    }
                     Err(e) => Err(e),
                 }
             }

@@ -633,7 +633,9 @@ where
                 /* Downgrade the version so that write_response_header won't panic */
                 header.set_version(Version::HTTP_11);
 
-                // these status codes / method cannot have body, so no need to add chunked encoding
+                // These status codes / method cannot have body. For H2 HEAD, close the stream on
+                // the HEADERS frame instead of later sending an empty DATA frame: some clients
+                // validate content-length against DATA bytes even though HEAD has no body.
                 let no_body = session.req_header().method == "HEAD"
                     || matches!(header.status.as_u16(), 204 | 304);
 
@@ -645,7 +647,7 @@ where
                 {
                     header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
                 }
-                Ok(HttpTask::Header(header, eos))
+                Ok(HttpTask::Header(header, eos || no_body))
             }
             HttpTask::Body(data, eos) => {
                 if track_max_cache_size {

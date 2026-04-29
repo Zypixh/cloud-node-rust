@@ -1133,8 +1133,17 @@ pub fn start_cache_janitor() {
                 tracing::debug!("FAST_L1 janitor: evicted {} expired entries, {} remain", evicted, FAST_L1.len());
             }
 
-            // OPEN_FILE_CACHE is naturally bounded by OS file descriptor limit (ulimit).
-            // No artificial cap — random eviction would hurt CDN cache hit rates.
+            // Cap OPEN_FILE_CACHE to prevent fd exhaustion. Use retain to keep
+            // the most recently accessed entries (DashMap iter order approximates
+            // insertion order, so taking from the start evicts oldest first).
+            const MAX_OPEN_FILES: usize = 65536;
+            if OPEN_FILE_CACHE.len() > MAX_OPEN_FILES {
+                let excess = OPEN_FILE_CACHE.len() - MAX_OPEN_FILES;
+                let keys: Vec<_> = OPEN_FILE_CACHE.iter().take(excess).map(|e| e.key().clone()).collect();
+                for key in keys {
+                    OPEN_FILE_CACHE.remove(&key);
+                }
+            }
         }
     });
 }

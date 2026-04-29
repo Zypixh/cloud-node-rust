@@ -2932,12 +2932,10 @@ impl ProxyHttp for EdgeProxy {
             }
         }
 
-        if self.waf_state.has_rules()
-            && self.waf_state.is_whitelisted(
-                ctx.client_ip,
-                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-            )
-        {
+        if self.waf_state.is_whitelisted(
+            ctx.client_ip,
+            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+        ) {
             return Ok(false);
         }
 
@@ -2988,12 +2986,10 @@ impl ProxyHttp for EdgeProxy {
             return Ok(true);
         }
 
-        if self.waf_state.has_rules()
-            && self.waf_state.is_blocked(
-                ctx.client_ip,
-                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-            )
-        {
+        if self.waf_state.is_blocked(
+            ctx.client_ip,
+            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+        ) {
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
 
@@ -3852,7 +3848,7 @@ impl ProxyHttp for EdgeProxy {
         upstream_request: &mut pingora_http::RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let global_cfg = self.config.get_global_http_config_sync();
+        let global_cfg = ctx.global_http_config.as_ref().unwrap();
         upstream_request.remove_header("x-cloud-resolved-real-ip");
         // Strip internal L1→L2 headers to prevent leaking them to origin servers
         upstream_request.remove_header("X-Cloud-Access-Token");
