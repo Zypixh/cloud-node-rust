@@ -234,9 +234,13 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                // Downgrade TLS-on-HTTP probes to debug — they are noisy but harmless
+                // Downgrade TLS-on-HTTP probes to debug — they are noisy but harmless.
+                // Check for TLS ClientHello magic bytes (22 = 0x16 = handshake, 3 = 0x03 = TLS major version)
                 let is_tls_scan = matches!(e.etype, InvalidHTTPHeader)
-                    && format!("{e}").contains("[22, 3,");
+                    && {
+                        let s = format!("{e}");
+                        s.contains("[22, 3,") || s.contains("\\x16\\x03")
+                    };
                 if is_tls_scan {
                     debug!("TLS probe on HTTP port: {e}");
                 } else {
