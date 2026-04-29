@@ -469,6 +469,7 @@ struct FastL1Entry {
     data: bytes::Bytes,
     fresh_until: i64,
     created_at: i64,
+    status: u16,
 }
 
 /// Global lock-free L1 cache. Sharded by DashMap, no contention at 1000+ concurrent reads.
@@ -732,7 +733,7 @@ impl Storage for HybridStorage {
                     std::time::UNIX_EPOCH + created_at_dur,
                     0,
                     0,
-                    pingora_http::ResponseHeader::build(200, None).unwrap(),
+                    pingora_http::ResponseHeader::build(entry.status, None).unwrap(),
                 );
                 prof_record_l1_hit();
                 return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), offset: 0 }))));
@@ -753,10 +754,12 @@ impl Storage for HybridStorage {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or(std::time::Duration::from_secs(3600))
                         .as_secs() as i64;
+                    let status = meta.response_header().status.as_u16();
                     FAST_L1.insert(hash, FastL1Entry {
                         data: mem_handler.data.clone(),
                         fresh_until,
                         created_at: now,
+                        status,
                     });
                     prof_record_l2_mem_promotion();
                 }
@@ -780,10 +783,12 @@ impl Storage for HybridStorage {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or(std::time::Duration::from_secs(3600))
                         .as_secs() as i64;
+                    let status = meta.response_header().status.as_u16();
                     FAST_L1.insert(hash, FastL1Entry {
                         data: mem_handler.data.clone(),
                         fresh_until,
                         created_at: now,
+                        status,
                     });
                     prof_record_l2_mem_promotion();
                 }

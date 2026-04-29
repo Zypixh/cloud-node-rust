@@ -234,7 +234,14 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                error!("Fail to proxy: {e}");
+                // Downgrade TLS-on-HTTP probes to debug — they are noisy but harmless
+                let is_tls_scan = matches!(e.etype, InvalidHTTPHeader)
+                    && format!("{e}").contains("[22, 3,");
+                if is_tls_scan {
+                    debug!("TLS probe on HTTP port: {e}");
+                } else {
+                    error!("Fail to proxy: {e}");
+                }
                 if matches!(e.etype, InvalidHTTPHeader) {
                     downstream_session
                         .respond_error(400)
