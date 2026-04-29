@@ -481,6 +481,15 @@ static FAST_L1: Lazy<DashMap<u64, FastL1Entry>> = Lazy::new(DashMap::new);
 /// Max total bytes in FAST_L1. 0 = auto-detect from available system memory.
 static FAST_L1_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Current total bytes in FAST_L1. Maintained by insert (+=len) and remove (-=len).
+static FAST_L1_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn fast_l1_remove(hash: &u64) {
+    if let Some((_, entry)) = FAST_L1.remove(hash) {
+        FAST_L1_BYTES.fetch_sub(entry.data.len() as u64, Ordering::Relaxed);
+    }
+}
+
 const POLICY_FILE: u8 = 0;
 const POLICY_MEMORY: u8 = 1;
 
@@ -567,7 +576,7 @@ impl HybridStorage {
         }
         let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
         if max_l1 > 0 {
-            let current: u64 = FAST_L1.iter().map(|e| e.data.len() as u64).sum();
+            let current = FAST_L1_BYTES.load(Ordering::Relaxed);
             if current + data.len() as u64 > max_l1 {
                 return false; // would exceed budget, insertion rejected
             }
@@ -579,6 +588,7 @@ impl HybridStorage {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
+        let len = data.len() as u64;
         FAST_L1.insert(hash, FastL1Entry {
             data,
             fresh_until,
@@ -586,6 +596,7 @@ impl HybridStorage {
             status,
             headers,
         });
+        FAST_L1_BYTES.fetch_add(len, Ordering::Relaxed);
         true
     }
 
@@ -708,7 +719,7 @@ impl HybridStorage {
         crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
 
         // Clear from lock-free L1 cache
-        FAST_L1.remove(&fast_hash_key(key));
+        fast_l1_remove(&fast_hash_key(key));
 
         let full_key = CacheKey::new("edge", key, "");
         let ck = full_key.to_compact();
@@ -806,7 +817,7 @@ impl Storage for HybridStorage {
             }
             // Expired: remove and fall through
             drop(entry);
-            FAST_L1.remove(&hash);
+            fast_l1_remove(&hash);
         }
 
         // Fallback: try MemCache (for entries not yet in FAST_L1)
@@ -861,45 +872,6 @@ impl Storage for HybridStorage {
                         prof_record_l2_mem_promotion();
                     }
                 }
-                prof_record_l2_async_promotion();
-                let storage_l2 = self.l2;
-                let cache_key_cloned = key.clone();
-                tokio::spawn(async move {
-                    let path = storage_l2.get_path(&cache_key_cloned).await;
-                    if let Ok(attr) = tokio::fs::metadata(&path).await {
-                        if attr.len() > 0 && attr.len() < MEMORY_SERVE_MAX {
-                            if let Ok(mut file) = tokio::fs::File::open(&path).await {
-                                use tokio::io::AsyncReadExt;
-                                let mut buffer = Vec::with_capacity(attr.len() as usize);
-                                if file.read_to_end(&mut buffer).await.is_ok() {
-                                    let header =
-                                        pingora_http::ResponseHeader::build(200, None).unwrap();
-                                    let new_meta = CacheMeta::new(
-                                        std::time::SystemTime::now()
-                                            + std::time::Duration::from_secs(3600),
-                                        std::time::SystemTime::now(),
-                                        0,
-                                        0,
-                                        header,
-                                    );
-                                    let _trace = pingora_cache::trace::Span::inactive().handle();
-                                    if let Ok(mut miss_handler) =
-                                        crate::cache_manager::CACHE
-                                            .storage
-                                            .l1
-                                            .get_miss_handler(&cache_key_cloned, &new_meta, &_trace)
-                                            .await
-                                    {
-                                        let _ = miss_handler
-                                            .write_body(bytes::Bytes::from(buffer), true)
-                                            .await;
-                                        let _ = miss_handler.finish().await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
             }
 
             return Ok(Some((meta, handler)));
@@ -1082,7 +1054,7 @@ pub fn fast_l1_lookup(key_str: &str) -> Option<bytes::Bytes> {
             return Some(entry.data.clone());
         }
         drop(entry);
-        FAST_L1.remove(&hash);
+        fast_l1_remove(&hash);
     }
     None
 }
@@ -1175,10 +1147,19 @@ pub fn start_cache_janitor() {
             // Evict expired FAST_L1 entries
             let now = crate::utils::time::now_timestamp();
             let before = FAST_L1.len();
-            FAST_L1.retain(|_, entry| entry.fresh_until > now);
+            let mut expired_bytes: u64 = 0;
+            FAST_L1.retain(|_, entry| {
+                if entry.fresh_until > now {
+                    true
+                } else {
+                    expired_bytes += entry.data.len() as u64;
+                    false
+                }
+            });
             let evicted = before.saturating_sub(FAST_L1.len());
             if evicted > 0 {
-                tracing::debug!("FAST_L1 janitor: evicted {} expired entries, {} remain", evicted, FAST_L1.len());
+                FAST_L1_BYTES.fetch_sub(expired_bytes, Ordering::Relaxed);
+                tracing::debug!("FAST_L1 janitor: evicted {} expired entries ({} bytes), {} remain", evicted, expired_bytes, FAST_L1.len());
             }
 
             // Enforce FAST_L1 memory budget
