@@ -13,14 +13,12 @@ use std::sync::Arc;
 use tokio::fs;
 use tracing::{info, warn};
 
-use tokio::sync::RwLock;
+use arc_swap::ArcSwap;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 static CACHED_DISK_AVAILABLE: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Global cache for open file handles to reduce open() syscalls
-static OPEN_FILE_CACHE: Lazy<DashMap<PathBuf, Arc<std::fs::File>>> = Lazy::new(DashMap::new);
 
 /// Synchronous zstd decompression for serving small files from memory.
 fn zstd_decompress_to_bytes(data: &[u8]) -> Option<Vec<u8>> {
@@ -36,7 +34,7 @@ const MEMORY_SERVE_MAX: u64 = 50 * 1024 * 1024; // 50MB
 
 /// Dynamic Disk-based storage for Pingora-cache
 pub struct FileStorage {
-    pub inner: Arc<RwLock<FileStorageInner>>,
+    pub inner: ArcSwap<FileStorageInner>,
     enable_sendfile: AtomicBool,
     enable_file_cache: AtomicBool,
 }
@@ -51,32 +49,29 @@ impl FileStorage {
         let main_root = root.into();
         let _ = std::fs::create_dir_all(&main_root);
         Self {
-            inner: Arc::new(RwLock::new(FileStorageInner {
+            inner: ArcSwap::from_pointee(FileStorageInner {
                 main_root,
                 extra_roots: Vec::new(),
-            })),
+            }),
             enable_sendfile: AtomicBool::new(true),
             enable_file_cache: AtomicBool::new(true),
         }
     }
 
-    pub async fn update_config(
+    pub fn update_config(
         &self,
         main: PathBuf,
         extras: Vec<PathBuf>,
         sendfile: bool,
         file_cache: bool,
     ) {
-        let mut lock = self.inner.write().await;
         let _ = std::fs::create_dir_all(&main);
-        lock.main_root = main;
-        lock.extra_roots = extras;
+        self.inner.store(Arc::new(FileStorageInner {
+            main_root: main,
+            extra_roots: extras,
+        }));
         self.enable_sendfile.store(sendfile, Ordering::Relaxed);
         self.enable_file_cache.store(file_cache, Ordering::Relaxed);
-
-        if !file_cache {
-            OPEN_FILE_CACHE.clear();
-        }
     }
 
     fn get_hash(&self, key: &CacheKey) -> String {
@@ -84,8 +79,8 @@ impl FileStorage {
         format!("{:x}", md5_legacy::compute(k_str))
     }
 
-    pub async fn get_path(&self, key: &CacheKey) -> PathBuf {
-        let lock = self.inner.read().await;
+    pub fn get_path(&self, key: &CacheKey) -> PathBuf {
+        let lock = self.inner.load();
         let hash = self.get_hash(key);
 
         lock.main_root
@@ -117,7 +112,7 @@ impl Storage for FileStorage {
             let _ = header.insert_header(name.to_string(), val.as_str());
         }
 
-        let path = self.get_path(key).await;
+        let path = self.get_path(key);
 
         let cache_meta = CacheMeta::new(
             std::time::SystemTime::now() + std::time::Duration::from_secs(ttl),
@@ -157,7 +152,7 @@ impl Storage for FileStorage {
         meta: &CacheMeta,
         _trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<MissHandler> {
-        let path = self.get_path(key).await;
+        let path = self.get_path(key);
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -484,6 +479,11 @@ static FAST_L1_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Current total bytes in FAST_L1. Maintained by insert (+=len) and remove (-=len).
 static FAST_L1_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Min-heap for O(log n) eviction: entries with smallest fresh_until are evicted first.
+/// Uses Reverse so BinaryHeap (max-heap) behaves as min-heap.
+static EVICTION_HEAP: Lazy<parking_lot::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(i64, u64)>>>> =
+    Lazy::new(|| parking_lot::Mutex::new(std::collections::BinaryHeap::new()));
+
 fn fast_l1_remove(hash: &u64) {
     if let Some((_, entry)) = FAST_L1.remove(hash) {
         FAST_L1_BYTES.fetch_sub(entry.data.len() as u64, Ordering::Relaxed);
@@ -495,30 +495,18 @@ const POLICY_MEMORY: u8 = 1;
 
 #[inline]
 fn fast_hash_key(s: &str) -> u64 {
-    // Fast hash for cache keys — fixed seed, no per-call random init.
-    // Processes 8 bytes at a time, good distribution for URL-like strings.
-    let bytes = s.as_bytes();
-    let mut hash: u64 = 0x9ae16a3b2f90404f;
-    for chunk in bytes.chunks(8) {
-        let mut word: u64 = 0;
-        for (i, &b) in chunk.iter().enumerate() {
-            word |= (b as u64) << (i * 8);
-        }
-        hash ^= word;
-        hash = hash.wrapping_mul(0x9e3779b97f4a7c15);
-        hash = hash.rotate_left(31);
-    }
-    hash ^= hash >> 33;
-    hash = hash.wrapping_mul(0xff51afd7ed558ccd);
-    hash ^= hash >> 33;
-    hash
+    use std::hash::{BuildHasher, Hash, Hasher};
+    static HASHER: Lazy<ahash::RandomState> = Lazy::new(|| {
+        ahash::RandomState::with_seeds(0x9ae16a3b2f90404f, 0x9e3779b97f4a7c15, 0xff51afd7ed558ccd, 0x517cc1b727220a95)
+    });
+    let mut h = HASHER.build_hasher();
+    s.hash(&mut h);
+    h.finish()
 }
 
 pub struct HybridStorage {
     pub l1: Arc<MemCache>,
     pub l2: &'static FileStorage,
-    hot_counts: DashMap<u64, u32>,
-    hot_threshold: std::sync::atomic::AtomicU32,
     pub max_disk_bytes: std::sync::atomic::AtomicU64,
     pub min_free_bytes: std::sync::atomic::AtomicU64,
     pub max_fast_l1_bytes: std::sync::atomic::AtomicU64,
@@ -531,7 +519,6 @@ pub struct CacheRuntimeStats {
     pub memory_bytes: u64,
     pub disk_count: usize,
     pub disk_bytes: u64,
-    pub open_file_cache_count: usize,
     pub max_disk_bytes: u64,
     pub min_free_bytes: u64,
 }
@@ -543,8 +530,6 @@ impl HybridStorage {
         Self {
             l1: Arc::new(l1),
             l2: Box::leak(Box::new(FileStorage::new(disk_root))),
-            hot_counts: DashMap::new(),
-            hot_threshold: std::sync::atomic::AtomicU32::new(2),
             max_disk_bytes: std::sync::atomic::AtomicU64::new(10 * 1024 * 1024 * 1024),
             min_free_bytes: std::sync::atomic::AtomicU64::new(2 * 1024 * 1024 * 1024),
             max_fast_l1_bytes: std::sync::atomic::AtomicU64::new(0), // 0 = auto-detect
@@ -553,11 +538,10 @@ impl HybridStorage {
     }
 
     fn compute_memory_budget() -> u64 {
-        let mut sys = sysinfo::System::new_all();
+        let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total = sys.total_memory();
         let available = sys.available_memory();
-        // Use 25% of available RAM, capped at 50% of total
         let budget = (available as f64 * 0.25) as u64;
         budget.min((total as f64 * 0.5) as u64)
     }
@@ -578,20 +562,25 @@ impl HybridStorage {
         let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
         let len = data.len() as u64;
         if max_l1 > 0 {
-            let mut current = FAST_L1_BYTES.load(Ordering::Relaxed);
-            // Evict entries closest to expiry until there is room (max 100 evictions per insert)
-            let mut evict_attempts = 0;
-            while current + len > max_l1 && evict_attempts < 100 {
-                let victim = FAST_L1
-                    .iter()
-                    .min_by_key(|e| e.value().fresh_until)
-                    .map(|e| *e.key());
-                if let Some(victim_key) = victim {
-                    fast_l1_remove(&victim_key);
-                    current = FAST_L1_BYTES.load(Ordering::Relaxed);
-                    evict_attempts += 1;
-                } else {
-                    break;
+            let current = FAST_L1_BYTES.load(Ordering::Relaxed);
+            if current + len > max_l1 {
+                let mut heap = EVICTION_HEAP.lock();
+                let mut freed = 0u64;
+                let mut evict_attempts = 0;
+                while FAST_L1_BYTES.load(Ordering::Relaxed) + len - freed > max_l1 && evict_attempts < 100 {
+                    match heap.pop() {
+                        Some(std::cmp::Reverse((_, victim_key))) => {
+                            if FAST_L1.contains_key(&victim_key) {
+                                if let Some((_, entry)) = FAST_L1.remove(&victim_key) {
+                                    let sz = entry.data.len() as u64;
+                                    FAST_L1_BYTES.fetch_sub(sz, Ordering::Relaxed);
+                                    freed += sz;
+                                }
+                            }
+                            evict_attempts += 1;
+                        }
+                        None => break,
+                    }
                 }
             }
         }
@@ -610,6 +599,7 @@ impl HybridStorage {
             headers,
         });
         FAST_L1_BYTES.fetch_add(len, Ordering::Relaxed);
+        EVICTION_HEAP.lock().push(std::cmp::Reverse((fresh_until, hash)));
         true
     }
 
@@ -633,11 +623,6 @@ impl HybridStorage {
             {
                 FAST_L1_MAX_BYTES.store(mem, Ordering::Relaxed);
                 self.max_fast_l1_bytes.store(mem, Ordering::Relaxed);
-            }
-
-            if let Some(hot) = options.get("hotThreshold").and_then(|v| v.as_u64()) {
-                self.hot_threshold
-                    .store(hot as u32, std::sync::atomic::Ordering::Relaxed);
             }
 
             let min_free_setting = if let Some(min_free) = options.get("minFreeSpace") {
@@ -714,16 +699,15 @@ impl HybridStorage {
                         sub_dirs.unwrap_or_default(),
                         enable_sendfile,
                         enable_file_cache,
-                    )
-                    .await;
+                    );
             }
         }
     }
 
     pub async fn purge_by_key(&self, key: &str) -> bool {
         let hash = format!("{:x}", md5_legacy::compute(key));
-        let lock = self.l2.inner.read().await;
-        let path = lock
+        let inner = self.l2.inner.load();
+        let path = inner
             .main_root
             .join(&hash[0..2])
             .join(&hash[2..4])
@@ -750,24 +734,25 @@ impl HybridStorage {
 
     pub async fn purge_by_prefix(&self, prefix: &str) -> bool {
         let clean_prefix = prefix.trim_end_matches('*');
+        let inner = self.l2.inner.load();
         let mut deleted_count = 0;
+        let mut to_delete = Vec::new();
 
-        let all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
-        for (hash, meta) in all_meta {
-            let k = &meta.cache_key;
-            if !k.is_empty() {
-                if k.starts_with(clean_prefix) {
-                    let lock = self.l2.inner.read().await;
-                    let path = lock
-                        .main_root
-                        .join(&hash[0..2])
-                        .join(&hash[2..4])
-                        .join(&hash);
-                    let _ = fs::remove_file(&path).await;
-                    crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                    deleted_count += 1;
-                }
+        crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
+            if !meta.cache_key.is_empty() && meta.cache_key.starts_with(clean_prefix) {
+                to_delete.push(hash);
             }
+        });
+
+        for hash in to_delete {
+            let path = inner
+                .main_root
+                .join(&hash[0..2])
+                .join(&hash[2..4])
+                .join(&hash);
+            let _ = fs::remove_file(&path).await;
+            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+            deleted_count += 1;
         }
         info!(
             "RPC_CACHE: Purged {} items matching prefix: {}",
@@ -785,7 +770,6 @@ impl HybridStorage {
             memory_bytes: memory_bytes as u64,
             disk_count,
             disk_bytes,
-            open_file_cache_count: OPEN_FILE_CACHE.len(),
             max_disk_bytes: self
                 .max_disk_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -869,8 +853,6 @@ impl Storage for HybridStorage {
                     prof_record_l2_mem_promotion();
                 }
             }
-            // Track access counts for eviction priority (hot entries protected from LRU eviction)
-            self.hot_counts.entry(hash).and_modify(|c| *c += 1).or_insert(1);
 
             return Ok(Some((meta, handler)));
         }
@@ -1160,25 +1142,25 @@ pub fn start_cache_janitor() {
                 tracing::debug!("FAST_L1 janitor: evicted {} expired entries ({} bytes), {} remain", evicted, expired_bytes, FAST_L1.len());
             }
 
-            // Enforce FAST_L1 memory budget
+            // Enforce FAST_L1 memory budget via eviction heap
             let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
             if max_l1 > 0 {
                 let total = FAST_L1_BYTES.load(Ordering::Relaxed);
                 if total > max_l1 {
-                    let to_free = total - max_l1;
-                    // Evict entries closest to expiry first (weakest entries)
-                    let mut entries: Vec<_> = FAST_L1
-                        .iter()
-                        .map(|e| (*e.key(), e.value().fresh_until, e.value().data.len() as u64))
-                        .collect();
-                    entries.sort_by_key(|(_, fresh_until, _)| *fresh_until);
+                    let mut heap = EVICTION_HEAP.lock();
                     let mut freed: u64 = 0;
-                    for (key, _, size) in &entries {
-                        if freed >= to_free {
-                            break;
+                    let to_free = total - max_l1;
+                    while freed < to_free {
+                        match heap.pop() {
+                            Some(std::cmp::Reverse((_, victim_key))) => {
+                                if let Some((_, entry)) = FAST_L1.remove(&victim_key) {
+                                    let sz = entry.data.len() as u64;
+                                    FAST_L1_BYTES.fetch_sub(sz, Ordering::Relaxed);
+                                    freed += sz;
+                                }
+                            }
+                            None => break,
                         }
-                        fast_l1_remove(key);
-                        freed += size;
                     }
                     if freed > 0 {
                         tracing::debug!(
@@ -1194,16 +1176,6 @@ pub fn start_cache_janitor() {
                 let budget = HybridStorage::compute_memory_budget();
                 if budget > 0 {
                     FAST_L1_MAX_BYTES.store(budget, Ordering::Relaxed);
-                }
-            }
-
-            // Cap OPEN_FILE_CACHE to prevent fd exhaustion
-            const MAX_OPEN_FILES: usize = 65536;
-            if OPEN_FILE_CACHE.len() > MAX_OPEN_FILES {
-                let excess = OPEN_FILE_CACHE.len() - MAX_OPEN_FILES;
-                let keys: Vec<_> = OPEN_FILE_CACHE.iter().take(excess).map(|e| e.key().clone()).collect();
-                for key in keys {
-                    OPEN_FILE_CACHE.remove(&key);
                 }
             }
         }

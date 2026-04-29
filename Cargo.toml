@@ -67,6 +67,8 @@ libc = "0.2"
 parking_lot = "0.12"
 aes-gcm = "0.10.3"
 async-compression = { version = "0.4.42", features = ["tokio", "zstd"] }
+arc-swap = "1"
+ahash = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 neli = "0.7.4"

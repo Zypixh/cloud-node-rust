@@ -62,7 +62,6 @@ struct PerfSample {
     cache_disk_count: usize,
     cache_memory_bytes: u64,
     cache_memory_count: usize,
-    cache_open_file_handles: usize,
     cache_policy_type: String,
     cache_disk_limit_bytes: u64,
     cache_min_free_bytes: u64,
@@ -199,7 +198,6 @@ async fn sample_loop(store: SharedStore) {
             cache_disk_count: cache_stats.disk_count,
             cache_memory_bytes: cache_stats.memory_bytes,
             cache_memory_count: cache_stats.memory_count,
-            cache_open_file_handles: cache_stats.open_file_cache_count,
             cache_policy_type: cache_stats.policy_type,
             cache_disk_limit_bytes: cache_stats.max_disk_bytes,
             cache_min_free_bytes: cache_stats.min_free_bytes,
@@ -518,7 +516,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <div class="card full"><div class="label">缓存概览</div><div class="mini-grid">
       <div class="mini"><div class="label">Disk Cache Files</div><div class="value" id="cacheDiskCount">-</div><div class="hint" id="cacheDiskSize">-</div></div>
       <div class="mini"><div class="label">Memory Cache Items</div><div class="value" id="cacheMemoryCount">-</div><div class="hint" id="cacheMemorySize">-</div></div>
-      <div class="mini"><div class="label">Open File Cache</div><div class="value" id="cacheOpenFiles">-</div><div class="hint" id="cachePolicy">-</div></div>
+      <div class="mini"><div class="label">Cache Policy</div><div class="value" id="cachePolicy">-</div></div>
       <div class="mini"><div class="label">Disk Cache Limit</div><div class="value" id="cacheLimit">-</div><div class="hint" id="cacheMinFree">-</div></div>
     </div></div>
     <div class="card full"><div class="label">优化建议</div><div class="advice" id="advice"></div></div>
@@ -658,8 +656,7 @@ async function refresh() {
   $('cacheDiskSize').textContent = fmtBytes(last.cache_disk_bytes);
   $('cacheMemoryCount').textContent = last.cache_memory_count.toLocaleString();
   $('cacheMemorySize').textContent = fmtBytes(last.cache_memory_bytes);
-  $('cacheOpenFiles').textContent = last.cache_open_file_handles.toLocaleString();
-  $('cachePolicy').textContent = `policy ${last.cache_policy_type || '-'}`;
+  $('cachePolicy').textContent = last.cache_policy_type || '-';
   $('cacheLimit').textContent = fmtBytes(last.cache_disk_limit_bytes);
   $('cacheMinFree').textContent = `min free ${fmtBytes(last.cache_min_free_bytes)}`;
   drawChart($('traffic'), [{name:'Out', color:'#56d68f', data:data.map(x=>x.traffic_out_bps)}, {name:'In', color:'#f5bd68', data:data.map(x=>x.traffic_in_bps)}], {unit:'Bytes/s', format:'bytes', samples:data});

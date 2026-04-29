@@ -619,7 +619,9 @@ version = "1.0.5"
 dependencies = [
  "aes",
  "aes-gcm",
+ "ahash",
  "anyhow",
+ "arc-swap",
  "async-compression",
  "async-stream",
  "async-trait",
