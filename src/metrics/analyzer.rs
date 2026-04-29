@@ -49,6 +49,8 @@ impl Clone for RequestStats {
     }
 }
 
+static GEO_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 static GEO_CITY_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
     let path = "GeoLite2-City.mmdb";
     match maxminddb::Reader::open_readfile(path) {
@@ -58,6 +60,7 @@ static GEO_CITY_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| 
                 "Failed to load GeoIP City database at {}: {}. Geo stats will be disabled.",
                 path, e
             );
+            GEO_AVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
             None
         }
     }
@@ -113,7 +116,8 @@ static UA_CACHE: Lazy<ShardedLru<String, (Arc<str>, Arc<str>)>> = Lazy::new(|| {
 static UA_PARSER: Lazy<Parser> = Lazy::new(Parser::new);
 
 pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
-    let geo = {
+    // Fast path: skip Mutex lock when GeoIP database is unavailable
+    let geo = if GEO_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
         let mutex = GEO_CACHE.get_shard(&ip);
         let mut cache = mutex.lock().unwrap();
         if let Some(cached) = cache.get(&ip) {
@@ -123,9 +127,13 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
             cache.put(ip, res.clone());
             res
         }
+    } else {
+        None
     };
 
-    let (browser, os) = {
+    let (browser, os) = if ua.is_empty() {
+        (Arc::from(""), Arc::from(""))
+    } else {
         let ua_owned = ua.to_string();
         let mutex = UA_CACHE.get_shard(&ua_owned);
         let mut cache = mutex.lock().unwrap();
