@@ -1,3 +1,4 @@
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -1192,6 +1193,9 @@ pub struct URLPattern {
     pub pattern: String,
 }
 
+static URL_PATTERN_RE_CACHE: Lazy<dashmap::DashMap<String, regex::Regex>> =
+    Lazy::new(dashmap::DashMap::new);
+
 impl URLPattern {
     pub fn matches(&self, url: &str) -> bool {
         let url = url.to_ascii_lowercase();
@@ -1218,9 +1222,16 @@ impl URLPattern {
                 } else {
                     format!("(?i){}", self.pattern)
                 };
-                regex::Regex::new(&pattern)
-                    .map(|re| re.is_match(url.as_str()))
-                    .unwrap_or(false)
+                if let Some(re) = URL_PATTERN_RE_CACHE.get(&pattern) {
+                    re.is_match(url.as_str())
+                } else {
+                    let Ok(re) = regex::Regex::new(&pattern) else {
+                        return false;
+                    };
+                    let result = re.is_match(url.as_str());
+                    URL_PATTERN_RE_CACHE.insert(pattern, re);
+                    result
+                }
             }
             _ => {
                 if self.pattern.is_empty() {
@@ -1233,9 +1244,16 @@ impl URLPattern {
                 } else {
                     format!("(?i)^{}$", wildcard)
                 };
-                regex::Regex::new(&pattern)
-                    .map(|re| re.is_match(url.as_str()))
-                    .unwrap_or(false)
+                if let Some(re) = URL_PATTERN_RE_CACHE.get(&pattern) {
+                    re.is_match(url.as_str())
+                } else {
+                    let Ok(re) = regex::Regex::new(&pattern) else {
+                        return false;
+                    };
+                    let result = re.is_match(url.as_str());
+                    URL_PATTERN_RE_CACHE.insert(pattern, re);
+                    result
+                }
             }
         }
     }
