@@ -161,23 +161,29 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     }
 
     // Collect response headers — pre-allocate capacity
+    // Read sent headers from the ACTUAL response written (includes Pingora
+    // modifications like chunked encoding, H2 eos flags, etc.)
     let mut sent_headers: std::collections::HashMap<String, pb::Strings> =
-        std::collections::HashMap::with_capacity(ctx.response_headers.len());
-    for (k, v) in ctx.response_headers.iter() {
-        sent_headers.insert(
-            k.clone(),
-            pb::Strings {
-                values: vec![v.clone()],
-            },
-        );
+        std::collections::HashMap::new();
+    let mut content_type = String::new();
+    if let Some(resp) = session.response_written() {
+        sent_headers.reserve(resp.headers.len());
+        for (name, value) in resp.headers.iter() {
+            let v_str = value.to_str().unwrap_or("");
+            sent_headers.insert(
+                name.to_string(),
+                pb::Strings {
+                    values: vec![v_str.to_string()],
+                },
+            );
+        }
+        content_type = resp
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
     }
-
-    // Content-Type from response headers
-    let content_type = ctx
-        .response_headers
-        .get("content-type")
-        .cloned()
-        .unwrap_or_default();
 
     // Format times matching Go: ISO8601 and Apache Common Log Format
     let start_dt = crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
