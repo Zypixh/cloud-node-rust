@@ -2,6 +2,7 @@ use crate::config_models::{HTTPHostRedirectConfig, HTTPRewriteRef, HTTPRewriteRu
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::Arc;
 use tracing::debug;
 
 pub enum RewriteResult {
@@ -14,7 +15,7 @@ pub enum RewriteResult {
 }
 
 /// Match and evaluate rewrite rules, mirroring GoEdge's configureWeb/doRewrite logic
-static REWRITE_RE_CACHE: Lazy<DashMap<String, Regex>> = Lazy::new(DashMap::new);
+static REWRITE_RE_CACHE: Lazy<DashMap<String, std::sync::Arc<Regex>>> = Lazy::new(DashMap::new);
 
 pub fn evaluate_rewrites(
     original_uri: &str,
@@ -47,8 +48,9 @@ pub fn evaluate_rewrites(
                 debug!("Invalid rewrite pattern: {}", pattern);
                 continue;
             };
-            REWRITE_RE_CACHE.insert(pattern.clone(), compiled.clone());
-            compiled
+            let re = Arc::new(compiled);
+            REWRITE_RE_CACHE.insert(pattern.clone(), Arc::clone(&re));
+            re
         };
 
         // Extract path portion for matching

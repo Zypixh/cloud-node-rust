@@ -1,6 +1,7 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -1193,7 +1194,7 @@ pub struct URLPattern {
     pub pattern: String,
 }
 
-static URL_PATTERN_RE_CACHE: Lazy<dashmap::DashMap<String, regex::Regex>> =
+static URL_PATTERN_RE_CACHE: Lazy<dashmap::DashMap<String, std::sync::Arc<regex::Regex>>> =
     Lazy::new(dashmap::DashMap::new);
 
 impl URLPattern {
@@ -1223,13 +1224,13 @@ impl URLPattern {
                     format!("(?i){}", self.pattern)
                 };
                 if let Some(re) = URL_PATTERN_RE_CACHE.get(&pattern) {
-                    re.is_match(url.as_str())
+                    re.is_match(&url)
                 } else {
                     let Ok(re) = regex::Regex::new(&pattern) else {
                         return false;
                     };
-                    let result = re.is_match(url.as_str());
-                    URL_PATTERN_RE_CACHE.insert(pattern, re);
+                    let result = re.is_match(&url);
+                    URL_PATTERN_RE_CACHE.insert(pattern, Arc::new(re));
                     result
                 }
             }
@@ -1245,13 +1246,13 @@ impl URLPattern {
                     format!("(?i)^{}$", wildcard)
                 };
                 if let Some(re) = URL_PATTERN_RE_CACHE.get(&pattern) {
-                    re.is_match(url.as_str())
+                    re.is_match(&url)
                 } else {
                     let Ok(re) = regex::Regex::new(&pattern) else {
                         return false;
                     };
-                    let result = re.is_match(url.as_str());
-                    URL_PATTERN_RE_CACHE.insert(pattern, re);
+                    let result = re.is_match(&url);
+                    URL_PATTERN_RE_CACHE.insert(pattern, Arc::new(re));
                     result
                 }
             }

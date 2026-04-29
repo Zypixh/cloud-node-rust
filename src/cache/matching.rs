@@ -3,8 +3,9 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use pingora_proxy::Session;
 use regex::Regex;
+use std::sync::Arc;
 
-static CACHE_RE_CACHE: Lazy<DashMap<String, Regex>> = Lazy::new(DashMap::new);
+static CACHE_RE_CACHE: Lazy<DashMap<String, std::sync::Arc<Regex>>> = Lazy::new(DashMap::new);
 
 pub trait Matcher {
     fn match_request(&self, session: &Session) -> bool;
@@ -241,22 +242,24 @@ pub fn get_variable_value(session: &Session, param: &str) -> String {
 }
 
 pub fn format_variables(session: &Session, template: &str) -> String {
+    static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").unwrap());
     if !template.contains("${") {
         return template.to_string();
     }
-    let re = Regex::new(r"\$\{[^}]+\}").unwrap();
+    let re = &*RE_VAR;
     let result = re.replace_all(template, |caps: &regex::Captures| {
         get_variable_value(session, &caps[0])
     });
     result.to_string()
 }
 
-fn get_cached_regex(pattern: &str) -> Option<Regex> {
+fn get_cached_regex(pattern: &str) -> Option<Arc<Regex>> {
     if let Some(cached) = CACHE_RE_CACHE.get(pattern) {
-        return Some(cached.clone());
+        return Some(Arc::clone(&*cached));
     }
     Regex::new(pattern).ok().map(|re| {
-        CACHE_RE_CACHE.insert(pattern.to_string(), re.clone());
+        let re = Arc::new(re);
+        CACHE_RE_CACHE.insert(pattern.to_string(), Arc::clone(&re));
         re
     })
 }
