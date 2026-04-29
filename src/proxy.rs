@@ -2921,9 +2921,14 @@ impl ProxyHttp for EdgeProxy {
                 );
                 ctx.lb = Some(lb_arc.clone());
 
-                self.config
-                    .cache_server_route(host.clone(), server.clone(), lb_arc)
-                    .await;
+                // Fire-and-forget: cache the route in background to avoid
+                // blocking the hot path on a config write lock.
+                let config = self.config.clone();
+                let host_c = host.clone();
+                let server_c = server.clone();
+                tokio::spawn(async move {
+                    config.cache_server_route(host_c, server_c, lb_arc).await;
+                });
             }
         }
 
