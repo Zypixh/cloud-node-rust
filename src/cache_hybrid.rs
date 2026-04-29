@@ -475,6 +475,9 @@ struct FastL1Entry {
 /// Global lock-free L1 cache. Sharded by DashMap, no contention at 1000+ concurrent reads.
 static FAST_L1: Lazy<DashMap<u64, FastL1Entry>> = Lazy::new(DashMap::new);
 
+/// Max total bytes in FAST_L1. 0 = auto-detect from available system memory.
+static FAST_L1_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+
 const POLICY_FILE: u8 = 0;
 const POLICY_MEMORY: u8 = 1;
 
@@ -506,6 +509,7 @@ pub struct HybridStorage {
     hot_threshold: std::sync::atomic::AtomicU32,
     pub max_disk_bytes: std::sync::atomic::AtomicU64,
     pub min_free_bytes: std::sync::atomic::AtomicU64,
+    pub max_fast_l1_bytes: std::sync::atomic::AtomicU64,
     pub policy_type: AtomicU8,
 }
 
@@ -530,9 +534,20 @@ impl HybridStorage {
             hot_counts: DashMap::new(),
             hot_threshold: std::sync::atomic::AtomicU32::new(5),
             max_disk_bytes: std::sync::atomic::AtomicU64::new(10 * 1024 * 1024 * 1024),
-            min_free_bytes: std::sync::atomic::AtomicU64::new(2 * 1024 * 1024 * 1024), // 2GB default
+            min_free_bytes: std::sync::atomic::AtomicU64::new(2 * 1024 * 1024 * 1024),
+            max_fast_l1_bytes: std::sync::atomic::AtomicU64::new(0), // 0 = auto-detect
             policy_type: AtomicU8::new(POLICY_FILE),
         }
+    }
+
+    fn compute_memory_budget() -> u64 {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_memory();
+        let total = sys.total_memory();
+        let available = sys.available_memory();
+        // Use 25% of available RAM, capped at 50% of total
+        let budget = (available as f64 * 0.25) as u64;
+        budget.min((total as f64 * 0.5) as u64)
     }
 
     pub async fn apply_policy(&self, policy: &crate::config_models::HTTPCachePolicy) {
@@ -548,6 +563,15 @@ impl HybridStorage {
         }
 
         if let Some(options) = &policy.options {
+            // Memory capacity for FAST_L1: 0 = auto-detect, explicit value = use directly
+            if let Some(mem) = options.get("memoryCapacity")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                FAST_L1_MAX_BYTES.store(mem, Ordering::Relaxed);
+                self.max_fast_l1_bytes.store(mem, Ordering::Relaxed);
+            }
+
             if let Some(hot) = options.get("hotThreshold").and_then(|v| v.as_u64()) {
                 self.hot_threshold
                     .store(hot as u32, std::sync::atomic::Ordering::Relaxed);
@@ -1122,9 +1146,44 @@ pub fn start_cache_janitor() {
                 tracing::debug!("FAST_L1 janitor: evicted {} expired entries, {} remain", evicted, FAST_L1.len());
             }
 
-            // Cap OPEN_FILE_CACHE to prevent fd exhaustion. Use retain to keep
-            // the most recently accessed entries (DashMap iter order approximates
-            // insertion order, so taking from the start evicts oldest first).
+            // Enforce FAST_L1 memory budget
+            let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
+            if max_l1 > 0 {
+                let total: u64 = FAST_L1.iter().map(|e| e.data.len() as u64).sum();
+                if total > max_l1 {
+                    let to_free = total - max_l1;
+                    // Evict entries closest to expiry first (minimize cache churn)
+                    let mut entries: Vec<_> = FAST_L1
+                        .iter()
+                        .map(|e| (*e.key(), e.fresh_until, e.data.len() as u64))
+                        .collect();
+                    entries.sort_by_key(|(_, fresh_until, _)| *fresh_until);
+                    let mut freed: u64 = 0;
+                    for (key, _, size) in &entries {
+                        if freed >= to_free {
+                            break;
+                        }
+                        FAST_L1.remove(key);
+                        freed += size;
+                    }
+                    if freed > 0 {
+                        tracing::debug!(
+                            "FAST_L1 memory budget: {}/{} bytes, evicted {} bytes, {} entries remain",
+                            total, max_l1, freed, FAST_L1.len()
+                        );
+                    }
+                }
+            }
+
+            // Update auto memory budget from system
+            if max_l1 == 0 {
+                let budget = HybridStorage::compute_memory_budget();
+                if budget > 0 {
+                    FAST_L1_MAX_BYTES.store(budget, Ordering::Relaxed);
+                }
+            }
+
+            // Cap OPEN_FILE_CACHE to prevent fd exhaustion
             const MAX_OPEN_FILES: usize = 65536;
             if OPEN_FILE_CACHE.len() > MAX_OPEN_FILES {
                 let excess = OPEN_FILE_CACHE.len() - MAX_OPEN_FILES;
