@@ -25,6 +25,13 @@ static NUMERIC_NODE_ID: AtomicI64 = AtomicI64::new(0);
 static REQUEST_ID_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 static REQUEST_ID_COUNTER: AtomicI32 = AtomicI32::new(1_000_000);
 
+pub fn init_log_disabled_from_env() {
+    if std::env::var("CLOUD_NODE_NO_LOG").is_ok() {
+        LOG_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("Access logging disabled via CLOUD_NODE_NO_LOG env var");
+    }
+}
+
 pub fn init_global_log_bus(sender: mpsc::Sender<pb::HttpAccessLog>, node_sender: mpsc::Sender<pb::NodeLog>) {
     let _ = LOG_SENDER.set(sender);
     let _ = NODE_LOG_SENDER.set(node_sender);
@@ -60,7 +67,12 @@ pub fn report_node_log(level: String, tag: String, message: String, server_id: i
     }
 }
 
+static LOG_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn log_access(session: &Session, ctx: &ProxyCTX) {
+    if LOG_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     if ctx.no_log {
         return;
     }
