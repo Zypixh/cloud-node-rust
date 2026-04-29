@@ -1,9 +1,13 @@
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 use std::net::IpAddr;
 
 /// Limit regex memory usage to 1MB to prevent catastrophic backtracking from user-controlled WAF patterns
 const REGEX_SIZE_LIMIT: usize = 1_048_576;
+
+/// Cache compiled user-defined regex patterns to avoid per-request compilation
+static WAF_RE_CACHE: Lazy<DashMap<String, Regex>> = Lazy::new(DashMap::new);
 
 static RE_SQLI: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(union\s+select|select\s+.*\s+from|insert\s+into|update\s+.*\s+set|delete\s+from|drop\s+table|truncate\s+table|benchmark\(|sleep\()").unwrap()
@@ -36,41 +40,20 @@ pub fn evaluate_operator(
         "eq string" => actual == expected,
         "neq string" => actual != expected,
         "match" | "matches" | "regexp" => {
-            if let Ok(re) = RegexBuilder::new(&expected)
-                .size_limit(REGEX_SIZE_LIMIT)
-                .build()
-            {
-                re.is_match(&actual)
-            } else {
-                false
-            }
+            get_or_compile_regex(&expected).map_or(false, |re| re.is_match(&actual))
         }
         "not match" | "notmatches" | "notregexp" => {
-            if let Ok(re) = RegexBuilder::new(&expected)
-                .size_limit(REGEX_SIZE_LIMIT)
-                .build()
-            {
-                !re.is_match(&actual)
-            } else {
-                false
-            }
+            get_or_compile_regex(&expected).map_or(false, |re| !re.is_match(&actual))
         }
         "wildcard match" => {
-            // simplistic wildcard to regex conversion: * -> .*
             let escaped = regex::escape(&expected).replace("\\*", ".*");
-            if let Ok(re) = Regex::new(&format!("^{}$", escaped)) {
-                re.is_match(&actual)
-            } else {
-                false
-            }
+            let re_str = format!("^{}$", escaped);
+            get_or_compile_regex(&re_str).map_or(false, |re| re.is_match(&actual))
         }
         "wildcard not match" => {
             let escaped = regex::escape(&expected).replace("\\*", ".*");
-            if let Ok(re) = Regex::new(&format!("^{}$", escaped)) {
-                !re.is_match(&actual)
-            } else {
-                false
-            }
+            let re_str = format!("^{}$", escaped);
+            get_or_compile_regex(&re_str).map_or(false, |re| !re.is_match(&actual))
         }
         "contains" | "containsstring" => actual.contains(&expected),
         "not contains" | "notcontains" => !actual.contains(&expected),
@@ -382,4 +365,20 @@ fn is_ai_bot(ua: &str) -> bool {
     ];
     let ua_lower = ua.to_lowercase();
     bots.iter().any(|bot| ua_lower.contains(bot))
+}
+
+/// Get or compile a regex from cache — avoids per-request regex compilation.
+#[inline]
+fn get_or_compile_regex(pattern: &str) -> Option<Regex> {
+    if let Some(cached) = WAF_RE_CACHE.get(pattern) {
+        return Some(cached.clone());
+    }
+    RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .ok()
+        .map(|re| {
+            WAF_RE_CACHE.insert(pattern.to_string(), re.clone());
+            re
+        })
 }

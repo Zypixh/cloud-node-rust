@@ -3692,12 +3692,15 @@ impl ProxyHttp for EdgeProxy {
         }
 
         // 2. L1 Node: Learn from L2's pressure announcement
+        // Fire-and-forget: move write lock off the hot path
         if let Some(p_header) = upstream_response.headers.get("X-Cloud-Node-Pressure") {
             if let Ok(p_str) = p_header.to_str() {
                 if let Ok(p_val) = p_str.parse::<f32>() {
-                    // Update the pressure map for this L2 node using the actual upstream address
-                    self.config
-                        .update_parent_pressure(&ctx.origin_address, p_val);
+                    let config = self.config.clone();
+                    let addr = ctx.origin_address.clone();
+                    tokio::spawn(async move {
+                        config.update_parent_pressure(&addr, p_val);
+                    });
                 }
             }
         }

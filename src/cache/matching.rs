@@ -1,6 +1,10 @@
 use crate::config_models::{HTTPRequestCond, HTTPRequestCondGroup, HTTPRequestCondsConfig};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use pingora_proxy::Session;
 use regex::Regex;
+
+static CACHE_RE_CACHE: Lazy<DashMap<String, Regex>> = Lazy::new(DashMap::new);
 
 pub trait Matcher {
     fn match_request(&self, session: &Session) -> bool;
@@ -44,9 +48,8 @@ impl HTTPRequestCond {
                 } else {
                     self.value.clone()
                 };
-                Regex::new(&pattern)
-                    .map(|re| re.is_match(&param_value))
-                    .unwrap_or(false)
+                get_cached_regex(&pattern)
+                    .map_or(false, |re| re.is_match(&param_value))
             }
             "notMatches" | "notRegexp" => {
                 let pattern = if self.is_case_insensitive && !self.value.starts_with("(?i)") {
@@ -54,9 +57,8 @@ impl HTTPRequestCond {
                 } else {
                     self.value.clone()
                 };
-                Regex::new(&pattern)
-                    .map(|re| !re.is_match(&param_value))
-                    .unwrap_or(false)
+                get_cached_regex(&pattern)
+                    .map_or(false, |re| !re.is_match(&param_value))
             }
             "eq" | "equals" => {
                 if self.is_case_insensitive {
@@ -247,4 +249,14 @@ pub fn format_variables(session: &Session, template: &str) -> String {
         get_variable_value(session, &caps[0])
     });
     result.to_string()
+}
+
+fn get_cached_regex(pattern: &str) -> Option<Regex> {
+    if let Some(cached) = CACHE_RE_CACHE.get(pattern) {
+        return Some(cached.clone());
+    }
+    Regex::new(pattern).ok().map(|re| {
+        CACHE_RE_CACHE.insert(pattern.to_string(), re.clone());
+        re
+    })
 }

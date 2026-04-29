@@ -1,4 +1,6 @@
 use crate::config_models::{HTTPHostRedirectConfig, HTTPRewriteRef, HTTPRewriteRule};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use tracing::debug;
 
@@ -12,6 +14,8 @@ pub enum RewriteResult {
 }
 
 /// Match and evaluate rewrite rules, mirroring GoEdge's configureWeb/doRewrite logic
+static REWRITE_RE_CACHE: Lazy<DashMap<String, Regex>> = Lazy::new(DashMap::new);
+
 pub fn evaluate_rewrites(
     original_uri: &str,
     raw_query: &str,
@@ -35,10 +39,16 @@ pub fn evaluate_rewrites(
             continue;
         };
 
-        // Build regex from pattern
-        let Ok(re) = Regex::new(pattern) else {
-            debug!("Invalid rewrite pattern: {}", pattern);
-            continue;
+        // Use cached compiled regex — avoid per-request compilation
+        let re = if let Some(cached) = REWRITE_RE_CACHE.get(pattern) {
+            cached.clone()
+        } else {
+            let Ok(compiled) = Regex::new(pattern) else {
+                debug!("Invalid rewrite pattern: {}", pattern);
+                continue;
+            };
+            REWRITE_RE_CACHE.insert(pattern.clone(), compiled.clone());
+            compiled
         };
 
         // Extract path portion for matching
