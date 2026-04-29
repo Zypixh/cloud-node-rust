@@ -112,57 +112,53 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         "http"
     };
 
-    // Parse cookies from request header
-    let cookies: std::collections::HashMap<String, String> = req
+    // Parse cookies from request header — build only when cookies are present
+    let cookies: std::collections::HashMap<String, String> = if let Some(cookie_str) = req
         .headers
         .get("cookie")
         .and_then(|v| v.to_str().ok())
-        .map(|cookie_str| {
-            cookie_str
-                .split(';')
-                .filter_map(|p| {
-                    let p = p.trim();
-                    p.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    {
+        cookie_str
+            .split(';')
+            .filter_map(|p| {
+                let p = p.trim();
+                p.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Collect request query args and query string
     let query_string = req.uri.query().unwrap_or("").to_string();
     let args = query_string.clone();
 
-    // Collect full request headers
-    let req_headers: std::collections::HashMap<String, pb::Strings> = req
-        .headers
-        .iter()
-        .filter(|(_, v)| !v.is_empty())
-        .map(|(name, value)| {
-            (
-                name.to_string(),
-                pb::Strings {
-                    values: vec![value
-                        .to_str()
-                        .unwrap_or("")
-                        .to_string()],
-                },
-            )
-        })
-        .collect();
+    // Collect full request headers — pre-allocate capacity
+    let mut req_headers: std::collections::HashMap<String, pb::Strings> =
+        std::collections::HashMap::with_capacity(req.headers.len());
+    for (name, value) in req.headers.iter() {
+        if value.is_empty() {
+            continue;
+        }
+        req_headers.insert(
+            name.to_string(),
+            pb::Strings {
+                values: vec![value.to_str().unwrap_or("").to_string()],
+            },
+        );
+    }
 
-    // Collect response headers
-    let sent_headers: std::collections::HashMap<String, pb::Strings> = ctx
-        .response_headers
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.clone(),
-                pb::Strings {
-                    values: vec![v.clone()],
-                },
-            )
-        })
-        .collect();
+    // Collect response headers — pre-allocate capacity
+    let mut sent_headers: std::collections::HashMap<String, pb::Strings> =
+        std::collections::HashMap::with_capacity(ctx.response_headers.len());
+    for (k, v) in ctx.response_headers.iter() {
+        sent_headers.insert(
+            k.clone(),
+            pb::Strings {
+                values: vec![v.clone()],
+            },
+        );
+    }
 
     // Content-Type from response headers
     let content_type = ctx

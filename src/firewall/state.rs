@@ -33,6 +33,10 @@ impl WafStateManager {
         }
     }
 
+    pub fn has_rules(&self) -> bool {
+        !self.whitelists.is_empty() || !self.blocks.is_empty() || !self.block_networks.is_empty()
+    }
+
     pub fn is_whitelisted(&self, ip: IpAddr, server_id: i64) -> bool {
         if let Some(expiry) = self.whitelists.get(&(0, ip)) {
             if crate::utils::time::now_timestamp() < *expiry {
