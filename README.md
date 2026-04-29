@@ -1,8 +1,8 @@
 # CloudNode Rust
 
-`CloudNode Rust` 是一个基于 Cloudflare [Pingora](https://github.com/cloudflare/pingora) 构建的高性能 CDN / 边缘节点实现，面向多级分发、缓存加速、站点安全、日志统计和控制面协议对齐场景。
+`CloudNode Rust` 是一个基于 Cloudflare [Pingora](https://github.com/cloudflare/pingora) 构建的高性能 CDN 边缘代理节点，面向多级分发、缓存加速、站点安全、日志统计和控制面协议对接场景。
 
-当前仓库已经完成 HTTP、HTTPS、HTTP/2、HTTP/3、gRPC、WebSocket、TCP、UDP、`@sni_passthrough`、混合缓存、访问日志、统计上报、自定义错误页、性能监控页等主链路接入，并持续围绕旧 EdgeNode 的运行时行为做对齐。
+当前仓库已完成 HTTP、HTTPS、HTTP/2、HTTP/3、gRPC、WebSocket、TCP、UDP、`@sni_passthrough`、混合缓存、访问日志、统计上报、自定义错误页、性能监控页等全链路接入，持续围绕生产环境运行时行为做深度对齐。
 
 ## 当前能力
 
@@ -111,15 +111,15 @@ cargo run -- --monitor-port 8888
 
 ### 关于协议对齐
 
-本项目并不是只做“能运行”的 Pingora 代理，而是持续对齐旧控制面与旧 EdgeNode 的行为，包括：
+本项目并非简单的 Pingora 代理样例，而是面向生产环境的完整实现，包括：
 
-- 配置同步字段
+- 配置同步与热更新
 - 页面与变量能力
-- 日志上报格式
-- 统计聚合口径
+- 日志上报格式对齐
+- 统计聚合口径一致
 - L7 / L4 计费与趋势数据
 
-因此仓库中的很多实现细节，优先目标是运行时兼容，而不是做一个最简代理样例。
+仓库中的实现细节以运行时兼容性为优先目标，而非最小化示例。
 
 ### 关于老系统兼容包
 
