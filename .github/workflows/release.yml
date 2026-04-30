@@ -34,7 +34,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             cpu: generic
             name: linux-arm64-generic
-            rustflags: "-C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+neon,+crypto,+crc -C embed-bitcode=yes"
+            rustflags: "-C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+neon,+aes,+sha2,+crc -C embed-bitcode=yes"
             cxxflags: ""
           - target: aarch64-unknown-linux-gnu
             cpu: neoverse-n1

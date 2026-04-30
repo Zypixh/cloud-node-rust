@@ -64,6 +64,7 @@ pub struct ProxyCTX {
     pub is_grpc: bool,
     pub max_inspection_size: i64,
     pub no_log: bool,
+    pub access_log_ref: Option<crate::config_models::HTTPAccessLogRef>,
     pub response_headers_size: usize,
     pub origin_address: String,
     pub origin_status: i32,
@@ -140,6 +141,7 @@ impl Default for ProxyCTX {
             is_grpc: false,
             max_inspection_size: 512 * 1024, // Default 512K as per PB requirement
             no_log: false,
+            access_log_ref: None,
             response_headers_size: 0,
             origin_address: String::new(),
             origin_status: 0,
@@ -2635,7 +2637,14 @@ impl EdgeProxy {
         {
             if let Some(policy) = &web.firewall_policy {
                 if policy.is_on {
-                    if policy.max_request_body_size > 0 {
+                    if let Some(inbound) = &policy.inbound
+                        && let Some(region) = &inbound.region
+                    {
+                        waf_match = crate::firewall::check_region_deny(
+                            region, ctx.client_ip, policy.id, &policy.deny_country_html,
+                        );
+                    }
+                    if waf_match.is_none() && policy.max_request_body_size > 0 {
                         let content_length = session
                             .get_header("content-length")
                             .and_then(|v| v.to_str().ok())
@@ -2826,10 +2835,9 @@ impl ProxyHttp for EdgeProxy {
                 && ws.is_on
             {
                 ctx.is_websocket = true;
-                ctx.is_grpc = true; // Restore coupling: WebSocket on = gRPC support on
             }
             if let Some(grpc) = &server.grpc {
-                if grpc.is_on {
+                if grpc.is_on && ctx.is_websocket {
                     ctx.is_grpc = true;
                 }
             }
@@ -2854,6 +2862,11 @@ impl ProxyHttp for EdgeProxy {
                     "gRPC enabled for request, setting max_inspection_size to {} bytes",
                     final_max_recv
                 );
+            }
+
+            // Load per-server access log config for runtime log control
+            if let Some(web) = &server.web {
+                ctx.access_log_ref = web.access_log_ref.clone();
             }
         }
 

@@ -348,6 +348,24 @@ pub struct GlobalHTTPAllConfig {
 pub struct GlobalServerConfig {
     #[serde(rename = "httpAll")]
     pub http_all: Option<GlobalHTTPAllConfig>,
+    #[serde(rename = "httpAccessLog", default)]
+    pub http_access_log: Option<GlobalHTTPAccessLogConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct GlobalHTTPAccessLogConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "enableRequestHeaders", default)]
+    pub enable_request_headers: bool,
+    #[serde(rename = "commonRequestHeadersOnly", default)]
+    pub common_request_headers_only: bool,
+    #[serde(rename = "enableResponseHeaders", default)]
+    pub enable_response_headers: bool,
+    #[serde(rename = "enableCookies", default)]
+    pub enable_cookies: bool,
+    #[serde(rename = "enableServerNotFound", default)]
+    pub enable_server_not_found: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1490,6 +1508,8 @@ pub struct HTTPFirewallInboundConfig {
     pub is_on: bool,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub groups: Vec<HTTPFirewallRuleGroup>,
+    #[serde(default)]
+    pub region: Option<HTTPFirewallRegionConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1498,6 +1518,26 @@ pub struct HTTPFirewallOutboundConfig {
     pub is_on: bool,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub groups: Vec<HTTPFirewallRuleGroup>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPFirewallRegionConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "denyCountryIds", default, deserialize_with = "deserialize_null_default")]
+    pub deny_country_ids: Vec<i64>,
+    #[serde(rename = "allowCountryIds", default, deserialize_with = "deserialize_null_default")]
+    pub allow_country_ids: Vec<i64>,
+    #[serde(rename = "denyProvinceIds", default, deserialize_with = "deserialize_null_default")]
+    pub deny_province_ids: Vec<i64>,
+    #[serde(rename = "allowProvinceIds", default, deserialize_with = "deserialize_null_default")]
+    pub allow_province_ids: Vec<i64>,
+    #[serde(rename = "denyCountryHTML", default, deserialize_with = "deserialize_null_default")]
+    pub deny_country_html: String,
+    #[serde(rename = "denyProvinceHTML", default, deserialize_with = "deserialize_null_default")]
+    pub deny_province_html: String,
+    #[serde(default)]
+    pub allow_search_engine: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

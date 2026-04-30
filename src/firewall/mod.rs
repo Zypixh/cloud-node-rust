@@ -5,11 +5,13 @@ pub mod state;
 pub mod verifier;
 
 use crate::config_models::{
-    HTTPFirewallPolicy, WAFBlockOptions, WAFCaptchaOptions, WAFJSCookieOptions, WAFPageOptions,
+    HTTPFirewallPolicy, HTTPFirewallRegionConfig, WAFBlockOptions, WAFCaptchaOptions, WAFJSCookieOptions, WAFPageOptions,
 };
+use crate::metrics::analyzer;
 use pingora_proxy::Session;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 #[derive(Debug, Clone)]
 pub enum ActionResponse {
@@ -645,5 +647,203 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
             _ => {}
         }
     }
+    None
+}
+
+fn goedge_country_id_to_iso(id: i64) -> Option<&'static str> {
+    match id {
+        1 => Some("CN"),    // China
+        2 => Some("US"),    // United States
+        3 => Some("JP"),    // Japan
+        4 => Some("KR"),    // South Korea
+        5 => Some("GB"),    // United Kingdom
+        6 => Some("DE"),    // Germany
+        7 => Some("FR"),    // France
+        8 => Some("RU"),    // Russia
+        9 => Some("SG"),    // Singapore
+        10 => Some("AU"),   // Australia
+        11 => Some("IN"),   // India
+        12 => Some("CA"),   // Canada
+        13 => Some("BR"),   // Brazil
+        14 => Some("TH"),   // Thailand
+        15 => Some("VN"),   // Vietnam
+        16 => Some("MY"),   // Malaysia
+        17 => Some("PH"),   // Philippines
+        18 => Some("ID"),   // Indonesia
+        19 => Some("NL"),   // Netherlands
+        20 => Some("IT"),   // Italy
+        261 => Some("HK"),  // Hong Kong
+        262 => Some("TW"),  // Taiwan
+        263 => Some("MO"),  // Macau
+        264 => Some("CN"),  // Mainland China
+        _ => None,
+    }
+}
+
+fn goedge_province_id_to_name(id: i64) -> Option<&'static str> {
+    match id {
+        1 => Some("Beijing"),
+        2 => Some("Tianjin"),
+        3 => Some("Hebei"),
+        4 => Some("Shanxi"),
+        5 => Some("Inner Mongolia"),
+        6 => Some("Liaoning"),
+        7 => Some("Jilin"),
+        8 => Some("Heilongjiang"),
+        9 => Some("Shanghai"),
+        10 => Some("Jiangsu"),
+        11 => Some("Zhejiang"),
+        12 => Some("Anhui"),
+        13 => Some("Fujian"),
+        14 => Some("Jiangxi"),
+        15 => Some("Shandong"),
+        16 => Some("Henan"),
+        17 => Some("Hubei"),
+        18 => Some("Hunan"),
+        19 => Some("Guangdong"),
+        20 => Some("Guangxi"),
+        21 => Some("Hainan"),
+        22 => Some("Chongqing"),
+        23 => Some("Sichuan"),
+        24 => Some("Guizhou"),
+        25 => Some("Yunnan"),
+        26 => Some("Tibet"),
+        27 => Some("Shaanxi"),
+        28 => Some("Gansu"),
+        29 => Some("Qinghai"),
+        30 => Some("Ningxia"),
+        31 => Some("Xinjiang"),
+        32 => Some("Hong Kong"),
+        33 => Some("Macau"),
+        34 => Some("Taiwan"),
+        _ => None,
+    }
+}
+
+pub fn check_region_deny(
+    region: &HTTPFirewallRegionConfig,
+    client_ip: IpAddr,
+    policy_id: i64,
+    deny_html_fallback: &str,
+) -> Option<MatchedAction> {
+    if !region.is_on {
+        return None;
+    }
+    let geo = analyzer::lookup_geo(client_ip)?;
+
+    let has_allow_countries = !region.allow_country_ids.is_empty();
+    let has_deny_countries = !region.deny_country_ids.is_empty();
+    let has_allow_provinces = !region.allow_province_ids.is_empty();
+    let has_deny_provinces = !region.deny_province_ids.is_empty();
+
+    if has_allow_countries || has_deny_countries {
+        let country_iso = geo.country_iso.as_ref();
+        let country_blocked = if has_allow_countries {
+            !region.allow_country_ids.iter().any(|&id| {
+                goedge_country_id_to_iso(id).map_or(false, |iso| iso == country_iso)
+            })
+        } else {
+            region.deny_country_ids.iter().any(|&id| {
+                goedge_country_id_to_iso(id).map_or(false, |iso| iso == country_iso)
+            })
+        };
+        if country_blocked {
+            let html = if !region.deny_country_html.is_empty() {
+                region.deny_country_html.clone()
+            } else {
+                deny_html_fallback.to_string()
+            };
+            let body = if html.is_empty() {
+                "Access denied: your country is not allowed".to_string()
+            } else {
+                html
+            };
+            return Some(MatchedAction {
+                action: ActionResponse::Block {
+                    status: 403,
+                    body,
+                },
+                policy_id,
+                group_id: 0,
+                set_id: 0,
+                action_code: "block".to_string(),
+                timeout_secs: Some(3600),
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: 0,
+                fail_block_timeout: 0,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: None,
+                tags: vec!["denyCountry".to_string()],
+                ip_list_id: 0,
+                event_level: "error".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+            });
+        }
+    }
+
+    let geo_country_iso = geo.country_iso.as_ref();
+    let is_cn = geo_country_iso == "CN" || geo_country_iso == "HK" || geo_country_iso == "TW" || geo_country_iso == "MO";
+
+    if is_cn && (has_allow_provinces || has_deny_provinces) {
+        let region_name = geo.region.as_ref();
+        let province_blocked = if has_allow_provinces {
+            !region.allow_province_ids.iter().any(|&id| {
+                goedge_province_id_to_name(id).map_or(false, |name| name == region_name)
+            })
+        } else {
+            region.deny_province_ids.iter().any(|&id| {
+                goedge_province_id_to_name(id).map_or(false, |name| name == region_name)
+            })
+        };
+        if province_blocked {
+            let html = if !region.deny_province_html.is_empty() {
+                region.deny_province_html.clone()
+            } else {
+                deny_html_fallback.to_string()
+            };
+            let body = if html.is_empty() {
+                "Access denied: your region is not allowed".to_string()
+            } else {
+                html
+            };
+            return Some(MatchedAction {
+                action: ActionResponse::Block {
+                    status: 403,
+                    body,
+                },
+                policy_id,
+                group_id: 0,
+                set_id: 0,
+                action_code: "block".to_string(),
+                timeout_secs: Some(3600),
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: 0,
+                fail_block_timeout: 0,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: None,
+                tags: vec!["denyProvince".to_string()],
+                ip_list_id: 0,
+                event_level: "error".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+            });
+        }
+    }
+
     None
 }

@@ -12,8 +12,10 @@ use std::hash::{Hash, Hasher};
 pub struct GeoInfo {
     pub country: Arc<str>,
     pub country_id: i64,
+    pub country_iso: Arc<str>,
     pub region: Arc<str>,
     pub region_id: i64,
+    pub region_iso: Arc<str>,
     pub city: Arc<str>,
     pub city_id: i64,
     pub provider: Arc<str>,
@@ -24,8 +26,10 @@ impl Clone for GeoInfo {
         Self {
             country: self.country.clone(),
             country_id: self.country_id,
+            country_iso: self.country_iso.clone(),
             region: self.region.clone(),
             region_id: self.region_id,
+            region_iso: self.region_iso.clone(),
             city: self.city.clone(),
             city_id: self.city_id,
             provider: self.provider.clone(),
@@ -185,6 +189,11 @@ fn lookup_geo_internal(ip: IpAddr) -> Option<GeoInfo> {
                     .and_then(|c| c.geoname_id)
                     .map(|id| id as i64)
                     .unwrap_or(0),
+                country_iso: Arc::from(city
+                    .country
+                    .as_ref()
+                    .and_then(|c| c.iso_code)
+                    .unwrap_or_default()),
                 region: Arc::from(city
                     .subdivisions
                     .as_ref()
@@ -200,6 +209,12 @@ fn lookup_geo_internal(ip: IpAddr) -> Option<GeoInfo> {
                     .and_then(|sd| sd.geoname_id)
                     .map(|id| id as i64)
                     .unwrap_or(0),
+                region_iso: Arc::from(city
+                    .subdivisions
+                    .as_ref()
+                    .and_then(|s| s.first())
+                    .and_then(|sd| sd.iso_code)
+                    .unwrap_or_default()),
                 city: Arc::from(city
                     .city
                     .as_ref()

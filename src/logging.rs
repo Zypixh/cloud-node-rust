@@ -76,6 +76,11 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     if ctx.no_log {
         return;
     }
+    if let Some(ref access_log) = ctx.access_log_ref {
+        if !access_log.is_on {
+            return;
+        }
+    }
     let sender = match LOG_SENDER.get() {
         Some(s) => s,
         None => return,
