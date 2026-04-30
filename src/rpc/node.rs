@@ -1038,6 +1038,27 @@ pub async fn fetch_and_apply_config<F>(
                             }
 
                             let _ = sync_active_plans(api_config, config_store).await;
+                            // Fetch enabled features for management-plane reporting
+                            if numeric_id > 0 {
+                                if let Ok(client) = RpcClient::new(api_config).await {
+                                    let mut service = client.node_service();
+                                    match service
+                                        .find_enabled_node_config_info(pb::FindEnabledNodeConfigInfoRequest {
+                                            node_id: numeric_id,
+                                        })
+                                        .await
+                                    {
+                                        Ok(resp) => {
+                                            let info = resp.into_inner();
+                                            debug!("Node enabled features: DNS={} Cache={} Thresholds={} Sys={} DDoS={} Sched={} AccessLog={}",
+                                                info.has_dns_info, info.has_cache_info, info.has_thresholds,
+                                                info.has_system_settings, info.has_d_do_s_protection,
+                                                info.has_schedule_settings, info.has_access_log_settings);
+                                        }
+                                        Err(e) => debug!("Failed to fetch enabled features: {}", e),
+                                    }
+                                }
+                            }
                         }
                         Err(e) => error!("Error parsing NodeConfigPayload: {}", e),
                     }
