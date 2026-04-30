@@ -70,8 +70,8 @@ pub struct NodeConfig {
 
     /// Real-time pressure/load factor for L2 nodes (0.0 - 1.0)
     pub parent_pressure: HashMap<String, (f32, std::time::Instant)>,
-    /// Global or node-specific cache policy
-    pub cache_policy: Option<Arc<HTTPCachePolicy>>,
+    /// Global or node-specific cache policies (multi-policy support)
+    pub cache_policies: Vec<Arc<HTTPCachePolicy>>,
     /// Global or node-specific firewall policies
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     /// Global WAF action defaults
@@ -129,7 +129,7 @@ impl Default for NodeConfig {
             allow_lan_ip: false,
             global_http_config: Arc::default(),
             parent_pressure: HashMap::new(),
-            cache_policy: None,
+            cache_policies: Vec::new(),
             firewall_policies: Arc::new(Vec::new()),
             waf_actions: Vec::new(),
             uam_policies: HashMap::new(),
@@ -160,7 +160,7 @@ pub struct HotPathSnapshot {
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     pub grpc_policy: Option<crate::config_models::GRPCConfig>,
     pub has_any_sni_passthrough: bool,
-    pub cache_policy: Option<Arc<HTTPCachePolicy>>,
+    pub cache_policies: Vec<Arc<HTTPCachePolicy>>,
 }
 
 impl Default for ConfigStore {
@@ -244,7 +244,7 @@ impl ConfigStore {
             firewall_policies: Arc::clone(&lock.firewall_policies),
             grpc_policy: lock.grpc_policy.clone(),
             has_any_sni_passthrough: lock.has_any_sni_passthrough,
-            cache_policy: lock.cache_policy.as_ref().map(Arc::clone),
+            cache_policies: lock.cache_policies.clone(),
         }
     }
 
@@ -330,7 +330,7 @@ impl ConfigStore {
 
     pub fn get_cache_policy_sync(&self) -> Option<Arc<HTTPCachePolicy>> {
         let lock = self.inner.read();
-        lock.cache_policy.clone()
+        lock.cache_policies.first().cloned()
     }
 
     pub fn get_firewall_policies_sync(&self) -> Arc<Vec<HTTPFirewallPolicy>> {
@@ -627,7 +627,7 @@ impl ConfigStore {
         request_origins_with_encodings: bool,
         xff_max_addresses: i32,
         allow_lan_ip: bool,
-        cache_policy: Option<Arc<HTTPCachePolicy>>,
+        cache_policy: Vec<Arc<HTTPCachePolicy>>,
         firewall_policies: Vec<HTTPFirewallPolicy>,
         waf_actions: Vec<crate::config_models::WAFActionConfig>,
         uam_policies: HashMap<i64, UAMPolicy>,
@@ -678,7 +678,7 @@ impl ConfigStore {
         lock.xff_max_addresses = global_http.xff_max_addresses;
         lock.allow_lan_ip = global_http.allow_lan_ip;
         lock.global_http_config = global_http;
-        lock.cache_policy = cache_policy;
+        lock.cache_policies = cache_policy;
         lock.firewall_policies = Arc::new(firewall_policies);
         lock.waf_actions = waf_actions;
         lock.uam_policies = uam_policies;

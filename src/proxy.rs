@@ -96,7 +96,7 @@ pub struct ProxyCTX {
     pub request_limit_out_bandwidth_bytes: i64,
     pub request_limit_out_bandwidth_sent: i64,
     pub request_limit_out_bandwidth_window_start: Option<std::time::Instant>,
-    pub global_cache_policy: Option<Arc<HTTPCachePolicy>>,
+    pub global_cache_policies: Vec<Arc<HTTPCachePolicy>>,
     /// Cached during request_filter to avoid config lock in response_filter/body_filter
     pub global_http_config: Option<Arc<crate::config_models::GlobalHTTPAllConfig>>,
     pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
@@ -174,7 +174,7 @@ impl Default for ProxyCTX {
             request_limit_out_bandwidth_bytes: 0,
             request_limit_out_bandwidth_sent: 0,
             request_limit_out_bandwidth_window_start: None,
-            global_cache_policy: None,
+            global_cache_policies: Vec::new(),
             global_http_config: None,
             firewall_policies_snapshot: None,
             node_level: 0,
@@ -2773,7 +2773,7 @@ impl ProxyHttp for EdgeProxy {
         // Cache these in ctx to avoid config lock acquisitions in response_filter / body_filter
         ctx.global_http_config = Some(Arc::clone(&hot_path.global_http));
         ctx.firewall_policies_snapshot = Some(Arc::clone(&hot_path.firewall_policies));
-        ctx.global_cache_policy = hot_path.cache_policy.clone();
+        ctx.global_cache_policies = hot_path.cache_policies.clone();
         ctx.global_access_log_on = self.config.get_global_access_log_sync()
             .map(|cfg| cfg.is_on)
             .unwrap_or(true);
@@ -3019,7 +3019,7 @@ impl ProxyHttp for EdgeProxy {
             .and_then(|w| w.cache.as_ref())
             .map(|c| c.is_on)
             .unwrap_or(false)
-            || hot_path.cache_policy.is_some();
+            || !hot_path.cache_policies.is_empty();
 
         if cache_configured {
             ctx.waf_deferred = true;
@@ -3410,7 +3410,7 @@ impl ProxyHttp for EdgeProxy {
                 let policy_opt: Option<Arc<HTTPCachePolicy>> = if let Some(p) = &cache.cache_policy {
                     Some(Arc::new(p.clone()))
                 } else {
-                    ctx.global_cache_policy.clone()
+                    ctx.global_cache_policies.first().cloned()
                 };
                 if let Some(policy) = policy_opt {
                     for cache_ref in &policy.cache_refs {
