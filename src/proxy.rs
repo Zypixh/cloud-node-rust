@@ -65,6 +65,7 @@ pub struct ProxyCTX {
     pub max_inspection_size: i64,
     pub no_log: bool,
     pub access_log_ref: Option<crate::config_models::HTTPAccessLogRef>,
+    pub global_access_log_on: bool,
     pub response_headers_size: usize,
     pub origin_address: String,
     pub origin_status: i32,
@@ -142,6 +143,7 @@ impl Default for ProxyCTX {
             max_inspection_size: 512 * 1024, // Default 512K as per PB requirement
             no_log: false,
             access_log_ref: None,
+            global_access_log_on: true,
             response_headers_size: 0,
             origin_address: String::new(),
             origin_status: 0,
@@ -2772,6 +2774,9 @@ impl ProxyHttp for EdgeProxy {
         ctx.global_http_config = Some(Arc::clone(&hot_path.global_http));
         ctx.firewall_policies_snapshot = Some(Arc::clone(&hot_path.firewall_policies));
         ctx.global_cache_policy = hot_path.cache_policy.clone();
+        ctx.global_access_log_on = self.config.get_global_access_log_sync()
+            .map(|cfg| cfg.is_on)
+            .unwrap_or(true);
 
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
         ctx.is_on = hot_path.is_on;

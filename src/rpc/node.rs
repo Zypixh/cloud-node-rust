@@ -1019,6 +1019,7 @@ pub async fn fetch_and_apply_config<F>(
                                     parse_i64_keyed_map(&payload.http_pages_policies),
                                     parse_i64_keyed_map(&payload.webp_image_policies),
                                     payload.toa.clone(),
+                                    payload.global_server_config.as_ref().and_then(|g| g.http_access_log.clone()),
                                 )
                                 .await;
 

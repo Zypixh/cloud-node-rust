@@ -88,6 +88,7 @@ pub struct NodeConfig {
     pub webp_image_policies: HashMap<i64, WebPImagePolicy>,
     /// Global TOA config
     pub toa: Option<TOAConfig>,
+    pub global_access_log: Option<crate::config_models::GlobalHTTPAccessLogConfig>,
     /// Cached plans referenced by current runtime servers
     pub plans: HashMap<i64, crate::pb::Plan>,
     /// Cached user plans referenced by current runtime servers
@@ -137,6 +138,7 @@ impl Default for NodeConfig {
             http_pages_policies: HashMap::new(),
             webp_image_policies: HashMap::new(),
             toa: None,
+            global_access_log: None,
             plans: HashMap::new(),
             user_plans: HashMap::new(),
             has_any_sni_passthrough: false,
@@ -430,6 +432,11 @@ impl ConfigStore {
         Arc::clone(&lock.global_http_config)
     }
 
+    pub fn get_global_access_log_sync(&self) -> Option<crate::config_models::GlobalHTTPAccessLogConfig> {
+        let lock = self.inner.read();
+        lock.global_access_log.clone()
+    }
+
     pub fn get_grpc_policy_sync(&self) -> Option<crate::config_models::GRPCConfig> {
         let lock = self.inner.read();
         lock.grpc_policy.clone()
@@ -629,6 +636,7 @@ impl ConfigStore {
         http_pages_policies: HashMap<i64, HTTPPagesPolicy>,
         webp_image_policies: HashMap<i64, WebPImagePolicy>,
         toa: Option<TOAConfig>,
+        global_access_log: Option<crate::config_models::GlobalHTTPAccessLogConfig>,
     ) {
         let mut lock = self.inner.write();
         lock.id = id;
@@ -679,6 +687,7 @@ impl ConfigStore {
         lock.http_pages_policies = http_pages_policies;
         lock.webp_image_policies = webp_image_policies;
         lock.toa = toa;
+        lock.global_access_log = global_access_log;
         // Track whether any SNI passthrough server exists (for fast TLS path)
         lock.has_any_sni_passthrough = lock.all_servers.iter().any(|s| s.is_sni_passthrough());
         drop(lock);

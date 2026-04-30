@@ -81,6 +81,9 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
             return;
         }
     }
+    if !ctx.global_access_log_on {
+        return;
+    }
     let sender = match LOG_SENDER.get() {
         Some(s) => s,
         None => return,
