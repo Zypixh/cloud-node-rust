@@ -4,7 +4,7 @@ use crate::pb;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 /// A high-performance uploader for access logs.
 /// Batches logs and sends them asynchronously to the Master node.
@@ -99,7 +99,7 @@ impl LogUploader {
     #[allow(clippy::result_large_err)]
     async fn flush_batch(&mut self, buffer: &mut Vec<pb::HttpAccessLog>) {
         let count = buffer.len();
-        debug!("Flushing batch of {} logs to Master", count);
+        info!("Flushing batch of {} access logs to Master", count);
 
         let logs_to_send = std::mem::replace(buffer, Vec::with_capacity(self.batch_size));
 
@@ -115,9 +115,25 @@ impl LogUploader {
                 channel,
                 move |mut req: tonic::Request<()>| {
                     let token = generate_token(&node_id, &secret, "edge").unwrap_or_default();
-                    req.metadata_mut().insert("token", token.parse().unwrap());
-                    req.metadata_mut()
-                        .insert("nodeid", node_id.parse().unwrap());
+                    let val = node_id
+                        .parse()
+                        .unwrap_or(tonic::metadata::MetadataValue::from_static("0"));
+                    req.metadata_mut().insert("nodeid", val.clone());
+                    req.metadata_mut().insert(
+                        "type",
+                        tonic::metadata::MetadataValue::from_static("edge"),
+                    );
+                    if let Ok(key) =
+                        tonic::metadata::MetadataKey::from_bytes(b"nodeId")
+                    {
+                        req.metadata_mut().insert(key, val);
+                    }
+                    req.metadata_mut().insert(
+                        "token",
+                        token
+                            .parse()
+                            .unwrap_or(tonic::metadata::MetadataValue::from_static("")),
+                    );
                     Ok(req)
                 },
             );
@@ -128,7 +144,7 @@ impl LogUploader {
 
         match client.create_http_access_logs(req).await {
             Ok(_) => {
-                debug!("Successfully uploaded {} access logs", count);
+                info!("Successfully uploaded {} access logs", count);
             }
             Err(e) => {
                 error!("Failed to upload access logs: {}", e);
@@ -239,9 +255,25 @@ impl NodeLogUploader {
             channel,
             move |mut req: tonic::Request<()>| {
                 let token = generate_token(&node_id, &secret, "edge").unwrap_or_default();
-                req.metadata_mut().insert("token", token.parse().unwrap());
-                req.metadata_mut()
-                    .insert("nodeid", node_id.parse().unwrap());
+                let val = node_id
+                    .parse()
+                    .unwrap_or(tonic::metadata::MetadataValue::from_static("0"));
+                req.metadata_mut().insert("nodeid", val.clone());
+                req.metadata_mut().insert(
+                    "type",
+                    tonic::metadata::MetadataValue::from_static("edge"),
+                );
+                if let Ok(key) =
+                    tonic::metadata::MetadataKey::from_bytes(b"nodeId")
+                {
+                    req.metadata_mut().insert(key, val);
+                }
+                req.metadata_mut().insert(
+                    "token",
+                    token
+                        .parse()
+                        .unwrap_or(tonic::metadata::MetadataValue::from_static("")),
+                );
                 Ok(req)
             },
         );
@@ -252,7 +284,7 @@ impl NodeLogUploader {
             })
             .await
         {
-            Ok(_) => debug!("Successfully uploaded {} node logs", count),
+            Ok(_) => info!("Successfully uploaded {} node logs", count),
             Err(e) => {
                 error!("Failed to upload node logs: {}", e);
                 self.channel = None;

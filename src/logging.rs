@@ -62,32 +62,41 @@ pub fn report_node_log(level: String, tag: String, message: String, server_id: i
 
 pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     if !ctx.access_log_module_enabled {
+        debug!("ACCESS_LOG: blocked by access_log_module_enabled=false");
         return;
     }
     if ctx.no_log {
+        debug!("ACCESS_LOG: blocked by no_log=true");
         return;
     }
     if let Some(ref access_log) = ctx.access_log_ref {
         if !access_log.is_on {
+            debug!("ACCESS_LOG: blocked by per-server access_log_ref.is_on=false");
             return;
         }
     }
     if !ctx.global_access_log_on {
+        debug!("ACCESS_LOG: blocked by global_access_log_on=false");
         return;
     }
     if ctx.server.is_none() {
         if let Some(ref cfg) = ctx.global_access_log_config {
             if !cfg.enable_server_not_found {
+                debug!("ACCESS_LOG: blocked by enable_server_not_found=false (404)");
                 return;
             }
         }
     }
     let sender = match LOG_SENDER.get() {
         Some(s) => s,
-        None => return,
+        None => {
+            debug!("ACCESS_LOG: blocked by LOG_SENDER not initialized");
+            return;
+        }
     };
 
     if sender.capacity() == 0 {
+        debug!("ACCESS_LOG: blocked by sender channel full");
         return;
     }
 
@@ -387,7 +396,9 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         }
     }
 
-    let _ = sender.try_send(log);
+    if let Err(e) = sender.try_send(log) {
+        tracing::warn!("ACCESS_LOG: failed to enqueue log: {}", e);
+    }
 }
 
 fn is_common_request_header(name: &str) -> bool {
@@ -515,5 +526,7 @@ pub fn log_sni_passthrough_access(
         "Reporting SNI passthrough log: {} -> Status {}",
         log.request_uri, log.status
     );
-    let _ = sender.try_send(log);
+    if let Err(e) = sender.try_send(log) {
+        tracing::warn!("ACCESS_LOG: failed to enqueue SNI passthrough log: {}", e);
+    }
 }
