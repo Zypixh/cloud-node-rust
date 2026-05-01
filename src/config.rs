@@ -266,8 +266,20 @@ impl ConfigStore {
     ) {
         let lock = self.inner.read();
         let hot_path = Self::build_hot_path_snapshot(&lock);
-        let server = lock.servers.get(host).cloned();
-        let upstream = lock.routes.get(host).cloned();
+
+        // 1. Exact match
+        let mut server = lock.servers.get(host).cloned();
+        let mut upstream = lock.routes.get(host).cloned();
+
+        // 2. Wildcard match if no exact match
+        if server.is_none() {
+            if let Some(pos) = host.find('.') {
+                let wildcard = format!("*{}", &host[pos..]);
+                server = lock.servers.get(&wildcard).cloned();
+                upstream = lock.routes.get(&wildcard).cloned();
+            }
+        }
+
         (hot_path, server, upstream)
     }
 
