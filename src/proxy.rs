@@ -2812,7 +2812,9 @@ impl ProxyHttp for EdgeProxy {
         ctx.firewall_policies_snapshot = Some(Arc::clone(&hot_path.firewall_policies));
         ctx.global_cache_policies = hot_path.cache_policies.clone();
         ctx.global_access_log_config = hot_path.global_access_log.clone();
-        ctx.access_log_module_enabled = hot_path.enabled_features.access_log_settings;
+        // Always enable access logging — the management plane's has_access_log_settings
+        // flag indicates whether custom field filters exist, not whether logging is on.
+        ctx.access_log_module_enabled = true;
         ctx.global_access_log_on = ctx.global_access_log_config
             .as_ref()
             .map(|cfg| cfg.is_on)
@@ -3262,21 +3264,21 @@ impl ProxyHttp for EdgeProxy {
 
             let host = if let Some(ext) = backend_ext {
                 if !ext.host.is_empty() {
+                    // Custom host: override client Host with configured value
                     ext.host.clone()
                 } else if ext.follow_host {
+                    // follow_host=true: forward client's Host header to origin
                     session
                         .get_header("host")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("localhost"))
                         .to_string()
                 } else {
-                    session
-                        .get_header("host")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("localhost"))
-                        .to_string()
+                    // follow_host=false: use origin address hostname as SNI
+                    peer_addr.split(':').next().unwrap_or(&peer_addr).to_string()
                 }
             } else {
+                // No backend extension: forward client's Host header
                 session
                     .get_header("host")
                     .and_then(|v| v.to_str().ok())
