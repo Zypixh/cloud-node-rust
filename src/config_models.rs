@@ -319,7 +319,7 @@ pub struct GlobalHTTPAllConfig {
         deserialize_with = "deserialize_null_default"
     )]
     pub ln_request_scheduling_method: String,
-    #[serde(rename = "supportsLowVersionHTTP", default)]
+    #[serde(rename = "supportsLowVersionHTTP", default = "default_true")]
     pub supports_low_version_http: bool,
     #[serde(rename = "matchCertFromAllServers", default)]
     pub match_cert_from_all_servers: bool,
@@ -354,17 +354,17 @@ pub struct GlobalServerConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GlobalHTTPAccessLogConfig {
-    #[serde(rename = "isOn", default)]
+    #[serde(rename = "isOn", default = "default_true")]
     pub is_on: bool,
-    #[serde(rename = "enableRequestHeaders", default)]
+    #[serde(rename = "enableRequestHeaders", default = "default_true")]
     pub enable_request_headers: bool,
     #[serde(rename = "commonRequestHeadersOnly", default)]
     pub common_request_headers_only: bool,
-    #[serde(rename = "enableResponseHeaders", default)]
+    #[serde(rename = "enableResponseHeaders", default = "default_true")]
     pub enable_response_headers: bool,
-    #[serde(rename = "enableCookies", default)]
+    #[serde(rename = "enableCookies", default = "default_true")]
     pub enable_cookies: bool,
-    #[serde(rename = "enableServerNotFound", default)]
+    #[serde(rename = "enableServerNotFound", default = "default_true")]
     pub enable_server_not_found: bool,
 }
 
