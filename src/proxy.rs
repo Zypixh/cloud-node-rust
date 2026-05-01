@@ -10,7 +10,7 @@ use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use rand::Rng;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::api_config::ApiConfig;
 use crate::cache::should_cache_response;
@@ -1105,6 +1105,60 @@ impl EdgeProxy {
         self.collect_candidate_pages(server)
             .into_iter()
             .find(|page| page.is_on && page.matches_status(status))
+    }
+
+    fn set_cors_headers(
+        resp: &mut pingora_http::ResponseHeader,
+        session: &Session,
+        cors: &crate::config_models::CORSConfig,
+    ) {
+        // Allow-Origin
+        if cors.allow_origin.is_empty() {
+            if let Some(origin) = session.get_header("origin") {
+                if let Ok(origin_str) = origin.to_str() {
+                    let _ = resp.insert_header("access-control-allow-origin", origin_str);
+                }
+            }
+        } else {
+            let _ = resp.insert_header("access-control-allow-origin", &cors.allow_origin);
+        }
+
+        // Allow-Methods
+        if cors.allow_methods.is_empty() {
+            let _ = resp.insert_header(
+                "access-control-allow-methods",
+                "PUT, GET, POST, DELETE, HEAD, OPTIONS, PATCH",
+            );
+        } else {
+            let _ = resp.insert_header(
+                "access-control-allow-methods",
+                cors.allow_methods.join(", "),
+            );
+        }
+
+        // Allow-Headers
+        if !cors.allow_headers.is_empty() {
+            let _ = resp.insert_header(
+                "access-control-allow-headers",
+                cors.allow_headers.join(", "),
+            );
+        }
+
+        // Max-Age
+        if cors.max_age > 0 {
+            let _ = resp.insert_header("access-control-max-age", cors.max_age.to_string());
+        }
+
+        // Expose-Headers
+        if !cors.expose_headers.is_empty() {
+            let _ = resp.insert_header(
+                "access-control-expose-headers",
+                cors.expose_headers.join(", "),
+            );
+        }
+
+        // Allow-Credentials
+        let _ = resp.insert_header("access-control-allow-credentials", "true");
     }
 
     async fn respond_status_with_pages(
@@ -2954,6 +3008,29 @@ impl ProxyHttp for EdgeProxy {
             {
                 return Ok(true);
             }
+
+            // CORS preflight: handle OPTIONS immediately without proxying to origin
+            if let Some(ref rhp) = web.response_header_policy {
+                if let Some(ref cors) = rhp.cors {
+                    if cors.is_on
+                        && (!cors.options_method_only
+                            || session.req_header().method == http::method::Method::OPTIONS)
+                    {
+                        let is_options =
+                            session.req_header().method == http::method::Method::OPTIONS;
+                        if is_options {
+                            let mut resp =
+                                pingora_http::ResponseHeader::build(204, None).unwrap();
+                            Self::set_cors_headers(&mut resp, session, cors);
+                            session
+                                .write_response_header(Box::new(resp), true)
+                                .await?;
+                            ctx.response_status = 204;
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
         }
 
         if ctx.lb.is_none() {
@@ -3132,6 +3209,7 @@ impl ProxyHttp for EdgeProxy {
             ctx.response_status = code;
             if matches!(e.esource(), ErrorSource::Upstream) {
                 ctx.origin_status = code as i32;
+                info!("ACCESS_LOG: fail_to_proxy set origin_status={} (upstream error)", ctx.origin_status);
             }
             let write_result = if is_upstream_http_status {
                 // Preserve the upstream status code instead of treating a real upstream 5xx
@@ -3291,6 +3369,7 @@ impl ProxyHttp for EdgeProxy {
                 peer_addr, is_tls, host
             );
             ctx.origin_address = peer_addr.clone();
+            info!("ACCESS_LOG: origin_address set to '{}'", ctx.origin_address);
 
             let mut peer_obj = HttpPeer::new(peer_addr, is_tls, host);
 
@@ -3637,6 +3716,7 @@ impl ProxyHttp for EdgeProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         ctx.origin_status = upstream_response.status.as_u16() as i32;
+        info!("ACCESS_LOG: origin_status set to {}", ctx.origin_status);
 
         if let Some(cache_ref) = &ctx.cache_ref {
             let mut force_cache = false;
@@ -3777,6 +3857,18 @@ impl ProxyHttp for EdgeProxy {
                         .unwrap();
                 }
             }
+            // CORS headers for cache HIT responses
+            if let Some(server) = &ctx.server {
+                if let Some(web) = &server.web {
+                    if let Some(ref rhp) = web.response_header_policy {
+                        if let Some(ref cors) = rhp.cors {
+                            if cors.is_on && !cors.options_method_only {
+                                Self::set_cors_headers(upstream_response, session, cors);
+                            }
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -3824,6 +3916,20 @@ impl ProxyHttp for EdgeProxy {
                 upstream_response
                     .insert_header("Server", &global_cfg.server_name)
                     .unwrap();
+            }
+        }
+
+        // CORS: add headers for non-OPTIONS responses when CORS is enabled
+        // (OPTIONS preflight is handled in request_filter)
+        if let Some(server) = &ctx.server {
+            if let Some(web) = &server.web {
+                if let Some(ref rhp) = web.response_header_policy {
+                    if let Some(ref cors) = rhp.cors {
+                        if cors.is_on && !cors.options_method_only {
+                            Self::set_cors_headers(upstream_response, session, cors);
+                        }
+                    }
+                }
             }
         }
 

@@ -1712,6 +1712,27 @@ pub struct HTTPHeaderPolicy {
         deserialize_with = "deserialize_null_default"
     )]
     pub replace_headers: Vec<HTTPHeaderReplaceConfig>,
+    pub cors: Option<CORSConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct CORSConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "optionsMethodOnly", default)]
+    pub options_method_only: bool,
+    #[serde(rename = "allowOrigin", default, deserialize_with = "deserialize_null_default")]
+    pub allow_origin: String,
+    #[serde(rename = "allowMethods", default, deserialize_with = "deserialize_null_default")]
+    pub allow_methods: Vec<String>,
+    #[serde(rename = "maxAge", default)]
+    pub max_age: i64,
+    #[serde(rename = "exposeHeaders", default, deserialize_with = "deserialize_null_default")]
+    pub expose_headers: Vec<String>,
+    #[serde(rename = "requestMethod", default, deserialize_with = "deserialize_null_default")]
+    pub request_method: String,
+    #[serde(rename = "allowHeaders", default, deserialize_with = "deserialize_null_default")]
+    pub allow_headers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

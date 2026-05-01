@@ -396,6 +396,11 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         }
     }
 
+    debug!(
+        "ACCESS_LOG: sending log origin_address='{}', origin_status={}, status={}",
+        log.origin_address, log.origin_status, log.status
+    );
+
     if let Err(e) = sender.try_send(log) {
         tracing::warn!("ACCESS_LOG: failed to enqueue log: {}", e);
     }
