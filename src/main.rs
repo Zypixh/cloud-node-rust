@@ -132,7 +132,7 @@ fn main() -> anyhow::Result<()> {
             let exe_cstr = CString::new(exe.to_str().unwrap_or("cloud-node"))?;
             let mut argv: Vec<CString> = vec![
                 exe_cstr.clone(),
-                CString::new("_start-internal")?,
+                CString::new("start-internal")?,
             ];
             if let Some(port) = cli.monitor_port {
                 argv.push(CString::new("--monitor-port")?);
