@@ -127,26 +127,11 @@ fn main() -> anyhow::Result<()> {
             // Ensure data & log directories exist before daemonizing
             fs::create_dir_all("../data").ok();
 
-            // Build argv for the grandchild exec
-            let exe = std::env::current_exe()?;
-            let exe_cstr = CString::new(exe.to_str().unwrap_or("cloud-node"))?;
-            let mut argv: Vec<CString> = vec![
-                exe_cstr.clone(),
-                CString::new("start-internal")?,
-            ];
-            if let Some(port) = cli.monitor_port {
-                argv.push(CString::new("--monitor-port")?);
-                argv.push(CString::new(port.to_string())?);
-            }
-            if cli.monitor_clear {
-                argv.push(CString::new("--monitor-clear")?);
-            }
-
-            // Double-fork daemonize
+            // Single-fork daemonize
             unsafe {
                 let pid1 = libc::fork();
                 if pid1 < 0 {
-                    eprintln!("First fork failed: {}", std::io::Error::last_os_error());
+                    eprintln!("fork failed: {}", std::io::Error::last_os_error());
                     std::process::exit(1);
                 }
                 if pid1 > 0 {
@@ -155,18 +140,8 @@ fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                // Child: create new session to detach from terminal
+                // Child: detach from terminal
                 libc::setsid();
-
-                let pid2 = libc::fork();
-                if pid2 < 0 {
-                    libc::_exit(1);
-                }
-                if pid2 > 0 {
-                    libc::_exit(0);
-                }
-
-                // Grandchild: the actual daemon process
 
                 // Redirect stdin/stdout to /dev/null
                 let devnull = libc::open(
@@ -195,10 +170,11 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // exec into the same binary with _start-internal
-                libc::execvp(exe_cstr.as_ptr(), argv.as_ptr().cast());
-                // If exec fails
-                libc::_exit(127);
+                // Run directly in the daemon child
+                if let Err(e) = run_node(cli.monitor_port, cli.monitor_clear) {
+                    eprintln!("CloudNode fatal error: {}", e);
+                    libc::_exit(1);
+                }
             }
         }
         Some(Commands::_StartInternal) => {
