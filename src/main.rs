@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::ffi::CString;
 use std::fs;
 use std::future::Future;
 use std::process::Command;
@@ -123,22 +124,82 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let executable = std::env::current_exe()?;
-            let mut command = Command::new(executable);
-            command.arg("_start-internal");
+            // Ensure data & log directories exist before daemonizing
+            fs::create_dir_all("../data").ok();
+
+            // Build argv for the grandchild exec
+            let exe = std::env::current_exe()?;
+            let exe_cstr = CString::new(exe.to_str().unwrap_or("cloud-node"))?;
+            let mut argv: Vec<CString> = vec![
+                exe_cstr.clone(),
+                CString::new("_start-internal")?,
+            ];
             if let Some(port) = cli.monitor_port {
-                command.arg("--monitor-port").arg(port.to_string());
+                argv.push(CString::new("--monitor-port")?);
+                argv.push(CString::new(port.to_string())?);
             }
             if cli.monitor_clear {
-                command.arg("--monitor-clear");
+                argv.push(CString::new("--monitor-clear")?);
             }
-            let child = command
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()?;
 
-            println!("CloudNode started in background (PID: {})", child.id());
+            // Double-fork daemonize
+            unsafe {
+                let pid1 = libc::fork();
+                if pid1 < 0 {
+                    eprintln!("First fork failed: {}", std::io::Error::last_os_error());
+                    std::process::exit(1);
+                }
+                if pid1 > 0 {
+                    // Parent: report and exit
+                    println!("CloudNode started in background (PID: {})", pid1);
+                    return Ok(());
+                }
+
+                // Child: create new session to detach from terminal
+                libc::setsid();
+
+                let pid2 = libc::fork();
+                if pid2 < 0 {
+                    libc::_exit(1);
+                }
+                if pid2 > 0 {
+                    libc::_exit(0);
+                }
+
+                // Grandchild: the actual daemon process
+
+                // Redirect stdin/stdout to /dev/null
+                let devnull = libc::open(
+                    b"/dev/null\0".as_ptr() as *const libc::c_char,
+                    libc::O_RDWR,
+                );
+                if devnull >= 0 {
+                    libc::dup2(devnull, libc::STDIN_FILENO);
+                    libc::dup2(devnull, libc::STDOUT_FILENO);
+                    if devnull > libc::STDOUT_FILENO {
+                        libc::close(devnull);
+                    }
+                }
+
+                // Redirect stderr to log file for crash diagnostics
+                let log_path = CString::new("../data/cloud-node-stderr.log")?;
+                let log_fd = libc::open(
+                    log_path.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                    0o644,
+                );
+                if log_fd >= 0 {
+                    libc::dup2(log_fd, libc::STDERR_FILENO);
+                    if log_fd > libc::STDERR_FILENO {
+                        libc::close(log_fd);
+                    }
+                }
+
+                // exec into the same binary with _start-internal
+                libc::execvp(exe_cstr.as_ptr(), argv.as_ptr().cast());
+                // If exec fails
+                libc::_exit(127);
+            }
         }
         Some(Commands::_StartInternal) => {
             run_node(cli.monitor_port, cli.monitor_clear)?;
@@ -478,7 +539,6 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     // Log Uploader
     let (log_tx, log_rx) = tokio::sync::mpsc::channel(100000);
     let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(10000);
-    logging::init_log_disabled_from_env();
     logging::init_global_log_bus(log_tx, node_log_tx);
 
     let uploader =

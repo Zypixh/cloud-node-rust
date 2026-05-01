@@ -9,6 +9,8 @@ pub fn should_cache_response(
     headers: &http::HeaderMap,
     _host: &str,
     body_size: usize,
+    force_partial_content: bool,
+    skip_size_checks: bool,
 ) -> bool {
     if !cache_ref.is_on {
         return false;
@@ -29,7 +31,7 @@ pub fn should_cache_response(
 
     // 2. Check Status
     let status_allowed = if cache_ref.status.is_empty() {
-        status == 200 || (status == 206 && cache_ref.allow_partial_content)
+        status == 200 || (status == 206 && (cache_ref.allow_partial_content || force_partial_content))
     } else {
         cache_ref.status.contains(&(status as i32))
             || (status == 206 && cache_ref.allow_partial_content)
@@ -38,17 +40,19 @@ pub fn should_cache_response(
         return false;
     }
 
-    // 3. Check Size
-    if let Some(min_size_val) = &cache_ref.min_size {
-        let min_bytes = crate::config_models::SizeCapacity::from_json(min_size_val).to_bytes();
-        if min_bytes > 0 && (body_size as i64) < min_bytes {
-            return false;
+    // 3. Check Size (skip for chunked encoding when policy allows)
+    if !skip_size_checks {
+        if let Some(min_size_val) = &cache_ref.min_size {
+            let min_bytes = crate::config_models::SizeCapacity::from_json(min_size_val).to_bytes();
+            if min_bytes > 0 && (body_size as i64) < min_bytes {
+                return false;
+            }
         }
-    }
-    if let Some(max_size_val) = &cache_ref.max_size {
-        let max_bytes = crate::config_models::SizeCapacity::from_json(max_size_val).to_bytes();
-        if max_bytes > 0 && (body_size as i64) > max_bytes {
-            return false;
+        if let Some(max_size_val) = &cache_ref.max_size {
+            let max_bytes = crate::config_models::SizeCapacity::from_json(max_size_val).to_bytes();
+            if max_bytes > 0 && (body_size as i64) > max_bytes {
+                return false;
+            }
         }
     }
 

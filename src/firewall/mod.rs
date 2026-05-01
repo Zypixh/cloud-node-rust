@@ -650,6 +650,23 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
     None
 }
 
+fn is_search_engine_bot(user_agent: &str) -> bool {
+    let ua = user_agent.to_lowercase();
+    ua.contains("googlebot")
+        || ua.contains("bingbot")
+        || ua.contains("baiduspider")
+        || ua.contains("yandexbot")
+        || ua.contains("sogou")
+        || ua.contains("360spider")
+        || ua.contains("duckduckbot")
+        || ua.contains("facebookexternalhit")
+        || ua.contains("twitterbot")
+        || ua.contains("slurp")
+        || ua.contains("msnbot")
+        || ua.contains("yisouspider")
+        || ua.contains("bytespider")
+}
+
 fn goedge_country_id_to_iso(id: i64) -> Option<&'static str> {
     match id {
         1 => Some("CN"),    // China
@@ -725,8 +742,12 @@ pub fn check_region_deny(
     client_ip: IpAddr,
     policy_id: i64,
     deny_html_fallback: &str,
+    user_agent: &str,
 ) -> Option<MatchedAction> {
     if !region.is_on {
+        return None;
+    }
+    if region.allow_search_engine && is_search_engine_bot(user_agent) {
         return None;
     }
     let geo = analyzer::lookup_geo(client_ip)?;

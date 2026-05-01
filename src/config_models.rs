@@ -497,10 +497,18 @@ pub struct NodeConfigPayload {
     pub ssl_policy: Option<SSLPolicyConfig>,
     #[serde(rename = "nodeRegion", alias = "NodeRegion", default)]
     pub node_region: Option<NodeRegionConfig>,
+    #[serde(rename = "nodeCluster", alias = "NodeCluster", default)]
+    pub node_cluster: Option<NodeClusterConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct NodeRegionConfig {
+    #[serde(default, deserialize_with = "deserialize_flexible_i64")]
+    pub id: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct NodeClusterConfig {
     #[serde(default, deserialize_with = "deserialize_flexible_i64")]
     pub id: i64,
 }
@@ -1397,12 +1405,26 @@ pub struct HTTPCachePolicy {
     pub capacity: Option<Value>,
     #[serde(rename = "maxItemSize")]
     pub max_item_size: Option<Value>,
+    #[serde(rename = "maxSize")]
+    pub max_size: Option<Value>,
     #[serde(
         rename = "cacheRefs",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub cache_refs: Vec<HTTPCacheRef>,
+    #[serde(rename = "cachePolicyId", default)]
+    pub cache_policy_id: i64,
+    #[serde(rename = "addStatusHeader", default = "default_true")]
+    pub add_status_header: bool,
+    #[serde(rename = "addAgeHeader", default)]
+    pub add_age_header: bool,
+    #[serde(rename = "allowChunkedEncoding", default)]
+    pub allow_chunked_encoding: bool,
+    #[serde(rename = "forcePartialContent", default)]
+    pub force_partial_content: bool,
+    #[serde(rename = "enableReadingOriginAsync", default)]
+    pub enable_reading_origin_async: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1488,7 +1510,7 @@ pub struct HTTPFirewallPolicy {
     #[serde(rename = "useLocalFirewall", default)]
     pub use_local_firewall: bool,
     #[serde(rename = "synFlood", default)]
-    pub syn_flood: Option<Value>,
+    pub syn_flood: Option<SynFloodConfig>,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub mode: String, // "defense" or "observe"
 }
@@ -1598,6 +1620,18 @@ pub struct EmptyConnectionFloodConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TLSExhaustionAttackConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(default)]
+    pub threshold: u32,
+    #[serde(default)]
+    pub period: i32,
+    #[serde(rename = "banDuration", default)]
+    pub ban_duration: i32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct SynFloodConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(default)]

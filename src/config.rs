@@ -40,6 +40,17 @@ pub struct NodeConfig {
     pub level: i32,
     /// Region ID used by stats aggregation APIs
     pub node_region_id: i64,
+    /// Node cluster ID for policy selection (0 = default cluster)
+    pub node_cluster_id: i64,
+    /// Module enable flags from findEnabledNodeConfigInfo
+    pub dns_info_enabled: bool,
+    pub cache_info_enabled: bool,
+    pub thresholds_enabled: bool,
+    pub ssh_enabled: bool,
+    pub system_settings_enabled: bool,
+    pub ddos_protection_enabled: bool,
+    pub schedule_info_enabled: bool,
+    pub access_log_settings_enabled: bool,
     /// Whether the node is enabled
     pub is_on: bool,
     /// Whether to sync IP lists
@@ -112,6 +123,15 @@ impl Default for NodeConfig {
             metric_items: Vec::new(),
             level: 1, // Default to L1
             node_region_id: 0,
+            node_cluster_id: 0,
+            dns_info_enabled: true,
+            cache_info_enabled: true,
+            thresholds_enabled: true,
+            ssh_enabled: true,
+            system_settings_enabled: true,
+            ddos_protection_enabled: true,
+            schedule_info_enabled: true,
+            access_log_settings_enabled: true,
             is_on: true,
             enable_ip_lists: false,
             parent_nodes: HashMap::new(),
@@ -153,6 +173,18 @@ pub struct ConfigStore {
     reload_notify: Arc<Notify>,
 }
 
+#[derive(Clone, Default)]
+pub struct EnabledNodeFeatures {
+    pub dns_info: bool,
+    pub cache_info: bool,
+    pub thresholds: bool,
+    pub ssh: bool,
+    pub system_settings: bool,
+    pub ddos_protection: bool,
+    pub schedule_info: bool,
+    pub access_log_settings: bool,
+}
+
 #[derive(Clone)]
 pub struct HotPathSnapshot {
     pub is_on: bool,
@@ -161,6 +193,8 @@ pub struct HotPathSnapshot {
     pub grpc_policy: Option<crate::config_models::GRPCConfig>,
     pub has_any_sni_passthrough: bool,
     pub cache_policies: Vec<Arc<HTTPCachePolicy>>,
+    pub global_access_log: Option<Arc<crate::config_models::GlobalHTTPAccessLogConfig>>,
+    pub enabled_features: EnabledNodeFeatures,
 }
 
 impl Default for ConfigStore {
@@ -245,6 +279,17 @@ impl ConfigStore {
             grpc_policy: lock.grpc_policy.clone(),
             has_any_sni_passthrough: lock.has_any_sni_passthrough,
             cache_policies: lock.cache_policies.clone(),
+            global_access_log: lock.global_access_log.clone().map(Arc::new),
+            enabled_features: EnabledNodeFeatures {
+                dns_info: lock.dns_info_enabled,
+                cache_info: lock.cache_info_enabled,
+                thresholds: lock.thresholds_enabled,
+                ssh: lock.ssh_enabled,
+                system_settings: lock.system_settings_enabled,
+                ddos_protection: lock.ddos_protection_enabled,
+                schedule_info: lock.schedule_info_enabled,
+                access_log_settings: lock.access_log_settings_enabled,
+            },
         }
     }
 
@@ -328,9 +373,9 @@ impl ConfigStore {
         None
     }
 
-    pub fn get_cache_policy_sync(&self) -> Option<Arc<HTTPCachePolicy>> {
+    pub fn get_cache_policy_sync(&self) -> Vec<Arc<HTTPCachePolicy>> {
         let lock = self.inner.read();
-        lock.cache_policies.first().cloned()
+        lock.cache_policies.clone()
     }
 
     pub fn get_firewall_policies_sync(&self) -> Arc<Vec<HTTPFirewallPolicy>> {
@@ -348,35 +393,42 @@ impl ConfigStore {
         lock.global_pages.clone()
     }
 
-    fn pick_global_policy<T: Clone>(map: &HashMap<i64, T>) -> Option<T> {
-        map.get(&0)
+    fn pick_global_policy<T: Clone>(map: &HashMap<i64, T>, node_cluster_id: i64) -> Option<T> {
+        // Priority: exact cluster_id → default cluster (0) → any available
+        map.get(&node_cluster_id)
+            .or_else(|| map.get(&0))
+            .or_else(|| map.values().next())
             .cloned()
-            .or_else(|| map.values().next().cloned())
     }
 
     pub fn get_global_uam_policy_sync(&self) -> Option<UAMPolicy> {
         let lock = self.inner.read();
-        Self::pick_global_policy(&lock.uam_policies)
+        let cluster_id = lock.node_cluster_id;
+        Self::pick_global_policy(&lock.uam_policies, cluster_id)
     }
 
     pub fn get_global_http_cc_policy_sync(&self) -> Option<HTTPCCPolicy> {
         let lock = self.inner.read();
-        Self::pick_global_policy(&lock.http_cc_policies)
+        let cluster_id = lock.node_cluster_id;
+        Self::pick_global_policy(&lock.http_cc_policies, cluster_id)
     }
 
     pub fn get_global_http3_policy_sync(&self) -> Option<HTTP3Policy> {
         let lock = self.inner.read();
-        Self::pick_global_policy(&lock.http3_policies)
+        let cluster_id = lock.node_cluster_id;
+        Self::pick_global_policy(&lock.http3_policies, cluster_id)
     }
 
     pub fn get_global_http_pages_policy_sync(&self) -> Option<HTTPPagesPolicy> {
         let lock = self.inner.read();
-        Self::pick_global_policy(&lock.http_pages_policies)
+        let cluster_id = lock.node_cluster_id;
+        Self::pick_global_policy(&lock.http_pages_policies, cluster_id)
     }
 
     pub fn get_global_webp_policy_sync(&self) -> Option<WebPImagePolicy> {
         let lock = self.inner.read();
-        Self::pick_global_policy(&lock.webp_image_policies)
+        let cluster_id = lock.node_cluster_id;
+        Self::pick_global_policy(&lock.webp_image_policies, cluster_id)
     }
 
     pub fn get_toa_config_sync(&self) -> Option<TOAConfig> {
@@ -390,6 +442,11 @@ impl ConfigStore {
     ) -> Option<Arc<LoadBalancer<Consistent>>> {
         let lock = self.inner.read();
         lock.parent_routes.get(&cluster_id).cloned()
+    }
+
+    pub fn get_parent_route_keys_sync(&self) -> Vec<i64> {
+        let lock = self.inner.read();
+        lock.parent_routes.keys().copied().collect()
     }
 
     pub fn get_force_ln_request_sync(&self) -> bool {
@@ -407,14 +464,38 @@ impl ConfigStore {
         lock.level
     }
 
-    pub fn get_upstream_peer_context_sync(&self) -> (i32, bool, bool, String) {
+    pub fn get_upstream_peer_context_sync(&self) -> (i32, bool, bool, String, i64) {
         let lock = self.inner.read();
         (
             lock.level,
             lock.force_ln_request,
             lock.tiered_origin_bypass,
             lock.ln_request_scheduling_method.clone(),
+            lock.node_cluster_id,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_enabled_features(
+        &self,
+        has_dns: bool,
+        has_cache: bool,
+        has_thresholds: bool,
+        has_ssh: bool,
+        has_system: bool,
+        has_ddos: bool,
+        has_schedule: bool,
+        has_access_log: bool,
+    ) {
+        let mut lock = self.inner.write();
+        lock.dns_info_enabled = has_dns;
+        lock.cache_info_enabled = has_cache;
+        lock.thresholds_enabled = has_thresholds;
+        lock.ssh_enabled = has_ssh;
+        lock.system_settings_enabled = has_system;
+        lock.ddos_protection_enabled = has_ddos;
+        lock.schedule_info_enabled = has_schedule;
+        lock.access_log_settings_enabled = has_access_log;
     }
 
     pub fn get_node_is_on_sync(&self) -> bool {
@@ -588,7 +669,7 @@ impl ConfigStore {
         lock.version
     }
 
-    pub async fn get_cache_policy(&self) -> Option<Arc<HTTPCachePolicy>> {
+    pub async fn get_cache_policy(&self) -> Vec<Arc<HTTPCachePolicy>> {
         self.get_cache_policy_sync()
     }
 
@@ -603,6 +684,7 @@ impl ConfigStore {
         id: i64,
         version: i64,
         node_region_id: i64,
+        node_cluster_id: i64,
         all_servers: Vec<Arc<ServerConfig>>,
         servers: HashMap<String, Arc<ServerConfig>>,
         routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
@@ -642,6 +724,7 @@ impl ConfigStore {
         lock.id = id;
         lock.version = version;
         lock.node_region_id = node_region_id;
+        lock.node_cluster_id = node_cluster_id;
         lock.all_servers = all_servers;
         lock.servers = servers;
         lock.routes = routes;

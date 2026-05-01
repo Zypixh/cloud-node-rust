@@ -25,13 +25,6 @@ static NUMERIC_NODE_ID: AtomicI64 = AtomicI64::new(0);
 static REQUEST_ID_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 static REQUEST_ID_COUNTER: AtomicI32 = AtomicI32::new(1_000_000);
 
-pub fn init_log_disabled_from_env() {
-    if std::env::var("CLOUD_NODE_NO_LOG").is_ok() {
-        LOG_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!("Access logging disabled via CLOUD_NODE_NO_LOG env var");
-    }
-}
-
 pub fn init_global_log_bus(sender: mpsc::Sender<pb::HttpAccessLog>, node_sender: mpsc::Sender<pb::NodeLog>) {
     let _ = LOG_SENDER.set(sender);
     let _ = NODE_LOG_SENDER.set(node_sender);
@@ -67,10 +60,8 @@ pub fn report_node_log(level: String, tag: String, message: String, server_id: i
     }
 }
 
-static LOG_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 pub fn log_access(session: &Session, ctx: &ProxyCTX) {
-    if LOG_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+    if !ctx.access_log_module_enabled {
         return;
     }
     if ctx.no_log {
@@ -84,6 +75,13 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     if !ctx.global_access_log_on {
         return;
     }
+    if ctx.server.is_none() {
+        if let Some(ref cfg) = ctx.global_access_log_config {
+            if !cfg.enable_server_not_found {
+                return;
+            }
+        }
+    }
     let sender = match LOG_SENDER.get() {
         Some(s) => s,
         None => return,
@@ -92,6 +90,18 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     if sender.capacity() == 0 {
         return;
     }
+
+    let (log_cookies, log_req_headers, log_resp_headers, common_req_headers_only) =
+        if let Some(ref cfg) = ctx.global_access_log_config {
+            (
+                cfg.enable_cookies,
+                cfg.enable_request_headers,
+                cfg.enable_response_headers,
+                cfg.common_request_headers_only,
+            )
+        } else {
+            (true, true, true, false)
+        };
 
     let req = session.req_header();
     let server_id = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
@@ -132,19 +142,23 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         "http"
     };
 
-    // Parse cookies from request header — build only when cookies are present
-    let cookies: std::collections::HashMap<String, String> = if let Some(cookie_str) = req
-        .headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-    {
-        cookie_str
-            .split(';')
-            .filter_map(|p| {
-                let p = p.trim();
-                p.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            })
-            .collect()
+    // Parse cookies from request header — gated by enableCookies
+    let cookies: std::collections::HashMap<String, String> = if log_cookies {
+        if let Some(cookie_str) = req
+            .headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+        {
+            cookie_str
+                .split(';')
+                .filter_map(|p| {
+                    let p = p.trim();
+                    p.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        }
     } else {
         std::collections::HashMap::new()
     };
@@ -153,37 +167,45 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     let query_string = req.uri.query().unwrap_or("").to_string();
     let args = query_string.clone();
 
-    // Collect full request headers — pre-allocate capacity
+    // Collect request headers — gated by enableRequestHeaders
     let mut req_headers: std::collections::HashMap<String, pb::Strings> =
-        std::collections::HashMap::with_capacity(req.headers.len());
-    for (name, value) in req.headers.iter() {
-        if value.is_empty() {
-            continue;
+        std::collections::HashMap::new();
+    if log_req_headers {
+        req_headers.reserve(req.headers.len());
+        for (name, value) in req.headers.iter() {
+            if value.is_empty() {
+                continue;
+            }
+            if common_req_headers_only && !is_common_request_header(name.as_str()) {
+                continue;
+            }
+            req_headers.insert(
+                name.to_string(),
+                pb::Strings {
+                    values: vec![value.to_str().unwrap_or("").to_string()],
+                },
+            );
         }
-        req_headers.insert(
-            name.to_string(),
-            pb::Strings {
-                values: vec![value.to_str().unwrap_or("").to_string()],
-            },
-        );
     }
 
-    // Collect response headers — pre-allocate capacity
+    // Collect response headers — gated by enableResponseHeaders
     // Read sent headers from the ACTUAL response written (includes Pingora
     // modifications like chunked encoding, H2 eos flags, etc.)
     let mut sent_headers: std::collections::HashMap<String, pb::Strings> =
         std::collections::HashMap::new();
     let mut content_type = String::new();
     if let Some(resp) = session.response_written() {
-        sent_headers.reserve(resp.headers.len());
-        for (name, value) in resp.headers.iter() {
-            let v_str = value.to_str().unwrap_or("");
-            sent_headers.insert(
-                name.to_string(),
-                pb::Strings {
-                    values: vec![v_str.to_string()],
-                },
-            );
+        if log_resp_headers {
+            sent_headers.reserve(resp.headers.len());
+            for (name, value) in resp.headers.iter() {
+                let v_str = value.to_str().unwrap_or("");
+                sent_headers.insert(
+                    name.to_string(),
+                    pb::Strings {
+                        values: vec![v_str.to_string()],
+                    },
+                );
+            }
         }
         content_type = resp
             .headers
@@ -358,7 +380,81 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         log.attrs.insert("os".to_string(), analyzed.os.to_string());
     }
 
+    // Apply per-server fields whitelist (HTTPAccessLogRef.fields)
+    if let Some(ref access_log) = ctx.access_log_ref {
+        if !access_log.fields.is_empty() {
+            apply_fields_whitelist(&mut log, &access_log.fields);
+        }
+    }
+
     let _ = sender.try_send(log);
+}
+
+fn is_common_request_header(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "host" | "user-agent" | "accept" | "accept-encoding"
+            | "accept-language" | "content-type" | "content-length"
+            | "referer" | "origin" | "connection" | "cache-control"
+            | "pragma" | "if-none-match" | "if-modified-since"
+    )
+}
+
+fn apply_fields_whitelist(log: &mut pb::HttpAccessLog, fields: &[i32]) {
+    use std::collections::HashSet;
+    let allowed: HashSet<i32> = fields.iter().copied().collect();
+    if !allowed.contains(&1) { log.server_id = 0; }
+    if !allowed.contains(&2) { log.node_id = 0; }
+    if !allowed.contains(&3) { log.location_id = 0; }
+    if !allowed.contains(&4) { log.rewrite_id = 0; }
+    if !allowed.contains(&5) { log.origin_id = 0; }
+    if !allowed.contains(&6) { log.remote_addr = String::new(); }
+    if !allowed.contains(&7) { log.raw_remote_addr = String::new(); }
+    if !allowed.contains(&8) { log.remote_port = 0; }
+    if !allowed.contains(&9) { log.remote_user = String::new(); }
+    if !allowed.contains(&10) { log.request_uri = String::new(); }
+    if !allowed.contains(&11) { log.request_path = String::new(); }
+    if !allowed.contains(&12) { log.request_length = 0; }
+    if !allowed.contains(&13) { log.request_time = 0.0; }
+    if !allowed.contains(&14) { log.request_method = String::new(); }
+    if !allowed.contains(&15) { log.request_filename = String::new(); }
+    if !allowed.contains(&16) { log.scheme = String::new(); }
+    if !allowed.contains(&17) { log.proto = String::new(); }
+    if !allowed.contains(&18) { log.bytes_sent = 0; }
+    if !allowed.contains(&19) { log.body_bytes_sent = 0; }
+    if !allowed.contains(&20) { log.status = 0; }
+    if !allowed.contains(&21) { log.status_message = String::new(); }
+    if !allowed.contains(&22) { log.sent_header.clear(); }
+    if !allowed.contains(&23) { log.time_iso8601 = String::new(); }
+    if !allowed.contains(&24) { log.time_local = String::new(); }
+    if !allowed.contains(&25) { log.msec = 0.0; }
+    if !allowed.contains(&26) { log.timestamp = 0; }
+    if !allowed.contains(&27) { log.host = String::new(); }
+    if !allowed.contains(&28) { log.referer = String::new(); }
+    if !allowed.contains(&29) { log.user_agent = String::new(); }
+    if !allowed.contains(&30) { log.request = String::new(); }
+    if !allowed.contains(&31) { log.content_type = String::new(); }
+    if !allowed.contains(&32) { log.cookie.clear(); }
+    if !allowed.contains(&34) { log.args = String::new(); }
+    if !allowed.contains(&35) { log.query_string = String::new(); }
+    if !allowed.contains(&36) { log.header.clear(); }
+    if !allowed.contains(&37) { log.server_name = String::new(); }
+    if !allowed.contains(&38) { log.server_port = 0; }
+    if !allowed.contains(&39) { log.server_protocol = String::new(); }
+    if !allowed.contains(&40) { log.hostname = String::new(); }
+    if !allowed.contains(&41) { log.origin_address = String::new(); }
+    if !allowed.contains(&42) { log.errors.clear(); }
+    if !allowed.contains(&43) { log.attrs.clear(); }
+    if !allowed.contains(&44) { log.firewall_policy_id = 0; }
+    if !allowed.contains(&45) { log.firewall_rule_group_id = 0; }
+    if !allowed.contains(&46) { log.firewall_rule_set_id = 0; }
+    if !allowed.contains(&47) { log.firewall_rule_id = 0; }
+    if !allowed.contains(&48) { log.request_id = String::new(); }
+    if !allowed.contains(&49) { log.firewall_actions.clear(); }
+    if !allowed.contains(&50) { log.tags.clear(); }
+    if !allowed.contains(&51) { log.request_body.clear(); }
+    if !allowed.contains(&52) { log.origin_status = 0; }
+    if !allowed.contains(&53) { log.origin_header_response_time = 0.0; }
 }
 
 #[allow(clippy::too_many_arguments)]

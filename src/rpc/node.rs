@@ -987,6 +987,7 @@ pub async fn fetch_and_apply_config<F>(
                                     numeric_id,
                                     config_resp.timestamp,
                                     payload.node_region.as_ref().map(|r| r.id).unwrap_or(0),
+                                    payload.node_cluster.as_ref().map(|c| c.id).unwrap_or(0),
                                     payload.servers.clone().into_iter().map(Arc::new).collect(),
                                     new_servers,
                                     new_routes,
@@ -1050,10 +1051,21 @@ pub async fn fetch_and_apply_config<F>(
                                     {
                                         Ok(resp) => {
                                             let info = resp.into_inner();
-                                            debug!("Node enabled features: DNS={} Cache={} Thresholds={} Sys={} DDoS={} Sched={} AccessLog={}",
+                                            debug!("Node enabled features: DNS={} Cache={} Thresholds={} SSH={} Sys={} DDoS={} Sched={} AccessLog={}",
                                                 info.has_dns_info, info.has_cache_info, info.has_thresholds,
+                                                info.has_ssh,
                                                 info.has_system_settings, info.has_d_do_s_protection,
                                                 info.has_schedule_settings, info.has_access_log_settings);
+                                            config_store.set_enabled_features(
+                                                info.has_dns_info,
+                                                info.has_cache_info,
+                                                info.has_thresholds,
+                                                info.has_ssh,
+                                                info.has_system_settings,
+                                                info.has_d_do_s_protection,
+                                                info.has_schedule_settings,
+                                                info.has_access_log_settings,
+                                            );
                                         }
                                         Err(e) => debug!("Failed to fetch enabled features: {}", e),
                                     }

@@ -54,7 +54,15 @@ pub async fn sync_node_tasks(
                     | "httpPagesPolicyChanged"
                     | "toaChanged"
                     | "networkSecurityPolicyChanged"
-                    | "webPPolicyChanged" => {
+                    | "webPPolicyChanged"
+                    | "accessLogChanged"
+                    | "dnsResolverChanged"
+                    | "grpcPolicyChanged"
+                    | "scheduleChanged"
+                    | "apiConfigChanged"
+                    | "indexNodeConfigChanged"
+                    | "cachePolicyChanged"
+                    | "firewallPolicyChanged" => {
                         if task.server_id > 0 {
                             sync_single_server_config(
                                 api_config,
@@ -127,7 +135,13 @@ pub async fn sync_node_tasks(
                         true
                     }
                     "plusChanged" | "nodeVersionChanged" => true,
-                    _ => true,
+                    other => {
+                        warn!(
+                            "Unknown NodeTask type '{}' (task id={}). Marking done to avoid retry loop.",
+                            other, task.id
+                        );
+                        true
+                    }
                 };
 
                 if let Some(options) = task_type.strip_prefix("ipListDeleted@")
