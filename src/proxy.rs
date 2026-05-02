@@ -2354,6 +2354,11 @@ impl EdgeProxy {
                 mut status,
                 mut body,
             } => {
+                warn!(
+                    "WAF_BLOCK: IP={} host={} method={} uri={} status={} policy_id={} group_id={} action={} tags={:?}",
+                    ip, ctx.host, session.req_header().method, session.req_header().uri,
+                    status, matched.policy_id, matched.group_id, matched.action_code, matched.tags
+                );
                 let mut final_timeout = matched.timeout_secs.unwrap_or(300);
                 let mut scope = matched.scope.as_deref().unwrap_or("server");
                 let mut max_timeout = 0;
@@ -2649,6 +2654,7 @@ impl EdgeProxy {
                     if !self.waf_state.check_special_defense(
                         format!("ECF:{}", ctx.client_ip_str), threshold, period,
                     ) {
+                        warn!("WAF_SPECIAL: Empty Connection Flood triggered for IP={} (threshold={}, period={}s)", ctx.client_ip_str, threshold, period);
                         self.waf_state.block_ip(ctx.client_ip, 0, ban, Some("global"), false, gp.use_local_firewall);
                         self.respond_status_with_pages(session, ctx, 403).await?;
                         return Ok((true, None));
@@ -2666,6 +2672,7 @@ impl EdgeProxy {
                     if !self.waf_state.check_special_defense(
                         format!("TLS:{}", ctx.client_ip_str), threshold, period,
                     ) {
+                        warn!("WAF_SPECIAL: TLS Exhaustion triggered for IP={} (threshold={}, period={}s)", ctx.client_ip_str, threshold, period);
                         self.waf_state.block_ip(ctx.client_ip, 0, ban, Some("global"), true, gp.use_local_firewall);
                         self.respond_status_with_pages(session, ctx, 403).await?;
                         return Ok((true, None));
@@ -2681,6 +2688,7 @@ impl EdgeProxy {
                     if !self.waf_state.check_special_defense(
                         format!("SYN:{}", ctx.client_ip_str), threshold, period,
                     ) {
+                        warn!("WAF_SPECIAL: SYN Flood triggered for IP={} (threshold={}, period={}s)", ctx.client_ip_str, threshold, period);
                         self.waf_state.block_ip(ctx.client_ip, 0, ban, Some("global"), false, gp.use_local_firewall);
                         self.respond_status_with_pages(session, ctx, 403).await?;
                         return Ok((true, None));
@@ -3154,6 +3162,10 @@ impl ProxyHttp for EdgeProxy {
             ctx.client_ip,
             ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
         ) {
+            warn!(
+                "BLOCKED: IP {} is blocked by WAF state (host={}, method={}, uri={})",
+                ctx.client_ip_str, host, session.req_header().method, session.req_header().uri
+            );
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
 
