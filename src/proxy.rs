@@ -104,6 +104,7 @@ pub struct ProxyCTX {
     pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
     pub node_level: i32,
     pub host: String,
+    pub origin_host: String,
 }
 
 impl Default for ProxyCTX {
@@ -183,6 +184,7 @@ impl Default for ProxyCTX {
             firewall_policies_snapshot: None,
             node_level: 0,
             host: String::new(),
+            origin_host: String::new(),
         }
     }
 }
@@ -3351,6 +3353,8 @@ impl ProxyHttp for EdgeProxy {
             let host = if let Some(ext) = backend_ext {
                 if !ext.host.is_empty() {
                     // Custom host: override client Host with configured value
+                    // Store for upstream_request_filter to set Host header
+                    ctx.origin_host = ext.host.clone();
                     ext.host.clone()
                 } else if ext.follow_host {
                     // follow_host=true: forward client's Host header to origin
@@ -4088,6 +4092,15 @@ impl ProxyHttp for EdgeProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         let global_cfg = ctx.global_http_config.as_ref().unwrap();
+
+        // Override Host header with origin-specific hostname if configured.
+        // Pingora's HttpPeer only sets TLS SNI, not the HTTP Host header.
+        if !ctx.origin_host.is_empty() {
+            upstream_request
+                .insert_header("host", ctx.origin_host.clone())
+                .unwrap();
+        }
+
         upstream_request.remove_header("x-cloud-resolved-real-ip");
         // Strip internal L1→L2 headers to prevent leaking them to origin servers
         upstream_request.remove_header("X-Cloud-Access-Token");
