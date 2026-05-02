@@ -623,7 +623,7 @@ fn tune_kernel_param(key: &str, target: &str) {
     }
 
     let current = match fs::read_to_string(path_ref) {
-        Ok(value) => value.trim().to_string(),
+        Ok(value) => value.split_whitespace().collect::<Vec<_>>().join(" "),
         Err(err) => {
             warn!("Kernel tuning failed to read {}: {}", key, err);
             return;
@@ -638,7 +638,7 @@ fn tune_kernel_param(key: &str, target: &str) {
     match fs::write(path_ref, target) {
         Ok(_) => match fs::read_to_string(path_ref) {
             Ok(updated) => {
-                let updated = updated.trim().to_string();
+                let updated = updated.split_whitespace().collect::<Vec<_>>().join(" ");
                 if updated == target {
                     info!(
                         "Kernel tuning applied successfully: {} {} -> {}",

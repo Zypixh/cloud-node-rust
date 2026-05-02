@@ -38,8 +38,8 @@ pub fn build_lb(
     let mut endpoints = Vec::new();
     let mut has_health_check = false;
 
-    // GoEdge: reverseProxy-level requestHost is used only when type is "customized"
-    let rp_host = if rp_cfg.request_host_type == "customized" && !rp_cfg.request_host.is_empty() {
+    // reverseProxy-level requestHost is used only when type == 2 (customized)
+    let rp_host = if rp_cfg.request_host_type == 2 && !rp_cfg.request_host.is_empty() {
         rp_cfg.request_host.clone()
     } else {
         String::new()

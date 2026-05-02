@@ -1857,12 +1857,12 @@ pub struct ReverseProxyConfig {
         deserialize_with = "deserialize_null_default"
     )]
     pub backup_origins: Vec<OriginConfig>,
-    // GoEdge: global request host override (used when requestHostType == "customized")
+    // Global request host override (used when requestHostType == 2)
     #[serde(rename = "requestHost", default, deserialize_with = "deserialize_null_default")]
     pub request_host: String,
-    // GoEdge: "origin" | "customized" | etc.
-    #[serde(rename = "requestHostType", default, deserialize_with = "deserialize_null_default")]
-    pub request_host_type: String,
+    // 0=proxyServer(CDN domain), 1=origin, 2=customized
+    #[serde(rename = "requestHostType", default)]
+    pub request_host_type: i8,
 }
 
 fn default_true() -> bool {
