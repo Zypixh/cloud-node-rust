@@ -3,10 +3,10 @@ use futures_util::FutureExt;
 use http;
 use http::Extensions;
 use pingora_load_balancing::{
-    Backend, Backends, LoadBalancer,
     discovery::Static,
     health_check,
     selection::{Consistent, RoundRobin},
+    Backend, Backends, LoadBalancer,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 #[derive(Clone, Debug)]
 pub struct BackendExtension {
     pub use_tls: bool,
-    pub host: String, // Per-origin custom host (origin.requestHost)
+    pub host: String,    // Per-origin custom host (origin.requestHost)
     pub rp_host: String, // Reverse-proxy-level custom host (reverseProxy.requestHost)
     pub follow_host: bool,
     pub tls_verify: bool, // true = strict/auto, false = none
@@ -38,13 +38,6 @@ pub fn build_lb(
     let mut endpoints = Vec::new();
     let mut has_health_check = false;
 
-    // reverseProxy-level requestHost is used only when type == 2 (customized)
-    let rp_host = if rp_cfg.request_host_type == 2 && !rp_cfg.request_host.is_empty() {
-        rp_cfg.request_host.clone()
-    } else {
-        String::new()
-    };
-
     // Build Origin Pool (Direct to primary/backup origins)
     for origin in &rp_cfg.primary_origins {
         if !origin.is_on {
@@ -52,6 +45,7 @@ pub fn build_lb(
         }
         if let Some(addr) = &origin.addr {
             let target = addr.to_address();
+            let rp_host = reverse_proxy_request_host(rp_cfg, addr);
 
             if !allow_lan && is_local_addr(&target) {
                 warn!(
@@ -80,7 +74,7 @@ pub fn build_lb(
                 ext.insert(BackendExtension {
                     use_tls: addr.is_https(),
                     host: origin.request_host.clone(),
-                    rp_host: rp_host.clone(),
+                    rp_host,
                     follow_host: origin.follow_host,
                     tls_verify,
                     client_cert: origin.cert.clone(),
@@ -99,6 +93,7 @@ pub fn build_lb(
             }
             if let Some(addr) = &origin.addr {
                 let target = addr.to_address();
+                let rp_host = reverse_proxy_request_host(rp_cfg, addr);
 
                 if !allow_lan && is_local_addr(&target) {
                     warn!(
@@ -127,7 +122,7 @@ pub fn build_lb(
                     ext.insert(BackendExtension {
                         use_tls: addr.is_https(),
                         host: origin.request_host.clone(),
-                        rp_host: rp_host.clone(),
+                        rp_host,
                         follow_host: origin.follow_host,
                         tls_verify,
                         client_cert: origin.cert.clone(),
@@ -301,6 +296,35 @@ pub fn build_parent_lb(
     Arc::new(lb)
 }
 
+fn reverse_proxy_request_host(
+    rp_cfg: &ReverseProxyConfig,
+    addr: &crate::config_models::FlexibleAddr,
+) -> String {
+    match rp_cfg.request_host_type {
+        // GoEdge requestHostType=1 means send the origin host as upstream Host/SNI.
+        1 => origin_addr_host(addr),
+        // GoEdge requestHostType=2 means use the reverse-proxy-level custom Host.
+        2 if !rp_cfg.request_host.is_empty() => rp_cfg.request_host.clone(),
+        _ => String::new(),
+    }
+}
+
+fn origin_addr_host(addr: &crate::config_models::FlexibleAddr) -> String {
+    let host = match addr {
+        crate::config_models::FlexibleAddr::Object(obj) => obj.host.clone().unwrap_or_default(),
+        crate::config_models::FlexibleAddr::String(s) => s.clone(),
+    };
+    host.strip_prefix("http://")
+        .or_else(|| host.strip_prefix("https://"))
+        .or_else(|| host.strip_prefix("tcp://"))
+        .or_else(|| host.strip_prefix("tls://"))
+        .unwrap_or(&host)
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
 fn is_local_addr(addr: &str) -> bool {
     let host = addr.split(':').next().unwrap_or(addr);
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -314,5 +338,62 @@ fn is_local_addr(addr: &str) -> bool {
     } else {
         // If it's a hostname like "localhost"
         host.eq_ignore_ascii_case("localhost")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_models::{FlexibleAddr, NetworkAddressConfig};
+
+    fn rp_cfg(request_host_type: i8, request_host: &str) -> ReverseProxyConfig {
+        ReverseProxyConfig {
+            is_on: true,
+            primary_origins: vec![],
+            backup_origins: vec![],
+            request_host: request_host.to_string(),
+            request_host_type,
+        }
+    }
+
+    #[test]
+    fn request_host_type_origin_uses_object_origin_host() {
+        let addr = FlexibleAddr::Object(NetworkAddressConfig {
+            protocol: Some("https".to_string()),
+            host: Some("origin.example.com".to_string()),
+            port_range: Some("443".to_string()),
+        });
+
+        assert_eq!(
+            reverse_proxy_request_host(&rp_cfg(1, ""), &addr),
+            "origin.example.com"
+        );
+    }
+
+    #[test]
+    fn request_host_type_origin_strips_scheme_and_port_from_string_origin() {
+        let addr = FlexibleAddr::String("https://origin.example.com:443".to_string());
+
+        assert_eq!(
+            reverse_proxy_request_host(&rp_cfg(1, ""), &addr),
+            "origin.example.com"
+        );
+    }
+
+    #[test]
+    fn request_host_type_custom_uses_configured_request_host() {
+        let addr = FlexibleAddr::String("origin.example.com:443".to_string());
+
+        assert_eq!(
+            reverse_proxy_request_host(&rp_cfg(2, "custom.example.com"), &addr),
+            "custom.example.com"
+        );
+    }
+
+    #[test]
+    fn request_host_type_proxy_server_leaves_host_unset() {
+        let addr = FlexibleAddr::String("origin.example.com:443".to_string());
+
+        assert_eq!(reverse_proxy_request_host(&rp_cfg(0, ""), &addr), "");
     }
 }
