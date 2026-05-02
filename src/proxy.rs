@@ -1112,13 +1112,15 @@ impl EdgeProxy {
         session: &Session,
         cors: &crate::config_models::CORSConfig,
     ) {
-        // Allow-Origin
+        // Allow-Origin: use configured value, or echo the request Origin
         if cors.allow_origin.is_empty() {
             if let Some(origin) = session.get_header("origin") {
                 if let Ok(origin_str) = origin.to_str() {
                     let _ = resp.insert_header("access-control-allow-origin", origin_str);
                 }
             }
+            // Also set Vary: Origin when echoing, so caches distinguish per-origin
+            let _ = resp.insert_header("vary", "Origin");
         } else {
             let _ = resp.insert_header("access-control-allow-origin", &cors.allow_origin);
         }
@@ -1136,12 +1138,18 @@ impl EdgeProxy {
             );
         }
 
-        // Allow-Headers
+        // Allow-Headers: use configured value, or echo Access-Control-Request-Headers
+        // from the preflight request so browsers allow non-simple headers
+        // (Content-Type: application/json, Authorization, etc.)
         if !cors.allow_headers.is_empty() {
             let _ = resp.insert_header(
                 "access-control-allow-headers",
                 cors.allow_headers.join(", "),
             );
+        } else if let Some(req_headers) = session.get_header("access-control-request-headers") {
+            if let Ok(req_headers_str) = req_headers.to_str() {
+                let _ = resp.insert_header("access-control-allow-headers", req_headers_str);
+            }
         }
 
         // Max-Age
@@ -3862,7 +3870,7 @@ impl ProxyHttp for EdgeProxy {
                 if let Some(web) = &server.web {
                     if let Some(ref rhp) = web.response_header_policy {
                         if let Some(ref cors) = rhp.cors {
-                            if cors.is_on && !cors.options_method_only {
+                            if cors.is_on {
                                 Self::set_cors_headers(upstream_response, session, cors);
                             }
                         }
@@ -3919,13 +3927,19 @@ impl ProxyHttp for EdgeProxy {
             }
         }
 
-        // CORS: add headers for non-OPTIONS responses when CORS is enabled
+        // CORS: add headers for all responses when CORS is enabled
         // (OPTIONS preflight is handled in request_filter)
         if let Some(server) = &ctx.server {
             if let Some(web) = &server.web {
                 if let Some(ref rhp) = web.response_header_policy {
                     if let Some(ref cors) = rhp.cors {
-                        if cors.is_on && !cors.options_method_only {
+                        if cors.is_on {
+                            debug!(
+                                "CORS: adding headers for {} {} (status={})",
+                                session.req_header().method,
+                                session.req_header().uri.path(),
+                                upstream_response.status.as_u16()
+                            );
                             Self::set_cors_headers(upstream_response, session, cors);
                         }
                     }
