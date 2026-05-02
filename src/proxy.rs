@@ -2640,62 +2640,11 @@ impl EdgeProxy {
     ) -> Result<(bool, Option<String>)> {
         let mut waf_action: Option<String> = None;
 
-        // Mandatory Global Special Defenses
-        for gp in global_policies {
-            if !gp.is_on {
-                continue;
-            }
-            // Empty Connection Flood
-            if let Some(cfg) = &gp.empty_connection_flood {
-                if cfg.is_on {
-                    let threshold = cfg.threshold.max(10);
-                    let period = if cfg.period > 0 { cfg.period as i64 } else { 60 };
-                    let ban = if cfg.ban_duration > 0 { cfg.ban_duration as i64 } else { 3600 };
-                    if !self.waf_state.check_special_defense(
-                        format!("ECF:{}", ctx.client_ip_str), threshold, period,
-                    ) {
-                        warn!("WAF_SPECIAL: Empty Connection Flood triggered for IP={} (threshold={}, period={}s)", ctx.client_ip_str, threshold, period);
-                        self.waf_state.block_ip(ctx.client_ip, 0, ban, Some("global"), false, gp.use_local_firewall);
-                        self.respond_status_with_pages(session, ctx, 403).await?;
-                        return Ok((true, None));
-                    }
-                }
-            }
-            // TLS Exhaustion Attack
-            if let Some(cfg) = &gp.tls_exhaustion_attack {
-                let is_tls = session.downstream_session.digest()
-                    .and_then(|d| d.ssl_digest.as_ref()).is_some();
-                if cfg.is_on && (is_tls || session.req_header().uri.scheme_str() == Some("https")) {
-                    let threshold = cfg.threshold.max(10);
-                    let period = if cfg.period > 0 { cfg.period as i64 } else { 60 };
-                    let ban = if cfg.ban_duration > 0 { cfg.ban_duration as i64 } else { 3600 };
-                    if !self.waf_state.check_special_defense(
-                        format!("TLS:{}", ctx.client_ip_str), threshold, period,
-                    ) {
-                        warn!("WAF_SPECIAL: TLS Exhaustion triggered for IP={} (threshold={}, period={}s)", ctx.client_ip_str, threshold, period);
-                        self.waf_state.block_ip(ctx.client_ip, 0, ban, Some("global"), true, gp.use_local_firewall);
-                        self.respond_status_with_pages(session, ctx, 403).await?;
-                        return Ok((true, None));
-                    }
-                }
-            }
-            // SYN Flood Protection
-            if let Some(cfg) = &gp.syn_flood {
-                if cfg.is_on {
-                    let threshold = cfg.threshold.max(10);
-                    let period = if cfg.period > 0 { cfg.period as i64 } else { 60 };
-                    let ban = if cfg.ban_duration > 0 { cfg.ban_duration as i64 } else { 3600 };
-                    if !self.waf_state.check_special_defense(
-                        format!("SYN:{}", ctx.client_ip_str), threshold, period,
-                    ) {
-                        warn!("WAF_SPECIAL: SYN Flood triggered for IP={} (threshold={}, period={}s)", ctx.client_ip_str, threshold, period);
-                        self.waf_state.block_ip(ctx.client_ip, 0, ban, Some("global"), false, gp.use_local_firewall);
-                        self.respond_status_with_pages(session, ctx, 403).await?;
-                        return Ok((true, None));
-                    }
-                }
-            }
-        }
+        // NOTE: Empty Connection Flood, TLS Exhaustion, and SYN Flood are
+        // connection-level attacks. By the time request_filter runs, a complete
+        // HTTP request has been received — counting requests here incorrectly
+        // blocks legitimate traffic (e.g. 10+ requests/min triggers ECF).
+        // These defenses belong at the TCP connection accept layer.
 
         if self.enforce_uam(session, ctx, &ctx.client_ip_str.clone()).await? {
             return Ok((true, None));
