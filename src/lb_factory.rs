@@ -9,6 +9,7 @@ use pingora_load_balancing::{
     Backend, Backends, LoadBalancer,
 };
 use std::collections::{BTreeSet, HashMap};
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -55,7 +56,9 @@ pub fn build_lb(
                 continue;
             }
 
-            if let Ok(mut backend) = Backend::new(&target) {
+            if let Some(mut backend) =
+                backend_from_origin_target(&target, addr, "origin", allow_lan)
+            {
                 let mut ext = Extensions::new();
 
                 let tls_verify = if let Some(v) = &origin.tls_verify {
@@ -103,7 +106,9 @@ pub fn build_lb(
                     continue;
                 }
 
-                if let Ok(mut backend) = Backend::new(&target) {
+                if let Some(mut backend) =
+                    backend_from_origin_target(&target, addr, "backup origin", allow_lan)
+                {
                     let mut ext = Extensions::new();
 
                     let tls_verify = if let Some(v) = &origin.tls_verify {
@@ -309,20 +314,52 @@ fn reverse_proxy_request_host(
     }
 }
 
+fn backend_from_origin_target(
+    target: &str,
+    raw: &crate::config_models::FlexibleAddr,
+    label: &str,
+    allow_lan: bool,
+) -> Option<Backend> {
+    if let Ok(backend) = Backend::new(target) {
+        return Some(backend);
+    }
+
+    match target.to_socket_addrs() {
+        Ok(mut addrs) => {
+            if let Some(addr) = addrs.next() {
+                let resolved = addr.to_string();
+                if !allow_lan && is_local_addr(&resolved) {
+                    warn!(
+                        "LB Builder: Skipping {} address {} resolved to LAN address {}.",
+                        label, target, resolved
+                    );
+                    return None;
+                }
+                debug!(
+                    "LB Builder: Resolved {} address {} to {}",
+                    label, target, resolved
+                );
+                Backend::new(&resolved).ok()
+            } else {
+                warn!(
+                    "LB Builder: Skipping {} address {} (normalized from {:?}): DNS returned no addresses",
+                    label, target, raw
+                );
+                None
+            }
+        }
+        Err(err) => {
+            warn!(
+                "LB Builder: Skipping invalid {} address {} (normalized from {:?}): {}",
+                label, target, raw, err
+            );
+            None
+        }
+    }
+}
+
 fn origin_addr_host(addr: &crate::config_models::FlexibleAddr) -> String {
-    let host = match addr {
-        crate::config_models::FlexibleAddr::Object(obj) => obj.host.clone().unwrap_or_default(),
-        crate::config_models::FlexibleAddr::String(s) => s.clone(),
-    };
-    host.strip_prefix("http://")
-        .or_else(|| host.strip_prefix("https://"))
-        .or_else(|| host.strip_prefix("tcp://"))
-        .or_else(|| host.strip_prefix("tls://"))
-        .unwrap_or(&host)
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    addr.host()
 }
 
 fn is_local_addr(addr: &str) -> bool {
@@ -344,7 +381,7 @@ fn is_local_addr(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_models::{FlexibleAddr, NetworkAddressConfig};
+    use crate::config_models::{FlexibleAddr, NetworkAddressConfig, OriginConfig};
 
     fn rp_cfg(request_host_type: i8, request_host: &str) -> ReverseProxyConfig {
         ReverseProxyConfig {
@@ -353,6 +390,21 @@ mod tests {
             backup_origins: vec![],
             request_host: request_host.to_string(),
             request_host_type,
+        }
+    }
+
+    fn origin(addr: FlexibleAddr, request_host: &str) -> OriginConfig {
+        OriginConfig {
+            id: 1,
+            name: String::new(),
+            addr: Some(addr),
+            is_on: true,
+            weight: 1,
+            health_check: None,
+            request_host: request_host.to_string(),
+            follow_host: false,
+            cert: None,
+            tls_verify: None,
         }
     }
 
@@ -395,5 +447,26 @@ mod tests {
         let addr = FlexibleAddr::String("origin.example.com:443".to_string());
 
         assert_eq!(reverse_proxy_request_host(&rp_cfg(0, ""), &addr), "");
+    }
+
+    #[test]
+    fn build_lb_accepts_http_url_origin_and_preserves_custom_host() {
+        let mut cfg = rp_cfg(2, "custom.example.com");
+        cfg.primary_origins.push(origin(
+            FlexibleAddr::String("http://127.0.0.1:8080".to_string()),
+            "",
+        ));
+
+        let (lb, has_hc) = build_lb(1, &cfg, 2, &HashMap::new(), false, true);
+        let peer = lb.select(b"", 128).expect("origin should be selectable");
+        let ext = peer
+            .ext
+            .get::<BackendExtension>()
+            .expect("backend extension should be present");
+
+        assert_eq!(peer.addr.to_string(), "127.0.0.1:8080");
+        assert!(!ext.use_tls);
+        assert_eq!(ext.rp_host, "custom.example.com");
+        assert!(!has_hc);
     }
 }

@@ -554,11 +554,12 @@ pub struct NetworkAddressConfig {
 
 impl NetworkAddressConfig {
     pub fn to_address(&self) -> String {
-        format!(
-            "{}:{}",
-            self.host.as_deref().unwrap_or("127.0.0.1"),
-            self.port_range.as_deref().unwrap_or("80")
-        )
+        let protocol = self.protocol.as_deref().unwrap_or("");
+        let port = self
+            .port_range
+            .clone()
+            .unwrap_or_else(|| default_port_for_protocol(protocol).to_string());
+        format!("{}:{}", self.host.as_deref().unwrap_or("127.0.0.1"), port)
     }
 }
 
@@ -1880,14 +1881,14 @@ impl FlexibleAddr {
     pub fn to_address(&self) -> String {
         match self {
             Self::Object(obj) => obj.to_address(),
-            Self::String(s) => s.clone(),
+            Self::String(s) => normalize_origin_addr_string(s).address,
         }
     }
 
     pub fn host(&self) -> String {
         match self {
             Self::Object(obj) => obj.host.clone().unwrap_or_default(),
-            Self::String(s) => s.split(':').next().unwrap_or(s).to_string(),
+            Self::String(s) => normalize_origin_addr_string(s).host,
         }
     }
 
@@ -1897,8 +1898,107 @@ impl FlexibleAddr {
                 let p = obj.protocol.as_deref().unwrap_or("");
                 p == "https" || p == "tls"
             }
-            Self::String(s) => s.starts_with("https://") || s.starts_with("tls://"),
+            Self::String(s) => normalize_origin_addr_string(s).use_tls,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedOriginAddr {
+    address: String,
+    host: String,
+    use_tls: bool,
+}
+
+fn normalize_origin_addr_string(raw: &str) -> NormalizedOriginAddr {
+    let trimmed = raw.trim();
+
+    if has_uri_scheme(trimmed) {
+        if let Ok(uri) = trimmed.parse::<http::Uri>() {
+            let scheme = uri.scheme_str().unwrap_or("");
+            let use_tls =
+                scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("tls");
+            let host = uri.host().unwrap_or("").to_string();
+            let port = uri
+                .port_u16()
+                .unwrap_or_else(|| default_port_for_protocol(scheme));
+            return NormalizedOriginAddr {
+                address: format_host_port(&host, port),
+                host,
+                use_tls,
+            };
+        }
+    }
+
+    let (without_scheme, use_tls) = strip_known_scheme(trimmed);
+    let without_path = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    let (host, port) = split_host_port(without_path);
+    let port = port.unwrap_or_else(|| if use_tls { 443 } else { 80 });
+
+    NormalizedOriginAddr {
+        address: format_host_port(&host, port),
+        host,
+        use_tls,
+    }
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    value.find("://").is_some_and(|idx| {
+        matches!(
+            &value[..idx].to_ascii_lowercase()[..],
+            "http" | "https" | "tls"
+        )
+    })
+}
+
+fn strip_known_scheme(value: &str) -> (&str, bool) {
+    if let Some(rest) = value.strip_prefix("https://") {
+        (rest, true)
+    } else if let Some(rest) = value.strip_prefix("tls://") {
+        (rest, true)
+    } else if let Some(rest) = value.strip_prefix("http://") {
+        (rest, false)
+    } else {
+        (value, false)
+    }
+}
+
+fn split_host_port(value: &str) -> (String, Option<u16>) {
+    if let Some(rest) = value.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let host = rest[..end].to_string();
+            let port = rest[end + 1..]
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok());
+            return (host, port);
+        }
+    }
+
+    if value.matches(':').count() == 1 {
+        if let Some((host, port)) = value.rsplit_once(':') {
+            return (host.to_string(), port.parse::<u16>().ok());
+        }
+    }
+
+    (value.to_string(), None)
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+fn default_port_for_protocol(protocol: &str) -> u16 {
+    if protocol.eq_ignore_ascii_case("https") || protocol.eq_ignore_ascii_case("tls") {
+        443
+    } else {
+        80
     }
 }
 
@@ -1988,4 +2088,47 @@ pub fn parse_life_to_seconds(v: &Value) -> u64 {
         };
     }
     3600
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flexible_addr_http_url_normalizes_to_socket_address() {
+        let addr = FlexibleAddr::String("http://127.0.0.1:8080".to_string());
+
+        assert_eq!(addr.to_address(), "127.0.0.1:8080");
+        assert_eq!(addr.host(), "127.0.0.1");
+        assert!(!addr.is_https());
+    }
+
+    #[test]
+    fn flexible_addr_https_url_uses_default_port() {
+        let addr = FlexibleAddr::String("https://127.0.0.1".to_string());
+
+        assert_eq!(addr.to_address(), "127.0.0.1:443");
+        assert_eq!(addr.host(), "127.0.0.1");
+        assert!(addr.is_https());
+    }
+
+    #[test]
+    fn flexible_addr_plain_host_port_stays_http() {
+        let addr = FlexibleAddr::String("127.0.0.1:80".to_string());
+
+        assert_eq!(addr.to_address(), "127.0.0.1:80");
+        assert_eq!(addr.host(), "127.0.0.1");
+        assert!(!addr.is_https());
+    }
+
+    #[test]
+    fn network_address_https_defaults_to_443() {
+        let addr = NetworkAddressConfig {
+            protocol: Some("https".to_string()),
+            host: Some("127.0.0.1".to_string()),
+            port_range: None,
+        };
+
+        assert_eq!(addr.to_address(), "127.0.0.1:443");
+    }
 }
