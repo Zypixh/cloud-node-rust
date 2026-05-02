@@ -2903,7 +2903,7 @@ impl ProxyHttp for EdgeProxy {
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
         ctx.is_on = hot_path.is_on;
         if !ctx.is_on {
-            debug!("Node is DISABLED (isOn=false). Rejecting request.");
+            warn!("BLOCKED: Node is DISABLED (isOn=false), rejecting {} {} from IP={}", session.req_header().method, session.req_header().uri, ctx.client_ip_str);
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
 
