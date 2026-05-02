@@ -76,6 +76,59 @@ pub fn apply_request_header_policy(session: &mut Session, policy: &HTTPHeaderPol
     }
 }
 
+/// Applies request header policies to upstream request headers.
+/// Unlike `apply_request_header_policy`, this operates on the outgoing upstream request
+/// rather than the downstream session, and receives template variables directly.
+pub fn apply_request_header_policy_to_upstream(
+    upstream_request: &mut pingora_http::RequestHeader,
+    policy: &HTTPHeaderPolicy,
+    host: &str,
+    request_uri: &str,
+    remote_addr: &str,
+) {
+    let resolve = |value: &str| -> String {
+        format_template(value, |var_name| match var_name {
+            "host" => host.to_string(),
+            "requestURI" => request_uri.to_string(),
+            "remoteAddr" => remote_addr.to_string(),
+            _ => "".to_string(),
+        })
+    };
+
+    // Delete headers
+    for name in &policy.delete_headers {
+        if let Ok(header_name) = HeaderName::from_str(name) {
+            upstream_request.remove_header(&header_name);
+        }
+    }
+
+    // Set headers (overwrite existing)
+    for h in &policy.set_headers {
+        if !h.is_on {
+            continue;
+        }
+        let resolved = resolve(&h.value);
+        if let (Ok(hn), Ok(hv)) = (HeaderName::from_str(&h.name), HeaderValue::from_str(&resolved))
+        {
+            upstream_request.insert_header(hn, hv).ok();
+        }
+    }
+
+    // Add headers (do not overwrite if already present)
+    for h in &policy.add_headers {
+        if !h.is_on {
+            continue;
+        }
+        let resolved = resolve(&h.value);
+        if let (Ok(hn), Ok(hv)) = (HeaderName::from_str(&h.name), HeaderValue::from_str(&resolved))
+        {
+            if upstream_request.headers.get(&hn).is_none() {
+                upstream_request.insert_header(hn, hv).ok();
+            }
+        }
+    }
+}
+
 /// Applies response header policies to the response header, mirroring GoEdge's ProcessResponseHeaders
 pub fn apply_response_header_policy_to_map(
     headers: &mut std::collections::HashMap<String, String>,

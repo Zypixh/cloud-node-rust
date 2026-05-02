@@ -4139,6 +4139,54 @@ impl ProxyHttp for EdgeProxy {
         upstream_request.remove_header("X-Cloud-Real-Port");
         upstream_request.remove_header("X-Cloud-Http3-Bridge");
 
+        // Apply requestHeaderPolicy: set/delete/add custom headers to upstream request.
+        // This mirrors GoEdge's processRequestHeaders logic.
+        if let Some(server) = &ctx.server {
+            if let Some(web) = &server.web {
+                if let Some(policy) = &web.request_header_policy {
+                    if policy.is_on {
+                        let request_uri = upstream_request
+                            .raw_path()
+                            .iter()
+                            .map(|b| *b as char)
+                            .collect::<String>();
+                        let host_for_template = if !ctx.origin_host.is_empty() {
+                            ctx.origin_host.clone()
+                        } else {
+                            ctx.host.clone()
+                        };
+                        crate::headers::apply_request_header_policy_to_upstream(
+                            upstream_request,
+                            policy,
+                            &host_for_template,
+                            &request_uri,
+                            &ctx.client_ip_str,
+                        );
+                        debug!(
+                            "UPSTREAM: applied requestHeaderPolicy (set={}, add={}, delete={})",
+                            policy.set_headers.len(),
+                            policy.add_headers.len(),
+                            policy.delete_headers.len()
+                        );
+                    }
+                }
+            }
+        }
+
+        // Debug: log full upstream request for troubleshooting (after policy application)
+        {
+            let headers_str: Vec<String> = upstream_request.headers.iter()
+                .map(|(n, v)| format!("{}: {}", n, v.to_str().unwrap_or("?")))
+                .collect();
+            info!(
+                "UPSTREAM_REQUEST: {} {} {:?}, headers=[{}]",
+                upstream_request.method,
+                upstream_request.raw_path().iter().map(|b| *b as char).collect::<String>(),
+                upstream_request.version,
+                headers_str.join("; ")
+            );
+        }
+
         // 1. Automatic Gzip Back to Origin
         if global_cfg.request_origins_with_encodings {
             if upstream_request.headers.get("accept-encoding").is_none() {
