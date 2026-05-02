@@ -2708,6 +2708,7 @@ impl EdgeProxy {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(0);
             if content_length > 0 && content_length <= 2 * 1024 * 1024 {
+                session.as_mut().enable_retry_buffering();
                 let mut buffered = Vec::with_capacity(content_length);
                 while let Some(chunk) = session.read_request_body().await? {
                     buffered.extend_from_slice(&chunk);
@@ -3004,9 +3005,7 @@ impl ProxyHttp for EdgeProxy {
                 ctx.is_websocket = true;
             }
             if let Some(grpc) = &server.grpc {
-                if grpc.is_on && ctx.is_websocket {
-                    ctx.is_grpc = true;
-                }
+                ctx.is_grpc = grpc.is_on && Self::is_grpc_request(session);
             }
 
             // Apply gRPC message size limits if enabled
