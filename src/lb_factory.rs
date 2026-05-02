@@ -3,10 +3,10 @@ use futures_util::FutureExt;
 use http;
 use http::Extensions;
 use pingora_load_balancing::{
+    Backend, Backends, LoadBalancer,
     discovery::Static,
     health_check,
     selection::{Consistent, RoundRobin},
-    Backend, Backends, LoadBalancer,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::net::ToSocketAddrs;
@@ -20,8 +20,15 @@ pub struct BackendExtension {
     pub use_tls: bool,
     pub host: String,    // Per-origin custom host (origin.requestHost)
     pub rp_host: String, // Reverse-proxy-level custom host (reverseProxy.requestHost)
+    pub origin_host: String,
+    pub follow_port: bool,
     pub follow_host: bool,
+    pub http2_enabled: bool,
     pub tls_verify: bool, // true = strict/auto, false = none
+    pub request_host_excluding_port: bool,
+    pub connection_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
+    pub idle_timeout: Option<Duration>,
     pub client_cert: Option<crate::config_models::SSLCertConfig>,
 }
 
@@ -78,8 +85,15 @@ pub fn build_lb(
                     use_tls: addr.is_https(),
                     host: origin.request_host.clone(),
                     rp_host,
+                    origin_host: addr.host(),
+                    follow_port: origin.follow_port,
                     follow_host: origin.follow_host,
+                    http2_enabled: origin.http2_enabled,
                     tls_verify,
+                    request_host_excluding_port: rp_cfg.request_host_excluding_port,
+                    connection_timeout: origin.conn_timeout.as_ref().map(crate::utils::to_duration),
+                    read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
+                    idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
                     client_cert: origin.cert.clone(),
                 });
                 backend.ext = ext;
@@ -128,8 +142,18 @@ pub fn build_lb(
                         use_tls: addr.is_https(),
                         host: origin.request_host.clone(),
                         rp_host,
+                        origin_host: addr.host(),
+                        follow_port: origin.follow_port,
                         follow_host: origin.follow_host,
+                        http2_enabled: origin.http2_enabled,
                         tls_verify,
+                        request_host_excluding_port: rp_cfg.request_host_excluding_port,
+                        connection_timeout: origin
+                            .conn_timeout
+                            .as_ref()
+                            .map(crate::utils::to_duration),
+                        read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
+                        idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
                         client_cert: origin.cert.clone(),
                     });
                     backend.ext = ext;
@@ -266,8 +290,15 @@ pub fn build_parent_lb(
                     use_tls: true, // L1 -> L2 always TLS by default in GoEdge
                     host: String::new(),
                     rp_host: String::new(),
+                    origin_host: String::new(),
+                    follow_port: false,
                     follow_host: false,
+                    http2_enabled: false,
                     tls_verify: false,
+                    request_host_excluding_port: false,
+                    connection_timeout: None,
+                    read_timeout: None,
+                    idle_timeout: None,
                     client_cert: None,
                 });
                 backend.ext = ext;
@@ -305,12 +336,17 @@ fn reverse_proxy_request_host(
     rp_cfg: &ReverseProxyConfig,
     addr: &crate::config_models::FlexibleAddr,
 ) -> String {
-    match rp_cfg.request_host_type {
+    let host = match rp_cfg.request_host_type {
         // GoEdge requestHostType=1 means send the origin host as upstream Host/SNI.
         1 => origin_addr_host(addr),
         // GoEdge requestHostType=2 means use the reverse-proxy-level custom Host.
         2 if !rp_cfg.request_host.is_empty() => rp_cfg.request_host.clone(),
         _ => String::new(),
+    };
+    if rp_cfg.request_host_excluding_port {
+        strip_addr_port(&host)
+    } else {
+        host
     }
 }
 
@@ -359,7 +395,26 @@ fn backend_from_origin_target(
 }
 
 fn origin_addr_host(addr: &crate::config_models::FlexibleAddr) -> String {
-    addr.host()
+    let host = addr.to_address();
+    if addr.is_https() {
+        host.strip_suffix(":443").unwrap_or(&host).to_string()
+    } else {
+        host.strip_suffix(":80").unwrap_or(&host).to_string()
+    }
+}
+
+pub(crate) fn strip_addr_port(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[..end].to_string();
+    }
+    if value.matches(':').count() == 1
+        && let Some((host, _)) = value.rsplit_once(':')
+    {
+        return host.to_string();
+    }
+    value.to_string()
 }
 
 fn is_local_addr(addr: &str) -> bool {
@@ -390,6 +445,7 @@ mod tests {
             backup_origins: vec![],
             request_host: request_host.to_string(),
             request_host_type,
+            request_host_excluding_port: false,
         }
     }
 
@@ -403,6 +459,11 @@ mod tests {
             health_check: None,
             request_host: request_host.to_string(),
             follow_host: false,
+            follow_port: false,
+            http2_enabled: false,
+            conn_timeout: None,
+            read_timeout: None,
+            idle_timeout: None,
             cert: None,
             tls_verify: None,
         }
@@ -447,6 +508,28 @@ mod tests {
         let addr = FlexibleAddr::String("origin.example.com:443".to_string());
 
         assert_eq!(reverse_proxy_request_host(&rp_cfg(0, ""), &addr), "");
+    }
+
+    #[test]
+    fn request_host_type_origin_keeps_non_default_port() {
+        let addr = FlexibleAddr::String("http://origin.example.com:8080".to_string());
+
+        assert_eq!(
+            reverse_proxy_request_host(&rp_cfg(1, ""), &addr),
+            "origin.example.com:8080"
+        );
+    }
+
+    #[test]
+    fn request_host_excluding_port_strips_custom_port() {
+        let addr = FlexibleAddr::String("http://origin.example.com:8080".to_string());
+        let mut cfg = rp_cfg(1, "");
+        cfg.request_host_excluding_port = true;
+
+        assert_eq!(
+            reverse_proxy_request_host(&cfg, &addr),
+            "origin.example.com"
+        );
     }
 
     #[test]

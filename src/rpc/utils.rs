@@ -34,8 +34,15 @@ pub fn build_runtime_maps(
                 use_tls: false,
                 host: String::new(),
                 rp_host: String::new(),
+                origin_host: String::new(),
+                follow_port: false,
                 follow_host: false,
+                http2_enabled: false,
                 tls_verify: true,
+                request_host_excluding_port: false,
+                connection_timeout: None,
+                read_timeout: None,
+                idle_timeout: None,
                 client_cert: None,
             });
             b.ext = ext;

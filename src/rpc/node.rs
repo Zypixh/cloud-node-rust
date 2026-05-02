@@ -793,8 +793,15 @@ pub async fn fetch_and_apply_config<F>(
                                             use_tls: false,
                                             host: String::new(),
                                             rp_host: String::new(),
+                                            origin_host: String::new(),
+                                            follow_port: false,
                                             follow_host: false,
+                                            http2_enabled: false,
                                             tls_verify: true,
+                                            request_host_excluding_port: false,
+                                            connection_timeout: None,
+                                            read_timeout: None,
+                                            idle_timeout: None,
                                             client_cert: None,
                                         });
                                         b.ext = ext;
@@ -1012,7 +1019,11 @@ pub async fn fetch_and_apply_config<F>(
                                     request_origins_with_encodings,
                                     xff_max_addresses,
                                     allow_lan_ip,
-                                    payload.http_cache_policies.iter().map(|p| Arc::new(p.clone())).collect(),
+                                    payload
+                                        .http_cache_policies
+                                        .iter()
+                                        .map(|p| Arc::new(p.clone()))
+                                        .collect(),
                                     payload.http_firewall_policies.clone(),
                                     payload.waf_actions.clone(),
                                     parse_i64_keyed_map(&payload.uam_policies),
@@ -1021,7 +1032,10 @@ pub async fn fetch_and_apply_config<F>(
                                     parse_i64_keyed_map(&payload.http_pages_policies),
                                     parse_i64_keyed_map(&payload.webp_image_policies),
                                     payload.toa.clone(),
-                                    payload.global_server_config.as_ref().and_then(|g| g.http_access_log.clone()),
+                                    payload
+                                        .global_server_config
+                                        .as_ref()
+                                        .and_then(|g| g.http_access_log.clone()),
                                 )
                                 .await;
 
@@ -1045,18 +1059,26 @@ pub async fn fetch_and_apply_config<F>(
                                 if let Ok(client) = RpcClient::new(api_config).await {
                                     let mut service = client.node_service();
                                     match service
-                                        .find_enabled_node_config_info(pb::FindEnabledNodeConfigInfoRequest {
-                                            node_id: numeric_id,
-                                        })
+                                        .find_enabled_node_config_info(
+                                            pb::FindEnabledNodeConfigInfoRequest {
+                                                node_id: numeric_id,
+                                            },
+                                        )
                                         .await
                                     {
                                         Ok(resp) => {
                                             let info = resp.into_inner();
-                                            debug!("Node enabled features: DNS={} Cache={} Thresholds={} SSH={} Sys={} DDoS={} Sched={} AccessLog={}",
-                                                info.has_dns_info, info.has_cache_info, info.has_thresholds,
+                                            debug!(
+                                                "Node enabled features: DNS={} Cache={} Thresholds={} SSH={} Sys={} DDoS={} Sched={} AccessLog={}",
+                                                info.has_dns_info,
+                                                info.has_cache_info,
+                                                info.has_thresholds,
                                                 info.has_ssh,
-                                                info.has_system_settings, info.has_d_do_s_protection,
-                                                info.has_schedule_settings, info.has_access_log_settings);
+                                                info.has_system_settings,
+                                                info.has_d_do_s_protection,
+                                                info.has_schedule_settings,
+                                                info.has_access_log_settings
+                                            );
                                             config_store.set_enabled_features(
                                                 info.has_dns_info,
                                                 info.has_cache_info,
@@ -1110,7 +1132,8 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         let (traffic_out, traffic_in, connections) = crate::metrics::METRICS.get_node_totals();
         let rpc_snap = crate::metrics::METRICS.rpc.snapshot();
         let api_success_percent = if rpc_snap.total_requests > 0 {
-            (rpc_snap.total_requests - rpc_snap.total_errors) as f64 / rpc_snap.total_requests as f64
+            (rpc_snap.total_requests - rpc_snap.total_errors) as f64
+                / rpc_snap.total_requests as f64
         } else {
             1.0
         };

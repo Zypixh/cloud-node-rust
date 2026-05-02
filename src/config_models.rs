@@ -557,9 +557,17 @@ impl NetworkAddressConfig {
         let protocol = self.protocol.as_deref().unwrap_or("");
         let port = self
             .port_range
-            .clone()
+            .as_deref()
+            .and_then(first_port_in_range)
+            .map(|p| p.to_string())
             .unwrap_or_else(|| default_port_for_protocol(protocol).to_string());
         format!("{}:{}", self.host.as_deref().unwrap_or("127.0.0.1"), port)
+    }
+
+    pub fn is_https(&self) -> bool {
+        let protocol = self.protocol.as_deref().unwrap_or("");
+        let port = self.port_range.as_deref().and_then(first_port_in_range);
+        corrected_origin_tls(protocol, port)
     }
 }
 
@@ -1864,6 +1872,8 @@ pub struct ReverseProxyConfig {
     // 0=proxyServer(CDN domain), 1=origin, 2=customized
     #[serde(rename = "requestHostType", default)]
     pub request_host_type: i8,
+    #[serde(rename = "requestHostExcludingPort", default)]
+    pub request_host_excluding_port: bool,
 }
 
 fn default_true() -> bool {
@@ -1894,10 +1904,7 @@ impl FlexibleAddr {
 
     pub fn is_https(&self) -> bool {
         match self {
-            Self::Object(obj) => {
-                let p = obj.protocol.as_deref().unwrap_or("");
-                p == "https" || p == "tls"
-            }
+            Self::Object(obj) => obj.is_https(),
             Self::String(s) => normalize_origin_addr_string(s).use_tls,
         }
     }
@@ -1916,12 +1923,11 @@ fn normalize_origin_addr_string(raw: &str) -> NormalizedOriginAddr {
     if has_uri_scheme(trimmed) {
         if let Ok(uri) = trimmed.parse::<http::Uri>() {
             let scheme = uri.scheme_str().unwrap_or("");
-            let use_tls =
-                scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("tls");
             let host = uri.host().unwrap_or("").to_string();
             let port = uri
                 .port_u16()
                 .unwrap_or_else(|| default_port_for_protocol(scheme));
+            let use_tls = corrected_origin_tls(scheme, Some(port));
             return NormalizedOriginAddr {
                 address: format_host_port(&host, port),
                 host,
@@ -1937,6 +1943,7 @@ fn normalize_origin_addr_string(raw: &str) -> NormalizedOriginAddr {
         .unwrap_or(without_scheme);
     let (host, port) = split_host_port(without_path);
     let port = port.unwrap_or_else(|| if use_tls { 443 } else { 80 });
+    let use_tls = corrected_origin_tls(if use_tls { "https" } else { "http" }, Some(port));
 
     NormalizedOriginAddr {
         address: format_host_port(&host, port),
@@ -1995,11 +2002,32 @@ fn format_host_port(host: &str, port: u16) -> String {
 }
 
 fn default_port_for_protocol(protocol: &str) -> u16 {
-    if protocol.eq_ignore_ascii_case("https") || protocol.eq_ignore_ascii_case("tls") {
+    if is_tls_origin_protocol(protocol) {
         443
     } else {
         80
     }
+}
+
+fn corrected_origin_tls(protocol: &str, port: Option<u16>) -> bool {
+    match port {
+        Some(443) => true,
+        Some(80) => false,
+        _ => is_tls_origin_protocol(protocol),
+    }
+}
+
+fn is_tls_origin_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol.to_ascii_lowercase().as_str(),
+        "https" | "https4" | "https6" | "tls" | "tls4" | "tls6"
+    )
+}
+
+fn first_port_in_range(port_range: &str) -> Option<u16> {
+    let raw = port_range.trim();
+    let first = raw.split(['-', ':']).next().unwrap_or(raw).trim();
+    first.parse::<u16>().ok()
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2021,6 +2049,16 @@ pub struct OriginConfig {
     pub request_host: String,
     #[serde(rename = "followHost", default)]
     pub follow_host: bool,
+    #[serde(rename = "followPort", default)]
+    pub follow_port: bool,
+    #[serde(rename = "http2Enabled", default)]
+    pub http2_enabled: bool,
+    #[serde(rename = "connTimeout", default)]
+    pub conn_timeout: Option<Value>,
+    #[serde(rename = "readTimeout", default)]
+    pub read_timeout: Option<Value>,
+    #[serde(rename = "idleTimeout", default)]
+    pub idle_timeout: Option<Value>,
     pub cert: Option<SSLCertConfig>,
     #[serde(rename = "tlsVerify", default)]
     pub tls_verify: Option<Value>, // Can be boolean or object or int in GoEdge
@@ -2104,6 +2142,22 @@ mod tests {
     }
 
     #[test]
+    fn flexible_addr_http_url_on_443_is_https() {
+        let addr = FlexibleAddr::String("http://127.0.0.1:443".to_string());
+
+        assert_eq!(addr.to_address(), "127.0.0.1:443");
+        assert!(addr.is_https());
+    }
+
+    #[test]
+    fn flexible_addr_https_url_on_80_is_http() {
+        let addr = FlexibleAddr::String("https://127.0.0.1:80".to_string());
+
+        assert_eq!(addr.to_address(), "127.0.0.1:80");
+        assert!(!addr.is_https());
+    }
+
+    #[test]
     fn flexible_addr_https_url_uses_default_port() {
         let addr = FlexibleAddr::String("https://127.0.0.1".to_string());
 
@@ -2130,5 +2184,22 @@ mod tests {
         };
 
         assert_eq!(addr.to_address(), "127.0.0.1:443");
+    }
+
+    #[test]
+    fn network_address_corrects_protocol_by_special_ports() {
+        let http_443 = NetworkAddressConfig {
+            protocol: Some("http".to_string()),
+            host: Some("127.0.0.1".to_string()),
+            port_range: Some("443".to_string()),
+        };
+        let https_80 = NetworkAddressConfig {
+            protocol: Some("https".to_string()),
+            host: Some("127.0.0.1".to_string()),
+            port_range: Some("80".to_string()),
+        };
+
+        assert!(http_443.is_https());
+        assert!(!https_80.is_https());
     }
 }

@@ -66,7 +66,8 @@ pub struct ProxyCTX {
     pub no_log: bool,
     pub access_log_ref: Option<crate::config_models::HTTPAccessLogRef>,
     pub global_access_log_on: bool,
-    pub global_access_log_config: Option<std::sync::Arc<crate::config_models::GlobalHTTPAccessLogConfig>>,
+    pub global_access_log_config:
+        Option<std::sync::Arc<crate::config_models::GlobalHTTPAccessLogConfig>>,
     pub access_log_module_enabled: bool,
     pub response_headers_size: usize,
     pub origin_address: String,
@@ -245,14 +246,19 @@ const MAX_HLS_SEGMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 use pingora_cache::lock::CacheLock;
 
-static CACHE_LOCK: once_cell::sync::Lazy<CacheLock> = once_cell::sync::Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(1)));
+static CACHE_LOCK: once_cell::sync::Lazy<CacheLock> =
+    once_cell::sync::Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(1)));
 
 impl EdgeProxy {
     fn is_grpc_request(session: &Session) -> bool {
         session
             .get_header("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.trim().to_ascii_lowercase().starts_with("application/grpc"))
+            .map(|v| {
+                v.trim()
+                    .to_ascii_lowercase()
+                    .starts_with("application/grpc")
+            })
             .unwrap_or(false)
     }
 
@@ -277,6 +283,33 @@ impl EdgeProxy {
             .ok()
             .and_then(|code| code.canonical_reason().map(str::to_string))
             .unwrap_or_default()
+    }
+
+    fn downstream_local_port(session: &Session) -> Option<u16> {
+        session
+            .downstream_session
+            .digest()
+            .and_then(|d| d.socket_digest.as_ref())
+            .and_then(|sd| sd.local_addr())
+            .and_then(|addr| addr.as_inet())
+            .map(|inet| inet.port())
+    }
+
+    fn maybe_strip_host_port(host: &str, strip: bool) -> String {
+        if strip {
+            crate::lb_factory::strip_addr_port(host)
+        } else {
+            host.to_string()
+        }
+    }
+
+    fn replace_addr_port(addr: &str, port: u16) -> String {
+        let host = crate::lb_factory::strip_addr_port(addr);
+        if host.contains(':') && !host.starts_with('[') {
+            format!("[{}]:{}", host, port)
+        } else {
+            format!("{}:{}", host, port)
+        }
     }
 
     fn apply_template_modifier(value: String, modifier: &str) -> String {
@@ -2031,9 +2064,11 @@ impl EdgeProxy {
         body: &[u8],
         config: &crate::config_models::HTTPHTMLOptimizationConfig,
     ) -> anyhow::Result<Vec<u8>> {
-        static RE_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<!--[\s\S]*?-->").unwrap());
+        static RE_COMMENT: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"<!--[\s\S]*?-->").unwrap());
         static RE_BETWEEN_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">\s+<").unwrap());
-        static RE_MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t\r\n]{2,}").unwrap());
+        static RE_MULTI_SPACE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"[ \t\r\n]{2,}").unwrap());
 
         let mut text = String::from_utf8(body.to_vec())?;
         if !config.keep_comments {
@@ -2058,9 +2093,11 @@ impl EdgeProxy {
     }
 
     fn minify_css(body: &[u8]) -> anyhow::Result<Vec<u8>> {
-        static RE_COMMENTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
+        static RE_COMMENTS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
         static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
-        static RE_TOKENS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*([{}:;,>])\s*").unwrap());
+        static RE_TOKENS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\s*([{}:;,>])\s*").unwrap());
 
         let mut text = String::from_utf8(body.to_vec())?;
         text = RE_COMMENTS.replace_all(&text, "").to_string();
@@ -2070,8 +2107,10 @@ impl EdgeProxy {
     }
 
     fn minify_js(body: &[u8]) -> anyhow::Result<Vec<u8>> {
-        static RE_BLOCK_COMMENTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
-        static RE_LINE_COMMENTS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*//.*$").unwrap());
+        static RE_BLOCK_COMMENTS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
+        static RE_LINE_COMMENTS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?m)^\s*//.*$").unwrap());
         static RE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
         let mut text = String::from_utf8(body.to_vec())?;
@@ -2356,8 +2395,15 @@ impl EdgeProxy {
             } => {
                 warn!(
                     "WAF_BLOCK: IP={} host={} method={} uri={} status={} policy_id={} group_id={} action={} tags={:?}",
-                    ip, ctx.host, session.req_header().method, session.req_header().uri,
-                    status, matched.policy_id, matched.group_id, matched.action_code, matched.tags
+                    ip,
+                    ctx.host,
+                    session.req_header().method,
+                    session.req_header().uri,
+                    status,
+                    matched.policy_id,
+                    matched.group_id,
+                    matched.action_code,
+                    matched.tags
                 );
                 let mut final_timeout = matched.timeout_secs.unwrap_or(300);
                 let mut scope = matched.scope.as_deref().unwrap_or("server");
@@ -2646,7 +2692,10 @@ impl EdgeProxy {
         // blocks legitimate traffic (e.g. 10+ requests/min triggers ECF).
         // These defenses belong at the TCP connection accept layer.
 
-        if self.enforce_uam(session, ctx, &ctx.client_ip_str.clone()).await? {
+        if self
+            .enforce_uam(session, ctx, &ctx.client_ip_str.clone())
+            .await?
+        {
             return Ok((true, None));
         }
 
@@ -2662,7 +2711,9 @@ impl EdgeProxy {
                 let mut buffered = Vec::with_capacity(content_length);
                 while let Some(chunk) = session.read_request_body().await? {
                     buffered.extend_from_slice(&chunk);
-                    if buffered.len() >= content_length { break; }
+                    if buffered.len() >= content_length {
+                        break;
+                    }
                 }
                 ctx.request_body = buffered;
             }
@@ -2687,7 +2738,11 @@ impl EdgeProxy {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("");
                         waf_match = crate::firewall::check_region_deny(
-                            region, ctx.client_ip, policy.id, &policy.deny_country_html, ua,
+                            region,
+                            ctx.client_ip,
+                            policy.id,
+                            &policy.deny_country_html,
+                            ua,
                         );
                     }
                     if waf_match.is_none() && policy.max_request_body_size > 0 {
@@ -2704,20 +2759,34 @@ impl EdgeProxy {
                                     status: 413,
                                     body: "Request Entity Too Large".to_string(),
                                 },
-                                policy_id: policy.id, group_id: 0, set_id: 0,
+                                policy_id: policy.id,
+                                group_id: 0,
+                                set_id: 0,
                                 action_code: "block".to_string(),
-                                timeout_secs: Some(3600), max_timeout_secs: None,
-                                life_seconds: None, max_fails: 0, fail_block_timeout: 0,
-                                scope: None, block_c_class: false, use_local_firewall: false,
-                                next_group_id: None, next_set_id: None, allow_scope: None,
-                                tags: vec![], ip_list_id: 0, event_level: "error".to_string(),
-                                block_options: None, page_options: None,
-                                captcha_options: None, js_cookie_options: None,
+                                timeout_secs: Some(3600),
+                                max_timeout_secs: None,
+                                life_seconds: None,
+                                max_fails: 0,
+                                fail_block_timeout: 0,
+                                scope: None,
+                                block_c_class: false,
+                                use_local_firewall: false,
+                                next_group_id: None,
+                                next_set_id: None,
+                                allow_scope: None,
+                                tags: vec![],
+                                ip_list_id: 0,
+                                event_level: "error".to_string(),
+                                block_options: None,
+                                page_options: None,
+                                captcha_options: None,
+                                js_cookie_options: None,
                             });
                         }
                     }
                     if waf_match.is_none() {
-                        waf_match = crate::firewall::evaluate_policy(policy, session, &ctx.request_body);
+                        waf_match =
+                            crate::firewall::evaluate_policy(policy, session, &ctx.request_body);
                     }
                 }
             }
@@ -2732,13 +2801,19 @@ impl EdgeProxy {
                                 .and_then(|v| v.to_str().ok())
                                 .unwrap_or("");
                             waf_match = crate::firewall::check_region_deny(
-                                region, ctx.client_ip, gp.id, &gp.deny_country_html, ua,
+                                region,
+                                ctx.client_ip,
+                                gp.id,
+                                &gp.deny_country_html,
+                                ua,
                             );
                             if waf_match.is_some() {
                                 break;
                             }
                         }
-                        if let Some(action) = crate::firewall::evaluate_policy(gp, session, &ctx.request_body) {
+                        if let Some(action) =
+                            crate::firewall::evaluate_policy(gp, session, &ctx.request_body)
+                        {
                             waf_match = Some(action);
                             break;
                         }
@@ -2753,7 +2828,12 @@ impl EdgeProxy {
             ctx.waf_set_id = matched.set_id;
             waf_action = Some(matched.action_code.clone());
             ctx.waf_action = waf_action.clone();
-            self.maybe_report_firewall_event(ctx, matched.policy_id, matched.group_id, matched.set_id);
+            self.maybe_report_firewall_event(
+                ctx,
+                matched.policy_id,
+                matched.group_id,
+                matched.set_id,
+            );
 
             if matched.action_code == "record_ip_white" {
                 self.waf_state.unblock_ip(
@@ -2781,7 +2861,10 @@ impl EdgeProxy {
                     matched.use_local_firewall,
                 );
             }
-            if self.respond_waf_action(session, ctx, matched.clone(), ctx.client_ip_str.clone()).await? {
+            if self
+                .respond_waf_action(session, ctx, matched.clone(), ctx.client_ip_str.clone())
+                .await?
+            {
                 return Ok((true, waf_action));
             }
         }
@@ -2793,7 +2876,9 @@ impl EdgeProxy {
             let site_cc_policy = web.cc_policy.clone();
             let site_server_id = server.id.unwrap_or(0);
             if let Some(cc) = site_cc_policy.as_ref()
-                && self.apply_cc_policy(session, ctx, cc, site_server_id).await?
+                && self
+                    .apply_cc_policy(session, ctx, cc, site_server_id)
+                    .await?
             {
                 return Ok((true, waf_action));
             }
@@ -2844,7 +2929,8 @@ impl ProxyHttp for EdgeProxy {
         // Always enable access logging — the management plane's has_access_log_settings
         // flag indicates whether custom field filters exist, not whether logging is on.
         ctx.access_log_module_enabled = true;
-        ctx.global_access_log_on = ctx.global_access_log_config
+        ctx.global_access_log_on = ctx
+            .global_access_log_config
             .as_ref()
             .map(|cfg| cfg.is_on)
             .unwrap_or(true);
@@ -2852,7 +2938,12 @@ impl ProxyHttp for EdgeProxy {
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
         ctx.is_on = hot_path.is_on;
         if !ctx.is_on {
-            warn!("BLOCKED: Node is DISABLED (isOn=false), rejecting {} {} from IP={}", session.req_header().method, session.req_header().uri, ctx.client_ip_str);
+            warn!(
+                "BLOCKED: Node is DISABLED (isOn=false), rejecting {} {} from IP={}",
+                session.req_header().method,
+                session.req_header().uri,
+                ctx.client_ip_str
+            );
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
 
@@ -2994,8 +3085,7 @@ impl ProxyHttp for EdgeProxy {
                         let is_options =
                             session.req_header().method == http::method::Method::OPTIONS;
                         if is_options {
-                            let mut resp =
-                                pingora_http::ResponseHeader::build(204, None).unwrap();
+                            let mut resp = pingora_http::ResponseHeader::build(204, None).unwrap();
                             Self::set_cors_headers(&mut resp, session, cors);
                             // Ensure no body-related headers on 204
                             resp.remove_header("content-length");
@@ -3003,12 +3093,16 @@ impl ProxyHttp for EdgeProxy {
                             info!(
                                 "OPTIONS preflight: host='{}' origin='{}' resp_headers={:?}",
                                 host,
-                                session.get_header("origin").and_then(|v| v.to_str().ok()).unwrap_or(""),
-                                resp.headers.iter().map(|(n, v)| format!("{}={}", n, v.to_str().unwrap_or("?"))).collect::<Vec<_>>()
+                                session
+                                    .get_header("origin")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or(""),
+                                resp.headers
+                                    .iter()
+                                    .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap_or("?")))
+                                    .collect::<Vec<_>>()
                             );
-                            session
-                                .write_response_header(Box::new(resp), true)
-                                .await?;
+                            session.write_response_header(Box::new(resp), true).await?;
                             ctx.response_status = 204;
                             return Ok(true);
                         }
@@ -3070,7 +3164,7 @@ impl ProxyHttp for EdgeProxy {
 
         // Record request start for global metrics
         ctx.request_id = crate::logging::next_request_id();
-        
+
         let sid = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
         if sid > 0 && ctx.server_metrics.is_none() {
             ctx.server_metrics = Some(crate::metrics::record::get_or_create(sid));
@@ -3113,7 +3207,10 @@ impl ProxyHttp for EdgeProxy {
         ) {
             warn!(
                 "BLOCKED: IP {} is blocked by WAF state (host={}, method={}, uri={})",
-                ctx.client_ip_str, host, session.req_header().method, session.req_header().uri
+                ctx.client_ip_str,
+                host,
+                session.req_header().method,
+                session.req_header().uri
             );
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
@@ -3121,7 +3218,9 @@ impl ProxyHttp for EdgeProxy {
         // Check if cache is configured for this server — if so, defer heavy WAF
         // to upstream_peer (runs only on cache MISS, saving ~50 lines of CPU work
         // on every cache HIT).
-        let cache_configured = ctx.server.as_ref()
+        let cache_configured = ctx
+            .server
+            .as_ref()
             .and_then(|s| s.web.as_ref())
             .and_then(|w| w.cache.as_ref())
             .map(|c| c.is_on)
@@ -3131,7 +3230,9 @@ impl ProxyHttp for EdgeProxy {
         if cache_configured {
             ctx.waf_deferred = true;
         } else {
-            let (blocked, _action) = self.run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies).await?;
+            let (blocked, _action) = self
+                .run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies)
+                .await?;
             if blocked {
                 return Ok(true);
             }
@@ -3179,8 +3280,8 @@ impl ProxyHttp for EdgeProxy {
         e: &Error,
         ctx: &mut Self::CTX,
     ) -> FailToProxy {
-        let is_upstream_http_status = matches!(e.esource(), ErrorSource::Upstream)
-            && matches!(e.etype(), HTTPStatus(_));
+        let is_upstream_http_status =
+            matches!(e.esource(), ErrorSource::Upstream) && matches!(e.etype(), HTTPStatus(_));
         let code = match e.etype() {
             HTTPStatus(code) => *code,
             _ => match e.esource() {
@@ -3195,9 +3296,12 @@ impl ProxyHttp for EdgeProxy {
 
         if code > 0 {
             ctx.response_status = code;
-            if matches!(e.esource(), ErrorSource::Upstream) {
+            if is_upstream_http_status {
                 ctx.origin_status = code as i32;
-                info!("ACCESS_LOG: fail_to_proxy set origin_status={} (upstream error)", ctx.origin_status);
+                info!(
+                    "ACCESS_LOG: fail_to_proxy preserved upstream origin_status={}",
+                    ctx.origin_status
+                );
             }
             let write_result = if is_upstream_http_status {
                 // Preserve the upstream status code instead of treating a real upstream 5xx
@@ -3209,10 +3313,7 @@ impl ProxyHttp for EdgeProxy {
                     .map(|_| ())
             };
             if let Err(write_err) = write_result {
-                error!(
-                    "failed to send error response to downstream: {}",
-                    write_err
-                );
+                error!("failed to send error response to downstream: {}", write_err);
             }
         }
 
@@ -3225,7 +3326,9 @@ impl ProxyHttp for EdgeProxy {
     fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, e: &Error) -> bool {
         match e.etype() {
             // Silence common downstream disconnection errors to reduce log noise during load tests
-            pingora::ErrorType::WriteError | pingora::ErrorType::ReadError | pingora::ErrorType::ConnectionClosed => {
+            pingora::ErrorType::WriteError
+            | pingora::ErrorType::ReadError
+            | pingora::ErrorType::ConnectionClosed => {
                 if matches!(e.esource(), pingora::ErrorSource::Downstream) {
                     return true;
                 }
@@ -3245,13 +3348,16 @@ impl ProxyHttp for EdgeProxy {
         if ctx.waf_deferred {
             let hot_path = self.config.get_hot_path_snapshot_sync();
             let host = ctx.host.clone();
-            let (blocked, _action) = self.run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies).await?;
+            let (blocked, _action) = self
+                .run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies)
+                .await?;
             if blocked {
                 return Err(Error::new(HTTPStatus(403)));
             }
         }
 
-        let (node_level, force_ln, bypass_l2, ln_method, node_cluster_id) = self.config.get_upstream_peer_context_sync();
+        let (node_level, force_ln, bypass_l2, ln_method, node_cluster_id) =
+            self.config.get_upstream_peer_context_sync();
         ctx.node_level = node_level;
 
         let mut target_peer = None;
@@ -3322,49 +3428,87 @@ impl ProxyHttp for EdgeProxy {
         }
 
         if let Some(peer) = target_peer {
-            let peer_addr = peer.to_string();
+            let mut peer_addr = peer.to_string();
             let backend_ext = peer.ext.get::<crate::lb_factory::BackendExtension>();
             let is_tls = backend_ext
                 .map(|e| e.use_tls)
                 .unwrap_or(peer_addr.contains("443"));
 
-            let host = if let Some(ext) = backend_ext {
+            if let Some(ext) = backend_ext
+                && ext.follow_port
+            {
+                if let Some(server_port) = Self::downstream_local_port(session) {
+                    peer_addr = Self::replace_addr_port(
+                        if ext.origin_host.is_empty() {
+                            &peer_addr
+                        } else {
+                            &ext.origin_host
+                        },
+                        server_port,
+                    );
+                }
+            }
+
+            let client_host = session
+                .get_header("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("localhost"))
+                .to_string();
+
+            let (sni_host, host_override) = if let Some(ext) = backend_ext {
                 if !ext.host.is_empty() {
                     // Per-origin requestHost: highest priority
-                    ctx.origin_host = ext.host.clone();
-                    ext.host.clone()
+                    let host =
+                        Self::maybe_strip_host_port(&ext.host, ext.request_host_excluding_port);
+                    (host.clone(), Some(host))
                 } else if !ext.rp_host.is_empty() {
-                    // ReverseProxy-level requestHost (when requestHostType == "customized")
-                    ctx.origin_host = ext.rp_host.clone();
-                    ext.rp_host.clone()
+                    // ReverseProxy-level requestHost or requestHostType=origin.
+                    let host =
+                        Self::maybe_strip_host_port(&ext.rp_host, ext.request_host_excluding_port);
+                    (host.clone(), Some(host))
                 } else if ext.follow_host {
                     // follow_host=true: forward client's Host header to origin
-                    session
-                        .get_header("host")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("localhost"))
-                        .to_string()
+                    let host =
+                        Self::maybe_strip_host_port(&client_host, ext.request_host_excluding_port);
+                    let override_host = if ext.request_host_excluding_port {
+                        Some(host.clone())
+                    } else {
+                        None
+                    };
+                    (host, override_host)
                 } else {
-                    // follow_host=false: use origin address hostname as SNI
-                    peer_addr.split(':').next().unwrap_or(&peer_addr).to_string()
+                    // requestHostType=proxyServer: keep the downstream Host, matching GoEdge.
+                    let host =
+                        Self::maybe_strip_host_port(&client_host, ext.request_host_excluding_port);
+                    let override_host = if ext.request_host_excluding_port {
+                        Some(host.clone())
+                    } else {
+                        None
+                    };
+                    (host, override_host)
                 }
             } else {
                 // No backend extension: forward client's Host header
-                session
-                    .get_header("host")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("localhost"))
-                    .to_string()
+                (client_host, None)
             };
 
+            ctx.origin_host = host_override.unwrap_or_default();
             debug!(
-                "Selected upstream: {} (TLS={}) for SNI: {}",
-                peer_addr, is_tls, host
+                "Selected upstream: connect_addr={} TLS={} SNI={} HostOverride={} h2_enabled={}",
+                peer_addr,
+                is_tls,
+                sni_host,
+                if ctx.origin_host.is_empty() {
+                    "<original>"
+                } else {
+                    &ctx.origin_host
+                },
+                backend_ext.map(|e| e.http2_enabled).unwrap_or(false)
             );
             ctx.origin_address = peer_addr.clone();
             info!("ACCESS_LOG: origin_address set to '{}'", ctx.origin_address);
 
-            let mut peer_obj = HttpPeer::new(peer_addr, is_tls, host);
+            let mut peer_obj = HttpPeer::new(peer_addr, is_tls, sni_host);
 
             // --- OPTIMIZATION: L7 TCP & Protocol ---
             // Pingora sets nodelay by default.
@@ -3377,18 +3521,24 @@ impl ProxyHttp for EdgeProxy {
                 user_timeout: std::time::Duration::from_secs(0),
             });
 
-            // Default 10s idle timeout to avoid stale connections in pool
-            // (origin/L2 may close keepalive sooner than 60s)
-            peer_obj.options.idle_timeout = Some(std::time::Duration::from_secs(60));
-            // Read and write timeout (to prevent hanging connections dragging down performance)
-            peer_obj.options.read_timeout = Some(std::time::Duration::from_secs(60));
-            peer_obj.options.write_timeout = Some(std::time::Duration::from_secs(60));
-            // Connection timeout (L1 -> L2 or L2 -> Origin)
-            peer_obj.options.connection_timeout = Some(std::time::Duration::from_secs(10));
+            let connection_timeout = backend_ext
+                .and_then(|e| e.connection_timeout)
+                .unwrap_or_else(|| std::time::Duration::from_secs(15));
+            let idle_timeout = backend_ext
+                .and_then(|e| e.idle_timeout)
+                .unwrap_or_else(|| std::time::Duration::from_secs(120));
+
+            peer_obj.options.idle_timeout = Some(idle_timeout);
+            peer_obj.options.read_timeout = backend_ext.and_then(|e| e.read_timeout);
+            peer_obj.options.write_timeout = None;
+            peer_obj.options.connection_timeout = Some(connection_timeout);
 
             if ctx.is_grpc && Self::is_grpc_request(session) {
                 // Force ALPN to h2 ONLY for actual gRPC requests
                 peer_obj.options.alpn = pingora_core::protocols::ALPN::H2;
+            } else if is_tls && backend_ext.map(|e| e.http2_enabled).unwrap_or(false) {
+                // GoEdge only enables upstream H2 when the HTTPS origin explicitly supports it.
+                peer_obj.options.alpn = pingora_core::protocols::ALPN::H2H1;
             }
 
             if let Some(ext) = backend_ext {
@@ -3449,7 +3599,10 @@ impl ProxyHttp for EdgeProxy {
 
                 // Deferred GeoIP + UA analysis — off hot path, runs after response sent
                 if ctx.analyzed.is_none() && !user_agent.is_empty() {
-                    ctx.analyzed = Some(crate::metrics::analyzer::analyze_request(ctx.client_ip, user_agent));
+                    ctx.analyzed = Some(crate::metrics::analyzer::analyze_request(
+                        ctx.client_ip,
+                        user_agent,
+                    ));
                     crate::client_agent::maybe_report_client_agent(
                         (*self.api_config).clone(),
                         ctx.client_ip_str.clone(),
@@ -3501,7 +3654,8 @@ impl ProxyHttp for EdgeProxy {
             && cache.is_on
         {
             let mut matched_ref = None;
-            let mut matched_policy: Option<std::sync::Arc<crate::config_models::HTTPCachePolicy>> = None;
+            let mut matched_policy: Option<std::sync::Arc<crate::config_models::HTTPCachePolicy>> =
+                None;
             for cache_ref in &cache.cache_refs {
                 if !cache_ref.is_on {
                     continue;
@@ -3681,7 +3835,9 @@ impl ProxyHttp for EdgeProxy {
                     session.req_header_mut().headers.remove("if-modified-since");
                 }
 
-                session.cache.enable(CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
+                session
+                    .cache
+                    .enable(CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
             } else {
                 tracing::debug!(
                     "No cache rule matched for request: {}",
@@ -3814,14 +3970,22 @@ impl ProxyHttp for EdgeProxy {
                         .insert(name.to_string(), value_str.to_string());
                 }
             }
-            if ctx.cache_policy.as_ref().map(|p| p.add_status_header).unwrap_or(true) {
+            if ctx
+                .cache_policy
+                .as_ref()
+                .map(|p| p.add_status_header)
+                .unwrap_or(true)
+            {
                 ctx.response_headers
                     .insert("x-cache".to_string(), "HIT".to_string());
-                upstream_response
-                    .insert_header("x-cache", "HIT")
-                    .unwrap();
+                upstream_response.insert_header("x-cache", "HIT").unwrap();
             }
-            if ctx.cache_policy.as_ref().map(|p| p.add_age_header).unwrap_or(false) {
+            if ctx
+                .cache_policy
+                .as_ref()
+                .map(|p| p.add_age_header)
+                .unwrap_or(false)
+            {
                 if let Some(date_val) = upstream_response.headers.get("date") {
                     if let Ok(date_str) = date_val.to_str() {
                         if let Ok(parsed) = chrono::DateTime::parse_from_rfc2822(date_str) {
@@ -3831,9 +3995,7 @@ impl ProxyHttp for EdgeProxy {
                             let age_str = age.to_string();
                             ctx.response_headers
                                 .insert("age".to_string(), age_str.clone());
-                            upstream_response
-                                .insert_header("age", age_str)
-                                .unwrap();
+                            upstream_response.insert_header("age", age_str).unwrap();
                         }
                     }
                 }
@@ -3942,20 +4104,20 @@ impl ProxyHttp for EdgeProxy {
 
         let mut matched_outbound = None;
         if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
-        for gp in global_policies.iter() {
-            if !gp.is_on {
-                continue;
+            for gp in global_policies.iter() {
+                if !gp.is_on {
+                    continue;
+                }
+                if let Some(action) = crate::firewall::evaluate_outbound_policy(
+                    gp,
+                    session,
+                    &ctx.request_body,
+                    &outbound_ctx,
+                ) {
+                    matched_outbound = Some(action);
+                    break;
+                }
             }
-            if let Some(action) = crate::firewall::evaluate_outbound_policy(
-                gp,
-                session,
-                &ctx.request_body,
-                &outbound_ctx,
-            ) {
-                matched_outbound = Some(action);
-                break;
-            }
-        }
         } // end if let Some(ref global_policies)
         if matched_outbound.is_none() {
             if let Some(server) = &ctx.server
@@ -4014,7 +4176,12 @@ impl ProxyHttp for EdgeProxy {
         }
 
         // X-Cache header — gated by addStatusHeader on cache policy
-        if ctx.cache_policy.as_ref().map(|p| p.add_status_header).unwrap_or(true) {
+        if ctx
+            .cache_policy
+            .as_ref()
+            .map(|p| p.add_status_header)
+            .unwrap_or(true)
+        {
             let phase = session.cache.phase();
             let x_cache = if !session.cache.enabled() && !session.cache.bypassing() {
                 "BYPASS".to_string()
@@ -4088,7 +4255,11 @@ impl ProxyHttp for EdgeProxy {
             info!(
                 "UPSTREAM: keeping original Host header (origin_address={}, follow_host={})",
                 ctx.origin_address,
-                upstream_request.headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("?")
+                upstream_request
+                    .headers
+                    .get("host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("?")
             );
         }
 
@@ -4136,13 +4307,19 @@ impl ProxyHttp for EdgeProxy {
 
         // Debug: log full upstream request for troubleshooting (after policy application)
         {
-            let headers_str: Vec<String> = upstream_request.headers.iter()
+            let headers_str: Vec<String> = upstream_request
+                .headers
+                .iter()
                 .map(|(n, v)| format!("{}: {}", n, v.to_str().unwrap_or("?")))
                 .collect();
             info!(
                 "UPSTREAM_REQUEST: {} {} {:?}, headers=[{}]",
                 upstream_request.method,
-                upstream_request.raw_path().iter().map(|b| *b as char).collect::<String>(),
+                upstream_request
+                    .raw_path()
+                    .iter()
+                    .map(|b| *b as char)
+                    .collect::<String>(),
                 upstream_request.version,
                 headers_str.join("; ")
             );
@@ -4364,20 +4541,20 @@ impl ProxyHttp for EdgeProxy {
 
                 let mut matched_outbound = None;
                 if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
-                for gp in global_policies.iter() {
-                    if !gp.is_on {
-                        continue;
+                    for gp in global_policies.iter() {
+                        if !gp.is_on {
+                            continue;
+                        }
+                        if let Some(action) = crate::firewall::evaluate_outbound_policy(
+                            gp,
+                            session,
+                            &ctx.request_body,
+                            &outbound_ctx,
+                        ) {
+                            matched_outbound = Some(action);
+                            break;
+                        }
                     }
-                    if let Some(action) = crate::firewall::evaluate_outbound_policy(
-                        gp,
-                        session,
-                        &ctx.request_body,
-                        &outbound_ctx,
-                    ) {
-                        matched_outbound = Some(action);
-                        break;
-                    }
-                }
                 }
                 if matched_outbound.is_none() {
                     if let Some(server) = &ctx.server
@@ -4452,7 +4629,11 @@ impl ProxyHttp for EdgeProxy {
                 .unwrap_or(0);
             let host = session.req_header().uri.host().unwrap_or("");
 
-            let allow_chunked = ctx.cache_policy.as_ref().map(|p| p.allow_chunked_encoding).unwrap_or(false);
+            let allow_chunked = ctx
+                .cache_policy
+                .as_ref()
+                .map(|p| p.allow_chunked_encoding)
+                .unwrap_or(false);
             let is_chunked = resp
                 .headers
                 .get("transfer-encoding")
@@ -4461,7 +4642,11 @@ impl ProxyHttp for EdgeProxy {
                 .unwrap_or(false);
             let skip_size_checks = allow_chunked && is_chunked && body_size == 0;
 
-            let force_partial = ctx.cache_policy.as_ref().map(|p| p.force_partial_content).unwrap_or(false);
+            let force_partial = ctx
+                .cache_policy
+                .as_ref()
+                .map(|p| p.force_partial_content)
+                .unwrap_or(false);
             if !should_cache_response(
                 resp.status.as_u16(),
                 cache_ref,
@@ -4472,7 +4657,8 @@ impl ProxyHttp for EdgeProxy {
                 force_partial,
                 skip_size_checks,
             ) {
-                if resp.status.as_u16() == 206 && (cache_ref.allow_partial_content || force_partial) {
+                if resp.status.as_u16() == 206 && (cache_ref.allow_partial_content || force_partial)
+                {
                 } else {
                     return Ok(pingora_cache::RespCacheable::Uncacheable(
                         pingora_cache::NoCacheReason::Custom("PolicyMismatch"),
