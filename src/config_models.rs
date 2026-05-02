@@ -1857,6 +1857,12 @@ pub struct ReverseProxyConfig {
         deserialize_with = "deserialize_null_default"
     )]
     pub backup_origins: Vec<OriginConfig>,
+    // GoEdge: global request host override (used when requestHostType == "customized")
+    #[serde(rename = "requestHost", default, deserialize_with = "deserialize_null_default")]
+    pub request_host: String,
+    // GoEdge: "origin" | "customized" | etc.
+    #[serde(rename = "requestHostType", default, deserialize_with = "deserialize_null_default")]
+    pub request_host_type: String,
 }
 
 fn default_true() -> bool {
@@ -1910,9 +1916,9 @@ pub struct OriginConfig {
     pub weight: u32,
     #[serde(rename = "healthCheck", alias = "HealthCheck")]
     pub health_check: Option<HealthCheckConfig>,
-    // New fields for TLS and Host
-    #[serde(default, deserialize_with = "deserialize_null_default")]
-    pub host: String,
+    // GoEdge uses "requestHost" for per-origin custom Host header override
+    #[serde(rename = "requestHost", alias = "host", default, deserialize_with = "deserialize_null_default")]
+    pub request_host: String,
     #[serde(rename = "followHost", default)]
     pub follow_host: bool,
     pub cert: Option<SSLCertConfig>,

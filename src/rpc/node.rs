@@ -792,6 +792,7 @@ pub async fn fetch_and_apply_config<F>(
                                         ext.insert(crate::lb_factory::BackendExtension {
                                             use_tls: false,
                                             host: String::new(),
+                                            rp_host: String::new(),
                                             follow_host: false,
                                             tls_verify: true,
                                             client_cert: None,

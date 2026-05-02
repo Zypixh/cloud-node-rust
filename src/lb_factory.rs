@@ -17,7 +17,8 @@ use tracing::{debug, warn};
 #[derive(Clone, Debug)]
 pub struct BackendExtension {
     pub use_tls: bool,
-    pub host: String, // Custom SNI host
+    pub host: String, // Per-origin custom host (origin.requestHost)
+    pub rp_host: String, // Reverse-proxy-level custom host (reverseProxy.requestHost)
     pub follow_host: bool,
     pub tls_verify: bool, // true = strict/auto, false = none
     pub client_cert: Option<crate::config_models::SSLCertConfig>,
@@ -36,6 +37,13 @@ pub fn build_lb(
 ) -> (Arc<LoadBalancer<RoundRobin>>, bool) {
     let mut endpoints = Vec::new();
     let mut has_health_check = false;
+
+    // GoEdge: reverseProxy-level requestHost is used only when type is "customized"
+    let rp_host = if rp_cfg.request_host_type == "customized" && !rp_cfg.request_host.is_empty() {
+        rp_cfg.request_host.clone()
+    } else {
+        String::new()
+    };
 
     // Build Origin Pool (Direct to primary/backup origins)
     for origin in &rp_cfg.primary_origins {
@@ -71,7 +79,8 @@ pub fn build_lb(
 
                 ext.insert(BackendExtension {
                     use_tls: addr.is_https(),
-                    host: origin.host.clone(),
+                    host: origin.request_host.clone(),
+                    rp_host: rp_host.clone(),
                     follow_host: origin.follow_host,
                     tls_verify,
                     client_cert: origin.cert.clone(),
@@ -117,7 +126,8 @@ pub fn build_lb(
 
                     ext.insert(BackendExtension {
                         use_tls: addr.is_https(),
-                        host: origin.host.clone(),
+                        host: origin.request_host.clone(),
+                        rp_host: rp_host.clone(),
                         follow_host: origin.follow_host,
                         tls_verify,
                         client_cert: origin.cert.clone(),
@@ -255,6 +265,7 @@ pub fn build_parent_lb(
                 ext.insert(BackendExtension {
                     use_tls: true, // L1 -> L2 always TLS by default in GoEdge
                     host: String::new(),
+                    rp_host: String::new(),
                     follow_host: false,
                     tls_verify: false,
                     client_cert: None,

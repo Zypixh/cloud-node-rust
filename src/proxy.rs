@@ -3369,10 +3369,13 @@ impl ProxyHttp for EdgeProxy {
 
             let host = if let Some(ext) = backend_ext {
                 if !ext.host.is_empty() {
-                    // Custom host: override client Host with configured value
-                    // Store for upstream_request_filter to set Host header
+                    // Per-origin requestHost: highest priority
                     ctx.origin_host = ext.host.clone();
                     ext.host.clone()
+                } else if !ext.rp_host.is_empty() {
+                    // ReverseProxy-level requestHost (when requestHostType == "customized")
+                    ctx.origin_host = ext.rp_host.clone();
+                    ext.rp_host.clone()
                 } else if ext.follow_host {
                     // follow_host=true: forward client's Host header to origin
                     session
