@@ -2869,6 +2869,14 @@ impl ProxyHttp for EdgeProxy {
 
         // Single lock acquisition for hot_path + server + upstream
         let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
+        info!(
+            "REQUEST_FILTER: method={} host='{}' server_found={} lb_found={} uri='{}'",
+            session.req_header().method,
+            host,
+            server.is_some(),
+            upstream.is_some(),
+            session.req_header().uri
+        );
         ctx.server = server;
         ctx.lb = upstream;
         // Cache these in ctx to avoid config lock acquisitions in response_filter / body_filter
@@ -2993,7 +3001,7 @@ impl ProxyHttp for EdgeProxy {
         }
 
         if ctx.server.is_none() {
-            debug!(
+            info!(
                 "404 Not Found for host: '{}'. Registered hosts: {:?}",
                 host,
                 self.config.get_all_hosts_sync()
@@ -3032,6 +3040,15 @@ impl ProxyHttp for EdgeProxy {
                             let mut resp =
                                 pingora_http::ResponseHeader::build(204, None).unwrap();
                             Self::set_cors_headers(&mut resp, session, cors);
+                            // Ensure no body-related headers on 204
+                            resp.remove_header("content-length");
+                            resp.remove_header("transfer-encoding");
+                            info!(
+                                "OPTIONS preflight: host='{}' origin='{}' resp_headers={:?}",
+                                host,
+                                session.get_header("origin").and_then(|v| v.to_str().ok()).unwrap_or(""),
+                                resp.headers.iter().map(|(n, v)| format!("{}={}", n, v.to_str().unwrap_or("?"))).collect::<Vec<_>>()
+                            );
                             session
                                 .write_response_header(Box::new(resp), true)
                                 .await?;
@@ -4096,9 +4113,19 @@ impl ProxyHttp for EdgeProxy {
         // Override Host header with origin-specific hostname if configured.
         // Pingora's HttpPeer only sets TLS SNI, not the HTTP Host header.
         if !ctx.origin_host.is_empty() {
+            info!(
+                "UPSTREAM: overriding Host header to '{}' (origin_address={})",
+                ctx.origin_host, ctx.origin_address
+            );
             upstream_request
                 .insert_header("host", ctx.origin_host.clone())
                 .unwrap();
+        } else {
+            info!(
+                "UPSTREAM: keeping original Host header (origin_address={}, follow_host={})",
+                ctx.origin_address,
+                upstream_request.headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("?")
+            );
         }
 
         upstream_request.remove_header("x-cloud-resolved-real-ip");
