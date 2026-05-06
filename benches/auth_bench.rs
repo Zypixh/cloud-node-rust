@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use cloud_node_rust::auth::{generate_token, verify_url_auth, UrlAuthConfig};
+use cloud_node_rust::auth::{UrlAuthConfig, generate_token, verify_url_auth};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn bench_generate_token(c: &mut Criterion) {
@@ -7,14 +7,16 @@ fn bench_generate_token(c: &mut Criterion) {
 
     group.bench_function("generate_token_typical", |b| {
         b.iter(|| {
-            generate_token(black_box("node-abc123"), black_box("secret-key-32bytes!!!"), black_box("edge"))
+            generate_token(
+                black_box("node-abc123"),
+                black_box("secret-key-32bytes!!!"),
+                black_box("edge"),
+            )
         })
     });
 
     group.bench_function("generate_token_short_secret", |b| {
-        b.iter(|| {
-            generate_token(black_box("n1"), black_box("sh0rt"), black_box("edge"))
-        })
+        b.iter(|| generate_token(black_box("n1"), black_box("sh0rt"), black_box("edge")))
     });
 
     group.bench_function("generate_token_long_inputs", |b| {
@@ -31,7 +33,10 @@ fn bench_generate_token(c: &mut Criterion) {
 }
 
 fn bench_url_auth(c: &mut Criterion) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let config = UrlAuthConfig {
         auth_type: "A".to_string(),
         secret: "very-secret-key-1234567890".to_string(),
@@ -46,9 +51,7 @@ fn bench_url_auth(c: &mut Criterion) {
     let mut group = c.benchmark_group("url_auth_verification");
 
     group.bench_function("verify_type_a", |b| {
-        b.iter(|| {
-            verify_url_auth(black_box(path), black_box(&query), black_box(&config))
-        })
+        b.iter(|| verify_url_auth(black_box(path), black_box(&query), black_box(&config)))
     });
 
     group.finish();

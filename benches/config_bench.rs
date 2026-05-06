@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use cloud_node_rust::config::ConfigStore;
 use cloud_node_rust::config_models::ServerConfig;
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -24,13 +24,41 @@ fn bench_config_lookup(c: &mut Criterion) {
         let all_servers: Vec<Arc<ServerConfig>> = servers.values().cloned().collect();
         store
             .update_config(
-                1, 1, 1, all_servers, servers, HashMap::new(), HashMap::new(),
-                vec![], vec![], vec![], 1, true, false, HashMap::new(),
-                false, false, String::new(), HashMap::new(), None,
-                false, false, String::new(),
-                false, false, 0, false,
-                None, vec![], vec![], HashMap::new(), HashMap::new(),
-                HashMap::new(), HashMap::new(), HashMap::new(), None,
+                1,
+                1,
+                1,
+                all_servers,
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                vec![],
+                vec![],
+                vec![],
+                1,
+                true,
+                false,
+                HashMap::new(),
+                false,
+                false,
+                String::new(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                None,
+                vec![],
+                vec![],
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
             )
             .await;
     });

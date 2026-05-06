@@ -108,8 +108,10 @@ pub fn apply_request_header_policy_to_upstream(
             continue;
         }
         let resolved = resolve(&h.value);
-        if let (Ok(hn), Ok(hv)) = (HeaderName::from_str(&h.name), HeaderValue::from_str(&resolved))
-        {
+        if let (Ok(hn), Ok(hv)) = (
+            HeaderName::from_str(&h.name),
+            HeaderValue::from_str(&resolved),
+        ) {
             upstream_request.insert_header(hn, hv).ok();
         }
     }
@@ -120,8 +122,10 @@ pub fn apply_request_header_policy_to_upstream(
             continue;
         }
         let resolved = resolve(&h.value);
-        if let (Ok(hn), Ok(hv)) = (HeaderName::from_str(&h.name), HeaderValue::from_str(&resolved))
-        {
+        if let (Ok(hn), Ok(hv)) = (
+            HeaderName::from_str(&h.name),
+            HeaderValue::from_str(&resolved),
+        ) {
             if upstream_request.headers.get(&hn).is_none() {
                 upstream_request.insert_header(hn, hv).ok();
             }

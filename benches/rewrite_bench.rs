@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use cloud_node_rust::rewrite::{evaluate_rewrites, evaluate_host_redirects};
-use cloud_node_rust::config_models::{HTTPRewriteRule, HTTPRewriteRef, HTTPHostRedirectConfig};
+use cloud_node_rust::config_models::{HTTPHostRedirectConfig, HTTPRewriteRef, HTTPRewriteRule};
+use cloud_node_rust::rewrite::{evaluate_host_redirects, evaluate_rewrites};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn bench_rewrite_logic(c: &mut Criterion) {
     // Mock rules: /api/v1/(.*) -> /v1/$1
@@ -58,9 +58,7 @@ fn bench_rewrite_logic(c: &mut Criterion) {
             ..Default::default()
         })
         .collect();
-    let many_refs: Vec<HTTPRewriteRef> = (0..20)
-        .map(|_| HTTPRewriteRef { is_on: true })
-        .collect();
+    let many_refs: Vec<HTTPRewriteRef> = (0..20).map(|_| HTTPRewriteRef { is_on: true }).collect();
 
     c.bench_function("rewrite_20_rules_last_match", |b| {
         b.iter(|| {

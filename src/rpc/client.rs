@@ -132,10 +132,12 @@ impl RpcClient {
 
             // Standard lowercase keys (canonical gRPC)
             req.metadata_mut().insert("nodeid", val.clone());
-            req.metadata_mut().insert(
-                "type",
-                tonic::metadata::MetadataValue::from_static(type_str),
-            );
+            if node_type.is_some() {
+                req.metadata_mut().insert(
+                    "type",
+                    tonic::metadata::MetadataValue::from_static(type_str),
+                );
+            }
 
             // Go-style CamelCase key
             if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(b"nodeId") {
@@ -184,6 +186,22 @@ impl RpcClient {
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
+    }
+
+    pub fn node_service_plain(
+        &self,
+    ) -> pb::node_service_client::NodeServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            Channel,
+            impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + 'static,
+        >,
+    > {
+        pb::node_service_client::NodeServiceClient::with_interceptor(
+            self.channel.clone(),
+            Self::interceptor(&self.api_config, None),
+        )
         .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }

@@ -84,24 +84,57 @@ impl MetricStorage {
 
         for u in updates {
             let prefix = format!("S{}_T{}", u.server_id, period);
-            
+
             // Store delta-based counters using merge operator
-            batch.merge(format!("{}_req", prefix).as_bytes(), u.total_requests.to_be_bytes());
-            batch.merge(format!("{}_sent", prefix).as_bytes(), u.bytes_sent.to_be_bytes());
-            batch.merge(format!("{}_recv", prefix).as_bytes(), u.bytes_received.to_be_bytes());
-            batch.merge(format!("{}_cached_sent", prefix).as_bytes(), u.cached_bytes.to_be_bytes());
-            batch.merge(format!("{}_cached_req", prefix).as_bytes(), u.count_cached_requests.to_be_bytes());
-            batch.merge(format!("{}_attack_req", prefix).as_bytes(), u.count_attack_requests.to_be_bytes());
-            batch.merge(format!("{}_attack_sent", prefix).as_bytes(), u.attack_bytes.to_be_bytes());
-            
+            batch.merge(
+                format!("{}_req", prefix).as_bytes(),
+                u.total_requests.to_be_bytes(),
+            );
+            batch.merge(
+                format!("{}_sent", prefix).as_bytes(),
+                u.bytes_sent.to_be_bytes(),
+            );
+            batch.merge(
+                format!("{}_recv", prefix).as_bytes(),
+                u.bytes_received.to_be_bytes(),
+            );
+            batch.merge(
+                format!("{}_cached_sent", prefix).as_bytes(),
+                u.cached_bytes.to_be_bytes(),
+            );
+            batch.merge(
+                format!("{}_cached_req", prefix).as_bytes(),
+                u.count_cached_requests.to_be_bytes(),
+            );
+            batch.merge(
+                format!("{}_attack_req", prefix).as_bytes(),
+                u.count_attack_requests.to_be_bytes(),
+            );
+            batch.merge(
+                format!("{}_attack_sent", prefix).as_bytes(),
+                u.attack_bytes.to_be_bytes(),
+            );
+
             // Store gauge values using put
-            batch.put(format!("{}_conns", prefix).as_bytes(), u.active_connections.to_be_bytes());
-            batch.put(format!("{}_ips", prefix).as_bytes(), u.count_ips.to_be_bytes());
+            batch.put(
+                format!("{}_conns", prefix).as_bytes(),
+                u.active_connections.to_be_bytes(),
+            );
+            batch.put(
+                format!("{}_ips", prefix).as_bytes(),
+                u.count_ips.to_be_bytes(),
+            );
         }
 
         let node_prefix = format!("NODE_T{}", period);
-        batch.merge(format!("{}_sent", node_prefix).as_bytes(), node_sent.to_be_bytes());
-        batch.merge(format!("{}_recv", node_prefix).as_bytes(), node_received.to_be_bytes());
+        batch.merge(
+            format!("{}_sent", node_prefix).as_bytes(),
+            node_sent.to_be_bytes(),
+        );
+        batch.merge(
+            format!("{}_recv", node_prefix).as_bytes(),
+            node_received.to_be_bytes(),
+        );
 
         let _ = db.write(batch);
     }
@@ -183,7 +216,9 @@ impl MetricStorage {
         };
         let _ = db.put(
             format!("CMETA_{}", hash).as_bytes(),
-            serde_json::to_string(&json_val).unwrap_or_default().as_bytes(),
+            serde_json::to_string(&json_val)
+                .unwrap_or_default()
+                .as_bytes(),
         );
     }
 
@@ -235,7 +270,12 @@ impl MetricStorage {
                     "h": meta.headers.iter().map(|(k,v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<_,_>>(),
                     "c": meta.compressed
                 });
-                batch.put(db_key.as_bytes(), serde_json::to_string(&json_val).unwrap_or_default().as_bytes());
+                batch.put(
+                    db_key.as_bytes(),
+                    serde_json::to_string(&json_val)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
             }
         }
         let _ = db.write(batch);
@@ -419,12 +459,21 @@ pub fn load_cache_meta_index() {
                 .strip_prefix("CMETA_")
                 .unwrap_or(&key_str)
                 .to_string();
-            let headers: Vec<(String, String)> = raw.get("h")
+            let headers: Vec<(String, String)> = raw
+                .get("h")
                 .and_then(|h| h.as_object())
-                .map(|obj| obj.iter().map(|(k,v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+                .map(|obj| {
+                    obj.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
             let entry = CacheMetaEntry {
-                cache_key: raw.get("k").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                cache_key: raw
+                    .get("k")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 size: raw.get("s").and_then(|v| v.as_u64()).unwrap_or(0),
                 expires: raw.get("e").and_then(|v| v.as_i64()).unwrap_or(0),
                 access_time: raw.get("a").and_then(|v| v.as_i64()).unwrap_or(0),

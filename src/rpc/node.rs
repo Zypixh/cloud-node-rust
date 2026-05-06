@@ -36,7 +36,7 @@ fn log_raw_json_hints(label: &str, raw: &[u8]) {
         if let Some(pos) = text.find(needle) {
             let start = pos.saturating_sub(240);
             let end = (pos + needle.len() + 240).min(text.len());
-            info!(
+            debug!(
                 "RPC_NODE: Raw {} contains {:?}. snippet={}",
                 label,
                 needle,
@@ -179,80 +179,41 @@ fn log_global_settings(
     if *last_gsc_hash != current_gsc_hash {
         *last_gsc_hash = current_gsc_hash;
 
-        info!("RPC_NODE: Global Cluster/Node Settings Updated:");
         info!(
-            "  - Node Enabled (isOn): {}",
+            "RPC_NODE: Global settings updated: node_on={} ip_lists={} server_name={} force_ln={} ln_method={} low_http={} lan_origin={}",
             if payload.is_on {
                 "YES"
             } else {
                 "NO (Inaccessible)"
-            }
-        );
-        info!(
-            "  - Sync IP Lists: {}",
-            if payload.enable_ip_lists { "YES" } else { "No" }
-        );
-        info!(
-            "  - Server Flag: {}",
+            },
+            if payload.enable_ip_lists { "YES" } else { "No" },
             if server_name.is_empty() {
                 "Default"
             } else {
                 server_name
-            }
-        );
-        info!(
-            "  - Force Ln Request: {}",
-            if force_ln { "YES" } else { "No" }
-        );
-        info!("  - Ln Scheduling Method: {}", ln_method);
-        info!(
-            "  - Support Low HTTP Versions (<1.1): {}",
+            },
+            if force_ln { "YES" } else { "No" },
+            ln_method,
             if supports_low_version_http {
                 "YES"
             } else {
                 "No"
-            }
+            },
+            if allow_lan_ip { "YES" } else { "No" }
         );
-        info!(
+        debug!(
             "  - Match Cert From All Servers: {}",
-            if match_cert_from_all_servers {
-                "YES"
-            } else {
-                "No"
-            }
+            match_cert_from_all_servers
         );
-        info!(
+        debug!(
             "  - Enable ${{serverAddr}} Variable: {}",
-            if enable_server_addr_variable {
-                "YES"
-            } else {
-                "No"
-            }
+            enable_server_addr_variable
         );
-        info!(
+        debug!(
             "  - Auto Gzip Back to Origin: {}",
-            if request_origins_with_encodings {
-                "YES"
-            } else {
-                "No"
-            }
+            request_origins_with_encodings
         );
-        info!(
-            "  - XFF Max Addresses: {}",
-            if xff_max_addresses == 0 {
-                "Unlimited".to_string()
-            } else {
-                xff_max_addresses.to_string()
-            }
-        );
-        info!(
-            "  - Allow LAN Origin IP: {}",
-            if allow_lan_ip {
-                "YES (WARNING: Security Risk)"
-            } else {
-                "No"
-            }
-        );
+        debug!("  - XFF Max Addresses: {}", xff_max_addresses);
 
         if let Some(gp) = grpc_policy {
             if gp.is_on {
@@ -266,7 +227,7 @@ fn log_global_settings(
                     .as_ref()
                     .map(|s| format!("{} {}", s.count, s.unit))
                     .unwrap_or_else(|| "2 MiB".to_string());
-                info!(
+                debug!(
                     "  - gRPC Proxy: ENABLED (Max Message: Recv={}, Send={})",
                     r_size, s_size
                 );
@@ -388,7 +349,7 @@ pub async fn fetch_and_apply_config<F>(
                             crate::logging::set_numeric_node_id(numeric_id);
 
                             for cp in &payload.http_cache_policies {
-                                info!(
+                                debug!(
                                     "RPC_NODE: Loaded Global Cache Policy: {} (ID: {}, Type: {})",
                                     cp.name, cp.id, cp.r#type
                                 );
@@ -513,7 +474,7 @@ pub async fn fetch_and_apply_config<F>(
 
                             if waf_changed {
                                 for wp in &payload.http_firewall_policies {
-                                    info!(
+                                    debug!(
                                         "RPC_NODE: Loaded Global WAF Policy: {} (ID: {}, Mode: {}, IsOn: {})",
                                         wp.name, wp.id, wp.mode, wp.is_on
                                     );
@@ -737,6 +698,10 @@ pub async fn fetch_and_apply_config<F>(
                             let mut enable_server_addr_variable = false;
                             let mut request_origins_with_encodings = false;
                             let mut xff_max_addresses = 0;
+                            let mut match_domain_strictly = false;
+                            let mut node_ip_show_page = false;
+                            let mut node_ip_page_html = String::new();
+                            let mut domain_mismatch_action = None;
 
                             if let Some(gsc) = &payload.global_server_config {
                                 if let Some(http_all) = &gsc.http_all {
@@ -752,6 +717,11 @@ pub async fn fetch_and_apply_config<F>(
                                     request_origins_with_encodings =
                                         http_all.request_origins_with_encodings;
                                     xff_max_addresses = http_all.xff_max_addresses;
+                                    match_domain_strictly = http_all.match_domain_strictly;
+                                    node_ip_show_page = http_all.node_ip_show_page;
+                                    node_ip_page_html = http_all.node_ip_page_html.clone();
+                                    domain_mismatch_action =
+                                        http_all.domain_mismatch_action.clone();
                                 }
                             }
 
@@ -760,7 +730,7 @@ pub async fn fetch_and_apply_config<F>(
 
                             for server in &payload.servers {
                                 if !server.is_on {
-                                    info!(
+                                    debug!(
                                         "RPC_NODE: Skipping server {} because it is OFF",
                                         server.numeric_id()
                                     );
@@ -769,7 +739,7 @@ pub async fn fetch_and_apply_config<F>(
 
                                 if server.is_sni_passthrough() {
                                     match serde_json::to_string(server) {
-                                        Ok(raw) => info!(
+                                        Ok(raw) => debug!(
                                             "RPC_NODE: SNI passthrough server loaded. id={} names={:?} raw_json={}",
                                             server.numeric_id(),
                                             server.get_plain_server_names(),
@@ -937,25 +907,26 @@ pub async fn fetch_and_apply_config<F>(
                                 }
                             }
 
+                            let loaded_domain_count = loaded_domain_names.len();
                             if loaded_domain_names.is_empty() {
-                                info!(
+                                debug!(
                                     "RPC_NODE: Loaded 0 named domains. Port-only servers: {}",
                                     port_only_server_count
                                 );
                             } else {
                                 let loaded_names: Vec<_> =
                                     loaded_domain_names.into_iter().collect();
-                                info!(
+                                debug!(
                                     "RPC_NODE: Loaded {} named domains. Port-only servers: {}",
                                     loaded_names.len(),
                                     port_only_server_count
                                 );
                                 for chunk in loaded_names.chunks(20) {
-                                    info!("RPC_NODE: Domains => {}", chunk.join(", "));
+                                    debug!("RPC_NODE: Domains => {}", chunk.join(", "));
                                 }
                             }
 
-                            info!(
+                            debug!(
                                 "RPC_NODE: Loaded global custom pages: {}. Global page policies: {}",
                                 payload.global_pages.len(),
                                 payload.http_pages_policies.len()
@@ -1030,6 +1001,10 @@ pub async fn fetch_and_apply_config<F>(
                                     request_origins_with_encodings,
                                     xff_max_addresses,
                                     allow_lan_ip,
+                                    match_domain_strictly,
+                                    node_ip_show_page,
+                                    node_ip_page_html,
+                                    domain_mismatch_action,
                                     payload
                                         .http_cache_policies
                                         .iter()
@@ -1049,6 +1024,24 @@ pub async fn fetch_and_apply_config<F>(
                                         .and_then(|g| g.http_access_log.clone()),
                                 )
                                 .await;
+
+                            info!(
+                                "RPC_NODE: Applied config version={} node_id={} servers={} domains={} port_only={} cache_policies={} waf_policies={} pages={}",
+                                config_resp.timestamp,
+                                numeric_id,
+                                payload.servers.len(),
+                                loaded_domain_count,
+                                port_only_server_count,
+                                payload.http_cache_policies.len(),
+                                payload.http_firewall_policies.len(),
+                                payload.global_pages.len() + payload.http_pages_policies.len()
+                            );
+
+                            if let Err(err) =
+                                report_node_online_once(config_store, api_config).await
+                            {
+                                debug!("RPC_NODE: immediate online status report failed: {}", err);
+                            }
 
                             if payload.toa.as_ref().map(|toa| toa.is_on).unwrap_or(false) {
                                 let toa_config = payload.toa.clone();
@@ -1284,6 +1277,97 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         }
     }
 }
+
+pub async fn report_node_online_once(
+    config_store: &ConfigStore,
+    api_config: &ApiConfig,
+) -> anyhow::Result<()> {
+    let node_id = config_store.get_node_id().await;
+    if node_id <= 0 {
+        anyhow::bail!("node id is not available");
+    }
+
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_all();
+    let (traffic_out, traffic_in, connections) = crate::metrics::METRICS.get_node_totals();
+    let rpc_snap = crate::metrics::METRICS.rpc.snapshot();
+    let api_success_percent = if rpc_snap.total_requests > 0 {
+        (rpc_snap.total_requests - rpc_snap.total_errors) as f64 / rpc_snap.total_requests as f64
+    } else {
+        1.0
+    };
+    let api_avg_cost = if rpc_snap.total_requests > 0 {
+        rpc_snap.total_cost_ms as f64 / rpc_snap.total_requests as f64
+    } else {
+        0.0
+    };
+    let load = sysinfo::System::load_average();
+    let total_memory = sys.total_memory() as i64;
+    let used_memory = sys.used_memory() as i64;
+    let memory_usage = if total_memory > 0 {
+        used_memory as f64 / total_memory as f64
+    } else {
+        0.0
+    };
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_default();
+    let host_ip = local_ip_address::local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    let now = crate::utils::time::now_timestamp();
+    let status = serde_json::json!({
+        "buildVersion": env!("CARGO_PKG_VERSION"),
+        "buildVersionCode": 1000000,
+        "configVersion": config_store.get_config_version().await,
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "hostname": hostname,
+        "hostIP": host_ip,
+        "cpuUsage": sys.global_cpu_usage() as f64 / 100.0,
+        "cpuLogicalCount": sys.cpus().len(),
+        "cpuPhysicalCount": sys.physical_core_count().unwrap_or(sys.cpus().len()),
+        "memoryUsage": memory_usage,
+        "memoryTotal": total_memory,
+        "load1m": load.one,
+        "load5m": load.five,
+        "load15m": load.fifteen,
+        "trafficInBytes": traffic_in,
+        "trafficOutBytes": traffic_out,
+        "connectionCount": connections,
+        "apiSuccessPercent": api_success_percent,
+        "apiAvgCostSeconds": api_avg_cost,
+        "cacheTotalDiskSize": crate::metrics::storage::STORAGE.total_cache_size(),
+        "updatedAt": now,
+        "timestamp": now,
+        "isActive": true,
+        "isHealthy": true,
+    });
+
+    let client = RpcClient::new(api_config).await?;
+    let mut service = client.node_service();
+    if let Err(err) = service
+        .update_node_up(pb::UpdateNodeUpRequest {
+            node_id,
+            is_up: true,
+        })
+        .await
+    {
+        debug!(
+            "RPC_NODE: updateNodeUp is not accepted by this API node: {}",
+            err
+        );
+    }
+    service
+        .update_node_status(pb::UpdateNodeStatusRequest {
+            node_id,
+            status_json: status.to_string().into_bytes(),
+        })
+        .await?;
+    Ok(())
+}
+
 pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_config: ApiConfig) {
     info!("Node Value Reporter service started. Interval: 60s");
     let mut sys = sysinfo::System::new_all();

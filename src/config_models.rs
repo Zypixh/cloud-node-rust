@@ -342,6 +342,26 @@ pub struct GlobalHTTPAllConfig {
         deserialize_with = "deserialize_flexible_bool"
     )]
     pub allow_lan_ip: bool,
+    #[serde(rename = "matchDomainStrictly", default)]
+    pub match_domain_strictly: bool,
+    #[serde(rename = "nodeIPShowPage", default)]
+    pub node_ip_show_page: bool,
+    #[serde(
+        rename = "nodeIPPageHTML",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub node_ip_page_html: String,
+    #[serde(rename = "domainMismatchAction", default)]
+    pub domain_mismatch_action: Option<DomainMismatchActionConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DomainMismatchActionConfig {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub code: String,
+    #[serde(default)]
+    pub options: Value,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -882,9 +902,9 @@ pub struct WebConfig {
     pub cc_policy: Option<CCPolicy>,
     #[serde(rename = "webP", alias = "webp")]
     pub webp: Option<WebPConfig>,
-    #[serde(rename = "userAgentConfig")]
+    #[serde(rename = "userAgentConfig", alias = "userAgent")]
     pub user_agent_config: Option<UserAgentConfig>,
-    #[serde(rename = "refererConfig")]
+    #[serde(rename = "refererConfig", alias = "referers")]
     pub referer_config: Option<ReferersConfig>,
     #[serde(
         rename = "hostRedirects",
@@ -1341,14 +1361,70 @@ pub struct CCPolicy {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UserAgentConfig {
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub filters: Vec<UserAgentFilter>,
+    #[serde(
+        rename = "onlyURLPatterns",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub only_url_patterns: Vec<URLPattern>,
+    #[serde(
+        rename = "exceptURLPatterns",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub except_url_patterns: Vec<URLPattern>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct UserAgentFilter {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub keywords: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub action: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ReferersConfig {
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(rename = "allowEmpty", default)]
+    pub allow_empty: bool,
+    #[serde(rename = "allowSameDomain", default)]
+    pub allow_same_domain: bool,
+    #[serde(
+        rename = "allowDomains",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub allow_domains: Vec<String>,
+    #[serde(
+        rename = "denyDomains",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub deny_domains: Vec<String>,
+    #[serde(rename = "checkOrigin", default = "default_true")]
+    pub check_origin: bool,
+    #[serde(
+        rename = "onlyURLPatterns",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub only_url_patterns: Vec<URLPattern>,
+    #[serde(
+        rename = "exceptURLPatterns",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub except_url_patterns: Vec<URLPattern>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1389,8 +1465,44 @@ pub struct HTTPRewriteRule {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HTTPAuthConfig {
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(
+        rename = "policyRefs",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub policy_refs: Vec<HTTPAuthPolicyRef>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPAuthPolicyRef {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "authPolicyId", default)]
+    pub auth_policy_id: i64,
+    #[serde(rename = "authPolicy", default)]
+    pub auth_policy: Option<HTTPAuthPolicy>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPAuthPolicy {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub name: String,
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub auth_type: String,
+    #[serde(default)]
+    pub params: Value,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2260,5 +2372,114 @@ mod tests {
 
         assert!(http_443.is_https());
         assert!(!https_80.is_https());
+    }
+
+    #[test]
+    fn node_config_payload_parses_global_http_compat_fields() {
+        let payload: NodeConfigPayload = serde_json::from_value(serde_json::json!({
+            "id": 1001,
+            "globalServerConfig": {
+                "httpAll": {
+                    "forceLnRequest": true,
+                    "lnRequestSchedulingMethod": "urlMapping",
+                    "supportsLowVersionHTTP": true,
+                    "matchCertFromAllServers": true,
+                    "serverName": "edge-node",
+                    "enableServerAddrVariable": true,
+                    "requestOriginsWithEncodings": true,
+                    "xffMaxAddresses": 3,
+                    "allowLANIP": true,
+                    "matchDomainStrictly": true,
+                    "nodeIPShowPage": true,
+                    "nodeIPPageHTML": "<h1>${host}</h1>",
+                    "domainMismatchAction": {
+                        "code": "page",
+                        "options": {
+                            "statusCode": 451,
+                            "contentHTML": "blocked"
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("node config payload should parse");
+
+        let http_all = payload
+            .global_server_config
+            .and_then(|g| g.http_all)
+            .expect("httpAll should be present");
+        assert!(http_all.force_ln_request);
+        assert_eq!(http_all.ln_request_scheduling_method, "urlMapping");
+        assert!(http_all.match_domain_strictly);
+        assert!(http_all.node_ip_show_page);
+        assert_eq!(http_all.node_ip_page_html, "<h1>${host}</h1>");
+        let action = http_all
+            .domain_mismatch_action
+            .expect("domain mismatch action should parse");
+        assert_eq!(action.code, "page");
+        assert_eq!(action.options["statusCode"], 451);
+    }
+
+    #[test]
+    fn web_config_parses_auth_referer_and_user_agent_aliases() {
+        let web: WebConfig = serde_json::from_value(serde_json::json!({
+            "isOn": true,
+            "auth": {
+                "isOn": true,
+                "policyRefs": [{
+                    "isOn": true,
+                    "authPolicyId": 10,
+                    "authPolicy": {
+                        "id": 10,
+                        "name": "basic",
+                        "isOn": true,
+                        "type": "basicAuth",
+                        "params": {
+                            "realm": "private",
+                            "users": [{"username": "u", "password": "p"}]
+                        }
+                    }
+                }]
+            },
+            "referers": {
+                "isOn": true,
+                "allowEmpty": false,
+                "allowSameDomain": true,
+                "allowDomains": ["*.example.com"],
+                "denyDomains": ["bad.example.com"],
+                "checkOrigin": true
+            },
+            "userAgent": {
+                "isOn": true,
+                "filters": [{
+                    "keywords": ["curl*", "BadBot"],
+                    "action": "deny"
+                }]
+            }
+        }))
+        .expect("web config should parse compatibility aliases");
+
+        let auth = web.auth.expect("auth should parse");
+        assert!(auth.is_on);
+        assert_eq!(auth.policy_refs[0].auth_policy_id, 10);
+        assert_eq!(
+            auth.policy_refs[0]
+                .auth_policy
+                .as_ref()
+                .expect("policy should parse")
+                .auth_type,
+            "basicAuth"
+        );
+
+        let referers = web.referer_config.expect("referers alias should parse");
+        assert!(referers.is_on);
+        assert!(referers.allow_same_domain);
+        assert_eq!(referers.allow_domains, vec!["*.example.com"]);
+        assert_eq!(referers.deny_domains, vec!["bad.example.com"]);
+
+        let ua = web.user_agent_config.expect("userAgent alias should parse");
+        assert!(ua.is_on);
+        assert_eq!(ua.filters[0].keywords, vec!["curl*", "BadBot"]);
+        assert_eq!(ua.filters[0].action, "deny");
     }
 }

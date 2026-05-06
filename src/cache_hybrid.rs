@@ -15,10 +15,9 @@ use tracing::{info, warn};
 
 use arc_swap::ArcSwap;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 static CACHED_DISK_AVAILABLE: AtomicU64 = AtomicU64::new(u64::MAX);
-
 
 /// Synchronous zstd decompression for serving small files from memory.
 fn zstd_decompress_to_bytes(data: &[u8]) -> Option<Vec<u8>> {
@@ -124,13 +123,15 @@ impl Storage for FileStorage {
 
         // Read entire file into memory, serve in 32KB chunks via MemoryHitHandler
         let io_start = std::time::Instant::now();
-        let file_data = tokio::fs::read(&path).await
+        let file_data = tokio::fs::read(&path)
+            .await
             .map_err(|_| Error::new(ErrorType::InternalError))?;
         PROF_DISK_READ_US.fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         crate::metrics::storage::STORAGE.record_cache_access(&hash);
 
         let body: bytes::Bytes = if meta.compressed {
-            let result = tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&file_data)).await;
+            let result =
+                tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&file_data)).await;
             match result {
                 Ok(Some(data)) => bytes::Bytes::from(data),
                 _ => return Ok(None),
@@ -156,7 +157,7 @@ impl Storage for FileStorage {
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        
+
         // Use a unique temp path to prevent concurrent cache misses from corrupting the same file
         let random_id = crate::utils::time::now_timestamp_millis();
         let temp_path = path.with_extension(format!("tmp.{}", random_id));
@@ -481,8 +482,9 @@ static FAST_L1_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Min-heap for O(log n) eviction: entries with smallest fresh_until are evicted first.
 /// Uses Reverse so BinaryHeap (max-heap) behaves as min-heap.
-static EVICTION_HEAP: Lazy<parking_lot::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(i64, u64)>>>> =
-    Lazy::new(|| parking_lot::Mutex::new(std::collections::BinaryHeap::new()));
+static EVICTION_HEAP: Lazy<
+    parking_lot::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(i64, u64)>>>,
+> = Lazy::new(|| parking_lot::Mutex::new(std::collections::BinaryHeap::new()));
 
 fn fast_l1_remove(hash: &u64) {
     if let Some((_, entry)) = FAST_L1.remove(hash) {
@@ -497,7 +499,12 @@ const POLICY_MEMORY: u8 = 1;
 fn fast_hash_key(s: &str) -> u64 {
     use std::hash::{BuildHasher, Hash, Hasher};
     static HASHER: Lazy<ahash::RandomState> = Lazy::new(|| {
-        ahash::RandomState::with_seeds(0x9ae16a3b2f90404f, 0x9e3779b97f4a7c15, 0xff51afd7ed558ccd, 0x517cc1b727220a95)
+        ahash::RandomState::with_seeds(
+            0x9ae16a3b2f90404f,
+            0x9e3779b97f4a7c15,
+            0xff51afd7ed558ccd,
+            0x517cc1b727220a95,
+        )
     });
     let mut h = HASHER.build_hasher();
     s.hash(&mut h);
@@ -567,7 +574,9 @@ impl HybridStorage {
                 let mut heap = EVICTION_HEAP.lock();
                 let mut freed = 0u64;
                 let mut evict_attempts = 0;
-                while FAST_L1_BYTES.load(Ordering::Relaxed) + len - freed > max_l1 && evict_attempts < 100 {
+                while FAST_L1_BYTES.load(Ordering::Relaxed) + len - freed > max_l1
+                    && evict_attempts < 100
+                {
                     match heap.pop() {
                         Some(std::cmp::Reverse((_, victim_key))) => {
                             if FAST_L1.contains_key(&victim_key) {
@@ -591,20 +600,29 @@ impl HybridStorage {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        FAST_L1.insert(hash, FastL1Entry {
-            data,
-            fresh_until,
-            created_at: now,
-            status,
-            headers,
-        });
+        FAST_L1.insert(
+            hash,
+            FastL1Entry {
+                data,
+                fresh_until,
+                created_at: now,
+                status,
+                headers,
+            },
+        );
         FAST_L1_BYTES.fetch_add(len, Ordering::Relaxed);
-        EVICTION_HEAP.lock().push(std::cmp::Reverse((fresh_until, hash)));
+        EVICTION_HEAP
+            .lock()
+            .push(std::cmp::Reverse((fresh_until, hash)));
         true
     }
 
     pub async fn apply_policy(&self, policy: &crate::config_models::HTTPCachePolicy) {
-        let val = if policy.r#type == "memory" { POLICY_MEMORY } else { POLICY_FILE };
+        let val = if policy.r#type == "memory" {
+            POLICY_MEMORY
+        } else {
+            POLICY_FILE
+        };
         self.policy_type.store(val, Ordering::Relaxed);
 
         if let Some(capacity) = &policy.capacity {
@@ -617,7 +635,8 @@ impl HybridStorage {
 
         if let Some(options) = &policy.options {
             // Memory capacity for FAST_L1: 0 = auto-detect, explicit value = use directly
-            if let Some(mem) = options.get("memoryCapacity")
+            if let Some(mem) = options
+                .get("memoryCapacity")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<u64>().ok())
             {
@@ -693,13 +712,12 @@ impl HybridStorage {
                     "RPC_CACHE: Updating cache configuration (Sendfile: {}, HandleCache: {})",
                     enable_sendfile, enable_file_cache
                 );
-                self.l2
-                    .update_config(
-                        main,
-                        sub_dirs.unwrap_or_default(),
-                        enable_sendfile,
-                        enable_file_cache,
-                    );
+                self.l2.update_config(
+                    main,
+                    sub_dirs.unwrap_or_default(),
+                    enable_sendfile,
+                    enable_file_cache,
+                );
             }
         }
     }
@@ -765,7 +783,11 @@ impl HybridStorage {
         let (memory_count, memory_bytes) = self.l1.stats();
         let (disk_count, disk_bytes) = crate::metrics::storage::STORAGE.cache_summary();
         CacheRuntimeStats {
-            policy_type: if self.policy_type.load(Ordering::Relaxed) == POLICY_MEMORY { "memory".to_string() } else { "file".to_string() },
+            policy_type: if self.policy_type.load(Ordering::Relaxed) == POLICY_MEMORY {
+                "memory".to_string()
+            } else {
+                "file".to_string()
+            },
             memory_count,
             memory_bytes: memory_bytes as u64,
             disk_count,
@@ -810,7 +832,13 @@ impl Storage for HybridStorage {
                     hdr,
                 );
                 prof_record_l1_hit();
-                return Ok(Some((meta, Box::new(MemoryHitHandler { data: entry.data.clone(), offset: 0 }))));
+                return Ok(Some((
+                    meta,
+                    Box::new(MemoryHitHandler {
+                        data: entry.data.clone(),
+                        offset: 0,
+                    }),
+                )));
             }
             // Expired: remove and fall through
             drop(entry);
@@ -823,11 +851,13 @@ impl Storage for HybridStorage {
             // Promote to FAST_L1 for subsequent zero-lock hits
             if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
                 let now = crate::utils::time::now_timestamp();
-                let fresh_until = meta.fresh_until()
+                let fresh_until = meta
+                    .fresh_until()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or(std::time::Duration::from_secs(3600))
                     .as_secs() as i64;
-                if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now) {
+                if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now)
+                {
                     prof_record_l2_mem_promotion();
                 }
             }
@@ -845,11 +875,13 @@ impl Storage for HybridStorage {
             // Memory budget + eviction control the total size, not an artificial threshold.
             if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
                 let now = crate::utils::time::now_timestamp();
-                let fresh_until = meta.fresh_until()
+                let fresh_until = meta
+                    .fresh_until()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or(std::time::Duration::from_secs(3600))
                     .as_secs() as i64;
-                if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now) {
+                if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now)
+                {
                     prof_record_l2_mem_promotion();
                 }
             }
@@ -1090,9 +1122,21 @@ pub fn start_cache_profiler() {
             if total == 0 && reqfil_cnt == 0 {
                 continue;
             }
-            let l1_pct = if total > 0 { l1 as f64 / total as f64 * 100.0 } else { 0.0 };
-            let avg_disk_ms = if l2 > 0 { disk_us as f64 / l2 as f64 / 1000.0 } else { 0.0 };
-            let avg_reqfil_ms = if reqfil_cnt > 0 { reqfil_us as f64 / reqfil_cnt as f64 / 1000.0 } else { 0.0 };
+            let l1_pct = if total > 0 {
+                l1 as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
+            let avg_disk_ms = if l2 > 0 {
+                disk_us as f64 / l2 as f64 / 1000.0
+            } else {
+                0.0
+            };
+            let avg_reqfil_ms = if reqfil_cnt > 0 {
+                reqfil_us as f64 / reqfil_cnt as f64 / 1000.0
+            } else {
+                0.0
+            };
             tracing::info!(
                 "CACHE_PROFILE: L1={l1}/s L2={l2}/s L1%={l1_pct:.1} sync_prom={sync_prom}/s async_prom={async_prom}/s total={total}/s disk={avg_disk_ms:.1}ms rf={avg_reqfil_ms:.1}ms fp={fastpath}/s"
             );
@@ -1139,7 +1183,12 @@ pub fn start_cache_janitor() {
             let evicted = before.saturating_sub(FAST_L1.len());
             if evicted > 0 {
                 FAST_L1_BYTES.fetch_sub(expired_bytes, Ordering::Relaxed);
-                tracing::debug!("FAST_L1 janitor: evicted {} expired entries ({} bytes), {} remain", evicted, expired_bytes, FAST_L1.len());
+                tracing::debug!(
+                    "FAST_L1 janitor: evicted {} expired entries ({} bytes), {} remain",
+                    evicted,
+                    expired_bytes,
+                    FAST_L1.len()
+                );
             }
 
             // Enforce FAST_L1 memory budget via eviction heap
@@ -1165,7 +1214,10 @@ pub fn start_cache_janitor() {
                     if freed > 0 {
                         tracing::debug!(
                             "FAST_L1 memory budget: {}/{} bytes, evicted {} bytes, {} entries remain",
-                            total, max_l1, freed, FAST_L1.len()
+                            total,
+                            max_l1,
+                            freed,
+                            FAST_L1.len()
                         );
                     }
                 }

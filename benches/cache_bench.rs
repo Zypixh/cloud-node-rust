@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use cloud_node_rust::cache_hybrid::HybridStorage;
 use cloud_node_rust::cache_manager::create_meta;
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use pingora_cache::{CacheKey, Storage, trace::Span};
 use tokio::runtime::Runtime;
 

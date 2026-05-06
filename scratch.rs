@@ -12,9 +12,9 @@ pub struct ApiConfig {
 
 fn main() {
     let content = r#"
-rpc.endpoints: [ "http://47.97.60.155:8001" ]
-nodeId: "01f5632b3239fba4911f43fbdc4bd661"
-secret: "XMz3OqJicVJE6uhmCoam1AwUKBI24VXR"
+rpc.endpoints: [ "http://127.0.0.1:8001" ]
+nodeId: "your-node-id"
+secret: "your-node-secret"
 "#;
     let config: Result<ApiConfig, _> = serde_yaml::from_str(content);
     println!("{:?}", config);

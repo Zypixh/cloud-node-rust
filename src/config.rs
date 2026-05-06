@@ -722,6 +722,10 @@ impl ConfigStore {
         request_origins_with_encodings: bool,
         xff_max_addresses: i32,
         allow_lan_ip: bool,
+        match_domain_strictly: bool,
+        node_ip_show_page: bool,
+        node_ip_page_html: String,
+        domain_mismatch_action: Option<crate::config_models::DomainMismatchActionConfig>,
         cache_policy: Vec<Arc<HTTPCachePolicy>>,
         firewall_policies: Vec<HTTPFirewallPolicy>,
         waf_actions: Vec<crate::config_models::WAFActionConfig>,
@@ -764,6 +768,10 @@ impl ConfigStore {
             request_origins_with_encodings,
             xff_max_addresses,
             allow_lan_ip,
+            match_domain_strictly,
+            node_ip_show_page,
+            node_ip_page_html,
+            domain_mismatch_action,
         });
         lock.ln_request_scheduling_method = global_http.ln_request_scheduling_method.clone();
         lock.supports_low_version_http = global_http.supports_low_version_http;
@@ -979,5 +987,93 @@ impl ConfigStore {
         lock.parent_routes = parent_routes;
         drop(lock);
         self.notify_runtime_reload();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn update_config_applies_global_http_compat_fields_to_hot_path() {
+        let store = ConfigStore::new();
+        store
+            .update_config(
+                10,
+                20,
+                30,
+                40,
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                true,
+                "urlMapping".to_string(),
+                HashMap::new(),
+                None,
+                true,
+                true,
+                "edge-node".to_string(),
+                true,
+                true,
+                2,
+                true,
+                true,
+                true,
+                "<h1>${host}</h1>".to_string(),
+                Some(crate::config_models::DomainMismatchActionConfig {
+                    code: "redirect".to_string(),
+                    options: json!({"url": "https://example.com"}),
+                }),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                Some(crate::config_models::GlobalHTTPAccessLogConfig {
+                    is_on: true,
+                    enable_request_headers: false,
+                    common_request_headers_only: true,
+                    enable_response_headers: false,
+                    enable_cookies: false,
+                    enable_server_not_found: true,
+                }),
+            )
+            .await;
+
+        let snapshot = store.get_hot_path_snapshot_sync();
+        assert!(snapshot.is_on);
+        assert!(snapshot.global_http.force_ln_request);
+        assert_eq!(
+            snapshot.global_http.ln_request_scheduling_method,
+            "urlMapping"
+        );
+        assert_eq!(snapshot.global_http.server_name, "edge-node");
+        assert!(snapshot.global_http.match_domain_strictly);
+        assert!(snapshot.global_http.node_ip_show_page);
+        assert_eq!(snapshot.global_http.node_ip_page_html, "<h1>${host}</h1>");
+        assert_eq!(
+            snapshot
+                .global_http
+                .domain_mismatch_action
+                .as_ref()
+                .expect("domain mismatch action should be applied")
+                .code,
+            "redirect"
+        );
+        assert!(snapshot.global_access_log.is_some());
     }
 }

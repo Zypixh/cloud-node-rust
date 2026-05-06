@@ -6,14 +6,13 @@
 ///   2. Generate URLs: for i in $(seq 0 9999); do echo "/$i.bin" >> /tmp/urls.txt; done
 ///   3. Start proxy:   cargo run --bin bench-proxy
 ///   4. Run oha:       oha -z 30s -c 200 --urls-from-file /tmp/urls.txt http://127.0.0.1:8080
-
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use pingora_cache::lock::CacheLock;
-use pingora_core::server::configuration::ServerConf;
-use pingora_core::server::Server;
-use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
+use pingora_core::server::Server;
+use pingora_core::server::configuration::ServerConf;
+use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use std::time::Duration;
@@ -34,7 +33,9 @@ impl ProxyHttp for BenchProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
-        session.cache.enable(&*CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
+        session
+            .cache
+            .enable(&*CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
         Ok(false)
     }
 
@@ -63,13 +64,7 @@ impl ProxyHttp for BenchProxy {
     ) -> Result<pingora_cache::RespCacheable> {
         use pingora_cache::CacheMeta;
         let now = std::time::SystemTime::now();
-        let meta = CacheMeta::new(
-            now + Duration::from_secs(3600),
-            now,
-            0,
-            0,
-            resp.clone(),
-        );
+        let meta = CacheMeta::new(now + Duration::from_secs(3600), now, 0, 0, resp.clone());
         Ok(pingora_cache::RespCacheable::Cacheable(meta))
     }
 

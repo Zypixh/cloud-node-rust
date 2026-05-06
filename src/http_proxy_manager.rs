@@ -255,7 +255,7 @@ impl HttpProxyManager {
                 res = listener.accept() => res,
             };
             let (client_stream, client_addr) = accept_result?;
-            
+
             // Optimization: TCP_NODELAY for small file performance
             let _ = client_stream.set_nodelay(true);
 
@@ -306,24 +306,27 @@ impl HttpProxyManager {
 
                 let l4_stream = stream_with_socket_digest(client_stream, client_addr);
                 let downstream_socket_digest = l4_stream.get_socket_digest();
-                let (stream, alpn): (pingora_core::protocols::Stream, Option<Vec<u8>>) = if let Some(ssl_acceptor) = &acceptor_clone {
-                    let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
-                        Box::new((*selector).clone());
-                    match handshake_with_callback(ssl_acceptor, l4_stream, &callbacks).await {
-                        Ok(s) => {
-                            let alpn = s.ssl().selected_alpn_protocol().map(|v| v.to_vec());
-                            (Box::new(s), alpn)
-                        }
-                        Err(e) => {
-                            if !is_benign_tls_accept_error(&e.to_string()) && configured_tls_host {
-                                error!("TLS handshake failed: {}", e);
+                let (stream, alpn): (pingora_core::protocols::Stream, Option<Vec<u8>>) =
+                    if let Some(ssl_acceptor) = &acceptor_clone {
+                        let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+                            Box::new((*selector).clone());
+                        match handshake_with_callback(ssl_acceptor, l4_stream, &callbacks).await {
+                            Ok(s) => {
+                                let alpn = s.ssl().selected_alpn_protocol().map(|v| v.to_vec());
+                                (Box::new(s), alpn)
                             }
-                            return;
+                            Err(e) => {
+                                if !is_benign_tls_accept_error(&e.to_string())
+                                    && configured_tls_host
+                                {
+                                    error!("TLS handshake failed: {}", e);
+                                }
+                                return;
+                            }
                         }
-                    }
-                } else {
-                    (Box::new(l4_stream), None)
-                };
+                    } else {
+                        (Box::new(l4_stream), None)
+                    };
 
                 if alpn.as_deref() == Some(b"h2") {
                     // HTTP/2 Logic

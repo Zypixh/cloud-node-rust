@@ -251,7 +251,13 @@ impl TcpProxyManager {
 
             tokio::spawn(async move {
                 if let Err(e) = manager
-                    .handle_connection(client_stream, client_addr, server_inner, is_tls, acceptor_clone)
+                    .handle_connection(
+                        client_stream,
+                        client_addr,
+                        server_inner,
+                        is_tls,
+                        acceptor_clone,
+                    )
                     .await
                 {
                     debug!("TCP connection from {} failed: {}", client_addr, e);
@@ -390,7 +396,15 @@ impl TcpProxyManager {
 
             // Metrics: Start connection
             let client_ip = client_addr.ip().to_string();
-            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id, None, false);
+            crate::metrics::record::request_start(
+                sid,
+                client_ip,
+                user_id,
+                user_plan_id,
+                plan_id,
+                None,
+                false,
+            );
 
             let toa_config = self.config_store.get_toa_config_sync();
             let backend_stream = match crate::toa::connect_with_toa(
@@ -420,7 +434,8 @@ impl TcpProxyManager {
                         0,
                         0,
                         0,
-                        None, None,
+                        None,
+                        None,
                     );
                     crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
                     return Err(e.into());
@@ -493,7 +508,8 @@ impl TcpProxyManager {
                     0,
                     0,
                     0,
-                    None, None,
+                    None,
+                    None,
                 );
                 crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
                 e
@@ -535,7 +551,8 @@ impl TcpProxyManager {
                 bytes_sent as i64,
                 0,
                 0,
-                None, None,
+                None,
+                None,
             );
 
             crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
@@ -543,7 +560,15 @@ impl TcpProxyManager {
         } else {
             // Metrics: Start connection
             let client_ip = client_addr.ip().to_string();
-            crate::metrics::record::request_start(sid, client_ip, user_id, user_plan_id, plan_id, None, false);
+            crate::metrics::record::request_start(
+                sid,
+                client_ip,
+                user_id,
+                user_plan_id,
+                plan_id,
+                None,
+                false,
+            );
 
             let toa_config = self.config_store.get_toa_config_sync();
             let backend_stream = match crate::toa::connect_with_toa(
@@ -573,7 +598,8 @@ impl TcpProxyManager {
                         0,
                         0,
                         0,
-                        None, None,
+                        None,
+                        None,
                     );
                     crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
                     return Err(e.into());
@@ -652,7 +678,8 @@ impl TcpProxyManager {
                 bytes_sent as i64,
                 0,
                 0,
-                None, None,
+                None,
+                None,
             );
 
             crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);

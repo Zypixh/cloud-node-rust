@@ -89,6 +89,24 @@ cloud-node --monitor-port 8888 --monitor-clear
 
 热路径读取的是快照和引用，避免每个请求重新解析完整配置。
 
+## 控制面长连接
+
+节点启动后会同时进行周期配置同步和 `nodeStream` 长连接维护。`nodeStream` 使用控制面 `pb.NodeService/nodeStream` 双向流，用于接收控制面实时消息并回传执行结果。
+
+当前支持的消息动作包括：
+
+- `connectedAPINode`：记录已连接 API 节点 ID，触发节点状态上报和任务同步。
+- `newNodeTask` / `NewNodeTask` / `configChanged`：立即触发节点任务同步。
+- `writeCache`：将控制面下发的缓存预热内容写入本地请求路径。
+- `readCache`：读取缓存元数据并回复是否命中。
+- `statCache`：统计本地缓存大小和对象数量。
+- `cleanCache`：清理本地缓存文件和缓存元数据。
+- `getStat`：回传 CPU、内存、负载、流量和连接数。
+- `changeAPINode`：切换运行时 API endpoint，并触发重连。
+- `checkLocalFirewall`：检查本地 `nftables` 可用性并回复版本或错误。
+
+未知消息会回复 `unhandled`，不会静默丢弃。HTTP 明文 endpoint 下，运行时使用底层 HTTP/2 gRPC frame 实现保持流打开，行为更接近 Go 客户端：请求流打开后即开始心跳，不把“服务端响应头已返回”作为建流成功的前置条件。
+
 ## 负载均衡和回源
 
 L7 回源由 `lb_factory` 构建 Pingora `LoadBalancer`。运行时会根据源站配置、父节点配置、TLS 选项、SNI、Host 策略和健康检查结果选择上游。

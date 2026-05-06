@@ -1,8 +1,8 @@
+use chrono::Timelike;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use chrono::Timelike;
 
 use std::sync::atomic::AtomicU32;
 
@@ -220,20 +220,22 @@ impl<T: Clone + Default> TimeCache<T> {
         }
     }
 
-    fn get_or_update<F>(&self, current_tick: i64, f: F) -> T 
-    where F: FnOnce() -> T {
+    fn get_or_update<F>(&self, current_tick: i64, f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
         {
             let read = self.data.read().unwrap();
             if read.0 == current_tick {
                 return read.1.clone();
             }
         }
-        
+
         let mut write = self.data.write().unwrap();
         if write.0 == current_tick {
             return write.1.clone();
         }
-        
+
         let new_val = f();
         *write = (current_tick, new_val.clone());
         new_val
@@ -248,7 +250,7 @@ lazy_static! {
 fn get_current_day() -> String {
     let now = crate::utils::time::now_timestamp();
     let now_day = now / 86400;
-    
+
     DAY_CACHE.get_or_update(now_day, || {
         crate::utils::time::now_local().format("%Y%m%d").to_string()
     })
@@ -305,14 +307,10 @@ pub mod record {
         }
         m.total_requests.fetch_add(1, Ordering::Relaxed);
         m.active_connections.fetch_add(1, Ordering::Relaxed);
-        
+
         if !ip_recorded {
             let day = get_current_day();
-            crate::metrics::daily::UNIQUE_IP_TRACKER.record(
-                server_id,
-                &day,
-                &remote_ip,
-            );
+            crate::metrics::daily::UNIQUE_IP_TRACKER.record(server_id, &day, &remote_ip);
             m.distinct_ips.insert(remote_ip);
             return true;
         }
@@ -548,7 +546,8 @@ pub async fn start_persistence_flusher() {
                 count_attack_requests: current.count_attack_requests - last.count_attack_requests,
                 attack_bytes: current.attack_bytes - last.attack_bytes,
                 active_connections: current.active_connections,
-                count_websocket_connections: current.count_websocket_connections - last.count_websocket_connections,
+                count_websocket_connections: current.count_websocket_connections
+                    - last.count_websocket_connections,
                 count_ips: current.count_ips,
             });
 

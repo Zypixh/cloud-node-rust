@@ -1,7 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use cloud_node_rust::config_models::{
-    parse_life_to_seconds, URLPattern, SizeCapacity, ServerConfig,
+    ServerConfig, SizeCapacity, URLPattern, parse_life_to_seconds,
 };
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use serde_json::Value;
 
 fn bench_parse_life_to_seconds(c: &mut Criterion) {
@@ -144,13 +144,13 @@ fn bench_server_config(c: &mut Criterion) {
         id: Some(42),
         ..Default::default()
     };
-    server.server_names.push(
-        cloud_node_rust::config_models::ServerNameConfig {
+    server
+        .server_names
+        .push(cloud_node_rust::config_models::ServerNameConfig {
             name: "www.example.com".to_string(),
             sub_names: vec!["api.example.com".to_string(), "cdn.example.com".to_string()],
             ..Default::default()
-        },
-    );
+        });
 
     let mut group = c.benchmark_group("server_config");
 
@@ -158,13 +158,9 @@ fn bench_server_config(c: &mut Criterion) {
         b.iter(|| server.get_plain_server_names())
     });
 
-    group.bench_function("get_first_host", |b| {
-        b.iter(|| server.get_first_host())
-    });
+    group.bench_function("get_first_host", |b| b.iter(|| server.get_first_host()));
 
-    group.bench_function("numeric_id", |b| {
-        b.iter(|| server.numeric_id())
-    });
+    group.bench_function("numeric_id", |b| b.iter(|| server.numeric_id()));
 
     group.bench_function("is_sni_passthrough_no", |b| {
         b.iter(|| server.is_sni_passthrough())

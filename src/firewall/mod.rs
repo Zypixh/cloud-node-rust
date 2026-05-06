@@ -5,7 +5,8 @@ pub mod state;
 pub mod verifier;
 
 use crate::config_models::{
-    HTTPFirewallPolicy, HTTPFirewallRegionConfig, WAFBlockOptions, WAFCaptchaOptions, WAFJSCookieOptions, WAFPageOptions,
+    HTTPFirewallPolicy, HTTPFirewallRegionConfig, WAFBlockOptions, WAFCaptchaOptions,
+    WAFJSCookieOptions, WAFPageOptions,
 };
 use crate::metrics::analyzer;
 use pingora_proxy::Session;
@@ -669,30 +670,30 @@ fn is_search_engine_bot(user_agent: &str) -> bool {
 
 fn legacy_country_id_to_iso(id: i64) -> Option<&'static str> {
     match id {
-        1 => Some("CN"),    // China
-        2 => Some("US"),    // United States
-        3 => Some("JP"),    // Japan
-        4 => Some("KR"),    // South Korea
-        5 => Some("GB"),    // United Kingdom
-        6 => Some("DE"),    // Germany
-        7 => Some("FR"),    // France
-        8 => Some("RU"),    // Russia
-        9 => Some("SG"),    // Singapore
-        10 => Some("AU"),   // Australia
-        11 => Some("IN"),   // India
-        12 => Some("CA"),   // Canada
-        13 => Some("BR"),   // Brazil
-        14 => Some("TH"),   // Thailand
-        15 => Some("VN"),   // Vietnam
-        16 => Some("MY"),   // Malaysia
-        17 => Some("PH"),   // Philippines
-        18 => Some("ID"),   // Indonesia
-        19 => Some("NL"),   // Netherlands
-        20 => Some("IT"),   // Italy
-        261 => Some("HK"),  // Hong Kong
-        262 => Some("TW"),  // Taiwan
-        263 => Some("MO"),  // Macau
-        264 => Some("CN"),  // Mainland China
+        1 => Some("CN"),   // China
+        2 => Some("US"),   // United States
+        3 => Some("JP"),   // Japan
+        4 => Some("KR"),   // South Korea
+        5 => Some("GB"),   // United Kingdom
+        6 => Some("DE"),   // Germany
+        7 => Some("FR"),   // France
+        8 => Some("RU"),   // Russia
+        9 => Some("SG"),   // Singapore
+        10 => Some("AU"),  // Australia
+        11 => Some("IN"),  // India
+        12 => Some("CA"),  // Canada
+        13 => Some("BR"),  // Brazil
+        14 => Some("TH"),  // Thailand
+        15 => Some("VN"),  // Vietnam
+        16 => Some("MY"),  // Malaysia
+        17 => Some("PH"),  // Philippines
+        18 => Some("ID"),  // Indonesia
+        19 => Some("NL"),  // Netherlands
+        20 => Some("IT"),  // Italy
+        261 => Some("HK"), // Hong Kong
+        262 => Some("TW"), // Taiwan
+        263 => Some("MO"), // Macau
+        264 => Some("CN"), // Mainland China
         _ => None,
     }
 }
@@ -760,13 +761,15 @@ pub fn check_region_deny(
     if has_allow_countries || has_deny_countries {
         let country_iso = geo.country_iso.as_ref();
         let country_blocked = if has_allow_countries {
-            !region.allow_country_ids.iter().any(|&id| {
-                legacy_country_id_to_iso(id).map_or(false, |iso| iso == country_iso)
-            })
+            !region
+                .allow_country_ids
+                .iter()
+                .any(|&id| legacy_country_id_to_iso(id).map_or(false, |iso| iso == country_iso))
         } else {
-            region.deny_country_ids.iter().any(|&id| {
-                legacy_country_id_to_iso(id).map_or(false, |iso| iso == country_iso)
-            })
+            region
+                .deny_country_ids
+                .iter()
+                .any(|&id| legacy_country_id_to_iso(id).map_or(false, |iso| iso == country_iso))
         };
         if country_blocked {
             let html = if !region.deny_country_html.is_empty() {
@@ -780,10 +783,7 @@ pub fn check_region_deny(
                 html
             };
             return Some(MatchedAction {
-                action: ActionResponse::Block {
-                    status: 403,
-                    body,
-                },
+                action: ActionResponse::Block { status: 403, body },
                 policy_id,
                 group_id: 0,
                 set_id: 0,
@@ -811,19 +811,23 @@ pub fn check_region_deny(
     }
 
     let geo_country_iso = geo.country_iso.as_ref();
-    let is_cn = geo_country_iso == "CN" || geo_country_iso == "HK" || geo_country_iso == "TW" || geo_country_iso == "MO";
+    let is_cn = geo_country_iso == "CN"
+        || geo_country_iso == "HK"
+        || geo_country_iso == "TW"
+        || geo_country_iso == "MO";
 
     if is_cn && (has_allow_provinces || has_deny_provinces) {
         let region_name = geo.region.as_ref();
-        let province_blocked = if has_allow_provinces {
-            !region.allow_province_ids.iter().any(|&id| {
-                legacy_province_id_to_name(id).map_or(false, |name| name == region_name)
-            })
-        } else {
-            region.deny_province_ids.iter().any(|&id| {
-                legacy_province_id_to_name(id).map_or(false, |name| name == region_name)
-            })
-        };
+        let province_blocked =
+            if has_allow_provinces {
+                !region.allow_province_ids.iter().any(|&id| {
+                    legacy_province_id_to_name(id).map_or(false, |name| name == region_name)
+                })
+            } else {
+                region.deny_province_ids.iter().any(|&id| {
+                    legacy_province_id_to_name(id).map_or(false, |name| name == region_name)
+                })
+            };
         if province_blocked {
             let html = if !region.deny_province_html.is_empty() {
                 region.deny_province_html.clone()
@@ -836,10 +840,7 @@ pub fn check_region_deny(
                 html
             };
             return Some(MatchedAction {
-                action: ActionResponse::Block {
-                    status: 403,
-                    body,
-                },
+                action: ActionResponse::Block { status: 403, body },
                 policy_id,
                 group_id: 0,
                 set_id: 0,

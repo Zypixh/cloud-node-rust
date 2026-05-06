@@ -25,7 +25,10 @@ static NUMERIC_NODE_ID: AtomicI64 = AtomicI64::new(0);
 static REQUEST_ID_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 static REQUEST_ID_COUNTER: AtomicI32 = AtomicI32::new(1_000_000);
 
-pub fn init_global_log_bus(sender: mpsc::Sender<pb::HttpAccessLog>, node_sender: mpsc::Sender<pb::NodeLog>) {
+pub fn init_global_log_bus(
+    sender: mpsc::Sender<pb::HttpAccessLog>,
+    node_sender: mpsc::Sender<pb::NodeLog>,
+) {
     let _ = LOG_SENDER.set(sender);
     let _ = NODE_LOG_SENDER.set(node_sender);
 }
@@ -153,16 +156,13 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
 
     // Parse cookies from request header — gated by enableCookies
     let cookies: std::collections::HashMap<String, String> = if log_cookies {
-        if let Some(cookie_str) = req
-            .headers
-            .get("cookie")
-            .and_then(|v| v.to_str().ok())
-        {
+        if let Some(cookie_str) = req.headers.get("cookie").and_then(|v| v.to_str().ok()) {
             cookie_str
                 .split(';')
                 .filter_map(|p| {
                     let p = p.trim();
-                    p.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    p.split_once('=')
+                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
                 })
                 .collect()
         } else {
@@ -245,7 +245,8 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         .and_then(|auth| {
             if auth.to_lowercase().starts_with("basic ") {
                 let encoded = auth[6..].trim();
-                general_purpose::STANDARD.decode(encoded.as_bytes())
+                general_purpose::STANDARD
+                    .decode(encoded.as_bytes())
                     .ok()
                     .and_then(|decoded| String::from_utf8(decoded).ok())
                     .and_then(|creds| creds.split_once(':').map(|(user, _)| user.to_string()))
@@ -374,18 +375,26 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     // Cache status in attrs, matching Go: logAttrs["cache.status"] = "HIT"
     log.attrs.insert(
         "cache.status".to_string(),
-        if is_cached { "HIT".to_string() } else { "BYPASS".to_string() },
+        if is_cached {
+            "HIT".to_string()
+        } else {
+            "BYPASS".to_string()
+        },
     );
 
     // Attrs: geo + browser/OS analysis
     if let Some(analyzed) = &ctx.analyzed {
         if let Some(geo) = &analyzed.geo {
-            log.attrs.insert("region".to_string(), geo.region.to_string());
+            log.attrs
+                .insert("region".to_string(), geo.region.to_string());
             log.attrs.insert("city".to_string(), geo.city.to_string());
-            log.attrs.insert("isp".to_string(), geo.provider.to_string());
-            log.attrs.insert("country".to_string(), geo.country.to_string());
+            log.attrs
+                .insert("isp".to_string(), geo.provider.to_string());
+            log.attrs
+                .insert("country".to_string(), geo.country.to_string());
         }
-        log.attrs.insert("browser".to_string(), analyzed.browser.to_string());
+        log.attrs
+            .insert("browser".to_string(), analyzed.browser.to_string());
         log.attrs.insert("os".to_string(), analyzed.os.to_string());
     }
 
@@ -409,68 +418,182 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
 fn is_common_request_header(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
-        "host" | "user-agent" | "accept" | "accept-encoding"
-            | "accept-language" | "content-type" | "content-length"
-            | "referer" | "origin" | "connection" | "cache-control"
-            | "pragma" | "if-none-match" | "if-modified-since"
+        "host"
+            | "user-agent"
+            | "accept"
+            | "accept-encoding"
+            | "accept-language"
+            | "content-type"
+            | "content-length"
+            | "referer"
+            | "origin"
+            | "connection"
+            | "cache-control"
+            | "pragma"
+            | "if-none-match"
+            | "if-modified-since"
     )
 }
 
 fn apply_fields_whitelist(log: &mut pb::HttpAccessLog, fields: &[i32]) {
     use std::collections::HashSet;
     let allowed: HashSet<i32> = fields.iter().copied().collect();
-    if !allowed.contains(&1) { log.server_id = 0; }
-    if !allowed.contains(&2) { log.node_id = 0; }
-    if !allowed.contains(&3) { log.location_id = 0; }
-    if !allowed.contains(&4) { log.rewrite_id = 0; }
-    if !allowed.contains(&5) { log.origin_id = 0; }
-    if !allowed.contains(&6) { log.remote_addr = String::new(); }
-    if !allowed.contains(&7) { log.raw_remote_addr = String::new(); }
-    if !allowed.contains(&8) { log.remote_port = 0; }
-    if !allowed.contains(&9) { log.remote_user = String::new(); }
-    if !allowed.contains(&10) { log.request_uri = String::new(); }
-    if !allowed.contains(&11) { log.request_path = String::new(); }
-    if !allowed.contains(&12) { log.request_length = 0; }
-    if !allowed.contains(&13) { log.request_time = 0.0; }
-    if !allowed.contains(&14) { log.request_method = String::new(); }
-    if !allowed.contains(&15) { log.request_filename = String::new(); }
-    if !allowed.contains(&16) { log.scheme = String::new(); }
-    if !allowed.contains(&17) { log.proto = String::new(); }
-    if !allowed.contains(&18) { log.bytes_sent = 0; }
-    if !allowed.contains(&19) { log.body_bytes_sent = 0; }
-    if !allowed.contains(&20) { log.status = 0; }
-    if !allowed.contains(&21) { log.status_message = String::new(); }
-    if !allowed.contains(&22) { log.sent_header.clear(); }
-    if !allowed.contains(&23) { log.time_iso8601 = String::new(); }
-    if !allowed.contains(&24) { log.time_local = String::new(); }
-    if !allowed.contains(&25) { log.msec = 0.0; }
-    if !allowed.contains(&26) { log.timestamp = 0; }
-    if !allowed.contains(&27) { log.host = String::new(); }
-    if !allowed.contains(&28) { log.referer = String::new(); }
-    if !allowed.contains(&29) { log.user_agent = String::new(); }
-    if !allowed.contains(&30) { log.request = String::new(); }
-    if !allowed.contains(&31) { log.content_type = String::new(); }
-    if !allowed.contains(&32) { log.cookie.clear(); }
-    if !allowed.contains(&34) { log.args = String::new(); }
-    if !allowed.contains(&35) { log.query_string = String::new(); }
-    if !allowed.contains(&36) { log.header.clear(); }
-    if !allowed.contains(&37) { log.server_name = String::new(); }
-    if !allowed.contains(&38) { log.server_port = 0; }
-    if !allowed.contains(&39) { log.server_protocol = String::new(); }
-    if !allowed.contains(&40) { log.hostname = String::new(); }
-    if !allowed.contains(&41) { log.origin_address = String::new(); }
-    if !allowed.contains(&42) { log.errors.clear(); }
-    if !allowed.contains(&43) { log.attrs.clear(); }
-    if !allowed.contains(&44) { log.firewall_policy_id = 0; }
-    if !allowed.contains(&45) { log.firewall_rule_group_id = 0; }
-    if !allowed.contains(&46) { log.firewall_rule_set_id = 0; }
-    if !allowed.contains(&47) { log.firewall_rule_id = 0; }
-    if !allowed.contains(&48) { log.request_id = String::new(); }
-    if !allowed.contains(&49) { log.firewall_actions.clear(); }
-    if !allowed.contains(&50) { log.tags.clear(); }
-    if !allowed.contains(&51) { log.request_body.clear(); }
-    if !allowed.contains(&52) { log.origin_status = 0; }
-    if !allowed.contains(&53) { log.origin_header_response_time = 0.0; }
+    if !allowed.contains(&1) {
+        log.server_id = 0;
+    }
+    if !allowed.contains(&2) {
+        log.node_id = 0;
+    }
+    if !allowed.contains(&3) {
+        log.location_id = 0;
+    }
+    if !allowed.contains(&4) {
+        log.rewrite_id = 0;
+    }
+    if !allowed.contains(&5) {
+        log.origin_id = 0;
+    }
+    if !allowed.contains(&6) {
+        log.remote_addr = String::new();
+    }
+    if !allowed.contains(&7) {
+        log.raw_remote_addr = String::new();
+    }
+    if !allowed.contains(&8) {
+        log.remote_port = 0;
+    }
+    if !allowed.contains(&9) {
+        log.remote_user = String::new();
+    }
+    if !allowed.contains(&10) {
+        log.request_uri = String::new();
+    }
+    if !allowed.contains(&11) {
+        log.request_path = String::new();
+    }
+    if !allowed.contains(&12) {
+        log.request_length = 0;
+    }
+    if !allowed.contains(&13) {
+        log.request_time = 0.0;
+    }
+    if !allowed.contains(&14) {
+        log.request_method = String::new();
+    }
+    if !allowed.contains(&15) {
+        log.request_filename = String::new();
+    }
+    if !allowed.contains(&16) {
+        log.scheme = String::new();
+    }
+    if !allowed.contains(&17) {
+        log.proto = String::new();
+    }
+    if !allowed.contains(&18) {
+        log.bytes_sent = 0;
+    }
+    if !allowed.contains(&19) {
+        log.body_bytes_sent = 0;
+    }
+    if !allowed.contains(&20) {
+        log.status = 0;
+    }
+    if !allowed.contains(&21) {
+        log.status_message = String::new();
+    }
+    if !allowed.contains(&22) {
+        log.sent_header.clear();
+    }
+    if !allowed.contains(&23) {
+        log.time_iso8601 = String::new();
+    }
+    if !allowed.contains(&24) {
+        log.time_local = String::new();
+    }
+    if !allowed.contains(&25) {
+        log.msec = 0.0;
+    }
+    if !allowed.contains(&26) {
+        log.timestamp = 0;
+    }
+    if !allowed.contains(&27) {
+        log.host = String::new();
+    }
+    if !allowed.contains(&28) {
+        log.referer = String::new();
+    }
+    if !allowed.contains(&29) {
+        log.user_agent = String::new();
+    }
+    if !allowed.contains(&30) {
+        log.request = String::new();
+    }
+    if !allowed.contains(&31) {
+        log.content_type = String::new();
+    }
+    if !allowed.contains(&32) {
+        log.cookie.clear();
+    }
+    if !allowed.contains(&34) {
+        log.args = String::new();
+    }
+    if !allowed.contains(&35) {
+        log.query_string = String::new();
+    }
+    if !allowed.contains(&36) {
+        log.header.clear();
+    }
+    if !allowed.contains(&37) {
+        log.server_name = String::new();
+    }
+    if !allowed.contains(&38) {
+        log.server_port = 0;
+    }
+    if !allowed.contains(&39) {
+        log.server_protocol = String::new();
+    }
+    if !allowed.contains(&40) {
+        log.hostname = String::new();
+    }
+    if !allowed.contains(&41) {
+        log.origin_address = String::new();
+    }
+    if !allowed.contains(&42) {
+        log.errors.clear();
+    }
+    if !allowed.contains(&43) {
+        log.attrs.clear();
+    }
+    if !allowed.contains(&44) {
+        log.firewall_policy_id = 0;
+    }
+    if !allowed.contains(&45) {
+        log.firewall_rule_group_id = 0;
+    }
+    if !allowed.contains(&46) {
+        log.firewall_rule_set_id = 0;
+    }
+    if !allowed.contains(&47) {
+        log.firewall_rule_id = 0;
+    }
+    if !allowed.contains(&48) {
+        log.request_id = String::new();
+    }
+    if !allowed.contains(&49) {
+        log.firewall_actions.clear();
+    }
+    if !allowed.contains(&50) {
+        log.tags.clear();
+    }
+    if !allowed.contains(&51) {
+        log.request_body.clear();
+    }
+    if !allowed.contains(&52) {
+        log.origin_status = 0;
+    }
+    if !allowed.contains(&53) {
+        log.origin_header_response_time = 0.0;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

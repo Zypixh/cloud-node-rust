@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use cloud_node_rust::metrics::record;
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn bench_metrics_recording(c: &mut Criterion) {
     let server_id = 123;

@@ -1,13 +1,13 @@
+use lru::LruCache;
 use maxminddb::geoip2;
 use once_cell::sync::Lazy;
-use std::net::IpAddr;
-use tracing::warn;
-use woothee::parser::Parser;
-use std::sync::{Mutex, Arc};
-use lru::LruCache;
-use std::num::NonZeroUsize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+use tracing::warn;
+use woothee::parser::Parser;
 
 pub struct GeoInfo {
     pub country: Arc<str>,
@@ -94,7 +94,9 @@ impl<K: Hash + Eq, V: Clone> ShardedLru<K, V> {
     fn new(capacity_per_shard: usize) -> Self {
         let mut shards = Vec::with_capacity(CACHE_SHARDS);
         for _ in 0..CACHE_SHARDS {
-            shards.push(Mutex::new(LruCache::new(NonZeroUsize::new(capacity_per_shard).unwrap())));
+            shards.push(Mutex::new(LruCache::new(
+                NonZeroUsize::new(capacity_per_shard).unwrap(),
+            )));
         }
         Self { shards }
     }
@@ -176,32 +178,35 @@ fn lookup_geo_internal(ip: IpAddr) -> Option<GeoInfo> {
     if let Some(reader) = &*GEO_CITY_READER {
         match reader.lookup::<geoip2::City>(ip) {
             Ok(city) => Some(GeoInfo {
-                country: Arc::from(city
-                    .country
-                    .as_ref()
-                    .and_then(|c| c.names.as_ref())
-                    .and_then(|n| n.get("en"))
-                    .map(|s| s.as_ref())
-                    .unwrap_or_default()),
+                country: Arc::from(
+                    city.country
+                        .as_ref()
+                        .and_then(|c| c.names.as_ref())
+                        .and_then(|n| n.get("en"))
+                        .map(|s| s.as_ref())
+                        .unwrap_or_default(),
+                ),
                 country_id: city
                     .country
                     .as_ref()
                     .and_then(|c| c.geoname_id)
                     .map(|id| id as i64)
                     .unwrap_or(0),
-                country_iso: Arc::from(city
-                    .country
-                    .as_ref()
-                    .and_then(|c| c.iso_code)
-                    .unwrap_or_default()),
-                region: Arc::from(city
-                    .subdivisions
-                    .as_ref()
-                    .and_then(|s| s.first())
-                    .and_then(|sd| sd.names.as_ref())
-                    .and_then(|n| n.get("en"))
-                    .map(|s| s.as_ref())
-                    .unwrap_or_default()),
+                country_iso: Arc::from(
+                    city.country
+                        .as_ref()
+                        .and_then(|c| c.iso_code)
+                        .unwrap_or_default(),
+                ),
+                region: Arc::from(
+                    city.subdivisions
+                        .as_ref()
+                        .and_then(|s| s.first())
+                        .and_then(|sd| sd.names.as_ref())
+                        .and_then(|n| n.get("en"))
+                        .map(|s| s.as_ref())
+                        .unwrap_or_default(),
+                ),
                 region_id: city
                     .subdivisions
                     .as_ref()
@@ -209,19 +214,21 @@ fn lookup_geo_internal(ip: IpAddr) -> Option<GeoInfo> {
                     .and_then(|sd| sd.geoname_id)
                     .map(|id| id as i64)
                     .unwrap_or(0),
-                region_iso: Arc::from(city
-                    .subdivisions
-                    .as_ref()
-                    .and_then(|s| s.first())
-                    .and_then(|sd| sd.iso_code)
-                    .unwrap_or_default()),
-                city: Arc::from(city
-                    .city
-                    .as_ref()
-                    .and_then(|c| c.names.as_ref())
-                    .and_then(|n| n.get("en"))
-                    .map(|s| s.as_ref())
-                    .unwrap_or_default()),
+                region_iso: Arc::from(
+                    city.subdivisions
+                        .as_ref()
+                        .and_then(|s| s.first())
+                        .and_then(|sd| sd.iso_code)
+                        .unwrap_or_default(),
+                ),
+                city: Arc::from(
+                    city.city
+                        .as_ref()
+                        .and_then(|c| c.names.as_ref())
+                        .and_then(|n| n.get("en"))
+                        .map(|s| s.as_ref())
+                        .unwrap_or_default(),
+                ),
                 city_id: city
                     .city
                     .as_ref()

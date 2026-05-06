@@ -1503,6 +1503,410 @@ impl EdgeProxy {
         self.apply_cc_policy(session, ctx, &policy, 0).await
     }
 
+    fn wildcard_domain_matches(patterns: &[String], domain: &str) -> bool {
+        let domain = crate::lb_factory::strip_addr_port(domain)
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        patterns.iter().any(|pattern| {
+            let pattern = crate::lb_factory::strip_addr_port(pattern)
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if pattern == domain {
+                return true;
+            }
+            if let Some(suffix) = pattern.strip_prefix("*.") {
+                return domain == suffix || domain.ends_with(&format!(".{}", suffix));
+            }
+            if pattern.contains('*') {
+                let escaped = regex::escape(&pattern).replace("\\*", ".*");
+                return regex::Regex::new(&format!("(?i)^{}$", escaped))
+                    .map(|re| re.is_match(&domain))
+                    .unwrap_or(false);
+            }
+            false
+        })
+    }
+
+    fn url_patterns_match(
+        url: &str,
+        only: &[crate::config_models::URLPattern],
+        except: &[crate::config_models::URLPattern],
+    ) -> bool {
+        if except.iter().any(|pattern| pattern.matches(url)) {
+            return false;
+        }
+        if only.is_empty() {
+            return true;
+        }
+        only.iter().any(|pattern| pattern.matches(url))
+    }
+
+    fn basic_auth_matches(
+        session: &Session,
+        params: &serde_json::Value,
+    ) -> Option<(bool, String, Option<String>)> {
+        let domains = params
+            .get("domains")
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            .unwrap_or_default();
+        if !domains.is_empty() {
+            let host = session
+                .get_header("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if !Self::wildcard_domain_matches(&domains, host) {
+                return None;
+            }
+        }
+
+        let exts = params
+            .get("exts")
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            .unwrap_or_default();
+        if !exts.is_empty() {
+            let path = session.req_header().uri.path().to_ascii_lowercase();
+            if !exts.iter().any(|ext| {
+                let ext = ext.to_ascii_lowercase();
+                if ext.starts_with('.') {
+                    path.ends_with(&ext)
+                } else {
+                    path.ends_with(&format!(".{}", ext))
+                }
+            }) {
+                return None;
+            }
+        }
+
+        let realm = params
+            .get("realm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let charset = params
+            .get("charset")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+
+        let Some(auth) = session
+            .get_header("authorization")
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Some((false, realm, charset));
+        };
+        let Some(encoded) = auth.trim().strip_prefix("Basic ") else {
+            return Some((false, realm, charset));
+        };
+        let decoded = match general_purpose::STANDARD.decode(encoded.trim()) {
+            Ok(data) => data,
+            Err(_) => return Some((false, realm, charset)),
+        };
+        let decoded = String::from_utf8_lossy(&decoded);
+        let Some((username, password)) = decoded.split_once(':') else {
+            return Some((false, realm, charset));
+        };
+
+        let users = params
+            .get("users")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("username").and_then(|v| v.as_str()) == Some(username)
+                        && item.get("password").and_then(|v| v.as_str()) == Some(password)
+                })
+            })
+            .unwrap_or(false);
+        Some((users, realm, charset))
+    }
+
+    async fn enforce_auth(&self, session: &mut Session, ctx: &mut ProxyCTX) -> Result<bool> {
+        let Some(web) = ctx.server.as_ref().and_then(|s| s.web.as_ref()) else {
+            return Ok(false);
+        };
+        let Some(auth) = &web.auth else {
+            return Ok(false);
+        };
+        if !auth.is_on {
+            return Ok(false);
+        }
+
+        for policy_ref in &auth.policy_refs {
+            let Some(policy) = &policy_ref.auth_policy else {
+                continue;
+            };
+            if !policy_ref.is_on || !policy.is_on {
+                continue;
+            }
+            if policy.auth_type != "basicAuth" {
+                continue;
+            }
+            let Some((ok, realm, charset)) = Self::basic_auth_matches(session, &policy.params)
+            else {
+                continue;
+            };
+            ctx.waf_action = Some(format!("auth:{}", policy.auth_type));
+            if ok {
+                return Ok(false);
+            }
+
+            let realm = if realm.is_empty() { &ctx.host } else { &realm };
+            let mut header = format!("Basic realm=\"{}\"", realm.replace('"', ""));
+            if let Some(charset) = charset {
+                header.push_str(&format!(", charset=\"{}\"", charset.replace('"', "")));
+            }
+            let mut resp = pingora_http::ResponseHeader::build(401, None).unwrap();
+            let _ = resp.insert_header("www-authenticate", header);
+            let _ = resp.insert_header("cache-control", "no-store");
+            session.write_response_header(Box::new(resp), true).await?;
+            ctx.response_status = 401;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    async fn enforce_referers(&self, session: &mut Session, ctx: &mut ProxyCTX) -> Result<bool> {
+        let Some(config) = ctx
+            .server
+            .as_ref()
+            .and_then(|s| s.web.as_ref())
+            .and_then(|w| w.referer_config.as_ref())
+        else {
+            return Ok(false);
+        };
+        if !config.is_on {
+            return Ok(false);
+        }
+        let url = Self::current_request_url(session);
+        if !Self::url_patterns_match(&url, &config.only_url_patterns, &config.except_url_patterns) {
+            return Ok(false);
+        }
+
+        let origin = session
+            .get_header("origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let referer = session
+            .get_header("referer")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let source = if referer.is_empty()
+            && config.check_origin
+            && !origin.is_empty()
+            && origin != "null"
+        {
+            origin
+        } else {
+            referer
+        };
+
+        let source_host = if source.is_empty() {
+            String::new()
+        } else {
+            http::Uri::try_from(source)
+                .ok()
+                .and_then(|uri| uri.host().map(str::to_string))
+                .or_else(|| {
+                    if source.contains("://") {
+                        None
+                    } else {
+                        Some(crate::lb_factory::strip_addr_port(source))
+                    }
+                })
+                .unwrap_or_default()
+        };
+
+        let allowed = if source_host.is_empty() {
+            config.allow_empty
+        } else if config.allow_same_domain && source_host.eq_ignore_ascii_case(&ctx.host) {
+            true
+        } else if config.allow_domains.is_empty() {
+            !config.deny_domains.is_empty()
+                && !Self::wildcard_domain_matches(&config.deny_domains, &source_host)
+        } else {
+            Self::wildcard_domain_matches(&config.allow_domains, &source_host)
+                && !Self::wildcard_domain_matches(&config.deny_domains, &source_host)
+        };
+
+        if allowed {
+            return Ok(false);
+        }
+
+        ctx.waf_action = Some("refererCheck".to_string());
+        let mut resp = pingora_http::ResponseHeader::build(403, None).unwrap();
+        let _ = resp.insert_header("cache-control", "max-age=3600");
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(
+                Some(bytes::Bytes::from_static(b"The referer has been blocked.")),
+                true,
+            )
+            .await?;
+        ctx.response_status = 403;
+        Ok(true)
+    }
+
+    async fn enforce_user_agent(&self, session: &mut Session, ctx: &mut ProxyCTX) -> Result<bool> {
+        let Some(config) = ctx
+            .server
+            .as_ref()
+            .and_then(|s| s.web.as_ref())
+            .and_then(|w| w.user_agent_config.as_ref())
+        else {
+            return Ok(false);
+        };
+        if !config.is_on {
+            return Ok(false);
+        }
+        let url = Self::current_request_url(session);
+        if !Self::url_patterns_match(&url, &config.only_url_patterns, &config.except_url_patterns) {
+            return Ok(false);
+        }
+        let ua = session
+            .get_header("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        for filter in &config.filters {
+            if filter.keywords.is_empty() {
+                continue;
+            }
+            let matched = filter.keywords.iter().any(|keyword| {
+                if keyword.is_empty() {
+                    ua.is_empty()
+                } else if keyword.contains('*') {
+                    let pattern = regex::escape(keyword).replace("\\*", ".*");
+                    regex::Regex::new(&format!("(?i){}", pattern))
+                        .map(|re| re.is_match(ua))
+                        .unwrap_or(false)
+                } else {
+                    ua.to_ascii_lowercase()
+                        .contains(&keyword.to_ascii_lowercase())
+                }
+            });
+            if matched {
+                if filter.action == "allow" {
+                    return Ok(false);
+                }
+                ctx.waf_action = Some("userAgentCheck".to_string());
+                let mut resp = pingora_http::ResponseHeader::build(403, None).unwrap();
+                let _ = resp.insert_header("cache-control", "max-age=3600");
+                session.write_response_header(Box::new(resp), false).await?;
+                session
+                    .write_response_body(
+                        Some(bytes::Bytes::from_static(
+                            b"The User-Agent has been blocked.",
+                        )),
+                        true,
+                    )
+                    .await?;
+                ctx.response_status = 403;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn respond_domain_mismatch(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        hot_path: &crate::config::HotPathSnapshot,
+        host: &str,
+    ) -> Result<bool> {
+        const HEALTH_CHECK_HEADER: &str = "X-Edge-Health-Check-Key";
+        if let Some(value) = session
+            .get_header(HEALTH_CHECK_HEADER)
+            .and_then(|v| v.to_str().ok())
+            && general_purpose::STANDARD.decode(value.trim()).is_ok()
+        {
+            let resp = pingora_http::ResponseHeader::build(200, None).unwrap();
+            session.write_response_header(Box::new(resp), true).await?;
+            ctx.response_status = 200;
+            return Ok(true);
+        }
+
+        let server_id = 0;
+        if self.waf_state.is_blocked(ctx.client_ip, server_id) {
+            return self.respond_status_with_pages(session, ctx, 403).await;
+        }
+
+        if hot_path.global_http.match_domain_strictly {
+            let count = self
+                .waf_state
+                .increase_counter(format!("MISMATCH_DOMAIN:{}", ctx.client_ip), 60);
+            if count > 100 {
+                self.waf_state.block_ip(
+                    ctx.client_ip,
+                    server_id,
+                    3600,
+                    Some("global"),
+                    false,
+                    false,
+                );
+            }
+        }
+
+        let action = hot_path.global_http.domain_mismatch_action.as_ref();
+        let status = action
+            .and_then(|a| a.options.get("statusCode").and_then(|v| v.as_i64()))
+            .filter(|status| (100..1000).contains(status))
+            .unwrap_or(404) as u16;
+
+        if hot_path.global_http.node_ip_show_page && host.parse::<std::net::IpAddr>().is_ok() {
+            let body = self.render_page_template(
+                session,
+                ctx,
+                &hot_path.global_http.node_ip_page_html,
+                status,
+            );
+            let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
+            let _ = resp.insert_header("content-type", "text/html; charset=utf-8");
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                .await?;
+            ctx.response_status = status;
+            return Ok(true);
+        }
+
+        match action.map(|a| a.code.as_str()) {
+            Some("page") => {
+                let body = action
+                    .and_then(|a| a.options.get("contentHTML").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let body = self.render_page_template(session, ctx, body, status);
+                let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
+                let _ = resp.insert_header("content-type", "text/html; charset=utf-8");
+                session.write_response_header(Box::new(resp), false).await?;
+                session
+                    .write_response_body(Some(bytes::Bytes::from(body)), true)
+                    .await?;
+            }
+            Some("redirect") => {
+                let location = action
+                    .and_then(|a| a.options.get("url").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                if !location.is_empty() {
+                    let location = self.render_page_template(session, ctx, location, 307);
+                    let mut resp = pingora_http::ResponseHeader::build(307, None).unwrap();
+                    let _ = resp.insert_header("location", location);
+                    session.write_response_header(Box::new(resp), true).await?;
+                    ctx.response_status = 307;
+                    return Ok(true);
+                }
+                return self.respond_status_with_pages(session, ctx, 404).await;
+            }
+            Some("close") => {
+                self.respond_status_with_pages(session, ctx, 404).await?;
+            }
+            _ => {
+                return self.respond_status_with_pages(session, ctx, 404).await;
+            }
+        }
+        ctx.response_status = status;
+        Ok(true)
+    }
+
     fn resolve_plan_max_upload_bytes(&self, server: &ServerConfig) -> i64 {
         if server.user_plan_id <= 0 {
             return 0;
@@ -3098,11 +3502,13 @@ impl ProxyHttp for EdgeProxy {
 
         if ctx.server.is_none() {
             info!(
-                "404 Not Found for host: '{}'. Registered hosts: {:?}",
+                "Domain mismatch for host: '{}'. Registered hosts: {:?}",
                 host,
                 self.config.get_all_hosts_sync()
             );
-            return self.respond_status_with_pages(session, ctx, 404).await;
+            return self
+                .respond_domain_mismatch(session, ctx, &hot_path, &host)
+                .await;
         }
 
         if let Some(server) = ctx.server.clone()
@@ -3291,6 +3697,18 @@ impl ProxyHttp for EdgeProxy {
             if blocked {
                 return Ok(true);
             }
+        }
+
+        if self.enforce_referers(session, ctx).await? {
+            return Ok(true);
+        }
+
+        if self.enforce_user_agent(session, ctx).await? {
+            return Ok(true);
+        }
+
+        if self.enforce_auth(session, ctx).await? {
+            return Ok(true);
         }
 
         // Redirect / rewrite checks — routing logic, must always run

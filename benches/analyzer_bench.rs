@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use cloud_node_rust::metrics::analyzer::analyze_request;
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::net::IpAddr;
 
 fn bench_request_analysis(c: &mut Criterion) {

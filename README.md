@@ -78,6 +78,11 @@ cloud-node --monitor-port 8888
 - [配置说明](docs/configuration.md)
 - [部署与运维](docs/operations.md)
 
+发布说明：
+
+- [1.0.6](release-notes/v1.0.6.md)
+- [1.0.5](release-notes/v1.0.5.md)
+
 ## 构建产物
 
 Release workflow 面向不同 CPU 和系统环境提供多个 Linux 产物：

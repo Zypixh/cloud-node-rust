@@ -31,7 +31,8 @@ pub fn should_cache_response(
 
     // 2. Check Status
     let status_allowed = if cache_ref.status.is_empty() {
-        status == 200 || (status == 206 && (cache_ref.allow_partial_content || force_partial_content))
+        status == 200
+            || (status == 206 && (cache_ref.allow_partial_content || force_partial_content))
     } else {
         cache_ref.status.contains(&(status as i32))
             || (status == 206 && cache_ref.allow_partial_content)

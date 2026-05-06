@@ -129,8 +129,10 @@ pub async fn sync_node_tasks(
                         }
                     }
                     "scriptsChanged" => {
+                        let unsupported = crate::unsupported::request_scripts::unsupported();
                         warn!(
-                            "Ignoring unsupported task 'scriptsChanged': edge script runtime is not implemented in Rust node"
+                            "Ignoring unsupported task 'scriptsChanged': {} ({})",
+                            unsupported.reason, unsupported.code
                         );
                         true
                     }

@@ -1,11 +1,15 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use serde_json;
 
 fn bench_serialization_large_list(c: &mut Criterion) {
     // Mock 10,000 blocked IPs with (IP, ServerID, ExpireTimestamp)
     let mut ips = Vec::new();
     for i in 0..10000 {
-        ips.push((format!("103.20.{}.{}", i % 255, i % 100), i as i64, 1770000000 + i as u64));
+        ips.push((
+            format!("103.20.{}.{}", i % 255, i % 100),
+            i as i64,
+            1770000000 + i as u64,
+        ));
     }
 
     c.bench_function("serialize_10k_blocked_ips", |b| {

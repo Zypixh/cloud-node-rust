@@ -141,6 +141,18 @@ tail -n 200 ../data/cloud-node-stderr.log
 - 防火墙或安全组是否放行。
 - Host 是否命中站点域名。
 
+### 控制端显示节点在线但没有实时命令
+
+检查：
+
+- 周期配置同步是否成功。
+- `nodeStream` 是否能保持连接。
+- 控制端是否向该节点下发 `connectedAPINode` 或其它 stream 消息。
+- 节点日志中是否出现 `Node stream transport opened`。
+- API endpoint 是否发生运行时切换。
+
+节点在线状态和 `nodeStream` 是两条路径：在线状态可以通过 `updateNodeStatus` 上报成功，而实时命令需要控制端在 `nodeStream` 上实际发送消息。
+
 ### HTTPS 握手失败
 
 检查：

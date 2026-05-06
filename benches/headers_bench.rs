@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use cloud_node_rust::config_models::{HTTPHeaderConfig, HTTPHeaderPolicy};
 use cloud_node_rust::headers::apply_response_header_policy_to_map;
-use cloud_node_rust::config_models::{HTTPHeaderPolicy, HTTPHeaderConfig};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::collections::HashMap;
 
 fn bench_headers_policy(c: &mut Criterion) {
@@ -11,12 +11,16 @@ fn bench_headers_policy(c: &mut Criterion) {
 
     let policy = HTTPHeaderPolicy {
         delete_headers: vec!["x-powered-by".to_string()],
-        set_headers: vec![
-            HTTPHeaderConfig { name: "server".to_string(), value: "CloudNode".to_string(), is_on: true },
-        ],
-        add_headers: vec![
-            HTTPHeaderConfig { name: "x-frame-options".to_string(), value: "SAMEORIGIN".to_string(), is_on: true },
-        ],
+        set_headers: vec![HTTPHeaderConfig {
+            name: "server".to_string(),
+            value: "CloudNode".to_string(),
+            is_on: true,
+        }],
+        add_headers: vec![HTTPHeaderConfig {
+            name: "x-frame-options".to_string(),
+            value: "SAMEORIGIN".to_string(),
+            is_on: true,
+        }],
         ..Default::default()
     };
 

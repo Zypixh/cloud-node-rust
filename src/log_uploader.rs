@@ -5,9 +5,9 @@ use crate::rpc::client::RPC_MAX_MESSAGE_BYTES;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tonic::Code;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
-use tonic::Code;
 use tracing::{error, info};
 
 /// A high-performance uploader for access logs.

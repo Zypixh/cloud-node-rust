@@ -1,8 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use cloud_node_rust::logging::{
-    next_request_id, report_node_log, set_numeric_node_id,
-};
+use cloud_node_rust::logging::{next_request_id, report_node_log, set_numeric_node_id};
 use cloud_node_rust::utils::time::{local_from_timestamp_millis, now_timestamp_millis};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn bench_request_id(c: &mut Criterion) {
     set_numeric_node_id(42);

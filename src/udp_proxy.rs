@@ -251,13 +251,23 @@ impl UdpProxyManager {
                 let shutdown_rx_clone = session.shutdown.clone();
                 let server_id = session.server_id;
                 let client_addr = session.client_addr;
-                
+
                 let listen_socket_inner = listen_socket.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        Self::handle_session(backend_addr, shutdown_rx_clone, server_id, client_addr, listen_socket_inner, rx).await
+                    if let Err(e) = Self::handle_session(
+                        backend_addr,
+                        shutdown_rx_clone,
+                        server_id,
+                        client_addr,
+                        listen_socket_inner,
+                        rx,
+                    )
+                    .await
                     {
-                        debug!("UDP session {} -> {} closed: {}", client_addr, backend_addr, e);
+                        debug!(
+                            "UDP session {} -> {} closed: {}",
+                            client_addr, backend_addr, e
+                        );
                     }
                 });
 
