@@ -14,7 +14,7 @@ pub enum RewriteResult {
     NoMatch,
 }
 
-/// Match and evaluate rewrite rules, mirroring GoEdge's configureWeb/doRewrite logic
+/// Match and evaluate rewrite rules using the legacy configureWeb/doRewrite behavior.
 static REWRITE_RE_CACHE: Lazy<DashMap<String, std::sync::Arc<Regex>>> = Lazy::new(DashMap::new);
 
 pub fn evaluate_rewrites(
@@ -89,7 +89,7 @@ pub fn evaluate_rewrites(
     RewriteResult::NoMatch
 }
 
-/// Evaluate host redirect rules, mirroring GoEdge's doHostRedirect logic
+/// Evaluate host redirect rules using the legacy doHostRedirect behavior.
 pub fn evaluate_host_redirects(
     host: &str,
     uri: &str,

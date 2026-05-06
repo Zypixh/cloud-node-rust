@@ -43,7 +43,7 @@ md5_legacy = { package = "md5", version = "0.7" }
 brotli = "7.0"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1.18"
-tonic = "0.12.3"
+tonic = { version = "0.12.3", features = ["gzip"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 urlencoding = "2.1.3"

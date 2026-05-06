@@ -152,7 +152,7 @@ pub fn evaluate_policy(
                                     current_group_idx = g_idx;
                                     // Note: we can't easily jump to a specific set within match_group
                                     // without refactoring it to take a start_set_id.
-                                    // For now, we jump to the group, which is usually correct in GoEdge flow.
+                                    // For now, we jump to the group, which is usually correct in the legacy flow.
                                     found = true;
                                     break;
                                 }
@@ -667,7 +667,7 @@ fn is_search_engine_bot(user_agent: &str) -> bool {
         || ua.contains("bytespider")
 }
 
-fn goedge_country_id_to_iso(id: i64) -> Option<&'static str> {
+fn legacy_country_id_to_iso(id: i64) -> Option<&'static str> {
     match id {
         1 => Some("CN"),    // China
         2 => Some("US"),    // United States
@@ -697,7 +697,7 @@ fn goedge_country_id_to_iso(id: i64) -> Option<&'static str> {
     }
 }
 
-fn goedge_province_id_to_name(id: i64) -> Option<&'static str> {
+fn legacy_province_id_to_name(id: i64) -> Option<&'static str> {
     match id {
         1 => Some("Beijing"),
         2 => Some("Tianjin"),
@@ -761,11 +761,11 @@ pub fn check_region_deny(
         let country_iso = geo.country_iso.as_ref();
         let country_blocked = if has_allow_countries {
             !region.allow_country_ids.iter().any(|&id| {
-                goedge_country_id_to_iso(id).map_or(false, |iso| iso == country_iso)
+                legacy_country_id_to_iso(id).map_or(false, |iso| iso == country_iso)
             })
         } else {
             region.deny_country_ids.iter().any(|&id| {
-                goedge_country_id_to_iso(id).map_or(false, |iso| iso == country_iso)
+                legacy_country_id_to_iso(id).map_or(false, |iso| iso == country_iso)
             })
         };
         if country_blocked {
@@ -817,11 +817,11 @@ pub fn check_region_deny(
         let region_name = geo.region.as_ref();
         let province_blocked = if has_allow_provinces {
             !region.allow_province_ids.iter().any(|&id| {
-                goedge_province_id_to_name(id).map_or(false, |name| name == region_name)
+                legacy_province_id_to_name(id).map_or(false, |name| name == region_name)
             })
         } else {
             region.deny_province_ids.iter().any(|&id| {
-                goedge_province_id_to_name(id).map_or(false, |name| name == region_name)
+                legacy_province_id_to_name(id).map_or(false, |name| name == region_name)
             })
         };
         if province_blocked {

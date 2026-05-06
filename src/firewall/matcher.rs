@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -29,13 +30,16 @@ pub fn evaluate_operator(
     expected_value: &str,
     case_insensitive: bool,
 ) -> bool {
-    let mut actual = actual_value.to_string();
-    let mut expected = expected_value.to_string();
-
-    if case_insensitive {
-        actual = actual.to_lowercase();
-        expected = expected.to_lowercase();
-    }
+    let actual: Cow<'_, str> = if case_insensitive {
+        Cow::Owned(actual_value.to_lowercase())
+    } else {
+        Cow::Borrowed(actual_value)
+    };
+    let expected: Cow<'_, str> = if case_insensitive {
+        Cow::Owned(expected_value.to_lowercase())
+    } else {
+        Cow::Borrowed(expected_value)
+    };
 
     match operator.trim().to_ascii_lowercase().as_str() {
         "eq string" => actual == expected,
@@ -56,10 +60,10 @@ pub fn evaluate_operator(
             let re_str = format!("^{}$", escaped);
             get_or_compile_regex(&re_str).map_or(false, |re| !re.is_match(&actual))
         }
-        "contains" | "containsstring" => actual.contains(&expected),
-        "not contains" | "notcontains" => !actual.contains(&expected),
-        "prefix" | "hasprefix" => actual.starts_with(&expected),
-        "suffix" | "hassuffix" => actual.ends_with(&expected),
+        "contains" | "containsstring" => actual.contains(expected.as_ref()),
+        "not contains" | "notcontains" => !actual.contains(expected.as_ref()),
+        "prefix" | "hasprefix" => actual.starts_with(expected.as_ref()),
+        "suffix" | "hassuffix" => actual.ends_with(expected.as_ref()),
         "contains any" => {
             let lines: Vec<&str> = expected.lines().collect();
             lines.into_iter().any(|line| actual.contains(line))

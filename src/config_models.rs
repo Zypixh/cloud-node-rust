@@ -1234,24 +1234,30 @@ static URL_PATTERN_RE_CACHE: Lazy<dashmap::DashMap<String, std::sync::Arc<regex:
 
 impl URLPattern {
     pub fn matches(&self, url: &str) -> bool {
-        let url = url.to_ascii_lowercase();
+        fn ends_with_ascii_ignore_case(value: &str, suffix: &str) -> bool {
+            let value = value.as_bytes();
+            let suffix = suffix.as_bytes();
+            value.len() >= suffix.len()
+                && value[value.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        }
+
         match self.type_name.as_str() {
             "images" => [
                 ".apng", ".avif", ".gif", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp", ".png",
                 ".svg", ".webp", ".bmp", ".ico", ".cur", ".tif", ".tiff",
             ]
             .iter()
-            .any(|ext| url.ends_with(ext)),
+            .any(|ext| ends_with_ascii_ignore_case(url, ext)),
             "audios" => [
                 ".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".m3u8",
             ]
             .iter()
-            .any(|ext| url.ends_with(ext)),
+            .any(|ext| ends_with_ascii_ignore_case(url, ext)),
             "videos" => [
                 ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".mpeg", ".3gp", ".webm", ".ts", ".m3u8",
             ]
             .iter()
-            .any(|ext| url.ends_with(ext)),
+            .any(|ext| ends_with_ascii_ignore_case(url, ext)),
             "regexp" => {
                 let pattern = if self.pattern.starts_with("(?i)") {
                     self.pattern.clone()
@@ -1259,12 +1265,12 @@ impl URLPattern {
                     format!("(?i){}", self.pattern)
                 };
                 if let Some(re) = URL_PATTERN_RE_CACHE.get(&pattern) {
-                    re.is_match(&url)
+                    re.is_match(url)
                 } else {
                     let Ok(re) = regex::Regex::new(&pattern) else {
                         return false;
                     };
-                    let result = re.is_match(&url);
+                    let result = re.is_match(url);
                     URL_PATTERN_RE_CACHE.insert(pattern, Arc::new(re));
                     result
                 }
@@ -1281,12 +1287,12 @@ impl URLPattern {
                     format!("(?i)^{}$", wildcard)
                 };
                 if let Some(re) = URL_PATTERN_RE_CACHE.get(&pattern) {
-                    re.is_match(&url)
+                    re.is_match(url)
                 } else {
                     let Ok(re) = regex::Regex::new(&pattern) else {
                         return false;
                     };
-                    let result = re.is_match(&url);
+                    let result = re.is_match(url);
                     URL_PATTERN_RE_CACHE.insert(pattern, Arc::new(re));
                     result
                 }
@@ -1555,17 +1561,41 @@ pub struct HTTPFirewallOutboundConfig {
 pub struct HTTPFirewallRegionConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
-    #[serde(rename = "denyCountryIds", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "denyCountryIds",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub deny_country_ids: Vec<i64>,
-    #[serde(rename = "allowCountryIds", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "allowCountryIds",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub allow_country_ids: Vec<i64>,
-    #[serde(rename = "denyProvinceIds", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "denyProvinceIds",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub deny_province_ids: Vec<i64>,
-    #[serde(rename = "allowProvinceIds", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "allowProvinceIds",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub allow_province_ids: Vec<i64>,
-    #[serde(rename = "denyCountryHTML", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "denyCountryHTML",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub deny_country_html: String,
-    #[serde(rename = "denyProvinceHTML", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "denyProvinceHTML",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub deny_province_html: String,
     #[serde(default)]
     pub allow_search_engine: bool,
@@ -1730,17 +1760,37 @@ pub struct CORSConfig {
     pub is_on: bool,
     #[serde(rename = "optionsMethodOnly", default)]
     pub options_method_only: bool,
-    #[serde(rename = "allowOrigin", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "allowOrigin",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub allow_origin: String,
-    #[serde(rename = "allowMethods", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "allowMethods",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub allow_methods: Vec<String>,
     #[serde(rename = "maxAge", default)]
     pub max_age: i64,
-    #[serde(rename = "exposeHeaders", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "exposeHeaders",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub expose_headers: Vec<String>,
-    #[serde(rename = "requestMethod", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "requestMethod",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub request_method: String,
-    #[serde(rename = "allowHeaders", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "allowHeaders",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub allow_headers: Vec<String>,
 }
 
@@ -1867,7 +1917,11 @@ pub struct ReverseProxyConfig {
     )]
     pub backup_origins: Vec<OriginConfig>,
     // Global request host override (used when requestHostType == 2)
-    #[serde(rename = "requestHost", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "requestHost",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub request_host: String,
     // 0=proxyServer(CDN domain), 1=origin, 2=customized
     #[serde(rename = "requestHostType", default)]
@@ -2044,8 +2098,13 @@ pub struct OriginConfig {
     pub weight: u32,
     #[serde(rename = "healthCheck", alias = "HealthCheck")]
     pub health_check: Option<HealthCheckConfig>,
-    // GoEdge uses "requestHost" for per-origin custom Host header override
-    #[serde(rename = "requestHost", alias = "host", default, deserialize_with = "deserialize_null_default")]
+    // Legacy API uses "requestHost" for per-origin custom Host header override.
+    #[serde(
+        rename = "requestHost",
+        alias = "host",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub request_host: String,
     #[serde(rename = "followHost", default)]
     pub follow_host: bool,
@@ -2061,7 +2120,7 @@ pub struct OriginConfig {
     pub idle_timeout: Option<Value>,
     pub cert: Option<SSLCertConfig>,
     #[serde(rename = "tlsVerify", default)]
-    pub tls_verify: Option<Value>, // Can be boolean or object or int in GoEdge
+    pub tls_verify: Option<Value>, // Can be boolean, object, or int in legacy configs.
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

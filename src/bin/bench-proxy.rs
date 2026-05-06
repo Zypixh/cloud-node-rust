@@ -1,4 +1,4 @@
-/// Minimal benchmark proxy — isolates Pingora + cache throughput from GoEdge overhead.
+/// Minimal benchmark proxy — isolates Pingora + cache throughput from control-plane overhead.
 /// Listens on :8080 (HTTP). Forwards all requests to 127.0.0.1:8081 (local origin).
 ///
 /// Usage:

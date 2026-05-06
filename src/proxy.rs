@@ -26,6 +26,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Clone)]
 pub struct ProxyCTX {
@@ -99,7 +100,7 @@ pub struct ProxyCTX {
     pub request_limit_out_bandwidth_bytes: i64,
     pub request_limit_out_bandwidth_sent: i64,
     pub request_limit_out_bandwidth_window_start: Option<std::time::Instant>,
-    pub global_cache_policies: Vec<Arc<HTTPCachePolicy>>,
+    pub global_cache_policies: Arc<Vec<Arc<HTTPCachePolicy>>>,
     /// Cached during request_filter to avoid config lock in response_filter/body_filter
     pub global_http_config: Option<Arc<crate::config_models::GlobalHTTPAllConfig>>,
     pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
@@ -180,7 +181,7 @@ impl Default for ProxyCTX {
             request_limit_out_bandwidth_bytes: 0,
             request_limit_out_bandwidth_sent: 0,
             request_limit_out_bandwidth_window_start: None,
-            global_cache_policies: Vec::new(),
+            global_cache_policies: Arc::new(Vec::new()),
             global_http_config: None,
             firewall_policies_snapshot: None,
             node_level: 0,
@@ -237,7 +238,18 @@ struct RequestLimitBinding {
     last_seen: std::time::Instant,
 }
 
-static REQUEST_LIMIT_BINDINGS: Lazy<DashMap<String, RequestLimitBinding>> = Lazy::new(DashMap::new);
+static REQUEST_LIMIT_BINDINGS: Lazy<DashMap<String, RequestLimitBinding>> =
+    Lazy::new(|| DashMap::with_shard_amount(64));
+static REQUEST_LIMIT_SERVER_COUNTS: Lazy<DashMap<i64, Arc<AtomicI32>>> =
+    Lazy::new(|| DashMap::with_shard_amount(64));
+static REQUEST_LIMIT_IP_COUNTS: Lazy<DashMap<std::net::IpAddr, Arc<AtomicI32>>> =
+    Lazy::new(|| DashMap::with_shard_amount(64));
+static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
+    hostname::get()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+});
 const REQUEST_LIMIT_BINDING_IDLE_SECS: u64 = 180;
 const MAX_OPTIMIZATION_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEBP_CONVERSION_BODY_BYTES: usize = 10 * 1024 * 1024;
@@ -488,10 +500,7 @@ impl EdgeProxy {
                             }
                         }
                     ),
-                    "hostname" => hostname::get()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
+                    "hostname" => HOSTNAME.clone(),
                     _ => crate::firewall::matcher_plus::format_variables(
                         session,
                         raw,
@@ -509,17 +518,58 @@ impl EdgeProxy {
 
     fn cleanup_request_limit_bindings() {
         let now = std::time::Instant::now();
-        let stale_keys: Vec<String> = REQUEST_LIMIT_BINDINGS
+        let stale: Vec<(String, i64, std::net::IpAddr)> = REQUEST_LIMIT_BINDINGS
             .iter()
             .filter_map(|entry| {
                 (now.duration_since(entry.value().last_seen).as_secs()
                     > REQUEST_LIMIT_BINDING_IDLE_SECS)
-                    .then(|| entry.key().clone())
+                    .then(|| {
+                        (
+                            entry.key().clone(),
+                            entry.value().server_id,
+                            entry.value().client_ip,
+                        )
+                    })
             })
             .collect();
 
-        for key in stale_keys {
-            REQUEST_LIMIT_BINDINGS.remove(&key);
+        for (key, server_id, client_ip) in stale {
+            if REQUEST_LIMIT_BINDINGS.remove(&key).is_some() {
+                Self::decrement_request_limit_count(server_id, client_ip);
+            }
+        }
+    }
+
+    fn request_limit_count(map: &DashMap<i64, Arc<AtomicI32>>, key: i64) -> i32 {
+        map.get(&key)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    fn request_limit_ip_count(ip: std::net::IpAddr) -> i32 {
+        REQUEST_LIMIT_IP_COUNTS
+            .get(&ip)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    fn increment_request_limit_count(server_id: i64, client_ip: std::net::IpAddr) {
+        REQUEST_LIMIT_SERVER_COUNTS
+            .entry(server_id)
+            .or_insert_with(|| Arc::new(AtomicI32::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
+        REQUEST_LIMIT_IP_COUNTS
+            .entry(client_ip)
+            .or_insert_with(|| Arc::new(AtomicI32::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_request_limit_count(server_id: i64, client_ip: std::net::IpAddr) {
+        if let Some(count) = REQUEST_LIMIT_SERVER_COUNTS.get(&server_id) {
+            count.fetch_sub(1, Ordering::Relaxed);
+        }
+        if let Some(count) = REQUEST_LIMIT_IP_COUNTS.get(&client_ip) {
+            count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -544,20 +594,15 @@ impl EdgeProxy {
         }
 
         if max_conns > 0 {
-            let current_server_conns = REQUEST_LIMIT_BINDINGS
-                .iter()
-                .filter(|entry| entry.value().server_id == server_id)
-                .count() as i32;
+            let current_server_conns =
+                Self::request_limit_count(&REQUEST_LIMIT_SERVER_COUNTS, server_id);
             if current_server_conns >= max_conns {
                 return false;
             }
         }
 
         if max_conns_per_ip > 0 {
-            let current_ip_conns = REQUEST_LIMIT_BINDINGS
-                .iter()
-                .filter(|entry| entry.value().client_ip == client_ip)
-                .count() as i32;
+            let current_ip_conns = Self::request_limit_ip_count(client_ip);
             if current_ip_conns >= max_conns_per_ip {
                 return false;
             }
@@ -571,6 +616,7 @@ impl EdgeProxy {
                 last_seen: now,
             },
         );
+        Self::increment_request_limit_count(server_id, client_ip);
         true
     }
 
@@ -843,7 +889,7 @@ impl EdgeProxy {
             if !path.starts_with("pages") && !path.starts_with("/pages") {
                 format!("404 page not found: '{}'", shutdown.url)
             } else {
-                match std::fs::read_to_string(path) {
+                match tokio::fs::read_to_string(path).await {
                     Ok(content) => self.render_page_template(session, ctx, &content, status),
                     Err(_) => format!("404 page not found: '{}'", shutdown.url),
                 }
@@ -2342,9 +2388,12 @@ impl EdgeProxy {
         ua: &str,
         ctx: &ProxyCTX,
     ) -> bool {
-        let verifier = crate::firewall::verifier::WafVerifier::new(&self.api_config.secret);
-
         if let Some(cookies) = session.get_header("cookie").and_then(|v| v.to_str().ok()) {
+            if !cookies.contains("WAF-Token=") && !cookies.contains("WAF-PoW=") {
+                return false;
+            }
+
+            let verifier = crate::firewall::verifier::WafVerifier::new(&self.api_config.secret);
             let mut current_token = None;
             let mut current_pow = None;
 
@@ -2863,7 +2912,7 @@ impl EdgeProxy {
                 );
             }
             if self
-                .respond_waf_action(session, ctx, matched.clone(), ctx.client_ip_str.clone())
+                .respond_waf_action(session, ctx, matched, ctx.client_ip_str.clone())
                 .await?
             {
                 return Ok((true, waf_action));
@@ -3112,12 +3161,15 @@ impl ProxyHttp for EdgeProxy {
 
         if ctx.lb.is_none() {
             if let Some(server) = &ctx.server {
-                debug!("LB missing for host '{}', rebuilding manually.", host);
+                warn!(
+                    "LB missing for host '{}'; scheduling background rebuild and returning 502 for this request.",
+                    host
+                );
                 let (level, parents) = self.config.get_tiered_origin_info().await;
                 let bypass = self.config.is_tiered_origin_bypass().await;
 
                 let rp_cfg = match &server.reverse_proxy {
-                    Some(rp) => rp,
+                    Some(rp) => rp.clone(),
                     None => {
                         session.respond_error(502).await?;
                         return Ok(true);
@@ -3125,24 +3177,28 @@ impl ProxyHttp for EdgeProxy {
                 };
 
                 let server_id = server.numeric_id();
-                let (lb_arc, _has_hc) = crate::lb_factory::build_lb(
-                    server_id,
-                    rp_cfg,
-                    level,
-                    &parents,
-                    bypass,
-                    hot_path.global_http.allow_lan_ip,
-                );
-                ctx.lb = Some(lb_arc.clone());
-
-                // Fire-and-forget: cache the route in background to avoid
-                // blocking the hot path on a config write lock.
                 let config = self.config.clone();
                 let host_c = host.clone();
                 let server_c = server.clone();
+                let allow_lan_ip = hot_path.global_http.allow_lan_ip;
                 tokio::spawn(async move {
-                    config.cache_server_route(host_c, server_c, lb_arc).await;
+                    let built = tokio::task::spawn_blocking(move || {
+                        crate::lb_factory::build_lb(
+                            server_id,
+                            &rp_cfg,
+                            level,
+                            &parents,
+                            bypass,
+                            allow_lan_ip,
+                        )
+                    })
+                    .await;
+                    if let Ok((lb_arc, _has_hc)) = built {
+                        config.cache_server_route(host_c, server_c, lb_arc).await;
+                    }
                 });
+                session.respond_error(502).await?;
+                return Ok(true);
             }
         }
 
@@ -3476,7 +3532,7 @@ impl ProxyHttp for EdgeProxy {
                     };
                     (host, override_host)
                 } else {
-                    // requestHostType=proxyServer: keep the downstream Host, matching GoEdge.
+                    // requestHostType=proxyServer: keep the downstream Host.
                     let host =
                         Self::maybe_strip_host_port(&client_host, ext.request_host_excluding_port);
                     let override_host = if ext.request_host_excluding_port {
@@ -3536,7 +3592,7 @@ impl ProxyHttp for EdgeProxy {
                 // Force ALPN to h2 ONLY for actual gRPC requests
                 peer_obj.options.alpn = pingora_core::protocols::ALPN::H2;
             } else if is_tls && backend_ext.map(|e| e.http2_enabled).unwrap_or(false) {
-                // GoEdge only enables upstream H2 when the HTTPS origin explicitly supports it.
+                // Only enable upstream H2 when the HTTPS origin explicitly supports it.
                 peer_obj.options.alpn = pingora_core::protocols::ALPN::H2H1;
             }
 
@@ -3710,7 +3766,7 @@ impl ProxyHttp for EdgeProxy {
                         }
                     }
                 } else {
-                    'policy_loop: for policy in &ctx.global_cache_policies {
+                    'policy_loop: for policy in ctx.global_cache_policies.iter() {
                         for cache_ref in &policy.cache_refs {
                             if !cache_ref.is_on {
                                 continue;
@@ -4271,7 +4327,7 @@ impl ProxyHttp for EdgeProxy {
         upstream_request.remove_header("X-Cloud-Http3-Bridge");
 
         // Apply requestHeaderPolicy: set/delete/add custom headers to upstream request.
-        // This mirrors GoEdge's processRequestHeaders logic.
+        // This mirrors the legacy processRequestHeaders behavior.
         if let Some(server) = &ctx.server {
             if let Some(web) = &server.web {
                 if let Some(policy) = &web.request_header_policy {
@@ -4348,7 +4404,7 @@ impl ProxyHttp for EdgeProxy {
                 .insert_header("X-Cloud-Real-Ip", ctx.client_ip.to_string())
                 .unwrap();
 
-            // 2.3 Security Token (Simple version of GoEdge token)
+            // 2.3 Security Token
             if let Ok(token) = crate::auth::generate_token(node_id, secret, "edge") {
                 upstream_request
                     .insert_header("X-Cloud-Access-Token", token)

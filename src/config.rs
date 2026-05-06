@@ -1,10 +1,11 @@
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use pingora_load_balancing::{
     LoadBalancer,
     selection::{Consistent, RoundRobin},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tokio::sync::Notify;
 
 use crate::config_models::{
@@ -79,10 +80,8 @@ pub struct NodeConfig {
     /// Pre-built global HTTP config to avoid per-request construction inside config lock.
     pub global_http_config: Arc<crate::config_models::GlobalHTTPAllConfig>,
 
-    /// Real-time pressure/load factor for L2 nodes (0.0 - 1.0)
-    pub parent_pressure: HashMap<String, (f32, std::time::Instant)>,
     /// Global or node-specific cache policies (multi-policy support)
-    pub cache_policies: Vec<Arc<HTTPCachePolicy>>,
+    pub cache_policies: Arc<Vec<Arc<HTTPCachePolicy>>>,
     /// Global or node-specific firewall policies
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     /// Global WAF action defaults
@@ -148,8 +147,7 @@ impl Default for NodeConfig {
             xff_max_addresses: 0,
             allow_lan_ip: false,
             global_http_config: Arc::default(),
-            parent_pressure: HashMap::new(),
-            cache_policies: Vec::new(),
+            cache_policies: Arc::new(Vec::new()),
             firewall_policies: Arc::new(Vec::new()),
             waf_actions: Vec::new(),
             uam_policies: HashMap::new(),
@@ -171,6 +169,7 @@ impl Default for NodeConfig {
 pub struct ConfigStore {
     inner: Arc<RwLock<NodeConfig>>,
     reload_notify: Arc<Notify>,
+    parent_pressure: Arc<DashMap<String, (f32, std::time::Instant)>>,
 }
 
 #[derive(Clone, Default)]
@@ -192,7 +191,7 @@ pub struct HotPathSnapshot {
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     pub grpc_policy: Option<crate::config_models::GRPCConfig>,
     pub has_any_sni_passthrough: bool,
-    pub cache_policies: Vec<Arc<HTTPCachePolicy>>,
+    pub cache_policies: Arc<Vec<Arc<HTTPCachePolicy>>>,
     pub global_access_log: Option<Arc<crate::config_models::GlobalHTTPAccessLogConfig>>,
     pub enabled_features: EnabledNodeFeatures,
 }
@@ -208,6 +207,7 @@ impl ConfigStore {
         Self {
             inner: Arc::new(RwLock::new(NodeConfig::default())),
             reload_notify: Arc::new(Notify::new()),
+            parent_pressure: Arc::new(DashMap::new()),
         }
     }
 
@@ -385,9 +385,9 @@ impl ConfigStore {
         None
     }
 
-    pub fn get_cache_policy_sync(&self) -> Vec<Arc<HTTPCachePolicy>> {
+    pub fn get_cache_policy_sync(&self) -> Arc<Vec<Arc<HTTPCachePolicy>>> {
         let lock = self.inner.read();
-        lock.cache_policies.clone()
+        Arc::clone(&lock.cache_policies)
     }
 
     pub fn get_firewall_policies_sync(&self) -> Arc<Vec<HTTPFirewallPolicy>> {
@@ -525,7 +525,9 @@ impl ConfigStore {
         Arc::clone(&lock.global_http_config)
     }
 
-    pub fn get_global_access_log_sync(&self) -> Option<crate::config_models::GlobalHTTPAccessLogConfig> {
+    pub fn get_global_access_log_sync(
+        &self,
+    ) -> Option<crate::config_models::GlobalHTTPAccessLogConfig> {
         let lock = self.inner.read();
         lock.global_access_log.clone()
     }
@@ -546,17 +548,16 @@ impl ConfigStore {
     }
 
     pub fn update_parent_pressure(&self, addr: &str, pressure: f32) {
-        let mut lock = self.inner.write();
-        lock.parent_pressure
+        self.parent_pressure
             .insert(addr.to_string(), (pressure, std::time::Instant::now()));
     }
 
     pub fn get_parent_pressure(&self, addr: &str) -> f32 {
-        let lock = self.inner.read();
-        if let Some((p, ts)) = lock.parent_pressure.get(addr) {
+        if let Some(entry) = self.parent_pressure.get(addr) {
+            let (p, ts) = *entry.value();
             // Data expires after 60 seconds of no update
             if ts.elapsed().as_secs() < 60 {
-                return *p;
+                return p;
             }
         }
         0.0
@@ -681,7 +682,7 @@ impl ConfigStore {
         lock.version
     }
 
-    pub async fn get_cache_policy(&self) -> Vec<Arc<HTTPCachePolicy>> {
+    pub async fn get_cache_policy(&self) -> Arc<Vec<Arc<HTTPCachePolicy>>> {
         self.get_cache_policy_sync()
     }
 
@@ -773,7 +774,7 @@ impl ConfigStore {
         lock.xff_max_addresses = global_http.xff_max_addresses;
         lock.allow_lan_ip = global_http.allow_lan_ip;
         lock.global_http_config = global_http;
-        lock.cache_policies = cache_policy;
+        lock.cache_policies = Arc::new(cache_policy);
         lock.firewall_policies = Arc::new(firewall_policies);
         lock.waf_actions = waf_actions;
         lock.uam_policies = uam_policies;

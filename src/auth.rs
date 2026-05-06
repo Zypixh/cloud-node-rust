@@ -7,8 +7,8 @@ use serde_json::json;
 
 type Aes256CfbEnc = Encryptor<Aes256>;
 
-/// Generates the base64 AES256-CFB encrypted token required by GoEdge API Node.
-/// Uses deterministic key/IV derivation compatible with the Go master's decodeToken().
+/// Generates the base64 AES256-CFB encrypted token required by the API node.
+/// Uses deterministic key/IV derivation compatible with the control-plane decodeToken().
 pub fn generate_token(node_id: &str, secret: &str, _node_type: &str) -> anyhow::Result<String> {
     // Key: secret padded/truncated to 32 bytes (matching Go master)
     let mut key = [b' '; 32];
@@ -39,7 +39,7 @@ pub fn generate_token(node_id: &str, secret: &str, _node_type: &str) -> anyhow::
 }
 
 /// URL Auth Verification (Types A, B, C, D)
-/// This module implements GoEdge / CDN compatible URL authentication signatures.
+/// This module implements CDN-compatible URL authentication signatures.
 pub struct UrlAuthConfig {
     pub auth_type: String, // "A", "B", "C", "D"
     pub secret: String,

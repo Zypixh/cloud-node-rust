@@ -144,10 +144,8 @@ fn main() -> anyhow::Result<()> {
                 libc::setsid();
 
                 // Redirect stdin/stdout to /dev/null
-                let devnull = libc::open(
-                    b"/dev/null\0".as_ptr() as *const libc::c_char,
-                    libc::O_RDWR,
-                );
+                let devnull =
+                    libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
                 if devnull >= 0 {
                     libc::dup2(devnull, libc::STDIN_FILENO);
                     libc::dup2(devnull, libc::STDOUT_FILENO);
@@ -184,7 +182,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(pid) = check_running() {
                 println!("Stopping CloudNode (PID: {})...", pid);
                 let _ = Command::new("kill").arg(pid.to_string()).status();
-                // We don't necessarily need to remove the file, flock will handle it, 
+                // We don't necessarily need to remove the file, flock will handle it,
                 // but for cleanliness we can try.
                 let _ = fs::remove_file(PID_FILE);
             } else {
@@ -307,7 +305,8 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     // Try to get an exclusive lock
     if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN)
+        {
             if let Ok(content) = fs::read_to_string(PID_FILE) {
                 eprintln!(
                     "Error: Another instance is already running (PID: {})",
@@ -337,8 +336,9 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
 
     cloud_node_rust::utils::time::init_local_timezone();
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,pingora_proxy::proxy_cache=off"));
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,pingora_proxy::proxy_cache=off")
+    });
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -346,7 +346,6 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         .init();
 
     info!("Starting CloudNode Rust v{}...", env!("CARGO_PKG_VERSION"));
-
 
     #[cfg(target_family = "unix")]
     {
@@ -518,7 +517,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     logging::init_global_log_bus(log_tx, node_log_tx);
 
     let uploader =
-        log_uploader::LogUploader::new(log_rx, api_config.clone(), 100, Duration::from_secs(5));
+        log_uploader::LogUploader::new(log_rx, api_config.clone(), 2000, Duration::from_secs(1));
     spawn_staggered(&rt, Duration::from_secs(10), async move {
         uploader.start().await;
     });
@@ -538,7 +537,10 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     conf.threads = num_cpus::get_physical().min(32);
     conf.upstream_keepalive_pool_size = 32768;
     let mut my_server = pingora_core::server::Server::new_with_opt_and_conf(None, conf);
-    info!("Pingora server configured with {} threads.", my_server.configuration.threads);
+    info!(
+        "Pingora server configured with {} threads.",
+        my_server.configuration.threads
+    );
     my_server.bootstrap();
 
     // 5. Setup Dynamic HTTP/HTTPS Proxy Manager

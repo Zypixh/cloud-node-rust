@@ -32,7 +32,7 @@ pub struct BackendExtension {
     pub client_cert: Option<crate::config_models::SSLCertConfig>,
 }
 
-/// Builds a Pingora LoadBalancer from a GoEdge ReverseProxyConfig.
+/// Builds a Pingora LoadBalancer from a legacy ReverseProxyConfig.
 /// Supports Tiered Origin: if level == 1 and parent_nodes are provided,
 /// the parent nodes (L2) will be used as the upstreams.
 pub fn build_lb(
@@ -287,7 +287,7 @@ pub fn build_parent_lb(
             if let Ok(mut backend) = Backend::new(&target) {
                 let mut ext = Extensions::new();
                 ext.insert(BackendExtension {
-                    use_tls: true, // L1 -> L2 always TLS by default in GoEdge
+                    use_tls: true, // L1 -> L2 always TLS by default.
                     host: String::new(),
                     rp_host: String::new(),
                     origin_host: String::new(),
@@ -337,9 +337,9 @@ fn reverse_proxy_request_host(
     addr: &crate::config_models::FlexibleAddr,
 ) -> String {
     let host = match rp_cfg.request_host_type {
-        // GoEdge requestHostType=1 means send the origin host as upstream Host/SNI.
+        // requestHostType=1 means send the origin host as upstream Host/SNI.
         1 => origin_addr_host(addr),
-        // GoEdge requestHostType=2 means use the reverse-proxy-level custom Host.
+        // requestHostType=2 means use the reverse-proxy-level custom Host.
         2 if !rp_cfg.request_host.is_empty() => rp_cfg.request_host.clone(),
         _ => String::new(),
     };

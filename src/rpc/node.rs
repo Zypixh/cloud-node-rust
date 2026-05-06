@@ -299,9 +299,9 @@ pub async fn fetch_and_apply_config<F>(
     );
     let req = Request::new(pb::FindCurrentNodeConfigRequest {
         version: fetch_version,
-        compress: false,
+        compress: true,
         node_task_version: *task_version,
-        use_data_map: false,
+        use_data_map: true,
     });
 
     match client.find_current_node_config(req).await {
@@ -326,13 +326,24 @@ pub async fn fetch_and_apply_config<F>(
                 let mut node_json = config_resp.node_json;
 
                 if config_resp.is_compressed {
-                    let mut decompressor = brotli::Decompressor::new(&node_json[..], 4096);
-                    let mut decoded = Vec::new();
-                    if let Err(e) = decompressor.read_to_end(&mut decoded) {
-                        error!("Failed to decompress node_json: {}", e);
-                        return;
+                    let compressed = node_json;
+                    let decoded = tokio::task::spawn_blocking(move || {
+                        let mut decompressor = brotli::Decompressor::new(&compressed[..], 4096);
+                        let mut decoded = Vec::new();
+                        decompressor.read_to_end(&mut decoded).map(|_| decoded)
+                    })
+                    .await;
+                    match decoded {
+                        Ok(Ok(decoded)) => node_json = decoded,
+                        Ok(Err(e)) => {
+                            error!("Failed to decompress node_json: {}", e);
+                            return;
+                        }
+                        Err(e) => {
+                            error!("Failed to join node_json decompression task: {}", e);
+                            return;
+                        }
                     }
-                    node_json = decoded;
                 }
 
                 // Check content hash to avoid redundant reloads

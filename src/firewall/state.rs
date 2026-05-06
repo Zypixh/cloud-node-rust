@@ -1,6 +1,8 @@
 use dashmap::DashMap;
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
 use ipnet::IpNet;
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -8,6 +10,7 @@ use std::sync::Arc;
 pub struct WafStateManager {
     pub blocks: DashMap<(i64, IpAddr), i64>,
     pub block_networks: DashMap<(i64, IpNet), i64>, // Support CIDR/C-class blocks
+    block_network_snapshots: RwLock<HashMap<i64, Arc<Vec<(IpNet, i64)>>>>,
     pub whitelists: DashMap<(i64, IpAddr), i64>,
     server_limiters: DashMap<i64, Arc<RateLimiter<i64, DashMapStateStore<i64>, DefaultClock>>>,
     ip_limiters:
@@ -26,6 +29,7 @@ impl WafStateManager {
         Self {
             blocks: DashMap::new(),
             block_networks: DashMap::new(),
+            block_network_snapshots: RwLock::new(HashMap::new()),
             whitelists: DashMap::new(),
             server_limiters: DashMap::new(),
             ip_limiters: DashMap::new(),
@@ -59,15 +63,56 @@ impl WafStateManager {
             return true;
         }
 
-        // 2. Check Network-level blocks (C-Class etc.)
-        for entry in self.block_networks.iter() {
-            let ((sid, net), expiry) = entry.pair();
-            if (*sid == 0 || *sid == server_id) && now < *expiry && net.contains(&ip) {
-                return true;
+        // 2. Check Network-level blocks (C-Class etc.) without scanning DashMap shards.
+        let snapshots = self.block_network_snapshots.read();
+        for sid in [0, server_id] {
+            let Some(networks) = snapshots.get(&sid) else {
+                continue;
+            };
+            for (net, expiry) in networks.iter() {
+                if now < *expiry && net.contains(&ip) {
+                    return true;
+                }
             }
         }
 
         false
+    }
+
+    fn insert_block_network(&self, server_id: i64, net: IpNet, expiry: i64) {
+        self.block_networks.insert((server_id, net), expiry);
+        let now = crate::utils::time::now_timestamp();
+        let mut snapshots = self.block_network_snapshots.write();
+        let mut networks = snapshots
+            .get(&server_id)
+            .map(|items| {
+                items
+                    .iter()
+                    .copied()
+                    .filter(|(_, exp)| now < *exp)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        networks.retain(|(existing, _)| *existing != net);
+        networks.push((net, expiry));
+        snapshots.insert(server_id, Arc::new(networks));
+    }
+
+    fn remove_block_network(&self, server_id: i64, net: IpNet) {
+        self.block_networks.remove(&(server_id, net));
+        let mut snapshots = self.block_network_snapshots.write();
+        if let Some(items) = snapshots.get(&server_id) {
+            let networks = items
+                .iter()
+                .copied()
+                .filter(|(existing, _)| *existing != net)
+                .collect::<Vec<_>>();
+            if networks.is_empty() {
+                snapshots.remove(&server_id);
+            } else {
+                snapshots.insert(server_id, Arc::new(networks));
+            }
+        }
     }
 
     fn check_block_expiry(&self, server_id: i64, ip: IpAddr, now: i64) -> bool {
@@ -97,7 +142,7 @@ impl WafStateManager {
 
         if block_c_class {
             if let Ok(net) = self.get_c_class_net(ip) {
-                self.block_networks.insert((key_server_id, net), expiry);
+                self.insert_block_network(key_server_id, net, expiry);
                 if use_local_firewall {
                     self.exec_local_firewall(net.to_string(), timeout_secs);
                 }
@@ -158,7 +203,7 @@ impl WafStateManager {
 
         // Remove from network blocks as well (C-Class)
         if let Ok(net) = self.get_c_class_net(ip) {
-            self.block_networks.remove(&(key_server_id, net));
+            self.remove_block_network(key_server_id, net);
             if use_local_firewall {
                 self.exec_local_unblock(net.to_string());
             }

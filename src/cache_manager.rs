@@ -2,7 +2,7 @@ pub use crate::cache_hybrid::HybridStorage;
 use pingora_cache::CacheMeta;
 use pingora_core::Result;
 
-/// Central manager for Pingora-based caching in GoEdge Node
+/// Central manager for Pingora-based node caching.
 pub struct CacheManager {
     pub storage: &'static HybridStorage,
 }

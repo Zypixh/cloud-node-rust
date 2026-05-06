@@ -6,7 +6,7 @@ use pingora_proxy::Session;
 use std::str::FromStr;
 
 /// Applies request header policies to the upstream request headers.
-/// Mirrors GoEdge's ProcessRequestHeaders logic.
+/// Mirrors the legacy ProcessRequestHeaders behavior.
 pub fn apply_request_header_policy(session: &mut Session, policy: &HTTPHeaderPolicy) {
     // Collect variables first to avoid borrowing session mutably and immutably at the same time
     let host = session
@@ -129,7 +129,7 @@ pub fn apply_request_header_policy_to_upstream(
     }
 }
 
-/// Applies response header policies to the response header, mirroring GoEdge's ProcessResponseHeaders
+/// Applies response header policies using the legacy ProcessResponseHeaders behavior.
 pub fn apply_response_header_policy_to_map(
     headers: &mut std::collections::HashMap<String, String>,
     policy: &HTTPHeaderPolicy,

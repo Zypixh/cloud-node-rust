@@ -686,7 +686,7 @@ impl HybridStorage {
                 .get("openFileCache")
                 .and_then(|v| v.get("isOn"))
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false); // Default to false for 10M+ files safety, matching GoEdge typical behavior unless explicitly ON
+                .unwrap_or(false); // Default to false for 10M+ files safety unless explicitly ON.
 
             if let Some(main) = main_dir {
                 info!(

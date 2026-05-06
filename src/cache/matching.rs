@@ -6,6 +6,7 @@ use regex::Regex;
 use std::sync::Arc;
 
 static CACHE_RE_CACHE: Lazy<DashMap<String, std::sync::Arc<Regex>>> = Lazy::new(DashMap::new);
+static CACHE_IN_VALUES: Lazy<DashMap<String, Arc<Vec<String>>>> = Lazy::new(DashMap::new);
 
 pub trait Matcher {
     fn match_request(&self, session: &Session) -> bool;
@@ -49,8 +50,7 @@ impl HTTPRequestCond {
                 } else {
                     self.value.clone()
                 };
-                get_cached_regex(&pattern)
-                    .map_or(false, |re| re.is_match(&param_value))
+                get_cached_regex(&pattern).map_or(false, |re| re.is_match(&param_value))
             }
             "notMatches" | "notRegexp" => {
                 let pattern = if self.is_case_insensitive && !self.value.starts_with("(?i)") {
@@ -58,8 +58,7 @@ impl HTTPRequestCond {
                 } else {
                     self.value.clone()
                 };
-                get_cached_regex(&pattern)
-                    .map_or(false, |re| !re.is_match(&param_value))
+                get_cached_regex(&pattern).map_or(false, |re| !re.is_match(&param_value))
             }
             "eq" | "equals" => {
                 if self.is_case_insensitive {
@@ -103,7 +102,21 @@ impl HTTPRequestCond {
                 }
             }
             "in" => {
-                if let Ok(values) = serde_json::from_str::<Vec<String>>(&self.value) {
+                let values = CACHE_IN_VALUES
+                    .entry(self.value.clone())
+                    .or_insert_with(|| {
+                        let parsed = serde_json::from_str::<Vec<String>>(&self.value)
+                            .unwrap_or_else(|_| {
+                                self.value
+                                    .split(',')
+                                    .map(|v| v.trim().to_string())
+                                    .filter(|v| !v.is_empty())
+                                    .collect()
+                            });
+                        Arc::new(parsed)
+                    })
+                    .clone();
+                if !values.is_empty() {
                     if self.is_case_insensitive {
                         let lower_param = param_value.to_lowercase();
                         values.iter().any(|v| v.to_lowercase() == lower_param)
@@ -111,8 +124,7 @@ impl HTTPRequestCond {
                         values.contains(&param_value)
                     }
                 } else {
-                    // Fallback for non-json values
-                    self.value.split(',').any(|v| v.trim() == param_value)
+                    false
                 }
             }
             _ => false,

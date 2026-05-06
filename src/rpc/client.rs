@@ -3,10 +3,13 @@
 use crate::api_config::ApiConfig;
 use crate::auth::generate_token;
 use crate::pb;
+use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 
 use std::time::Duration;
+
+pub const RPC_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct RpcClient {
@@ -100,7 +103,11 @@ impl RpcClient {
         let mut service = pb::ping_service_client::PingServiceClient::with_interceptor(
             channel,
             Self::interceptor(api_config, None),
-        );
+        )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES);
 
         service.ping(pb::PingRequest {}).await.is_ok()
     }
@@ -157,6 +164,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn node_service_with_type(
@@ -171,6 +182,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, Some("edge")),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn server_service(
@@ -185,6 +200,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn node_task_service(
@@ -199,6 +218,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn user_service(
@@ -213,6 +236,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn node_value_service(
@@ -227,6 +254,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn node_value_service_with_type(
@@ -241,6 +272,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, Some("edge")),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn node_log_service(
@@ -255,6 +290,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn bandwidth_stat_service(
@@ -269,6 +308,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn daily_stat_service(
@@ -283,6 +326,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn metric_stat_service(
@@ -297,6 +344,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn ip_item_service(
@@ -311,6 +362,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn ip_item_service_with_type(
@@ -325,6 +380,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, Some("edge")),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn ip_list_service(
@@ -339,6 +398,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn deleted_content_service(
@@ -364,6 +427,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn firewall_service(
@@ -378,6 +445,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn acme_service(
@@ -392,6 +463,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn ip_library_artifact_service(
@@ -406,6 +481,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn file_chunk_service(
@@ -420,6 +499,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn ssl_cert_service(
@@ -434,6 +517,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn cache_task_service(
@@ -448,6 +535,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn ping_service(
@@ -462,6 +553,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn plan_service(
@@ -476,6 +571,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn updating_server_list_service(
@@ -490,6 +589,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn authority_key_service(
@@ -504,6 +607,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn client_agent_ip_service(
@@ -518,6 +625,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn file_service(
@@ -532,6 +643,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn script_service(
@@ -546,6 +661,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     /*pub fn index_service(&self) -> pb::index_service_client::IndexServiceClient<tonic::service::interceptor::InterceptedService<Channel, impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + 'static>> {
@@ -564,6 +683,10 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn server_top_ip_stat_service(
@@ -578,5 +701,9 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 }

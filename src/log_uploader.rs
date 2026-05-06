@@ -1,9 +1,13 @@
 use crate::api_config::ApiConfig;
 use crate::auth::generate_token;
 use crate::pb;
+use crate::rpc::client::RPC_MAX_MESSAGE_BYTES;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
+use tonic::Code;
 use tracing::{error, info};
 
 /// A high-performance uploader for access logs.
@@ -14,6 +18,8 @@ pub struct LogUploader {
     batch_size: usize,
     flush_interval: Duration,
     channel: Option<Channel>,
+    retry_buffer: VecDeque<pb::HttpAccessLog>,
+    max_retry_logs: usize,
 }
 
 impl LogUploader {
@@ -29,6 +35,8 @@ impl LogUploader {
             batch_size,
             flush_interval,
             channel: None,
+            retry_buffer: VecDeque::new(),
+            max_retry_logs: batch_size.saturating_mul(10).max(batch_size),
         }
     }
 
@@ -47,13 +55,13 @@ impl LogUploader {
             tokio::select! {
                 Some(log) = self.rx.recv() => {
                     buffer.push(log);
-                    if buffer.len() >= self.batch_size {
+                    if buffer.len() + self.retry_buffer.len() >= self.batch_size {
                         self.flush_batch(&mut buffer).await;
                         last_flush = Instant::now();
                     }
                 }
                 _ = timeout => {
-                    if !buffer.is_empty() {
+                    if !buffer.is_empty() || !self.retry_buffer.is_empty() {
                         self.flush_batch(&mut buffer).await;
                     }
                     last_flush = Instant::now();
@@ -96,14 +104,48 @@ impl LogUploader {
         }
     }
 
+    fn take_logs_to_send(&mut self, buffer: &mut Vec<pb::HttpAccessLog>) -> Vec<pb::HttpAccessLog> {
+        let mut logs = Vec::with_capacity(self.batch_size);
+        while logs.len() < self.batch_size {
+            let Some(log) = self.retry_buffer.pop_front() else {
+                break;
+            };
+            logs.push(log);
+        }
+
+        let remaining = self.batch_size.saturating_sub(logs.len());
+        let take_from_buffer = remaining.min(buffer.len());
+        logs.extend(buffer.drain(..take_from_buffer));
+        logs
+    }
+
+    fn requeue_failed_logs(&mut self, mut logs: Vec<pb::HttpAccessLog>) {
+        let available = self.max_retry_logs.saturating_sub(self.retry_buffer.len());
+        if logs.len() > available {
+            let drop_count = logs.len() - available;
+            logs.drain(..drop_count);
+            tracing::warn!(
+                "ACCESS_LOG: retry buffer full, dropped {} oldest failed access logs",
+                drop_count
+            );
+        }
+
+        for log in logs.into_iter().rev() {
+            self.retry_buffer.push_front(log);
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     async fn flush_batch(&mut self, buffer: &mut Vec<pb::HttpAccessLog>) {
-        let count = buffer.len();
+        let mut logs_to_send = self.take_logs_to_send(buffer);
+        let count = logs_to_send.len();
+        if count == 0 {
+            return;
+        }
         info!("Flushing batch of {} access logs to Master", count);
 
-        let logs_to_send = std::mem::replace(buffer, Vec::with_capacity(self.batch_size));
-
         let Some(channel) = self.get_or_connect_channel().await.cloned() else {
+            self.requeue_failed_logs(logs_to_send);
             return;
         };
 
@@ -119,13 +161,9 @@ impl LogUploader {
                         .parse()
                         .unwrap_or(tonic::metadata::MetadataValue::from_static("0"));
                     req.metadata_mut().insert("nodeid", val.clone());
-                    req.metadata_mut().insert(
-                        "type",
-                        tonic::metadata::MetadataValue::from_static("edge"),
-                    );
-                    if let Ok(key) =
-                        tonic::metadata::MetadataKey::from_bytes(b"nodeId")
-                    {
+                    req.metadata_mut()
+                        .insert("type", tonic::metadata::MetadataValue::from_static("edge"));
+                    if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(b"nodeId") {
                         req.metadata_mut().insert(key, val);
                     }
                     req.metadata_mut().insert(
@@ -136,10 +174,14 @@ impl LogUploader {
                     );
                     Ok(req)
                 },
-            );
+            )
+            .send_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES);
 
         let req = pb::CreateHttpAccessLogsRequest {
-            http_access_logs: logs_to_send,
+            http_access_logs: logs_to_send.clone(),
         };
 
         match client.create_http_access_logs(req).await {
@@ -147,7 +189,31 @@ impl LogUploader {
                 info!("Successfully uploaded {} access logs", count);
             }
             Err(e) => {
+                if e.code() == Code::ResourceExhausted {
+                    for log in &mut logs_to_send {
+                        log.request_body.clear();
+                    }
+                    let retry_req = pb::CreateHttpAccessLogsRequest {
+                        http_access_logs: logs_to_send.clone(),
+                    };
+                    match client.create_http_access_logs(retry_req).await {
+                        Ok(_) => {
+                            info!(
+                                "Successfully uploaded {} access logs after stripping request bodies",
+                                count
+                            );
+                            return;
+                        }
+                        Err(retry_err) => {
+                            error!(
+                                "Failed to upload access logs after ResourceExhausted retry: {}",
+                                retry_err
+                            );
+                        }
+                    }
+                }
                 error!("Failed to upload access logs: {}", e);
+                self.requeue_failed_logs(logs_to_send);
                 self.channel = None;
             }
         }
@@ -259,13 +325,9 @@ impl NodeLogUploader {
                     .parse()
                     .unwrap_or(tonic::metadata::MetadataValue::from_static("0"));
                 req.metadata_mut().insert("nodeid", val.clone());
-                req.metadata_mut().insert(
-                    "type",
-                    tonic::metadata::MetadataValue::from_static("edge"),
-                );
-                if let Ok(key) =
-                    tonic::metadata::MetadataKey::from_bytes(b"nodeId")
-                {
+                req.metadata_mut()
+                    .insert("type", tonic::metadata::MetadataValue::from_static("edge"));
+                if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(b"nodeId") {
                     req.metadata_mut().insert(key, val);
                 }
                 req.metadata_mut().insert(
@@ -276,7 +338,11 @@ impl NodeLogUploader {
                 );
                 Ok(req)
             },
-        );
+        )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES);
 
         match client
             .create_node_logs(pb::CreateNodeLogsRequest {
