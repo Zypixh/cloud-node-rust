@@ -1,85 +1,58 @@
 # CloudNode Rust
 
-`CloudNode Rust` 是一个基于 Cloudflare [Pingora](https://github.com/cloudflare/pingora) 构建的高性能 CDN 边缘代理节点，面向多级分发、缓存加速、站点安全、日志统计和控制面协议对接场景。
+CloudNode Rust 是一个基于 [Pingora](https://github.com/cloudflare/pingora) 构建的高性能 CDN 边缘节点。它面向生产环境中的站点加速、多级分发、动态配置、边缘安全、访问日志和统计上报场景，而不是一个最小化代理示例。
 
-当前仓库已完成 HTTP、HTTPS、HTTP/2、HTTP/3、gRPC、WebSocket、TCP、UDP、`@sni_passthrough`、混合缓存、访问日志、统计上报、自定义错误页、性能监控页等全链路接入，持续围绕生产环境运行时行为做深度对齐。
+项目的核心目标是用 Rust 运行时承载完整边缘节点能力：从控制面协议同步配置，到 L7/L4 代理、缓存、WAF、证书、日志、统计和本地可观测性，尽量让节点在高并发和复杂站点策略下保持稳定、可解释、可运维。
 
-## 当前能力
+## 核心特性
 
-- 多协议代理
-  - HTTP/1.1、HTTP/2、HTTP/3
-  - gRPC、WebSocket
-  - TCP、TCP-TLS、UDP
-  - 共享 `443` 端口下的 `@sni_passthrough`
+- **多协议边缘代理**：HTTP/1.1、HTTP/2、HTTP/3、gRPC、WebSocket、TCP、TCP-TLS、UDP。
+- **共享端口接入**：支持共享 `443` 端口下的 TLS、HTTP/2、HTTP/3 和 `@sni_passthrough` 流量分流。
+- **混合缓存系统**：Memory + Disk 缓存，RocksDB 元数据索引，多缓存策略匹配，支持大文件和高并发切片分发。
+- **站点安全能力**：WAF、UAM、CC、防盗链、访问限制、请求限制、带宽和流量限制、自定义拦截页面。
+- **内容处理能力**：WebP 转换、HTML/CSS/JS 优化、HLS 播放列表和分片处理、自定义错误页和模板变量。
+- **动态运行时**：配置热更新、动态证书、OCSP 同步、源站健康检查、多级回源和父节点压力感知。
+- **日志与统计**：访问日志、节点日志、L7/L4 指标、日统计、域名统计、Top IP、缓存命中和攻击统计。
+- **本地可观测性**：内置性能监控页面，展示请求、连接、缓存、系统资源和异常趋势。
 
-- 缓存与内容处理
-  - Memory + Disk 混合缓存
-  - RocksDB 元数据持久化
-  - WebP 转换
-  - HLS 播放列表与分片处理
-  - 大文件与高并发切片场景下的全异步磁盘 I/O
+## 适用场景
 
-- 安全与站点能力
-  - WAF、UAM、CC、防盗链、User-Agent / Referer 规则
-  - 站点关停页、自定义页面、全局页面回退
-  - `redirectToHttps`
-  - 请求限速、带宽限制、流量限制页面
+- 需要以 Rust/Pingora 承载 CDN 边缘节点能力。
+- 需要控制面下发 PB 配置，节点侧进行热更新和运行时兼容。
+- 需要同时处理 HTTP 站点流量、四层转发、SNI 透传和 UDP 服务。
+- 需要在边缘层完成缓存加速、WAF 防护、访问日志和统计上报。
+- 需要面向大文件、HLS、图片分发或高并发小文件场景做性能优化。
 
-- 统计与日志
-  - 访问日志、节点日志、节点值、IP 上报
-  - 带宽统计、日统计、域名统计、Top IP
-  - L7 / L4 统计对齐
-  - 缓存命中标签、HTTP/3 传输标识
+## 快速开始
 
-- 运维与可观测性
-  - 本地性能监控网页 `--monitor-port`
-  - 动态证书与 OCSP 同步
-  - 配置热更新
-  - 共享 `443` 端口的 TLS / HTTP2 噪音日志收敛
+准备 `api_node.yaml`：
 
-## 构建与发布
+```yaml
+rpc.endpoints: [ "http://127.0.0.1:8001" ]
+nodeId: "your-node-id"
+secret: "your-node-secret"
+```
 
-### 本地编译
+构建：
 
 ```bash
 cargo build --release
 ```
 
-### 高性能编译示例
+前台运行：
 
 ```bash
-# x86_64 v3
-RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat" cargo build --release
-
-# ARM64
-RUSTFLAGS="-C target-cpu=neoverse-n1 -C opt-level=3 -C lto=fat" cargo build --release
+./target/release/cloud-node-rust
 ```
 
-### GitHub Release 自动产物
-
-当前 Release workflow 会自动构建以下 Linux 产物：
-
-- `linux-x64-v2-sse4.2`
-- `linux-x64-v3-avx2`
-- `linux-x64-v4-avx512`
-- `linux-arm64-generic`
-- `linux-arm64-neoverse-n1`
-- `linux-x64-legacy-glibc217`
-
-其中：
-
-- `linux-x64-legacy-glibc217` 面向老系统兼容，目标覆盖 `CentOS 7.6`、`Debian 10` 等较老环境
-- 其余产物偏向性能优先，需要匹配对应 CPU / glibc 条件
-
-## 运行方式
-
-### 安装
+安装为系统命令和 systemd 服务：
 
 ```bash
-sudo ./cloud-node install
+sudo ./target/release/cloud-node-rust install
+sudo systemctl start cloud-node
 ```
 
-### 常用命令
+常用命令：
 
 ```bash
 cloud-node start
@@ -89,52 +62,67 @@ cloud-node status
 cloud-node test
 ```
 
-### 性能监控网页
+启动本地性能监控页：
 
 ```bash
 cloud-node --monitor-port 8888
 ```
 
-或：
+## 文档
+
+详细文档位于 [docs](docs/README.md)：
+
+- [架构概览](docs/architecture.md)
+- [运行时说明](docs/runtime.md)
+- [功能说明](docs/features.md)
+- [配置说明](docs/configuration.md)
+- [部署与运维](docs/operations.md)
+
+## 构建产物
+
+Release workflow 面向不同 CPU 和系统环境提供多个 Linux 产物：
+
+- `linux-x64-v2-sse4.2`
+- `linux-x64-v3-avx2`
+- `linux-x64-v4-avx512`
+- `linux-arm64-generic`
+- `linux-arm64-neoverse-n1`
+- `linux-x64-legacy-glibc217`
+
+选择建议：
+
+- 新系统和新 CPU 优先选择匹配微架构的性能包。
+- `CentOS 7.x`、`Debian 10` 等较老系统优先选择 `legacy-glibc217` 包。
+- 自行编译时可以根据机器设置 `RUSTFLAGS`，但需要确认目标 CPU 指令集和运行环境一致。
+
+高性能编译示例：
 
 ```bash
-cargo run -- --monitor-port 8888
+RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat" cargo build --release
 ```
 
 ## 系统要求
 
-- Linux
-- 推荐内核 `5.x+`
-- 若启用大规模磁盘缓存与高并发流媒体分发，建议使用更高的文件句柄上限和更充足的内存
+- Linux。
+- 推荐内核 `5.x+`。
+- 大规模并发场景建议提高 `LimitNOFILE`、`somaxconn`、`tcp_max_syn_backlog`、本地端口范围和 conntrack 容量。
+- 启用 GeoIP、缓存和证书能力时，需要确保数据文件、缓存目录和运行目录权限正确。
 
-## 项目说明
+## 项目状态
 
-### 关于协议对齐
+CloudNode Rust 已接入主要边缘节点能力，并持续优化以下方向：
 
-本项目并非简单的 Pingora 代理样例，而是面向生产环境的完整实现，包括：
-
-- 配置同步与热更新
-- 页面与变量能力
-- 日志上报格式对齐
-- 统计聚合口径一致
-- L7 / L4 计费与趋势数据
-
-仓库中的实现细节以运行时兼容性为优先目标，而非最小化示例。
-
-### 关于老系统兼容包
-
-为了兼顾新旧环境，Release 同时提供：
-
-- 面向新环境的性能优化包
-- 面向旧环境的 `glibc 2.17` 兼容包
-
-如果部署环境是 `CentOS 7.x`、`Debian 10` 一类老系统，优先使用 `legacy` 包。
+- 控制面 PB 协议兼容。
+- 请求热路径锁竞争和分配开销。
+- 高并发日志与统计上报。
+- 缓存命中路径和大文件磁盘 I/O。
+- WAF、内容处理和图片处理的 CPU 隔离。
 
 ## 致谢
 
 感谢 Cloudflare 开源 Pingora，为本项目提供了高质量的网络框架基础。
 
-同时感谢 **FlexCDN** 在协议对齐、运行时行为验证和长期工程实践上的参考与支持。本仓库不少兼容性修正、页面能力、日志字段和统计口径的整理，都直接受益于 FlexCDN 的历史经验。
+同时感谢 FlexCDN 在协议设计、生产行为验证和长期工程实践上的参考与支持。
 
 ## 开源协议
 
