@@ -302,10 +302,15 @@ fn contains_word(actual: &str, term: &str) -> bool {
 }
 
 fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    if value.contains(needle) {
+        return true;
+    }
     let value = value.as_bytes();
     let needle = needle.as_bytes();
-    !needle.is_empty()
-        && value.len() >= needle.len()
+    value.len() >= needle.len()
         && value
             .windows(needle.len())
             .any(|part| part.eq_ignore_ascii_case(needle))
