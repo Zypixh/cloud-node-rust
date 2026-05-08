@@ -1,4 +1,3 @@
-use futures_util::FutureExt;
 use once_cell::sync::Lazy;
 use std::io::Read;
 use std::sync::Arc;
@@ -756,51 +755,28 @@ pub async fn fetch_and_apply_config<F>(
                                 let server_id = server.numeric_id();
                                 let names = server.get_plain_server_names();
                                 let (lb_arc, has_hc) = match &server.reverse_proxy {
-                                    Some(rp_cfg) => crate::lb_factory::build_lb(
-                                        server_id,
-                                        rp_cfg,
-                                        node_level,
-                                        &parent_nodes,
-                                        tiered_origin_bypass,
-                                        allow_lan_ip,
-                                    ),
-                                    None => {
-                                        // Default/Dummy LB if no reverse proxy config exists
-                                        let mut b =
-                                            pingora_load_balancing::Backend::new("127.0.0.1:80")
-                                                .unwrap();
-                                        let mut ext = http::Extensions::new();
-                                        ext.insert(crate::lb_factory::BackendExtension {
-                                            use_tls: false,
-                                            host: String::new(),
-                                            rp_host: String::new(),
-                                            origin_host: String::new(),
-                                            follow_port: false,
-                                            follow_host: false,
-                                            http2_enabled: false,
-                                            tls_verify: true,
-                                            request_host_excluding_port: false,
-                                            connection_timeout: None,
-                                            read_timeout: None,
-                                            idle_timeout: None,
-                                            client_cert: None,
-                                        });
-                                        b.ext = ext;
-                                        let mut set = std::collections::BTreeSet::new();
-                                        set.insert(b);
-                                        let backends = pingora_load_balancing::Backends::new(
-                                            pingora_load_balancing::discovery::Static::new(set),
-                                        );
-                                        let lb =
-                                            pingora_load_balancing::LoadBalancer::from_backends(
-                                                backends,
-                                            );
-                                        lb.update()
-                                            .now_or_never()
-                                            .expect("static fallback load balancer update should not block")
-                                            .expect("static fallback load balancer update should not fail");
-                                        (std::sync::Arc::new(lb), false)
+                                    Some(rp_cfg) => {
+                                        match crate::lb_factory::build_lb_blocking(
+                                            server_id,
+                                            rp_cfg.clone(),
+                                            node_level,
+                                            Arc::new(parent_nodes.clone()),
+                                            tiered_origin_bypass,
+                                            allow_lan_ip,
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => result,
+                                            Err(err) => {
+                                                warn!(
+                                                    "RPC_NODE: failed to build LB for server {}: {}. Using fallback dummy LB.",
+                                                    server_id, err
+                                                );
+                                                crate::rpc::utils::fallback_runtime_lb()
+                                            }
+                                        }
                                     }
+                                    None => crate::rpc::utils::fallback_runtime_lb(),
                                 };
                                 let server_id = server.numeric_id();
                                 if server_id > 0 {

@@ -6,7 +6,7 @@ use pingora_load_balancing::{
     Backend, Backends, LoadBalancer,
     discovery::Static,
     health_check,
-    selection::{Consistent, RoundRobin},
+    selection::{Consistent, Random, RoundRobin},
 };
 use std::collections::{BTreeSet, HashMap};
 use std::net::ToSocketAddrs;
@@ -14,12 +14,59 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+#[derive(Clone)]
+pub enum AnyLoadBalancer {
+    RoundRobin(Arc<LoadBalancer<RoundRobin>>),
+    Random(Arc<LoadBalancer<Random>>),
+}
+
+impl AnyLoadBalancer {
+    pub fn select(&self, key: &[u8], max_iterations: usize) -> Option<Backend> {
+        match self {
+            Self::RoundRobin(lb) => lb.select(key, max_iterations),
+            Self::Random(lb) => lb.select(key, max_iterations),
+        }
+    }
+
+    pub async fn run_health_check(&self, parallel: bool) {
+        match self {
+            Self::RoundRobin(lb) => lb.backends().run_health_check(parallel).await,
+            Self::Random(lb) => lb.backends().run_health_check(parallel).await,
+        }
+    }
+
+    pub fn backend_health(&self) -> Vec<(Backend, bool)> {
+        match self {
+            Self::RoundRobin(lb) => lb
+                .backends()
+                .get_backend()
+                .iter()
+                .map(|backend| (backend.clone(), lb.backends().ready(backend)))
+                .collect(),
+            Self::Random(lb) => lb
+                .backends()
+                .get_backend()
+                .iter()
+                .map(|backend| (backend.clone(), lb.backends().ready(backend)))
+                .collect(),
+        }
+    }
+
+    pub fn as_round_robin(&self) -> Option<Arc<LoadBalancer<RoundRobin>>> {
+        match self {
+            Self::RoundRobin(lb) => Some(Arc::clone(lb)),
+            Self::Random(_) => None,
+        }
+    }
+}
+
 /// Custom metadata stored in Backend Extensions
 #[derive(Clone, Debug)]
 pub struct BackendExtension {
     pub use_tls: bool,
     pub host: String,    // Per-origin custom host (origin.requestHost)
     pub rp_host: String, // Reverse-proxy-level custom host (reverseProxy.requestHost)
+    pub origin_id: i64,
     pub origin_host: String,
     pub follow_port: bool,
     pub follow_host: bool,
@@ -42,7 +89,7 @@ pub fn build_lb(
     _parent_nodes: &HashMap<i64, Vec<ParentNodeConfig>>,
     _tiered_origin_bypass: bool,
     allow_lan: bool,
-) -> (Arc<LoadBalancer<RoundRobin>>, bool) {
+) -> (Arc<AnyLoadBalancer>, bool) {
     let mut endpoints = Vec::new();
     let mut has_health_check = false;
 
@@ -85,6 +132,7 @@ pub fn build_lb(
                     use_tls: addr.is_https(),
                     host: origin.request_host.clone(),
                     rp_host,
+                    origin_id: origin.id,
                     origin_host: addr.host(),
                     follow_port: origin.follow_port,
                     follow_host: origin.follow_host,
@@ -142,6 +190,7 @@ pub fn build_lb(
                         use_tls: addr.is_https(),
                         host: origin.request_host.clone(),
                         rp_host,
+                        origin_id: origin.id,
                         origin_host: addr.host(),
                         follow_port: origin.follow_port,
                         follow_host: origin.follow_host,
@@ -178,15 +227,41 @@ pub fn build_lb(
         set.insert(e);
     }
     let backends = Backends::new(Static::new(set));
-    let mut lb = LoadBalancer::from_backends(backends);
-    lb.update()
-        .now_or_never()
-        .expect("static load balancer update should not block")
-        .expect("static load balancer update should not fail");
+    let use_random = rp_cfg
+        .scheduling
+        .as_ref()
+        .map(|scheduling| {
+            scheduling.code.is_empty() || scheduling.code.eq_ignore_ascii_case("random")
+        })
+        .unwrap_or(true);
+    let mut round_robin_lb = None;
+    let mut random_lb = None;
+    if use_random {
+        let lb: LoadBalancer<Random> = LoadBalancer::from_backends(backends);
+        lb.update()
+            .now_or_never()
+            .expect("static load balancer update should not block")
+            .expect("static load balancer update should not fail");
+        random_lb = Some(lb);
+    } else {
+        let lb: LoadBalancer<RoundRobin> = LoadBalancer::from_backends(backends);
+        lb.update()
+            .now_or_never()
+            .expect("static load balancer update should not block")
+            .expect("static load balancer update should not fail");
+        round_robin_lb = Some(lb);
+    }
 
     // Skip health check if we are in fallback mode
     if is_fallback {
-        return (Arc::new(lb), false);
+        let any_lb = if let Some(lb) = random_lb {
+            AnyLoadBalancer::Random(Arc::new(lb))
+        } else {
+            AnyLoadBalancer::RoundRobin(Arc::new(
+                round_robin_lb.expect("round robin lb should exist"),
+            ))
+        };
+        return (Arc::new(any_lb), false);
     }
 
     // Look for health check configuration in the first origin
@@ -207,60 +282,93 @@ pub fn build_lb(
 
     if let Some((origin, hc_cfg)) = detected_hc {
         has_health_check = true;
+        let frequency = hc_cfg
+            .interval
+            .as_ref()
+            .map(crate::utils::to_duration)
+            .unwrap_or(Duration::from_secs(30));
         let use_tcp = hc_cfg.protocol.as_deref() == Some("tcp");
-
-        if use_tcp {
-            debug!("LB Builder: Enabling TCP health check for origins.");
-            let mut hc = health_check::TcpHealthCheck::new();
-            if let Some(timeout) = &hc_cfg.timeout {
-                hc.peer_template.options.connection_timeout =
-                    Some(crate::utils::to_duration(timeout));
-            }
-            // TcpHealthCheck::new() returns a Box<TcpHealthCheck>, so we just need to cast it
-            let check: Box<dyn health_check::HealthCheck + Send + Sync + 'static> = hc;
-            lb.set_health_check(check);
-        } else {
-            debug!("LB Builder: Enabling HTTP health check for origins.");
-            let host = origin.addr.as_ref().map(|a| a.host()).unwrap_or_default();
-            let use_tls = origin.addr.as_ref().map(|a| a.is_https()).unwrap_or(false);
-
-            let mut hc = health_check::HttpHealthCheck::new(&host, use_tls);
-            if !hc_cfg.url.is_empty() {
-                if let Ok(uri) = hc_cfg.url.parse::<http::Uri>() {
-                    if let Some(path_and_query) = uri.path_and_query() {
-                        let mut parts = hc.req.uri.clone().into_parts();
-                        parts.path_and_query = Some(path_and_query.clone());
-                        if let Ok(new_uri) = http::Uri::from_parts(parts) {
-                            hc.req.uri = new_uri;
-                        }
+        let make_health_check = || -> Box<dyn health_check::HealthCheck + Send + Sync + 'static> {
+            if use_tcp {
+                debug!("LB Builder: Enabling TCP health check for origins.");
+                let mut hc = health_check::TcpHealthCheck::new();
+                if let Some(timeout) = &hc_cfg.timeout {
+                    hc.peer_template.options.connection_timeout =
+                        Some(crate::utils::to_duration(timeout));
+                }
+                hc
+            } else {
+                debug!("LB Builder: Enabling HTTP health check for origins.");
+                let host = origin.addr.as_ref().map(|a| a.host()).unwrap_or_default();
+                let use_tls = origin.addr.as_ref().map(|a| a.is_https()).unwrap_or(false);
+                let mut hc = health_check::HttpHealthCheck::new(&host, use_tls);
+                if !hc_cfg.url.is_empty()
+                    && let Ok(uri) = hc_cfg.url.parse::<http::Uri>()
+                    && let Some(path_and_query) = uri.path_and_query()
+                {
+                    let mut parts = hc.req.uri.clone().into_parts();
+                    parts.path_and_query = Some(path_and_query.clone());
+                    if let Ok(new_uri) = http::Uri::from_parts(parts) {
+                        hc.req.uri = new_uri;
                     }
                 }
+                if let Some(timeout) = &hc_cfg.timeout {
+                    hc.peer_template.options.connection_timeout =
+                        Some(crate::utils::to_duration(timeout));
+                }
+                Box::new(hc)
             }
+        };
 
-            // Apply connection timeout if configured
-            if let Some(timeout) = &hc_cfg.timeout {
-                hc.peer_template.options.connection_timeout =
-                    Some(crate::utils::to_duration(timeout));
-            }
-            // HttpHealthCheck::new() returns HttpHealthCheck, so we need to Box it
-            lb.set_health_check(Box::new(hc));
+        if let Some(lb) = round_robin_lb.as_mut() {
+            lb.set_health_check(make_health_check());
+            lb.health_check_frequency = Some(frequency);
+            debug!(
+                "Enabled health check for upstream pool. Frequency: {:?}",
+                lb.health_check_frequency
+            );
         }
-
-        lb.health_check_frequency = Some(
-            hc_cfg
-                .interval
-                .as_ref()
-                .map(crate::utils::to_duration)
-                .unwrap_or(Duration::from_secs(30)),
-        );
-
-        debug!(
-            "Enabled health check for upstream pool. Frequency: {:?}",
-            lb.health_check_frequency
-        );
+        if let Some(lb) = random_lb.as_mut() {
+            lb.set_health_check(make_health_check());
+            lb.health_check_frequency = Some(frequency);
+            debug!(
+                "Enabled health check for random upstream pool. Frequency: {:?}",
+                lb.health_check_frequency
+            );
+        }
     }
 
+    let lb = if let Some(lb) = random_lb {
+        AnyLoadBalancer::Random(Arc::new(lb))
+    } else {
+        AnyLoadBalancer::RoundRobin(Arc::new(
+            round_robin_lb.expect("round robin lb should exist"),
+        ))
+    };
     (Arc::new(lb), has_health_check)
+}
+
+#[allow(clippy::type_complexity)]
+pub async fn build_lb_blocking(
+    server_id: i64,
+    rp_cfg: ReverseProxyConfig,
+    level: i32,
+    parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
+    tiered_origin_bypass: bool,
+    allow_lan: bool,
+) -> anyhow::Result<(Arc<AnyLoadBalancer>, bool)> {
+    tokio::task::spawn_blocking(move || {
+        build_lb(
+            server_id,
+            &rp_cfg,
+            level,
+            parent_nodes.as_ref(),
+            tiered_origin_bypass,
+            allow_lan,
+        )
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("load balancer build task failed: {}", err))
 }
 
 pub fn build_parent_lb(
@@ -290,6 +398,7 @@ pub fn build_parent_lb(
                     use_tls: true, // L1 -> L2 always TLS by default.
                     host: String::new(),
                     rp_host: String::new(),
+                    origin_id: 0,
                     origin_host: String::new(),
                     follow_port: false,
                     follow_host: false,

@@ -24,6 +24,22 @@ static RE_XSS_STRICT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(<xml|<audio|<video|<svg|<iframe|<img|<link|<style|<form)").unwrap()
 });
 
+fn contains_sqli(value: &str, strict: bool) -> bool {
+    if libinjectionrs::detect_sqli(value.as_bytes()).is_injection() {
+        return true;
+    }
+    let lower = value.to_lowercase();
+    RE_SQLI.is_match(&lower) || (strict && RE_SQLI_STRICT.is_match(&lower))
+}
+
+fn contains_xss(value: &str, strict: bool) -> bool {
+    if libinjectionrs::detect_xss(value.as_bytes()).is_injection() {
+        return true;
+    }
+    let lower = value.to_lowercase();
+    RE_XSS.is_match(&lower) || (strict && RE_XSS_STRICT.is_match(&lower))
+}
+
 pub fn evaluate_operator(
     actual_value: &str,
     operator: &str,
@@ -159,20 +175,10 @@ pub fn evaluate_operator(
             }
         }
         "contains sql injection" | "contains sql injection strictly" => {
-            let is_strict = operator.contains("strictly");
-            let mut matched = RE_SQLI.is_match(&actual.to_lowercase());
-            if !matched && is_strict {
-                matched = RE_SQLI_STRICT.is_match(&actual.to_lowercase());
-            }
-            matched
+            contains_sqli(&actual, operator.contains("strictly"))
         }
         "contains xss" | "contains xss strictly" => {
-            let is_strict = operator.contains("strictly");
-            let mut matched = RE_XSS.is_match(&actual.to_lowercase());
-            if !matched && is_strict {
-                matched = RE_XSS_STRICT.is_match(&actual.to_lowercase());
-            }
-            matched
+            contains_xss(&actual, operator.contains("strictly"))
         }
         "contains binary" => decode_base64(&expected)
             .map(|needle| actual.as_bytes().windows(needle.len()).any(|w| w == needle))

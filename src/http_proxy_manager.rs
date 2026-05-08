@@ -614,14 +614,15 @@ impl HttpProxyManager {
         let (level, parents) = self.config_store.get_tiered_origin_info().await;
         let bypass = self.config_store.is_tiered_origin_bypass().await;
         let global_cfg = self.config_store.get_global_http_config_sync();
-        let (lb, _) = crate::lb_factory::build_lb(
+        let (lb, _) = crate::lb_factory::build_lb_blocking(
             server_id,
-            rp_cfg,
+            rp_cfg.clone(),
             level,
-            &parents,
+            parents,
             bypass,
             global_cfg.allow_lan_ip,
-        );
+        )
+        .await?;
         let peer = lb.select(b"", 128).with_context(|| {
             format!(
                 "no healthy upstream for SNI passthrough server {}",

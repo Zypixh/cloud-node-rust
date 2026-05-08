@@ -646,6 +646,7 @@ dependencies = [
  "ipnet",
  "lazy_static",
  "libc",
+ "libinjectionrs",
  "local-ip-address",
  "lru 0.12.5",
  "maxminddb",
@@ -2026,6 +2027,14 @@ name = "libc"
 version = "0.2.184"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
+
+[[package]]
+name = "libinjectionrs"
+version = "0.1.1"
+dependencies = [
+ "bitflags 2.11.0",
+ "smallvec",
+]
 
 [[package]]
 name = "libloading"

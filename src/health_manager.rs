@@ -1,16 +1,13 @@
 use dashmap::DashMap;
-use pingora_load_balancing::{
-    LoadBalancer,
-    selection::{Consistent, RoundRobin},
-};
+use pingora_load_balancing::{LoadBalancer, selection::Consistent};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 /// Represents a single health check target.
-struct HealthCheckItem<S: pingora_load_balancing::selection::BackendSelection> {
-    lb: Weak<LoadBalancer<S>>,
+struct HealthCheckItem<L> {
+    lb: Weak<L>,
     frequency: Duration,
     last_check: Instant,
 }
@@ -19,9 +16,9 @@ struct HealthCheckItem<S: pingora_load_balancing::selection::BackendSelection> {
 /// Handles millions of upstreams by using a pooled executor and rate-limiting.
 pub struct GlobalHealthManager {
     /// Key: Unique ID for the upstream pool (e.g. Server ID)
-    registry: DashMap<i64, HealthCheckItem<RoundRobin>>,
+    registry: DashMap<i64, HealthCheckItem<crate::lb_factory::AnyLoadBalancer>>,
     /// Registry for L2 (Parent) pools using consistent hashing
-    parent_registry: DashMap<i64, HealthCheckItem<Consistent>>,
+    parent_registry: DashMap<i64, HealthCheckItem<LoadBalancer<Consistent>>>,
     /// Global limit on concurrent probes
     concurrency_limiter: Arc<Semaphore>,
 }
@@ -37,7 +34,12 @@ impl GlobalHealthManager {
     }
 
     /// Registers a load balancer for periodic health monitoring.
-    pub fn register(&self, id: i64, lb: Arc<LoadBalancer<RoundRobin>>, frequency: Duration) {
+    pub fn register(
+        &self,
+        id: i64,
+        lb: Arc<crate::lb_factory::AnyLoadBalancer>,
+        frequency: Duration,
+    ) {
         info!(
             "Registering health check for upstream pool {} (Frequency: {:?})",
             id, frequency
@@ -55,12 +57,10 @@ impl GlobalHealthManager {
         let lb_clone = lb.clone();
         tokio::spawn(async move {
             debug!("Immediate health check for pool {}", id);
-            lb_clone.backends().run_health_check(true).await;
+            lb_clone.run_health_check(true).await;
 
-            let backends = lb_clone.backends();
-            let backends_set = backends.get_backend();
-            for backend in backends_set.iter() {
-                if backends.ready(backend) {
+            for (backend, healthy) in lb_clone.backend_health() {
+                if healthy {
                     debug!("Pool {}: Backend {} is HEALTHY (Initial)", id, backend.addr);
                 } else {
                     warn!(
@@ -151,10 +151,9 @@ impl GlobalHealthManager {
                     Ok(p) => p,
                     Err(_) => return,
                 };
-                lb.backends().run_health_check(true).await;
-                let backends = lb.backends();
-                for backend in backends.get_backend().iter() {
-                    if !backends.ready(backend) {
+                lb.run_health_check(true).await;
+                for (backend, healthy) in lb.backend_health() {
+                    if !healthy {
                         warn!("Pool {}: Backend {} is UNHEALTHY", id, backend.addr);
                     }
                 }

@@ -757,6 +757,11 @@ async fn handle_message(
                 ApiConfig::set_runtime_rpc_endpoints(vec![msg.addr]);
             }
         }
+        "checkSystemdService" => {
+            let (ok, reply) = check_systemd_service("cloud-node").await;
+            is_ok = ok;
+            message_reply = reply;
+        }
         "checkLocalFirewall" => {
             let msg = serde_json::from_slice::<CheckLocalFirewallMessage>(&message.data_json)
                 .unwrap_or(CheckLocalFirewallMessage {
@@ -798,4 +803,76 @@ async fn handle_message(
     }
 
     Ok(())
+}
+
+async fn check_systemd_service(service_name: &str) -> (bool, String) {
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("systemctl")
+            .arg("is-enabled")
+            .arg(service_name)
+            .output(),
+    )
+    .await;
+
+    match output {
+        Ok(Ok(output)) => interpret_systemd_is_enabled(
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ),
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            (false, "'systemctl' not found".to_string())
+        }
+        Ok(Err(err)) => (false, format!("'systemctl' command error: {}", err)),
+        Err(_) => (false, "'systemctl' command timed out after 10s".to_string()),
+    }
+}
+
+fn interpret_systemd_is_enabled(success: bool, stdout: &str, stderr: &str) -> (bool, String) {
+    let stdout = stdout.trim();
+    if stdout == "enabled" {
+        return (true, "ok".to_string());
+    }
+    if success || !stdout.is_empty() {
+        return (false, "not installed".to_string());
+    }
+    let err = stderr.trim();
+    if err.is_empty() {
+        (false, "'systemctl' command error".to_string())
+    } else {
+        (false, format!("'systemctl' command error: {}", err))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interpret_systemd_is_enabled;
+
+    #[test]
+    fn systemd_enabled_output_maps_to_ok() {
+        assert_eq!(
+            interpret_systemd_is_enabled(true, "enabled\n", ""),
+            (true, "ok".to_string())
+        );
+    }
+
+    #[test]
+    fn systemd_non_enabled_success_maps_to_not_installed() {
+        assert_eq!(
+            interpret_systemd_is_enabled(true, "disabled\n", ""),
+            (false, "not installed".to_string())
+        );
+    }
+
+    #[test]
+    fn systemd_failed_output_keeps_error_detail() {
+        assert_eq!(
+            interpret_systemd_is_enabled(false, "", "unit not found\n"),
+            (
+                false,
+                "'systemctl' command error: unit not found".to_string()
+            )
+        );
+    }
 }

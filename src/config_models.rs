@@ -814,6 +814,22 @@ pub struct SSLPolicyConfig {
     pub http2_enabled: bool,
     #[serde(rename = "minVersion", default)]
     pub min_version: String,
+    #[serde(default)]
+    pub hsts: Option<HSTSConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HSTSConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(rename = "maxAge", default)]
+    pub max_age: i32,
+    #[serde(rename = "includeSubDomains", default)]
+    pub include_sub_domains: bool,
+    #[serde(default)]
+    pub preload: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub domains: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -945,6 +961,22 @@ pub struct WebConfig {
 pub struct WebSocketConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(rename = "allowAllOrigins", default)]
+    pub allow_all_origins: bool,
+    #[serde(
+        rename = "allowedOrigins",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub allowed_origins: Vec<String>,
+    #[serde(rename = "requestSameOrigin", default)]
+    pub request_same_origin: bool,
+    #[serde(
+        rename = "requestOrigin",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub request_origin: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -1427,10 +1459,92 @@ pub struct ReferersConfig {
     pub except_url_patterns: Vec<URLPattern>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HTTPHostRedirectConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(default)]
+    pub status: i32,
+    #[serde(rename = "statusCode", default)]
+    pub status_code: i32,
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub r#type: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub mode: String,
+    #[serde(
+        rename = "beforeURL",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub before_url: String,
+    #[serde(
+        rename = "afterURL",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub after_url: String,
+    #[serde(rename = "matchPrefix", default)]
+    pub match_prefix: bool,
+    #[serde(rename = "matchRegexp", default)]
+    pub match_regexp: bool,
+    #[serde(rename = "keepRequestURI", default)]
+    pub keep_request_uri: bool,
+    #[serde(rename = "keepArgs", default)]
+    pub keep_args: bool,
+    #[serde(rename = "domainsAll", alias = "domainAll", default)]
+    pub domains_all: bool,
+    #[serde(
+        rename = "domainsBefore",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub domains_before: Vec<String>,
+    #[serde(rename = "domainBeforeIgnorePorts", default)]
+    pub domain_before_ignore_ports: bool,
+    #[serde(
+        rename = "domainAfter",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub domain_after: String,
+    #[serde(
+        rename = "domainAfterScheme",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub domain_after_scheme: String,
+    #[serde(rename = "portsAll", default)]
+    pub ports_all: bool,
+    #[serde(
+        rename = "portsBefore",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub ports_before: Vec<String>,
+    #[serde(rename = "portAfter", alias = "port", default)]
+    pub port_after: i32,
+    #[serde(
+        rename = "portAfterScheme",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub port_after_scheme: String,
+    #[serde(
+        rename = "onlyDomains",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub only_domains: Vec<String>,
+    #[serde(
+        rename = "exceptDomains",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub except_domains: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub before: String,
     #[serde(default, deserialize_with = "deserialize_null_default")]
@@ -1439,10 +1553,6 @@ pub struct HTTPHostRedirectConfig {
     pub before_host: Option<String>,
     #[serde(rename = "afterHost")]
     pub after_host: Option<String>,
-    #[serde(rename = "statusCode", default)]
-    pub status_code: i32,
-    #[serde(rename = "keepRequestURI", default)]
-    pub keep_request_uri: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -1461,6 +1571,12 @@ pub struct HTTPRewriteRule {
     #[serde(rename = "withQuery", default)]
     pub with_query: bool,
     pub mode: Option<String>,
+    #[serde(rename = "redirectStatus", default)]
+    pub redirect_status: i32,
+    #[serde(rename = "isBreak", default)]
+    pub is_break: bool,
+    #[serde(rename = "proxyHost", default)]
+    pub proxy_host: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1514,7 +1630,7 @@ pub struct WebCacheConfig {
         default,
         deserialize_with = "deserialize_null_default"
     )]
-    pub cache_refs: Vec<HTTPCacheRef>,
+    pub cache_refs: Vec<Arc<HTTPCacheRef>>,
     #[serde(rename = "cachePolicy")]
     pub cache_policy: Option<HTTPCachePolicy>,
     #[serde(rename = "disablePolicyRefs", default)]
@@ -1539,7 +1655,7 @@ pub struct HTTPCachePolicy {
         default,
         deserialize_with = "deserialize_null_default"
     )]
-    pub cache_refs: Vec<HTTPCacheRef>,
+    pub cache_refs: Vec<Arc<HTTPCacheRef>>,
     #[serde(rename = "cachePolicyId", default)]
     pub cache_policy_id: i64,
     #[serde(rename = "addStatusHeader", default = "default_true")]
@@ -1836,6 +1952,20 @@ pub struct HTTPRequestCond {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPStatusConfig {
+    #[serde(default)]
+    pub always: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub codes: Vec<i32>,
+}
+
+impl HTTPStatusConfig {
+    pub fn matches(&self, status: u16) -> bool {
+        self.always || self.codes.iter().any(|code| *code == status as i32)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HTTPHeaderPolicy {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
@@ -1914,6 +2044,36 @@ pub struct HTTPHeaderConfig {
     pub name: String,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub value: String,
+    #[serde(default)]
+    pub status: Option<HTTPStatusConfig>,
+    #[serde(rename = "disableRedirect", default)]
+    pub disable_redirect: bool,
+    #[serde(rename = "shouldAppend", default)]
+    pub should_append: bool,
+    #[serde(rename = "shouldReplace", default)]
+    pub should_replace: bool,
+    #[serde(
+        rename = "replaceValues",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub replace_values: Vec<HTTPHeaderReplaceValue>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub methods: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub domains: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPHeaderReplaceValue {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub pattern: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub replacement: String,
+    #[serde(rename = "isCaseInsensitive", default)]
+    pub is_case_insensitive: bool,
+    #[serde(rename = "isRegexp", default)]
+    pub is_regexp: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2012,6 +2172,14 @@ pub struct SSLCertConfig {
     pub dns_names: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct SchedulingConfig {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub code: String,
+    #[serde(default)]
+    pub options: Value,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ReverseProxyConfig {
     #[serde(rename = "isOn", alias = "IsOn", default)]
@@ -2028,6 +2196,8 @@ pub struct ReverseProxyConfig {
         deserialize_with = "deserialize_null_default"
     )]
     pub backup_origins: Vec<OriginConfig>,
+    #[serde(default)]
+    pub scheduling: Option<SchedulingConfig>,
     // Global request host override (used when requestHostType == 2)
     #[serde(
         rename = "requestHost",

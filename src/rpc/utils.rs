@@ -2,18 +2,18 @@ use crate::api_config::ApiConfig;
 use crate::config_models::ServerConfig;
 use crate::health_manager::GlobalHealthManager;
 use futures_util::FutureExt;
-use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
+use pingora_load_balancing::{Backends, LoadBalancer, discovery::Static, selection::RoundRobin};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 #[allow(clippy::type_complexity)]
-pub fn build_runtime_maps(
+pub async fn build_runtime_maps(
     servers: Vec<ServerConfig>,
     health_manager: &GlobalHealthManager,
 ) -> (
     HashMap<String, Arc<ServerConfig>>,
-    HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
+    HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
 ) {
     let mut new_servers = HashMap::new();
     let mut new_routes = HashMap::new();
@@ -25,38 +25,28 @@ pub fn build_runtime_maps(
 
         let server_id = server.numeric_id();
         let (lb_arc, has_hc) = if let Some(rp) = &server.reverse_proxy {
-            crate::lb_factory::build_lb(server_id, rp, 1, &HashMap::new(), false, false)
+            match crate::lb_factory::build_lb_blocking(
+                server_id,
+                rp.clone(),
+                1,
+                Arc::new(HashMap::new()),
+                false,
+                false,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to build runtime LB for server {}: {}",
+                        server_id,
+                        err
+                    );
+                    fallback_runtime_lb()
+                }
+            }
         } else {
-            // Fallback if no reverse proxy config
-            let mut b = pingora_load_balancing::Backend::new("127.0.0.1:80").unwrap();
-            let mut ext = http::Extensions::new();
-            ext.insert(crate::lb_factory::BackendExtension {
-                use_tls: false,
-                host: String::new(),
-                rp_host: String::new(),
-                origin_host: String::new(),
-                follow_port: false,
-                follow_host: false,
-                http2_enabled: false,
-                tls_verify: true,
-                request_host_excluding_port: false,
-                connection_timeout: None,
-                read_timeout: None,
-                idle_timeout: None,
-                client_cert: None,
-            });
-            b.ext = ext;
-            let mut set = std::collections::BTreeSet::new();
-            set.insert(b);
-            let backends = pingora_load_balancing::Backends::new(
-                pingora_load_balancing::discovery::Static::new(set),
-            );
-            let lb = LoadBalancer::from_backends(backends);
-            lb.update()
-                .now_or_never()
-                .expect("static fallback load balancer update should not block")
-                .expect("static fallback load balancer update should not fail");
-            (Arc::new(lb), false)
+            fallback_runtime_lb()
         };
 
         if let Some(id) = server.id {
@@ -80,6 +70,40 @@ pub fn build_runtime_maps(
     }
 
     (new_servers, new_routes)
+}
+
+pub(crate) fn fallback_runtime_lb() -> (Arc<crate::lb_factory::AnyLoadBalancer>, bool) {
+    let mut b = pingora_load_balancing::Backend::new("127.0.0.1:80").unwrap();
+    let mut ext = http::Extensions::new();
+    ext.insert(crate::lb_factory::BackendExtension {
+        use_tls: false,
+        host: String::new(),
+        rp_host: String::new(),
+        origin_id: 0,
+        origin_host: String::new(),
+        follow_port: false,
+        follow_host: false,
+        http2_enabled: false,
+        tls_verify: true,
+        request_host_excluding_port: false,
+        connection_timeout: None,
+        read_timeout: None,
+        idle_timeout: None,
+        client_cert: None,
+    });
+    b.ext = ext;
+    let mut set = std::collections::BTreeSet::new();
+    set.insert(b);
+    let backends = Backends::new(Static::new(set));
+    let lb: LoadBalancer<RoundRobin> = LoadBalancer::from_backends(backends);
+    lb.update()
+        .now_or_never()
+        .expect("static fallback load balancer update should not block")
+        .expect("static fallback load balancer update should not fail");
+    (
+        Arc::new(crate::lb_factory::AnyLoadBalancer::RoundRobin(Arc::new(lb))),
+        false,
+    )
 }
 
 pub async fn sync_deleted_contents(

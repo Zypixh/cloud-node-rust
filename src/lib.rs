@@ -20,6 +20,7 @@ pub mod local_firewall;
 pub mod log_uploader;
 pub mod logging;
 pub mod metrics;
+pub mod origin_state;
 pub mod perf_monitor;
 pub mod proxy;
 pub mod rewrite;

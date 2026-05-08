@@ -1,8 +1,9 @@
-use crate::config_models::HTTPHeaderPolicy;
+use crate::config_models::{HTTPHeaderConfig, HTTPHeaderPolicy, HTTPHeaderReplaceValue};
 use crate::utils::template::format_template;
 use http::HeaderValue;
 use http::header::HeaderName;
 use pingora_proxy::Session;
+use regex::Regex;
 use std::str::FromStr;
 
 /// Applies request header policies to the upstream request headers.
@@ -76,22 +77,61 @@ pub fn apply_request_header_policy(session: &mut Session, policy: &HTTPHeaderPol
     }
 }
 
+pub struct RequestTemplateVars<'a> {
+    pub scheme: &'a str,
+    pub method: &'a str,
+    pub host: &'a str,
+    pub request_uri: &'a str,
+    pub path: &'a str,
+    pub query: &'a str,
+    pub port: &'a str,
+    pub referer: &'a str,
+    pub user_agent: &'a str,
+    pub content_type: &'a str,
+    pub remote_addr: &'a str,
+}
+
+pub fn resolve_request_template_var(vars: &RequestTemplateVars<'_>, var_name: &str) -> String {
+    match var_name {
+        "scheme" => vars.scheme.to_string(),
+        "method" | "requestMethod" => vars.method.to_string(),
+        "host" => vars.host.to_string(),
+        "requestURI" => vars.request_uri.to_string(),
+        "path" | "requestPath" => vars.path.to_string(),
+        "query" | "args" | "queryString" => vars.query.to_string(),
+        "port" | "serverPort" => vars.port.to_string(),
+        "referer" | "httpReferer" => vars.referer.to_string(),
+        "userAgent" | "httpUserAgent" => vars.user_agent.to_string(),
+        "contentType" => vars.content_type.to_string(),
+        "remoteAddr" => vars.remote_addr.to_string(),
+        _ if var_name.starts_with("host.") => var_name[5..]
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| vars.host.split('.').nth(index))
+            .unwrap_or_default()
+            .to_string(),
+        _ if var_name.starts_with("host[") && var_name.ends_with(']') => var_name
+            [5..var_name.len() - 1]
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| vars.host.split('.').nth(index))
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Applies request header policies to upstream request headers.
 /// Unlike `apply_request_header_policy`, this operates on the outgoing upstream request
 /// rather than the downstream session, and receives template variables directly.
 pub fn apply_request_header_policy_to_upstream(
     upstream_request: &mut pingora_http::RequestHeader,
     policy: &HTTPHeaderPolicy,
-    host: &str,
-    request_uri: &str,
-    remote_addr: &str,
+    vars: &RequestTemplateVars<'_>,
 ) {
     let resolve = |value: &str| -> String {
-        format_template(value, |var_name| match var_name {
-            "host" => host.to_string(),
-            "requestURI" => request_uri.to_string(),
-            "remoteAddr" => remote_addr.to_string(),
-            _ => "".to_string(),
+        format_template(value, |var_name| {
+            resolve_request_template_var(vars, var_name)
         })
     };
 
@@ -129,6 +169,167 @@ pub fn apply_request_header_policy_to_upstream(
             if upstream_request.headers.get(&hn).is_none() {
                 upstream_request.insert_header(hn, hv).ok();
             }
+        }
+    }
+}
+
+fn domain_matches(patterns: &[String], domain: &str) -> bool {
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    patterns.iter().any(|pattern| {
+        let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+        if pattern == domain || pattern == "*" {
+            return true;
+        }
+        if let Some(suffix) = pattern.strip_prefix('.') {
+            return domain.ends_with(&format!(".{}", suffix));
+        }
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            return domain == suffix || domain.ends_with(&format!(".{}", suffix));
+        }
+        if pattern.contains('*') {
+            let regex = format!("^{}$", regex::escape(&pattern).replace("\\*", "[^.]*"));
+            return Regex::new(&regex)
+                .map(|re| re.is_match(&domain))
+                .unwrap_or(false);
+        }
+        false
+    })
+}
+
+fn header_condition_matches(
+    header: &HTTPHeaderConfig,
+    status: u16,
+    method: &str,
+    host: &str,
+) -> bool {
+    if !header.is_on {
+        return false;
+    }
+    if let Some(status_config) = &header.status
+        && !status_config.matches(status)
+    {
+        return false;
+    }
+    if header.disable_redirect && (300..=399).contains(&status) {
+        return false;
+    }
+    if !header.methods.is_empty()
+        && !header
+            .methods
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(method))
+    {
+        return false;
+    }
+    if !header.domains.is_empty() && !domain_matches(&header.domains, host) {
+        return false;
+    }
+    true
+}
+
+fn replace_header_value(value: String, rule: &HTTPHeaderReplaceValue) -> String {
+    if rule.is_regexp || rule.is_case_insensitive {
+        let pattern = if rule.is_regexp {
+            rule.pattern.clone()
+        } else {
+            regex::escape(&rule.pattern)
+        };
+        let pattern = if rule.is_case_insensitive && !pattern.starts_with("(?i)") {
+            format!("(?i){}", pattern)
+        } else {
+            pattern
+        };
+        Regex::new(&pattern)
+            .map(|re| {
+                re.replace_all(&value, rule.replacement.as_str())
+                    .into_owned()
+            })
+            .unwrap_or(value)
+    } else {
+        value.replace(&rule.pattern, &rule.replacement)
+    }
+}
+
+pub fn apply_response_header_policy(
+    headers: &mut pingora_http::ResponseHeader,
+    policy: &HTTPHeaderPolicy,
+    vars: &RequestTemplateVars<'_>,
+    status: u16,
+    method: &str,
+    host: &str,
+) {
+    for name in &policy.delete_headers {
+        headers.remove_header(name);
+    }
+
+    for header in &policy.set_headers {
+        if !header_condition_matches(header, status, method, host) {
+            continue;
+        }
+        if policy
+            .delete_headers
+            .iter()
+            .any(|deleted| deleted.eq_ignore_ascii_case(header.name.as_str()))
+        {
+            continue;
+        }
+        let mut value = format_template(&header.value, |var_name| {
+            resolve_request_template_var(vars, var_name)
+        });
+        if header.should_replace {
+            if value.is_empty() {
+                value = headers
+                    .headers
+                    .get(header.name.as_str())
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            for rule in &header.replace_values {
+                value = replace_header_value(value, rule);
+            }
+        }
+        let Ok(name) = HeaderName::from_str(&header.name) else {
+            continue;
+        };
+        if header.should_append {
+            headers.append_header(name, value).ok();
+        } else {
+            headers.insert_header(name, value).ok();
+        }
+    }
+
+    for header in &policy.add_headers {
+        if !header_condition_matches(header, status, method, host)
+            || headers.headers.get(header.name.as_str()).is_some()
+        {
+            continue;
+        }
+        let value = format_template(&header.value, |var_name| {
+            resolve_request_template_var(vars, var_name)
+        });
+        let Ok(name) = HeaderName::from_str(&header.name) else {
+            continue;
+        };
+        headers.insert_header(name, value).ok();
+    }
+
+    for rh in &policy.replace_headers {
+        if !rh.is_on {
+            continue;
+        }
+        if let Some(current) = headers
+            .headers
+            .get(rh.name.as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+        {
+            let Ok(name) = HeaderName::from_str(&rh.name) else {
+                continue;
+            };
+            headers
+                .insert_header(name, current.replace(&rh.old_value, &rh.new_value))
+                .ok();
         }
     }
 }

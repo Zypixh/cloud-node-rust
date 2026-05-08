@@ -316,7 +316,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
             } else if ctx.request_body.len() > 2_097_152 {
                 ctx.request_body[..2_097_152].to_vec()
             } else {
-                ctx.request_body.clone()
+                ctx.request_body.to_vec()
             }
         },
         scheme: scheme.to_string(),
@@ -359,7 +359,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         firewall_rule_group_id: ctx.waf_group_id,
         firewall_rule_set_id: ctx.waf_set_id,
         firewall_rule_id: ctx.waf_rule_id,
-        errors: ctx.errors.clone(),
+        errors: ctx.errors.clone().unwrap_or_default(),
         ..Default::default()
     };
 
@@ -369,8 +369,8 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     }
 
     // Tags: collect from ctx.tags
-    for tag in &ctx.tags {
-        log.tags.push(tag.clone());
+    if let Some(tags) = &ctx.tags {
+        log.tags.extend(tags.iter().cloned());
     }
     // Cache status in attrs, matching Go: logAttrs["cache.status"] = "HIT"
     log.attrs.insert(

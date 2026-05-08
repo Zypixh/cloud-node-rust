@@ -6,7 +6,6 @@ use bytes::Bytes;
 use image::AnimationDecoder;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
-use pingora_load_balancing::{LoadBalancer, selection::RoundRobin};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use rand::Rng;
 use std::sync::Arc;
@@ -28,33 +27,95 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+#[derive(Clone, Default)]
+pub struct LazyBytes(Option<Vec<u8>>);
+
+static EMPTY_BYTES_VEC: LazyLock<Vec<u8>> = LazyLock::new(Vec::new);
+
+impl LazyBytes {
+    fn take(&mut self) -> Vec<u8> {
+        self.0.take().unwrap_or_default()
+    }
+
+    fn set(&mut self, value: Vec<u8>) {
+        self.0 = Some(value);
+    }
+
+    fn clear(&mut self) {
+        if let Some(value) = &mut self.0 {
+            value.clear();
+        }
+    }
+}
+
+impl std::ops::Deref for LazyBytes {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap_or(&EMPTY_BYTES_VEC)
+    }
+}
+
+impl std::ops::DerefMut for LazyBytes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.get_or_insert_with(Vec::new)
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct LazyResponseHeaders(Option<HashMap<String, String>>);
+
+static EMPTY_RESPONSE_HEADERS: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
+
+impl LazyResponseHeaders {
+    fn clear(&mut self) {
+        if let Some(value) = &mut self.0 {
+            value.clear();
+        }
+    }
+}
+
+impl std::ops::Deref for LazyResponseHeaders {
+    type Target = HashMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap_or(&EMPTY_RESPONSE_HEADERS)
+    }
+}
+
+impl std::ops::DerefMut for LazyResponseHeaders {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.get_or_insert_with(HashMap::new)
+    }
+}
+
 #[derive(Clone)]
 pub struct ProxyCTX {
     pub start_time: std::time::Instant,
     pub start_timestamp_millis: i64,
     pub request_id: String,
     pub server: Option<Arc<ServerConfig>>,
-    pub lb: Option<Arc<LoadBalancer<RoundRobin>>>,
+    pub lb: Option<Arc<crate::lb_factory::AnyLoadBalancer>>,
     pub metrics_recorded: bool,
     pub ttfb: Option<std::time::Duration>,
     pub response_status: u16,
     pub cache_policy: Option<HTTPCachePolicy>,
-    pub cache_ref: Option<HTTPCacheRef>,
+    pub cache_ref: Option<Arc<HTTPCacheRef>>,
     pub cache_key: Option<String>,
     pub cache_hit: Option<bool>,
     pub cacheable: bool,
-    pub response_headers: HashMap<String, String>,
+    pub response_headers: LazyResponseHeaders,
     pub response_body_len: usize,
-    pub response_body_buffer: Vec<u8>,
-    pub request_body: Vec<u8>,
+    pub response_body_buffer: LazyBytes,
+    pub request_body: LazyBytes,
     pub waf_policy_id: i64,
     pub waf_group_id: i64,
     pub waf_set_id: i64,
     pub waf_rule_id: i64,
     pub waf_deferred: bool,
     pub waf_action: Option<String>,
-    pub errors: Vec<String>,
-    pub tags: Vec<String>,
+    pub errors: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
     pub firewall_event_reported: bool,
     pub compress_zstd: bool,
     pub compression_type: Option<String>,
@@ -72,6 +133,8 @@ pub struct ProxyCTX {
     pub access_log_module_enabled: bool,
     pub response_headers_size: usize,
     pub origin_address: String,
+    pub origin_id: i64,
+    pub upstream_retries: u8,
     pub origin_status: i32,
     pub is_on: bool,
     pub client_ip: std::net::IpAddr,
@@ -85,16 +148,16 @@ pub struct ProxyCTX {
     pub ip_recorded: bool,
     pub webp_convert_enabled: bool,
     pub webp_source_content_type: Option<String>,
-    pub webp_pending_body: Vec<u8>,
+    pub webp_pending_body: LazyBytes,
     pub webp_quality: i32,
     pub optimize_enabled: bool,
     pub optimize_kind: Option<String>,
-    pub optimize_pending_body: Vec<u8>,
+    pub optimize_pending_body: LazyBytes,
     pub hls_playlist_enabled: bool,
     pub hls_segment_encrypt_enabled: bool,
     pub hls_segment_key: Option<[u8; 16]>,
     pub hls_segment_iv: Option<[u8; 16]>,
-    pub hls_segment_pending_body: Vec<u8>,
+    pub hls_segment_pending_body: LazyBytes,
     pub hls_session_id: Option<String>,
     pub hls_session_exp: Option<i64>,
     pub request_limit_out_bandwidth_bytes: i64,
@@ -125,18 +188,18 @@ impl Default for ProxyCTX {
             cache_key: None,
             cache_hit: None,
             cacheable: false,
-            response_headers: HashMap::new(),
+            response_headers: LazyResponseHeaders::default(),
             response_body_len: 0,
-            response_body_buffer: Vec::new(),
-            request_body: Vec::new(),
+            response_body_buffer: LazyBytes::default(),
+            request_body: LazyBytes::default(),
             waf_policy_id: 0,
             waf_group_id: 0,
             waf_set_id: 0,
             waf_rule_id: 0,
             waf_deferred: false,
             waf_action: None,
-            errors: Vec::new(),
-            tags: Vec::new(),
+            errors: None,
+            tags: None,
             firewall_event_reported: false,
             compress_zstd: false,
             compression_type: None,
@@ -153,6 +216,8 @@ impl Default for ProxyCTX {
             access_log_module_enabled: true,
             response_headers_size: 0,
             origin_address: String::new(),
+            origin_id: 0,
+            upstream_retries: 0,
             origin_status: 0,
             is_on: true,
             client_ip: "127.0.0.1".parse().unwrap(),
@@ -166,16 +231,16 @@ impl Default for ProxyCTX {
             ip_recorded: false,
             webp_convert_enabled: false,
             webp_source_content_type: None,
-            webp_pending_body: Vec::new(),
+            webp_pending_body: LazyBytes::default(),
             webp_quality: 80,
             optimize_enabled: false,
             optimize_kind: None,
-            optimize_pending_body: Vec::new(),
+            optimize_pending_body: LazyBytes::default(),
             hls_playlist_enabled: false,
             hls_segment_encrypt_enabled: false,
             hls_segment_key: None,
             hls_segment_iv: None,
-            hls_segment_pending_body: Vec::new(),
+            hls_segment_pending_body: LazyBytes::default(),
             hls_session_id: None,
             hls_session_exp: None,
             request_limit_out_bandwidth_bytes: 0,
@@ -244,6 +309,10 @@ static REQUEST_LIMIT_SERVER_COUNTS: Lazy<DashMap<i64, Arc<AtomicI32>>> =
     Lazy::new(|| DashMap::with_shard_amount(64));
 static REQUEST_LIMIT_IP_COUNTS: Lazy<DashMap<std::net::IpAddr, Arc<AtomicI32>>> =
     Lazy::new(|| DashMap::with_shard_amount(64));
+static WILDCARD_DOMAIN_REGEX_CACHE: Lazy<DashMap<String, Arc<Regex>>> =
+    Lazy::new(|| DashMap::with_shard_amount(64));
+static UA_WILDCARD_REGEX_CACHE: Lazy<DashMap<String, Arc<Regex>>> =
+    Lazy::new(|| DashMap::with_shard_amount(64));
 static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
     hostname::get()
         .unwrap_or_default()
@@ -295,6 +364,24 @@ impl EdgeProxy {
             .ok()
             .and_then(|code| code.canonical_reason().map(str::to_string))
             .unwrap_or_default()
+    }
+
+    fn sync_response_headers(
+        upstream_response: &pingora::http::ResponseHeader,
+        ctx: &mut ProxyCTX,
+    ) {
+        ctx.response_headers.clear();
+        for (name, value) in upstream_response.headers.iter() {
+            if let Ok(value_str) = value.to_str() {
+                ctx.response_headers
+                    .insert(name.to_string(), value_str.to_string());
+            }
+        }
+        ctx.response_headers_size = upstream_response
+            .headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.len() + 4)
+            .sum();
     }
 
     fn downstream_local_port(session: &Session) -> Option<u16> {
@@ -839,11 +926,48 @@ impl EdgeProxy {
             host.to_string()
         };
 
-        let status = u16::try_from(redirect.status)
+        let status = Self::redirect_to_https_status(redirect.status);
+        Some((format!("https://{}{}", target_host, request_uri), status))
+    }
+
+    fn redirect_to_https_status(status: i32) -> u16 {
+        u16::try_from(status)
             .ok()
             .filter(|code| matches!(*code, 301 | 302 | 307 | 308))
-            .unwrap_or(302);
-        Some((format!("https://{}{}", target_host, request_uri), status))
+            .unwrap_or(301)
+    }
+
+    fn forwarded_proto(session: &Session, ctx: &ProxyCTX) -> &'static str {
+        if ctx.is_http3_bridge
+            || session
+                .downstream_session
+                .digest()
+                .and_then(|digest| digest.ssl_digest.as_ref())
+                .is_some()
+            || session.req_header().uri.scheme_str() == Some("https")
+        {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    fn append_forwarded_for(existing: Option<&str>, ip: &str, max_addresses: i32) -> String {
+        let mut parts: Vec<String> = existing
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect();
+        parts.push(ip.to_string());
+
+        if max_addresses > 0 && parts.len() > max_addresses as usize {
+            let start = parts.len() - max_addresses as usize;
+            parts = parts[start..].to_vec();
+        }
+
+        parts.join(", ")
     }
 
     async fn respond_shutdown(
@@ -1518,13 +1642,84 @@ impl EdgeProxy {
                 return domain == suffix || domain.ends_with(&format!(".{}", suffix));
             }
             if pattern.contains('*') {
-                let escaped = regex::escape(&pattern).replace("\\*", ".*");
-                return regex::Regex::new(&format!("(?i)^{}$", escaped))
-                    .map(|re| re.is_match(&domain))
-                    .unwrap_or(false);
+                return Self::cached_wildcard_domain_regex_matches(&pattern, &domain);
             }
             false
         })
+    }
+
+    fn hsts_header_value(hsts: &crate::config_models::HSTSConfig) -> String {
+        let max_age = if hsts.max_age > 0 {
+            hsts.max_age
+        } else {
+            31_536_000
+        };
+        let mut value = format!("max-age={}", max_age);
+        if hsts.include_sub_domains {
+            value.push_str("; includeSubDomains");
+        }
+        if hsts.preload {
+            value.push_str("; preload");
+        }
+        value
+    }
+
+    fn websocket_origin_allowed(
+        ws: &crate::config_models::WebSocketConfig,
+        origin_host: &str,
+    ) -> bool {
+        ws.allow_all_origins || Self::wildcard_domain_matches(&ws.allowed_origins, origin_host)
+    }
+
+    fn origin_header_host(origin: &str) -> Option<&str> {
+        let (_, rest) = origin.split_once("://")?;
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        (!host.is_empty()).then_some(host)
+    }
+
+    fn is_websocket_request(session: &Session) -> bool {
+        let upgrade = session
+            .get_header("upgrade")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+        let connection = session
+            .get_header("connection")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_ascii_lowercase().contains("upgrade"))
+            .unwrap_or(false);
+        upgrade && connection
+    }
+
+    fn cached_wildcard_domain_regex_matches(pattern: &str, domain: &str) -> bool {
+        if let Some(re) = WILDCARD_DOMAIN_REGEX_CACHE.get(pattern) {
+            return re.is_match(domain);
+        }
+
+        let escaped = regex::escape(pattern).replace("\\*", ".*");
+        let Ok(re) = Regex::new(&format!("(?i)^{}$", escaped)) else {
+            return false;
+        };
+        let re = Arc::new(re);
+        let matched = re.is_match(domain);
+        WILDCARD_DOMAIN_REGEX_CACHE.insert(pattern.to_string(), re);
+        matched
+    }
+
+    fn cached_user_agent_wildcard_matches(keyword: &str, user_agent: &str) -> bool {
+        if let Some(re) = UA_WILDCARD_REGEX_CACHE.get(keyword) {
+            return re.is_match(user_agent);
+        }
+
+        let pattern = regex::escape(keyword).replace("\\*", ".*");
+        let Ok(re) = Regex::new(&format!("(?i){}", pattern)) else {
+            return false;
+        };
+        let re = Arc::new(re);
+        let matched = re.is_match(user_agent);
+        UA_WILDCARD_REGEX_CACHE.insert(keyword.to_string(), re);
+        matched
     }
 
     fn url_patterns_match(
@@ -1774,10 +1969,7 @@ impl EdgeProxy {
                 if keyword.is_empty() {
                     ua.is_empty()
                 } else if keyword.contains('*') {
-                    let pattern = regex::escape(keyword).replace("\\*", ".*");
-                    regex::Regex::new(&format!("(?i){}", pattern))
-                        .map(|re| re.is_match(ua))
-                        .unwrap_or(false)
+                    Self::cached_user_agent_wildcard_matches(keyword, ua)
                 } else {
                     ua.to_ascii_lowercase()
                         .contains(&keyword.to_ascii_lowercase())
@@ -3145,10 +3337,8 @@ impl EdgeProxy {
         // blocks legitimate traffic (e.g. 10+ requests/min triggers ECF).
         // These defenses belong at the TCP connection accept layer.
 
-        if self
-            .enforce_uam(session, ctx, &ctx.client_ip_str.clone())
-            .await?
-        {
+        let client_ip = ctx.client_ip_str.clone();
+        if self.enforce_uam(session, ctx, &client_ip).await? {
             return Ok((true, None));
         }
 
@@ -3169,7 +3359,7 @@ impl EdgeProxy {
                         break;
                     }
                 }
-                ctx.request_body = buffered;
+                ctx.request_body.set(buffered);
             }
         }
 
@@ -3454,7 +3644,17 @@ impl ProxyHttp for EdgeProxy {
             if let Some(web) = &server.web
                 && let Some(ws) = &web.websocket
                 && ws.is_on
+                && Self::is_websocket_request(session)
             {
+                if let Some(origin) = session.get_header("origin").and_then(|v| v.to_str().ok()) {
+                    if let Some(origin_host) = Self::origin_header_host(origin) {
+                        let same_origin = crate::lb_factory::strip_addr_port(origin_host)
+                            .eq_ignore_ascii_case(&crate::lb_factory::strip_addr_port(&host));
+                        if !same_origin && !Self::websocket_origin_allowed(ws, origin_host) {
+                            return self.respond_status_with_pages(session, ctx, 403).await;
+                        }
+                    }
+                }
                 ctx.is_websocket = true;
             }
             if let Some(grpc) = &server.grpc {
@@ -3593,7 +3793,7 @@ impl ProxyHttp for EdgeProxy {
                             server_id,
                             &rp_cfg,
                             level,
-                            &parents,
+                            parents.as_ref(),
                             bypass,
                             allow_lan_ip,
                         )
@@ -3723,9 +3923,24 @@ impl ProxyHttp for EdgeProxy {
             let query = session.req_header().uri.query().unwrap_or("");
 
             if !host_redirects.is_empty() {
-                if let Some((location, status)) =
-                    evaluate_host_redirects(&host, uri_str, host_redirects)
-                {
+                let redirect_host = session
+                    .get_header("host")
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&host)
+                    .to_ascii_lowercase();
+                let user_agent = session
+                    .get_header("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if let Some((location, status)) = evaluate_host_redirects(
+                    &redirect_host,
+                    Self::forwarded_proto(session, ctx),
+                    uri_str,
+                    query,
+                    user_agent,
+                    host_redirects,
+                ) {
                     let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
                     resp.insert_header("location", location).unwrap();
                     session.write_response_header(Box::new(resp), true).await?;
@@ -3733,18 +3948,44 @@ impl ProxyHttp for EdgeProxy {
                 }
             }
 
-            if !rewrite_rules.is_empty()
-                && let RewriteResult::Redirect { location, status } =
-                    evaluate_rewrites(uri_str, query, rewrite_refs, rewrite_rules)
-            {
-                let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
-                resp.insert_header("location", location).unwrap();
-                session.write_response_header(Box::new(resp), true).await?;
-                return Ok(true);
+            if !rewrite_rules.is_empty() {
+                match evaluate_rewrites(uri_str, query, rewrite_refs, rewrite_rules) {
+                    RewriteResult::Redirect { location, status } => {
+                        let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
+                        resp.insert_header("location", location).unwrap();
+                        session.write_response_header(Box::new(resp), true).await?;
+                        return Ok(true);
+                    }
+                    RewriteResult::Proxy {
+                        new_uri,
+                        proxy_host,
+                    } => {
+                        if let Ok(new_parsed) = new_uri.parse::<http::Uri>() {
+                            session.req_header_mut().set_uri(new_parsed);
+                        }
+                        if let Some(host) = proxy_host {
+                            ctx.origin_host = host;
+                        }
+                    }
+                    RewriteResult::NoMatch => {}
+                }
             }
         }
 
         Ok(false)
+    }
+
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(ctx.origin_id);
+        ctx.upstream_retries = ctx.upstream_retries.saturating_add(1);
+        e.set_retry(ctx.upstream_retries < 2);
+        e
     }
 
     async fn fail_to_proxy(
@@ -3766,6 +4007,10 @@ impl ProxyHttp for EdgeProxy {
                 ErrorSource::Internal | ErrorSource::Unset => 500,
             },
         };
+
+        if matches!(e.esource(), ErrorSource::Upstream) && (code == 0 || code >= 500) {
+            crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(ctx.origin_id);
+        }
 
         if code > 0 {
             ctx.response_status = code;
@@ -3793,6 +4038,26 @@ impl ProxyHttp for EdgeProxy {
         FailToProxy {
             error_code: code,
             can_reuse_downstream: false,
+        }
+    }
+
+    fn should_serve_stale(
+        &self,
+        _session: &mut Session,
+        ctx: &mut Self::CTX,
+        error: Option<&Error>,
+    ) -> bool {
+        if ctx.cache_ref.is_none() {
+            return false;
+        }
+        match error {
+            None => true,
+            Some(err) if err.esource() != &ErrorSource::Upstream => false,
+            Some(err) => match err.etype() {
+                HTTPStatus(502 | 503 | 504) => true,
+                HTTPStatus(code) => *code == 0,
+                _ => true,
+            },
         }
     }
 
@@ -3894,8 +4159,25 @@ impl ProxyHttp for EdgeProxy {
         // --- FALLBACK TO ORIGIN LB ---
         if target_peer.is_none() {
             if let Some(lb) = &ctx.lb {
-                if let Some(peer) = lb.select(b"", 128) {
+                let mut down_fallback = None;
+                for _ in 0..16 {
+                    let Some(peer) = lb.select(b"", 128) else {
+                        break;
+                    };
+                    let origin_id = peer
+                        .ext
+                        .get::<crate::lb_factory::BackendExtension>()
+                        .map(|ext| ext.origin_id)
+                        .unwrap_or(0);
+                    if crate::origin_state::ORIGIN_STATE_MANAGER.is_down(origin_id) {
+                        down_fallback.get_or_insert_with(|| peer.clone());
+                        continue;
+                    }
                     target_peer = Some(peer.clone());
+                    break;
+                }
+                if target_peer.is_none() {
+                    target_peer = down_fallback;
                 }
             }
         }
@@ -3965,6 +4247,7 @@ impl ProxyHttp for EdgeProxy {
                 (client_host, None)
             };
 
+            ctx.origin_id = backend_ext.map(|ext| ext.origin_id).unwrap_or(0);
             ctx.origin_host = host_override.unwrap_or_default();
             debug!(
                 "Selected upstream: connect_addr={} TLS={} SNI={} HostOverride={} h2_enabled={}",
@@ -4338,6 +4621,11 @@ impl ProxyHttp for EdgeProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         ctx.origin_status = upstream_response.status.as_u16() as i32;
+        if ctx.origin_status >= 500 {
+            crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(ctx.origin_id);
+        } else {
+            crate::origin_state::ORIGIN_STATE_MANAGER.record_success(ctx.origin_id);
+        }
         info!("ACCESS_LOG: origin_status set to {}", ctx.origin_status);
 
         if let Some(cache_ref) = &ctx.cache_ref {
@@ -4473,11 +4761,6 @@ impl ProxyHttp for EdgeProxy {
                     }
                 }
             }
-            ctx.response_headers_size = upstream_response
-                .headers
-                .iter()
-                .map(|(n, v)| n.as_str().len() + v.len() + 4)
-                .sum();
             if let Some(global_cfg) = &ctx.global_http_config {
                 if !global_cfg.server_name.is_empty() {
                     upstream_response
@@ -4489,6 +4772,50 @@ impl ProxyHttp for EdgeProxy {
             if let Some(server) = &ctx.server {
                 if let Some(web) = &server.web {
                     if let Some(ref rhp) = web.response_header_policy {
+                        if rhp.is_on {
+                            let request_uri = session
+                                .req_header()
+                                .uri
+                                .path_and_query()
+                                .map(|pq| pq.as_str().to_string())
+                                .unwrap_or_else(|| "/".to_string());
+                            let port = Self::downstream_local_port(session)
+                                .map(|port| port.to_string())
+                                .unwrap_or_default();
+                            let referer = session
+                                .get_header("referer")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            let user_agent = session
+                                .get_header("user-agent")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            let content_type = session
+                                .get_header("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            let vars = crate::headers::RequestTemplateVars {
+                                scheme: Self::forwarded_proto(session, ctx),
+                                method: session.req_header().method.as_str(),
+                                host: &ctx.host,
+                                request_uri: &request_uri,
+                                path: session.req_header().uri.path(),
+                                query: session.req_header().uri.query().unwrap_or(""),
+                                port: &port,
+                                referer,
+                                user_agent,
+                                content_type,
+                                remote_addr: &ctx.client_ip_str,
+                            };
+                            crate::headers::apply_response_header_policy(
+                                upstream_response,
+                                rhp,
+                                &vars,
+                                upstream_response.status.as_u16(),
+                                session.req_header().method.as_str(),
+                                &ctx.host,
+                            );
+                        }
                         if let Some(ref cors) = rhp.cors {
                             if cors.is_on {
                                 Self::set_cors_headers(upstream_response, session, cors);
@@ -4497,22 +4824,11 @@ impl ProxyHttp for EdgeProxy {
                     }
                 }
             }
+            Self::sync_response_headers(upstream_response, ctx);
             return Ok(());
         }
 
-        // Sync all response headers from upstream to context for accurate logging and WAF
-        for (name, value) in upstream_response.headers.iter() {
-            if let Ok(value_str) = value.to_str() {
-                ctx.response_headers
-                    .insert(name.to_string(), value_str.to_string());
-            }
-        }
-
-        ctx.response_headers_size = upstream_response
-            .headers
-            .iter()
-            .map(|(n, v)| n.as_str().len() + v.len() + 4)
-            .sum();
+        Self::sync_response_headers(upstream_response, ctx);
 
         // --- SMART LOAD BALANCING FEEDBACK ---
         // 1. L2 Node: Announce pressure to L1
@@ -4547,11 +4863,73 @@ impl ProxyHttp for EdgeProxy {
             }
         }
 
+        if Self::forwarded_proto(session, ctx) == "https" {
+            if let Some(server) = &ctx.server
+                && let Some(https) = &server.https
+                && let Some(ssl_policy) = &https.ssl_policy
+                && let Some(hsts) = &ssl_policy.hsts
+                && hsts.is_on
+                && (hsts.domains.is_empty()
+                    || Self::wildcard_domain_matches(&hsts.domains, &ctx.host))
+            {
+                let value = Self::hsts_header_value(hsts);
+                upstream_response
+                    .insert_header("strict-transport-security", value.clone())
+                    .unwrap();
+                ctx.response_headers
+                    .insert("strict-transport-security".to_string(), value);
+            }
+        }
+
         // CORS: add headers for all responses when CORS is enabled
         // (OPTIONS preflight is handled in request_filter)
         if let Some(server) = &ctx.server {
             if let Some(web) = &server.web {
                 if let Some(ref rhp) = web.response_header_policy {
+                    if rhp.is_on {
+                        let request_uri = session
+                            .req_header()
+                            .uri
+                            .path_and_query()
+                            .map(|pq| pq.as_str().to_string())
+                            .unwrap_or_else(|| "/".to_string());
+                        let port = Self::downstream_local_port(session)
+                            .map(|port| port.to_string())
+                            .unwrap_or_default();
+                        let referer = session
+                            .get_header("referer")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let user_agent = session
+                            .get_header("user-agent")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let content_type = session
+                            .get_header("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let vars = crate::headers::RequestTemplateVars {
+                            scheme: Self::forwarded_proto(session, ctx),
+                            method: session.req_header().method.as_str(),
+                            host: &ctx.host,
+                            request_uri: &request_uri,
+                            path: session.req_header().uri.path(),
+                            query: session.req_header().uri.query().unwrap_or(""),
+                            port: &port,
+                            referer,
+                            user_agent,
+                            content_type,
+                            remote_addr: &ctx.client_ip_str,
+                        };
+                        crate::headers::apply_response_header_policy(
+                            upstream_response,
+                            rhp,
+                            &vars,
+                            upstream_response.status.as_u16(),
+                            session.req_header().method.as_str(),
+                            &ctx.host,
+                        );
+                    }
                     if let Some(ref cors) = rhp.cors {
                         if cors.is_on {
                             debug!(
@@ -4566,6 +4944,8 @@ impl ProxyHttp for EdgeProxy {
                 }
             }
         }
+
+        Self::sync_response_headers(upstream_response, ctx);
 
         // 1. Initial Outbound WAF (Status & Headers)
         let outbound_ctx = crate::firewall::OutboundContext {
@@ -4703,6 +5083,7 @@ impl ProxyHttp for EdgeProxy {
             }
         }
         self.apply_charset_to_response(upstream_response, ctx);
+        Self::sync_response_headers(upstream_response, ctx);
         Ok(())
     }
 
@@ -4751,21 +5132,50 @@ impl ProxyHttp for EdgeProxy {
                 if let Some(policy) = &web.request_header_policy {
                     if policy.is_on {
                         let request_uri = upstream_request
-                            .raw_path()
-                            .iter()
-                            .map(|b| *b as char)
-                            .collect::<String>();
+                            .uri
+                            .path_and_query()
+                            .map(|pq| pq.as_str().to_string())
+                            .unwrap_or_else(|| "/".to_string());
+                        let path = upstream_request.uri.path().to_string();
+                        let query = upstream_request.uri.query().unwrap_or("").to_string();
                         let host_for_template = if !ctx.origin_host.is_empty() {
                             ctx.origin_host.clone()
                         } else {
                             ctx.host.clone()
                         };
+                        let method = upstream_request.method.as_str().to_string();
+                        let port = Self::downstream_local_port(_session)
+                            .map(|port| port.to_string())
+                            .unwrap_or_default();
+                        let referer = _session
+                            .get_header("referer")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let user_agent = _session
+                            .get_header("user-agent")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let content_type = _session
+                            .get_header("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let vars = crate::headers::RequestTemplateVars {
+                            scheme: Self::forwarded_proto(_session, ctx),
+                            method: &method,
+                            host: &host_for_template,
+                            request_uri: &request_uri,
+                            path: &path,
+                            query: &query,
+                            port: &port,
+                            referer,
+                            user_agent,
+                            content_type,
+                            remote_addr: &ctx.client_ip_str,
+                        };
                         crate::headers::apply_request_header_policy_to_upstream(
                             upstream_request,
                             policy,
-                            &host_for_template,
-                            &request_uri,
-                            &ctx.client_ip_str,
+                            &vars,
                         );
                         debug!(
                             "UPSTREAM: applied requestHeaderPolicy (set={}, add={}, delete={})",
@@ -4778,24 +5188,56 @@ impl ProxyHttp for EdgeProxy {
             }
         }
 
-        // Debug: log full upstream request for troubleshooting (after policy application)
-        {
-            let headers_str: Vec<String> = upstream_request
-                .headers
-                .iter()
-                .map(|(n, v)| format!("{}: {}", n, v.to_str().unwrap_or("?")))
-                .collect();
-            info!(
-                "UPSTREAM_REQUEST: {} {} {:?}, headers=[{}]",
-                upstream_request.method,
+        if ctx.is_websocket {
+            if let Some(server) = &ctx.server
+                && let Some(web) = &server.web
+                && let Some(ws) = &web.websocket
+                && !ws.request_same_origin
+                && !ws.request_origin.is_empty()
+            {
+                let request_uri = upstream_request
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_else(|| "/".to_string());
+                let path = upstream_request.uri.path().to_string();
+                let query = upstream_request.uri.query().unwrap_or("").to_string();
+                let port = Self::downstream_local_port(_session)
+                    .map(|port| port.to_string())
+                    .unwrap_or_default();
+                let referer = _session
+                    .get_header("referer")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let user_agent = _session
+                    .get_header("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let content_type = _session
+                    .get_header("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let vars = crate::headers::RequestTemplateVars {
+                    scheme: Self::forwarded_proto(_session, ctx),
+                    method: upstream_request.method.as_str(),
+                    host: &ctx.host,
+                    request_uri: &request_uri,
+                    path: &path,
+                    query: &query,
+                    port: &port,
+                    referer,
+                    user_agent,
+                    content_type,
+                    remote_addr: &ctx.client_ip_str,
+                };
+                let request_origin =
+                    crate::utils::template::format_template(&ws.request_origin, |var| {
+                        crate::headers::resolve_request_template_var(&vars, var)
+                    });
                 upstream_request
-                    .raw_path()
-                    .iter()
-                    .map(|b| *b as char)
-                    .collect::<String>(),
-                upstream_request.version,
-                headers_str.join("; ")
-            );
+                    .insert_header("origin", request_origin)
+                    .unwrap();
+            }
         }
 
         // 1. Automatic Gzip Back to Origin
@@ -4832,32 +5274,30 @@ impl ProxyHttp for EdgeProxy {
             debug!("L1: Injected tiered-origin headers for node {}", node_id);
         }
 
-        // 3. Standard logic: Add X-Forwarded-For with limit
-        let ip = ctx.client_ip.to_string();
-        if let Some(val) = upstream_request.headers.get("X-Forwarded-For") {
-            let mut parts: Vec<String> = val
-                .to_str()
-                .unwrap_or("")
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-            parts.push(ip);
+        // 3. Standard forwarded headers. These are written after custom request
+        // header policy so client-controlled or policy-injected values cannot
+        // override the edge-observed connection metadata.
+        upstream_request
+            .insert_header("X-Real-IP", ctx.client_ip_str.as_str())
+            .unwrap();
+        upstream_request
+            .insert_header("X-Forwarded-Host", ctx.host.as_str())
+            .unwrap();
+        upstream_request
+            .insert_header("X-Forwarded-Proto", Self::forwarded_proto(_session, ctx))
+            .unwrap();
 
-            // Apply XFF address limit
-            let max_xff = global_cfg.xff_max_addresses;
-            if max_xff > 0 && parts.len() > max_xff as usize {
-                let start = parts.len() - max_xff as usize;
-                parts = parts[start..].to_vec();
-            }
-
+        let forwarded_for = Self::append_forwarded_for(
             upstream_request
-                .insert_header("X-Forwarded-For", parts.join(", "))
-                .unwrap();
-        } else {
-            upstream_request
-                .insert_header("X-Forwarded-For", ip)
-                .unwrap();
-        }
+                .headers
+                .get("X-Forwarded-For")
+                .and_then(|v| v.to_str().ok()),
+            ctx.client_ip_str.as_str(),
+            global_cfg.xff_max_addresses,
+        );
+        upstream_request
+            .insert_header("X-Forwarded-For", forwarded_for)
+            .unwrap();
 
         Ok(())
     }
@@ -4903,7 +5343,7 @@ impl ProxyHttp for EdgeProxy {
             if let Some(optimized) = optimized {
                 *body = Some(Bytes::from(optimized));
             } else {
-                *body = Some(Bytes::from(std::mem::take(&mut ctx.optimize_pending_body)));
+                *body = Some(Bytes::from(ctx.optimize_pending_body.take()));
             }
             ctx.optimize_enabled = false;
             ctx.optimize_pending_body.clear();
@@ -4933,6 +5373,11 @@ impl ProxyHttp for EdgeProxy {
                         .extend_from_slice(&converted[..inspection_size]);
                     ctx.response_headers
                         .insert("content-type".to_string(), "image/webp".to_string());
+                    ctx.response_headers_size = ctx
+                        .response_headers
+                        .iter()
+                        .map(|(name, value)| name.len() + value.len() + 4)
+                        .sum();
                     *body = Some(Bytes::from(converted));
                     ctx.webp_pending_body.clear();
                 }
@@ -4942,7 +5387,7 @@ impl ProxyHttp for EdgeProxy {
                         err
                     );
                     ctx.webp_convert_enabled = false;
-                    *body = Some(Bytes::from(std::mem::take(&mut ctx.webp_pending_body)));
+                    *body = Some(Bytes::from(ctx.webp_pending_body.take()));
                 }
             }
         }
@@ -4979,9 +5424,7 @@ impl ProxyHttp for EdgeProxy {
                 let encrypted = Self::aes128_cbc_encrypt(&ctx.hls_segment_pending_body, key, iv);
                 *body = Some(Bytes::from(encrypted));
             } else {
-                *body = Some(Bytes::from(std::mem::take(
-                    &mut ctx.hls_segment_pending_body,
-                )));
+                *body = Some(Bytes::from(ctx.hls_segment_pending_body.take()));
             }
             ctx.hls_segment_pending_body.clear();
             ctx.hls_segment_encrypt_enabled = false;
@@ -5219,4 +5662,64 @@ pub fn start_request_limit_cleanup_task() {
             EdgeProxy::cleanup_request_limit_bindings();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EdgeProxy;
+
+    #[test]
+    fn redirect_to_https_defaults_to_301_and_preserves_valid_status() {
+        assert_eq!(EdgeProxy::redirect_to_https_status(0), 301);
+        assert_eq!(EdgeProxy::redirect_to_https_status(999), 301);
+        assert_eq!(EdgeProxy::redirect_to_https_status(302), 302);
+        assert_eq!(EdgeProxy::redirect_to_https_status(307), 307);
+        assert_eq!(EdgeProxy::redirect_to_https_status(308), 308);
+    }
+
+    #[test]
+    fn wildcard_domain_matching_uses_legacy_semantics() {
+        let patterns = vec![
+            "*.example.com".to_string(),
+            "api-*.service.test".to_string(),
+        ];
+
+        assert!(EdgeProxy::wildcard_domain_matches(
+            &patterns,
+            "www.example.com"
+        ));
+        assert!(EdgeProxy::wildcard_domain_matches(&patterns, "example.com"));
+        assert!(EdgeProxy::wildcard_domain_matches(
+            &patterns,
+            "api-east.service.test"
+        ));
+        assert!(!EdgeProxy::wildcard_domain_matches(
+            &patterns,
+            "static.service.test"
+        ));
+    }
+
+    #[test]
+    fn user_agent_wildcard_matching_is_case_insensitive() {
+        assert!(EdgeProxy::cached_user_agent_wildcard_matches(
+            "Bad*Bot",
+            "Mozilla bad-crawler-bot"
+        ));
+        assert!(!EdgeProxy::cached_user_agent_wildcard_matches(
+            "Bad*Bot",
+            "Mozilla good crawler"
+        ));
+    }
+
+    #[test]
+    fn append_forwarded_for_honors_max_addresses() {
+        assert_eq!(
+            EdgeProxy::append_forwarded_for(Some("1.1.1.1, 2.2.2.2"), "3.3.3.3", 2),
+            "2.2.2.2, 3.3.3.3"
+        );
+        assert_eq!(
+            EdgeProxy::append_forwarded_for(None, "3.3.3.3", 0),
+            "3.3.3.3"
+        );
+    }
 }

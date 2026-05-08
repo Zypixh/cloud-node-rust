@@ -33,7 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 quinn = "0.11.9"
 rustls = { version = "0.23.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
 sha1 = "0.11.0"
@@ -64,6 +64,7 @@ hex = "0.4.3"
 woothee = "0.13.0"
 rocksdb = { version = "0.23.0", features = ["lz4"] }
 rand = "0.8"
+libinjectionrs = { path = "vendor/libinjectionrs" }
 libc = "0.2"
 parking_lot = "0.12"
 aes-gcm = "0.10.3"

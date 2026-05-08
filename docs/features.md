@@ -11,9 +11,9 @@ HTTP 代理是 L7 能力的主入口，支持：
 - TLS 证书动态选择。
 - 上游 SNI 和 Host 策略。
 - 请求和响应 header policy。
-- URL rewrite 和 host redirect。
+- URL rewrite 和 host redirect，支持递归 rewrite、break、proxyHost 和 URL/domain/port redirect。
 - 自定义错误页和状态页。
-- OPTIONS CORS 预检响应。
+- 条件响应头策略、HSTS 和 OPTIONS CORS 预检响应。
 
 请求会先经过站点路由，再进入请求过滤、缓存判断、WAF 判断和上游选择。
 
@@ -28,6 +28,7 @@ gRPC 和 WebSocket 属于长连接协议，运行时会优先识别协议特征�
 行为要点：
 
 - WebSocket 未开启时，gRPC 不会被误放行。
+- WebSocket 可按 Origin allowlist 或同源策略拦截异常握手，并支持上游 Origin 模板覆盖。
 - gRPC 请求会强制使用上游 H2。
 - 长连接统计和普通 HTTP 请求分开处理。
 - 访问日志会保留协议标识和上游信息。
@@ -60,6 +61,8 @@ gRPC 和 WebSocket 属于长连接协议，运行时会优先识别协议特征�
 - 主源和备源。
 - 源站权重。
 - 健康检查。
+- Random 和 RoundRobin 调度，未显式配置时默认使用 Random。
+- 源站失败状态跟踪，连续失败后短暂摘除并自动恢复探测。
 - HTTP/2 回源。
 - TLS 校验开关。
 - 自定义 Host 和 SNI。
@@ -102,7 +105,8 @@ WAF 能力包括：
 
 - 规则组和规则集。
 - IP、CIDR、地区、User-Agent、Referer、URI、Header、Cookie、Query 条件。
-- 正则匹配和字符串操作符。
+- 正则匹配、字符串操作符和 SQLi/XSS 检测操作符。
+- SQLi/XSS 主检测使用本仓库内 patched libinjectionrs，保留受限正则兜底。
 - block、log、allow、captcha、JS challenge 等动作。
 - UAM 和 PoW 挑战。
 - CC 策略。
@@ -178,6 +182,7 @@ WAF 状态管理会维护 IP 和网段封禁快照。请求热路径使用快照
 - 缓存预热、缓存读取、缓存统计、缓存清理。
 - 节点运行状态采集。
 - API endpoint 切换。
+- systemd 服务启用状态检查。
 - 本地防火墙能力检查。
 
 暂未支持或被明确标记为暂不支持的能力，会在代码占位页和回复中说明，不会伪装成已执行。

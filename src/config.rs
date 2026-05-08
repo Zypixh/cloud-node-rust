@@ -1,9 +1,6 @@
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use pingora_load_balancing::{
-    LoadBalancer,
-    selection::{Consistent, RoundRobin},
-};
+use pingora_load_balancing::{LoadBalancer, selection::Consistent};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -26,9 +23,9 @@ pub struct NodeConfig {
     /// Unique runtime server list preserved independently from host routing map
     pub all_servers: Vec<Arc<ServerConfig>>,
     /// Mapping of Host domain to an upstream load balancer
-    pub routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
+    pub routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
     /// Direct mapping from Server ID to Load Balancer
-    pub id_to_lb: HashMap<i64, Arc<LoadBalancer<RoundRobin>>>,
+    pub id_to_lb: HashMap<i64, Arc<crate::lb_factory::AnyLoadBalancer>>,
     /// Banned URLs (e.g. for legal compliance)
     pub deleted_contents: Vec<String>,
     /// Cluster-wide custom pages
@@ -57,7 +54,7 @@ pub struct NodeConfig {
     /// Whether to sync IP lists
     pub enable_ip_lists: bool,
     /// Parent nodes (L2s) for tiered origin, grouped by cluster id
-    pub parent_nodes: HashMap<i64, Vec<ParentNodeConfig>>,
+    pub parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
     /// Whether to bypass L2 and go direct to origin (Load protection)
     pub tiered_origin_bypass: bool,
     /// Force all requests through L2 (Tiered Origin)
@@ -67,7 +64,7 @@ pub struct NodeConfig {
     /// L2 Load Balancers (Tiered Origin pools)
     pub parent_routes: HashMap<i64, Arc<LoadBalancer<Consistent>>>,
     /// Global gRPC policy
-    pub grpc_policy: Option<crate::config_models::GRPCConfig>,
+    pub grpc_policy: Option<Arc<crate::config_models::GRPCConfig>>,
 
     // New Global Cluster Settings
     pub supports_low_version_http: bool,
@@ -85,7 +82,7 @@ pub struct NodeConfig {
     /// Global or node-specific firewall policies
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
     /// Global WAF action defaults
-    pub waf_actions: Vec<crate::config_models::WAFActionConfig>,
+    pub waf_actions: Arc<Vec<crate::config_models::WAFActionConfig>>,
     /// Global UAM policies keyed by cluster id
     pub uam_policies: HashMap<i64, UAMPolicy>,
     /// Global HTTP CC policies keyed by cluster id
@@ -98,7 +95,7 @@ pub struct NodeConfig {
     pub webp_image_policies: HashMap<i64, WebPImagePolicy>,
     /// Global TOA config
     pub toa: Option<TOAConfig>,
-    pub global_access_log: Option<crate::config_models::GlobalHTTPAccessLogConfig>,
+    pub global_access_log: Option<Arc<crate::config_models::GlobalHTTPAccessLogConfig>>,
     /// Cached plans referenced by current runtime servers
     pub plans: HashMap<i64, crate::pb::Plan>,
     /// Cached user plans referenced by current runtime servers
@@ -133,7 +130,7 @@ impl Default for NodeConfig {
             access_log_settings_enabled: true,
             is_on: true,
             enable_ip_lists: false,
-            parent_nodes: HashMap::new(),
+            parent_nodes: Arc::new(HashMap::new()),
             tiered_origin_bypass: false,
             force_ln_request: false,
             ln_request_scheduling_method: "random".to_string(),
@@ -149,7 +146,7 @@ impl Default for NodeConfig {
             global_http_config: Arc::default(),
             cache_policies: Arc::new(Vec::new()),
             firewall_policies: Arc::new(Vec::new()),
-            waf_actions: Vec::new(),
+            waf_actions: Arc::new(Vec::new()),
             uam_policies: HashMap::new(),
             http_cc_policies: HashMap::new(),
             http3_policies: HashMap::new(),
@@ -189,7 +186,7 @@ pub struct HotPathSnapshot {
     pub is_on: bool,
     pub global_http: Arc<crate::config_models::GlobalHTTPAllConfig>,
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
-    pub grpc_policy: Option<crate::config_models::GRPCConfig>,
+    pub grpc_policy: Option<Arc<crate::config_models::GRPCConfig>>,
     pub has_any_sni_passthrough: bool,
     pub cache_policies: Arc<Vec<Arc<HTTPCachePolicy>>>,
     pub global_access_log: Option<Arc<crate::config_models::GlobalHTTPAccessLogConfig>>,
@@ -220,7 +217,7 @@ impl ConfigStore {
     }
 
     // Sync versions for high-performance path (proxy)
-    pub fn get_upstream_sync(&self, host: &str) -> Option<Arc<LoadBalancer<RoundRobin>>> {
+    pub fn get_upstream_sync(&self, host: &str) -> Option<Arc<crate::lb_factory::AnyLoadBalancer>> {
         let lock = self.inner.read();
         lock.routes.get(host).cloned()
     }
@@ -235,7 +232,7 @@ impl ConfigStore {
         host: &str,
     ) -> (
         Option<Arc<ServerConfig>>,
-        Option<Arc<LoadBalancer<RoundRobin>>>,
+        Option<Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
         let lock = self.inner.read();
         (
@@ -262,7 +259,7 @@ impl ConfigStore {
     ) -> (
         HotPathSnapshot,
         Option<Arc<ServerConfig>>,
-        Option<Arc<LoadBalancer<RoundRobin>>>,
+        Option<Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
         let lock = self.inner.read();
         let hot_path = Self::build_hot_path_snapshot(&lock);
@@ -291,7 +288,7 @@ impl ConfigStore {
             grpc_policy: lock.grpc_policy.clone(),
             has_any_sni_passthrough: lock.has_any_sni_passthrough,
             cache_policies: lock.cache_policies.clone(),
-            global_access_log: lock.global_access_log.clone().map(Arc::new),
+            global_access_log: lock.global_access_log.clone(),
             enabled_features: EnabledNodeFeatures {
                 dns_info: lock.dns_info_enabled,
                 cache_info: lock.cache_info_enabled,
@@ -395,9 +392,9 @@ impl ConfigStore {
         Arc::clone(&lock.firewall_policies)
     }
 
-    pub fn get_waf_actions_sync(&self) -> Vec<crate::config_models::WAFActionConfig> {
+    pub fn get_waf_actions_sync(&self) -> Arc<Vec<crate::config_models::WAFActionConfig>> {
         let lock = self.inner.read();
-        lock.waf_actions.clone()
+        Arc::clone(&lock.waf_actions)
     }
 
     pub fn get_global_pages_sync(&self) -> Vec<HTTPPageConfig> {
@@ -527,12 +524,12 @@ impl ConfigStore {
 
     pub fn get_global_access_log_sync(
         &self,
-    ) -> Option<crate::config_models::GlobalHTTPAccessLogConfig> {
+    ) -> Option<Arc<crate::config_models::GlobalHTTPAccessLogConfig>> {
         let lock = self.inner.read();
         lock.global_access_log.clone()
     }
 
-    pub fn get_grpc_policy_sync(&self) -> Option<crate::config_models::GRPCConfig> {
+    pub fn get_grpc_policy_sync(&self) -> Option<Arc<crate::config_models::GRPCConfig>> {
         let lock = self.inner.read();
         lock.grpc_policy.clone()
     }
@@ -564,7 +561,10 @@ impl ConfigStore {
     }
 
     // Async versions (keep name compatibility for most parts)
-    pub async fn get_upstream(&self, host: &str) -> Option<Arc<LoadBalancer<RoundRobin>>> {
+    pub async fn get_upstream(
+        &self,
+        host: &str,
+    ) -> Option<Arc<crate::lb_factory::AnyLoadBalancer>> {
         self.get_upstream_sync(host)
     }
 
@@ -617,7 +617,10 @@ impl ConfigStore {
         lock.servers.get(host).and_then(|s| s.id)
     }
 
-    pub async fn get_lb_by_id(&self, server_id: i64) -> Option<Arc<LoadBalancer<RoundRobin>>> {
+    pub async fn get_lb_by_id(
+        &self,
+        server_id: i64,
+    ) -> Option<Arc<crate::lb_factory::AnyLoadBalancer>> {
         let lock = self.inner.read();
         lock.id_to_lb.get(&server_id).cloned()
     }
@@ -625,7 +628,7 @@ impl ConfigStore {
     pub async fn find_upstream_by_server_id(
         &self,
         server_id: i64,
-    ) -> Option<Arc<LoadBalancer<RoundRobin>>> {
+    ) -> Option<Arc<crate::lb_factory::AnyLoadBalancer>> {
         self.get_lb_by_id(server_id).await
     }
 
@@ -647,9 +650,9 @@ impl ConfigStore {
         plan_ids
     }
 
-    pub async fn get_tiered_origin_info(&self) -> (i32, HashMap<i64, Vec<ParentNodeConfig>>) {
+    pub async fn get_tiered_origin_info(&self) -> (i32, Arc<HashMap<i64, Vec<ParentNodeConfig>>>) {
         let lock = self.inner.read();
-        (lock.level, lock.parent_nodes.clone())
+        (lock.level, Arc::clone(&lock.parent_nodes))
     }
 
     pub async fn is_tiered_origin_bypass(&self) -> bool {
@@ -700,8 +703,8 @@ impl ConfigStore {
         node_cluster_id: i64,
         all_servers: Vec<Arc<ServerConfig>>,
         servers: HashMap<String, Arc<ServerConfig>>,
-        routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
-        id_to_lb: HashMap<i64, Arc<LoadBalancer<RoundRobin>>>,
+        routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
+        id_to_lb: HashMap<i64, Arc<crate::lb_factory::AnyLoadBalancer>>,
         deleted_contents: Vec<String>,
         global_pages: Vec<HTTPPageConfig>,
         metric_items: Vec<MetricItemConfig>,
@@ -752,11 +755,11 @@ impl ConfigStore {
         lock.level = level;
         lock.is_on = is_on;
         lock.enable_ip_lists = enable_ip_lists;
-        lock.parent_nodes = parent_nodes;
+        lock.parent_nodes = Arc::new(parent_nodes);
         lock.tiered_origin_bypass = tiered_origin_bypass;
         lock.force_ln_request = force_ln_request;
         lock.parent_routes = parent_routes;
-        lock.grpc_policy = grpc_policy;
+        lock.grpc_policy = grpc_policy.map(Arc::new);
         // Build the pre-computed GlobalHTTPAllConfig Arc before moving individual fields.
         let global_http = Arc::new(crate::config_models::GlobalHTTPAllConfig {
             force_ln_request,
@@ -784,14 +787,14 @@ impl ConfigStore {
         lock.global_http_config = global_http;
         lock.cache_policies = Arc::new(cache_policy);
         lock.firewall_policies = Arc::new(firewall_policies);
-        lock.waf_actions = waf_actions;
+        lock.waf_actions = Arc::new(waf_actions);
         lock.uam_policies = uam_policies;
         lock.http_cc_policies = http_cc_policies;
         lock.http3_policies = http3_policies;
         lock.http_pages_policies = http_pages_policies;
         lock.webp_image_policies = webp_image_policies;
         lock.toa = toa;
-        lock.global_access_log = global_access_log;
+        lock.global_access_log = global_access_log.map(Arc::new);
         // Track whether any SNI passthrough server exists (for fast TLS path)
         lock.has_any_sni_passthrough = lock.all_servers.iter().any(|s| s.is_sni_passthrough());
         drop(lock);
@@ -803,7 +806,7 @@ impl ConfigStore {
         server_id: i64,
         all_servers: Vec<Arc<ServerConfig>>,
         servers: HashMap<String, Arc<ServerConfig>>,
-        routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
+        routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
         let mut lock = self.inner.write();
         lock.all_servers
@@ -841,7 +844,7 @@ impl ConfigStore {
         user_id: i64,
         all_servers: Vec<Arc<ServerConfig>>,
         servers: HashMap<String, Arc<ServerConfig>>,
-        routes: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
+        routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
         let mut lock = self.inner.write();
         lock.all_servers.retain(|server| server.user_id != user_id);
@@ -934,7 +937,7 @@ impl ConfigStore {
         &self,
         host: String,
         server: Arc<ServerConfig>,
-        lb: Arc<LoadBalancer<RoundRobin>>,
+        lb: Arc<crate::lb_factory::AnyLoadBalancer>,
     ) {
         let mut lock = self.inner.write();
         let server_id = server.numeric_id();
@@ -983,7 +986,7 @@ impl ConfigStore {
 
         let mut lock = self.inner.write();
         lock.level = level;
-        lock.parent_nodes = parent_nodes;
+        lock.parent_nodes = Arc::new(parent_nodes);
         lock.parent_routes = parent_routes;
         drop(lock);
         self.notify_runtime_reload();

@@ -68,7 +68,7 @@ cloud-node --monitor-port 8888 --monitor-clear
 - 节点任务同步。
 - 缓存任务同步和缓存清理。
 - 证书和 OCSP 同步。
-- 源站健康检查。
+- 源站健康检查和失败状态自动恢复。
 - 访问日志和节点日志上传。
 - 实时统计、日统计、Top IP 和节点值上报。
 - 本地性能监控采样。
@@ -103,13 +103,16 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `cleanCache`：清理本地缓存文件和缓存元数据。
 - `getStat`：回传 CPU、内存、负载、流量和连接数。
 - `changeAPINode`：切换运行时 API endpoint，并触发重连。
+- `checkSystemdService`：检查 `cloud-node` systemd service 是否已启用。
 - `checkLocalFirewall`：检查本地 `nftables` 可用性并回复版本或错误。
 
 未知消息会回复 `unhandled`，不会静默丢弃。HTTP 明文 endpoint 下，运行时使用底层 HTTP/2 gRPC frame 实现保持流打开，行为更接近 Go 客户端：请求流打开后即开始心跳，不把“服务端响应头已返回”作为建流成功的前置条件。
 
 ## 负载均衡和回源
 
-L7 回源由 `lb_factory` 构建 Pingora `LoadBalancer`。运行时会根据源站配置、父节点配置、TLS 选项、SNI、Host 策略和健康检查结果选择上游。
+L7 回源由 `lb_factory` 构建 Pingora `LoadBalancer`。运行时会根据源站配置、父节点配置、TLS 选项、SNI、Host 策略、健康检查结果和源站失败状态选择上游。
+
+源站调度支持 Random 和 RoundRobin。控制面未显式下发 scheduling 或 code 为空时默认使用 Random；源站连续失败会进入短暂 down 状态，超时后自动恢复探测。
 
 多级分发场景中，L1 节点可以回源到 L2 父节点。父节点压力通过响应头或控制面信息更新，调度时用于辅助选择。
 

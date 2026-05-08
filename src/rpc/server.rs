@@ -85,7 +85,7 @@ pub async fn sync_single_server_config(
                     let user_id = server.user_id;
                     let runtime_servers = vec![server];
                     let (servers, routes) =
-                        build_runtime_maps(runtime_servers.clone(), health_manager);
+                        build_runtime_maps(runtime_servers.clone(), health_manager).await;
                     if user_id > 0 {
                         config_store
                             .replace_user_servers(
@@ -229,7 +229,7 @@ pub async fn sync_user_servers_state(
                 Ok(servers) => {
                     let runtime_servers = servers;
                     let (servers_map, routes_map) =
-                        build_runtime_maps(runtime_servers.clone(), health_manager);
+                        build_runtime_maps(runtime_servers.clone(), health_manager).await;
                     config_store
                         .replace_user_servers(
                             user_id,

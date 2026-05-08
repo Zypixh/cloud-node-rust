@@ -1,0 +1,65 @@
+[package]
+edition = "2021"
+name = "libinjectionrs"
+version = "0.1.1"
+authors = ["William Saar <william@saar.se>"]
+publish = false
+include = [
+    "src/**/*",
+    "Cargo.toml",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Rust port of libinjection - SQL/XSS injection detection library"
+keywords = [
+    "security",
+    "sql-injection",
+    "xss",
+    "detection",
+    "web-security",
+]
+categories = [
+    "web-programming",
+    "parser-implementations",
+]
+license = "BSD-3-Clause"
+repository = "https://github.com/saarw/libinjectionrs"
+
+[features]
+default = [
+    "std",
+    "smallvec",
+]
+smallvec = ["dep:smallvec"]
+std = []
+
+[lib]
+name = "libinjectionrs"
+path = "src/lib.rs"
+
+[dependencies.bitflags]
+version = "2.6"
+
+[dependencies.smallvec]
+version = "1.13"
+optional = true
+
+[dev-dependencies.urlencoding]
+version = "2.0"
+
+[lints.clippy]
+arithmetic_side_effects = "warn"
+disallowed_methods = "deny"
+expect_used = "deny"
+float_arithmetic = "warn"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"
+
+[lints.rust]
+unsafe_code = "deny"
