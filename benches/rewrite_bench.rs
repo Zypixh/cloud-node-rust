@@ -114,18 +114,14 @@ fn bench_host_redirects(c: &mut Criterion) {
             after: "www.example.com".to_string(),
             status_code: 301,
             is_on: true,
-            before_host: None,
-            after_host: None,
-            keep_request_uri: false,
+            ..Default::default()
         },
         HTTPHostRedirectConfig {
             before: "www.example.com".to_string(),
             after: "https://www.example.com".to_string(),
             status_code: 301,
             is_on: true,
-            before_host: None,
-            after_host: None,
-            keep_request_uri: false,
+            ..Default::default()
         },
     ];
 
@@ -136,6 +132,9 @@ fn bench_host_redirects(c: &mut Criterion) {
             let _ = black_box(evaluate_host_redirects(
                 black_box(host),
                 black_box(scheme),
+                black_box("/index.html"),
+                black_box("a=1"),
+                black_box("Mozilla/5.0"),
                 black_box(&rules),
             ));
         })
@@ -146,6 +145,9 @@ fn bench_host_redirects(c: &mut Criterion) {
             let _ = black_box(evaluate_host_redirects(
                 black_box("other.example.com"),
                 black_box(scheme),
+                black_box("/index.html"),
+                black_box("a=1"),
+                black_box("Mozilla/5.0"),
                 black_box(&rules),
             ));
         })
@@ -158,15 +160,16 @@ fn bench_host_redirects(c: &mut Criterion) {
                 after: format!("redirect{}.example.com", i),
                 status_code: 301,
                 is_on: true,
-                before_host: None,
-                after_host: None,
-                keep_request_uri: false,
+                ..Default::default()
             })
             .collect();
         b.iter(|| {
             let _ = black_box(evaluate_host_redirects(
                 black_box("host9.example.com"),
                 black_box(scheme),
+                black_box("/index.html"),
+                black_box("a=1"),
+                black_box("Mozilla/5.0"),
                 black_box(&many_rules),
             ));
         })
