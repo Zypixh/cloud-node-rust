@@ -28,16 +28,14 @@ fn contains_sqli(value: &str, strict: bool) -> bool {
     if libinjectionrs::detect_sqli(value.as_bytes()).is_injection() {
         return true;
     }
-    let lower = value.to_lowercase();
-    RE_SQLI.is_match(&lower) || (strict && RE_SQLI_STRICT.is_match(&lower))
+    RE_SQLI.is_match(value) || (strict && RE_SQLI_STRICT.is_match(value))
 }
 
 fn contains_xss(value: &str, strict: bool) -> bool {
     if libinjectionrs::detect_xss(value.as_bytes()).is_injection() {
         return true;
     }
-    let lower = value.to_lowercase();
-    RE_XSS.is_match(&lower) || (strict && RE_XSS_STRICT.is_match(&lower))
+    RE_XSS.is_match(value) || (strict && RE_XSS_STRICT.is_match(value))
 }
 
 pub fn evaluate_operator(
@@ -46,6 +44,8 @@ pub fn evaluate_operator(
     expected_value: &str,
     case_insensitive: bool,
 ) -> bool {
+    let operator = operator.trim();
+    let operator_lower = operator.to_ascii_lowercase();
     let actual: Cow<'_, str> = if case_insensitive {
         Cow::Owned(actual_value.to_lowercase())
     } else {
@@ -57,7 +57,7 @@ pub fn evaluate_operator(
         Cow::Borrowed(expected_value)
     };
 
-    match operator.trim().to_ascii_lowercase().as_str() {
+    match operator_lower.as_str() {
         "eq string" => actual == expected,
         "neq string" => actual != expected,
         "match" | "matches" | "regexp" => {
@@ -80,27 +80,17 @@ pub fn evaluate_operator(
         "not contains" | "notcontains" => !actual.contains(expected.as_ref()),
         "prefix" | "hasprefix" => actual.starts_with(expected.as_ref()),
         "suffix" | "hassuffix" => actual.ends_with(expected.as_ref()),
-        "contains any" => {
-            let lines: Vec<&str> = expected.lines().collect();
-            lines.into_iter().any(|line| actual.contains(line))
+        "contains any" => expected.lines().any(|line| actual.contains(line)),
+        "contains all" => expected.lines().all(|line| actual.contains(line)),
+        "contains any word" => split_terms(&expected).any(|term| contains_word(&actual, term)),
+        "contains all words" => split_terms(&expected).all(|term| contains_word(&actual, term)),
+        "not contains any word" => {
+            !split_terms(&expected).any(|term| contains_word(&actual, term))
         }
-        "contains all" => {
-            let lines: Vec<&str> = expected.lines().collect();
-            lines.into_iter().all(|line| actual.contains(line))
-        }
-        "contains any word" => split_terms(&expected)
-            .iter()
-            .any(|term| contains_word(&actual, term)),
-        "contains all words" => split_terms(&expected)
-            .iter()
-            .all(|term| contains_word(&actual, term)),
-        "not contains any word" => !split_terms(&expected)
-            .iter()
-            .any(|term| contains_word(&actual, term)),
         "eq" | "neq" | "gt" | "gte" | "lt" | "lte" => {
             // number comparisons
             if let (Ok(a), Ok(e)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
-                match operator.trim().to_ascii_lowercase().as_str() {
+                match operator_lower.as_str() {
                     "eq" => (a - e).abs() < f64::EPSILON,
                     "neq" => (a - e).abs() > f64::EPSILON,
                     "gt" => a > e,
@@ -152,7 +142,7 @@ pub fn evaluate_operator(
                 }
                 false
             });
-            if operator == "ip range" {
+            if operator_lower == "ip range" {
                 matched
             } else {
                 !matched
@@ -162,8 +152,8 @@ pub fn evaluate_operator(
             if let (Ok(actual_ip), Ok(expected_ip)) =
                 (actual.parse::<IpAddr>(), expected.parse::<IpAddr>())
             {
-                let ordering = ip_to_bytes(actual_ip).cmp(&ip_to_bytes(expected_ip));
-                match operator.trim().to_ascii_lowercase().as_str() {
+                let ordering = compare_ip_bytes(actual_ip, expected_ip);
+                match operator_lower.as_str() {
                     "gt ip" => ordering.is_gt(),
                     "gte ip" => ordering.is_gt() || ordering.is_eq(),
                     "lt ip" => ordering.is_lt(),
@@ -175,10 +165,10 @@ pub fn evaluate_operator(
             }
         }
         "contains sql injection" | "contains sql injection strictly" => {
-            contains_sqli(&actual, operator.contains("strictly"))
+            contains_sqli(&actual, operator_lower.contains("strictly"))
         }
         "contains xss" | "contains xss strictly" => {
-            contains_xss(&actual, operator.contains("strictly"))
+            contains_xss(&actual, operator_lower.contains("strictly"))
         }
         "contains binary" => decode_base64(&expected)
             .map(|needle| actual.as_bytes().windows(needle.len()).any(|w| w == needle))
@@ -216,7 +206,7 @@ pub fn evaluate_operator(
             None => compare_versions(&actual, &expected).is_some_and(|o| o.is_gt() || o.is_eq()),
         },
         "contains cmd injection" | "contains cmd injection strictly" => {
-            let cmd_keywords = vec![
+            const CMD_KEYWORDS: &[&str] = &[
                 "/bin/sh",
                 "/bin/bash",
                 "cmd.exe",
@@ -224,9 +214,9 @@ pub fn evaluate_operator(
                 "curl ",
                 "wget ",
             ];
-            cmd_keywords
+            CMD_KEYWORDS
                 .iter()
-                .any(|keyword| actual.to_lowercase().contains(keyword))
+                .any(|keyword| contains_ascii_case_insensitive(&actual, keyword))
         }
         "is bot" | "common bot" => is_common_bot(&actual),
         "common ai bot" => is_ai_bot(&actual),
@@ -269,10 +259,16 @@ pub fn evaluate_operator(
     }
 }
 
-fn ip_to_bytes(ip: IpAddr) -> Vec<u8> {
-    match ip {
-        IpAddr::V4(v4) => v4.octets().to_vec(),
-        IpAddr::V6(v6) => v6.octets().to_vec(),
+fn compare_ip_bytes(left: IpAddr, right: IpAddr) -> std::cmp::Ordering {
+    match (left, right) {
+        (IpAddr::V4(left), IpAddr::V4(right)) => left.octets().cmp(&right.octets()),
+        (IpAddr::V6(left), IpAddr::V6(right)) => left.octets().cmp(&right.octets()),
+        (IpAddr::V4(left), IpAddr::V6(right)) => {
+            left.octets().as_slice().cmp(right.octets().as_slice())
+        }
+        (IpAddr::V6(left), IpAddr::V4(right)) => {
+            left.octets().as_slice().cmp(right.octets().as_slice())
+        }
     }
 }
 
@@ -283,22 +279,28 @@ fn ip_to_u128(ip: IpAddr) -> u128 {
     }
 }
 
-fn split_terms(expected: &str) -> Vec<String> {
+fn split_terms(expected: &str) -> impl Iterator<Item = &str> {
     expected
         .lines()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn contains_word(actual: &str, term: &str) -> bool {
     let pattern = format!(r"\b{}\b", regex::escape(term));
-    RegexBuilder::new(&pattern)
-        .size_limit(REGEX_SIZE_LIMIT)
-        .build()
+    get_or_compile_regex(&pattern)
         .map(|re| re.is_match(actual))
-        .unwrap_or_else(|_| actual.contains(term))
+        .unwrap_or_else(|| actual.contains(term))
+}
+
+fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
+    let value = value.as_bytes();
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && value.len() >= needle.len()
+        && value
+            .windows(needle.len())
+            .any(|part| part.eq_ignore_ascii_case(needle))
 }
 
 fn decode_base64(input: &str) -> Option<Vec<u8>> {
@@ -330,7 +332,6 @@ fn parse_version(input: &str) -> Option<Vec<u64>> {
 }
 
 fn is_common_bot(ua: &str) -> bool {
-    let ua_lower = ua.to_lowercase();
     let bots = [
         "googlebot",
         "google-inspectiontool",
@@ -346,7 +347,8 @@ fn is_common_bot(ua: &str) -> bool {
         "twitterbot",
         "linkedinbot",
     ];
-    bots.iter().any(|bot| ua_lower.contains(bot))
+    bots.iter()
+        .any(|bot| contains_ascii_case_insensitive(ua, bot))
 }
 
 fn is_ai_bot(ua: &str) -> bool {
@@ -374,8 +376,8 @@ fn is_ai_bot(ua: &str) -> bool {
         "diffbot",
         "phindbot",
     ];
-    let ua_lower = ua.to_lowercase();
-    bots.iter().any(|bot| ua_lower.contains(bot))
+    bots.iter()
+        .any(|bot| contains_ascii_case_insensitive(ua, bot))
 }
 
 /// Get or compile a regex from cache — avoids per-request regex compilation.
