@@ -304,27 +304,23 @@ impl ConfigStore {
 
     pub fn get_server_for_tls_name_sync(&self, host: &str) -> Option<Arc<ServerConfig>> {
         let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+        let lock = self.inner.read();
 
-        // 1. Try exact match from the fast index
-        {
-            let lock = self.inner.read();
-            if let Some(server) = lock.servers.get(&normalized) {
-                return Some(server.clone());
-            }
+        if let Some(server) = lock.servers.get(&normalized) {
+            return Some(server.clone());
         }
 
-        // 2. Try wildcard match from the fast index
         if let Some(pos) = normalized.find('.') {
             let wildcard = format!("*{}", &normalized[pos..]);
-            let lock = self.inner.read();
             if let Some(server) = lock.servers.get(&wildcard) {
                 return Some(server.clone());
             }
         }
 
-        // 3. Fallback to robust scanner (handles @sni_passthrough, complex wildcards, and sub_names)
-        // This port 0 means we don't care about the port for certificate matching
-        self.find_sni_passthrough_server_sync(host, 0)
+        lock.all_servers
+            .iter()
+            .find(|server| Self::matches_sni_passthrough_server(server, &normalized, 0))
+            .cloned()
     }
 
     pub fn find_sni_passthrough_server_sync(
@@ -335,51 +331,45 @@ impl ConfigStore {
         let normalized = host.trim_end_matches('.').to_ascii_lowercase();
         let lock = self.inner.read();
 
-        let matches_name = |server: &ServerConfig| {
-            server.server_names.iter().any(|sn| {
-                // Check primary name
-                let name = ServerConfig::normalize_runtime_server_name(&sn.name);
-                if !name.is_empty() {
-                    if name == normalized {
-                        return true;
-                    }
-                    if name.starts_with("*.") {
-                        let suffix = &name[1..];
-                        if normalized == &suffix[1..] || normalized.ends_with(suffix) {
-                            return true;
-                        }
-                    }
-                }
+        lock.all_servers
+            .iter()
+            .find(|server| Self::matches_sni_passthrough_server(server, &normalized, port))
+            .cloned()
+    }
 
-                // Check sub_names
-                sn.sub_names.iter().any(|sub| {
-                    let sub = ServerConfig::normalize_runtime_server_name(sub);
-                    if !sub.is_empty() {
-                        if sub == normalized {
-                            return true;
-                        }
-                        if sub.starts_with("*.") {
-                            let suffix = &sub[1..];
-                            if normalized == &suffix[1..] || normalized.ends_with(suffix) {
-                                return true;
-                            }
-                        }
-                    }
-                    false
-                })
-            })
-        };
-
-        for server in lock.all_servers.iter() {
-            // If port is 0, we bypass port check (used for general TLS name matching)
-            let port_matches = port == 0 || server.listens_on_https_port(port);
-            if server.is_sni_passthrough() && port_matches {
-                if matches_name(server) {
-                    return Some(server.clone());
-                }
-            }
+    fn matches_sni_passthrough_server(
+        server: &ServerConfig,
+        normalized_host: &str,
+        port: u16,
+    ) -> bool {
+        // If port is 0, bypass port checks. Certificate lookup uses this mode.
+        if !server.is_sni_passthrough() || (port != 0 && !server.listens_on_https_port(port)) {
+            return false;
         }
-        None
+
+        fn name_matches(name: &str, normalized_host: &str) -> bool {
+            let name = ServerConfig::normalize_runtime_server_name(name);
+            if name.is_empty() {
+                return false;
+            }
+            if name == normalized_host {
+                return true;
+            }
+            if let Some(suffix) = name.strip_prefix('*')
+                && let Some(apex) = suffix.strip_prefix('.')
+            {
+                return normalized_host == apex || normalized_host.ends_with(suffix);
+            }
+            false
+        }
+
+        server.server_names.iter().any(|sn| {
+            name_matches(&sn.name, normalized_host)
+                || sn
+                    .sub_names
+                    .iter()
+                    .any(|sub| name_matches(sub, normalized_host))
+        })
     }
 
     pub fn get_cache_policy_sync(&self) -> Arc<Vec<Arc<HTTPCachePolicy>>> {
@@ -473,14 +463,28 @@ impl ConfigStore {
         lock.level
     }
 
-    pub fn get_upstream_peer_context_sync(&self) -> (i32, bool, bool, String, i64) {
+    pub fn get_upstream_peer_context_sync(&self) -> (i32, bool, bool, bool, i64) {
         let lock = self.inner.read();
         (
             lock.level,
             lock.force_ln_request,
             lock.tiered_origin_bypass,
-            lock.ln_request_scheduling_method.clone(),
+            lock.ln_request_scheduling_method == "urlMapping",
             lock.node_cluster_id,
+        )
+    }
+
+    pub fn get_upstream_peer_context_with_firewall_policies_sync(
+        &self,
+    ) -> (i32, bool, bool, bool, i64, Arc<Vec<HTTPFirewallPolicy>>) {
+        let lock = self.inner.read();
+        (
+            lock.level,
+            lock.force_ln_request,
+            lock.tiered_origin_bypass,
+            lock.ln_request_scheduling_method == "urlMapping",
+            lock.node_cluster_id,
+            Arc::clone(&lock.firewall_policies),
         )
     }
 

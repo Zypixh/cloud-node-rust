@@ -651,21 +651,26 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
     None
 }
 
+const SEARCH_ENGINE_BOTS: &[&str] = &[
+    "googlebot",
+    "bingbot",
+    "baiduspider",
+    "yandexbot",
+    "sogou",
+    "360spider",
+    "duckduckbot",
+    "facebookexternalhit",
+    "twitterbot",
+    "slurp",
+    "msnbot",
+    "yisouspider",
+    "bytespider",
+];
+
 fn is_search_engine_bot(user_agent: &str) -> bool {
-    let ua = user_agent.to_lowercase();
-    ua.contains("googlebot")
-        || ua.contains("bingbot")
-        || ua.contains("baiduspider")
-        || ua.contains("yandexbot")
-        || ua.contains("sogou")
-        || ua.contains("360spider")
-        || ua.contains("duckduckbot")
-        || ua.contains("facebookexternalhit")
-        || ua.contains("twitterbot")
-        || ua.contains("slurp")
-        || ua.contains("msnbot")
-        || ua.contains("yisouspider")
-        || ua.contains("bytespider")
+    SEARCH_ENGINE_BOTS
+        .iter()
+        .any(|bot| crate::firewall::matcher::contains_ascii_case_insensitive(user_agent, bot))
 }
 
 fn legacy_country_id_to_iso(id: i64) -> Option<&'static str> {

@@ -226,13 +226,11 @@ impl MetricStorage {
     /// Access timestamps and counts are flushed to RocksDB periodically by the background task.
     pub fn record_cache_access(&self, hash: &str) {
         let now = crate::utils::time::now_timestamp();
-        CACHE_ACCESS_LOG
+        let entry = CACHE_ACCESS_LOG
             .entry(hash.to_string())
             .or_insert_with(|| (AtomicI64::new(now), AtomicU64::new(0)));
-        if let Some(entry) = CACHE_ACCESS_LOG.get(hash) {
-            entry.0.store(now, Ordering::Relaxed);
-            entry.1.fetch_add(1, Ordering::Relaxed);
-        }
+        entry.0.store(now, Ordering::Relaxed);
+        entry.1.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Flush in-memory access logs to RocksDB. Called by background task every 30s.

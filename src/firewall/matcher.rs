@@ -83,9 +83,7 @@ pub fn evaluate_operator(
         "contains all" => expected.lines().all(|line| actual.contains(line)),
         "contains any word" => split_terms(&expected).any(|term| contains_word(&actual, term)),
         "contains all words" => split_terms(&expected).all(|term| contains_word(&actual, term)),
-        "not contains any word" => {
-            !split_terms(&expected).any(|term| contains_word(&actual, term))
-        }
+        "not contains any word" => !split_terms(&expected).any(|term| contains_word(&actual, term)),
         "eq" | "neq" | "gt" | "gte" | "lt" | "lte" => {
             // number comparisons
             if let (Ok(a), Ok(e)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
@@ -288,10 +286,7 @@ fn normalize_operator(operator: &str) -> Cow<'_, str> {
 }
 
 fn split_terms(expected: &str) -> impl Iterator<Item = &str> {
-    expected
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    expected.lines().map(str::trim).filter(|s| !s.is_empty())
 }
 
 fn contains_word(actual: &str, term: &str) -> bool {
@@ -301,7 +296,7 @@ fn contains_word(actual: &str, term: &str) -> bool {
         .unwrap_or_else(|| actual.contains(term))
 }
 
-fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
+pub(crate) fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
     let value = value.as_bytes();
     let needle = needle.as_bytes();
     !needle.is_empty()

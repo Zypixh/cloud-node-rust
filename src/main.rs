@@ -552,6 +552,9 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
             waf_state: waf_state.clone(),
             api_config: api_config_arc.clone(),
             cert_selector: cert_selector.clone(),
+            waf_verifier: Arc::new(cloud_node_rust::firewall::verifier::WafVerifier::new(
+                &api_config_arc.secret,
+            )),
         },
         my_server.configuration.clone(),
     );

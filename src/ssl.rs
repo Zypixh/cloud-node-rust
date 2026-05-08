@@ -15,8 +15,16 @@ pub struct DynamicCertSelector {
     pub exact: Arc<RwLock<HashMap<String, Arc<CertPair>>>>,
     pub wildcard: Arc<RwLock<HashMap<String, Arc<CertPair>>>>,
     pub default: Arc<RwLock<Option<Arc<CertPair>>>>,
+    snapshot: Arc<RwLock<CertSnapshot>>,
     // Internal cache: ID -> (PEM_Hash, ParsedPair)
     cache: Arc<RwLock<HashMap<i64, (String, Arc<CertPair>)>>>,
+}
+
+#[derive(Clone, Default)]
+struct CertSnapshot {
+    exact: HashMap<String, Arc<CertPair>>,
+    wildcard: HashMap<String, Arc<CertPair>>,
+    default: Option<Arc<CertPair>>,
 }
 
 #[derive(Clone)]
@@ -34,6 +42,7 @@ impl DynamicCertSelector {
             exact: Arc::new(RwLock::new(HashMap::new())),
             wildcard: Arc::new(RwLock::new(HashMap::new())),
             default: Arc::new(RwLock::new(None)),
+            snapshot: Arc::new(RwLock::new(CertSnapshot::default())),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -52,8 +61,8 @@ impl DynamicCertSelector {
     }
 
     pub async fn export_default_pem(&self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let default = self.default.read().unwrap();
-        let pair = default.as_ref()?.clone();
+        let snapshot = self.snapshot.read().unwrap();
+        let pair = snapshot.default.as_ref()?.clone();
         let cert_pem = pair.cert.to_pem().ok()?;
         let key_pem = pair.key.private_key_to_pem_pkcs8().ok()?;
         Some((cert_pem, key_pem))
@@ -66,9 +75,7 @@ impl DynamicCertSelector {
         std::collections::HashMap<String, (Vec<u8>, Vec<u8>, Vec<u8>)>,
         (Vec<u8>, Vec<u8>, Vec<u8>),
     )> {
-        let exact = self.exact.read().unwrap();
-        let wildcard = self.wildcard.read().unwrap();
-        let default = self.default.read().unwrap();
+        let snapshot = self.snapshot.read().unwrap();
 
         let serialize = |pair: &Arc<CertPair>| -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
             Some((
@@ -79,20 +86,20 @@ impl DynamicCertSelector {
         };
 
         let mut exact_out = std::collections::HashMap::new();
-        for (name, pair) in exact.iter() {
+        for (name, pair) in snapshot.exact.iter() {
             if let Some(serialized) = serialize(pair) {
                 exact_out.insert(name.clone(), serialized);
             }
         }
 
         let mut wildcard_out = std::collections::HashMap::new();
-        for (name, pair) in wildcard.iter() {
+        for (name, pair) in snapshot.wildcard.iter() {
             if let Some(serialized) = serialize(pair) {
                 wildcard_out.insert(name.clone(), serialized);
             }
         }
 
-        let default_pair = serialize(default.as_ref()?)?;
+        let default_pair = serialize(snapshot.default.as_ref()?)?;
         Some((exact_out, wildcard_out, default_pair))
     }
 
@@ -111,24 +118,22 @@ impl DynamicCertSelector {
     }
 
     fn find_pair_blocking(&self, host: &str) -> Option<Arc<CertPair>> {
+        let snapshot = self.snapshot.read().unwrap();
         if !host.is_empty() {
-            let exact = self.exact.read().unwrap();
-            if let Some(pair) = exact.get(host) {
+            if let Some(pair) = snapshot.exact.get(host) {
                 return Some(pair.clone());
             }
-            drop(exact);
 
             if let Some(pos) = host.find('.') {
                 let suffix = &host[pos..];
                 let wildcard_key = format!("*{}", suffix);
-                let wildcard = self.wildcard.read().unwrap();
-                if let Some(pair) = wildcard.get(&wildcard_key) {
+                if let Some(pair) = snapshot.wildcard.get(&wildcard_key) {
                     return Some(pair.clone());
                 }
             }
         }
 
-        self.default.read().unwrap().clone()
+        snapshot.default.clone()
     }
 }
 
@@ -255,14 +260,21 @@ pub async fn sync_certs(
     }; // old_cache dropped here
 
     {
+        let new_snapshot = CertSnapshot {
+            exact: new_exact.clone(),
+            wildcard: new_wildcard.clone(),
+            default: first_pair.clone(),
+        };
         let mut exact_lock = cert_selector.exact.write().unwrap();
         let mut wildcard_lock = cert_selector.wildcard.write().unwrap();
         let mut default_lock = cert_selector.default.write().unwrap();
+        let mut snapshot_lock = cert_selector.snapshot.write().unwrap();
         let mut cache_lock = cert_selector.cache.write().unwrap();
 
         *exact_lock = new_exact;
         *wildcard_lock = new_wildcard;
         *default_lock = first_pair;
+        *snapshot_lock = new_snapshot;
         *cache_lock = new_cache;
     }
 
@@ -284,68 +296,18 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
             .to_lowercase();
 
         if !host.is_empty() {
-            // 1. Exact Match
-            {
-                let exact = self.exact.read().unwrap();
-                if let Some(pair) = exact.get(&host) {
-                    let _ = ext::ssl_use_certificate(ssl, &pair.cert);
-                    let _ = ext::ssl_use_private_key(ssl, &pair.key);
-                    for cert in pair.chain.iter().skip(1) {
-                        let _ = ext::ssl_add_chain_cert(ssl, cert);
-                    }
-                    if let Ok(ocsp) = pair.ocsp.read()
-                        && !ocsp.is_empty()
-                    {
-                        let _ = ssl.set_ocsp_status(&ocsp);
-                    }
-                    return;
-                }
+            if let Some(pair) = self.find_pair_blocking(&host) {
+                apply_cert_pair(ssl, &pair);
+            } else {
+                tracing::error!(
+                    "No default certificate available for request (SNI: {})",
+                    host
+                );
             }
-
-            // 2. Wildcard Match
-            {
-                if let Some(pos) = host.find('.') {
-                    let suffix = &host[pos..];
-                    let wildcard_key = format!("*{}", suffix);
-
-                    let wildcard = self.wildcard.read().unwrap();
-                    if let Some(pair) = wildcard.get(&wildcard_key) {
-                        let _ = ext::ssl_use_certificate(ssl, &pair.cert);
-                        let _ = ext::ssl_use_private_key(ssl, &pair.key);
-                        for cert in pair.chain.iter().skip(1) {
-                            let _ = ext::ssl_add_chain_cert(ssl, cert);
-                        }
-                        if let Ok(ocsp) = pair.ocsp.read()
-                            && !ocsp.is_empty()
-                        {
-                            let _ = ssl.set_ocsp_status(&ocsp);
-                        }
-                        return;
-                    }
-                }
-            }
-            tracing::debug!(
-                "No certificate match for SNI: {}, falling back to default",
-                host
-            );
         } else {
             tracing::debug!("No SNI provided, using default certificate");
-        }
-
-        // 3. Fallback to Default Certificate
-        {
-            let default = self.default.read().unwrap();
-            if let Some(pair) = &*default {
-                let _ = ext::ssl_use_certificate(ssl, &pair.cert);
-                let _ = ext::ssl_use_private_key(ssl, &pair.key);
-                for cert in pair.chain.iter().skip(1) {
-                    let _ = ext::ssl_add_chain_cert(ssl, cert);
-                }
-                if let Ok(ocsp) = pair.ocsp.read()
-                    && !ocsp.is_empty()
-                {
-                    let _ = ssl.set_ocsp_status(&ocsp);
-                }
+            if let Some(pair) = self.find_pair_blocking("") {
+                apply_cert_pair(ssl, &pair);
             } else {
                 tracing::error!(
                     "No default certificate available for request (SNI: {})",
@@ -353,5 +315,18 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
                 );
             }
         }
+    }
+}
+
+fn apply_cert_pair(ssl: &mut SslRef, pair: &CertPair) {
+    let _ = ext::ssl_use_certificate(ssl, &pair.cert);
+    let _ = ext::ssl_use_private_key(ssl, &pair.key);
+    for cert in pair.chain.iter().skip(1) {
+        let _ = ext::ssl_add_chain_cert(ssl, cert);
+    }
+    if let Ok(ocsp) = pair.ocsp.read()
+        && !ocsp.is_empty()
+    {
+        let _ = ssl.set_ocsp_status(&ocsp);
     }
 }

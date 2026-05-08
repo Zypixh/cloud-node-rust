@@ -8,6 +8,7 @@ use pingora_proxy::Session;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 pub struct MatchResult<'a> {
     pub matched: bool,
@@ -208,6 +209,9 @@ fn match_preset_group(code: &str, session: &Session, request_body: &[u8]) -> boo
 }
 
 static CC_COUNTERS: Lazy<DashMap<String, Vec<i64>>> = Lazy::new(DashMap::new);
+static CC_COUNTER_LAST_SWEEP: AtomicI64 = AtomicI64::new(0);
+const CC_COUNTER_MAX_PERIOD_SECS: i64 = 7 * 86_400;
+const CC_COUNTER_SWEEP_INTERVAL_SECS: i64 = 60;
 
 fn get_full_request_data(session: &Session, request_body: &[u8]) -> String {
     let mut data = session.req_header().uri.to_string();
@@ -304,11 +308,31 @@ fn cc_value(
 
 fn increase_counter(key: String, period_secs: i64) -> u64 {
     let now = crate::utils::time::now_timestamp();
+    sweep_cc_counters(now);
     let min_ts = now - period_secs.max(1);
     let mut entry = CC_COUNTERS.entry(key).or_default();
     entry.retain(|ts| *ts >= min_ts);
     entry.push(now);
     entry.len() as u64
+}
+
+fn sweep_cc_counters(now: i64) {
+    let last = CC_COUNTER_LAST_SWEEP.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < CC_COUNTER_SWEEP_INTERVAL_SECS {
+        return;
+    }
+    if CC_COUNTER_LAST_SWEEP
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    let stale_before = now - CC_COUNTER_MAX_PERIOD_SECS;
+    CC_COUNTERS.retain(|_, timestamps| {
+        timestamps.retain(|ts| *ts >= stale_before);
+        !timestamps.is_empty()
+    });
 }
 
 fn get_response_variable_value(

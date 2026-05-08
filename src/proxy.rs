@@ -262,6 +262,7 @@ pub struct EdgeProxy {
     pub waf_state: Arc<WafStateManager>,
     pub api_config: Arc<ApiConfig>,
     pub cert_selector: Arc<crate::ssl::DynamicCertSelector>,
+    pub waf_verifier: Arc<crate::firewall::verifier::WafVerifier>,
 }
 
 const DEFAULT_TRAFFIC_LIMIT_NOTICE_PAGE_BODY: &str = r#"<!DOCTYPE html>
@@ -2989,7 +2990,7 @@ impl EdgeProxy {
                 return false;
             }
 
-            let verifier = crate::firewall::verifier::WafVerifier::new(&self.api_config.secret);
+            let verifier = self.waf_verifier.as_ref();
             let mut current_token = None;
             let mut current_pow = None;
 
@@ -3213,7 +3214,7 @@ impl EdgeProxy {
                     .get_header("user-agent")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                let verifier = crate::firewall::verifier::WafVerifier::new(&self.api_config.secret);
+                let verifier = self.waf_verifier.as_ref();
                 let token = verifier.generate_token(&ip, ua);
 
                 let (status, is_redirect) = match action {
@@ -4081,21 +4082,38 @@ impl ProxyHttp for EdgeProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        // Run deferred heavy WAF checks (skipped in request_filter when cache was configured).
-        // This ensures WAF only runs on cache MISS, not on every cache HIT.
-        if ctx.waf_deferred {
-            let hot_path = self.config.get_hot_path_snapshot_sync();
-            let host = ctx.host.clone();
-            let (blocked, _action) = self
-                .run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies)
-                .await?;
-            if blocked {
-                return Err(Error::new(HTTPStatus(403)));
-            }
-        }
+        let (node_level, force_ln, bypass_l2, ln_by_url_mapping, node_cluster_id) =
+            if ctx.waf_deferred {
+                let (
+                    node_level,
+                    force_ln,
+                    bypass_l2,
+                    ln_by_url_mapping,
+                    node_cluster_id,
+                    firewall_policies,
+                ) = self
+                    .config
+                    .get_upstream_peer_context_with_firewall_policies_sync();
 
-        let (node_level, force_ln, bypass_l2, ln_method, node_cluster_id) =
-            self.config.get_upstream_peer_context_sync();
+                // Run deferred heavy WAF checks (skipped in request_filter when cache was configured).
+                // This ensures WAF only runs on cache MISS, not on every cache HIT.
+                let host = ctx.host.clone();
+                let (blocked, _action) = self
+                    .run_heavy_waf(session, ctx, &host, firewall_policies.as_ref().as_slice())
+                    .await?;
+                if blocked {
+                    return Err(Error::new(HTTPStatus(403)));
+                }
+                (
+                    node_level,
+                    force_ln,
+                    bypass_l2,
+                    ln_by_url_mapping,
+                    node_cluster_id,
+                )
+            } else {
+                self.config.get_upstream_peer_context_sync()
+            };
         ctx.node_level = node_level;
 
         let mut target_peer = None;
@@ -4105,7 +4123,7 @@ impl ProxyHttp for EdgeProxy {
             if ctx.server.is_some() {
                 // Find cluster-specific Parent LB
                 if let Some(parent_lb) = self.config.get_parent_upstream_sync(node_cluster_id) {
-                    let hash_key = if ln_method == "urlMapping" {
+                    let hash_key = if ln_by_url_mapping {
                         // Hash by full URL (Scheme + Host + Path + Query)
                         session.req_header().uri.to_string().into_bytes()
                     } else {
@@ -4139,7 +4157,11 @@ impl ProxyHttp for EdgeProxy {
                             debug!(
                                 "Selected L2 upstream: {} (Method: {}, Pressure: {:.2}) for host: {}",
                                 peer_addr,
-                                ln_method,
+                                if ln_by_url_mapping {
+                                    "urlMapping"
+                                } else {
+                                    "random"
+                                },
                                 pressure,
                                 session.req_header().uri.host().unwrap_or("")
                             );
