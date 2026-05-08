@@ -552,6 +552,7 @@ mod tests {
             is_on: true,
             primary_origins: vec![],
             backup_origins: vec![],
+            scheduling: None,
             request_host: request_host.to_string(),
             request_host_type,
             request_host_excluding_port: false,
