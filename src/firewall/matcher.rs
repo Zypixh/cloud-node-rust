@@ -44,8 +44,7 @@ pub fn evaluate_operator(
     expected_value: &str,
     case_insensitive: bool,
 ) -> bool {
-    let operator = operator.trim();
-    let operator_lower = operator.to_ascii_lowercase();
+    let operator_lower = normalize_operator(operator);
     let actual: Cow<'_, str> = if case_insensitive {
         Cow::Owned(actual_value.to_lowercase())
     } else {
@@ -57,7 +56,7 @@ pub fn evaluate_operator(
         Cow::Borrowed(expected_value)
     };
 
-    match operator_lower.as_str() {
+    match operator_lower.as_ref() {
         "eq string" => actual == expected,
         "neq string" => actual != expected,
         "match" | "matches" | "regexp" => {
@@ -90,7 +89,7 @@ pub fn evaluate_operator(
         "eq" | "neq" | "gt" | "gte" | "lt" | "lte" => {
             // number comparisons
             if let (Ok(a), Ok(e)) = (actual.parse::<f64>(), expected.parse::<f64>()) {
-                match operator_lower.as_str() {
+                match operator_lower.as_ref() {
                     "eq" => (a - e).abs() < f64::EPSILON,
                     "neq" => (a - e).abs() > f64::EPSILON,
                     "gt" => a > e,
@@ -142,7 +141,7 @@ pub fn evaluate_operator(
                 }
                 false
             });
-            if operator_lower == "ip range" {
+            if operator_lower.as_ref() == "ip range" {
                 matched
             } else {
                 !matched
@@ -153,7 +152,7 @@ pub fn evaluate_operator(
                 (actual.parse::<IpAddr>(), expected.parse::<IpAddr>())
             {
                 let ordering = compare_ip_bytes(actual_ip, expected_ip);
-                match operator_lower.as_str() {
+                match operator_lower.as_ref() {
                     "gt ip" => ordering.is_gt(),
                     "gte ip" => ordering.is_gt() || ordering.is_eq(),
                     "lt ip" => ordering.is_lt(),
@@ -276,6 +275,15 @@ fn ip_to_u128(ip: IpAddr) -> u128 {
     match ip {
         IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()) as u128,
         IpAddr::V6(v6) => u128::from_be_bytes(v6.octets()),
+    }
+}
+
+fn normalize_operator(operator: &str) -> Cow<'_, str> {
+    let operator = operator.trim();
+    if operator.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(operator.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(operator)
     }
 }
 
