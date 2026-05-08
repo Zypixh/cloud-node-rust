@@ -740,6 +740,9 @@ impl ConfigStore {
         toa: Option<TOAConfig>,
         global_access_log: Option<crate::config_models::GlobalHTTPAccessLogConfig>,
     ) {
+        for server in &all_servers {
+            server.compile_url_patterns();
+        }
         let mut lock = self.inner.write();
         lock.id = id;
         lock.version = version;
@@ -808,6 +811,9 @@ impl ConfigStore {
         servers: HashMap<String, Arc<ServerConfig>>,
         routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
+        for server in &all_servers {
+            server.compile_url_patterns();
+        }
         let mut lock = self.inner.write();
         lock.all_servers
             .retain(|server| server.numeric_id() != server_id);
@@ -846,6 +852,9 @@ impl ConfigStore {
         servers: HashMap<String, Arc<ServerConfig>>,
         routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
+        for server in &all_servers {
+            server.compile_url_patterns();
+        }
         let mut lock = self.inner.write();
         lock.all_servers.retain(|server| server.user_id != user_id);
         let stale_hosts = lock

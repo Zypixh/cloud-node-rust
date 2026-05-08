@@ -1,7 +1,6 @@
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -656,6 +655,12 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn compile_url_patterns(&self) {
+        if let Some(web) = &self.web {
+            web.compile_url_patterns();
+        }
+    }
+
     pub(crate) fn normalize_runtime_server_name(name: &str) -> String {
         let trimmed = name.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -957,6 +962,23 @@ pub struct WebConfig {
     pub root: Option<Value>, // Root can be RootConfig object in Go
 }
 
+impl WebConfig {
+    pub fn compile_url_patterns(&self) {
+        if let Some(user_agent) = &self.user_agent_config {
+            user_agent.compile_url_patterns();
+        }
+        if let Some(referers) = &self.referer_config {
+            referers.compile_url_patterns();
+        }
+        if let Some(optimization) = &self.optimization {
+            optimization.compile_url_patterns();
+        }
+        if let Some(hls) = &self.hls {
+            hls.compile_url_patterns();
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WebSocketConfig {
     #[serde(rename = "isOn", default)]
@@ -1133,6 +1155,18 @@ pub struct HTTPPageOptimizationConfig {
 }
 
 impl HTTPPageOptimizationConfig {
+    pub fn compile_url_patterns(&self) {
+        if let Some(html) = &self.html {
+            html.base.compile_url_patterns();
+        }
+        if let Some(javascript) = &self.javascript {
+            javascript.base.compile_url_patterns();
+        }
+        if let Some(css) = &self.css {
+            css.base.compile_url_patterns();
+        }
+    }
+
     pub fn is_on(&self) -> bool {
         self.html.as_ref().map(|v| v.is_on).unwrap_or(false)
             || self.javascript.as_ref().map(|v| v.is_on).unwrap_or(false)
@@ -1157,6 +1191,16 @@ pub struct HTTPBaseOptimizationConfig {
 }
 
 impl HTTPBaseOptimizationConfig {
+    pub fn compile_url_patterns(&self) {
+        for pattern in self
+            .only_url_patterns
+            .iter()
+            .chain(self.except_url_patterns.iter())
+        {
+            pattern.compile();
+        }
+    }
+
     pub fn matches_url(&self, url: &str) -> bool {
         let path = url.split('?').next().unwrap_or(url);
         if !self.except_url_patterns.is_empty()
@@ -1231,6 +1275,14 @@ pub struct HLSConfig {
     pub encrypting: Option<HLSEncryptingConfig>,
 }
 
+impl HLSConfig {
+    pub fn compile_url_patterns(&self) {
+        if let Some(encrypting) = &self.encrypting {
+            encrypting.compile_url_patterns();
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HLSEncryptingConfig {
     #[serde(rename = "isOn", default)]
@@ -1250,6 +1302,16 @@ pub struct HLSEncryptingConfig {
 }
 
 impl HLSEncryptingConfig {
+    pub fn compile_url_patterns(&self) {
+        for pattern in self
+            .only_url_patterns
+            .iter()
+            .chain(self.except_url_patterns.iter())
+        {
+            pattern.compile();
+        }
+    }
+
     pub fn matches_url(&self, url: &str) -> bool {
         let path = url.split('?').next().unwrap_or(url);
         if !self.except_url_patterns.is_empty()
@@ -1269,7 +1331,7 @@ impl HLSEncryptingConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct URLPattern {
     #[serde(
         rename = "type",
@@ -1279,76 +1341,108 @@ pub struct URLPattern {
     pub type_name: String,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub pattern: String,
+    #[serde(skip)]
+    pub compiled: OnceLock<Option<Arc<regex::Regex>>>,
 }
 
-static URL_PATTERN_RE_CACHE: Lazy<dashmap::DashMap<String, std::sync::Arc<regex::Regex>>> =
-    Lazy::new(dashmap::DashMap::new);
+impl Clone for URLPattern {
+    fn clone(&self) -> Self {
+        let cloned = Self {
+            type_name: self.type_name.clone(),
+            pattern: self.pattern.clone(),
+            compiled: OnceLock::new(),
+        };
+        if let Some(compiled) = self.compiled.get() {
+            let _ = cloned.compiled.set(compiled.clone());
+        }
+        cloned
+    }
+}
 
 impl URLPattern {
-    pub fn matches(&self, url: &str) -> bool {
-        fn ends_with_ascii_ignore_case(value: &str, suffix: &str) -> bool {
-            let value = value.as_bytes();
-            let suffix = suffix.as_bytes();
-            value.len() >= suffix.len()
-                && value[value.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-        }
+    pub fn compile(&self) {
+        let _ = self.compiled.get_or_init(|| Self::compile_regex(&self.type_name, &self.pattern));
+    }
 
-        match self.type_name.as_str() {
-            "images" => [
-                ".apng", ".avif", ".gif", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp", ".png",
-                ".svg", ".webp", ".bmp", ".ico", ".cur", ".tif", ".tiff",
-            ]
-            .iter()
-            .any(|ext| ends_with_ascii_ignore_case(url, ext)),
-            "audios" => [
-                ".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".m3u8",
-            ]
-            .iter()
-            .any(|ext| ends_with_ascii_ignore_case(url, ext)),
-            "videos" => [
-                ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".mpeg", ".3gp", ".webm", ".ts", ".m3u8",
-            ]
-            .iter()
-            .any(|ext| ends_with_ascii_ignore_case(url, ext)),
+    fn compile_regex(type_name: &str, pattern: &str) -> Option<Arc<regex::Regex>> {
+        let pattern = Self::compiled_pattern(type_name, pattern)?;
+        regex::Regex::new(&pattern).ok().map(Arc::new)
+    }
+
+    fn compiled_pattern(type_name: &str, pattern: &str) -> Option<String> {
+        match type_name {
+            "images" | "audios" | "videos" => None,
             "regexp" => {
-                let pattern = if self.pattern.starts_with("(?i)") {
-                    self.pattern.clone()
+                if pattern.starts_with("(?i)") {
+                    Some(pattern.to_string())
                 } else {
-                    format!("(?i){}", self.pattern)
-                };
-                if let Some(re) = URL_PATTERN_RE_CACHE.get(&pattern) {
-                    re.is_match(url)
-                } else {
-                    let Ok(re) = regex::Regex::new(&pattern) else {
-                        return false;
-                    };
-                    let result = re.is_match(url);
-                    URL_PATTERN_RE_CACHE.insert(pattern, Arc::new(re));
-                    result
+                    Some(format!("(?i){}", pattern))
                 }
             }
             _ => {
-                if self.pattern.is_empty() {
-                    return url.is_empty();
+                if pattern.is_empty() {
+                    return None;
                 }
-                let escaped = regex::escape(&self.pattern);
+                let escaped = regex::escape(pattern);
                 let wildcard = escaped.replace("\\*", "(.*)");
-                let pattern = if wildcard.starts_with('/') {
-                    format!("(?i)^(http|https)://[\\w.-]+{}$", wildcard)
+                if wildcard.starts_with('/') {
+                    Some(format!("(?i)^(http|https)://[\\w.-]+{}$", wildcard))
                 } else {
-                    format!("(?i)^{}$", wildcard)
-                };
-                if let Some(re) = URL_PATTERN_RE_CACHE.get(&pattern) {
-                    re.is_match(url)
-                } else {
-                    let Ok(re) = regex::Regex::new(&pattern) else {
-                        return false;
-                    };
-                    let result = re.is_match(url);
-                    URL_PATTERN_RE_CACHE.insert(pattern, Arc::new(re));
-                    result
+                    Some(format!("(?i)^{}$", wildcard))
                 }
             }
+        }
+    }
+
+    fn is_image_url(url: &str) -> bool {
+        Self::has_any_suffix(
+            url,
+            &[
+                ".apng", ".avif", ".gif", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp",
+                ".png", ".svg", ".webp", ".bmp", ".ico", ".cur", ".tif", ".tiff",
+            ],
+        )
+    }
+
+    fn is_audio_url(url: &str) -> bool {
+        Self::has_any_suffix(
+            url,
+            &[
+                ".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".m3u8",
+            ],
+        )
+    }
+
+    fn is_video_url(url: &str) -> bool {
+        Self::has_any_suffix(
+            url,
+            &[
+                ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".mpeg", ".3gp", ".webm",
+                ".ts", ".m3u8",
+            ],
+        )
+    }
+
+    fn has_any_suffix(value: &str, suffixes: &[&str]) -> bool {
+        let value = value.as_bytes();
+        suffixes.iter().any(|suffix| {
+            let suffix = suffix.as_bytes();
+            value.len() >= suffix.len()
+                && value[value.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        })
+    }
+
+    pub fn matches(&self, url: &str) -> bool {
+        match self.type_name.as_str() {
+            "images" => Self::is_image_url(url),
+            "audios" => Self::is_audio_url(url),
+            "videos" => Self::is_video_url(url),
+            _ if self.pattern.is_empty() => url.is_empty(),
+            _ => self
+                .compiled
+                .get_or_init(|| Self::compile_regex(&self.type_name, &self.pattern))
+                .as_ref()
+                .is_some_and(|re| re.is_match(url)),
         }
     }
 }
@@ -1413,6 +1507,18 @@ pub struct UserAgentConfig {
     pub except_url_patterns: Vec<URLPattern>,
 }
 
+impl UserAgentConfig {
+    pub fn compile_url_patterns(&self) {
+        for pattern in self
+            .only_url_patterns
+            .iter()
+            .chain(self.except_url_patterns.iter())
+        {
+            pattern.compile();
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct UserAgentFilter {
     #[serde(default, deserialize_with = "deserialize_null_default")]
@@ -1457,6 +1563,18 @@ pub struct ReferersConfig {
         deserialize_with = "deserialize_null_default"
     )]
     pub except_url_patterns: Vec<URLPattern>,
+}
+
+impl ReferersConfig {
+    pub fn compile_url_patterns(&self) {
+        for pattern in self
+            .only_url_patterns
+            .iter()
+            .chain(self.except_url_patterns.iter())
+        {
+            pattern.compile();
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -2440,18 +2558,33 @@ pub struct SizeCapacity {
 
 impl SizeCapacity {
     pub fn from_json(v: &Value) -> Self {
-        serde_json::from_value(v.clone()).unwrap_or(Self {
+        let fallback = || Self {
             count: 0,
             unit: "b".to_string(),
-        })
+        };
+        let Some(map) = v.as_object() else {
+            return fallback();
+        };
+        let Some(count) = map.get("count").and_then(Value::as_i64) else {
+            return fallback();
+        };
+        let unit = match map.get("unit") {
+            Some(Value::String(unit)) => unit.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(_) => return fallback(),
+        };
+        Self { count, unit }
     }
 
     pub fn to_bytes(&self) -> i64 {
-        match self.unit.to_lowercase().as_str() {
-            "kb" | "k" => self.count * 1024,
-            "mb" | "m" => self.count * 1024 * 1024,
-            "gb" | "g" => self.count * 1024 * 1024 * 1024,
-            _ => self.count,
+        if self.unit.eq_ignore_ascii_case("kb") || self.unit.eq_ignore_ascii_case("k") {
+            self.count * 1024
+        } else if self.unit.eq_ignore_ascii_case("mb") || self.unit.eq_ignore_ascii_case("m") {
+            self.count * 1024 * 1024
+        } else if self.unit.eq_ignore_ascii_case("gb") || self.unit.eq_ignore_ascii_case("g") {
+            self.count * 1024 * 1024 * 1024
+        } else {
+            self.count
         }
     }
 }
@@ -2459,11 +2592,14 @@ impl SizeCapacity {
 pub fn parse_life_to_seconds(v: &Value) -> u64 {
     if let Some(count) = v.get("count").and_then(|c| c.as_u64()) {
         let unit = v.get("unit").and_then(|u| u.as_str()).unwrap_or("s");
-        return match unit.to_lowercase().as_str() {
-            "m" | "min" => count * 60,
-            "h" | "hour" => count * 3600,
-            "d" | "day" => count * 86400,
-            _ => count,
+        return if unit.eq_ignore_ascii_case("m") || unit.eq_ignore_ascii_case("min") {
+            count * 60
+        } else if unit.eq_ignore_ascii_case("h") || unit.eq_ignore_ascii_case("hour") {
+            count * 3600
+        } else if unit.eq_ignore_ascii_case("d") || unit.eq_ignore_ascii_case("day") {
+            count * 86400
+        } else {
+            count
         };
     }
     3600
@@ -2472,6 +2608,102 @@ pub fn parse_life_to_seconds(v: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_pattern_preserves_match_semantics() {
+        let regexp = URLPattern {
+            type_name: "regexp".to_string(),
+            pattern: r"^/api/v\d+/users/\d+$".to_string(),
+            ..Default::default()
+        };
+        assert!(regexp.matches("/API/v2/users/123"));
+        assert!(!regexp.matches("/api/v2/users/abc"));
+
+        let wildcard = URLPattern {
+            type_name: "wildcard".to_string(),
+            pattern: "/static/*/image.jpg".to_string(),
+            ..Default::default()
+        };
+        assert!(wildcard.matches("https://example.com/static/a/image.jpg"));
+        assert!(!wildcard.matches("/static/a/image.jpg"));
+
+        let empty = URLPattern {
+            type_name: "wildcard".to_string(),
+            pattern: String::new(),
+            ..Default::default()
+        };
+        assert!(empty.matches(""));
+        assert!(!empty.matches("/"));
+
+        let invalid = URLPattern {
+            type_name: "regexp".to_string(),
+            pattern: "(".to_string(),
+            ..Default::default()
+        };
+        assert!(!invalid.matches("/anything"));
+
+        let image = URLPattern {
+            type_name: "images".to_string(),
+            pattern: String::new(),
+            ..Default::default()
+        };
+        assert!(image.matches("/static/photo.JPG"));
+        assert!(!image.matches("/static/photo.txt"));
+    }
+
+    #[test]
+    fn size_capacity_from_json_and_to_bytes_preserve_fallbacks() {
+        let kb = SizeCapacity::from_json(&serde_json::json!({"count": 2, "unit": "KB"}));
+        assert_eq!(kb.count, 2);
+        assert_eq!(kb.unit, "KB");
+        assert_eq!(kb.to_bytes(), 2048);
+
+        let raw = SizeCapacity::from_json(&serde_json::json!({"count": -5, "unit": "unknown"}));
+        assert_eq!(raw.to_bytes(), -5);
+
+        let missing_unit = SizeCapacity::from_json(&serde_json::json!({"count": 5}));
+        assert_eq!(missing_unit.count, 5);
+        assert_eq!(missing_unit.unit, "");
+        assert_eq!(missing_unit.to_bytes(), 5);
+
+        let missing_count = SizeCapacity::from_json(&serde_json::json!({"unit": "KB"}));
+        assert_eq!(missing_count.count, 0);
+        assert_eq!(missing_count.unit, "b");
+
+        let invalid_unit_type =
+            SizeCapacity::from_json(&serde_json::json!({"count": 5, "unit": 1}));
+        assert_eq!(invalid_unit_type.count, 0);
+        assert_eq!(invalid_unit_type.unit, "b");
+
+        let fallback = SizeCapacity::from_json(&serde_json::json!(null));
+        assert_eq!(fallback.count, 0);
+        assert_eq!(fallback.unit, "b");
+        assert_eq!(fallback.to_bytes(), 0);
+    }
+
+    #[test]
+    fn parse_life_to_seconds_preserves_units_and_default() {
+        assert_eq!(
+            parse_life_to_seconds(&serde_json::json!({"count": 5, "unit": "m"})),
+            300
+        );
+        assert_eq!(
+            parse_life_to_seconds(&serde_json::json!({"count": 2, "unit": "hour"})),
+            7200
+        );
+        assert_eq!(
+            parse_life_to_seconds(&serde_json::json!({"count": 7, "unit": "DAY"})),
+            604800
+        );
+        assert_eq!(
+            parse_life_to_seconds(&serde_json::json!({"count": 9, "unit": "s"})),
+            9
+        );
+        assert_eq!(
+            parse_life_to_seconds(&serde_json::json!({"unit": "h"})),
+            3600
+        );
+    }
 
     #[test]
     fn flexible_addr_http_url_normalizes_to_socket_address() {

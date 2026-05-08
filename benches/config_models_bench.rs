@@ -8,27 +8,27 @@ fn bench_parse_life_to_seconds(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse_life_to_seconds");
 
     group.bench_function("seconds_unit", |b| {
-        let v = Value::String("30s".to_string());
+        let v = serde_json::json!({"count": 30, "unit": "s"});
         b.iter(|| parse_life_to_seconds(black_box(&v)))
     });
 
     group.bench_function("minutes_unit", |b| {
-        let v = Value::String("5m".to_string());
+        let v = serde_json::json!({"count": 5, "unit": "m"});
         b.iter(|| parse_life_to_seconds(black_box(&v)))
     });
 
     group.bench_function("hours_unit", |b| {
-        let v = Value::String("2h".to_string());
+        let v = serde_json::json!({"count": 2, "unit": "h"});
         b.iter(|| parse_life_to_seconds(black_box(&v)))
     });
 
     group.bench_function("days_unit", |b| {
-        let v = Value::String("7d".to_string());
+        let v = serde_json::json!({"count": 7, "unit": "d"});
         b.iter(|| parse_life_to_seconds(black_box(&v)))
     });
 
-    group.bench_function("number_value", |b| {
-        let v = Value::Number(3600.into());
+    group.bench_function("missing_count_default", |b| {
+        let v = serde_json::json!({"unit": "h"});
         b.iter(|| parse_life_to_seconds(black_box(&v)))
     });
 
@@ -40,7 +40,7 @@ fn bench_url_pattern(c: &mut Criterion) {
 
     // Regex pattern
     let regex_pattern = URLPattern {
-        type_name: "regex".to_string(),
+        type_name: "regexp".to_string(),
         pattern: r"^/api/v\d+/users/\d+/profile$".to_string(),
         ..Default::default()
     };

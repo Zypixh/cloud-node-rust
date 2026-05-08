@@ -724,6 +724,10 @@ pub async fn fetch_and_apply_config<F>(
                                 }
                             }
 
+                            for server in &payload.servers {
+                                server.compile_url_patterns();
+                            }
+
                             let mut loaded_domain_names = std::collections::BTreeSet::new();
                             let mut port_only_server_count = 0usize;
 

@@ -19,6 +19,7 @@ pub async fn build_runtime_maps(
     let mut new_routes = HashMap::new();
 
     for server in servers {
+        server.compile_url_patterns();
         if !server.is_on {
             continue;
         }
