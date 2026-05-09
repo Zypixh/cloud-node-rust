@@ -134,9 +134,26 @@ read_prompt() {
 
 read_prompt_secret() {
     local __var="$1"
+    local __input=""
+    local __char=""
     prompt_available || return 1
-    IFS= read -rs "$__var" < "$PROMPT_INPUT"
+    while IFS= read -rsn1 __char <&3; do
+        if [ -z "$__char" ]; then
+            break
+        fi
+        # Handle backspace / delete
+        if [ "$__char" = $'\x7f' ] || [ "$__char" = $'\x08' ]; then
+            if [ -n "$__input" ]; then
+                __input="${__input%?}"
+                printf '\b \b' >&2
+            fi
+        else
+            __input="${__input}${__char}"
+            printf '*' >&2
+        fi
+    done 3< "$PROMPT_INPUT"
     printf '\n' >&2
+    printf -v "$__var" '%s' "$__input"
 }
 
 die_need_mode() {
