@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 脚本会执行以下步骤：
 
 - 第一步询问界面语言，支持中文和英文；自动化场景可使用 `--lang zh` 或 `--lang en`。
-- 交互式选择操作：从 Go 原版迁移安装 Rust 版、全新安装 Rust 版、从备份恢复 Go 原版。
+- 默认交互式选择操作：覆盖/升级旧 Go 原版为 Rust 版、全新安装 Rust 版、从备份恢复 Go 原版。自动化场景必须显式传 `--install` 或 `--fresh`。
 - 查找当前 `cloud-node` 命令、`cloud-node.service` 的 `ExecStart` 和常见安装路径。
 - 将找到的旧二进制、`/usr/bin/cloud-node` 和 systemd unit 备份到 `/var/backups/cloud-node-rust-migration/<timestamp>/`。
 - 备份文件统一带有 `go-original` 标识，例如 `usr_bin_cloud-node.go-original` 和 `cloud-node.service.go-original`。
@@ -76,7 +76,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 - 交互询问是否从 `https://github.com/P3TERX/GeoLite.mmdb` 下载 `GeoLite2-City.mmdb`、`GeoLite2-ASN.mmdb` 和 `GeoLite2-Country.mmdb`。
 - 如果迁移前服务处于运行状态，默认会在替换后重新启动服务。
 
-迁移安装默认要求找到旧 `cloud-node`，避免在未备份原版的情况下误装。全新安装使用 `--fresh`，会自动允许没有旧节点的环境。
+显式 `--install` 迁移安装要求找到旧 `cloud-node`，避免在未备份原版的情况下误装。全新安装使用 `--fresh`，会自动允许没有旧节点的环境。
 
 全新安装会默认创建 `/root/cloud-node`，并交互输入 API 连接配置，生成 `/root/cloud-node/api_node.yaml`。
 

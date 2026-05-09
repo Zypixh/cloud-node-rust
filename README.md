@@ -58,7 +58,7 @@ sudo systemctl start cloud-node
 curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash
 ```
 
-脚本会先询问语言，支持中文；可选择迁移安装、全新安装到 `/root/cloud-node` 或从备份恢复 Go 原版。迁移时会备份原 Go 版二进制，并可选择从 `P3TERX/GeoLite.mmdb` 下载 GeoIP 库。
+脚本会先询问语言，支持中文；默认交互式选择“覆盖/升级旧 Go 原版为 Rust 版”“全新安装到 `/root/cloud-node`”或“从备份恢复 Go 原版”。迁移时会备份原 Go 版二进制，并可选择从 `P3TERX/GeoLite.mmdb` 下载 GeoIP 库。非交互自动化场景需要显式传 `--fresh` 或 `--install`。
 
 全新安装的一条非交互命令示例：
 

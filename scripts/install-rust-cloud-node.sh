@@ -22,7 +22,8 @@ ALLOW_FRESH=0
 
 usage() {
     cat <<'USAGE'
-Install the Rust CloudNode release over an existing Go cloud-node deployment.
+Install the Rust CloudNode release over an existing Go cloud-node deployment,
+or perform a fresh install on a new server.
 
 The script:
   1. Asks for the interface language when running interactively.
@@ -43,6 +44,7 @@ Run directly from GitHub:
 
 Options:
   --install              Install or migrate to the Rust release.
+                         Explicit mode; fails if no existing cloud-node is found.
   --fresh                Fresh install under /root/cloud-node and create api_node.yaml.
   --restore              Restore the Go original from a previous backup.
   --restore-backup DIR   Restore from this backup dir. Default: latest backup.
@@ -107,8 +109,12 @@ setup_colors
 setup_prompt_input() {
     if [ -t 0 ]; then
         PROMPT_INPUT="/dev/stdin"
-    elif [ -r /dev/tty ]; then
+    elif [ -r /dev/tty ] && [ -w /dev/tty ] && { [ -t 1 ] || [ -t 2 ]; }; then
         PROMPT_INPUT="/dev/tty"
+    elif [ -t 2 ] && [ -r /dev/fd/2 ]; then
+        PROMPT_INPUT="/dev/fd/2"
+    elif [ -t 2 ] && [ -r /proc/self/fd/2 ]; then
+        PROMPT_INPUT="/proc/self/fd/2"
     else
         PROMPT_INPUT=""
     fi
@@ -130,7 +136,15 @@ read_prompt_secret() {
     local __var="$1"
     prompt_available || return 1
     IFS= read -rs "$__var" < "$PROMPT_INPUT"
-    printf '\n'
+    printf '\n' >&2
+}
+
+die_need_mode() {
+    if is_zh; then
+        die "默认模式需要交互式选择；请传 --fresh 全新安装，或传 --install 覆盖/升级旧 Go 版"
+    else
+        die "default mode needs an interactive choice; pass --fresh for a new install or --install to upgrade an existing Go node"
+    fi
 }
 
 title() {
@@ -232,23 +246,22 @@ prompt_mode() {
     esac
 
     if [ "$ASSUME_YES" -eq 1 ] || ! prompt_available; then
-        MODE="install"
-        return
+        die_need_mode
     fi
 
     section "$(is_zh && printf '选择操作' || printf 'Choose Action')"
     if is_zh; then
-        printf '  %s1)%s 从 Go 原版迁移安装 Rust 版\n' "$BOLD" "$RESET"
+        printf '  %s1)%s 覆盖/升级旧 Go 原版为 Rust 版\n' "$BOLD" "$RESET"
         printf '  %s2)%s 全新安装 Rust 版到 /root/cloud-node\n' "$BOLD" "$RESET"
         printf '  %s3)%s 从备份恢复 Go 原版\n' "$BOLD" "$RESET"
         printf '\n输入序号 %s[1]%s: ' "$DIM" "$RESET"
     else
-        printf '  %s1)%s Install or migrate to Rust\n' "$BOLD" "$RESET"
+        printf '  %s1)%s Upgrade/overwrite existing Go node with Rust\n' "$BOLD" "$RESET"
         printf '  %s2)%s Fresh install to /root/cloud-node\n' "$BOLD" "$RESET"
         printf '  %s3)%s Restore Go original from backup\n' "$BOLD" "$RESET"
         printf '\nEnter choice %s[1]%s: ' "$DIM" "$RESET"
     fi
-    read_prompt mode_choice || mode_choice=""
+    read_prompt mode_choice || die_need_mode
     case "${mode_choice:-1}" in
         1|install|INSTALL)
             MODE="install"
@@ -303,14 +316,14 @@ prompt_text() {
     local answer=""
 
     if is_zh; then
-        printf '%s' "$prompt_zh"
+        printf '%s' "$prompt_zh" >&2
     else
-        printf '%s' "$prompt_en"
+        printf '%s' "$prompt_en" >&2
     fi
     if [ -n "$default_value" ]; then
-        printf ' %s[%s]%s' "$DIM" "$default_value" "$RESET"
+        printf ' %s[%s]%s' "$DIM" "$default_value" "$RESET" >&2
     fi
-    printf ': '
+    printf ': ' >&2
 
     if [ "$secret" = "yes" ] && prompt_available; then
         read_prompt_secret answer || answer=""
@@ -933,8 +946,13 @@ fi
 
 EXISTING_BINARY="$(find_existing_cloud_node || true)"
 SERVICE_WORKDIR="$(systemd_value WorkingDirectory || true)"
+if [ "$MODE" = "fresh" ]; then
+    ALLOW_FRESH=1
+fi
 if [ -z "$INSTALL_DIR" ]; then
-    if [ -n "$SERVICE_WORKDIR" ] && [ "$SERVICE_WORKDIR" != "/" ]; then
+    if [ "$MODE" = "fresh" ]; then
+        INSTALL_DIR="/root/cloud-node"
+    elif [ -n "$SERVICE_WORKDIR" ] && [ "$SERVICE_WORKDIR" != "/" ]; then
         INSTALL_DIR="$SERVICE_WORKDIR"
     else
         INSTALL_DIR="/opt/cloud-node-rust"
