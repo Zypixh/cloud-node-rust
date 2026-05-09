@@ -560,11 +560,16 @@ async fn handle_message(
             crate::rpc::node_task::trigger_task_sync();
         }
         "writeCache" => {
-            is_ok = false;
-            match serde_json::from_slice::<WriteCacheMessage>(&message.data_json) {
-                Ok(msg) => {
-                    let key = msg.key.clone();
-                    tokio::spawn(async move {
+            let tx_cloned = tx.clone();
+            let msg_cloned = message.clone();
+
+            tokio::spawn(async move {
+                let mut is_ok = false;
+                let reply_text;
+
+                match serde_json::from_slice::<WriteCacheMessage>(&msg_cloned.data_json) {
+                    Ok(msg) => {
+                        let key = msg.key.clone();
                         let full_key =
                             if !key.starts_with("http://") && !key.starts_with("https://") {
                                 format!("http://{}", key)
@@ -573,32 +578,65 @@ async fn handle_message(
                             };
 
                         if let Ok(url) = full_key.parse::<reqwest::Url>() {
-                            let preheat_url = format!("http://127.0.0.1:80{}", url.path());
-                            let query = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+                            let host = url.host_str().unwrap_or("localhost");
+                            let is_https = url.scheme() == "https";
+                            let port =
+                                url.port().unwrap_or(if is_https { 443 } else { 80 });
+                            let scheme = if is_https { "https" } else { "http" };
+                            let preheat_url =
+                                format!("{}://127.0.0.1:{}{}", scheme, port, url.path());
+                            let query =
+                                url.query().map(|q| format!("?{}", q)).unwrap_or_default();
                             let final_url = format!("{}{}", preheat_url, query);
 
                             let client = reqwest::Client::builder()
-                                .timeout(std::time::Duration::from_secs(10))
+                                .timeout(std::time::Duration::from_secs(30))
                                 .build()
                                 .unwrap_or_default();
 
-                            // Use POST to carry the actual value payload (decoded from Base64 if needed)
-                            let _ = client
-                                .post(&final_url)
-                                .header("host", &key)
+                            match client
+                                .get(&final_url)
+                                .header("host", host)
                                 .header("x-cloud-cache-action", "fetch")
                                 .header("x-cloud-preheat", "1")
-                                .body(msg.get_value_bytes())
+                                .header(
+                                    "user-agent",
+                                    "Mozilla/5.0 (compatible; CacheTest/1.0)",
+                                )
                                 .send()
-                                .await;
+                                .await
+                            {
+                                Ok(resp) => {
+                                    if resp.status().is_success() {
+                                        is_ok = true;
+                                        reply_text = "write ok".to_string();
+                                    } else {
+                                        reply_text =
+                                            format!("upstream returned {}", resp.status());
+                                    }
+                                }
+                                Err(e) => {
+                                    reply_text = format!("request failed: {}", e);
+                                }
+                            }
+                        } else {
+                            reply_text = "invalid URL".to_string();
                         }
-                    });
-
-                    is_ok = true;
-                    message_reply = "write ok".to_string();
+                    }
+                    Err(e) => reply_text = format!("decode failed: {:?}", e),
                 }
-                Err(e) => message_reply = format!("decode failed: {:?}", e),
-            }
+
+                let reply = pb::NodeStreamMessage {
+                    node_id,
+                    request_id: msg_cloned.request_id,
+                    code: msg_cloned.code.clone(),
+                    message: reply_text,
+                    is_ok,
+                    ..Default::default()
+                };
+                let _ = tx_cloned.send(reply).await;
+            });
+            return Ok(());
         }
         "readCache" => {
             let tx_cloned = tx.clone();
@@ -610,7 +648,16 @@ async fn handle_message(
 
                 match serde_json::from_slice::<ReadCacheMessage>(&msg_cloned.data_json) {
                     Ok(msg) => {
-                        let hash = format!("{:x}", md5_legacy::compute(&msg.key));
+                        // Reconstruct cache key in the same format as proxy's
+                        // default_cache_key_for_session() which uses "http://{host}{path}"
+                        let full_key =
+                            if !msg.key.starts_with("http://") && !msg.key.starts_with("https://")
+                            {
+                                format!("http://{}", msg.key)
+                            } else {
+                                msg.key.clone()
+                            };
+                        let hash = format!("{:x}", md5_legacy::compute(&full_key));
                         if let Some(meta) = crate::metrics::storage::STORAGE.get_cache_meta(&hash) {
                             is_ok = true;
                             reply_text = format!("value {} bytes", meta.size);
