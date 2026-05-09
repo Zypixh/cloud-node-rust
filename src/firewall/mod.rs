@@ -116,15 +116,7 @@ pub fn evaluate_policy(
                         matched.js_cookie_options = policy.js_cookie_options.clone();
                         matched.use_local_firewall = policy.use_local_firewall;
 
-                        // Handle Observe Mode: Change blocking actions to 'log'
-                        if policy.mode == "observe"
-                            && (matched.action_code == "block"
-                                || matched.action_code == "captcha"
-                                || matched.action_code == "jsCookie")
-                        {
-                            matched.action_code = "log".to_string();
-                            // We still return it so it can be logged, but the proxy will continue
-                        }
+                        apply_observe_mode(policy, &mut matched);
 
                         // Flow Control: ALLOW Scope
                         if matched.action_code == "allow" {
@@ -163,20 +155,9 @@ pub fn evaluate_policy(
                             }
                         }
 
-                        // Flow Control: Continue evaluation if action is just 'log' or 'none' (not implemented as separate case yet)
-                        // but specifically for 'log' actions matched.
                         if matched.action_code == "log" {
                             current_group_idx += 1;
                             continue;
-                        }
-
-                        // Handle Observe Mode: Change blocking actions to 'log'
-                        if policy.mode == "observe"
-                            && (matched.action_code == "block"
-                                || matched.action_code == "captcha"
-                                || matched.action_code == "jsCookie")
-                        {
-                            matched.action_code = "log".to_string();
                         }
 
                         return Some(matched);
@@ -184,9 +165,7 @@ pub fn evaluate_policy(
                 }
                 if result.matched {
                     let mut action = default_block_action(policy.id, group.id);
-                    if policy.mode == "observe" {
-                        action.action_code = "log".to_string();
-                    }
+                    apply_observe_mode(policy, &mut action);
                     return Some(action);
                 }
             }
@@ -229,28 +208,41 @@ pub fn evaluate_outbound_policy(
                         matched.js_cookie_options = policy.js_cookie_options.clone();
                         matched.use_local_firewall = policy.use_local_firewall;
 
-                        if policy.mode == "observe"
-                            && (matched.action_code == "block"
-                                || matched.action_code == "captcha"
-                                || matched.action_code == "jsCookie")
-                        {
-                            matched.action_code = "log".to_string();
-                        }
+                        apply_observe_mode(policy, &mut matched);
 
                         return Some(matched);
                     }
                 }
                 if result.matched {
                     let mut action = default_block_action(policy.id, group.id);
-                    if policy.mode == "observe" {
-                        action.action_code = "log".to_string();
-                    }
+                    apply_observe_mode(policy, &mut action);
                     return Some(action);
                 }
             }
         }
     }
     None
+}
+
+fn apply_observe_mode(policy: &HTTPFirewallPolicy, matched: &mut MatchedAction) {
+    if policy.mode == "observe" && is_blocking_action_code(&matched.action_code) {
+        matched.action_code = "log".to_string();
+        matched.action = ActionResponse::Allow;
+    }
+}
+
+fn is_blocking_action_code(action_code: &str) -> bool {
+    matches!(
+        action_code,
+        "block"
+            | "record_ip"
+            | "captcha"
+            | "js_cookie"
+            | "jsCookie"
+            | "jscookie"
+            | "get_302"
+            | "post_307"
+    )
 }
 
 fn default_block_action(policy_id: i64, group_id: i64) -> MatchedAction {

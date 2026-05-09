@@ -313,14 +313,22 @@ impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
 }
 
 fn apply_cert_pair(ssl: &mut SslRef, pair: &CertPair) {
-    let _ = ext::ssl_use_certificate(ssl, &pair.cert);
-    let _ = ext::ssl_use_private_key(ssl, &pair.key);
+    if let Err(e) = ext::ssl_use_certificate(ssl, &pair.cert) {
+        tracing::warn!("Failed to set SSL certificate (id={}): {:?}", pair.id, e);
+    }
+    if let Err(e) = ext::ssl_use_private_key(ssl, &pair.key) {
+        tracing::warn!("Failed to set SSL private key (id={}): {:?}", pair.id, e);
+    }
     for cert in pair.chain.iter().skip(1) {
-        let _ = ext::ssl_add_chain_cert(ssl, cert);
+        if let Err(e) = ext::ssl_add_chain_cert(ssl, cert) {
+            tracing::warn!("Failed to add chain cert (id={}): {:?}", pair.id, e);
+        }
     }
     if let Ok(ocsp) = pair.ocsp.read()
         && !ocsp.is_empty()
     {
-        let _ = ssl.set_ocsp_status(&ocsp);
+        if let Err(e) = ssl.set_ocsp_status(&ocsp) {
+            tracing::debug!("Failed to set OCSP status (id={}): {:?}", pair.id, e);
+        }
     }
 }

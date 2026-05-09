@@ -98,7 +98,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             let node_region_id = config_store.get_node_region_id().await;
             let now_ts = crate::utils::time::now_timestamp();
             pending_stats.retain(|item| now_ts - item.queued_at <= STAT_RETRY_RETENTION_SECS);
-            let mut upload_items = pending_stats.clone();
+            let mut upload_items = std::mem::take(&mut pending_stats);
             upload_items.extend(window_stats.drain().map(|(_, stat)| PendingBandwidthStat {
                 queued_at: window_started_at - BANDWIDTH_REPORT_INTERVAL_SECS as i64,
                 stat: pb::ServerBandwidthStat {
@@ -140,7 +140,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
                 let start = std::time::Instant::now();
                 let result = service
                     .upload_server_bandwidth_stats(pb::UploadServerBandwidthStatsRequest {
-                        server_bandwidth_stats: stats.clone(),
+                        server_bandwidth_stats: stats,
                     })
                     .await;
                 let cost = start.elapsed().as_millis() as u64;
@@ -230,14 +230,14 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
             pending_domain_stats
                 .retain(|item| now_ts - item.created_at <= STAT_RETRY_RETENTION_SECS);
 
-            let mut stats: Vec<_> = pending_stats.clone();
+            let mut stats: Vec<_> = std::mem::take(&mut pending_stats);
             stats.extend(window_stats.drain().map(|(_, mut stat)| {
                 stat.cached_bytes = stat.cached_bytes.min(stat.bytes);
                 stat.attack_bytes = stat.attack_bytes.min(stat.bytes);
                 stat
             }));
 
-            let mut domain_stats = pending_domain_stats.clone();
+            let mut domain_stats = std::mem::take(&mut pending_domain_stats);
             let mut domain_rows = crate::metrics::daily::DAILY_DOMAIN_TRACKER
                 .flush_older_than(created_at)
                 .into_iter()

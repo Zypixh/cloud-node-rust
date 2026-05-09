@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use std::io::Read;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
@@ -57,11 +57,7 @@ where
 }
 
 async fn report_connected_api_nodes(api_config: &ApiConfig) {
-    let api_node_ids = CONNECTED_API_NODE_IDS
-        .read()
-        .ok()
-        .map(|guard| guard.iter().copied().collect::<Vec<_>>())
-        .unwrap_or_default();
+    let api_node_ids: Vec<_> = CONNECTED_API_NODE_IDS.read().iter().copied().collect();
 
     if api_node_ids.is_empty() {
         return;
@@ -174,7 +170,7 @@ fn log_global_settings(
     );
     let current_gsc_hash = format!("{:x}", md5_legacy::compute(&global_settings_hash_input));
 
-    let mut last_gsc_hash = LAST_GLOBAL_CONFIG_HASH.write().unwrap();
+    let mut last_gsc_hash = LAST_GLOBAL_CONFIG_HASH.write();
     if *last_gsc_hash != current_gsc_hash {
         *last_gsc_hash = current_gsc_hash;
 
@@ -310,7 +306,7 @@ pub async fn fetch_and_apply_config<F>(
                 let current_hash = format!("{:x}", md5_legacy::compute(&node_json));
                 let mut should_reload = true;
                 {
-                    let last_hash = LAST_CONFIG_HASH.read().unwrap();
+                    let last_hash = LAST_CONFIG_HASH.read();
                     if *last_hash == current_hash {
                         debug!(
                             "RPC_NODE: Configuration content unchanged (Hash: {}), skipping heavy reload.",
@@ -326,7 +322,7 @@ pub async fn fetch_and_apply_config<F>(
                     log_raw_json_hints("node_json", &node_json);
                     // Content changed, update hash and proceed
                     {
-                        let mut last_hash = LAST_CONFIG_HASH.write().unwrap();
+                        let mut last_hash = LAST_CONFIG_HASH.write();
                         *last_hash = current_hash;
                     }
 
@@ -464,7 +460,7 @@ pub async fn fetch_and_apply_config<F>(
                             );
                             let mut waf_changed = false;
                             {
-                                let mut last_waf_hash = LAST_WAF_HASH.write().unwrap();
+                                let mut last_waf_hash = LAST_WAF_HASH.write();
                                 if *last_waf_hash != current_waf_hash {
                                     *last_waf_hash = current_waf_hash;
                                     waf_changed = true;

@@ -4,6 +4,7 @@ use crate::config::ConfigStore;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use bytes::{Buf, Bytes};
+use futures_util::StreamExt;
 use h2::client::SendRequest;
 use http::{HeaderValue, Request, Uri};
 use prost::Message;
@@ -55,26 +56,8 @@ struct CheckLocalFirewallMessage {
 }
 
 pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigStore>) {
-    // Create a single long-lived Channel — gRPC channels manage connection pools
-    // and automatic reconnection internally. Recreating the channel on every
-    // disconnect defeats HTTP/2 keepalive and triggers unnecessary handshakes.
     let mut last_endpoints = api_config.effective_rpc_endpoints();
     loop {
-        let client = match RpcClient::new_with_endpoints(&api_config, &last_endpoints, false).await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                // Reset endpoints to force a refresh on next attempt
-                last_endpoints = api_config.effective_rpc_endpoints();
-                error!(
-                    "Failed to connect to API node for stream: {}. Retrying in 10s...",
-                    e
-                );
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                continue;
-            }
-        };
-
         let stream_result = match try_run_h2_stream(&api_config, config_store.clone(), None).await {
             Ok(result) => Ok(result),
             Err(h2_err) => {
@@ -89,6 +72,24 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
                         "HTTP/2 node stream failed: {}. Falling back to tonic stream...",
                         h2_err
                     );
+                    let client = match RpcClient::new_with_endpoints(
+                        &api_config,
+                        &last_endpoints,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            last_endpoints = api_config.effective_rpc_endpoints();
+                            error!(
+                                "Failed to connect to API node for stream: {}. Retrying in 10s...",
+                                e
+                            );
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    };
                     run_stream(client, &api_config, config_store.clone())
                         .await
                         .map(|_| NodeStreamProbeResult::default())
@@ -243,9 +244,7 @@ async fn try_run_h2_stream(
                             info!("Successfully connected to API node via stream. API Node ID: {}", msg.api_node_id);
                             current_api_node_id = Some(msg.api_node_id);
                             stats.connected_api_node_id = Some(msg.api_node_id);
-                            if let Ok(mut guard) = crate::rpc::node::CONNECTED_API_NODE_IDS.write() {
-                                guard.insert(msg.api_node_id);
-                            }
+                            crate::rpc::node::CONNECTED_API_NODE_IDS.write().insert(msg.api_node_id);
                             crate::rpc::node::trigger_api_node_report();
                         }
                         Err(e) => {
@@ -280,9 +279,7 @@ async fn try_run_h2_stream(
 
     writer.abort();
     if let Some(id) = current_api_node_id {
-        if let Ok(mut guard) = crate::rpc::node::CONNECTED_API_NODE_IDS.write() {
-            guard.remove(&id);
-        }
+        crate::rpc::node::CONNECTED_API_NODE_IDS.write().remove(&id);
     }
 
     Ok(stats)
@@ -439,9 +436,7 @@ async fn run_stream(
                                Ok(msg) => {
                                    info!("Successfully connected to API node via stream. API Node ID: {}", msg.api_node_id);
                                    current_api_node_id = Some(msg.api_node_id);
-                                   if let Ok(mut guard) = crate::rpc::node::CONNECTED_API_NODE_IDS.write() {
-                                       guard.insert(msg.api_node_id);
-                                   }
+                                   crate::rpc::node::CONNECTED_API_NODE_IDS.write().insert(msg.api_node_id);
                                    crate::rpc::node::trigger_api_node_report();
                                }
                                Err(e) => {
@@ -455,9 +450,7 @@ async fn run_stream(
                     Ok(None) => {
                         debug!("Node stream connection closed by API node.");
                         if let Some(id) = current_api_node_id {
-                             if let Ok(mut guard) = crate::rpc::node::CONNECTED_API_NODE_IDS.write() {
-                                 guard.remove(&id);
-                             }
+                             crate::rpc::node::CONNECTED_API_NODE_IDS.write().remove(&id);
                         }
                         break;
                     }
@@ -465,9 +458,7 @@ async fn run_stream(
                         warn!("Node stream error: {}", e);
 
                         if let Some(id) = current_api_node_id {
-                             if let Ok(mut guard) = crate::rpc::node::CONNECTED_API_NODE_IDS.write() {
-                                 guard.remove(&id);
-                             }
+                             crate::rpc::node::CONNECTED_API_NODE_IDS.write().remove(&id);
                         }
                         return Err(e.into());
                     }
@@ -501,9 +492,7 @@ async fn run_stream(
     }
 
     if let Some(id) = current_api_node_id {
-        if let Ok(mut guard) = crate::rpc::node::CONNECTED_API_NODE_IDS.write() {
-            guard.remove(&id);
-        }
+        crate::rpc::node::CONNECTED_API_NODE_IDS.write().remove(&id);
     }
 
     Ok(())
@@ -558,13 +547,11 @@ async fn handle_message(
                         if let Ok(url) = full_key.parse::<reqwest::Url>() {
                             let host = url.host_str().unwrap_or("localhost");
                             let is_https = url.scheme() == "https";
-                            let port =
-                                url.port().unwrap_or(if is_https { 443 } else { 80 });
+                            let port = url.port().unwrap_or(if is_https { 443 } else { 80 });
                             let scheme = if is_https { "https" } else { "http" };
                             let preheat_url =
                                 format!("{}://127.0.0.1:{}{}", scheme, port, url.path());
-                            let query =
-                                url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+                            let query = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
                             let final_url = format!("{}{}", preheat_url, query);
 
                             let client = reqwest::Client::builder()
@@ -577,20 +564,29 @@ async fn handle_message(
                                 .header("host", host)
                                 .header("x-cloud-cache-action", "fetch")
                                 .header("x-cloud-preheat", "1")
-                                .header(
-                                    "user-agent",
-                                    "Mozilla/5.0 (compatible; CacheTest/1.0)",
-                                )
+                                .header("user-agent", "Mozilla/5.0 (compatible; CacheTest/1.0)")
                                 .send()
                                 .await
                             {
                                 Ok(resp) => {
-                                    if resp.status().is_success() {
-                                        is_ok = true;
-                                        reply_text = "write ok".to_string();
+                                    let status = resp.status();
+                                    if status.is_success() {
+                                        let mut body = resp.bytes_stream();
+                                        let mut read_error = None;
+                                        while let Some(chunk) = body.next().await {
+                                            if let Err(e) = chunk {
+                                                read_error = Some(e);
+                                                break;
+                                            }
+                                        }
+                                        if let Some(e) = read_error {
+                                            reply_text = format!("body read failed: {}", e);
+                                        } else {
+                                            is_ok = true;
+                                            reply_text = "write ok".to_string();
+                                        }
                                     } else {
-                                        reply_text =
-                                            format!("upstream returned {}", resp.status());
+                                        reply_text = format!("upstream returned {}", status);
                                     }
                                 }
                                 Err(e) => {
@@ -628,13 +624,13 @@ async fn handle_message(
                     Ok(msg) => {
                         // Reconstruct cache key in the same format as proxy's
                         // default_cache_key_for_session() which uses "http://{host}{path}"
-                        let full_key =
-                            if !msg.key.starts_with("http://") && !msg.key.starts_with("https://")
-                            {
-                                format!("http://{}", msg.key)
-                            } else {
-                                msg.key.clone()
-                            };
+                        let full_key = if !msg.key.starts_with("http://")
+                            && !msg.key.starts_with("https://")
+                        {
+                            format!("http://{}", msg.key)
+                        } else {
+                            msg.key.clone()
+                        };
                         let hash = format!("{:x}", md5_legacy::compute(&full_key));
                         if let Some(meta) = crate::metrics::storage::STORAGE.get_cache_meta(&hash) {
                             is_ok = true;
@@ -701,12 +697,20 @@ async fn handle_message(
             tokio::spawn(async move {
                 let all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
                 let mut count = 0;
-                let root = std::path::Path::new("../data/cache");
+                let inner = crate::cache_manager::CACHE.storage.l2.inner.load();
+                let root = &inner.main_root;
 
                 for (hash, _) in all_meta {
                     let file_path = root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
                     if file_path.exists() {
                         let _ = std::fs::remove_file(&file_path);
+                    }
+                    // Also check extra_roots
+                    for extra in &inner.extra_roots {
+                        let extra_path = extra.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
+                        if extra_path.exists() {
+                            let _ = std::fs::remove_file(&extra_path);
+                        }
                     }
                     crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
                     count += 1;
@@ -814,7 +818,7 @@ async fn handle_message(
         }
     }
 
-    if message.request_id >= 0 && message.code != "connectedAPINode" {
+    if message.request_id > 0 && message.code != "connectedAPINode" {
         let reply = pb::NodeStreamMessage {
             node_id,
             request_id: message.request_id,

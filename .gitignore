@@ -5,3 +5,12 @@ cloud-node-rust
 configs/cache/disk/
 bench-cert.pem
 bench-key.pem
+
+# Ignore local hidden tool/editor directories and their contents.
+.*/
+
+# Keep project metadata that is intentionally versioned.
+!.github/
+!.github/**
+!.cargo/
+!.cargo/**

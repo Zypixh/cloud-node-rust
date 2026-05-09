@@ -19,6 +19,7 @@ use arc_swap::ArcSwap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 
 static CACHED_DISK_AVAILABLE: AtomicU64 = AtomicU64::new(u64::MAX);
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CACHED_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
 static CACHED_MEMORY_BUDGET_AT: AtomicI64 = AtomicI64::new(0);
 const MEMORY_BUDGET_TTL_SECS: i64 = 30;
@@ -163,8 +164,8 @@ impl Storage for FileStorage {
         }
 
         // Use a unique temp path to prevent concurrent cache misses from corrupting the same file
-        let random_id = crate::utils::time::now_timestamp_millis();
-        let temp_path = path.with_extension(format!("tmp.{}", random_id));
+        let unique_id = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), unique_id));
 
         let std_file = tokio::fs::File::create(&temp_path)
             .await
@@ -471,6 +472,7 @@ struct FastL1Entry {
     data: bytes::Bytes,
     fresh_until: i64,
     created_at: i64,
+    generation: u64,
     response_header: ResponseHeader,
 }
 
@@ -483,16 +485,61 @@ static FAST_L1_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Current total bytes in FAST_L1. Maintained by insert (+=len) and remove (-=len).
 static FAST_L1_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic generation used to distinguish stale heap entries from replaced cache entries.
+static FAST_L1_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 /// Min-heap for O(log n) eviction: entries with smallest fresh_until are evicted first.
 /// Uses Reverse so BinaryHeap (max-heap) behaves as min-heap.
 static EVICTION_HEAP: Lazy<
-    parking_lot::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(i64, u64)>>>,
+    parking_lot::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(i64, u64, u64)>>>,
 > = Lazy::new(|| parking_lot::Mutex::new(std::collections::BinaryHeap::new()));
 
 fn fast_l1_remove(hash: &u64) {
     if let Some((_, entry)) = FAST_L1.remove(hash) {
-        FAST_L1_BYTES.fetch_sub(entry.data.len() as u64, Ordering::Relaxed);
+        FAST_L1_BYTES.fetch_sub(entry.data.len() as u64, Ordering::Release);
     }
+}
+
+fn fast_l1_remove_generation(hash: &u64, generation: u64) -> Option<FastL1Entry> {
+    let removed = FAST_L1.remove_if(hash, |_, entry| entry.generation == generation)?;
+    let entry = removed.1;
+    FAST_L1_BYTES.fetch_sub(entry.data.len() as u64, Ordering::Release);
+    Some(entry)
+}
+
+fn fast_l1_evict_expired(now: i64) -> (u64, usize) {
+    let mut expired_bytes = 0u64;
+    let mut evicted = 0usize;
+    let mut heap = EVICTION_HEAP.lock();
+    while let Some(&std::cmp::Reverse((fresh_until, _, _))) = heap.peek() {
+        if fresh_until > now {
+            break;
+        }
+        let std::cmp::Reverse((_, generation, victim_key)) = heap.pop().unwrap();
+        if let Some(entry) = fast_l1_remove_generation(&victim_key, generation) {
+            expired_bytes += entry.data.len() as u64;
+            evicted += 1;
+        }
+    }
+    (expired_bytes, evicted)
+}
+
+fn fast_l1_evict_over_budget(max_l1: u64, max_attempts: usize) -> (u64, usize) {
+    let mut freed = 0u64;
+    let mut evicted = 0usize;
+    let mut attempts = 0usize;
+    let mut heap = EVICTION_HEAP.lock();
+    while FAST_L1_BYTES.load(Ordering::Acquire) > max_l1 && attempts < max_attempts {
+        attempts += 1;
+        let Some(std::cmp::Reverse((_, generation, victim_key))) = heap.pop() else {
+            break;
+        };
+        if let Some(entry) = fast_l1_remove_generation(&victim_key, generation) {
+            freed += entry.data.len() as u64;
+            evicted += 1;
+        }
+    }
+    (freed, evicted)
 }
 
 fn fast_l1_cache_meta(entry: &FastL1Entry) -> CacheMeta {
@@ -616,45 +663,29 @@ impl HybridStorage {
         }
         let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
         let len = data.len() as u64;
-        if max_l1 > 0 {
-            let current = FAST_L1_BYTES.load(Ordering::Relaxed);
-            if current + len > max_l1 {
-                let mut heap = EVICTION_HEAP.lock();
-                let mut freed = 0u64;
-                let mut evict_attempts = 0;
-                while FAST_L1_BYTES.load(Ordering::Relaxed) + len - freed > max_l1
-                    && evict_attempts < 100
-                {
-                    match heap.pop() {
-                        Some(std::cmp::Reverse((_, victim_key))) => {
-                            if FAST_L1.contains_key(&victim_key) {
-                                if let Some((_, entry)) = FAST_L1.remove(&victim_key) {
-                                    let sz = entry.data.len() as u64;
-                                    FAST_L1_BYTES.fetch_sub(sz, Ordering::Relaxed);
-                                    freed += sz;
-                                }
-                            }
-                            evict_attempts += 1;
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-        FAST_L1.insert(
+        let generation = FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed);
+        if let Some(old_entry) = FAST_L1.insert(
             hash,
             FastL1Entry {
                 data,
                 fresh_until,
                 created_at: now,
+                generation,
                 response_header: meta.response_header().clone(),
             },
-        );
-        FAST_L1_BYTES.fetch_add(len, Ordering::Relaxed);
+        ) {
+            FAST_L1_BYTES.fetch_sub(old_entry.data.len() as u64, Ordering::Release);
+        }
+        FAST_L1_BYTES.fetch_add(len, Ordering::Release);
         EVICTION_HEAP
             .lock()
-            .push(std::cmp::Reverse((fresh_until, hash)));
-        true
+            .push(std::cmp::Reverse((fresh_until, generation, hash)));
+        if max_l1 > 0 && FAST_L1_BYTES.load(Ordering::Acquire) > max_l1 {
+            fast_l1_evict_over_budget(max_l1, 100);
+        }
+        FAST_L1
+            .get(&hash)
+            .is_some_and(|entry| entry.generation == generation)
     }
 
     pub async fn apply_policy(&self, policy: &crate::config_models::HTTPCachePolicy) {
@@ -1196,21 +1227,10 @@ pub fn start_cache_janitor() {
                 .unwrap_or(u64::MAX);
             CACHED_DISK_AVAILABLE.store(available, Ordering::Relaxed);
 
-            // Evict expired FAST_L1 entries
+            // Evict expired FAST_L1 entries via heap (avoids full-table retain() lock)
             let now = crate::utils::time::now_timestamp();
-            let before = FAST_L1.len();
-            let mut expired_bytes: u64 = 0;
-            FAST_L1.retain(|_, entry| {
-                if entry.fresh_until > now {
-                    true
-                } else {
-                    expired_bytes += entry.data.len() as u64;
-                    false
-                }
-            });
-            let evicted = before.saturating_sub(FAST_L1.len());
+            let (expired_bytes, evicted) = fast_l1_evict_expired(now);
             if evicted > 0 {
-                FAST_L1_BYTES.fetch_sub(expired_bytes, Ordering::Relaxed);
                 tracing::debug!(
                     "FAST_L1 janitor: evicted {} expired entries ({} bytes), {} remain",
                     evicted,
@@ -1222,23 +1242,9 @@ pub fn start_cache_janitor() {
             // Enforce FAST_L1 memory budget via eviction heap
             let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
             if max_l1 > 0 {
-                let total = FAST_L1_BYTES.load(Ordering::Relaxed);
+                let total = FAST_L1_BYTES.load(Ordering::Acquire);
                 if total > max_l1 {
-                    let mut heap = EVICTION_HEAP.lock();
-                    let mut freed: u64 = 0;
-                    let to_free = total - max_l1;
-                    while freed < to_free {
-                        match heap.pop() {
-                            Some(std::cmp::Reverse((_, victim_key))) => {
-                                if let Some((_, entry)) = FAST_L1.remove(&victim_key) {
-                                    let sz = entry.data.len() as u64;
-                                    FAST_L1_BYTES.fetch_sub(sz, Ordering::Relaxed);
-                                    freed += sz;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
+                    let (freed, _) = fast_l1_evict_over_budget(max_l1, usize::MAX);
                     if freed > 0 {
                         tracing::debug!(
                             "FAST_L1 memory budget: {}/{} bytes, evicted {} bytes, {} entries remain",
@@ -1266,6 +1272,9 @@ pub fn start_cache_janitor() {
 mod tests {
     use super::*;
 
+    static FAST_L1_TEST_LOCK: Lazy<parking_lot::Mutex<()>> =
+        Lazy::new(|| parking_lot::Mutex::new(()));
+
     #[test]
     fn fast_l1_cache_meta_preserves_header_template() {
         let mut header = ResponseHeader::build(206, None).expect("response header");
@@ -1276,6 +1285,7 @@ mod tests {
             data: bytes::Bytes::from_static(b"body"),
             fresh_until: 1_700_000_100,
             created_at: 1_700_000_000,
+            generation: 1,
             response_header: header,
         };
 
@@ -1288,5 +1298,69 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("HIT")
         );
+    }
+
+    #[test]
+    fn stale_heap_entry_does_not_remove_replaced_fast_l1_entry() {
+        let _guard = FAST_L1_TEST_LOCK.lock();
+        let hash = fast_hash_key("stale-heap-entry-test");
+        fast_l1_remove(&hash);
+
+        let old_generation = FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed);
+        EVICTION_HEAP
+            .lock()
+            .push(std::cmp::Reverse((1_700_000_000, old_generation, hash)));
+
+        let new_generation = FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let header = ResponseHeader::build(200, None).expect("response header");
+        FAST_L1.insert(
+            hash,
+            FastL1Entry {
+                data: bytes::Bytes::from_static(b"new"),
+                fresh_until: 1_800_000_000,
+                created_at: 1_700_000_100,
+                generation: new_generation,
+                response_header: header,
+            },
+        );
+        FAST_L1_BYTES.fetch_add(3, Ordering::Release);
+
+        let (_, evicted) = fast_l1_evict_expired(1_700_000_001);
+        assert_eq!(evicted, 0);
+        assert_eq!(
+            FAST_L1.get(&hash).map(|entry| entry.generation),
+            Some(new_generation)
+        );
+
+        fast_l1_remove(&hash);
+    }
+
+    #[test]
+    fn current_generation_expired_heap_entry_removes_fast_l1_entry() {
+        let _guard = FAST_L1_TEST_LOCK.lock();
+        let hash = fast_hash_key("current-generation-expired-test");
+        fast_l1_remove(&hash);
+
+        let generation = FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let header = ResponseHeader::build(200, None).expect("response header");
+        FAST_L1.insert(
+            hash,
+            FastL1Entry {
+                data: bytes::Bytes::from_static(b"old"),
+                fresh_until: 1_700_000_000,
+                created_at: 1_699_999_900,
+                generation,
+                response_header: header,
+            },
+        );
+        FAST_L1_BYTES.fetch_add(3, Ordering::Release);
+        EVICTION_HEAP
+            .lock()
+            .push(std::cmp::Reverse((1_700_000_000, generation, hash)));
+
+        let (expired_bytes, evicted) = fast_l1_evict_expired(1_700_000_001);
+        assert_eq!(expired_bytes, 3);
+        assert_eq!(evicted, 1);
+        assert!(FAST_L1.get(&hash).is_none());
     }
 }
