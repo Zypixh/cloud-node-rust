@@ -7,6 +7,7 @@ use pingora_cache::storage::{
 };
 use pingora_cache::{CacheKey, CacheMeta, MemCache};
 use pingora_core::{Error, ErrorType, Result};
+use pingora_http::ResponseHeader;
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,9 +16,12 @@ use tracing::{info, warn};
 
 use arc_swap::ArcSwap;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 
 static CACHED_DISK_AVAILABLE: AtomicU64 = AtomicU64::new(u64::MAX);
+static CACHED_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
+static CACHED_MEMORY_BUDGET_AT: AtomicI64 = AtomicI64::new(0);
+const MEMORY_BUDGET_TTL_SECS: i64 = 30;
 
 /// Synchronous zstd decompression for serving small files from memory.
 fn zstd_decompress_to_bytes(data: &[u8]) -> Option<Vec<u8>> {
@@ -467,8 +471,7 @@ struct FastL1Entry {
     data: bytes::Bytes,
     fresh_until: i64,
     created_at: i64,
-    status: u16,
-    headers: Vec<(String, String)>,
+    response_header: ResponseHeader,
 }
 
 /// Global lock-free L1 cache. Sharded by DashMap, no contention at 1000+ concurrent reads.
@@ -490,6 +493,18 @@ fn fast_l1_remove(hash: &u64) {
     if let Some((_, entry)) = FAST_L1.remove(hash) {
         FAST_L1_BYTES.fetch_sub(entry.data.len() as u64, Ordering::Relaxed);
     }
+}
+
+fn fast_l1_cache_meta(entry: &FastL1Entry) -> CacheMeta {
+    let fresh_until_dur = std::time::Duration::from_secs(entry.fresh_until as u64);
+    let created_at_dur = std::time::Duration::from_secs(entry.created_at as u64);
+    CacheMeta::new(
+        std::time::UNIX_EPOCH + fresh_until_dur,
+        std::time::UNIX_EPOCH + created_at_dur,
+        0,
+        0,
+        entry.response_header.clone(),
+    )
 }
 
 const POLICY_FILE: u8 = 0;
@@ -545,12 +560,22 @@ impl HybridStorage {
     }
 
     fn compute_memory_budget() -> u64 {
+        let now = crate::utils::time::now_timestamp();
+        let cached = CACHED_MEMORY_BUDGET.load(Ordering::Relaxed);
+        let cached_at = CACHED_MEMORY_BUDGET_AT.load(Ordering::Relaxed);
+        if cached > 0 && now.saturating_sub(cached_at) < MEMORY_BUDGET_TTL_SECS {
+            return cached;
+        }
+
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total = sys.total_memory();
         let available = sys.available_memory();
         let budget = (available as f64 * 0.25) as u64;
-        budget.min((total as f64 * 0.5) as u64)
+        let budget = budget.min((total as f64 * 0.5) as u64);
+        CACHED_MEMORY_BUDGET.store(budget, Ordering::Relaxed);
+        CACHED_MEMORY_BUDGET_AT.store(now, Ordering::Relaxed);
+        budget
     }
 
     /// Promote to FAST_L1 with capacity check and header extraction from CacheMeta.
@@ -593,21 +618,13 @@ impl HybridStorage {
                 }
             }
         }
-        let status = meta.response_header().status.as_u16();
-        let headers: Vec<(String, String)> = meta
-            .response_header()
-            .headers
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
         FAST_L1.insert(
             hash,
             FastL1Entry {
                 data,
                 fresh_until,
                 created_at: now,
-                status,
-                headers,
+                response_header: meta.response_header().clone(),
             },
         );
         FAST_L1_BYTES.fetch_add(len, Ordering::Relaxed);
@@ -818,19 +835,7 @@ impl Storage for HybridStorage {
         if let Some(entry) = FAST_L1.get(&hash) {
             let now = crate::utils::time::now_timestamp();
             if entry.fresh_until > now {
-                let fresh_until_dur = std::time::Duration::from_secs(entry.fresh_until as u64);
-                let created_at_dur = std::time::Duration::from_secs(entry.created_at as u64);
-                let mut hdr = pingora_http::ResponseHeader::build(entry.status, None).unwrap();
-                for (name, val) in &entry.headers {
-                    let _ = hdr.insert_header(name.to_string(), val.as_str());
-                }
-                let meta = CacheMeta::new(
-                    std::time::UNIX_EPOCH + fresh_until_dur,
-                    std::time::UNIX_EPOCH + created_at_dur,
-                    0,
-                    0,
-                    hdr,
-                );
+                let meta = fast_l1_cache_meta(&entry);
                 prof_record_l1_hit();
                 return Ok(Some((
                     meta,
@@ -1232,4 +1237,33 @@ pub fn start_cache_janitor() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_l1_cache_meta_preserves_header_template() {
+        let mut header = ResponseHeader::build(206, None).expect("response header");
+        header
+            .insert_header("x-cache-status", "HIT")
+            .expect("insert header");
+        let entry = FastL1Entry {
+            data: bytes::Bytes::from_static(b"body"),
+            fresh_until: 1_700_000_100,
+            created_at: 1_700_000_000,
+            response_header: header,
+        };
+
+        let meta = fast_l1_cache_meta(&entry);
+        assert_eq!(meta.response_header().status.as_u16(), 206);
+        assert_eq!(
+            meta.response_header()
+                .headers
+                .get("x-cache-status")
+                .and_then(|v| v.to_str().ok()),
+            Some("HIT")
+        );
+    }
 }

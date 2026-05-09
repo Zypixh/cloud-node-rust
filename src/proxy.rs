@@ -3327,7 +3327,6 @@ impl EdgeProxy {
         &self,
         session: &mut Session,
         ctx: &mut ProxyCTX,
-        _host: &str,
         global_policies: &[crate::config_models::HTTPFirewallPolicy],
     ) -> Result<(bool, Option<String>)> {
         let mut waf_action: Option<String> = None;
@@ -3893,7 +3892,7 @@ impl ProxyHttp for EdgeProxy {
             ctx.waf_deferred = true;
         } else {
             let (blocked, _action) = self
-                .run_heavy_waf(session, ctx, &host, &hot_path.firewall_policies)
+                .run_heavy_waf(session, ctx, &hot_path.firewall_policies)
                 .await?;
             if blocked {
                 return Ok(true);
@@ -4097,9 +4096,8 @@ impl ProxyHttp for EdgeProxy {
 
                 // Run deferred heavy WAF checks (skipped in request_filter when cache was configured).
                 // This ensures WAF only runs on cache MISS, not on every cache HIT.
-                let host = ctx.host.clone();
                 let (blocked, _action) = self
-                    .run_heavy_waf(session, ctx, &host, firewall_policies.as_ref().as_slice())
+                    .run_heavy_waf(session, ctx, firewall_policies.as_ref().as_slice())
                     .await?;
                 if blocked {
                     return Err(Error::new(HTTPStatus(403)));

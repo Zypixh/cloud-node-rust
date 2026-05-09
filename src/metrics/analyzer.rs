@@ -107,6 +107,17 @@ impl<K: Hash + Eq, V: Clone> ShardedLru<K, V> {
         let hash = s.finish();
         &self.shards[(hash as usize) % CACHE_SHARDS]
     }
+
+    fn get_shard_by<Q>(&self, key: &Q) -> &Mutex<LruCache<K, V>>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let mut s = DefaultHasher::new();
+        key.hash(&mut s);
+        let hash = s.finish();
+        &self.shards[(hash as usize) % CACHE_SHARDS]
+    }
 }
 
 // Cache for GeoIP results (IP -> GeoInfo)
@@ -140,10 +151,9 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
     let (browser, os) = if ua.is_empty() {
         (Arc::from(""), Arc::from(""))
     } else {
-        let ua_owned = ua.to_string();
-        let mutex = UA_CACHE.get_shard(&ua_owned);
+        let mutex = UA_CACHE.get_shard_by(ua);
         let mut cache = mutex.lock().unwrap();
-        if let Some(cached) = cache.get(&ua_owned) {
+        if let Some(cached) = cache.get(ua) {
             cached.clone()
         } else {
             let parsed_ua = UA_PARSER.parse(ua);
@@ -151,7 +161,7 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
                 Some(p) => (Arc::from(p.name), Arc::from(p.os)),
                 None => (Arc::from("Unknown"), Arc::from("Unknown")),
             };
-            cache.put(ua_owned, res.clone());
+            cache.put(ua.to_string(), res.clone());
             res
         }
     };
@@ -241,6 +251,23 @@ fn lookup_geo_internal(ip: IpAddr) -> Option<GeoInfo> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyze_request_reuses_ua_cache_result_shape() {
+        let ip = "127.0.0.1".parse().expect("valid ip");
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
+
+        let first = analyze_request(ip, ua);
+        let second = analyze_request(ip, ua);
+
+        assert_eq!(&*first.browser, &*second.browser);
+        assert_eq!(&*first.os, &*second.os);
     }
 }
 

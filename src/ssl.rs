@@ -12,9 +12,6 @@ use crate::config_models::{SSLCertConfig, SSLPolicyConfig};
 
 #[derive(Clone)]
 pub struct DynamicCertSelector {
-    pub exact: Arc<RwLock<HashMap<String, Arc<CertPair>>>>,
-    pub wildcard: Arc<RwLock<HashMap<String, Arc<CertPair>>>>,
-    pub default: Arc<RwLock<Option<Arc<CertPair>>>>,
     snapshot: Arc<RwLock<CertSnapshot>>,
     // Internal cache: ID -> (PEM_Hash, ParsedPair)
     cache: Arc<RwLock<HashMap<i64, (String, Arc<CertPair>)>>>,
@@ -39,9 +36,6 @@ pub struct CertPair {
 impl DynamicCertSelector {
     pub fn new() -> Self {
         Self {
-            exact: Arc::new(RwLock::new(HashMap::new())),
-            wildcard: Arc::new(RwLock::new(HashMap::new())),
-            default: Arc::new(RwLock::new(None)),
             snapshot: Arc::new(RwLock::new(CertSnapshot::default())),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -265,26 +259,21 @@ pub async fn sync_certs(
             wildcard: new_wildcard.clone(),
             default: first_pair.clone(),
         };
-        let mut exact_lock = cert_selector.exact.write().unwrap();
-        let mut wildcard_lock = cert_selector.wildcard.write().unwrap();
-        let mut default_lock = cert_selector.default.write().unwrap();
+        let default_present = new_snapshot.default.is_some();
         let mut snapshot_lock = cert_selector.snapshot.write().unwrap();
         let mut cache_lock = cert_selector.cache.write().unwrap();
 
-        *exact_lock = new_exact;
-        *wildcard_lock = new_wildcard;
-        *default_lock = first_pair;
         *snapshot_lock = new_snapshot;
         *cache_lock = new_cache;
-    }
 
-    tracing::info!(
-        "SSL Sync Result: {} certs processed (Reused: {}, Parsed: {}). Default Cert present: {}",
-        stats_parsed,
-        stats_reused,
-        stats_parsed - stats_reused,
-        cert_selector.default.read().unwrap().is_some()
-    );
+        tracing::info!(
+            "SSL Sync Result: {} certs processed (Reused: {}, Parsed: {}). Default Cert present: {}",
+            stats_parsed,
+            stats_reused,
+            stats_parsed - stats_reused,
+            default_present
+        );
+    }
 }
 
 #[async_trait]

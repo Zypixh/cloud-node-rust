@@ -651,7 +651,7 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
     None
 }
 
-const SEARCH_ENGINE_BOTS: &[&str] = &[
+pub(crate) const SEARCH_ENGINE_BOTS: &[&str] = &[
     "googlebot",
     "bingbot",
     "baiduspider",

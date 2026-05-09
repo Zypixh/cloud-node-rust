@@ -158,24 +158,8 @@ fn host_redirect_status(redirect: &HTTPHostRedirectConfig, user_agent: &str) -> 
     }
 }
 
-const SEARCH_ENGINE_BOTS: &[&str] = &[
-    "googlebot",
-    "bingbot",
-    "baiduspider",
-    "yandexbot",
-    "sogou",
-    "360spider",
-    "duckduckbot",
-    "facebookexternalhit",
-    "twitterbot",
-    "slurp",
-    "msnbot",
-    "yisouspider",
-    "bytespider",
-];
-
 fn is_search_engine_bot(user_agent: &str) -> bool {
-    SEARCH_ENGINE_BOTS
+    crate::firewall::SEARCH_ENGINE_BOTS
         .iter()
         .any(|bot| crate::firewall::matcher::contains_ascii_case_insensitive(user_agent, bot))
 }

@@ -2823,6 +2823,37 @@ mod tests {
     }
 
     #[test]
+    fn traffic_limit_status_represents_exceeded_state_not_config_presence() {
+        let configured_only = ServerConfig {
+            traffic_limit: Some(TrafficLimitConfig {
+                is_on: true,
+                ..Default::default()
+            }),
+            traffic_limit_status: None,
+            ..Default::default()
+        };
+        assert!(!configured_only.has_valid_traffic_limit());
+
+        let exceeded = ServerConfig {
+            traffic_limit_status: Some(TrafficLimitStatus {
+                until_day: "99991231".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(exceeded.has_valid_traffic_limit());
+
+        let expired = ServerConfig {
+            traffic_limit_status: Some(TrafficLimitStatus {
+                until_day: "19700101".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!expired.has_valid_traffic_limit());
+    }
+
+    #[test]
     fn web_config_parses_auth_referer_and_user_agent_aliases() {
         let web: WebConfig = serde_json::from_value(serde_json::json!({
             "isOn": true,
