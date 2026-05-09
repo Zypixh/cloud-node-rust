@@ -52,6 +52,20 @@ sudo ./target/release/cloud-node-rust install
 sudo systemctl start cloud-node
 ```
 
+从 Go 原版节点迁移到 GitHub 最新 Rust Release，或全新安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash
+```
+
+脚本会先询问语言，支持中文；可选择迁移安装、全新安装到 `/root/cloud-node` 或从备份恢复 Go 原版。迁移时会备份原 Go 版二进制，并可选择从 `P3TERX/GeoLite.mmdb` 下载 GeoIP 库。
+
+全新安装的一条非交互命令示例：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --fresh --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret --geoip
+```
+
 常用命令：
 
 ```bash

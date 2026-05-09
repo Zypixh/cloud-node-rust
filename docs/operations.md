@@ -55,6 +55,93 @@ cloud-node restart
 cloud-node status
 ```
 
+## 从 Go 原版迁移安装 Rust 版
+
+仓库提供迁移安装脚本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash
+```
+
+脚本会执行以下步骤：
+
+- 第一步询问界面语言，支持中文和英文；自动化场景可使用 `--lang zh` 或 `--lang en`。
+- 交互式选择操作：从 Go 原版迁移安装 Rust 版、全新安装 Rust 版、从备份恢复 Go 原版。
+- 查找当前 `cloud-node` 命令、`cloud-node.service` 的 `ExecStart` 和常见安装路径。
+- 将找到的旧二进制、`/usr/bin/cloud-node` 和 systemd unit 备份到 `/var/backups/cloud-node-rust-migration/<timestamp>/`。
+- 备份文件统一带有 `go-original` 标识，例如 `usr_bin_cloud-node.go-original` 和 `cloud-node.service.go-original`。
+- 根据系统架构和 glibc 版本选择 GitHub 最新 Rust Release 包。
+- 将 Rust 二进制安装到现有 service `WorkingDirectory`，没有旧 service 时默认安装到 `/opt/cloud-node-rust/cloud-node-rust`。
+- 执行 Rust 二进制内置的 `install` 命令，重新注册 `/usr/bin/cloud-node` wrapper 和 `cloud-node.service`。
+- 交互询问是否从 `https://github.com/P3TERX/GeoLite.mmdb` 下载 `GeoLite2-City.mmdb`、`GeoLite2-ASN.mmdb` 和 `GeoLite2-Country.mmdb`。
+- 如果迁移前服务处于运行状态，默认会在替换后重新启动服务。
+
+迁移安装默认要求找到旧 `cloud-node`，避免在未备份原版的情况下误装。全新安装使用 `--fresh`，会自动允许没有旧节点的环境。
+
+全新安装会默认创建 `/root/cloud-node`，并交互输入 API 连接配置，生成 `/root/cloud-node/api_node.yaml`。
+
+上线前建议先 dry-run：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --dry-run
+```
+
+安装指定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.0.6 --yes
+```
+
+全新安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --fresh
+```
+
+全新安装的一条非交互命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --fresh --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret --geoip
+```
+
+非交互下载 GeoIP 库：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --lang zh --geoip --yes
+```
+
+GeoIP 文件默认写入节点工作目录，因为运行时会从工作目录读取 `GeoLite2-City.mmdb` 和 `GeoLite2-ASN.mmdb`。如需指定目录：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --geoip --geoip-dir /opt/cloud-node-rust --yes
+```
+
+指定安装目录或禁止自动启动：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --install-dir /opt/cloud-node-rust --no-start --yes
+```
+
+列出可用备份：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --list-backups
+```
+
+从最近一次备份恢复 Go 原版：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --restore
+```
+
+非交互恢复指定备份：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --restore --restore-backup /var/backups/cloud-node-rust-migration/20260509-120000 --yes
+```
+
+恢复时脚本会停止当前服务，恢复 `go-original` 二进制、`/usr/bin/cloud-node` 和 systemd unit，并将当前 Rust 文件备份到 `restore-current-*` 目录。手动回滚也可以停止服务后恢复备份目录中的文件，再执行 `systemctl daemon-reload` 与 `systemctl start cloud-node`。
+
 ## 运行前检查
 
 上线前建议确认：
