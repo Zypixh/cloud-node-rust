@@ -104,6 +104,35 @@ setup_colors() {
 
 setup_colors
 
+setup_prompt_input() {
+    if [ -t 0 ]; then
+        PROMPT_INPUT="/dev/stdin"
+    elif [ -r /dev/tty ]; then
+        PROMPT_INPUT="/dev/tty"
+    else
+        PROMPT_INPUT=""
+    fi
+}
+
+setup_prompt_input
+
+prompt_available() {
+    [ -n "$PROMPT_INPUT" ]
+}
+
+read_prompt() {
+    local __var="$1"
+    prompt_available || return 1
+    IFS= read -r "$__var" < "$PROMPT_INPUT"
+}
+
+read_prompt_secret() {
+    local __var="$1"
+    prompt_available || return 1
+    IFS= read -rs "$__var" < "$PROMPT_INPUT"
+    printf '\n'
+}
+
 title() {
     printf '\n%s%s%s\n' "$BOLD" "CloudNode Rust Installer" "$RESET"
     printf '%s\n\n' "============================================================"
@@ -167,13 +196,13 @@ prompt_language() {
         return
     fi
 
-    if [ -t 0 ]; then
+    if prompt_available; then
         title
         printf '%s\n' "请选择语言 / Select language"
         printf '  %s1)%s 中文\n' "$BOLD" "$RESET"
         printf '  %s2)%s English\n' "$BOLD" "$RESET"
         printf '\n输入序号 / Enter choice %s[1]%s: ' "$DIM" "$RESET"
-        read -r lang_choice
+        read_prompt lang_choice || lang_choice=""
         case "${lang_choice:-1}" in
             1|zh|ZH|中文)
                 LANGUAGE="zh"
@@ -202,7 +231,7 @@ prompt_mode() {
             ;;
     esac
 
-    if [ "$ASSUME_YES" -eq 1 ] || [ ! -t 0 ]; then
+    if [ "$ASSUME_YES" -eq 1 ] || ! prompt_available; then
         MODE="install"
         return
     fi
@@ -219,7 +248,7 @@ prompt_mode() {
         printf '  %s3)%s Restore Go original from backup\n' "$BOLD" "$RESET"
         printf '\nEnter choice %s[1]%s: ' "$DIM" "$RESET"
     fi
-    read -r mode_choice
+    read_prompt mode_choice || mode_choice=""
     case "${mode_choice:-1}" in
         1|install|INSTALL)
             MODE="install"
@@ -254,7 +283,7 @@ ask_yes_no() {
     else
         printf '%s %s ' "$prompt_en" "$prompt_suffix"
     fi
-    read -r answer
+    read_prompt answer || answer=""
     answer="${answer:-$default_answer}"
     case "$answer" in
         y|Y|yes|YES|Yes|是|好|确认)
@@ -283,11 +312,10 @@ prompt_text() {
     fi
     printf ': '
 
-    if [ "$secret" = "yes" ] && [ -t 0 ]; then
-        read -rs answer
-        printf '\n'
+    if [ "$secret" = "yes" ] && prompt_available; then
+        read_prompt_secret answer || answer=""
     else
-        read -r answer
+        read_prompt answer || answer=""
     fi
     printf '%s\n' "${answer:-$default_value}"
 }
@@ -649,7 +677,7 @@ collect_fresh_api_config() {
         return
     fi
 
-    if [ -t 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
+    if prompt_available && [ "$ASSUME_YES" -eq 0 ]; then
         section "$(is_zh && printf 'API 连接配置' || printf 'API Connection Config')"
         if [ -z "$API_ENDPOINTS" ]; then
             API_ENDPOINTS="$(prompt_text \
@@ -770,7 +798,7 @@ choose_restore_backup() {
     mapfile -t backups < <(backup_dirs)
     [ "${#backups[@]}" -gt 0 ] || die "no backups found under $BACKUP_ROOT"
 
-    if [ "$ASSUME_YES" -eq 1 ] || [ ! -t 0 ]; then
+    if [ "$ASSUME_YES" -eq 1 ] || ! prompt_available; then
         printf '%s\n' "${backups[0]}"
         return
     fi
@@ -786,7 +814,7 @@ choose_restore_backup() {
     else
         printf '\nEnter choice %s[1]%s: ' "$DIM" "$RESET"
     fi
-    read -r choice
+    read_prompt choice || choice=""
     choice="${choice:-1}"
     case "$choice" in
         ''|*[!0-9]*)
@@ -928,7 +956,7 @@ case "$DOWNLOAD_GEOIP" in
 esac
 
 if [ "$DOWNLOAD_GEOIP" = "ask" ]; then
-    if [ "$ASSUME_YES" -eq 1 ] || [ ! -t 0 ]; then
+    if [ "$ASSUME_YES" -eq 1 ] || ! prompt_available; then
         DOWNLOAD_GEOIP="no"
     elif ask_yes_no \
         "是否从 https://github.com/P3TERX/GeoLite.mmdb 下载 GeoIP 库？" \
