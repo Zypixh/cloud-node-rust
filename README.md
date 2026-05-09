@@ -122,6 +122,7 @@ CloudNode Rust 已接入主要边缘节点能力，并持续优化以下方向�
 - 高并发日志与统计上报。
 - 缓存命中路径和大文件磁盘 I/O。
 - WAF、内容处理和图片处理的 CPU 隔离。
+- 针对 Fast L1、TLS selector、UA analyzer、WAF verifier 和响应体 CPU 处理的持续 benchmark 验证。
 
 ## 致谢
 

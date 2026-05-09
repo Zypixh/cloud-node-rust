@@ -148,6 +148,7 @@ pub struct ProxyCTX {
     pub ip_recorded: bool,
     pub webp_convert_enabled: bool,
     pub webp_source_content_type: Option<String>,
+    pub webp_source_content_length: Option<usize>,
     pub webp_pending_body: LazyBytes,
     pub webp_quality: i32,
     pub optimize_enabled: bool,
@@ -231,6 +232,7 @@ impl Default for ProxyCTX {
             ip_recorded: false,
             webp_convert_enabled: false,
             webp_source_content_type: None,
+            webp_source_content_length: None,
             webp_pending_body: LazyBytes::default(),
             webp_quality: 80,
             optimize_enabled: false,
@@ -1067,6 +1069,17 @@ impl EdgeProxy {
             .unwrap_or(false)
     }
 
+    fn request_path_has_webp_image_extension(session: &Session) -> bool {
+        let path = session.req_header().uri.path();
+        let Some((_, ext)) = path.rsplit_once('.') else {
+            return false;
+        };
+        ext.eq_ignore_ascii_case("jpg")
+            || ext.eq_ignore_ascii_case("jpeg")
+            || ext.eq_ignore_ascii_case("png")
+            || ext.eq_ignore_ascii_case("gif")
+    }
+
     fn response_is_webp_convertible(content_type: &str) -> bool {
         let content_type = content_type.to_ascii_lowercase();
         content_type.starts_with("image/jpeg")
@@ -1118,6 +1131,7 @@ impl EdgeProxy {
     ) {
         ctx.webp_convert_enabled = false;
         ctx.webp_source_content_type = None;
+        ctx.webp_source_content_length = None;
         ctx.webp_pending_body.clear();
 
         let Some(server) = ctx.server.as_ref() else {
@@ -1135,9 +1149,11 @@ impl EdgeProxy {
         if !Self::site_webp_matches_request(site_webp, session) {
             return;
         }
-        if policy.require_cache && ctx.cache_ref.is_none() {
+        // WebP conversion is treated as a transformed-cache feature. Without
+        // a matched cache rule, converting here would spend CPU on every request.
+        let Some(cache_ref) = ctx.cache_ref.as_ref() else {
             return;
-        }
+        };
         if upstream_response.status.as_u16() != 200 {
             return;
         }
@@ -1197,9 +1213,28 @@ impl EdgeProxy {
         if effective_max > 0 && content_length > effective_max {
             return;
         }
+        let force_partial = ctx
+            .cache_policy
+            .as_ref()
+            .map(|p| p.force_partial_content)
+            .unwrap_or(false);
+        let host = session.req_header().uri.host().unwrap_or("");
+        if !should_cache_response(
+            upstream_response.status.as_u16(),
+            cache_ref,
+            session.req_header().method.as_str(),
+            &upstream_response.headers,
+            host,
+            content_length_usize,
+            force_partial,
+            false,
+        ) {
+            return;
+        }
 
         ctx.webp_convert_enabled = true;
         ctx.webp_source_content_type = Some(content_type);
+        ctx.webp_source_content_length = Some(content_length_usize);
         ctx.webp_quality = policy.quality;
 
         upstream_response.remove_header("content-length");
@@ -4608,19 +4643,14 @@ impl ProxyHttp for EdgeProxy {
                 }
 
                 // 2. WebP Suffix (if applicable)
-                let accept = session
-                    .get_header("accept")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                if accept.contains("image/webp") {
-                    let path = session.req_header().uri.path().to_lowercase();
-                    if path.ends_with(".jpg")
-                        || path.ends_with(".jpeg")
-                        || path.ends_with(".png")
-                        || path.ends_with(".gif")
-                    {
-                        key.push_str("@webp");
-                    }
+                if Self::request_path_has_webp_image_extension(session)
+                    && s.web
+                        .as_ref()
+                        .and_then(|web| web.webp.as_ref())
+                        .map(|webp| Self::site_webp_matches_request(webp, session))
+                        .unwrap_or(false)
+                {
+                    key.push_str("@webp");
                 }
 
                 // 3. Compression Suffix (EdgeNode parity: "@encoding")
@@ -4761,6 +4791,7 @@ impl ProxyHttp for EdgeProxy {
                     .unwrap();
             }
         }
+        self.maybe_enable_webp_conversion(session, upstream_response, ctx);
         Ok(())
     }
 
@@ -5112,7 +5143,6 @@ impl ProxyHttp for EdgeProxy {
 
         self.maybe_enable_optimization(session, upstream_response, ctx);
         self.maybe_enable_hls(session, upstream_response, ctx);
-        self.maybe_enable_webp_conversion(session, upstream_response, ctx);
 
         if let Some(cache_ref) = &ctx.cache_ref
             && let Some(expires_cfg) = &cache_ref.expires_time
@@ -5354,6 +5384,48 @@ impl ProxyHttp for EdgeProxy {
         Ok(())
     }
 
+    fn upstream_response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<std::time::Duration>> {
+        if !ctx.webp_convert_enabled {
+            return Ok(None);
+        }
+
+        if let Some(chunk) = body.take() {
+            ctx.webp_pending_body.extend_from_slice(&chunk);
+        }
+
+        if !end_of_stream {
+            return Ok(None);
+        }
+
+        let source_type = ctx
+            .webp_source_content_type
+            .clone()
+            .unwrap_or_else(|| "image/jpeg".to_string());
+
+        match Self::convert_to_webp(&source_type, &ctx.webp_pending_body, ctx.webp_quality) {
+            Ok(converted) => {
+                *body = Some(Bytes::from(converted));
+                ctx.webp_pending_body.clear();
+                ctx.webp_convert_enabled = false;
+                Ok(None)
+            }
+            Err(err) => {
+                ctx.webp_pending_body.clear();
+                ctx.webp_convert_enabled = false;
+                Err(Error::explain(
+                    Custom("WebPConversionFailed"),
+                    format!("WebP conversion failed: {}", err),
+                ))
+            }
+        }
+    }
+
     fn response_body_filter(
         &self,
         session: &mut Session,
@@ -5399,49 +5471,6 @@ impl ProxyHttp for EdgeProxy {
             }
             ctx.optimize_enabled = false;
             ctx.optimize_pending_body.clear();
-        }
-
-        if ctx.webp_convert_enabled {
-            if let Some(chunk) = body.take() {
-                ctx.webp_pending_body.extend_from_slice(&chunk);
-            }
-
-            if !_end_of_stream {
-                return Ok(None);
-            }
-
-            let source_type = ctx
-                .webp_source_content_type
-                .clone()
-                .unwrap_or_else(|| "image/jpeg".to_string());
-
-            match Self::convert_to_webp(&source_type, &ctx.webp_pending_body, ctx.webp_quality) {
-                Ok(converted) => {
-                    ctx.response_body_len = converted.len();
-                    ctx.response_body_buffer.clear();
-                    let inspection_size =
-                        std::cmp::min(converted.len(), ctx.max_inspection_size as usize);
-                    ctx.response_body_buffer
-                        .extend_from_slice(&converted[..inspection_size]);
-                    ctx.response_headers
-                        .insert("content-type".to_string(), "image/webp".to_string());
-                    ctx.response_headers_size = ctx
-                        .response_headers
-                        .iter()
-                        .map(|(name, value)| name.len() + value.len() + 4)
-                        .sum();
-                    *body = Some(Bytes::from(converted));
-                    ctx.webp_pending_body.clear();
-                }
-                Err(err) => {
-                    debug!(
-                        "WebP conversion skipped due to decode/encode failure: {}",
-                        err
-                    );
-                    ctx.webp_convert_enabled = false;
-                    *body = Some(Bytes::from(ctx.webp_pending_body.take()));
-                }
-            }
         }
 
         if ctx.hls_playlist_enabled {
@@ -5594,6 +5623,7 @@ impl ProxyHttp for EdgeProxy {
                 .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s: &str| s.parse::<usize>().ok())
+                .or(ctx.webp_source_content_length)
                 .unwrap_or(0);
             let host = session.req_header().uri.host().unwrap_or("");
 

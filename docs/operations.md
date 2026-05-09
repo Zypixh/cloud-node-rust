@@ -116,7 +116,7 @@ tail -n 200 ../data/cloud-node-stderr.log
 - 调整 listen backlog 和 SYN backlog。
 - 将缓存目录放到高 IOPS 磁盘。
 - 避免对大 body 开启详细访问日志。
-- 谨慎开启 WebP、JS/CSS/HTML 优化等 CPU 密集型能力。
+- 谨慎开启 JS/CSS/HTML 优化等 CPU 密集型能力；WebP 会写入独立缓存变体，仍建议配合缓存策略和图片大小限制使用。
 - 对大流量站点启用合适的缓存策略，减少回源。
 
 ## 缓存运维
@@ -128,6 +128,7 @@ tail -n 200 ../data/cloud-node-stderr.log
 - 避免多个节点共享同一个本地缓存目录。
 - 控制缓存对象数量，避免极端小文件造成元数据压力。
 - 定期检查 RocksDB 指标和缓存清理日志。
+- 开启 WebP 时确认站点 WebP 规则、缓存策略和响应状态码同时满足要求；否则节点会按普通响应处理，不会为了不可缓存响应重复转换。
 
 ## 常见问题
 
