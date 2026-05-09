@@ -1245,6 +1245,15 @@ impl EdgeProxy {
         Ok(encoder.encode(quality.clamp(1, 100) as f32).to_vec())
     }
 
+    #[doc(hidden)]
+    pub fn bench_convert_to_webp(
+        content_type: &str,
+        body: &[u8],
+        quality: i32,
+    ) -> anyhow::Result<Vec<u8>> {
+        Self::convert_to_webp(content_type, body, quality)
+    }
+
     fn resolve_http3_advertisement_port(
         &self,
         session: &Session,
@@ -2703,6 +2712,11 @@ impl EdgeProxy {
         out
     }
 
+    #[doc(hidden)]
+    pub fn bench_aes128_cbc_encrypt(body: &[u8], key: [u8; 16], iv: [u8; 16]) -> Vec<u8> {
+        Self::aes128_cbc_encrypt(body, key, iv)
+    }
+
     fn minify_html(
         body: &[u8],
         config: &crate::config_models::HTTPHTMLOptimizationConfig,
@@ -2735,6 +2749,14 @@ impl EdgeProxy {
         Ok(text.into_bytes())
     }
 
+    #[doc(hidden)]
+    pub fn bench_minify_html(
+        body: &[u8],
+        config: &crate::config_models::HTTPHTMLOptimizationConfig,
+    ) -> anyhow::Result<Vec<u8>> {
+        Self::minify_html(body, config)
+    }
+
     fn minify_css(body: &[u8]) -> anyhow::Result<Vec<u8>> {
         static RE_COMMENTS: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
@@ -2749,6 +2771,11 @@ impl EdgeProxy {
         Ok(text.trim().as_bytes().to_vec())
     }
 
+    #[doc(hidden)]
+    pub fn bench_minify_css(body: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Self::minify_css(body)
+    }
+
     fn minify_js(body: &[u8]) -> anyhow::Result<Vec<u8>> {
         static RE_BLOCK_COMMENTS: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"/\*[\s\S]*?\*/").unwrap());
@@ -2761,6 +2788,11 @@ impl EdgeProxy {
         text = RE_LINE_COMMENTS.replace_all(&text, "").to_string();
         text = RE_SPACES.replace_all(&text, " ").to_string();
         Ok(text.trim().as_bytes().to_vec())
+    }
+
+    #[doc(hidden)]
+    pub fn bench_minify_js(body: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Self::minify_js(body)
     }
 
     fn maybe_enable_optimization(

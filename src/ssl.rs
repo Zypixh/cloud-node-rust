@@ -129,6 +129,11 @@ impl DynamicCertSelector {
 
         snapshot.default.clone()
     }
+
+    #[doc(hidden)]
+    pub fn bench_find_pair(&self, host: &str) -> bool {
+        self.find_pair_blocking(host).is_some()
+    }
 }
 
 pub async fn sync_certs(

@@ -142,6 +142,10 @@ harness = false
 name = "config_models_bench"
 harness = false
 
+[[bench]]
+name = "targeted_hotspots_bench"
+harness = false
+
 [build-dependencies]
 tonic-build = "0.12.3"
 

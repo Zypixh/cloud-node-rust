@@ -578,6 +578,29 @@ impl HybridStorage {
         budget
     }
 
+    #[doc(hidden)]
+    pub fn bench_compute_memory_budget() -> u64 {
+        Self::compute_memory_budget()
+    }
+
+    #[doc(hidden)]
+    pub fn bench_fast_l1_insert(
+        key_str: &str,
+        data: bytes::Bytes,
+        meta: &CacheMeta,
+        ttl_secs: i64,
+    ) -> bool {
+        let now = crate::utils::time::now_timestamp();
+        let hash = fast_hash_key(key_str);
+        Self::promote_to_fast_l1(hash, data, meta, now.saturating_add(ttl_secs), now)
+    }
+
+    #[doc(hidden)]
+    pub fn bench_fast_l1_remove(key_str: &str) {
+        let hash = fast_hash_key(key_str);
+        fast_l1_remove(&hash);
+    }
+
     /// Promote to FAST_L1 with capacity check and header extraction from CacheMeta.
     /// When budget is exceeded, evicts the entry closest to expiry to make room.
     /// Returns true if inserted, false if skipped (data too large).
