@@ -40,28 +40,6 @@ struct ChangeAPINodeMessage {
 struct WriteCacheMessage {
     #[serde(rename = "key")]
     key: String,
-    #[serde(rename = "value")]
-    value: serde_json::Value, // Temporarily hold as Value to handle string or array
-    #[serde(rename = "lifeSeconds")]
-    _life_seconds: i64,
-}
-
-impl WriteCacheMessage {
-    fn get_value_bytes(&self) -> Vec<u8> {
-        match &self.value {
-            serde_json::Value::String(s) => {
-                use base64::{Engine as _, engine::general_purpose};
-                general_purpose::STANDARD
-                    .decode(s)
-                    .unwrap_or_else(|_| s.as_bytes().to_vec())
-            }
-            serde_json::Value::Array(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_u64().map(|n| n as u8))
-                .collect(),
-            _ => vec![],
-        }
-    }
 }
 
 #[derive(Debug, serde::Deserialize)]
