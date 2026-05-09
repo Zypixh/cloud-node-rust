@@ -4,6 +4,7 @@ pub mod pb {
 
 pub mod api_config;
 pub mod auth;
+pub mod bench;
 pub mod cache;
 pub mod cache_hybrid;
 pub mod cache_manager;

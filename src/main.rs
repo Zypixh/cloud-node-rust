@@ -68,6 +68,33 @@ enum Commands {
     Install,
     /// Test the configuration
     Test,
+    /// Run a full-stack stress test and compute peak QPS
+    Bench {
+        /// Benchmark duration per phase in seconds
+        #[arg(long, default_value = "30")]
+        duration: u64,
+        /// Number of concurrent connections (default: CPU cores * 64)
+        #[arg(long)]
+        concurrency: Option<usize>,
+        /// Override upstream origin address (default: built-in mock)
+        #[arg(long)]
+        upstream: Option<String>,
+        /// HTTP proxy port for bench
+        #[arg(long, default_value = "18080")]
+        http_port: u16,
+        /// HTTPS proxy port for bench
+        #[arg(long, default_value = "18443")]
+        https_port: u16,
+        /// Mock response body size: small(1KB), medium(64KB), large(1MB)
+        #[arg(long, default_value = "medium")]
+        body_size: String,
+        /// Skip component-level tests (Phase 1)
+        #[arg(long)]
+        skip_component: bool,
+        /// Skip end-to-end tests (Phase 2)
+        #[arg(long)]
+        skip_e2e: bool,
+    },
     /// Internal use only
     #[command(hide = true)]
     _StartInternal,
@@ -282,6 +309,27 @@ fn main() -> anyhow::Result<()> {
             println!("Testing configuration...");
             let _ = ApiConfig::load_default()?;
             println!("Configuration is valid.");
+        }
+        Some(Commands::Bench {
+            duration,
+            concurrency,
+            upstream,
+            http_port,
+            https_port,
+            body_size,
+            skip_component,
+            skip_e2e,
+        }) => {
+            cloud_node_rust::bench::run_bench(cloud_node_rust::bench::BenchParams {
+                duration,
+                concurrency,
+                upstream,
+                http_port,
+                https_port,
+                body_size,
+                skip_component,
+                skip_e2e,
+            })?;
         }
     }
     Ok(())
