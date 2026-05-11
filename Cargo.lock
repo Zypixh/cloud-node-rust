@@ -669,6 +669,7 @@ dependencies = [
  "reqwest",
  "rocksdb",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",

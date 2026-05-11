@@ -77,6 +77,7 @@ pub(crate) fn fallback_runtime_lb() -> (Arc<crate::lb_factory::AnyLoadBalancer>,
     let mut b = pingora_load_balancing::Backend::new("127.0.0.1:80").unwrap();
     let mut ext = http::Extensions::new();
     ext.insert(crate::lb_factory::BackendExtension {
+        origin_role: crate::lb_factory::OriginRole::Fallback,
         use_tls: false,
         host: String::new(),
         rp_host: String::new(),
@@ -85,6 +86,7 @@ pub(crate) fn fallback_runtime_lb() -> (Arc<crate::lb_factory::AnyLoadBalancer>,
         follow_port: false,
         follow_host: false,
         http2_enabled: false,
+        http3_enabled: false,
         tls_verify: true,
         request_host_excluding_port: false,
         connection_timeout: None,

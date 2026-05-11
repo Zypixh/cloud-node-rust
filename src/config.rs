@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use pingora_load_balancing::{LoadBalancer, selection::Consistent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -28,6 +28,7 @@ pub struct NodeConfig {
     pub id_to_lb: HashMap<i64, Arc<crate::lb_factory::AnyLoadBalancer>>,
     /// Banned URLs (e.g. for legal compliance)
     pub deleted_contents: Vec<String>,
+    pub deleted_content_urls: HashSet<String>,
     /// Cluster-wide custom pages
     pub global_pages: Vec<HTTPPageConfig>,
     /// IDs of servers currently being updated by the control plane
@@ -114,6 +115,7 @@ impl Default for NodeConfig {
             routes: HashMap::new(),
             id_to_lb: HashMap::new(),
             deleted_contents: Vec::new(),
+            deleted_content_urls: HashSet::new(),
             global_pages: Vec::new(),
             updating_server_ids: std::collections::HashSet::new(),
             metric_items: Vec::new(),
@@ -601,6 +603,10 @@ impl ConfigStore {
             .any(|banned| url == banned || url.starts_with(banned))
     }
 
+    pub fn is_deleted_content_exact_sync(&self, url: &str) -> bool {
+        self.inner.read().deleted_content_urls.contains(url)
+    }
+
     pub async fn is_updating_server(&self, server_id: i64) -> bool {
         let lock = self.inner.read();
         lock.updating_server_ids.contains(&server_id)
@@ -756,6 +762,7 @@ impl ConfigStore {
         lock.servers = servers;
         lock.routes = routes;
         lock.id_to_lb = id_to_lb;
+        lock.deleted_content_urls = deleted_contents.iter().cloned().collect();
         lock.deleted_contents = deleted_contents;
         lock.global_pages = global_pages;
         lock.metric_items = metric_items;
@@ -968,6 +975,7 @@ impl ConfigStore {
 
     pub async fn set_deleted_contents(&self, deleted_contents: Vec<String>) {
         let mut lock = self.inner.write();
+        lock.deleted_content_urls = deleted_contents.iter().cloned().collect();
         lock.deleted_contents = deleted_contents;
     }
 

@@ -350,7 +350,11 @@ mod tests {
         };
         assert!(verify_url_auth(&c_path, "", &c_config));
 
-        let d_hash = md5_hex(&[secret.as_bytes(), real_path.as_bytes(), timestamp.as_bytes()]);
+        let d_hash = md5_hex(&[
+            secret.as_bytes(),
+            real_path.as_bytes(),
+            timestamp.as_bytes(),
+        ]);
         let d_query = format!("sign={d_hash}&t={timestamp}");
         let d_config = UrlAuthConfig {
             auth_type: "D".to_string(),
@@ -360,7 +364,11 @@ mod tests {
         };
         assert!(verify_url_auth(real_path, &d_query, &d_config));
 
-        let f_hash = md5_hex(&[real_path.as_bytes(), secret.as_bytes(), timestamp.as_bytes()]);
+        let f_hash = md5_hex(&[
+            real_path.as_bytes(),
+            secret.as_bytes(),
+            timestamp.as_bytes(),
+        ]);
         let f_query = format!("auth_key={f_hash}&timestamp={timestamp}");
         let f_config = UrlAuthConfig {
             auth_type: "F".to_string(),

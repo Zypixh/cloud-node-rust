@@ -1261,6 +1261,17 @@ where
     proxy
 }
 
+pub fn http_proxy_custom<SV, C>(conf: &Arc<ServerConf>, inner: SV, connector: C) -> HttpProxy<SV, C>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+{
+    let mut proxy = HttpProxy::new_custom(inner, conf.clone(), connector, None, None);
+    proxy.handle_init_modules();
+    proxy
+}
+
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///
 /// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.

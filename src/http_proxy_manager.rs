@@ -30,6 +30,11 @@ struct ListenerHandle {
     shutdown_tx: watch::Sender<bool>,
 }
 
+struct PassthroughBackendTarget {
+    addr: String,
+    origin_id: i64,
+}
+
 pub struct HttpProxyManager {
     config_store: ConfigStore,
     cert_selector: Arc<DynamicCertSelector>,
@@ -470,7 +475,9 @@ impl HttpProxyManager {
             false,
         );
 
-        let backend_addr = self.select_passthrough_backend_target(&server).await?;
+        let backend_target = self.select_passthrough_backend_target(&server).await?;
+        let backend_addr = backend_target.addr;
+        let origin_id = backend_target.origin_id;
         let toa_config = self.config_store.get_toa_config_sync();
         let backend_stream = match crate::toa::connect_with_toa(
             &backend_addr,
@@ -511,6 +518,7 @@ impl HttpProxyManager {
                     None,
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                 return Err(err).with_context(|| {
                     format!("failed to connect passthrough upstream {}", backend_addr)
                 });
@@ -525,6 +533,7 @@ impl HttpProxyManager {
 
         configure_passthrough_socket(&client_stream);
         configure_passthrough_socket(&backend_stream);
+        crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
 
         let result = crate::tcp_proxy::stream_bidirectional_with_metrics(
             server_id,
@@ -584,6 +593,7 @@ impl HttpProxyManager {
                     Some(&err.to_string()),
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                 Err(err.into())
             }
         }
@@ -592,13 +602,18 @@ impl HttpProxyManager {
     async fn select_passthrough_backend_target(
         &self,
         server: &ServerConfig,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<PassthroughBackendTarget> {
         let server_id = server.numeric_id();
 
         if let Some(lb) = self.config_store.get_lb_by_id(server_id).await
-            && let Some(peer) = lb.select(b"", 128)
+            && let Some(peer) = lb.select_with_backup(b"", 16, |origin_id| {
+                crate::origin_state::ORIGIN_STATE_MANAGER.is_down(origin_id)
+            })
         {
-            return Ok(normalize_passthrough_target(&peer.addr.to_string()));
+            return Ok(PassthroughBackendTarget {
+                addr: normalize_passthrough_target(&peer.addr.to_string()),
+                origin_id: crate::lb_factory::peer_origin_id(&peer),
+            });
         }
 
         let rp_cfg = server.reverse_proxy.as_ref().with_context(|| {
@@ -619,13 +634,20 @@ impl HttpProxyManager {
             global_cfg.allow_lan_ip,
         )
         .await?;
-        let peer = lb.select(b"", 128).with_context(|| {
-            format!(
-                "no healthy upstream for SNI passthrough server {}",
-                server_id
-            )
-        })?;
-        Ok(normalize_passthrough_target(&peer.addr.to_string()))
+        let peer = lb
+            .select_with_backup(b"", 16, |origin_id| {
+                crate::origin_state::ORIGIN_STATE_MANAGER.is_down(origin_id)
+            })
+            .with_context(|| {
+                format!(
+                    "no healthy upstream for SNI passthrough server {}",
+                    server_id
+                )
+            })?;
+        Ok(PassthroughBackendTarget {
+            addr: normalize_passthrough_target(&peer.addr.to_string()),
+            origin_id: crate::lb_factory::peer_origin_id(&peer),
+        })
     }
 }
 

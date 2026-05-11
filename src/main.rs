@@ -544,18 +544,19 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     my_server.bootstrap();
 
     // 5. Setup Dynamic HTTP/HTTPS Proxy Manager
+    let proxy_logic = EdgeProxy {
+        config: config_store.clone(),
+        waf_state: waf_state.clone(),
+        api_config: api_config_arc.clone(),
+        cert_selector: cert_selector.clone(),
+        waf_verifier: Arc::new(cloud_node_rust::firewall::verifier::WafVerifier::new(
+            &api_config_arc.secret,
+        )),
+    };
     let http_manager = cloud_node_rust::http_proxy_manager::HttpProxyManager::new(
         (*config_store).clone(),
         cert_selector.clone(),
-        EdgeProxy {
-            config: config_store.clone(),
-            waf_state: waf_state.clone(),
-            api_config: api_config_arc.clone(),
-            cert_selector: cert_selector.clone(),
-            waf_verifier: Arc::new(cloud_node_rust::firewall::verifier::WafVerifier::new(
-                &api_config_arc.secret,
-            )),
-        },
+        proxy_logic.clone(),
         my_server.configuration.clone(),
     );
     cloud_node_rust::proxy::start_request_limit_cleanup_task();
@@ -572,6 +573,8 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     let http3_manager = cloud_node_rust::http3_proxy_manager::Http3ProxyManager::new(
         (*config_store).clone(),
         cert_selector.clone(),
+        proxy_logic,
+        my_server.configuration.clone(),
     );
     spawn_staggered(&rt, Duration::from_secs(2), async move {
         http3_manager.start_listeners().await;

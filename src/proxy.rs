@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use image::AnimationDecoder;
+use pingora_core::protocols::tls::CustomALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
@@ -143,6 +144,7 @@ pub struct ProxyCTX {
     pub raw_remote_addr: String,
     pub analyzed: Option<crate::metrics::analyzer::RequestStats>,
     pub is_http3_bridge: bool,
+    pub is_http3_downstream: bool,
     pub is_loopback: bool,
     pub server_metrics: Option<Arc<crate::metrics::ServerMetrics>>,
     pub ip_recorded: bool,
@@ -227,6 +229,7 @@ impl Default for ProxyCTX {
             raw_remote_addr: String::new(),
             analyzed: None,
             is_http3_bridge: false,
+            is_http3_downstream: false,
             is_loopback: false,
             server_metrics: None,
             ip_recorded: false,
@@ -955,6 +958,29 @@ impl EdgeProxy {
         }
     }
 
+    fn request_full_url(session: &Session, ctx: &ProxyCTX) -> String {
+        let scheme = Self::forwarded_proto(session, ctx);
+        let authority = session
+            .get_header("host")
+            .and_then(|v| v.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                session
+                    .req_header()
+                    .uri
+                    .authority()
+                    .map(|value| value.as_str())
+            })
+            .unwrap_or(&ctx.host);
+        let path_and_query = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        format!("{scheme}://{authority}{path_and_query}")
+    }
+
     fn append_forwarded_for(existing: Option<&str>, ip: &str, max_addresses: i32) -> String {
         let mut parts: Vec<String> = existing
             .unwrap_or_default()
@@ -1289,6 +1315,11 @@ impl EdgeProxy {
         Self::convert_to_webp(content_type, body, quality)
     }
 
+    pub(crate) fn is_mobile_user_agent(ua: &str) -> bool {
+        let ua = ua.to_ascii_lowercase();
+        ua.contains("mobile") || ua.contains("android") || ua.contains("iphone") || ua.contains("ipad")
+    }
+
     fn resolve_http3_advertisement_port(
         &self,
         session: &Session,
@@ -1312,13 +1343,8 @@ impl EdgeProxy {
         let ua = session
             .get_header("user-agent")
             .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let is_mobile = ua.contains("mobile")
-            || ua.contains("android")
-            || ua.contains("iphone")
-            || ua.contains("ipad");
-        if is_mobile && !policy.support_mobile_browsers {
+            .unwrap_or("");
+        if Self::is_mobile_user_agent(ua) && !policy.support_mobile_browsers {
             return None;
         }
 
@@ -1502,12 +1528,98 @@ impl EdgeProxy {
             );
         }
 
+        if status == 451 {
+            return self
+                .respond_default_deleted_content_page(session, ctx)
+                .await;
+        }
+
         ctx.response_status = status;
         ctx.response_body_len = 0;
         ctx.response_headers.clear();
         ctx.response_headers_size = 0;
         session.respond_error(status).await?;
         Ok(true)
+    }
+
+    async fn respond_default_deleted_content_page(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+    ) -> Result<bool> {
+        let url = Self::request_full_url(session, ctx);
+        let escaped_url = Self::html_escape(&url);
+        let template = format!(
+            r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>451 Unavailable For Legal Reasons</title>
+<style>
+:root {{ color-scheme: light dark; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 32px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at top left, #dbeafe, transparent 34%), linear-gradient(135deg, #f8fafc 0%, #eef2ff 100%); color: #0f172a; }}
+main {{ width: min(720px, 100%); border: 1px solid rgba(148, 163, 184, .28); border-radius: 28px; padding: 42px; background: rgba(255, 255, 255, .84); box-shadow: 0 24px 80px rgba(15, 23, 42, .14); backdrop-filter: blur(20px); }}
+.badge {{ display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; background: #fff7ed; color: #9a3412; font-weight: 700; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; }}
+h1 {{ margin: 24px 0 12px; font-size: clamp(32px, 6vw, 56px); line-height: .95; letter-spacing: -.05em; }}
+p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
+.url {{ margin-top: 28px; padding: 16px 18px; border-radius: 16px; background: #f8fafc; border: 1px solid #e2e8f0; color: #334155; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; }}
+.meta {{ margin-top: 26px; display: flex; flex-wrap: wrap; gap: 10px; color: #64748b; font-size: 13px; }}
+.meta span {{ padding: 8px 10px; border-radius: 999px; background: rgba(15, 23, 42, .05); }}
+@media (prefers-color-scheme: dark) {{ body {{ background: radial-gradient(circle at top left, #1e3a8a, transparent 34%), linear-gradient(135deg, #020617 0%, #111827 100%); color: #e5e7eb; }} main {{ background: rgba(15, 23, 42, .84); border-color: rgba(148, 163, 184, .22); }} p {{ color: #cbd5e1; }} .url {{ background: rgba(15, 23, 42, .7); border-color: rgba(148, 163, 184, .24); color: #e2e8f0; }} .meta {{ color: #94a3b8; }} .meta span {{ background: rgba(255, 255, 255, .08); }} }}
+</style>
+</head>
+<body>
+<main>
+<div class="badge">HTTP ${{status}} · ${{statusMessage}}</div>
+<h1>Content unavailable</h1>
+<p>This resource is not available on this node for legal or compliance reasons.</p>
+<div class="url">{escaped_url}</div>
+<div class="meta"><span>Request ID: ${{requestId}}</span><span>Time: ${{timeISO8601}}</span></div>
+</main>
+</body>
+</html>"#
+        );
+        let body = self.render_page_template(session, ctx, &template, 451);
+        ctx.response_status = 451;
+        ctx.response_body_len = body.len();
+        ctx.response_headers.clear();
+        ctx.response_headers.insert(
+            "content-type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        );
+        ctx.response_headers
+            .insert("cache-control".to_string(), "no-store".to_string());
+        let mut resp = pingora_http::ResponseHeader::build(451, None).unwrap();
+        resp.insert_header("content-type", "text/html; charset=utf-8")
+            .unwrap();
+        resp.insert_header("cache-control", "no-store").unwrap();
+        ctx.response_headers_size = resp
+            .headers
+            .iter()
+            .map(|(n, v)| n.as_str().len() + v.len() + 4)
+            .sum();
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(Some(Bytes::from(body)), true)
+            .await?;
+        Ok(true)
+    }
+
+    fn html_escape(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for ch in value.chars() {
+            match ch {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                '"' => escaped.push_str("&quot;"),
+                '\'' => escaped.push_str("&#39;"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped
     }
 
     fn maybe_report_firewall_event(
@@ -1729,12 +1841,15 @@ impl EdgeProxy {
             .and_then(|v| v.to_str().ok())
             .map(|v| v.eq_ignore_ascii_case("websocket"))
             .unwrap_or(false);
-        let connection = session
+        Self::has_upgrade_connection(session) && upgrade
+    }
+
+    fn has_upgrade_connection(session: &Session) -> bool {
+        session
             .get_header("connection")
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_ascii_lowercase().contains("upgrade"))
-            .unwrap_or(false);
-        upgrade && connection
+            .unwrap_or(false)
     }
 
     fn cached_wildcard_domain_regex_matches(pattern: &str, domain: &str) -> bool {
@@ -3389,8 +3504,35 @@ impl EdgeProxy {
         }
     }
 
-    /// Heavy WAF checks deferred to cache-miss path. See request_filter for rationale.
-    async fn run_heavy_waf(
+    async fn run_lightweight_request_security(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+    ) -> Result<bool> {
+        let client_ip = ctx.client_ip_str.clone();
+        if self.enforce_uam(session, ctx, &client_ip).await? {
+            return Ok(true);
+        }
+
+        if let Some(server) = &ctx.server
+            && let Some(web) = &server.web
+        {
+            let site_cc_policy = web.cc_policy.clone();
+            let site_server_id = server.id.unwrap_or(0);
+            if let Some(cc) = site_cc_policy.as_ref()
+                && self
+                    .apply_cc_policy(session, ctx, cc, site_server_id)
+                    .await?
+            {
+                return Ok(true);
+            }
+        }
+
+        self.apply_global_cc_policy(session, ctx).await
+    }
+
+    /// Request-body WAF checks deferred to cache-miss path. See request_filter for rationale.
+    async fn run_miss_only_body_waf(
         &self,
         session: &mut Session,
         ctx: &mut ProxyCTX,
@@ -3403,11 +3545,6 @@ impl EdgeProxy {
         // HTTP request has been received — counting requests here incorrectly
         // blocks legitimate traffic (e.g. 10+ requests/min triggers ECF).
         // These defenses belong at the TCP connection accept layer.
-
-        let client_ip = ctx.client_ip_str.clone();
-        if self.enforce_uam(session, ctx, &client_ip).await? {
-            return Ok((true, None));
-        }
 
         let mut waf_match: Option<crate::firewall::MatchedAction> = None;
 
@@ -3580,25 +3717,6 @@ impl EdgeProxy {
             }
         }
 
-        // CC Basic Defense & Rate Limit
-        if let Some(server) = &ctx.server
-            && let Some(web) = &server.web
-        {
-            let site_cc_policy = web.cc_policy.clone();
-            let site_server_id = server.id.unwrap_or(0);
-            if let Some(cc) = site_cc_policy.as_ref()
-                && self
-                    .apply_cc_policy(session, ctx, cc, site_server_id)
-                    .await?
-            {
-                return Ok((true, waf_action));
-            }
-        }
-
-        if self.apply_global_cc_policy(session, ctx).await? {
-            return Ok((true, waf_action));
-        }
-
         Ok((false, waf_action))
     }
 }
@@ -3619,6 +3737,7 @@ impl ProxyHttp for EdgeProxy {
             .unwrap_or_else(|| session.req_header().uri.host().unwrap_or(""))
             .to_lowercase();
         ctx.host = host.clone();
+        ctx.is_http3_downstream = session.req_header().version == http::Version::HTTP_3;
 
         // Single lock acquisition for hot_path + server + upstream
         let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
@@ -3917,6 +4036,16 @@ impl ProxyHttp for EdgeProxy {
             ctx.ip_recorded,
         );
 
+        let full_url = Self::request_full_url(session, ctx);
+        if self.config.is_deleted_content_exact_sync(&full_url) {
+            warn!(
+                "Deleted content matched exact URL, returning 451: server_id={} url={}",
+                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+                full_url
+            );
+            return self.respond_status_with_pages(session, ctx, 451).await;
+        }
+
         if self.enforce_request_limit(session, ctx).await? {
             return Ok(true);
         }
@@ -3943,6 +4072,10 @@ impl ProxyHttp for EdgeProxy {
             return self.respond_status_with_pages(session, ctx, 403).await;
         }
 
+        if self.run_lightweight_request_security(session, ctx).await? {
+            return Ok(true);
+        }
+
         // Check if cache is configured for this server — if so, defer heavy WAF
         // to upstream_peer (runs only on cache MISS, saving ~50 lines of CPU work
         // on every cache HIT).
@@ -3959,7 +4092,7 @@ impl ProxyHttp for EdgeProxy {
             ctx.waf_deferred = true;
         } else {
             let (blocked, _action) = self
-                .run_heavy_waf(session, ctx, &hot_path.firewall_policies)
+                .run_miss_only_body_waf(session, ctx, &hot_path.firewall_policies)
                 .await?;
             if blocked {
                 return Ok(true);
@@ -4164,7 +4297,7 @@ impl ProxyHttp for EdgeProxy {
                 // Run deferred heavy WAF checks (skipped in request_filter when cache was configured).
                 // This ensures WAF only runs on cache MISS, not on every cache HIT.
                 let (blocked, _action) = self
-                    .run_heavy_waf(session, ctx, firewall_policies.as_ref().as_slice())
+                    .run_miss_only_body_waf(session, ctx, firewall_policies.as_ref().as_slice())
                     .await?;
                 if blocked {
                     return Err(Error::new(HTTPStatus(403)));
@@ -4246,32 +4379,25 @@ impl ProxyHttp for EdgeProxy {
         // --- FALLBACK TO ORIGIN LB ---
         if target_peer.is_none() {
             if let Some(lb) = &ctx.lb {
-                let mut down_fallback = None;
-                for _ in 0..16 {
-                    let Some(peer) = lb.select(b"", 128) else {
-                        break;
-                    };
-                    let origin_id = peer
-                        .ext
-                        .get::<crate::lb_factory::BackendExtension>()
-                        .map(|ext| ext.origin_id)
-                        .unwrap_or(0);
-                    if crate::origin_state::ORIGIN_STATE_MANAGER.is_down(origin_id) {
-                        down_fallback.get_or_insert_with(|| peer.clone());
-                        continue;
-                    }
-                    target_peer = Some(peer.clone());
-                    break;
-                }
-                if target_peer.is_none() {
-                    target_peer = down_fallback;
-                }
+                target_peer = lb.select_with_backup(b"", 16, |origin_id| {
+                    crate::origin_state::ORIGIN_STATE_MANAGER.is_down(origin_id)
+                });
             }
         }
 
         if let Some(peer) = target_peer {
             let mut peer_addr = peer.to_string();
             let backend_ext = peer.ext.get::<crate::lb_factory::BackendExtension>();
+            if let Some(ext) = backend_ext
+                && ext.origin_role == crate::lb_factory::OriginRole::Backup
+            {
+                warn!(
+                    "Selected backup origin: server_id={} origin_id={} addr={}",
+                    ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+                    ext.origin_id,
+                    peer_addr
+                );
+            }
             let is_tls = backend_ext
                 .map(|e| e.use_tls)
                 .unwrap_or(peer_addr.contains("443"));
@@ -4336,18 +4462,12 @@ impl ProxyHttp for EdgeProxy {
 
             ctx.origin_id = backend_ext.map(|ext| ext.origin_id).unwrap_or(0);
             ctx.origin_host = host_override.unwrap_or_default();
-            debug!(
-                "Selected upstream: connect_addr={} TLS={} SNI={} HostOverride={} h2_enabled={}",
-                peer_addr,
-                is_tls,
-                sni_host,
-                if ctx.origin_host.is_empty() {
-                    "<original>"
-                } else {
-                    &ctx.origin_host
-                },
-                backend_ext.map(|e| e.http2_enabled).unwrap_or(false)
-            );
+            let is_upgrade_request = Self::has_upgrade_connection(session) || session.get_header("upgrade").is_some();
+            let origin_h3_configured = is_tls
+                && ctx.is_http3_downstream
+                && !is_upgrade_request
+                && !(ctx.is_grpc && Self::is_grpc_request(session))
+                && backend_ext.map(|e| e.http3_enabled).unwrap_or(false);
             ctx.origin_address = peer_addr.clone();
             info!("ACCESS_LOG: origin_address set to '{}'", ctx.origin_address);
 
@@ -4376,7 +4496,10 @@ impl ProxyHttp for EdgeProxy {
             peer_obj.options.write_timeout = None;
             peer_obj.options.connection_timeout = Some(connection_timeout);
 
-            if ctx.is_grpc && Self::is_grpc_request(session) {
+            let origin_h3_selected = origin_h3_configured && crate::origin_h3::should_try_origin_h3_for_peer(&peer_obj);
+            if origin_h3_selected {
+                peer_obj.options.alpn = pingora_core::protocols::ALPN::Custom(CustomALPN::new(b"h3".to_vec()));
+            } else if ctx.is_grpc && Self::is_grpc_request(session) {
                 // Force ALPN to h2 ONLY for actual gRPC requests
                 peer_obj.options.alpn = pingora_core::protocols::ALPN::H2;
             } else if is_tls && backend_ext.map(|e| e.http2_enabled).unwrap_or(false) {
@@ -4389,6 +4512,21 @@ impl ProxyHttp for EdgeProxy {
                     peer_obj.options.verify_cert = false;
                 }
             }
+
+            debug!(
+                "Selected upstream: connect_addr={} TLS={} SNI={} HostOverride={} h2_enabled={} h3_configured={} h3_selected={}",
+                ctx.origin_address,
+                is_tls,
+                peer_obj.sni,
+                if ctx.origin_host.is_empty() {
+                    "<original>"
+                } else {
+                    &ctx.origin_host
+                },
+                backend_ext.map(|e| e.http2_enabled).unwrap_or(false),
+                origin_h3_configured,
+                origin_h3_selected
+            );
 
             return Ok(Box::new(peer_obj));
         }

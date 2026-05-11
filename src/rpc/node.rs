@@ -948,6 +948,7 @@ pub async fn fetch_and_apply_config<F>(
                                 new_parent_routes.insert(*cluster_id, lb);
                             }
 
+                            let deleted_contents = config_store.get_deleted_contents().await;
                             config_store
                                 .update_config(
                                     numeric_id,
@@ -958,7 +959,7 @@ pub async fn fetch_and_apply_config<F>(
                                     new_servers,
                                     new_routes,
                                     new_id_to_lb,
-                                    vec![],
+                                    deleted_contents,
                                     payload.global_pages.clone(),
                                     payload.metric_items.clone(),
                                     node_level,

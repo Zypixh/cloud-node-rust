@@ -13,6 +13,7 @@ use crate::config_models::ServerConfig;
 pub struct UdpSession {
     pub client_addr: SocketAddr,
     pub backend_addr: SocketAddr,
+    pub origin_id: i64,
     pub server_id: i64,
     pub user_id: i64,
     pub user_plan_id: i64,
@@ -210,13 +211,16 @@ impl UdpProxyManager {
 
                 // Hash based on client IP for sticky session if needed,
                 // but for UDP (ClientAddr, Port) is already the session key.
-                let peer = match lb.select(b"", 128) {
+                let peer = match lb.select_with_backup(b"", 16, |origin_id| {
+                    crate::origin_state::ORIGIN_STATE_MANAGER.is_down(origin_id)
+                }) {
                     Some(p) => p,
                     None => {
                         error!("No healthy backends for UDP server {}", sid);
                         continue;
                     }
                 };
+                let origin_id = crate::lb_factory::peer_origin_id(&peer);
                 let b_addr: SocketAddr = peer.addr.to_string().parse()?;
 
                 debug!(
@@ -227,6 +231,7 @@ impl UdpProxyManager {
                 let session = Arc::new(UdpSession {
                     client_addr,
                     backend_addr: b_addr,
+                    origin_id,
                     server_id: sid,
                     user_id,
                     user_plan_id,
@@ -250,6 +255,7 @@ impl UdpProxyManager {
                 let backend_addr = session.backend_addr;
                 let shutdown_rx_clone = session.shutdown.clone();
                 let server_id = session.server_id;
+                let origin_id = session.origin_id;
                 let client_addr = session.client_addr;
 
                 let listen_socket_inner = listen_socket.clone();
@@ -258,6 +264,7 @@ impl UdpProxyManager {
                         backend_addr,
                         shutdown_rx_clone,
                         server_id,
+                        origin_id,
                         client_addr,
                         listen_socket_inner,
                         rx,
@@ -291,12 +298,23 @@ impl UdpProxyManager {
         backend_addr: SocketAddr,
         mut shutdown_rx: watch::Receiver<bool>,
         server_id: i64,
+        origin_id: i64,
         client_addr: SocketAddr,
         listen_socket: Arc<UdpSocket>,
         mut rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
-        let backend_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        backend_socket.connect(backend_addr).await?;
+        let backend_socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(socket) => socket,
+            Err(err) => {
+                crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                return Err(err.into());
+            }
+        };
+        if let Err(err) = backend_socket.connect(backend_addr).await {
+            crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+            return Err(err.into());
+        }
+        crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
         let mut downstream_sent = 0u64;
         let mut downstream_received = 0u64;
 
@@ -309,7 +327,10 @@ impl UdpProxyManager {
                 // Client -> Backend
                 Some(data) = rx.recv() => {
                     let len = data.len() as u64;
-                    backend_socket.send(&data).await?;
+                    if let Err(err) = backend_socket.send(&data).await {
+                        crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                        return Err(err.into());
+                    }
                     downstream_received += len;
                     // Client -> Backend: Origin Sent = len, Origin Received = 0
                     crate::metrics::record::record_origin_traffic(server_id, len, 0, None);

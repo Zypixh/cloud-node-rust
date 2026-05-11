@@ -347,7 +347,9 @@ impl TcpProxyManager {
         })?;
 
         let peer = lb
-            .select(b"", 128)
+            .select_with_backup(b"", 16, |origin_id| {
+                crate::origin_state::ORIGIN_STATE_MANAGER.is_down(origin_id)
+            })
             .ok_or_else(|| {
                 error!(
                     "TCP Proxy: No healthy backends found for server id {}. names={:?} reverse_proxy={:?}",
@@ -358,6 +360,7 @@ impl TcpProxyManager {
                 anyhow::anyhow!("No backends")
             })?;
 
+        let origin_id = crate::lb_factory::peer_origin_id(&peer);
         let backend_ext = peer.ext.get::<crate::lb_factory::BackendExtension>();
         let use_tls_to_backend = backend_ext.map(|e| e.use_tls).unwrap_or(false);
 
@@ -438,6 +441,7 @@ impl TcpProxyManager {
                         None,
                     );
                     crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
+                    crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                     return Err(e.into());
                 }
             };
@@ -512,9 +516,11 @@ impl TcpProxyManager {
                     None,
                 );
                 crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
+                crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                 e
             })?;
 
+            crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
             let res = stream_bidirectional_with_metrics(sid, client_stream, backend_stream).await;
             if let Some(local_port) = toa_local_port {
                 if let Err(err) =
@@ -602,6 +608,7 @@ impl TcpProxyManager {
                         None,
                     );
                     crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
+                    crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                     return Err(e.into());
                 }
             };
@@ -645,6 +652,7 @@ impl TcpProxyManager {
                 }
             }
 
+            crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
             let res = stream_bidirectional_with_metrics(sid, client_stream, backend_stream).await;
             if let Some(local_port) = toa_local_port {
                 if let Err(err) =

@@ -1361,7 +1361,9 @@ impl Clone for URLPattern {
 
 impl URLPattern {
     pub fn compile(&self) {
-        let _ = self.compiled.get_or_init(|| Self::compile_regex(&self.type_name, &self.pattern));
+        let _ = self
+            .compiled
+            .get_or_init(|| Self::compile_regex(&self.type_name, &self.pattern));
     }
 
     fn compile_regex(type_name: &str, pattern: &str) -> Option<Arc<regex::Regex>> {
@@ -1398,8 +1400,8 @@ impl URLPattern {
         Self::has_any_suffix(
             url,
             &[
-                ".apng", ".avif", ".gif", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp",
-                ".png", ".svg", ".webp", ".bmp", ".ico", ".cur", ".tif", ".tiff",
+                ".apng", ".avif", ".gif", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp", ".png",
+                ".svg", ".webp", ".bmp", ".ico", ".cur", ".tif", ".tiff",
             ],
         )
     }
@@ -1417,8 +1419,7 @@ impl URLPattern {
         Self::has_any_suffix(
             url,
             &[
-                ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".mpeg", ".3gp", ".webm",
-                ".ts", ".m3u8",
+                ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".mpeg", ".3gp", ".webm", ".ts", ".m3u8",
             ],
         )
     }
@@ -2512,6 +2513,14 @@ pub struct OriginConfig {
     pub follow_port: bool,
     #[serde(rename = "http2Enabled", default)]
     pub http2_enabled: bool,
+    #[serde(
+        rename = "http3Enabled",
+        alias = "supportsHTTP3",
+        alias = "enableHTTP3",
+        alias = "enableHttp3",
+        default
+    )]
+    pub http3_enabled: bool,
     #[serde(rename = "connTimeout", default)]
     pub conn_timeout: Option<Value>,
     #[serde(rename = "readTimeout", default)]

@@ -1,4 +1,4 @@
-use crate::config_models::{ParentNodeConfig, ReverseProxyConfig};
+use crate::config_models::{OriginConfig, ParentNodeConfig, ReverseProxyConfig};
 use futures_util::FutureExt;
 use http;
 use http::Extensions;
@@ -18,6 +18,10 @@ use tracing::{debug, warn};
 pub enum AnyLoadBalancer {
     RoundRobin(Arc<LoadBalancer<RoundRobin>>),
     Random(Arc<LoadBalancer<Random>>),
+    OriginPool {
+        primary: Arc<AnyLoadBalancer>,
+        backup: Option<Arc<AnyLoadBalancer>>,
+    },
 }
 
 impl AnyLoadBalancer {
@@ -25,14 +29,101 @@ impl AnyLoadBalancer {
         match self {
             Self::RoundRobin(lb) => lb.select(key, max_iterations),
             Self::Random(lb) => lb.select(key, max_iterations),
+            Self::OriginPool { primary, .. } => primary.select(key, max_iterations),
         }
     }
 
-    pub async fn run_health_check(&self, parallel: bool) {
+    pub fn select_with_backup<F>(
+        &self,
+        key: &[u8],
+        max_iterations: usize,
+        is_down: F,
+    ) -> Option<Backend>
+    where
+        F: Fn(i64) -> bool + Copy,
+    {
         match self {
-            Self::RoundRobin(lb) => lb.backends().run_health_check(parallel).await,
-            Self::Random(lb) => lb.backends().run_health_check(parallel).await,
+            Self::OriginPool { primary, backup } => {
+                if let Some(peer) = primary.select_healthy(key, max_iterations, is_down) {
+                    return Some(peer);
+                }
+                backup
+                    .as_ref()
+                    .and_then(|lb| lb.select_healthy(key, max_iterations, is_down))
+                    .or_else(|| primary.select_down_fallback(key, max_iterations, is_down))
+                    .or_else(|| {
+                        backup
+                            .as_ref()
+                            .and_then(|lb| lb.select_down_fallback(key, max_iterations, is_down))
+                    })
+                    .or_else(|| primary.select(key, max_iterations))
+            }
+            _ => self.select_available(key, max_iterations, is_down),
         }
+    }
+
+    fn select_available<F>(&self, key: &[u8], max_iterations: usize, is_down: F) -> Option<Backend>
+    where
+        F: Fn(i64) -> bool + Copy,
+    {
+        self.select_healthy(key, max_iterations, is_down)
+            .or_else(|| self.select_down_fallback(key, max_iterations, is_down))
+    }
+
+    fn select_healthy<F>(&self, key: &[u8], max_iterations: usize, is_down: F) -> Option<Backend>
+    where
+        F: Fn(i64) -> bool + Copy,
+    {
+        for _ in 0..max_iterations.max(1) {
+            let Some(peer) = self.select(key, max_iterations) else {
+                break;
+            };
+            let origin_id = peer_origin_id(&peer);
+            if origin_id > 0 && is_down(origin_id) {
+                continue;
+            }
+            return Some(peer);
+        }
+        None
+    }
+
+    fn select_down_fallback<F>(
+        &self,
+        key: &[u8],
+        max_iterations: usize,
+        is_down: F,
+    ) -> Option<Backend>
+    where
+        F: Fn(i64) -> bool + Copy,
+    {
+        for _ in 0..max_iterations.max(1) {
+            let Some(peer) = self.select(key, max_iterations) else {
+                break;
+            };
+            let origin_id = peer_origin_id(&peer);
+            if origin_id > 0 && is_down(origin_id) {
+                return Some(peer);
+            }
+        }
+        None
+    }
+
+    pub fn run_health_check(
+        &self,
+        parallel: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match self {
+                Self::RoundRobin(lb) => lb.backends().run_health_check(parallel).await,
+                Self::Random(lb) => lb.backends().run_health_check(parallel).await,
+                Self::OriginPool { primary, backup } => {
+                    primary.run_health_check(parallel).await;
+                    if let Some(backup) = backup {
+                        backup.run_health_check(parallel).await;
+                    }
+                }
+            }
+        })
     }
 
     pub fn backend_health(&self) -> Vec<(Backend, bool)> {
@@ -49,6 +140,13 @@ impl AnyLoadBalancer {
                 .iter()
                 .map(|backend| (backend.clone(), lb.backends().ready(backend)))
                 .collect(),
+            Self::OriginPool { primary, backup } => {
+                let mut health = primary.backend_health();
+                if let Some(backup) = backup {
+                    health.extend(backup.backend_health());
+                }
+                health
+            }
         }
     }
 
@@ -56,13 +154,29 @@ impl AnyLoadBalancer {
         match self {
             Self::RoundRobin(lb) => Some(Arc::clone(lb)),
             Self::Random(_) => None,
+            Self::OriginPool { primary, .. } => primary.as_round_robin(),
         }
     }
+}
+
+pub fn peer_origin_id(peer: &Backend) -> i64 {
+    peer.ext
+        .get::<BackendExtension>()
+        .map(|ext| ext.origin_id)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OriginRole {
+    Primary,
+    Backup,
+    Fallback,
 }
 
 /// Custom metadata stored in Backend Extensions
 #[derive(Clone, Debug)]
 pub struct BackendExtension {
+    pub origin_role: OriginRole,
     pub use_tls: bool,
     pub host: String,    // Per-origin custom host (origin.requestHost)
     pub rp_host: String, // Reverse-proxy-level custom host (reverseProxy.requestHost)
@@ -71,6 +185,7 @@ pub struct BackendExtension {
     pub follow_port: bool,
     pub follow_host: bool,
     pub http2_enabled: bool,
+    pub http3_enabled: bool,
     pub tls_verify: bool, // true = strict/auto, false = none
     pub request_host_excluding_port: bool,
     pub connection_timeout: Option<Duration>,
@@ -79,9 +194,6 @@ pub struct BackendExtension {
     pub client_cert: Option<crate::config_models::SSLCertConfig>,
 }
 
-/// Builds a Pingora LoadBalancer from a legacy ReverseProxyConfig.
-/// Supports Tiered Origin: if level == 1 and parent_nodes are provided,
-/// the parent nodes (L2) will be used as the upstreams.
 pub fn build_lb(
     _server_id: i64,
     rp_cfg: &ReverseProxyConfig,
@@ -90,141 +202,118 @@ pub fn build_lb(
     _tiered_origin_bypass: bool,
     allow_lan: bool,
 ) -> (Arc<AnyLoadBalancer>, bool) {
-    let mut endpoints = Vec::new();
-    let mut has_health_check = false;
+    build_origin_pool(rp_cfg, allow_lan)
+}
 
-    // Build Origin Pool (Direct to primary/backup origins)
-    for origin in &rp_cfg.primary_origins {
+fn build_origin_pool(rp_cfg: &ReverseProxyConfig, allow_lan: bool) -> (Arc<AnyLoadBalancer>, bool) {
+    let (primary, primary_hc) = build_origin_lb(
+        rp_cfg,
+        &rp_cfg.primary_origins,
+        OriginRole::Primary,
+        allow_lan,
+    );
+    let (backup, backup_hc) = build_origin_lb(
+        rp_cfg,
+        &rp_cfg.backup_origins,
+        OriginRole::Backup,
+        allow_lan,
+    );
+
+    match (primary, backup) {
+        (Some(primary), backup) => (
+            Arc::new(AnyLoadBalancer::OriginPool { primary, backup }),
+            primary_hc || backup_hc,
+        ),
+        (None, Some(backup)) => (backup, backup_hc),
+        (None, None) => fallback_lb(),
+    }
+}
+
+fn build_origin_lb(
+    rp_cfg: &ReverseProxyConfig,
+    origins: &[OriginConfig],
+    role: OriginRole,
+    allow_lan: bool,
+) -> (Option<Arc<AnyLoadBalancer>>, bool) {
+    let mut endpoints = Vec::new();
+    let mut detected_hc = None;
+
+    for origin in origins {
         if !origin.is_on {
             continue;
         }
-        if let Some(addr) = &origin.addr {
-            let target = addr.to_address();
-            let rp_host = reverse_proxy_request_host(rp_cfg, addr);
+        let Some(addr) = &origin.addr else {
+            continue;
+        };
+        let target = addr.to_address();
+        if !allow_lan && is_local_addr(&target) {
+            warn!(
+                "LB Builder: Skipping {:?} origin {} as it is not allowed in cluster settings.",
+                role, target
+            );
+            continue;
+        }
+        let Some(mut backend) = backend_from_origin_target(&target, addr, "origin", allow_lan)
+        else {
+            continue;
+        };
 
-            if !allow_lan && is_local_addr(&target) {
-                warn!(
-                    "LB Builder: Skipping LAN origin {} as it is not allowed in cluster settings.",
-                    target
-                );
-                continue;
+        let rp_host = reverse_proxy_request_host(rp_cfg, addr);
+        let tls_verify = if let Some(v) = &origin.tls_verify {
+            match v {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::Object(obj) => {
+                    obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true)
+                }
+                serde_json::Value::Number(n) => n.as_i64().unwrap_or(1) > 0,
+                _ => true,
             }
+        } else {
+            true
+        };
+        let mut ext = Extensions::new();
+        ext.insert(BackendExtension {
+            origin_role: role,
+            use_tls: addr.is_https(),
+            host: origin.request_host.clone(),
+            rp_host,
+            origin_id: origin.id,
+            origin_host: addr.host(),
+            follow_port: origin.follow_port,
+            follow_host: origin.follow_host,
+            http2_enabled: origin.http2_enabled,
+            http3_enabled: origin.http3_enabled,
+            tls_verify,
+            request_host_excluding_port: rp_cfg.request_host_excluding_port,
+            connection_timeout: origin.conn_timeout.as_ref().map(crate::utils::to_duration),
+            read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
+            idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
+            client_cert: origin.cert.clone(),
+        });
+        backend.ext = ext;
+        backend.weight = origin.weight.max(1) as usize;
+        endpoints.push(backend);
 
-            if let Some(mut backend) =
-                backend_from_origin_target(&target, addr, "origin", allow_lan)
-            {
-                let mut ext = Extensions::new();
-
-                let tls_verify = if let Some(v) = &origin.tls_verify {
-                    match v {
-                        serde_json::Value::Bool(b) => *b,
-                        serde_json::Value::Object(obj) => {
-                            obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true)
-                        }
-                        serde_json::Value::Number(n) => n.as_i64().unwrap_or(1) > 0,
-                        _ => true,
-                    }
-                } else {
-                    true
-                };
-
-                ext.insert(BackendExtension {
-                    use_tls: addr.is_https(),
-                    host: origin.request_host.clone(),
-                    rp_host,
-                    origin_id: origin.id,
-                    origin_host: addr.host(),
-                    follow_port: origin.follow_port,
-                    follow_host: origin.follow_host,
-                    http2_enabled: origin.http2_enabled,
-                    tls_verify,
-                    request_host_excluding_port: rp_cfg.request_host_excluding_port,
-                    connection_timeout: origin.conn_timeout.as_ref().map(crate::utils::to_duration),
-                    read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
-                    idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
-                    client_cert: origin.cert.clone(),
-                });
-                backend.ext = ext;
-                backend.weight = origin.weight.max(1) as usize;
-                endpoints.push(backend);
-            }
+        if detected_hc.is_none()
+            && let Some(hc) = &origin.health_check
+            && hc.is_on
+        {
+            detected_hc = Some((origin, hc));
         }
     }
 
     if endpoints.is_empty() {
-        for origin in &rp_cfg.backup_origins {
-            if !origin.is_on {
-                continue;
-            }
-            if let Some(addr) = &origin.addr {
-                let target = addr.to_address();
-                let rp_host = reverse_proxy_request_host(rp_cfg, addr);
-
-                if !allow_lan && is_local_addr(&target) {
-                    warn!(
-                        "LB Builder: Skipping LAN backup origin {} as it is not allowed.",
-                        target
-                    );
-                    continue;
-                }
-
-                if let Some(mut backend) =
-                    backend_from_origin_target(&target, addr, "backup origin", allow_lan)
-                {
-                    let mut ext = Extensions::new();
-
-                    let tls_verify = if let Some(v) = &origin.tls_verify {
-                        match v {
-                            serde_json::Value::Bool(b) => *b,
-                            serde_json::Value::Object(obj) => {
-                                obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true)
-                            }
-                            serde_json::Value::Number(n) => n.as_i64().unwrap_or(1) > 0,
-                            _ => true,
-                        }
-                    } else {
-                        true
-                    };
-
-                    ext.insert(BackendExtension {
-                        use_tls: addr.is_https(),
-                        host: origin.request_host.clone(),
-                        rp_host,
-                        origin_id: origin.id,
-                        origin_host: addr.host(),
-                        follow_port: origin.follow_port,
-                        follow_host: origin.follow_host,
-                        http2_enabled: origin.http2_enabled,
-                        tls_verify,
-                        request_host_excluding_port: rp_cfg.request_host_excluding_port,
-                        connection_timeout: origin
-                            .conn_timeout
-                            .as_ref()
-                            .map(crate::utils::to_duration),
-                        read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
-                        idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
-                        client_cert: origin.cert.clone(),
-                    });
-                    backend.ext = ext;
-                    endpoints.push(backend);
-                }
-            }
-        }
+        return (None, false);
     }
 
-    let mut is_fallback = false;
-    if endpoints.is_empty() {
-        warn!("LB Builder: No upstreams found. Falling back to 127.0.0.1:80");
-        if let Ok(b) = Backend::new("127.0.0.1:80") {
-            endpoints.push(b);
-        }
-        is_fallback = true;
-    }
-
-    debug!("LB Builder: Creating LB with {} endpoints", endpoints.len());
+    debug!(
+        "LB Builder: Creating {:?} LB with {} endpoints",
+        role,
+        endpoints.len()
+    );
     let mut set = BTreeSet::new();
-    for e in endpoints {
-        set.insert(e);
+    for endpoint in endpoints {
+        set.insert(endpoint);
     }
     let backends = Backends::new(Static::new(set));
     let use_random = rp_cfg
@@ -252,36 +341,8 @@ pub fn build_lb(
         round_robin_lb = Some(lb);
     }
 
-    // Skip health check if we are in fallback mode
-    if is_fallback {
-        let any_lb = if let Some(lb) = random_lb {
-            AnyLoadBalancer::Random(Arc::new(lb))
-        } else {
-            AnyLoadBalancer::RoundRobin(Arc::new(
-                round_robin_lb.expect("round robin lb should exist"),
-            ))
-        };
-        return (Arc::new(any_lb), false);
-    }
-
-    // Look for health check configuration in the first origin
-    let mut detected_hc = None;
-    for origin in &rp_cfg.primary_origins {
-        if let Some(hc) = &origin.health_check {
-            if hc.is_on {
-                detected_hc = Some((origin, hc));
-                break;
-            } else {
-                debug!(
-                    "LB Builder: Health check for origin {} is present but OFF",
-                    origin.id
-                );
-            }
-        }
-    }
-
+    let has_health_check = detected_hc.is_some();
     if let Some((origin, hc_cfg)) = detected_hc {
-        has_health_check = true;
         let frequency = hc_cfg
             .interval
             .as_ref()
@@ -290,7 +351,6 @@ pub fn build_lb(
         let use_tcp = hc_cfg.protocol.as_deref() == Some("tcp");
         let make_health_check = || -> Box<dyn health_check::HealthCheck + Send + Sync + 'static> {
             if use_tcp {
-                debug!("LB Builder: Enabling TCP health check for origins.");
                 let mut hc = health_check::TcpHealthCheck::new();
                 if let Some(timeout) = &hc_cfg.timeout {
                     hc.peer_template.options.connection_timeout =
@@ -298,7 +358,6 @@ pub fn build_lb(
                 }
                 hc
             } else {
-                debug!("LB Builder: Enabling HTTP health check for origins.");
                 let host = origin.addr.as_ref().map(|a| a.host()).unwrap_or_default();
                 let use_tls = origin.addr.as_ref().map(|a| a.is_https()).unwrap_or(false);
                 let mut hc = health_check::HttpHealthCheck::new(&host, use_tls);
@@ -323,18 +382,10 @@ pub fn build_lb(
         if let Some(lb) = round_robin_lb.as_mut() {
             lb.set_health_check(make_health_check());
             lb.health_check_frequency = Some(frequency);
-            debug!(
-                "Enabled health check for upstream pool. Frequency: {:?}",
-                lb.health_check_frequency
-            );
         }
         if let Some(lb) = random_lb.as_mut() {
             lb.set_health_check(make_health_check());
             lb.health_check_frequency = Some(frequency);
-            debug!(
-                "Enabled health check for random upstream pool. Frequency: {:?}",
-                lb.health_check_frequency
-            );
         }
     }
 
@@ -345,7 +396,41 @@ pub fn build_lb(
             round_robin_lb.expect("round robin lb should exist"),
         ))
     };
-    (Arc::new(lb), has_health_check)
+    (Some(Arc::new(lb)), has_health_check)
+}
+
+fn fallback_lb() -> (Arc<AnyLoadBalancer>, bool) {
+    warn!("LB Builder: No upstreams found. Falling back to 127.0.0.1:80");
+    let mut b = Backend::new("127.0.0.1:80").expect("valid fallback backend");
+    let mut ext = Extensions::new();
+    ext.insert(BackendExtension {
+        origin_role: OriginRole::Fallback,
+        use_tls: false,
+        host: String::new(),
+        rp_host: String::new(),
+        origin_id: 0,
+        origin_host: String::new(),
+        follow_port: false,
+        follow_host: false,
+        http2_enabled: false,
+        http3_enabled: false,
+        tls_verify: true,
+        request_host_excluding_port: false,
+        connection_timeout: None,
+        read_timeout: None,
+        idle_timeout: None,
+        client_cert: None,
+    });
+    b.ext = ext;
+    let mut set = BTreeSet::new();
+    set.insert(b);
+    let backends = Backends::new(Static::new(set));
+    let lb: LoadBalancer<RoundRobin> = LoadBalancer::from_backends(backends);
+    lb.update()
+        .now_or_never()
+        .expect("static fallback load balancer update should not block")
+        .expect("static fallback load balancer update should not fail");
+    (Arc::new(AnyLoadBalancer::RoundRobin(Arc::new(lb))), false)
 }
 
 #[allow(clippy::type_complexity)]
@@ -395,6 +480,7 @@ pub fn build_parent_lb(
             if let Ok(mut backend) = Backend::new(&target) {
                 let mut ext = Extensions::new();
                 ext.insert(BackendExtension {
+                    origin_role: OriginRole::Primary,
                     use_tls: true, // L1 -> L2 always TLS by default.
                     host: String::new(),
                     rp_host: String::new(),
@@ -403,6 +489,7 @@ pub fn build_parent_lb(
                     follow_port: false,
                     follow_host: false,
                     http2_enabled: false,
+                    http3_enabled: false,
                     tls_verify: false,
                     request_host_excluding_port: false,
                     connection_timeout: None,

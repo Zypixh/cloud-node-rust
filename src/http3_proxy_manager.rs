@@ -3,24 +3,24 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::{Context, Result};
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use dashmap::DashMap;
 use h3::quic::OpenStreams;
 use h3::server::RequestResolver;
+use pingora_core::apps::HttpServerApp;
+use pingora_core::protocols::http::server::Session as ServerSession;
+use pingora_core::server::configuration::ServerConf;
+use pingora_proxy::http_proxy_custom;
 use quinn::Endpoint;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::watch;
-use tokio_stream::StreamExt;
 use tracing::{error, info, warn};
 
 use crate::config::ConfigStore;
+use crate::h3_downstream::H3DownstreamSession;
+use crate::proxy::EdgeProxy;
 use crate::ssl::DynamicCertSelector;
-
-const MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
-const MAX_HTTP3_BRIDGE_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 struct ListenerHandle {
     cert_hash: u64,
@@ -30,14 +30,23 @@ struct ListenerHandle {
 pub struct Http3ProxyManager {
     config_store: ConfigStore,
     cert_selector: Arc<DynamicCertSelector>,
+    proxy_logic: EdgeProxy,
+    server_conf: Arc<ServerConf>,
     handled_ports: DashMap<u16, ListenerHandle>,
 }
 
 impl Http3ProxyManager {
-    pub fn new(config_store: ConfigStore, cert_selector: Arc<DynamicCertSelector>) -> Arc<Self> {
+    pub fn new(
+        config_store: ConfigStore,
+        cert_selector: Arc<DynamicCertSelector>,
+        proxy_logic: EdgeProxy,
+        server_conf: Arc<ServerConf>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config_store,
             cert_selector,
+            proxy_logic,
+            server_conf,
             handled_ports: DashMap::new(),
         })
     }
@@ -50,7 +59,7 @@ impl Http3ProxyManager {
                 self.spawn_listener(*port, cert_hash).await;
             }
             self.reconcile_listeners(&desired_ports, cert_hash);
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            self.config_store.wait_for_runtime_reload().await;
         }
     }
 
@@ -147,6 +156,11 @@ impl Http3ProxyManager {
             .context("build quinn server config")?;
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         let endpoint = Endpoint::server(server_config, bind_addr)?;
+        let proxy = Arc::new(http_proxy_custom(
+            &self.server_conf,
+            self.proxy_logic.clone(),
+            crate::origin_h3::OriginH3Connector,
+        ));
         info!("HTTP/3 listener active on UDP {}", bind_addr);
 
         loop {
@@ -162,9 +176,11 @@ impl Http3ProxyManager {
                 continue;
             };
 
-            let config_store = self.config_store.clone();
+            let manager = self.clone();
+            let proxy = proxy.clone();
+            let shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
-                if let Err(err) = Self::serve_connection(connecting, port, config_store).await {
+                if let Err(err) = manager.serve_connection(connecting, port, proxy, shutdown).await {
                     error!(
                         "HTTP/3 connection handling failed on port {}: {}",
                         port, err
@@ -269,9 +285,11 @@ impl Http3ProxyManager {
     }
 
     async fn serve_connection(
+        self: Arc<Self>,
         connecting: quinn::Incoming,
         listen_port: u16,
-        config_store: ConfigStore,
+        proxy: Arc<pingora_proxy::HttpProxy<EdgeProxy, crate::origin_h3::OriginH3Connector>>,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         let conn = connecting.await?;
         let remote_addr = conn.remote_address();
@@ -282,11 +300,13 @@ impl Http3ProxyManager {
         loop {
             match h3_conn.accept().await {
                 Ok(Some(resolver)) => {
-                    let config_store = config_store.clone();
+                    let manager = self.clone();
+                    let proxy = proxy.clone();
+                    let shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
-                        if let Err(err) =
-                            Self::handle_request(resolver, listen_port, remote_addr, config_store)
-                                .await
+                        if let Err(err) = manager
+                            .handle_request(resolver, listen_port, remote_addr, proxy, shutdown)
+                            .await
                         {
                             error!(
                                 "HTTP/3 request handling failed on port {}: {}",
@@ -308,10 +328,12 @@ impl Http3ProxyManager {
     }
 
     async fn handle_request<C>(
+        &self,
         resolver: RequestResolver<C, Bytes>,
         listen_port: u16,
         remote_addr: SocketAddr,
-        config_store: ConfigStore,
+        proxy: Arc<pingora_proxy::HttpProxy<EdgeProxy, crate::origin_h3::OriginH3Connector>>,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> Result<()>
     where
         C: h3::quic::Connection<Bytes> + Send + 'static,
@@ -320,8 +342,9 @@ impl Http3ProxyManager {
         let (request, mut stream) = resolver.resolve_request().await?;
         let host = Self::request_host(&request, listen_port)
             .context("missing host/authority in HTTP/3 request")?;
-        if config_store
-            .get_server_for_tls_name_sync(host.split(':').next().unwrap_or(&host))
+        if self
+            .config_store
+            .get_server_for_tls_name_sync(authority_host_for_lookup(&host).as_str())
             .is_some_and(|server| server.is_sni_passthrough())
         {
             let response = http::Response::builder().status(421).body(())?;
@@ -332,177 +355,35 @@ impl Http3ProxyManager {
             stream.finish().await?;
             return Ok(());
         }
-        let target_port = listen_port;
-        let path_and_query = request
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/");
-
-        let declared_request_len = request
-            .headers()
-            .get("content-length")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok());
-        if declared_request_len.is_some_and(|value| value > MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES) {
-            warn!(
-                "HTTP/3 bridge request body exceeded declared limit for host {} on port {}",
-                host, listen_port
-            );
-            Self::send_simple_response(&mut stream, 413, b"Request Entity Too Large".as_slice())
+        if self.should_reject_mobile_h3(&request) {
+            let response = http::Response::builder().status(421).body(())?;
+            stream.send_response(response).await?;
+            stream
+                .send_data(Bytes::from_static(b"HTTP/3 is not available for this client"))
                 .await?;
+            stream.finish().await?;
             return Ok(());
         }
-
-        let mut body = Vec::with_capacity(
-            declared_request_len
-                .unwrap_or(0)
-                .min(MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES),
-        );
-        while let Some(mut chunk) = stream.recv_data().await? {
-            while chunk.has_remaining() {
-                let bytes = chunk.copy_to_bytes(chunk.remaining());
-                if body.len().saturating_add(bytes.len()) > MAX_HTTP3_BRIDGE_REQUEST_BODY_BYTES {
-                    warn!(
-                        "HTTP/3 bridge request body exceeded limit for host {} on port {}",
-                        host, listen_port
-                    );
-                    Self::send_simple_response(
-                        &mut stream,
-                        413,
-                        b"Request Entity Too Large".as_slice(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                body.extend_from_slice(&bytes);
-            }
-        }
-
-        let target_url = if host.contains(':') {
-            format!("https://{}{}", host, path_and_query)
-        } else {
-            format!("https://{}:{}{}", host, target_port, path_and_query)
-        };
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .resolve(
-                &host,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), target_port),
-            )
-            .build()?;
-
-        let mut outbound = client.request(request.method().clone(), &target_url);
-        outbound = outbound.header("host", host.as_str());
-        outbound = outbound.header("x-forwarded-proto", "https");
-        outbound = outbound.header("x-cloud-http3-bridge", "1");
-        outbound = outbound.header("x-cloud-real-ip", remote_addr.ip().to_string());
-        outbound = outbound.header("x-cloud-real-port", remote_addr.port().to_string());
-        for (name, value) in request.headers() {
-            if matches!(
-                name.as_str(),
-                "host"
-                    | "content-length"
-                    | "connection"
-                    | "transfer-encoding"
-                    | "x-cloud-real-ip"
-                    | "x-cloud-real-port"
-                    | "x-cloud-http3-bridge"
-            ) {
-                continue;
-            }
-            outbound = outbound.header(name, value);
-        }
-        if !body.is_empty() {
-            outbound = outbound.body(body);
-        }
-
-        match outbound.send().await {
-            Ok(upstream_response) => {
-                let status = upstream_response.status();
-                let headers = upstream_response.headers().clone();
-                if headers
-                    .get("content-length")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .is_some_and(|value| value > MAX_HTTP3_BRIDGE_RESPONSE_BODY_BYTES)
-                {
-                    warn!(
-                        "HTTP/3 bridge upstream response body exceeded declared limit for host {} on port {}",
-                        host, listen_port
-                    );
-                    Self::send_simple_response(
-                        &mut stream,
-                        502,
-                        b"Upstream Response Too Large".as_slice(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-
-                let mut builder = http::Response::builder().status(status);
-                for (name, value) in &headers {
-                    if matches!(name.as_str(), "connection" | "transfer-encoding") {
-                        continue;
-                    }
-                    builder = builder.header(name, value);
-                }
-                let downstream_response = builder.body(())?;
-                stream.send_response(downstream_response).await?;
-
-                let mut total_sent = 0usize;
-                let mut response_stream = upstream_response.bytes_stream();
-                while let Some(chunk_result) = response_stream.next().await {
-                    let chunk = match chunk_result {
-                        Ok(chunk) => chunk,
-                        Err(err) => {
-                            warn!(
-                                "HTTP/3 bridge failed while streaming upstream response: {}",
-                                err
-                            );
-                            break;
-                        }
-                    };
-                    total_sent = total_sent.saturating_add(chunk.len());
-                    if total_sent > MAX_HTTP3_BRIDGE_RESPONSE_BODY_BYTES {
-                        warn!(
-                            "HTTP/3 bridge streamed response exceeded limit for host {} on port {}",
-                            host, listen_port
-                        );
-                        break;
-                    }
-                    stream.send_data(chunk).await?;
-                }
-                stream.finish().await?;
-            }
-            Err(err) => {
-                warn!("HTTP/3 bridge upstream request failed: {}", err);
-                let response = http::Response::builder().status(502).body(())?;
-                stream.send_response(response).await?;
-                stream.send_data(Bytes::from_static(b"Bad Gateway")).await?;
-                stream.finish().await?;
-            }
-        }
-
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port);
+        let h3_session = H3DownstreamSession::new(request, stream, remote_addr, local_addr)?;
+        let server_session = ServerSession::new_custom(Box::new(h3_session));
+        proxy.process_new_http(server_session, &shutdown_rx).await;
         Ok(())
     }
 
-    async fn send_simple_response<S>(
-        stream: &mut h3::server::RequestStream<S, Bytes>,
-        status: u16,
-        body: &[u8],
-    ) -> Result<()>
-    where
-        S: h3::quic::BidiStream<Bytes>,
-    {
-        let response = http::Response::builder().status(status).body(())?;
-        stream.send_response(response).await?;
-        if !body.is_empty() {
-            stream.send_data(Bytes::copy_from_slice(body)).await?;
+    fn should_reject_mobile_h3(&self, request: &http::Request<()>) -> bool {
+        let Some(policy) = self.config_store.get_global_http3_policy_sync() else {
+            return false;
+        };
+        if !policy.is_on || policy.support_mobile_browsers {
+            return false;
         }
-        stream.finish().await?;
-        Ok(())
+        let user_agent = request
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        crate::proxy::EdgeProxy::is_mobile_user_agent(user_agent)
     }
 
     fn request_host(request: &http::Request<()>, listen_port: u16) -> Option<String> {
@@ -516,6 +397,24 @@ impl Http3ProxyManager {
             Some(format!("{}:{}", host, listen_port))
         }
     }
+}
+
+fn authority_host_for_lookup(authority: &str) -> String {
+    authority_host_for_resolve(authority)
+}
+
+fn authority_host_for_resolve(authority: &str) -> String {
+    if let Some(rest) = authority.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        return rest[..end].to_string();
+    }
+    if authority.matches(':').count() == 1
+        && let Some((host, _)) = authority.rsplit_once(':')
+    {
+        return host.to_string();
+    }
+    authority.to_string()
 }
 
 #[derive(Debug)]
