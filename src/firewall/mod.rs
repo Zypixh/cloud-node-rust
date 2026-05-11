@@ -56,8 +56,9 @@ pub struct MatchedAction {
     pub timeout_secs: Option<i64>,
     pub max_timeout_secs: Option<i64>,
     pub life_seconds: Option<i64>,
-    pub max_fails: i32,
-    pub fail_block_timeout: i64,
+    pub max_fails: Option<i32>,
+    pub fail_block_timeout: Option<i64>,
+    pub fail_global: Option<bool>,
     pub scope: Option<String>,
     pub block_c_class: bool,
     pub use_local_firewall: bool,
@@ -258,8 +259,9 @@ fn default_block_action(policy_id: i64, group_id: i64) -> MatchedAction {
         timeout_secs: None,
         max_timeout_secs: None,
         life_seconds: None,
-        max_fails: 0,
-        fail_block_timeout: 0,
+        max_fails: None,
+        fail_block_timeout: None,
+        fail_global: None,
         scope: None,
         block_c_class: false,
         use_local_firewall: false,
@@ -276,13 +278,20 @@ fn default_block_action(policy_id: i64, group_id: i64) -> MatchedAction {
     }
 }
 
+fn normalize_action_code(code: &str) -> String {
+    match code.trim() {
+        "jsCookie" | "js-cookie" | "jscookie" | "JSCookie" => "js_cookie".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
 fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
     for action in actions {
         let code = action
             .get("code")
             .or_else(|| action.get("action"))
             .and_then(Value::as_str)
-            .map(|s| s.to_ascii_lowercase())?;
+            .map(normalize_action_code)?;
         let options = action.get("options");
 
         match code.as_str() {
@@ -301,8 +310,9 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                     timeout_secs: None,
                     max_timeout_secs: None,
                     life_seconds: None,
-                    max_fails: 0,
-                    fail_block_timeout: 0,
+                    max_fails: None,
+                    fail_block_timeout: None,
+                    fail_global: None,
                     scope: None,
                     block_c_class: false,
                     use_local_firewall: false,
@@ -328,8 +338,9 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                     timeout_secs: None,
                     max_timeout_secs: None,
                     life_seconds: None,
-                    max_fails: 0,
-                    fail_block_timeout: 0,
+                    max_fails: None,
+                    fail_block_timeout: None,
+                    fail_global: None,
                     scope: None,
                     block_c_class: false,
                     use_local_firewall: false,
@@ -365,8 +376,9 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                     timeout_secs: None,
                     max_timeout_secs: None,
                     life_seconds: None,
-                    max_fails: 0,
-                    fail_block_timeout: 0,
+                    max_fails: None,
+                    fail_block_timeout: None,
+                    fail_global: None,
                     scope: None,
                     block_c_class: false,
                     use_local_firewall: false,
@@ -392,8 +404,9 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                     timeout_secs: None,
                     max_timeout_secs: None,
                     life_seconds: None,
-                    max_fails: 0,
-                    fail_block_timeout: 0,
+                    max_fails: None,
+                    fail_block_timeout: None,
+                    fail_global: None,
                     scope: None,
                     block_c_class: false,
                     use_local_firewall: false,
@@ -443,8 +456,9 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                             timeout_secs: timeout,
                             max_timeout_secs: None,
                             life_seconds: None,
-                            max_fails: 0,
-                            fail_block_timeout: 0,
+                            max_fails: None,
+                            fail_block_timeout: None,
+                            fail_global: None,
                             scope,
                             block_c_class: false,
                             use_local_firewall: false,
@@ -470,8 +484,9 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                             timeout_secs: timeout,
                             max_timeout_secs: None,
                             life_seconds: None,
-                            max_fails: 0,
-                            fail_block_timeout: 0,
+                            max_fails: None,
+                            fail_block_timeout: None,
+                            fail_global: None,
                             scope,
                             block_c_class: false,
                             use_local_firewall: false,
@@ -512,8 +527,9 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                     timeout_secs: None,
                     max_timeout_secs: None,
                     life_seconds: None,
-                    max_fails: 0,
-                    fail_block_timeout: 0,
+                    max_fails: None,
+                    fail_block_timeout: None,
+                    fail_global: None,
                     scope: None,
                     block_c_class: false,
                     use_local_firewall: false,
@@ -533,15 +549,17 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                 let life = options
                     .and_then(|v| v.get("lifeSeconds"))
                     .and_then(Value::as_i64)
-                    .unwrap_or(600);
+                    .unwrap_or(0);
                 let max_fails = options
                     .and_then(|v| v.get("maxFails"))
                     .and_then(Value::as_i64)
-                    .unwrap_or(0) as i32;
+                    .map(|value| value as i32);
                 let fail_timeout = options
                     .and_then(|v| v.get("failBlockTimeout"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(3600);
+                    .and_then(Value::as_i64);
+                let fail_global = options
+                    .and_then(|v| v.get("failGlobal"))
+                    .and_then(Value::as_bool);
                 let action = match code.as_str() {
                     "captcha" => ActionResponse::Captcha { life_seconds: life },
                     "js_cookie" => ActionResponse::JsCookie { life_seconds: life },
@@ -559,6 +577,7 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                     life_seconds: Some(life),
                     max_fails,
                     fail_block_timeout: fail_timeout,
+                    fail_global,
                     scope: None,
                     block_c_class: false,
                     use_local_firewall: false,
@@ -587,8 +606,9 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                     timeout_secs: None,
                     max_timeout_secs: None,
                     life_seconds: None,
-                    max_fails: 0,
-                    fail_block_timeout: 0,
+                    max_fails: None,
+                    fail_block_timeout: None,
+                    fail_global: None,
                     scope: None,
                     block_c_class: false,
                     use_local_firewall: false,
@@ -620,8 +640,9 @@ fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
                     timeout_secs: None,
                     max_timeout_secs: None,
                     life_seconds: None,
-                    max_fails: 0,
-                    fail_block_timeout: 0,
+                    max_fails: None,
+                    fail_block_timeout: None,
+                    fail_global: None,
                     scope: None,
                     block_c_class: false,
                     use_local_firewall: false,
@@ -788,8 +809,9 @@ pub fn check_region_deny(
                 timeout_secs: Some(3600),
                 max_timeout_secs: None,
                 life_seconds: None,
-                max_fails: 0,
-                fail_block_timeout: 0,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
                 scope: None,
                 block_c_class: false,
                 use_local_firewall: false,
@@ -845,8 +867,9 @@ pub fn check_region_deny(
                 timeout_secs: Some(3600),
                 max_timeout_secs: None,
                 life_seconds: None,
-                max_fails: 0,
-                fail_block_timeout: 0,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
                 scope: None,
                 block_c_class: false,
                 use_local_firewall: false,

@@ -194,6 +194,17 @@ impl WafStateManager {
         scope: Option<&str>,
         use_local_firewall: bool,
     ) {
+        self.unblock_ip_for(ip, server_id, scope, use_local_firewall, 3600);
+    }
+
+    pub fn unblock_ip_for(
+        &self,
+        ip: IpAddr,
+        server_id: i64,
+        scope: Option<&str>,
+        use_local_firewall: bool,
+        ttl_secs: i64,
+    ) {
         let key_server_id = if matches!(scope, Some("global")) {
             0
         } else {
@@ -213,8 +224,7 @@ impl WafStateManager {
             self.exec_local_unblock(ip.to_string());
         }
 
-        // Add to whitelist to prevent immediate re-block
-        let expiry = crate::utils::time::now_timestamp() + 3600;
+        let expiry = crate::utils::time::now_timestamp() + ttl_secs.max(1);
         self.whitelists.insert((key_server_id, ip), expiry);
     }
 

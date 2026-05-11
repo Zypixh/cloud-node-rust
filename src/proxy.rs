@@ -301,6 +301,7 @@ const TEXT_MIME_TYPES: &[&str] = &[
     "text/sgml",
 ];
 const HLS_KEY_ROUTE: &str = "/.well-known/cloud-node/hls-key";
+const WAF_VERIFY_ROUTE: &str = "/.well-known/cloud-node/waf-verify";
 
 #[derive(Clone)]
 struct RequestLimitBinding {
@@ -1687,8 +1688,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             timeout_secs: None,
             max_timeout_secs: None,
             life_seconds: Some(300),
-            max_fails: 0,
-            fail_block_timeout: 0,
+            max_fails: None,
+            fail_block_timeout: None,
+            fail_global: None,
             scope: Some(if site_uam_enabled {
                 "server".to_string()
             } else {
@@ -2551,9 +2553,69 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             query.split('&').find_map(|part| {
                 let mut it = part.splitn(2, '=');
                 let key = it.next()?;
-                (key == name).then(|| it.next().unwrap_or("").to_string())
+                if key != name {
+                    return None;
+                }
+                let value = it.next().unwrap_or("").replace('+', " ");
+                Some(
+                    urlencoding::decode(&value)
+                        .map(|decoded| decoded.into_owned())
+                        .unwrap_or(value),
+                )
             })
         })
+    }
+
+    fn sanitize_waf_return_path(value: &str) -> String {
+        let decoded = urlencoding::decode(value)
+            .map(|v| v.into_owned())
+            .unwrap_or_else(|_| value.to_string());
+        if decoded.starts_with('/')
+            && !decoded.starts_with("//")
+            && !decoded.contains('\r')
+            && !decoded.contains('\n')
+        {
+            decoded
+        } else {
+            "/".to_string()
+        }
+    }
+
+    fn waf_life_seconds(life_seconds: i64) -> i64 {
+        if life_seconds > 0 { life_seconds } else { 600 }
+    }
+
+    fn waf_cookie_suffix(session: &Session, life_seconds: i64) -> String {
+        let secure = if session
+            .downstream_session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .is_some()
+            || session.req_header().uri.scheme_str() == Some("https")
+        {
+            "; Secure"
+        } else {
+            ""
+        };
+        format!("Path=/; Max-Age={}; SameSite=Lax{}", Self::waf_life_seconds(life_seconds), secure)
+    }
+
+    fn waf_redirect_signature(&self, token: &str, ip: &str, ua: &str) -> String {
+        let digest = Self::hmac_sha256(
+            self.api_config.secret.as_bytes(),
+            format!("waf-redirect|{token}|{ip}|{ua}").as_bytes(),
+        );
+        hex::encode(digest)
+    }
+
+    fn waf_challenge_css() -> &'static str {
+        r#":root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:radial-gradient(circle at top left,#dbeafe,transparent 32rem),linear-gradient(135deg,#0f172a,#111827 55%,#1e293b);color:#e5e7eb}.waf-card{width:min(92vw,440px);padding:34px;border:1px solid rgba(255,255,255,.14);border-radius:28px;background:rgba(15,23,42,.78);box-shadow:0 24px 80px rgba(0,0,0,.35);backdrop-filter:blur(18px);text-align:center}.waf-mark{width:54px;height:54px;margin:0 auto 18px;border-radius:18px;background:linear-gradient(135deg,#38bdf8,#6366f1);box-shadow:0 12px 30px rgba(56,189,248,.35)}h1{margin:0 0 10px;font-size:24px}p{margin:0 0 22px;color:#b6c2d1;line-height:1.6}.waf-progress,.waf-track{height:46px;border-radius:999px;background:rgba(148,163,184,.18);overflow:hidden;position:relative}.waf-progress span{display:block;width:42%;height:100%;border-radius:999px;background:linear-gradient(90deg,#38bdf8,#818cf8);animation:wafPulse 1.4s ease-in-out infinite}.waf-track{touch-action:none;cursor:pointer;border:1px solid rgba(255,255,255,.12)}.waf-track:before{content:'';position:absolute;inset:0;background:repeating-linear-gradient(110deg,transparent 0 13px,rgba(255,255,255,.055) 14px 16px)}.waf-fill{position:absolute;inset:0 auto 0 0;width:0;background:linear-gradient(90deg,rgba(56,189,248,.85),rgba(129,140,248,.85));border-radius:999px}.waf-handle{position:absolute;top:3px;left:3px;width:40px;height:40px;border-radius:50%;display:grid;place-items:center;background:#f8fafc;color:#0f172a;font-weight:800;box-shadow:0 6px 20px rgba(0,0,0,.28);user-select:none}.waf-status{margin-top:14px;font-size:14px;color:#cbd5e1}.waf-error{color:#fecaca}@keyframes wafPulse{0%,100%{transform:translateX(-18%)}50%{transform:translateX(150%)}}@media (prefers-color-scheme:light){body{background:radial-gradient(circle at top left,#bae6fd,transparent 30rem),linear-gradient(135deg,#f8fafc,#e0e7ff);color:#0f172a}.waf-card{background:rgba(255,255,255,.82);border-color:rgba(15,23,42,.08)}p{color:#475569}.waf-status{color:#475569}}"#
+    }
+
+    fn waf_slider_body(token: &str, target: u32, return_path: &str) -> String {
+        let token_js = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+        let return_js = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
+        format!(r#"<main class="waf-card"><div class="waf-mark"></div><h1>Security verification</h1><p>Slide to complete the security check. This helps protect the site from automated abuse.</p><div id="wafTrack" class="waf-track" aria-label="Slide to verify"><div id="wafFill" class="waf-fill"></div><div id="wafHandle" class="waf-handle">›</div></div><div id="wafStatus" class="waf-status">Slide the handle to the highlighted zone</div><noscript><p class="waf-error">JavaScript is required for this verification.</p></noscript></main><script>(function(){{const token={token_js};const ret={return_js};const target={target};const track=document.getElementById('wafTrack');const handle=document.getElementById('wafHandle');const fill=document.getElementById('wafFill');const status=document.getElementById('wafStatus');const zone=document.createElement('div');zone.style.cssText='position:absolute;top:4px;height:38px;width:26px;border-radius:999px;background:rgba(34,197,94,.28);box-shadow:0 0 0 1px rgba(34,197,94,.4) inset;left:'+(target+10)+'px';';track.appendChild(zone);const enc=new TextEncoder();let dragging=false,startX=0,current=0,start=Date.now(),trace=[];async function pow(){{let n=0;while(true){{const h=await crypto.subtle.digest('SHA-256',enc.encode(token+n));const x=Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('');if(x.startsWith('0000'))return String(n);n++;if(n%200===0)await new Promise(r=>setTimeout(r,0));}}}}function setX(x){{current=Math.max(0,Math.min(260,x));handle.style.left=(current+3)+'px';fill.style.width=(current+43)+'px';trace.push(Math.round(current)+','+(Date.now()-start));}}track.addEventListener('pointerdown',e=>{{dragging=true;startX=e.clientX-current;track.setPointerCapture(e.pointerId);}});track.addEventListener('pointermove',e=>{{if(dragging)setX(e.clientX-startX);}});track.addEventListener('pointerup',async e=>{{if(!dragging)return;dragging=false;setX(e.clientX-startX);if(Math.abs(current-target)>16){{status.textContent='Not quite there, please try again';status.className='waf-status waf-error';return;}}status.textContent='Verifying browser...';try{{const nonce=await pow();const qs=new URLSearchParams({{__waf_token:token,__waf_pow:nonce,__waf_elapsed:String(Date.now()-start),__waf_x:String(Math.round(current)),__waf_trace:trace.slice(-80).join(';'),__waf_return:ret}});location.href='{WAF_VERIFY_ROUTE}?'+qs.toString();}}catch(_){{status.textContent='Verification failed, please retry';status.className='waf-status waf-error';}}}});}})();</script>"#)
     }
 
     fn hmac_sha256(secret: &[u8], data: &[u8]) -> [u8; 32] {
@@ -2693,6 +2755,99 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .await?;
         ctx.response_status = 200;
         ctx.no_log = true;
+        Ok(true)
+    }
+
+    async fn maybe_serve_waf_verify(&self, session: &mut Session, ctx: &mut ProxyCTX) -> Result<bool> {
+        if session.req_header().uri.path() != WAF_VERIFY_ROUTE {
+            return Ok(false);
+        }
+
+        let token = Self::query_param(session, "__waf_token").unwrap_or_default();
+        let pow = Self::query_param(session, "__waf_pow").unwrap_or_default();
+        let elapsed = Self::query_param(session, "__waf_elapsed")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let final_x = Self::query_param(session, "__waf_x")
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(i32::MIN);
+        let trace = Self::query_param(session, "__waf_trace").unwrap_or_default();
+        let return_path = Self::query_param(session, "__waf_return")
+            .map(|value| Self::sanitize_waf_return_path(&value))
+            .unwrap_or_else(|| "/".to_string());
+        let ua = session
+            .get_header("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token_remaining = (!token.is_empty())
+            .then(|| self.waf_verifier.token_seconds_remaining(&ctx.client_ip_str, ua, &token, 3600))
+            .flatten();
+        let verified = token_remaining.is_some()
+            && !pow.is_empty()
+            && self.waf_verifier.verify_pow(&token, &pow, 4)
+            && self
+                .waf_verifier
+                .verify_slider_trace(&token, final_x, elapsed, &trace);
+
+        if verified {
+            let remaining = token_remaining.unwrap_or(1) as i64;
+            if let Ok(ip) = ctx.client_ip_str.parse() {
+                let server_id = ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0);
+                self.waf_state.unblock_ip_for(ip, server_id, Some("server"), true, remaining);
+            }
+            let suffix = Self::waf_cookie_suffix(session, remaining);
+            let mut resp = pingora_http::ResponseHeader::build(303, None).unwrap();
+            resp.insert_header("location", return_path).unwrap();
+            resp.append_header("set-cookie", format!("WAF-Token={token}; HttpOnly; {suffix}"))
+                .unwrap();
+            resp.append_header("set-cookie", format!("WAF-PoW={pow}; {suffix}"))
+                .unwrap();
+            resp.insert_header("cache-control", "no-store").unwrap();
+            session.write_response_header(Box::new(resp), true).await?;
+            ctx.response_status = 303;
+            return Ok(true);
+        }
+
+        if let Some(failure_config) = self
+            .waf_verifier
+            .token_failure_config(&ctx.client_ip_str, ua, &token)
+            && failure_config.max_fails > 0
+        {
+            let server_id = ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0);
+            let failure_scope_id = if failure_config.fail_global { 0 } else { server_id };
+            let failures = self.waf_state.record_failure(format!(
+                "WAF_CHALLENGE:{failure_scope_id}:{}",
+                ctx.client_ip_str
+            ));
+            if failures >= failure_config.max_fails as u64
+                && let Ok(ip) = ctx.client_ip_str.parse()
+            {
+                let scope = if failure_config.fail_global { "global" } else { "server" };
+                self.waf_state.block_ip(
+                    ip,
+                    server_id,
+                    failure_config.fail_block_timeout.max(1),
+                    Some(scope),
+                    false,
+                    true,
+                );
+            }
+        }
+
+        let mut resp = pingora_http::ResponseHeader::build(403, None).unwrap();
+        resp.insert_header("content-type", "text/html; charset=utf-8")
+            .unwrap();
+        resp.insert_header("cache-control", "no-store").unwrap();
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(
+                Some(Bytes::from_static(
+                    b"<!doctype html><html><body><h1>Security verification failed</h1><p>Please go back and try again.</p></body></html>",
+                )),
+                true,
+            )
+            .await?;
+        ctx.response_status = 403;
         Ok(true)
     }
 
@@ -3168,35 +3323,44 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         ctx: &ProxyCTX,
     ) -> bool {
         if let Some(cookies) = session.get_header("cookie").and_then(|v| v.to_str().ok()) {
-            if !cookies.contains("WAF-Token=") && !cookies.contains("WAF-PoW=") {
+            if !cookies.contains("WAF-Token=") {
                 return false;
             }
 
             let verifier = self.waf_verifier.as_ref();
             let mut current_token = None;
+            let mut token_remaining = 0;
             let mut current_pow = None;
+            let mut redirect_sig = None;
 
             for part in cookies.split(';') {
                 let part = part.trim();
                 // 1. Check AES-256-GCM Token
-                if let Some(token) = part.strip_prefix("WAF-Token=") {
-                    if verifier.verify_token(ip_str, ua, token, 3600) {
-                        current_token = Some(token);
-                    }
+                if let Some(token) = part.strip_prefix("WAF-Token=")
+                    && let Some(remaining) = verifier.token_seconds_remaining(ip_str, ua, token, 3600)
+                {
+                    current_token = Some(token);
+                    token_remaining = remaining as i64;
                 }
                 // 2. Check PoW Solution
                 if let Some(pow) = part.strip_prefix("WAF-PoW=") {
                     current_pow = Some(pow);
                 }
+                if let Some(sig) = part.strip_prefix("WAF-Redirect=") {
+                    redirect_sig = Some(sig);
+                }
             }
 
-            if let (Some(token), Some(nonce)) = (current_token, current_pow) {
-                // Strict Server-side verify
-                if verifier.verify_pow(token, nonce, 4) {
+            if let Some(token) = current_token {
+                let redirect_verified = redirect_sig.is_some_and(|sig| {
+                    sig == self.waf_redirect_signature(token, ip_str, ua)
+                });
+                let pow_verified = current_pow.is_some_and(|nonce| verifier.verify_pow(token, nonce, 4));
+                if redirect_verified || pow_verified {
                     if let Ok(ip) = ip_str.parse() {
                         let server_id = ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0);
                         self.waf_state
-                            .unblock_ip(ip, server_id, Some("server"), true);
+                            .unblock_ip_for(ip, server_id, Some("server"), true, token_remaining.max(1));
                     }
                     return true;
                 }
@@ -3397,108 +3561,148 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
                 let verifier = self.waf_verifier.as_ref();
-                let token = verifier.generate_token(&ip, ua);
 
-                let (status, is_redirect) = match action {
-                    crate::firewall::ActionResponse::Get302 { .. } => (302, true),
-                    crate::firewall::ActionResponse::Post307 { .. } => (307, true),
-                    _ => (403, false),
+                let status = match action {
+                    crate::firewall::ActionResponse::Get302 { .. } => 302,
+                    crate::firewall::ActionResponse::Post307 { .. } => 307,
+                    _ => 403,
                 };
 
-                let mut captcha_opts = matched.captcha_options.clone();
-                let mut js_opts = matched.js_cookie_options.clone();
+                let captcha_opts = matched.captcha_options.clone();
+                let js_opts = matched.js_cookie_options.clone();
+                let rule_life_seconds = matched.life_seconds.unwrap_or(0);
+                let rule_max_fails = matched.max_fails;
+                let rule_fail_block_timeout = matched.fail_block_timeout;
+                let rule_fail_global = matched.fail_global;
+                let policy_values = match action {
+                    crate::firewall::ActionResponse::Captcha { .. }
+                    | crate::firewall::ActionResponse::Get302 { .. }
+                    | crate::firewall::ActionResponse::Post307 { .. } => captcha_opts.as_ref().map(|opts| {
+                        (
+                            opts.life_seconds as i64,
+                            opts.max_fails,
+                            opts.fail_block_timeout as i64,
+                            opts.fail_global,
+                        )
+                    }),
+                    crate::firewall::ActionResponse::JsCookie { .. } => js_opts.as_ref().map(|opts| {
+                        (
+                            opts.life_seconds as i64,
+                            opts.max_fails,
+                            opts.fail_block_timeout as i64,
+                            opts.fail_global,
+                        )
+                    }),
+                    _ => None,
+                };
+                let global_values = global_actions
+                    .iter()
+                    .find(|global| global.code == matched.action_code)
+                    .map(|global| {
+                        (
+                            global.options.get("lifeSeconds").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                            global.options.get("maxFails").and_then(serde_json::Value::as_i64).unwrap_or(0) as i32,
+                            global.options.get("failBlockTimeout").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                            global.options.get("failGlobal").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                        )
+                    });
 
-                // Fallback to Global Defaults
-                if captcha_opts.is_none() {
-                    if let Some(global) = global_actions.iter().find(|a| a.code == "captcha") {
-                        captcha_opts = serde_json::from_value(global.options.clone()).ok();
-                    }
+                life_seconds = if rule_life_seconds > 0 {
+                    rule_life_seconds
+                } else {
+                    policy_values
+                        .and_then(|values| (values.0 > 0).then_some(values.0))
+                        .or_else(|| global_values.and_then(|values| (values.0 > 0).then_some(values.0)))
+                        .unwrap_or(life_seconds)
+                };
+                let max_fails = rule_max_fails.unwrap_or_else(|| {
+                    policy_values
+                        .map(|values| values.1.max(0))
+                        .or_else(|| global_values.map(|values| values.1.max(0)))
+                        .unwrap_or(0)
+                });
+                let fail_block_timeout = rule_fail_block_timeout.unwrap_or_else(|| {
+                    policy_values
+                        .and_then(|values| (values.2 > 0).then_some(values.2))
+                        .or_else(|| global_values.and_then(|values| (values.2 > 0).then_some(values.2)))
+                        .unwrap_or(3600)
+                });
+                let fail_global = rule_fail_global.unwrap_or_else(|| {
+                    policy_values
+                        .map(|values| values.3)
+                        .or_else(|| global_values.map(|values| values.3))
+                        .unwrap_or(false)
+                });
+                life_seconds = Self::waf_life_seconds(life_seconds);
+                let token = verifier.generate_token_with_config(
+                    &ip,
+                    ua,
+                    life_seconds as u64,
+                    crate::firewall::verifier::ChallengeFailureConfig {
+                        max_fails,
+                        fail_block_timeout,
+                        fail_global,
+                    },
+                );
+                let suffix = Self::waf_cookie_suffix(session, life_seconds);
+
+                if matches!(action, crate::firewall::ActionResponse::Get302 { .. } | crate::firewall::ActionResponse::Post307 { .. }) {
+                    let redirect_sig = self.waf_redirect_signature(&token, &ip, ua);
+                    let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
+                    resp.insert_header("location", Self::current_request_path_query(session)).unwrap();
+                    resp.append_header("set-cookie", format!("WAF-Token={token}; HttpOnly; {suffix}"))
+                        .unwrap();
+                    resp.append_header("set-cookie", format!("WAF-Redirect={redirect_sig}; HttpOnly; {suffix}"))
+                        .unwrap();
+                    resp.insert_header("cache-control", "no-store").unwrap();
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
                 }
-                if js_opts.is_none() {
-                    if let Some(global) = global_actions.iter().find(|a| a.code == "js_cookie") {
-                        js_opts = serde_json::from_value(global.options.clone()).ok();
-                    }
-                }
 
-                let mut body_html = String::new();
-                let mut template = "<!doctype html><html><head><title>${title}</title><style>${css}</style></head><body>${promptHeader}${body}${promptFooter}</body></html>".to_string();
-
-                if let Some(opts) = &captcha_opts {
-                    if opts.life_seconds > 0 {
-                        life_seconds = opts.life_seconds as i64;
-                    }
-                    if let Some(ui) = &opts.ui {
-                        if !ui.template.is_empty() {
-                            template = ui.template.clone();
-                        }
-                        let mut form = format!(
-                            "<form method='GET' class='waf-form'><input type='hidden' name='__waf_token' value='{}'/><button type='submit' class='verify-btn'>{}</button></form>",
-                            token, ui.button_title
-                        );
-                        if ui.show_request_id {
-                            form.push_str(&format!(
-                                "<p class='request-id'>Request ID: {}</p>",
-                                "0"
-                            ));
-                        }
-
-                        body_html = template
-                            .replace("${title}", &ui.title)
-                            .replace("${css}", &ui.css)
+                let body_html = if matches!(action, crate::firewall::ActionResponse::JsCookie { .. }) {
+                    let pow_script = verifier.get_pow_script_with_life(&token, 4, life_seconds);
+                    format!(
+                        "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}</style></head><body><main class='waf-card'><div class='waf-mark'></div><h1>Checking your browser</h1><p>Please wait while we verify your browser capability.</p><div class='waf-progress'><span></span></div></main><script>{}</script></body></html>",
+                        Self::waf_challenge_css(),
+                        pow_script
+                    )
+                } else {
+                    let target = verifier.slider_target(&token);
+                    let return_path = urlencoding::encode(&Self::current_request_path_query(session)).into_owned();
+                    let slider = Self::waf_slider_body(&token, target, &return_path);
+                    if let Some(opts) = &captcha_opts
+                        && let Some(ui) = &opts.ui
+                        && !ui.template.is_empty()
+                    {
+                        ui.template
+                            .replace("${title}", if ui.title.is_empty() { "Security verification" } else { &ui.title })
+                            .replace("${css}", &format!("{}{}", Self::waf_challenge_css(), ui.css))
                             .replace("${promptHeader}", &ui.prompt_header)
                             .replace("${promptFooter}", &ui.prompt_footer)
-                            .replace("${body}", &form);
-                    }
-                }
-
-                if body_html.is_empty() {
-                    if let Some(opts) = &js_opts {
-                        if opts.life_seconds > 0 {
-                            life_seconds = opts.life_seconds as i64;
-                        }
-                    }
-
-                    let pow_script = verifier.get_pow_script(&token, 4); // Difficulty 4
-                    body_html = if matches!(
-                        action,
-                        crate::firewall::ActionResponse::JsCookie { .. }
-                    ) {
-                        format!(
-                            "<!doctype html><html><body><script>{}</script><script>document.cookie='WAF-Token={}; Path=/; Max-Age={}';</script></body></html>",
-                            pow_script, token, life_seconds
-                        )
+                            .replace("${body}", &slider)
                     } else {
                         format!(
-                            "<!doctype html><html><head><script>{}</script></head><body><h1>Antigravity Security Verification</h1><p>Solving proof-of-work challenge...</p><form style='display:none'><input type='hidden' name='__waf_token' value='{}'/></form></body></html>",
-                            pow_script, token
+                            "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}</style></head><body>{}</body></html>",
+                            Self::waf_challenge_css(),
+                            slider
                         )
-                    };
-                }
+                    }
+                };
 
                 let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
-                if is_redirect {
-                    let mut path_and_query = session.req_header().uri.path().to_string();
-                    let connector = if path_and_query.contains('?') {
-                        "&"
-                    } else {
-                        "?"
-                    };
-                    path_and_query.push_str(&format!("{connector}__waf_token={token}"));
-                    resp.insert_header("location", path_and_query).unwrap();
-                    session.write_response_header(Box::new(resp), true).await?;
-                } else {
-                    resp.insert_header("content-type", "text/html; charset=utf-8")
-                        .unwrap();
-                    resp.insert_header(
-                        "set-cookie",
-                        format!("WAF-Token={token}; Path=/; HttpOnly; Max-Age={life_seconds}"),
-                    )
+                resp.insert_header("content-type", "text/html; charset=utf-8")
                     .unwrap();
-                    session.write_response_header(Box::new(resp), false).await?;
-                    session
-                        .write_response_body(Some(Bytes::from(body_html)), true)
-                        .await?;
+                resp.insert_header("cache-control", "no-store").unwrap();
+                resp.insert_header("x-content-type-options", "nosniff").unwrap();
+                resp.insert_header("referrer-policy", "same-origin").unwrap();
+                if !matches!(action, crate::firewall::ActionResponse::Captcha { .. }) {
+                    resp.append_header("set-cookie", format!("WAF-Token={token}; HttpOnly; {suffix}"))
+                        .unwrap();
                 }
+                session.write_response_header(Box::new(resp), false).await?;
+                session
+                    .write_response_body(Some(Bytes::from(body_html)), true)
+                    .await?;
                 Ok(true)
             }
         }
@@ -3614,8 +3818,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                                 timeout_secs: Some(3600),
                                 max_timeout_secs: None,
                                 life_seconds: None,
-                                max_fails: 0,
-                                fail_block_timeout: 0,
+                                max_fails: None,
+                                fail_block_timeout: None,
+                                fail_global: None,
                                 scope: None,
                                 block_c_class: false,
                                 use_local_firewall: false,
@@ -3825,6 +4030,10 @@ impl ProxyHttp for EdgeProxy {
             ctx.client_port,
         );
         ctx.client_ip_str = ctx.client_ip.to_string();
+
+        if self.maybe_serve_waf_verify(session, ctx).await? {
+            return Ok(true);
+        }
 
         if let Some(server) = &ctx.server {
             if let Some(web) = &server.web
