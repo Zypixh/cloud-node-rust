@@ -45,25 +45,25 @@ cargo build --release
 ./target/release/cloud-node-rust
 ```
 
-安装为系统命令和 systemd 服务：
+安装为系统命令和 systemd 服务（以下安装命令默认在 root 用户下执行）：
 
 ```bash
-sudo ./target/release/cloud-node-rust install
-sudo systemctl start cloud-node
+./target/release/cloud-node-rust install
+systemctl start cloud-node
 ```
 
 从 Go 原版节点迁移到 GitHub 最新 Rust Release，或全新安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | bash
 ```
 
-脚本会先询问语言，支持中文；默认交互式选择“覆盖/升级旧 Go 原版为 Rust 版”“全新安装到 `/root/cloud-node`”或“从备份恢复 Go 原版”。迁移时会备份原 Go 版二进制，按 `configs/`、`data/`、`logs/` 布局写入运行文件，并可选择从 `P3TERX/GeoLite.mmdb` 下载 GeoIP 库到 `data/`。非交互自动化场景需要显式传 `--fresh` 或 `--install`。
+脚本会先询问语言，支持中文；默认交互式选择“覆盖/升级旧 Go 原版为 Rust 版”“全新安装到 `/root/cloud-node`”或“从备份恢复 Go 原版”。迁移时会备份原 Go 版二进制，并可选择下载 GeoIP 库。非交互自动化场景需要显式传 `--fresh` 或 `--install`。
 
 全新安装的一条非交互命令示例：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --fresh --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret --geoip
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | bash -s -- --fresh --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret --geoip
 ```
 
 常用命令：
