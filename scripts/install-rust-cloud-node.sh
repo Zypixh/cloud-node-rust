@@ -64,8 +64,8 @@ Options:
   --api-endpoints LIST   Comma-separated API RPC endpoints for fresh install.
   --node-id ID           nodeId for fresh install.
   --secret SECRET        secret for fresh install.
-  --start                Start service after install even if it was stopped before.
-  --no-start             Do not start service after install.
+  --start                Restart/start service after install without prompting.
+  --no-start             Do not restart/start service after install.
   --allow-fresh          Allow install when no existing cloud-node is found.
   --dry-run              Print actions without changing files.
   --yes                  Do not prompt for confirmation.
@@ -1103,6 +1103,8 @@ fi
 
 if [ "$EXISTING_RUNTIME" = "rust" ] && [ "$NORMALIZED_VERSION" = "latest" ]; then
     ok "existing Rust cloud-node will be upgraded to the latest release."
+elif [ "$EXISTING_RUNTIME" = "rust" ]; then
+    ok "existing Rust cloud-node will be upgraded to the selected release."
 elif [ "$EXISTING_RUNTIME" = "unknown" ]; then
     warn "existing binary runtime is unknown; it will still be backed up before install."
 fi
@@ -1174,7 +1176,6 @@ fi
 SERVICE_WAS_ACTIVE=0
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME"; then
     SERVICE_WAS_ACTIVE=1
-    run systemctl stop "$SERVICE_NAME"
 fi
 
 log "downloading: $DOWNLOAD_URL"
@@ -1190,9 +1191,11 @@ fi
 run mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/configs" "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
 migrate_runtime_layout
 if [ "$DRY_RUN" -eq 0 ]; then
-    install -m 0755 "$TMP_DIR/cloud-node" "$INSTALL_BINARY"
+    install -m 0755 "$TMP_DIR/cloud-node" "$INSTALL_BINARY.new"
+    mv -f "$INSTALL_BINARY.new" "$INSTALL_BINARY"
 else
-    log "+ install -m 0755 $TMP_DIR/cloud-node $INSTALL_BINARY"
+    log "+ install -m 0755 $TMP_DIR/cloud-node $INSTALL_BINARY.new"
+    log "+ mv -f $INSTALL_BINARY.new $INSTALL_BINARY"
 fi
 
 write_api_node_config
@@ -1211,15 +1214,24 @@ if command -v systemctl >/dev/null 2>&1; then
     run systemctl daemon-reload
 fi
 
+RESTART_SERVICE=0
 case "$START_MODE" in
     always)
-        if command -v systemctl >/dev/null 2>&1; then
-            run systemctl restart "$SERVICE_NAME"
-        fi
+        RESTART_SERVICE=1
         ;;
     preserve)
-        if [ "$SERVICE_WAS_ACTIVE" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
-            run systemctl start "$SERVICE_NAME"
+        if [ "$ASSUME_YES" -eq 0 ] && prompt_available; then
+            if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+                if ask_yes_no "安装/升级已完成，是否现在重启 ${SERVICE_NAME} 进程？" "Install/upgrade completed. Restart ${SERVICE_NAME} now?" "yes"; then
+                    RESTART_SERVICE=1
+                fi
+            else
+                if ask_yes_no "安装/升级已完成，是否现在启动 ${SERVICE_NAME} 进程？" "Install/upgrade completed. Start ${SERVICE_NAME} now?" "no"; then
+                    RESTART_SERVICE=1
+                fi
+            fi
+        elif [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+            RESTART_SERVICE=1
         fi
         ;;
     never)
@@ -1228,6 +1240,18 @@ case "$START_MODE" in
         die "invalid START_MODE: $START_MODE"
         ;;
 esac
+
+if [ "$RESTART_SERVICE" -eq 1 ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+            run systemctl restart "$SERVICE_NAME"
+        else
+            run systemctl start "$SERVICE_NAME"
+        fi
+    else
+        warn "systemctl not found; please restart $SERVICE_NAME manually"
+    fi
+fi
 
 log "done"
 log "previous binary backup: $BACKUP_DIR"
