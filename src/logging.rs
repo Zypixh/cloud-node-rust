@@ -618,6 +618,9 @@ pub fn log_sni_passthrough_access(
     let server_id = server.id.unwrap_or(0);
     let request_started_at = started_at_millis / 1000;
 
+    let start_dt = crate::utils::time::local_from_timestamp_millis(started_at_millis);
+    let time_iso8601 = start_dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
+    let time_local = start_dt.format("%d/%b/%Y:%H:%M:%S %z").to_string();
     let request_uri = "/".to_string();
     let request_line = format!("CONNECT {} TCP", sni_host);
     let mut log = pb::HttpAccessLog {
@@ -641,6 +644,8 @@ pub fn log_sni_passthrough_access(
         host: sni_host.to_string(),
         timestamp: request_started_at,
         msec: started_at_millis as f64 / 1000.0,
+        time_iso8601,
+        time_local,
         hostname: CACHED_HOSTNAME.clone(),
         origin_address: backend_addr.to_string(),
         origin_status: status,
