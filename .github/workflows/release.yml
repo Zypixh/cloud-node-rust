@@ -6,6 +6,20 @@ on:
       - main
     tags:
       - 'v*'
+    paths:
+      - '.cargo/**'
+      - '.github/workflows/release.yml'
+      - 'benches/**'
+      - 'build.rs'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'pingora-main/**'
+      - 'proto_defs/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'toa-main/**'
+      - 'toa-sender/**'
+      - 'vendor/**'
 
 jobs:
   build:
