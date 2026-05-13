@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -66,9 +68,14 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          CXXFLAGS: ${{ matrix.cxxflags }}
+          CFLAGS: ${{ matrix.cxxflags }}
         with:
-          # Important: Include the unique variant name and flags in the cache key
-          key: ${{ matrix.name }}-${{ matrix.target }}
+          key: release-${{ matrix.name }}-${{ matrix.target }}-${{ matrix.cpu }}
+          shared-key: release-${{ matrix.name }}-${{ matrix.target }}-${{ matrix.cpu }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           env-vars: "RUSTFLAGS CXXFLAGS CFLAGS"
 
       - name: Build
@@ -114,8 +121,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Cache legacy cargo artifacts
-        uses: actions/cache@v4
+      - name: Restore legacy cargo artifacts
+        id: cache-legacy
+        uses: actions/cache/restore@v4
         with:
           path: |
             .cargo-legacy/registry
@@ -166,6 +174,16 @@ jobs:
               cargo build --release --target x86_64-unknown-linux-gnu
             '
 
+      - name: Save legacy cargo artifacts
+        if: github.ref == 'refs/heads/main' && steps.cache-legacy.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cargo-legacy/registry
+            .cargo-legacy/git
+            target-legacy
+          key: ${{ steps.cache-legacy.outputs.cache-primary-key }}
+
       - name: Package
         shell: bash
         run: |
@@ -187,6 +205,7 @@ jobs:
 
   release:
     name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - build
       - build-legacy
