@@ -8,7 +8,7 @@ use pingora_proxy::Session;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -35,6 +35,17 @@ pub fn init_global_log_bus(
 
 pub fn set_numeric_node_id(id: i64) {
     NUMERIC_NODE_ID.store(id, Ordering::Relaxed);
+}
+
+fn unix_epoch_millis_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn access_log_started_at_millis(duration: Duration) -> i64 {
+    unix_epoch_millis_now().saturating_sub(duration.as_millis().min(i64::MAX as u128) as i64)
 }
 
 pub fn next_request_id() -> String {
@@ -140,7 +151,8 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     let bytes_received = session.body_bytes_read() as i64 + 500;
     let bytes_sent = session.body_bytes_sent() as i64 + ctx.response_headers_size as i64 + 20;
 
-    let request_started_at_millis = ctx.start_timestamp_millis;
+    let request_duration = ctx.start_time.elapsed();
+    let request_started_at_millis = access_log_started_at_millis(request_duration);
     let request_started_at = request_started_at_millis / 1000;
 
     let scheme = if ctx.is_tls_downstream
@@ -307,7 +319,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         request_method: req.method.to_string(),
         request_filename,
         request_length: bytes_received,
-        request_time: ctx.start_time.elapsed().as_secs_f64(),
+        request_time: request_duration.as_secs_f64(),
         request: request_line,
         request_body: {
             if ctx.request_body.is_empty() {
@@ -603,7 +615,7 @@ pub fn log_sni_passthrough_access(
     client_addr: SocketAddr,
     listen_port: u16,
     backend_addr: &str,
-    started_at_millis: i64,
+    _started_at_millis: i64,
     duration: Duration,
     bytes_received: u64,
     bytes_sent: u64,
@@ -616,9 +628,10 @@ pub fn log_sni_passthrough_access(
     };
 
     let server_id = server.id.unwrap_or(0);
-    let request_started_at = started_at_millis / 1000;
+    let request_started_at_millis = access_log_started_at_millis(duration);
+    let request_started_at = request_started_at_millis / 1000;
 
-    let start_dt = crate::utils::time::local_from_timestamp_millis(started_at_millis);
+    let start_dt = crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
     let time_iso8601 = start_dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
     let time_local = start_dt.format("%d/%b/%Y:%H:%M:%S %z").to_string();
     let request_uri = "/".to_string();
@@ -643,7 +656,7 @@ pub fn log_sni_passthrough_access(
         body_bytes_sent: bytes_sent as i64,
         host: sni_host.to_string(),
         timestamp: request_started_at,
-        msec: started_at_millis as f64 / 1000.0,
+        msec: request_started_at_millis as f64 / 1000.0,
         time_iso8601,
         time_local,
         hostname: CACHED_HOSTNAME.clone(),
