@@ -633,9 +633,9 @@ detect_asset_name() {
     case "$arch" in
         x86_64|amd64)
             if glibc_is_older_than_228; then
-                printf 'cloud-node-rust-linux-x64-legacy-glibc217.tar.gz\n'
+                die "x86_64 systems with glibc older than 2.28 are not supported by official release assets"
             elif ! cpu_has_flag sse4_2; then
-                printf 'cloud-node-rust-linux-x64-legacy-glibc217.tar.gz\n'
+                die "x86_64 CPU without SSE4.2 is not supported by official release assets"
             elif cpu_has_flag avx512f; then
                 printf 'cloud-node-rust-linux-x64-v4-avx512.tar.gz\n'
             elif cpu_has_flag avx2; then

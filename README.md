@@ -107,12 +107,10 @@ Release workflow 面向不同 CPU 和系统环境提供多个 Linux 产物：
 - `linux-x64-v4-avx512`
 - `linux-arm64-generic`
 - `linux-arm64-neoverse-n1`
-- `linux-x64-legacy-glibc217`
 
 选择建议：
 
 - 新系统和新 CPU 优先选择匹配微架构的性能包。
-- `CentOS 7.x`、`Debian 10` 等较老系统优先选择 `legacy-glibc217` 包。
 - 自行编译时可以根据机器设置 `RUSTFLAGS`，但需要确认目标 CPU 指令集和运行环境一致。
 
 高性能编译示例：

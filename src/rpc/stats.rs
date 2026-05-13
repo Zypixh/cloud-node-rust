@@ -19,6 +19,22 @@ fn billable_bytes(snapshot: &ServerStatusSnapshot, api_config: &ApiConfig) -> u6
 const BANDWIDTH_REPORT_INTERVAL_SECS: u64 = 300;
 const BANDWIDTH_SAMPLE_INTERVAL_SECS: u64 = 2;
 const STAT_RETRY_RETENTION_SECS: i64 = 1200;
+const BANDWIDTH_ALGO_AVG: &str = "avg";
+
+fn bandwidth_bytes_per_sec(stat: &BandwidthWindowStat, config_store: &ConfigStore) -> u64 {
+    let use_avg = stat.user_plan_id > 0
+        && config_store
+            .get_user_plan_sync(stat.user_plan_id)
+            .and_then(|user_plan| user_plan.user)
+            .map(|user| user.bandwidth_algo == BANDWIDTH_ALGO_AVG)
+            .unwrap_or(false);
+
+    if use_avg {
+        stat.total_bytes / BANDWIDTH_REPORT_INTERVAL_SECS
+    } else {
+        stat.peak_bytes_per_sec
+    }
+}
 
 #[derive(Clone, Default)]
 struct BandwidthWindowStat {
@@ -107,31 +123,34 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             let now_ts = crate::utils::time::now_timestamp();
             pending_stats.retain(|item| now_ts - item.queued_at <= STAT_RETRY_RETENTION_SECS);
             let mut upload_items = std::mem::take(&mut pending_stats);
-            upload_items.extend(window_stats.drain().map(|(_, stat)| PendingBandwidthStat {
-                queued_at: window_started_at - BANDWIDTH_REPORT_INTERVAL_SECS as i64,
-                stat: pb::ServerBandwidthStat {
-                    user_id: stat.user_id,
-                    server_id: stat.server_id,
-                    day: stat.day.clone(),
-                    time_at: stat.time_at,
-                    bytes: stat.peak_bytes_per_sec as i64,
-                    bits: (stat.peak_bytes_per_sec * 8) as i64,
-                    total_bytes: stat.total_bytes as i64,
-                    cached_bytes: stat.cached_bytes.min(stat.total_bytes) as i64,
-                    attack_bytes: stat.attack_bytes.min(stat.total_bytes) as i64,
-                    count_requests: stat.count_requests as i64,
-                    count_cached_requests: stat.count_cached_requests as i64,
-                    count_attack_requests: stat.count_attack_requests as i64,
-                    user_plan_id: stat.user_plan_id,
-                    count_websocket_connections: stat.count_websocket_connections as i64,
-                    origin_total_bytes: stat.origin_total_bytes as i64,
-                    origin_avg_bytes: stat.origin_avg_bytes as i64,
-                    origin_avg_bits: stat.origin_avg_bits as i64,
-                    count_i_ps:
-                        crate::metrics::daily::UNIQUE_IP_TRACKER.count(stat.server_id, &stat.day),
-                    node_region_id,
-                    ..Default::default()
-                },
+            upload_items.extend(window_stats.drain().map(|(_, stat)| {
+                let bytes_per_sec = bandwidth_bytes_per_sec(&stat, &config_store);
+                PendingBandwidthStat {
+                    queued_at: window_started_at - BANDWIDTH_REPORT_INTERVAL_SECS as i64,
+                    stat: pb::ServerBandwidthStat {
+                        user_id: stat.user_id,
+                        server_id: stat.server_id,
+                        day: stat.day.clone(),
+                        time_at: stat.time_at,
+                        bytes: bytes_per_sec as i64,
+                        bits: (bytes_per_sec * 8) as i64,
+                        total_bytes: stat.total_bytes as i64,
+                        cached_bytes: stat.cached_bytes.min(stat.total_bytes) as i64,
+                        attack_bytes: stat.attack_bytes.min(stat.total_bytes) as i64,
+                        count_requests: stat.count_requests as i64,
+                        count_cached_requests: stat.count_cached_requests as i64,
+                        count_attack_requests: stat.count_attack_requests as i64,
+                        user_plan_id: stat.user_plan_id,
+                        count_websocket_connections: stat.count_websocket_connections as i64,
+                        origin_total_bytes: stat.origin_total_bytes as i64,
+                        origin_avg_bytes: stat.origin_avg_bytes as i64,
+                        origin_avg_bits: stat.origin_avg_bits as i64,
+                        count_i_ps: crate::metrics::daily::UNIQUE_IP_TRACKER
+                            .count(stat.server_id, &stat.day),
+                        node_region_id,
+                        ..Default::default()
+                    },
+                }
             }));
             if !upload_items.is_empty() {
                 let stats: Vec<_> = upload_items.iter().map(|item| item.stat.clone()).collect();
