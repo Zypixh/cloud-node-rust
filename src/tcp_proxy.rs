@@ -533,14 +533,14 @@ impl TcpProxyManager {
                 }
             }
 
-            let (_bytes_received, bytes_sent) = match res {
-                Ok((r, s)) => (r, s),
-                Err(ref e) => {
+            let (_bytes_received, bytes_sent) = match &res {
+                Ok((r, s)) => (*r, *s),
+                Err(e) => {
                     debug!(
                         "TCP Proxy: Bidirectional copy (TLS upstream) finished with error: {}",
                         e
                     );
-                    (0, 0)
+                    (e.bytes_received, e.bytes_sent)
                 }
             };
 
@@ -562,7 +562,7 @@ impl TcpProxyManager {
             );
 
             crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
-            res.map(|_| ())
+            res.map(|_| ()).map_err(Into::into)
         } else {
             // Metrics: Start connection
             let client_ip = client_addr.ip().to_string();
@@ -691,8 +691,27 @@ impl TcpProxyManager {
             );
 
             crate::metrics::record::request_end(sid, 0, 0, false, false, false, None);
-            res.map(|_| ())
+            res.map(|_| ()).map_err(Into::into)
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BidirectionalStreamError {
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for BidirectionalStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for BidirectionalStreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -700,58 +719,71 @@ pub(crate) async fn stream_bidirectional_with_metrics<C, B>(
     server_id: i64,
     client: C,
     backend: B,
-) -> anyhow::Result<(u64, u64)>
+) -> Result<(u64, u64), BidirectionalStreamError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
     let (client_reader, client_writer) = tokio::io::split(client);
     let (backend_reader, backend_writer) = tokio::io::split(backend);
+    let bytes_received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    let client_to_backend_bytes = bytes_received.clone();
     let client_to_backend = async move {
         copy_stream_and_track(client_reader, backend_writer, |n| {
+            client_to_backend_bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
             crate::metrics::record::record_transfer(server_id, 0, n, None);
             crate::metrics::record::record_origin_traffic(server_id, n, 0, None);
         })
         .await
     };
 
+    let backend_to_client_bytes = bytes_sent.clone();
     let backend_to_client = async move {
         copy_stream_and_track(backend_reader, client_writer, |n| {
+            backend_to_client_bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
             crate::metrics::record::record_transfer(server_id, n, 0, None);
             crate::metrics::record::record_origin_traffic(server_id, 0, n, None);
         })
         .await
     };
 
-    let (c_to_b, b_to_c) = tokio::try_join!(client_to_backend, backend_to_client)?;
-    Ok((c_to_b, b_to_c))
+    tokio::try_join!(client_to_backend, backend_to_client).map_err(|source| {
+        BidirectionalStreamError {
+            bytes_received: bytes_received.load(std::sync::atomic::Ordering::Relaxed),
+            bytes_sent: bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
+            source,
+        }
+    })?;
+
+    Ok((
+        bytes_received.load(std::sync::atomic::Ordering::Relaxed),
+        bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
+    ))
 }
 
 async fn copy_stream_and_track<R, W, F>(
     mut reader: R,
     mut writer: W,
     mut on_chunk: F,
-) -> std::io::Result<u64>
+) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
     F: FnMut(u64),
 {
-    let mut total = 0u64;
     let mut buf = vec![0u8; 16 * 1024];
 
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
             writer.shutdown().await?;
-            return Ok(total);
+            return Ok(());
         }
 
         writer.write_all(&buf[..n]).await?;
-        let n = n as u64;
-        total += n;
-        on_chunk(n);
+        on_chunk(n as u64);
     }
 }
 

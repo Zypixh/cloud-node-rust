@@ -580,6 +580,19 @@ impl HttpProxyManager {
                 Ok(())
             }
             Err(err) => {
+                let bytes_received = err.bytes_received;
+                let bytes_sent = err.bytes_sent;
+                crate::metrics::record::record_http_dimensions(
+                    server_id,
+                    client_addr.ip(),
+                    &sni_host,
+                    "-",
+                    bytes_sent as i64,
+                    0,
+                    0,
+                    None,
+                    None,
+                );
                 crate::logging::log_sni_passthrough_access(
                     request_id,
                     &server,
@@ -589,8 +602,8 @@ impl HttpProxyManager {
                     &backend_addr,
                     started_at_millis,
                     started.elapsed(),
-                    0,
-                    0,
+                    bytes_received,
+                    bytes_sent,
                     502,
                     Some(&err.to_string()),
                 );

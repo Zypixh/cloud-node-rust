@@ -257,6 +257,11 @@ impl UdpProxyManager {
                 let server_id = session.server_id;
                 let origin_id = session.origin_id;
                 let client_addr = session.client_addr;
+                let domain = server
+                    .get_plain_server_names()
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
 
                 let listen_socket_inner = listen_socket.clone();
                 tokio::spawn(async move {
@@ -266,6 +271,7 @@ impl UdpProxyManager {
                         server_id,
                         origin_id,
                         client_addr,
+                        domain,
                         listen_socket_inner,
                         rx,
                     )
@@ -300,6 +306,7 @@ impl UdpProxyManager {
         server_id: i64,
         origin_id: i64,
         client_addr: SocketAddr,
+        domain: String,
         listen_socket: Arc<UdpSocket>,
         mut rx: mpsc::Receiver<Vec<u8>>,
     ) -> anyhow::Result<()> {
@@ -307,56 +314,83 @@ impl UdpProxyManager {
             Ok(socket) => socket,
             Err(err) => {
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                crate::metrics::record::record_http_dimensions(
+                    server_id,
+                    client_addr.ip(),
+                    &domain,
+                    "-",
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                );
+                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 return Err(err.into());
             }
         };
         if let Err(err) = backend_socket.connect(backend_addr).await {
             crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+            crate::metrics::record::record_http_dimensions(
+                server_id,
+                client_addr.ip(),
+                &domain,
+                "-",
+                0,
+                0,
+                0,
+                None,
+                None,
+            );
+            crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
             return Err(err.into());
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
-        let mut downstream_sent = 0u64;
-        let mut downstream_received = 0u64;
 
+        let mut downstream_sent = 0u64;
+        let mut result = Ok(());
         let mut buf = vec![0u8; 65535];
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     break;
                 }
-                // Client -> Backend
                 Some(data) = rx.recv() => {
                     let len = data.len() as u64;
                     if let Err(err) = backend_socket.send(&data).await {
                         crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
-                        return Err(err.into());
+                        result = Err(err.into());
+                        break;
                     }
-                    downstream_received += len;
-                    // Client -> Backend: Origin Sent = len, Origin Received = 0
+                    crate::metrics::record::record_transfer(server_id, 0, len, None);
                     crate::metrics::record::record_origin_traffic(server_id, len, 0, None);
                 }
-                // Backend -> Client
                 Ok(len) = backend_socket.recv(&mut buf) => {
                     let len_u64 = len as u64;
-                    listen_socket.send_to(&buf[..len], client_addr).await?;
+                    if let Err(err) = listen_socket.send_to(&buf[..len], client_addr).await {
+                        result = Err(err.into());
+                        break;
+                    }
                     downstream_sent += len_u64;
-                    // Backend -> Client: Origin Sent = 0, Origin Received = len
+                    crate::metrics::record::record_transfer(server_id, len_u64, 0, None);
                     crate::metrics::record::record_origin_traffic(server_id, 0, len_u64, None);
                 }
-                // Timeout or close (rx closed means manager decided to terminate or buffer full/dropped)
                 else => break,
             }
         }
-        crate::metrics::record::request_end(
+        crate::metrics::record::record_http_dimensions(
             server_id,
-            downstream_sent,
-            downstream_received,
-            false,
-            false,
-            false,
+            client_addr.ip(),
+            &domain,
+            "-",
+            downstream_sent as i64,
+            0,
+            0,
+            None,
             None,
         );
-        Ok(())
+        crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+        result
     }
 
     async fn find_server_by_port(&self, port: u16) -> Option<Arc<ServerConfig>> {

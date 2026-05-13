@@ -618,6 +618,8 @@ pub fn log_sni_passthrough_access(
     let server_id = server.id.unwrap_or(0);
     let request_started_at = started_at_millis / 1000;
 
+    let request_uri = "/".to_string();
+    let request_line = format!("CONNECT {} TCP", sni_host);
     let mut log = pb::HttpAccessLog {
         request_id,
         server_id,
@@ -625,11 +627,12 @@ pub fn log_sni_passthrough_access(
         remote_addr: client_addr.ip().to_string(),
         raw_remote_addr: client_addr.ip().to_string(),
         remote_port: client_addr.port() as i32,
-        request_uri: format!("https://{}/", sni_host),
-        request_path: "/".to_string(),
+        request_uri: request_uri.clone(),
+        request_path: request_uri,
         request_method: "CONNECT".to_string(),
         request_length: bytes_received as i64,
         request_time: duration.as_secs_f64(),
+        request: request_line,
         scheme: "https".to_string(),
         proto: "TCP".to_string(),
         status,
@@ -642,6 +645,7 @@ pub fn log_sni_passthrough_access(
         origin_address: backend_addr.to_string(),
         origin_status: status,
         server_port: listen_port as i32,
+        server_protocol: "TCP".to_string(),
         ..Default::default()
     };
 
