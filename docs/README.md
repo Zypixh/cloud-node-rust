@@ -7,7 +7,7 @@
 - [架构概览](architecture.md)：说明控制面、代理运行时、缓存、WAF、日志统计和四层代理之间的关系。
 - [运行时说明](runtime.md)：说明进程启动、任务调度、配置热更新、证书、缓存后台任务和性能监控。
 - [功能说明](features.md)：逐项介绍协议代理、缓存、WAF、内容处理、日志统计、证书和多级分发能力。
-- [配置说明](configuration.md)：说明 `api_node.yaml`、运行目录、数据文件、缓存目录和控制面配置兼容。
+- [配置说明](configuration.md)：说明 `configs/api_node.yaml`、运行目录、数据文件、缓存目录和控制面配置兼容。
 - [部署与运维](operations.md)：说明构建、安装、systemd、系统参数、监控、日志和排障建议。
 
 ## 阅读顺序

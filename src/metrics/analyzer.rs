@@ -56,32 +56,53 @@ impl Clone for RequestStats {
 static GEO_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 static GEO_CITY_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
-    let path = "GeoLite2-City.mmdb";
-    match maxminddb::Reader::open_readfile(path) {
-        Ok(r) => Some(r),
-        Err(e) => {
-            warn!(
-                "Failed to load GeoIP City database at {}: {}. Geo stats will be disabled.",
-                path, e
-            );
-            GEO_AVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-            None
+    let paths = crate::paths::NodePaths::current().geoip_city_candidates();
+    for path in &paths {
+        if path.exists() {
+            return match maxminddb::Reader::open_readfile(path) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!(
+                        "Failed to load GeoIP City database at {}: {}. Geo stats will be disabled.",
+                        path.display(),
+                        e
+                    );
+                    GEO_AVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+                    None
+                }
+            };
         }
     }
+    warn!(
+        "Failed to load GeoIP City database from {:?}. Geo stats will be disabled.",
+        paths
+    );
+    GEO_AVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+    None
 });
 
 static GEO_ASN_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
-    let path = "GeoLite2-ASN.mmdb";
-    match maxminddb::Reader::open_readfile(path) {
-        Ok(r) => Some(r),
-        Err(e) => {
-            warn!(
-                "Failed to load GeoIP ASN database at {}: {}. ASN stats will be disabled.",
-                path, e
-            );
-            None
+    let paths = crate::paths::NodePaths::current().geoip_asn_candidates();
+    for path in &paths {
+        if path.exists() {
+            return match maxminddb::Reader::open_readfile(path) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!(
+                        "Failed to load GeoIP ASN database at {}: {}. ASN stats will be disabled.",
+                        path.display(),
+                        e
+                    );
+                    None
+                }
+            };
         }
     }
+    warn!(
+        "Failed to load GeoIP ASN database from {:?}. ASN stats will be disabled.",
+        paths
+    );
+    None
 });
 
 const CACHE_SHARDS: usize = 64;

@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::ffi::CString;
 use std::fs;
 use std::future::Future;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,8 +17,6 @@ use cloud_node_rust::health_manager::GlobalHealthManager;
 use cloud_node_rust::proxy::EdgeProxy;
 use cloud_node_rust::ssl::DynamicCertSelector;
 use cloud_node_rust::{firewall, log_uploader, logging, rpc, tcp_proxy, udp_proxy};
-
-const PID_FILE: &str = "../data/cloud-node.pid";
 
 struct LocalLogTimer;
 
@@ -85,25 +84,28 @@ where
     });
 }
 
-fn check_running() -> Option<u32> {
+fn check_running() -> Option<(u32, PathBuf)> {
     use std::os::unix::io::AsRawFd;
-    let file = fs::File::open(PID_FILE).ok()?;
-    let fd = file.as_raw_fd();
+    for path in cloud_node_rust::paths::NodePaths::current().pid_file_candidates() {
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let fd = file.as_raw_fd();
 
-    // Try to get an exclusive lock without blocking
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if ret == 0 {
-        // We got the lock, so it's NOT running
-        unsafe { libc::flock(fd, libc::LOCK_UN) };
-        return None;
-    }
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret == 0 {
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+            continue;
+        }
 
-    // If it failed with EWOULDBLOCK, someone else has the lock
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN) {
-        // It is running. Read the PID.
-        if let Ok(content) = fs::read_to_string(PID_FILE) {
-            return content.trim().parse::<u32>().ok();
+        let err = std::io::Error::last_os_error();
+        if (err.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || err.raw_os_error() == Some(libc::EAGAIN))
+            && let Ok(content) = fs::read_to_string(&path)
+            && let Ok(pid) = content.trim().parse::<u32>()
+        {
+            return Some((pid, path));
         }
     }
 
@@ -119,13 +121,13 @@ fn main() -> anyhow::Result<()> {
             run_node(cli.monitor_port, cli.monitor_clear)?;
         }
         Some(Commands::Start) => {
-            if let Some(pid) = check_running() {
+            if let Some((pid, _)) = check_running() {
                 println!("CloudNode is already running (PID: {})", pid);
                 return Ok(());
             }
 
-            // Ensure data & log directories exist before daemonizing
-            fs::create_dir_all("../data").ok();
+            let node_paths = cloud_node_rust::paths::NodePaths::current();
+            node_paths.ensure_runtime_dirs().ok();
 
             // Single-fork daemonize
             unsafe {
@@ -154,14 +156,15 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Redirect stderr to log file for crash diagnostics
-                let log_path = CString::new("../data/cloud-node-stderr.log")?;
+                let log_path =
+                    CString::new(node_paths.run_log_file().to_string_lossy().as_bytes())?;
                 let log_fd = libc::open(
                     log_path.as_ptr(),
                     libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
                     0o644,
                 );
                 if log_fd >= 0 {
+                    libc::dup2(log_fd, libc::STDOUT_FILENO);
                     libc::dup2(log_fd, libc::STDERR_FILENO);
                     if log_fd > libc::STDERR_FILENO {
                         libc::close(log_fd);
@@ -179,18 +182,16 @@ fn main() -> anyhow::Result<()> {
             run_node(cli.monitor_port, cli.monitor_clear)?;
         }
         Some(Commands::Stop) => {
-            if let Some(pid) = check_running() {
+            if let Some((pid, pid_path)) = check_running() {
                 println!("Stopping CloudNode (PID: {})...", pid);
                 let _ = Command::new("kill").arg(pid.to_string()).status();
-                // We don't necessarily need to remove the file, flock will handle it,
-                // but for cleanliness we can try.
-                let _ = fs::remove_file(PID_FILE);
+                let _ = fs::remove_file(pid_path);
             } else {
                 println!("CloudNode is not running.");
             }
         }
         Some(Commands::Status) => {
-            if let Some(pid) = check_running() {
+            if let Some((pid, _)) = check_running() {
                 println!("CloudNode is running (PID: {})", pid);
             } else {
                 println!("CloudNode is stopped.");
@@ -206,6 +207,7 @@ fn main() -> anyhow::Result<()> {
             {
                 let exe_path = std::env::current_exe()?.canonicalize()?;
                 let work_dir = std::env::current_dir()?.canonicalize()?;
+                let node_paths = cloud_node_rust::paths::NodePaths::from_root(&work_dir);
 
                 // 1. Create global command wrapper
                 let bin_path = "/usr/bin/cloud-node";
@@ -240,7 +242,7 @@ fn main() -> anyhow::Result<()> {
                      After=network.target\n\n\
                      [Service]\n\
                      Type=forking\n\
-                     PIDFile={}/../data/cloud-node.pid\n\
+                     PIDFile={}\n\
                      WorkingDirectory={}\n\
                      ExecStart={} start\n\
                      ExecStop={} stop\n\
@@ -250,7 +252,7 @@ fn main() -> anyhow::Result<()> {
                      LimitNOFILE=1048576\n\n\
                      [Install]\n\
                      WantedBy=multi-user.target\n",
-                    work_dir.display(),
+                    node_paths.pid_file().display(),
                     work_dir.display(),
                     exe_path.display(),
                     exe_path.display(),
@@ -288,18 +290,19 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()> {
-    // Ensure data directory exists
-    fs::create_dir_all("../data").ok();
+    let node_paths = cloud_node_rust::paths::NodePaths::current();
+    node_paths.ensure_runtime_dirs().ok();
 
     // 0. Ensure single instance and write PID using flock
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
 
+    let pid_path = node_paths.pid_file();
     let pid_file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .open(PID_FILE)?;
+        .open(&pid_path)?;
     let fd = pid_file.as_raw_fd();
 
     // Try to get an exclusive lock
@@ -307,7 +310,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN)
         {
-            if let Ok(content) = fs::read_to_string(PID_FILE) {
+            if let Ok(content) = fs::read_to_string(&pid_path) {
                 eprintln!(
                     "Error: Another instance is already running (PID: {})",
                     content.trim()
@@ -406,7 +409,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     }
 
     // 1. Load API Config
-    let api_config = ApiConfig::load_default().expect("Failed to load api_node.yaml");
+    let api_config = ApiConfig::load_default().expect("Failed to load configs/api_node.yaml");
     let api_config_arc = Arc::new(api_config.clone());
 
     // 2. Initialize Managers

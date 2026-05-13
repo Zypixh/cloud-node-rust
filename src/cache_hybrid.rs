@@ -727,7 +727,7 @@ impl HybridStorage {
                     .get("dir")
                     .and_then(|v| v.as_str())
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("../data/cache"));
+                    .unwrap_or_else(|| crate::paths::NodePaths::current().cache_dir());
 
                 let disks = sysinfo::Disks::new_with_refreshed_list();
                 let disk_size = disks
@@ -1206,7 +1206,7 @@ pub fn start_cache_profiler() {
 /// Periodically evict expired entries from FAST_L1 and cap OPEN_FILE_CACHE size.
 pub fn start_cache_janitor() {
     tokio::spawn(async {
-        let disk_root = std::path::Path::new("configs/cache/disk");
+        let disk_root = crate::paths::NodePaths::current().cache_dir();
         // Initialize memory budget immediately — don't wait 60s
         if FAST_L1_MAX_BYTES.load(Ordering::Relaxed) == 0 {
             let budget = HybridStorage::compute_memory_budget();

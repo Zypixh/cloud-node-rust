@@ -9,11 +9,11 @@ pub struct CacheManager {
 
 impl CacheManager {
     pub fn new(max_memory_bytes: usize) -> Self {
-        // HybridStorage uses L1 (Memory) and L2 (Disk at configs/cache/disk)
+        let cache_dir = crate::paths::NodePaths::current().cache_dir();
         Self {
             storage: Box::leak(Box::new(HybridStorage::new(
                 max_memory_bytes,
-                "configs/cache/disk",
+                cache_dir.to_string_lossy().as_ref(),
             ))),
         }
     }

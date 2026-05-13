@@ -6,10 +6,10 @@ CloudNode Rust 的运行时由一个主进程和多个异步后台任务组成�
 
 启动过程大致如下：
 
-1. 创建 `../data` 目录。
-2. 通过 `../data/cloud-node.pid` 和 `flock` 保证单实例运行。
+1. 创建 `configs`、`data`、`logs` 目录。
+2. 通过 `data/cloud-node.pid` 和 `flock` 保证单实例运行。
 3. 初始化日志系统。
-4. 加载 `api_node.yaml`。
+4. 加载 `configs/api_node.yaml`。
 5. 初始化 `ConfigStore`、WAF 状态、证书选择器、健康检查管理器。
 6. 启动控制面同步任务。
 7. 启动 HTTP、HTTPS、HTTP/3、TCP、UDP 等监听器。
@@ -43,21 +43,22 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `restart`：先停止再启动。
 - `status`：读取 PID 文件和文件锁判断节点状态。
 - `install`：注册 `/usr/bin/cloud-node` wrapper 和 systemd service。
-- `test`：验证 `api_node.yaml` 是否可解析。
+- `test`：验证 `configs/api_node.yaml` 是否可解析。
 
 ## 进程和目录
 
-默认运行目录假设二进制位于项目或安装目录内，并使用相对路径保存状态：
+默认运行目录采用 GoEdge/FlexCDN 风格的三类目录：
 
-- `../data/cloud-node.pid`：后台进程 PID 文件。
-- `../data/cloud-node-stderr.log`：后台进程 stderr。
-- `../data/state.json`：部分运行状态持久化。
-- `../data/blocked_ips.json`：本地封禁 IP 持久化。
-- `../data/metrics.db`：统计和缓存元数据持久化。
-- `../data/cache`：部分缓存测试和默认数据目录。
-- `configs/cache/disk`：默认磁盘缓存目录。
+- `configs/api_node.yaml`：API 节点连接配置。
+- `data/cloud-node.pid`：后台进程 PID 文件。
+- `data/state.json`：部分运行状态持久化。
+- `data/blocked_ips.json`：本地封禁 IP 持久化。
+- `data/metrics.db`：统计和缓存元数据持久化。
+- `data/cache`：默认磁盘缓存目录。
+- `data/GeoLite2-City.mmdb`、`data/GeoLite2-ASN.mmdb`：GeoIP 数据库。
+- `logs/run.log`：后台进程 stdout/stderr。
 
-生产部署时应保持工作目录稳定，不要只移动二进制而忽略相对目录。
+生产部署时应保持工作目录稳定。旧版 `../data/*`、根目录 `api_node.yaml` 和工作目录下的 GeoIP 文件仅作为迁移 fallback 读取。
 
 ## 异步任务
 
@@ -145,4 +146,4 @@ cloud-node --monitor-port 8888
 
 - `systemctl status cloud-node`
 - `journalctl -u cloud-node`
-- `../data/cloud-node-stderr.log`
+- `logs/run.log`

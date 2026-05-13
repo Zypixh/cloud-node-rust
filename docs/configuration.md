@@ -2,9 +2,9 @@
 
 CloudNode Rust 的本地配置很少，主要配置来自控制面。节点本地只需要知道 API 节点地址、节点 ID 和密钥。
 
-## api_node.yaml
+## configs/api_node.yaml
 
-默认配置文件位于运行目录：
+默认配置文件位于运行目录的 `configs/api_node.yaml`：
 
 ```yaml
 rpc.endpoints: [ "http://127.0.0.1:8001" ]
@@ -51,14 +51,15 @@ secret: "your-node-secret"
 
 常见目录和文件：
 
-- `api_node.yaml`：API 节点连接配置。
-- `GeoLite2-City.mmdb`：GeoIP 城市库。
-- `GeoLite2-ASN.mmdb`：ASN 数据库。
-- `GeoLite2-Country.mmdb`：国家数据库。
-- `configs/cache/disk`：默认磁盘缓存目录。
-- `../data`：运行状态、日志、统计和部分缓存数据。
+- `configs/api_node.yaml`：API 节点连接配置。
+- `data/GeoLite2-City.mmdb`：GeoIP 城市库。
+- `data/GeoLite2-ASN.mmdb`：ASN 数据库。
+- `data/GeoLite2-Country.mmdb`：国家数据库。
+- `data/cache`：默认磁盘缓存目录。
+- `data/state.json`、`data/blocked_ips.json`、`data/metrics.db`：运行状态、封禁和统计数据。
+- `logs/run.log`：后台启动模式的 stdout/stderr 日志。
 
-GeoIP 文件缺失时，地区类 WAF、地区统计和 ASN 识别能力会受限。
+旧版根目录 `api_node.yaml`、`../data/*` 和工作目录下的 `GeoLite2-*.mmdb` 会作为迁移兼容读取，新写入统一使用 `configs/`、`data/`、`logs/`。GeoIP 文件缺失时，地区类 WAF、地区统计和 ASN 识别能力会受限。
 
 ## 缓存配置
 
@@ -103,7 +104,7 @@ sysctl -w net.ipv4.ip_local_port_range="1024 65535"
 
 ## 配置验证
 
-验证本地 `api_node.yaml`：
+验证本地 `configs/api_node.yaml`：
 
 ```bash
 cloud-node test

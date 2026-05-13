@@ -3,6 +3,7 @@ use crate::pb;
 use crate::rpc::client::RpcClient;
 use crate::rpc::logs::report_node_log_with_context;
 use std::fs;
+use std::path::Path;
 use tracing::{error, info, warn};
 
 pub async fn start_ip_library_syncer(api_config: ApiConfig) {
@@ -42,13 +43,14 @@ pub async fn start_ip_library_syncer(api_config: ApiConfig) {
                 if let Some(artifact_item) = artifact.ip_library_artifact {
                     let file_id = artifact_item.file_id;
                     if file_id > 0 && file_id != last_file_id {
-                        let target_path = "GeoLite2-City.mmdb"; // Default target
+                        let node_paths = crate::paths::NodePaths::current();
+                        let target_path = node_paths.geoip_city_file();
 
                         info!(
                             "New IP library version found (FileId: {}). Starting download...",
                             file_id
                         );
-                        match download_file(&client, file_id, target_path).await {
+                        match download_file(&client, file_id, &target_path).await {
                             Ok(_) => {
                                 info!("IP library updated successfully to FileId: {}.", file_id);
                                 last_file_id = file_id;
@@ -93,7 +95,7 @@ pub async fn start_ip_library_syncer(api_config: ApiConfig) {
     }
 }
 
-async fn download_file(client: &RpcClient, file_id: i64, target_path: &str) -> anyhow::Result<()> {
+async fn download_file(client: &RpcClient, file_id: i64, target_path: &Path) -> anyhow::Result<()> {
     let mut chunk_client = client.file_chunk_service();
     let resp = chunk_client
         .find_all_file_chunk_ids(pb::FindAllFileChunkIdsRequest {
@@ -103,7 +105,10 @@ async fn download_file(client: &RpcClient, file_id: i64, target_path: &str) -> a
         .await?;
 
     let chunk_ids = resp.into_inner().file_chunk_ids;
-    let tmp_path = format!("{}.tmp", target_path);
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = target_path.with_extension("mmdb.tmp");
     let mut file_content = Vec::new();
 
     for chunk_id in chunk_ids {

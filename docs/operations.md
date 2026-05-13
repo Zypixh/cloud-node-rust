@@ -78,7 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 
 显式 `--install` 迁移安装要求找到旧 `cloud-node`，避免在未备份原版的情况下误装。全新安装使用 `--fresh`，会自动允许没有旧节点的环境。
 
-全新安装会默认创建 `/root/cloud-node`，并交互输入 API 连接配置，生成 `/root/cloud-node/api_node.yaml`。
+全新安装会默认创建 `/root/cloud-node`，并交互输入 API 连接配置，生成 `/root/cloud-node/configs/api_node.yaml`。
 
 上线前建议先 dry-run：
 
@@ -89,7 +89,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.0.6 --yes
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.0.7 --yes
 ```
 
 全新安装：
@@ -110,10 +110,10 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --lang zh --geoip --yes
 ```
 
-GeoIP 文件默认写入节点工作目录，因为运行时会从工作目录读取 `GeoLite2-City.mmdb` 和 `GeoLite2-ASN.mmdb`。如需指定目录：
+GeoIP 文件默认写入节点 `data/` 目录，因为运行时会优先从 `data/GeoLite2-City.mmdb` 和 `data/GeoLite2-ASN.mmdb` 读取。旧版工作目录 GeoIP 文件仍作为迁移 fallback。 如需指定目录：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --geoip --geoip-dir /opt/cloud-node-rust --yes
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --geoip --geoip-dir /opt/cloud-node-rust/data --yes
 ```
 
 指定安装目录或禁止自动启动：
@@ -146,10 +146,10 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 
 上线前建议确认：
 
-- `api_node.yaml` 存在且 nodeId、secret 正确。
+- `configs/api_node.yaml` 存在且 nodeId、secret 正确。
 - API 节点 RPC endpoint 可达。
 - 运行目录权限正确。
-- `../data` 可写。
+- `data` 和 `logs` 可写。
 - 缓存目录可写且容量充足。
 - GeoIP 数据文件存在。
 - 监听端口没有被其它进程占用。
@@ -181,7 +181,7 @@ cloud-node --monitor-port 8888
 常见日志来源：
 
 - systemd 日志：`journalctl -u cloud-node`
-- 后台 stderr：`../data/cloud-node-stderr.log`
+- 后台 stdout/stderr：`logs/run.log`
 - 控制面节点日志：由 NodeLogUploader 上报。
 - 访问日志：由 LogUploader 批量上报。
 
@@ -190,7 +190,7 @@ cloud-node --monitor-port 8888
 ```bash
 systemctl status cloud-node
 journalctl -u cloud-node -n 200 --no-pager
-tail -n 200 ../data/cloud-node-stderr.log
+tail -n 200 logs/run.log
 ```
 
 ## 性能建议

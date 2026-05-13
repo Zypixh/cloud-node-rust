@@ -40,7 +40,7 @@ CloudNode Rust 由控制面同步、代理运行时、缓存系统、安全策�
 
 ## 控制面同步
 
-节点通过 `api_node.yaml` 获取 RPC endpoint、`nodeId` 和 `secret`。启动后会连接控制面，完成以下同步：
+节点通过 `configs/api_node.yaml` 获取 RPC endpoint、`nodeId` 和 `secret`。启动后会连接控制面，完成以下同步：
 
 - 节点基础信息上报。
 - 已连接 API 节点上报。
@@ -71,7 +71,7 @@ RPC 客户端使用 gzip 压缩和较大的 message size 限制，适配大配�
 - `HybridStorage` 负责 Memory + Disk 的读写和淘汰。
 - RocksDB 和内存索引保存缓存元数据，避免命中路径频繁访问 RocksDB。
 
-缓存目录默认使用 `configs/cache/disk` 或控制面下发的缓存目录。运行时会维护缓存大小、文件数量、磁盘剩余空间和后台清理任务。
+缓存目录默认使用 `data/cache`，也可使用控制面下发的缓存目录。运行时会维护缓存大小、文件数量、磁盘剩余空间和后台清理任务。
 
 响应变体会进入缓存 key 计算。非 GET 请求追加 method 变体，压缩响应追加 encoding 变体，WebP 图片转换追加 `@webp` 变体。WebP 变体只在站点 WebP 规则匹配图片请求时启用，并在上游响应写入缓存前完成转换，避免缓存命中后重复执行图片编码。
 

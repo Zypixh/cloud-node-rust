@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 static RUNTIME_RPC_ENDPOINTS: Lazy<RwLock<Option<Vec<String>>>> = Lazy::new(|| RwLock::new(None));
@@ -19,13 +19,8 @@ pub struct ApiConfig {
 }
 
 impl ApiConfig {
-    pub fn default_paths() -> Vec<String> {
-        vec![
-            "../configs/api_node.yaml".to_string(),
-            "configs/api_node.yaml".to_string(),
-            "api_node.yaml".to_string(),
-            "cloud-node/configs/api_node.yaml".to_string(),
-        ]
+    pub fn default_paths() -> Vec<PathBuf> {
+        crate::paths::NodePaths::current().api_config_candidates()
     }
 
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -45,10 +40,20 @@ impl ApiConfig {
     }
 
     pub fn load_default() -> anyhow::Result<Self> {
-        let paths = Self::default_paths();
+        let node_paths = crate::paths::NodePaths::current();
+        let canonical = node_paths.api_config_file();
+        let paths = node_paths.api_config_candidates();
         for path in &paths {
-            if Path::new(path).exists() {
-                tracing::info!("Loading config from: {}", path);
+            if path.exists() {
+                if path != &canonical {
+                    tracing::warn!(
+                        "Loading API config from legacy path {}. Please migrate it to {}.",
+                        path.display(),
+                        canonical.display()
+                    );
+                } else {
+                    tracing::info!("Loading config from: {}", path.display());
+                }
                 return Self::load(path);
             }
         }
@@ -56,10 +61,9 @@ impl ApiConfig {
     }
 
     pub fn write_default(&self) -> anyhow::Result<()> {
-        let target = Self::default_paths()
-            .into_iter()
-            .find(|path| Path::new(path).parent().map(|p| p.exists()).unwrap_or(true))
-            .unwrap_or_else(|| "api_node.yaml".to_string());
+        let node_paths = crate::paths::NodePaths::current();
+        fs::create_dir_all(node_paths.config_dir())?;
+        let target = node_paths.api_config_file();
         let content = serde_yaml::to_string(self)?;
         fs::write(target, content)?;
         Ok(())

@@ -406,12 +406,26 @@ impl MetricStorage {
 }
 
 pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
-    let path = "../data/metrics.db";
-    match MetricStorage::open(path) {
+    let node_paths = crate::paths::NodePaths::current();
+    let canonical = node_paths.metrics_db_dir();
+    let path = if !canonical.exists() && node_paths.legacy_metrics_db_dir().exists() {
+        let legacy = node_paths.legacy_metrics_db_dir();
+        tracing::warn!(
+            "Using legacy metrics database path {}. New deployments should use {}.",
+            legacy.display(),
+            canonical.display()
+        );
+        legacy
+    } else {
+        let _ = std::fs::create_dir_all(node_paths.data_dir());
+        canonical
+    };
+    match MetricStorage::open(&path) {
         Ok(storage) => storage,
         Err(err) => {
             error!(
-                "Failed to open RocksDB for metrics, metrics storage disabled: {}",
+                "Failed to open RocksDB for metrics at {}, metrics storage disabled: {}",
+                path.display(),
                 err
             );
             MetricStorage::unavailable()

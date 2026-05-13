@@ -45,12 +45,12 @@ Run directly from GitHub:
 Options:
   --install              Install or migrate to the Rust release.
                          Explicit mode; fails if no existing cloud-node is found.
-  --fresh                Fresh install under /root/cloud-node and create api_node.yaml.
+  --fresh                Fresh install under /root/cloud-node and create configs/api_node.yaml.
   --restore              Restore the Go original from a previous backup.
   --restore-backup DIR   Restore from this backup dir. Default: latest backup.
   --list-backups         List available backup dirs and exit.
   --repo OWNER/REPO       GitHub repo. Default: Zypixh/cloud-node-rust
-  --version VERSION      Release tag, for example v1.0.6. Default: latest
+  --version VERSION      Release tag, for example v1.0.7. Default: latest
   --service NAME         systemd service name. Default: cloud-node
   --install-dir DIR      Runtime working directory. Default: existing service WorkingDirectory or /opt/cloud-node-rust
   --install-binary PATH  Installed Rust binary path. Default: INSTALL_DIR/cloud-node-rust
@@ -58,7 +58,7 @@ Options:
   --lang zh|en           Interface language. Default: ask interactively.
   --geoip                Download GeoLite2 mmdb files from P3TERX/GeoLite.mmdb.
   --no-geoip             Do not download GeoLite2 mmdb files.
-  --geoip-dir DIR        GeoIP target dir. Default: INSTALL_DIR.
+  --geoip-dir DIR        GeoIP target dir. Default: INSTALL_DIR/data.
   --api-endpoint URL     API RPC endpoint for fresh install. Can be repeated.
   --api-endpoints LIST   Comma-separated API RPC endpoints for fresh install.
   --node-id ID           nodeId for fresh install.
@@ -728,8 +728,31 @@ collect_fresh_api_config() {
     [ -n "$NODE_SECRET" ] || die "fresh install requires --secret"
 }
 
+migrate_runtime_layout() {
+    local legacy_config="$INSTALL_DIR/api_node.yaml"
+    local config_path="$INSTALL_DIR/configs/api_node.yaml"
+    local legacy_data_dir="$INSTALL_DIR/../data"
+
+    run mkdir -p "$INSTALL_DIR/configs" "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
+
+    if [ -e "$legacy_config" ] && [ ! -e "$config_path" ]; then
+        run cp -a "$legacy_config" "$config_path"
+        run cp -a "$legacy_config" "$BACKUP_DIR/api_node.yaml.legacy-original"
+    fi
+
+    if [ -e "$legacy_data_dir/state.json" ] && [ ! -e "$INSTALL_DIR/data/state.json" ]; then
+        run cp -a "$legacy_data_dir/state.json" "$INSTALL_DIR/data/state.json"
+    fi
+    if [ -e "$legacy_data_dir/blocked_ips.json" ] && [ ! -e "$INSTALL_DIR/data/blocked_ips.json" ]; then
+        run cp -a "$legacy_data_dir/blocked_ips.json" "$INSTALL_DIR/data/blocked_ips.json"
+    fi
+    if [ -d "$legacy_data_dir/metrics.db" ] && [ ! -e "$INSTALL_DIR/data/metrics.db" ]; then
+        run cp -a "$legacy_data_dir/metrics.db" "$INSTALL_DIR/data/metrics.db"
+    fi
+}
+
 write_api_node_config() {
-    local config_path="$INSTALL_DIR/api_node.yaml"
+    local config_path="$INSTALL_DIR/configs/api_node.yaml"
     local endpoint=""
     local endpoint_array=()
     local first=1
@@ -750,6 +773,7 @@ write_api_node_config() {
     list="${list} ]"
     [ "$first" -eq 0 ] || die "fresh install requires at least one non-empty API endpoint"
 
+    run mkdir -p "$INSTALL_DIR/configs"
     if [ -e "$config_path" ]; then
         run cp -a "$config_path" "$BACKUP_DIR/api_node.yaml.config-original"
     fi
@@ -979,7 +1003,7 @@ if [ -z "$INSTALL_BINARY" ]; then
     INSTALL_BINARY="$INSTALL_DIR/cloud-node-rust"
 fi
 if [ -z "$GEOIP_DIR" ]; then
-    GEOIP_DIR="$INSTALL_DIR"
+    GEOIP_DIR="$INSTALL_DIR/data"
 fi
 
 case "$DOWNLOAD_GEOIP" in
@@ -1027,6 +1051,9 @@ kv "existing cloud-node" "${EXISTING_BINARY:-not found}"
 kv "existing runtime" "$EXISTING_RUNTIME"
 kv "install dir" "$INSTALL_DIR"
 kv "install binary" "$INSTALL_BINARY"
+kv "config dir" "$INSTALL_DIR/configs"
+kv "data dir" "$INSTALL_DIR/data"
+kv "logs dir" "$INSTALL_DIR/logs"
 kv "backup dir" "$BACKUP_DIR"
 kv "service" "$SERVICE_NAME"
 kv "start mode" "$START_MODE"
@@ -1089,10 +1116,13 @@ if [ "$DRY_RUN" -eq 0 ]; then
         fi
         printf 'install_dir=%s\n' "$INSTALL_DIR"
         printf 'install_binary=%s\n' "$INSTALL_BINARY"
+        printf 'config_dir=%s\n' "$INSTALL_DIR/configs"
+        printf 'data_dir=%s\n' "$INSTALL_DIR/data"
+        printf 'logs_dir=%s\n' "$INSTALL_DIR/logs"
         printf 'download_geoip=%s\n' "$DOWNLOAD_GEOIP"
         printf 'geoip_dir=%s\n' "$GEOIP_DIR"
         if [ "$MODE" = "fresh" ]; then
-            printf 'api_config=%s\n' "$INSTALL_DIR/api_node.yaml"
+            printf 'api_config=%s\n' "$INSTALL_DIR/configs/api_node.yaml"
             printf 'api_endpoints=%s\n' "$API_ENDPOINTS"
             printf 'node_id=%s\n' "$NODE_ID"
         fi
@@ -1117,7 +1147,8 @@ else
     log "+ tar -xzf $TMP_DIR/$ASSET_NAME -C $TMP_DIR"
 fi
 
-run mkdir -p "$INSTALL_DIR"
+run mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/configs" "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
+migrate_runtime_layout
 if [ "$DRY_RUN" -eq 0 ]; then
     install -m 0755 "$TMP_DIR/cloud-node" "$INSTALL_BINARY"
 else
