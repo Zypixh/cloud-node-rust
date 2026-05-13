@@ -143,12 +143,11 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     let request_started_at_millis = ctx.start_timestamp_millis;
     let request_started_at = request_started_at_millis / 1000;
 
-    let is_tls = session
-        .downstream_session
-        .digest()
-        .and_then(|d| d.ssl_digest.as_ref())
-        .is_some();
-    let scheme = if is_tls || req.uri.scheme_str() == Some("https") {
+    let scheme = if ctx.is_tls_downstream
+        || ctx.is_http3_downstream
+        || ctx.is_http3_bridge
+        || req.uri.scheme_str() == Some("https")
+    {
         "https"
     } else {
         "http"

@@ -156,13 +156,11 @@ impl LogUploader {
             pb::http_access_log_service_client::HttpAccessLogServiceClient::with_interceptor(
                 channel,
                 move |mut req: tonic::Request<()>| {
-                    let token = generate_token(&node_id, &secret, "edge").unwrap_or_default();
+                    let token = generate_token(&node_id, &secret, "node").unwrap_or_default();
                     let val = node_id
                         .parse()
                         .unwrap_or(tonic::metadata::MetadataValue::from_static("0"));
                     req.metadata_mut().insert("nodeid", val.clone());
-                    req.metadata_mut()
-                        .insert("type", tonic::metadata::MetadataValue::from_static("edge"));
                     if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(b"nodeId") {
                         req.metadata_mut().insert(key, val);
                     }
@@ -320,13 +318,11 @@ impl NodeLogUploader {
         let mut client = pb::node_log_service_client::NodeLogServiceClient::with_interceptor(
             channel,
             move |mut req: tonic::Request<()>| {
-                let token = generate_token(&node_id, &secret, "edge").unwrap_or_default();
+                let token = generate_token(&node_id, &secret, "node").unwrap_or_default();
                 let val = node_id
                     .parse()
                     .unwrap_or(tonic::metadata::MetadataValue::from_static("0"));
                 req.metadata_mut().insert("nodeid", val.clone());
-                req.metadata_mut()
-                    .insert("type", tonic::metadata::MetadataValue::from_static("edge"));
                 if let Ok(key) = tonic::metadata::MetadataKey::from_bytes(b"nodeId") {
                     req.metadata_mut().insert(key, val);
                 }

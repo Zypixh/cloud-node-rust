@@ -124,7 +124,10 @@ impl RpcClient {
         let secret = api_config.secret.clone();
         let type_str = node_type.unwrap_or("node");
         move |mut req: Request<()>| {
-            let token = generate_token(&node_id, &secret, type_str).unwrap_or_default();
+            // Control-plane RPC authentication is Goedge-compatible: the token
+            // role must remain "node". `type_str` is only an optional metadata
+            // hint for newer API nodes.
+            let token = generate_token(&node_id, &secret, "node").unwrap_or_default();
 
             let val = node_id
                 .parse()
@@ -217,6 +220,24 @@ impl RpcClient {
         pb::server_service_client::ServerServiceClient::with_interceptor(
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
+        )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
+    }
+
+    pub fn server_service_with_type(
+        &self,
+    ) -> pb::server_service_client::ServerServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            Channel,
+            impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + 'static,
+        >,
+    > {
+        pb::server_service_client::ServerServiceClient::with_interceptor(
+            self.channel.clone(),
+            Self::interceptor(&self.api_config, Some("edge")),
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)
@@ -415,6 +436,24 @@ impl RpcClient {
         pb::ip_list_service_client::IpListServiceClient::with_interceptor(
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
+        )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
+    }
+
+    pub fn ip_list_service_with_type(
+        &self,
+    ) -> pb::ip_list_service_client::IpListServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            Channel,
+            impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + 'static,
+        >,
+    > {
+        pb::ip_list_service_client::IpListServiceClient::with_interceptor(
+            self.channel.clone(),
+            Self::interceptor(&self.api_config, Some("edge")),
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)

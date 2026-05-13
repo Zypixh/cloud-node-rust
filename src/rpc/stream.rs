@@ -8,6 +8,7 @@ use futures_util::StreamExt;
 use h2::client::SendRequest;
 use http::{HeaderValue, Request, Uri};
 use prost::Message;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -20,6 +21,7 @@ const GRPC_FRAME_HEADER_LEN: usize = 5;
 #[derive(Debug, Default)]
 pub struct NodeStreamProbeResult {
     pub transport_opened: bool,
+    pub response_headers_received: bool,
     pub connected_api_node_id: Option<i64>,
     pub inbound_messages: usize,
     pub pings_sent: usize,
@@ -58,43 +60,28 @@ struct CheckLocalFirewallMessage {
 pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigStore>) {
     let mut last_endpoints = api_config.effective_rpc_endpoints();
     loop {
-        let stream_result = match try_run_h2_stream(&api_config, config_store.clone(), None).await {
-            Ok(result) => Ok(result),
-            Err(h2_err) => {
-                let first_endpoint_is_plain_http = api_config
-                    .effective_rpc_endpoints()
-                    .first()
-                    .is_some_and(|endpoint| endpoint.starts_with("http://"));
-                if first_endpoint_is_plain_http {
-                    Err(h2_err)
-                } else {
-                    warn!(
-                        "HTTP/2 node stream failed: {}. Falling back to tonic stream...",
-                        h2_err
-                    );
-                    let client = match RpcClient::new_with_endpoints(
-                        &api_config,
-                        &last_endpoints,
-                        false,
-                    )
-                    .await
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            last_endpoints = api_config.effective_rpc_endpoints();
-                            error!(
-                                "Failed to connect to API node for stream: {}. Retrying in 10s...",
-                                e
-                            );
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            continue;
-                        }
-                    };
-                    run_stream(client, &api_config, config_store.clone())
-                        .await
-                        .map(|_| NodeStreamProbeResult::default())
-                }
-            }
+        let stream_result = if last_endpoints
+            .first()
+            .is_some_and(|endpoint| endpoint.starts_with("http://"))
+        {
+            try_run_h2_stream(&api_config, config_store.clone(), None).await
+        } else {
+            let client =
+                match RpcClient::new_with_endpoints(&api_config, &last_endpoints, false).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        last_endpoints = api_config.effective_rpc_endpoints();
+                        error!(
+                            "Failed to connect to API node for stream: {}. Retrying in 10s...",
+                            e
+                        );
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        continue;
+                    }
+                };
+            run_stream(client, &api_config, config_store.clone())
+                .await
+                .map(|_| NodeStreamProbeResult::default())
         };
 
         match stream_result {
@@ -117,7 +104,16 @@ pub async fn probe_node_stream(
     config_store: Arc<ConfigStore>,
     hold: Duration,
 ) -> anyhow::Result<NodeStreamProbeResult> {
-    try_run_h2_stream(api_config, config_store, Some(hold)).await
+    if api_config
+        .effective_rpc_endpoints()
+        .first()
+        .is_some_and(|endpoint| endpoint.starts_with("http://"))
+    {
+        try_run_h2_stream(api_config, config_store, Some(hold)).await
+    } else {
+        let client = RpcClient::new(api_config).await?;
+        run_tonic_stream(client, api_config, config_store, Some(hold)).await
+    }
 }
 
 async fn try_run_h2_stream(
@@ -152,9 +148,8 @@ async fn try_run_h2_stream(
         }
     });
 
-    let initial_node_id = config_store.get_node_id().await;
     let (mut response_rx, send_stream) =
-        open_h2_node_stream(h2_client, &authority, api_config, initial_node_id).await?;
+        open_h2_node_stream(h2_client, &authority, api_config).await?;
     let (out_tx, mut out_rx) = mpsc::channel::<pb::NodeStreamMessage>(100);
     let writer = tokio::spawn(async move {
         let mut send_stream = send_stream;
@@ -182,6 +177,7 @@ async fn try_run_h2_stream(
         ..Default::default()
     };
     let mut recv_body = None;
+    let mut response_encoding = None;
     let mut decode_buffer = Vec::with_capacity(8192);
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
     let mut endpoint_check_interval = tokio::time::interval(Duration::from_secs(15));
@@ -199,8 +195,10 @@ async fn try_run_h2_stream(
             tokio::select! {
                 response_result = &mut response_rx => {
                     match response_result {
-                        Ok(Ok(body)) => {
+                        Ok(Ok((body, encoding))) => {
                             info!("Node stream response headers received.");
+                            stats.response_headers_received = true;
+                            response_encoding = encoding;
                             recv_body = Some(body);
                         }
                         Ok(Err(err)) => return Err(err),
@@ -231,7 +229,11 @@ async fn try_run_h2_stream(
         }
 
         tokio::select! {
-            next_message = read_next_h2_grpc_message(recv_body.as_mut().expect("node stream body exists"), &mut decode_buffer) => {
+            next_message = read_next_h2_grpc_message(
+                recv_body.as_mut().expect("node stream body exists"),
+                &mut decode_buffer,
+                response_encoding.as_deref(),
+            ) => {
                 let Some(message) = next_message? else {
                     debug!("Node stream connection closed by API node.");
                     break;
@@ -308,9 +310,8 @@ async fn open_h2_node_stream(
     h2_client: SendRequest<Bytes>,
     authority: &str,
     api_config: &ApiConfig,
-    initial_node_id: i64,
 ) -> anyhow::Result<(
-    oneshot::Receiver<anyhow::Result<h2::RecvStream>>,
+    oneshot::Receiver<anyhow::Result<(h2::RecvStream, Option<String>)>>,
     h2::SendStream<Bytes>,
 )> {
     let token = generate_token(&api_config.node_id, &api_config.secret, "node")?;
@@ -322,22 +323,13 @@ async fn open_h2_node_stream(
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .header("user-agent", "grpc-go/1.0")
-        .header("nodeid", node_id.clone())
+        .header("nodeid", node_id)
         .header("token", token)
         .header("grpc-accept-encoding", "gzip")
         .body(())?;
 
     let mut ready = h2_client.ready().await?;
-    let (response, mut send_stream) = ready.send_request(request, false)?;
-    let initial_ping = pb::NodeStreamMessage {
-        node_id: initial_node_id,
-        request_id: 0,
-        code: "ping".to_string(),
-        is_ok: true,
-        ..Default::default()
-    };
-    let initial_ping_frame = Bytes::from(encode_grpc_message(&initial_ping)?);
-    send_stream.send_data(initial_ping_frame.clone(), false)?;
+    let (response, send_stream) = ready.send_request(request, false)?;
     let (response_tx, response_rx) = oneshot::channel();
     tokio::spawn(async move {
         let result = async move {
@@ -345,7 +337,12 @@ async fn open_h2_node_stream(
             if response.status() != http::StatusCode::OK {
                 anyhow::bail!("nodeStream returned HTTP status {}", response.status());
             }
-            Ok(response.into_body())
+            let encoding = response
+                .headers()
+                .get("grpc-encoding")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_ascii_lowercase());
+            Ok((response.into_body(), encoding))
         }
         .await;
         let _ = response_tx.send(result);
@@ -367,9 +364,10 @@ fn encode_grpc_message(message: &pb::NodeStreamMessage) -> anyhow::Result<Vec<u8
 async fn read_next_h2_grpc_message(
     body: &mut h2::RecvStream,
     buffer: &mut Vec<u8>,
+    encoding: Option<&str>,
 ) -> anyhow::Result<Option<pb::NodeStreamMessage>> {
     loop {
-        if let Some(message) = try_decode_grpc_message(buffer)? {
+        if let Some(message) = try_decode_grpc_message(buffer, encoding)? {
             return Ok(Some(message));
         }
 
@@ -390,20 +388,33 @@ async fn read_next_h2_grpc_message(
     }
 }
 
-fn try_decode_grpc_message(buffer: &mut Vec<u8>) -> anyhow::Result<Option<pb::NodeStreamMessage>> {
+fn try_decode_grpc_message(
+    buffer: &mut Vec<u8>,
+    encoding: Option<&str>,
+) -> anyhow::Result<Option<pb::NodeStreamMessage>> {
     if buffer.len() < GRPC_FRAME_HEADER_LEN {
         return Ok(None);
     }
-    let compressed = buffer[0];
-    if compressed != 0 {
-        anyhow::bail!("compressed nodeStream messages are not supported");
-    }
+    let compressed = buffer[0] != 0;
     let len = u32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
     if buffer.len() < GRPC_FRAME_HEADER_LEN + len {
         return Ok(None);
     }
-    let payload = buffer[GRPC_FRAME_HEADER_LEN..GRPC_FRAME_HEADER_LEN + len].to_vec();
+    let mut payload = buffer[GRPC_FRAME_HEADER_LEN..GRPC_FRAME_HEADER_LEN + len].to_vec();
     buffer.drain(..GRPC_FRAME_HEADER_LEN + len);
+
+    if compressed {
+        match encoding.unwrap_or("gzip") {
+            "gzip" => {
+                let mut decoder = flate2::read::GzDecoder::new(payload.as_slice());
+                let mut decoded = Vec::new();
+                decoder.read_to_end(&mut decoded)?;
+                payload = decoded;
+            }
+            other => anyhow::bail!("unsupported compressed nodeStream encoding: {}", other),
+        }
+    }
+
     Ok(Some(pb::NodeStreamMessage::decode(payload.as_slice())?))
 }
 
@@ -412,30 +423,61 @@ async fn run_stream(
     api_config: &ApiConfig,
     config_store: Arc<ConfigStore>,
 ) -> anyhow::Result<()> {
+    run_tonic_stream(client, api_config, config_store, None)
+        .await
+        .map(|_| ())
+}
+
+async fn run_tonic_stream(
+    client: RpcClient,
+    api_config: &ApiConfig,
+    config_store: Arc<ConfigStore>,
+    hold: Option<Duration>,
+) -> anyhow::Result<NodeStreamProbeResult> {
     let connected_endpoints = api_config.effective_rpc_endpoints();
     let (tx, rx) = mpsc::channel(100);
+    let initial_ping_sent = send_node_stream_ping(&config_store, &tx).await;
     let rx_stream = ReceiverStream::new(rx);
 
-    let mut node_client = client.node_service_plain();
-    let response = node_client.node_stream(rx_stream).await?;
+    let mut node_client = client.node_service();
+    let response =
+        tokio::time::timeout(Duration::from_secs(30), node_client.node_stream(rx_stream))
+            .await
+            .map_err(|_| anyhow::anyhow!("nodeStream response headers timed out"))??;
     let mut inbound = response.into_inner();
 
     info!("Node stream established.");
 
     let mut current_api_node_id = None;
+    let mut stats = NodeStreamProbeResult {
+        transport_opened: true,
+        response_headers_received: true,
+        pings_sent: usize::from(initial_ping_sent),
+        ..Default::default()
+    };
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(60));
     let mut endpoint_check_interval = tokio::time::interval(Duration::from_secs(15));
+    let deadline = hold.map(|duration| tokio::time::Instant::now() + duration);
+    let sleep_until_deadline = async {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(sleep_until_deadline);
 
     loop {
         tokio::select! {
             msg_res = inbound.message() => {
                 match msg_res {
                     Ok(Some(message)) => {
+                        stats.inbound_messages += 1;
                         if message.code == "connectedAPINode" {
                            match serde_json::from_slice::<ConnectedAPINodeMessage>(&message.data_json) {
                                Ok(msg) => {
                                    info!("Successfully connected to API node via stream. API Node ID: {}", msg.api_node_id);
                                    current_api_node_id = Some(msg.api_node_id);
+                                   stats.connected_api_node_id = Some(msg.api_node_id);
                                    crate::rpc::node::CONNECTED_API_NODE_IDS.write().insert(msg.api_node_id);
                                    crate::rpc::node::trigger_api_node_report();
                                }
@@ -465,16 +507,8 @@ async fn run_stream(
                 }
             }
             _ = heartbeat_interval.tick() => {
-                let current_node_id = config_store.get_node_id().await;
-                if current_node_id > 0 {
-                    let ping = pb::NodeStreamMessage {
-                        node_id: current_node_id,
-                        request_id: 0,
-                        code: "ping".to_string(),
-                        is_ok: true,
-                        ..Default::default()
-                    };
-                    let _ = tx.try_send(ping);
+                if send_node_stream_ping(&config_store, &tx).await {
+                    stats.pings_sent += 1;
                 }
             }
             _ = endpoint_check_interval.tick() => {
@@ -488,6 +522,9 @@ async fn run_stream(
                     break;
                 }
             }
+            _ = &mut sleep_until_deadline => {
+                break;
+            }
         }
     }
 
@@ -495,7 +532,7 @@ async fn run_stream(
         crate::rpc::node::CONNECTED_API_NODE_IDS.write().remove(&id);
     }
 
-    Ok(())
+    Ok(stats)
 }
 
 async fn handle_message(

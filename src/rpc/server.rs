@@ -84,8 +84,17 @@ pub async fn sync_single_server_config(
                 Ok(server) => {
                     let user_id = server.user_id;
                     let runtime_servers = vec![server];
-                    let (servers, routes) =
-                        build_runtime_maps(runtime_servers.clone(), health_manager).await;
+                    let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
+                        config_store.get_origin_runtime_context().await;
+                    let (servers, routes) = build_runtime_maps(
+                        runtime_servers.clone(),
+                        health_manager,
+                        node_level,
+                        parent_nodes,
+                        tiered_origin_bypass,
+                        allow_lan,
+                    )
+                    .await;
                     if user_id > 0 {
                         config_store
                             .replace_user_servers(
@@ -228,8 +237,17 @@ pub async fn sync_user_servers_state(
             match serde_json::from_slice::<Vec<ServerConfig>>(&payload.servers_config_json) {
                 Ok(servers) => {
                     let runtime_servers = servers;
-                    let (servers_map, routes_map) =
-                        build_runtime_maps(runtime_servers.clone(), health_manager).await;
+                    let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
+                        config_store.get_origin_runtime_context().await;
+                    let (servers_map, routes_map) = build_runtime_maps(
+                        runtime_servers.clone(),
+                        health_manager,
+                        node_level,
+                        parent_nodes,
+                        tiered_origin_bypass,
+                        allow_lan,
+                    )
+                    .await;
                     config_store
                         .replace_user_servers(
                             user_id,

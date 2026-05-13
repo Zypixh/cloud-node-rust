@@ -15,7 +15,7 @@ pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool 
             channel,
             move |mut req: Request<()>| {
                 let token =
-                    generate_token(&node_id_clone, &secret_clone, "edge").unwrap_or_default();
+                    generate_token(&node_id_clone, &secret_clone, "node").unwrap_or_default();
                 req.metadata_mut()
                     .insert("nodeid", node_id_clone.parse().unwrap());
                 req.metadata_mut().insert("token", token.parse().unwrap());

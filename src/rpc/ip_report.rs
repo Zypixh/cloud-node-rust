@@ -74,7 +74,7 @@ pub async fn start_ip_report_service(api_config: ApiConfig) {
             }
         };
 
-        let mut ip_item_service = client.ip_item_service_with_type();
+        let mut ip_item_service = client.ip_item_service();
 
         let item_count = items.len();
         let req = pb::CreateIpItemsRequest {

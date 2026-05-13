@@ -1,8 +1,3 @@
-use std::collections::HashSet;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -14,6 +9,11 @@ use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy_custom;
 use quinn::Endpoint;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
@@ -156,9 +156,11 @@ impl Http3ProxyManager {
             .context("build quinn server config")?;
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         let endpoint = Endpoint::server(server_config, bind_addr)?;
+        let mut proxy_logic = self.proxy_logic.clone();
+        proxy_logic.tls_downstream = true;
         let proxy = Arc::new(http_proxy_custom(
             &self.server_conf,
-            self.proxy_logic.clone(),
+            proxy_logic,
             crate::origin_h3::OriginH3Connector,
         ));
         info!("HTTP/3 listener active on UDP {}", bind_addr);
@@ -180,7 +182,10 @@ impl Http3ProxyManager {
             let proxy = proxy.clone();
             let shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
-                if let Err(err) = manager.serve_connection(connecting, port, proxy, shutdown).await {
+                if let Err(err) = manager
+                    .serve_connection(connecting, port, proxy, shutdown)
+                    .await
+                {
                     error!(
                         "HTTP/3 connection handling failed on port {}: {}",
                         port, err
@@ -359,7 +364,9 @@ impl Http3ProxyManager {
             let response = http::Response::builder().status(421).body(())?;
             stream.send_response(response).await?;
             stream
-                .send_data(Bytes::from_static(b"HTTP/3 is not available for this client"))
+                .send_data(Bytes::from_static(
+                    b"HTTP/3 is not available for this client",
+                ))
                 .await?;
             stream.finish().await?;
             return Ok(());

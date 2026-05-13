@@ -14,6 +14,7 @@ cfb-mode = "0.8.2"
 dashmap = "6.1.0"
 clap = { version = "4", features = ["derive"] }
 http = "1.4.0"
+hmac = "0.13.0"
 h2 = "0.4.13"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"

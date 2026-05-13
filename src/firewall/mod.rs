@@ -87,6 +87,7 @@ pub fn evaluate_policy(
     policy: &HTTPFirewallPolicy,
     session: &Session,
     request_body: &[u8],
+    scheme: &str,
 ) -> Option<MatchedAction> {
     if !policy.is_on || policy.mode == "bypass" {
         return None;
@@ -105,7 +106,7 @@ pub fn evaluate_policy(
                 continue;
             }
 
-            if let Some(result) = matcher_plus::match_group(group, session, request_body) {
+            if let Some(result) = matcher_plus::match_group(group, session, request_body, scheme) {
                 if let Some(set) = result.set {
                     if let Some(mut matched) = perform_actions(&set.actions) {
                         matched.policy_id = policy.id;
@@ -181,6 +182,7 @@ pub fn evaluate_outbound_policy(
     session: &Session,
     request_body: &[u8],
     response: &OutboundContext<'_>,
+    scheme: &str,
 ) -> Option<MatchedAction> {
     if !policy.is_on || policy.mode == "bypass" {
         return None;
@@ -196,7 +198,7 @@ pub fn evaluate_outbound_policy(
                 continue;
             }
             if let Some(result) =
-                matcher_plus::match_group_response(group, session, request_body, response)
+                matcher_plus::match_group_response(group, session, request_body, response, scheme)
             {
                 if let Some(set) = result.set {
                     if let Some(mut matched) = perform_actions(&set.actions) {

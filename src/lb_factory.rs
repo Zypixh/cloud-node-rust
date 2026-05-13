@@ -192,6 +192,8 @@ pub struct BackendExtension {
     pub read_timeout: Option<Duration>,
     pub idle_timeout: Option<Duration>,
     pub client_cert: Option<crate::config_models::SSLCertConfig>,
+    pub unsupported_reason: Option<String>,
+    pub oss_backend: Option<crate::oss_origin::OssBackend>,
 }
 
 pub fn build_lb(
@@ -236,12 +238,30 @@ fn build_origin_lb(
     allow_lan: bool,
 ) -> (Option<Arc<AnyLoadBalancer>>, bool) {
     let mut endpoints = Vec::new();
+    let mut unsupported_endpoints = Vec::new();
     let mut detected_hc = None;
 
     for origin in origins {
         if !origin.is_on {
             continue;
         }
+
+        if origin.is_oss() {
+            match oss_origin_backend(origin, role, rp_cfg, allow_lan) {
+                Some(backend) => endpoints.push(backend),
+                None => {
+                    if let Some(backend) = unsupported_origin_backend(
+                        origin,
+                        role,
+                        "OSS origin configuration is invalid",
+                    ) {
+                        unsupported_endpoints.push(backend);
+                    }
+                }
+            }
+            continue;
+        }
+
         let Some(addr) = &origin.addr else {
             continue;
         };
@@ -289,6 +309,8 @@ fn build_origin_lb(
             read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
             idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
             client_cert: origin.cert.clone(),
+            unsupported_reason: None,
+            oss_backend: None,
         });
         backend.ext = ext;
         backend.weight = origin.weight.max(1) as usize;
@@ -300,6 +322,10 @@ fn build_origin_lb(
         {
             detected_hc = Some((origin, hc));
         }
+    }
+
+    if endpoints.is_empty() && !unsupported_endpoints.is_empty() {
+        endpoints = unsupported_endpoints;
     }
 
     if endpoints.is_empty() {
@@ -420,6 +446,8 @@ fn fallback_lb() -> (Arc<AnyLoadBalancer>, bool) {
         read_timeout: None,
         idle_timeout: None,
         client_cert: None,
+        unsupported_reason: None,
+        oss_backend: None,
     });
     b.ext = ext;
     let mut set = BTreeSet::new();
@@ -431,6 +459,155 @@ fn fallback_lb() -> (Arc<AnyLoadBalancer>, bool) {
         .expect("static fallback load balancer update should not block")
         .expect("static fallback load balancer update should not fail");
     (Arc::new(AnyLoadBalancer::RoundRobin(Arc::new(lb))), false)
+}
+
+fn unsupported_origin_backend(
+    origin: &OriginConfig,
+    role: OriginRole,
+    reason: &str,
+) -> Option<Backend> {
+    let mut backend = Backend::new("127.0.0.1:9").ok()?;
+    let mut ext = Extensions::new();
+    ext.insert(BackendExtension {
+        origin_role: role,
+        use_tls: false,
+        host: origin.request_host.clone(),
+        rp_host: String::new(),
+        origin_id: origin.id,
+        origin_host: String::new(),
+        follow_port: false,
+        follow_host: false,
+        http2_enabled: false,
+        http3_enabled: false,
+        tls_verify: true,
+        request_host_excluding_port: false,
+        connection_timeout: origin.conn_timeout.as_ref().map(crate::utils::to_duration),
+        read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
+        idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
+        client_cert: origin.cert.clone(),
+        unsupported_reason: Some(reason.to_string()),
+        oss_backend: None,
+    });
+    backend.ext = ext;
+    backend.weight = origin.weight.max(1) as usize;
+    Some(backend)
+}
+
+fn oss_origin_backend(
+    origin: &OriginConfig,
+    role: OriginRole,
+    rp_cfg: &ReverseProxyConfig,
+    allow_lan: bool,
+) -> Option<Backend> {
+    let oss_backend = match crate::oss_origin::OssBackend::from_origin(origin) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(
+                "LB Builder: Skipping invalid OSS {:?} origin {}: {}",
+                role, origin.id, err
+            );
+            return None;
+        }
+    };
+    let mut backend =
+        match backend_from_oss_target(&oss_backend.connect_addr, role, origin.id, allow_lan) {
+            Some(backend) => backend,
+            None => return None,
+        };
+    let tls_verify = origin
+        .tls_verify
+        .as_ref()
+        .map(|v| match v {
+            serde_json::Value::Bool(b) => *b,
+            serde_json::Value::Object(obj) => {
+                obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true)
+            }
+            serde_json::Value::Number(n) => n.as_i64().unwrap_or(1) > 0,
+            _ => true,
+        })
+        .unwrap_or(true);
+    let mut ext = Extensions::new();
+    ext.insert(BackendExtension {
+        origin_role: role,
+        use_tls: oss_backend.use_tls,
+        host: origin.request_host.clone(),
+        rp_host: String::new(),
+        origin_id: origin.id,
+        origin_host: oss_backend.host_header.clone(),
+        follow_port: false,
+        follow_host: false,
+        http2_enabled: origin.http2_enabled,
+        http3_enabled: origin.http3_enabled,
+        tls_verify,
+        request_host_excluding_port: rp_cfg.request_host_excluding_port,
+        connection_timeout: non_zero_duration(origin.conn_timeout.as_ref()),
+        read_timeout: non_zero_duration(origin.read_timeout.as_ref()),
+        idle_timeout: non_zero_duration(origin.idle_timeout.as_ref()),
+        client_cert: origin.cert.clone(),
+        unsupported_reason: None,
+        oss_backend: Some(oss_backend),
+    });
+    backend.ext = ext;
+    backend.weight = origin.weight.max(1) as usize;
+    Some(backend)
+}
+
+fn non_zero_duration(value: Option<&serde_json::Value>) -> Option<Duration> {
+    value
+        .map(crate::utils::to_duration)
+        .filter(|duration| !duration.is_zero())
+}
+
+fn backend_from_oss_target(
+    target: &str,
+    role: OriginRole,
+    origin_id: i64,
+    allow_lan: bool,
+) -> Option<Backend> {
+    if !allow_lan && is_local_addr(target) {
+        warn!(
+            "LB Builder: Skipping OSS {:?} origin {} address {} as it is not allowed in cluster settings.",
+            role, origin_id, target
+        );
+        return None;
+    }
+
+    if let Ok(backend) = Backend::new(target) {
+        return Some(backend);
+    }
+
+    match target.to_socket_addrs() {
+        Ok(mut addrs) => {
+            if let Some(addr) = addrs.next() {
+                let resolved = addr.to_string();
+                if !allow_lan && is_local_addr(&resolved) {
+                    warn!(
+                        "LB Builder: Skipping OSS {:?} origin {} address {} resolved to LAN address {}.",
+                        role, origin_id, target, resolved
+                    );
+                    return None;
+                }
+                debug!(
+                    "LB Builder: Resolved OSS {:?} origin {} address {} to {}",
+                    role, origin_id, target, resolved
+                );
+                Backend::new(&resolved).ok()
+            } else {
+                warn!(
+                    "LB Builder: Skipping OSS {:?} origin {} address {}: DNS returned no addresses",
+                    role, origin_id, target
+                );
+                None
+            }
+        }
+        Err(err) => {
+            warn!(
+                "LB Builder: Skipping invalid OSS {:?} origin {} address {}: {}",
+                role, origin_id, target, err
+            );
+            None
+        }
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -496,6 +673,8 @@ pub fn build_parent_lb(
                     read_timeout: None,
                     idle_timeout: None,
                     client_cert: None,
+                    unsupported_reason: None,
+                    oss_backend: None,
                 });
                 backend.ext = ext;
                 backend.weight = node.weight.max(1) as usize;
@@ -658,11 +837,13 @@ mod tests {
             follow_host: false,
             follow_port: false,
             http2_enabled: false,
+            http3_enabled: false,
             conn_timeout: None,
             read_timeout: None,
             idle_timeout: None,
             cert: None,
             tls_verify: None,
+            oss: None,
         }
     }
 

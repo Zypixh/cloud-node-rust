@@ -26,6 +26,7 @@ pub async fn sync_node_tasks(
     api_config: &ApiConfig,
     config_store: &ConfigStore,
     health_manager: &crate::health_manager::GlobalHealthManager,
+    cert_selector: &crate::ssl::DynamicCertSelector,
     ip_list_manager: &crate::firewall::lists::GlobalIpListManager,
     task_version: &mut i64,
 ) {
@@ -86,15 +87,14 @@ pub async fn sync_node_tasks(
                     "ipItemChanged" => sync_ip_items_incremental(api_config, ip_list_manager).await,
                     "updatingServers" => {
                         let mut last_id = 0i64;
-                        let mut updating = std::collections::HashSet::new();
                         sync_updating_server_list_once(
                             api_config,
                             config_store,
+                            health_manager,
+                            cert_selector,
                             &mut last_id,
-                            &mut updating,
                         )
-                        .await;
-                        true
+                        .await
                     }
                     "userServersStateChanged" => {
                         sync_user_servers_state(
@@ -118,7 +118,7 @@ pub async fn sync_node_tasks(
                             );
                             false
                         } else {
-                            let mut node_client = client.node_service_with_type();
+                            let mut node_client = client.node_service();
                             node_client
                                 .update_node_is_installed(pb::UpdateNodeIsInstalledRequest {
                                     node_id: numeric_node_id,

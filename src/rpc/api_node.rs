@@ -1,8 +1,11 @@
 use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
+use crate::health_manager::GlobalHealthManager;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use crate::rpc::logs::report_node_log_with_context;
+use crate::rpc::utils::build_runtime_maps;
+use crate::ssl::DynamicCertSelector;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -21,18 +24,27 @@ pub async fn start_api_node_syncer(api_config: ApiConfig) {
 pub async fn start_updating_server_list_syncer(
     api_config: ApiConfig,
     config_store: Arc<ConfigStore>,
+    health_manager: Arc<GlobalHealthManager>,
+    cert_selector: Arc<DynamicCertSelector>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut last_id = 0i64;
-    let mut updating_set = std::collections::HashSet::new();
 
     loop {
         interval.tick().await;
+        if config_store.get_node_id().await <= 0 {
+            continue;
+        }
+        let baseline = config_store.get_updating_server_list_id().await;
+        if last_id <= 0 || baseline > last_id {
+            last_id = baseline;
+        }
         sync_updating_server_list_once(
             &api_config,
             config_store.as_ref(),
+            health_manager.as_ref(),
+            cert_selector.as_ref(),
             &mut last_id,
-            &mut updating_set,
         )
         .await;
     }
@@ -41,9 +53,14 @@ pub async fn start_updating_server_list_syncer(
 pub async fn sync_updating_server_list_once(
     api_config: &ApiConfig,
     config_store: &ConfigStore,
+    health_manager: &GlobalHealthManager,
+    cert_selector: &DynamicCertSelector,
     last_id: &mut i64,
-    updating_set: &mut std::collections::HashSet<i64>,
-) {
+) -> bool {
+    if *last_id <= 0 {
+        *last_id = config_store.get_updating_server_list_id().await;
+    }
+
     let client = match RpcClient::new(api_config).await {
         Ok(client) => client,
         Err(e) => {
@@ -58,7 +75,7 @@ pub async fn sync_updating_server_list_once(
                 None,
             )
             .await;
-            return;
+            return false;
         }
     };
 
@@ -78,18 +95,60 @@ pub async fn sync_updating_server_list_once(
                     &resp.servers_json,
                 ) {
                     Ok(servers) => {
-                        for s in servers {
-                            if let Some(id) = s.id {
-                                if s.is_on {
-                                    updating_set.insert(id);
-                                } else {
-                                    updating_set.remove(&id);
-                                }
+                        let changed = servers
+                            .iter()
+                            .filter_map(|server| server.id)
+                            .collect::<std::collections::HashSet<_>>();
+                        let enabled = servers
+                            .into_iter()
+                            .filter(|server| server.is_on)
+                            .collect::<Vec<_>>();
+                        let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
+                            config_store.get_origin_runtime_context().await;
+                        let (server_map, route_map) = build_runtime_maps(
+                            enabled.clone(),
+                            health_manager,
+                            node_level,
+                            parent_nodes,
+                            tiered_origin_bypass,
+                            allow_lan,
+                        )
+                        .await;
+                        for server_id in changed {
+                            if server_id > 0 {
+                                config_store.remove_server(server_id).await;
                             }
                         }
-                        config_store
-                            .set_updating_servers(updating_set.iter().cloned().collect())
-                            .await;
+                        for server in enabled {
+                            if let Some(server_id) = server.id
+                                && server_id > 0
+                            {
+                                let replacement = Arc::new(server);
+                                config_store
+                                    .replace_server(
+                                        server_id,
+                                        vec![replacement],
+                                        server_map
+                                            .iter()
+                                            .filter_map(|(host, cfg)| {
+                                                (cfg.id == Some(server_id))
+                                                    .then_some((host.clone(), cfg.clone()))
+                                            })
+                                            .collect(),
+                                        route_map
+                                            .iter()
+                                            .filter_map(|(host, lb)| {
+                                                server_map.get(host).and_then(|cfg| {
+                                                    (cfg.id == Some(server_id))
+                                                        .then_some((host.clone(), lb.clone()))
+                                                })
+                                            })
+                                            .collect(),
+                                    )
+                                    .await;
+                            }
+                        }
+                        refresh_certificates(config_store, cert_selector).await;
                     }
                     Err(e) => {
                         warn!("Failed to parse updating servers JSON: {}", e);
@@ -103,9 +162,11 @@ pub async fn sync_updating_server_list_once(
                             None,
                         )
                         .await;
+                        return false;
                     }
                 }
             }
+            true
         }
         Err(e) => {
             warn!("Failed to sync updating server list: {}", e);
@@ -119,8 +180,14 @@ pub async fn sync_updating_server_list_once(
                 None,
             )
             .await;
+            false
         }
     }
+}
+
+async fn refresh_certificates(config_store: &ConfigStore, cert_selector: &DynamicCertSelector) {
+    let (certs, ssl_policy) = config_store.collect_ssl_config().await;
+    crate::ssl::sync_certs(cert_selector, &certs, ssl_policy.as_ref()).await;
 }
 
 pub async fn sync_api_nodes(api_config: &ApiConfig) {

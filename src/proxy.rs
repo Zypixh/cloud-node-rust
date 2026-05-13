@@ -10,7 +10,7 @@ use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use rand::Rng;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::api_config::ApiConfig;
 use crate::cache::should_cache_response;
@@ -145,6 +145,7 @@ pub struct ProxyCTX {
     pub analyzed: Option<crate::metrics::analyzer::RequestStats>,
     pub is_http3_bridge: bool,
     pub is_http3_downstream: bool,
+    pub is_tls_downstream: bool,
     pub is_loopback: bool,
     pub server_metrics: Option<Arc<crate::metrics::ServerMetrics>>,
     pub ip_recorded: bool,
@@ -171,8 +172,10 @@ pub struct ProxyCTX {
     pub global_http_config: Option<Arc<crate::config_models::GlobalHTTPAllConfig>>,
     pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
     pub node_level: i32,
+    pub upstream_is_parent: bool,
     pub host: String,
     pub origin_host: String,
+    pub oss_backend: Option<crate::oss_origin::OssBackend>,
 }
 
 impl Default for ProxyCTX {
@@ -230,6 +233,7 @@ impl Default for ProxyCTX {
             analyzed: None,
             is_http3_bridge: false,
             is_http3_downstream: false,
+            is_tls_downstream: false,
             is_loopback: false,
             server_metrics: None,
             ip_recorded: false,
@@ -255,8 +259,10 @@ impl Default for ProxyCTX {
             global_http_config: None,
             firewall_policies_snapshot: None,
             node_level: 0,
+            upstream_is_parent: false,
             host: String::new(),
             origin_host: String::new(),
+            oss_backend: None,
         }
     }
 }
@@ -268,6 +274,7 @@ pub struct EdgeProxy {
     pub api_config: Arc<ApiConfig>,
     pub cert_selector: Arc<crate::ssl::DynamicCertSelector>,
     pub waf_verifier: Arc<crate::firewall::verifier::WafVerifier>,
+    pub tls_downstream: bool,
 }
 
 const DEFAULT_TRAFFIC_LIMIT_NOTICE_PAGE_BODY: &str = r#"<!DOCTYPE html>
@@ -509,19 +516,7 @@ impl EdgeProxy {
                         .and_then(|addr| addr.as_inet())
                         .map(|inet| inet.port().to_string())
                         .unwrap_or_default(),
-                    "scheme" => {
-                        if session
-                            .downstream_session
-                            .digest()
-                            .and_then(|d| d.ssl_digest.as_ref())
-                            .is_some()
-                            || session.req_header().uri.scheme_str() == Some("https")
-                        {
-                            "https".to_string()
-                        } else {
-                            "http".to_string()
-                        }
-                    }
+                    "scheme" => Self::forwarded_proto(session, ctx).to_string(),
                     "proto" => {
                         if ctx.is_http3_bridge {
                             "HTTP/3.0".to_string()
@@ -599,6 +594,7 @@ impl EdgeProxy {
                         session,
                         raw,
                         &ctx.request_body,
+                        Self::forwarded_proto(session, ctx),
                     ),
                 };
 
@@ -883,6 +879,7 @@ impl EdgeProxy {
     fn should_redirect_to_https(
         &self,
         session: &Session,
+        ctx: &ProxyCTX,
         server: &ServerConfig,
         host: &str,
     ) -> Option<(String, u16)> {
@@ -894,23 +891,14 @@ impl EdgeProxy {
             return None;
         }
 
-        let is_https = session
-            .downstream_session
-            .digest()
-            .and_then(|digest| digest.ssl_digest.as_ref())
-            .is_some()
-            || session.req_header().uri.scheme_str() == Some("https");
-        if is_https {
+        if Self::is_https_downstream(session, ctx) {
             return None;
         }
 
-        if !redirect.domains.is_empty()
-            && !redirect.domains.iter().any(|domain| {
-                let domain = domain.to_ascii_lowercase();
-                let host = host.to_ascii_lowercase();
-                host == domain || host.ends_with(&format!(".{}", domain))
-            })
-        {
+        if Self::domain_list_matches(&redirect.except_domains, host) {
+            return None;
+        }
+        if !redirect.domains.is_empty() && !Self::domain_list_matches(&redirect.domains, host) {
             return None;
         }
 
@@ -944,15 +932,28 @@ impl EdgeProxy {
             .unwrap_or(301)
     }
 
-    fn forwarded_proto(session: &Session, ctx: &ProxyCTX) -> &'static str {
-        if ctx.is_http3_bridge
+    fn is_https_downstream(session: &Session, ctx: &ProxyCTX) -> bool {
+        ctx.is_tls_downstream
+            || ctx.is_http3_downstream
+            || ctx.is_http3_bridge
             || session
                 .downstream_session
                 .digest()
                 .and_then(|digest| digest.ssl_digest.as_ref())
                 .is_some()
             || session.req_header().uri.scheme_str() == Some("https")
-        {
+    }
+
+    fn domain_list_matches(domains: &[String], host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        domains.iter().any(|domain| {
+            let domain = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+            !domain.is_empty() && (host == domain || host.ends_with(&format!(".{}", domain)))
+        })
+    }
+
+    fn forwarded_proto(session: &Session, ctx: &ProxyCTX) -> &'static str {
+        if Self::is_https_downstream(session, ctx) {
             "https"
         } else {
             "http"
@@ -1318,7 +1319,10 @@ impl EdgeProxy {
 
     pub(crate) fn is_mobile_user_agent(ua: &str) -> bool {
         let ua = ua.to_ascii_lowercase();
-        ua.contains("mobile") || ua.contains("android") || ua.contains("iphone") || ua.contains("ipad")
+        ua.contains("mobile")
+            || ua.contains("android")
+            || ua.contains("iphone")
+            || ua.contains("ipad")
     }
 
     fn resolve_http3_advertisement_port(
@@ -2034,7 +2038,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         if !config.is_on {
             return Ok(false);
         }
-        let url = Self::current_request_url(session);
+        let url = Self::current_request_url(session, ctx);
         if !Self::url_patterns_match(&url, &config.only_url_patterns, &config.except_url_patterns) {
             return Ok(false);
         }
@@ -2115,7 +2119,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         if !config.is_on {
             return Ok(false);
         }
-        let url = Self::current_request_url(session);
+        let url = Self::current_request_url(session, ctx);
         if !Self::url_patterns_match(&url, &config.only_url_patterns, &config.except_url_patterns) {
             return Ok(false);
         }
@@ -2472,18 +2476,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .insert("content-type".to_string(), content_type);
     }
 
-    fn current_request_url(session: &Session) -> String {
-        let scheme = if session
-            .downstream_session
-            .digest()
-            .and_then(|digest| digest.ssl_digest.as_ref())
-            .is_some()
-            || session.req_header().uri.scheme_str() == Some("https")
-        {
-            "https"
-        } else {
-            "http"
-        };
+    fn current_request_url(session: &Session, ctx: &ProxyCTX) -> String {
+        let scheme = Self::forwarded_proto(session, ctx);
         let host = session
             .get_header("host")
             .and_then(|v| v.to_str().ok())
@@ -2516,18 +2510,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .join("&")
     }
 
-    fn default_cache_key_for_session(session: &Session) -> String {
-        let scheme = if session
-            .downstream_session
-            .digest()
-            .and_then(|digest| digest.ssl_digest.as_ref())
-            .is_some()
-            || session.req_header().uri.scheme_str() == Some("https")
-        {
-            "https"
-        } else {
-            "http"
-        };
+    fn default_cache_key_for_session(session: &Session, ctx: &ProxyCTX) -> String {
+        let scheme = Self::forwarded_proto(session, ctx);
         let host = session
             .get_header("host")
             .and_then(|v| v.to_str().ok())
@@ -2585,19 +2569,17 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         if life_seconds > 0 { life_seconds } else { 600 }
     }
 
-    fn waf_cookie_suffix(session: &Session, life_seconds: i64) -> String {
-        let secure = if session
-            .downstream_session
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some()
-            || session.req_header().uri.scheme_str() == Some("https")
-        {
+    fn waf_cookie_suffix(session: &Session, ctx: &ProxyCTX, life_seconds: i64) -> String {
+        let secure = if Self::is_https_downstream(session, ctx) {
             "; Secure"
         } else {
             ""
         };
-        format!("Path=/; Max-Age={}; SameSite=Lax{}", Self::waf_life_seconds(life_seconds), secure)
+        format!(
+            "Path=/; Max-Age={}; SameSite=Lax{}",
+            Self::waf_life_seconds(life_seconds),
+            secure
+        )
     }
 
     fn waf_redirect_signature(&self, token: &str, ip: &str, ua: &str) -> String {
@@ -2615,7 +2597,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
     fn waf_slider_body(token: &str, target: u32, return_path: &str) -> String {
         let token_js = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
         let return_js = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
-        format!(r#"<main class="waf-card"><div class="waf-mark"></div><h1>Security verification</h1><p>Slide to complete the security check. This helps protect the site from automated abuse.</p><div id="wafTrack" class="waf-track" aria-label="Slide to verify"><div id="wafFill" class="waf-fill"></div><div id="wafHandle" class="waf-handle">›</div></div><div id="wafStatus" class="waf-status">Slide the handle to the highlighted zone</div><noscript><p class="waf-error">JavaScript is required for this verification.</p></noscript></main><script>(function(){{const token={token_js};const ret={return_js};const target={target};const track=document.getElementById('wafTrack');const handle=document.getElementById('wafHandle');const fill=document.getElementById('wafFill');const status=document.getElementById('wafStatus');const zone=document.createElement('div');zone.style.cssText='position:absolute;top:4px;height:38px;width:26px;border-radius:999px;background:rgba(34,197,94,.28);box-shadow:0 0 0 1px rgba(34,197,94,.4) inset;left:'+(target+10)+'px';';track.appendChild(zone);const enc=new TextEncoder();let dragging=false,startX=0,current=0,start=Date.now(),trace=[];async function pow(){{let n=0;while(true){{const h=await crypto.subtle.digest('SHA-256',enc.encode(token+n));const x=Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('');if(x.startsWith('0000'))return String(n);n++;if(n%200===0)await new Promise(r=>setTimeout(r,0));}}}}function setX(x){{current=Math.max(0,Math.min(260,x));handle.style.left=(current+3)+'px';fill.style.width=(current+43)+'px';trace.push(Math.round(current)+','+(Date.now()-start));}}track.addEventListener('pointerdown',e=>{{dragging=true;startX=e.clientX-current;track.setPointerCapture(e.pointerId);}});track.addEventListener('pointermove',e=>{{if(dragging)setX(e.clientX-startX);}});track.addEventListener('pointerup',async e=>{{if(!dragging)return;dragging=false;setX(e.clientX-startX);if(Math.abs(current-target)>16){{status.textContent='Not quite there, please try again';status.className='waf-status waf-error';return;}}status.textContent='Verifying browser...';try{{const nonce=await pow();const qs=new URLSearchParams({{__waf_token:token,__waf_pow:nonce,__waf_elapsed:String(Date.now()-start),__waf_x:String(Math.round(current)),__waf_trace:trace.slice(-80).join(';'),__waf_return:ret}});location.href='{WAF_VERIFY_ROUTE}?'+qs.toString();}}catch(_){{status.textContent='Verification failed, please retry';status.className='waf-status waf-error';}}}});}})();</script>"#)
+        format!(
+            r#"<main class="waf-card"><div class="waf-mark"></div><h1>Security verification</h1><p>Slide to complete the security check. This helps protect the site from automated abuse.</p><div id="wafTrack" class="waf-track" aria-label="Slide to verify"><div id="wafFill" class="waf-fill"></div><div id="wafHandle" class="waf-handle">›</div></div><div id="wafStatus" class="waf-status">Slide the handle to the highlighted zone</div><noscript><p class="waf-error">JavaScript is required for this verification.</p></noscript></main><script>(function(){{const token={token_js};const ret={return_js};const target={target};const track=document.getElementById('wafTrack');const handle=document.getElementById('wafHandle');const fill=document.getElementById('wafFill');const status=document.getElementById('wafStatus');const zone=document.createElement('div');zone.style.cssText='position:absolute;top:4px;height:38px;width:26px;border-radius:999px;background:rgba(34,197,94,.28);box-shadow:0 0 0 1px rgba(34,197,94,.4) inset;left:'+(target+10)+'px';';track.appendChild(zone);const enc=new TextEncoder();let dragging=false,startX=0,current=0,start=Date.now(),trace=[];async function pow(){{let n=0;while(true){{const h=await crypto.subtle.digest('SHA-256',enc.encode(token+n));const x=Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('');if(x.startsWith('0000'))return String(n);n++;if(n%200===0)await new Promise(r=>setTimeout(r,0));}}}}function setX(x){{current=Math.max(0,Math.min(260,x));handle.style.left=(current+3)+'px';fill.style.width=(current+43)+'px';trace.push(Math.round(current)+','+(Date.now()-start));}}track.addEventListener('pointerdown',e=>{{dragging=true;startX=e.clientX-current;track.setPointerCapture(e.pointerId);}});track.addEventListener('pointermove',e=>{{if(dragging)setX(e.clientX-startX);}});track.addEventListener('pointerup',async e=>{{if(!dragging)return;dragging=false;setX(e.clientX-startX);if(Math.abs(current-target)>16){{status.textContent='Not quite there, please try again';status.className='waf-status waf-error';return;}}status.textContent='Verifying browser...';try{{const nonce=await pow();const qs=new URLSearchParams({{__waf_token:token,__waf_pow:nonce,__waf_elapsed:String(Date.now()-start),__waf_x:String(Math.round(current)),__waf_trace:trace.slice(-80).join(';'),__waf_return:ret}});location.href='{WAF_VERIFY_ROUTE}?'+qs.toString();}}catch(_){{status.textContent='Verification failed, please retry';status.className='waf-status waf-error';}}}});}})();</script>"#
+        )
     }
 
     fn hmac_sha256(secret: &[u8], data: &[u8]) -> [u8; 32] {
@@ -2758,7 +2742,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         Ok(true)
     }
 
-    async fn maybe_serve_waf_verify(&self, session: &mut Session, ctx: &mut ProxyCTX) -> Result<bool> {
+    async fn maybe_serve_waf_verify(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+    ) -> Result<bool> {
         if session.req_header().uri.path() != WAF_VERIFY_ROUTE {
             return Ok(false);
         }
@@ -2780,7 +2768,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let token_remaining = (!token.is_empty())
-            .then(|| self.waf_verifier.token_seconds_remaining(&ctx.client_ip_str, ua, &token, 3600))
+            .then(|| {
+                self.waf_verifier
+                    .token_seconds_remaining(&ctx.client_ip_str, ua, &token, 3600)
+            })
             .flatten();
         let verified = token_remaining.is_some()
             && !pow.is_empty()
@@ -2793,13 +2784,17 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             let remaining = token_remaining.unwrap_or(1) as i64;
             if let Ok(ip) = ctx.client_ip_str.parse() {
                 let server_id = ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0);
-                self.waf_state.unblock_ip_for(ip, server_id, Some("server"), true, remaining);
+                self.waf_state
+                    .unblock_ip_for(ip, server_id, Some("server"), true, remaining);
             }
-            let suffix = Self::waf_cookie_suffix(session, remaining);
+            let suffix = Self::waf_cookie_suffix(session, ctx, remaining);
             let mut resp = pingora_http::ResponseHeader::build(303, None).unwrap();
             resp.insert_header("location", return_path).unwrap();
-            resp.append_header("set-cookie", format!("WAF-Token={token}; HttpOnly; {suffix}"))
-                .unwrap();
+            resp.append_header(
+                "set-cookie",
+                format!("WAF-Token={token}; HttpOnly; {suffix}"),
+            )
+            .unwrap();
             resp.append_header("set-cookie", format!("WAF-PoW={pow}; {suffix}"))
                 .unwrap();
             resp.insert_header("cache-control", "no-store").unwrap();
@@ -2808,13 +2803,17 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return Ok(true);
         }
 
-        if let Some(failure_config) = self
-            .waf_verifier
-            .token_failure_config(&ctx.client_ip_str, ua, &token)
+        if let Some(failure_config) =
+            self.waf_verifier
+                .token_failure_config(&ctx.client_ip_str, ua, &token)
             && failure_config.max_fails > 0
         {
             let server_id = ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0);
-            let failure_scope_id = if failure_config.fail_global { 0 } else { server_id };
+            let failure_scope_id = if failure_config.fail_global {
+                0
+            } else {
+                server_id
+            };
             let failures = self.waf_state.record_failure(format!(
                 "WAF_CHALLENGE:{failure_scope_id}:{}",
                 ctx.client_ip_str
@@ -2822,7 +2821,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             if failures >= failure_config.max_fails as u64
                 && let Ok(ip) = ctx.client_ip_str.parse()
             {
-                let scope = if failure_config.fail_global { "global" } else { "server" };
+                let scope = if failure_config.fail_global {
+                    "global"
+                } else {
+                    "server"
+                };
                 self.waf_state.block_ip(
                     ip,
                     server_id,
@@ -2925,7 +2928,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         normalized
     }
 
-    fn is_hls_encrypted_request(&self, session: &Session, server: &ServerConfig) -> bool {
+    fn is_hls_encrypted_request(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        server: &ServerConfig,
+    ) -> bool {
         let Some(encrypting) = server
             .web
             .as_ref()
@@ -2941,7 +2949,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         if !path.ends_with(".m3u8") && !path.ends_with(".ts") {
             return false;
         }
-        encrypting.matches_url(&Self::current_request_url(session))
+        encrypting.matches_url(&Self::current_request_url(session, ctx))
     }
 
     fn strip_hls_session_query(path_and_query: &str) -> String {
@@ -3137,7 +3145,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return;
         }
 
-        let request_url = Self::current_request_url(session);
+        let request_url = Self::current_request_url(session, ctx);
         let content_type = upstream_response
             .headers
             .get("content-type")
@@ -3207,7 +3215,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return;
         }
 
-        let request_url = Self::current_request_url(session);
+        let request_url = Self::current_request_url(session, ctx);
         if !encrypting.matches_url(&request_url) {
             return;
         }
@@ -3337,7 +3345,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 let part = part.trim();
                 // 1. Check AES-256-GCM Token
                 if let Some(token) = part.strip_prefix("WAF-Token=")
-                    && let Some(remaining) = verifier.token_seconds_remaining(ip_str, ua, token, 3600)
+                    && let Some(remaining) =
+                        verifier.token_seconds_remaining(ip_str, ua, token, 3600)
                 {
                     current_token = Some(token);
                     token_remaining = remaining as i64;
@@ -3352,15 +3361,20 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             }
 
             if let Some(token) = current_token {
-                let redirect_verified = redirect_sig.is_some_and(|sig| {
-                    sig == self.waf_redirect_signature(token, ip_str, ua)
-                });
-                let pow_verified = current_pow.is_some_and(|nonce| verifier.verify_pow(token, nonce, 4));
+                let redirect_verified = redirect_sig
+                    .is_some_and(|sig| sig == self.waf_redirect_signature(token, ip_str, ua));
+                let pow_verified =
+                    current_pow.is_some_and(|nonce| verifier.verify_pow(token, nonce, 4));
                 if redirect_verified || pow_verified {
                     if let Ok(ip) = ip_str.parse() {
                         let server_id = ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0);
-                        self.waf_state
-                            .unblock_ip_for(ip, server_id, Some("server"), true, token_remaining.max(1));
+                        self.waf_state.unblock_ip_for(
+                            ip,
+                            server_id,
+                            Some("server"),
+                            true,
+                            token_remaining.max(1),
+                        );
                     }
                     return true;
                 }
@@ -3577,22 +3591,26 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 let policy_values = match action {
                     crate::firewall::ActionResponse::Captcha { .. }
                     | crate::firewall::ActionResponse::Get302 { .. }
-                    | crate::firewall::ActionResponse::Post307 { .. } => captcha_opts.as_ref().map(|opts| {
-                        (
-                            opts.life_seconds as i64,
-                            opts.max_fails,
-                            opts.fail_block_timeout as i64,
-                            opts.fail_global,
-                        )
-                    }),
-                    crate::firewall::ActionResponse::JsCookie { .. } => js_opts.as_ref().map(|opts| {
-                        (
-                            opts.life_seconds as i64,
-                            opts.max_fails,
-                            opts.fail_block_timeout as i64,
-                            opts.fail_global,
-                        )
-                    }),
+                    | crate::firewall::ActionResponse::Post307 { .. } => {
+                        captcha_opts.as_ref().map(|opts| {
+                            (
+                                opts.life_seconds as i64,
+                                opts.max_fails,
+                                opts.fail_block_timeout as i64,
+                                opts.fail_global,
+                            )
+                        })
+                    }
+                    crate::firewall::ActionResponse::JsCookie { .. } => {
+                        js_opts.as_ref().map(|opts| {
+                            (
+                                opts.life_seconds as i64,
+                                opts.max_fails,
+                                opts.fail_block_timeout as i64,
+                                opts.fail_global,
+                            )
+                        })
+                    }
                     _ => None,
                 };
                 let global_values = global_actions
@@ -3600,10 +3618,26 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     .find(|global| global.code == matched.action_code)
                     .map(|global| {
                         (
-                            global.options.get("lifeSeconds").and_then(serde_json::Value::as_i64).unwrap_or(0),
-                            global.options.get("maxFails").and_then(serde_json::Value::as_i64).unwrap_or(0) as i32,
-                            global.options.get("failBlockTimeout").and_then(serde_json::Value::as_i64).unwrap_or(0),
-                            global.options.get("failGlobal").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                            global
+                                .options
+                                .get("lifeSeconds")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0),
+                            global
+                                .options
+                                .get("maxFails")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0) as i32,
+                            global
+                                .options
+                                .get("failBlockTimeout")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0),
+                            global
+                                .options
+                                .get("failGlobal")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
                         )
                     });
 
@@ -3612,7 +3646,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 } else {
                     policy_values
                         .and_then(|values| (values.0 > 0).then_some(values.0))
-                        .or_else(|| global_values.and_then(|values| (values.0 > 0).then_some(values.0)))
+                        .or_else(|| {
+                            global_values.and_then(|values| (values.0 > 0).then_some(values.0))
+                        })
                         .unwrap_or(life_seconds)
                 };
                 let max_fails = rule_max_fails.unwrap_or_else(|| {
@@ -3624,7 +3660,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 let fail_block_timeout = rule_fail_block_timeout.unwrap_or_else(|| {
                     policy_values
                         .and_then(|values| (values.2 > 0).then_some(values.2))
-                        .or_else(|| global_values.and_then(|values| (values.2 > 0).then_some(values.2)))
+                        .or_else(|| {
+                            global_values.and_then(|values| (values.2 > 0).then_some(values.2))
+                        })
                         .unwrap_or(3600)
                 });
                 let fail_global = rule_fail_global.unwrap_or_else(|| {
@@ -3644,22 +3682,37 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         fail_global,
                     },
                 );
-                let suffix = Self::waf_cookie_suffix(session, life_seconds);
+                let suffix = Self::waf_cookie_suffix(session, ctx, life_seconds);
 
-                if matches!(action, crate::firewall::ActionResponse::Get302 { .. } | crate::firewall::ActionResponse::Post307 { .. }) {
+                if matches!(
+                    action,
+                    crate::firewall::ActionResponse::Get302 { .. }
+                        | crate::firewall::ActionResponse::Post307 { .. }
+                ) {
                     let redirect_sig = self.waf_redirect_signature(&token, &ip, ua);
-                    let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
-                    resp.insert_header("location", Self::current_request_path_query(session)).unwrap();
-                    resp.append_header("set-cookie", format!("WAF-Token={token}; HttpOnly; {suffix}"))
+                    let mut resp =
+                        pingora_http::ResponseHeader::build(status as u16, None).unwrap();
+                    resp.insert_header("location", Self::current_request_path_query(session))
                         .unwrap();
-                    resp.append_header("set-cookie", format!("WAF-Redirect={redirect_sig}; HttpOnly; {suffix}"))
-                        .unwrap();
+                    resp.append_header(
+                        "set-cookie",
+                        format!("WAF-Token={token}; HttpOnly; {suffix}"),
+                    )
+                    .unwrap();
+                    resp.append_header(
+                        "set-cookie",
+                        format!("WAF-Redirect={redirect_sig}; HttpOnly; {suffix}"),
+                    )
+                    .unwrap();
                     resp.insert_header("cache-control", "no-store").unwrap();
                     session.write_response_header(Box::new(resp), true).await?;
                     return Ok(true);
                 }
 
-                let body_html = if matches!(action, crate::firewall::ActionResponse::JsCookie { .. }) {
+                let body_html = if matches!(
+                    action,
+                    crate::firewall::ActionResponse::JsCookie { .. }
+                ) {
                     let pow_script = verifier.get_pow_script_with_life(&token, 4, life_seconds);
                     format!(
                         "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}</style></head><body><main class='waf-card'><div class='waf-mark'></div><h1>Checking your browser</h1><p>Please wait while we verify your browser capability.</p><div class='waf-progress'><span></span></div></main><script>{}</script></body></html>",
@@ -3668,15 +3721,27 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     )
                 } else {
                     let target = verifier.slider_target(&token);
-                    let return_path = urlencoding::encode(&Self::current_request_path_query(session)).into_owned();
+                    let return_path =
+                        urlencoding::encode(&Self::current_request_path_query(session))
+                            .into_owned();
                     let slider = Self::waf_slider_body(&token, target, &return_path);
                     if let Some(opts) = &captcha_opts
                         && let Some(ui) = &opts.ui
                         && !ui.template.is_empty()
                     {
                         ui.template
-                            .replace("${title}", if ui.title.is_empty() { "Security verification" } else { &ui.title })
-                            .replace("${css}", &format!("{}{}", Self::waf_challenge_css(), ui.css))
+                            .replace(
+                                "${title}",
+                                if ui.title.is_empty() {
+                                    "Security verification"
+                                } else {
+                                    &ui.title
+                                },
+                            )
+                            .replace(
+                                "${css}",
+                                &format!("{}{}", Self::waf_challenge_css(), ui.css),
+                            )
                             .replace("${promptHeader}", &ui.prompt_header)
                             .replace("${promptFooter}", &ui.prompt_footer)
                             .replace("${body}", &slider)
@@ -3693,11 +3758,16 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 resp.insert_header("content-type", "text/html; charset=utf-8")
                     .unwrap();
                 resp.insert_header("cache-control", "no-store").unwrap();
-                resp.insert_header("x-content-type-options", "nosniff").unwrap();
-                resp.insert_header("referrer-policy", "same-origin").unwrap();
+                resp.insert_header("x-content-type-options", "nosniff")
+                    .unwrap();
+                resp.insert_header("referrer-policy", "same-origin")
+                    .unwrap();
                 if !matches!(action, crate::firewall::ActionResponse::Captcha { .. }) {
-                    resp.append_header("set-cookie", format!("WAF-Token={token}; HttpOnly; {suffix}"))
-                        .unwrap();
+                    resp.append_header(
+                        "set-cookie",
+                        format!("WAF-Token={token}; HttpOnly; {suffix}"),
+                    )
+                    .unwrap();
                 }
                 session.write_response_header(Box::new(resp), false).await?;
                 session
@@ -3838,8 +3908,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         }
                     }
                     if waf_match.is_none() {
-                        waf_match =
-                            crate::firewall::evaluate_policy(policy, session, &ctx.request_body);
+                        waf_match = crate::firewall::evaluate_policy(
+                            policy,
+                            session,
+                            &ctx.request_body,
+                            Self::forwarded_proto(session, ctx),
+                        );
                     }
                 }
             }
@@ -3864,9 +3938,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                                 break;
                             }
                         }
-                        if let Some(action) =
-                            crate::firewall::evaluate_policy(gp, session, &ctx.request_body)
-                        {
+                        if let Some(action) = crate::firewall::evaluate_policy(
+                            gp,
+                            session,
+                            &ctx.request_body,
+                            Self::forwarded_proto(session, ctx),
+                        ) {
                             waf_match = Some(action);
                             break;
                         }
@@ -3942,11 +4019,12 @@ impl ProxyHttp for EdgeProxy {
             .unwrap_or_else(|| session.req_header().uri.host().unwrap_or(""))
             .to_lowercase();
         ctx.host = host.clone();
+        ctx.is_tls_downstream = self.tls_downstream;
         ctx.is_http3_downstream = session.req_header().version == http::Version::HTTP_3;
 
         // Single lock acquisition for hot_path + server + upstream
         let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
-        info!(
+        debug!(
             "REQUEST_FILTER: method={} host='{}' server_found={} lb_found={} uri='{}'",
             session.req_header().method,
             host,
@@ -4096,7 +4174,7 @@ impl ProxyHttp for EdgeProxy {
         }
 
         if ctx.server.is_none() {
-            info!(
+            debug!(
                 "Domain mismatch for host: '{}'. Registered hosts: {:?}",
                 host,
                 self.config.get_all_hosts_sync()
@@ -4109,7 +4187,8 @@ impl ProxyHttp for EdgeProxy {
         if let Some(server) = ctx.server.clone()
             && let Some(ref web) = server.web
         {
-            if let Some((location, status)) = self.should_redirect_to_https(session, &server, &host)
+            if let Some((location, status)) =
+                self.should_redirect_to_https(session, ctx, &server, &host)
             {
                 let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
                 resp.insert_header("location", location).unwrap();
@@ -4139,7 +4218,7 @@ impl ProxyHttp for EdgeProxy {
                             // Ensure no body-related headers on 204
                             resp.remove_header("content-length");
                             resp.remove_header("transfer-encoding");
-                            info!(
+                            debug!(
                                 "OPTIONS preflight: host='{}' origin='{}' resp_headers={:?}",
                                 host,
                                 session
@@ -4425,7 +4504,7 @@ impl ProxyHttp for EdgeProxy {
             ctx.response_status = code;
             if is_upstream_http_status {
                 ctx.origin_status = code as i32;
-                info!(
+                debug!(
                     "ACCESS_LOG: fail_to_proxy preserved upstream origin_status={}",
                     ctx.origin_status
                 );
@@ -4556,8 +4635,10 @@ impl ProxyHttp for EdgeProxy {
                                     "Drifted L2 selection from {} to {}",
                                     peer_addr, second_peer.addr
                                 );
+                                ctx.upstream_is_parent = true;
                                 target_peer = Some(second_peer.clone());
                             } else {
+                                ctx.upstream_is_parent = true;
                                 target_peer = Some(peer.clone());
                             }
                         } else {
@@ -4572,6 +4653,7 @@ impl ProxyHttp for EdgeProxy {
                                 pressure,
                                 session.req_header().uri.host().unwrap_or("")
                             );
+                            ctx.upstream_is_parent = true;
                             target_peer = Some(peer.clone());
                         }
                     }
@@ -4597,6 +4679,19 @@ impl ProxyHttp for EdgeProxy {
         if let Some(peer) = target_peer {
             let mut peer_addr = peer.to_string();
             let backend_ext = peer.ext.get::<crate::lb_factory::BackendExtension>();
+            if let Some(ext) = backend_ext
+                && let Some(reason) = &ext.unsupported_reason
+            {
+                ctx.origin_id = ext.origin_id;
+                ctx.origin_address = peer_addr.clone();
+                warn!(
+                    "Selected unsupported origin: server_id={} origin_id={} reason={}",
+                    ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+                    ext.origin_id,
+                    reason
+                );
+                return Err(Error::new(HTTPStatus(502)));
+            }
             if let Some(ext) = backend_ext
                 && ext.origin_role == crate::lb_factory::OriginRole::Backup
             {
@@ -4633,7 +4728,10 @@ impl ProxyHttp for EdgeProxy {
                 .to_string();
 
             let (sni_host, host_override) = if let Some(ext) = backend_ext {
-                if !ext.host.is_empty() {
+                if let Some(oss_backend) = &ext.oss_backend {
+                    let host = oss_backend.host_header.clone();
+                    (host.clone(), Some(host))
+                } else if !ext.host.is_empty() {
                     // Per-origin requestHost: highest priority
                     let host =
                         Self::maybe_strip_host_port(&ext.host, ext.request_host_excluding_port);
@@ -4671,14 +4769,21 @@ impl ProxyHttp for EdgeProxy {
 
             ctx.origin_id = backend_ext.map(|ext| ext.origin_id).unwrap_or(0);
             ctx.origin_host = host_override.unwrap_or_default();
-            let is_upgrade_request = Self::has_upgrade_connection(session) || session.get_header("upgrade").is_some();
+            ctx.oss_backend = backend_ext.and_then(|ext| ext.oss_backend.clone());
+            if let Some(oss_backend) = &ctx.oss_backend {
+                ctx.origin_host = oss_backend.host_header.clone();
+                ctx.origin_address = oss_backend.log_origin_address();
+            } else {
+                ctx.origin_address = peer_addr.clone();
+            }
+            let is_upgrade_request =
+                Self::has_upgrade_connection(session) || session.get_header("upgrade").is_some();
             let origin_h3_configured = is_tls
                 && ctx.is_http3_downstream
                 && !is_upgrade_request
                 && !(ctx.is_grpc && Self::is_grpc_request(session))
                 && backend_ext.map(|e| e.http3_enabled).unwrap_or(false);
-            ctx.origin_address = peer_addr.clone();
-            info!("ACCESS_LOG: origin_address set to '{}'", ctx.origin_address);
+            debug!("ACCESS_LOG: origin_address set to '{}'", ctx.origin_address);
 
             let mut peer_obj = HttpPeer::new(peer_addr, is_tls, sni_host);
 
@@ -4705,9 +4810,11 @@ impl ProxyHttp for EdgeProxy {
             peer_obj.options.write_timeout = None;
             peer_obj.options.connection_timeout = Some(connection_timeout);
 
-            let origin_h3_selected = origin_h3_configured && crate::origin_h3::should_try_origin_h3_for_peer(&peer_obj);
+            let origin_h3_selected =
+                origin_h3_configured && crate::origin_h3::should_try_origin_h3_for_peer(&peer_obj);
             if origin_h3_selected {
-                peer_obj.options.alpn = pingora_core::protocols::ALPN::Custom(CustomALPN::new(b"h3".to_vec()));
+                peer_obj.options.alpn =
+                    pingora_core::protocols::ALPN::Custom(CustomALPN::new(b"h3".to_vec()));
             } else if ctx.is_grpc && Self::is_grpc_request(session) {
                 // Force ALPN to h2 ONLY for actual gRPC requests
                 peer_obj.options.alpn = pingora_core::protocols::ALPN::H2;
@@ -4846,14 +4953,15 @@ impl ProxyHttp for EdgeProxy {
             let mut matched_ref = None;
             let mut matched_policy: Option<std::sync::Arc<crate::config_models::HTTPCachePolicy>> =
                 None;
+            let scheme = Self::forwarded_proto(session, ctx);
             for cache_ref in &cache.cache_refs {
                 if !cache_ref.is_on {
                     continue;
                 }
                 let is_match = if let Some(conds) = &cache_ref.conds {
-                    conds.match_request(session)
+                    conds.match_request_with_scheme(session, scheme)
                 } else if let Some(simple_cond) = &cache_ref.simple_cond {
-                    simple_cond.match_request(session)
+                    simple_cond.match_request_with_scheme(session, scheme)
                 } else {
                     true
                 };
@@ -4876,9 +4984,9 @@ impl ProxyHttp for EdgeProxy {
                             continue;
                         }
                         let is_match = if let Some(conds) = &cache_ref.conds {
-                            conds.match_request(session)
+                            conds.match_request_with_scheme(session, scheme)
                         } else if let Some(simple_cond) = &cache_ref.simple_cond {
-                            simple_cond.match_request(session)
+                            simple_cond.match_request_with_scheme(session, scheme)
                         } else {
                             true
                         };
@@ -4907,9 +5015,9 @@ impl ProxyHttp for EdgeProxy {
                                 continue;
                             }
                             let is_match = if let Some(conds) = &cache_ref.conds {
-                                conds.match_request(session)
+                                conds.match_request_with_scheme(session, scheme)
                             } else if let Some(simple_cond) = &cache_ref.simple_cond {
-                                simple_cond.match_request(session)
+                                simple_cond.match_request_with_scheme(session, scheme)
                             } else {
                                 true
                             };
@@ -4936,7 +5044,7 @@ impl ProxyHttp for EdgeProxy {
             }
 
             if let Some(cache_ref) = matched_ref {
-                if self.is_hls_encrypted_request(session, s) {
+                if self.is_hls_encrypted_request(session, ctx, s) {
                     tracing::debug!(
                         "Skip cache for HLS encrypted request: {}",
                         session.req_header().uri.path()
@@ -4974,12 +5082,16 @@ impl ProxyHttp for EdgeProxy {
                 // --- PROTOCOL PARITY: Salted Key Generation ---
                 let mut key = if let Some(key_template) = &cache_ref.key {
                     if key_template.is_empty() {
-                        Self::default_cache_key_for_session(session)
+                        Self::default_cache_key_for_session(session, ctx)
                     } else {
-                        crate::cache::matching::format_variables(session, key_template)
+                        crate::cache::matching::format_variables_with_scheme(
+                            session,
+                            key_template,
+                            scheme,
+                        )
                     }
                 } else {
-                    Self::default_cache_key_for_session(session)
+                    Self::default_cache_key_for_session(session, ctx)
                 };
 
                 // 1. Method Suffix (EdgeNode parity: "@method:METHOD")
@@ -5055,7 +5167,7 @@ impl ProxyHttp for EdgeProxy {
         } else {
             crate::origin_state::ORIGIN_STATE_MANAGER.record_success(ctx.origin_id);
         }
-        info!("ACCESS_LOG: origin_status set to {}", ctx.origin_status);
+        debug!("ACCESS_LOG: origin_status set to {}", ctx.origin_status);
 
         if let Some(cache_ref) = &ctx.cache_ref {
             let mut force_cache = false;
@@ -5396,6 +5508,7 @@ impl ProxyHttp for EdgeProxy {
                     session,
                     &ctx.request_body,
                     &outbound_ctx,
+                    Self::forwarded_proto(session, ctx),
                 ) {
                     matched_outbound = Some(action);
                     break;
@@ -5414,6 +5527,7 @@ impl ProxyHttp for EdgeProxy {
                         session,
                         &ctx.request_body,
                         &outbound_ctx,
+                        Self::forwarded_proto(session, ctx),
                     ) {
                         matched_outbound = Some(action);
                     }
@@ -5440,13 +5554,7 @@ impl ProxyHttp for EdgeProxy {
             }
         }
 
-        let is_https = session
-            .downstream_session
-            .digest()
-            .and_then(|digest| digest.ssl_digest.as_ref())
-            .is_some()
-            || session.req_header().uri.scheme_str() == Some("https");
-        if is_https
+        if Self::is_https_downstream(session, ctx)
             && upstream_response.headers.get("alt-svc").is_none()
             && let Some(port) =
                 self.resolve_http3_advertisement_port(session, ctx.server.as_deref())
@@ -5524,10 +5632,31 @@ impl ProxyHttp for EdgeProxy {
     ) -> Result<()> {
         let global_cfg = ctx.global_http_config.as_ref().unwrap();
 
+        if let Some(oss_backend) = &ctx.oss_backend {
+            let path = upstream_request.uri.path().to_string();
+            let query = upstream_request.uri.query().map(ToString::to_string);
+            let transform = oss_backend.transform_request(
+                &upstream_request.method,
+                &path,
+                query.as_deref(),
+                &upstream_request.headers,
+                crate::utils::time::now_utc(),
+            );
+            let new_uri = transform
+                .path_and_query
+                .parse::<http::Uri>()
+                .map_err(|_| Error::new(InternalError))?;
+            upstream_request.set_uri(new_uri);
+            ctx.origin_host = transform.host_header.clone();
+            ctx.origin_address = oss_backend.log_origin_address_for_bucket(&transform.bucket);
+            crate::oss_origin::insert_headers(upstream_request, transform.headers)
+                .map_err(|_| Error::new(InternalError))?;
+        }
+
         // Override Host header with origin-specific hostname if configured.
         // Pingora's HttpPeer only sets TLS SNI, not the HTTP Host header.
         if !ctx.origin_host.is_empty() {
-            info!(
+            debug!(
                 "UPSTREAM: overriding Host header to '{}' (origin_address={})",
                 ctx.origin_host, ctx.origin_address
             );
@@ -5535,7 +5664,7 @@ impl ProxyHttp for EdgeProxy {
                 .insert_header("host", ctx.origin_host.clone())
                 .unwrap();
         } else {
-            info!(
+            debug!(
                 "UPSTREAM: keeping original Host header (origin_address={}, follow_host={})",
                 ctx.origin_address,
                 upstream_request
@@ -5679,7 +5808,7 @@ impl ProxyHttp for EdgeProxy {
         }
 
         // 2. L1 Logic: Inject Identity headers when talking to L2
-        if ctx.node_level == 1 {
+        if ctx.node_level == 1 && ctx.upstream_is_parent {
             let node_id = &self.api_config.node_id;
             let secret = &self.api_config.secret;
 
@@ -5894,6 +6023,7 @@ impl ProxyHttp for EdgeProxy {
                             session,
                             &ctx.request_body,
                             &outbound_ctx,
+                            Self::forwarded_proto(session, ctx),
                         ) {
                             matched_outbound = Some(action);
                             break;
@@ -5912,6 +6042,7 @@ impl ProxyHttp for EdgeProxy {
                                 session,
                                 &ctx.request_body,
                                 &outbound_ctx,
+                                Self::forwarded_proto(session, ctx),
                             ) {
                                 matched_outbound = Some(action);
                             }
@@ -5957,7 +6088,7 @@ impl ProxyHttp for EdgeProxy {
         ctx: &mut Self::CTX,
     ) -> Result<pingora_cache::RespCacheable> {
         if let Some(server) = &ctx.server
-            && self.is_hls_encrypted_request(session, server)
+            && self.is_hls_encrypted_request(session, ctx, server)
         {
             return Ok(pingora_cache::RespCacheable::Uncacheable(
                 pingora_cache::NoCacheReason::Custom("HLSEncrypted"),
@@ -6126,6 +6257,19 @@ mod tests {
             &patterns,
             "static.service.test"
         ));
+    }
+
+    #[test]
+    fn redirect_domain_lists_match_parent_and_subdomains() {
+        let domains = vec!["example.com".to_string(), ".internal.test".to_string()];
+
+        assert!(EdgeProxy::domain_list_matches(&domains, "example.com"));
+        assert!(EdgeProxy::domain_list_matches(&domains, "www.example.com"));
+        assert!(EdgeProxy::domain_list_matches(
+            &domains,
+            "api.internal.test"
+        ));
+        assert!(!EdgeProxy::domain_list_matches(&domains, "badexample.com"));
     }
 
     #[test]

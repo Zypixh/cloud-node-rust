@@ -5,6 +5,7 @@ use pingora_core::tls::ext;
 use pingora_core::tls::pkey::{PKey, Private};
 use pingora_core::tls::ssl::NameType;
 use pingora_core::tls::x509::X509;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -153,7 +154,6 @@ pub async fn sync_certs(
     let mut first_pair: Option<Arc<CertPair>> = None;
 
     // We'll prepare a new cache map based on existing one
-    // We'll prepare a new cache map based on existing one
     let mut new_cache = HashMap::new();
 
     // Scoped read to avoid holding it during the whole loop if not needed,
@@ -173,10 +173,12 @@ pub async fn sync_certs(
             let cert_id = cert_cfg.id;
 
             if let (Some(c), Some(k)) = (&cert_cfg.cert_data_json, &cert_cfg.key_data_json) {
-                if let (Some(cert_pem_raw), Some(key_pem_raw)) = (c.as_str(), k.as_str()) {
+                if let (Some(cert_bytes), Some(key_bytes)) =
+                    (cert_value_to_bytes(c), cert_value_to_bytes(k))
+                {
                     // --- FINGERPRINT CHECK ---
                     let current_fingerprint =
-                        crate::utils::fnv_hash64(&format!("{}{}", cert_pem_raw, key_pem_raw))
+                        fnv_hash64_bytes([cert_bytes.as_slice(), key_bytes.as_slice()].as_slice())
                             .to_string();
 
                     let pair = if let Some((old_fp, old_pair)) = old_cache.get(&cert_id)
@@ -185,20 +187,11 @@ pub async fn sync_certs(
                         reused += 1;
                         old_pair.clone()
                     } else {
-                        // FULL/MISS: Parse the PEM data
-                        let clean_pem = |s: &str| -> Vec<u8> {
-                            if let Ok(decoded) = general_purpose::STANDARD.decode(s.trim()) {
-                                return decoded;
-                            }
-                            s.replace("\\n", "\n").into_bytes()
-                        };
-
-                        let cert_bytes = clean_pem(cert_pem_raw);
-                        let key_bytes = clean_pem(key_pem_raw);
-
                         let cert_chain = X509::stack_from_pem(&cert_bytes).ok();
-                        let cert_res = X509::from_pem(&cert_bytes);
-                        let key_res = PKey::private_key_from_pem(&key_bytes);
+                        let cert_res =
+                            X509::from_pem(&cert_bytes).or_else(|_| X509::from_der(&cert_bytes));
+                        let key_res = PKey::private_key_from_pem(&key_bytes)
+                            .or_else(|_| PKey::private_key_from_der(&key_bytes));
 
                         match (cert_res, key_res) {
                             (Ok(cert), Ok(key)) => Arc::new(CertPair {
@@ -210,8 +203,10 @@ pub async fn sync_certs(
                             }),
                             _ => {
                                 tracing::error!(
-                                    "SSL Parse Error for ID {}: Cert data invalid",
-                                    cert_id
+                                    "SSL Parse Error for ID {}: certificate/key data invalid (cert_type={}, key_type={})",
+                                    cert_id,
+                                    json_value_kind(c),
+                                    json_value_kind(k)
                                 );
                                 continue;
                             }
@@ -243,6 +238,14 @@ pub async fn sync_certs(
                             }
                         }
                     }
+                    names.extend(
+                        cert_cfg
+                            .dns_names
+                            .iter()
+                            .map(|name| name.trim())
+                            .filter(|name| !name.is_empty())
+                            .map(ToString::to_string),
+                    );
 
                     for name in names {
                         let name_low = name.to_lowercase();
@@ -252,6 +255,14 @@ pub async fn sync_certs(
                             new_exact.insert(name_low, pair.clone());
                         }
                     }
+                } else {
+                    tracing::error!(
+                        "SSL Parse Error for ID {}: unsupported certificate/key JSON shape (cert_type={}, key_type={})",
+                        cert_id,
+                        json_value_kind(c),
+                        json_value_kind(k)
+                    );
+                    continue;
                 }
             }
         }
@@ -279,6 +290,86 @@ pub async fn sync_certs(
             default_present
         );
     }
+}
+
+fn cert_value_to_bytes(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::String(raw) => cert_string_to_bytes(raw),
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let byte = item.as_u64()?;
+                if byte > u8::MAX as u64 {
+                    return None;
+                }
+                out.push(byte as u8);
+            }
+            if out.is_empty() { None } else { Some(out) }
+        }
+        Value::Object(map) => {
+            for key in [
+                "data", "value", "bytes", "pem", "content", "certData", "keyData",
+            ] {
+                if let Some(inner) = map.get(key)
+                    && let Some(bytes) = cert_value_to_bytes(inner)
+                {
+                    return Some(bytes);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn cert_string_to_bytes(raw: &str) -> Option<Vec<u8>> {
+    let normalized = raw.replace("\\n", "\n");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(encoded) = trimmed.strip_prefix("base64:") {
+        return decode_base64(encoded.trim()).or_else(|| Some(trimmed.as_bytes().to_vec()));
+    }
+
+    if trimmed.contains("-----BEGIN ") {
+        return Some(normalized.into_bytes());
+    }
+
+    decode_base64(trimmed).or_else(|| Some(normalized.into_bytes()))
+}
+
+fn decode_base64(raw: &str) -> Option<Vec<u8>> {
+    let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    general_purpose::STANDARD
+        .decode(compact.as_bytes())
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(compact.as_bytes()))
+        .ok()
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn fnv_hash64_bytes(chunks: &[&[u8]]) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET;
+    for chunk in chunks {
+        for byte in *chunk {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
 }
 
 #[async_trait]

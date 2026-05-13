@@ -225,7 +225,9 @@ impl HttpProxyManager {
         let listener = bind_with_backlog(&addr, 4096)?;
         info!("HTTP Proxy (TLS={}) listening on {}", is_tls, addr);
 
-        let proxy = http_proxy(&self.server_conf, self.proxy_logic.clone());
+        let mut proxy_logic = self.proxy_logic.clone();
+        proxy_logic.tls_downstream = is_tls;
+        let proxy = http_proxy(&self.server_conf, proxy_logic);
         let proxy_arc = Arc::new(proxy);
 
         let shared_ssl_acceptor = if is_tls {

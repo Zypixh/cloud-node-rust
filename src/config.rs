@@ -7,8 +7,8 @@ use tokio::sync::Notify;
 
 use crate::config_models::{
     HTTP3Policy, HTTPCCPolicy, HTTPCachePolicy, HTTPFirewallPolicy, HTTPPageConfig,
-    HTTPPagesPolicy, MetricItemConfig, ParentNodeConfig, ServerConfig, TOAConfig, UAMPolicy,
-    WebPImagePolicy,
+    HTTPPagesPolicy, MetricItemConfig, ParentNodeConfig, SSLCertConfig, SSLPolicyConfig,
+    ServerConfig, TOAConfig, UAMPolicy, WebPImagePolicy,
 };
 
 /// Configuration for the local EdgeNode.
@@ -66,6 +66,11 @@ pub struct NodeConfig {
     pub parent_routes: HashMap<i64, Arc<LoadBalancer<Consistent>>>,
     /// Global gRPC policy
     pub grpc_policy: Option<Arc<crate::config_models::GRPCConfig>>,
+    /// Cluster/global certificates delivered with the full node config.
+    pub ssl_certs: Vec<SSLCertConfig>,
+    pub ssl_policy: Option<SSLPolicyConfig>,
+    /// Last updating-server-list cursor delivered with the full node config.
+    pub updating_server_list_id: i64,
 
     // New Global Cluster Settings
     pub supports_low_version_http: bool,
@@ -138,6 +143,9 @@ impl Default for NodeConfig {
             ln_request_scheduling_method: "random".to_string(),
             parent_routes: HashMap::new(),
             grpc_policy: None,
+            ssl_certs: Vec::new(),
+            ssl_policy: None,
+            updating_server_list_id: 0,
             supports_low_version_http: false,
             match_cert_from_all_servers: false,
             server_name: String::new(),
@@ -221,12 +229,14 @@ impl ConfigStore {
     // Sync versions for high-performance path (proxy)
     pub fn get_upstream_sync(&self, host: &str) -> Option<Arc<crate::lb_factory::AnyLoadBalancer>> {
         let lock = self.inner.read();
-        lock.routes.get(host).cloned()
+        let normalized = Self::normalize_host(host);
+        Self::find_route_locked(&lock, &normalized)
     }
 
     pub fn get_server_sync(&self, host: &str) -> Option<Arc<ServerConfig>> {
         let lock = self.inner.read();
-        lock.servers.get(host).cloned()
+        let normalized = Self::normalize_host(host);
+        Self::find_server_locked(&lock, &normalized)
     }
 
     pub fn get_server_and_upstream_sync(
@@ -237,9 +247,10 @@ impl ConfigStore {
         Option<Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
         let lock = self.inner.read();
+        let normalized = Self::normalize_host(host);
         (
-            lock.servers.get(host).cloned(),
-            lock.routes.get(host).cloned(),
+            Self::find_server_locked(&lock, &normalized),
+            Self::find_route_locked(&lock, &normalized),
         )
     }
 
@@ -265,21 +276,53 @@ impl ConfigStore {
     ) {
         let lock = self.inner.read();
         let hot_path = Self::build_hot_path_snapshot(&lock);
+        let normalized = Self::normalize_host(host);
 
         // 1. Exact match
-        let mut server = lock.servers.get(host).cloned();
-        let mut upstream = lock.routes.get(host).cloned();
+        let mut server = lock.servers.get(&normalized).cloned();
+        let mut upstream = lock.routes.get(&normalized).cloned();
 
         // 2. Wildcard match if no exact match
         if server.is_none() {
-            if let Some(pos) = host.find('.') {
-                let wildcard = format!("*{}", &host[pos..]);
+            if let Some(pos) = normalized.find('.') {
+                let wildcard = format!("*{}", &normalized[pos..]);
                 server = lock.servers.get(&wildcard).cloned();
                 upstream = lock.routes.get(&wildcard).cloned();
             }
         }
 
         (hot_path, server, upstream)
+    }
+
+    fn normalize_host(host: &str) -> String {
+        crate::lb_factory::strip_addr_port(host)
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+    }
+
+    fn find_server_locked(lock: &NodeConfig, normalized_host: &str) -> Option<Arc<ServerConfig>> {
+        if let Some(server) = lock.servers.get(normalized_host) {
+            return Some(server.clone());
+        }
+        if let Some(pos) = normalized_host.find('.') {
+            let wildcard = format!("*{}", &normalized_host[pos..]);
+            return lock.servers.get(&wildcard).cloned();
+        }
+        None
+    }
+
+    fn find_route_locked(
+        lock: &NodeConfig,
+        normalized_host: &str,
+    ) -> Option<Arc<crate::lb_factory::AnyLoadBalancer>> {
+        if let Some(route) = lock.routes.get(normalized_host) {
+            return Some(route.clone());
+        }
+        if let Some(pos) = normalized_host.find('.') {
+            let wildcard = format!("*{}", &normalized_host[pos..]);
+            return lock.routes.get(&wildcard).cloned();
+        }
+        None
     }
 
     fn build_hot_path_snapshot(lock: &NodeConfig) -> HotPathSnapshot {
@@ -305,7 +348,7 @@ impl ConfigStore {
     }
 
     pub fn get_server_for_tls_name_sync(&self, host: &str) -> Option<Arc<ServerConfig>> {
-        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+        let normalized = Self::normalize_host(host);
         let lock = self.inner.read();
 
         if let Some(server) = lock.servers.get(&normalized) {
@@ -330,7 +373,7 @@ impl ConfigStore {
         host: &str,
         port: u16,
     ) -> Option<Arc<ServerConfig>> {
-        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+        let normalized = Self::normalize_host(host);
         let lock = self.inner.read();
 
         lock.all_servers
@@ -665,9 +708,26 @@ impl ConfigStore {
         (lock.level, Arc::clone(&lock.parent_nodes))
     }
 
+    pub async fn get_origin_runtime_context(
+        &self,
+    ) -> (i32, Arc<HashMap<i64, Vec<ParentNodeConfig>>>, bool, bool) {
+        let lock = self.inner.read();
+        (
+            lock.level,
+            Arc::clone(&lock.parent_nodes),
+            lock.tiered_origin_bypass,
+            lock.allow_lan_ip,
+        )
+    }
+
     pub async fn is_tiered_origin_bypass(&self) -> bool {
         let lock = self.inner.read();
         lock.tiered_origin_bypass
+    }
+
+    pub async fn allow_lan_ip(&self) -> bool {
+        let lock = self.inner.read();
+        lock.allow_lan_ip
     }
 
     pub async fn set_tiered_origin_bypass(&self, bypass: bool) {
@@ -695,6 +755,29 @@ impl ConfigStore {
         lock.version
     }
 
+    pub async fn get_updating_server_list_id(&self) -> i64 {
+        let lock = self.inner.read();
+        lock.updating_server_list_id
+    }
+
+    pub async fn collect_ssl_config(&self) -> (Vec<SSLCertConfig>, Option<SSLPolicyConfig>) {
+        let lock = self.inner.read();
+        let mut certs = lock.ssl_certs.clone();
+        let mut active_policy = lock.ssl_policy.clone();
+
+        for server in &lock.all_servers {
+            if let Some(https) = &server.https
+                && https.is_on
+                && let Some(policy) = &https.ssl_policy
+            {
+                certs.extend(policy.certs.clone());
+                active_policy = Some(policy.clone());
+            }
+        }
+
+        (certs, active_policy)
+    }
+
     pub async fn get_cache_policy(&self) -> Arc<Vec<Arc<HTTPCachePolicy>>> {
         self.get_cache_policy_sync()
     }
@@ -718,6 +801,9 @@ impl ConfigStore {
         deleted_contents: Vec<String>,
         global_pages: Vec<HTTPPageConfig>,
         metric_items: Vec<MetricItemConfig>,
+        ssl_certs: Vec<SSLCertConfig>,
+        ssl_policy: Option<SSLPolicyConfig>,
+        updating_server_list_id: i64,
         level: i32,
         is_on: bool,
         enable_ip_lists: bool,
@@ -766,6 +852,9 @@ impl ConfigStore {
         lock.deleted_contents = deleted_contents;
         lock.global_pages = global_pages;
         lock.metric_items = metric_items;
+        lock.ssl_certs = ssl_certs;
+        lock.ssl_policy = ssl_policy;
+        lock.updating_server_list_id = updating_server_list_id;
         lock.level = level;
         lock.is_on = is_on;
         lock.enable_ip_lists = enable_ip_lists;
@@ -809,8 +898,7 @@ impl ConfigStore {
         lock.webp_image_policies = webp_image_policies;
         lock.toa = toa;
         lock.global_access_log = global_access_log.map(Arc::new);
-        // Track whether any SNI passthrough server exists (for fast TLS path)
-        lock.has_any_sni_passthrough = lock.all_servers.iter().any(|s| s.is_sni_passthrough());
+        Self::refresh_sni_passthrough_flag(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -852,6 +940,7 @@ impl ConfigStore {
             }
             lock.routes.insert(host, lb);
         }
+        Self::refresh_sni_passthrough_flag(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -874,8 +963,8 @@ impl ConfigStore {
             .filter_map(|(host, server)| (server.user_id == user_id).then_some(host.clone()))
             .collect::<Vec<_>>();
         let stale_server_ids = lock
-            .servers
-            .values()
+            .all_servers
+            .iter()
             .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
             .collect::<std::collections::HashSet<_>>();
 
@@ -901,23 +990,24 @@ impl ConfigStore {
         for (host, lb) in routes {
             lock.routes.insert(host, lb);
         }
+        Self::refresh_sni_passthrough_flag(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
 
     pub async fn remove_user_servers(&self, user_id: i64) {
         let mut lock = self.inner.write();
+        let stale_server_ids = lock
+            .all_servers
+            .iter()
+            .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
+            .collect::<std::collections::HashSet<_>>();
         lock.all_servers.retain(|server| server.user_id != user_id);
         let stale_hosts = lock
             .servers
             .iter()
             .filter_map(|(host, server)| (server.user_id == user_id).then_some(host.clone()))
             .collect::<Vec<_>>();
-        let stale_server_ids = lock
-            .servers
-            .values()
-            .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
-            .collect::<std::collections::HashSet<_>>();
 
         for host in stale_hosts {
             lock.servers.remove(&host);
@@ -928,6 +1018,7 @@ impl ConfigStore {
                 lock.id_to_lb.remove(&server_id);
             }
         }
+        Self::refresh_sni_passthrough_flag(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -949,6 +1040,7 @@ impl ConfigStore {
         if server_id > 0 {
             lock.id_to_lb.remove(&server_id);
         }
+        Self::refresh_sni_passthrough_flag(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -969,8 +1061,13 @@ impl ConfigStore {
         lock.all_servers.push(server.clone());
         lock.servers.insert(host.clone(), server);
         lock.routes.insert(host, lb);
+        Self::refresh_sni_passthrough_flag(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
+    }
+
+    fn refresh_sni_passthrough_flag(lock: &mut NodeConfig) {
+        lock.has_any_sni_passthrough = lock.all_servers.iter().any(|s| s.is_sni_passthrough());
     }
 
     pub async fn set_deleted_contents(&self, deleted_contents: Vec<String>) {
@@ -1035,6 +1132,9 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
+                None,
+                55,
                 1,
                 true,
                 true,
@@ -1099,5 +1199,6 @@ mod tests {
             "redirect"
         );
         assert!(snapshot.global_access_log.is_some());
+        assert_eq!(store.get_updating_server_list_id().await, 55);
     }
 }

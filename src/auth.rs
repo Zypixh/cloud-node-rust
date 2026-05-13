@@ -25,7 +25,7 @@ fn lower_hex_eq(digest: &[u8], expected: &str) -> bool {
 
 /// Generates the base64 AES256-CFB encrypted token required by the API node.
 /// Uses deterministic key/IV derivation compatible with the control-plane decodeToken().
-pub fn generate_token(node_id: &str, secret: &str, _node_type: &str) -> anyhow::Result<String> {
+pub fn generate_token(node_id: &str, secret: &str, node_type: &str) -> anyhow::Result<String> {
     // Key: secret padded/truncated to 32 bytes (matching Go master)
     let mut key = [b' '; 32];
     let secret_bytes = secret.as_bytes();
@@ -42,8 +42,8 @@ pub fn generate_token(node_id: &str, secret: &str, _node_type: &str) -> anyhow::
     let mut payload = String::with_capacity(48);
     write!(
         &mut payload,
-        r#"{{"timestamp":{},"type":"node","userId":0}}"#,
-        timestamp
+        r#"{{"timestamp":{},"type":"{}","userId":0}}"#,
+        timestamp, node_type
     )
     .expect("writing to String should not fail");
 

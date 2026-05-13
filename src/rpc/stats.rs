@@ -525,7 +525,7 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
                 continue;
             }
         };
-        let mut node_service = client.node_service_with_type();
+        let mut node_service = client.node_service();
         let mut server_service = client.server_service();
 
         match node_service

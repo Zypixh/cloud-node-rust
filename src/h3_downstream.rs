@@ -6,11 +6,11 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures_util::Stream;
 use h3::error::Code;
 use http::{HeaderMap, Request, Response, Version};
-use pingora_core::protocols::http::custom::server::Session as CustomServerSession;
-use pingora_core::protocols::http::custom::CustomMessageWrite;
-use pingora_core::protocols::http::HttpTask;
-use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_core::protocols::Digest;
+use pingora_core::protocols::http::HttpTask;
+use pingora_core::protocols::http::custom::CustomMessageWrite;
+use pingora_core::protocols::http::custom::server::Session as CustomServerSession;
+use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_core::{Error, ErrorType, Result as PingoraResult};
 use pingora_http::{RequestHeader, ResponseHeader};
 use tokio::sync::Mutex;
@@ -75,7 +75,12 @@ where
         let result = if let Some(timeout) = self.read_timeout {
             match tokio::time::timeout(timeout, stream.recv_data()).await {
                 Ok(result) => result,
-                Err(_) => return Error::e_explain(ErrorType::ReadTimedout, "reading HTTP/3 request body"),
+                Err(_) => {
+                    return Error::e_explain(
+                        ErrorType::ReadTimedout,
+                        "reading HTTP/3 request body",
+                    );
+                }
             }
         } else {
             stream.recv_data().await
@@ -87,7 +92,8 @@ where
                 ErrorType::ReadError,
                 format!("reading HTTP/3 request body: {err}"),
             )
-        })? else {
+        })?
+        else {
             self.body_done = true;
             return Ok(None);
         };
@@ -116,7 +122,9 @@ where
         if let Some(timeout) = self.write_timeout {
             tokio::time::timeout(timeout, stream.send_response(response))
                 .await
-                .map_err(|_| Error::explain(ErrorType::WriteTimedout, "writing HTTP/3 response header"))?
+                .map_err(|_| {
+                    Error::explain(ErrorType::WriteTimedout, "writing HTTP/3 response header")
+                })?
         } else {
             stream.send_response(response).await
         }
@@ -141,7 +149,9 @@ where
         if let Some(timeout) = self.write_timeout {
             tokio::time::timeout(timeout, stream.send_data(data))
                 .await
-                .map_err(|_| Error::explain(ErrorType::WriteTimedout, "writing HTTP/3 response body"))?
+                .map_err(|_| {
+                    Error::explain(ErrorType::WriteTimedout, "writing HTTP/3 response body")
+                })?
         } else {
             stream.send_data(data).await
         }
@@ -178,19 +188,27 @@ where
             Ok(())
         };
         if let Some(timeout) = timeout {
-            tokio::time::timeout(timeout, drain)
-                .await
-                .map_err(|_| Error::explain(ErrorType::ReadTimedout, "draining HTTP/3 request body"))?
+            tokio::time::timeout(timeout, drain).await.map_err(|_| {
+                Error::explain(ErrorType::ReadTimedout, "draining HTTP/3 request body")
+            })?
         } else {
             drain.await
         }
     }
 
-    async fn write_response_header(&mut self, resp: Box<ResponseHeader>, end: bool) -> PingoraResult<()> {
+    async fn write_response_header(
+        &mut self,
+        resp: Box<ResponseHeader>,
+        end: bool,
+    ) -> PingoraResult<()> {
         self.send_response(&resp, end).await
     }
 
-    async fn write_response_header_ref(&mut self, resp: &ResponseHeader, end: bool) -> PingoraResult<()> {
+    async fn write_response_header_ref(
+        &mut self,
+        resp: &ResponseHeader,
+        end: bool,
+    ) -> PingoraResult<()> {
         self.send_response(resp, end).await
     }
 
@@ -210,7 +228,12 @@ where
             .await
             .send_trailers(trailers)
             .await
-            .map_err(|err| Error::explain(ErrorType::WriteError, format!("writing HTTP/3 trailers: {err}")))?;
+            .map_err(|err| {
+                Error::explain(
+                    ErrorType::WriteError,
+                    format!("writing HTTP/3 trailers: {err}"),
+                )
+            })?;
         self.finish().await
     }
 
@@ -273,7 +296,10 @@ where
     }
 
     async fn shutdown(&mut self, _code: u32, _ctx: &str) {
-        self.stream.lock().await.stop_stream(Code::H3_REQUEST_CANCELLED);
+        self.stream
+            .lock()
+            .await
+            .stop_stream(Code::H3_REQUEST_CANCELLED);
     }
 
     fn is_body_done(&mut self) -> bool {
@@ -284,12 +310,12 @@ where
         if self.response_done {
             return Ok(());
         }
-        self.stream
-            .lock()
-            .await
-            .finish()
-            .await
-            .map_err(|err| Error::explain(ErrorType::WriteError, format!("finishing HTTP/3 response: {err}")))?;
+        self.stream.lock().await.finish().await.map_err(|err| {
+            Error::explain(
+                ErrorType::WriteError,
+                format!("finishing HTTP/3 response: {err}"),
+            )
+        })?;
         self.response_done = true;
         Ok(())
     }
@@ -356,7 +382,9 @@ where
     }
 
     fn get_retry_buffer(&self) -> Option<Bytes> {
-        self.retry_buffer.as_ref().map(|buffer| buffer.clone().freeze())
+        self.retry_buffer
+            .as_ref()
+            .map(|buffer| buffer.clone().freeze())
     }
 
     async fn finish_custom(&mut self) -> PingoraResult<()> {
@@ -380,7 +408,10 @@ where
         Some(Box::new(()))
     }
 
-    fn restore_custom_message_writer(&mut self, _writer: Box<dyn CustomMessageWrite>) -> PingoraResult<()> {
+    fn restore_custom_message_writer(
+        &mut self,
+        _writer: Box<dyn CustomMessageWrite>,
+    ) -> PingoraResult<()> {
         Ok(())
     }
 }
@@ -392,7 +423,8 @@ fn build_request_header(request: Request<()>) -> PingoraResult<RequestHeader> {
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
-    let mut req = RequestHeader::build_no_case(parts.method, path.as_bytes(), Some(parts.headers.len()))?;
+    let mut req =
+        RequestHeader::build_no_case(parts.method, path.as_bytes(), Some(parts.headers.len()))?;
     req.set_version(Version::HTTP_3);
 
     if let Some(authority) = parts.uri.authority()
@@ -420,14 +452,23 @@ fn build_h3_response(resp: &ResponseHeader) -> PingoraResult<Response<()>> {
         }
         builder = builder.header(name, value);
     }
-    builder
-        .body(())
-        .map_err(|err| Error::explain(ErrorType::InvalidHTTPHeader, format!("building HTTP/3 response: {err}")))
+    builder.body(()).map_err(|err| {
+        Error::explain(
+            ErrorType::InvalidHTTPHeader,
+            format!("building HTTP/3 response: {err}"),
+        )
+    })
 }
 
 fn is_h3_forbidden_response_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "connection" | "keep-alive" | "proxy-connection" | "te" | "trailer" | "transfer-encoding" | "upgrade"
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
     )
 }

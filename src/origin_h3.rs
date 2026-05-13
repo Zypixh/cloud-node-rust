@@ -21,7 +21,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::sync::Mutex;
 
-use crate::origin_h3_state::{OriginH3Key, ORIGIN_H3_STATE_MANAGER};
+use crate::origin_h3_state::{ORIGIN_H3_STATE_MANAGER, OriginH3Key};
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -86,37 +86,56 @@ async fn connect_h3<P: Peer + Send + Sync + 'static>(
     _key: OriginH3Key,
 ) -> PingoraResult<OriginH3ClientSession> {
     let Some(server_addr) = peer.address().as_inet().copied() else {
-        return Error::e_explain(ErrorType::ConnectError, "HTTP/3 origin requires an IP socket address");
+        return Error::e_explain(
+            ErrorType::ConnectError,
+            "HTTP/3 origin requires an IP socket address",
+        );
     };
 
     let bind_addr = match server_addr.ip() {
         IpAddr::V4(_) => StdSocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         IpAddr::V6(_) => StdSocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
     };
-    let mut endpoint = Endpoint::client(bind_addr)
-        .map_err(|err| Error::explain(ErrorType::ConnectError, format!("creating H3 endpoint: {err}")))?;
+    let mut endpoint = Endpoint::client(bind_addr).map_err(|err| {
+        Error::explain(
+            ErrorType::ConnectError,
+            format!("creating H3 endpoint: {err}"),
+        )
+    })?;
     endpoint.set_default_client_config(client_config(peer.verify_cert())?);
 
     let sni = peer.sni();
-    let connecting = endpoint
-        .connect(server_addr, sni)
-        .map_err(|err| Error::explain(ErrorType::ConnectError, format!("starting H3 connect: {err}")))?;
+    let connecting = endpoint.connect(server_addr, sni).map_err(|err| {
+        Error::explain(
+            ErrorType::ConnectError,
+            format!("starting H3 connect: {err}"),
+        )
+    })?;
     let connection = match peer.connection_timeout() {
         Some(timeout) => tokio::time::timeout(timeout, connecting)
             .await
-            .map_err(|_| Error::explain(ErrorType::ConnectTimedout, "connecting to HTTP/3 origin"))?,
+            .map_err(|_| {
+                Error::explain(ErrorType::ConnectTimedout, "connecting to HTTP/3 origin")
+            })?,
         None => connecting.await,
     }
-    .map_err(|err| Error::explain(ErrorType::ConnectError, format!("connecting to HTTP/3 origin: {err}")))?;
+    .map_err(|err| {
+        Error::explain(
+            ErrorType::ConnectError,
+            format!("connecting to HTTP/3 origin: {err}"),
+        )
+    })?;
 
     let local_addr = endpoint
         .local_addr()
         .unwrap_or_else(|_| StdSocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
     let h3_conn = h3_quinn::Connection::new(connection.clone());
-    let (mut driver, send_request) = h3::client::builder()
-        .build(h3_conn)
-        .await
-        .map_err(|err| Error::explain(ErrorType::ConnectError, format!("starting H3 client: {err}")))?;
+    let (mut driver, send_request) = h3::client::builder().build(h3_conn).await.map_err(|err| {
+        Error::explain(
+            ErrorType::ConnectError,
+            format!("starting H3 client: {err}"),
+        )
+    })?;
     tokio::spawn(async move {
         let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
@@ -153,8 +172,12 @@ fn client_config(verify_cert: bool) -> PingoraResult<ClientConfig> {
             .with_no_client_auth()
     };
     crypto.alpn_protocols = vec![b"h3".to_vec()];
-    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-        .map_err(|err| Error::explain(ErrorType::ConnectError, format!("building H3 TLS config: {err}")))?;
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(|err| {
+        Error::explain(
+            ErrorType::ConnectError,
+            format!("building H3 TLS config: {err}"),
+        )
+    })?;
     Ok(ClientConfig::new(Arc::new(quic)))
 }
 
@@ -214,16 +237,27 @@ impl ServerCertVerifier for SkipServerVerification {
 
 #[async_trait]
 impl CustomClientSession for OriginH3ClientSession {
-    async fn write_request_header(&mut self, req: Box<RequestHeader>, _end: bool) -> PingoraResult<()> {
+    async fn write_request_header(
+        &mut self,
+        req: Box<RequestHeader>,
+        _end: bool,
+    ) -> PingoraResult<()> {
         let request = build_h3_request(&req)?;
         let mut send_request = self.send_request.lock().await;
         let stream = match self.write_timeout {
             Some(timeout) => tokio::time::timeout(timeout, send_request.send_request(request))
                 .await
-                .map_err(|_| Error::explain(ErrorType::WriteTimedout, "sending HTTP/3 request header"))?,
+                .map_err(|_| {
+                    Error::explain(ErrorType::WriteTimedout, "sending HTTP/3 request header")
+                })?,
             None => send_request.send_request(request).await,
         }
-        .map_err(|err| Error::explain(ErrorType::WriteError, format!("sending HTTP/3 request header: {err}")))?;
+        .map_err(|err| {
+            Error::explain(
+                ErrorType::WriteError,
+                format!("sending HTTP/3 request header: {err}"),
+            )
+        })?;
         drop(send_request);
 
         let stream = Arc::new(Mutex::new(stream));
@@ -233,7 +267,10 @@ impl CustomClientSession for OriginH3ClientSession {
 
     async fn write_request_body(&mut self, data: Bytes, end: bool) -> PingoraResult<()> {
         let Some(stream) = self.request_stream.as_ref().cloned() else {
-            return Error::e_explain(ErrorType::WriteError, "HTTP/3 request stream is not initialized");
+            return Error::e_explain(
+                ErrorType::WriteError,
+                "HTTP/3 request stream is not initialized",
+            );
         };
         write_h3_body(stream, data, end, self.write_timeout).await
     }
@@ -255,16 +292,26 @@ impl CustomClientSession for OriginH3ClientSession {
 
     async fn read_response_header(&mut self) -> PingoraResult<()> {
         let Some(stream) = self.request_stream.as_ref().cloned() else {
-            return Error::e_explain(ErrorType::ReadError, "HTTP/3 request stream is not initialized");
+            return Error::e_explain(
+                ErrorType::ReadError,
+                "HTTP/3 request stream is not initialized",
+            );
         };
         let mut stream = stream.lock().await;
         let response = match self.read_timeout {
             Some(timeout) => tokio::time::timeout(timeout, stream.recv_response())
                 .await
-                .map_err(|_| Error::explain(ErrorType::ReadTimedout, "reading HTTP/3 response header"))?,
+                .map_err(|_| {
+                    Error::explain(ErrorType::ReadTimedout, "reading HTTP/3 response header")
+                })?,
             None => stream.recv_response().await,
         }
-        .map_err(|err| Error::explain(ErrorType::ReadError, format!("reading HTTP/3 response header: {err}")))?;
+        .map_err(|err| {
+            Error::explain(
+                ErrorType::ReadError,
+                format!("reading HTTP/3 response header: {err}"),
+            )
+        })?;
         self.response_header = Some(build_response_header(response)?);
         Ok(())
     }
@@ -274,16 +321,26 @@ impl CustomClientSession for OriginH3ClientSession {
             return Ok(None);
         }
         let Some(stream) = self.request_stream.as_ref().cloned() else {
-            return Error::e_explain(ErrorType::ReadError, "HTTP/3 request stream is not initialized");
+            return Error::e_explain(
+                ErrorType::ReadError,
+                "HTTP/3 request stream is not initialized",
+            );
         };
         let mut stream = stream.lock().await;
         let result = match self.read_timeout {
             Some(timeout) => tokio::time::timeout(timeout, stream.recv_data())
                 .await
-                .map_err(|_| Error::explain(ErrorType::ReadTimedout, "reading HTTP/3 response body"))?,
+                .map_err(|_| {
+                    Error::explain(ErrorType::ReadTimedout, "reading HTTP/3 response body")
+                })?,
             None => stream.recv_data().await,
         }
-        .map_err(|err| Error::explain(ErrorType::ReadError, format!("reading HTTP/3 response body: {err}")))?;
+        .map_err(|err| {
+            Error::explain(
+                ErrorType::ReadError,
+                format!("reading HTTP/3 response body: {err}"),
+            )
+        })?;
         let Some(mut chunk) = result else {
             self.response_finished = true;
             return Ok(None);
@@ -336,10 +393,12 @@ impl CustomClientSession for OriginH3ClientSession {
             return Ok(None);
         };
         let mut stream = stream.lock().await;
-        stream
-            .recv_trailers()
-            .await
-            .map_err(|err| Error::explain(ErrorType::ReadError, format!("reading HTTP/3 trailers: {err}")))
+        stream.recv_trailers().await.map_err(|err| {
+            Error::explain(
+                ErrorType::ReadError,
+                format!("reading HTTP/3 trailers: {err}"),
+            )
+        })
     }
 
     fn fd(&self) -> UniqueIDType {
@@ -429,19 +488,33 @@ async fn write_h3_body(
         match write_timeout {
             Some(timeout) => tokio::time::timeout(timeout, stream.send_data(data))
                 .await
-                .map_err(|_| Error::explain(ErrorType::WriteTimedout, "writing HTTP/3 request body"))?,
+                .map_err(|_| {
+                    Error::explain(ErrorType::WriteTimedout, "writing HTTP/3 request body")
+                })?,
             None => stream.send_data(data).await,
         }
-        .map_err(|err| Error::explain(ErrorType::WriteError, format!("writing HTTP/3 request body: {err}")))?;
+        .map_err(|err| {
+            Error::explain(
+                ErrorType::WriteError,
+                format!("writing HTTP/3 request body: {err}"),
+            )
+        })?;
     }
     if end {
         match write_timeout {
             Some(timeout) => tokio::time::timeout(timeout, stream.finish())
                 .await
-                .map_err(|_| Error::explain(ErrorType::WriteTimedout, "finishing HTTP/3 request body"))?,
+                .map_err(|_| {
+                    Error::explain(ErrorType::WriteTimedout, "finishing HTTP/3 request body")
+                })?,
             None => stream.finish().await,
         }
-        .map_err(|err| Error::explain(ErrorType::WriteError, format!("finishing HTTP/3 request body: {err}")))?;
+        .map_err(|err| {
+            Error::explain(
+                ErrorType::WriteError,
+                format!("finishing HTTP/3 request body: {err}"),
+            )
+        })?;
     }
     Ok(())
 }
@@ -462,7 +535,12 @@ fn build_h3_request(req: &RequestHeader) -> PingoraResult<http::Request<()>> {
         .unwrap_or_else(|| req.uri.host().unwrap_or("localhost"));
     let uri = format!("https://{authority}{path}")
         .parse::<http::Uri>()
-        .map_err(|err| Error::explain(ErrorType::InvalidHTTPHeader, format!("building HTTP/3 request URI: {err}")))?;
+        .map_err(|err| {
+            Error::explain(
+                ErrorType::InvalidHTTPHeader,
+                format!("building HTTP/3 request URI: {err}"),
+            )
+        })?;
     let mut builder = http::Request::builder()
         .method(req.method.clone())
         .uri(uri)
@@ -473,9 +551,12 @@ fn build_h3_request(req: &RequestHeader) -> PingoraResult<http::Request<()>> {
         }
         builder = builder.header(name, value);
     }
-    builder
-        .body(())
-        .map_err(|err| Error::explain(ErrorType::InvalidHTTPHeader, format!("building HTTP/3 request: {err}")))
+    builder.body(()).map_err(|err| {
+        Error::explain(
+            ErrorType::InvalidHTTPHeader,
+            format!("building HTTP/3 request: {err}"),
+        )
+    })
 }
 
 fn build_response_header(response: Response<()>) -> PingoraResult<ResponseHeader> {
@@ -495,7 +576,13 @@ fn build_response_header(response: Response<()>) -> PingoraResult<ResponseHeader
 fn is_h3_forbidden_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "connection" | "keep-alive" | "proxy-connection" | "te" | "trailer" | "transfer-encoding" | "upgrade"
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
     )
 }
 

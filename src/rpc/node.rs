@@ -15,6 +15,7 @@ use crate::rpc::node_task::sync_node_tasks;
 use crate::rpc::plan::sync_active_plans;
 use crate::rpc::utils::sync_deleted_contents;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) static CONNECTED_API_NODE_IDS: Lazy<RwLock<HashSet<i64>>> =
     Lazy::new(|| RwLock::new(HashSet::new()));
@@ -28,6 +29,67 @@ pub fn trigger_api_node_report() {
 static LAST_CONFIG_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 static LAST_WAF_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 static LAST_GLOBAL_CONFIG_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
+static CONNECTED_API_NODE_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
+static ENABLED_FEATURES_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
+static UPDATE_NODE_UP_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn cert_data_score(cert: &crate::config_models::SSLCertConfig) -> usize {
+    fn score(value: &Option<serde_json::Value>) -> usize {
+        match value {
+            Some(serde_json::Value::String(s)) => {
+                if s.contains("-----BEGIN ") {
+                    4
+                } else if s.contains("GOEDGE_DATA_MAP:") || s.contains("_DATA_MAP:") {
+                    1
+                } else if s.trim().len() >= 128 {
+                    3
+                } else {
+                    2
+                }
+            }
+            Some(serde_json::Value::Array(items)) if items.len() >= 128 => 3,
+            Some(serde_json::Value::Object(_)) => 2,
+            Some(_) => 1,
+            None => 0,
+        }
+    }
+
+    score(&cert.cert_data_json) + score(&cert.key_data_json)
+}
+
+fn dedup_ssl_certs(
+    certs: Vec<crate::config_models::SSLCertConfig>,
+) -> Vec<crate::config_models::SSLCertConfig> {
+    let mut order = Vec::new();
+    let mut by_id: std::collections::HashMap<i64, crate::config_models::SSLCertConfig> =
+        std::collections::HashMap::new();
+
+    for cert in certs {
+        if cert.id <= 0 {
+            order.push(cert.id);
+            by_id.insert(cert.id, cert);
+            continue;
+        }
+        if !by_id.contains_key(&cert.id) {
+            order.push(cert.id);
+            by_id.insert(cert.id, cert);
+            continue;
+        }
+        let replace = by_id
+            .get(&cert.id)
+            .map(|existing| cert_data_score(&cert) > cert_data_score(existing))
+            .unwrap_or(true);
+        if replace {
+            by_id.insert(cert.id, cert);
+        }
+    }
+
+    order.dedup();
+    order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
+}
 
 fn log_raw_json_hints(label: &str, raw: &[u8]) {
     let text = String::from_utf8_lossy(raw);
@@ -75,6 +137,14 @@ async fn report_connected_api_nodes(api_config: &ApiConfig) {
                 "Successfully reported connected API nodes: {:?}",
                 api_node_ids
             ),
+            Err(e) if is_unsupported_node_type_error(&e) => {
+                if !CONNECTED_API_NODE_UNSUPPORTED_LOGGED.swap(true, Ordering::Relaxed) {
+                    debug!(
+                        "Connected API node report is not supported by this API node for node credentials: {}",
+                        e
+                    );
+                }
+            }
             Err(e) => warn!("Failed to report connected API nodes: {}", e),
         }
     }
@@ -266,17 +336,14 @@ pub async fn fetch_and_apply_config<F>(
             if config_resp.node_json.is_empty() {
                 if !config_resp.is_changed {
                     debug!("RPC_NODE: No configuration changes reported by API.");
-                    return; // Early return to avoid reprocessing same config
                 } else {
                     warn!("RPC_NODE: API reported change but sent empty JSON!");
                 }
             } else {
                 debug!(
-                    "RPC_NODE: Received node_json ({} bytes). First 256 bytes: {}",
+                    "RPC_NODE: Received node_json ({} bytes, compressed={}).",
                     config_resp.node_json.len(),
-                    String::from_utf8_lossy(
-                        &config_resp.node_json[..std::cmp::min(256, config_resp.node_json.len())]
-                    )
+                    config_resp.is_compressed
                 );
                 *config_version = config_resp.timestamp;
                 let mut node_json = config_resp.node_json;
@@ -331,6 +398,7 @@ pub async fn fetch_and_apply_config<F>(
                     ) {
                         Ok(payload) => {
                             let numeric_id = payload.id.unwrap_or(0);
+                            let mut payload_servers = payload.servers.clone();
 
                             debug!(
                                 "Successfully parsed NodeConfigPayload. Numeric ID: {}, Server count: {}",
@@ -570,7 +638,7 @@ pub async fn fetch_and_apply_config<F>(
                                 active_ssl_policy = Some(policy.clone());
                             }
 
-                            for server in &payload.servers {
+                            for server in &payload_servers {
                                 if !server.is_on {
                                     continue;
                                 }
@@ -610,38 +678,78 @@ pub async fn fetch_and_apply_config<F>(
                             if let Some(dm) = &payload.data_map {
                                 tracing::debug!(
                                     "RPC_NODE: DataMap found with {} entries. Restoring certificates...",
-                                    dm.r#map.len()
+                                    dm.len()
                                 );
                                 let mut restored_count = 0;
                                 let mut restore_cert =
                                     |cert: &mut crate::config_models::SSLCertConfig| {
                                         use base64::{Engine as _, engine::general_purpose};
+                                        fn value_to_ref_string(
+                                            value: &serde_json::Value,
+                                        ) -> Option<String>
+                                        {
+                                            fn decode_ref_candidate(raw: &str) -> Option<String> {
+                                                let encoded =
+                                                    raw.strip_prefix("base64:").unwrap_or(raw);
+                                                general_purpose::STANDARD
+                                                    .decode(encoded.trim())
+                                                    .or_else(|_| {
+                                                        general_purpose::STANDARD_NO_PAD
+                                                            .decode(encoded.trim())
+                                                    })
+                                                    .ok()
+                                                    .map(|decoded| {
+                                                        String::from_utf8_lossy(&decoded)
+                                                            .to_string()
+                                                    })
+                                            }
+
+                                            match value {
+                                                serde_json::Value::String(s) => {
+                                                    if s.contains("GOEDGE_DATA_MAP:")
+                                                        || s.contains("_DATA_MAP:")
+                                                    {
+                                                        return Some(s.clone());
+                                                    }
+                                                    if let Some(decoded) = decode_ref_candidate(s) {
+                                                        if decoded.contains("GOEDGE_DATA_MAP:")
+                                                            || decoded.contains("_DATA_MAP:")
+                                                        {
+                                                            return Some(decoded);
+                                                        }
+                                                    }
+                                                    Some(s.clone())
+                                                }
+                                                serde_json::Value::Array(items) => {
+                                                    let mut bytes = Vec::with_capacity(items.len());
+                                                    for item in items {
+                                                        let byte = item.as_u64()?;
+                                                        if byte > u8::MAX as u64 {
+                                                            return None;
+                                                        }
+                                                        bytes.push(byte as u8);
+                                                    }
+                                                    Some(
+                                                        String::from_utf8_lossy(&bytes).to_string(),
+                                                    )
+                                                }
+                                                _ => None,
+                                            }
+                                        }
                                         let mut process_field =
                                             |val: &mut Option<serde_json::Value>| {
-                                                if let Some(serde_json::Value::String(s)) = val {
-                                                    let raw_ref = if s.starts_with("base64:") {
-                                                        let b64 =
-                                                            s.strip_prefix("base64:").unwrap_or(s);
-                                                        if let Ok(decoded) =
-                                                            general_purpose::STANDARD
-                                                                .decode(b64.trim())
-                                                        {
-                                                            String::from_utf8_lossy(&decoded)
-                                                                .to_string()
-                                                        } else {
-                                                            s.clone()
-                                                        }
-                                                    } else {
-                                                        s.clone()
+                                                if let Some(current) = val {
+                                                    let Some(raw_ref) =
+                                                        value_to_ref_string(current)
+                                                    else {
+                                                        return;
                                                     };
 
-                                                    if raw_ref.contains("_DATA_MAP:") {
-                                                        if let Some(real_val) =
-                                                            dm.r#map.get(&raw_ref)
-                                                        {
-                                                            *val = Some(serde_json::Value::String(
-                                                                real_val.clone(),
-                                                            ));
+                                                    if raw_ref.contains("GOEDGE_DATA_MAP:")
+                                                        || raw_ref.contains("_DATA_MAP:")
+                                                    {
+                                                        if let Some(real_val) = dm.get(&raw_ref) {
+                                                            *val = Some(real_val.clone());
                                                             restored_count += 1;
                                                         } else {
                                                             tracing::warn!(
@@ -659,6 +767,26 @@ pub async fn fetch_and_apply_config<F>(
                                 for cert in &mut all_certs {
                                     restore_cert(cert);
                                 }
+                                for server in &mut payload_servers {
+                                    if let Some(https) = &mut server.https
+                                        && let Some(policy) = &mut https.ssl_policy
+                                    {
+                                        for cert in &mut policy.certs {
+                                            restore_cert(cert);
+                                        }
+                                    }
+                                    if let Some(rp) = &mut server.reverse_proxy {
+                                        for origin in rp
+                                            .primary_origins
+                                            .iter_mut()
+                                            .chain(rp.backup_origins.iter_mut())
+                                        {
+                                            if let Some(cert) = &mut origin.cert {
+                                                restore_cert(cert);
+                                            }
+                                        }
+                                    }
+                                }
                                 tracing::debug!(
                                     "RPC_NODE: Restored {} fields from DataMap",
                                     restored_count
@@ -666,6 +794,15 @@ pub async fn fetch_and_apply_config<F>(
                             } else if has_data_map_refs {
                                 tracing::warn!(
                                     "RPC_NODE: DataMap references found but NO DataMap in payload. Certificates will fail to parse."
+                                );
+                            }
+                            let before_dedup_certs = all_certs.len();
+                            all_certs = dedup_ssl_certs(all_certs);
+                            if all_certs.len() != before_dedup_certs {
+                                tracing::debug!(
+                                    "RPC_NODE: Deduplicated certificates by ID: {} -> {}",
+                                    before_dedup_certs,
+                                    all_certs.len()
                                 );
                             }
 
@@ -720,14 +857,14 @@ pub async fn fetch_and_apply_config<F>(
                                 }
                             }
 
-                            for server in &payload.servers {
+                            for server in &payload_servers {
                                 server.compile_url_patterns();
                             }
 
                             let mut loaded_domain_names = std::collections::BTreeSet::new();
                             let mut port_only_server_count = 0usize;
 
-                            for server in &payload.servers {
+                            for server in &payload_servers {
                                 if !server.is_on {
                                     debug!(
                                         "RPC_NODE: Skipping server {} because it is OFF",
@@ -741,7 +878,7 @@ pub async fn fetch_and_apply_config<F>(
                                         Ok(raw) => debug!(
                                             "RPC_NODE: SNI passthrough server loaded. id={} names={:?} raw_json={}",
                                             server.numeric_id(),
-                                            server.get_plain_server_names(),
+                                            crate::rpc::utils::server_runtime_names(server),
                                             raw
                                         ),
                                         Err(err) => warn!(
@@ -753,7 +890,7 @@ pub async fn fetch_and_apply_config<F>(
                                 }
 
                                 let server_id = server.numeric_id();
-                                let names = server.get_plain_server_names();
+                                let names = crate::rpc::utils::server_runtime_names(server);
                                 let (lb_arc, has_hc) = match &server.reverse_proxy {
                                     Some(rp_cfg) => {
                                         match crate::lb_factory::build_lb_blocking(
@@ -955,13 +1092,16 @@ pub async fn fetch_and_apply_config<F>(
                                     config_resp.timestamp,
                                     payload.node_region.as_ref().map(|r| r.id).unwrap_or(0),
                                     payload.node_cluster.as_ref().map(|c| c.id).unwrap_or(0),
-                                    payload.servers.clone().into_iter().map(Arc::new).collect(),
+                                    payload_servers.clone().into_iter().map(Arc::new).collect(),
                                     new_servers,
                                     new_routes,
                                     new_id_to_lb,
                                     deleted_contents,
                                     payload.global_pages.clone(),
                                     payload.metric_items.clone(),
+                                    all_certs.clone(),
+                                    active_ssl_policy.clone(),
+                                    payload.updating_server_list_id,
                                     node_level,
                                     payload.is_on,
                                     payload.enable_ip_lists,
@@ -1006,7 +1146,7 @@ pub async fn fetch_and_apply_config<F>(
                                 "RPC_NODE: Applied config version={} node_id={} servers={} domains={} port_only={} cache_policies={} waf_policies={} pages={}",
                                 config_resp.timestamp,
                                 numeric_id,
-                                payload.servers.len(),
+                                payload_servers.len(),
                                 loaded_domain_count,
                                 port_only_server_count,
                                 payload.http_cache_policies.len(),
@@ -1038,7 +1178,7 @@ pub async fn fetch_and_apply_config<F>(
                             // Fetch enabled features for management-plane reporting
                             if numeric_id > 0 {
                                 if let Ok(client) = RpcClient::new(api_config).await {
-                                    let mut service = client.node_service();
+                                    let mut service = client.node_service_with_type();
                                     match service
                                         .find_enabled_node_config_info(
                                             pb::FindEnabledNodeConfigInfoRequest {
@@ -1071,6 +1211,16 @@ pub async fn fetch_and_apply_config<F>(
                                                 info.has_access_log_settings,
                                             );
                                         }
+                                        Err(e) if is_unsupported_node_type_error(&e) => {
+                                            if !ENABLED_FEATURES_UNSUPPORTED_LOGGED
+                                                .swap(true, Ordering::Relaxed)
+                                            {
+                                                debug!(
+                                                    "Enabled feature sync is not supported by this API node for node credentials: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
                                         Err(e) => debug!("Failed to fetch enabled features: {}", e),
                                     }
                                 }
@@ -1089,6 +1239,7 @@ pub async fn fetch_and_apply_config<F>(
         api_config,
         config_store,
         health_manager,
+        cert_selector,
         ip_list_manager,
         task_version,
     )
@@ -1331,10 +1482,19 @@ pub async fn report_node_online_once(
         })
         .await
     {
-        debug!(
-            "RPC_NODE: updateNodeUp is not accepted by this API node: {}",
-            err
-        );
+        if is_unsupported_node_type_error(&err) {
+            if !UPDATE_NODE_UP_UNSUPPORTED_LOGGED.swap(true, Ordering::Relaxed) {
+                debug!(
+                    "RPC_NODE: updateNodeUp is not supported by this API node for node credentials: {}",
+                    err
+                );
+            }
+        } else {
+            debug!(
+                "RPC_NODE: updateNodeUp is not accepted by this API node: {}",
+                err
+            );
+        }
     }
     service
         .update_node_status(pb::UpdateNodeStatusRequest {
@@ -1343,6 +1503,10 @@ pub async fn report_node_online_once(
         })
         .await?;
     Ok(())
+}
+
+fn is_unsupported_node_type_error(err: &tonic::Status) -> bool {
+    err.message().contains("not supported node type")
 }
 
 pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_config: ApiConfig) {
@@ -1595,7 +1759,7 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
 
         let node_value_items_count = node_value_items.len();
         if let Ok(client) = RpcClient::new(&api_config).await {
-            let mut service = client.node_value_service_with_type();
+            let mut service = client.node_value_service();
             match service
                 .create_node_values(pb::CreateNodeValuesRequest { node_value_items })
                 .await

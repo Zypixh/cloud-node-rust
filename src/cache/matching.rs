@@ -8,41 +8,45 @@ use std::sync::Arc;
 static CACHE_RE_CACHE: Lazy<DashMap<String, std::sync::Arc<Regex>>> = Lazy::new(DashMap::new);
 static CACHE_IN_VALUES: Lazy<DashMap<String, Arc<Vec<String>>>> = Lazy::new(DashMap::new);
 
-pub trait Matcher {
-    fn match_request(&self, session: &Session) -> bool;
-}
-
 impl HTTPRequestCondsConfig {
-    pub fn match_request(&self, session: &Session) -> bool {
+    pub fn match_request_with_scheme(&self, session: &Session, scheme: &str) -> bool {
         if !self.is_on || self.groups.is_empty() {
             return true;
         }
 
         if self.connector == "and" {
-            self.groups.iter().all(|group| group.match_request(session))
+            self.groups
+                .iter()
+                .all(|group| group.match_request_with_scheme(session, scheme))
         } else {
-            self.groups.iter().any(|group| group.match_request(session))
+            self.groups
+                .iter()
+                .any(|group| group.match_request_with_scheme(session, scheme))
         }
     }
 }
 
 impl HTTPRequestCondGroup {
-    pub fn match_request(&self, session: &Session) -> bool {
+    pub fn match_request_with_scheme(&self, session: &Session, scheme: &str) -> bool {
         if !self.is_on || self.conds.is_empty() {
             return true;
         }
 
         if self.connector == "and" {
-            self.conds.iter().all(|cond| cond.match_request(session))
+            self.conds
+                .iter()
+                .all(|cond| cond.match_request_with_scheme(session, scheme))
         } else {
-            self.conds.iter().any(|cond| cond.match_request(session))
+            self.conds
+                .iter()
+                .any(|cond| cond.match_request_with_scheme(session, scheme))
         }
     }
 }
 
 impl HTTPRequestCond {
-    pub fn match_request(&self, session: &Session) -> bool {
-        let param_value = get_variable_value(session, &self.param);
+    pub fn match_request_with_scheme(&self, session: &Session, scheme: &str) -> bool {
+        let param_value = get_variable_value_with_scheme(session, &self.param, scheme);
         let matched = match self.operator.as_str() {
             "matches" | "regexp" => {
                 let pattern = if self.is_case_insensitive && !self.value.starts_with("(?i)") {
@@ -134,7 +138,7 @@ impl HTTPRequestCond {
     }
 }
 
-pub fn get_variable_value(session: &Session, param: &str) -> String {
+pub fn get_variable_value_with_scheme(session: &Session, param: &str, scheme: &str) -> String {
     match param {
         "${requestPath}" => session.req_header().uri.path().to_string(),
         "${requestPathLowerExtension}" => {
@@ -156,30 +160,7 @@ pub fn get_variable_value(session: &Session, param: &str) -> String {
                 .unwrap_or("")
                 .to_string()
         }
-        "${scheme}" => {
-            // 1. Check if it's a real TLS connection
-            let is_tls = session
-                .downstream_session
-                .digest()
-                .and_then(|d| d.ssl_digest.as_ref())
-                .is_some();
-            if is_tls {
-                "https".to_string()
-            } else {
-                // 2. Fallback to X-Forwarded-Proto or URI scheme
-                let xfp = session
-                    .get_header("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                if xfp.to_lowercase() == "https"
-                    || session.req_header().uri.scheme_str() == Some("https")
-                {
-                    "https".to_string()
-                } else {
-                    "http".to_string()
-                }
-            }
-        }
+        "${scheme}" => scheme.to_string(),
         "${isArgs}" => {
             if session.req_header().uri.query().is_some() {
                 "?".to_string()
@@ -253,14 +234,14 @@ pub fn get_variable_value(session: &Session, param: &str) -> String {
     }
 }
 
-pub fn format_variables(session: &Session, template: &str) -> String {
+pub fn format_variables_with_scheme(session: &Session, template: &str, scheme: &str) -> String {
     static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").unwrap());
     if !template.contains("${") {
         return template.to_string();
     }
     let re = &*RE_VAR;
     let result = re.replace_all(template, |caps: &regex::Captures| {
-        get_variable_value(session, &caps[0])
+        get_variable_value_with_scheme(session, &caps[0], scheme)
     });
     result.to_string()
 }

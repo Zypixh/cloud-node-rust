@@ -2,8 +2,11 @@ use crate::api_config::ApiConfig;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
+
+static IP_LIST_NODE_TYPE_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 pub async fn start_ip_list_syncer(
     api_config: ApiConfig,
@@ -64,7 +67,7 @@ pub async fn sync_ip_items_incremental(
             return false;
         }
     };
-    let mut service = client.ip_item_service_with_type();
+    let mut service = client.ip_item_service();
 
     let last_version = ip_list_manager.last_version();
     match service
@@ -100,7 +103,7 @@ pub async fn sync_ip_list_metadata(
             return false;
         }
     };
-    let mut service = client.ip_list_service();
+    let mut service = client.ip_list_service_with_type();
     let mut offset = 0i64;
     let size = 1000i64;
     let mut all_lists = Vec::new();
@@ -125,6 +128,15 @@ pub async fn sync_ip_list_metadata(
                 offset += count;
             }
             Err(e) => {
+                if is_unsupported_node_type_error(&e) {
+                    if !IP_LIST_NODE_TYPE_UNSUPPORTED_LOGGED.swap(true, Ordering::Relaxed) {
+                        debug!(
+                            "IP list metadata sync is not supported by this API node for node credentials: {}",
+                            e
+                        );
+                    }
+                    return false;
+                }
                 debug!("Failed to list enabled IP lists: {}", e);
                 return false;
             }
@@ -133,6 +145,10 @@ pub async fn sync_ip_list_metadata(
 
     ip_list_manager.replace_metadata(all_lists);
     true
+}
+
+fn is_unsupported_node_type_error(err: &tonic::Status) -> bool {
+    err.message().contains("not supported node type")
 }
 
 pub async fn sync_ip_list_ref(

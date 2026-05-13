@@ -451,8 +451,10 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
 
     let ac_us = api_config.clone();
     let cs_us = config_store.clone();
+    let hm_us = health_manager.clone();
+    let ds_us = cert_selector.clone();
     spawn_staggered(&rt, Duration::from_secs(9), async move {
-        rpc::start_updating_server_list_syncer(ac_us, cs_us).await;
+        rpc::start_updating_server_list_syncer(ac_us, cs_us, hm_us, ds_us).await;
     });
 
     // Reporters
@@ -552,6 +554,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         waf_verifier: Arc::new(cloud_node_rust::firewall::verifier::WafVerifier::new(
             &api_config_arc.secret,
         )),
+        tls_downstream: false,
     };
     let http_manager = cloud_node_rust::http_proxy_manager::HttpProxyManager::new(
         (*config_store).clone(),

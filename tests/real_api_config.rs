@@ -193,12 +193,21 @@ async fn real_api_config_can_be_fetched_parsed_and_applied() -> anyhow::Result<(
         "node stream HTTP/2 transport should open and hold for {}s",
         hold_secs
     );
-    if stream_result.connected_api_node_id.is_none() {
-        eprintln!(
-            "real API node stream did not emit connectedAPINode within {}s; inbound_messages={}",
-            hold_secs, stream_result.inbound_messages
-        );
-    }
+    assert!(
+        stream_result.response_headers_received,
+        "node stream should receive gRPC response headers"
+    );
+    assert!(
+        stream_result.inbound_messages > 0,
+        "node stream should receive at least one control-plane message within {}s",
+        hold_secs
+    );
+    assert!(
+        stream_result.connected_api_node_id.is_some(),
+        "node stream should emit connectedAPINode within {}s; inbound_messages={}",
+        hold_secs,
+        stream_result.inbound_messages
+    );
     assert!(
         stream_result.pings_sent >= 1,
         "node stream should keep running long enough to send multiple pings; sent={}",

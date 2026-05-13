@@ -2,7 +2,10 @@ use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
 use crate::pb;
 use crate::rpc::client::RpcClient;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::debug;
+
+static PLAN_NODE_TYPE_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 pub async fn sync_active_plans(api_config: &ApiConfig, config_store: &ConfigStore) -> bool {
     let server_ids = config_store
@@ -30,7 +33,7 @@ pub async fn sync_active_plans(api_config: &ApiConfig, config_store: &ConfigStor
         }
     };
 
-    let mut server_service = client.server_service();
+    let mut server_service = client.server_service_with_type();
     let mut user_plans = std::collections::HashMap::new();
     let mut plan_ids = std::collections::HashSet::new();
 
@@ -48,6 +51,15 @@ pub async fn sync_active_plans(api_config: &ApiConfig, config_store: &ConfigStor
                 }
             }
             Err(err) => {
+                if is_unsupported_node_type_error(&err) {
+                    if !PLAN_NODE_TYPE_UNSUPPORTED_LOGGED.swap(true, Ordering::Relaxed) {
+                        debug!(
+                            "Plan sync is not supported by this API node for node credentials: {}",
+                            err
+                        );
+                    }
+                    return false;
+                }
                 debug!(
                     "Failed to fetch user plan for server {}: {}",
                     server_id, err
@@ -88,4 +100,8 @@ pub async fn sync_active_plans(api_config: &ApiConfig, config_store: &ConfigStor
     config_store.set_user_plans(user_plans).await;
     config_store.set_plans(plans).await;
     true
+}
+
+fn is_unsupported_node_type_error(err: &tonic::Status) -> bool {
+    err.message().contains("not supported node type")
 }

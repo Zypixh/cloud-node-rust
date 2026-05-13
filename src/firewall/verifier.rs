@@ -104,12 +104,7 @@ impl WafVerifier {
             combined.extend_from_slice(&ciphertext);
             let token_str = general_purpose::URL_SAFE_NO_PAD.encode(combined);
 
-            crate::metrics::storage::STORAGE.save_waf_token(
-                &token_str,
-                ip,
-                &payload.ua_hash,
-                exp,
-            );
+            crate::metrics::storage::STORAGE.save_waf_token(&token_str, ip, &payload.ua_hash, exp);
 
             return token_str;
         }
@@ -118,14 +113,23 @@ impl WafVerifier {
 
     /// Verifies the token and ensures it matches the requester's context
     pub fn verify_token(&self, ip: &str, ua: &str, token: &str, window_secs: u64) -> bool {
-        self.token_seconds_remaining(ip, ua, token, window_secs).is_some()
+        self.token_seconds_remaining(ip, ua, token, window_secs)
+            .is_some()
     }
 
-    pub fn token_seconds_remaining(&self, ip: &str, ua: &str, token: &str, window_secs: u64) -> Option<u64> {
+    pub fn token_seconds_remaining(
+        &self,
+        ip: &str,
+        ua: &str,
+        token: &str,
+        window_secs: u64,
+    ) -> Option<u64> {
         let current_ua_hash = Self::ua_hash(ua);
         let decoded = match general_purpose::URL_SAFE_NO_PAD.decode(token) {
             Ok(d) => d,
-            Err(_) => return self.token_seconds_remaining_from_storage(ip, &current_ua_hash, token),
+            Err(_) => {
+                return self.token_seconds_remaining_from_storage(ip, &current_ua_hash, token);
+            }
         };
 
         if decoded.len() < 12 {
@@ -149,10 +153,16 @@ impl WafVerifier {
         if let Some(exp) = payload.exp {
             return (now <= exp).then_some(exp.saturating_sub(now).max(1));
         }
-        (now - payload.ts <= window_secs).then_some(window_secs.saturating_sub(now - payload.ts).max(1))
+        (now - payload.ts <= window_secs)
+            .then_some(window_secs.saturating_sub(now - payload.ts).max(1))
     }
 
-    pub fn token_failure_config(&self, ip: &str, ua: &str, token: &str) -> Option<ChallengeFailureConfig> {
+    pub fn token_failure_config(
+        &self,
+        ip: &str,
+        ua: &str,
+        token: &str,
+    ) -> Option<ChallengeFailureConfig> {
         let current_ua_hash = Self::ua_hash(ua);
         let decoded = general_purpose::URL_SAFE_NO_PAD.decode(token).ok()?;
         if decoded.len() < 12 {
@@ -207,7 +217,8 @@ impl WafVerifier {
         let exp = meta["exp"].as_u64().unwrap_or(0);
         let now = crate::utils::time::now_timestamp() as u64;
 
-        (stored_ip == ip && stored_ua == ua_hash && now <= exp).then_some(exp.saturating_sub(now).max(1))
+        (stored_ip == ip && stored_ua == ua_hash && now <= exp)
+            .then_some(exp.saturating_sub(now).max(1))
     }
 
     /// Validates a Proof-of-Work solution
@@ -229,7 +240,13 @@ impl WafVerifier {
         44 + (u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 173)
     }
 
-    pub fn verify_slider_trace(&self, token: &str, final_x: i32, elapsed_ms: u64, trace: &str) -> bool {
+    pub fn verify_slider_trace(
+        &self,
+        token: &str,
+        final_x: i32,
+        elapsed_ms: u64,
+        trace: &str,
+    ) -> bool {
         if elapsed_ms < 650 || elapsed_ms > 120_000 {
             return false;
         }
@@ -282,7 +299,12 @@ impl WafVerifier {
         self.get_pow_script_with_life(challenge, difficulty, 3600)
     }
 
-    pub fn get_pow_script_with_life(&self, challenge: &str, difficulty: u32, life_seconds: i64) -> String {
+    pub fn get_pow_script_with_life(
+        &self,
+        challenge: &str,
+        difficulty: u32,
+        life_seconds: i64,
+    ) -> String {
         let challenge = serde_json::to_string(challenge).unwrap_or_else(|_| "\"\"".to_string());
         let life_seconds = life_seconds.max(1);
         format!(
@@ -318,4 +340,3 @@ impl WafVerifier {
         )
     }
 }
-

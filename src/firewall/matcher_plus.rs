@@ -19,6 +19,7 @@ pub fn match_group<'a>(
     group: &'a HTTPFirewallRuleGroup,
     session: &Session,
     request_body: &[u8],
+    scheme: &str,
 ) -> Option<MatchResult<'a>> {
     if !group.is_on {
         return None;
@@ -34,7 +35,7 @@ pub fn match_group<'a>(
     }
 
     for set in &group.sets {
-        if match_set(set, session, request_body) {
+        if match_set(set, session, request_body, scheme) {
             return Some(MatchResult {
                 matched: true,
                 set: Some(set),
@@ -45,43 +46,11 @@ pub fn match_group<'a>(
     None
 }
 
-pub fn match_set(set: &HTTPFirewallRuleSet, session: &Session, request_body: &[u8]) -> bool {
-    if !set.is_on || set.rules.is_empty() {
-        return false;
-    }
-
-    // Bypass check
-    let ip = parse_remote_ip(session);
-    if set.ignore_local && is_local_ip(&ip) {
-        return false;
-    }
-    if set.ignore_search_engine
-        && crate::firewall::matcher::evaluate_operator(
-            &header_value(session, "user-agent"),
-            "common bot",
-            "",
-            true,
-        )
-    {
-        return false;
-    }
-
-    if set.connector == "and" {
-        set.rules
-            .iter()
-            .all(|rule| match_rule(rule, session, request_body))
-    } else {
-        set.rules
-            .iter()
-            .any(|rule| match_rule(rule, session, request_body))
-    }
-}
-
-pub fn match_set_response(
+pub fn match_set(
     set: &HTTPFirewallRuleSet,
     session: &Session,
     request_body: &[u8],
-    response: &OutboundContext<'_>,
+    scheme: &str,
 ) -> bool {
     if !set.is_on || set.rules.is_empty() {
         return false;
@@ -106,11 +75,49 @@ pub fn match_set_response(
     if set.connector == "and" {
         set.rules
             .iter()
-            .all(|rule| match_rule_response(rule, session, request_body, response))
+            .all(|rule| match_rule(rule, session, request_body, scheme))
     } else {
         set.rules
             .iter()
-            .any(|rule| match_rule_response(rule, session, request_body, response))
+            .any(|rule| match_rule(rule, session, request_body, scheme))
+    }
+}
+
+pub fn match_set_response(
+    set: &HTTPFirewallRuleSet,
+    session: &Session,
+    request_body: &[u8],
+    response: &OutboundContext<'_>,
+    scheme: &str,
+) -> bool {
+    if !set.is_on || set.rules.is_empty() {
+        return false;
+    }
+
+    // Bypass check
+    let ip = parse_remote_ip(session);
+    if set.ignore_local && is_local_ip(&ip) {
+        return false;
+    }
+    if set.ignore_search_engine
+        && crate::firewall::matcher::evaluate_operator(
+            &header_value(session, "user-agent"),
+            "common bot",
+            "",
+            true,
+        )
+    {
+        return false;
+    }
+
+    if set.connector == "and" {
+        set.rules
+            .iter()
+            .all(|rule| match_rule_response(rule, session, request_body, response, scheme))
+    } else {
+        set.rules
+            .iter()
+            .any(|rule| match_rule_response(rule, session, request_body, response, scheme))
     }
 }
 
@@ -119,13 +126,14 @@ pub fn match_group_response<'a>(
     session: &Session,
     request_body: &[u8],
     response: &OutboundContext<'_>,
+    scheme: &str,
 ) -> Option<MatchResult<'a>> {
     if !group.is_on {
         return None;
     }
 
     for set in &group.sets {
-        if match_set_response(set, session, request_body, response) {
+        if match_set_response(set, session, request_body, response, scheme) {
             return Some(MatchResult {
                 matched: true,
                 set: Some(set),
@@ -147,8 +155,13 @@ fn is_local_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
-pub fn match_rule(rule: &HTTPFirewallRule, session: &Session, request_body: &[u8]) -> bool {
-    let param_value = get_rule_value(rule, session, request_body);
+pub fn match_rule(
+    rule: &HTTPFirewallRule,
+    session: &Session,
+    request_body: &[u8],
+    scheme: &str,
+) -> bool {
+    let param_value = get_rule_value(rule, session, request_body, scheme);
     let matched = crate::firewall::matcher::evaluate_operator(
         &param_value,
         &rule.operator,
@@ -164,8 +177,9 @@ pub fn match_rule_response(
     session: &Session,
     request_body: &[u8],
     response: &OutboundContext<'_>,
+    scheme: &str,
 ) -> bool {
-    let param_value = get_response_rule_value(rule, session, request_body, response);
+    let param_value = get_response_rule_value(rule, session, request_body, response, scheme);
     let matched = crate::firewall::matcher::evaluate_operator(
         &param_value,
         &rule.operator,
@@ -225,7 +239,7 @@ fn get_full_request_data(session: &Session, request_body: &[u8]) -> String {
     data
 }
 
-fn get_variable_value(session: &Session, param: &str, request_body: &[u8]) -> String {
+fn get_variable_value(session: &Session, param: &str, request_body: &[u8], scheme: &str) -> String {
     if !param.contains("${") {
         return param.to_string();
     }
@@ -233,7 +247,7 @@ fn get_variable_value(session: &Session, param: &str, request_body: &[u8]) -> St
     static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
 
     if let Some(inner) = param.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        return resolve_variable(session, inner, request_body);
+        return resolve_variable(session, inner, request_body, scheme);
     }
 
     RE_VAR
@@ -243,20 +257,25 @@ fn get_variable_value(session: &Session, param: &str, request_body: &[u8]) -> St
                 .strip_prefix("${")
                 .and_then(|s| s.strip_suffix('}'))
                 .unwrap_or(inner);
-            resolve_variable(session, inner, request_body)
+            resolve_variable(session, inner, request_body, scheme)
         })
         .to_string()
 }
 
-fn get_rule_value(rule: &HTTPFirewallRule, session: &Session, request_body: &[u8]) -> String {
+fn get_rule_value(
+    rule: &HTTPFirewallRule,
+    session: &Session,
+    request_body: &[u8],
+    scheme: &str,
+) -> String {
     if rule.param.starts_with("${cc.")
         || rule.param == "${cc}"
         || rule.param.starts_with("${cc2.")
         || rule.param == "${cc2}"
     {
-        return cc_value(rule, session, request_body, true);
+        return cc_value(rule, session, request_body, true, scheme);
     }
-    get_variable_value(session, &rule.param, request_body)
+    get_variable_value(session, &rule.param, request_body, scheme)
 }
 
 fn get_response_rule_value(
@@ -264,15 +283,16 @@ fn get_response_rule_value(
     session: &Session,
     request_body: &[u8],
     response: &OutboundContext<'_>,
+    scheme: &str,
 ) -> String {
     if rule.param.starts_with("${cc.")
         || rule.param == "${cc}"
         || rule.param.starts_with("${cc2.")
         || rule.param == "${cc2}"
     {
-        return cc_value(rule, session, request_body, true);
+        return cc_value(rule, session, request_body, true, scheme);
     }
-    get_response_variable_value(session, &rule.param, request_body, response)
+    get_response_variable_value(session, &rule.param, request_body, response, scheme)
 }
 
 fn cc_value(
@@ -280,6 +300,7 @@ fn cc_value(
     session: &Session,
     request_body: &[u8],
     is_cc2: bool,
+    scheme: &str,
 ) -> String {
     let options = rule.checkpoint_options.as_ref();
     let period = options
@@ -297,7 +318,7 @@ fn cc_value(
         let key_values = keys
             .iter()
             .filter_map(Value::as_str)
-            .map(|template| get_variable_value(session, template, request_body))
+            .map(|template| get_variable_value(session, template, request_body, scheme))
             .collect::<Vec<_>>();
         format!("WAF-CC2-{}-{}", rule.param, key_values.join("@"))
     } else {
@@ -345,6 +366,7 @@ fn get_response_variable_value(
     param: &str,
     request_body: &[u8],
     response: &OutboundContext<'_>,
+    scheme: &str,
 ) -> String {
     if !param.contains("${") {
         return param.to_string();
@@ -353,7 +375,7 @@ fn get_response_variable_value(
     static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
 
     if let Some(inner) = param.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        return resolve_response_variable(session, inner, request_body, response);
+        return resolve_response_variable(session, inner, request_body, response, scheme);
     }
 
     RE_VAR
@@ -363,12 +385,12 @@ fn get_response_variable_value(
                 .strip_prefix("${")
                 .and_then(|s| s.strip_suffix('}'))
                 .unwrap_or(inner);
-            resolve_response_variable(session, inner, request_body, response)
+            resolve_response_variable(session, inner, request_body, response, scheme)
         })
         .to_string()
 }
 
-fn resolve_variable(session: &Session, inner: &str, request_body: &[u8]) -> String {
+fn resolve_variable(session: &Session, inner: &str, request_body: &[u8], scheme: &str) -> String {
     match inner {
         "remoteAddr" => get_remote_addr(session),
         "rawRemoteAddr" => get_raw_remote_addr(session),
@@ -389,7 +411,7 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8]) -> Stri
         "requestPath" => session.req_header().uri.path().to_string(),
         "requestURL" => format!(
             "{}://{}{}",
-            get_scheme(session),
+            scheme,
             session.req_header().uri.host().unwrap_or(""),
             get_request_uri(session)
         ),
@@ -414,7 +436,7 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8]) -> Stri
             String::from_utf8_lossy(request_body)
         ),
         "requestMethod" => session.req_header().method.as_str().to_string(),
-        "scheme" => get_scheme(session),
+        "scheme" => scheme.to_string(),
         "proto" => format!("{:?}", session.req_header().version),
         "host" | "requestHost" => session.req_header().uri.host().unwrap_or("").to_string(),
         "refererOrigin" => {
@@ -504,6 +526,7 @@ fn resolve_response_variable(
     inner: &str,
     request_body: &[u8],
     response: &OutboundContext<'_>,
+    scheme: &str,
 ) -> String {
     match inner {
         "status" => response.status.to_string(),
@@ -528,7 +551,7 @@ fn resolve_response_variable(
             if let Some(name) = colon_arg(inner, &["responseHeader"]) {
                 return response_header_value(response, name);
             }
-            resolve_variable(session, inner, request_body)
+            resolve_variable(session, inner, request_body, scheme)
         }
     }
 }
@@ -665,24 +688,6 @@ fn get_raw_remote_addr(session: &Session) -> String {
             })
         })
         .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]).to_string())
-}
-
-fn get_scheme(session: &Session) -> String {
-    let is_tls = session
-        .downstream_session
-        .digest()
-        .and_then(|d| d.ssl_digest.as_ref())
-        .is_some();
-    if is_tls || session.req_header().uri.scheme_str() == Some("https") {
-        "https".to_string()
-    } else {
-        let xfp = header_value(session, "x-forwarded-proto");
-        if !xfp.is_empty() {
-            xfp
-        } else {
-            "http".to_string()
-        }
-    }
 }
 
 fn header_value(session: &Session, name: &str) -> String {
@@ -917,40 +922,11 @@ fn apply_modifier(value: String, modifier: &str) -> String {
     }
 }
 
-pub fn format_variables(session: &Session, template: &str, request_body: &[u8]) -> String {
-    static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
-    RE_VAR
-        .replace_all(template, |caps: &regex::Captures| {
-            let inner = &caps[0];
-            let inner = inner
-                .strip_prefix("${")
-                .and_then(|s| s.strip_suffix('}'))
-                .unwrap_or(inner);
-            let mut parts = inner.split('|');
-            let var_name = parts.next().unwrap_or("");
-            let mut value = match var_name {
-                "rawRemoteAddr" => get_raw_remote_addr(session),
-                "requestPathExtension" => std::path::Path::new(session.req_header().uri.path())
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| format!(".{}", ext))
-                    .unwrap_or_default(),
-                "requestFilename" => session.req_header().uri.path().to_string(),
-                _ => resolve_variable(session, var_name, request_body),
-            };
-            for modifier in parts {
-                value = apply_modifier(value, modifier);
-            }
-            value
-        })
-        .to_string()
-}
-
-pub fn format_response_variables(
+pub fn format_variables(
     session: &Session,
     template: &str,
     request_body: &[u8],
-    response: &OutboundContext<'_>,
+    scheme: &str,
 ) -> String {
     static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
     RE_VAR
@@ -970,7 +946,42 @@ pub fn format_response_variables(
                     .map(|ext| format!(".{}", ext))
                     .unwrap_or_default(),
                 "requestFilename" => session.req_header().uri.path().to_string(),
-                _ => resolve_response_variable(session, var_name, request_body, response),
+                _ => resolve_variable(session, var_name, request_body, scheme),
+            };
+            for modifier in parts {
+                value = apply_modifier(value, modifier);
+            }
+            value
+        })
+        .to_string()
+}
+
+pub fn format_response_variables(
+    session: &Session,
+    template: &str,
+    request_body: &[u8],
+    response: &OutboundContext<'_>,
+    scheme: &str,
+) -> String {
+    static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
+    RE_VAR
+        .replace_all(template, |caps: &regex::Captures| {
+            let inner = &caps[0];
+            let inner = inner
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(inner);
+            let mut parts = inner.split('|');
+            let var_name = parts.next().unwrap_or("");
+            let mut value = match var_name {
+                "rawRemoteAddr" => get_raw_remote_addr(session),
+                "requestPathExtension" => std::path::Path::new(session.req_header().uri.path())
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| format!(".{}", ext))
+                    .unwrap_or_default(),
+                "requestFilename" => session.req_header().uri.path().to_string(),
+                _ => resolve_response_variable(session, var_name, request_body, response, scheme),
             };
             for modifier in parts {
                 value = apply_modifier(value, modifier);

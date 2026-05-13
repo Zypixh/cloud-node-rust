@@ -304,8 +304,25 @@ pub struct HTTPPagesPolicy {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DataMapConfig {
-    #[serde(default, deserialize_with = "deserialize_null_default")]
-    pub r#map: std::collections::HashMap<String, String>, // Key is the reference, Value is the Base64 PEM
+    #[serde(
+        rename = "map",
+        alias = "Map",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub r#map: std::collections::HashMap<String, Value>,
+    #[serde(flatten, default)]
+    pub extra: std::collections::HashMap<String, Value>,
+}
+
+impl DataMapConfig {
+    pub fn len(&self) -> usize {
+        self.r#map.len() + self.extra.len()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.r#map.get(key).or_else(|| self.extra.get(key))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -412,6 +429,8 @@ pub struct NodeConfigPayload {
         deserialize_with = "deserialize_null_default"
     )]
     pub metric_items: Vec<MetricItemConfig>,
+    #[serde(rename = "updatingServerListId", default)]
+    pub updating_server_list_id: i64,
     #[serde(default)]
     pub level: i32,
     #[serde(rename = "isOn", default = "default_true")]
@@ -587,6 +606,13 @@ impl NetworkAddressConfig {
         let protocol = self.protocol.as_deref().unwrap_or("");
         let port = self.port_range.as_deref().and_then(first_port_in_range);
         corrected_origin_tls(protocol, port)
+    }
+
+    pub fn is_oss(&self) -> bool {
+        self.protocol
+            .as_deref()
+            .map(|protocol| protocol.to_ascii_lowercase().starts_with("oss:"))
+            .unwrap_or(false)
     }
 }
 
@@ -1015,10 +1041,21 @@ pub struct HTTPRedirectToHttpsConfig {
     pub status: i32,
     #[serde(
         rename = "domains",
+        alias = "allowedDomains",
+        alias = "allowDomains",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub domains: Vec<String>,
+    #[serde(
+        rename = "exceptDomains",
+        alias = "excludedDomains",
+        alias = "excludeDomains",
+        alias = "denyDomains",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub except_domains: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -2363,6 +2400,13 @@ impl FlexibleAddr {
             Self::String(s) => normalize_origin_addr_string(s).use_tls,
         }
     }
+
+    pub fn is_oss(&self) -> bool {
+        match self {
+            Self::Object(obj) => obj.is_oss(),
+            Self::String(s) => s.trim().to_ascii_lowercase().starts_with("oss:"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2530,6 +2574,19 @@ pub struct OriginConfig {
     pub cert: Option<SSLCertConfig>,
     #[serde(rename = "tlsVerify", default)]
     pub tls_verify: Option<Value>, // Can be boolean, object, or int in legacy configs.
+    #[serde(default)]
+    pub oss: Option<Value>,
+}
+
+impl OriginConfig {
+    pub fn is_oss(&self) -> bool {
+        self.oss.is_some()
+            || self
+                .addr
+                .as_ref()
+                .map(FlexibleAddr::is_oss)
+                .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

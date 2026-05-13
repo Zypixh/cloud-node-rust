@@ -1,16 +1,52 @@
 use crate::api_config::ApiConfig;
-use crate::config_models::ServerConfig;
+use crate::config_models::{ParentNodeConfig, ServerConfig};
 use crate::health_manager::GlobalHealthManager;
 use futures_util::FutureExt;
 use pingora_load_balancing::{Backends, LoadBalancer, discovery::Static, selection::RoundRobin};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 #[allow(clippy::type_complexity)]
+pub fn server_runtime_names(server: &ServerConfig) -> Vec<String> {
+    let mut names = server.get_plain_server_names();
+    if server_has_subdomain_oss_origin(server) {
+        let mut seen: HashSet<String> = names.iter().cloned().collect();
+        for name in server.get_plain_server_names() {
+            if name.starts_with("*.") || name.starts_with("*") || name.is_empty() {
+                continue;
+            }
+            let wildcard = format!("*.{}", name.trim_start_matches('.'));
+            if seen.insert(wildcard.clone()) {
+                names.push(wildcard);
+            }
+        }
+    }
+    names
+}
+
+fn server_has_subdomain_oss_origin(server: &ServerConfig) -> bool {
+    let Some(rp) = &server.reverse_proxy else {
+        return false;
+    };
+    rp.primary_origins
+        .iter()
+        .chain(rp.backup_origins.iter())
+        .filter(|origin| origin.is_on && origin.is_oss())
+        .any(|origin| {
+            crate::oss_origin::OssBackend::from_origin(origin)
+                .map(|backend| backend.bucket_source == crate::oss_origin::BucketSource::Subdomain)
+                .unwrap_or(false)
+        })
+}
+
 pub async fn build_runtime_maps(
     servers: Vec<ServerConfig>,
     health_manager: &GlobalHealthManager,
+    node_level: i32,
+    parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
+    tiered_origin_bypass: bool,
+    allow_lan: bool,
 ) -> (
     HashMap<String, Arc<ServerConfig>>,
     HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
@@ -29,10 +65,10 @@ pub async fn build_runtime_maps(
             match crate::lb_factory::build_lb_blocking(
                 server_id,
                 rp.clone(),
-                1,
-                Arc::new(HashMap::new()),
-                false,
-                false,
+                node_level,
+                Arc::clone(&parent_nodes),
+                tiered_origin_bypass,
+                allow_lan,
             )
             .await
             {
@@ -56,7 +92,7 @@ pub async fn build_runtime_maps(
             }
         }
 
-        let names = server.get_plain_server_names();
+        let names = server_runtime_names(&server);
         let server_arc = Arc::new(server);
         if names.is_empty() {
             let synthetic = format!("__id_{}", server_arc.numeric_id());
@@ -93,6 +129,8 @@ pub(crate) fn fallback_runtime_lb() -> (Arc<crate::lb_factory::AnyLoadBalancer>,
         read_timeout: None,
         idle_timeout: None,
         client_cert: None,
+        unsupported_reason: None,
+        oss_backend: None,
     });
     b.ext = ext;
     let mut set = std::collections::BTreeSet::new();

@@ -210,7 +210,7 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
 
         let node_value_items_count = node_value_items.len();
         if let Ok(client) = RpcClient::new(&api_config).await {
-            let mut service = client.node_value_service_with_type();
+            let mut service = client.node_value_service();
             match service.create_node_values(pb::CreateNodeValuesRequest { node_value_items }).await {
                 Ok(_) => info!("Successfully reported {} node values", node_value_items_count),
                 Err(e) => error!("Error reporting node values: {}", e),
