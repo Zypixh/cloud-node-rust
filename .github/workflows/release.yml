@@ -21,10 +21,15 @@ on:
       - 'toa-sender/**'
       - 'vendor/**'
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
 jobs:
   build:
     name: Build - ${{ matrix.name }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -68,11 +73,27 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install dependencies & Cross-Linkers
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential golang-go
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential golang-go; then
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep 10
+          done
           if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            for attempt in 1 2 3; do
+              if sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu; then
+                break
+              fi
+              if [ "$attempt" = "3" ]; then
+                exit 1
+              fi
+              sleep 10
+            done
           fi
 
       - name: Install protoc
@@ -130,6 +151,7 @@ jobs:
   build-legacy:
     name: Build - linux-x64-legacy-glibc217
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
 
     steps:
       - name: Checkout code
@@ -149,6 +171,7 @@ jobs:
 
       - name: Build legacy package
         shell: bash
+        timeout-minutes: 75
         env:
           RUSTFLAGS: "-C target-cpu=x86-64 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes"
           PROTOC_VERSION: "25.3"
