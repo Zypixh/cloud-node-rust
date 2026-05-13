@@ -22,14 +22,14 @@ ALLOW_FRESH=0
 
 usage() {
     cat <<'USAGE'
-Install the Rust CloudNode release over an existing Go cloud-node deployment,
+Install or upgrade the Rust CloudNode release over an existing cloud-node deployment,
 or perform a fresh install on a new server.
 
 The script:
   1. Asks for the interface language when running interactively.
   2. Finds the current cloud-node systemd ExecStart binary or command.
-  3. Backs it up under a timestamped directory with a go-original marker.
-  4. Downloads the latest Rust release from GitHub.
+  3. Backs it up under a timestamped directory.
+  4. Downloads the requested Rust release from GitHub; latest is the default.
   5. Optionally downloads GeoLite2 mmdb files from P3TERX/GeoLite.mmdb.
   6. Installs the Rust binary and re-registers the cloud-node command/service.
 
@@ -43,8 +43,9 @@ Run directly from GitHub:
   curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --fresh --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret --geoip
 
 Options:
-  --install              Install or migrate to the Rust release.
+  --install              Install, migrate, or upgrade to the Rust release.
                          Explicit mode; fails if no existing cloud-node is found.
+  --upgrade              Alias for --install --version latest; upgrade an existing Rust node to latest.
   --fresh                Fresh install under /root/cloud-node and create configs/api_node.yaml.
   --restore              Restore the Go original from a previous backup.
   --restore-backup DIR   Restore from this backup dir. Default: latest backup.
@@ -158,9 +159,9 @@ read_prompt_secret() {
 
 die_need_mode() {
     if is_zh; then
-        die "默认模式需要交互式选择；请传 --fresh 全新安装，或传 --install 覆盖/升级旧 Go 版"
+        die "默认模式需要交互式选择；请传 --fresh 全新安装，或传 --install/--upgrade 升级现有节点"
     else
-        die "default mode needs an interactive choice; pass --fresh for a new install or --install to upgrade an existing Go node"
+        die "default mode needs an interactive choice; pass --fresh for a new install or --install/--upgrade to upgrade an existing node"
     fi
 }
 
@@ -268,12 +269,12 @@ prompt_mode() {
 
     section "$(is_zh && printf '选择操作' || printf 'Choose Action')"
     if is_zh; then
-        printf '  %s1)%s 覆盖/升级旧 Go 原版为 Rust 版\n' "$BOLD" "$RESET"
+        printf '  %s1)%s 安装/升级现有 cloud-node 到最新 Rust 版\n' "$BOLD" "$RESET"
         printf '  %s2)%s 全新安装 Rust 版到 /root/cloud-node\n' "$BOLD" "$RESET"
         printf '  %s3)%s 从备份恢复 Go 原版\n' "$BOLD" "$RESET"
         printf '\n输入序号 %s[1]%s: ' "$DIM" "$RESET"
     else
-        printf '  %s1)%s Upgrade/overwrite existing Go node with Rust\n' "$BOLD" "$RESET"
+        printf '  %s1)%s Install/upgrade existing cloud-node to latest Rust\n' "$BOLD" "$RESET"
         printf '  %s2)%s Fresh install to /root/cloud-node\n' "$BOLD" "$RESET"
         printf '  %s3)%s Restore Go original from backup\n' "$BOLD" "$RESET"
         printf '\nEnter choice %s[1]%s: ' "$DIM" "$RESET"
@@ -368,6 +369,11 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --install)
             MODE="install"
+            shift
+            ;;
+        --upgrade)
+            MODE="install"
+            VERSION="latest"
             shift
             ;;
         --fresh|--new)
@@ -758,7 +764,9 @@ write_api_node_config() {
     local first=1
     local list="[ "
 
-    [ "$MODE" = "fresh" ] || return
+    if [ "$MODE" != "fresh" ]; then
+        return 0
+    fi
 
     IFS=',' read -r -a endpoint_array <<< "$API_ENDPOINTS"
     for endpoint in "${endpoint_array[@]}"; do
@@ -796,12 +804,26 @@ write_api_node_config() {
 manifest_value() {
     local backup_dir="$1"
     local key="$2"
-    local manifest="$backup_dir/manifest.go-original.txt"
+    local manifest="$backup_dir/manifest.current.txt"
+    if [ ! -f "$manifest" ]; then
+        manifest="$backup_dir/manifest.go-original.txt"
+    fi
     [ -f "$manifest" ] || return 0
     sed -n "s/^${key}=//p" "$manifest" | tail -n 1
 }
 
 backup_dirs() {
+    local backup=""
+    [ -d "$BACKUP_ROOT" ] || return 0
+    for backup in "$BACKUP_ROOT"/*; do
+        [ -d "$backup" ] || continue
+        if [ -f "$backup/manifest.current.txt" ] || [ -f "$backup/manifest.go-original.txt" ] || ls "$backup"/*.go-original "$backup"/*.rust-current >/dev/null 2>&1; then
+            printf '%s\n' "$backup"
+        fi
+    done | sort -r
+}
+
+restore_backup_dirs() {
     local backup=""
     [ -d "$BACKUP_ROOT" ] || return 0
     for backup in "$BACKUP_ROOT"/*; do
@@ -849,7 +871,7 @@ choose_restore_backup() {
         return
     fi
 
-    mapfile -t backups < <(backup_dirs)
+    mapfile -t backups < <(restore_backup_dirs)
     [ "${#backups[@]}" -gt 0 ] || die "no backups found under $BACKUP_ROOT"
 
     if [ "$ASSUME_YES" -eq 1 ] || ! prompt_available; then
@@ -1035,9 +1057,21 @@ ASSET_NAME="$(detect_asset_name)"
 NORMALIZED_VERSION="$(normalize_version)"
 DOWNLOAD_URL="$(download_url_for "$NORMALIZED_VERSION" "$ASSET_NAME")"
 EXISTING_RUNTIME="not-found"
+CURRENT_BACKUP_SUFFIX="current"
 if [ -n "$EXISTING_BINARY" ]; then
     EXISTING_RUNTIME="$(detect_runtime "$EXISTING_BINARY")"
 fi
+case "$EXISTING_RUNTIME" in
+    go)
+        CURRENT_BACKUP_SUFFIX="go-original"
+        ;;
+    rust)
+        CURRENT_BACKUP_SUFFIX="rust-current"
+        ;;
+    *)
+        CURRENT_BACKUP_SUFFIX="current"
+        ;;
+esac
 if [ -z "$EXISTING_BINARY" ] && [ "$ALLOW_FRESH" -eq 0 ]; then
     die "no existing cloud-node was found; pass --allow-fresh for a new install"
 fi
@@ -1067,8 +1101,10 @@ if [ "$MODE" = "fresh" ]; then
     kv "secret" "******"
 fi
 
-if [ "$EXISTING_RUNTIME" != "go" ] && [ "$EXISTING_RUNTIME" != "not-found" ]; then
-    warn "existing binary was not confidently detected as Go; it will still be backed up as go-original."
+if [ "$EXISTING_RUNTIME" = "rust" ] && [ "$NORMALIZED_VERSION" = "latest" ]; then
+    ok "existing Rust cloud-node will be upgraded to the latest release."
+elif [ "$EXISTING_RUNTIME" = "unknown" ]; then
+    warn "existing binary runtime is unknown; it will still be backed up before install."
 fi
 
 confirm_install
@@ -1082,23 +1118,23 @@ trap cleanup EXIT
 run mkdir -p "$BACKUP_DIR"
 
 if [ -n "$EXISTING_BINARY" ] && [ -e "$EXISTING_BINARY" ]; then
-    backup_name="$(sanitize_path "$EXISTING_BINARY").go-original"
+    backup_name="$(sanitize_path "$EXISTING_BINARY").$CURRENT_BACKUP_SUFFIX"
     run cp -a "$EXISTING_BINARY" "$BACKUP_DIR/$backup_name"
 fi
 
 if [ -e /usr/bin/cloud-node ]; then
-    run cp -a /usr/bin/cloud-node "$BACKUP_DIR/usr_bin_cloud-node.go-original"
+    run cp -a /usr/bin/cloud-node "$BACKUP_DIR/usr_bin_cloud-node.$CURRENT_BACKUP_SUFFIX"
 fi
 
 if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
-    run cp -a "/etc/systemd/system/${SERVICE_NAME}.service" "$BACKUP_DIR/${SERVICE_NAME}.service.go-original"
+    run cp -a "/etc/systemd/system/${SERVICE_NAME}.service" "$BACKUP_DIR/${SERVICE_NAME}.service.$CURRENT_BACKUP_SUFFIX"
 fi
 
 if command -v systemctl >/dev/null 2>&1 && systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
     if [ "$DRY_RUN" -eq 0 ]; then
-        systemctl cat "$SERVICE_NAME" > "$BACKUP_DIR/${SERVICE_NAME}.service.cat.go-original.txt"
+        systemctl cat "$SERVICE_NAME" > "$BACKUP_DIR/${SERVICE_NAME}.service.cat.$CURRENT_BACKUP_SUFFIX.txt"
     else
-        log "+ systemctl cat $SERVICE_NAME > $BACKUP_DIR/${SERVICE_NAME}.service.cat.go-original.txt"
+        log "+ systemctl cat $SERVICE_NAME > $BACKUP_DIR/${SERVICE_NAME}.service.cat.$CURRENT_BACKUP_SUFFIX.txt"
     fi
 fi
 
@@ -1111,6 +1147,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
         printf 'asset=%s\n' "$ASSET_NAME"
         printf 'existing_binary=%s\n' "${EXISTING_BINARY:-not found}"
         printf 'existing_runtime_guess=%s\n' "$EXISTING_RUNTIME"
+        printf 'backup_suffix=%s\n' "$CURRENT_BACKUP_SUFFIX"
         if [ -n "$EXISTING_BINARY" ] && [ -f "$EXISTING_BINARY" ]; then
             printf 'existing_sha256=%s\n' "$(sha256_file "$EXISTING_BINARY")"
         fi
@@ -1126,9 +1163,12 @@ if [ "$DRY_RUN" -eq 0 ]; then
             printf 'api_endpoints=%s\n' "$API_ENDPOINTS"
             printf 'node_id=%s\n' "$NODE_ID"
         fi
-    } > "$BACKUP_DIR/manifest.go-original.txt"
+    } > "$BACKUP_DIR/manifest.current.txt"
+    if [ "$CURRENT_BACKUP_SUFFIX" = "go-original" ]; then
+        cp -a "$BACKUP_DIR/manifest.current.txt" "$BACKUP_DIR/manifest.go-original.txt"
+    fi
 else
-    log "+ write $BACKUP_DIR/manifest.go-original.txt"
+    log "+ write $BACKUP_DIR/manifest.current.txt"
 fi
 
 SERVICE_WAS_ACTIVE=0
@@ -1190,5 +1230,5 @@ case "$START_MODE" in
 esac
 
 log "done"
-log "go-original backup: $BACKUP_DIR"
+log "previous binary backup: $BACKUP_DIR"
 log "Rust binary installed at: $INSTALL_BINARY"
