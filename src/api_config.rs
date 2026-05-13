@@ -16,6 +16,8 @@ pub struct ApiConfig {
     pub node_id: String,
     #[serde(rename = "secret")]
     pub secret: String,
+    #[serde(rename = "billing.countInboundTraffic", default)]
+    pub billing_count_inbound_traffic: bool,
 }
 
 impl ApiConfig {

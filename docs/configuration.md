@@ -10,6 +10,8 @@ CloudNode Rust 的本地配置很少，主要配置来自控制面。节点本�
 rpc.endpoints: [ "http://127.0.0.1:8001" ]
 nodeId: "your-node-id"
 secret: "your-node-secret"
+# 可选，默认 false，保持 FlexCDN/GoEdge 只按下行计费口径
+billing.countInboundTraffic: false
 ```
 
 字段说明：
@@ -17,6 +19,7 @@ secret: "your-node-secret"
 - `rpc.endpoints`：API 节点 RPC 地址列表。节点会连接其中可用 endpoint。
 - `nodeId`：节点身份标识。
 - `secret`：节点认证密钥。
+- `billing.countInboundTraffic`：是否把客户端上传到节点的上行流量也计入控制面带宽和日统计计费流量。默认 `false`，只按节点下行流量计费；设为 `true` 后当前节点按上下行合计计费。
 
 不要把真实生产密钥提交到公开仓库。
 

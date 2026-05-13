@@ -8,6 +8,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
+fn billable_bytes(snapshot: &ServerStatusSnapshot, api_config: &ApiConfig) -> u64 {
+    if api_config.billing_count_inbound_traffic {
+        snapshot.total_bytes()
+    } else {
+        snapshot.bytes_sent
+    }
+}
+
 const BANDWIDTH_REPORT_INTERVAL_SECS: u64 = 300;
 const BANDWIDTH_SAMPLE_INTERVAL_SECS: u64 = 2;
 const STAT_RETRY_RETENTION_SECS: i64 = 1200;
@@ -164,7 +172,8 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             }
 
             let origin_total_bytes = delta.origin_bytes_received + delta.origin_bytes_sent;
-            let peak_bytes_per_sec = delta.bytes_sent / BANDWIDTH_SAMPLE_INTERVAL_SECS;
+            let billable_bytes = billable_bytes(&delta, &api_config);
+            let peak_bytes_per_sec = billable_bytes / BANDWIDTH_SAMPLE_INTERVAL_SECS;
             let stat = window_stats
                 .entry(delta.server_id)
                 .or_insert_with(|| BandwidthWindowStat {
@@ -178,7 +187,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             stat.user_id = delta.user_id;
             stat.user_plan_id = delta.user_plan_id;
             stat.peak_bytes_per_sec = stat.peak_bytes_per_sec.max(peak_bytes_per_sec);
-            stat.total_bytes += delta.bytes_sent;
+            stat.total_bytes += billable_bytes;
             stat.cached_bytes += delta.cached_bytes;
             stat.attack_bytes += delta.attack_bytes;
             stat.count_requests += delta.total_requests;
@@ -332,7 +341,7 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
             stat.created_at = created_at;
             stat.check_traffic_limiting = check_traffic_limiting;
             stat.plan_id = delta.plan_id;
-            stat.bytes += delta.bytes_sent as i64;
+            stat.bytes += billable_bytes(&delta, &api_config) as i64;
             stat.cached_bytes += delta.cached_bytes as i64;
             stat.count_requests += delta.total_requests as i64;
             stat.count_cached_requests += delta.count_cached_requests as i64;

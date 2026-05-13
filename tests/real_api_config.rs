@@ -40,6 +40,7 @@ fn real_api_config_from_env() -> anyhow::Result<Option<ApiConfig>> {
         rpc_disable_update: false,
         node_id,
         secret,
+        billing_count_inbound_traffic: false,
     }))
 }
 
