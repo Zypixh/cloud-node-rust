@@ -73,28 +73,21 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install dependencies & Cross-Linkers
-        timeout-minutes: 10
+        timeout-minutes: 25
         run: |
+          packages=(cmake build-essential golang-go)
+          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
+            packages+=(gcc-aarch64-linux-gnu g++-aarch64-linux-gnu)
+          fi
           for attempt in 1 2 3; do
-            if sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential golang-go; then
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends "${packages[@]}"; then
               break
             fi
             if [ "$attempt" = "3" ]; then
               exit 1
             fi
-            sleep 10
+            sleep 20
           done
-          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
-            for attempt in 1 2 3; do
-              if sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu; then
-                break
-              fi
-              if [ "$attempt" = "3" ]; then
-                exit 1
-              fi
-              sleep 10
-            done
-          fi
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
