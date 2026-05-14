@@ -4,6 +4,8 @@
 
 ## 构建
 
+GitHub Release workflow 会在 `v*` tag 上执行正式发布构建。`main` 分支只在 `.cargo/`、`pingora-main/`、`toa-main/`、`toa-sender/` 和 `vendor/` 这些基础框架或底层依赖变化时预热 release 缓存；普通业务代码、`build.rs`、Cargo 清单、proto 和测试变更不会触发 main 预热。
+
 普通构建：
 
 ```bash

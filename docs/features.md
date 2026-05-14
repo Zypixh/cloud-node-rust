@@ -11,6 +11,7 @@ HTTP 代理是 L7 能力的主入口，支持：
 - TLS 证书动态选择。
 - 上游 SNI 和 Host 策略。
 - 请求和响应 header policy。
+- 标准回源头 `X-Real-IP`、`X-Forwarded-Host`、`X-Forwarded-Proto` 和 `X-Forwarded-For`。
 - URL rewrite 和 host redirect，支持递归 rewrite、break、proxyHost 和 URL/domain/port redirect。
 - 自定义错误页和状态页。
 - 条件响应头策略、HSTS 和 OPTIONS CORS 预检响应。
@@ -132,17 +133,21 @@ WAF 状态管理会维护 IP 和网段封禁快照。请求热路径使用快照
 
 这些能力通常在请求进入上游前执行，能够减少无效回源和异常流量成本。
 
-## 证书和 OCSP
+## 证书、ACME 和 OCSP
 
 证书能力包括：
 
 - 动态证书加载。
+- 单服务多个证书。
 - SNI 到证书映射。
+- ACME HTTP-01 challenge 代理查询。
 - OCSP 同步。
-- 证书热更新。
+- 证书热更新和删除生效。
 - TLS 噪音日志收敛。
 
-证书更新由控制面同步任务触发，运行时选择器负责在 TLS 握手阶段返回合适证书。
+证书更新由控制面同步任务触发，运行时选择器负责在 TLS 握手阶段返回合适证书。证书匹配会使用证书 SAN、CN 和控制面下发的 `dnsNames`，因此同一服务绑定多个域名时可以按 SNI 返回对应证书。服务级证书不会写入全局证书池；删除证书或移除服务后，下一次配置/服务更新会按当前配置重建证书快照，旧证书不会继续被选择。
+
+ACME HTTP-01 请求命中 `/.well-known/acme-challenge/` 时，节点会向 API 查询 token 对应 key；查询成功时直接返回 challenge 内容，查询不到或 RPC 失败时继续正常站点请求流程。
 
 ## 访问日志
 

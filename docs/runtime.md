@@ -90,6 +90,8 @@ cloud-node --monitor-port 8888 --monitor-clear
 - 证书和 SNI 映射。
 - 访问日志和全局开关。
 
+证书快照按当前全局证书和当前启用服务的 HTTPS SSLPolicy 重建。服务级证书不会持久化为全局证书；局部服务更新后会重新收集当前配置中的证书，因此证书删除、服务删除和单服务多证书变更都会在下一次同步后反映到 TLS SNI 选择器。
+
 热路径读取的是快照和引用，避免每个请求重新解析完整配置。
 
 ## 控制面长连接
@@ -114,6 +116,8 @@ cloud-node --monitor-port 8888 --monitor-clear
 ## 负载均衡和回源
 
 L7 回源由 `lb_factory` 构建 Pingora `LoadBalancer`。运行时会根据源站配置、父节点配置、TLS 选项、SNI、Host 策略、健康检查结果和源站失败状态选择上游。
+
+回源请求会在自定义请求头策略之后写入边缘节点观测到的标准转发头：`X-Real-IP`、`X-Forwarded-Host`、`X-Forwarded-Proto` 和 `X-Forwarded-For`。其中 `X-Forwarded-Proto` 会根据下游是否 HTTPS、HTTP/3 或 L1→L2 HTTP/3 bridge 写入 `https` 或 `http`。
 
 源站调度支持 Random 和 RoundRobin。控制面未显式下发 scheduling 或 code 为空时默认使用 Random；源站连续失败会进入短暂 down 状态，超时后自动恢复探测。
 

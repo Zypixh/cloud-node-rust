@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::config_models::{SSLCertConfig, SSLPolicyConfig};
+use crate::config_models::SSLCertConfig;
 
 #[derive(Clone)]
 pub struct DynamicCertSelector {
@@ -137,18 +137,7 @@ impl DynamicCertSelector {
     }
 }
 
-pub async fn sync_certs(
-    cert_selector: &DynamicCertSelector,
-    certs: &[SSLCertConfig],
-    ssl_policy: Option<&SSLPolicyConfig>,
-) {
-    if let Some(policy) = ssl_policy {
-        if !policy.is_on {
-            tracing::warn!("SSL policy is OFF, skipping certificate sync");
-            return;
-        }
-    }
-
+pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertConfig]) {
     let mut new_exact = HashMap::new();
     let mut new_wildcard = HashMap::new();
     let mut first_pair: Option<Arc<CertPair>> = None;

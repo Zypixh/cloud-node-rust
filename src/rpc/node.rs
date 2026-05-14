@@ -99,6 +99,43 @@ fn dedup_ssl_certs(
         .collect()
 }
 
+fn cert_has_data_map_ref(cert: &crate::config_models::SSLCertConfig) -> bool {
+    fn has_ref(value: &Option<serde_json::Value>) -> bool {
+        value
+            .as_ref()
+            .and_then(|value| value.as_str())
+            .map(|value| value.contains("_DATA_MAP:"))
+            .unwrap_or(false)
+    }
+
+    has_ref(&cert.cert_data_json) || has_ref(&cert.key_data_json)
+}
+
+fn collect_enabled_ssl_certs(
+    global_certs: &[crate::config_models::SSLCertConfig],
+    global_policy: Option<&crate::config_models::SSLPolicyConfig>,
+    servers: &[crate::config_models::ServerConfig],
+) -> Vec<crate::config_models::SSLCertConfig> {
+    let mut certs = Vec::new();
+    certs.extend(global_certs.iter().cloned());
+
+    if let Some(policy) = global_policy.filter(|policy| policy.is_on) {
+        certs.extend(policy.certs.iter().cloned());
+    }
+
+    for server in servers.iter().filter(|server| server.is_on) {
+        if let Some(https) = &server.https
+            && https.is_on
+            && let Some(policy) = &https.ssl_policy
+            && policy.is_on
+        {
+            certs.extend(policy.certs.iter().cloned());
+        }
+    }
+
+    dedup_ssl_certs(certs)
+}
+
 fn log_raw_json_hints(label: &str, raw: &[u8]) {
     let text = String::from_utf8_lossy(raw);
     for needle in ["@sni_passthrough", "speedtest", "www.speedtest.cn"] {
@@ -404,7 +441,7 @@ pub async fn fetch_and_apply_config<F>(
                     match serde_json::from_slice::<crate::config_models::NodeConfigPayload>(
                         &node_json,
                     ) {
-                        Ok(payload) => {
+                        Ok(mut payload) => {
                             let numeric_id = payload.id.unwrap_or(0);
                             let mut payload_servers = payload.servers.clone();
 
@@ -635,53 +672,22 @@ pub async fn fetch_and_apply_config<F>(
 
                             let mut new_servers = std::collections::HashMap::new();
                             let mut new_routes = std::collections::HashMap::new();
-                            let mut all_certs = Vec::new();
-                            let mut active_ssl_policy: Option<
-                                crate::config_models::SSLPolicyConfig,
-                            > = None;
-
-                            // 1. Collect everything first
-                            all_certs.extend(payload.ssl_certs.clone());
-                            if let Some(policy) = &payload.ssl_policy {
-                                active_ssl_policy = Some(policy.clone());
-                            }
-
-                            for server in &payload_servers {
-                                if !server.is_on {
-                                    continue;
-                                }
-                                if let Some(https) = &server.https {
-                                    if https.is_on {
-                                        if let Some(policy) = &https.ssl_policy {
-                                            all_certs.extend(policy.certs.clone());
-                                            active_ssl_policy = Some(policy.clone());
-                                        }
-                                    }
-                                }
-                            }
 
                             // 2. Restore from DataMap if exists
-                            let mut has_data_map_refs = false;
-                            for cert in &all_certs {
-                                if let Some(c) = &cert.cert_data_json {
-                                    if c.as_str()
-                                        .map(|s| s.contains("_DATA_MAP:"))
-                                        .unwrap_or(false)
-                                    {
-                                        has_data_map_refs = true;
-                                        break;
-                                    }
-                                }
-                                if let Some(k) = &cert.key_data_json {
-                                    if k.as_str()
-                                        .map(|s| s.contains("_DATA_MAP:"))
-                                        .unwrap_or(false)
-                                    {
-                                        has_data_map_refs = true;
-                                        break;
-                                    }
-                                }
-                            }
+                            let has_data_map_refs =
+                                payload.ssl_certs.iter().any(cert_has_data_map_ref)
+                                    || payload.ssl_policy.as_ref().is_some_and(|policy| {
+                                        policy.certs.iter().any(cert_has_data_map_ref)
+                                    })
+                                    || payload_servers.iter().any(|server| {
+                                        server
+                                            .https
+                                            .as_ref()
+                                            .and_then(|https| https.ssl_policy.as_ref())
+                                            .is_some_and(|policy| {
+                                                policy.certs.iter().any(cert_has_data_map_ref)
+                                            })
+                                    });
 
                             if let Some(dm) = &payload.data_map {
                                 tracing::debug!(
@@ -772,8 +778,13 @@ pub async fn fetch_and_apply_config<F>(
                                         process_field(&mut cert.key_data_json);
                                     };
 
-                                for cert in &mut all_certs {
+                                for cert in &mut payload.ssl_certs {
                                     restore_cert(cert);
+                                }
+                                if let Some(policy) = &mut payload.ssl_policy {
+                                    for cert in &mut policy.certs {
+                                        restore_cert(cert);
+                                    }
                                 }
                                 for server in &mut payload_servers {
                                     if let Some(https) = &mut server.https
@@ -802,15 +813,6 @@ pub async fn fetch_and_apply_config<F>(
                             } else if has_data_map_refs {
                                 tracing::warn!(
                                     "RPC_NODE: DataMap references found but NO DataMap in payload. Certificates will fail to parse."
-                                );
-                            }
-                            let before_dedup_certs = all_certs.len();
-                            all_certs = dedup_ssl_certs(all_certs);
-                            if all_certs.len() != before_dedup_certs {
-                                tracing::debug!(
-                                    "RPC_NODE: Deduplicated certificates by ID: {} -> {}",
-                                    before_dedup_certs,
-                                    all_certs.len()
                                 );
                             }
 
@@ -979,16 +981,8 @@ pub async fn fetch_and_apply_config<F>(
                                     }
                                 }
 
-                                // 1. Collect server-specific certificates via SSLPolicy
                                 if let Some(https) = &server.https {
                                     if https.is_on {
-                                        if let Some(policy) = &https.ssl_policy {
-                                            if !policy.certs.is_empty() {
-                                                all_certs.extend(policy.certs.clone());
-                                            }
-                                            // Prefer server-level policy
-                                            active_ssl_policy = Some(policy.clone());
-                                        }
                                         debug!(
                                             "RPC_NODE: Server {} has HTTPS ON (Listen count: {})",
                                             server.numeric_id(),
@@ -1053,16 +1047,16 @@ pub async fn fetch_and_apply_config<F>(
                                 payload.http_pages_policies.len()
                             );
 
+                            let all_certs = collect_enabled_ssl_certs(
+                                &payload.ssl_certs,
+                                payload.ssl_policy.as_ref(),
+                                &payload_servers,
+                            );
                             tracing::debug!(
-                                "Received {} certificates from RPC, starting sync...",
+                                "Received {} active certificates from RPC, starting sync...",
                                 all_certs.len()
                             );
-                            crate::ssl::sync_certs(
-                                cert_selector,
-                                &all_certs,
-                                active_ssl_policy.as_ref(),
-                            )
-                            .await;
+                            crate::ssl::sync_certs(cert_selector, &all_certs).await;
                             tracing::debug!("Certificate sync completed");
 
                             // 4. gRPC Policy
@@ -1107,8 +1101,8 @@ pub async fn fetch_and_apply_config<F>(
                                     deleted_contents,
                                     payload.global_pages.clone(),
                                     payload.metric_items.clone(),
-                                    all_certs.clone(),
-                                    active_ssl_policy.clone(),
+                                    payload.ssl_certs.clone(),
+                                    payload.ssl_policy.clone(),
                                     payload.updating_server_list_id,
                                     node_level,
                                     payload.is_on,

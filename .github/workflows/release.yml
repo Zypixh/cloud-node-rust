@@ -8,13 +8,7 @@ on:
       - 'v*'
     paths:
       - '.cargo/**'
-      - 'benches/**'
-      - 'build.rs'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
       - 'pingora-main/**'
-      - 'proto_defs/**'
-      - 'tests/**'
       - 'toa-main/**'
       - 'toa-sender/**'
       - 'vendor/**'

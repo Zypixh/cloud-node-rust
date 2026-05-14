@@ -186,8 +186,8 @@ pub async fn sync_updating_server_list_once(
 }
 
 async fn refresh_certificates(config_store: &ConfigStore, cert_selector: &DynamicCertSelector) {
-    let (certs, ssl_policy) = config_store.collect_ssl_config().await;
-    crate::ssl::sync_certs(cert_selector, &certs, ssl_policy.as_ref()).await;
+    let certs = config_store.collect_ssl_config().await;
+    crate::ssl::sync_certs(cert_selector, &certs).await;
 }
 
 pub async fn sync_api_nodes(api_config: &ApiConfig) {

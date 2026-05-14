@@ -209,6 +209,61 @@ impl Default for ConfigStore {
     }
 }
 
+fn cert_data_score(cert: &SSLCertConfig) -> usize {
+    fn score(value: &Option<serde_json::Value>) -> usize {
+        match value {
+            Some(serde_json::Value::String(s)) => {
+                if s.contains("-----BEGIN ") {
+                    4
+                } else if s.contains("GOEDGE_DATA_MAP:") || s.contains("_DATA_MAP:") {
+                    1
+                } else if s.trim().len() >= 128 {
+                    3
+                } else {
+                    2
+                }
+            }
+            Some(serde_json::Value::Array(items)) if items.len() >= 128 => 3,
+            Some(serde_json::Value::Object(_)) => 2,
+            Some(_) => 1,
+            None => 0,
+        }
+    }
+
+    score(&cert.cert_data_json) + score(&cert.key_data_json)
+}
+
+fn dedup_ssl_certs(certs: Vec<SSLCertConfig>) -> Vec<SSLCertConfig> {
+    let mut order = Vec::new();
+    let mut by_id: HashMap<i64, SSLCertConfig> = HashMap::new();
+
+    for cert in certs {
+        if cert.id <= 0 {
+            order.push(cert.id);
+            by_id.insert(cert.id, cert);
+            continue;
+        }
+        if !by_id.contains_key(&cert.id) {
+            order.push(cert.id);
+            by_id.insert(cert.id, cert);
+            continue;
+        }
+        let replace = by_id
+            .get(&cert.id)
+            .map(|existing| cert_data_score(&cert) > cert_data_score(existing))
+            .unwrap_or(true);
+        if replace {
+            by_id.insert(cert.id, cert);
+        }
+    }
+
+    order.dedup();
+    order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
+}
+
 impl ConfigStore {
     pub fn new() -> Self {
         Self {
@@ -760,22 +815,25 @@ impl ConfigStore {
         lock.updating_server_list_id
     }
 
-    pub async fn collect_ssl_config(&self) -> (Vec<SSLCertConfig>, Option<SSLPolicyConfig>) {
+    pub async fn collect_ssl_config(&self) -> Vec<SSLCertConfig> {
         let lock = self.inner.read();
         let mut certs = lock.ssl_certs.clone();
-        let mut active_policy = lock.ssl_policy.clone();
+
+        if let Some(policy) = lock.ssl_policy.as_ref().filter(|policy| policy.is_on) {
+            certs.extend(policy.certs.iter().cloned());
+        }
 
         for server in &lock.all_servers {
             if let Some(https) = &server.https
                 && https.is_on
                 && let Some(policy) = &https.ssl_policy
+                && policy.is_on
             {
-                certs.extend(policy.certs.clone());
-                active_policy = Some(policy.clone());
+                certs.extend(policy.certs.iter().cloned());
             }
         }
 
-        (certs, active_policy)
+        dedup_ssl_certs(certs)
     }
 
     pub async fn get_cache_policy(&self) -> Arc<Vec<Arc<HTTPCachePolicy>>> {
