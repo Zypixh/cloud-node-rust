@@ -119,7 +119,11 @@ L7 回源由 `lb_factory` 构建 Pingora `LoadBalancer`。运行时会根据源�
 
 回源请求会在自定义请求头策略之后写入边缘节点观测到的标准转发头：`X-Real-IP`、`X-Forwarded-Host`、`X-Forwarded-Proto` 和 `X-Forwarded-For`。其中 `X-Forwarded-Proto` 会根据下游是否 HTTPS、HTTP/3 或 L1→L2 HTTP/3 bridge 写入 `https` 或 `http`。
 
-源站调度支持 Random 和 RoundRobin。控制面未显式下发 scheduling 或 code 为空时默认使用 Random；源站连续失败会进入短暂 down 状态，超时后自动恢复探测。
+源站调度支持 Random 和 RoundRobin。控制面未显式下发 scheduling 或 code 为空时默认使用 Random；源站 `weight` 按单个源站生效，数值越大，被选择的比例越高。源站连续失败会进入短暂 down 状态，超时后自动恢复探测。
+
+HTTPS 源站的 `http2Enabled` 按单个源站生效。开启后该源站回源 ALPN 会使用 H2/H1；未开启时保持普通 HTTPS 回源。
+
+HTTPS/TLS 源站的 `tlsSecurityVerifyMode` 按单个源站生效，支持 `auto`、`force` 和 `skip`。`force` 始终校验证书和主机名，`skip` 不校验证书和主机名；`auto` 会在回源 SNI/Host 能安全对应源站地址或显式源站 Host 时启用校验，避免把下游访问域名错误用于校验无关源站证书。旧版 `tlsVerify` 仅作为兼容字段读取。
 
 多级分发场景中，L1 节点可以回源到 L2 父节点。父节点压力通过响应头或控制面信息更新，调度时用于辅助选择。
 

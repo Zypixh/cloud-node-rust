@@ -60,12 +60,12 @@ gRPC 和 WebSocket 属于长连接协议，运行时会优先识别协议特征�
 源站能力包括：
 
 - 主源和备源。
-- 源站权重。
+- 源站权重，数字越大分配的请求比例越高。
 - 健康检查。
 - Random 和 RoundRobin 调度，未显式配置时默认使用 Random。
 - 源站失败状态跟踪，连续失败后短暂摘除并自动恢复探测。
-- HTTP/2 回源。
-- TLS 校验开关。
+- HTTPS 源站可按单个源站启用 HTTP/2 回源。
+- 单个 HTTPS/TLS 源站可配置 TLS 证书校验模式：auto、force、skip。
 - 自定义 Host 和 SNI。
 - follow host 和 follow port。
 - 连接、读取和空闲超时。
