@@ -744,13 +744,15 @@ fn configure_passthrough_socket(stream: &TcpStream) {
 }
 
 async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Option<String>> {
-    const CLIENT_HELLO_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
-    const CLIENT_HELLO_IDLE_TIMEOUT: Duration = Duration::from_millis(200);
-    const CLIENT_HELLO_READ_WAIT: Duration = Duration::from_millis(50);
+    const CLIENT_HELLO_TOTAL_TIMEOUT: Duration = Duration::from_millis(500);
+    const CLIENT_HELLO_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+    const CLIENT_HELLO_READ_WAIT: Duration = Duration::from_millis(25);
+    const CLIENT_HELLO_INITIAL_BUF: usize = 2048;
+    const CLIENT_HELLO_MAX_BUF: usize = 16 * 1024;
 
     let started = tokio::time::Instant::now();
     let mut last_progress = started;
-    let mut peek_buf = vec![0u8; 64 * 1024];
+    let mut peek_buf = vec![0u8; CLIENT_HELLO_INITIAL_BUF];
     let mut last_size = 0usize;
     loop {
         if started.elapsed() >= CLIENT_HELLO_TOTAL_TIMEOUT
@@ -767,10 +769,14 @@ async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Opti
         match parse_tls_client_hello_sni(&peek_buf[..size]) {
             ClientHelloParse::Found(host) => return Ok(Some(host)),
             ClientHelloParse::NeedMore => {
+                if size == peek_buf.len() && peek_buf.len() < CLIENT_HELLO_MAX_BUF {
+                    peek_buf.resize((peek_buf.len() * 2).min(CLIENT_HELLO_MAX_BUF), 0);
+                    continue;
+                }
                 if size > last_size {
                     last_progress = tokio::time::Instant::now();
                 } else {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 last_size = size;
             }
@@ -786,53 +792,52 @@ enum ClientHelloParse {
 }
 
 fn parse_tls_client_hello_sni(buf: &[u8]) -> ClientHelloParse {
-    if buf.len() < 5 {
+    if buf.len() < 9 {
         return ClientHelloParse::NeedMore;
     }
+    if buf[0] != 22 {
+        return ClientHelloParse::NotClientHello;
+    }
 
-    let mut pos = 0usize;
-    let mut handshake = Vec::new();
-    let mut hello_len = None;
+    let first_record_len = usize::from(u16::from_be_bytes([buf[3], buf[4]]));
+    if buf.len() < 5 + first_record_len {
+        return ClientHelloParse::NeedMore;
+    }
+    let first_record = &buf[5..5 + first_record_len];
+    if first_record.len() < 4 {
+        return ClientHelloParse::NeedMore;
+    }
+    if first_record[0] != 1 {
+        return ClientHelloParse::NotClientHello;
+    }
+    let hello_len = ((usize::from(first_record[1])) << 16)
+        | ((usize::from(first_record[2])) << 8)
+        | usize::from(first_record[3]);
+    let needed_handshake_len = 4 + hello_len;
 
-    while pos + 5 <= buf.len() {
-        if buf[pos] != 22 {
-            return if handshake.is_empty() {
-                ClientHelloParse::NotClientHello
-            } else {
-                ClientHelloParse::NeedMore
-            };
-        }
-
-        let record_len = usize::from(u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]));
-        if buf.len() < pos + 5 + record_len {
-            return ClientHelloParse::NeedMore;
-        }
-
-        handshake.extend_from_slice(&buf[pos + 5..pos + 5 + record_len]);
-        pos += 5 + record_len;
-
-        if handshake.len() >= 4 {
-            if handshake[0] != 1 {
+    let hello_storage;
+    let hello = if first_record.len() >= needed_handshake_len {
+        &first_record[4..needed_handshake_len]
+    } else {
+        let mut handshake = Vec::with_capacity(needed_handshake_len);
+        let mut pos = 0usize;
+        while pos + 5 <= buf.len() && handshake.len() < needed_handshake_len {
+            if buf[pos] != 22 {
                 return ClientHelloParse::NotClientHello;
             }
-            let parsed_len = ((usize::from(handshake[1])) << 16)
-                | ((usize::from(handshake[2])) << 8)
-                | usize::from(handshake[3]);
-            hello_len = Some(parsed_len);
-            if handshake.len() >= 4 + parsed_len {
-                break;
+            let record_len = usize::from(u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]));
+            if buf.len() < pos + 5 + record_len {
+                return ClientHelloParse::NeedMore;
             }
+            handshake.extend_from_slice(&buf[pos + 5..pos + 5 + record_len]);
+            pos += 5 + record_len;
         }
-    }
-
-    let Some(hello_len) = hello_len else {
-        return ClientHelloParse::NeedMore;
+        if handshake.len() < needed_handshake_len {
+            return ClientHelloParse::NeedMore;
+        }
+        hello_storage = handshake;
+        &hello_storage[4..needed_handshake_len]
     };
-    if handshake.len() < 4 + hello_len {
-        return ClientHelloParse::NeedMore;
-    }
-
-    let hello = &handshake[4..4 + hello_len];
     let mut pos = 0usize;
 
     pos += 2; // legacy_version

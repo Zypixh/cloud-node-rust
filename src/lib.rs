@@ -2,6 +2,7 @@ pub mod pb {
     tonic::include_proto!("pb");
 }
 
+pub mod adaptive_cpu;
 pub mod api_config;
 pub mod auth;
 pub mod cache;

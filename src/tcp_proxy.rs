@@ -716,6 +716,14 @@ impl std::error::Error for BidirectionalStreamError {
     }
 }
 
+const STREAM_METRICS_FLUSH_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum StreamDirection {
+    ClientToBackend,
+    BackendToClient,
+}
+
 pub(crate) async fn stream_bidirectional_with_metrics<C, B>(
     server_id: i64,
     client: C,
@@ -727,64 +735,89 @@ where
 {
     let (client_reader, client_writer) = tokio::io::split(client);
     let (backend_reader, backend_writer) = tokio::io::split(backend);
-    let bytes_received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let bytes_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_received_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let bytes_sent_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let client_to_backend = copy_stream_and_count(
+        server_id,
+        StreamDirection::ClientToBackend,
+        client_reader,
+        backend_writer,
+        bytes_received_counter.clone(),
+    );
+    let backend_to_client = copy_stream_and_count(
+        server_id,
+        StreamDirection::BackendToClient,
+        backend_reader,
+        client_writer,
+        bytes_sent_counter.clone(),
+    );
 
-    let client_to_backend_bytes = bytes_received.clone();
-    let client_to_backend = async move {
-        copy_stream_and_track(client_reader, backend_writer, |n| {
-            client_to_backend_bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-            crate::metrics::record::record_transfer(server_id, 0, n, None);
-            crate::metrics::record::record_origin_traffic(server_id, n, 0, None);
-        })
-        .await
-    };
-
-    let backend_to_client_bytes = bytes_sent.clone();
-    let backend_to_client = async move {
-        copy_stream_and_track(backend_reader, client_writer, |n| {
-            backend_to_client_bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-            crate::metrics::record::record_transfer(server_id, n, 0, None);
-            crate::metrics::record::record_origin_traffic(server_id, 0, n, None);
-        })
-        .await
-    };
-
-    tokio::try_join!(client_to_backend, backend_to_client).map_err(|source| {
-        BidirectionalStreamError {
-            bytes_received: bytes_received.load(std::sync::atomic::Ordering::Relaxed),
-            bytes_sent: bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
+    match tokio::try_join!(client_to_backend, backend_to_client) {
+        Ok((bytes_received, bytes_sent)) => Ok((bytes_received, bytes_sent)),
+        Err(source) => Err(BidirectionalStreamError {
+            bytes_received: bytes_received_counter.load(std::sync::atomic::Ordering::Relaxed),
+            bytes_sent: bytes_sent_counter.load(std::sync::atomic::Ordering::Relaxed),
             source,
-        }
-    })?;
-
-    Ok((
-        bytes_received.load(std::sync::atomic::Ordering::Relaxed),
-        bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
-    ))
+        }),
+    }
 }
 
-async fn copy_stream_and_track<R, W, F>(
+async fn copy_stream_and_count<R, W>(
+    server_id: i64,
+    direction: StreamDirection,
     mut reader: R,
     mut writer: W,
-    mut on_chunk: F,
-) -> std::io::Result<()>
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
-    F: FnMut(u64),
 {
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut total = 0u64;
+    let mut unflushed = 0u64;
 
     loop {
-        let n = reader.read(&mut buf).await?;
+        let n = match reader.read(&mut buf).await {
+            Ok(n) => n,
+            Err(err) => {
+                record_stream_metrics_delta(server_id, direction, unflushed);
+                return Err(err);
+            }
+        };
         if n == 0 {
+            record_stream_metrics_delta(server_id, direction, unflushed);
             writer.shutdown().await?;
-            return Ok(());
+            return Ok(total);
         }
 
-        writer.write_all(&buf[..n]).await?;
-        on_chunk(n as u64);
+        if let Err(err) = writer.write_all(&buf[..n]).await {
+            record_stream_metrics_delta(server_id, direction, unflushed);
+            return Err(err);
+        }
+        total += n as u64;
+        unflushed += n as u64;
+        counter.store(total, std::sync::atomic::Ordering::Relaxed);
+        if unflushed >= STREAM_METRICS_FLUSH_BYTES {
+            record_stream_metrics_delta(server_id, direction, unflushed);
+            unflushed = 0;
+        }
+    }
+}
+
+fn record_stream_metrics_delta(server_id: i64, direction: StreamDirection, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    match direction {
+        StreamDirection::ClientToBackend => {
+            crate::metrics::record::record_transfer(server_id, 0, bytes, None);
+            crate::metrics::record::record_origin_traffic(server_id, bytes, 0, None);
+        }
+        StreamDirection::BackendToClient => {
+            crate::metrics::record::record_transfer(server_id, bytes, 0, None);
+            crate::metrics::record::record_origin_traffic(server_id, 0, bytes, None);
+        }
     }
 }
 

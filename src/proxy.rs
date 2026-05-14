@@ -90,7 +90,6 @@ impl std::ops::DerefMut for LazyResponseHeaders {
     }
 }
 
-#[derive(Clone)]
 pub struct ProxyCTX {
     pub start_time: std::time::Instant,
     pub start_timestamp_millis: i64,
@@ -109,6 +108,7 @@ pub struct ProxyCTX {
     pub response_body_len: usize,
     pub response_body_buffer: LazyBytes,
     pub request_body: LazyBytes,
+    pub has_outbound_waf_body_rules: bool,
     pub waf_policy_id: i64,
     pub waf_group_id: i64,
     pub waf_set_id: i64,
@@ -154,6 +154,7 @@ pub struct ProxyCTX {
     pub webp_source_content_length: Option<usize>,
     pub webp_pending_body: LazyBytes,
     pub webp_quality: i32,
+    pub webp_cpu_permit: Option<crate::adaptive_cpu::CpuTransformReservation<'static>>,
     pub optimize_enabled: bool,
     pub optimize_kind: Option<String>,
     pub optimize_pending_body: LazyBytes,
@@ -198,6 +199,7 @@ impl Default for ProxyCTX {
             response_body_len: 0,
             response_body_buffer: LazyBytes::default(),
             request_body: LazyBytes::default(),
+            has_outbound_waf_body_rules: false,
             waf_policy_id: 0,
             waf_group_id: 0,
             waf_set_id: 0,
@@ -242,6 +244,7 @@ impl Default for ProxyCTX {
             webp_source_content_length: None,
             webp_pending_body: LazyBytes::default(),
             webp_quality: 80,
+            webp_cpu_permit: None,
             optimize_enabled: false,
             optimize_kind: None,
             optimize_pending_body: LazyBytes::default(),
@@ -396,6 +399,15 @@ impl EdgeProxy {
             .iter()
             .map(|(name, value)| name.as_str().len() + value.len() + 4)
             .sum();
+    }
+
+    fn disable_request_cache(session: &mut Session, ctx: &mut ProxyCTX, reason: &'static str) {
+        ctx.cache_ref = None;
+        ctx.cache_policy = None;
+        ctx.cache_key = None;
+        session
+            .cache
+            .disable(pingora_cache::NoCacheReason::Custom(reason));
     }
 
     fn downstream_local_port(session: &Session) -> Option<u16> {
@@ -1160,6 +1172,7 @@ impl EdgeProxy {
         ctx.webp_convert_enabled = false;
         ctx.webp_source_content_type = None;
         ctx.webp_source_content_length = None;
+        ctx.webp_cpu_permit = None;
         ctx.webp_pending_body.clear();
 
         let Some(server) = ctx.server.as_ref() else {
@@ -1260,7 +1273,13 @@ impl EdgeProxy {
             return;
         }
 
+        let Some(reservation) = crate::adaptive_cpu::CPU_TRANSFORM_GATE.try_reserve_optional()
+        else {
+            return;
+        };
+
         ctx.webp_convert_enabled = true;
+        ctx.webp_cpu_permit = Some(reservation);
         ctx.webp_source_content_type = Some(content_type);
         ctx.webp_source_content_length = Some(content_length_usize);
         ctx.webp_quality = policy.quality;
@@ -2346,17 +2365,20 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return Ok(false);
         }
 
-        ctx.request_limit_out_bandwidth_bytes = request_limit.out_bandwidth_per_conn_bytes_value();
-        if ctx.request_limit_out_bandwidth_bytes <= 0 {
-            ctx.request_limit_out_bandwidth_sent = 0;
-            ctx.request_limit_out_bandwidth_window_start = None;
-        }
-
         if self
             .waf_state
             .is_whitelisted(ctx.client_ip, server.numeric_id())
         {
+            ctx.request_limit_out_bandwidth_bytes = 0;
+            ctx.request_limit_out_bandwidth_sent = 0;
+            ctx.request_limit_out_bandwidth_window_start = None;
             return Ok(false);
+        }
+
+        ctx.request_limit_out_bandwidth_bytes = request_limit.out_bandwidth_per_conn_bytes_value();
+        if ctx.request_limit_out_bandwidth_bytes <= 0 {
+            ctx.request_limit_out_bandwidth_sent = 0;
+            ctx.request_limit_out_bandwidth_window_start = None;
         }
 
         let max_body_bytes = request_limit.max_body_bytes_value();
@@ -4982,6 +5004,7 @@ impl ProxyHttp for EdgeProxy {
                 if is_match {
                     if cache_ref.is_reverse {
                         tracing::debug!("Website Cache Rule matched: SKIP");
+                        Self::disable_request_cache(session, ctx, "RuleSkipped");
                         return Ok(());
                     }
                     matched_ref = Some(cache_ref.clone());
@@ -5009,6 +5032,7 @@ impl ProxyHttp for EdgeProxy {
                                     "Server Cache Policy '{}' rule matched: SKIP",
                                     p.name
                                 );
+                                Self::disable_request_cache(session, ctx, "RuleSkipped");
                                 return Ok(());
                             }
                             matched_ref = Some(cache_ref.clone());
@@ -5040,6 +5064,7 @@ impl ProxyHttp for EdgeProxy {
                                         "GLOBAL Cluster Policy '{}' rule matched: SKIP",
                                         policy.name
                                     );
+                                    Self::disable_request_cache(session, ctx, "RuleSkipped");
                                     return Ok(());
                                 }
                                 matched_ref = Some(cache_ref.clone());
@@ -5062,12 +5087,11 @@ impl ProxyHttp for EdgeProxy {
                         "Skip cache for HLS encrypted request: {}",
                         session.req_header().uri.path()
                     );
-                    session
-                        .cache
-                        .disable(pingora_cache::NoCacheReason::Custom("HLSEncrypted"));
+                    Self::disable_request_cache(session, ctx, "HLSEncrypted");
                     return Ok(());
                 }
                 if cache_ref.always_forward_range_request && session.get_header("range").is_some() {
+                    Self::disable_request_cache(session, ctx, "RangeForwarded");
                     return Ok(());
                 }
                 if cache_ref.enable_request_cache_pragma {
@@ -5080,6 +5104,7 @@ impl ProxyHttp for EdgeProxy {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
                     if cc.contains("no-cache") || pragma.contains("no-cache") {
+                        Self::disable_request_cache(session, ctx, "RequestNoCache");
                         return Ok(());
                     }
                 }
@@ -5153,16 +5178,11 @@ impl ProxyHttp for EdgeProxy {
                     "No cache rule matched for request: {}",
                     session.req_header().uri.path()
                 );
-                // CRITICAL: Explicitly disable cache to clear state from Keep-Alive requests
-                session
-                    .cache
-                    .disable(pingora_cache::NoCacheReason::Custom("RuleDisabled"));
+                Self::disable_request_cache(session, ctx, "RuleDisabled");
             }
         } else {
             tracing::debug!("Cache is OFF for this server or web config.");
-            session
-                .cache
-                .disable(pingora_cache::NoCacheReason::Custom("CacheConfigOff"));
+            Self::disable_request_cache(session, ctx, "CacheConfigOff");
         }
         Ok(())
     }
@@ -5202,7 +5222,19 @@ impl ProxyHttp for EdgeProxy {
                 }
             }
 
-            if force_cache {
+            let force_partial = ctx
+                .cache_policy
+                .as_ref()
+                .map(|p| p.force_partial_content)
+                .unwrap_or(false);
+            let status_allows_cache = crate::cache::cache_ref_allows_method_status(
+                upstream_response.status.as_u16(),
+                cache_ref,
+                session.req_header().method.as_str(),
+                force_partial,
+            );
+
+            if force_cache && status_allows_cache {
                 // 1. Sanitize Cache-Control (Robust Split-Filter-Join)
                 let cc_header = upstream_response
                     .headers
@@ -5501,6 +5533,28 @@ impl ProxyHttp for EdgeProxy {
         }
 
         Self::sync_response_headers(upstream_response, ctx);
+
+        ctx.has_outbound_waf_body_rules = ctx
+            .firewall_policies_snapshot
+            .as_ref()
+            .map(|policies| {
+                policies
+                    .iter()
+                    .any(crate::firewall::outbound_policy_uses_response_body)
+            })
+            .unwrap_or(false)
+            || ctx
+                .server
+                .as_ref()
+                .and_then(|server| server.web.as_ref())
+                .and_then(|web| {
+                    web.firewall_ref
+                        .as_ref()
+                        .filter(|fw_ref| fw_ref.is_on)
+                        .and_then(|_| web.firewall_policy.as_ref())
+                })
+                .map(crate::firewall::outbound_policy_uses_response_body)
+                .unwrap_or(false);
 
         // 1. Initial Outbound WAF (Status & Headers)
         let outbound_ctx = crate::firewall::OutboundContext {
@@ -5897,21 +5951,29 @@ impl ProxyHttp for EdgeProxy {
             .clone()
             .unwrap_or_else(|| "image/jpeg".to_string());
 
-        match Self::convert_to_webp(&source_type, &ctx.webp_pending_body, ctx.webp_quality) {
+        let pending = ctx.webp_pending_body.take();
+        let quality = ctx.webp_quality;
+        let Some(reservation) = ctx.webp_cpu_permit.take() else {
+            ctx.webp_convert_enabled = false;
+            return Err(Error::explain(
+                Custom("WebPConversionNotReserved"),
+                "WebP conversion reservation is missing",
+            ));
+        };
+        let _permit = reservation.activate();
+        let result =
+            tokio::task::block_in_place(|| Self::convert_to_webp(&source_type, &pending, quality));
+        ctx.webp_convert_enabled = false;
+
+        match result {
             Ok(converted) => {
                 *body = Some(Bytes::from(converted));
-                ctx.webp_pending_body.clear();
-                ctx.webp_convert_enabled = false;
                 Ok(None)
             }
-            Err(err) => {
-                ctx.webp_pending_body.clear();
-                ctx.webp_convert_enabled = false;
-                Err(Error::explain(
-                    Custom("WebPConversionFailed"),
-                    format!("WebP conversion failed: {}", err),
-                ))
-            }
+            Err(err) => Err(Error::explain(
+                Custom("WebPConversionFailed"),
+                format!("WebP conversion failed: {}", err),
+            )),
         }
     }
 
@@ -5940,30 +6002,47 @@ impl ProxyHttp for EdgeProxy {
                 return Ok(None);
             }
 
-            let optimized = match ctx.optimize_kind.as_deref() {
-                Some("html") => ctx
+            let pending = ctx.optimize_pending_body.take();
+            let optimized = if let Some(_permit) =
+                crate::adaptive_cpu::CPU_TRANSFORM_GATE.try_admit_optional()
+            {
+                let kind = ctx.optimize_kind.as_deref();
+                let html_cfg = ctx
                     .server
                     .as_ref()
                     .and_then(|server| server.web.as_ref())
                     .and_then(|web| web.optimization.as_ref())
-                    .and_then(|opt| opt.html.as_ref())
-                    .and_then(|cfg| Self::minify_html(&ctx.optimize_pending_body, cfg).ok()),
-                Some("css") => Self::minify_css(&ctx.optimize_pending_body).ok(),
-                Some("js") => Self::minify_js(&ctx.optimize_pending_body).ok(),
-                _ => None,
+                    .and_then(|opt| opt.html.as_ref());
+                tokio::task::block_in_place(|| match kind {
+                    Some("html") => html_cfg.and_then(|cfg| Self::minify_html(&pending, cfg).ok()),
+                    Some("css") => Self::minify_css(&pending).ok(),
+                    Some("js") => Self::minify_js(&pending).ok(),
+                    _ => None,
+                })
+            } else {
+                None
             };
 
             if let Some(optimized) = optimized {
                 *body = Some(Bytes::from(optimized));
             } else {
-                *body = Some(Bytes::from(ctx.optimize_pending_body.take()));
+                *body = Some(Bytes::from(pending));
             }
             ctx.optimize_enabled = false;
-            ctx.optimize_pending_body.clear();
+            ctx.optimize_kind = None;
         }
 
         if ctx.hls_playlist_enabled {
             if let Some(chunk) = body.take() {
+                let Some(_permit) = crate::adaptive_cpu::CPU_TRANSFORM_GATE
+                    .acquire_required_blocking(std::time::Duration::from_millis(100))
+                else {
+                    ctx.hls_playlist_enabled = false;
+                    return Err(Error::explain(
+                        Custom("HlsTransformOverloaded"),
+                        "CPU transform gate overloaded while rewriting HLS playlist",
+                    ));
+                };
                 let body_text = String::from_utf8_lossy(&chunk).to_string();
                 let playlist_path = ctx
                     .server
@@ -5974,7 +6053,13 @@ impl ProxyHttp for EdgeProxy {
                     .server
                     .as_ref()
                     .map(|server| {
-                        self.rewrite_hls_playlist(&body_text, server.numeric_id(), &playlist_path)
+                        tokio::task::block_in_place(|| {
+                            self.rewrite_hls_playlist(
+                                &body_text,
+                                server.numeric_id(),
+                                &playlist_path,
+                            )
+                        })
                     })
                     .unwrap_or(body_text);
                 *body = Some(Bytes::from(rewritten));
@@ -5990,13 +6075,28 @@ impl ProxyHttp for EdgeProxy {
                 return Ok(None);
             }
 
-            if let (Some(key), Some(iv)) = (ctx.hls_segment_key, ctx.hls_segment_iv) {
-                let encrypted = Self::aes128_cbc_encrypt(&ctx.hls_segment_pending_body, key, iv);
-                *body = Some(Bytes::from(encrypted));
-            } else {
-                *body = Some(Bytes::from(ctx.hls_segment_pending_body.take()));
-            }
-            ctx.hls_segment_pending_body.clear();
+            let (Some(key), Some(iv)) = (ctx.hls_segment_key, ctx.hls_segment_iv) else {
+                ctx.hls_segment_pending_body.clear();
+                ctx.hls_segment_encrypt_enabled = false;
+                return Err(Error::explain(
+                    Custom("HlsEncryptionMissingKey"),
+                    "HLS segment encryption key is missing",
+                ));
+            };
+            let Some(_permit) = crate::adaptive_cpu::CPU_TRANSFORM_GATE
+                .acquire_required_blocking(std::time::Duration::from_millis(200))
+            else {
+                ctx.hls_segment_pending_body.clear();
+                ctx.hls_segment_encrypt_enabled = false;
+                return Err(Error::explain(
+                    Custom("HlsTransformOverloaded"),
+                    "CPU transform gate overloaded while encrypting HLS segment",
+                ));
+            };
+            let pending = ctx.hls_segment_pending_body.take();
+            let encrypted =
+                tokio::task::block_in_place(|| Self::aes128_cbc_encrypt(&pending, key, iv));
+            *body = Some(Bytes::from(encrypted));
             ctx.hls_segment_encrypt_enabled = false;
         }
 
@@ -6010,7 +6110,9 @@ impl ProxyHttp for EdgeProxy {
             ctx.response_body_len += chunk_len;
 
             // 2. Outbound WAF Body Inspection (Up to max_inspection_size)
-            if ctx.response_body_buffer.len() < ctx.max_inspection_size as usize {
+            if ctx.has_outbound_waf_body_rules
+                && ctx.response_body_buffer.len() < ctx.max_inspection_size as usize
+            {
                 let remaining = (ctx.max_inspection_size as usize)
                     .saturating_sub(ctx.response_body_buffer.len());
                 let to_copy = std::cmp::min(chunk_len, remaining);

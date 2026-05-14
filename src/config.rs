@@ -108,6 +108,8 @@ pub struct NodeConfig {
     pub user_plans: HashMap<i64, crate::pb::UserPlan>,
     /// Whether any SNI passthrough server is configured (fast check for TLS path)
     pub has_any_sni_passthrough: bool,
+    pub sni_passthrough_exact: HashMap<(u16, String), Arc<ServerConfig>>,
+    pub sni_passthrough_wildcard: HashMap<(u16, String), Arc<ServerConfig>>,
 }
 
 impl Default for NodeConfig {
@@ -167,6 +169,8 @@ impl Default for NodeConfig {
             plans: HashMap::new(),
             user_plans: HashMap::new(),
             has_any_sni_passthrough: false,
+            sni_passthrough_exact: HashMap::new(),
+            sni_passthrough_wildcard: HashMap::new(),
         }
     }
 }
@@ -417,10 +421,7 @@ impl ConfigStore {
             }
         }
 
-        lock.all_servers
-            .iter()
-            .find(|server| Self::matches_sni_passthrough_server(server, &normalized, 0))
-            .cloned()
+        Self::find_sni_passthrough_server_locked(&lock, &normalized, 0)
     }
 
     pub fn find_sni_passthrough_server_sync(
@@ -430,46 +431,37 @@ impl ConfigStore {
     ) -> Option<Arc<ServerConfig>> {
         let normalized = Self::normalize_host(host);
         let lock = self.inner.read();
-
-        lock.all_servers
-            .iter()
-            .find(|server| Self::matches_sni_passthrough_server(server, &normalized, port))
-            .cloned()
+        Self::find_sni_passthrough_server_locked(&lock, &normalized, port)
     }
 
-    fn matches_sni_passthrough_server(
-        server: &ServerConfig,
+    fn find_sni_passthrough_server_locked(
+        lock: &NodeConfig,
         normalized_host: &str,
         port: u16,
-    ) -> bool {
-        // If port is 0, bypass port checks. Certificate lookup uses this mode.
-        if !server.is_sni_passthrough() || (port != 0 && !server.listens_on_https_port(port)) {
-            return false;
+    ) -> Option<Arc<ServerConfig>> {
+        if let Some(server) = lock
+            .sni_passthrough_exact
+            .get(&(port, normalized_host.to_string()))
+        {
+            return Some(server.clone());
         }
-
-        fn name_matches(name: &str, normalized_host: &str) -> bool {
-            let name = ServerConfig::normalize_runtime_server_name(name);
-            if name.is_empty() {
-                return false;
-            }
-            if name == normalized_host {
-                return true;
-            }
-            if let Some(suffix) = name.strip_prefix('*')
-                && let Some(apex) = suffix.strip_prefix('.')
+        if let Some(server) = lock
+            .sni_passthrough_wildcard
+            .get(&(port, normalized_host.to_string()))
+        {
+            return Some(server.clone());
+        }
+        let mut suffix = normalized_host;
+        while let Some((_, rest)) = suffix.split_once('.') {
+            suffix = rest;
+            if let Some(server) = lock
+                .sni_passthrough_wildcard
+                .get(&(port, suffix.to_string()))
             {
-                return normalized_host == apex || normalized_host.ends_with(suffix);
+                return Some(server.clone());
             }
-            false
         }
-
-        server.server_names.iter().any(|sn| {
-            name_matches(&sn.name, normalized_host)
-                || sn
-                    .sub_names
-                    .iter()
-                    .any(|sub| name_matches(sub, normalized_host))
-        })
+        None
     }
 
     pub fn get_cache_policy_sync(&self) -> Arc<Vec<Arc<HTTPCachePolicy>>> {
@@ -1125,7 +1117,61 @@ impl ConfigStore {
     }
 
     fn refresh_sni_passthrough_flag(lock: &mut NodeConfig) {
-        lock.has_any_sni_passthrough = lock.all_servers.iter().any(|s| s.is_sni_passthrough());
+        lock.sni_passthrough_exact.clear();
+        lock.sni_passthrough_wildcard.clear();
+
+        for server in &lock.all_servers {
+            if !server.is_sni_passthrough() {
+                continue;
+            }
+            let mut ports = server
+                .https
+                .as_ref()
+                .filter(|https| https.is_on)
+                .map(|https| {
+                    https
+                        .listen
+                        .iter()
+                        .filter_map(|addr| {
+                            addr.port_range
+                                .as_deref()
+                                .and_then(|range| range.split('-').next())
+                                .and_then(|value| value.parse::<u16>().ok())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            ports.push(0);
+            ports.sort_unstable();
+            ports.dedup();
+
+            for name in server.get_plain_server_names() {
+                let name = Self::normalize_host(&name);
+                if name.is_empty() {
+                    continue;
+                }
+                let (wildcard, key_name) = if let Some(suffix) = name.strip_prefix("*.") {
+                    (true, suffix.to_string())
+                } else {
+                    (false, name)
+                };
+                for port in &ports {
+                    let key = (*port, key_name.clone());
+                    if wildcard {
+                        lock.sni_passthrough_wildcard
+                            .entry(key)
+                            .or_insert_with(|| server.clone());
+                    } else {
+                        lock.sni_passthrough_exact
+                            .entry(key)
+                            .or_insert_with(|| server.clone());
+                    }
+                }
+            }
+        }
+
+        lock.has_any_sni_passthrough =
+            !lock.sni_passthrough_exact.is_empty() || !lock.sni_passthrough_wildcard.is_empty();
     }
 
     pub async fn set_deleted_contents(&self, deleted_contents: Vec<String>) {

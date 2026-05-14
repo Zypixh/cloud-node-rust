@@ -2,6 +2,37 @@ use crate::config_models::HTTPCacheRef;
 
 pub mod matching;
 
+pub fn cache_ref_allows_method_status(
+    status: u16,
+    cache_ref: &HTTPCacheRef,
+    method: &str,
+    force_partial_content: bool,
+) -> bool {
+    if !cache_ref.is_on {
+        return false;
+    }
+
+    let method_allowed = if cache_ref.methods.is_empty() {
+        true
+    } else {
+        cache_ref
+            .methods
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(method))
+    };
+    if !method_allowed {
+        return false;
+    }
+
+    if cache_ref.status.is_empty() {
+        status == 200
+            || (status == 206 && (cache_ref.allow_partial_content || force_partial_content))
+    } else {
+        cache_ref.status.contains(&(status as i32))
+            || (status == 206 && cache_ref.allow_partial_content)
+    }
+}
+
 pub fn should_cache_response(
     status: u16,
     cache_ref: &HTTPCacheRef,
@@ -12,32 +43,7 @@ pub fn should_cache_response(
     force_partial_content: bool,
     skip_size_checks: bool,
 ) -> bool {
-    if !cache_ref.is_on {
-        return false;
-    }
-
-    // 1. Check Method
-    let method_allowed = if cache_ref.methods.is_empty() {
-        true
-    } else {
-        cache_ref
-            .methods
-            .iter()
-            .any(|m| m.to_uppercase() == method.to_uppercase())
-    };
-    if !method_allowed {
-        return false;
-    }
-
-    // 2. Check Status
-    let status_allowed = if cache_ref.status.is_empty() {
-        status == 200
-            || (status == 206 && (cache_ref.allow_partial_content || force_partial_content))
-    } else {
-        cache_ref.status.contains(&(status as i32))
-            || (status == 206 && cache_ref.allow_partial_content)
-    };
-    if !status_allowed {
+    if !cache_ref_allows_method_status(status, cache_ref, method, force_partial_content) {
         return false;
     }
 

@@ -106,20 +106,7 @@ impl HTTPRequestCond {
                 }
             }
             "in" => {
-                let values = CACHE_IN_VALUES
-                    .entry(self.value.clone())
-                    .or_insert_with(|| {
-                        let parsed = serde_json::from_str::<Vec<String>>(&self.value)
-                            .unwrap_or_else(|_| {
-                                self.value
-                                    .split(',')
-                                    .map(|v| v.trim().to_string())
-                                    .filter(|v| !v.is_empty())
-                                    .collect()
-                            });
-                        Arc::new(parsed)
-                    })
-                    .clone();
+                let values = cached_list_values(&self.value);
                 if !values.is_empty() {
                     if self.is_case_insensitive {
                         let lower_param = param_value.to_lowercase();
@@ -130,6 +117,11 @@ impl HTTPRequestCond {
                 } else {
                     false
                 }
+            }
+            "fileExt" | "fileExtension" | "fileExtensions" => {
+                let extension =
+                    get_variable_value_with_scheme(session, "${requestPathLowerExtension}", scheme);
+                extension_in_configured_values(&extension, &self.value)
             }
             _ => false,
         };
@@ -244,6 +236,42 @@ pub fn format_variables_with_scheme(session: &Session, template: &str, scheme: &
         get_variable_value_with_scheme(session, &caps[0], scheme)
     });
     result.to_string()
+}
+
+fn cached_list_values(value: &str) -> Arc<Vec<String>> {
+    CACHE_IN_VALUES
+        .entry(value.to_string())
+        .or_insert_with(|| {
+            let parsed = serde_json::from_str::<Vec<String>>(value).unwrap_or_else(|_| {
+                value
+                    .split(',')
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect()
+            });
+            Arc::new(parsed)
+        })
+        .clone()
+}
+
+fn extension_in_configured_values(extension: &str, value: &str) -> bool {
+    if extension.is_empty() {
+        return false;
+    }
+
+    let extension = extension.to_ascii_lowercase();
+    cached_list_values(value).iter().any(|item| {
+        let item = item.trim().trim_matches('"').to_ascii_lowercase();
+        if item.is_empty() {
+            return false;
+        }
+        let item = if item.starts_with('.') {
+            item
+        } else {
+            format!(".{item}")
+        };
+        item == extension
+    })
 }
 
 fn get_cached_regex(pattern: &str) -> Option<Arc<Regex>> {

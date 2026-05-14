@@ -91,7 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.0.8 --yes
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.0.9 --yes
 ```
 
 升级现有 Rust 节点到最新版：

@@ -177,6 +177,28 @@ pub fn evaluate_policy(
     None
 }
 
+pub fn outbound_policy_uses_response_body(policy: &HTTPFirewallPolicy) -> bool {
+    if !policy.is_on || policy.mode == "bypass" {
+        return false;
+    }
+    let Some(outbound) = &policy.outbound else {
+        return false;
+    };
+    if !outbound.is_on {
+        return false;
+    }
+
+    outbound.groups.iter().any(|group| {
+        group.is_on
+            && group.sets.iter().any(|set| {
+                set.is_on
+                    && set.rules.iter().any(|rule| {
+                        rule.param.contains("responseBody") || rule.value.contains("responseBody")
+                    })
+            })
+    })
+}
+
 pub fn evaluate_outbound_policy(
     policy: &HTTPFirewallPolicy,
     session: &Session,
