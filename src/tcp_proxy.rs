@@ -387,7 +387,8 @@ impl TcpProxyManager {
                 .configure()
                 .expect("Failed to create connect configuration");
 
-            if !ext.tls_verify {
+            let verify_origin_tls = crate::lb_factory::should_verify_origin_tls(ext, &host, None);
+            if !verify_origin_tls {
                 conn_config.set_verify(pingora_core::tls::ssl::SslVerifyMode::NONE);
             } else {
                 conn_config.set_verify(pingora_core::tls::ssl::SslVerifyMode::PEER);

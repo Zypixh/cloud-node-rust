@@ -4732,8 +4732,7 @@ impl ProxyHttp for EdgeProxy {
             let client_host = session
                 .get_header("host")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("localhost"))
-                .to_string();
+                .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("localhost"));
 
             let (sni_host, host_override) = if let Some(ext) = backend_ext {
                 if let Some(oss_backend) = &ext.oss_backend {
@@ -4772,7 +4771,7 @@ impl ProxyHttp for EdgeProxy {
                 }
             } else {
                 // No backend extension: forward client's Host header
-                (client_host, None)
+                (client_host.to_string(), None)
             };
 
             ctx.origin_id = backend_ext.map(|ext| ext.origin_id).unwrap_or(0);
@@ -4832,8 +4831,14 @@ impl ProxyHttp for EdgeProxy {
             }
 
             if let Some(ext) = backend_ext {
-                if !ext.tls_verify {
+                let verify_origin_tls = crate::lb_factory::should_verify_origin_tls(
+                    ext,
+                    &peer_obj.sni,
+                    Some(client_host),
+                );
+                if !verify_origin_tls {
                     peer_obj.options.verify_cert = false;
+                    peer_obj.options.verify_hostname = false;
                 }
             }
 

@@ -53,6 +53,29 @@ where
     }
 }
 
+fn deserialize_origin_tls_security_verify_mode<'de, D>(
+    deserializer: D,
+) -> Result<OriginTlsSecurityVerifyMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let mode = match value {
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "force" | "strict" | "on" | "true" | "1" => OriginTlsSecurityVerifyMode::Force,
+            "skip" | "none" | "off" | "false" | "0" => OriginTlsSecurityVerifyMode::Skip,
+            _ => OriginTlsSecurityVerifyMode::Auto,
+        },
+        Value::Bool(true) => OriginTlsSecurityVerifyMode::Force,
+        Value::Bool(false) => OriginTlsSecurityVerifyMode::Skip,
+        Value::Number(value) if value.as_i64().unwrap_or(0) > 0 => {
+            OriginTlsSecurityVerifyMode::Force
+        }
+        _ => OriginTlsSecurityVerifyMode::Auto,
+    };
+    Ok(mode)
+}
+
 fn default_connector() -> String {
     "or".to_string()
 }
@@ -2529,6 +2552,15 @@ fn first_port_in_range(port_range: &str) -> Option<u16> {
     first.parse::<u16>().ok()
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OriginTlsSecurityVerifyMode {
+    #[default]
+    Auto,
+    Force,
+    Skip,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OriginConfig {
     #[serde(alias = "id")]
@@ -2572,8 +2604,14 @@ pub struct OriginConfig {
     #[serde(rename = "idleTimeout", default)]
     pub idle_timeout: Option<Value>,
     pub cert: Option<SSLCertConfig>,
+    #[serde(
+        rename = "tlsSecurityVerifyMode",
+        default,
+        deserialize_with = "deserialize_origin_tls_security_verify_mode"
+    )]
+    pub tls_security_verify_mode: OriginTlsSecurityVerifyMode,
     #[serde(rename = "tlsVerify", default)]
-    pub tls_verify: Option<Value>, // Can be boolean, object, or int in legacy configs.
+    pub tls_verify: Option<Value>,
     #[serde(default)]
     pub oss: Option<Value>,
 }

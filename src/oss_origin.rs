@@ -1089,7 +1089,7 @@ pub fn insert_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_models::{FlexibleAddr, OriginConfig};
+    use crate::config_models::{FlexibleAddr, OriginConfig, OriginTlsSecurityVerifyMode};
     use chrono::TimeZone;
     use serde_json::json;
 
@@ -1110,6 +1110,7 @@ mod tests {
             read_timeout: None,
             idle_timeout: None,
             cert: None,
+            tls_security_verify_mode: OriginTlsSecurityVerifyMode::Auto,
             tls_verify: None,
             oss: Some(oss),
         }

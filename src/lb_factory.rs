@@ -1,4 +1,6 @@
-use crate::config_models::{OriginConfig, ParentNodeConfig, ReverseProxyConfig};
+use crate::config_models::{
+    OriginConfig, OriginTlsSecurityVerifyMode, ParentNodeConfig, ReverseProxyConfig,
+};
 use futures_util::FutureExt;
 use http;
 use http::Extensions;
@@ -166,6 +168,40 @@ pub fn peer_origin_id(peer: &Backend) -> i64 {
         .unwrap_or(0)
 }
 
+pub fn should_verify_origin_tls(
+    ext: &BackendExtension,
+    sni_host: &str,
+    client_host: Option<&str>,
+) -> bool {
+    if let Some(legacy) = ext.legacy_tls_verify {
+        return legacy;
+    }
+
+    match ext.tls_security_verify_mode {
+        OriginTlsSecurityVerifyMode::Force => true,
+        OriginTlsSecurityVerifyMode::Skip => false,
+        OriginTlsSecurityVerifyMode::Auto => {
+            let sni_host = strip_addr_port(sni_host).to_ascii_lowercase();
+            if sni_host.is_empty() {
+                return false;
+            }
+            let origin_host = &ext.origin_host_normalized;
+
+            if !origin_host.is_empty() && sni_host == *origin_host {
+                return true;
+            }
+            if ext.explicit_tls_host_normalized.as_deref() == Some(sni_host.as_str()) {
+                return true;
+            }
+
+            client_host
+                .map(strip_addr_port)
+                .map(|host| host.to_ascii_lowercase() != sni_host)
+                .unwrap_or(false)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OriginRole {
     Primary,
@@ -182,11 +218,14 @@ pub struct BackendExtension {
     pub rp_host: String, // Reverse-proxy-level custom host (reverseProxy.requestHost)
     pub origin_id: i64,
     pub origin_host: String,
+    pub origin_host_normalized: String,
+    pub explicit_tls_host_normalized: Option<String>,
     pub follow_port: bool,
     pub follow_host: bool,
     pub http2_enabled: bool,
     pub http3_enabled: bool,
-    pub tls_verify: bool, // true = strict/auto, false = none
+    pub tls_security_verify_mode: OriginTlsSecurityVerifyMode,
+    pub legacy_tls_verify: Option<bool>,
     pub request_host_excluding_port: bool,
     pub connection_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
@@ -279,18 +318,9 @@ fn build_origin_lb(
         };
 
         let rp_host = reverse_proxy_request_host(rp_cfg, addr);
-        let tls_verify = if let Some(v) = &origin.tls_verify {
-            match v {
-                serde_json::Value::Bool(b) => *b,
-                serde_json::Value::Object(obj) => {
-                    obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true)
-                }
-                serde_json::Value::Number(n) => n.as_i64().unwrap_or(1) > 0,
-                _ => true,
-            }
-        } else {
-            true
-        };
+        let origin_host = addr.host();
+        let explicit_tls_host_normalized = explicit_tls_host(&origin.request_host, &rp_host);
+        let legacy_tls_verify = parse_legacy_tls_verify(origin.tls_verify.as_ref());
         let mut ext = Extensions::new();
         ext.insert(BackendExtension {
             origin_role: role,
@@ -298,12 +328,15 @@ fn build_origin_lb(
             host: origin.request_host.clone(),
             rp_host,
             origin_id: origin.id,
-            origin_host: addr.host(),
+            origin_host: origin_host.clone(),
+            origin_host_normalized: normalized_tls_host(&origin_host),
+            explicit_tls_host_normalized,
             follow_port: origin.follow_port,
             follow_host: origin.follow_host,
             http2_enabled: origin.http2_enabled,
             http3_enabled: origin.http3_enabled,
-            tls_verify,
+            tls_security_verify_mode: origin.tls_security_verify_mode,
+            legacy_tls_verify,
             request_host_excluding_port: rp_cfg.request_host_excluding_port,
             connection_timeout: origin.conn_timeout.as_ref().map(crate::utils::to_duration),
             read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
@@ -436,11 +469,14 @@ fn fallback_lb() -> (Arc<AnyLoadBalancer>, bool) {
         rp_host: String::new(),
         origin_id: 0,
         origin_host: String::new(),
+        origin_host_normalized: String::new(),
+        explicit_tls_host_normalized: None,
         follow_port: false,
         follow_host: false,
         http2_enabled: false,
         http3_enabled: false,
-        tls_verify: true,
+        tls_security_verify_mode: OriginTlsSecurityVerifyMode::Force,
+        legacy_tls_verify: None,
         request_host_excluding_port: false,
         connection_timeout: None,
         read_timeout: None,
@@ -475,11 +511,14 @@ fn unsupported_origin_backend(
         rp_host: String::new(),
         origin_id: origin.id,
         origin_host: String::new(),
+        origin_host_normalized: String::new(),
+        explicit_tls_host_normalized: None,
         follow_port: false,
         follow_host: false,
         http2_enabled: false,
         http3_enabled: false,
-        tls_verify: true,
+        tls_security_verify_mode: OriginTlsSecurityVerifyMode::Force,
+        legacy_tls_verify: None,
         request_host_excluding_port: false,
         connection_timeout: origin.conn_timeout.as_ref().map(crate::utils::to_duration),
         read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
@@ -514,18 +553,7 @@ fn oss_origin_backend(
             Some(backend) => backend,
             None => return None,
         };
-    let tls_verify = origin
-        .tls_verify
-        .as_ref()
-        .map(|v| match v {
-            serde_json::Value::Bool(b) => *b,
-            serde_json::Value::Object(obj) => {
-                obj.get("isOn").and_then(|v| v.as_bool()).unwrap_or(true)
-            }
-            serde_json::Value::Number(n) => n.as_i64().unwrap_or(1) > 0,
-            _ => true,
-        })
-        .unwrap_or(true);
+    let legacy_tls_verify = parse_legacy_tls_verify(origin.tls_verify.as_ref());
     let mut ext = Extensions::new();
     ext.insert(BackendExtension {
         origin_role: role,
@@ -534,11 +562,14 @@ fn oss_origin_backend(
         rp_host: String::new(),
         origin_id: origin.id,
         origin_host: oss_backend.host_header.clone(),
+        origin_host_normalized: normalized_tls_host(&oss_backend.host_header),
+        explicit_tls_host_normalized: explicit_tls_host(&origin.request_host, ""),
         follow_port: false,
         follow_host: false,
         http2_enabled: origin.http2_enabled,
         http3_enabled: origin.http3_enabled,
-        tls_verify,
+        tls_security_verify_mode: origin.tls_security_verify_mode,
+        legacy_tls_verify,
         request_host_excluding_port: rp_cfg.request_host_excluding_port,
         connection_timeout: non_zero_duration(origin.conn_timeout.as_ref()),
         read_timeout: non_zero_duration(origin.read_timeout.as_ref()),
@@ -550,6 +581,36 @@ fn oss_origin_backend(
     backend.ext = ext;
     backend.weight = origin.weight.max(1) as usize;
     Some(backend)
+}
+
+fn normalized_tls_host(value: &str) -> String {
+    strip_addr_port(value).to_ascii_lowercase()
+}
+
+fn explicit_tls_host(origin_host: &str, rp_host: &str) -> Option<String> {
+    if !origin_host.is_empty() {
+        Some(normalized_tls_host(origin_host))
+    } else if !rp_host.is_empty() {
+        Some(normalized_tls_host(rp_host))
+    } else {
+        None
+    }
+}
+
+fn parse_legacy_tls_verify(value: Option<&serde_json::Value>) -> Option<bool> {
+    value.map(|value| match value {
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Object(obj) => obj
+            .get("isOn")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true),
+        serde_json::Value::Number(value) => value.as_i64().unwrap_or(1) > 0,
+        serde_json::Value::String(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no" | "skip" | "none"
+        ),
+        _ => true,
+    })
 }
 
 fn non_zero_duration(value: Option<&serde_json::Value>) -> Option<Duration> {
@@ -663,11 +724,14 @@ pub fn build_parent_lb(
                     rp_host: String::new(),
                     origin_id: 0,
                     origin_host: String::new(),
+                    origin_host_normalized: String::new(),
+                    explicit_tls_host_normalized: None,
                     follow_port: false,
                     follow_host: false,
                     http2_enabled: false,
                     http3_enabled: false,
-                    tls_verify: false,
+                    tls_security_verify_mode: OriginTlsSecurityVerifyMode::Skip,
+                    legacy_tls_verify: None,
                     request_host_excluding_port: false,
                     connection_timeout: None,
                     read_timeout: None,
@@ -842,9 +906,81 @@ mod tests {
             read_timeout: None,
             idle_timeout: None,
             cert: None,
+            tls_security_verify_mode: OriginTlsSecurityVerifyMode::Auto,
             tls_verify: None,
             oss: None,
         }
+    }
+
+    #[test]
+    fn origin_tls_security_mode_uses_real_control_plane_field() {
+        let raw = serde_json::json!({
+            "id": 1011,
+            "addr": {"protocol": "https", "host": "a.com", "portRange": "443"},
+            "tlsSecurityVerifyMode": "skip",
+            "http2Enabled": true,
+            "weight": 10
+        });
+        let origin: OriginConfig = serde_json::from_value(raw).unwrap();
+
+        assert_eq!(
+            origin.tls_security_verify_mode,
+            OriginTlsSecurityVerifyMode::Skip
+        );
+        assert!(origin.http2_enabled);
+        assert_eq!(origin.weight, 10);
+    }
+
+    #[test]
+    fn origin_tls_auto_verifies_explicit_origin_host_but_not_downstream_host() {
+        let mut ext = BackendExtension {
+            origin_role: OriginRole::Primary,
+            use_tls: true,
+            host: String::new(),
+            rp_host: String::new(),
+            origin_id: 44,
+            origin_host: "test.yhtuj.cn".to_string(),
+            origin_host_normalized: "test.yhtuj.cn".to_string(),
+            explicit_tls_host_normalized: None,
+            follow_port: false,
+            follow_host: false,
+            http2_enabled: false,
+            http3_enabled: false,
+            tls_security_verify_mode: OriginTlsSecurityVerifyMode::Auto,
+            legacy_tls_verify: None,
+            request_host_excluding_port: false,
+            connection_timeout: None,
+            read_timeout: None,
+            idle_timeout: None,
+            client_cert: None,
+            unsupported_reason: None,
+            oss_backend: None,
+        };
+
+        assert!(should_verify_origin_tls(
+            &ext,
+            "test.yhtuj.cn",
+            Some("test2s.yhtuj.cn")
+        ));
+        assert!(!should_verify_origin_tls(
+            &ext,
+            "test2s.yhtuj.cn",
+            Some("test2s.yhtuj.cn")
+        ));
+
+        ext.tls_security_verify_mode = OriginTlsSecurityVerifyMode::Force;
+        assert!(should_verify_origin_tls(
+            &ext,
+            "test2s.yhtuj.cn",
+            Some("test2s.yhtuj.cn")
+        ));
+
+        ext.tls_security_verify_mode = OriginTlsSecurityVerifyMode::Skip;
+        assert!(!should_verify_origin_tls(
+            &ext,
+            "test.yhtuj.cn",
+            Some("test2s.yhtuj.cn")
+        ));
     }
 
     #[test]
