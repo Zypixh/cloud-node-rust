@@ -182,7 +182,7 @@ impl Default for ProxyCTX {
     fn default() -> Self {
         Self {
             start_time: std::time::Instant::now(),
-            start_timestamp_millis: crate::utils::time::now_timestamp_millis(),
+            start_timestamp_millis: crate::utils::time::system_timestamp_millis(),
             request_id: String::new(),
             server: None,
             lb: None,
@@ -2862,17 +2862,24 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         const ACME_PREFIX: &str = "/.well-known/acme-challenge/";
 
         let path = session.req_header().uri.path();
-        let Some(token) = path.strip_prefix(ACME_PREFIX) else {
+        let Some(token_path) = path.strip_prefix(ACME_PREFIX) else {
             return Ok(false);
         };
-        if token.is_empty() || token.contains('/') {
-            ctx.response_status = 404;
-            return self.respond_status_with_pages(session, ctx, 404).await;
+        let token = token_path.rsplit('/').next().unwrap_or_default();
+        if token == "acme-challenge" || token.len() <= 32 {
+            return Ok(false);
         }
 
-        let Some(key) = crate::rpc::acme::find_acme_key(&self.api_config, token).await else {
-            ctx.response_status = 404;
-            return self.respond_status_with_pages(session, ctx, 404).await;
+        let key = match crate::rpc::acme::find_acme_key(&self.api_config, token).await {
+            crate::rpc::acme::AcmeKeyLookup::Found(key) => key,
+            crate::rpc::acme::AcmeKeyLookup::Missing => return Ok(false),
+            crate::rpc::acme::AcmeKeyLookup::RpcError(err) => {
+                warn!(
+                    "ACME challenge key lookup failed for token={}: {}",
+                    token, err
+                );
+                return Ok(false);
+            }
         };
 
         let mut resp = pingora_http::ResponseHeader::build(200, None).unwrap();
@@ -4048,6 +4055,10 @@ impl ProxyHttp for EdgeProxy {
             .map(|cfg| cfg.is_on)
             .unwrap_or(true);
 
+        if self.maybe_serve_acme_challenge(session, ctx).await? {
+            return Ok(true);
+        }
+
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
         ctx.is_on = hot_path.is_on;
         if !ctx.is_on {
@@ -4061,9 +4072,6 @@ impl ProxyHttp for EdgeProxy {
         }
 
         if self.maybe_serve_hls_key(session, ctx).await? {
-            return Ok(true);
-        }
-        if self.maybe_serve_acme_challenge(session, ctx).await? {
             return Ok(true);
         }
 

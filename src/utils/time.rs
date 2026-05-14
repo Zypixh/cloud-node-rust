@@ -20,14 +20,23 @@ pub fn update_time_offset(server_timestamp: i64) {
 }
 
 #[inline]
+pub fn system_timestamp() -> i64 {
+    Utc::now().timestamp()
+}
+
+#[inline]
+pub fn system_timestamp_millis() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+#[inline]
 pub fn now_timestamp() -> i64 {
-    // Fast path: Atomic load + Integer addition
-    Utc::now().timestamp() + TIME_OFFSET_SECONDS.load(Ordering::Relaxed)
+    system_timestamp() + TIME_OFFSET_SECONDS.load(Ordering::Relaxed)
 }
 
 #[inline]
 pub fn now_timestamp_millis() -> i64 {
-    Utc::now().timestamp_millis() + TIME_OFFSET_SECONDS.load(Ordering::Relaxed) * 1000
+    system_timestamp_millis() + TIME_OFFSET_SECONDS.load(Ordering::Relaxed) * 1000
 }
 
 #[inline]
@@ -36,8 +45,18 @@ pub fn now_utc() -> DateTime<Utc> {
 }
 
 #[inline]
+pub fn system_local() -> DateTime<FixedOffset> {
+    let tz = FixedOffset::east_opt(LOCAL_TZ_OFFSET_SECONDS.load(Ordering::Relaxed))
+        .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
+    tz.from_utc_datetime(
+        &DateTime::from_timestamp(system_timestamp(), 0)
+            .unwrap()
+            .naive_utc(),
+    )
+}
+
+#[inline]
 pub fn now_local() -> DateTime<FixedOffset> {
-    // Reuse cached TZ offset (default +0800)
     let tz = FixedOffset::east_opt(LOCAL_TZ_OFFSET_SECONDS.load(Ordering::Relaxed))
         .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
     tz.from_utc_datetime(
@@ -45,6 +64,11 @@ pub fn now_local() -> DateTime<FixedOffset> {
             .unwrap()
             .naive_utc(),
     )
+}
+
+#[inline]
+pub fn system_local_millis() -> DateTime<FixedOffset> {
+    local_from_timestamp_millis(system_timestamp_millis())
 }
 
 #[inline]

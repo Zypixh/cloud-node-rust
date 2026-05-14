@@ -2,10 +2,16 @@ use crate::api_config::ApiConfig;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 
-pub async fn find_acme_key(api_config: &ApiConfig, token: &str) -> Option<String> {
+pub enum AcmeKeyLookup {
+    Found(String),
+    Missing,
+    RpcError(String),
+}
+
+pub async fn find_acme_key(api_config: &ApiConfig, token: &str) -> AcmeKeyLookup {
     let client = match RpcClient::new(api_config).await {
         Ok(c) => c,
-        Err(_) => return None,
+        Err(err) => return AcmeKeyLookup::RpcError(err.to_string()),
     };
     let mut service = client.acme_service();
 
@@ -15,7 +21,14 @@ pub async fn find_acme_key(api_config: &ApiConfig, token: &str) -> Option<String
         })
         .await
     {
-        Ok(resp) => Some(resp.into_inner().key),
-        Err(_) => None,
+        Ok(resp) => {
+            let key = resp.into_inner().key;
+            if key.is_empty() {
+                AcmeKeyLookup::Missing
+            } else {
+                AcmeKeyLookup::Found(key)
+            }
+        }
+        Err(err) => AcmeKeyLookup::RpcError(err.to_string()),
     }
 }

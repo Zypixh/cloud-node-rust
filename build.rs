@@ -1,4 +1,5 @@
 use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn find_protos(dir: &str) -> Result<Vec<String>, std::io::Error> {
     let mut protos = Vec::new();
@@ -15,6 +16,25 @@ fn find_protos(dir: &str) -> Result<Vec<String>, std::io::Error> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+
+    let build_timestamp = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0)
+        });
+    println!(
+        "cargo:rustc-env=CLOUD_NODE_BUILD_TIMESTAMP={}",
+        build_timestamp
+    );
+
     let proto_dir = "proto_defs/output_protos";
     let models_dir = "proto_defs/output_protos/models";
 

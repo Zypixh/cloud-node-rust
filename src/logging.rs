@@ -49,7 +49,7 @@ fn access_log_started_at_millis(duration: Duration) -> i64 {
 }
 
 pub fn next_request_id() -> String {
-    let now = crate::utils::time::now_timestamp_millis();
+    let now = crate::utils::time::system_timestamp_millis();
     let prev = REQUEST_ID_TIMESTAMP.swap(now, Ordering::AcqRel);
     if now > prev {
         REQUEST_ID_COUNTER.store(1_000_000, Ordering::Release);

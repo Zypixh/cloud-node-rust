@@ -33,6 +33,14 @@ static CONNECTED_API_NODE_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false
 static ENABLED_FEATURES_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
 static UPDATE_NODE_UP_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
 
+fn build_version_code() -> u32 {
+    env!("CARGO_PKG_VERSION")
+        .split('.')
+        .take(3)
+        .map(|part| part.parse::<u32>().unwrap_or(0).min(999))
+        .fold(0, |acc, part| acc * 1000 + part)
+}
+
 fn cert_data_score(cert: &crate::config_models::SSLCertConfig) -> usize {
     fn score(value: &Option<serde_json::Value>) -> usize {
         match value {
@@ -1323,7 +1331,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             0.0
         };
 
-        let now = crate::utils::time::now_timestamp();
+        let now = crate::utils::time::system_timestamp();
         let hostname = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -1339,6 +1347,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         let mut disk_total = 0u64;
         let mut disk_used = 0u64;
         let mut disk_max_usage = 0.0f64;
+        let mut disk_max_partition = String::new();
 
         let disks = sysinfo::Disks::new_with_refreshed_list();
         for disk in &disks {
@@ -1354,6 +1363,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             };
             if usage > disk_max_usage {
                 disk_max_usage = usage;
+                disk_max_partition = disk.mount_point().to_string_lossy().to_string();
             }
         }
         let disk_usage = if disk_total > 0 {
@@ -1363,8 +1373,8 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         };
 
         let status = serde_json::json!({
-            "buildVersion": "1.1.5",
-            "buildVersionCode": 1001005,
+            "buildVersion": env!("CARGO_PKG_VERSION"),
+            "buildVersionCode": build_version_code(),
             "configVersion": config_store.get_config_version().await,
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
@@ -1379,6 +1389,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "diskUsage": disk_usage,
             "diskTotal": disk_total,
             "diskMaxUsage": disk_max_usage,
+            "diskMaxUsagePartition": disk_max_partition,
             "load1m": load.one,
             "load5m": load.five,
             "load15m": load.fifteen,
@@ -1444,10 +1455,10 @@ pub async fn report_node_online_once(
     let host_ip = local_ip_address::local_ip()
         .map(|ip| ip.to_string())
         .unwrap_or_default();
-    let now = crate::utils::time::now_timestamp();
+    let now = crate::utils::time::system_timestamp();
     let status = serde_json::json!({
         "buildVersion": env!("CARGO_PKG_VERSION"),
-        "buildVersionCode": 1000000,
+        "buildVersionCode": build_version_code(),
         "configVersion": config_store.get_config_version().await,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,

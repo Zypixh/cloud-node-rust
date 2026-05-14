@@ -1,3 +1,4 @@
+use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
 use std::ffi::CString;
 use std::fs;
@@ -82,6 +83,14 @@ where
         }
         task.await;
     });
+}
+
+fn build_time_display() -> String {
+    option_env!("CLOUD_NODE_BUILD_TIMESTAMP")
+        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S %z").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn check_running() -> Option<(u32, PathBuf)> {
@@ -191,6 +200,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Status) => {
+            println!("CloudNode version: {}", env!("CARGO_PKG_VERSION"));
+            println!("Build time: {}", build_time_display());
             if let Some((pid, _)) = check_running() {
                 println!("CloudNode is running (PID: {})", pid);
             } else {
