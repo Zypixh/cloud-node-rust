@@ -1109,6 +1109,7 @@ mod tests {
             conn_timeout: None,
             read_timeout: None,
             idle_timeout: None,
+            write_timeout: None,
             cert: None,
             tls_security_verify_mode: OriginTlsSecurityVerifyMode::Auto,
             tls_verify: None,

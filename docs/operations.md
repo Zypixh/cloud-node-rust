@@ -94,6 +94,10 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.0.9 --yes
 ```
 
+## 1.0.9 说明
+
+1.0.9 补充了集群级超时配置接入：`httpAll` 的源站连接、读取、空闲、写入超时，以及客户端自动读/写超时现在都会进入运行时配置；源站连接/读取/写入超时在访问日志中按 `504 Gateway Timeout` 处理。
+
 升级现有 Rust 节点到最新版：
 
 ```bash

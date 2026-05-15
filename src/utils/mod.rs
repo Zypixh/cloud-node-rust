@@ -39,17 +39,31 @@ pub fn ensure_single_instance(pid_file: &str) -> anyhow::Result<()> {
 }
 
 pub fn to_duration(v: &serde_json::Value) -> Duration {
+    if let Some(count) = v.as_u64() {
+        return Duration::from_secs(count);
+    }
+    if let Some(value) = v.as_str()
+        && let Ok(count) = value.trim().parse::<u64>()
+    {
+        return Duration::from_secs(count);
+    }
     if let Some(count) = v.get("count").and_then(|c| c.as_u64()) {
         let unit = v.get("unit").and_then(|u| u.as_str()).unwrap_or("s");
         let secs = match unit.to_lowercase().as_str() {
-            "m" | "min" => count * 60,
-            "h" | "hour" => count * 3600,
-            "d" | "day" => count * 86400,
+            "ms" | "millisecond" | "milliseconds" => return Duration::from_millis(count),
+            "m" | "min" | "minute" | "minutes" => count * 60,
+            "h" | "hour" | "hours" => count * 3600,
+            "d" | "day" | "days" => count * 86400,
             _ => count,
         };
         return Duration::from_secs(secs);
     }
     Duration::from_secs(30)
+}
+
+pub fn non_zero_duration(v: &serde_json::Value) -> Option<Duration> {
+    let duration = to_duration(v);
+    (!duration.is_zero()).then_some(duration)
 }
 
 pub fn fnv_hash64(s: &str) -> u64 {

@@ -4040,6 +4040,29 @@ impl ProxyHttp for EdgeProxy {
         ProxyCTX::default()
     }
 
+    async fn early_request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        let global_http = self.config.get_global_http_config_sync();
+        let read_timeout = global_http
+            .auto_read_timeout
+            .as_ref()
+            .and_then(crate::utils::non_zero_duration);
+        let write_timeout = global_http
+            .auto_write_timeout
+            .as_ref()
+            .and_then(crate::utils::non_zero_duration);
+        if read_timeout.is_some() {
+            session.as_mut().set_read_timeout(read_timeout);
+        }
+        if write_timeout.is_some() {
+            session.as_mut().set_write_timeout(write_timeout);
+        }
+        Ok(())
+    }
+
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let host = session
             .get_header("host")
@@ -4516,6 +4539,7 @@ impl ProxyHttp for EdgeProxy {
             matches!(e.esource(), ErrorSource::Upstream) && matches!(e.etype(), HTTPStatus(_));
         let code = match e.etype() {
             HTTPStatus(code) => *code,
+            ConnectTimedout | ReadTimedout | WriteTimedout => 504,
             _ => match e.esource() {
                 ErrorSource::Upstream => 502,
                 ErrorSource::Downstream => match e.etype() {
@@ -4836,7 +4860,7 @@ impl ProxyHttp for EdgeProxy {
 
             peer_obj.options.idle_timeout = Some(idle_timeout);
             peer_obj.options.read_timeout = backend_ext.and_then(|e| e.read_timeout);
-            peer_obj.options.write_timeout = None;
+            peer_obj.options.write_timeout = backend_ext.and_then(|e| e.write_timeout);
             peer_obj.options.connection_timeout = Some(connection_timeout);
 
             let origin_h3_selected =

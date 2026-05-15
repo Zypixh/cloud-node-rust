@@ -875,6 +875,7 @@ impl ConfigStore {
         node_ip_show_page: bool,
         node_ip_page_html: String,
         domain_mismatch_action: Option<crate::config_models::DomainMismatchActionConfig>,
+        global_http_config: Option<crate::config_models::GlobalHTTPAllConfig>,
         cache_policy: Vec<Arc<HTTPCachePolicy>>,
         firewall_policies: Vec<HTTPFirewallPolicy>,
         waf_actions: Vec<crate::config_models::WAFActionConfig>,
@@ -913,22 +914,21 @@ impl ConfigStore {
         lock.force_ln_request = force_ln_request;
         lock.parent_routes = parent_routes;
         lock.grpc_policy = grpc_policy.map(Arc::new);
-        // Build the pre-computed GlobalHTTPAllConfig Arc before moving individual fields.
-        let global_http = Arc::new(crate::config_models::GlobalHTTPAllConfig {
-            force_ln_request,
-            ln_request_scheduling_method: ln_method,
-            supports_low_version_http,
-            match_cert_from_all_servers,
-            server_name,
-            enable_server_addr_variable,
-            request_origins_with_encodings,
-            xff_max_addresses,
-            allow_lan_ip,
-            match_domain_strictly,
-            node_ip_show_page,
-            node_ip_page_html,
-            domain_mismatch_action,
-        });
+        let mut global_http = global_http_config.unwrap_or_default();
+        global_http.force_ln_request = force_ln_request;
+        global_http.ln_request_scheduling_method = ln_method;
+        global_http.supports_low_version_http = supports_low_version_http;
+        global_http.match_cert_from_all_servers = match_cert_from_all_servers;
+        global_http.server_name = server_name;
+        global_http.enable_server_addr_variable = enable_server_addr_variable;
+        global_http.request_origins_with_encodings = request_origins_with_encodings;
+        global_http.xff_max_addresses = xff_max_addresses;
+        global_http.allow_lan_ip = allow_lan_ip;
+        global_http.match_domain_strictly = match_domain_strictly;
+        global_http.node_ip_show_page = node_ip_show_page;
+        global_http.node_ip_page_html = node_ip_page_html;
+        global_http.domain_mismatch_action = domain_mismatch_action;
+        let global_http = Arc::new(global_http);
         lock.ln_request_scheduling_method = global_http.ln_request_scheduling_method.clone();
         lock.supports_low_version_http = global_http.supports_low_version_http;
         lock.match_cert_from_all_servers = global_http.match_cert_from_all_servers;
@@ -1262,6 +1262,13 @@ mod tests {
                     code: "redirect".to_string(),
                     options: json!({"url": "https://example.com"}),
                 }),
+                Some(crate::config_models::GlobalHTTPAllConfig {
+                    conn_timeout: Some(json!(50)),
+                    read_timeout: Some(json!({"count": 10, "unit": "s"})),
+                    auto_read_timeout: Some(json!(15)),
+                    auto_write_timeout: Some(json!(20)),
+                    ..Default::default()
+                }),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -1301,6 +1308,40 @@ mod tests {
                 .expect("domain mismatch action should be applied")
                 .code,
             "redirect"
+        );
+        assert_eq!(
+            snapshot
+                .global_http
+                .conn_timeout
+                .as_ref()
+                .and_then(|v| v.as_u64()),
+            Some(50)
+        );
+        assert_eq!(
+            crate::utils::non_zero_duration(
+                snapshot
+                    .global_http
+                    .read_timeout
+                    .as_ref()
+                    .expect("read timeout")
+            ),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            snapshot
+                .global_http
+                .auto_read_timeout
+                .as_ref()
+                .and_then(|v| v.as_u64()),
+            Some(15)
+        );
+        assert_eq!(
+            snapshot
+                .global_http
+                .auto_write_timeout
+                .as_ref()
+                .and_then(|v| v.as_u64()),
+            Some(20)
         );
         assert!(snapshot.global_access_log.is_some());
         assert_eq!(store.get_updating_server_list_id().await, 55);

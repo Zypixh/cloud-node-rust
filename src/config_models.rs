@@ -393,6 +393,34 @@ pub struct GlobalHTTPAllConfig {
     pub node_ip_page_html: String,
     #[serde(rename = "domainMismatchAction", default)]
     pub domain_mismatch_action: Option<DomainMismatchActionConfig>,
+    #[serde(
+        rename = "connTimeout",
+        alias = "connectionTimeout",
+        alias = "originConnTimeout",
+        alias = "originConnectionTimeout",
+        default
+    )]
+    pub conn_timeout: Option<Value>,
+    #[serde(rename = "readTimeout", alias = "originReadTimeout", default)]
+    pub read_timeout: Option<Value>,
+    #[serde(rename = "idleTimeout", alias = "originIdleTimeout", default)]
+    pub idle_timeout: Option<Value>,
+    #[serde(rename = "writeTimeout", alias = "originWriteTimeout", default)]
+    pub write_timeout: Option<Value>,
+    #[serde(
+        rename = "autoReadTimeout",
+        alias = "autoReadDataTimeout",
+        alias = "clientReadTimeout",
+        default
+    )]
+    pub auto_read_timeout: Option<Value>,
+    #[serde(
+        rename = "autoWriteTimeout",
+        alias = "autoWriteDataTimeout",
+        alias = "clientWriteTimeout",
+        default
+    )]
+    pub auto_write_timeout: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -2603,6 +2631,8 @@ pub struct OriginConfig {
     pub read_timeout: Option<Value>,
     #[serde(rename = "idleTimeout", default)]
     pub idle_timeout: Option<Value>,
+    #[serde(rename = "writeTimeout", default)]
+    pub write_timeout: Option<Value>,
     pub cert: Option<SSLCertConfig>,
     #[serde(
         rename = "tlsSecurityVerifyMode",
@@ -2904,7 +2934,12 @@ mod tests {
                             "statusCode": 451,
                             "contentHTML": "blocked"
                         }
-                    }
+                    },
+                    "connTimeout": 50,
+                    "readTimeout": {"count": 10, "unit": "s"},
+                    "idleTimeout": 0,
+                    "autoReadTimeout": 15,
+                    "autoWriteTimeout": "20"
                 }
             }
         }))
@@ -2924,6 +2959,33 @@ mod tests {
             .expect("domain mismatch action should parse");
         assert_eq!(action.code, "page");
         assert_eq!(action.options["statusCode"], 451);
+        assert_eq!(
+            http_all.conn_timeout.as_ref().and_then(|v| v.as_u64()),
+            Some(50)
+        );
+        assert_eq!(
+            http_all
+                .read_timeout
+                .as_ref()
+                .and_then(|v| v.get("count"))
+                .and_then(|v| v.as_u64()),
+            Some(10)
+        );
+        assert_eq!(
+            http_all.idle_timeout.as_ref().and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            http_all.auto_read_timeout.as_ref().and_then(|v| v.as_u64()),
+            Some(15)
+        );
+        assert_eq!(
+            http_all
+                .auto_write_timeout
+                .as_ref()
+                .and_then(|v| v.as_str()),
+            Some("20")
+        );
     }
 
     #[test]

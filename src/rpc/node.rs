@@ -903,13 +903,17 @@ pub async fn fetch_and_apply_config<F>(
                                 let names = crate::rpc::utils::server_runtime_names(server);
                                 let (lb_arc, has_hc) = match &server.reverse_proxy {
                                     Some(rp_cfg) => {
-                                        match crate::lb_factory::build_lb_blocking(
+                                        match crate::lb_factory::build_lb_blocking_with_global_http(
                                             server_id,
                                             rp_cfg.clone(),
                                             node_level,
                                             Arc::new(parent_nodes.clone()),
                                             tiered_origin_bypass,
                                             allow_lan_ip,
+                                            payload
+                                                .global_server_config
+                                                .as_ref()
+                                                .and_then(|g| g.http_all.clone()),
                                         )
                                         .await
                                         {
@@ -1124,6 +1128,10 @@ pub async fn fetch_and_apply_config<F>(
                                     node_ip_show_page,
                                     node_ip_page_html,
                                     domain_mismatch_action,
+                                    payload
+                                        .global_server_config
+                                        .as_ref()
+                                        .and_then(|g| g.http_all.clone()),
                                     payload
                                         .http_cache_policies
                                         .iter()

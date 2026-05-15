@@ -1,5 +1,6 @@
 use crate::config_models::{
-    OriginConfig, OriginTlsSecurityVerifyMode, ParentNodeConfig, ReverseProxyConfig,
+    GlobalHTTPAllConfig, OriginConfig, OriginTlsSecurityVerifyMode, ParentNodeConfig,
+    ReverseProxyConfig,
 };
 use futures_util::FutureExt;
 use http;
@@ -230,6 +231,7 @@ pub struct BackendExtension {
     pub connection_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
     pub idle_timeout: Option<Duration>,
+    pub write_timeout: Option<Duration>,
     pub client_cert: Option<crate::config_models::SSLCertConfig>,
     pub unsupported_reason: Option<String>,
     pub oss_backend: Option<crate::oss_origin::OssBackend>,
@@ -243,21 +245,39 @@ pub fn build_lb(
     _tiered_origin_bypass: bool,
     allow_lan: bool,
 ) -> (Arc<AnyLoadBalancer>, bool) {
-    build_origin_pool(rp_cfg, allow_lan)
+    build_origin_pool(rp_cfg, allow_lan, None)
 }
 
-fn build_origin_pool(rp_cfg: &ReverseProxyConfig, allow_lan: bool) -> (Arc<AnyLoadBalancer>, bool) {
+pub fn build_lb_with_global_http(
+    _server_id: i64,
+    rp_cfg: &ReverseProxyConfig,
+    _level: i32,
+    _parent_nodes: &HashMap<i64, Vec<ParentNodeConfig>>,
+    _tiered_origin_bypass: bool,
+    allow_lan: bool,
+    global_http: Option<&GlobalHTTPAllConfig>,
+) -> (Arc<AnyLoadBalancer>, bool) {
+    build_origin_pool(rp_cfg, allow_lan, global_http)
+}
+
+fn build_origin_pool(
+    rp_cfg: &ReverseProxyConfig,
+    allow_lan: bool,
+    global_http: Option<&GlobalHTTPAllConfig>,
+) -> (Arc<AnyLoadBalancer>, bool) {
     let (primary, primary_hc) = build_origin_lb(
         rp_cfg,
         &rp_cfg.primary_origins,
         OriginRole::Primary,
         allow_lan,
+        global_http,
     );
     let (backup, backup_hc) = build_origin_lb(
         rp_cfg,
         &rp_cfg.backup_origins,
         OriginRole::Backup,
         allow_lan,
+        global_http,
     );
 
     match (primary, backup) {
@@ -275,6 +295,7 @@ fn build_origin_lb(
     origins: &[OriginConfig],
     role: OriginRole,
     allow_lan: bool,
+    global_http: Option<&GlobalHTTPAllConfig>,
 ) -> (Option<Arc<AnyLoadBalancer>>, bool) {
     let mut endpoints = Vec::new();
     let mut unsupported_endpoints = Vec::new();
@@ -286,7 +307,7 @@ fn build_origin_lb(
         }
 
         if origin.is_oss() {
-            match oss_origin_backend(origin, role, rp_cfg, allow_lan) {
+            match oss_origin_backend(origin, role, rp_cfg, allow_lan, global_http) {
                 Some(backend) => endpoints.push(backend),
                 None => {
                     if let Some(backend) = unsupported_origin_backend(
@@ -338,9 +359,22 @@ fn build_origin_lb(
             tls_security_verify_mode: origin.tls_security_verify_mode,
             legacy_tls_verify,
             request_host_excluding_port: rp_cfg.request_host_excluding_port,
-            connection_timeout: origin.conn_timeout.as_ref().map(crate::utils::to_duration),
-            read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
-            idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
+            connection_timeout: origin_or_global_duration(
+                origin.conn_timeout.as_ref(),
+                global_http.and_then(|cfg| cfg.conn_timeout.as_ref()),
+            ),
+            read_timeout: origin_or_global_duration(
+                origin.read_timeout.as_ref(),
+                global_http.and_then(|cfg| cfg.read_timeout.as_ref()),
+            ),
+            idle_timeout: origin_or_global_duration(
+                origin.idle_timeout.as_ref(),
+                global_http.and_then(|cfg| cfg.idle_timeout.as_ref()),
+            ),
+            write_timeout: origin_or_global_duration(
+                origin.write_timeout.as_ref(),
+                global_http.and_then(|cfg| cfg.write_timeout.as_ref()),
+            ),
             client_cert: origin.cert.clone(),
             unsupported_reason: None,
             oss_backend: None,
@@ -481,6 +515,7 @@ fn fallback_lb() -> (Arc<AnyLoadBalancer>, bool) {
         connection_timeout: None,
         read_timeout: None,
         idle_timeout: None,
+        write_timeout: None,
         client_cert: None,
         unsupported_reason: None,
         oss_backend: None,
@@ -523,6 +558,7 @@ fn unsupported_origin_backend(
         connection_timeout: origin.conn_timeout.as_ref().map(crate::utils::to_duration),
         read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
         idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
+        write_timeout: origin.write_timeout.as_ref().map(crate::utils::to_duration),
         client_cert: origin.cert.clone(),
         unsupported_reason: Some(reason.to_string()),
         oss_backend: None,
@@ -537,6 +573,7 @@ fn oss_origin_backend(
     role: OriginRole,
     rp_cfg: &ReverseProxyConfig,
     allow_lan: bool,
+    global_http: Option<&GlobalHTTPAllConfig>,
 ) -> Option<Backend> {
     let oss_backend = match crate::oss_origin::OssBackend::from_origin(origin) {
         Ok(config) => config,
@@ -571,9 +608,22 @@ fn oss_origin_backend(
         tls_security_verify_mode: origin.tls_security_verify_mode,
         legacy_tls_verify,
         request_host_excluding_port: rp_cfg.request_host_excluding_port,
-        connection_timeout: non_zero_duration(origin.conn_timeout.as_ref()),
-        read_timeout: non_zero_duration(origin.read_timeout.as_ref()),
-        idle_timeout: non_zero_duration(origin.idle_timeout.as_ref()),
+        connection_timeout: origin_or_global_duration(
+            origin.conn_timeout.as_ref(),
+            global_http.and_then(|cfg| cfg.conn_timeout.as_ref()),
+        ),
+        read_timeout: origin_or_global_duration(
+            origin.read_timeout.as_ref(),
+            global_http.and_then(|cfg| cfg.read_timeout.as_ref()),
+        ),
+        idle_timeout: origin_or_global_duration(
+            origin.idle_timeout.as_ref(),
+            global_http.and_then(|cfg| cfg.idle_timeout.as_ref()),
+        ),
+        write_timeout: origin_or_global_duration(
+            origin.write_timeout.as_ref(),
+            global_http.and_then(|cfg| cfg.write_timeout.as_ref()),
+        ),
         client_cert: origin.cert.clone(),
         unsupported_reason: None,
         oss_backend: Some(oss_backend),
@@ -613,10 +663,13 @@ fn parse_legacy_tls_verify(value: Option<&serde_json::Value>) -> Option<bool> {
     })
 }
 
-fn non_zero_duration(value: Option<&serde_json::Value>) -> Option<Duration> {
-    value
-        .map(crate::utils::to_duration)
-        .filter(|duration| !duration.is_zero())
+fn origin_or_global_duration(
+    origin_value: Option<&serde_json::Value>,
+    global_value: Option<&serde_json::Value>,
+) -> Option<Duration> {
+    origin_value
+        .and_then(crate::utils::non_zero_duration)
+        .or_else(|| global_value.and_then(crate::utils::non_zero_duration))
 }
 
 fn backend_from_oss_target(
@@ -680,14 +733,37 @@ pub async fn build_lb_blocking(
     tiered_origin_bypass: bool,
     allow_lan: bool,
 ) -> anyhow::Result<(Arc<AnyLoadBalancer>, bool)> {
+    build_lb_blocking_with_global_http(
+        server_id,
+        rp_cfg,
+        level,
+        parent_nodes,
+        tiered_origin_bypass,
+        allow_lan,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::type_complexity)]
+pub async fn build_lb_blocking_with_global_http(
+    server_id: i64,
+    rp_cfg: ReverseProxyConfig,
+    level: i32,
+    parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
+    tiered_origin_bypass: bool,
+    allow_lan: bool,
+    global_http: Option<GlobalHTTPAllConfig>,
+) -> anyhow::Result<(Arc<AnyLoadBalancer>, bool)> {
     tokio::task::spawn_blocking(move || {
-        build_lb(
+        build_lb_with_global_http(
             server_id,
             &rp_cfg,
             level,
             parent_nodes.as_ref(),
             tiered_origin_bypass,
             allow_lan,
+            global_http.as_ref(),
         )
     })
     .await
@@ -736,6 +812,7 @@ pub fn build_parent_lb(
                     connection_timeout: None,
                     read_timeout: None,
                     idle_timeout: None,
+                    write_timeout: None,
                     client_cert: None,
                     unsupported_reason: None,
                     oss_backend: None,
@@ -905,11 +982,32 @@ mod tests {
             conn_timeout: None,
             read_timeout: None,
             idle_timeout: None,
+            write_timeout: None,
             cert: None,
             tls_security_verify_mode: OriginTlsSecurityVerifyMode::Auto,
             tls_verify: None,
             oss: None,
         }
+    }
+
+    #[test]
+    fn origin_timeout_zero_falls_back_to_global_http_timeout() {
+        let global = Some(serde_json::json!(50));
+        let other = Some(serde_json::json!(8));
+
+        assert_eq!(
+            origin_or_global_duration(Some(&serde_json::json!(0)), global.as_ref()),
+            Some(Duration::from_secs(50))
+        );
+        assert_eq!(
+            origin_or_global_duration(other.as_ref(), global.as_ref()),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(
+            origin_or_global_duration(None, global.as_ref()),
+            Some(Duration::from_secs(50))
+        );
+        assert_eq!(origin_or_global_duration(None, None), None);
     }
 
     #[test]
@@ -952,6 +1050,7 @@ mod tests {
             connection_timeout: None,
             read_timeout: None,
             idle_timeout: None,
+            write_timeout: None,
             client_cert: None,
             unsupported_reason: None,
             oss_backend: None,
