@@ -615,7 +615,7 @@ pub fn log_sni_passthrough_access(
     client_addr: SocketAddr,
     listen_port: u16,
     backend_addr: &str,
-    _started_at_millis: i64,
+    started_at_millis: i64,
     duration: Duration,
     bytes_received: u64,
     bytes_sent: u64,
@@ -628,7 +628,11 @@ pub fn log_sni_passthrough_access(
     };
 
     let server_id = server.id.unwrap_or(0);
-    let request_started_at_millis = access_log_started_at_millis(duration);
+    let request_started_at_millis = if started_at_millis > 0 {
+        started_at_millis
+    } else {
+        access_log_started_at_millis(duration)
+    };
     let request_started_at = request_started_at_millis / 1000;
 
     let start_dt = crate::utils::time::local_from_timestamp_millis(request_started_at_millis);

@@ -1509,6 +1509,18 @@ pub async fn report_node_online_once(
             );
         }
     }
+    if let Err(err) = service
+        .update_node_is_installed(pb::UpdateNodeIsInstalledRequest {
+            node_id,
+            is_installed: true,
+        })
+        .await
+    {
+        debug!(
+            "RPC_NODE: updateNodeIsInstalled is not accepted by this API node: {}",
+            err
+        );
+    }
     service
         .update_node_status(pb::UpdateNodeStatusRequest {
             node_id,
