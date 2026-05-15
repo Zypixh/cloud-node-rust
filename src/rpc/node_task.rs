@@ -29,6 +29,7 @@ pub async fn sync_node_tasks(
     cert_selector: &crate::ssl::DynamicCertSelector,
     ip_list_manager: &crate::firewall::lists::GlobalIpListManager,
     task_version: &mut i64,
+    config_version: &mut i64,
 ) {
     let client = match RpcClient::new(api_config).await {
         Ok(c) => c,
@@ -73,8 +74,18 @@ pub async fn sync_node_tasks(
                             )
                             .await
                         } else {
-                            trigger_task_sync();
-                            true
+                            let mut node_service = client.node_service();
+                            let mut requested_task_version = task.version;
+                            crate::rpc::node::fetch_and_apply_config(
+                                &mut node_service,
+                                config_store,
+                                api_config,
+                                health_manager,
+                                cert_selector,
+                                &mut requested_task_version,
+                                config_version,
+                            )
+                            .await
                         }
                     }
                     "nodeLevelChanged" => {
@@ -153,7 +164,7 @@ pub async fn sync_node_tasks(
                     ip_list_manager.remove_list(list_id);
                 }
 
-                let _ = task_service
+                let reported = task_service
                     .report_node_task_done(pb::ReportNodeTaskDoneRequest {
                         node_task_id: task.id,
                         is_ok: success,
@@ -163,10 +174,13 @@ pub async fn sync_node_tasks(
                             "Task failed".to_string()
                         },
                     })
-                    .await;
+                    .await
+                    .is_ok();
 
-                if task.version > *task_version {
+                if success && reported && task.version > *task_version {
                     *task_version = task.version;
+                } else if !reported {
+                    warn!("Failed to report NodeTask {} completion", task.id);
                 }
             }
         }

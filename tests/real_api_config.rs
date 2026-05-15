@@ -3,8 +3,6 @@ use std::time::Duration;
 
 use cloud_node_rust::api_config::ApiConfig;
 use cloud_node_rust::config::ConfigStore;
-use cloud_node_rust::firewall::lists::GlobalIpListManager;
-use cloud_node_rust::firewall::state::WafStateManager;
 use cloud_node_rust::health_manager::GlobalHealthManager;
 use cloud_node_rust::pb;
 use cloud_node_rust::rpc::client::RpcClient;
@@ -66,8 +64,6 @@ async fn real_api_config_can_be_fetched_parsed_and_applied() -> anyhow::Result<(
     };
 
     let config_store = ConfigStore::new();
-    let waf_state = Arc::new(WafStateManager::new());
-    let ip_list_manager = Arc::new(GlobalIpListManager::new(waf_state));
     let health_manager = GlobalHealthManager::new(4);
     let cert_selector = Arc::new(DynamicCertSelector::new());
     let rpc_client = RpcClient::new(&api_config).await?;
@@ -114,7 +110,6 @@ async fn real_api_config_can_be_fetched_parsed_and_applied() -> anyhow::Result<(
 
     let mut node_service = rpc_client.node_service();
     let mut task_version = 0;
-    let mut deleted_content_version = 0;
     let mut config_version = -1;
 
     tokio::time::timeout(
@@ -123,11 +118,9 @@ async fn real_api_config_can_be_fetched_parsed_and_applied() -> anyhow::Result<(
             &mut node_service,
             &config_store,
             &api_config,
-            &ip_list_manager,
             &health_manager,
             &cert_selector,
             &mut task_version,
-            &mut deleted_content_version,
             &mut config_version,
         ),
     )

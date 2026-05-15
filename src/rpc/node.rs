@@ -231,18 +231,29 @@ pub async fn start_config_syncer(
 
         let mut node_service = client.node_service();
 
-        fetch_and_apply_config(
+        if fetch_and_apply_config(
             &mut node_service,
             &config_store,
             &api_config,
-            &ip_list_manager,
             &health_manager,
             &cert_selector,
             &mut task_version,
-            &mut deleted_content_version,
             &mut config_version,
         )
-        .await;
+        .await
+        {
+            sync_deleted_contents(&api_config, &config_store, &mut deleted_content_version).await;
+            sync_node_tasks(
+                &api_config,
+                &config_store,
+                &health_manager,
+                &cert_selector,
+                &ip_list_manager,
+                &mut task_version,
+                &mut config_version,
+            )
+            .await;
+        }
 
         report_connected_api_nodes(&api_config).await;
 
@@ -352,13 +363,12 @@ pub async fn fetch_and_apply_config<F>(
     >,
     config_store: &ConfigStore,
     api_config: &ApiConfig,
-    ip_list_manager: &crate::firewall::lists::GlobalIpListManager,
     health_manager: &crate::health_manager::GlobalHealthManager,
     cert_selector: &crate::ssl::DynamicCertSelector,
     task_version: &mut i64,
-    deleted_content_version: &mut i64,
     config_version: &mut i64,
-) where
+) -> bool
+where
     F: FnMut(Request<()>) -> Result<Request<()>, Status> + Send + 'static,
 {
     let current_id = config_store.get_node_id().await;
@@ -383,6 +393,7 @@ pub async fn fetch_and_apply_config<F>(
                     debug!("RPC_NODE: No configuration changes reported by API.");
                 } else {
                     warn!("RPC_NODE: API reported change but sent empty JSON!");
+                    return false;
                 }
             } else {
                 debug!(
@@ -390,7 +401,6 @@ pub async fn fetch_and_apply_config<F>(
                     config_resp.node_json.len(),
                     config_resp.is_compressed
                 );
-                *config_version = config_resp.timestamp;
                 let mut node_json = config_resp.node_json;
 
                 if config_resp.is_compressed {
@@ -405,11 +415,11 @@ pub async fn fetch_and_apply_config<F>(
                         Ok(Ok(decoded)) => node_json = decoded,
                         Ok(Err(e)) => {
                             error!("Failed to decompress node_json: {}", e);
-                            return;
+                            return false;
                         }
                         Err(e) => {
                             error!("Failed to join node_json decompression task: {}", e);
-                            return;
+                            return false;
                         }
                     }
                 }
@@ -428,20 +438,21 @@ pub async fn fetch_and_apply_config<F>(
                     }
                 }
 
-                *config_version = config_resp.timestamp;
+                if !should_reload {
+                    *config_version = config_resp.timestamp;
+                }
 
                 if should_reload {
                     log_raw_json_hints("node_json", &node_json);
-                    // Content changed, update hash and proceed
-                    {
-                        let mut last_hash = LAST_CONFIG_HASH.write();
-                        *last_hash = current_hash;
-                    }
-
                     match serde_json::from_slice::<crate::config_models::NodeConfigPayload>(
                         &node_json,
                     ) {
                         Ok(mut payload) => {
+                            *config_version = config_resp.timestamp;
+                            {
+                                let mut last_hash = LAST_CONFIG_HASH.write();
+                                *last_hash = current_hash;
+                            }
                             let numeric_id = payload.id.unwrap_or(0);
                             let mut payload_servers = payload.servers.clone();
 
@@ -1236,24 +1247,21 @@ pub async fn fetch_and_apply_config<F>(
                                 }
                             }
                         }
-                        Err(e) => error!("Error parsing NodeConfigPayload: {}", e),
+                        Err(e) => {
+                            error!("Error parsing NodeConfigPayload: {}", e);
+                            return false;
+                        }
                     }
                 }
             }
         }
-        Err(e) => error!("Error fetching node config: {}", e),
+        Err(e) => {
+            error!("Error fetching node config: {}", e);
+            return false;
+        }
     }
 
-    sync_deleted_contents(api_config, config_store, deleted_content_version).await;
-    sync_node_tasks(
-        api_config,
-        config_store,
-        health_manager,
-        cert_selector,
-        ip_list_manager,
-        task_version,
-    )
-    .await;
+    true
 }
 
 pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: ApiConfig) {
