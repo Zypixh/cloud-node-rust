@@ -430,6 +430,38 @@ impl EdgeProxy {
         }
     }
 
+    fn normalize_request_host(host: &str) -> String {
+        let host = host.rsplit('@').next().unwrap_or(host).trim();
+        crate::lb_factory::strip_addr_port(host)
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+    }
+
+    fn request_host(session: &Session) -> String {
+        let host = session
+            .get_header("host")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                session
+                    .get_header(":authority")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .or_else(|| {
+                session
+                    .req_header()
+                    .uri
+                    .authority()
+                    .map(|value| value.as_str())
+            })
+            .or_else(|| session.req_header().uri.host())
+            .unwrap_or_default();
+        Self::normalize_request_host(host)
+    }
+
     fn replace_addr_port(addr: &str, port: u16) -> String {
         let host = crate::lb_factory::strip_addr_port(addr);
         if host.contains(':') && !host.starts_with('[') {
@@ -4066,12 +4098,7 @@ impl ProxyHttp for EdgeProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let host = session
-            .get_header("host")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.split(':').next().unwrap_or(v))
-            .unwrap_or_else(|| session.req_header().uri.host().unwrap_or(""))
-            .to_lowercase();
+        let host = Self::request_host(session);
         ctx.host = host.clone();
         ctx.is_tls_downstream = self.tls_downstream;
         ctx.is_http3_downstream = session.req_header().version == http::Version::HTTP_3;
@@ -4466,12 +4493,11 @@ impl ProxyHttp for EdgeProxy {
             let query = session.req_header().uri.query().unwrap_or("");
 
             if !host_redirects.is_empty() {
-                let redirect_host = session
-                    .get_header("host")
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(&host)
-                    .to_ascii_lowercase();
+                let redirect_host = if host.is_empty() {
+                    Self::request_host(session)
+                } else {
+                    host.clone()
+                };
                 let user_agent = session
                     .get_header("user-agent")
                     .and_then(|v| v.to_str().ok())

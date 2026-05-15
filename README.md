@@ -33,25 +33,6 @@ nodeId: "your-node-id"
 secret: "your-node-secret"
 ```
 
-构建：
-
-```bash
-cargo build --release
-```
-
-前台运行：
-
-```bash
-./target/release/cloud-node-rust
-```
-
-安装为系统命令和 systemd 服务（以下安装命令默认在 root 用户下执行）：
-
-```bash
-./target/release/cloud-node-rust install
-systemctl start cloud-node
-```
-
 从 Go 原版节点迁移到 GitHub 最新 Rust Release，或全新安装：
 
 ```bash

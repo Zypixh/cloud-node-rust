@@ -39,16 +39,7 @@ sudo ./target/release/cloud-node-rust install
 - 写入 `/usr/bin/cloud-node` wrapper。
 - 写入 `/etc/systemd/system/cloud-node.service` 并启用服务。
 
-安装后的常用命令：
-
-```bash
-sudo systemctl start cloud-node
-sudo systemctl stop cloud-node
-sudo systemctl restart cloud-node
-sudo systemctl status cloud-node
-```
-
-也可以直接使用：
+安装后的常用命令优先使用节点内置进程命令：
 
 ```bash
 cloud-node start
@@ -56,6 +47,8 @@ cloud-node stop
 cloud-node restart
 cloud-node status
 ```
+
+systemd unit 仍会注册，用于开机自启、日志和状态排障。
 
 ## 从 Go 原版迁移安装 Rust 版
 

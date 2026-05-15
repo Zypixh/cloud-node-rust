@@ -133,15 +133,26 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         .headers
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .map(|v| v.split(':').next().unwrap_or(v))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            req.headers
+                .get(":authority")
+                .and_then(|h| h.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| req.uri.authority().map(|value| value.as_str()))
+        .or_else(|| req.uri.host())
         .or_else(|| {
             if ctx.host.is_empty() {
-                req.uri.host()
+                None
             } else {
                 Some(ctx.host.as_str())
             }
         })
-        .unwrap_or("-");
+        .map(crate::lb_factory::strip_addr_port)
+        .unwrap_or_else(|| "-".to_string());
 
     let proto = if ctx.is_http3_bridge {
         "HTTP/3.0"
@@ -601,7 +612,7 @@ fn apply_fields_whitelist(log: &mut pb::HttpAccessLog, fields: &[i32]) {
         log.firewall_actions.clear();
     }
     if !allowed.contains(&50) {
-        log.tags.clear();
+        log.tags.retain(|tag| tag == "rewrite");
     }
     if !allowed.contains(&51) {
         log.request_body.clear();

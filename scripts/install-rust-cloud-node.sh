@@ -1242,14 +1242,18 @@ case "$START_MODE" in
 esac
 
 if [ "$RESTART_SERVICE" -eq 1 ]; then
-    if command -v systemctl >/dev/null 2>&1; then
+    if [ "$DRY_RUN" -eq 0 ]; then
         if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
-            run systemctl restart "$SERVICE_NAME"
+            log "+ cd $INSTALL_DIR && $INSTALL_BINARY restart"
+            (cd "$INSTALL_DIR" && "$INSTALL_BINARY" restart)
         else
-            run systemctl start "$SERVICE_NAME"
+            log "+ cd $INSTALL_DIR && $INSTALL_BINARY start"
+            (cd "$INSTALL_DIR" && "$INSTALL_BINARY" start)
         fi
+    elif [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+        log "+ cd $INSTALL_DIR && $INSTALL_BINARY restart"
     else
-        warn "systemctl not found; please restart $SERVICE_NAME manually"
+        log "+ cd $INSTALL_DIR && $INSTALL_BINARY start"
     fi
 fi
 
