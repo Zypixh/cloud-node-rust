@@ -18,7 +18,7 @@ use crate::cache_manager::CACHE;
 use crate::config::ConfigStore;
 use crate::config_models::{HTTPCachePolicy, HTTPCacheRef, HTTPFirewallPolicy, ServerConfig};
 use crate::firewall::state::WafStateManager;
-use crate::rewrite::{RewriteResult, evaluate_host_redirects, evaluate_rewrites};
+use crate::rewrite::{RewriteResult, evaluate_host_redirects, evaluate_rewrites_with_cond};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -113,6 +113,7 @@ pub struct ProxyCTX {
     pub waf_group_id: i64,
     pub waf_set_id: i64,
     pub waf_rule_id: i64,
+    pub rewrite_id: i64,
     pub waf_deferred: bool,
     pub waf_action: Option<String>,
     pub errors: Option<Vec<String>>,
@@ -204,6 +205,7 @@ impl Default for ProxyCTX {
             waf_group_id: 0,
             waf_set_id: 0,
             waf_rule_id: 0,
+            rewrite_id: 0,
             waf_deferred: false,
             waf_action: None,
             errors: None,
@@ -4490,8 +4492,30 @@ impl ProxyHttp for EdgeProxy {
             }
 
             if !rewrite_rules.is_empty() {
-                match evaluate_rewrites(uri_str, query, rewrite_refs, rewrite_rules) {
-                    RewriteResult::Redirect { location, status } => {
+                let scheme = Self::forwarded_proto(session, ctx);
+                let rewrite_result = evaluate_rewrites_with_cond(
+                    uri_str,
+                    query,
+                    Some(&host),
+                    rewrite_refs,
+                    rewrite_rules,
+                    |rule| {
+                        rule.conds
+                            .as_ref()
+                            .map(|conds| conds.match_request_with_scheme(session, scheme))
+                            .unwrap_or(true)
+                    },
+                );
+                match rewrite_result {
+                    RewriteResult::Redirect {
+                        location,
+                        status,
+                        rewrite_id,
+                    } => {
+                        ctx.rewrite_id = rewrite_id;
+                        ctx.tags
+                            .get_or_insert_with(Vec::new)
+                            .push("rewrite".to_string());
                         let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
                         resp.insert_header("location", location).unwrap();
                         session.write_response_header(Box::new(resp), true).await?;
@@ -4500,9 +4524,21 @@ impl ProxyHttp for EdgeProxy {
                     RewriteResult::Proxy {
                         new_uri,
                         proxy_host,
+                        rewrite_id,
                     } => {
+                        ctx.rewrite_id = rewrite_id;
+                        ctx.tags
+                            .get_or_insert_with(Vec::new)
+                            .push("rewrite".to_string());
+                        let preserve_original_host = proxy_host.is_none();
                         if let Ok(new_parsed) = new_uri.parse::<http::Uri>() {
                             session.req_header_mut().set_uri(new_parsed);
+                            if preserve_original_host && !ctx.host.is_empty() {
+                                session
+                                    .req_header_mut()
+                                    .insert_header("host", ctx.host.clone())
+                                    .unwrap();
+                            }
                         }
                         if let Some(host) = proxy_host {
                             ctx.origin_host = host;

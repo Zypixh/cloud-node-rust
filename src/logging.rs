@@ -134,7 +134,14 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         .get("host")
         .and_then(|h| h.to_str().ok())
         .map(|v| v.split(':').next().unwrap_or(v))
-        .unwrap_or_else(|| req.uri.host().unwrap_or("-"));
+        .or_else(|| {
+            if ctx.host.is_empty() {
+                req.uri.host()
+            } else {
+                Some(ctx.host.as_str())
+            }
+        })
+        .unwrap_or("-");
 
     let proto = if ctx.is_http3_bridge {
         "HTTP/3.0"
@@ -300,7 +307,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         server_id,
         node_id: NUMERIC_NODE_ID.load(Ordering::Relaxed),
         location_id: 0,
-        rewrite_id: 0,
+        rewrite_id: ctx.rewrite_id,
         origin_id,
         remote_addr: ctx.client_ip_str.clone(),
         raw_remote_addr: if ctx.raw_remote_addr.is_empty() {

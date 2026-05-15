@@ -66,41 +66,35 @@ impl HTTPRequestCond {
             }
             "eq" | "equals" => {
                 if self.is_case_insensitive {
-                    param_value.to_lowercase() == self.value.to_lowercase()
+                    eq_case_insensitive(&param_value, &self.value)
                 } else {
                     param_value == self.value
                 }
             }
             "neq" | "notEquals" => {
                 if self.is_case_insensitive {
-                    param_value.to_lowercase() != self.value.to_lowercase()
+                    !eq_case_insensitive(&param_value, &self.value)
                 } else {
                     param_value != self.value
                 }
             }
             "prefix" | "hasPrefix" => {
                 if self.is_case_insensitive {
-                    param_value
-                        .to_lowercase()
-                        .starts_with(&self.value.to_lowercase())
+                    starts_with_ascii_case_insensitive(&param_value, &self.value)
                 } else {
                     param_value.starts_with(&self.value)
                 }
             }
             "suffix" | "hasSuffix" => {
                 if self.is_case_insensitive {
-                    param_value
-                        .to_lowercase()
-                        .ends_with(&self.value.to_lowercase())
+                    ends_with_ascii_case_insensitive(&param_value, &self.value)
                 } else {
                     param_value.ends_with(&self.value)
                 }
             }
             "contains" | "containsString" => {
                 if self.is_case_insensitive {
-                    param_value
-                        .to_lowercase()
-                        .contains(&self.value.to_lowercase())
+                    contains_ascii_case_insensitive(&param_value, &self.value)
                 } else {
                     param_value.contains(&self.value)
                 }
@@ -109,8 +103,7 @@ impl HTTPRequestCond {
                 let values = cached_list_values(&self.value);
                 if !values.is_empty() {
                     if self.is_case_insensitive {
-                        let lower_param = param_value.to_lowercase();
-                        values.iter().any(|v| v.to_lowercase() == lower_param)
+                        values.iter().any(|v| eq_case_insensitive(&param_value, v))
                     } else {
                         values.contains(&param_value)
                     }
@@ -272,6 +265,43 @@ fn extension_in_configured_values(extension: &str, value: &str) -> bool {
         };
         item == extension
     })
+}
+
+fn eq_case_insensitive(value: &str, expected: &str) -> bool {
+    if value.is_ascii() && expected.is_ascii() {
+        value.eq_ignore_ascii_case(expected)
+    } else {
+        value.to_lowercase() == expected.to_lowercase()
+    }
+}
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    if value.is_ascii() && prefix.is_ascii() {
+        return value.len() >= prefix.len()
+            && value.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes());
+    }
+    value.to_lowercase().starts_with(&prefix.to_lowercase())
+}
+
+fn ends_with_ascii_case_insensitive(value: &str, suffix: &str) -> bool {
+    if value.is_ascii() && suffix.is_ascii() {
+        return value.len() >= suffix.len()
+            && value.as_bytes()[value.len() - suffix.len()..]
+                .eq_ignore_ascii_case(suffix.as_bytes());
+    }
+    value.to_lowercase().ends_with(&suffix.to_lowercase())
+}
+
+fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
+    if value.is_ascii() && needle.is_ascii() {
+        return !needle.is_empty()
+            && value.len() >= needle.len()
+            && value
+                .as_bytes()
+                .windows(needle.len())
+                .any(|part| part.eq_ignore_ascii_case(needle.as_bytes()));
+    }
+    value.to_lowercase().contains(&needle.to_lowercase())
 }
 
 fn get_cached_regex(pattern: &str) -> Option<Arc<Regex>> {

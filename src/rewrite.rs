@@ -5,14 +5,20 @@ use regex::Regex;
 use std::sync::Arc;
 use tracing::debug;
 
+#[derive(Debug)]
 pub enum RewriteResult {
     /// Continue to proxy with possibly modified URI
     Proxy {
         new_uri: String,
         proxy_host: Option<String>,
+        rewrite_id: i64,
     },
     /// Redirect to another URL
-    Redirect { location: String, status: u16 },
+    Redirect {
+        location: String,
+        status: u16,
+        rewrite_id: i64,
+    },
     /// No rewrite matched, continue with original
     NoMatch,
 }
@@ -20,26 +26,124 @@ pub enum RewriteResult {
 /// Match and evaluate rewrite rules using the legacy configureWeb/doRewrite behavior.
 static REWRITE_RE_CACHE: Lazy<DashMap<String, std::sync::Arc<Regex>>> = Lazy::new(DashMap::new);
 
+fn rewrite_pattern_regex(pattern: &str) -> Option<Arc<Regex>> {
+    if let Some(cached) = REWRITE_RE_CACHE.get(pattern) {
+        return Some(cached.clone());
+    }
+    let compiled = if pattern == "*" {
+        Regex::new("^/(.*)$")
+    } else {
+        Regex::new(pattern)
+    }
+    .ok()?;
+    let re = Arc::new(compiled);
+    REWRITE_RE_CACHE.insert(pattern.to_string(), Arc::clone(&re));
+    Some(re)
+}
+
+fn expand_rewrite_replacement(
+    regex: &Regex,
+    captures: &regex::Captures<'_>,
+    replacement: &str,
+) -> String {
+    let mut result = expand_go_regex_replacement(regex, captures, replacement);
+    for index in 0..captures.len() {
+        let value = captures.get(index).map(|m| m.as_str()).unwrap_or_default();
+        result = result.replace(&format!("${}", index), value);
+    }
+    result
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn normalize_proxy_target(
+    target: String,
+    configured_proxy_host: Option<String>,
+) -> (String, Option<String>) {
+    if let Ok(uri) = target.parse::<http::Uri>()
+        && uri.scheme().is_some()
+        && let Some(host) = uri.host()
+    {
+        let path = uri
+            .path_and_query()
+            .map(|path| path.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        return (
+            path,
+            configured_proxy_host.or_else(|| Some(host.to_string())),
+        );
+    }
+
+    if !target.starts_with('/')
+        && !target.starts_with('?')
+        && let Some((host, rest)) = target.split_once('/')
+        && host.contains('.')
+        && !host.contains('@')
+    {
+        return (
+            format!("/{}", rest),
+            configured_proxy_host.or_else(|| Some(host.to_string())),
+        );
+    }
+
+    (target, configured_proxy_host)
+}
+
 pub fn evaluate_rewrites(
     original_uri: &str,
     raw_query: &str,
     rewrite_refs: &[HTTPRewriteRef],
     rewrite_rules: &[HTTPRewriteRule],
 ) -> RewriteResult {
+    evaluate_rewrites_with_host(original_uri, raw_query, None, rewrite_refs, rewrite_rules)
+}
+
+pub fn evaluate_rewrites_with_host(
+    original_uri: &str,
+    raw_query: &str,
+    current_host: Option<&str>,
+    rewrite_refs: &[HTTPRewriteRef],
+    rewrite_rules: &[HTTPRewriteRule],
+) -> RewriteResult {
+    evaluate_rewrites_with_cond(
+        original_uri,
+        raw_query,
+        current_host,
+        rewrite_refs,
+        rewrite_rules,
+        |_| true,
+    )
+}
+
+pub fn evaluate_rewrites_with_cond(
+    original_uri: &str,
+    raw_query: &str,
+    current_host: Option<&str>,
+    rewrite_refs: &[HTTPRewriteRef],
+    rewrite_rules: &[HTTPRewriteRule],
+    mut cond_matches: impl FnMut(&HTTPRewriteRule) -> bool,
+) -> RewriteResult {
     let mut uri = original_uri.to_string();
+    let current_host = current_host.map(normalize_host);
+    let mut matched_rewrite_id = 0;
+    let mut matched_proxy_host = None;
 
     // Support recursive rewrites up to 8 levels (Go parity)
     for _iteration in 0..8 {
         let mut matched_this_pass = false;
 
-        for (i, rule_ref) in rewrite_refs.iter().enumerate() {
-            if !rule_ref.is_on {
+        for (i, rule) in rewrite_rules.iter().enumerate() {
+            if !rule.is_on {
                 continue;
             }
-            let Some(rule) = rewrite_rules.get(i) else {
+            if let Some(rule_ref) = rewrite_refs.get(i)
+                && !rule_ref.is_on
+            {
                 continue;
-            };
-            if !rule.is_on {
+            }
+            if !cond_matches(rule) {
                 continue;
             }
             let Some(pattern) = &rule.pattern else {
@@ -49,22 +153,21 @@ pub fn evaluate_rewrites(
                 continue;
             };
 
-            let re = if let Some(cached) = REWRITE_RE_CACHE.get(pattern) {
-                cached.clone()
-            } else {
-                let Ok(compiled) = Regex::new(pattern) else {
-                    debug!("Invalid rewrite pattern: {}", pattern);
-                    continue;
-                };
-                let re = Arc::new(compiled);
-                REWRITE_RE_CACHE.insert(pattern.clone(), Arc::clone(&re));
-                re
+            let Some(re) = rewrite_pattern_regex(pattern) else {
+                debug!("Invalid rewrite pattern: {}", pattern);
+                continue;
             };
 
             let path = uri.split('?').next().unwrap_or(&uri);
 
-            if re.captures(path).is_some() {
-                let replaced = re.replace(path, replace.as_str()).to_string();
+            if let Some(captures) = re.captures(path) {
+                let matched = captures.get(0).expect("captures always include full match");
+                let replacement = expand_rewrite_replacement(&re, &captures, replace.as_str());
+                let mut replaced =
+                    String::with_capacity(path.len() - matched.as_str().len() + replacement.len());
+                replaced.push_str(&path[..matched.start()]);
+                replaced.push_str(&replacement);
+                replaced.push_str(&path[matched.end()..]);
 
                 let final_url = if rule.with_query && !raw_query.is_empty() {
                     if replaced.contains('?') {
@@ -87,16 +190,42 @@ pub fn evaluate_rewrites(
                         return RewriteResult::Redirect {
                             location: final_url,
                             status,
+                            rewrite_id: rule.id.unwrap_or_default(),
                         };
                     }
                     _ => {
+                        let (new_uri, proxy_host) =
+                            normalize_proxy_target(final_url, rule.proxy_host.clone());
+                        let proxy_host = proxy_host.filter(|host| {
+                            current_host
+                                .as_deref()
+                                .is_none_or(|current| normalize_host(host) != current)
+                        });
+
+                        if new_uri == uri && proxy_host == matched_proxy_host {
+                            break;
+                        }
+
+                        if new_uri == uri && proxy_host.is_some() {
+                            return RewriteResult::Proxy {
+                                new_uri,
+                                proxy_host,
+                                rewrite_id: rule.id.unwrap_or_default(),
+                            };
+                        }
+
+                        matched_rewrite_id = rule.id.unwrap_or_default();
                         matched_this_pass = true;
-                        uri = final_url;
+                        if proxy_host.is_some() {
+                            matched_proxy_host = proxy_host.clone();
+                        }
+                        uri = new_uri;
 
                         if rule.is_break {
                             return RewriteResult::Proxy {
                                 new_uri: uri,
-                                proxy_host: rule.proxy_host.clone(),
+                                proxy_host,
+                                rewrite_id: rule.id.unwrap_or_default(),
                             };
                         }
                         break;
@@ -113,11 +242,277 @@ pub fn evaluate_rewrites(
     if uri != original_uri {
         return RewriteResult::Proxy {
             new_uri: uri,
-            proxy_host: None,
+            proxy_host: matched_proxy_host,
+            rewrite_id: matched_rewrite_id,
         };
     }
 
     RewriteResult::NoMatch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_works_without_refs() {
+        let rules = vec![HTTPRewriteRule {
+            is_on: true,
+            pattern: Some("/MoyuNetworkApi".to_string()),
+            replace: Some("/api/v1".to_string()),
+            ..Default::default()
+        }];
+
+        match evaluate_rewrites("/MoyuNetworkApi/passport/auth/login", "", &[], &rules) {
+            RewriteResult::Proxy {
+                new_uri,
+                proxy_host,
+                rewrite_id,
+            } => {
+                assert_eq!(new_uri, "/api/v1/passport/auth/login");
+                assert!(proxy_host.is_none());
+                assert_eq!(rewrite_id, 0);
+            }
+            other => panic!("unexpected rewrite result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_respects_disabled_ref_when_present() {
+        let rules = vec![HTTPRewriteRule {
+            is_on: true,
+            pattern: Some("/MoyuNetworkApi".to_string()),
+            replace: Some("/api/v1".to_string()),
+            ..Default::default()
+        }];
+        let refs = vec![HTTPRewriteRef { is_on: false }];
+
+        assert!(matches!(
+            evaluate_rewrites("/MoyuNetworkApi/passport/auth/login", "", &refs, &rules),
+            RewriteResult::NoMatch
+        ));
+    }
+
+    #[test]
+    fn rewrite_skips_rule_when_condition_callback_rejects() {
+        let rules = vec![HTTPRewriteRule {
+            id: Some(6),
+            is_on: true,
+            pattern: Some("^/old$".to_string()),
+            replace: Some("/new".to_string()),
+            ..Default::default()
+        }];
+
+        assert!(matches!(
+            evaluate_rewrites_with_cond("/old", "", None, &[], &rules, |_| false),
+            RewriteResult::NoMatch
+        ));
+    }
+
+    #[test]
+    fn rewrite_supports_documented_capture_syntax() {
+        let rules = vec![HTTPRewriteRule {
+            id: Some(7),
+            is_on: true,
+            pattern: Some("^/MoyuNetworkApi/(.*)$".to_string()),
+            replace: Some("/api/v1/${1}".to_string()),
+            ..Default::default()
+        }];
+
+        match evaluate_rewrites("/MoyuNetworkApi/passport/auth/login", "", &[], &rules) {
+            RewriteResult::Proxy {
+                new_uri,
+                proxy_host,
+                rewrite_id,
+            } => {
+                assert_eq!(new_uri, "/api/v1/passport/auth/login");
+                assert!(proxy_host.is_none());
+                assert_eq!(rewrite_id, 7);
+            }
+            other => panic!("unexpected rewrite result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_wildcard_target_url_keeps_query_when_enabled() {
+        let rules = vec![HTTPRewriteRule {
+            id: Some(8),
+            is_on: true,
+            pattern: Some("*".to_string()),
+            replace: Some("st.mymya.cn/api/v1/${1}".to_string()),
+            with_query: true,
+            is_break: true,
+            ..Default::default()
+        }];
+
+        match evaluate_rewrites("/passport/auth/login", "x=1", &[], &rules) {
+            RewriteResult::Proxy {
+                new_uri,
+                proxy_host,
+                rewrite_id,
+            } => {
+                assert_eq!(new_uri, "/api/v1/passport/auth/login?x=1");
+                assert_eq!(proxy_host.as_deref(), Some("st.mymya.cn"));
+                assert_eq!(rewrite_id, 8);
+            }
+            other => panic!("unexpected rewrite result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_full_url_target_sets_proxy_host() {
+        let rules = vec![HTTPRewriteRule {
+            id: Some(9),
+            is_on: true,
+            pattern: Some("^/old$".to_string()),
+            replace: Some("https://example.com/new".to_string()),
+            ..Default::default()
+        }];
+
+        match evaluate_rewrites("/old", "", &[], &rules) {
+            RewriteResult::Proxy {
+                new_uri,
+                proxy_host,
+                rewrite_id,
+            } => {
+                assert_eq!(new_uri, "/new");
+                assert_eq!(proxy_host.as_deref(), Some("example.com"));
+                assert_eq!(rewrite_id, 9);
+            }
+            other => panic!("unexpected rewrite result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_preserves_proxy_host_across_followup_path_rewrite() {
+        let rules = vec![
+            HTTPRewriteRule {
+                id: Some(10),
+                is_on: true,
+                pattern: Some("^/old/(.*)$".to_string()),
+                replace: Some("example.com/api/${1}".to_string()),
+                ..Default::default()
+            },
+            HTTPRewriteRule {
+                id: Some(11),
+                is_on: true,
+                pattern: Some("^/api/(.*)$".to_string()),
+                replace: Some("/v1/${1}".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        match evaluate_rewrites("/old/users", "", &[], &rules) {
+            RewriteResult::Proxy {
+                new_uri,
+                proxy_host,
+                rewrite_id,
+            } => {
+                assert_eq!(new_uri, "/v1/users");
+                assert_eq!(proxy_host.as_deref(), Some("example.com"));
+                assert_eq!(rewrite_id, 11);
+            }
+            other => panic!("unexpected rewrite result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_stops_on_followup_noop_without_dropping_previous_change() {
+        let rules = vec![
+            HTTPRewriteRule {
+                id: Some(12),
+                is_on: true,
+                pattern: Some("^/old/(.*)$".to_string()),
+                replace: Some("/api/${1}".to_string()),
+                ..Default::default()
+            },
+            HTTPRewriteRule {
+                id: Some(13),
+                is_on: true,
+                pattern: Some("^/api/(.*)$".to_string()),
+                replace: Some("/api/${1}".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        match evaluate_rewrites("/old/users", "", &[], &rules) {
+            RewriteResult::Proxy {
+                new_uri,
+                proxy_host,
+                rewrite_id,
+            } => {
+                assert_eq!(new_uri, "/api/users");
+                assert!(proxy_host.is_none());
+                assert_eq!(rewrite_id, 12);
+            }
+            other => panic!("unexpected rewrite result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_to_same_host_and_path_is_no_match() {
+        let rules = vec![HTTPRewriteRule {
+            id: Some(12),
+            is_on: true,
+            pattern: Some("^/api/(.*)$".to_string()),
+            replace: Some("https://example.com/api/${1}".to_string()),
+            ..Default::default()
+        }];
+
+        assert!(matches!(
+            evaluate_rewrites_with_host("/api/users", "", Some("example.com"), &[], &rules),
+            RewriteResult::NoMatch
+        ));
+    }
+
+    #[test]
+    fn rewrite_to_different_host_same_path_stops_after_host_change() {
+        let rules = vec![HTTPRewriteRule {
+            id: Some(13),
+            is_on: true,
+            pattern: Some("^/api/(.*)$".to_string()),
+            replace: Some("https://origin.example.com/api/${1}".to_string()),
+            ..Default::default()
+        }];
+
+        match evaluate_rewrites_with_host("/api/users", "", Some("example.com"), &[], &rules) {
+            RewriteResult::Proxy {
+                new_uri,
+                proxy_host,
+                rewrite_id,
+            } => {
+                assert_eq!(new_uri, "/api/users");
+                assert_eq!(proxy_host.as_deref(), Some("origin.example.com"));
+                assert_eq!(rewrite_id, 13);
+            }
+            other => panic!("unexpected rewrite result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rewrite_explicit_mode_redirects() {
+        let rules = vec![HTTPRewriteRule {
+            id: Some(10),
+            is_on: true,
+            pattern: Some("^/old$".to_string()),
+            replace: Some("https://example.com/new".to_string()),
+            mode: Some("redirect".to_string()),
+            ..Default::default()
+        }];
+
+        match evaluate_rewrites("/old", "", &[], &rules) {
+            RewriteResult::Redirect {
+                location,
+                status,
+                rewrite_id,
+            } => {
+                assert_eq!(location, "https://example.com/new");
+                assert_eq!(status, 307);
+                assert_eq!(rewrite_id, 10);
+            }
+            other => panic!("unexpected rewrite result: {:?}", other),
+        }
+    }
 }
 
 static HOST_REDIRECT_RE_CACHE: Lazy<DashMap<String, Arc<Regex>>> = Lazy::new(DashMap::new);

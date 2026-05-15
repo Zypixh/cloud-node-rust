@@ -1,10 +1,26 @@
 use crate::config_models::{HTTPHeaderConfig, HTTPHeaderPolicy, HTTPHeaderReplaceValue};
 use crate::utils::template::format_template;
+use dashmap::DashMap;
 use http::HeaderValue;
 use http::header::HeaderName;
+use once_cell::sync::Lazy;
 use pingora_proxy::Session;
 use regex::Regex;
 use std::str::FromStr;
+use std::sync::Arc;
+
+static HEADER_RE_CACHE: Lazy<DashMap<String, Arc<Regex>>> = Lazy::new(DashMap::new);
+
+fn cached_header_regex(pattern: &str) -> Option<Arc<Regex>> {
+    if let Some(cached) = HEADER_RE_CACHE.get(pattern) {
+        return Some(Arc::clone(&*cached));
+    }
+    Regex::new(pattern).ok().map(|re| {
+        let re = Arc::new(re);
+        HEADER_RE_CACHE.insert(pattern.to_string(), Arc::clone(&re));
+        re
+    })
+}
 
 /// Applies request header policies to the upstream request headers.
 /// Mirrors the legacy ProcessRequestHeaders behavior.
@@ -188,7 +204,7 @@ fn domain_matches(patterns: &[String], domain: &str) -> bool {
         }
         if pattern.contains('*') {
             let regex = format!("^{}$", regex::escape(&pattern).replace("\\*", "[^.]*"));
-            return Regex::new(&regex)
+            return cached_header_regex(&regex)
                 .map(|re| re.is_match(&domain))
                 .unwrap_or(false);
         }
@@ -239,7 +255,7 @@ fn replace_header_value(value: String, rule: &HTTPHeaderReplaceValue) -> String 
         } else {
             pattern
         };
-        Regex::new(&pattern)
+        cached_header_regex(&pattern)
             .map(|re| {
                 re.replace_all(&value, rule.replacement.as_str())
                     .into_owned()

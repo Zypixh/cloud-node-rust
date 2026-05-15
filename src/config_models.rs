@@ -1773,9 +1773,16 @@ pub struct HTTPRewriteRule {
     pub id: Option<i64>,
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(alias = "match", alias = "source", alias = "from")]
     pub pattern: Option<String>,
+    #[serde(
+        alias = "targetURL",
+        alias = "targetUrl",
+        alias = "target",
+        alias = "to"
+    )]
     pub replace: Option<String>,
-    #[serde(rename = "withQuery", default)]
+    #[serde(rename = "withQuery", alias = "keepArgs", alias = "keepQuery", default)]
     pub with_query: bool,
     pub mode: Option<String>,
     #[serde(rename = "redirectStatus", default)]
@@ -1784,6 +1791,7 @@ pub struct HTTPRewriteRule {
     pub is_break: bool,
     #[serde(rename = "proxyHost", default)]
     pub proxy_host: Option<String>,
+    pub conds: Option<HTTPRequestCondsConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
