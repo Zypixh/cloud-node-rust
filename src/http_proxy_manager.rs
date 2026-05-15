@@ -640,13 +640,14 @@ impl HttpProxyManager {
         let (level, parents) = self.config_store.get_tiered_origin_info().await;
         let bypass = self.config_store.is_tiered_origin_bypass().await;
         let global_cfg = self.config_store.get_global_http_config_sync();
-        let (lb, _) = crate::lb_factory::build_lb_blocking(
+        let (lb, _) = crate::lb_factory::build_lb_blocking_with_global_http(
             server_id,
             rp_cfg.clone(),
             level,
             parents,
             bypass,
             global_cfg.allow_lan_ip,
+            Some((*global_cfg).clone()),
         )
         .await?;
         let peer = lb

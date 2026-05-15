@@ -105,6 +105,8 @@ pub async fn sync_updating_server_list_once(
                             .collect::<Vec<_>>();
                         let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
                             config_store.get_origin_runtime_context().await;
+                        let global_http =
+                            Some((*config_store.get_global_http_config_sync()).clone());
                         let (server_map, route_map) = build_runtime_maps(
                             enabled.clone(),
                             health_manager,
@@ -112,6 +114,7 @@ pub async fn sync_updating_server_list_once(
                             parent_nodes,
                             tiered_origin_bypass,
                             allow_lan,
+                            global_http,
                         )
                         .await;
                         for server_id in changed {

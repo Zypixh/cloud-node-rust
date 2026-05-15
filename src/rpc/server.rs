@@ -86,6 +86,7 @@ pub async fn sync_single_server_config(
                     let runtime_servers = vec![server];
                     let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
                         config_store.get_origin_runtime_context().await;
+                    let global_http = Some((*config_store.get_global_http_config_sync()).clone());
                     let (servers, routes) = build_runtime_maps(
                         runtime_servers.clone(),
                         health_manager,
@@ -93,6 +94,7 @@ pub async fn sync_single_server_config(
                         parent_nodes,
                         tiered_origin_bypass,
                         allow_lan,
+                        global_http,
                     )
                     .await;
                     if user_id > 0 {
@@ -239,6 +241,7 @@ pub async fn sync_user_servers_state(
                     let runtime_servers = servers;
                     let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
                         config_store.get_origin_runtime_context().await;
+                    let global_http = Some((*config_store.get_global_http_config_sync()).clone());
                     let (servers_map, routes_map) = build_runtime_maps(
                         runtime_servers.clone(),
                         health_manager,
@@ -246,6 +249,7 @@ pub async fn sync_user_servers_state(
                         parent_nodes,
                         tiered_origin_bypass,
                         allow_lan,
+                        global_http,
                     )
                     .await;
                     config_store

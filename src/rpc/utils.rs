@@ -47,6 +47,7 @@ pub async fn build_runtime_maps(
     parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
     tiered_origin_bypass: bool,
     allow_lan: bool,
+    global_http: Option<crate::config_models::GlobalHTTPAllConfig>,
 ) -> (
     HashMap<String, Arc<ServerConfig>>,
     HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
@@ -62,13 +63,14 @@ pub async fn build_runtime_maps(
 
         let server_id = server.numeric_id();
         let (lb_arc, has_hc) = if let Some(rp) = &server.reverse_proxy {
-            match crate::lb_factory::build_lb_blocking(
+            match crate::lb_factory::build_lb_blocking_with_global_http(
                 server_id,
                 rp.clone(),
                 node_level,
                 Arc::clone(&parent_nodes),
                 tiered_origin_bypass,
                 allow_lan,
+                global_http.clone(),
             )
             .await
             {
