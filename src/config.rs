@@ -410,18 +410,52 @@ impl ConfigStore {
         let normalized = Self::normalize_host(host);
         let lock = self.inner.read();
 
-        if let Some(server) = lock.servers.get(&normalized) {
-            return Some(server.clone());
-        }
+        Self::find_l7_server_locked(&lock, &normalized)
+            .or_else(|| Self::find_sni_passthrough_server_locked(&lock, &normalized, 0))
+    }
 
-        if let Some(pos) = normalized.find('.') {
-            let wildcard = format!("*{}", &normalized[pos..]);
-            if let Some(server) = lock.servers.get(&wildcard) {
-                return Some(server.clone());
-            }
-        }
+    pub fn get_l7_server_for_tls_name_sync(&self, host: &str) -> Option<Arc<ServerConfig>> {
+        let normalized = Self::normalize_host(host);
+        let lock = self.inner.read();
+        Self::find_l7_server_locked(&lock, &normalized)
+    }
 
-        Self::find_sni_passthrough_server_locked(&lock, &normalized, 0)
+    pub fn get_exact_l7_server_for_tls_name_sync(&self, host: &str) -> Option<Arc<ServerConfig>> {
+        let normalized = Self::normalize_host(host);
+        let lock = self.inner.read();
+        lock.servers
+            .get(&normalized)
+            .filter(|server| !server.is_sni_passthrough())
+            .cloned()
+    }
+
+    pub fn find_exact_sni_passthrough_server_sync(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Option<Arc<ServerConfig>> {
+        let normalized = Self::normalize_host(host);
+        let lock = self.inner.read();
+        lock.sni_passthrough_exact.get(&(port, normalized)).cloned()
+    }
+
+    fn find_l7_server_locked(
+        lock: &NodeConfig,
+        normalized_host: &str,
+    ) -> Option<Arc<ServerConfig>> {
+        lock.servers
+            .get(normalized_host)
+            .filter(|server| !server.is_sni_passthrough())
+            .cloned()
+            .or_else(|| {
+                normalized_host.find('.').and_then(|pos| {
+                    let wildcard = format!("*{}", &normalized_host[pos..]);
+                    lock.servers
+                        .get(&wildcard)
+                        .filter(|server| !server.is_sni_passthrough())
+                        .cloned()
+                })
+            })
     }
 
     pub fn find_sni_passthrough_server_sync(
@@ -1218,6 +1252,7 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_models::{HTTPSConfig, NetworkAddressConfig, ServerNameConfig};
     use serde_json::json;
 
     #[tokio::test]
@@ -1345,5 +1380,170 @@ mod tests {
         );
         assert!(snapshot.global_access_log.is_some());
         assert_eq!(store.get_updating_server_list_id().await, 55);
+    }
+
+    #[tokio::test]
+    async fn l7_https_server_takes_precedence_over_sni_passthrough_wildcard() {
+        let store = ConfigStore::new();
+        let l7_server = Arc::new(ServerConfig {
+            id: Some(1),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "rancher.mymya.cn".to_string(),
+                ..Default::default()
+            }],
+            https: Some(HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: None,
+            }),
+            ..Default::default()
+        });
+        let passthrough_server = Arc::new(ServerConfig {
+            id: Some(2),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "*.mymya.cn@sni_passthrough".to_string(),
+                ..Default::default()
+            }],
+            https: Some(HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: None,
+            }),
+            ..Default::default()
+        });
+
+        let mut servers = HashMap::new();
+        servers.insert("rancher.mymya.cn".to_string(), l7_server.clone());
+        servers.insert("*.mymya.cn".to_string(), passthrough_server.clone());
+        let all_servers = vec![l7_server.clone(), passthrough_server.clone()];
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                0,
+                all_servers,
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            store
+                .get_l7_server_for_tls_name_sync("rancher.mymya.cn")
+                .map(|server| server.numeric_id()),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .find_sni_passthrough_server_sync("rancher.mymya.cn", 443)
+                .map(|server| server.numeric_id()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn http_https_listen_ports_come_from_configured_port_ranges() {
+        let server = ServerConfig {
+            id: Some(3),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "ports.example.com".to_string(),
+                ..Default::default()
+            }],
+            http: Some(crate::config_models::HTTPConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("http".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("8080".to_string()),
+                }],
+            }),
+            https: Some(HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("8443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: None,
+            }),
+            ..Default::default()
+        };
+
+        let http_ports: Vec<_> = server
+            .http
+            .as_ref()
+            .into_iter()
+            .flat_map(|http| &http.listen)
+            .filter_map(|addr| addr.port_range.as_deref())
+            .filter_map(|range| range.split('-').next())
+            .filter_map(|port| port.parse::<u16>().ok())
+            .collect();
+        let https_ports: Vec<_> = server
+            .https
+            .as_ref()
+            .into_iter()
+            .flat_map(|https| &https.listen)
+            .filter_map(|addr| addr.port_range.as_deref())
+            .filter_map(|range| range.split('-').next())
+            .filter_map(|port| port.parse::<u16>().ok())
+            .collect();
+
+        assert_eq!(http_ports, vec![8080]);
+        assert_eq!(https_ports, vec![8443]);
+        assert!(!server.listens_on_https_port(443));
+        assert!(server.listens_on_https_port(8443));
     }
 }

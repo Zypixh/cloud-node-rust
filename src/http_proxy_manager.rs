@@ -415,6 +415,29 @@ impl HttpProxyManager {
             return Ok(None);
         };
 
+        if self
+            .config_store
+            .get_exact_l7_server_for_tls_name_sync(&host)
+            .is_some_and(|server| server.listens_on_https_port(port))
+        {
+            return Ok(Some((host, None)));
+        }
+
+        if let Some(server) = self
+            .config_store
+            .find_exact_sni_passthrough_server_sync(&host, port)
+        {
+            return Ok(Some((host, Some(server))));
+        }
+
+        if self
+            .config_store
+            .get_l7_server_for_tls_name_sync(&host)
+            .is_some_and(|server| server.listens_on_https_port(port))
+        {
+            return Ok(Some((host, None)));
+        }
+
         let server = self
             .config_store
             .find_sni_passthrough_server_sync(&host, port);
