@@ -95,6 +95,7 @@ impl UdpProxyManager {
         );
         let mut desired_ports = HashSet::new();
         for server in servers {
+            let mut server_ports = Vec::new();
             if let Some(udp_cfg) = &server.udp {
                 if udp_cfg.is_on {
                     if udp_cfg.listen.is_empty() {
@@ -103,14 +104,13 @@ impl UdpProxyManager {
                             server.numeric_id()
                         );
                     }
-                    for port in udp_cfg
-                        .listen
-                        .iter()
-                        .filter_map(|addr| addr.port_range.as_deref())
-                        .flat_map(crate::config_models::ports_in_range)
-                    {
-                        desired_ports.insert(port);
-                    }
+                    server_ports.extend(
+                        udp_cfg
+                            .listen
+                            .iter()
+                            .filter_map(|addr| addr.port_range.as_deref())
+                            .flat_map(crate::config_models::ports_in_range),
+                    );
                 } else {
                     debug!(
                         "UDP Proxy Manager: Server {} UDP is OFF",
@@ -123,6 +123,20 @@ impl UdpProxyManager {
                     server.numeric_id()
                 );
             }
+            if server.is_quic_passthrough() && server_ports.is_empty() {
+                if let Some(https) = &server.https
+                    && https.is_on
+                {
+                    server_ports.extend(
+                        https
+                            .listen
+                            .iter()
+                            .filter_map(|addr| addr.port_range.as_deref())
+                            .flat_map(crate::config_models::ports_in_range),
+                    );
+                }
+            }
+            desired_ports.extend(server_ports);
         }
         desired_ports
     }

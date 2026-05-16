@@ -1288,7 +1288,7 @@ impl ConfigStore {
                 );
             }
             if server.is_quic_passthrough() {
-                let ports = Self::server_udp_ports(server, false);
+                let ports = Self::server_quic_passthrough_ports(server);
                 Self::index_passthrough_server(
                     &mut lock.quic_passthrough_exact,
                     &mut lock.quic_passthrough_wildcard,
@@ -1367,6 +1367,17 @@ impl ConfigStore {
         }
         ports.sort_unstable();
         ports.dedup();
+        ports
+    }
+
+    fn server_quic_passthrough_ports(server: &Arc<ServerConfig>) -> Vec<u16> {
+        let mut ports = Self::server_udp_ports(server, false);
+        if ports.is_empty() {
+            ports = Self::server_https_ports(server)
+                .into_iter()
+                .filter(|port| *port != 0)
+                .collect();
+        }
         ports
     }
 
@@ -1883,6 +1894,89 @@ mod tests {
                 .find_quic_passthrough_server_sync("a.qq.com", 8443)
                 .map(|server| server.numeric_id()),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn quic_passthrough_marker_falls_back_to_https_listener_ports() {
+        let store = ConfigStore::new();
+        let quic_server = Arc::new(ServerConfig {
+            id: Some(7),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "quic-only.example.com@quic".to_string(),
+                ..Default::default()
+            }],
+            https: Some(HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: Some(true),
+            }),
+            ..Default::default()
+        });
+        let mut servers = HashMap::new();
+        servers.insert("quic-only.example.com".to_string(), quic_server.clone());
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                0,
+                vec![quic_server],
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(store.has_any_quic_passthrough_sync());
+        assert_eq!(
+            store
+                .find_quic_passthrough_server_sync("quic-only.example.com", 443)
+                .map(|server| server.numeric_id()),
+            Some(7)
         );
     }
 
