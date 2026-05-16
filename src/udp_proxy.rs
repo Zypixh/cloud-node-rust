@@ -628,23 +628,6 @@ impl UdpProxyManager {
                 return Err(err.into());
             }
         };
-        if let Err(err) = backend_socket.connect(backend_addr).await {
-            crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
-            let current_client_addr = *client_addr.read().await;
-            crate::metrics::record::record_http_dimensions(
-                server_id,
-                current_client_addr.ip(),
-                &domain,
-                "-",
-                0,
-                0,
-                0,
-                None,
-                None,
-            );
-            crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
-            return Err(err.into());
-        }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
         let mut downstream_sent = 0u64;
         let mut result: anyhow::Result<()> = Ok(());
@@ -670,7 +653,7 @@ impl UdpProxyManager {
                         break;
                     };
                     let len = data.len() as u64;
-                    if let Err(err) = backend_socket.send(&data).await {
+                    if let Err(err) = backend_socket.send_to(&data, backend_addr).await {
                         crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                         result = Err(err.into());
                         break;
@@ -681,14 +664,17 @@ impl UdpProxyManager {
                     crate::metrics::record::record_transfer(server_id, 0, len, None);
                     crate::metrics::record::record_origin_traffic(server_id, len, 0, None);
                 }
-                recv = backend_socket.recv(&mut buf) => {
-                    let len = match recv {
-                        Ok(len) => len,
+                recv = backend_socket.recv_from(&mut buf) => {
+                    let (len, peer_addr) = match recv {
+                        Ok(packet) => packet,
                         Err(err) => {
                             result = Err(err.into());
                             break;
                         }
                     };
+                    if peer_addr != backend_addr {
+                        continue;
+                    }
                     let len_u64 = len as u64;
                     for cid in crate::quic_probe::quic_packet_cids(&buf[..len], 0)
                         .into_iter()
