@@ -148,7 +148,11 @@ cloud-node --monitor-port 8888
 
 ## 关闭和重启
 
-`stop` 使用 PID 文件找到后台进程并发送 `kill`。`restart` 执行 `stop` 后等待 1 秒再执行 `start`。
+`stop` 会通过 PID 文件和 Linux `/proc` 识别当前运行实例，先发送 `SIGTERM` 并等待进程退出；超时未退出时会发送 `SIGKILL`，确认进程结束后才清理匹配的 PID 文件。`restart` 会等待旧进程真实退出后再执行 `start`，避免旧进程仍占用 80/443 或持有数据目录锁时启动新实例。
+
+`status` 会清理陈旧 PID 文件；如果 PID 文件丢失但同一工作目录下仍有 cloud-node 进程，Linux 环境会继续识别为运行中，避免进程仍在监听端口但 CLI 误报 stopped。
+
+systemd 安装模式使用 `Type=simple` 直接托管前台进程，`TimeoutStopSec=35` 限制停止等待时间。Pingora 的 SIGTERM graceful shutdown 宽限期设置为 5 秒，避免 `systemctl stop cloud-node` 长时间停留在 deactivating。
 
 如果进程异常退出，systemd 安装模式下会按 `Restart=always` 自动拉起。排障时优先查看：
 
