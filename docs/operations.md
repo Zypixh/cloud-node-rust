@@ -84,12 +84,12 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.0.9 --yes
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.1.0 --yes
 ```
 
-## 1.0.9 说明
+## 1.1.0 说明
 
-1.0.9 补充了集群级超时配置接入：`httpAll` 的源站连接、读取、空闲、写入超时，以及客户端自动读/写超时现在都会进入运行时配置；源站连接/读取/写入超时在访问日志中按 `504 Gateway Timeout` 处理。
+1.1.0 新增 `@quic`/HY2 非 obfs UDP 域名透传：节点会解析 QUIC Initial 中的 TLS SNI，并在同一 UDP 端口上和 HTTP/3 共享监听；同时修复配置任务完成闭环，避免控制面任务未确认时本地跳过版本导致节点状态停留在同步中。
 
 升级现有 Rust 节点到最新版：
 

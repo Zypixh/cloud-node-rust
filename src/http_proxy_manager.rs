@@ -277,18 +277,15 @@ impl HttpProxyManager {
 
                 if is_tls {
                     match manager.inspect_tls_host(&client_stream, port).await {
-                        Ok(Some((host, passthrough_server))) => {
-                            configured_tls_host = manager
-                                .config_store
-                                .get_server_for_tls_name_sync(&host)
-                                .is_some();
-                            if let Some(server) = passthrough_server {
+                        Ok(Some(route)) => {
+                            configured_tls_host = route.has_l7_server;
+                            if let Some(server) = route.sni_passthrough_server {
                                 if let Err(err) = manager
                                     .handle_sni_passthrough(
                                         client_stream,
                                         client_addr,
                                         port,
-                                        host,
+                                        route.host,
                                         server,
                                     )
                                     .await
@@ -402,46 +399,15 @@ impl HttpProxyManager {
         &self,
         client_stream: &TcpStream,
         port: u16,
-    ) -> anyhow::Result<Option<(String, Option<Arc<ServerConfig>>)>> {
-        // Fast path: if no SNI passthrough servers exist, skip the expensive ClientHello peek
+    ) -> anyhow::Result<Option<crate::config::TlsRouteInspection>> {
         if !self.config_store.has_any_sni_passthrough_sync() {
             return Ok(None);
         }
 
-        let host = peek_client_hello_sni(client_stream)
-            .await?
-            .map(|value| value.trim_end_matches('.').to_ascii_lowercase());
-        let Some(host) = host else {
+        let Some(host) = peek_client_hello_sni(client_stream).await? else {
             return Ok(None);
         };
-
-        if self
-            .config_store
-            .get_exact_l7_server_for_tls_name_sync(&host)
-            .is_some_and(|server| server.listens_on_https_port(port))
-        {
-            return Ok(Some((host, None)));
-        }
-
-        if let Some(server) = self
-            .config_store
-            .find_exact_sni_passthrough_server_sync(&host, port)
-        {
-            return Ok(Some((host, Some(server))));
-        }
-
-        if self
-            .config_store
-            .get_l7_server_for_tls_name_sync(&host)
-            .is_some_and(|server| server.listens_on_https_port(port))
-        {
-            return Ok(Some((host, None)));
-        }
-
-        let server = self
-            .config_store
-            .find_sni_passthrough_server_sync(&host, port);
-        Ok(Some((host, server)))
+        Ok(self.config_store.inspect_tls_route_sync(&host, port))
     }
 
     async fn handle_sni_passthrough(

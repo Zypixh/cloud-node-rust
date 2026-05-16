@@ -63,7 +63,7 @@ impl Http3ProxyManager {
         }
     }
 
-    async fn desired_ports(&self) -> HashSet<u16> {
+    pub async fn desired_ports(&self) -> HashSet<u16> {
         let mut desired = HashSet::new();
         let Some(policy) = self.config_store.get_global_http3_policy_sync() else {
             return desired;
@@ -83,15 +83,16 @@ impl Http3ProxyManager {
             if let Some(https) = &server.https
                 && https.is_on
                 && !server.is_sni_passthrough()
+                && !server.is_quic_passthrough()
                 && https.http3_enabled()
             {
-                for addr in &https.listen {
-                    if let Some(port_str) = &addr.port_range
-                        && let Some(first) = port_str.split('-').next()
-                        && let Ok(port) = first.parse::<u16>()
-                    {
-                        desired.insert(port);
-                    }
+                for port in https
+                    .listen
+                    .iter()
+                    .filter_map(|addr| addr.port_range.as_deref())
+                    .flat_map(crate::config_models::ports_in_range)
+                {
+                    desired.insert(port);
                 }
             }
         }
@@ -125,6 +126,10 @@ impl Http3ProxyManager {
         });
     }
 
+    pub async fn current_cert_hash_for_demux(&self) -> u64 {
+        self.current_cert_hash().await
+    }
+
     fn reconcile_listeners(&self, desired_ports: &HashSet<u16>, cert_hash: u64) {
         let active_ports: Vec<(u16, u64)> = self
             .handled_ports
@@ -148,7 +153,7 @@ impl Http3ProxyManager {
     async fn run_listener(
         self: Arc<Self>,
         port: u16,
-        mut shutdown_rx: watch::Receiver<bool>,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         let server_config = self
             .build_quinn_server_config()
@@ -156,6 +161,16 @@ impl Http3ProxyManager {
             .context("build quinn server config")?;
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
         let endpoint = Endpoint::server(server_config, bind_addr)?;
+        info!("HTTP/3 listener active on UDP {}", bind_addr);
+        self.run_endpoint(port, endpoint, shutdown_rx).await
+    }
+
+    pub async fn run_endpoint(
+        self: Arc<Self>,
+        port: u16,
+        endpoint: Endpoint,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
         let mut proxy_logic = self.proxy_logic.clone();
         proxy_logic.tls_downstream = true;
         let proxy = Arc::new(http_proxy_custom(
@@ -163,7 +178,6 @@ impl Http3ProxyManager {
             proxy_logic,
             crate::origin_h3::OriginH3Connector,
         ));
-        info!("HTTP/3 listener active on UDP {}", bind_addr);
 
         loop {
             let connecting = tokio::select! {
@@ -195,7 +209,7 @@ impl Http3ProxyManager {
         }
     }
 
-    async fn build_quinn_server_config(&self) -> Result<quinn::ServerConfig> {
+    pub async fn build_quinn_server_config(&self) -> Result<quinn::ServerConfig> {
         let (exact, wildcard, default_pair) = self
             .cert_selector
             .export_snapshot_pem()

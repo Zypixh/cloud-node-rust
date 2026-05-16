@@ -29,7 +29,7 @@ pub async fn sync_node_tasks(
     cert_selector: &crate::ssl::DynamicCertSelector,
     ip_list_manager: &crate::firewall::lists::GlobalIpListManager,
     task_version: &mut i64,
-    config_version: &mut i64,
+    config_synced: bool,
 ) {
     let client = match RpcClient::new(api_config).await {
         Ok(c) => c,
@@ -73,19 +73,15 @@ pub async fn sync_node_tasks(
                                 task.server_id,
                             )
                             .await
+                        } else if config_synced {
+                            trigger_task_sync();
+                            true
                         } else {
-                            let mut node_service = client.node_service();
-                            let mut requested_task_version = task.version;
-                            crate::rpc::node::fetch_and_apply_config(
-                                &mut node_service,
-                                config_store,
-                                api_config,
-                                health_manager,
-                                cert_selector,
-                                &mut requested_task_version,
-                                config_version,
-                            )
-                            .await
+                            warn!(
+                                "Deferring NodeTask {} ({}) because config sync has not completed successfully in this round.",
+                                task.id, task.r#type
+                            );
+                            break;
                         }
                     }
                     "nodeLevelChanged" => {
@@ -177,10 +173,13 @@ pub async fn sync_node_tasks(
                     .await
                     .is_ok();
 
-                if success && reported && task.version > *task_version {
-                    *task_version = task.version;
-                } else if !reported {
+                if reported {
+                    if task.version > *task_version {
+                        *task_version = task.version;
+                    }
+                } else {
                     warn!("Failed to report NodeTask {} completion", task.id);
+                    break;
                 }
             }
         }

@@ -91,6 +91,19 @@ billing.countInboundTraffic: false
 
 高 QPS 环境下应谨慎开启请求 body 记录。上传端会在消息过大时尝试剥离 request body 后重试，但最好的做法仍是在配置侧避免大 body 日志。
 
+普通 TCP/UDP L4 和 `@quic` UDP 透传不生成访问日志。TCP SNI 透传会复用对应 L7 服务的访问日志配置，并同时遵守全局访问日志开关。
+
+## `@sni_passthrough` 和 `@quic` 服务标记
+
+控制面服务域名可以通过后缀标记启用透传模式：
+
+- `example.com@sni_passthrough`：TCP TLS SNI 透传，运行时按 `example.com` 建立路由索引。
+- `example.com@quic`：UDP QUIC 透传，运行时按 `example.com` 建立路由索引，主要用于非 obfs HY2/Hysteria2。
+
+标记不会作为真实域名参与匹配；运行时会移除后缀并统一小写。`@quic` 路由按 `SNI + UDP 监听端口` 匹配，不使用端口 `0` 兜底；同一端口只有一个 `@quic` 服务时，才会在没有普通 UDP 服务命中后作为 fallback。
+
+端口范围会完整展开到运行时监听和索引中，例如 `443-445` 会同时覆盖 `443`、`444` 和 `445`。
+
 ## 系统参数
 
 启动时会尝试进行部分内核参数调优。生产环境仍建议显式配置：

@@ -7,7 +7,7 @@ use once_cell::sync::{Lazy, OnceCell};
 use pingora_proxy::Session;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -22,9 +22,9 @@ static CACHED_HOSTNAME: Lazy<String> = Lazy::new(|| {
 });
 pub static NODE_LOG_SENDER: OnceCell<mpsc::Sender<pb::NodeLog>> = OnceCell::new();
 static NUMERIC_NODE_ID: AtomicI64 = AtomicI64::new(0);
+static GLOBAL_ACCESS_LOG_ON: AtomicBool = AtomicBool::new(true);
 static REQUEST_ID_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 static REQUEST_ID_COUNTER: AtomicI32 = AtomicI32::new(1_000_000);
-
 pub fn init_global_log_bus(
     sender: mpsc::Sender<pb::HttpAccessLog>,
     node_sender: mpsc::Sender<pb::NodeLog>,
@@ -35,6 +35,10 @@ pub fn init_global_log_bus(
 
 pub fn set_numeric_node_id(id: i64) {
     NUMERIC_NODE_ID.store(id, Ordering::Relaxed);
+}
+
+pub fn set_global_access_log_on(is_on: bool) {
+    GLOBAL_ACCESS_LOG_ON.store(is_on, Ordering::Relaxed);
 }
 
 fn unix_epoch_millis_now() -> i64 {
@@ -640,9 +644,77 @@ pub fn log_sni_passthrough_access(
     status: i32,
     error: Option<&str>,
 ) {
-    let sender = match LOG_SENDER.get() {
-        Some(s) => s,
-        None => return,
+    log_l4_passthrough_access(
+        request_id,
+        server,
+        sni_host,
+        client_addr,
+        listen_port,
+        backend_addr,
+        started_at_millis,
+        duration,
+        bytes_received,
+        bytes_sent,
+        status,
+        error,
+        "CONNECT",
+        "https",
+        "TCP",
+    );
+}
+
+fn l4_passthrough_log_sender(
+    access_log_ref: Option<&crate::config_models::HTTPAccessLogRef>,
+) -> Option<&'static mpsc::Sender<pb::HttpAccessLog>> {
+    if access_log_ref.is_some_and(|access_log| !access_log.is_on) {
+        return None;
+    }
+    if !GLOBAL_ACCESS_LOG_ON.load(Ordering::Relaxed) {
+        return None;
+    }
+    let sender = LOG_SENDER.get()?;
+    (sender.capacity() > 0).then_some(sender)
+}
+
+fn l4_passthrough_time_fields(
+    request_started_at_millis: i64,
+    fields: Option<&[i32]>,
+) -> (String, String) {
+    if fields.is_some_and(|fields| !fields.contains(&23) && !fields.contains(&24)) {
+        return (String::new(), String::new());
+    }
+    let start_dt = chrono::DateTime::from_timestamp_millis(request_started_at_millis)
+        .unwrap_or_else(chrono::Utc::now);
+    (
+        start_dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+        start_dt.format("%d/%b/%Y:%H:%M:%S +0000").to_string(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_l4_passthrough_access(
+    request_id: String,
+    server: &Arc<ServerConfig>,
+    sni_host: &str,
+    client_addr: SocketAddr,
+    listen_port: u16,
+    backend_addr: &str,
+    started_at_millis: i64,
+    duration: Duration,
+    bytes_received: u64,
+    bytes_sent: u64,
+    status: i32,
+    error: Option<&str>,
+    request_method: &str,
+    scheme: &str,
+    proto: &str,
+) {
+    let access_log_ref = server
+        .web
+        .as_ref()
+        .and_then(|web| web.access_log_ref.as_ref());
+    let Some(sender) = l4_passthrough_log_sender(access_log_ref) else {
+        return;
     };
 
     let server_id = server.id.unwrap_or(0);
@@ -653,11 +725,12 @@ pub fn log_sni_passthrough_access(
     };
     let request_started_at = request_started_at_millis / 1000;
 
-    let start_dt = crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
-    let time_iso8601 = start_dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
-    let time_local = start_dt.format("%d/%b/%Y:%H:%M:%S %z").to_string();
+    let fields = access_log_ref
+        .filter(|access_log| !access_log.fields.is_empty())
+        .map(|access_log| access_log.fields.as_slice());
+    let (time_iso8601, time_local) = l4_passthrough_time_fields(request_started_at_millis, fields);
     let request_uri = "/".to_string();
-    let request_line = format!("CONNECT {} TCP", sni_host);
+    let request_line = format!("{} {} {}", request_method, sni_host, proto);
     let mut log = pb::HttpAccessLog {
         request_id,
         server_id,
@@ -667,12 +740,12 @@ pub fn log_sni_passthrough_access(
         remote_port: client_addr.port() as i32,
         request_uri: request_uri.clone(),
         request_path: request_uri,
-        request_method: "CONNECT".to_string(),
+        request_method: request_method.to_string(),
         request_length: bytes_received as i64,
         request_time: duration.as_secs_f64(),
         request: request_line,
-        scheme: "https".to_string(),
-        proto: "TCP".to_string(),
+        scheme: scheme.to_string(),
+        proto: proto.to_string(),
         status,
         bytes_sent: bytes_sent as i64,
         body_bytes_sent: bytes_sent as i64,
@@ -685,19 +758,36 @@ pub fn log_sni_passthrough_access(
         origin_address: backend_addr.to_string(),
         origin_status: status,
         server_port: listen_port as i32,
-        server_protocol: "TCP".to_string(),
+        server_protocol: proto.to_string(),
         ..Default::default()
     };
 
     if let Some(error) = error.filter(|value| !value.is_empty()) {
         log.errors.push(error.to_string());
     }
+    if let Some(access_log_ref) = access_log_ref
+        && !access_log_ref.fields.is_empty()
+    {
+        apply_fields_whitelist(&mut log, &access_log_ref.fields);
+    }
 
     debug!(
-        "Reporting SNI passthrough log: {} -> Status {}",
+        "Reporting L4 passthrough log: {} -> Status {}",
         log.request_uri, log.status
     );
     if let Err(e) = sender.try_send(log) {
         tracing::warn!("ACCESS_LOG: failed to enqueue SNI passthrough log: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn l4_time_fields_are_utc_when_enabled() {
+        let (time_iso8601, time_local) =
+            l4_passthrough_time_fields(1_700_000_000_123, Some(&[23, 24]));
+        assert!(time_iso8601.ends_with('Z'));
+        assert!(time_local.ends_with("+0000"));
     }
 }

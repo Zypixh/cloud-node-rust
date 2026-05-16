@@ -231,7 +231,7 @@ pub async fn start_config_syncer(
 
         let mut node_service = client.node_service();
 
-        if fetch_and_apply_config(
+        let config_synced = fetch_and_apply_config(
             &mut node_service,
             &config_store,
             &api_config,
@@ -240,20 +240,21 @@ pub async fn start_config_syncer(
             &mut task_version,
             &mut config_version,
         )
-        .await
-        {
+        .await;
+
+        if config_synced {
             sync_deleted_contents(&api_config, &config_store, &mut deleted_content_version).await;
-            sync_node_tasks(
-                &api_config,
-                &config_store,
-                &health_manager,
-                &cert_selector,
-                &ip_list_manager,
-                &mut task_version,
-                &mut config_version,
-            )
-            .await;
         }
+        sync_node_tasks(
+            &api_config,
+            &config_store,
+            &health_manager,
+            &cert_selector,
+            &ip_list_manager,
+            &mut task_version,
+            config_synced,
+        )
+        .await;
 
         report_connected_api_nodes(&api_config).await;
 

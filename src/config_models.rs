@@ -741,11 +741,13 @@ impl ServerConfig {
     pub(crate) fn normalize_runtime_server_name(name: &str) -> String {
         let trimmed = name.trim();
         let lower = trimmed.to_ascii_lowercase();
-        if let Some(stripped) = lower.strip_suffix("@sni_passthrough") {
-            let prefix_len = stripped.len();
-            return trimmed[..prefix_len]
-                .trim_end_matches('@')
-                .to_ascii_lowercase();
+        for marker in ["@sni_passthrough", "@quic"] {
+            if let Some(stripped) = lower.strip_suffix(marker) {
+                let prefix_len = stripped.len();
+                return trimmed[..prefix_len]
+                    .trim_end_matches('@')
+                    .to_ascii_lowercase();
+            }
         }
         lower
     }
@@ -791,14 +793,20 @@ impl ServerConfig {
     }
 
     pub fn is_sni_passthrough(&self) -> bool {
-        // ONLY match if domain name specifically ends with @sni_passthrough
-        // DO NOT match description to avoid accidental activation
+        self.has_server_name_marker("@sni_passthrough")
+    }
+
+    pub fn is_quic_passthrough(&self) -> bool {
+        self.has_server_name_marker("@quic")
+    }
+
+    fn has_server_name_marker(&self, marker: &str) -> bool {
         self.server_names.iter().any(|sn| {
-            sn.name.to_ascii_lowercase().ends_with("@sni_passthrough")
+            sn.name.to_ascii_lowercase().ends_with(marker)
                 || sn
                     .sub_names
                     .iter()
-                    .any(|sub| sub.to_ascii_lowercase().ends_with("@sni_passthrough"))
+                    .any(|sub| sub.to_ascii_lowercase().ends_with(marker))
         })
     }
 
@@ -810,9 +818,7 @@ impl ServerConfig {
                 https.listen.iter().any(|addr| {
                     addr.port_range
                         .as_deref()
-                        .and_then(|range| range.split('-').next())
-                        .and_then(|value| value.parse::<u16>().ok())
-                        == Some(port)
+                        .is_some_and(|range| port_range_contains(range, port))
                 })
             })
             .unwrap_or(false)
@@ -2582,10 +2588,48 @@ fn is_tls_origin_protocol(protocol: &str) -> bool {
     )
 }
 
-fn first_port_in_range(port_range: &str) -> Option<u16> {
+pub(crate) fn first_port_in_range(port_range: &str) -> Option<u16> {
     let raw = port_range.trim();
     let first = raw.split(['-', ':']).next().unwrap_or(raw).trim();
     first.parse::<u16>().ok()
+}
+
+pub(crate) fn ports_in_range(port_range: &str) -> Vec<u16> {
+    let raw = port_range.trim();
+    let Some((start, end)) = raw.split_once('-') else {
+        return first_port_in_range(raw).into_iter().collect();
+    };
+    let Some(start) = first_port_in_range(start) else {
+        return Vec::new();
+    };
+    let Some(end) = first_port_in_range(end) else {
+        return Vec::new();
+    };
+    let (start, end) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    (start..=end).collect()
+}
+
+pub(crate) fn port_range_contains(port_range: &str, port: u16) -> bool {
+    let raw = port_range.trim();
+    let Some((start, end)) = raw.split_once('-') else {
+        return first_port_in_range(raw) == Some(port);
+    };
+    let Some(start) = first_port_in_range(start) else {
+        return false;
+    };
+    let Some(end) = first_port_in_range(end) else {
+        return false;
+    };
+    let (start, end) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    (start..=end).contains(&port)
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, Eq, PartialEq)]

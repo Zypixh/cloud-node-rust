@@ -110,6 +110,17 @@ pub struct NodeConfig {
     pub has_any_sni_passthrough: bool,
     pub sni_passthrough_exact: HashMap<(u16, String), Arc<ServerConfig>>,
     pub sni_passthrough_wildcard: HashMap<(u16, String), Arc<ServerConfig>>,
+    pub has_any_quic_passthrough: bool,
+    pub quic_passthrough_exact: HashMap<(u16, String), Arc<ServerConfig>>,
+    pub quic_passthrough_wildcard: HashMap<(u16, String), Arc<ServerConfig>>,
+    pub unique_quic_passthrough_by_port: HashMap<u16, Option<Arc<ServerConfig>>>,
+}
+
+#[derive(Clone)]
+pub struct TlsRouteInspection {
+    pub host: String,
+    pub has_l7_server: bool,
+    pub sni_passthrough_server: Option<Arc<ServerConfig>>,
 }
 
 impl Default for NodeConfig {
@@ -171,6 +182,10 @@ impl Default for NodeConfig {
             has_any_sni_passthrough: false,
             sni_passthrough_exact: HashMap::new(),
             sni_passthrough_wildcard: HashMap::new(),
+            has_any_quic_passthrough: false,
+            quic_passthrough_exact: HashMap::new(),
+            quic_passthrough_wildcard: HashMap::new(),
+            unique_quic_passthrough_by_port: HashMap::new(),
         }
     }
 }
@@ -318,6 +333,10 @@ impl ConfigStore {
         self.inner.read().has_any_sni_passthrough
     }
 
+    pub fn has_any_quic_passthrough_sync(&self) -> bool {
+        self.inner.read().has_any_quic_passthrough
+    }
+
     pub fn get_hot_path_snapshot_sync(&self) -> HotPathSnapshot {
         let lock = self.inner.read();
         Self::build_hot_path_snapshot(&lock)
@@ -425,7 +444,7 @@ impl ConfigStore {
         let lock = self.inner.read();
         lock.servers
             .get(&normalized)
-            .filter(|server| !server.is_sni_passthrough())
+            .filter(|server| !server.is_sni_passthrough() && !server.is_quic_passthrough())
             .cloned()
     }
 
@@ -445,14 +464,16 @@ impl ConfigStore {
     ) -> Option<Arc<ServerConfig>> {
         lock.servers
             .get(normalized_host)
-            .filter(|server| !server.is_sni_passthrough())
+            .filter(|server| !server.is_sni_passthrough() && !server.is_quic_passthrough())
             .cloned()
             .or_else(|| {
                 normalized_host.find('.').and_then(|pos| {
                     let wildcard = format!("*{}", &normalized_host[pos..]);
                     lock.servers
                         .get(&wildcard)
-                        .filter(|server| !server.is_sni_passthrough())
+                        .filter(|server| {
+                            !server.is_sni_passthrough() && !server.is_quic_passthrough()
+                        })
                         .cloned()
                 })
             })
@@ -468,31 +489,124 @@ impl ConfigStore {
         Self::find_sni_passthrough_server_locked(&lock, &normalized, port)
     }
 
+    pub fn find_quic_passthrough_server_sync(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Option<Arc<ServerConfig>> {
+        let normalized = Self::normalize_host(host);
+        let lock = self.inner.read();
+        Self::find_quic_passthrough_server_locked(&lock, &normalized, port)
+    }
+
+    pub fn find_unique_quic_passthrough_server_by_port_sync(
+        &self,
+        port: u16,
+    ) -> Option<Arc<ServerConfig>> {
+        let lock = self.inner.read();
+        lock.unique_quic_passthrough_by_port
+            .get(&port)
+            .and_then(Clone::clone)
+    }
+
+    pub fn inspect_tls_route_sync(&self, host: &str, port: u16) -> Option<TlsRouteInspection> {
+        let normalized = Self::normalize_host(host);
+        let lock = self.inner.read();
+        if lock
+            .servers
+            .get(&normalized)
+            .filter(|server| {
+                !server.is_sni_passthrough()
+                    && !server.is_quic_passthrough()
+                    && server.listens_on_https_port(port)
+            })
+            .is_some()
+        {
+            return Some(TlsRouteInspection {
+                host: normalized,
+                has_l7_server: true,
+                sni_passthrough_server: None,
+            });
+        }
+
+        if let Some(server) = lock
+            .sni_passthrough_exact
+            .get(&(port, normalized.clone()))
+            .cloned()
+        {
+            return Some(TlsRouteInspection {
+                host: normalized,
+                has_l7_server: false,
+                sni_passthrough_server: Some(server),
+            });
+        }
+
+        if Self::find_l7_server_locked(&lock, &normalized)
+            .is_some_and(|server| server.listens_on_https_port(port))
+        {
+            return Some(TlsRouteInspection {
+                host: normalized,
+                has_l7_server: true,
+                sni_passthrough_server: None,
+            });
+        }
+
+        Some(TlsRouteInspection {
+            sni_passthrough_server: Self::find_sni_passthrough_server_locked(
+                &lock,
+                &normalized,
+                port,
+            ),
+            host: normalized,
+            has_l7_server: false,
+        })
+    }
+
     fn find_sni_passthrough_server_locked(
         lock: &NodeConfig,
         normalized_host: &str,
         port: u16,
     ) -> Option<Arc<ServerConfig>> {
-        if let Some(server) = lock
-            .sni_passthrough_exact
-            .get(&(port, normalized_host.to_string()))
-        {
-            return Some(server.clone());
-        }
-        if let Some(server) = lock
-            .sni_passthrough_wildcard
-            .get(&(port, normalized_host.to_string()))
-        {
-            return Some(server.clone());
-        }
-        let mut suffix = normalized_host;
-        while let Some((_, rest)) = suffix.split_once('.') {
-            suffix = rest;
-            if let Some(server) = lock
-                .sni_passthrough_wildcard
-                .get(&(port, suffix.to_string()))
-            {
+        Self::find_passthrough_server_locked(
+            &lock.sni_passthrough_exact,
+            &lock.sni_passthrough_wildcard,
+            normalized_host,
+            port,
+        )
+    }
+
+    fn find_quic_passthrough_server_locked(
+        lock: &NodeConfig,
+        normalized_host: &str,
+        port: u16,
+    ) -> Option<Arc<ServerConfig>> {
+        Self::find_passthrough_server_locked(
+            &lock.quic_passthrough_exact,
+            &lock.quic_passthrough_wildcard,
+            normalized_host,
+            port,
+        )
+    }
+
+    fn find_passthrough_server_locked(
+        exact: &HashMap<(u16, String), Arc<ServerConfig>>,
+        wildcard: &HashMap<(u16, String), Arc<ServerConfig>>,
+        normalized_host: &str,
+        port: u16,
+    ) -> Option<Arc<ServerConfig>> {
+        for lookup_port in [port, 0] {
+            if let Some(server) = exact.get(&(lookup_port, normalized_host.to_string())) {
                 return Some(server.clone());
+            }
+            if let Some(server) = wildcard.get(&(lookup_port, normalized_host.to_string())) {
+                return Some(server.clone());
+            }
+            let mut suffix = normalized_host;
+            while let Some((_, rest)) = suffix.split_once('.') {
+                suffix = rest;
+                if let Some(server) = wildcard.get(&(lookup_port, suffix.to_string())) {
+                    return Some(server.clone());
+                }
             }
         }
         None
@@ -982,7 +1096,13 @@ impl ConfigStore {
         lock.webp_image_policies = webp_image_policies;
         lock.toa = toa;
         lock.global_access_log = global_access_log.map(Arc::new);
-        Self::refresh_sni_passthrough_flag(&mut lock);
+        crate::logging::set_global_access_log_on(
+            lock.global_access_log
+                .as_ref()
+                .map(|cfg| cfg.is_on)
+                .unwrap_or(true),
+        );
+        Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1024,7 +1144,7 @@ impl ConfigStore {
             }
             lock.routes.insert(host, lb);
         }
-        Self::refresh_sni_passthrough_flag(&mut lock);
+        Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1074,7 +1194,7 @@ impl ConfigStore {
         for (host, lb) in routes {
             lock.routes.insert(host, lb);
         }
-        Self::refresh_sni_passthrough_flag(&mut lock);
+        Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1102,7 +1222,7 @@ impl ConfigStore {
                 lock.id_to_lb.remove(&server_id);
             }
         }
-        Self::refresh_sni_passthrough_flag(&mut lock);
+        Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1124,7 +1244,7 @@ impl ConfigStore {
         if server_id > 0 {
             lock.id_to_lb.remove(&server_id);
         }
-        Self::refresh_sni_passthrough_flag(&mut lock);
+        Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1145,67 +1265,136 @@ impl ConfigStore {
         lock.all_servers.push(server.clone());
         lock.servers.insert(host.clone(), server);
         lock.routes.insert(host, lb);
-        Self::refresh_sni_passthrough_flag(&mut lock);
+        Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
 
-    fn refresh_sni_passthrough_flag(lock: &mut NodeConfig) {
+    fn refresh_passthrough_indexes(lock: &mut NodeConfig) {
         lock.sni_passthrough_exact.clear();
         lock.sni_passthrough_wildcard.clear();
+        lock.quic_passthrough_exact.clear();
+        lock.quic_passthrough_wildcard.clear();
+        lock.unique_quic_passthrough_by_port.clear();
 
         for server in &lock.all_servers {
-            if !server.is_sni_passthrough() {
-                continue;
+            if server.is_sni_passthrough() {
+                let ports = Self::server_https_ports(server);
+                Self::index_passthrough_server(
+                    &mut lock.sni_passthrough_exact,
+                    &mut lock.sni_passthrough_wildcard,
+                    server,
+                    ports,
+                );
             }
-            let mut ports = server
-                .https
-                .as_ref()
-                .filter(|https| https.is_on)
-                .map(|https| {
-                    https
-                        .listen
-                        .iter()
-                        .filter_map(|addr| {
-                            addr.port_range
-                                .as_deref()
-                                .and_then(|range| range.split('-').next())
-                                .and_then(|value| value.parse::<u16>().ok())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            ports.push(0);
-            ports.sort_unstable();
-            ports.dedup();
-
-            for name in server.get_plain_server_names() {
-                let name = Self::normalize_host(&name);
-                if name.is_empty() {
-                    continue;
-                }
-                let (wildcard, key_name) = if let Some(suffix) = name.strip_prefix("*.") {
-                    (true, suffix.to_string())
-                } else {
-                    (false, name)
-                };
-                for port in &ports {
-                    let key = (*port, key_name.clone());
-                    if wildcard {
-                        lock.sni_passthrough_wildcard
-                            .entry(key)
-                            .or_insert_with(|| server.clone());
-                    } else {
-                        lock.sni_passthrough_exact
-                            .entry(key)
-                            .or_insert_with(|| server.clone());
-                    }
-                }
+            if server.is_quic_passthrough() {
+                let ports = Self::server_udp_ports(server, false);
+                Self::index_passthrough_server(
+                    &mut lock.quic_passthrough_exact,
+                    &mut lock.quic_passthrough_wildcard,
+                    server,
+                    ports,
+                );
             }
         }
 
+        lock.unique_quic_passthrough_by_port = Self::build_unique_quic_passthrough_by_port(lock);
         lock.has_any_sni_passthrough =
             !lock.sni_passthrough_exact.is_empty() || !lock.sni_passthrough_wildcard.is_empty();
+        lock.has_any_quic_passthrough =
+            !lock.quic_passthrough_exact.is_empty() || !lock.quic_passthrough_wildcard.is_empty();
+    }
+
+    fn build_unique_quic_passthrough_by_port(
+        lock: &NodeConfig,
+    ) -> HashMap<u16, Option<Arc<ServerConfig>>> {
+        let mut unique = HashMap::<u16, Option<Arc<ServerConfig>>>::new();
+        for ((port, _), server) in lock
+            .quic_passthrough_exact
+            .iter()
+            .chain(lock.quic_passthrough_wildcard.iter())
+        {
+            unique
+                .entry(*port)
+                .and_modify(|matched| {
+                    if matched
+                        .as_ref()
+                        .is_some_and(|existing| existing.numeric_id() != server.numeric_id())
+                    {
+                        *matched = None;
+                    }
+                })
+                .or_insert_with(|| Some(server.clone()));
+        }
+        unique
+    }
+
+    fn server_https_ports(server: &Arc<ServerConfig>) -> Vec<u16> {
+        let mut ports = server
+            .https
+            .as_ref()
+            .filter(|https| https.is_on)
+            .map(|https| {
+                https
+                    .listen
+                    .iter()
+                    .filter_map(|addr| addr.port_range.as_deref())
+                    .flat_map(crate::config_models::ports_in_range)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        ports.push(0);
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    fn server_udp_ports(server: &Arc<ServerConfig>, include_fallback: bool) -> Vec<u16> {
+        let mut ports = server
+            .udp
+            .as_ref()
+            .filter(|udp| udp.is_on)
+            .map(|udp| {
+                udp.listen
+                    .iter()
+                    .filter_map(|addr| addr.port_range.as_deref())
+                    .flat_map(crate::config_models::ports_in_range)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if include_fallback {
+            ports.push(0);
+        }
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    fn index_passthrough_server(
+        exact: &mut HashMap<(u16, String), Arc<ServerConfig>>,
+        wildcard: &mut HashMap<(u16, String), Arc<ServerConfig>>,
+        server: &Arc<ServerConfig>,
+        ports: Vec<u16>,
+    ) {
+        for name in server.get_plain_server_names() {
+            let name = Self::normalize_host(&name);
+            if name.is_empty() {
+                continue;
+            }
+            let (is_wildcard, key_name) = if let Some(suffix) = name.strip_prefix("*.") {
+                (true, suffix.to_string())
+            } else {
+                (false, name)
+            };
+            for port in &ports {
+                let key = (*port, key_name.clone());
+                if is_wildcard {
+                    wildcard.entry(key).or_insert_with(|| server.clone());
+                } else {
+                    exact.entry(key).or_insert_with(|| server.clone());
+                }
+            }
+        }
     }
 
     pub async fn set_deleted_contents(&self, deleted_contents: Vec<String>) {
@@ -1252,7 +1441,7 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_models::{HTTPSConfig, NetworkAddressConfig, ServerNameConfig};
+    use crate::config_models::{HTTPSConfig, NetworkAddressConfig, ServerNameConfig, UDPConfig};
     use serde_json::json;
 
     #[tokio::test]
@@ -1490,6 +1679,401 @@ mod tests {
                 .map(|server| server.numeric_id()),
             Some(2)
         );
+        let route = store
+            .inspect_tls_route_sync("rancher.mymya.cn", 443)
+            .expect("TLS route should inspect configured host");
+        assert!(route.has_l7_server);
+        assert!(route.sni_passthrough_server.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_sni_passthrough_takes_precedence_over_l7_wildcard() {
+        let store = ConfigStore::new();
+        let l7_server = Arc::new(ServerConfig {
+            id: Some(1),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "*.mymya.cn".to_string(),
+                ..Default::default()
+            }],
+            https: Some(HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: None,
+            }),
+            ..Default::default()
+        });
+        let passthrough_server = Arc::new(ServerConfig {
+            id: Some(2),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "rancher.mymya.cn@sni_passthrough".to_string(),
+                ..Default::default()
+            }],
+            https: Some(HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: None,
+            }),
+            ..Default::default()
+        });
+
+        let mut servers = HashMap::new();
+        servers.insert("*.mymya.cn".to_string(), l7_server.clone());
+        servers.insert("rancher.mymya.cn".to_string(), passthrough_server.clone());
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                0,
+                vec![l7_server, passthrough_server],
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        let route = store
+            .inspect_tls_route_sync("rancher.mymya.cn", 443)
+            .expect("TLS route should inspect configured host");
+        assert!(!route.has_l7_server);
+        assert_eq!(
+            route
+                .sni_passthrough_server
+                .map(|server| server.numeric_id()),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn quic_passthrough_marker_indexes_udp_listener_names() {
+        let store = ConfigStore::new();
+        let quic_server = Arc::new(ServerConfig {
+            id: Some(4),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "*.qq.com@quic".to_string(),
+                ..Default::default()
+            }],
+            udp: Some(UDPConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("udp".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443-444".to_string()),
+                }],
+            }),
+            ..Default::default()
+        });
+        let mut servers = HashMap::new();
+        servers.insert("*.qq.com".to_string(), quic_server.clone());
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                0,
+                vec![quic_server],
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        assert!(store.has_any_quic_passthrough_sync());
+        assert_eq!(
+            store
+                .find_quic_passthrough_server_sync("a.qq.com", 443)
+                .map(|server| server.numeric_id()),
+            Some(4)
+        );
+        assert_eq!(
+            store
+                .find_quic_passthrough_server_sync("a.qq.com", 444)
+                .map(|server| server.numeric_id()),
+            Some(4)
+        );
+        assert_eq!(
+            store
+                .find_quic_passthrough_server_sync("a.qq.com", 8443)
+                .map(|server| server.numeric_id()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_quic_passthrough_by_port_requires_single_server() {
+        let store = ConfigStore::new();
+        let first = Arc::new(ServerConfig {
+            id: Some(4),
+            is_on: true,
+            server_names: vec![
+                ServerNameConfig {
+                    name: "a.example.com@quic".to_string(),
+                    ..Default::default()
+                },
+                ServerNameConfig {
+                    name: "b.example.com@quic".to_string(),
+                    ..Default::default()
+                },
+            ],
+            udp: Some(UDPConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("udp".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+            }),
+            ..Default::default()
+        });
+        let second = Arc::new(ServerConfig {
+            id: Some(5),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "c.example.com@quic".to_string(),
+                ..Default::default()
+            }],
+            udp: Some(UDPConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("udp".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("8443".to_string()),
+                }],
+            }),
+            ..Default::default()
+        });
+        let mut servers = HashMap::new();
+        servers.insert("a.example.com".to_string(), first.clone());
+        servers.insert("b.example.com".to_string(), first.clone());
+        servers.insert("c.example.com".to_string(), second.clone());
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                0,
+                vec![first.clone(), second.clone()],
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            store
+                .find_unique_quic_passthrough_server_by_port_sync(443)
+                .map(|server| server.numeric_id()),
+            Some(4)
+        );
+        assert_eq!(
+            store
+                .find_unique_quic_passthrough_server_by_port_sync(8443)
+                .map(|server| server.numeric_id()),
+            Some(5)
+        );
+
+        let third = Arc::new(ServerConfig {
+            id: Some(6),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "d.example.com@quic".to_string(),
+                ..Default::default()
+            }],
+            udp: Some(UDPConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("udp".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+            }),
+            ..Default::default()
+        });
+        let mut servers = HashMap::new();
+        servers.insert("a.example.com".to_string(), first.clone());
+        servers.insert("b.example.com".to_string(), first.clone());
+        servers.insert("c.example.com".to_string(), second.clone());
+        servers.insert("d.example.com".to_string(), third.clone());
+        store
+            .update_config(
+                1,
+                2,
+                0,
+                0,
+                vec![first, second, third],
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            store
+                .find_unique_quic_passthrough_server_by_port_sync(443)
+                .map(|server| server.numeric_id()),
+            None
+        );
     }
 
     #[test]
@@ -1514,7 +2098,7 @@ mod tests {
                 listen: vec![NetworkAddressConfig {
                     protocol: Some("https".to_string()),
                     host: Some("0.0.0.0".to_string()),
-                    port_range: Some("8443".to_string()),
+                    port_range: Some("8443-8444".to_string()),
                 }],
                 ssl_policy: None,
                 supports_http3: None,
@@ -1528,8 +2112,7 @@ mod tests {
             .into_iter()
             .flat_map(|http| &http.listen)
             .filter_map(|addr| addr.port_range.as_deref())
-            .filter_map(|range| range.split('-').next())
-            .filter_map(|port| port.parse::<u16>().ok())
+            .flat_map(crate::config_models::ports_in_range)
             .collect();
         let https_ports: Vec<_> = server
             .https
@@ -1537,13 +2120,13 @@ mod tests {
             .into_iter()
             .flat_map(|https| &https.listen)
             .filter_map(|addr| addr.port_range.as_deref())
-            .filter_map(|range| range.split('-').next())
-            .filter_map(|port| port.parse::<u16>().ok())
+            .flat_map(crate::config_models::ports_in_range)
             .collect();
 
         assert_eq!(http_ports, vec![8080]);
-        assert_eq!(https_ports, vec![8443]);
+        assert_eq!(https_ports, vec![8443, 8444]);
         assert!(!server.listens_on_https_port(443));
         assert!(server.listens_on_https_port(8443));
+        assert!(server.listens_on_https_port(8444));
     }
 }

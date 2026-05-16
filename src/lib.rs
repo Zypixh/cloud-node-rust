@@ -29,6 +29,8 @@ pub mod oss_origin;
 pub mod paths;
 pub mod perf_monitor;
 pub mod proxy;
+pub mod quic_probe;
+pub mod quic_udp_demux;
 pub mod rewrite;
 pub mod rpc;
 pub mod ssl;

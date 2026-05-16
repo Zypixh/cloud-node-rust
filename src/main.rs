@@ -593,14 +593,16 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         proxy_logic,
         my_server.configuration.clone(),
     );
-    spawn_staggered(&rt, Duration::from_secs(2), async move {
-        http3_manager.start_listeners().await;
-    });
 
     // UDP & TCP
     let udp_manager = udp_proxy::UdpProxyManager::new((*config_store).clone());
+    let quic_udp_demux = cloud_node_rust::quic_udp_demux::QuicUdpDemuxManager::new(
+        (*config_store).clone(),
+        http3_manager,
+        udp_manager,
+    );
     spawn_staggered(&rt, Duration::from_secs(2), async move {
-        udp_manager.start_listeners().await;
+        quic_udp_demux.start_listeners().await;
     });
 
     let tcp_manager =

@@ -20,7 +20,9 @@ HTTP 代理是 L7 能力的主入口，支持：
 
 ## HTTP/3
 
-HTTP/3 由独立入口处理，面向支持 QUIC 的客户端。运行时会根据配置开启监听，并在日志和统计中标记 HTTP/3 流量，方便和 HTTP/1.1、HTTP/2 做区分。
+HTTP/3 面向支持 QUIC 的客户端。运行时会根据配置开启监听，并在日志和统计中标记 HTTP/3 流量，方便和 HTTP/1.1、HTTP/2 做区分。
+
+当同一 UDP 端口同时存在 HTTP/3 站点和 `@quic` 透传服务时，节点会使用共享 UDP demux 绑定单个 socket：QUIC Initial 中 ALPN 为 H3 且命中 L7 站点的流量进入 HTTP/3，命中 `@quic` 的非 H3/HY2 流量进入 UDP 透传，避免端口绑定冲突。
 
 ## gRPC 和 WebSocket
 
@@ -41,19 +43,31 @@ gRPC 和 WebSocket 属于长连接协议，运行时会优先识别协议特征�
 - TCP 透明转发。
 - TCP-TLS 按 SNI 或端口路由。
 - UDP 双向转发和会话维护。
+- `@quic` UDP 透传，支持非 obfs HY2/Hysteria2 通过 QUIC Initial TLS SNI 按域名路由。
 - L4 流量统计和连接状态记录。
 
-四层代理不执行 HTTP header、WAF 规则和页面能力，但会参与节点级统计和连接级日志。
+四层代理不执行 HTTP header、WAF 规则和页面能力，但会参与节点级统计和连接状态记录。普通 L4 和 `@quic` 不生成访问日志；SNI 透传访问日志由对应 L7 服务配置控制。
 
 ## SNI 透传
 
-共享 `443` 端口下，运行时会解析 ClientHello 并判断是否进入 SNI 透传逻辑。透传模式不会终止 TLS，而是直接将连接转发到目标上游。
+共享 `443` 端口下，运行时会解析 TCP TLS ClientHello 并判断是否进入 SNI 透传逻辑。透传模式不会终止 TLS，而是直接将连接转发到目标上游。精确 L7 HTTPS 站点优先于通配 SNI 透传，精确 SNI 透传可优先于通配 L7 站点。
 
 适用场景：
 
 - 需要保持上游证书和 TLS 握手。
 - 需要在同一入口同时承载普通 HTTPS 和透明 TLS 服务。
 - 需要降低边缘层对特定 TLS 流量的干预。
+
+## `@quic` / HY2 UDP 透传
+
+服务域名以 `@quic` 结尾时，节点会把该服务作为 QUIC UDP 透传入口。非 obfs HY2/Hysteria2 使用标准 QUIC Initial 携带 TLS ClientHello，节点从 Initial CRYPTO frame 中提取 SNI，并按 `SNI + UDP 监听端口` 命中对应服务。
+
+行为边界：
+
+- `@quic` 只用于 UDP 透传，不作为 HTTP/3 L7 站点加入 H3 desired ports。
+- 同端口存在 HTTP/3 站点时，H3 ALPN 且命中 L7 站点的流量优先进入 HTTP/3。
+- 同端口存在普通 UDP 服务时，未能按 SNI 命中 `@quic` 的流量先匹配普通 UDP；只有该端口唯一配置了一个 `@quic` 服务时才作为 fallback。
+- `@quic` 不支持 obfs 流量的域名识别，也不生成访问日志。
 
 ## 源站和多级分发
 
@@ -162,6 +176,8 @@ ACME HTTP-01 请求命中 `/.well-known/acme-challenge/` 时，节点会向 API 
 - 站点、域名、节点元数据。
 
 日志通道使用非阻塞投递，避免控制面异常反压请求热路径。上传失败时会进入有限 retry buffer。
+
+普通 TCP/UDP L4 和 `@quic` UDP 透传不生成访问日志。TCP SNI 透传会沿用对应 L7 服务的访问日志配置，并遵守全局访问日志开关；时间字段统一按 UTC 输出。
 
 ## 节点日志和统计
 
