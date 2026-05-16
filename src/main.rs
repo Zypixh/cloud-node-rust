@@ -3,10 +3,11 @@ use clap::{Parser, Subcommand};
 use std::ffi::CString;
 use std::fs;
 use std::future::Future;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
@@ -93,10 +94,65 @@ fn build_time_display() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn check_running() -> Option<(u32, PathBuf)> {
+#[derive(Clone, Debug)]
+struct RunningInstance {
+    pid: u32,
+    pid_path: PathBuf,
+}
+
+fn process_exists(pid: u32) -> bool {
+    let exists = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    exists || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn is_cloud_node_process(pid: u32) -> bool {
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return true;
+    };
+
+    let cmdline = String::from_utf8_lossy(&cmdline);
+    cmdline.contains("cloud-node-rust") || cmdline.contains("cloud-node")
+}
+
+fn read_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn find_cloud_node_process_by_cwd(pid_path: PathBuf) -> Option<RunningInstance> {
+    let current_pid = std::process::id();
+    let root =
+        fs::canonicalize(cloud_node_rust::paths::NodePaths::current().runtime_root()).ok()?;
+
+    for entry in fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == current_pid || !process_exists(pid) || !is_cloud_node_process(pid) {
+            continue;
+        }
+
+        let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) else {
+            continue;
+        };
+        if fs::canonicalize(cwd).ok().as_ref() == Some(&root) {
+            return Some(RunningInstance { pid, pid_path });
+        }
+    }
+
+    None
+}
+
+fn check_running() -> Option<RunningInstance> {
     use std::os::unix::io::AsRawFd;
-    for path in cloud_node_rust::paths::NodePaths::current().pid_file_candidates() {
-        let file = match fs::File::open(&path) {
+
+    let node_paths = cloud_node_rust::paths::NodePaths::current();
+    let mut pid_paths = node_paths.pid_file_candidates();
+
+    for path in &pid_paths {
+        let file = match fs::File::open(path) {
             Ok(file) => file,
             Err(_) => continue,
         };
@@ -105,20 +161,79 @@ fn check_running() -> Option<(u32, PathBuf)> {
         let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
         if ret == 0 {
             unsafe { libc::flock(fd, libc::LOCK_UN) };
+            if let Some(pid) = read_pid(path)
+                && !process_exists(pid)
+            {
+                let _ = fs::remove_file(path);
+            }
             continue;
         }
 
-        let err = std::io::Error::last_os_error();
+        let err = io::Error::last_os_error();
         if (err.raw_os_error() == Some(libc::EWOULDBLOCK)
             || err.raw_os_error() == Some(libc::EAGAIN))
-            && let Ok(content) = fs::read_to_string(&path)
-            && let Ok(pid) = content.trim().parse::<u32>()
+            && let Some(pid) = read_pid(path)
         {
-            return Some((pid, path));
+            if process_exists(pid) && is_cloud_node_process(pid) {
+                return Some(RunningInstance {
+                    pid,
+                    pid_path: path.clone(),
+                });
+            }
+            let _ = fs::remove_file(path);
         }
     }
 
-    None
+    find_cloud_node_process_by_cwd(pid_paths.remove(0))
+}
+
+fn send_signal(pid: u32, signal: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        Ok(())
+    } else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    }
+}
+
+fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_exists(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    !process_exists(pid)
+}
+
+fn stop_running_instance(instance: RunningInstance) -> anyhow::Result<()> {
+    println!("Stopping CloudNode (PID: {})...", instance.pid);
+    send_signal(instance.pid, libc::SIGTERM)?;
+
+    if !wait_for_exit(instance.pid, Duration::from_secs(20)) {
+        eprintln!(
+            "CloudNode did not stop within 20s, forcing shutdown (PID: {})...",
+            instance.pid
+        );
+        send_signal(instance.pid, libc::SIGKILL)?;
+        if !wait_for_exit(instance.pid, Duration::from_secs(5)) {
+            anyhow::bail!(
+                "CloudNode process {} did not exit after SIGKILL",
+                instance.pid
+            );
+        }
+    }
+
+    if read_pid(&instance.pid_path) == Some(instance.pid) {
+        let _ = fs::remove_file(&instance.pid_path);
+    }
+    println!("CloudNode stopped.");
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -130,8 +245,8 @@ fn main() -> anyhow::Result<()> {
             run_node(cli.monitor_port, cli.monitor_clear)?;
         }
         Some(Commands::Start) => {
-            if let Some((pid, _)) = check_running() {
-                println!("CloudNode is already running (PID: {})", pid);
+            if let Some(instance) = check_running() {
+                println!("CloudNode is already running (PID: {})", instance.pid);
                 return Ok(());
             }
 
@@ -191,10 +306,8 @@ fn main() -> anyhow::Result<()> {
             run_node(cli.monitor_port, cli.monitor_clear)?;
         }
         Some(Commands::Stop) => {
-            if let Some((pid, pid_path)) = check_running() {
-                println!("Stopping CloudNode (PID: {})...", pid);
-                let _ = Command::new("kill").arg(pid.to_string()).status();
-                let _ = fs::remove_file(pid_path);
+            if let Some(instance) = check_running() {
+                stop_running_instance(instance)?;
             } else {
                 println!("CloudNode is not running.");
             }
@@ -202,16 +315,19 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Status) => {
             println!("CloudNode version: {}", env!("CARGO_PKG_VERSION"));
             println!("Build time: {}", build_time_display());
-            if let Some((pid, _)) = check_running() {
-                println!("CloudNode is running (PID: {})", pid);
+            if let Some(instance) = check_running() {
+                println!("CloudNode is running (PID: {})", instance.pid);
             } else {
                 println!("CloudNode is stopped.");
             }
         }
         Some(Commands::Restart) => {
-            let _ = Command::new(std::env::current_exe()?).arg("stop").status();
-            std::thread::sleep(Duration::from_secs(1));
-            let _ = Command::new(std::env::current_exe()?).arg("start").status();
+            if let Some(instance) = check_running() {
+                stop_running_instance(instance)?;
+            }
+            Command::new(std::env::current_exe()?)
+                .arg("start")
+                .status()?;
         }
         Some(Commands::Install) => {
             #[cfg(target_os = "linux")]
@@ -252,20 +368,18 @@ fn main() -> anyhow::Result<()> {
                      Description=CloudNode High Performance Edge Node\n\
                      After=network.target\n\n\
                      [Service]\n\
-                     Type=forking\n\
-                     PIDFile={}\n\
+                     Type=simple\n\
                      WorkingDirectory={}\n\
-                     ExecStart={} start\n\
+                     ExecStart={}\n\
                      ExecStop={} stop\n\
-                     ExecReload={} restart\n\
+                     TimeoutStopSec=35\n\
+                     KillMode=process\n\
                      Restart=always\n\
                      RestartSec=10\n\
                      LimitNOFILE=1048576\n\n\
                      [Install]\n\
                      WantedBy=multi-user.target\n",
-                    node_paths.pid_file().display(),
                     work_dir.display(),
-                    exe_path.display(),
                     exe_path.display(),
                     exe_path.display()
                 );
@@ -552,6 +666,8 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     let mut conf = pingora_core::server::configuration::ServerConf::default();
     conf.threads = num_cpus::get_physical().min(32);
     conf.upstream_keepalive_pool_size = 32768;
+    conf.grace_period_seconds = Some(5);
+    conf.graceful_shutdown_timeout_seconds = Some(5);
     let mut my_server = pingora_core::server::Server::new_with_opt_and_conf(None, conf);
     info!(
         "Pingora server configured with {} threads.",
