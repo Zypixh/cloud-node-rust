@@ -66,6 +66,13 @@ struct LongHeader<'a> {
     payload_len: usize,
 }
 
+struct InitialKeyMaterial {
+    salt: &'static [u8; 20],
+    key_label: &'static [u8],
+    iv_label: &'static [u8],
+    hp_label: &'static [u8],
+}
+
 pub fn probe_quic_client_hello(packet: &[u8]) -> Option<QuicClientHello> {
     match probe_quic_client_hello_result(packet) {
         QuicProbeResult::Found(client_hello) => Some(client_hello),
@@ -119,9 +126,9 @@ pub fn probe_quic_client_hello_fragment_result(packet: &[u8]) -> QuicProbeFragme
         if packet.len() < packet_end {
             break;
         }
-        let salts = salts_for_version(header.version);
-        for salt in salts {
-            match decrypt_and_parse(packet, &header, salt) {
+        let key_materials = initial_key_materials_for_version(header.version);
+        for key_material in key_materials {
+            match decrypt_and_parse(packet, &header, key_material) {
                 DecryptResult::Found(result) => return QuicProbeFragmentResult::Found(result),
                 DecryptResult::Incomplete(fragment) => {
                     merge_crypto_fragment(&mut combined_data, &mut combined_ranges, fragment);
@@ -147,15 +154,36 @@ pub fn probe_quic_client_hello_fragment_result(packet: &[u8]) -> QuicProbeFragme
     }
 }
 
-fn salts_for_version(version: u32) -> &'static [&'static [u8; 20]] {
+const QUIC_V1_KEY_MATERIAL: InitialKeyMaterial = InitialKeyMaterial {
+    salt: &QUIC_V1_INITIAL_SALT,
+    key_label: b"quic key",
+    iv_label: b"quic iv",
+    hp_label: b"quic hp",
+};
+
+const QUIC_V1_DRAFT_KEY_MATERIAL: InitialKeyMaterial = InitialKeyMaterial {
+    salt: &QUIC_V1_DRAFT_INITIAL_SALT,
+    key_label: b"quic key",
+    iv_label: b"quic iv",
+    hp_label: b"quic hp",
+};
+
+const QUIC_V2_KEY_MATERIAL: InitialKeyMaterial = InitialKeyMaterial {
+    salt: &QUIC_V2_INITIAL_SALT,
+    key_label: b"quicv2 key",
+    iv_label: b"quicv2 iv",
+    hp_label: b"quicv2 hp",
+};
+
+fn initial_key_materials_for_version(version: u32) -> &'static [InitialKeyMaterial] {
     match version {
-        0x0000_0001 => &[&QUIC_V1_INITIAL_SALT],
-        0x6b33_43cf => &[&QUIC_V2_INITIAL_SALT],
-        0xff00_001d..=0xff00_0020 => &[&QUIC_V1_DRAFT_INITIAL_SALT],
+        0x0000_0001 => &[QUIC_V1_KEY_MATERIAL],
+        0x6b33_43cf => &[QUIC_V2_KEY_MATERIAL],
+        0xff00_001d..=0xff00_0020 => &[QUIC_V1_DRAFT_KEY_MATERIAL],
         _ => &[
-            &QUIC_V1_INITIAL_SALT,
-            &QUIC_V1_DRAFT_INITIAL_SALT,
-            &QUIC_V2_INITIAL_SALT,
+            QUIC_V1_KEY_MATERIAL,
+            QUIC_V1_DRAFT_KEY_MATERIAL,
+            QUIC_V2_KEY_MATERIAL,
         ],
     }
 }
@@ -164,11 +192,12 @@ fn parse_initial_long_header_at(packet: &[u8], start: usize) -> Option<LongHeade
     if packet.len().saturating_sub(start) < 7 || packet[start] & 0x80 == 0 {
         return None;
     }
+    let version = u32::from_be_bytes(packet.get(start + 1..start + 5)?.try_into().ok()?);
     let packet_type = (packet[start] & 0x30) >> 4;
-    if packet_type != 0 {
+    let initial_packet_type = if version == 0x6b33_43cf { 1 } else { 0 };
+    if packet_type != initial_packet_type {
         return None;
     }
-    let version = u32::from_be_bytes(packet.get(start + 1..start + 5)?.try_into().ok()?);
     let mut offset = start + 5;
     let dcid_len = *packet.get(offset)? as usize;
     offset += 1;
@@ -205,7 +234,11 @@ enum DecryptResult {
     None,
 }
 
-fn decrypt_and_parse(packet: &[u8], header: &LongHeader<'_>, salt: &[u8; 20]) -> DecryptResult {
+fn decrypt_and_parse(
+    packet: &[u8],
+    header: &LongHeader<'_>,
+    key_material: &InitialKeyMaterial,
+) -> DecryptResult {
     let Some(packet_end) = packet_end(header) else {
         return DecryptResult::None;
     };
@@ -215,7 +248,7 @@ fn decrypt_and_parse(packet: &[u8], header: &LongHeader<'_>, salt: &[u8; 20]) ->
     let pn_offset = header.pn_offset.saturating_sub(header.start);
     let payload_base_offset = header.payload_offset.saturating_sub(header.start);
     let mut protected = packet.to_vec();
-    let Some((key, iv, hp)) = derive_initial_keys(header.dcid, salt) else {
+    let Some((key, iv, hp)) = derive_initial_keys(header.dcid, key_material) else {
         return DecryptResult::None;
     };
     if remove_header_protection(&mut protected, pn_offset, &hp).is_none() {
@@ -266,16 +299,19 @@ fn decrypt_and_parse(packet: &[u8], header: &LongHeader<'_>, salt: &[u8; 20]) ->
     }
 }
 
-fn derive_initial_keys(dcid: &[u8], salt: &[u8; 20]) -> Option<([u8; 16], [u8; 12], [u8; 16])> {
-    let initial_secret = hkdf_extract(salt, dcid)?;
+fn derive_initial_keys(
+    dcid: &[u8],
+    key_material: &InitialKeyMaterial,
+) -> Option<([u8; 16], [u8; 12], [u8; 16])> {
+    let initial_secret = hkdf_extract(key_material.salt, dcid)?;
     let client_secret = hkdf_expand_label(&initial_secret, b"client in", &[], 32)?;
-    let key = hkdf_expand_label(&client_secret, b"quic key", &[], 16)?
+    let key = hkdf_expand_label(&client_secret, key_material.key_label, &[], 16)?
         .try_into()
         .ok()?;
-    let iv = hkdf_expand_label(&client_secret, b"quic iv", &[], 12)?
+    let iv = hkdf_expand_label(&client_secret, key_material.iv_label, &[], 12)?
         .try_into()
         .ok()?;
-    let hp = hkdf_expand_label(&client_secret, b"quic hp", &[], 16)?
+    let hp = hkdf_expand_label(&client_secret, key_material.hp_label, &[], 16)?
         .try_into()
         .ok()?;
     Some((key, iv, hp))
@@ -663,6 +699,31 @@ mod tests {
         let cids = quic_packet_cids(&short, 4).expect("short header dcid should parse");
         assert_eq!(cids.dcid, vec![9, 8, 7, 6]);
         assert_eq!(cids.scid, None);
+    }
+
+    #[test]
+    fn quic_v2_uses_v2_initial_packet_type_and_labels() {
+        let mut initial = vec![0xd0];
+        initial.extend_from_slice(&0x6b33_43cfu32.to_be_bytes());
+        initial.push(4);
+        initial.extend_from_slice(&[1, 2, 3, 4]);
+        initial.push(3);
+        initial.extend_from_slice(&[5, 6, 7]);
+        initial.push(0);
+        initial.push(4);
+        initial.extend_from_slice(&[0, 0, 0, 0]);
+
+        let header = parse_initial_long_header_at(&initial, 0).expect("v2 initial should parse");
+        assert_eq!(header.version, 0x6b33_43cf);
+        let material = initial_key_materials_for_version(header.version);
+        assert_eq!(material.len(), 1);
+        assert_eq!(material[0].key_label, b"quicv2 key");
+        assert_eq!(material[0].iv_label, b"quicv2 iv");
+        assert_eq!(material[0].hp_label, b"quicv2 hp");
+
+        let mut v1_type_initial = initial.clone();
+        v1_type_initial[0] = 0xc0;
+        assert!(parse_initial_long_header_at(&v1_type_initial, 0).is_none());
     }
 
     #[test]
