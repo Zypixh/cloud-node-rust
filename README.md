@@ -7,7 +7,7 @@ CloudNode Rust 是一个基于 [Pingora](https://github.com/cloudflare/pingora) 
 ## 核心特性
 
 - **多协议边缘代理**：HTTP/1.1、HTTP/2、HTTP/3、gRPC、WebSocket、TCP、TCP-TLS、UDP。
-- **共享端口接入**：支持共享 `443` 端口下的 TLS、HTTP/2、HTTP/3、`@sni_passthrough` 和 `@quic`/HY2 流量分流。
+- **共享端口接入**：支持共享 `443` 端口下的 TLS、HTTP/2、HTTP/3、`@sni_passthrough` 和 `@quic` 流量分流。
 - **混合缓存系统**：Memory + Disk 缓存，RocksDB 元数据索引，多缓存策略匹配，支持大文件和高并发切片分发。
 - **站点安全能力**：WAF、UAM、CC、防盗链、访问限制、请求限制、带宽和流量限制、自定义拦截页面。
 - **内容处理能力**：WebP 转换、HTML/CSS/JS 优化、HLS 播放列表和分片处理、自定义错误页和模板变量。

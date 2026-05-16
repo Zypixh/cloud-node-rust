@@ -98,7 +98,7 @@ billing.countInboundTraffic: false
 控制面服务域名可以通过后缀标记启用透传模式：
 
 - `example.com@sni_passthrough`：TCP TLS SNI 透传，运行时按 `example.com` 建立路由索引。
-- `example.com@quic`：UDP QUIC 透传，运行时按 `example.com` 建立路由索引，主要用于非 obfs HY2/Hysteria2。
+- `example.com@quic`：UDP QUIC 透传，运行时按 `example.com` 建立路由索引。
 
 标记不会作为真实域名参与匹配；运行时会移除后缀并统一小写。`@quic` 路由按 `SNI + UDP 监听端口` 匹配，不使用端口 `0` 兜底；同一端口只有一个 `@quic` 服务时，才会在没有普通 UDP 服务命中后作为 fallback。
 

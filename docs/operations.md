@@ -89,7 +89,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 
 ## 1.1.0 说明
 
-1.1.0 新增 `@quic`/HY2 非 obfs UDP 域名透传：节点会解析 QUIC Initial 中的 TLS SNI，并在同一 UDP 端口上和 HTTP/3 共享监听；同时修复配置任务完成闭环，避免控制面任务未确认时本地跳过版本导致节点状态停留在同步中。
+1.1.0 新增 `@quic` UDP 域名透传：节点会解析 QUIC Initial 中的 TLS SNI，并在同一 UDP 端口上和 HTTP/3 共享监听；同时修复配置任务完成闭环，避免控制面任务未确认时本地跳过版本导致节点状态停留在同步中。
 
 升级现有 Rust 节点到最新版：
 

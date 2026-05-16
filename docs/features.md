@@ -22,7 +22,7 @@ HTTP 代理是 L7 能力的主入口，支持：
 
 HTTP/3 面向支持 QUIC 的客户端。运行时会根据配置开启监听，并在日志和统计中标记 HTTP/3 流量，方便和 HTTP/1.1、HTTP/2 做区分。
 
-当同一 UDP 端口同时存在 HTTP/3 站点和 `@quic` 透传服务时，节点会使用共享 UDP demux 绑定单个 socket：QUIC Initial 中 ALPN 为 H3 且命中 L7 站点的流量进入 HTTP/3，命中 `@quic` 的非 H3/HY2 流量进入 UDP 透传，避免端口绑定冲突。
+当同一 UDP 端口同时存在 HTTP/3 站点和 `@quic` 透传服务时，节点会使用共享 UDP demux 绑定单个 socket：QUIC Initial 中 ALPN 为 H3 且命中 L7 站点的流量进入 HTTP/3，命中 `@quic` 的非 H3 流量进入 UDP 透传，避免端口绑定冲突。
 
 ## gRPC 和 WebSocket
 
@@ -43,7 +43,7 @@ gRPC 和 WebSocket 属于长连接协议，运行时会优先识别协议特征�
 - TCP 透明转发。
 - TCP-TLS 按 SNI 或端口路由。
 - UDP 双向转发和会话维护。
-- `@quic` UDP 透传，支持非 obfs HY2/Hysteria2 通过 QUIC Initial TLS SNI 按域名路由。
+- `@quic` UDP 透传，支持通过 QUIC Initial TLS SNI 按域名路由。
 - L4 流量统计和连接状态记录。
 
 四层代理不执行 HTTP header、WAF 规则和页面能力，但会参与节点级统计和连接状态记录。普通 L4 和 `@quic` 不生成访问日志；SNI 透传访问日志由对应 L7 服务配置控制。
@@ -58,9 +58,9 @@ gRPC 和 WebSocket 属于长连接协议，运行时会优先识别协议特征�
 - 需要在同一入口同时承载普通 HTTPS 和透明 TLS 服务。
 - 需要降低边缘层对特定 TLS 流量的干预。
 
-## `@quic` / HY2 UDP 透传
+## `@quic` UDP 透传
 
-服务域名以 `@quic` 结尾时，节点会把该服务作为 QUIC UDP 透传入口。非 obfs HY2/Hysteria2 使用标准 QUIC Initial 携带 TLS ClientHello，节点从 Initial CRYPTO frame 中提取 SNI，并按 `SNI + UDP 监听端口` 命中对应服务。
+服务域名以 `@quic` 结尾时，节点会把该服务作为 QUIC UDP 透传入口。节点从 QUIC Initial CRYPTO frame 中提取 TLS SNI，并按 `SNI + UDP 监听端口` 命中对应服务。
 
 行为边界：
 

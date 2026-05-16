@@ -554,7 +554,7 @@ impl UdpProxyManager {
             .find_unique_quic_passthrough_server_by_port_sync(port)
         {
             debug!(
-                "UDP Proxy: HY2 passthrough fallback on port {} matched unique @quic server {}",
+                "UDP Proxy: QUIC passthrough fallback on port {} matched unique @quic server {}",
                 port,
                 server.numeric_id()
             );
@@ -618,7 +618,7 @@ mod tests {
             id: Some(20),
             is_on: true,
             server_names: vec![ServerNameConfig {
-                name: "hy2.example.com@quic".to_string(),
+                name: "quic.example.com@quic".to_string(),
                 ..Default::default()
             }],
             udp: Some(UDPConfig {
@@ -633,7 +633,7 @@ mod tests {
         });
         let mut servers = HashMap::new();
         servers.insert("udp.example.com".to_string(), normal_udp.clone());
-        servers.insert("hy2.example.com".to_string(), quic_udp.clone());
+        servers.insert("quic.example.com".to_string(), quic_udp.clone());
         store
             .update_config(
                 1,
