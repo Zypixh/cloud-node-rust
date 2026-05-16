@@ -19,7 +19,7 @@ use tracing::{debug, error, info};
 use crate::config::ConfigStore;
 use crate::http3_proxy_manager::Http3ProxyManager;
 use crate::quic_probe::{QuicCryptoFragment, QuicProbeFragmentResult};
-use crate::udp_proxy::{UdpProxyManager, UdpSession};
+use crate::udp_proxy::{UdpProxyManager, UdpSession, UdpSessionQuicCid, UdpSessionSendStatus};
 
 const MAX_DATAGRAM_SIZE: usize = 65_535;
 const H3_QUEUE_SIZE: usize = 8192;
@@ -48,6 +48,12 @@ struct H3Datagram {
     from: SocketAddr,
     data: Bytes,
 }
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct QuicConnectionId(Vec<u8>);
+
+type CidRoutes = DashMap<usize, DashMap<QuicConnectionId, RouteKind>>;
+type SessionRoutes = DashMap<u64, RouteKind>;
 
 struct PendingQuicRoute {
     created_at: Instant,
@@ -282,6 +288,106 @@ fn client_hello_supports_h3(client_hello: &crate::quic_probe::QuicClientHello) -
         .any(|alpn| alpn == "h3" || alpn.starts_with("h3-"))
 }
 
+fn insert_cid_route(cid_routes: &CidRoutes, cid: QuicConnectionId, route: RouteKind) {
+    if cid.0.is_empty() {
+        return;
+    }
+    cid_routes
+        .entry(cid.0.len())
+        .or_default()
+        .insert(cid, route);
+}
+
+fn lookup_cid_route(cid_routes: &CidRoutes, data: &[u8]) -> Option<RouteKind> {
+    cid_routes.iter().find_map(|bucket| {
+        short_header_dcid(data, *bucket.key())
+            .and_then(|cid| bucket.value().get(&cid).map(|route| route.value().clone()))
+    })
+}
+
+fn remove_cid_routes_for_route(cid_routes: &CidRoutes, route: &RouteKind) {
+    cid_routes.retain(|_, bucket| {
+        bucket.retain(|_, existing| !route_kind_same(existing, route));
+        !bucket.is_empty()
+    });
+}
+
+fn insert_session_cids(cid_routes: &CidRoutes, route: &RouteKind) {
+    for cid in session_cids(route) {
+        insert_cid_route(cid_routes, cid, route.clone());
+    }
+}
+
+fn remove_cid_route(cid_routes: &CidRoutes, cid: &[u8]) {
+    if cid.is_empty() {
+        return;
+    }
+    if let Some(bucket) = cid_routes.get(&cid.len()) {
+        bucket.remove(&QuicConnectionId(cid.to_vec()));
+    }
+}
+
+fn apply_session_cid_update(
+    update: UdpSessionQuicCid,
+    session_routes: &SessionRoutes,
+    cid_routes: &CidRoutes,
+) {
+    let route = session_routes
+        .get(&update.session_id)
+        .map(|entry| entry.value().clone());
+    let Some(route) = route else {
+        return;
+    };
+    if let Some(retired_cid) = update.retired_cid {
+        remove_cid_route(cid_routes, &retired_cid);
+    }
+    insert_cid_route(cid_routes, QuicConnectionId(update.cid), route);
+}
+
+fn drain_session_cid_updates(
+    updates: &mut mpsc::Receiver<UdpSessionQuicCid>,
+    session_routes: &SessionRoutes,
+    cid_routes: &CidRoutes,
+) {
+    while let Ok(update) = updates.try_recv() {
+        apply_session_cid_update(update, session_routes, cid_routes);
+    }
+}
+
+fn session_cids(route: &RouteKind) -> Vec<QuicConnectionId> {
+    match route {
+        RouteKind::Passthrough(session) => UdpProxyManager::session_quic_cids(session)
+            .into_iter()
+            .map(QuicConnectionId)
+            .collect(),
+        RouteKind::Http3(_) => Vec::new(),
+    }
+}
+
+fn route_cids(data: &[u8]) -> Vec<QuicConnectionId> {
+    crate::quic_probe::quic_packet_cids(data, 0)
+        .into_iter()
+        .flat_map(|cids| [Some(cids.dcid), cids.scid].into_iter().flatten())
+        .filter(|cid| !cid.is_empty())
+        .map(QuicConnectionId)
+        .collect()
+}
+
+fn short_header_dcid(data: &[u8], cid_len: usize) -> Option<QuicConnectionId> {
+    crate::quic_probe::quic_packet_cids(data, cid_len).map(|cids| QuicConnectionId(cids.dcid))
+}
+
+fn should_use_generic_h3_fallback(
+    config_store: &ConfigStore,
+    port: u16,
+    client_hello: &crate::quic_probe::QuicClientHello,
+    http3_enabled: bool,
+) -> bool {
+    http3_enabled
+        && client_hello_supports_h3(client_hello)
+        && !config_store.has_quic_passthrough_on_port_sync(port)
+}
+
 fn server_has_http3_on_port(
     config_store: &ConfigStore,
     server: &crate::config_models::ServerConfig,
@@ -303,18 +409,41 @@ fn server_has_http3_on_port(
     server.listens_on_https_port(port)
 }
 
-fn cleanup_routes(
-    udp_manager: &UdpProxyManager,
-    routes: &DashMap<SocketAddr, RouteKind>,
-    pending_routes: &DashMap<SocketAddr, PendingQuicRoute>,
-    pending_reassembly_bytes: &AtomicUsize,
-) {
-    let now = Instant::now();
-    pending_routes
-        .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_QUIC_ROUTE_TIMEOUT);
-    pending_retained_bytes(pending_routes, pending_reassembly_bytes);
-    udp_manager.cleanup_idle_sessions(UDP_SESSION_IDLE_TIMEOUT);
-    routes.retain(|_, route| match route {
+fn route_session_id(route: &RouteKind) -> Option<u64> {
+    match route {
+        RouteKind::Passthrough(session) => Some(session.id),
+        RouteKind::Http3(_) => None,
+    }
+}
+
+fn remove_route_aliases(routes: &DashMap<SocketAddr, RouteKind>, route: &RouteKind) {
+    if let Some(session_id) = route_session_id(route) {
+        routes.retain(|_, existing| route_session_id(existing) != Some(session_id));
+    }
+}
+
+fn insert_session_route(session_routes: &SessionRoutes, route: &RouteKind) {
+    if let Some(session_id) = route_session_id(route) {
+        session_routes.insert(session_id, route.clone());
+    }
+}
+
+fn remove_session_route(session_routes: &SessionRoutes, route: &RouteKind) {
+    if let Some(session_id) = route_session_id(route) {
+        session_routes.remove(&session_id);
+    }
+}
+
+fn route_kind_same(left: &RouteKind, right: &RouteKind) -> bool {
+    match (left, right) {
+        (RouteKind::Http3(left), RouteKind::Http3(right)) => Arc::ptr_eq(left, right),
+        (RouteKind::Passthrough(left), RouteKind::Passthrough(right)) => left.id == right.id,
+        _ => false,
+    }
+}
+
+fn route_kind_is_active(route: &RouteKind, now: Instant) -> bool {
+    match route {
         RouteKind::Http3(last_activity) => last_activity
             .lock()
             .map(|last| now.duration_since(*last) < H3_ROUTE_IDLE_TIMEOUT)
@@ -324,6 +453,27 @@ fn cleanup_routes(
             .try_read()
             .map(|last| now.duration_since(*last) < UDP_SESSION_IDLE_TIMEOUT)
             .unwrap_or(true),
+    }
+}
+
+fn cleanup_routes(
+    udp_manager: &UdpProxyManager,
+    routes: &DashMap<SocketAddr, RouteKind>,
+    cid_routes: &CidRoutes,
+    pending_routes: &DashMap<SocketAddr, PendingQuicRoute>,
+    pending_reassembly_bytes: &AtomicUsize,
+    session_routes: &SessionRoutes,
+) {
+    let now = Instant::now();
+    pending_routes
+        .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_QUIC_ROUTE_TIMEOUT);
+    pending_retained_bytes(pending_routes, pending_reassembly_bytes);
+    udp_manager.cleanup_idle_sessions(UDP_SESSION_IDLE_TIMEOUT);
+    routes.retain(|_, route| route_kind_is_active(route, now));
+    session_routes.retain(|_, route| route_kind_is_active(route, now));
+    cid_routes.retain(|_, bucket| {
+        bucket.retain(|_, route| route_kind_is_active(route, now));
+        !bucket.is_empty()
     });
 }
 
@@ -495,10 +645,13 @@ impl QuicUdpDemuxManager {
         let socket = Arc::new(bind_udp_with_retry(bind_addr, &mut shutdown_rx).await?);
         let local_addr = socket.local_addr()?;
         let routes = Arc::new(DashMap::<SocketAddr, RouteKind>::new());
+        let cid_routes = Arc::new(CidRoutes::new());
+        let session_routes = Arc::new(SessionRoutes::new());
         let pending_routes = Arc::new(DashMap::<SocketAddr, PendingQuicRoute>::new());
         let pending_reassembly_bytes = AtomicUsize::new(0);
         let new_route_windows = Arc::new(DashMap::<StdIpAddr, VecDeque<Instant>>::new());
         let (h3_tx, h3_rx) = mpsc::channel(H3_QUEUE_SIZE);
+        let (quic_cid_tx, mut quic_cid_rx) = mpsc::channel(H3_QUEUE_SIZE);
 
         if http3_enabled {
             let server_config = self
@@ -539,6 +692,7 @@ impl QuicUdpDemuxManager {
         cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut next_pressure_cleanup = Instant::now() + ROUTE_CLEANUP_PRESSURE_INTERVAL;
         loop {
+            drain_session_cid_updates(&mut quic_cid_rx, &session_routes, &cid_routes);
             let recv_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
                     info!("QUIC UDP demux listener on port {} shutting down", port);
@@ -548,10 +702,19 @@ impl QuicUdpDemuxManager {
                     cleanup_routes(
                         &self.udp_manager,
                         &routes,
+                        &cid_routes,
                         &pending_routes,
                         &pending_reassembly_bytes,
+                        &session_routes,
                     );
                     cleanup_new_route_windows(&new_route_windows);
+                    continue;
+                }
+                update = quic_cid_rx.recv() => {
+                    if let Some(update) = update {
+                        apply_session_cid_update(update, &session_routes, &cid_routes);
+                        drain_session_cid_updates(&mut quic_cid_rx, &session_routes, &cid_routes);
+                    }
                     continue;
                 }
                 result = socket.recv_from(&mut buf) => result,
@@ -564,8 +727,10 @@ impl QuicUdpDemuxManager {
                 cleanup_routes(
                     &self.udp_manager,
                     &routes,
+                    &cid_routes,
                     &pending_routes,
                     &pending_reassembly_bytes,
+                    &session_routes,
                 );
                 cleanup_new_route_windows(&new_route_windows);
                 next_pressure_cleanup = now + ROUTE_CLEANUP_PRESSURE_INTERVAL;
@@ -573,11 +738,47 @@ impl QuicUdpDemuxManager {
 
             if let Some(route) = routes.get(&client_addr).map(|entry| entry.value().clone()) {
                 if self
-                    .dispatch_existing_route(route, client_addr, data, &h3_tx, http3_enabled)
+                    .dispatch_existing_route(
+                        route.clone(),
+                        client_addr,
+                        data,
+                        &h3_tx,
+                        http3_enabled,
+                    )
                     .await
                     == DispatchStatus::Closed
                 {
                     routes.remove(&client_addr);
+                    remove_session_route(&session_routes, &route);
+                    remove_cid_routes_for_route(&cid_routes, &route);
+                } else {
+                    insert_session_cids(&cid_routes, &route);
+                }
+                continue;
+            }
+
+            if let Some(route) = lookup_cid_route(&cid_routes, &data) {
+                match self
+                    .dispatch_existing_route(
+                        route.clone(),
+                        client_addr,
+                        data,
+                        &h3_tx,
+                        http3_enabled,
+                    )
+                    .await
+                {
+                    DispatchStatus::Closed => {
+                        remove_route_aliases(&routes, &route);
+                        remove_session_route(&session_routes, &route);
+                        remove_cid_routes_for_route(&cid_routes, &route);
+                    }
+                    DispatchStatus::Sent | DispatchStatus::Dropped => {
+                        remove_route_aliases(&routes, &route);
+                        insert_session_cids(&cid_routes, &route);
+                        insert_session_route(&session_routes, &route);
+                        routes.insert(client_addr, route);
+                    }
                 }
                 continue;
             }
@@ -586,8 +787,10 @@ impl QuicUdpDemuxManager {
                 cleanup_routes(
                     &self.udp_manager,
                     &routes,
+                    &cid_routes,
                     &pending_routes,
                     &pending_reassembly_bytes,
+                    &session_routes,
                 );
             }
             if routes.len() >= MAX_ROUTES_PER_PORT {
@@ -620,6 +823,7 @@ impl QuicUdpDemuxManager {
                     http3_enabled,
                     socket.clone(),
                     shutdown_rx.clone(),
+                    quic_cid_tx.clone(),
                 )
                 .await?;
             let Some((route, datagrams)) = route else {
@@ -629,6 +833,12 @@ impl QuicUdpDemuxManager {
                 record_new_route_for_ip(&new_route_windows, client_addr.ip());
             }
             routes.insert(client_addr, route.clone());
+            insert_session_route(&session_routes, &route);
+            if let Some(first_datagram) = datagrams.first() {
+                for cid in route_cids(first_datagram) {
+                    insert_cid_route(&cid_routes, cid, route.clone());
+                }
+            }
             for datagram in datagrams {
                 if self
                     .dispatch_existing_route(
@@ -642,6 +852,8 @@ impl QuicUdpDemuxManager {
                     == DispatchStatus::Closed
                 {
                     routes.remove(&client_addr);
+                    remove_session_route(&session_routes, &route);
+                    remove_cid_routes_for_route(&cid_routes, &route);
                     break;
                 }
             }
@@ -660,6 +872,7 @@ impl QuicUdpDemuxManager {
         http3_enabled: bool,
         socket: Arc<UdpSocket>,
         shutdown_rx: watch::Receiver<bool>,
+        quic_cid_tx: mpsc::Sender<UdpSessionQuicCid>,
     ) -> Result<Option<(RouteKind, Vec<Bytes>)>> {
         match crate::quic_probe::probe_quic_client_hello_fragment_result(&data) {
             QuicProbeFragmentResult::Found(client_hello) => {
@@ -680,6 +893,7 @@ impl QuicUdpDemuxManager {
                     http3_enabled,
                     socket,
                     shutdown_rx,
+                    quic_cid_tx.clone(),
                 )
                 .await
                 .map(|route| route.map(|route| (route, datagrams)))
@@ -745,13 +959,14 @@ impl QuicUdpDemuxManager {
                             .unwrap_or_else(|| vec![data.clone()]);
                         let session = match self
                             .udp_manager
-                            .create_passthrough_session_for_server(
+                            .create_passthrough_session_for_server_with_cid_updates(
                                 client_addr,
                                 port,
                                 server,
                                 None,
                                 socket,
                                 shutdown_rx,
+                                Some(quic_cid_tx.clone()),
                             )
                             .await
                         {
@@ -791,6 +1006,7 @@ impl QuicUdpDemuxManager {
                     http3_enabled,
                     socket,
                     shutdown_rx,
+                    quic_cid_tx.clone(),
                 )
                 .await
                 .map(|route| route.map(|route| (route, datagrams)))
@@ -826,7 +1042,7 @@ impl QuicUdpDemuxManager {
                 if let Some(session) = session {
                     return Ok(Some((RouteKind::Passthrough(session), vec![data])));
                 }
-                if http3_enabled {
+                if http3_enabled && !self.config_store.has_quic_passthrough_on_port_sync(port) {
                     if h3_tx
                         .try_send(H3Datagram {
                             from: client_addr,
@@ -854,14 +1070,15 @@ impl QuicUdpDemuxManager {
         http3_enabled: bool,
         socket: Arc<UdpSocket>,
         shutdown_rx: watch::Receiver<bool>,
+        quic_cid_tx: mpsc::Sender<UdpSessionQuicCid>,
     ) -> Result<Option<RouteKind>> {
         if let Some(server_name) = client_hello.server_name.as_deref() {
             if let Some(server) = self
                 .config_store
-                .find_quic_passthrough_server_sync(server_name, port)
+                .find_exact_quic_passthrough_server_sync(server_name, port)
             {
                 debug!(
-                    "QUIC UDP demux: @quic {} on port {} matched server {} alpn={:?}",
+                    "QUIC UDP demux: exact @quic {} on port {} matched server {} alpn={:?}",
                     server_name,
                     port,
                     server.numeric_id(),
@@ -869,20 +1086,21 @@ impl QuicUdpDemuxManager {
                 );
                 let session = match self
                     .udp_manager
-                    .create_passthrough_session_for_server(
+                    .create_passthrough_session_for_server_with_cid_updates(
                         client_addr,
                         port,
                         server,
                         Some(server_name.to_string()),
                         socket,
                         shutdown_rx,
+                        Some(quic_cid_tx.clone()),
                     )
                     .await
                 {
                     Ok(session) => session,
                     Err(err) => {
                         debug!(
-                            "QUIC UDP demux: @quic session creation failed for {} on port {}: {}",
+                            "QUIC UDP demux: exact @quic session creation failed for {} on port {}: {}",
                             client_addr, port, err
                         );
                         return Ok(None);
@@ -906,9 +1124,81 @@ impl QuicUdpDemuxManager {
                 );
                 return Ok(Some(RouteKind::Http3(Arc::new(Mutex::new(Instant::now())))));
             }
+
+            if let Some(server) = self
+                .config_store
+                .find_quic_passthrough_server_sync(server_name, port)
+            {
+                debug!(
+                    "QUIC UDP demux: @quic {} on port {} matched server {} alpn={:?}",
+                    server_name,
+                    port,
+                    server.numeric_id(),
+                    client_hello.alpns
+                );
+                let session = match self
+                    .udp_manager
+                    .create_passthrough_session_for_server_with_cid_updates(
+                        client_addr,
+                        port,
+                        server,
+                        Some(server_name.to_string()),
+                        socket,
+                        shutdown_rx,
+                        Some(quic_cid_tx.clone()),
+                    )
+                    .await
+                {
+                    Ok(session) => session,
+                    Err(err) => {
+                        debug!(
+                            "QUIC UDP demux: @quic session creation failed for {} on port {}: {}",
+                            client_addr, port, err
+                        );
+                        return Ok(None);
+                    }
+                };
+                return Ok(session.map(RouteKind::Passthrough));
+            }
         }
 
-        if http3_enabled && client_hello_supports_h3(&client_hello) {
+        if let Some(server) = self
+            .config_store
+            .find_unique_quic_passthrough_server_by_port_sync(port)
+        {
+            debug!(
+                "QUIC UDP demux: @quic fallback on port {} matched unique server {} sni={:?} alpn={:?}",
+                port,
+                server.numeric_id(),
+                client_hello.server_name,
+                client_hello.alpns
+            );
+            let session = match self
+                .udp_manager
+                .create_passthrough_session_for_server_with_cid_updates(
+                    client_addr,
+                    port,
+                    server,
+                    client_hello.server_name.clone(),
+                    socket,
+                    shutdown_rx,
+                    Some(quic_cid_tx.clone()),
+                )
+                .await
+            {
+                Ok(session) => session,
+                Err(err) => {
+                    debug!(
+                        "QUIC UDP demux: @quic fallback session creation failed for {} on port {}: {}",
+                        client_addr, port, err
+                    );
+                    return Ok(None);
+                }
+            };
+            return Ok(session.map(RouteKind::Passthrough));
+        }
+
+        if should_use_generic_h3_fallback(&self.config_store, port, &client_hello, http3_enabled) {
             return Ok(Some(RouteKind::Http3(Arc::new(Mutex::new(Instant::now())))));
         }
 
@@ -962,20 +1252,230 @@ impl QuicUdpDemuxManager {
                     Err(mpsc::error::TrySendError::Closed(_)) => DispatchStatus::Closed,
                 }
             }
-            RouteKind::Passthrough(session) => match session.tx.try_send(data) {
-                Ok(()) => {
-                    UdpProxyManager::update_session_activity(&session);
-                    DispatchStatus::Sent
+            RouteKind::Passthrough(session) => {
+                match UdpProxyManager::send_to_session_from_client(&session, client_addr, data)
+                    .await
+                {
+                    UdpSessionSendStatus::Sent => DispatchStatus::Sent,
+                    UdpSessionSendStatus::Full => {
+                        debug!(
+                            "UDP passthrough session {} buffer full, dropping packet",
+                            client_addr
+                        );
+                        DispatchStatus::Dropped
+                    }
+                    UdpSessionSendStatus::Closed => DispatchStatus::Closed,
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    debug!(
-                        "UDP passthrough session {} buffer full, dropping packet",
-                        client_addr
-                    );
-                    DispatchStatus::Dropped
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => DispatchStatus::Closed,
-            },
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_models::{NetworkAddressConfig, ServerNameConfig, UDPConfig};
+    use std::collections::HashMap;
+
+    #[test]
+    fn short_header_matches_registered_connection_id() {
+        let initial = [
+            0xc0, 0, 0, 0, 1, 4, 1, 2, 3, 4, 3, 5, 6, 7, 0, 4, 0, 0, 0, 0,
+        ];
+        let cids = route_cids(&initial);
+        assert!(cids.contains(&QuicConnectionId(vec![1, 2, 3, 4])));
+        assert!(cids.contains(&QuicConnectionId(vec![5, 6, 7])));
+
+        let short = [0x40, 1, 2, 3, 4, 0xaa];
+        assert_eq!(
+            short_header_dcid(&short, 4),
+            Some(QuicConnectionId(vec![1, 2, 3, 4]))
+        );
+    }
+
+    #[test]
+    fn cid_routes_are_bucketed_by_connection_id_length() {
+        let cid_routes = CidRoutes::new();
+        let route = RouteKind::Http3(Arc::new(Mutex::new(Instant::now())));
+        insert_cid_route(
+            &cid_routes,
+            QuicConnectionId(vec![1, 2, 3, 4]),
+            route.clone(),
+        );
+
+        assert!(cid_routes.get(&4).is_some());
+        assert!(lookup_cid_route(&cid_routes, &[0x40, 1, 2, 3, 4, 0xaa]).is_some());
+        assert!(lookup_cid_route(&cid_routes, &[0x40, 1, 2, 3, 5, 0xaa]).is_none());
+    }
+
+    #[test]
+    fn session_cid_updates_insert_and_retire_demux_routes() {
+        let session_routes = SessionRoutes::new();
+        let cid_routes = CidRoutes::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let session = Arc::new(UdpSession {
+            id: 77,
+            client_addr: Arc::new(tokio::sync::RwLock::new("127.0.0.1:10000".parse().unwrap())),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity: Arc::new(tokio::sync::RwLock::new(Instant::now())),
+            quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
+            quic_cid_tx: None,
+            tx,
+            shutdown,
+        });
+        session_routes.insert(77, RouteKind::Passthrough(session));
+        let (cid_tx, mut cid_rx) = mpsc::channel(2);
+        cid_tx
+            .try_send(UdpSessionQuicCid {
+                session_id: 77,
+                cid: vec![1, 2, 3, 4],
+                retired_cid: None,
+            })
+            .unwrap();
+        cid_tx
+            .try_send(UdpSessionQuicCid {
+                session_id: 77,
+                cid: vec![5, 6, 7, 8],
+                retired_cid: Some(vec![1, 2, 3, 4]),
+            })
+            .unwrap();
+
+        drain_session_cid_updates(&mut cid_rx, &session_routes, &cid_routes);
+
+        assert!(lookup_cid_route(&cid_routes, &[0x40, 1, 2, 3, 4, 0xaa]).is_none());
+        assert!(lookup_cid_route(&cid_routes, &[0x40, 5, 6, 7, 8, 0xaa]).is_some());
+    }
+
+    #[test]
+    fn rebind_alias_cleanup_keeps_single_socket_route_per_session() {
+        let routes = DashMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let session = Arc::new(UdpSession {
+            id: 77,
+            client_addr: Arc::new(tokio::sync::RwLock::new("127.0.0.1:10000".parse().unwrap())),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity: Arc::new(tokio::sync::RwLock::new(Instant::now())),
+            quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
+            quic_cid_tx: None,
+            tx,
+            shutdown,
+        });
+        let route = RouteKind::Passthrough(session);
+        routes.insert("127.0.0.1:10000".parse().unwrap(), route.clone());
+
+        remove_route_aliases(&routes, &route);
+        routes.insert("127.0.0.1:10001".parse().unwrap(), route.clone());
+
+        assert_eq!(routes.len(), 1);
+        assert!(
+            routes
+                .get(&"127.0.0.1:10001".parse::<SocketAddr>().unwrap())
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_h3_fallback_is_disabled_on_quic_passthrough_port() {
+        let store = ConfigStore::new();
+        let quic_server = Arc::new(crate::config_models::ServerConfig {
+            id: Some(9),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "quic.example.com@quic".to_string(),
+                ..Default::default()
+            }],
+            udp: Some(UDPConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("udp".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+            }),
+            ..Default::default()
+        });
+        let mut servers = HashMap::new();
+        servers.insert("quic.example.com".to_string(), quic_server.clone());
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                0,
+                vec![quic_server],
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        let client_hello = crate::quic_probe::QuicClientHello {
+            server_name: Some("other.example.com".to_string()),
+            alpns: vec!["h3".to_string()],
+        };
+
+        assert!(!should_use_generic_h3_fallback(
+            &store,
+            443,
+            &client_hello,
+            true
+        ));
+        assert!(should_use_generic_h3_fallback(
+            &store,
+            8443,
+            &client_hello,
+            true
+        ));
     }
 }

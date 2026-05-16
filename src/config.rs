@@ -499,6 +499,24 @@ impl ConfigStore {
         Self::find_quic_passthrough_server_locked(&lock, &normalized, port)
     }
 
+    pub fn find_exact_quic_passthrough_server_sync(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Option<Arc<ServerConfig>> {
+        let normalized = Self::normalize_host(host);
+        let lock = self.inner.read();
+        for lookup_port in [port, 0] {
+            if let Some(server) = lock
+                .quic_passthrough_exact
+                .get(&(lookup_port, normalized.clone()))
+            {
+                return Some(server.clone());
+            }
+        }
+        None
+    }
+
     pub fn find_unique_quic_passthrough_server_by_port_sync(
         &self,
         port: u16,
@@ -507,6 +525,11 @@ impl ConfigStore {
         lock.unique_quic_passthrough_by_port
             .get(&port)
             .and_then(Clone::clone)
+    }
+
+    pub fn has_quic_passthrough_on_port_sync(&self, port: u16) -> bool {
+        let lock = self.inner.read();
+        lock.unique_quic_passthrough_by_port.contains_key(&port)
     }
 
     pub fn inspect_tls_route_sync(&self, host: &str, port: u16) -> Option<TlsRouteInspection> {
@@ -1372,12 +1395,13 @@ impl ConfigStore {
 
     fn server_quic_passthrough_ports(server: &Arc<ServerConfig>) -> Vec<u16> {
         let mut ports = Self::server_udp_ports(server, false);
-        if ports.is_empty() {
-            ports = Self::server_https_ports(server)
+        ports.extend(
+            Self::server_https_ports(server)
                 .into_iter()
-                .filter(|port| *port != 0)
-                .collect();
-        }
+                .filter(|port| *port != 0),
+        );
+        ports.sort_unstable();
+        ports.dedup();
         ports
     }
 
@@ -1977,6 +2001,102 @@ mod tests {
                 .find_quic_passthrough_server_sync("quic-only.example.com", 443)
                 .map(|server| server.numeric_id()),
             Some(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn quic_passthrough_indexes_udp_and_https_listener_ports() {
+        let store = ConfigStore::new();
+        let quic_server = Arc::new(ServerConfig {
+            id: Some(8),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "mixed-quic.example.com@quic".to_string(),
+                ..Default::default()
+            }],
+            udp: Some(UDPConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("udp".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("8443".to_string()),
+                }],
+            }),
+            https: Some(HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: Some(true),
+            }),
+            ..Default::default()
+        });
+        let mut servers = HashMap::new();
+        servers.insert("mixed-quic.example.com".to_string(), quic_server.clone());
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                0,
+                vec![quic_server],
+                servers,
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            store
+                .find_quic_passthrough_server_sync("mixed-quic.example.com", 443)
+                .map(|server| server.numeric_id()),
+            Some(8)
+        );
+        assert_eq!(
+            store
+                .find_quic_passthrough_server_sync("mixed-quic.example.com", 8443)
+                .map(|server| server.numeric_id()),
+            Some(8)
         );
     }
 

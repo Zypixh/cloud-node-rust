@@ -51,6 +51,12 @@ pub enum QuicProbeFragmentResult {
     None,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicPacketCids {
+    pub dcid: Vec<u8>,
+    pub scid: Option<Vec<u8>>,
+}
+
 struct LongHeader<'a> {
     start: usize,
     version: u32,
@@ -73,6 +79,30 @@ pub fn probe_quic_client_hello_result(packet: &[u8]) -> QuicProbeResult {
         QuicProbeFragmentResult::Incomplete(_) => QuicProbeResult::Incomplete,
         QuicProbeFragmentResult::None => QuicProbeResult::None,
     }
+}
+
+pub fn quic_packet_cids(packet: &[u8], short_dcid_len: usize) -> Option<QuicPacketCids> {
+    let first = *packet.first()?;
+    if first & 0x80 != 0 {
+        let version = u32::from_be_bytes(packet.get(1..5)?.try_into().ok()?);
+        if version == 0 {
+            return None;
+        }
+        let mut offset = 5;
+        let dcid_len = *packet.get(offset)? as usize;
+        offset += 1;
+        let dcid = packet.get(offset..offset + dcid_len)?.to_vec();
+        offset += dcid_len;
+        let scid_len = *packet.get(offset)? as usize;
+        offset += 1;
+        let scid = packet.get(offset..offset + scid_len)?.to_vec();
+        return Some(QuicPacketCids {
+            dcid,
+            scid: Some(scid),
+        });
+    }
+    let dcid = packet.get(1..1 + short_dcid_len)?.to_vec();
+    Some(QuicPacketCids { dcid, scid: None })
 }
 
 pub fn probe_quic_client_hello_fragment_result(packet: &[u8]) -> QuicProbeFragmentResult {
@@ -611,6 +641,28 @@ mod tests {
         message.extend_from_slice(&body);
 
         message
+    }
+
+    #[test]
+    fn extracts_long_and_short_header_connection_ids() {
+        let mut initial = vec![0xc0];
+        initial.extend_from_slice(&1u32.to_be_bytes());
+        initial.push(4);
+        initial.extend_from_slice(&[1, 2, 3, 4]);
+        initial.push(3);
+        initial.extend_from_slice(&[5, 6, 7]);
+        initial.push(0);
+        initial.push(4);
+        initial.extend_from_slice(&[0, 0, 0, 0]);
+
+        let cids = quic_packet_cids(&initial, 0).expect("initial cids should parse");
+        assert_eq!(cids.dcid, vec![1, 2, 3, 4]);
+        assert_eq!(cids.scid, Some(vec![5, 6, 7]));
+
+        let short = [0x40, 9, 8, 7, 6, 0xaa];
+        let cids = quic_packet_cids(&short, 4).expect("short header dcid should parse");
+        assert_eq!(cids.dcid, vec![9, 8, 7, 6]);
+        assert_eq!(cids.scid, None);
     }
 
     #[test]

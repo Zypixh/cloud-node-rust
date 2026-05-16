@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,11 +14,27 @@ use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const UDP_SESSION_QUEUE_SIZE: usize = 4096;
+const UDP_SESSION_MAX_QUIC_CIDS: usize = 8;
 
 /// Session tracking for UDP sessions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpSessionSendStatus {
+    Sent,
+    Full,
+    Closed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UdpSessionQuicCid {
+    pub session_id: u64,
+    pub cid: Vec<u8>,
+    pub retired_cid: Option<Vec<u8>>,
+}
+
 pub struct UdpSession {
     pub id: u64,
-    pub client_addr: SocketAddr,
+    pub client_addr: Arc<RwLock<SocketAddr>>,
     pub listen_port: u16,
     pub backend_addr: SocketAddr,
     pub origin_id: i64,
@@ -27,6 +43,8 @@ pub struct UdpSession {
     pub user_plan_id: i64,
     pub plan_id: i64,
     pub last_activity: Arc<RwLock<Instant>>,
+    pub quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
+    pub quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
     pub tx: mpsc::Sender<Bytes>,
     pub shutdown: watch::Receiver<bool>,
 }
@@ -123,7 +141,7 @@ impl UdpProxyManager {
                     server.numeric_id()
                 );
             }
-            if server.is_quic_passthrough() && server_ports.is_empty() {
+            if server.is_quic_passthrough() {
                 if let Some(https) = &server.https
                     && https.is_on
                 {
@@ -225,13 +243,17 @@ impl UdpProxyManager {
                 }
             };
 
-            // 3. Forward data to session task
-            if session.tx.try_send(data).is_err() {
-                debug!("UDP session {} buffer full, dropping packet", client_addr);
+            match Self::send_to_session(&session, data) {
+                UdpSessionSendStatus::Sent => {}
+                UdpSessionSendStatus::Full => {
+                    debug!("UDP session {} buffer full, dropping packet", client_addr);
+                }
+                UdpSessionSendStatus::Closed => {
+                    debug!("UDP session {} closed, dropping packet", client_addr);
+                    self.sessions
+                        .remove_if(&key, |_, existing| existing.id == session.id);
+                }
             }
-
-            // 4. Update activity timestamp
-            Self::update_session_activity(&session);
         }
     }
 
@@ -270,6 +292,28 @@ impl UdpProxyManager {
         probed_server_name: Option<String>,
         listen_socket: Arc<UdpSocket>,
         shutdown_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<Option<Arc<UdpSession>>> {
+        self.create_passthrough_session_for_server_with_cid_updates(
+            client_addr,
+            port,
+            server,
+            probed_server_name,
+            listen_socket,
+            shutdown_rx,
+            None,
+        )
+        .await
+    }
+
+    pub async fn create_passthrough_session_for_server_with_cid_updates(
+        &self,
+        client_addr: SocketAddr,
+        port: u16,
+        server: Arc<ServerConfig>,
+        probed_server_name: Option<String>,
+        listen_socket: Arc<UdpSocket>,
+        shutdown_rx: watch::Receiver<bool>,
+        quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
     ) -> anyhow::Result<Option<Arc<UdpSession>>> {
         let key = (client_addr, port);
         if let Some(session) = self.sessions.get(&key) {
@@ -329,10 +373,10 @@ impl UdpProxyManager {
             client_addr, b_addr, sid
         );
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(UDP_SESSION_QUEUE_SIZE);
         let session = Arc::new(UdpSession {
             id: session_id,
-            client_addr,
+            client_addr: Arc::new(RwLock::new(client_addr)),
             listen_port: port,
             backend_addr: b_addr,
             origin_id,
@@ -341,6 +385,8 @@ impl UdpProxyManager {
             user_plan_id,
             plan_id,
             last_activity: Arc::new(RwLock::new(Instant::now())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_cid_tx: quic_cid_tx.clone(),
             tx,
             shutdown: shutdown_rx.clone(),
         });
@@ -360,32 +406,44 @@ impl UdpProxyManager {
         let shutdown_rx_clone = session.shutdown.clone();
         let server_id = session.server_id;
         let origin_id = session.origin_id;
-        let client_addr = session.client_addr;
+        let initial_client_addr = client_addr;
+        let client_addr = session.client_addr.clone();
         let last_activity = session.last_activity.clone();
+        let quic_cids = session.quic_cids.clone();
+        let session_quic_cid_tx = session.quic_cid_tx.clone();
         let sessions = self.sessions.clone();
         self.sessions.insert(key, session.clone());
 
         tokio::spawn(async move {
             let result = Self::handle_session(
+                session_id,
                 backend_addr,
                 listen_port,
                 shutdown_rx_clone,
                 server_id,
                 origin_id,
-                client_addr,
+                client_addr.clone(),
                 domain,
                 last_activity,
+                quic_cids,
+                session_quic_cid_tx,
                 listen_socket,
                 rx,
             )
             .await;
-            sessions.remove_if(&(client_addr, listen_port), |_, session| {
+            let last_client_addr = *client_addr.read().await;
+            sessions.remove_if(&(initial_client_addr, listen_port), |_, session| {
                 session.id == session_id
             });
+            if last_client_addr != initial_client_addr {
+                sessions.remove_if(&(last_client_addr, listen_port), |_, session| {
+                    session.id == session_id
+                });
+            }
             if let Err(err) = result {
                 debug!(
                     "UDP session {} -> {} closed: {}",
-                    client_addr, backend_addr, err
+                    last_client_addr, backend_addr, err
                 );
             }
         });
@@ -396,6 +454,79 @@ impl UdpProxyManager {
     pub fn update_session_activity(session: &UdpSession) {
         if let Ok(mut last) = session.last_activity.try_write() {
             *last = Instant::now();
+        }
+    }
+
+    pub async fn update_session_client_addr(session: &UdpSession, client_addr: SocketAddr) {
+        let mut current = session.client_addr.write().await;
+        if *current != client_addr {
+            *current = client_addr;
+        }
+    }
+
+    pub fn session_quic_cids(session: &UdpSession) -> Vec<Vec<u8>> {
+        session
+            .quic_cids
+            .try_read()
+            .map(|cids| cids.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    async fn record_session_quic_cid(
+        session_id: u64,
+        cids: &Arc<RwLock<VecDeque<Vec<u8>>>>,
+        quic_cid_tx: Option<&mpsc::Sender<UdpSessionQuicCid>>,
+        cid: Vec<u8>,
+    ) {
+        if cid.is_empty() {
+            return;
+        }
+        let mut cids = cids.write().await;
+        if cids.iter().any(|existing| existing == &cid) {
+            return;
+        }
+        cids.push_back(cid.clone());
+        let mut retired_cid = None;
+        while cids.len() > UDP_SESSION_MAX_QUIC_CIDS {
+            retired_cid = cids.pop_front();
+        }
+        drop(cids);
+        if let Some(tx) = quic_cid_tx {
+            let _ = tx
+                .send(UdpSessionQuicCid {
+                    session_id,
+                    cid,
+                    retired_cid,
+                })
+                .await;
+        }
+    }
+
+    pub fn send_to_session(session: &UdpSession, data: Bytes) -> UdpSessionSendStatus {
+        match session.tx.try_send(data) {
+            Ok(()) => {
+                Self::update_session_activity(session);
+                UdpSessionSendStatus::Sent
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => UdpSessionSendStatus::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => UdpSessionSendStatus::Closed,
+        }
+    }
+
+    pub async fn send_to_session_from_client(
+        session: &UdpSession,
+        client_addr: SocketAddr,
+        data: Bytes,
+    ) -> UdpSessionSendStatus {
+        match session.tx.try_reserve() {
+            Ok(permit) => {
+                Self::update_session_client_addr(session, client_addr).await;
+                permit.send(data);
+                Self::update_session_activity(session);
+                UdpSessionSendStatus::Sent
+            }
+            Err(mpsc::error::TrySendError::Full(())) => UdpSessionSendStatus::Full,
+            Err(mpsc::error::TrySendError::Closed(())) => UdpSessionSendStatus::Closed,
         }
     }
 
@@ -420,14 +551,17 @@ impl UdpProxyManager {
     }
 
     async fn handle_session(
+        session_id: u64,
         backend_addr: SocketAddr,
         _listen_port: u16,
         mut shutdown_rx: watch::Receiver<bool>,
         server_id: i64,
         origin_id: i64,
-        client_addr: SocketAddr,
+        client_addr: Arc<RwLock<SocketAddr>>,
         domain: String,
         last_activity: Arc<RwLock<Instant>>,
+        quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
+        quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
         listen_socket: Arc<UdpSocket>,
         mut rx: mpsc::Receiver<Bytes>,
     ) -> anyhow::Result<()> {
@@ -435,9 +569,10 @@ impl UdpProxyManager {
             Ok(socket) => socket,
             Err(err) => {
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                let current_client_addr = *client_addr.read().await;
                 crate::metrics::record::record_http_dimensions(
                     server_id,
-                    client_addr.ip(),
+                    current_client_addr.ip(),
                     &domain,
                     "-",
                     0,
@@ -452,9 +587,10 @@ impl UdpProxyManager {
         };
         if let Err(err) = backend_socket.connect(backend_addr).await {
             crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+            let current_client_addr = *client_addr.read().await;
             crate::metrics::record::record_http_dimensions(
                 server_id,
-                client_addr.ip(),
+                current_client_addr.ip(),
                 &domain,
                 "-",
                 0,
@@ -511,7 +647,20 @@ impl UdpProxyManager {
                         }
                     };
                     let len_u64 = len as u64;
-                    if let Err(err) = listen_socket.send_to(&buf[..len], client_addr).await {
+                    for cid in crate::quic_probe::quic_packet_cids(&buf[..len], 0)
+                        .into_iter()
+                        .flat_map(|cids| [Some(cids.dcid), cids.scid].into_iter().flatten())
+                    {
+                        Self::record_session_quic_cid(
+                            session_id,
+                            &quic_cids,
+                            quic_cid_tx.as_ref(),
+                            cid,
+                        )
+                        .await;
+                    }
+                    let current_client_addr = *client_addr.read().await;
+                    if let Err(err) = listen_socket.send_to(&buf[..len], current_client_addr).await {
                         result = Err(err.into());
                         break;
                     }
@@ -524,9 +673,10 @@ impl UdpProxyManager {
                 }
             }
         }
+        let current_client_addr = *client_addr.read().await;
         crate::metrics::record::record_http_dimensions(
             server_id,
-            client_addr.ip(),
+            current_client_addr.ip(),
             &domain,
             "-",
             downstream_sent as i64,
@@ -607,6 +757,133 @@ mod tests {
     use super::*;
     use crate::config_models::{NetworkAddressConfig, ServerNameConfig, UDPConfig};
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn session_client_addr_updates_for_rebinding() {
+        let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let session = UdpSession {
+            id: 1,
+            client_addr: Arc::new(RwLock::new(first)),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_cid_tx: None,
+            tx,
+            shutdown,
+        };
+
+        UdpProxyManager::update_session_client_addr(&session, second).await;
+
+        assert_eq!(*session.client_addr.read().await, second);
+    }
+
+    #[tokio::test]
+    async fn send_to_session_from_client_does_not_update_addr_when_full() {
+        let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(Bytes::from_static(b"queued")).unwrap();
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let session = UdpSession {
+            id: 1,
+            client_addr: Arc::new(RwLock::new(first)),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_cid_tx: None,
+            tx,
+            shutdown,
+        };
+
+        assert_eq!(
+            UdpProxyManager::send_to_session_from_client(
+                &session,
+                second,
+                Bytes::from_static(b"next")
+            )
+            .await,
+            UdpSessionSendStatus::Full
+        );
+        assert_eq!(*session.client_addr.read().await, first);
+    }
+
+    #[tokio::test]
+    async fn send_to_session_reports_full_without_waiting() {
+        let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(Bytes::from_static(b"queued")).unwrap();
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let session = Arc::new(UdpSession {
+            id: 1,
+            client_addr: Arc::new(RwLock::new(first)),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_cid_tx: None,
+            tx,
+            shutdown,
+        });
+        assert_eq!(
+            UdpProxyManager::send_to_session(&session, Bytes::from_static(b"next")),
+            UdpSessionSendStatus::Full
+        );
+        assert_eq!(rx.recv().await.as_deref(), Some(&b"queued"[..]));
+        assert_eq!(
+            UdpProxyManager::send_to_session(&session, Bytes::from_static(b"next")),
+            UdpSessionSendStatus::Sent
+        );
+        assert_eq!(rx.recv().await.as_deref(), Some(&b"next"[..]));
+    }
+
+    #[test]
+    fn send_to_session_reports_closed() {
+        let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let session = UdpSession {
+            id: 1,
+            client_addr: Arc::new(RwLock::new(first)),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_cid_tx: None,
+            tx,
+            shutdown,
+        };
+
+        assert_eq!(
+            UdpProxyManager::send_to_session(&session, Bytes::from_static(b"next")),
+            UdpSessionSendStatus::Closed
+        );
+    }
 
     #[tokio::test]
     async fn normal_udp_server_takes_precedence_over_unique_quic_fallback() {
