@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::{HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -12,10 +12,43 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
+use crate::lb_factory::BackendExtension;
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_QUEUE_SIZE: usize = 4096;
 const UDP_SESSION_MAX_QUIC_CIDS: usize = 8;
+
+async fn resolve_udp_backend_addr(
+    addr: String,
+    origin_host: Option<&str>,
+    client_ip: IpAddr,
+) -> anyhow::Result<SocketAddr> {
+    let lookup_addr = origin_host
+        .filter(|host| !host.is_empty() && host.parse::<IpAddr>().is_err())
+        .and_then(|host| {
+            addr.rsplit_once(':')
+                .map(|(_, port)| format!("{}:{}", host, port))
+        });
+
+    let Some(lookup_addr) = lookup_addr else {
+        if let Ok(addr) = addr.parse() {
+            return Ok(addr);
+        }
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr).await?.collect();
+        return addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("UDP backend address {} resolved no addresses", addr));
+    };
+
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&lookup_addr).await?.collect();
+    addrs
+        .iter()
+        .copied()
+        .find(|addr| addr.is_ipv4() == client_ip.is_ipv4())
+        .or_else(|| addrs.first().copied())
+        .ok_or_else(|| anyhow::anyhow!("UDP backend address {} resolved no addresses", lookup_addr))
+}
 
 /// Session tracking for UDP sessions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,7 +399,12 @@ impl UdpProxyManager {
             }
         };
         let origin_id = crate::lb_factory::peer_origin_id(&peer);
-        let b_addr: SocketAddr = peer.addr.to_string().parse()?;
+        let origin_host = peer
+            .ext
+            .get::<BackendExtension>()
+            .map(|ext| ext.origin_host.as_str());
+        let b_addr =
+            resolve_udp_backend_addr(peer.addr.to_string(), origin_host, client_addr.ip()).await?;
 
         debug!(
             "Created new UDP session: {} -> {} (Server {})",
@@ -565,7 +603,12 @@ impl UdpProxyManager {
         listen_socket: Arc<UdpSocket>,
         mut rx: mpsc::Receiver<Bytes>,
     ) -> anyhow::Result<()> {
-        let backend_socket = match UdpSocket::bind("0.0.0.0:0").await {
+        let backend_bind_addr = if backend_addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let backend_socket = match UdpSocket::bind(backend_bind_addr).await {
             Ok(socket) => socket,
             Err(err) => {
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
@@ -757,6 +800,19 @@ mod tests {
     use super::*;
     use crate::config_models::{NetworkAddressConfig, ServerNameConfig, UDPConfig};
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn udp_backend_resolution_prefers_client_ip_family_for_domain_origin() {
+        let addr = resolve_udp_backend_addr(
+            "[::1]:18443".to_string(),
+            Some("localhost"),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(addr, "127.0.0.1:18443".parse().unwrap());
+    }
 
     #[tokio::test]
     async fn session_client_addr_updates_for_rebinding() {
