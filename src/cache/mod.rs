@@ -13,7 +13,7 @@ pub fn cache_ref_allows_method_status(
     }
 
     let method_allowed = if cache_ref.methods.is_empty() {
-        true
+        method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")
     } else {
         cache_ref
             .methods
@@ -83,4 +83,64 @@ pub fn should_cache_response(
 
 pub fn parse_life_to_seconds(v: &serde_json::Value) -> u64 {
     crate::config_models::parse_life_to_seconds(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_ref_allows_method_status;
+    use crate::config_models::HTTPCacheRef;
+
+    fn cache_ref(methods: Vec<String>) -> HTTPCacheRef {
+        HTTPCacheRef {
+            is_on: true,
+            key: None,
+            life: None,
+            methods,
+            status: vec![200],
+            min_size: None,
+            max_size: None,
+            skip_cache_control_values: vec![],
+            skip_set_cookie: false,
+            allow_partial_content: false,
+            always_forward_range_request: false,
+            enable_request_cache_pragma: false,
+            enable_if_none_match: false,
+            enable_if_modified_since: false,
+            is_reverse: false,
+            conds: None,
+            simple_cond: None,
+            expires_time: None,
+            cache_policy: None,
+        }
+    }
+
+    #[test]
+    fn empty_methods_default_to_safe_cache_methods() {
+        let cache_ref = cache_ref(vec![]);
+
+        assert!(cache_ref_allows_method_status(
+            200, &cache_ref, "GET", false
+        ));
+        assert!(cache_ref_allows_method_status(
+            200, &cache_ref, "HEAD", false
+        ));
+        assert!(!cache_ref_allows_method_status(
+            200, &cache_ref, "PUT", false
+        ));
+        assert!(!cache_ref_allows_method_status(
+            200, &cache_ref, "POST", false
+        ));
+    }
+
+    #[test]
+    fn explicit_methods_allow_non_get_cache_methods() {
+        let cache_ref = cache_ref(vec!["PUT".to_string()]);
+
+        assert!(cache_ref_allows_method_status(
+            200, &cache_ref, "PUT", false
+        ));
+        assert!(!cache_ref_allows_method_status(
+            200, &cache_ref, "GET", false
+        ));
+    }
 }

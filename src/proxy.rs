@@ -412,6 +412,25 @@ impl EdgeProxy {
             .disable(pingora_cache::NoCacheReason::Custom(reason));
     }
 
+    fn cache_ref_matches_request(
+        cache_ref: &HTTPCacheRef,
+        session: &Session,
+        scheme: &str,
+    ) -> bool {
+        if let Some(conds) = &cache_ref.conds
+            && conds.is_on
+            && !conds.groups.is_empty()
+        {
+            return conds.match_request_with_scheme(session, scheme);
+        }
+
+        if let Some(simple_cond) = &cache_ref.simple_cond {
+            return simple_cond.match_request_with_scheme(session, scheme);
+        }
+
+        true
+    }
+
     fn downstream_local_port(session: &Session) -> Option<u16> {
         session
             .downstream_session
@@ -5079,13 +5098,7 @@ impl ProxyHttp for EdgeProxy {
                 if !cache_ref.is_on {
                     continue;
                 }
-                let is_match = if let Some(conds) = &cache_ref.conds {
-                    conds.match_request_with_scheme(session, scheme)
-                } else if let Some(simple_cond) = &cache_ref.simple_cond {
-                    simple_cond.match_request_with_scheme(session, scheme)
-                } else {
-                    true
-                };
+                let is_match = Self::cache_ref_matches_request(cache_ref, session, scheme);
 
                 if is_match {
                     if cache_ref.is_reverse {
@@ -5105,13 +5118,7 @@ impl ProxyHttp for EdgeProxy {
                         if !cache_ref.is_on {
                             continue;
                         }
-                        let is_match = if let Some(conds) = &cache_ref.conds {
-                            conds.match_request_with_scheme(session, scheme)
-                        } else if let Some(simple_cond) = &cache_ref.simple_cond {
-                            simple_cond.match_request_with_scheme(session, scheme)
-                        } else {
-                            true
-                        };
+                        let is_match = Self::cache_ref_matches_request(cache_ref, session, scheme);
                         if is_match {
                             if cache_ref.is_reverse {
                                 tracing::debug!(
@@ -5137,13 +5144,8 @@ impl ProxyHttp for EdgeProxy {
                             if !cache_ref.is_on {
                                 continue;
                             }
-                            let is_match = if let Some(conds) = &cache_ref.conds {
-                                conds.match_request_with_scheme(session, scheme)
-                            } else if let Some(simple_cond) = &cache_ref.simple_cond {
-                                simple_cond.match_request_with_scheme(session, scheme)
-                            } else {
-                                true
-                            };
+                            let is_match =
+                                Self::cache_ref_matches_request(cache_ref, session, scheme);
                             if is_match {
                                 if cache_ref.is_reverse {
                                     tracing::debug!(
