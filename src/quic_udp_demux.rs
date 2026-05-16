@@ -819,46 +819,10 @@ impl QuicUdpDemuxManager {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Result<Option<RouteKind>> {
         if let Some(server_name) = client_hello.server_name.as_deref() {
-            if http3_enabled
-                && client_hello_supports_h3(&client_hello)
-                && self
-                    .config_store
-                    .get_exact_l7_server_for_tls_name_sync(server_name)
-                    .is_some_and(|server| {
-                        server_has_http3_on_port(&self.config_store, &server, port)
-                    })
+            if let Some(server) = self
+                .config_store
+                .find_quic_passthrough_server_sync(server_name, port)
             {
-                debug!(
-                    "QUIC UDP demux: L7 exact H3 {} on port {} wins over @quic alpn={:?}",
-                    server_name, port, client_hello.alpns
-                );
-                return Ok(Some(RouteKind::Http3(Arc::new(Mutex::new(Instant::now())))));
-            }
-
-            if self.config_store.has_any_quic_passthrough_sync()
-                && let Some(server) = self
-                    .config_store
-                    .find_quic_passthrough_server_sync(server_name, port)
-            {
-                if http3_enabled
-                    && client_hello_supports_h3(&client_hello)
-                    && self
-                        .config_store
-                        .get_l7_server_for_tls_name_sync(server_name)
-                        .is_some_and(|server| {
-                            server_has_http3_on_port(&self.config_store, &server, port)
-                        })
-                {
-                    debug!(
-                        "QUIC UDP demux: L7 wildcard H3 {} on port {} wins over @quic server {} alpn={:?}",
-                        server_name,
-                        port,
-                        server.numeric_id(),
-                        client_hello.alpns
-                    );
-                    return Ok(Some(RouteKind::Http3(Arc::new(Mutex::new(Instant::now())))));
-                }
-
                 debug!(
                     "QUIC UDP demux: @quic {} on port {} matched server {} alpn={:?}",
                     server_name,
@@ -888,6 +852,22 @@ impl QuicUdpDemuxManager {
                     }
                 };
                 return Ok(session.map(RouteKind::Passthrough));
+            }
+
+            if http3_enabled
+                && client_hello_supports_h3(&client_hello)
+                && self
+                    .config_store
+                    .get_l7_server_for_tls_name_sync(server_name)
+                    .is_some_and(|server| {
+                        server_has_http3_on_port(&self.config_store, &server, port)
+                    })
+            {
+                debug!(
+                    "QUIC UDP demux: L7 H3 {} on port {} matched alpn={:?}",
+                    server_name, port, client_hello.alpns
+                );
+                return Ok(Some(RouteKind::Http3(Arc::new(Mutex::new(Instant::now())))));
             }
         }
 
