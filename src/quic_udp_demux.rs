@@ -731,6 +731,43 @@ impl QuicUdpDemuxManager {
                 };
 
                 let Some(client_hello) = maybe_client_hello else {
+                    if let Some(server) = self
+                        .config_store
+                        .find_unique_quic_passthrough_server_by_port_sync(port)
+                    {
+                        let datagrams = pending_routes
+                            .remove(&client_addr)
+                            .map(|(_, pending)| {
+                                pending_reassembly_bytes
+                                    .fetch_sub(pending.retained_bytes(), Ordering::Relaxed);
+                                pending.datagrams
+                            })
+                            .unwrap_or_else(|| vec![data.clone()]);
+                        let session = match self
+                            .udp_manager
+                            .create_passthrough_session_for_server(
+                                client_addr,
+                                port,
+                                server,
+                                None,
+                                socket,
+                                shutdown_rx,
+                            )
+                            .await
+                        {
+                            Ok(session) => session,
+                            Err(err) => {
+                                debug!(
+                                    "QUIC UDP demux: unique @quic session creation failed for incomplete ClientHello from {} on port {}: {}",
+                                    client_addr, port, err
+                                );
+                                return Ok(None);
+                            }
+                        };
+                        return Ok(
+                            session.map(|session| (RouteKind::Passthrough(session), datagrams))
+                        );
+                    }
                     debug!(
                         "QUIC UDP demux: incomplete QUIC ClientHello from {} on port {}, waiting for next datagram",
                         client_addr, port

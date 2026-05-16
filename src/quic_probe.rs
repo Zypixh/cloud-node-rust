@@ -52,6 +52,7 @@ pub enum QuicProbeFragmentResult {
 }
 
 struct LongHeader<'a> {
+    start: usize,
     version: u32,
     dcid: &'a [u8],
     pn_offset: usize,
@@ -145,13 +146,16 @@ fn parse_initial_long_header_at(packet: &[u8], start: usize) -> Option<LongHeade
     offset += dcid_len;
     let scid_len = *packet.get(offset)? as usize;
     offset += 1 + scid_len;
-    read_varint(packet, &mut offset)?;
+    let token_len = read_varint(packet, &mut offset)? as usize;
+    packet.get(offset..offset + token_len)?;
+    offset += token_len;
     let payload_len = read_varint(packet, &mut offset)? as usize;
     let pn_offset = offset;
     if packet.len() < pn_offset + 4 {
         return None;
     }
     Some(LongHeader {
+        start,
         version,
         dcid,
         pn_offset,
@@ -175,28 +179,36 @@ fn decrypt_and_parse(packet: &[u8], header: &LongHeader<'_>, salt: &[u8; 20]) ->
     let Some(packet_end) = packet_end(header) else {
         return DecryptResult::None;
     };
-    let Some(packet) = packet.get(..packet_end) else {
+    let Some(packet) = packet.get(header.start..packet_end) else {
         return DecryptResult::None;
     };
+    let pn_offset = header.pn_offset.saturating_sub(header.start);
+    let payload_base_offset = header.payload_offset.saturating_sub(header.start);
     let mut protected = packet.to_vec();
     let Some((key, iv, hp)) = derive_initial_keys(header.dcid, salt) else {
         return DecryptResult::None;
     };
-    if remove_header_protection(&mut protected, header.pn_offset, &hp).is_none() {
+    if remove_header_protection(&mut protected, pn_offset, &hp).is_none() {
         return DecryptResult::None;
     }
     let pn_len = (protected[0] & 0x03) as usize + 1;
-    let Some(pn_bytes) = protected.get(header.pn_offset..header.pn_offset + pn_len) else {
+    let Some(pn_bytes) = protected.get(pn_offset..pn_offset + pn_len) else {
         return DecryptResult::None;
     };
     let packet_number = pn_bytes
         .iter()
         .fold(0u64, |acc, byte| (acc << 8) | *byte as u64);
-    let payload_offset = header.payload_offset + pn_len;
+    let payload_offset = payload_base_offset + pn_len;
+    let Some(packet_payload_len) = header.payload_len.checked_sub(pn_len) else {
+        return DecryptResult::None;
+    };
+    let Some(packet_end_offset) = payload_offset.checked_add(packet_payload_len) else {
+        return DecryptResult::None;
+    };
     let Some(header_bytes) = protected.get(..payload_offset).map(|value| value.to_vec()) else {
         return DecryptResult::None;
     };
-    let Some(payload) = protected.get_mut(payload_offset..) else {
+    let Some(payload) = protected.get_mut(payload_offset..packet_end_offset) else {
         return DecryptResult::None;
     };
     if payload.len() < 16 {
@@ -607,6 +619,42 @@ mod tests {
         let parsed = parse_tls_client_hello(&message).expect("client hello should parse");
         assert_eq!(parsed.server_name.as_deref(), Some("qq.com"));
         assert_eq!(parsed.alpns, vec!["h3"]);
+    }
+
+    #[test]
+    fn initial_header_skips_token_and_stops_at_packet_boundary() {
+        let mut first = vec![0xc0];
+        first.extend_from_slice(&1u32.to_be_bytes());
+        first.push(8);
+        first.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        first.push(0);
+        first.push(2);
+        first.extend_from_slice(&[9, 10]);
+        first.push(5);
+        let expected_pn_offset = first.len();
+        first.extend_from_slice(&[0, 1, 2, 3, 4]);
+
+        let mut second = vec![0xc0];
+        second.extend_from_slice(&1u32.to_be_bytes());
+        second.push(4);
+        second.extend_from_slice(&[11, 12, 13, 14]);
+        second.push(0);
+        second.push(0);
+        second.push(4);
+        let second_start = first.len();
+        second.extend_from_slice(&[5, 6, 7, 8]);
+
+        let mut datagram = first;
+        datagram.extend_from_slice(&second);
+
+        let first_header = parse_initial_long_header_at(&datagram, 0).expect("first packet header");
+        assert_eq!(first_header.pn_offset, expected_pn_offset);
+        assert_eq!(packet_end(&first_header), Some(second_start));
+
+        let second_header =
+            parse_initial_long_header_at(&datagram, second_start).expect("second packet header");
+        assert_eq!(second_header.start, second_start);
+        assert_eq!(packet_end(&second_header), Some(datagram.len()));
     }
 
     #[test]
