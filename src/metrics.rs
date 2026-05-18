@@ -286,7 +286,7 @@ pub mod record {
 
     pub fn request_start(
         server_id: i64,
-        remote_ip: String,
+        remote_ip: &str,
         user_id: i64,
         user_plan_id: i64,
         plan_id: i64,
@@ -312,8 +312,8 @@ pub mod record {
 
         if !ip_recorded {
             let day = get_current_day();
-            crate::metrics::daily::UNIQUE_IP_TRACKER.record(server_id, &day, &remote_ip);
-            m.distinct_ips.insert(remote_ip);
+            crate::metrics::daily::UNIQUE_IP_TRACKER.record(server_id, &day, remote_ip);
+            m.distinct_ips.insert(remote_ip.to_string());
             return true;
         }
         false
@@ -481,7 +481,7 @@ pub mod record {
             is_attack,
         );
         crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.record(key, bytes_sent, is_attack);
-        crate::metrics::top_ip::TOP_IP_TRACKER.record(server_id, &client_ip.to_string());
+        crate::metrics::top_ip::TOP_IP_TRACKER.record_addr(server_id, client_ip);
 
         let created_at = get_current_5min_ts();
         crate::metrics::daily::DAILY_DOMAIN_TRACKER.record(

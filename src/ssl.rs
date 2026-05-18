@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use pingora_core::protocols::tls::TlsRef as SslRef;
@@ -13,8 +14,7 @@ use crate::config_models::SSLCertConfig;
 
 #[derive(Clone)]
 pub struct DynamicCertSelector {
-    snapshot: Arc<RwLock<CertSnapshot>>,
-    // Internal cache: ID -> (PEM_Hash, ParsedPair)
+    snapshot: Arc<ArcSwap<CertSnapshot>>,
     cache: Arc<RwLock<HashMap<i64, (String, Arc<CertPair>)>>>,
 }
 
@@ -31,13 +31,13 @@ pub struct CertPair {
     pub cert: X509,
     pub key: PKey<Private>,
     pub chain: Vec<X509>,
-    pub ocsp: Arc<std::sync::RwLock<Vec<u8>>>,
+    pub ocsp: Arc<ArcSwap<Vec<u8>>>,
 }
 
 impl DynamicCertSelector {
     pub fn new() -> Self {
         Self {
-            snapshot: Arc::new(RwLock::new(CertSnapshot::default())),
+            snapshot: Arc::new(ArcSwap::from_pointee(CertSnapshot::default())),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -48,15 +48,13 @@ impl DynamicCertSelector {
         let cache = self.cache.read().unwrap();
         for (_, pair) in cache.values() {
             if pair.id == cert_id {
-                if let Ok(mut ocsp) = pair.ocsp.write() {
-                    *ocsp = data.clone();
-                }
+                pair.ocsp.store(Arc::new(data.clone()));
             }
         }
     }
 
     pub async fn export_default_pem(&self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let snapshot = self.snapshot.read().unwrap();
+        let snapshot = self.snapshot.load();
         let pair = snapshot.default.as_ref()?.clone();
         let cert_pem = pair.cert.to_pem().ok()?;
         let key_pem = pair.key.private_key_to_pem_pkcs8().ok()?;
@@ -70,13 +68,13 @@ impl DynamicCertSelector {
         std::collections::HashMap<String, (Vec<u8>, Vec<u8>, Vec<u8>)>,
         (Vec<u8>, Vec<u8>, Vec<u8>),
     )> {
-        let snapshot = self.snapshot.read().unwrap();
+        let snapshot = self.snapshot.load();
 
         let serialize = |pair: &Arc<CertPair>| -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
             Some((
                 pair.cert.to_pem().ok()?,
                 pair.key.private_key_to_pem_pkcs8().ok()?,
-                pair.ocsp.read().ok().map(|v| v.clone()).unwrap_or_default(),
+                pair.ocsp.load().as_ref().clone(),
             ))
         };
 
@@ -104,16 +102,15 @@ impl DynamicCertSelector {
             .unwrap_or("")
             .to_lowercase();
         if let Some(pair) = self.find_pair_blocking(&host) {
-            if let Ok(ocsp) = pair.ocsp.read()
-                && !ocsp.is_empty()
-            {
+            let ocsp = pair.ocsp.load();
+            if !ocsp.is_empty() {
                 let _ = ssl.set_ocsp_status(&ocsp);
             }
         }
     }
 
     fn find_pair_blocking(&self, host: &str) -> Option<Arc<CertPair>> {
-        let snapshot = self.snapshot.read().unwrap();
+        let snapshot = self.snapshot.load();
         if !host.is_empty() {
             if let Some(pair) = snapshot.exact.get(host) {
                 return Some(pair.clone());
@@ -188,7 +185,7 @@ pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertCon
                                 cert,
                                 key,
                                 chain: cert_chain.unwrap_or_default(),
-                                ocsp: Arc::new(std::sync::RwLock::new(Vec::new())),
+                                ocsp: Arc::new(ArcSwap::from_pointee(Vec::new())),
                             }),
                             _ => {
                                 tracing::error!(
@@ -260,16 +257,14 @@ pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertCon
 
     {
         let new_snapshot = CertSnapshot {
-            exact: new_exact.clone(),
-            wildcard: new_wildcard.clone(),
-            default: first_pair.clone(),
+            exact: new_exact,
+            wildcard: new_wildcard,
+            default: first_pair,
         };
         let default_present = new_snapshot.default.is_some();
-        let mut snapshot_lock = cert_selector.snapshot.write().unwrap();
         let mut cache_lock = cert_selector.cache.write().unwrap();
-
-        *snapshot_lock = new_snapshot;
         *cache_lock = new_cache;
+        cert_selector.snapshot.store(Arc::new(new_snapshot));
 
         tracing::info!(
             "SSL Sync Result: {} certs processed (Reused: {}, Parsed: {}). Default Cert present: {}",
@@ -404,9 +399,8 @@ fn apply_cert_pair(ssl: &mut SslRef, pair: &CertPair) {
             tracing::warn!("Failed to add chain cert (id={}): {:?}", pair.id, e);
         }
     }
-    if let Ok(ocsp) = pair.ocsp.read()
-        && !ocsp.is_empty()
-    {
+    let ocsp = pair.ocsp.load();
+    if !ocsp.is_empty() {
         if let Err(e) = ssl.set_ocsp_status(&ocsp) {
             tracing::debug!("Failed to set OCSP status (id={}): {:?}", pair.id, e);
         }

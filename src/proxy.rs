@@ -109,6 +109,7 @@ pub struct ProxyCTX {
     pub response_body_buffer: LazyBytes,
     pub request_body: LazyBytes,
     pub has_outbound_waf_body_rules: bool,
+    pub outbound_waf_body_evaluated: bool,
     pub waf_policy_id: i64,
     pub waf_group_id: i64,
     pub waf_set_id: i64,
@@ -201,6 +202,7 @@ impl Default for ProxyCTX {
             response_body_buffer: LazyBytes::default(),
             request_body: LazyBytes::default(),
             has_outbound_waf_body_rules: false,
+            outbound_waf_body_evaluated: false,
             waf_policy_id: 0,
             waf_group_id: 0,
             waf_set_id: 0,
@@ -401,6 +403,55 @@ impl EdgeProxy {
             .iter()
             .map(|(name, value)| name.as_str().len() + value.len() + 4)
             .sum();
+    }
+
+    fn evaluate_outbound_waf_body(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        body: &[u8],
+        bytes_sent: usize,
+    ) -> Option<crate::firewall::MatchedAction> {
+        let outbound_ctx = crate::firewall::OutboundContext {
+            status: ctx.response_status,
+            headers: &ctx.response_headers,
+            body,
+            bytes_sent,
+        };
+
+        if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
+            for policy in global_policies.iter() {
+                if !policy.is_on {
+                    continue;
+                }
+                if let Some(action) = crate::firewall::evaluate_outbound_policy(
+                    policy,
+                    session,
+                    &ctx.request_body,
+                    &outbound_ctx,
+                    Self::forwarded_proto(session, ctx),
+                ) {
+                    return Some(action);
+                }
+            }
+        }
+
+        if let Some(server) = &ctx.server
+            && let Some(web) = &server.web
+            && let Some(fw_ref) = &web.firewall_ref
+            && fw_ref.is_on
+            && let Some(policy) = &web.firewall_policy
+        {
+            return crate::firewall::evaluate_outbound_policy(
+                policy,
+                session,
+                &ctx.request_body,
+                &outbound_ctx,
+                Self::forwarded_proto(session, ctx),
+            );
+        }
+
+        None
     }
 
     fn disable_request_cache(session: &mut Session, ctx: &mut ProxyCTX, reason: &'static str) {
@@ -4417,7 +4468,7 @@ impl ProxyHttp for EdgeProxy {
         };
         ctx.ip_recorded = crate::metrics::record::request_start(
             sid,
-            ctx.client_ip_str.clone(),
+            &ctx.client_ip_str,
             ctx.server.as_ref().map(|s| s.user_id).unwrap_or(0),
             user_plan_id,
             plan_id,
@@ -5621,6 +5672,8 @@ impl ProxyHttp for EdgeProxy {
         }
 
         Self::sync_response_headers(upstream_response, ctx);
+        ctx.response_body_buffer.clear();
+        ctx.outbound_waf_body_evaluated = false;
 
         ctx.has_outbound_waf_body_rules = ctx
             .firewall_policies_snapshot
@@ -6083,41 +6136,55 @@ impl ProxyHttp for EdgeProxy {
 
         if ctx.optimize_enabled {
             if let Some(chunk) = body.take() {
-                ctx.optimize_pending_body.extend_from_slice(&chunk);
+                if ctx.optimize_pending_body.len().saturating_add(chunk.len())
+                    > MAX_OPTIMIZATION_BODY_BYTES
+                {
+                    let mut pending = ctx.optimize_pending_body.take();
+                    pending.extend_from_slice(&chunk);
+                    ctx.optimize_enabled = false;
+                    ctx.optimize_kind = None;
+                    *body = Some(Bytes::from(pending));
+                } else {
+                    ctx.optimize_pending_body.extend_from_slice(&chunk);
+                }
             }
 
-            if !_end_of_stream {
-                return Ok(None);
-            }
+            if ctx.optimize_enabled {
+                if !_end_of_stream {
+                    return Ok(None);
+                }
 
-            let pending = ctx.optimize_pending_body.take();
-            let optimized = if let Some(_permit) =
-                crate::adaptive_cpu::CPU_TRANSFORM_GATE.try_admit_optional()
-            {
-                let kind = ctx.optimize_kind.as_deref();
-                let html_cfg = ctx
-                    .server
-                    .as_ref()
-                    .and_then(|server| server.web.as_ref())
-                    .and_then(|web| web.optimization.as_ref())
-                    .and_then(|opt| opt.html.as_ref());
-                tokio::task::block_in_place(|| match kind {
-                    Some("html") => html_cfg.and_then(|cfg| Self::minify_html(&pending, cfg).ok()),
-                    Some("css") => Self::minify_css(&pending).ok(),
-                    Some("js") => Self::minify_js(&pending).ok(),
-                    _ => None,
-                })
-            } else {
-                None
-            };
+                let pending = ctx.optimize_pending_body.take();
+                let optimized = if let Some(_permit) =
+                    crate::adaptive_cpu::CPU_TRANSFORM_GATE.try_admit_optional()
+                {
+                    let kind = ctx.optimize_kind.as_deref();
+                    let html_cfg = ctx
+                        .server
+                        .as_ref()
+                        .and_then(|server| server.web.as_ref())
+                        .and_then(|web| web.optimization.as_ref())
+                        .and_then(|opt| opt.html.as_ref());
+                    tokio::task::block_in_place(|| match kind {
+                        Some("html") => {
+                            html_cfg.and_then(|cfg| Self::minify_html(&pending, cfg).ok())
+                        }
+                        Some("css") => Self::minify_css(&pending).ok(),
+                        Some("js") => Self::minify_js(&pending).ok(),
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
 
-            if let Some(optimized) = optimized {
-                *body = Some(Bytes::from(optimized));
-            } else {
-                *body = Some(Bytes::from(pending));
+                if let Some(optimized) = optimized {
+                    *body = Some(Bytes::from(optimized));
+                } else {
+                    *body = Some(Bytes::from(pending));
+                }
+                ctx.optimize_enabled = false;
+                ctx.optimize_kind = None;
             }
-            ctx.optimize_enabled = false;
-            ctx.optimize_kind = None;
         }
 
         if ctx.hls_playlist_enabled {
@@ -6188,72 +6255,76 @@ impl ProxyHttp for EdgeProxy {
             ctx.hls_segment_encrypt_enabled = false;
         }
 
-        let mut delay = None;
-        if let Some(chunk) = body.as_ref() {
-            delay = self.response_bandwidth_delay(chunk.len(), ctx);
-        }
-
-        if let Some(chunk) = body {
-            let chunk_len = chunk.len();
-            ctx.response_body_len += chunk_len;
-
-            // 2. Outbound WAF Body Inspection (Up to max_inspection_size)
-            if ctx.has_outbound_waf_body_rules
-                && ctx.response_body_buffer.len() < ctx.max_inspection_size as usize
+        if ctx.has_outbound_waf_body_rules && !ctx.outbound_waf_body_evaluated {
+            let inspection_limit = ctx.max_inspection_size.max(0) as usize;
+            if ctx.response_body_buffer.is_empty()
+                && inspection_limit > 0
+                && let Some(chunk) = body.as_ref()
+                && (chunk.len() >= inspection_limit || _end_of_stream)
             {
-                let remaining = (ctx.max_inspection_size as usize)
-                    .saturating_sub(ctx.response_body_buffer.len());
-                let to_copy = std::cmp::min(chunk_len, remaining);
-                ctx.response_body_buffer
-                    .extend_from_slice(&chunk[..to_copy]);
+                ctx.outbound_waf_body_evaluated = true;
+                let inspect_len = chunk.len().min(inspection_limit);
+                if let Some(action) = self.evaluate_outbound_waf_body(
+                    session,
+                    ctx,
+                    &chunk[..inspect_len],
+                    ctx.response_body_len + chunk.len(),
+                ) {
+                    if action.action_code == "block" {
+                        debug!(
+                            "Outbound WAF Blocked (Body): Policy ID {}",
+                            action.policy_id
+                        );
+                        ctx.waf_policy_id = action.policy_id;
+                        ctx.waf_group_id = action.group_id;
+                        ctx.waf_set_id = action.set_id;
+                        ctx.waf_action = Some(action.action_code.clone());
+                        self.maybe_report_firewall_event(
+                            ctx,
+                            action.policy_id,
+                            action.group_id,
+                            action.set_id,
+                        );
+                        *body = None;
+                        return Err(Error::explain(
+                            Custom("OutboundBlocked"),
+                            "Blocked by Outbound WAF",
+                        ));
+                    }
+                }
+            } else {
+                if let Some(chunk) = body.take() {
+                    let previous_len = ctx.response_body_buffer.len();
+                    let inspect_remaining = inspection_limit.saturating_sub(previous_len);
+                    if inspect_remaining == 0 || chunk.len() <= inspect_remaining {
+                        ctx.response_body_buffer.extend_from_slice(&chunk);
+                    } else {
+                        ctx.response_body_buffer
+                            .extend_from_slice(&chunk[..inspect_remaining]);
+                        ctx.response_body_buffer
+                            .extend_from_slice(&chunk[inspect_remaining..]);
+                    }
+                }
 
-                // Evaluate policy again with buffered body content
-                let outbound_ctx = crate::firewall::OutboundContext {
-                    status: ctx.response_status,
-                    headers: &ctx.response_headers,
-                    body: &ctx.response_body_buffer,
-                    bytes_sent: ctx.response_body_len,
+                let buffered_len = ctx.response_body_buffer.len();
+                let should_evaluate =
+                    _end_of_stream || inspection_limit == 0 || buffered_len >= inspection_limit;
+                if !should_evaluate {
+                    return Ok(None);
+                }
+
+                ctx.outbound_waf_body_evaluated = true;
+                let inspect_len = if inspection_limit == 0 {
+                    0
+                } else {
+                    buffered_len.min(inspection_limit)
                 };
-
-                let mut matched_outbound = None;
-                if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
-                    for gp in global_policies.iter() {
-                        if !gp.is_on {
-                            continue;
-                        }
-                        if let Some(action) = crate::firewall::evaluate_outbound_policy(
-                            gp,
-                            session,
-                            &ctx.request_body,
-                            &outbound_ctx,
-                            Self::forwarded_proto(session, ctx),
-                        ) {
-                            matched_outbound = Some(action);
-                            break;
-                        }
-                    }
-                }
-                if matched_outbound.is_none() {
-                    if let Some(server) = &ctx.server
-                        && let Some(web) = &server.web
-                        && let Some(fw_ref) = &web.firewall_ref
-                        && fw_ref.is_on
-                    {
-                        if let Some(policy) = &web.firewall_policy {
-                            if let Some(action) = crate::firewall::evaluate_outbound_policy(
-                                policy,
-                                session,
-                                &ctx.request_body,
-                                &outbound_ctx,
-                                Self::forwarded_proto(session, ctx),
-                            ) {
-                                matched_outbound = Some(action);
-                            }
-                        }
-                    }
-                }
-
-                if let Some(action) = matched_outbound {
+                if let Some(action) = self.evaluate_outbound_waf_body(
+                    session,
+                    ctx,
+                    &ctx.response_body_buffer[..inspect_len],
+                    ctx.response_body_len + buffered_len,
+                ) {
                     if action.action_code == "block" {
                         debug!(
                             "Outbound WAF Blocked (Body): Policy ID {}",
@@ -6270,16 +6341,25 @@ impl ProxyHttp for EdgeProxy {
                             action.set_id,
                         );
 
-                        // Clear the chunk to stop response body transmission
+                        ctx.response_body_buffer.clear();
                         *body = None;
-                        // Return error to terminate connection
                         return Err(Error::explain(
                             Custom("OutboundBlocked"),
                             "Blocked by Outbound WAF",
                         ));
                     }
                 }
+
+                if buffered_len > 0 {
+                    *body = Some(Bytes::from(ctx.response_body_buffer.take()));
+                }
             }
+        }
+
+        let mut delay = None;
+        if let Some(chunk) = body.as_ref() {
+            ctx.response_body_len += chunk.len();
+            delay = self.response_bandwidth_delay(chunk.len(), ctx);
         }
         Ok(delay)
     }

@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 pub struct TopIpTracker {
@@ -21,6 +22,14 @@ impl TopIpTracker {
 
     pub fn record(&self, server_id: i64, ip: &str) {
         if server_id <= 0 || ip.is_empty() {
+            return;
+        }
+        let mut entry = self.counts.entry((server_id, ip.to_string())).or_insert(0);
+        *entry += 1;
+    }
+
+    pub fn record_addr(&self, server_id: i64, ip: IpAddr) {
+        if server_id <= 0 {
             return;
         }
         let mut entry = self.counts.entry((server_id, ip.to_string())).or_insert(0);

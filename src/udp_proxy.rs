@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -17,6 +18,21 @@ use crate::lb_factory::BackendExtension;
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_QUEUE_SIZE: usize = 4096;
 const UDP_SESSION_MAX_QUIC_CIDS: usize = 8;
+
+static UDP_ACTIVITY_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
+
+pub(crate) fn udp_activity_now_ms() -> u64 {
+    UDP_ACTIVITY_EPOCH
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+pub(crate) fn udp_activity_is_alive(last_activity_ms: &AtomicU64, timeout: Duration) -> bool {
+    let last = last_activity_ms.load(Ordering::Relaxed);
+    let now = udp_activity_now_ms();
+    now.saturating_sub(last) < timeout.as_millis().min(u64::MAX as u128) as u64
+}
 
 async fn resolve_udp_backend_addr(
     addr: String,
@@ -75,7 +91,7 @@ pub struct UdpSession {
     pub user_id: i64,
     pub user_plan_id: i64,
     pub plan_id: i64,
-    pub last_activity: Arc<RwLock<Instant>>,
+    pub last_activity_ms: Arc<AtomicU64>,
     pub quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
     pub quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
     pub tx: mpsc::Sender<Bytes>,
@@ -119,18 +135,13 @@ impl UdpProxyManager {
             self.reconcile_listeners(&desired_ports);
 
             // Cleanup idle sessions (Sticky Session Timeout)
-            let now = Instant::now();
             let timeout = Duration::from_secs(60); // Default 60s idle timeout
             self.sessions.retain(|key, session| {
-                if let Ok(last) = session.last_activity.try_read() {
-                    let is_alive = now.duration_since(*last) < timeout;
-                    if !is_alive {
-                        debug!("Cleaning up idle UDP session: {:?}", key);
-                    }
-                    is_alive
-                } else {
-                    true // If locked, keep it for now
+                let is_alive = udp_activity_is_alive(&session.last_activity_ms, timeout);
+                if !is_alive {
+                    debug!("Cleaning up idle UDP session: {:?}", key);
                 }
+                is_alive
             });
 
             // Re-check config every minute or on notification
@@ -422,16 +433,17 @@ impl UdpProxyManager {
             user_id,
             user_plan_id,
             plan_id,
-            last_activity: Arc::new(RwLock::new(Instant::now())),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: quic_cid_tx.clone(),
             tx,
             shutdown: shutdown_rx.clone(),
         });
 
+        let client_ip = client_addr.ip().to_string();
         crate::metrics::record::request_start(
             sid,
-            client_addr.ip().to_string(),
+            &client_ip,
             user_id,
             user_plan_id,
             plan_id,
@@ -446,7 +458,7 @@ impl UdpProxyManager {
         let origin_id = session.origin_id;
         let initial_client_addr = client_addr;
         let client_addr = session.client_addr.clone();
-        let last_activity = session.last_activity.clone();
+        let last_activity_ms = session.last_activity_ms.clone();
         let quic_cids = session.quic_cids.clone();
         let session_quic_cid_tx = session.quic_cid_tx.clone();
         let sessions = self.sessions.clone();
@@ -462,7 +474,7 @@ impl UdpProxyManager {
                 origin_id,
                 client_addr.clone(),
                 domain,
-                last_activity,
+                last_activity_ms,
                 quic_cids,
                 session_quic_cid_tx,
                 listen_socket,
@@ -490,9 +502,9 @@ impl UdpProxyManager {
     }
 
     pub fn update_session_activity(session: &UdpSession) {
-        if let Ok(mut last) = session.last_activity.try_write() {
-            *last = Instant::now();
-        }
+        session
+            .last_activity_ms
+            .store(udp_activity_now_ms(), Ordering::Relaxed);
     }
 
     pub async fn update_session_client_addr(session: &UdpSession, client_addr: SocketAddr) {
@@ -574,13 +586,8 @@ impl UdpProxyManager {
     }
 
     pub fn cleanup_idle_sessions(&self, timeout: Duration) {
-        let now = Instant::now();
         self.sessions.retain(|key, session| {
-            let keep = session
-                .last_activity
-                .try_read()
-                .map(|last| now.duration_since(*last) < timeout)
-                .unwrap_or(true);
+            let keep = udp_activity_is_alive(&session.last_activity_ms, timeout);
             if !keep {
                 debug!("Cleaning up idle UDP session: {:?}", key);
             }
@@ -597,7 +604,7 @@ impl UdpProxyManager {
         origin_id: i64,
         client_addr: Arc<RwLock<SocketAddr>>,
         domain: String,
-        last_activity: Arc<RwLock<Instant>>,
+        last_activity_ms: Arc<AtomicU64>,
         quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
         quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
         listen_socket: Arc<UdpSocket>,
@@ -640,10 +647,7 @@ impl UdpProxyManager {
                     break;
                 }
                 _ = idle_tick.tick() => {
-                    let idle = last_activity
-                        .try_read()
-                        .map(|last| last.elapsed() >= UDP_SESSION_IDLE_TIMEOUT)
-                        .unwrap_or(false);
+                    let idle = !udp_activity_is_alive(&last_activity_ms, UDP_SESSION_IDLE_TIMEOUT);
                     if idle {
                         break;
                     }
@@ -658,9 +662,7 @@ impl UdpProxyManager {
                         result = Err(err.into());
                         break;
                     }
-                    if let Ok(mut last) = last_activity.try_write() {
-                        *last = Instant::now();
-                    }
+                    last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
                     crate::metrics::record::record_transfer(server_id, 0, len, None);
                     crate::metrics::record::record_origin_traffic(server_id, len, 0, None);
                 }
@@ -693,9 +695,7 @@ impl UdpProxyManager {
                         result = Err(err.into());
                         break;
                     }
-                    if let Ok(mut last) = last_activity.try_write() {
-                        *last = Instant::now();
-                    }
+                    last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
                     downstream_sent += len_u64;
                     crate::metrics::record::record_transfer(server_id, len_u64, 0, None);
                     crate::metrics::record::record_origin_traffic(server_id, 0, len_u64, None);
@@ -757,27 +757,7 @@ impl UdpProxyManager {
     }
 
     pub async fn find_server_by_port(&self, port: u16) -> Option<Arc<ServerConfig>> {
-        let servers = self.config_store.get_all_servers().await;
-        for s in servers {
-            if s.is_quic_passthrough() {
-                continue;
-            }
-            if let Some(udp) = &s.udp {
-                if !udp.is_on {
-                    continue;
-                }
-                for addr in &udp.listen {
-                    if addr
-                        .port_range
-                        .as_deref()
-                        .is_some_and(|range| crate::config_models::port_range_contains(range, port))
-                    {
-                        return Some(s.clone());
-                    }
-                }
-            }
-        }
-        None
+        self.config_store.find_udp_server_by_port_sync(port)
     }
 }
 
@@ -816,7 +796,7 @@ mod tests {
             user_id: 0,
             user_plan_id: 0,
             plan_id: 0,
-            last_activity: Arc::new(RwLock::new(Instant::now())),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
@@ -845,7 +825,7 @@ mod tests {
             user_id: 0,
             user_plan_id: 0,
             plan_id: 0,
-            last_activity: Arc::new(RwLock::new(Instant::now())),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
@@ -880,7 +860,7 @@ mod tests {
             user_id: 0,
             user_plan_id: 0,
             plan_id: 0,
-            last_activity: Arc::new(RwLock::new(Instant::now())),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
@@ -914,7 +894,7 @@ mod tests {
             user_id: 0,
             user_plan_id: 0,
             plan_id: 0,
-            last_activity: Arc::new(RwLock::new(Instant::now())),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,

@@ -456,9 +456,10 @@ impl HttpProxyManager {
             0
         };
 
+        let client_ip = client_addr.ip().to_string();
         crate::metrics::record::request_start(
             server_id,
-            client_addr.ip().to_string(),
+            &client_ip,
             server.user_id,
             user_plan_id,
             plan_id,

@@ -222,11 +222,11 @@ fn match_preset_group(code: &str, session: &Session, request_body: &[u8]) -> boo
     }
 }
 
-static CC_COUNTERS: Lazy<DashMap<String, Vec<i64>>> = Lazy::new(DashMap::new);
+static CC_COUNTERS: Lazy<DashMap<String, crate::firewall::state::RollingCounter>> =
+    Lazy::new(DashMap::new);
 static CC_COUNTER_LAST_SWEEP: AtomicI64 = AtomicI64::new(0);
 const CC_COUNTER_MAX_PERIOD_SECS: i64 = 7 * 86_400;
 const CC_COUNTER_SWEEP_INTERVAL_SECS: i64 = 60;
-const MAX_COUNTER_ENTRIES_PER_KEY: usize = 100_000;
 
 fn get_full_request_data(session: &Session, request_body: &[u8]) -> String {
     let mut data = session.req_header().uri.to_string();
@@ -320,9 +320,9 @@ fn cc_value(
             .filter_map(Value::as_str)
             .map(|template| get_variable_value(session, template, request_body, scheme))
             .collect::<Vec<_>>();
-        format!("WAF-CC2-{}-{}", rule.param, key_values.join("@"))
+        format!("WAF-CC2-{}-{}:{}", rule.param, period, key_values.join("@"))
     } else {
-        get_remote_addr(session)
+        format!("WAF-CC:{}:{}", period, get_remote_addr(session))
     };
 
     increase_counter(key, period).to_string()
@@ -331,15 +331,10 @@ fn cc_value(
 fn increase_counter(key: String, period_secs: i64) -> u64 {
     let now = crate::utils::time::now_timestamp();
     sweep_cc_counters(now);
-    let min_ts = now - period_secs.max(1);
-    let mut entry = CC_COUNTERS.entry(key).or_default();
-    entry.retain(|ts| *ts >= min_ts);
-    if entry.len() >= MAX_COUNTER_ENTRIES_PER_KEY {
-        let drain_count = entry.len() / 4;
-        entry.drain(..drain_count);
-    }
-    entry.push(now);
-    entry.len() as u64
+    CC_COUNTERS
+        .entry(key)
+        .or_default()
+        .increment(now, period_secs)
 }
 
 fn sweep_cc_counters(now: i64) {
@@ -354,11 +349,7 @@ fn sweep_cc_counters(now: i64) {
         return;
     }
 
-    let stale_before = now - CC_COUNTER_MAX_PERIOD_SECS;
-    CC_COUNTERS.retain(|_, timestamps| {
-        timestamps.retain(|ts| *ts >= stale_before);
-        !timestamps.is_empty()
-    });
+    CC_COUNTERS.retain(|_, counter| !counter.is_stale(now, CC_COUNTER_MAX_PERIOD_SECS));
 }
 
 fn get_response_variable_value(

@@ -9,9 +9,10 @@ use pingora_cache::{CacheKey, CacheMeta, MemCache};
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::ResponseHeader;
 use std::any::Any;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tracing::{info, warn};
 
 use arc_swap::ArcSwap;
@@ -24,17 +25,17 @@ static CACHED_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
 static CACHED_MEMORY_BUDGET_AT: AtomicI64 = AtomicI64::new(0);
 const MEMORY_BUDGET_TTL_SECS: i64 = 30;
 
-/// Synchronous zstd decompression for serving small files from memory.
-fn zstd_decompress_to_bytes(data: &[u8]) -> Option<Vec<u8>> {
+const DISK_HIT_CHUNK_BYTES: usize = 128 * 1024;
+const MEMORY_SERVE_MAX: u64 = 50 * 1024 * 1024;
+
+fn zstd_decompress_to_bytes(data: &[u8], capacity: usize) -> Option<Vec<u8>> {
     use std::io::Read;
     let decoder = zstd::Decoder::new(data).ok()?;
-    let mut out = Vec::with_capacity(data.len() * 3);
+    let mut out = Vec::with_capacity(capacity);
     let mut reader = std::io::BufReader::new(decoder);
     reader.read_to_end(&mut out).ok()?;
     Some(out)
 }
-
-const MEMORY_SERVE_MAX: u64 = 50 * 1024 * 1024; // 50MB
 
 /// Dynamic Disk-based storage for Pingora-cache
 pub struct FileStorage {
@@ -84,13 +85,37 @@ impl FileStorage {
     }
 
     pub fn get_path(&self, key: &CacheKey) -> PathBuf {
-        let lock = self.inner.load();
         let hash = self.get_hash(key);
+        self.get_path_by_hash(&hash)
+    }
 
-        lock.main_root
-            .join(&hash[0..2])
-            .join(&hash[2..4])
-            .join(hash)
+    fn get_path_by_hash(&self, hash: &str) -> PathBuf {
+        let lock = self.inner.load();
+        lock.main_root.join(cache_relative_path(hash))
+    }
+
+    async fn find_existing_path_by_hash(&self, hash: &str) -> PathBuf {
+        let lock = self.inner.load();
+        let relative = cache_relative_path(hash);
+        for root in &lock.extra_roots {
+            let path = root.join(&relative);
+            if tokio::fs::metadata(&path).await.is_ok() {
+                return path;
+            }
+        }
+        lock.main_root.join(&relative)
+    }
+}
+
+fn cache_relative_path(hash: &str) -> PathBuf {
+    Path::new(&hash[0..2]).join(&hash[2..4]).join(hash)
+}
+
+async fn remove_cache_file_from_roots(inner: &FileStorageInner, hash: &str) {
+    let relative = cache_relative_path(hash);
+    let _ = fs::remove_file(inner.main_root.join(&relative)).await;
+    for root in &inner.extra_roots {
+        let _ = fs::remove_file(root.join(&relative)).await;
     }
 }
 
@@ -103,7 +128,7 @@ impl Storage for FileStorage {
     ) -> Result<Option<(CacheMeta, HitHandler)>> {
         let hash = self.get_hash(key);
 
-        let meta = match crate::metrics::storage::STORAGE.get_cache_meta(&hash) {
+        let meta = match crate::metrics::storage::get_cache_meta_memory(&hash) {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -116,7 +141,7 @@ impl Storage for FileStorage {
             let _ = header.insert_header(name.to_string(), val.as_str());
         }
 
-        let path = self.get_path(key);
+        let path = self.find_existing_path_by_hash(&hash).await;
 
         let cache_meta = CacheMeta::new(
             std::time::SystemTime::now() + std::time::Duration::from_secs(ttl),
@@ -126,30 +151,75 @@ impl Storage for FileStorage {
             header,
         );
 
-        // Read entire file into memory, serve in 32KB chunks via MemoryHitHandler
         let io_start = std::time::Instant::now();
-        let file_data = tokio::fs::read(&path)
+
+        if !meta.compressed {
+            if meta.size <= MEMORY_SERVE_MAX {
+                let file_data = tokio::fs::read(&path)
+                    .await
+                    .map_err(|_| Error::new(ErrorType::InternalError))?;
+                PROF_DISK_READ_US
+                    .fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                crate::metrics::storage::record_cache_access_memory(&hash);
+                return Ok(Some((
+                    cache_meta,
+                    Box::new(MemoryHitHandler {
+                        data: bytes::Bytes::from(file_data),
+                        offset: 0,
+                    }),
+                )));
+            }
+
+            let file = tokio::fs::File::open(&path)
+                .await
+                .map_err(|_| Error::new(ErrorType::InternalError))?;
+            PROF_DISK_READ_US.fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::metrics::storage::record_cache_access_memory(&hash);
+            return Ok(Some((
+                cache_meta,
+                Box::new(FileHitHandler {
+                    reader: Box::new(file),
+                    buf_size: DISK_HIT_CHUNK_BYTES,
+                }),
+            )));
+        }
+
+        if meta.size > 0 && meta.size <= DISK_HIT_CHUNK_BYTES as u64 {
+            let file_data = tokio::fs::read(&path)
+                .await
+                .map_err(|_| Error::new(ErrorType::InternalError))?;
+            PROF_DISK_READ_US.fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::metrics::storage::record_cache_access_memory(&hash);
+            let capacity = meta.size.min(MEMORY_SERVE_MAX) as usize;
+            let result =
+                tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&file_data, capacity))
+                    .await;
+            let body = match result {
+                Ok(Some(data)) => bytes::Bytes::from(data),
+                _ => return Ok(None),
+            };
+            return Ok(Some((
+                cache_meta,
+                Box::new(MemoryHitHandler {
+                    data: body,
+                    offset: 0,
+                }),
+            )));
+        }
+
+        let file = tokio::fs::File::open(&path)
             .await
             .map_err(|_| Error::new(ErrorType::InternalError))?;
         PROF_DISK_READ_US.fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-        crate::metrics::storage::STORAGE.record_cache_access(&hash);
-
-        let body: bytes::Bytes = if meta.compressed {
-            let result =
-                tokio::task::spawn_blocking(move || zstd_decompress_to_bytes(&file_data)).await;
-            match result {
-                Ok(Some(data)) => bytes::Bytes::from(data),
-                _ => return Ok(None),
-            }
-        } else {
-            bytes::Bytes::from(file_data)
-        };
-
-        let handler = Box::new(MemoryHitHandler {
-            data: body,
-            offset: 0,
-        });
-        Ok(Some((cache_meta, handler)))
+        crate::metrics::storage::record_cache_access_memory(&hash);
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(BufReader::new(file));
+        Ok(Some((
+            cache_meta,
+            Box::new(FileHitHandler {
+                reader: Box::new(decoder),
+                buf_size: DISK_HIT_CHUNK_BYTES,
+            }),
+        )))
     }
 
     async fn get_miss_handler(
@@ -356,6 +426,45 @@ impl HandleHit for MemoryHitHandler {
         let chunk = self.data.slice(self.offset..end);
         self.offset = end;
         Ok(Some(chunk))
+    }
+
+    async fn finish(
+        self: Box<Self>,
+        _storage: &'static (dyn Storage + Sync),
+        _key: &CacheKey,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn as_any(&self) -> &(dyn Any + Send + Sync) {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
+        self
+    }
+}
+
+struct FileHitHandler {
+    reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    buf_size: usize,
+}
+
+#[async_trait]
+impl HandleHit for FileHitHandler {
+    async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
+        let mut buf = Vec::with_capacity(self.buf_size);
+        let read = self
+            .reader
+            .as_mut()
+            .take(self.buf_size as u64)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|_| Error::new(ErrorType::InternalError))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        Ok(Some(bytes::Bytes::from(buf)))
     }
 
     async fn finish(
@@ -796,12 +905,7 @@ impl HybridStorage {
     pub async fn purge_by_key(&self, key: &str) -> bool {
         let hash = format!("{:x}", md5_legacy::compute(key));
         let inner = self.l2.inner.load();
-        let path = inner
-            .main_root
-            .join(&hash[0..2])
-            .join(&hash[2..4])
-            .join(&hash);
-        let _ = fs::remove_file(&path).await;
+        remove_cache_file_from_roots(&inner, &hash).await;
         crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
 
         // Clear from lock-free L1 cache
@@ -834,12 +938,7 @@ impl HybridStorage {
         });
 
         for hash in to_delete {
-            let path = inner
-                .main_root
-                .join(&hash[0..2])
-                .join(&hash[2..4])
-                .join(&hash);
-            let _ = fs::remove_file(&path).await;
+            remove_cache_file_from_roots(&inner, &hash).await;
             crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
             deleted_count += 1;
         }
@@ -1024,7 +1123,7 @@ impl PartialOrd for EvictCandidate {
     }
 }
 
-pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: PathBuf) {
+pub async fn start_cache_purger(storage: &'static HybridStorage, _disk_root: PathBuf) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
 
     loop {
@@ -1033,6 +1132,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
         let max_bytes = storage
             .max_disk_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
+        let inner = storage.l2.inner.load();
 
         let mut current_size: u64 = 0;
         let mut expired_hashes = Vec::new();
@@ -1051,8 +1151,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
 
         // Execute: Delete expired files
         for hash in expired_hashes {
-            let path = disk_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
-            let _ = tokio::fs::remove_file(&path).await;
+            remove_cache_file_from_roots(&inner, &hash).await;
             crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
         }
 
@@ -1103,8 +1202,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, disk_root: Path
 
             for candidate in heap {
                 let hash = candidate.hash;
-                let path = disk_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
-                let _ = tokio::fs::remove_file(&path).await;
+                remove_cache_file_from_roots(&inner, &hash).await;
                 crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
             }
         }
@@ -1298,6 +1396,108 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("HIT")
         );
+    }
+
+    #[tokio::test]
+    async fn small_uncompressed_l2_hit_uses_memory_handler_for_fast_l1_promotion() {
+        let key_str = format!(
+            "small-l2-hit-{}-{}",
+            std::process::id(),
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        );
+        let root = std::env::temp_dir().join(format!(
+            "cloud-node-rust-cache-test-{}",
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let storage = Box::leak(Box::new(FileStorage::new(&root)));
+        let key = CacheKey::new("edge", key_str.as_str(), "");
+        let hash = storage.get_hash(&key);
+        let path = storage.get_path(&key);
+        tokio::fs::create_dir_all(path.parent().expect("cache path parent"))
+            .await
+            .expect("create cache dir");
+        tokio::fs::write(&path, b"small-body")
+            .await
+            .expect("write cache file");
+        crate::metrics::storage::insert_cache_meta_for_test(
+            hash.clone(),
+            crate::metrics::storage::CacheMetaEntry {
+                cache_key: key_str.clone(),
+                size: 10,
+                expires: crate::utils::time::now_timestamp() + 60,
+                access_time: crate::utils::time::now_timestamp(),
+                access_count: 1,
+                status: 200,
+                headers: Vec::new(),
+                compressed: false,
+            },
+        );
+
+        let trace = pingora_cache::trace::Span::inactive().handle();
+        let (_, handler) = storage
+            .lookup(&key, &trace)
+            .await
+            .expect("lookup result")
+            .expect("cache hit");
+        assert!(handler.as_any().is::<MemoryHitHandler>());
+
+        crate::metrics::storage::delete_cache_meta_for_test(&hash);
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn small_compressed_l2_hit_uses_memory_handler_for_fast_l1_promotion() {
+        let key_str = format!(
+            "small-compressed-l2-hit-{}-{}",
+            std::process::id(),
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        );
+        let root = std::env::temp_dir().join(format!(
+            "cloud-node-rust-cache-test-{}",
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let storage = Box::leak(Box::new(FileStorage::new(&root)));
+        let key = CacheKey::new("edge", key_str.as_str(), "");
+        let hash = storage.get_hash(&key);
+        let path = storage.get_path(&key);
+        tokio::fs::create_dir_all(path.parent().expect("cache path parent"))
+            .await
+            .expect("create cache dir");
+        let body = b"small compressed text body";
+        let compressed = zstd::encode_all(body.as_slice(), 0).expect("compress body");
+        tokio::fs::write(&path, compressed)
+            .await
+            .expect("write cache file");
+        crate::metrics::storage::insert_cache_meta_for_test(
+            hash.clone(),
+            crate::metrics::storage::CacheMetaEntry {
+                cache_key: key_str.clone(),
+                size: body.len() as u64,
+                expires: crate::utils::time::now_timestamp() + 60,
+                access_time: crate::utils::time::now_timestamp(),
+                access_count: 1,
+                status: 200,
+                headers: Vec::new(),
+                compressed: true,
+            },
+        );
+
+        let trace = pingora_cache::trace::Span::inactive().handle();
+        let (_, mut handler) = storage
+            .lookup(&key, &trace)
+            .await
+            .expect("lookup result")
+            .expect("cache hit");
+        assert!(handler.as_any().is::<MemoryHitHandler>());
+        let chunk = handler
+            .read_body()
+            .await
+            .expect("read body")
+            .expect("body chunk");
+        assert_eq!(chunk.as_ref(), body);
+
+        crate::metrics::storage::delete_cache_meta_for_test(&hash);
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[test]

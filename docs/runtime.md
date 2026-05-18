@@ -74,7 +74,9 @@ cloud-node --monitor-port 8888 --monitor-clear
 - 实时统计、日统计、Top IP 和节点值上报。
 - 本地性能监控采样。
 
-请求热路径避免执行慢速磁盘 I/O、同步 DNS、全表扫描和大对象深拷贝。WebP 图片转换只在缓存写入前执行一次，后续同一 WebP 变体命中缓存时不再重复转换。对 HTML/CSS/JS 优化、加密等仍可能在响应阶段执行的 CPU 密集型能力，需要在后续版本继续隔离到专用 worker 或 blocking 线程池。
+请求热路径避免执行慢速磁盘 I/O、同步 DNS、全表扫描和大对象深拷贝。WebP 图片转换只在缓存写入前执行一次，后续同一 WebP 变体命中缓存时不再重复转换。L2 磁盘缓存命中会优先使用内存索引；小对象返回内存命中以保持 Fast L1 晋升，大对象按块从文件读取，压缩对象支持流式 zstd 解压，避免大文件一次性读入内存。HTML/CSS/JS 优化、加密等响应体转换有大小边界，超过阈值时直接透传。
+
+WAF CC 计数器使用固定窗口滚动桶，单次更新不再对同一 key 的历史时间戳列表做线性 retain。UDP/QUIC 会话活动时间使用原子时间戳更新，TLS 证书快照和 OCSP 数据走无锁读路径，上游 TLS 连接器和客户端证书解析结果会复用，减少高并发握手路径的重复初始化。
 
 项目提供 `targeted_hotspots_bench` 用于服务器侧观察 Fast L1、响应体 CPU 处理、TLS selector、UA analyzer cache 和 WAF verifier 等热点。常规开发验证使用 `cargo check --all-targets`，bench 建议只在目标服务器上运行。
 

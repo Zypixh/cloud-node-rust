@@ -19,7 +19,10 @@ use tracing::{debug, error, info};
 use crate::config::ConfigStore;
 use crate::http3_proxy_manager::Http3ProxyManager;
 use crate::quic_probe::{QuicCryptoFragment, QuicProbeFragmentResult};
-use crate::udp_proxy::{UdpProxyManager, UdpSession, UdpSessionQuicCid, UdpSessionSendStatus};
+use crate::udp_proxy::{
+    UdpProxyManager, UdpSession, UdpSessionQuicCid, UdpSessionSendStatus, udp_activity_is_alive,
+    udp_activity_now_ms,
+};
 
 const MAX_DATAGRAM_SIZE: usize = 65_535;
 const H3_QUEUE_SIZE: usize = 8192;
@@ -40,7 +43,7 @@ const MAX_PENDING_RANGES_PER_CLIENT: usize = 16;
 
 #[derive(Clone)]
 enum RouteKind {
-    Http3(Arc<Mutex<Instant>>),
+    Http3(Arc<AtomicU64>),
     Passthrough(Arc<UdpSession>),
 }
 
@@ -442,17 +445,14 @@ fn route_kind_same(left: &RouteKind, right: &RouteKind) -> bool {
     }
 }
 
-fn route_kind_is_active(route: &RouteKind, now: Instant) -> bool {
+fn route_kind_is_active(route: &RouteKind) -> bool {
     match route {
-        RouteKind::Http3(last_activity) => last_activity
-            .lock()
-            .map(|last| now.duration_since(*last) < H3_ROUTE_IDLE_TIMEOUT)
-            .unwrap_or(true),
-        RouteKind::Passthrough(session) => session
-            .last_activity
-            .try_read()
-            .map(|last| now.duration_since(*last) < UDP_SESSION_IDLE_TIMEOUT)
-            .unwrap_or(true),
+        RouteKind::Http3(last_activity_ms) => {
+            udp_activity_is_alive(last_activity_ms, H3_ROUTE_IDLE_TIMEOUT)
+        }
+        RouteKind::Passthrough(session) => {
+            udp_activity_is_alive(&session.last_activity_ms, UDP_SESSION_IDLE_TIMEOUT)
+        }
     }
 }
 
@@ -469,10 +469,10 @@ fn cleanup_routes(
         .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_QUIC_ROUTE_TIMEOUT);
     pending_retained_bytes(pending_routes, pending_reassembly_bytes);
     udp_manager.cleanup_idle_sessions(UDP_SESSION_IDLE_TIMEOUT);
-    routes.retain(|_, route| route_kind_is_active(route, now));
-    session_routes.retain(|_, route| route_kind_is_active(route, now));
+    routes.retain(|_, route| route_kind_is_active(route));
+    session_routes.retain(|_, route| route_kind_is_active(route));
     cid_routes.retain(|_, bucket| {
-        bucket.retain(|_, route| route_kind_is_active(route, now));
+        bucket.retain(|_, route| route_kind_is_active(route));
         !bucket.is_empty()
     });
 }
@@ -1122,7 +1122,9 @@ impl QuicUdpDemuxManager {
                     "QUIC UDP demux: L7 H3 {} on port {} matched alpn={:?}",
                     server_name, port, client_hello.alpns
                 );
-                return Ok(Some(RouteKind::Http3(Arc::new(Mutex::new(Instant::now())))));
+                return Ok(Some(RouteKind::Http3(Arc::new(AtomicU64::new(
+                    udp_activity_now_ms(),
+                )))));
             }
 
             if let Some(server) = self
@@ -1199,7 +1201,9 @@ impl QuicUdpDemuxManager {
         }
 
         if should_use_generic_h3_fallback(&self.config_store, port, &client_hello, http3_enabled) {
-            return Ok(Some(RouteKind::Http3(Arc::new(Mutex::new(Instant::now())))));
+            return Ok(Some(RouteKind::Http3(Arc::new(AtomicU64::new(
+                udp_activity_now_ms(),
+            )))));
         }
 
         let session = match self
@@ -1228,7 +1232,7 @@ impl QuicUdpDemuxManager {
         http3_enabled: bool,
     ) -> DispatchStatus {
         match route {
-            RouteKind::Http3(last_activity) => {
+            RouteKind::Http3(last_activity_ms) => {
                 if !http3_enabled {
                     return DispatchStatus::Closed;
                 }
@@ -1237,9 +1241,7 @@ impl QuicUdpDemuxManager {
                     data,
                 }) {
                     Ok(()) => {
-                        if let Ok(mut last) = last_activity.lock() {
-                            *last = Instant::now();
-                        }
+                        last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
                         DispatchStatus::Sent
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1296,7 +1298,7 @@ mod tests {
     #[test]
     fn cid_routes_are_bucketed_by_connection_id_length() {
         let cid_routes = CidRoutes::new();
-        let route = RouteKind::Http3(Arc::new(Mutex::new(Instant::now())));
+        let route = RouteKind::Http3(Arc::new(AtomicU64::new(udp_activity_now_ms())));
         insert_cid_route(
             &cid_routes,
             QuicConnectionId(vec![1, 2, 3, 4]),
@@ -1324,7 +1326,7 @@ mod tests {
             user_id: 0,
             user_plan_id: 0,
             plan_id: 0,
-            last_activity: Arc::new(tokio::sync::RwLock::new(Instant::now())),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
@@ -1368,7 +1370,7 @@ mod tests {
             user_id: 0,
             user_plan_id: 0,
             plan_id: 0,
-            last_activity: Arc::new(tokio::sync::RwLock::new(Instant::now())),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,

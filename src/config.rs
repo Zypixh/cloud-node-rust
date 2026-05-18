@@ -114,6 +114,7 @@ pub struct NodeConfig {
     pub quic_passthrough_exact: HashMap<(u16, String), Arc<ServerConfig>>,
     pub quic_passthrough_wildcard: HashMap<(u16, String), Arc<ServerConfig>>,
     pub unique_quic_passthrough_by_port: HashMap<u16, Option<Arc<ServerConfig>>>,
+    pub udp_server_by_port: HashMap<u16, Arc<ServerConfig>>,
 }
 
 #[derive(Clone)]
@@ -186,6 +187,7 @@ impl Default for NodeConfig {
             quic_passthrough_exact: HashMap::new(),
             quic_passthrough_wildcard: HashMap::new(),
             unique_quic_passthrough_by_port: HashMap::new(),
+            udp_server_by_port: HashMap::new(),
         }
     }
 }
@@ -530,6 +532,10 @@ impl ConfigStore {
     pub fn has_quic_passthrough_on_port_sync(&self, port: u16) -> bool {
         let lock = self.inner.read();
         lock.unique_quic_passthrough_by_port.contains_key(&port)
+    }
+
+    pub fn find_udp_server_by_port_sync(&self, port: u16) -> Option<Arc<ServerConfig>> {
+        self.inner.read().udp_server_by_port.get(&port).cloned()
     }
 
     pub fn inspect_tls_route_sync(&self, host: &str, port: u16) -> Option<TlsRouteInspection> {
@@ -1299,8 +1305,16 @@ impl ConfigStore {
         lock.quic_passthrough_exact.clear();
         lock.quic_passthrough_wildcard.clear();
         lock.unique_quic_passthrough_by_port.clear();
+        lock.udp_server_by_port.clear();
 
         for server in &lock.all_servers {
+            if !server.is_quic_passthrough() {
+                for port in Self::server_udp_ports(server, false) {
+                    lock.udp_server_by_port
+                        .entry(port)
+                        .or_insert_with(|| server.clone());
+                }
+            }
             if server.is_sni_passthrough() {
                 let ports = Self::server_https_ports(server);
                 Self::index_passthrough_server(

@@ -75,6 +75,7 @@ cloud-node --monitor-port 8888
 
 发布说明：
 
+- [1.1.1](release-notes/v1.1.1.md)
 - [1.1.0](release-notes/v1.1.0.md)
 - [1.0.9](release-notes/v1.0.9.md)
 - [1.0.8](release-notes/v1.0.8.md)

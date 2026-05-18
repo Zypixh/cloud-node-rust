@@ -4,12 +4,17 @@ use crate::config_models::ServerConfig;
 use crate::ssl::DynamicCertSelector;
 use base64::Engine;
 use dashmap::DashMap;
+use lru::LruCache;
+use once_cell::sync::Lazy;
 use pingora_core::tls::ext;
 use pingora_core::tls::pkey::PKey;
 use pingora_core::tls::ssl::{SslConnector, SslMethod};
 use pingora_core::tls::x509::X509;
+use sha2::{Digest as _, Sha256};
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -19,6 +24,20 @@ struct ListenerHandle {
     is_tls: bool,
     shutdown_tx: watch::Sender<bool>,
 }
+
+#[derive(Clone)]
+struct ParsedClientCert {
+    cert_chain: Arc<Vec<X509>>,
+    key: Arc<PKey<pingora_core::tls::pkey::Private>>,
+}
+
+static CLIENT_CERT_CACHE: Lazy<Mutex<LruCache<String, ParsedClientCert>>> =
+    Lazy::new(|| Mutex::new(LruCache::new(NonZeroUsize::MIN)));
+static UPSTREAM_TLS_CONNECTOR: Lazy<SslConnector> = Lazy::new(|| {
+    SslConnector::builder(SslMethod::tls())
+        .expect("Failed to create SSL connector builder")
+        .build()
+});
 
 pub struct TcpProxyManager {
     config_store: ConfigStore,
@@ -43,6 +62,7 @@ impl TcpProxyManager {
                 "TCP Proxy Manager: Found {} servers in config store",
                 servers.len()
             );
+            resize_client_cert_cache_for_servers(&servers);
             let mut desired_ports = std::collections::HashMap::new();
             for server in servers {
                 // Handle TCP
@@ -117,7 +137,7 @@ impl TcpProxyManager {
 
     async fn spawn_listener(
         self: &Arc<Self>,
-        server: &ServerConfig,
+        server: &Arc<ServerConfig>,
         addr_cfg: &crate::config_models::NetworkAddressConfig,
         is_tls: bool,
     ) {
@@ -146,11 +166,11 @@ impl TcpProxyManager {
             );
 
             let manager = self.clone();
-            let server_clone = server.clone();
+            let server = server.clone();
             tokio::spawn(async move {
                 if let Err(e) = manager
                     .clone()
-                    .run_tcp_listener(port, server_clone, is_tls, shutdown_rx)
+                    .run_tcp_listener(port, server, is_tls, shutdown_rx)
                     .await
                 {
                     error!("TCP listener on port {} failed: {}", port, e);
@@ -186,7 +206,7 @@ impl TcpProxyManager {
     async fn run_tcp_listener(
         self: Arc<Self>,
         port: u16,
-        server: ServerConfig,
+        server: Arc<ServerConfig>,
         is_tls: bool,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
@@ -246,18 +266,12 @@ impl TcpProxyManager {
             }
 
             let manager = self.clone();
-            let server_inner = server.clone();
+            let server = server.clone();
             let acceptor_clone = shared_ssl_acceptor.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = manager
-                    .handle_connection(
-                        client_stream,
-                        client_addr,
-                        server_inner,
-                        is_tls,
-                        acceptor_clone,
-                    )
+                    .handle_connection(client_stream, client_addr, server, is_tls, acceptor_clone)
                     .await
                 {
                     debug!("TCP connection from {} failed: {}", client_addr, e);
@@ -270,7 +284,7 @@ impl TcpProxyManager {
         self: Arc<Self>,
         client_stream: TcpStream,
         client_addr: SocketAddr,
-        server: ServerConfig,
+        server: Arc<ServerConfig>,
         is_tls: bool,
         shared_ssl_acceptor: Option<Arc<pingora_core::tls::ssl::SslAcceptor>>,
     ) -> anyhow::Result<()> {
@@ -317,7 +331,7 @@ impl TcpProxyManager {
         self: Arc<Self>,
         client_stream: S,
         client_addr: SocketAddr,
-        server: ServerConfig,
+        server: Arc<ServerConfig>,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -380,10 +394,7 @@ impl TcpProxyManager {
                 server.get_first_host()
             };
 
-            let connector = SslConnector::builder(SslMethod::tls())
-                .expect("Failed to create SSL connector builder")
-                .build();
-            let mut conn_config = connector
+            let mut conn_config = UPSTREAM_TLS_CONNECTOR
                 .configure()
                 .expect("Failed to create connect configuration");
 
@@ -402,7 +413,7 @@ impl TcpProxyManager {
             let client_ip = client_addr.ip().to_string();
             crate::metrics::record::request_start(
                 sid,
-                client_ip,
+                &client_ip,
                 user_id,
                 user_plan_id,
                 plan_id,
@@ -569,7 +580,7 @@ impl TcpProxyManager {
             let client_ip = client_addr.ip().to_string();
             crate::metrics::record::request_start(
                 sid,
-                client_ip,
+                &client_ip,
                 user_id,
                 user_plan_id,
                 plan_id,
@@ -821,10 +832,60 @@ fn record_stream_metrics_delta(server_id: i64, direction: StreamDirection, bytes
     }
 }
 
+fn resize_client_cert_cache_for_servers(servers: &[Arc<ServerConfig>]) {
+    let mut cert_keys = HashSet::new();
+    for server in servers {
+        let Some(reverse_proxy) = &server.reverse_proxy else {
+            continue;
+        };
+
+        for origin in reverse_proxy
+            .primary_origins
+            .iter()
+            .chain(reverse_proxy.backup_origins.iter())
+        {
+            if let Some(key) = origin.cert.as_ref().and_then(client_cert_key_for_cache) {
+                cert_keys.insert(key);
+            }
+        }
+    }
+
+    let capacity = NonZeroUsize::new(cert_keys.len().max(1)).expect("non-zero cache capacity");
+    let mut cache = CLIENT_CERT_CACHE
+        .lock()
+        .expect("client cert cache mutex poisoned");
+    if cache.cap() != capacity {
+        cache.resize(capacity);
+    }
+}
+
+fn client_cert_key_for_cache(client_cert: &SSLCertConfig) -> Option<String> {
+    let cert_pem_raw = client_cert.cert_data_json.as_ref()?.as_str()?;
+    let key_pem_raw = client_cert.key_data_json.as_ref()?.as_str()?;
+    let cert_bytes = clean_pem_value(cert_pem_raw);
+    let key_bytes = clean_pem_value(key_pem_raw);
+    Some(client_cert_cache_key(&cert_bytes, &key_bytes))
+}
+
 fn apply_client_cert(
     conn_config: &mut pingora_core::tls::ssl::ConnectConfiguration,
     client_cert: &SSLCertConfig,
 ) -> anyhow::Result<()> {
+    let parsed = parsed_client_cert(client_cert)?;
+    let leaf = parsed
+        .cert_chain
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("client certificate chain is empty"))?;
+
+    ext::ssl_use_certificate(conn_config, leaf)?;
+    ext::ssl_use_private_key(conn_config, &parsed.key)?;
+    for cert in parsed.cert_chain.iter().skip(1) {
+        ext::ssl_add_chain_cert(conn_config, cert)?;
+    }
+    Ok(())
+}
+
+fn parsed_client_cert(client_cert: &SSLCertConfig) -> anyhow::Result<ParsedClientCert> {
     let cert_pem_raw = client_cert
         .cert_data_json
         .as_ref()
@@ -838,18 +899,38 @@ fn apply_client_cert(
 
     let cert_bytes = clean_pem_value(cert_pem_raw);
     let key_bytes = clean_pem_value(key_pem_raw);
-    let cert_chain = X509::stack_from_pem(&cert_bytes)?;
-    let leaf = cert_chain
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("client certificate chain is empty"))?;
-    let key = PKey::private_key_from_pem(&key_bytes)?;
-
-    ext::ssl_use_certificate(conn_config, leaf)?;
-    ext::ssl_use_private_key(conn_config, &key)?;
-    for cert in cert_chain.iter().skip(1) {
-        ext::ssl_add_chain_cert(conn_config, cert)?;
+    let cache_key = client_cert_cache_key(&cert_bytes, &key_bytes);
+    if let Some(parsed) = CLIENT_CERT_CACHE
+        .lock()
+        .expect("client cert cache mutex poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(parsed);
     }
-    Ok(())
+
+    let cert_chain = X509::stack_from_pem(&cert_bytes)?;
+    if cert_chain.is_empty() {
+        return Err(anyhow::anyhow!("client certificate chain is empty"));
+    }
+    let key = PKey::private_key_from_pem(&key_bytes)?;
+    let parsed = ParsedClientCert {
+        cert_chain: Arc::new(cert_chain),
+        key: Arc::new(key),
+    };
+    CLIENT_CERT_CACHE
+        .lock()
+        .expect("client cert cache mutex poisoned")
+        .put(cache_key, parsed.clone());
+    Ok(parsed)
+}
+
+fn client_cert_cache_key(cert_bytes: &[u8], key_bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(cert_bytes);
+    hasher.update([0]);
+    hasher.update(key_bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn clean_pem_value(raw: &str) -> Vec<u8> {

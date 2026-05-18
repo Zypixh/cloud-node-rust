@@ -6,6 +6,98 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+const ROLLING_COUNTER_BUCKETS: usize = 256;
+const COUNTER_SWEEP_INTERVAL_SECS: i64 = 60;
+const COUNTER_MAX_PERIOD_SECS: i64 = 7 * 86_400;
+
+pub(crate) struct RollingCounter {
+    buckets: [u64; ROLLING_COUNTER_BUCKETS],
+    bucket_secs: i64,
+    active_slots: usize,
+    current_bucket: i64,
+    current_slot: usize,
+    total: u64,
+    last_seen: i64,
+}
+
+impl Default for RollingCounter {
+    fn default() -> Self {
+        Self {
+            buckets: [0; ROLLING_COUNTER_BUCKETS],
+            bucket_secs: 1,
+            active_slots: 1,
+            current_bucket: 0,
+            current_slot: 0,
+            total: 0,
+            last_seen: 0,
+        }
+    }
+}
+
+impl RollingCounter {
+    pub(crate) fn increment(&mut self, now: i64, period_secs: i64) -> u64 {
+        let period_secs = period_secs.clamp(1, COUNTER_MAX_PERIOD_SECS);
+        let (bucket_secs, active_slots) = Self::shape(period_secs);
+        let now_bucket = now.div_euclid(bucket_secs);
+
+        if self.current_bucket == 0
+            || now_bucket < self.current_bucket
+            || self.bucket_secs != bucket_secs
+            || self.active_slots != active_slots
+        {
+            self.reset(now_bucket, bucket_secs, active_slots);
+        } else {
+            self.advance(now_bucket);
+        }
+
+        self.buckets[self.current_slot] = self.buckets[self.current_slot].saturating_add(1);
+        self.total = self.total.saturating_add(1);
+        self.last_seen = now;
+        self.total
+    }
+
+    pub(crate) fn is_stale(&self, now: i64, max_period_secs: i64) -> bool {
+        self.last_seen <= now.saturating_sub(max_period_secs.max(1))
+    }
+
+    fn shape(period_secs: i64) -> (i64, usize) {
+        let bucket_count = ROLLING_COUNTER_BUCKETS as i64;
+        let bucket_secs = ((period_secs + bucket_count - 1) / bucket_count).max(1);
+        let active_slots =
+            ((period_secs + bucket_secs - 1) / bucket_secs).clamp(1, bucket_count) as usize;
+        (bucket_secs, active_slots)
+    }
+
+    fn reset(&mut self, now_bucket: i64, bucket_secs: i64, active_slots: usize) {
+        self.buckets[..active_slots].fill(0);
+        self.bucket_secs = bucket_secs;
+        self.active_slots = active_slots;
+        self.current_bucket = now_bucket;
+        self.current_slot = 0;
+        self.total = 0;
+    }
+
+    fn advance(&mut self, now_bucket: i64) {
+        let delta = now_bucket.saturating_sub(self.current_bucket) as usize;
+        if delta == 0 {
+            return;
+        }
+
+        if delta >= self.active_slots {
+            self.buckets[..self.active_slots].fill(0);
+            self.total = 0;
+        } else {
+            for _ in 0..delta {
+                self.current_slot = (self.current_slot + 1) % self.active_slots;
+                self.total = self.total.saturating_sub(self.buckets[self.current_slot]);
+                self.buckets[self.current_slot] = 0;
+            }
+        }
+        self.current_bucket = now_bucket;
+    }
+}
 
 pub struct WafStateManager {
     pub blocks: DashMap<(i64, IpAddr), i64>,
@@ -15,7 +107,8 @@ pub struct WafStateManager {
     server_limiters: DashMap<i64, Arc<RateLimiter<i64, DashMapStateStore<i64>, DefaultClock>>>,
     ip_limiters:
         DashMap<(i64, IpAddr), Arc<RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>>>,
-    counters: DashMap<String, Vec<i64>>,
+    counters: DashMap<String, RollingCounter>,
+    counter_last_sweep: AtomicI64,
 }
 
 impl Default for WafStateManager {
@@ -34,6 +127,7 @@ impl WafStateManager {
             server_limiters: DashMap::new(),
             ip_limiters: DashMap::new(),
             counters: DashMap::new(),
+            counter_last_sweep: AtomicI64::new(0),
         }
     }
 
@@ -274,11 +368,28 @@ impl WafStateManager {
 
     pub fn increase_counter(&self, key: String, period_secs: i64) -> u64 {
         let now = crate::utils::time::now_timestamp();
-        let min_ts = now - period_secs.max(1);
-        let mut entry = self.counters.entry(key).or_default();
-        entry.retain(|ts| *ts >= min_ts);
-        entry.push(now);
-        entry.len() as u64
+        let period_secs = period_secs.clamp(1, COUNTER_MAX_PERIOD_SECS);
+        self.sweep_counters(now);
+        self.counters
+            .entry(format!("{}:{}", period_secs, key))
+            .or_default()
+            .increment(now, period_secs)
+    }
+
+    fn sweep_counters(&self, now: i64) {
+        let last = self.counter_last_sweep.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < COUNTER_SWEEP_INTERVAL_SECS {
+            return;
+        }
+        if self
+            .counter_last_sweep
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.counters
+            .retain(|_, counter| !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS));
     }
 
     pub fn flush_to_disk(&self) {}

@@ -225,12 +225,7 @@ impl MetricStorage {
     /// Records a cache access in memory only — no RocksDB I/O on the hot path.
     /// Access timestamps and counts are flushed to RocksDB periodically by the background task.
     pub fn record_cache_access(&self, hash: &str) {
-        let now = crate::utils::time::now_timestamp();
-        let entry = CACHE_ACCESS_LOG
-            .entry(hash.to_string())
-            .or_insert_with(|| (AtomicI64::new(now), AtomicU64::new(0)));
-        entry.0.store(now, Ordering::Relaxed);
-        entry.1.fetch_add(1, Ordering::Relaxed);
+        record_cache_access_memory(hash);
     }
 
     /// Flush in-memory access logs to RocksDB. Called by background task every 30s.
@@ -280,7 +275,7 @@ impl MetricStorage {
     }
 
     pub fn get_cache_meta(&self, hash: &str) -> Option<CacheMetaEntry> {
-        CACHE_META_INDEX.get(hash).map(|v| v.clone())
+        get_cache_meta_memory(hash)
     }
 
     pub fn delete_cache_meta(&self, hash: &str) {
@@ -453,6 +448,30 @@ pub struct CacheMetaEntry {
 /// In-memory cache metadata index: hash → typed metadata.
 /// All cache lookups read from here, eliminating synchronous RocksDB reads on the hot path.
 static CACHE_META_INDEX: Lazy<DashMap<String, CacheMetaEntry>> = Lazy::new(DashMap::new);
+
+pub fn get_cache_meta_memory(hash: &str) -> Option<CacheMetaEntry> {
+    CACHE_META_INDEX.get(hash).map(|v| v.clone())
+}
+
+pub fn record_cache_access_memory(hash: &str) {
+    let now = crate::utils::time::now_timestamp();
+    let entry = CACHE_ACCESS_LOG
+        .entry(hash.to_string())
+        .or_insert_with(|| (AtomicI64::new(now), AtomicU64::new(0)));
+    entry.0.store(now, Ordering::Relaxed);
+    entry.1.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn insert_cache_meta_for_test(hash: String, meta: CacheMetaEntry) {
+    CACHE_META_INDEX.insert(hash, meta);
+}
+
+#[cfg(test)]
+pub fn delete_cache_meta_for_test(hash: &str) {
+    CACHE_META_INDEX.remove(hash);
+    CACHE_ACCESS_LOG.remove(hash);
+}
 
 /// Load all existing cache metadata from RocksDB into the in-memory index at startup.
 pub fn load_cache_meta_index() {

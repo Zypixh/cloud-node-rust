@@ -84,8 +84,14 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.1.0 --yes
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.1.1 --yes
 ```
+
+## 1.1.1 说明
+
+1.1.1 聚焦数据面性能和可靠性：缓存 L2 大对象命中改为文件分块读取，压缩对象支持流式 zstd 解压，小对象继续走内存命中以保持 Fast L1 晋升；WAF CC 计数器改为固定窗口滚动桶，避免攻击流量下按请求数线性扫描时间戳。
+
+本版本同时优化访问日志、指标、UDP/QUIC 活动时间、上游 TLS 连接器和证书选择热路径；访问日志上传在中间 chunk 失败时会重新入队当前失败 chunk 与尚未发送的后续 chunk，避免批量日志丢失。
 
 ## 1.1.0 说明
 

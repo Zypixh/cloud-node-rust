@@ -63,6 +63,10 @@ pub fn next_request_id() -> String {
     format!("{now}{node_id}{counter}")
 }
 
+fn access_log_field_enabled(fields: Option<&[i32]>, field: i32) -> bool {
+    fields.map_or(true, |fields| fields.contains(&field))
+}
+
 pub fn report_node_log(level: String, tag: String, message: String, server_id: i64) {
     if let Some(sender) = NODE_LOG_SENDER.get() {
         let log = pb::NodeLog {
@@ -118,17 +122,46 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         return;
     }
 
+    let fields = ctx
+        .access_log_ref
+        .as_ref()
+        .filter(|access_log| !access_log.fields.is_empty())
+        .map(|access_log| access_log.fields.as_slice());
     let (log_cookies, log_req_headers, log_resp_headers, common_req_headers_only) =
         if let Some(ref cfg) = ctx.global_access_log_config {
             (
-                cfg.enable_cookies,
-                cfg.enable_request_headers,
-                cfg.enable_response_headers,
+                cfg.enable_cookies && access_log_field_enabled(fields, 32),
+                cfg.enable_request_headers && access_log_field_enabled(fields, 36),
+                cfg.enable_response_headers && access_log_field_enabled(fields, 22),
                 cfg.common_request_headers_only,
             )
         } else {
-            (true, true, true, false)
+            (
+                access_log_field_enabled(fields, 32),
+                access_log_field_enabled(fields, 36),
+                access_log_field_enabled(fields, 22),
+                false,
+            )
         };
+    let log_request_body = access_log_field_enabled(fields, 51);
+    let log_time_iso8601 = access_log_field_enabled(fields, 23);
+    let log_time_local = access_log_field_enabled(fields, 24);
+    let log_remote_user = access_log_field_enabled(fields, 9);
+    let log_request_uri = access_log_field_enabled(fields, 10);
+    let log_request_path = access_log_field_enabled(fields, 11);
+    let log_request_method = access_log_field_enabled(fields, 14);
+    let log_request_filename = access_log_field_enabled(fields, 15);
+    let log_request_line = access_log_field_enabled(fields, 30);
+    let log_content_type = access_log_field_enabled(fields, 31);
+    let log_args = access_log_field_enabled(fields, 34);
+    let log_query_string = access_log_field_enabled(fields, 35);
+    let log_server_name = access_log_field_enabled(fields, 37);
+    let log_hostname = access_log_field_enabled(fields, 40);
+    let log_origin_address = access_log_field_enabled(fields, 41);
+    let log_errors = access_log_field_enabled(fields, 42);
+    let log_attrs = access_log_field_enabled(fields, 43);
+    let log_firewall_actions = access_log_field_enabled(fields, 49);
+    let log_tags = access_log_field_enabled(fields, 50);
 
     let req = session.req_header();
     let server_id = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
@@ -205,9 +238,17 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         std::collections::HashMap::new()
     };
 
-    // Collect request query args and query string
-    let query_string = req.uri.query().unwrap_or("").to_string();
-    let args = query_string.clone();
+    let query = req.uri.query().unwrap_or("");
+    let query_string = if log_query_string {
+        query.to_string()
+    } else {
+        String::new()
+    };
+    let args = if log_args {
+        query.to_string()
+    } else {
+        String::new()
+    };
 
     // Collect request headers — gated by enableRequestHeaders
     let mut req_headers: std::collections::HashMap<String, pb::Strings> =
@@ -249,62 +290,88 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
                 );
             }
         }
-        content_type = resp
-            .headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        if log_content_type {
+            content_type = resp
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+        }
     }
 
-    // Format times matching Go: ISO8601 and Apache Common Log Format
-    let start_dt = crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
-    let time_iso8601 = start_dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
-    let time_local = start_dt.format("%d/%b/%Y:%H:%M:%S %z").to_string();
-
-    // Server name — use first configured server name or host
-    let server_name = ctx
-        .server
-        .as_ref()
-        .and_then(|s| s.server_names.first())
-        .map(|n| n.name.clone())
-        .unwrap_or_else(|| host.to_string());
-
-    // Remote user (HTTP basic auth)
-    let remote_user = req
-        .headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| {
-            if auth.to_lowercase().starts_with("basic ") {
-                let encoded = auth[6..].trim();
-                general_purpose::STANDARD
-                    .decode(encoded.as_bytes())
-                    .ok()
-                    .and_then(|decoded| String::from_utf8(decoded).ok())
-                    .and_then(|creds| creds.split_once(':').map(|(user, _)| user.to_string()))
+    let (time_iso8601, time_local) = if log_time_iso8601 || log_time_local {
+        let start_dt = crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
+        (
+            if log_time_iso8601 {
+                start_dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string()
             } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+                String::new()
+            },
+            if log_time_local {
+                start_dt.format("%d/%b/%Y:%H:%M:%S %z").to_string()
+            } else {
+                String::new()
+            },
+        )
+    } else {
+        (String::new(), String::new())
+    };
 
-    // Request line string (e.g., "GET /path?query=val HTTP/1.1")
-    let request_line = format!(
-        "{} {} {}",
-        req.method,
-        req.uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/"),
-        proto
-    );
+    let server_name = if log_server_name {
+        ctx.server
+            .as_ref()
+            .and_then(|s| s.server_names.first())
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| host.to_string())
+    } else {
+        String::new()
+    };
 
-    // Request filename (cache key or path)
-    let request_filename = ctx
-        .cache_key
-        .clone()
-        .unwrap_or_else(|| req.uri.path().to_string());
+    let remote_user = if log_remote_user {
+        req.headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|auth| {
+                auth.get(..6)
+                    .filter(|prefix| prefix.eq_ignore_ascii_case("basic "))
+                    .and_then(|_| {
+                        let encoded = auth[6..].trim();
+                        general_purpose::STANDARD
+                            .decode(encoded.as_bytes())
+                            .ok()
+                            .and_then(|decoded| String::from_utf8(decoded).ok())
+                            .and_then(|creds| {
+                                creds.split_once(':').map(|(user, _)| user.to_string())
+                            })
+                    })
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let request_line = if log_request_line {
+        format!(
+            "{} {} {}",
+            req.method,
+            req.uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/"),
+            proto
+        )
+    } else {
+        String::new()
+    };
+
+    let request_filename = if log_request_filename {
+        ctx.cache_key
+            .clone()
+            .unwrap_or_else(|| req.uri.path().to_string())
+    } else {
+        String::new()
+    };
 
     // Origin ID from reverse proxy config
     let origin_id = ctx
@@ -332,18 +399,29 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         },
         remote_port: ctx.client_port as i32,
         remote_user,
-        request_uri: req
-            .uri
-            .path_and_query()
-            .map(|pq| pq.as_str().to_string())
-            .unwrap_or_else(|| "/".to_string()),
-        request_path: req.uri.path().to_string(),
-        request_method: req.method.to_string(),
+        request_uri: if log_request_uri {
+            req.uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string())
+        } else {
+            String::new()
+        },
+        request_path: if log_request_path {
+            req.uri.path().to_string()
+        } else {
+            String::new()
+        },
+        request_method: if log_request_method {
+            req.method.to_string()
+        } else {
+            String::new()
+        },
         request_filename,
         request_length: bytes_received,
         request_time: request_duration.as_secs_f64(),
         request: request_line,
-        request_body: {
+        request_body: if log_request_body {
             if ctx.request_body.is_empty() {
                 vec![]
             } else if ctx.request_body.len() > 2_097_152 {
@@ -351,6 +429,8 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
             } else {
                 ctx.request_body.to_vec()
             }
+        } else {
+            vec![]
         },
         scheme: scheme.to_string(),
         proto: proto.to_string(),
@@ -381,61 +461,78 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         msec: request_started_at_millis as f64 / 1000.0,
         time_iso8601,
         time_local,
-        hostname: CACHED_HOSTNAME.clone(),
+        hostname: if log_hostname {
+            CACHED_HOSTNAME.clone()
+        } else {
+            String::new()
+        },
         server_name,
         server_port: 0,
         server_protocol: proto.to_string(),
-        origin_address: ctx.origin_address.clone(),
+        origin_address: if log_origin_address {
+            ctx.origin_address.clone()
+        } else {
+            String::new()
+        },
         origin_status: ctx.origin_status,
         origin_header_response_time: ctx.ttfb.map(|d| d.as_secs_f64()).unwrap_or(0.0),
         firewall_policy_id: ctx.waf_policy_id,
         firewall_rule_group_id: ctx.waf_group_id,
         firewall_rule_set_id: ctx.waf_set_id,
         firewall_rule_id: ctx.waf_rule_id,
-        errors: ctx.errors.clone().unwrap_or_default(),
+        errors: if log_errors {
+            ctx.errors.clone().unwrap_or_default()
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     };
 
-    // Firewall actions
-    if let Some(waf) = &ctx.waf_action {
-        log.firewall_actions.push(waf.clone());
-    }
-
-    // Tags: collect from ctx.tags
-    if let Some(tags) = &ctx.tags {
-        log.tags.extend(tags.iter().cloned());
-    }
-    // Cache status in attrs, matching Go: logAttrs["cache.status"] = "HIT"
-    log.attrs.insert(
-        "cache.status".to_string(),
-        if is_cached {
-            "HIT".to_string()
-        } else {
-            "BYPASS".to_string()
-        },
-    );
-
-    // Attrs: geo + browser/OS analysis
-    if let Some(analyzed) = &ctx.analyzed {
-        if let Some(geo) = &analyzed.geo {
-            log.attrs
-                .insert("region".to_string(), geo.region.to_string());
-            log.attrs.insert("city".to_string(), geo.city.to_string());
-            log.attrs
-                .insert("isp".to_string(), geo.provider.to_string());
-            log.attrs
-                .insert("country".to_string(), geo.country.to_string());
+    if log_firewall_actions {
+        if let Some(waf) = &ctx.waf_action {
+            log.firewall_actions.push(waf.clone());
         }
-        log.attrs
-            .insert("browser".to_string(), analyzed.browser.to_string());
-        log.attrs.insert("os".to_string(), analyzed.os.to_string());
     }
 
-    // Apply per-server fields whitelist (HTTPAccessLogRef.fields)
-    if let Some(ref access_log) = ctx.access_log_ref {
-        if !access_log.fields.is_empty() {
-            apply_fields_whitelist(&mut log, &access_log.fields);
+    if log_tags {
+        if let Some(tags) = &ctx.tags {
+            log.tags.extend(tags.iter().cloned());
         }
+    } else if fields.is_some() {
+        if let Some(tags) = &ctx.tags {
+            log.tags
+                .extend(tags.iter().filter(|tag| tag.as_str() == "rewrite").cloned());
+        }
+    }
+
+    if log_attrs {
+        log.attrs.insert(
+            "cache.status".to_string(),
+            if is_cached {
+                "HIT".to_string()
+            } else {
+                "BYPASS".to_string()
+            },
+        );
+
+        if let Some(analyzed) = &ctx.analyzed {
+            if let Some(geo) = &analyzed.geo {
+                log.attrs
+                    .insert("region".to_string(), geo.region.to_string());
+                log.attrs.insert("city".to_string(), geo.city.to_string());
+                log.attrs
+                    .insert("isp".to_string(), geo.provider.to_string());
+                log.attrs
+                    .insert("country".to_string(), geo.country.to_string());
+            }
+            log.attrs
+                .insert("browser".to_string(), analyzed.browser.to_string());
+            log.attrs.insert("os".to_string(), analyzed.os.to_string());
+        }
+    }
+
+    if let Some(fields) = fields {
+        apply_fields_whitelist(&mut log, fields);
     }
 
     debug!(
