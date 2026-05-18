@@ -31,6 +31,7 @@ pub mod perf_monitor;
 pub mod proxy;
 pub mod quic_probe;
 pub mod quic_udp_demux;
+pub mod resource_budget;
 pub mod rewrite;
 pub mod rpc;
 pub mod ssl;

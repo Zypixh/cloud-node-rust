@@ -46,6 +46,12 @@ pub struct TcpProxyManager {
 }
 
 impl TcpProxyManager {
+    fn tls_handshake_timeout(&self) -> std::time::Duration {
+        crate::resource_budget::tls_handshake_timeout(
+            &self.config_store.get_global_http_config_sync(),
+        )
+    }
+
     pub fn new(config_store: ConfigStore, cert_selector: Arc<DynamicCertSelector>) -> Arc<Self> {
         Arc::new(Self {
             config_store,
@@ -307,12 +313,19 @@ impl TcpProxyManager {
                 let selector = self._cert_selector.clone();
                 let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
                     Box::new((*selector).clone());
-                let res = pingora_core::protocols::tls::server::handshake_with_callback(
-                    &ssl_acceptor,
-                    l4_stream,
-                    &callbacks,
+                let tls_handshake_timeout = self.tls_handshake_timeout();
+                let res = tokio::time::timeout(
+                    tls_handshake_timeout,
+                    pingora_core::protocols::tls::server::handshake_with_callback(
+                        &ssl_acceptor,
+                        l4_stream,
+                        &callbacks,
+                    ),
                 )
-                .await;
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("TLS handshake timed out after {:?}", tls_handshake_timeout)
+                })?;
 
                 let tls_stream = res.map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
 

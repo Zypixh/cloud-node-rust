@@ -2292,6 +2292,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         host: &str,
     ) -> Result<bool> {
         const HEALTH_CHECK_HEADER: &str = "X-Edge-Health-Check-Key";
+        session.as_downstream_mut().set_keepalive(None);
         if let Some(value) = session
             .get_header(HEALTH_CHECK_HEADER)
             .and_then(|v| v.to_str().ok())
@@ -4323,11 +4324,13 @@ impl ProxyHttp for EdgeProxy {
         }
 
         if ctx.server.is_none() {
-            debug!(
-                "Domain mismatch for host: '{}'. Registered hosts: {:?}",
-                host,
-                self.config.get_all_hosts_sync()
-            );
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    "Unbound domain for host: '{}'. Bound hosts: {:?}",
+                    host,
+                    self.config.get_all_hosts_sync()
+                );
+            }
             return self
                 .respond_domain_mismatch(session, ctx, &hot_path, &host)
                 .await;

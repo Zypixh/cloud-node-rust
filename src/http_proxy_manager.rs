@@ -271,6 +271,9 @@ impl HttpProxyManager {
             let shutdown_inner = shutdown_rx.clone();
             let manager = self.clone();
             let acceptor_clone = shared_ssl_acceptor.clone();
+            let tls_handshake_timeout = manager.tls_handshake_timeout();
+            let downstream_read_timeout = manager.downstream_read_timeout();
+            let http2_handshake_timeout = manager.http2_handshake_timeout();
 
             tokio::spawn(async move {
                 let mut configured_tls_host = false;
@@ -314,16 +317,30 @@ impl HttpProxyManager {
                     if let Some(ssl_acceptor) = &acceptor_clone {
                         let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
                             Box::new((*selector).clone());
-                        match handshake_with_callback(ssl_acceptor, l4_stream, &callbacks).await {
-                            Ok(s) => {
+                        match tokio::time::timeout(
+                            tls_handshake_timeout,
+                            handshake_with_callback(ssl_acceptor, l4_stream, &callbacks),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => {
                                 let alpn = s.ssl().selected_alpn_protocol().map(|v| v.to_vec());
                                 (Box::new(s), alpn)
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 if !is_benign_tls_accept_error(&e.to_string())
                                     && configured_tls_host
                                 {
                                     error!("TLS handshake failed: {}", e);
+                                }
+                                return;
+                            }
+                            Err(_) => {
+                                if configured_tls_host {
+                                    debug!(
+                                        "TLS handshake timed out after {:?}",
+                                        tls_handshake_timeout
+                                    );
                                 }
                                 return;
                             }
@@ -338,8 +355,13 @@ impl HttpProxyManager {
                         socket_digest: downstream_socket_digest,
                         ..Default::default()
                     });
-                    match pingora_core::protocols::http::v2::server::handshake(stream, None).await {
-                        Ok(mut h2_conn) => {
+                    match tokio::time::timeout(
+                        http2_handshake_timeout,
+                        pingora_core::protocols::http::v2::server::handshake(stream, None),
+                    )
+                    .await
+                    {
+                        Ok(Ok(mut h2_conn)) => {
                             loop {
                                 match pingora_core::protocols::http::v2::server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await {
                                     Ok(Some(h2_session)) => {
@@ -362,15 +384,24 @@ impl HttpProxyManager {
                                 }
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             if !is_benign_h2_error(&e.to_string()) && configured_tls_host {
                                 error!("HTTP/2 handshake error: {}", e);
+                            }
+                        }
+                        Err(_) => {
+                            if configured_tls_host {
+                                debug!(
+                                    "HTTP/2 handshake timed out after {:?}",
+                                    http2_handshake_timeout
+                                );
                             }
                         }
                     }
                 } else {
                     // HTTP/1.1 Logic
                     let mut server_session = ServerSession::new_http1(stream);
+                    server_session.set_read_timeout(Some(downstream_read_timeout));
                     if *shutdown_inner.borrow() {
                         server_session.set_keepalive(None);
                     } else {
@@ -385,6 +416,7 @@ impl HttpProxyManager {
                         if let Some(persistent_settings) = persistent_settings {
                             persistent_settings.apply_to_session(&mut next_session);
                         }
+                        next_session.set_read_timeout(Some(downstream_read_timeout));
 
                         result = proxy_inner
                             .process_new_http(next_session, &shutdown_inner)
@@ -393,6 +425,24 @@ impl HttpProxyManager {
                 }
             });
         }
+    }
+
+    fn downstream_read_timeout(&self) -> Duration {
+        crate::resource_budget::downstream_read_timeout(
+            &self.config_store.get_global_http_config_sync(),
+        )
+    }
+
+    fn tls_handshake_timeout(&self) -> Duration {
+        crate::resource_budget::tls_handshake_timeout(
+            &self.config_store.get_global_http_config_sync(),
+        )
+    }
+
+    fn http2_handshake_timeout(&self) -> Duration {
+        crate::resource_budget::http2_handshake_timeout(
+            &self.config_store.get_global_http_config_sync(),
+        )
     }
 
     async fn inspect_tls_host(

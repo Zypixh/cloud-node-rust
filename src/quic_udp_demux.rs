@@ -389,6 +389,14 @@ fn should_use_generic_h3_fallback(
     http3_enabled
         && client_hello_supports_h3(client_hello)
         && !config_store.has_quic_passthrough_on_port_sync(port)
+        && client_hello
+            .server_name
+            .as_deref()
+            .is_some_and(|server_name| {
+                config_store
+                    .get_l7_server_for_tls_name_sync(server_name)
+                    .is_some_and(|server| server_has_http3_on_port(config_store, &server, port))
+            })
 }
 
 fn server_has_http3_on_port(
@@ -1387,7 +1395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_h3_fallback_is_disabled_on_quic_passthrough_port() {
+    async fn generic_h3_fallback_requires_bound_http3_host() {
         let store = ConfigStore::new();
         let quic_server = Arc::new(crate::config_models::ServerConfig {
             id: Some(9),
@@ -1406,15 +1414,35 @@ mod tests {
             }),
             ..Default::default()
         });
+        let h3_server = Arc::new(crate::config_models::ServerConfig {
+            id: Some(10),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "h3.example.com".to_string(),
+                ..Default::default()
+            }],
+            https: Some(crate::config_models::HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("8443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: Some(true),
+            }),
+            ..Default::default()
+        });
         let mut servers = HashMap::new();
         servers.insert("quic.example.com".to_string(), quic_server.clone());
+        servers.insert("h3.example.com".to_string(), h3_server.clone());
         store
             .update_config(
                 1,
                 1,
                 0,
                 0,
-                vec![quic_server],
+                vec![quic_server, h3_server],
                 servers,
                 HashMap::new(),
                 HashMap::new(),
@@ -1469,10 +1497,27 @@ mod tests {
             &client_hello,
             true
         ));
-        assert!(should_use_generic_h3_fallback(
+        assert!(!should_use_generic_h3_fallback(
             &store,
             8443,
             &client_hello,
+            true
+        ));
+
+        let bound_client_hello = crate::quic_probe::QuicClientHello {
+            server_name: Some("h3.example.com".to_string()),
+            alpns: vec!["h3".to_string()],
+        };
+        assert!(should_use_generic_h3_fallback(
+            &store,
+            8443,
+            &bound_client_hello,
+            true
+        ));
+        assert!(!should_use_generic_h3_fallback(
+            &store,
+            443,
+            &bound_client_hello,
             true
         ));
     }
