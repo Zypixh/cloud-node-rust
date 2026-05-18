@@ -20,9 +20,9 @@ HTTP 代理是 L7 能力的主入口，支持：
 
 ## HTTP/3
 
-HTTP/3 面向支持 QUIC 的客户端。运行时会根据配置开启监听，并在日志和统计中标记 HTTP/3 流量，方便和 HTTP/1.1、HTTP/2 做区分。
+HTTP/3 面向支持 QUIC 的客户端。集群级 HTTP/3 开关只表示当前集群具备 H3 能力；具体网站必须在 HTTPS 配置中显式开启 H3，节点才会发布 `Alt-Svc` 并允许该 Host 的 H3 请求进入 L7。运行时会在日志和统计中标记 HTTP/3 流量，方便和 HTTP/1.1、HTTP/2 做区分。
 
-当同一 UDP 端口同时存在 HTTP/3 站点和 `@quic` 透传服务时，节点会使用共享 UDP demux 绑定单个 socket：QUIC Initial 中 ALPN 为 H3 且命中 L7 站点的流量进入 HTTP/3，命中 `@quic` 的非 H3 流量进入 UDP 透传，避免端口绑定冲突。
+当同一 UDP 端口同时存在已启用 HTTP/3 的站点和 `@quic` 透传服务时，节点会使用共享 UDP demux 绑定单个 socket：QUIC Initial 中 ALPN 为 H3 且命中已启用 H3 的 L7 站点时进入 HTTP/3，命中 `@quic` 的非 H3 流量进入 UDP 透传，避免端口绑定冲突。
 
 ## gRPC 和 WebSocket
 

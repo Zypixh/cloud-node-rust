@@ -396,11 +396,7 @@ fn server_has_http3_on_port(
     server: &crate::config_models::ServerConfig,
     port: u16,
 ) -> bool {
-    if !server
-        .https
-        .as_ref()
-        .is_some_and(|https| https.is_on && https.http3_enabled())
-    {
+    if !server.http3_enabled() {
         return false;
     }
     if config_store
@@ -409,7 +405,7 @@ fn server_has_http3_on_port(
     {
         return true;
     }
-    server.listens_on_https_port(port)
+    server.supports_http3_on_port(port)
 }
 
 fn route_session_id(route: &RouteKind) -> Option<u64> {

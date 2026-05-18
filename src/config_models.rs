@@ -823,6 +823,16 @@ impl ServerConfig {
             })
             .unwrap_or(false)
     }
+
+    pub fn http3_enabled(&self) -> bool {
+        self.https
+            .as_ref()
+            .is_some_and(|https| https.is_on && https.http3_enabled())
+    }
+
+    pub fn supports_http3_on_port(&self, port: u16) -> bool {
+        self.http3_enabled() && self.listens_on_https_port(port)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -945,7 +955,7 @@ pub struct HTTPSConfig {
 
 impl HTTPSConfig {
     pub fn http3_enabled(&self) -> bool {
-        self.supports_http3.unwrap_or(true)
+        self.supports_http3.unwrap_or(false)
     }
 }
 

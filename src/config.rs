@@ -2357,4 +2357,44 @@ mod tests {
         assert!(server.listens_on_https_port(8443));
         assert!(server.listens_on_https_port(8444));
     }
+
+    #[test]
+    fn site_http3_requires_explicit_enable() {
+        let default_https = HTTPSConfig {
+            is_on: true,
+            listen: vec![NetworkAddressConfig {
+                protocol: Some("https".to_string()),
+                host: Some("0.0.0.0".to_string()),
+                port_range: Some("443".to_string()),
+            }],
+            ssl_policy: None,
+            supports_http3: None,
+        };
+        assert!(!default_https.http3_enabled());
+
+        let server = ServerConfig {
+            id: Some(4),
+            is_on: true,
+            https: Some(default_https),
+            ..Default::default()
+        };
+        assert!(!server.http3_enabled());
+        assert!(!server.supports_http3_on_port(443));
+
+        let enabled_server = ServerConfig {
+            https: Some(HTTPSConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    protocol: Some("https".to_string()),
+                    host: Some("0.0.0.0".to_string()),
+                    port_range: Some("443".to_string()),
+                }],
+                ssl_policy: None,
+                supports_http3: Some(true),
+            }),
+            ..Default::default()
+        };
+        assert!(enabled_server.http3_enabled());
+        assert!(enabled_server.supports_http3_on_port(443));
+    }
 }

@@ -1460,11 +1460,8 @@ impl EdgeProxy {
         if server.is_some_and(ServerConfig::is_sni_passthrough) {
             return None;
         }
-        let https_enabled = server
-            .and_then(|server| server.https.as_ref())
-            .map(|https| https.is_on && https.http3_enabled())
-            .unwrap_or(false);
-        if !https_enabled {
+        let server = server?;
+        if !server.http3_enabled() {
             return None;
         }
 

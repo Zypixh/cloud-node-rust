@@ -361,11 +361,10 @@ impl Http3ProxyManager {
         let (request, mut stream) = resolver.resolve_request().await?;
         let host = Self::request_host(&request, listen_port)
             .context("missing host/authority in HTTP/3 request")?;
-        if self
+        let server = self
             .config_store
-            .get_server_for_tls_name_sync(authority_host_for_lookup(&host).as_str())
-            .is_some_and(|server| server.is_sni_passthrough())
-        {
+            .get_l7_server_for_tls_name_sync(authority_host_for_lookup(&host).as_str());
+        if !server.is_some_and(|server| server.http3_enabled()) {
             let response = http::Response::builder().status(421).body(())?;
             stream.send_response(response).await?;
             stream
