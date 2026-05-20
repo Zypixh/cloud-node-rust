@@ -7,6 +7,36 @@ use tonic::Request;
 use tonic::transport::Channel;
 use tracing::{error, info};
 
+fn normalize_purge_prefix(key: &str) -> String {
+    let trimmed = key.trim();
+    if let Some((prefix, _)) = trimmed.split_once('*') {
+        return format!("{}*", prefix);
+    }
+
+    if trimmed.ends_with('/') {
+        format!("{}*", trimmed)
+    } else {
+        format!("{}/*", trimmed)
+    }
+}
+
+fn is_prefix_purge(key_type: &str, key: &str) -> bool {
+    let key_type = key_type.to_ascii_lowercase();
+    key.contains('*')
+        || key_type == "dir"
+        || key_type == "directory"
+        || key_type == "urlprefix"
+        || key_type == "url_prefix"
+        || key_type == "prefix"
+        || key_type == "all"
+        || key_type == "allurl"
+        || key_type == "all_url"
+        || key_type == "allurls"
+        || key_type == "all_urls"
+        || key_type == "site"
+        || key_type == "server"
+}
+
 pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool {
     let node_id_clone = api_config.node_id.clone();
     let secret_clone = api_config.secret.clone();
@@ -40,18 +70,44 @@ pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool 
                 let mut error = String::new();
 
                 if key_task.r#type == "purge" {
-                    info!("Purging cache key: {}", key_task.key);
-                    let purge_ok = if key_task.key.contains('*') {
+                    info!(
+                        "Purging cache key: {} (keyType: {})",
+                        key_task.key, key_task.key_type
+                    );
+                    let purge_ok = if is_prefix_purge(&key_task.key_type, &key_task.key) {
+                        let prefix = normalize_purge_prefix(&key_task.key);
                         crate::cache_manager::CACHE
-                            .purge_prefix(&key_task.key)
+                            .purge_prefix(&prefix)
                             .await
                             .is_ok()
                     } else {
                         crate::cache_manager::CACHE
-                            .purge_key(&key_task.key)
+                            .purge_key(key_task.key.trim())
                             .await
                             .is_ok()
                     };
+                    if purge_ok && crate::runtime_mode::RuntimeConfig::current_is_rke2() {
+                        let prefix = if is_prefix_purge(&key_task.key_type, &key_task.key) {
+                            normalize_purge_prefix(&key_task.key)
+                        } else {
+                            String::new()
+                        };
+                        let purge_id = format!("{}:{}", key_task.id, uuid::Uuid::new_v4());
+                        if let Err(err) = crate::cluster::purge::fanout(
+                            crate::cluster::purge::PurgeFanoutRequest {
+                                purge_id,
+                                task_id: key_task.id,
+                                key: key_task.key.trim().to_string(),
+                                key_type: key_task.key_type.clone(),
+                                prefix,
+                                leader_epoch: crate::cluster::leader::ROLE_STATE.epoch(),
+                            },
+                        )
+                        .await
+                        {
+                            error!("Purge fanout failed for {}: {}", key_task.key, err);
+                        }
+                    }
                     if !purge_ok {
                         error = "Purge failed".to_string();
                     }

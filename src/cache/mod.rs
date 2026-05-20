@@ -109,6 +109,8 @@ mod tests {
             is_reverse: false,
             conds: None,
             simple_cond: None,
+            only_url_patterns: vec![],
+            except_url_patterns: vec![],
             expires_time: None,
             cache_policy: None,
         }

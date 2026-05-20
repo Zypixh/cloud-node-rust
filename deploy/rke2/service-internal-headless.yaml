@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-node-internal
+  namespace: cloud-node
+spec:
+  clusterIP: None
+  selector:
+    app: cloud-node
+  ports:
+    - name: internal
+      port: 19090
+      targetPort: internal

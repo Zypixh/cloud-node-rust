@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use rocksdb::{DB, MergeOperands, Options, WriteBatch};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -189,36 +190,47 @@ impl MetricStorage {
         status: u16,
     ) {
         let now = crate::utils::time::now_timestamp();
-        let meta = CacheMetaEntry {
-            cache_key: key_str.to_string(),
+        self.upsert_cache_meta_absolute(CacheMetaUpsert {
+            hash,
+            cache_key: key_str,
             size,
             expires: now + ttl_secs as i64,
             access_time: now,
             access_count: 1,
             status,
-            headers: headers.to_vec(),
+            headers,
             compressed,
-        };
-        CACHE_META_INDEX.insert(hash.to_string(), meta);
-        // Persist to RocksDB as JSON for cross-restart durability
-        let json_val = serde_json::json!({
-            "k": key_str,
-            "s": size,
-            "e": now + ttl_secs as i64,
-            "a": now,
-            "f": 1,
-            "st": status,
-            "h": headers.iter().map(|(k,v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<_,_>>(),
-            "c": compressed
+            shard_id: None,
+            relative_path: None,
+            event_version: None,
+            updated_at: Some(now),
         });
+    }
+
+    pub fn upsert_cache_meta_absolute(&self, upsert: CacheMetaUpsert<'_>) {
+        let meta = CacheMetaEntry {
+            cache_key: upsert.cache_key.to_string(),
+            size: upsert.size,
+            expires: upsert.expires,
+            access_time: upsert.access_time,
+            access_count: upsert.access_count,
+            status: upsert.status,
+            headers: upsert.headers.to_vec(),
+            compressed: upsert.compressed,
+            shard_id: upsert.shard_id.map(str::to_string),
+            relative_path: upsert.relative_path.map(str::to_string),
+            event_version: upsert.event_version,
+            updated_at: upsert
+                .updated_at
+                .unwrap_or_else(crate::utils::time::now_timestamp),
+        };
+        CACHE_META_INDEX.insert(upsert.hash.to_string(), meta.clone());
         let Some(db) = &self.db else {
             return;
         };
         let _ = db.put(
-            format!("CMETA_{}", hash).as_bytes(),
-            serde_json::to_string(&json_val)
-                .unwrap_or_default()
-                .as_bytes(),
+            format!("CMETA_{}", upsert.hash).as_bytes(),
+            cache_meta_json(&meta).to_string().as_bytes(),
         );
     }
 
@@ -253,21 +265,9 @@ impl MetricStorage {
                 CACHE_META_INDEX.insert(hash.clone(), meta.clone());
                 // Persist to RocksDB
                 let db_key = format!("CMETA_{}", hash);
-                let json_val = serde_json::json!({
-                    "k": meta.cache_key,
-                    "s": meta.size,
-                    "e": meta.expires,
-                    "a": meta.access_time,
-                    "f": meta.access_count,
-                    "st": meta.status,
-                    "h": meta.headers.iter().map(|(k,v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<_,_>>(),
-                    "c": meta.compressed
-                });
                 batch.put(
                     db_key.as_bytes(),
-                    serde_json::to_string(&json_val)
-                        .unwrap_or_default()
-                        .as_bytes(),
+                    cache_meta_json(&meta).to_string().as_bytes(),
                 );
             }
         }
@@ -402,18 +402,28 @@ impl MetricStorage {
 
 pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
     let node_paths = crate::paths::NodePaths::current();
-    let canonical = node_paths.metrics_db_dir();
-    let path = if !canonical.exists() && node_paths.legacy_metrics_db_dir().exists() {
-        let legacy = node_paths.legacy_metrics_db_dir();
-        tracing::warn!(
-            "Using legacy metrics database path {}. New deployments should use {}.",
-            legacy.display(),
-            canonical.display()
-        );
-        legacy
+    let path = if let Some(config) = crate::runtime_mode::RuntimeConfig::current()
+        && config.is_rke2()
+    {
+        let path = config.cluster.cache.local_meta_dir.join("metrics.db");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        path
     } else {
-        let _ = std::fs::create_dir_all(node_paths.data_dir());
-        canonical
+        let canonical = node_paths.metrics_db_dir();
+        if !canonical.exists() && node_paths.legacy_metrics_db_dir().exists() {
+            let legacy = node_paths.legacy_metrics_db_dir();
+            tracing::warn!(
+                "Using legacy metrics database path {}. New deployments should use {}.",
+                legacy.display(),
+                canonical.display()
+            );
+            legacy
+        } else {
+            let _ = std::fs::create_dir_all(node_paths.data_dir());
+            canonical
+        }
     };
     match MetricStorage::open(&path) {
         Ok(storage) => storage,
@@ -432,8 +442,24 @@ pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
 /// Eliminates synchronous RocksDB I/O from the cache HIT hot path.
 static CACHE_ACCESS_LOG: Lazy<DashMap<String, (AtomicI64, AtomicU64)>> = Lazy::new(DashMap::new);
 
+pub struct CacheMetaUpsert<'a> {
+    pub hash: &'a str,
+    pub cache_key: &'a str,
+    pub size: u64,
+    pub expires: i64,
+    pub access_time: i64,
+    pub access_count: u64,
+    pub status: u16,
+    pub headers: &'a [(String, String)],
+    pub compressed: bool,
+    pub shard_id: Option<&'a str>,
+    pub relative_path: Option<&'a str>,
+    pub event_version: Option<u64>,
+    pub updated_at: Option<i64>,
+}
+
 /// Typed cache metadata — avoids per-lookup JSON clone/parse overhead.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheMetaEntry {
     pub cache_key: String,
     pub size: u64,
@@ -443,11 +469,36 @@ pub struct CacheMetaEntry {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub compressed: bool,
+    #[serde(default)]
+    pub shard_id: Option<String>,
+    #[serde(default)]
+    pub relative_path: Option<String>,
+    #[serde(default)]
+    pub event_version: Option<u64>,
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 /// In-memory cache metadata index: hash → typed metadata.
 /// All cache lookups read from here, eliminating synchronous RocksDB reads on the hot path.
 static CACHE_META_INDEX: Lazy<DashMap<String, CacheMetaEntry>> = Lazy::new(DashMap::new);
+
+fn cache_meta_json(meta: &CacheMetaEntry) -> serde_json::Value {
+    serde_json::json!({
+        "k": meta.cache_key,
+        "s": meta.size,
+        "e": meta.expires,
+        "a": meta.access_time,
+        "f": meta.access_count,
+        "st": meta.status,
+        "h": meta.headers.iter().map(|(k,v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<_,_>>(),
+        "c": meta.compressed,
+        "sh": meta.shard_id,
+        "rp": meta.relative_path,
+        "v": meta.event_version,
+        "u": meta.updated_at,
+    })
+}
 
 pub fn get_cache_meta_memory(hash: &str) -> Option<CacheMetaEntry> {
     CACHE_META_INDEX.get(hash).map(|v| v.clone())
@@ -512,6 +563,10 @@ pub fn load_cache_meta_index() {
                 status: raw.get("st").and_then(|v| v.as_u64()).unwrap_or(200) as u16,
                 headers,
                 compressed: raw.get("c").and_then(|v| v.as_bool()).unwrap_or(false),
+                shard_id: raw.get("sh").and_then(|v| v.as_str()).map(str::to_string),
+                relative_path: raw.get("rp").and_then(|v| v.as_str()).map(str::to_string),
+                event_version: raw.get("v").and_then(|v| v.as_u64()),
+                updated_at: raw.get("u").and_then(|v| v.as_i64()).unwrap_or(0),
             };
             CACHE_META_INDEX.insert(hash, entry);
             count += 1;

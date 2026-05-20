@@ -104,6 +104,9 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
 
     loop {
         interval.tick().await;
+        if !crate::cluster::leader::require_leader("bandwidth_reporter") {
+            continue;
+        }
         let snapshots = crate::metrics::METRICS.take_snapshots();
         let now = crate::utils::time::system_local();
         let day = now.format("%Y%m%d").to_string();
@@ -234,6 +237,9 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
 
     loop {
         interval.tick().await;
+        if !crate::cluster::leader::require_leader("daily_stat_reporter") {
+            continue;
+        }
         let snapshots = crate::metrics::METRICS.take_snapshots();
         let now = crate::utils::time::system_local();
         let day = now.format("%Y%m%d").to_string();
@@ -408,6 +414,9 @@ pub async fn start_metric_stat_reporter(
 
     loop {
         interval.tick().await;
+        if !crate::cluster::leader::require_leader("metric_stat_reporter") {
+            continue;
+        }
         let metric_items = config_store.get_metric_items().await;
         if metric_items.is_empty() {
             let _ = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.flush();
@@ -545,6 +554,9 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
 
     loop {
         interval.tick().await;
+        if !crate::cluster::leader::require_leader("metrics_aggregator_reporter") {
+            continue;
+        }
 
         let client = match RpcClient::new(&api_config).await {
             Ok(c) => c,
@@ -665,6 +677,9 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
 
     loop {
         interval.tick().await;
+        if !crate::cluster::leader::require_leader("top_ip_stat_reporter") {
+            continue;
+        }
         let rows = crate::metrics::top_ip::TOP_IP_TRACKER.flush();
         if rows.is_empty() {
             continue;

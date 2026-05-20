@@ -18,6 +18,105 @@ pub struct ApiConfig {
     pub secret: String,
     #[serde(rename = "billing.countInboundTraffic", default)]
     pub billing_count_inbound_traffic: bool,
+    #[serde(rename = "accessLogPipeline", default)]
+    pub access_log_pipeline: AccessLogPipelineConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AccessLogPipelineConfig {
+    #[serde(
+        rename = "queueCapacity",
+        default = "default_access_log_queue_capacity"
+    )]
+    pub queue_capacity: usize,
+    #[serde(rename = "batchSize", default = "default_access_log_batch_size")]
+    pub batch_size: usize,
+    #[serde(
+        rename = "flushIntervalMs",
+        default = "default_access_log_flush_interval_ms"
+    )]
+    pub flush_interval_ms: u64,
+    #[serde(
+        rename = "uploadConcurrency",
+        default = "default_access_log_upload_concurrency"
+    )]
+    pub upload_concurrency: usize,
+    #[serde(rename = "retryQueueCapacity", default)]
+    pub retry_queue_capacity: usize,
+    #[serde(rename = "targetChunkBytes", default)]
+    pub target_chunk_bytes: usize,
+    #[serde(
+        rename = "requestTimeoutMs",
+        default = "default_access_log_request_timeout_ms"
+    )]
+    pub request_timeout_ms: u64,
+    #[serde(
+        rename = "warningIntervalMs",
+        default = "default_access_log_warning_interval_ms"
+    )]
+    pub warning_interval_ms: u64,
+}
+
+impl Default for AccessLogPipelineConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: default_access_log_queue_capacity(),
+            batch_size: default_access_log_batch_size(),
+            flush_interval_ms: default_access_log_flush_interval_ms(),
+            upload_concurrency: default_access_log_upload_concurrency(),
+            retry_queue_capacity: 0,
+            target_chunk_bytes: 0,
+            request_timeout_ms: default_access_log_request_timeout_ms(),
+            warning_interval_ms: default_access_log_warning_interval_ms(),
+        }
+    }
+}
+
+impl AccessLogPipelineConfig {
+    pub fn normalized(&self) -> Self {
+        let batch_size = self.batch_size.max(1);
+        let upload_concurrency = self.upload_concurrency.max(1).min(32);
+        Self {
+            queue_capacity: self.queue_capacity.max(batch_size),
+            batch_size,
+            flush_interval_ms: self.flush_interval_ms.max(100),
+            upload_concurrency,
+            retry_queue_capacity: if self.retry_queue_capacity == 0 {
+                batch_size
+                    .saturating_mul(upload_concurrency)
+                    .saturating_mul(10)
+            } else {
+                self.retry_queue_capacity.max(batch_size)
+            },
+            target_chunk_bytes: self.target_chunk_bytes,
+            request_timeout_ms: self.request_timeout_ms.max(1000),
+            warning_interval_ms: self.warning_interval_ms.max(1000),
+        }
+    }
+}
+
+fn default_access_log_queue_capacity() -> usize {
+    100_000
+}
+
+fn default_access_log_batch_size() -> usize {
+    10_000
+}
+
+fn default_access_log_flush_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_access_log_upload_concurrency() -> usize {
+    1
+}
+
+fn default_access_log_request_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_access_log_warning_interval_ms() -> u64 {
+    5_000
 }
 
 impl ApiConfig {

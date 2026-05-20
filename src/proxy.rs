@@ -74,6 +74,14 @@ impl LazyResponseHeaders {
             value.clear();
         }
     }
+
+    fn ensure_allocated(&mut self) {
+        self.0.get_or_insert_with(HashMap::new);
+    }
+
+    fn is_allocated(&self) -> bool {
+        self.0.is_some()
+    }
 }
 
 impl std::ops::Deref for LazyResponseHeaders {
@@ -391,6 +399,19 @@ impl EdgeProxy {
         upstream_response: &pingora::http::ResponseHeader,
         ctx: &mut ProxyCTX,
     ) {
+        ctx.response_headers_size = upstream_response
+            .headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() + value.len() + 4)
+            .sum();
+
+        if !ctx.response_headers.is_allocated() {
+            if !Self::access_log_needs_response_headers(ctx) {
+                return;
+            }
+            ctx.response_headers.ensure_allocated();
+        }
+
         ctx.response_headers.clear();
         for (name, value) in upstream_response.headers.iter() {
             if let Ok(value_str) = value.to_str() {
@@ -398,11 +419,23 @@ impl EdgeProxy {
                     .insert(name.to_string(), value_str.to_string());
             }
         }
-        ctx.response_headers_size = upstream_response
-            .headers
-            .iter()
-            .map(|(name, value)| name.as_str().len() + value.len() + 4)
-            .sum();
+    }
+
+    fn access_log_needs_response_headers(ctx: &ProxyCTX) -> bool {
+        if !ctx.access_log_module_enabled || !ctx.global_access_log_on {
+            return false;
+        }
+        let field_enabled = ctx
+            .access_log_ref
+            .as_ref()
+            .map(|access_log| access_log.fields.is_empty() || access_log.fields.contains(&22))
+            .unwrap_or(true);
+        field_enabled
+            && ctx
+                .global_access_log_config
+                .as_ref()
+                .map(|cfg| cfg.enable_response_headers)
+                .unwrap_or(true)
     }
 
     fn evaluate_outbound_waf_body(
@@ -468,6 +501,25 @@ impl EdgeProxy {
         session: &Session,
         scheme: &str,
     ) -> bool {
+        let path = session.req_header().uri.path();
+        let mut url = None;
+        if !cache_ref.except_url_patterns.is_empty()
+            && cache_ref.except_url_patterns.iter().any(|pattern| {
+                pattern.matches(path)
+                    || pattern.matches(Self::cache_match_url(&mut url, session, scheme, path))
+            })
+        {
+            return false;
+        }
+        if !cache_ref.only_url_patterns.is_empty()
+            && !cache_ref.only_url_patterns.iter().any(|pattern| {
+                pattern.matches(path)
+                    || pattern.matches(Self::cache_match_url(&mut url, session, scheme, path))
+            })
+        {
+            return false;
+        }
+
         if let Some(conds) = &cache_ref.conds
             && conds.is_on
             && !conds.groups.is_empty()
@@ -480,6 +532,22 @@ impl EdgeProxy {
         }
 
         true
+    }
+
+    fn cache_match_url<'a>(
+        url: &'a mut Option<String>,
+        session: &Session,
+        scheme: &str,
+        path: &str,
+    ) -> &'a str {
+        url.get_or_insert_with(|| {
+            let host = session
+                .get_header("host")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            format!("{scheme}://{host}{path}")
+        })
+        .as_str()
     }
 
     fn downstream_local_port(session: &Session) -> Option<u16> {
@@ -871,13 +939,12 @@ impl EdgeProxy {
         candidate.parse().ok()
     }
 
-    fn header_value_ci(session: &Session, name: &str) -> String {
+    fn header_value_ci<'a>(session: &'a Session, name: &str) -> Option<&'a str> {
         session
             .get_header(name)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .trim()
-            .to_string()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     }
 
     fn fallback_client_ip(session: &Session, raw_ip: std::net::IpAddr) -> std::net::IpAddr {
@@ -895,8 +962,9 @@ impl EdgeProxy {
             "cdn-src-ip",
             "forwarded",
         ] {
-            let value = Self::header_value_ci(session, header);
-            if let Some(ip) = Self::parse_candidate_ip(&value) {
+            if let Some(value) = Self::header_value_ci(session, header)
+                && let Some(ip) = Self::parse_candidate_ip(value)
+            {
                 return ip;
             }
         }
@@ -943,7 +1011,9 @@ impl EdgeProxy {
                     .or_else(|| inner.strip_prefix("requestHeader:"))
                     .or_else(|| inner.strip_prefix("header:"))
                 {
-                    return Self::header_value_ci(session, name);
+                    return Self::header_value_ci(session, name)
+                        .map(str::to_string)
+                        .unwrap_or_default();
                 }
                 if inner.eq_ignore_ascii_case("socketRemoteAddr") {
                     return raw_remote_addr.to_string();
@@ -967,18 +1037,21 @@ impl EdgeProxy {
             .filter(|cfg| cfg.is_on && !cfg.is_empty())
         {
             for configured in remote_addr_cfg.configured_values() {
-                let value =
-                    if remote_addr_cfg.is_request_header_type() && !configured.contains("${") {
-                        Self::header_value_ci(session, &configured)
-                    } else {
-                        Self::resolve_remote_addr_template(
-                            session,
-                            &configured,
-                            raw_ip,
-                            raw_remote_addr,
-                            remote_port,
-                        )
-                    };
+                if remote_addr_cfg.is_request_header_type() && !configured.contains("${") {
+                    if let Some(value) = Self::header_value_ci(session, &configured)
+                        && let Some(ip) = Self::parse_candidate_ip(value)
+                    {
+                        return ip;
+                    }
+                    continue;
+                }
+                let value = Self::resolve_remote_addr_template(
+                    session,
+                    &configured,
+                    raw_ip,
+                    raw_remote_addr,
+                    remote_port,
+                );
                 if let Some(ip) = Self::parse_candidate_ip(&value) {
                     return ip;
                 }
@@ -1533,20 +1606,14 @@ impl EdgeProxy {
                 "PUT, GET, POST, DELETE, HEAD, OPTIONS, PATCH",
             );
         } else {
-            let _ = resp.insert_header(
-                "access-control-allow-methods",
-                cors.allow_methods.join(", "),
-            );
+            let _ = resp.insert_header("access-control-allow-methods", cors.allow_methods_header());
         }
 
         // Allow-Headers: use configured value, or echo Access-Control-Request-Headers
         // from the preflight request so browsers allow non-simple headers
         // (Content-Type: application/json, Authorization, etc.)
         if !cors.allow_headers.is_empty() {
-            let _ = resp.insert_header(
-                "access-control-allow-headers",
-                cors.allow_headers.join(", "),
-            );
+            let _ = resp.insert_header("access-control-allow-headers", cors.allow_headers_header());
         } else if let Some(req_headers) = session.get_header("access-control-request-headers") {
             if let Ok(req_headers_str) = req_headers.to_str() {
                 let _ = resp.insert_header("access-control-allow-headers", req_headers_str);
@@ -1555,14 +1622,14 @@ impl EdgeProxy {
 
         // Max-Age
         if cors.max_age > 0 {
-            let _ = resp.insert_header("access-control-max-age", cors.max_age.to_string());
+            let _ = resp.insert_header("access-control-max-age", cors.max_age_header());
         }
 
         // Expose-Headers
         if !cors.expose_headers.is_empty() {
             let _ = resp.insert_header(
                 "access-control-expose-headers",
-                cors.expose_headers.join(", "),
+                cors.expose_headers_header(),
             );
         }
 
@@ -5125,7 +5192,7 @@ impl ProxyHttp for EdgeProxy {
         ctx: &mut Self::CTX,
     ) -> Result<pingora_cache::CacheKey> {
         if let Some(key) = &ctx.cache_key {
-            return Ok(pingora_cache::CacheKey::new("", key.as_str(), ""));
+            return Ok(pingora_cache::CacheKey::new("", key.as_str(), key.as_str()));
         }
 
         // CRITICAL: If no key was set by request_cache_filter, we MUST return an error.
@@ -5447,24 +5514,15 @@ impl ProxyHttp for EdgeProxy {
         ctx.response_status = upstream_response.status.as_u16();
         ctx.ttfb = Some(ctx.start_time.elapsed());
 
-        // Cache HIT: sync response headers for access log, then skip WAF/Alt-Svc
+        // Cache HIT: skip origin-response-only filters.
         if session.cache.phase() == pingora_cache::CachePhase::Hit {
             ctx.cache_hit = Some(true);
-            // Populate response_headers for access log completeness
-            for (name, value) in upstream_response.headers.iter() {
-                if let Ok(value_str) = value.to_str() {
-                    ctx.response_headers
-                        .insert(name.to_string(), value_str.to_string());
-                }
-            }
             if ctx
                 .cache_policy
                 .as_ref()
                 .map(|p| p.add_status_header)
                 .unwrap_or(true)
             {
-                ctx.response_headers
-                    .insert("x-cache".to_string(), "HIT".to_string());
                 upstream_response.insert_header("x-cache", "HIT").unwrap();
             }
             if ctx
@@ -5479,10 +5537,9 @@ impl ProxyHttp for EdgeProxy {
                             let age = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
                                 .num_seconds()
                                 .max(0);
-                            let age_str = age.to_string();
-                            ctx.response_headers
-                                .insert("age".to_string(), age_str.clone());
-                            upstream_response.insert_header("age", age_str).unwrap();
+                            upstream_response
+                                .insert_header("age", age.to_string())
+                                .unwrap();
                         }
                     }
                 }

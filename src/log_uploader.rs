@@ -1,26 +1,30 @@
-use crate::api_config::ApiConfig;
+use crate::api_config::{AccessLogPipelineConfig, ApiConfig};
 use crate::auth::generate_token;
 use crate::pb;
 use crate::rpc::client::RPC_MAX_MESSAGE_BYTES;
 use prost::Message;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tonic::Code;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
-/// A high-performance uploader for access logs.
-/// Batches logs and sends them asynchronously to the Master node.
 pub struct LogUploader {
     rx: mpsc::Receiver<pb::HttpAccessLog>,
     api_config: ApiConfig,
-    batch_size: usize,
-    flush_interval: Duration,
+    config: AccessLogPipelineConfig,
+}
+
+struct AccessLogUploadWorker {
+    api_config: ApiConfig,
     channel: Option<Channel>,
-    retry_buffer: VecDeque<pb::HttpAccessLog>,
-    max_retry_logs: usize,
+    request_timeout: Duration,
+    target_chunk_bytes: usize,
+    retry_queue: VecDeque<pb::HttpAccessLog>,
+    retry_queue_capacity: usize,
 }
 
 enum AccessLogUploadError {
@@ -35,47 +39,113 @@ impl LogUploader {
     pub fn new(
         rx: mpsc::Receiver<pb::HttpAccessLog>,
         api_config: ApiConfig,
-        batch_size: usize,
-        flush_interval: Duration,
+        config: AccessLogPipelineConfig,
     ) -> Self {
         Self {
             rx,
             api_config,
-            batch_size,
-            flush_interval,
-            channel: None,
-            retry_buffer: VecDeque::new(),
-            max_retry_logs: batch_size.saturating_mul(10).max(batch_size),
+            config: config.normalized(),
         }
     }
 
     pub async fn start(mut self) {
         info!(
-            "Log Uploader service started. Batch size: {}, Interval: {:?}",
-            self.batch_size, self.flush_interval
+            "Log Uploader service started. Batch size: {}, Interval: {:?}, Workers: {}, Queue: {}",
+            self.config.batch_size,
+            Duration::from_millis(self.config.flush_interval_ms),
+            self.config.upload_concurrency,
+            self.config.queue_capacity
         );
 
-        let mut buffer = Vec::with_capacity(self.batch_size);
+        let (batch_tx, batch_rx) = mpsc::channel::<Vec<pb::HttpAccessLog>>(
+            self.config.upload_concurrency.saturating_mul(4).max(1),
+        );
+        let shared_rx = Arc::new(Mutex::new(batch_rx));
+        for _ in 0..self.config.upload_concurrency {
+            let rx = Arc::clone(&shared_rx);
+            let worker = AccessLogUploadWorker::new(self.api_config.clone(), &self.config);
+            tokio::spawn(async move {
+                worker.start(rx).await;
+            });
+        }
+
+        self.drain_to_batches(batch_tx).await;
+    }
+
+    async fn drain_to_batches(&mut self, batch_tx: mpsc::Sender<Vec<pb::HttpAccessLog>>) {
+        let batch_size = self.config.batch_size;
+        let flush_interval = Duration::from_millis(self.config.flush_interval_ms);
+        let mut buffer = Vec::with_capacity(batch_size);
         let mut last_flush = Instant::now();
 
         loop {
-            let timeout = tokio::time::sleep_until((last_flush + self.flush_interval).into());
-
+            let timeout = tokio::time::sleep_until((last_flush + flush_interval).into());
             tokio::select! {
                 Some(log) = self.rx.recv() => {
                     buffer.push(log);
-                    if buffer.len() + self.retry_buffer.len() >= self.batch_size {
-                        self.flush_batch(&mut buffer).await;
+                    while buffer.len() < batch_size {
+                        match self.rx.try_recv() {
+                            Ok(log) => buffer.push(log),
+                            Err(_) => break,
+                        }
+                    }
+                    if buffer.len() >= batch_size {
+                        Self::send_batch(&batch_tx, &mut buffer).await;
                         last_flush = Instant::now();
                     }
                 }
                 _ = timeout => {
-                    if !buffer.is_empty() || !self.retry_buffer.is_empty() {
-                        self.flush_batch(&mut buffer).await;
+                    if !buffer.is_empty() {
+                        Self::send_batch(&batch_tx, &mut buffer).await;
                     }
                     last_flush = Instant::now();
                 }
             }
+        }
+    }
+
+    async fn send_batch(
+        batch_tx: &mpsc::Sender<Vec<pb::HttpAccessLog>>,
+        buffer: &mut Vec<pb::HttpAccessLog>,
+    ) {
+        let batch = std::mem::take(buffer);
+        if let Err(err) = batch_tx.send(batch).await {
+            tracing::error!(
+                "ACCESS_LOG: upload worker queue closed, dropped {} buffered access logs",
+                err.0.len()
+            );
+        }
+    }
+}
+
+impl AccessLogUploadWorker {
+    fn new(api_config: ApiConfig, config: &AccessLogPipelineConfig) -> Self {
+        let config = config.normalized();
+        let target_chunk_bytes = if config.target_chunk_bytes == 0 {
+            RPC_MAX_MESSAGE_BYTES.saturating_mul(3) / 4
+        } else {
+            config.target_chunk_bytes.min(RPC_MAX_MESSAGE_BYTES)
+        };
+        Self {
+            api_config,
+            channel: None,
+            request_timeout: Duration::from_millis(config.request_timeout_ms),
+            target_chunk_bytes,
+            retry_queue: VecDeque::with_capacity(config.retry_queue_capacity.min(1024)),
+            retry_queue_capacity: config.retry_queue_capacity,
+        }
+    }
+
+    async fn start(mut self, rx: Arc<Mutex<mpsc::Receiver<Vec<pb::HttpAccessLog>>>>) {
+        loop {
+            let next_batch = {
+                let mut rx = rx.lock().await;
+                rx.recv().await
+            };
+            let Some(logs) = next_batch else {
+                return;
+            };
+            self.upload_batch(logs).await;
         }
     }
 
@@ -84,82 +154,51 @@ impl LogUploader {
             return self.channel.as_ref();
         }
 
-        let api_endpoint = self
-            .api_config
-            .effective_rpc_endpoints()
-            .first()
-            .cloned()
-            .unwrap_or_default();
-
-        let endpoint = match tonic::transport::Endpoint::from_shared(api_endpoint) {
-            Ok(ep) => ep
-                .keep_alive_timeout(Duration::from_secs(10))
-                .tcp_keepalive(Some(Duration::from_secs(30))),
-            Err(err) => {
-                error!("Failed to create gRPC channel for LogUploader: {}", err);
-                return None;
-            }
-        };
-
-        match endpoint.connect().await {
-            Ok(channel) => {
-                self.channel = Some(channel);
-                self.channel.as_ref()
-            }
-            Err(err) => {
-                error!("Failed to connect to Master gRPC for LogUploader: {}", err);
-                None
-            }
-        }
-    }
-
-    fn take_logs_to_send(&mut self, buffer: &mut Vec<pb::HttpAccessLog>) -> Vec<pb::HttpAccessLog> {
-        let mut logs = Vec::with_capacity(self.batch_size);
-        while logs.len() < self.batch_size {
-            let Some(log) = self.retry_buffer.pop_front() else {
-                break;
+        for api_endpoint in self.api_config.effective_rpc_endpoints() {
+            let endpoint = match tonic::transport::Endpoint::from_shared(api_endpoint.clone()) {
+                Ok(ep) => ep
+                    .keep_alive_timeout(Duration::from_secs(10))
+                    .tcp_keepalive(Some(Duration::from_secs(30))),
+                Err(err) => {
+                    error!("Failed to create gRPC channel for LogUploader: {}", err);
+                    continue;
+                }
             };
-            logs.push(log);
+
+            match endpoint.connect().await {
+                Ok(channel) => {
+                    self.channel = Some(channel);
+                    return self.channel.as_ref();
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to connect to Master gRPC for LogUploader endpoint {}: {}",
+                        api_endpoint, err
+                    );
+                }
+            }
         }
 
-        let remaining = self.batch_size.saturating_sub(logs.len());
-        let take_from_buffer = remaining.min(buffer.len());
-        logs.extend(buffer.drain(..take_from_buffer));
-        logs
+        None
     }
 
-    fn requeue_failed_logs(&mut self, mut logs: Vec<pb::HttpAccessLog>) {
-        let available = self.max_retry_logs.saturating_sub(self.retry_buffer.len());
-        if logs.len() > available {
-            let drop_count = logs.len() - available;
-            logs.drain(..drop_count);
-            tracing::warn!(
-                "ACCESS_LOG: retry buffer full, dropped {} oldest failed access logs",
-                drop_count
-            );
-        }
-
-        for log in logs.into_iter().rev() {
-            self.retry_buffer.push_front(log);
-        }
-    }
-
-    #[allow(clippy::result_large_err)]
-    async fn flush_batch(&mut self, buffer: &mut Vec<pb::HttpAccessLog>) {
-        let logs_to_send = self.take_logs_to_send(buffer);
-        let count = logs_to_send.len();
-        if count == 0 {
+    async fn upload_batch(&mut self, logs: Vec<pb::HttpAccessLog>) {
+        self.push_retry_logs(logs);
+        if self.retry_queue.is_empty() {
             return;
         }
-        info!("Flushing batch of {} access logs to Master", count);
+
+        let logs_to_send = self.take_retry_logs();
+        let count = logs_to_send.len();
+        debug!("Flushing batch of {} access logs to Master", count);
 
         let Some(channel) = self.get_or_connect_channel().await.cloned() else {
-            self.requeue_failed_logs(logs_to_send);
+            self.requeue_front(logs_to_send);
             return;
         };
 
         let mut chunks: VecDeque<Vec<pb::HttpAccessLog>> =
-            Self::split_logs_by_encoded_size(logs_to_send).into();
+            Self::split_logs_by_encoded_size(logs_to_send, self.target_chunk_bytes).into();
         while let Some(chunk) = chunks.pop_front() {
             match self.upload_access_log_chunk(&channel, chunk).await {
                 Ok(()) => {}
@@ -169,11 +208,48 @@ impl LogUploader {
                 }
                 Err(AccessLogUploadError::Retry(logs)) => {
                     let logs_to_requeue = Self::collect_logs_to_requeue(logs, chunks);
-                    self.requeue_failed_logs(logs_to_requeue);
+                    self.requeue_front(logs_to_requeue);
                     self.channel = None;
                     break;
                 }
             }
+        }
+    }
+
+    fn push_retry_logs(&mut self, mut logs: Vec<pb::HttpAccessLog>) {
+        let available = self
+            .retry_queue_capacity
+            .saturating_sub(self.retry_queue.len());
+        if logs.len() > available {
+            let drop_count = logs.len() - available;
+            logs.drain(..drop_count);
+            tracing::warn!(
+                "ACCESS_LOG: retry queue full, dropped {} oldest pending access logs",
+                drop_count
+            );
+        }
+        self.retry_queue.extend(logs);
+    }
+
+    fn take_retry_logs(&mut self) -> Vec<pb::HttpAccessLog> {
+        self.retry_queue.drain(..).collect()
+    }
+
+    fn requeue_front(&mut self, mut logs: Vec<pb::HttpAccessLog>) {
+        let available = self
+            .retry_queue_capacity
+            .saturating_sub(self.retry_queue.len());
+        if logs.len() > available {
+            let drop_count = logs.len() - available;
+            logs.drain(..drop_count);
+            tracing::warn!(
+                "ACCESS_LOG: retry queue full, dropped {} oldest failed access logs",
+                drop_count
+            );
+        }
+
+        for log in logs.into_iter().rev() {
+            self.retry_queue.push_front(log);
         }
     }
 
@@ -191,21 +267,21 @@ impl LogUploader {
     }
 
     fn access_log_request_size(logs: &[pb::HttpAccessLog]) -> usize {
-        pb::CreateHttpAccessLogsRequest {
-            http_access_logs: logs.to_vec(),
-        }
-        .encoded_len()
+        let logs_size = logs.iter().map(Message::encoded_len).sum::<usize>();
+        logs_size.saturating_add(logs.len().saturating_mul(8))
     }
 
-    fn split_logs_by_encoded_size(logs: Vec<pb::HttpAccessLog>) -> Vec<Vec<pb::HttpAccessLog>> {
-        let max_size = RPC_MAX_MESSAGE_BYTES.saturating_mul(3) / 4;
+    fn split_logs_by_encoded_size(
+        logs: Vec<pb::HttpAccessLog>,
+        target_chunk_bytes: usize,
+    ) -> Vec<Vec<pb::HttpAccessLog>> {
         let mut chunks = Vec::new();
         let mut current = Vec::new();
         let mut current_size: usize = 0;
 
         for log in logs {
             let log_size = log.encoded_len().saturating_add(8);
-            if !current.is_empty() && current_size.saturating_add(log_size) > max_size {
+            if !current.is_empty() && current_size.saturating_add(log_size) > target_chunk_bytes {
                 chunks.push(current);
                 current = Vec::new();
                 current_size = 0;
@@ -220,33 +296,6 @@ impl LogUploader {
         chunks
     }
 
-    fn shrink_access_logs(logs: &mut [pb::HttpAccessLog]) -> bool {
-        let mut changed = false;
-        for log in logs {
-            if !log.request_body.is_empty() {
-                log.request_body.clear();
-                changed = true;
-            }
-            if !log.header.is_empty() {
-                log.header.clear();
-                changed = true;
-            }
-            if !log.sent_header.is_empty() {
-                log.sent_header.clear();
-                changed = true;
-            }
-            if !log.cookie.is_empty() {
-                log.cookie.clear();
-                changed = true;
-            }
-            if !log.attrs.is_empty() {
-                log.attrs.clear();
-                changed = true;
-            }
-        }
-        changed
-    }
-
     async fn send_access_log_chunk(
         &self,
         channel: &Channel,
@@ -256,7 +305,13 @@ impl LogUploader {
             http_access_logs: logs.to_vec(),
         };
         let mut client = self.http_access_log_client(channel.clone());
-        client.create_http_access_logs(req).await.map(|_| ())
+        match tokio::time::timeout(self.request_timeout, client.create_http_access_logs(req)).await
+        {
+            Ok(result) => result.map(|_| ()),
+            Err(_) => Err(tonic::Status::deadline_exceeded(
+                "access log upload request timed out",
+            )),
+        }
     }
 
     async fn upload_access_log_chunk(
@@ -268,40 +323,20 @@ impl LogUploader {
         let encoded_size = Self::access_log_request_size(&logs);
         match self.send_access_log_chunk(channel, &logs).await {
             Ok(_) => {
-                info!(
+                debug!(
                     "Successfully uploaded {} access logs ({} bytes)",
                     count, encoded_size
                 );
                 Ok(())
             }
             Err(e) if e.code() == Code::ResourceExhausted => {
-                if Self::shrink_access_logs(&mut logs) {
-                    let shrunk_size = Self::access_log_request_size(&logs);
-                    match self.send_access_log_chunk(channel, &logs).await {
-                        Ok(_) => {
-                            info!(
-                                "Successfully uploaded {} access logs after stripping large fields ({} bytes)",
-                                count, shrunk_size
-                            );
-                            return Ok(());
-                        }
-                        Err(retry_err) if retry_err.code() == Code::ResourceExhausted => {}
-                        Err(retry_err) => {
-                            error!(
-                                "Failed to upload access logs after shrink retry: {}",
-                                retry_err
-                            );
-                            return Err(AccessLogUploadError::Retry(logs));
-                        }
-                    }
-                }
-
-                if logs.len() > 1 {
-                    let right = logs.split_off(logs.len() / 2);
+                if count > 1 {
+                    let right = logs.split_off(count / 2);
                     Err(AccessLogUploadError::Split { left: logs, right })
                 } else {
                     tracing::warn!(
-                        "ACCESS_LOG: dropping single oversized access log after shrink attempts"
+                        "ACCESS_LOG: dropping single oversized access log ({} bytes)",
+                        encoded_size
                     );
                     Ok(())
                 }
@@ -359,6 +394,20 @@ mod tests {
             node_id: "1".to_string(),
             secret: "secret".to_string(),
             billing_count_inbound_traffic: false,
+            access_log_pipeline: Default::default(),
+        }
+    }
+
+    fn pipeline_config() -> AccessLogPipelineConfig {
+        AccessLogPipelineConfig {
+            queue_capacity: 3,
+            batch_size: 3,
+            flush_interval_ms: 1_000,
+            upload_concurrency: 1,
+            retry_queue_capacity: 3,
+            target_chunk_bytes: 0,
+            request_timeout_ms: 1_000,
+            warning_interval_ms: 1_000,
         }
     }
 
@@ -383,21 +432,51 @@ mod tests {
         remaining.push_back(access_logs(&["c", "d"]));
         remaining.push_back(access_logs(&["e"]));
 
-        let logs = LogUploader::collect_logs_to_requeue(access_logs(&["b"]), remaining);
+        let logs = AccessLogUploadWorker::collect_logs_to_requeue(access_logs(&["b"]), remaining);
 
         assert_eq!(request_ids(logs), ["b", "c", "d", "e"]);
     }
 
     #[test]
-    fn requeue_failed_logs_preserves_order_and_drops_oldest_over_capacity() {
-        let (_tx, rx) = mpsc::channel(1);
-        let mut uploader = LogUploader::new(rx, api_config(), 10, Duration::from_secs(1));
-        uploader.max_retry_logs = 3;
+    fn requeue_front_preserves_order_and_drops_oldest_over_capacity() {
+        let mut worker = AccessLogUploadWorker::new(api_config(), &pipeline_config());
 
-        uploader.requeue_failed_logs(access_logs(&["b", "c", "d", "e"]));
+        worker.requeue_front(access_logs(&["b", "c", "d", "e"]));
 
-        let queued = uploader.retry_buffer.into_iter().map(|log| log.request_id);
+        let queued = worker.retry_queue.into_iter().map(|log| log.request_id);
         assert_eq!(queued.collect::<Vec<_>>(), ["c", "d", "e"]);
+    }
+
+    #[test]
+    fn split_logs_by_encoded_size_preserves_full_log_fields() {
+        let mut log = pb::HttpAccessLog {
+            request_id: "a".to_string(),
+            request_body: b"body".to_vec(),
+            ..Default::default()
+        };
+        log.cookie.insert("cookie".to_string(), "value".to_string());
+        log.attrs.insert("attr".to_string(), "value".to_string());
+        log.header.insert(
+            "header".to_string(),
+            pb::Strings {
+                values: vec!["value".to_string()],
+            },
+        );
+        log.sent_header.insert(
+            "sent".to_string(),
+            pb::Strings {
+                values: vec!["value".to_string()],
+            },
+        );
+
+        let mut chunks = AccessLogUploadWorker::split_logs_by_encoded_size(vec![log], 1);
+        let log = chunks.pop().unwrap().pop().unwrap();
+
+        assert_eq!(log.request_body, b"body".to_vec());
+        assert!(log.header.contains_key("header"));
+        assert!(log.sent_header.contains_key("sent"));
+        assert_eq!(log.cookie.get("cookie"), Some(&"value".to_string()));
+        assert_eq!(log.attrs.get("attr"), Some(&"value".to_string()));
     }
 }
 

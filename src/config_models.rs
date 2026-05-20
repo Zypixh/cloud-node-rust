@@ -1057,6 +1057,9 @@ pub struct WebConfig {
 
 impl WebConfig {
     pub fn compile_url_patterns(&self) {
+        if let Some(cache) = &self.cache {
+            cache.compile_url_patterns();
+        }
         if let Some(user_agent) = &self.user_agent_config {
             user_agent.compile_url_patterns();
         }
@@ -1485,6 +1488,20 @@ impl URLPattern {
                     Some(format!("(?i){}", pattern))
                 }
             }
+            "prefix" | "urlPrefix" | "url_prefix" | "dir" | "directory" => {
+                if pattern.is_empty() {
+                    return None;
+                }
+                let escaped = regex::escape(pattern.trim_end_matches('*').trim_end_matches('/'));
+                if escaped.starts_with('/') {
+                    Some(format!(
+                        "(?i)^(?:(?:http|https)://[^/]+)?{}(?:/.*)?$",
+                        escaped
+                    ))
+                } else {
+                    Some(format!("(?i)^{}.*$", escaped))
+                }
+            }
             _ => {
                 if pattern.is_empty() {
                     return None;
@@ -1492,7 +1509,7 @@ impl URLPattern {
                 let escaped = regex::escape(pattern);
                 let wildcard = escaped.replace("\\*", "(.*)");
                 if wildcard.starts_with('/') {
-                    Some(format!("(?i)^(http|https)://[\\w.-]+{}$", wildcard))
+                    Some(format!("(?i)^(?:http|https)://[^/]+{}$", wildcard))
                 } else {
                     Some(format!("(?i)^{}$", wildcard))
                 }
@@ -1868,6 +1885,17 @@ pub struct WebCacheConfig {
     pub disable_policy_refs: bool,
 }
 
+impl WebCacheConfig {
+    pub fn compile_url_patterns(&self) {
+        for cache_ref in &self.cache_refs {
+            cache_ref.compile_url_patterns();
+        }
+        if let Some(policy) = &self.cache_policy {
+            policy.compile_url_patterns();
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HTTPCachePolicy {
     pub id: i64,
@@ -1899,6 +1927,14 @@ pub struct HTTPCachePolicy {
     pub force_partial_content: bool,
     #[serde(rename = "enableReadingOriginAsync", default)]
     pub enable_reading_origin_async: bool,
+}
+
+impl HTTPCachePolicy {
+    pub fn compile_url_patterns(&self) {
+        for cache_ref in &self.cache_refs {
+            cache_ref.compile_url_patterns();
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -1938,10 +1974,39 @@ pub struct HTTPCacheRef {
     pub conds: Option<HTTPRequestCondsConfig>,
     #[serde(rename = "simpleCond")]
     pub simple_cond: Option<HTTPRequestCond>,
+    #[serde(
+        rename = "onlyURLPatterns",
+        alias = "onlyUrlPatterns",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub only_url_patterns: Vec<URLPattern>,
+    #[serde(
+        rename = "exceptURLPatterns",
+        alias = "exceptUrlPatterns",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub except_url_patterns: Vec<URLPattern>,
     #[serde(rename = "expiresTime")]
     pub expires_time: Option<HTTPExpiresTimeConfig>,
     #[serde(rename = "cachePolicy")]
     pub cache_policy: Option<HTTPCachePolicy>,
+}
+
+impl HTTPCacheRef {
+    pub fn compile_url_patterns(&self) {
+        for pattern in self
+            .only_url_patterns
+            .iter()
+            .chain(self.except_url_patterns.iter())
+        {
+            pattern.compile();
+        }
+        if let Some(policy) = &self.cache_policy {
+            policy.compile_url_patterns();
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2265,6 +2330,35 @@ pub struct CORSConfig {
         deserialize_with = "deserialize_null_default"
     )]
     pub allow_headers: Vec<String>,
+    #[serde(skip)]
+    allow_methods_header: once_cell::sync::OnceCell<String>,
+    #[serde(skip)]
+    allow_headers_header: once_cell::sync::OnceCell<String>,
+    #[serde(skip)]
+    expose_headers_header: once_cell::sync::OnceCell<String>,
+    #[serde(skip)]
+    max_age_header: once_cell::sync::OnceCell<String>,
+}
+
+impl CORSConfig {
+    pub fn allow_methods_header(&self) -> &str {
+        self.allow_methods_header
+            .get_or_init(|| self.allow_methods.join(", "))
+    }
+
+    pub fn allow_headers_header(&self) -> &str {
+        self.allow_headers_header
+            .get_or_init(|| self.allow_headers.join(", "))
+    }
+
+    pub fn expose_headers_header(&self) -> &str {
+        self.expose_headers_header
+            .get_or_init(|| self.expose_headers.join(", "))
+    }
+
+    pub fn max_age_header(&self) -> &str {
+        self.max_age_header.get_or_init(|| self.max_age.to_string())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2822,6 +2916,15 @@ mod tests {
         };
         assert!(wildcard.matches("https://example.com/static/a/image.jpg"));
         assert!(!wildcard.matches("/static/a/image.jpg"));
+
+        let prefix = URLPattern {
+            type_name: "prefix".to_string(),
+            pattern: "/static/".to_string(),
+            ..Default::default()
+        };
+        assert!(prefix.matches("/static/a/image.jpg"));
+        assert!(prefix.matches("https://example.com/static/a/image.jpg"));
+        assert!(!prefix.matches("/assets/a/image.jpg"));
 
         let empty = URLPattern {
             type_name: "wildcard".to_string(),

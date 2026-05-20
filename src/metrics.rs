@@ -1,12 +1,14 @@
 use chrono::Timelike;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use std::sync::atomic::AtomicU32;
 
 static CACHED_PRESSURE: AtomicU32 = AtomicU32::new(0);
+static EMPTY_ARC_STR: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
+static UNKNOWN_ARC_STR: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("Unknown"));
 
 pub fn start_pressure_updater() {
     tokio::spawn(async {
@@ -438,13 +440,13 @@ pub mod record {
             analyzed.geo.as_ref().map_or_else(
                 || {
                     (
-                        Arc::from(""),
+                        Arc::clone(&EMPTY_ARC_STR),
                         0,
-                        Arc::from(""),
+                        Arc::clone(&EMPTY_ARC_STR),
                         0,
-                        Arc::from(""),
+                        Arc::clone(&EMPTY_ARC_STR),
                         0,
-                        Arc::from("Unknown"),
+                        Arc::clone(&UNKNOWN_ARC_STR),
                     )
                 },
                 |geo| {

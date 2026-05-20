@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 static CACHE_RE_CACHE: Lazy<DashMap<String, std::sync::Arc<Regex>>> = Lazy::new(DashMap::new);
 static CACHE_IN_VALUES: Lazy<DashMap<String, Arc<Vec<String>>>> = Lazy::new(DashMap::new);
+static CACHE_EXTENSION_VALUES: Lazy<DashMap<String, Arc<Vec<String>>>> = Lazy::new(DashMap::new);
+static CACHE_OPERATOR_VALUES: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
 
 impl HTTPRequestCondsConfig {
     pub fn match_request_with_scheme(&self, session: &Session, scheme: &str) -> bool {
@@ -47,60 +49,54 @@ impl HTTPRequestCondGroup {
 impl HTTPRequestCond {
     pub fn match_request_with_scheme(&self, session: &Session, scheme: &str) -> bool {
         let param_value = get_variable_value_with_scheme(session, &self.param, scheme);
-        let matched = match self.operator.as_str() {
-            "matches" | "regexp" => {
-                let pattern = if self.is_case_insensitive && !self.value.starts_with("(?i)") {
-                    format!("(?i){}", self.value)
-                } else {
-                    self.value.clone()
-                };
-                get_cached_regex(&pattern).map_or(false, |re| re.is_match(&param_value))
+        let expected = self.value.as_str();
+        let operator = normalized_operator(&self.operator);
+        let matched = match operator.as_ref() {
+            "matches" | "regexp" => regex_matches(&param_value, expected, self.is_case_insensitive),
+            "notmatches" | "notregexp" => {
+                !regex_matches(&param_value, expected, self.is_case_insensitive)
             }
-            "notMatches" | "notRegexp" => {
-                let pattern = if self.is_case_insensitive && !self.value.starts_with("(?i)") {
-                    format!("(?i){}", self.value)
-                } else {
-                    self.value.clone()
-                };
-                get_cached_regex(&pattern).map_or(false, |re| !re.is_match(&param_value))
+            "wildcardmatch" => wildcard_matches(&param_value, expected, self.is_case_insensitive),
+            "wildcardnotmatch" | "notwildcardmatch" => {
+                !wildcard_matches(&param_value, expected, self.is_case_insensitive)
             }
             "eq" | "equals" => {
                 if self.is_case_insensitive {
-                    eq_case_insensitive(&param_value, &self.value)
+                    eq_case_insensitive(&param_value, expected)
                 } else {
-                    param_value == self.value
+                    param_value == expected
                 }
             }
-            "neq" | "notEquals" => {
+            "neq" | "notequals" => {
                 if self.is_case_insensitive {
-                    !eq_case_insensitive(&param_value, &self.value)
+                    !eq_case_insensitive(&param_value, expected)
                 } else {
-                    param_value != self.value
+                    param_value != expected
                 }
             }
-            "prefix" | "hasPrefix" => {
+            "prefix" | "hasprefix" => {
                 if self.is_case_insensitive {
-                    starts_with_ascii_case_insensitive(&param_value, &self.value)
+                    starts_with_ascii_case_insensitive(&param_value, expected)
                 } else {
-                    param_value.starts_with(&self.value)
+                    param_value.starts_with(expected)
                 }
             }
-            "suffix" | "hasSuffix" => {
+            "suffix" | "hassuffix" => {
                 if self.is_case_insensitive {
-                    ends_with_ascii_case_insensitive(&param_value, &self.value)
+                    ends_with_ascii_case_insensitive(&param_value, expected)
                 } else {
-                    param_value.ends_with(&self.value)
+                    param_value.ends_with(expected)
                 }
             }
-            "contains" | "containsString" => {
+            "contains" | "containsstring" => {
                 if self.is_case_insensitive {
-                    contains_ascii_case_insensitive(&param_value, &self.value)
+                    contains_ascii_case_insensitive(&param_value, expected)
                 } else {
-                    param_value.contains(&self.value)
+                    param_value.contains(expected)
                 }
             }
             "in" => {
-                let values = cached_list_values(&self.value);
+                let values = cached_list_values(expected);
                 if !values.is_empty() {
                     if self.is_case_insensitive {
                         values.iter().any(|v| eq_case_insensitive(&param_value, v))
@@ -111,10 +107,10 @@ impl HTTPRequestCond {
                     false
                 }
             }
-            "fileExt" | "fileExtension" | "fileExtensions" => {
+            "fileext" | "fileextension" | "fileextensions" => {
                 let extension =
                     get_variable_value_with_scheme(session, "${requestPathLowerExtension}", scheme);
-                extension_in_configured_values(&extension, &self.value)
+                extension_in_configured_values(&extension, expected)
             }
             _ => false,
         };
@@ -124,9 +120,20 @@ impl HTTPRequestCond {
 }
 
 pub fn get_variable_value_with_scheme(session: &Session, param: &str, scheme: &str) -> String {
-    match param {
-        "${requestPath}" => session.req_header().uri.path().to_string(),
-        "${requestPathLowerExtension}" => {
+    if let Some(inner) = param
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        return get_variable_inner_value_with_scheme(session, inner, scheme);
+    }
+
+    param.to_string()
+}
+
+fn get_variable_inner_value_with_scheme(session: &Session, inner: &str, scheme: &str) -> String {
+    match inner {
+        "requestPath" => session.req_header().uri.path().to_string(),
+        "requestPathLowerExtension" => {
             let path = session.req_header().uri.path();
             std::path::Path::new(path)
                 .extension()
@@ -134,27 +141,25 @@ pub fn get_variable_value_with_scheme(session: &Session, param: &str, scheme: &s
                 .map(|ext| format!(".{}", ext.to_lowercase()))
                 .unwrap_or_default()
         }
-        "${host}" | "${requestHost}" => {
-            session
-                .req_header()
-                .headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.split(':').next().unwrap_or(v)) // Remove port if present
-                .or_else(|| session.req_header().uri.host())
-                .unwrap_or("")
-                .to_string()
-        }
-        "${scheme}" => scheme.to_string(),
-        "${isArgs}" => {
+        "host" | "requestHost" => session
+            .req_header()
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(':').next().unwrap_or(v))
+            .or_else(|| session.req_header().uri.host())
+            .unwrap_or("")
+            .to_string(),
+        "scheme" => scheme.to_string(),
+        "isArgs" => {
             if session.req_header().uri.query().is_some() {
                 "?".to_string()
             } else {
                 "".to_string()
             }
         }
-        "${args}" => session.req_header().uri.query().unwrap_or("").to_string(),
-        "${requestURI}" => {
+        "args" => session.req_header().uri.query().unwrap_or("").to_string(),
+        "requestURI" => {
             let path = session.req_header().uri.path();
             let query = session
                 .req_header()
@@ -164,7 +169,7 @@ pub fn get_variable_value_with_scheme(session: &Session, param: &str, scheme: &s
                 .unwrap_or_default();
             format!("{}{}", path, query)
         }
-        "${remoteAddr}" => session
+        "remoteAddr" => session
             .downstream_session
             .digest()
             .and_then(|d| d.socket_digest.as_ref())
@@ -180,43 +185,78 @@ pub fn get_variable_value_with_scheme(session: &Session, param: &str, scheme: &s
                 })
             })
             .unwrap_or_else(|| "127.0.0.1".to_string()),
-        _ if param.starts_with("${arg:") => {
-            let key = &param[6..param.len() - 1];
-            session
-                .req_header()
-                .uri
-                .query()
-                .and_then(|q| {
-                    q.split('&')
-                        .find(|p| p.starts_with(key) && p.contains('='))
-                        .map(|p| p.split('=').nth(1).unwrap_or("").to_string())
-                })
-                .unwrap_or_default()
+        "referer" => header_value(session, "referer"),
+        "userAgent" | "httpUserAgent" => header_value(session, "user-agent"),
+        "contentType" => header_value(session, "content-type"),
+        "cookies" => header_value(session, "cookie"),
+        _ => {
+            if let Some(key) = prefixed_variable_arg(inner, &["arg", "requestArg"]) {
+                return query_param(session, key);
+            }
+            if let Some(key) = prefixed_variable_arg(inner, &["header", "requestHeader"]) {
+                return header_value(session, key);
+            }
+            if let Some(key) = prefixed_variable_arg(inner, &["cookie", "requestCookie"]) {
+                return cookie_value(session, key);
+            }
+            String::new()
         }
-        _ if param.starts_with("${header:") => {
-            let key = &param[9..param.len() - 1];
-            session
-                .get_header(key)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string()
-        }
-        _ if param.starts_with("${cookie:") => {
-            let key = &param[9..param.len() - 1];
-            session
-                .get_header("cookie")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|cookies| {
-                    cookies
-                        .split(';')
-                        .map(|c| c.trim())
-                        .find(|c| c.starts_with(key) && c.contains('='))
-                        .map(|c| c.split('=').nth(1).unwrap_or("").to_string())
-                })
-                .unwrap_or_default()
-        }
-        _ => param.to_string(),
     }
+}
+
+fn prefixed_variable_arg<'a>(inner: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    for prefix in prefixes {
+        let Some(rest) = inner.strip_prefix(prefix) else {
+            continue;
+        };
+        if let Some(value) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('.')) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn header_value(session: &Session, name: &str) -> String {
+    session
+        .get_header(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn query_param(session: &Session, name: &str) -> String {
+    session
+        .req_header()
+        .uri
+        .query()
+        .and_then(|query| {
+            query.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                if key == name {
+                    Some(value.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn cookie_value(session: &Session, name: &str) -> String {
+    session
+        .get_header("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').map(str::trim).find_map(|cookie| {
+                let (key, value) = cookie.split_once('=')?;
+                if key == name {
+                    Some(value.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default()
 }
 
 pub fn format_variables_with_scheme(session: &Session, template: &str, scheme: &str) -> String {
@@ -253,18 +293,31 @@ fn extension_in_configured_values(extension: &str, value: &str) -> bool {
     }
 
     let extension = extension.to_ascii_lowercase();
-    cached_list_values(value).iter().any(|item| {
-        let item = item.trim().trim_matches('"').to_ascii_lowercase();
-        if item.is_empty() {
-            return false;
-        }
-        let item = if item.starts_with('.') {
-            item
-        } else {
-            format!(".{item}")
-        };
-        item == extension
-    })
+    cached_extension_values(value)
+        .iter()
+        .any(|item| item.as_str() == extension)
+}
+
+fn cached_extension_values(value: &str) -> Arc<Vec<String>> {
+    CACHE_EXTENSION_VALUES
+        .entry(value.to_string())
+        .or_insert_with(|| {
+            let parsed = cached_list_values(value)
+                .iter()
+                .filter_map(|item| {
+                    let item = item.trim().trim_matches('"').to_ascii_lowercase();
+                    if item.is_empty() {
+                        None
+                    } else if item.starts_with('.') {
+                        Some(item)
+                    } else {
+                        Some(format!(".{item}"))
+                    }
+                })
+                .collect();
+            Arc::new(parsed)
+        })
+        .clone()
 }
 
 fn eq_case_insensitive(value: &str, expected: &str) -> bool {
@@ -302,6 +355,45 @@ fn contains_ascii_case_insensitive(value: &str, needle: &str) -> bool {
                 .any(|part| part.eq_ignore_ascii_case(needle.as_bytes()));
     }
     value.to_lowercase().contains(&needle.to_lowercase())
+}
+
+fn normalized_operator(operator: &str) -> Arc<str> {
+    if let Some(cached) = CACHE_OPERATOR_VALUES.get(operator) {
+        return Arc::clone(&*cached);
+    }
+    let normalized: Arc<str> = operator
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace() && *ch != '_' && *ch != '-')
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .into();
+    CACHE_OPERATOR_VALUES
+        .entry(operator.to_string())
+        .or_insert_with(|| Arc::clone(&normalized))
+        .clone()
+}
+
+fn regex_matches(value: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let pattern = if case_insensitive && !pattern.starts_with("(?i)") {
+        format!("(?i){pattern}")
+    } else {
+        pattern.to_string()
+    };
+    get_cached_regex(&pattern).is_some_and(|re| re.is_match(value))
+}
+
+fn wildcard_matches(value: &str, pattern: &str, case_insensitive: bool) -> bool {
+    if pattern.is_empty() {
+        return value.is_empty();
+    }
+    let pattern = regex::escape(pattern).replace("\\*", ".*");
+    let pattern = if case_insensitive {
+        format!("(?i)^{pattern}$")
+    } else {
+        format!("^{pattern}$")
+    };
+    get_cached_regex(&pattern).is_some_and(|re| re.is_match(value))
 }
 
 fn get_cached_regex(pattern: &str) -> Option<Arc<Regex>> {

@@ -37,6 +37,10 @@ impl NodePaths {
         self.config_dir().join("api_node.yaml")
     }
 
+    pub fn runtime_config_file(&self) -> PathBuf {
+        self.config_dir().join("runtime.yaml")
+    }
+
     pub fn legacy_api_config_file(&self) -> PathBuf {
         self.root.join("api_node.yaml")
     }

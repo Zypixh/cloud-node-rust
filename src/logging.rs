@@ -7,12 +7,60 @@ use once_cell::sync::{Lazy, OnceCell};
 use pingora_proxy::Session;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-pub static LOG_SENDER: OnceCell<mpsc::Sender<pb::HttpAccessLog>> = OnceCell::new();
+pub struct AccessLogHandle {
+    sender: mpsc::Sender<pb::HttpAccessLog>,
+    queue_capacity: usize,
+    warning_interval_ms: u64,
+    dropped_since_warning: AtomicU64,
+    last_warning_at_ms: AtomicI64,
+}
+
+impl AccessLogHandle {
+    fn new(
+        sender: mpsc::Sender<pb::HttpAccessLog>,
+        queue_capacity: usize,
+        warning_interval: Duration,
+    ) -> Self {
+        Self {
+            sender,
+            queue_capacity,
+            warning_interval_ms: warning_interval.as_millis().min(u64::MAX as u128) as u64,
+            dropped_since_warning: AtomicU64::new(0),
+            last_warning_at_ms: AtomicI64::new(0),
+        }
+    }
+
+    fn try_enqueue(&self, log: pb::HttpAccessLog, kind: &str) {
+        if let Err(err) = self.sender.try_send(log) {
+            self.dropped_since_warning.fetch_add(1, Ordering::Relaxed);
+            let now = unix_epoch_millis_now();
+            let last = self.last_warning_at_ms.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= self.warning_interval_ms as i64
+                && self
+                    .last_warning_at_ms
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let dropped = self.dropped_since_warning.swap(0, Ordering::Relaxed);
+                tracing::warn!(
+                    "ACCESS_LOG: queue saturated kind={} dropped={} queue_capacity={} available_capacity={} error={}",
+                    kind,
+                    dropped,
+                    self.queue_capacity,
+                    self.sender.capacity(),
+                    err
+                );
+            }
+        }
+    }
+}
+
+pub static LOG_SENDER: OnceCell<AccessLogHandle> = OnceCell::new();
 
 static CACHED_HOSTNAME: Lazy<String> = Lazy::new(|| {
     hostname::get()
@@ -28,8 +76,14 @@ static REQUEST_ID_COUNTER: AtomicI32 = AtomicI32::new(1_000_000);
 pub fn init_global_log_bus(
     sender: mpsc::Sender<pb::HttpAccessLog>,
     node_sender: mpsc::Sender<pb::NodeLog>,
+    queue_capacity: usize,
+    warning_interval: Duration,
 ) {
-    let _ = LOG_SENDER.set(sender);
+    let _ = LOG_SENDER.set(AccessLogHandle::new(
+        sender,
+        queue_capacity,
+        warning_interval,
+    ));
     let _ = NODE_LOG_SENDER.set(node_sender);
 }
 
@@ -63,8 +117,31 @@ pub fn next_request_id() -> String {
     format!("{now}{node_id}{counter}")
 }
 
-fn access_log_field_enabled(fields: Option<&[i32]>, field: i32) -> bool {
-    fields.map_or(true, |fields| fields.contains(&field))
+const ACCESS_LOG_FIELD_MAX: usize = 53;
+
+#[derive(Clone, Copy)]
+struct AccessLogFieldMask {
+    enabled: [bool; ACCESS_LOG_FIELD_MAX + 1],
+}
+
+impl AccessLogFieldMask {
+    fn from_fields(fields: &[i32]) -> Self {
+        let mut enabled = [false; ACCESS_LOG_FIELD_MAX + 1];
+        for &field in fields {
+            if field > 0 && (field as usize) <= ACCESS_LOG_FIELD_MAX {
+                enabled[field as usize] = true;
+            }
+        }
+        Self { enabled }
+    }
+
+    fn enabled(&self, field: i32) -> bool {
+        field > 0 && (field as usize) <= ACCESS_LOG_FIELD_MAX && self.enabled[field as usize]
+    }
+}
+
+fn access_log_field_enabled(fields: Option<&AccessLogFieldMask>, field: i32) -> bool {
+    fields.is_none_or(|fields| fields.enabled(field))
 }
 
 pub fn report_node_log(level: String, tag: String, message: String, server_id: i64) {
@@ -117,16 +194,12 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         }
     };
 
-    if sender.capacity() == 0 {
-        debug!("ACCESS_LOG: blocked by sender channel full");
-        return;
-    }
-
-    let fields = ctx
+    let field_mask = ctx
         .access_log_ref
         .as_ref()
         .filter(|access_log| !access_log.fields.is_empty())
-        .map(|access_log| access_log.fields.as_slice());
+        .map(|access_log| AccessLogFieldMask::from_fields(&access_log.fields));
+    let fields = field_mask.as_ref();
     let (log_cookies, log_req_headers, log_resp_headers, common_req_headers_only) =
         if let Some(ref cfg) = ctx.global_access_log_config {
             (
@@ -540,188 +613,188 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         log.origin_address, log.origin_status, log.status
     );
 
-    if let Err(e) = sender.try_send(log) {
-        tracing::warn!("ACCESS_LOG: failed to enqueue log: {}", e);
-    }
+    sender.try_enqueue(log, "http");
 }
 
 fn is_common_request_header(name: &str) -> bool {
-    matches!(
-        name.to_lowercase().as_str(),
-        "host"
-            | "user-agent"
-            | "accept"
-            | "accept-encoding"
-            | "accept-language"
-            | "content-type"
-            | "content-length"
-            | "referer"
-            | "origin"
-            | "connection"
-            | "cache-control"
-            | "pragma"
-            | "if-none-match"
-            | "if-modified-since"
-    )
+    match name.len() {
+        4 => name.eq_ignore_ascii_case("host"),
+        6 => {
+            name.eq_ignore_ascii_case("accept")
+                || name.eq_ignore_ascii_case("origin")
+                || name.eq_ignore_ascii_case("pragma")
+        }
+        7 => name.eq_ignore_ascii_case("referer"),
+        10 => name.eq_ignore_ascii_case("user-agent") || name.eq_ignore_ascii_case("connection"),
+        12 => name.eq_ignore_ascii_case("content-type"),
+        13 => {
+            name.eq_ignore_ascii_case("cache-control") || name.eq_ignore_ascii_case("if-none-match")
+        }
+        14 => name.eq_ignore_ascii_case("content-length"),
+        15 => {
+            name.eq_ignore_ascii_case("accept-encoding")
+                || name.eq_ignore_ascii_case("accept-language")
+        }
+        17 => name.eq_ignore_ascii_case("if-modified-since"),
+        _ => false,
+    }
 }
 
-fn apply_fields_whitelist(log: &mut pb::HttpAccessLog, fields: &[i32]) {
-    use std::collections::HashSet;
-    let allowed: HashSet<i32> = fields.iter().copied().collect();
-    if !allowed.contains(&1) {
+fn apply_fields_whitelist(log: &mut pb::HttpAccessLog, allowed: &AccessLogFieldMask) {
+    if !allowed.enabled(1) {
         log.server_id = 0;
     }
-    if !allowed.contains(&2) {
+    if !allowed.enabled(2) {
         log.node_id = 0;
     }
-    if !allowed.contains(&3) {
+    if !allowed.enabled(3) {
         log.location_id = 0;
     }
-    if !allowed.contains(&4) {
+    if !allowed.enabled(4) {
         log.rewrite_id = 0;
     }
-    if !allowed.contains(&5) {
+    if !allowed.enabled(5) {
         log.origin_id = 0;
     }
-    if !allowed.contains(&6) {
+    if !allowed.enabled(6) {
         log.remote_addr = String::new();
     }
-    if !allowed.contains(&7) {
+    if !allowed.enabled(7) {
         log.raw_remote_addr = String::new();
     }
-    if !allowed.contains(&8) {
+    if !allowed.enabled(8) {
         log.remote_port = 0;
     }
-    if !allowed.contains(&9) {
+    if !allowed.enabled(9) {
         log.remote_user = String::new();
     }
-    if !allowed.contains(&10) {
+    if !allowed.enabled(10) {
         log.request_uri = String::new();
     }
-    if !allowed.contains(&11) {
+    if !allowed.enabled(11) {
         log.request_path = String::new();
     }
-    if !allowed.contains(&12) {
+    if !allowed.enabled(12) {
         log.request_length = 0;
     }
-    if !allowed.contains(&13) {
+    if !allowed.enabled(13) {
         log.request_time = 0.0;
     }
-    if !allowed.contains(&14) {
+    if !allowed.enabled(14) {
         log.request_method = String::new();
     }
-    if !allowed.contains(&15) {
+    if !allowed.enabled(15) {
         log.request_filename = String::new();
     }
-    if !allowed.contains(&16) {
+    if !allowed.enabled(16) {
         log.scheme = String::new();
     }
-    if !allowed.contains(&17) {
+    if !allowed.enabled(17) {
         log.proto = String::new();
     }
-    if !allowed.contains(&18) {
+    if !allowed.enabled(18) {
         log.bytes_sent = 0;
     }
-    if !allowed.contains(&19) {
+    if !allowed.enabled(19) {
         log.body_bytes_sent = 0;
     }
-    if !allowed.contains(&20) {
+    if !allowed.enabled(20) {
         log.status = 0;
     }
-    if !allowed.contains(&21) {
+    if !allowed.enabled(21) {
         log.status_message = String::new();
     }
-    if !allowed.contains(&22) {
+    if !allowed.enabled(22) {
         log.sent_header.clear();
     }
-    if !allowed.contains(&23) {
+    if !allowed.enabled(23) {
         log.time_iso8601 = String::new();
     }
-    if !allowed.contains(&24) {
+    if !allowed.enabled(24) {
         log.time_local = String::new();
     }
-    if !allowed.contains(&25) {
+    if !allowed.enabled(25) {
         log.msec = 0.0;
     }
-    if !allowed.contains(&26) {
+    if !allowed.enabled(26) {
         log.timestamp = 0;
     }
-    if !allowed.contains(&27) {
+    if !allowed.enabled(27) {
         log.host = String::new();
     }
-    if !allowed.contains(&28) {
+    if !allowed.enabled(28) {
         log.referer = String::new();
     }
-    if !allowed.contains(&29) {
+    if !allowed.enabled(29) {
         log.user_agent = String::new();
     }
-    if !allowed.contains(&30) {
+    if !allowed.enabled(30) {
         log.request = String::new();
     }
-    if !allowed.contains(&31) {
+    if !allowed.enabled(31) {
         log.content_type = String::new();
     }
-    if !allowed.contains(&32) {
+    if !allowed.enabled(32) {
         log.cookie.clear();
     }
-    if !allowed.contains(&34) {
+    if !allowed.enabled(34) {
         log.args = String::new();
     }
-    if !allowed.contains(&35) {
+    if !allowed.enabled(35) {
         log.query_string = String::new();
     }
-    if !allowed.contains(&36) {
+    if !allowed.enabled(36) {
         log.header.clear();
     }
-    if !allowed.contains(&37) {
+    if !allowed.enabled(37) {
         log.server_name = String::new();
     }
-    if !allowed.contains(&38) {
+    if !allowed.enabled(38) {
         log.server_port = 0;
     }
-    if !allowed.contains(&39) {
+    if !allowed.enabled(39) {
         log.server_protocol = String::new();
     }
-    if !allowed.contains(&40) {
+    if !allowed.enabled(40) {
         log.hostname = String::new();
     }
-    if !allowed.contains(&41) {
+    if !allowed.enabled(41) {
         log.origin_address = String::new();
     }
-    if !allowed.contains(&42) {
+    if !allowed.enabled(42) {
         log.errors.clear();
     }
-    if !allowed.contains(&43) {
+    if !allowed.enabled(43) {
         log.attrs.clear();
     }
-    if !allowed.contains(&44) {
+    if !allowed.enabled(44) {
         log.firewall_policy_id = 0;
     }
-    if !allowed.contains(&45) {
+    if !allowed.enabled(45) {
         log.firewall_rule_group_id = 0;
     }
-    if !allowed.contains(&46) {
+    if !allowed.enabled(46) {
         log.firewall_rule_set_id = 0;
     }
-    if !allowed.contains(&47) {
+    if !allowed.enabled(47) {
         log.firewall_rule_id = 0;
     }
-    if !allowed.contains(&48) {
+    if !allowed.enabled(48) {
         log.request_id = String::new();
     }
-    if !allowed.contains(&49) {
+    if !allowed.enabled(49) {
         log.firewall_actions.clear();
     }
-    if !allowed.contains(&50) {
+    if !allowed.enabled(50) {
         log.tags.retain(|tag| tag == "rewrite");
     }
-    if !allowed.contains(&51) {
+    if !allowed.enabled(51) {
         log.request_body.clear();
     }
-    if !allowed.contains(&52) {
+    if !allowed.enabled(52) {
         log.origin_status = 0;
     }
-    if !allowed.contains(&53) {
+    if !allowed.enabled(53) {
         log.origin_header_response_time = 0.0;
     }
 }
@@ -762,22 +835,21 @@ pub fn log_sni_passthrough_access(
 
 fn l4_passthrough_log_sender(
     access_log_ref: Option<&crate::config_models::HTTPAccessLogRef>,
-) -> Option<&'static mpsc::Sender<pb::HttpAccessLog>> {
+) -> Option<&'static AccessLogHandle> {
     if access_log_ref.is_some_and(|access_log| !access_log.is_on) {
         return None;
     }
     if !GLOBAL_ACCESS_LOG_ON.load(Ordering::Relaxed) {
         return None;
     }
-    let sender = LOG_SENDER.get()?;
-    (sender.capacity() > 0).then_some(sender)
+    LOG_SENDER.get()
 }
 
 fn l4_passthrough_time_fields(
     request_started_at_millis: i64,
-    fields: Option<&[i32]>,
+    fields: Option<&AccessLogFieldMask>,
 ) -> (String, String) {
-    if fields.is_some_and(|fields| !fields.contains(&23) && !fields.contains(&24)) {
+    if fields.is_some_and(|fields| !fields.enabled(23) && !fields.enabled(24)) {
         return (String::new(), String::new());
     }
     let start_dt = chrono::DateTime::from_timestamp_millis(request_started_at_millis)
@@ -822,9 +894,10 @@ fn log_l4_passthrough_access(
     };
     let request_started_at = request_started_at_millis / 1000;
 
-    let fields = access_log_ref
+    let field_mask = access_log_ref
         .filter(|access_log| !access_log.fields.is_empty())
-        .map(|access_log| access_log.fields.as_slice());
+        .map(|access_log| AccessLogFieldMask::from_fields(&access_log.fields));
+    let fields = field_mask.as_ref();
     let (time_iso8601, time_local) = l4_passthrough_time_fields(request_started_at_millis, fields);
     let request_uri = "/".to_string();
     let request_line = format!("{} {} {}", request_method, sni_host, proto);
@@ -862,19 +935,15 @@ fn log_l4_passthrough_access(
     if let Some(error) = error.filter(|value| !value.is_empty()) {
         log.errors.push(error.to_string());
     }
-    if let Some(access_log_ref) = access_log_ref
-        && !access_log_ref.fields.is_empty()
-    {
-        apply_fields_whitelist(&mut log, &access_log_ref.fields);
+    if let Some(fields) = fields {
+        apply_fields_whitelist(&mut log, fields);
     }
 
     debug!(
         "Reporting L4 passthrough log: {} -> Status {}",
         log.request_uri, log.status
     );
-    if let Err(e) = sender.try_send(log) {
-        tracing::warn!("ACCESS_LOG: failed to enqueue SNI passthrough log: {}", e);
-    }
+    sender.try_enqueue(log, "sni_passthrough");
 }
 
 #[cfg(test)]
@@ -882,9 +951,33 @@ mod tests {
     use super::*;
     #[test]
     fn l4_time_fields_are_utc_when_enabled() {
+        let fields = AccessLogFieldMask::from_fields(&[23, 24]);
         let (time_iso8601, time_local) =
-            l4_passthrough_time_fields(1_700_000_000_123, Some(&[23, 24]));
+            l4_passthrough_time_fields(1_700_000_000_123, Some(&fields));
         assert!(time_iso8601.ends_with('Z'));
         assert!(time_local.ends_with("+0000"));
+    }
+
+    #[test]
+    fn common_request_headers_match_case_insensitively() {
+        for name in [
+            "host",
+            "User-Agent",
+            "accept",
+            "Accept-Encoding",
+            "Accept-Language",
+            "Content-Type",
+            "Content-Length",
+            "referer",
+            "origin",
+            "connection",
+            "Cache-Control",
+            "pragma",
+            "If-None-Match",
+            "If-Modified-Since",
+        ] {
+            assert!(is_common_request_header(name), "{name}");
+        }
+        assert!(!is_common_request_header("x-custom-header"));
     }
 }

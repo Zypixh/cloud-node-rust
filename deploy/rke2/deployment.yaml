@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-node
+  namespace: cloud-node
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cloud-node
+  template:
+    metadata:
+      labels:
+        app: cloud-node
+    spec:
+      serviceAccountName: cloud-node
+      containers:
+        - name: cloud-node
+          image: YOUR_REGISTRY/cloud-node-rust:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+            - name: https
+              containerPort: 443
+              protocol: TCP
+            - name: quic
+              containerPort: 443
+              protocol: UDP
+            - name: internal
+              containerPort: 19090
+              protocol: TCP
+          env:
+            - name: CLOUD_NODE_MODE
+              value: rke2
+            - name: CLOUD_NODE_HOME
+              value: /etc/cloud-node
+            - name: CLOUD_NODE_CLUSTER_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cloud-node-secret
+                  key: internal-token
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: api-config
+              mountPath: /etc/cloud-node/configs/api_node.yaml
+              subPath: api_node.yaml
+              readOnly: true
+            - name: runtime-config
+              mountPath: /etc/cloud-node/configs/runtime.yaml
+              subPath: runtime.yaml
+              readOnly: true
+            - name: local-data
+              mountPath: /etc/cloud-node/data
+            - name: local-cache-meta
+              mountPath: /var/lib/cloud-node/cache-meta
+            - name: cache-shard-00
+              mountPath: /cache-shards/shard-00
+            - name: cache-shard-01
+              mountPath: /cache-shards/shard-01
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              memory: 16Gi
+      volumes:
+        - name: api-config
+          secret:
+            secretName: cloud-node-secret
+            items:
+              - key: api_node.yaml
+                path: api_node.yaml
+        - name: runtime-config
+          configMap:
+            name: cloud-node-runtime
+            items:
+              - key: runtime.yaml
+                path: runtime.yaml
+        - name: local-data
+          emptyDir: {}
+        - name: local-cache-meta
+          emptyDir: {}
+        - name: cache-shard-00
+          persistentVolumeClaim:
+            claimName: cloud-node-cache-shard-00
+        - name: cache-shard-01
+          persistentVolumeClaim:
+            claimName: cloud-node-cache-shard-01

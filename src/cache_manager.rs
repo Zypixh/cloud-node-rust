@@ -19,12 +19,12 @@ impl CacheManager {
     }
 
     /// Purges a specific key from the cache
-    pub async fn purge_key(&self, key: &str) -> Result<bool> {
+    pub async fn purge_key(&'static self, key: &str) -> Result<bool> {
         Ok(self.storage.purge_by_key(key).await)
     }
 
     /// Purges all keys starting with a prefix
-    pub async fn purge_prefix(&self, prefix: &str) -> Result<bool> {
+    pub async fn purge_prefix(&'static self, prefix: &str) -> Result<bool> {
         Ok(self.storage.purge_by_prefix(prefix).await)
     }
 }

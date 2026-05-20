@@ -6,6 +6,13 @@ fn find_protos(dir: &str) -> Result<Vec<String>, std::io::Error> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("._"))
+        {
+            continue;
+        }
         if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("proto") {
             protos.push(path.to_string_lossy().into_owned());
         } else if path.is_dir() {

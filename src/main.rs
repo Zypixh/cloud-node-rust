@@ -17,6 +17,7 @@ use cloud_node_rust::config::ConfigStore;
 use cloud_node_rust::firewall::state::WafStateManager;
 use cloud_node_rust::health_manager::GlobalHealthManager;
 use cloud_node_rust::proxy::EdgeProxy;
+use cloud_node_rust::runtime_mode::RuntimeConfig;
 use cloud_node_rust::ssl::DynamicCertSelector;
 use cloud_node_rust::{firewall, log_uploader, logging, rpc, tcp_proxy, udp_proxy};
 
@@ -334,7 +335,6 @@ fn main() -> anyhow::Result<()> {
             {
                 let exe_path = std::env::current_exe()?.canonicalize()?;
                 let work_dir = std::env::current_dir()?.canonicalize()?;
-                let node_paths = cloud_node_rust::paths::NodePaths::from_root(&work_dir);
 
                 // 1. Create global command wrapper
                 let bin_path = "/usr/bin/cloud-node";
@@ -408,6 +408,8 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Test) => {
             println!("Testing configuration...");
             let _ = ApiConfig::load_default()?;
+            let runtime_config = RuntimeConfig::load_default()?;
+            println!("Runtime mode: {:?}", runtime_config.mode());
             println!("Configuration is valid.");
         }
     }
@@ -535,6 +537,23 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
 
     // 1. Load API Config
     let api_config = ApiConfig::load_default().expect("Failed to load configs/api_node.yaml");
+    let runtime_config =
+        RuntimeConfig::load_default().expect("Failed to load configs/runtime.yaml");
+    if runtime_config.is_rke2() {
+        info!(
+            "RKE2 runtime mode enabled for cluster {} in namespace {}.",
+            runtime_config.cluster.name, runtime_config.cluster.namespace
+        );
+    } else {
+        info!("Standalone runtime mode enabled.");
+    }
+    RuntimeConfig::set_current(runtime_config.clone());
+    if runtime_config.is_rke2() {
+        cloud_node_rust::cache_manager::CACHE
+            .storage
+            .apply_cluster_cache_config(&runtime_config.cluster.cache)?;
+    }
+    cloud_node_rust::cluster::runtime::start(&runtime_config);
     let api_config_arc = Arc::new(api_config.clone());
 
     // 2. Initialize Managers
@@ -642,12 +661,17 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     });
 
     // Log Uploader
-    let (log_tx, log_rx) = tokio::sync::mpsc::channel(100000);
+    let access_log_pipeline = api_config.access_log_pipeline.normalized();
+    let (log_tx, log_rx) = tokio::sync::mpsc::channel(access_log_pipeline.queue_capacity);
     let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(10000);
-    logging::init_global_log_bus(log_tx, node_log_tx);
+    logging::init_global_log_bus(
+        log_tx,
+        node_log_tx,
+        access_log_pipeline.queue_capacity,
+        Duration::from_millis(access_log_pipeline.warning_interval_ms),
+    );
 
-    let uploader =
-        log_uploader::LogUploader::new(log_rx, api_config.clone(), 2000, Duration::from_secs(1));
+    let uploader = log_uploader::LogUploader::new(log_rx, api_config.clone(), access_log_pipeline);
     spawn_staggered(&rt, Duration::from_secs(10), async move {
         uploader.start().await;
     });

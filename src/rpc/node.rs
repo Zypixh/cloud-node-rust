@@ -164,6 +164,9 @@ where
 }
 
 async fn report_connected_api_nodes(api_config: &ApiConfig) {
+    if !crate::cluster::leader::require_leader("connected_api_nodes_report") {
+        return;
+    }
     let api_node_ids: Vec<_> = CONNECTED_API_NODE_IDS.read().iter().copied().collect();
 
     if api_node_ids.is_empty() {
@@ -485,6 +488,13 @@ where
                                     if !r.is_on {
                                         continue;
                                     }
+                                    info!(
+                                        "RPC_NODE_CACHE_REF_DUMP policy_id={} policy_name={} rule_index={} rule={}",
+                                        cp.id,
+                                        cp.name,
+                                        idx + 1,
+                                        serde_json::to_string(r).unwrap_or_default()
+                                    );
                                     debug!("  -> Rule #{}", idx + 1);
 
                                     // 1. Conditions / Extensions
@@ -881,6 +891,34 @@ where
 
                             for server in &payload_servers {
                                 server.compile_url_patterns();
+                                if let Some(web) = &server.web
+                                    && let Some(cache) = &web.cache
+                                {
+                                    for (idx, cache_ref) in cache.cache_refs.iter().enumerate() {
+                                        info!(
+                                            "RPC_NODE_SERVER_CACHE_REF_DUMP server_id={} names={:?} rule_index={} rule={}",
+                                            server.numeric_id(),
+                                            crate::rpc::utils::server_runtime_names(server),
+                                            idx + 1,
+                                            serde_json::to_string(cache_ref).unwrap_or_default()
+                                        );
+                                    }
+                                    if let Some(policy) = &cache.cache_policy {
+                                        for (idx, cache_ref) in policy.cache_refs.iter().enumerate()
+                                        {
+                                            info!(
+                                                "RPC_NODE_SERVER_POLICY_CACHE_REF_DUMP server_id={} policy_id={} policy_name={} names={:?} rule_index={} rule={}",
+                                                server.numeric_id(),
+                                                policy.id,
+                                                policy.name,
+                                                crate::rpc::utils::server_runtime_names(server),
+                                                idx + 1,
+                                                serde_json::to_string(cache_ref)
+                                                    .unwrap_or_default()
+                                            );
+                                        }
+                                    }
+                                }
                             }
 
                             let mut loaded_domain_names = std::collections::BTreeSet::new();
@@ -1274,22 +1312,39 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
 
     loop {
         interval.tick().await;
+        if !crate::cluster::leader::require_leader("metrics_reporter") {
+            continue;
+        }
         let node_id = config_store.get_node_id().await;
         if node_id == 0 {
             continue;
         }
 
         sys.refresh_all(); // Refresh everything
-        let (traffic_out, traffic_in, connections) = crate::metrics::METRICS.get_node_totals();
+        let (mut traffic_out, mut traffic_in, mut connections) =
+            crate::metrics::METRICS.get_node_totals();
         let rpc_snap = crate::metrics::METRICS.rpc.snapshot();
-        let api_success_percent = if rpc_snap.total_requests > 0 {
-            (rpc_snap.total_requests - rpc_snap.total_errors) as f64
-                / rpc_snap.total_requests as f64
+        let mut rpc_total_requests = rpc_snap.total_requests;
+        let mut rpc_total_errors = rpc_snap.total_errors;
+        let mut rpc_total_cost_ms = rpc_snap.total_cost_ms;
+        if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
+            let aggregated = crate::cluster::stats::aggregate();
+            if aggregated.replica_count > 0 {
+                traffic_out = aggregated.traffic_out;
+                traffic_in = aggregated.traffic_in;
+                connections = aggregated.active_connections;
+                rpc_total_requests = aggregated.rpc_total_requests;
+                rpc_total_errors = aggregated.rpc_total_errors;
+                rpc_total_cost_ms = aggregated.rpc_total_cost_ms;
+            }
+        }
+        let api_success_percent = if rpc_total_requests > 0 {
+            (rpc_total_requests - rpc_total_errors) as f64 / rpc_total_requests as f64
         } else {
             1.0
         };
-        let api_avg_cost = if rpc_snap.total_requests > 0 {
-            rpc_snap.total_cost_ms as f64 / rpc_snap.total_requests as f64
+        let api_avg_cost = if rpc_total_requests > 0 {
+            rpc_total_cost_ms as f64 / rpc_total_requests as f64
         } else {
             0.0
         };
@@ -1335,7 +1390,15 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             }
         }
 
-        let cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
+        let mut cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
+        if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
+            let aggregated = crate::cluster::stats::aggregate();
+            if aggregated.replica_count > 0 {
+                cpu_usage = aggregated.cpu_usage_avg;
+                total_memory = aggregated.memory_total;
+                used_memory = aggregated.memory_used;
+            }
+        }
         let mem_usage = if total_memory > 0 {
             used_memory as f64 / total_memory as f64
         } else {
@@ -1439,21 +1502,45 @@ pub async fn report_node_online_once(
 
     let mut sys = sysinfo::System::new_all();
     sys.refresh_all();
-    let (traffic_out, traffic_in, connections) = crate::metrics::METRICS.get_node_totals();
+    let (mut traffic_out, mut traffic_in, mut connections) =
+        crate::metrics::METRICS.get_node_totals();
     let rpc_snap = crate::metrics::METRICS.rpc.snapshot();
-    let api_success_percent = if rpc_snap.total_requests > 0 {
-        (rpc_snap.total_requests - rpc_snap.total_errors) as f64 / rpc_snap.total_requests as f64
+    let mut rpc_total_requests = rpc_snap.total_requests;
+    let mut rpc_total_errors = rpc_snap.total_errors;
+    let mut rpc_total_cost_ms = rpc_snap.total_cost_ms;
+    if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
+        let aggregated = crate::cluster::stats::aggregate();
+        if aggregated.replica_count > 0 {
+            traffic_out = aggregated.traffic_out;
+            traffic_in = aggregated.traffic_in;
+            connections = aggregated.active_connections;
+            rpc_total_requests = aggregated.rpc_total_requests;
+            rpc_total_errors = aggregated.rpc_total_errors;
+            rpc_total_cost_ms = aggregated.rpc_total_cost_ms;
+        }
+    }
+    let api_success_percent = if rpc_total_requests > 0 {
+        (rpc_total_requests - rpc_total_errors) as f64 / rpc_total_requests as f64
     } else {
         1.0
     };
-    let api_avg_cost = if rpc_snap.total_requests > 0 {
-        rpc_snap.total_cost_ms as f64 / rpc_snap.total_requests as f64
+    let api_avg_cost = if rpc_total_requests > 0 {
+        rpc_total_cost_ms as f64 / rpc_total_requests as f64
     } else {
         0.0
     };
     let load = sysinfo::System::load_average();
-    let total_memory = sys.total_memory() as i64;
-    let used_memory = sys.used_memory() as i64;
+    let mut total_memory = sys.total_memory() as i64;
+    let mut used_memory = sys.used_memory() as i64;
+    let mut cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
+    if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
+        let aggregated = crate::cluster::stats::aggregate();
+        if aggregated.replica_count > 0 {
+            cpu_usage = aggregated.cpu_usage_avg;
+            total_memory = aggregated.memory_total;
+            used_memory = aggregated.memory_used;
+        }
+    }
     let memory_usage = if total_memory > 0 {
         used_memory as f64 / total_memory as f64
     } else {
@@ -1475,7 +1562,7 @@ pub async fn report_node_online_once(
         "arch": std::env::consts::ARCH,
         "hostname": hostname,
         "hostIP": host_ip,
-        "cpuUsage": sys.global_cpu_usage() as f64 / 100.0,
+        "cpuUsage": cpu_usage,
         "cpuLogicalCount": sys.cpus().len(),
         "cpuPhysicalCount": sys.physical_core_count().unwrap_or(sys.cpus().len()),
         "memoryUsage": memory_usage,
@@ -1556,6 +1643,9 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
 
     loop {
         interval.tick().await;
+        if !crate::cluster::leader::require_leader("node_value_reporter") {
+            continue;
+        }
         let node_id = config_store.get_node_id().await;
         if node_id == 0 {
             continue;
@@ -1564,7 +1654,8 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         sys.refresh_all();
         // ... (rest of the logic)
 
-        let (traffic_out, traffic_in, connections) = crate::metrics::METRICS.get_node_totals();
+        let (mut traffic_out, mut traffic_in, mut connections) =
+            crate::metrics::METRICS.get_node_totals();
         let load = sysinfo::System::load_average();
 
         #[allow(unused_mut)]
@@ -1630,9 +1721,23 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
             0.0
         };
 
+        let mut cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
         let snapshots = crate::metrics::METRICS.take_snapshots();
-        let requests: u64 = snapshots.iter().map(|s| s.1.total_requests).sum();
-        let attack_requests: u64 = snapshots.iter().map(|s| s.1.count_attack_requests).sum();
+        let mut requests: u64 = snapshots.iter().map(|s| s.1.total_requests).sum();
+        let mut attack_requests: u64 = snapshots.iter().map(|s| s.1.count_attack_requests).sum();
+        if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
+            let aggregated = crate::cluster::stats::aggregate();
+            if aggregated.replica_count > 0 {
+                traffic_out = aggregated.traffic_out;
+                traffic_in = aggregated.traffic_in;
+                connections = aggregated.active_connections;
+                requests = aggregated.app_total_requests;
+                attack_requests = aggregated.app_attack_requests;
+                cpu_usage = aggregated.cpu_usage_avg;
+                total_memory = aggregated.memory_total;
+                used_memory = aggregated.memory_used;
+            }
+        }
         let elapsed = last_tick.elapsed().as_secs().max(1);
         let traffic_in_delta = traffic_in.saturating_sub(last_traffic_in);
         let traffic_out_delta = traffic_out.saturating_sub(last_traffic_out);
@@ -1650,7 +1755,7 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         value_map.insert(
             "cpu".to_string(),
             serde_json::json!({
-                "usage": sys.global_cpu_usage() / 100.0,
+                "usage": cpu_usage,
                 "cores": sys.cpus().len(),
                 "logicalCount": sys.cpus().len(),
                 "physicalCount": sys.physical_core_count().unwrap_or(sys.cpus().len())

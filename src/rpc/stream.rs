@@ -60,6 +60,10 @@ struct CheckLocalFirewallMessage {
 pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigStore>) {
     let mut last_endpoints = api_config.effective_rpc_endpoints();
     loop {
+        if !crate::cluster::leader::require_leader("node_stream") {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
         let stream_result = if last_endpoints
             .first()
             .is_some_and(|endpoint| endpoint.starts_with("http://"))
@@ -734,19 +738,18 @@ async fn handle_message(
             tokio::spawn(async move {
                 let all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
                 let mut count = 0;
-                let inner = crate::cache_manager::CACHE.storage.l2.inner.load();
-                let root = &inner.main_root;
+                let roots = crate::cache_manager::CACHE
+                    .storage
+                    .l2
+                    .inner
+                    .load()
+                    .all_roots();
 
                 for (hash, _) in all_meta {
-                    let file_path = root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
-                    if file_path.exists() {
-                        let _ = std::fs::remove_file(&file_path);
-                    }
-                    // Also check extra_roots
-                    for extra in &inner.extra_roots {
-                        let extra_path = extra.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
-                        if extra_path.exists() {
-                            let _ = std::fs::remove_file(&extra_path);
+                    for root in &roots {
+                        let file_path = root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
+                        if file_path.exists() {
+                            let _ = std::fs::remove_file(&file_path);
                         }
                     }
                     crate::metrics::storage::STORAGE.delete_cache_meta(&hash);

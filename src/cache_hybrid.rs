@@ -19,6 +19,8 @@ use arc_swap::ArcSwap;
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 
+static CLUSTER_STORAGE_POLICY_SKIP_LOGGED: AtomicBool = AtomicBool::new(false);
+
 static CACHED_DISK_AVAILABLE: AtomicU64 = AtomicU64::new(u64::MAX);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CACHED_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
@@ -45,8 +47,25 @@ pub struct FileStorage {
 }
 
 pub struct FileStorageInner {
-    pub main_root: PathBuf,
-    pub extra_roots: Vec<PathBuf>,
+    layout: FileStorageLayout,
+}
+
+pub enum FileStorageLayout {
+    Single {
+        main_root: PathBuf,
+        extra_roots: Vec<PathBuf>,
+    },
+    Sharded {
+        shards: Vec<CacheShard>,
+        fallback_roots: Vec<PathBuf>,
+    },
+}
+
+#[derive(Clone)]
+pub struct CacheShard {
+    pub id: String,
+    pub root: PathBuf,
+    pub weight: u32,
 }
 
 impl FileStorage {
@@ -54,10 +73,7 @@ impl FileStorage {
         let main_root = root.into();
         let _ = std::fs::create_dir_all(&main_root);
         Self {
-            inner: ArcSwap::from_pointee(FileStorageInner {
-                main_root,
-                extra_roots: Vec::new(),
-            }),
+            inner: ArcSwap::from_pointee(FileStorageInner::single(main_root, Vec::new())),
             enable_sendfile: AtomicBool::new(true),
             enable_file_cache: AtomicBool::new(true),
         }
@@ -71,10 +87,30 @@ impl FileStorage {
         file_cache: bool,
     ) {
         let _ = std::fs::create_dir_all(&main);
-        self.inner.store(Arc::new(FileStorageInner {
-            main_root: main,
-            extra_roots: extras,
-        }));
+        for extra in &extras {
+            let _ = std::fs::create_dir_all(extra);
+        }
+        self.inner
+            .store(Arc::new(FileStorageInner::single(main, extras)));
+        self.enable_sendfile.store(sendfile, Ordering::Relaxed);
+        self.enable_file_cache.store(file_cache, Ordering::Relaxed);
+    }
+
+    pub fn update_shards(
+        &self,
+        shards: Vec<CacheShard>,
+        fallback_roots: Vec<PathBuf>,
+        sendfile: bool,
+        file_cache: bool,
+    ) {
+        for shard in &shards {
+            let _ = std::fs::create_dir_all(&shard.root);
+        }
+        for root in &fallback_roots {
+            let _ = std::fs::create_dir_all(root);
+        }
+        self.inner
+            .store(Arc::new(FileStorageInner::sharded(shards, fallback_roots)));
         self.enable_sendfile.store(sendfile, Ordering::Relaxed);
         self.enable_file_cache.store(file_cache, Ordering::Relaxed);
     }
@@ -89,21 +125,146 @@ impl FileStorage {
         self.get_path_by_hash(&hash)
     }
 
-    fn get_path_by_hash(&self, hash: &str) -> PathBuf {
-        let lock = self.inner.load();
-        lock.main_root.join(cache_relative_path(hash))
+    fn get_write_location(&self, key: &CacheKey) -> (PathBuf, Option<String>, String) {
+        let hash = self.get_hash(key);
+        let inner = self.inner.load();
+        inner.write_location(&hash)
     }
 
-    async fn find_existing_path_by_hash(&self, hash: &str) -> PathBuf {
-        let lock = self.inner.load();
-        let relative = cache_relative_path(hash);
-        for root in &lock.extra_roots {
-            let path = root.join(&relative);
+    fn get_path_by_hash(&self, hash: &str) -> PathBuf {
+        let inner = self.inner.load();
+        inner.write_path(hash)
+    }
+
+    async fn find_existing_path_by_hash(&self, hash: &str) -> Option<PathBuf> {
+        let paths = {
+            let inner = self.inner.load();
+            inner.read_paths(hash)
+        };
+        for path in paths {
             if tokio::fs::metadata(&path).await.is_ok() {
-                return path;
+                return Some(path);
             }
         }
-        lock.main_root.join(&relative)
+        None
+    }
+}
+
+impl FileStorageInner {
+    fn single(main_root: PathBuf, extra_roots: Vec<PathBuf>) -> Self {
+        Self {
+            layout: FileStorageLayout::Single {
+                main_root,
+                extra_roots,
+            },
+        }
+    }
+
+    fn sharded(shards: Vec<CacheShard>, fallback_roots: Vec<PathBuf>) -> Self {
+        Self {
+            layout: FileStorageLayout::Sharded {
+                shards,
+                fallback_roots,
+            },
+        }
+    }
+
+    fn write_path(&self, hash: &str) -> PathBuf {
+        self.write_location(hash).0
+    }
+
+    fn write_location(&self, hash: &str) -> (PathBuf, Option<String>, String) {
+        let relative = cache_relative_path(hash);
+        let relative_str = relative.to_string_lossy().to_string();
+        match &self.layout {
+            FileStorageLayout::Single { main_root, .. } => {
+                (main_root.join(relative), None, relative_str)
+            }
+            FileStorageLayout::Sharded { .. } => self
+                .selected_shard(hash)
+                .map(|shard| {
+                    (
+                        shard.root.join(&relative),
+                        Some(shard.id.clone()),
+                        relative_str.clone(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        crate::paths::NodePaths::current()
+                            .cache_dir()
+                            .join(relative),
+                        None,
+                        relative_str,
+                    )
+                }),
+        }
+    }
+
+    fn read_paths(&self, hash: &str) -> Vec<PathBuf> {
+        let relative = cache_relative_path(hash);
+        match &self.layout {
+            FileStorageLayout::Single {
+                main_root,
+                extra_roots,
+            } => extra_roots
+                .iter()
+                .chain(std::iter::once(main_root))
+                .map(|root| root.join(&relative))
+                .collect(),
+            FileStorageLayout::Sharded {
+                shards,
+                fallback_roots,
+            } => {
+                let mut roots = Vec::with_capacity(shards.len() + fallback_roots.len());
+                if let Some(selected) = self.selected_shard(hash) {
+                    roots.push(selected.root.clone());
+                }
+                for shard in shards {
+                    if !roots.iter().any(|root| root == &shard.root) {
+                        roots.push(shard.root.clone());
+                    }
+                }
+                roots.extend(fallback_roots.iter().cloned());
+                roots.into_iter().map(|root| root.join(&relative)).collect()
+            }
+        }
+    }
+
+    fn selected_shard(&self, hash: &str) -> Option<&CacheShard> {
+        let FileStorageLayout::Sharded { shards, .. } = &self.layout else {
+            return None;
+        };
+        if shards.is_empty() {
+            return None;
+        }
+        let prefix = hash.get(..16).unwrap_or(hash);
+        let value = u64::from_str_radix(prefix, 16).unwrap_or_else(|_| {
+            let bytes = md5_legacy::compute(hash.as_bytes());
+            u64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])
+        });
+        shards.get((value as usize) % shards.len())
+    }
+
+    pub fn all_roots(&self) -> Vec<PathBuf> {
+        match &self.layout {
+            FileStorageLayout::Single {
+                main_root,
+                extra_roots,
+            } => std::iter::once(main_root.clone())
+                .chain(extra_roots.iter().cloned())
+                .collect(),
+            FileStorageLayout::Sharded {
+                shards,
+                fallback_roots,
+            } => shards
+                .iter()
+                .map(|shard| shard.root.clone())
+                .chain(fallback_roots.iter().cloned())
+                .collect(),
+        }
     }
 }
 
@@ -111,10 +272,33 @@ fn cache_relative_path(hash: &str) -> PathBuf {
     Path::new(&hash[0..2]).join(&hash[2..4]).join(hash)
 }
 
+fn parse_runtime_size_bytes(value: &str) -> anyhow::Result<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+
+    let split_at = trimmed
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split_at);
+    let count = number
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("invalid size value: {value}"))?;
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1_f64,
+        "k" | "kb" | "ki" | "kib" => 1024_f64,
+        "m" | "mb" | "mi" | "mib" => 1024_f64.powi(2),
+        "g" | "gb" | "gi" | "gib" => 1024_f64.powi(3),
+        "t" | "tb" | "ti" | "tib" => 1024_f64.powi(4),
+        other => anyhow::bail!("unsupported size unit in {value}: {other}"),
+    };
+    Ok((count * multiplier) as u64)
+}
+
 async fn remove_cache_file_from_roots(inner: &FileStorageInner, hash: &str) {
     let relative = cache_relative_path(hash);
-    let _ = fs::remove_file(inner.main_root.join(&relative)).await;
-    for root in &inner.extra_roots {
+    for root in inner.all_roots() {
         let _ = fs::remove_file(root.join(&relative)).await;
     }
 }
@@ -141,7 +325,11 @@ impl Storage for FileStorage {
             let _ = header.insert_header(name.to_string(), val.as_str());
         }
 
-        let path = self.find_existing_path_by_hash(&hash).await;
+        let Some(path) = self.find_existing_path_by_hash(&hash).await else {
+            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+            fast_l1_remove(&fast_hash_key(&meta.cache_key));
+            return Ok(None);
+        };
 
         let cache_meta = CacheMeta::new(
             std::time::SystemTime::now() + std::time::Duration::from_secs(ttl),
@@ -155,9 +343,15 @@ impl Storage for FileStorage {
 
         if !meta.compressed {
             if meta.size <= MEMORY_SERVE_MAX {
-                let file_data = tokio::fs::read(&path)
-                    .await
-                    .map_err(|_| Error::new(ErrorType::InternalError))?;
+                let file_data = match tokio::fs::read(&path).await {
+                    Ok(data) => data,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                        fast_l1_remove(&fast_hash_key(&meta.cache_key));
+                        return Ok(None);
+                    }
+                    Err(_) => return Err(Error::new(ErrorType::InternalError)),
+                };
                 PROF_DISK_READ_US
                     .fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
                 crate::metrics::storage::record_cache_access_memory(&hash);
@@ -170,9 +364,15 @@ impl Storage for FileStorage {
                 )));
             }
 
-            let file = tokio::fs::File::open(&path)
-                .await
-                .map_err(|_| Error::new(ErrorType::InternalError))?;
+            let file = match tokio::fs::File::open(&path).await {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                    fast_l1_remove(&fast_hash_key(&meta.cache_key));
+                    return Ok(None);
+                }
+                Err(_) => return Err(Error::new(ErrorType::InternalError)),
+            };
             PROF_DISK_READ_US.fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
             crate::metrics::storage::record_cache_access_memory(&hash);
             return Ok(Some((
@@ -185,9 +385,15 @@ impl Storage for FileStorage {
         }
 
         if meta.size > 0 && meta.size <= DISK_HIT_CHUNK_BYTES as u64 {
-            let file_data = tokio::fs::read(&path)
-                .await
-                .map_err(|_| Error::new(ErrorType::InternalError))?;
+            let file_data = match tokio::fs::read(&path).await {
+                Ok(data) => data,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                    fast_l1_remove(&fast_hash_key(&meta.cache_key));
+                    return Ok(None);
+                }
+                Err(_) => return Err(Error::new(ErrorType::InternalError)),
+            };
             PROF_DISK_READ_US.fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
             crate::metrics::storage::record_cache_access_memory(&hash);
             let capacity = meta.size.min(MEMORY_SERVE_MAX) as usize;
@@ -207,9 +413,15 @@ impl Storage for FileStorage {
             )));
         }
 
-        let file = tokio::fs::File::open(&path)
-            .await
-            .map_err(|_| Error::new(ErrorType::InternalError))?;
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                fast_l1_remove(&fast_hash_key(&meta.cache_key));
+                return Ok(None);
+            }
+            Err(_) => return Err(Error::new(ErrorType::InternalError)),
+        };
         PROF_DISK_READ_US.fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         crate::metrics::storage::record_cache_access_memory(&hash);
         let decoder = async_compression::tokio::bufread::ZstdDecoder::new(BufReader::new(file));
@@ -228,7 +440,7 @@ impl Storage for FileStorage {
         meta: &CacheMeta,
         _trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<MissHandler> {
-        let path = self.get_path(key);
+        let (path, shard_id, relative_path) = self.get_write_location(key);
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -308,15 +520,25 @@ impl Storage for FileStorage {
                 .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
                 .collect(),
             compressed: should_compress,
+            shard_id,
+            relative_path,
         }))
     }
 
     async fn purge(
         &'static self,
-        _key: &CompactCacheKey,
+        key: &CompactCacheKey,
         _purge_type: PurgeType,
         _trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<bool> {
+        if key.user_tag.is_empty() {
+            return Ok(false);
+        }
+
+        let hash = format!("{:x}", md5_legacy::compute(key.user_tag.as_ref()));
+        let inner = self.inner.load();
+        remove_cache_file_from_roots(&inner, &hash).await;
+        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
         Ok(true)
     }
 
@@ -496,6 +718,8 @@ struct FileMissHandler {
     status: u16,
     headers: Vec<(String, String)>,
     compressed: bool,
+    shard_id: Option<String>,
+    relative_path: String,
 }
 
 #[async_trait]
@@ -561,15 +785,36 @@ impl HandleMiss for FileMissHandler {
             let _ = tokio::fs::remove_file(&self.temp_path).await;
         }
 
-        crate::metrics::storage::STORAGE.update_cache_meta(
-            &self.hash,
-            &self.key_str,
-            written as u64,
-            self.ttl,
-            &self.headers,
-            self.compressed,
-            self.status,
+        let now = crate::utils::time::now_timestamp();
+        let expires = now + self.ttl as i64;
+        crate::metrics::storage::STORAGE.upsert_cache_meta_absolute(
+            crate::metrics::storage::CacheMetaUpsert {
+                hash: &self.hash,
+                cache_key: &self.key_str,
+                size: written as u64,
+                expires,
+                access_time: now,
+                access_count: 1,
+                status: self.status,
+                headers: &self.headers,
+                compressed: self.compressed,
+                shard_id: self.shard_id.as_deref(),
+                relative_path: Some(&self.relative_path),
+                event_version: None,
+                updated_at: Some(now),
+            },
         );
+        crate::cluster::metadata::emit_upsert(crate::cluster::metadata::CacheMetaUpsertEvent {
+            hash: &self.hash,
+            cache_key: &self.key_str,
+            shard_id: self.shard_id.as_deref(),
+            relative_path: Some(&self.relative_path),
+            size: written as u64,
+            expires,
+            status: self.status,
+            headers: &self.headers,
+            compressed: self.compressed,
+        });
 
         Ok(MissFinishType::Created(written))
     }
@@ -797,7 +1042,58 @@ impl HybridStorage {
             .is_some_and(|entry| entry.generation == generation)
     }
 
+    pub fn apply_cluster_cache_config(
+        &self,
+        config: &crate::runtime_mode::ClusterCacheConfig,
+    ) -> anyhow::Result<()> {
+        if !config.shared_max_bytes.trim().is_empty() {
+            let bytes = parse_runtime_size_bytes(&config.shared_max_bytes)?;
+            if bytes > 0 {
+                self.max_disk_bytes.store(bytes, Ordering::Relaxed);
+            }
+        }
+
+        if !config.min_free_bytes.trim().is_empty() {
+            let bytes = parse_runtime_size_bytes(&config.min_free_bytes)?;
+            self.min_free_bytes.store(bytes, Ordering::Relaxed);
+        }
+
+        FAST_L1_MAX_BYTES.store(config.max_fast_l1_bytes, Ordering::Relaxed);
+        self.max_fast_l1_bytes
+            .store(config.max_fast_l1_bytes, Ordering::Relaxed);
+
+        let shards = config
+            .shards
+            .iter()
+            .map(|shard| CacheShard {
+                id: shard.id.clone(),
+                root: shard.path.clone(),
+                weight: shard.weight,
+            })
+            .collect();
+        self.l2.update_shards(shards, Vec::new(), true, false);
+
+        info!(
+            "RPC_CACHE: Applied local RKE2 cache config: shards={}, sharedMaxBytes={}, minFreeBytes={}, maxFastL1Bytes={}",
+            config.shards.len(),
+            config.shared_max_bytes,
+            config.min_free_bytes,
+            config.max_fast_l1_bytes
+        );
+        Ok(())
+    }
+
     pub async fn apply_policy(&self, policy: &crate::config_models::HTTPCachePolicy) {
+        if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
+            self.policy_type.store(POLICY_FILE, Ordering::Relaxed);
+            if !CLUSTER_STORAGE_POLICY_SKIP_LOGGED.swap(true, Ordering::Relaxed) {
+                info!(
+                    "RPC_CACHE: RKE2 runtime mode ignores control-plane cache storage path/capacity settings; local runtime cache config is authoritative."
+                );
+            }
+            return;
+        }
+
         let val = if policy.r#type == "memory" {
             POLICY_MEMORY
         } else {
@@ -902,45 +1198,67 @@ impl HybridStorage {
         }
     }
 
-    pub async fn purge_by_key(&self, key: &str) -> bool {
+    fn cache_key_variants(key: &str) -> Vec<String> {
+        let mut variants = Vec::with_capacity(6);
+        variants.push(key.to_string());
+
+        let suffixes = ["@br", "@gzip", "@webp", "@webp@br", "@webp@gzip"];
+        if !suffixes.iter().any(|suffix| key.ends_with(suffix)) {
+            variants.extend(suffixes.iter().map(|suffix| format!("{key}{suffix}")));
+        }
+
+        variants
+    }
+
+    async fn purge_exact_stored_key(&'static self, key: &str) -> bool {
         let hash = format!("{:x}", md5_legacy::compute(key));
         let inner = self.l2.inner.load();
         remove_cache_file_from_roots(&inner, &hash).await;
         crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-
-        // Clear from lock-free L1 cache
         fast_l1_remove(&fast_hash_key(key));
 
-        let full_key = CacheKey::new("edge", key, "");
+        let full_key = CacheKey::new("", key, key);
         let ck = full_key.to_compact();
-        // Use Global CACHE to bypass E0597
-        tokio::spawn(async move {
-            let trace = pingora_cache::trace::Span::inactive().handle();
-            let _ = crate::cache_manager::CACHE
-                .storage
-                .l1
-                .purge(&ck, PurgeType::Invalidation, &trace)
-                .await;
-        });
+        let trace = pingora_cache::trace::Span::inactive().handle();
+        let _ = self.l1.purge(&ck, PurgeType::Invalidation, &trace).await;
         true
     }
 
-    pub async fn purge_by_prefix(&self, prefix: &str) -> bool {
+    pub async fn purge_by_key(&'static self, key: &str) -> bool {
+        let mut variants = Self::cache_key_variants(key);
+        let variant_prefix = format!("{}@", key);
+        crate::metrics::storage::STORAGE.for_each_cache_meta(|_, meta| {
+            if meta.cache_key == key || meta.cache_key.starts_with(&variant_prefix) {
+                variants.push(meta.cache_key.clone());
+            }
+        });
+        variants.sort_unstable();
+        variants.dedup();
+
+        let deleted_count = variants.len();
+        for variant in variants {
+            self.purge_exact_stored_key(&variant).await;
+        }
+        info!(
+            "RPC_CACHE: Purged {} variants for key: {}",
+            deleted_count, key
+        );
+        true
+    }
+
+    pub async fn purge_by_prefix(&'static self, prefix: &str) -> bool {
         let clean_prefix = prefix.trim_end_matches('*');
-        let inner = self.l2.inner.load();
-        let mut deleted_count = 0;
         let mut to_delete = Vec::new();
 
-        crate::metrics::storage::STORAGE.for_each_cache_meta(|hash, meta| {
+        crate::metrics::storage::STORAGE.for_each_cache_meta(|_, meta| {
             if !meta.cache_key.is_empty() && meta.cache_key.starts_with(clean_prefix) {
-                to_delete.push(hash);
+                to_delete.push(meta.cache_key.clone());
             }
         });
 
-        for hash in to_delete {
-            remove_cache_file_from_roots(&inner, &hash).await;
-            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-            deleted_count += 1;
+        let deleted_count = to_delete.len();
+        for key in to_delete {
+            self.purge_exact_stored_key(&key).await;
         }
         info!(
             "RPC_CACHE: Purged {} items matching prefix: {}",
@@ -1079,11 +1397,18 @@ impl Storage for HybridStorage {
 
     async fn purge(
         &'static self,
-        _key: &CompactCacheKey,
-        _purge_type: PurgeType,
-        _trace: &pingora_cache::trace::SpanHandle,
+        key: &CompactCacheKey,
+        purge_type: PurgeType,
+        trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<bool> {
-        Ok(true)
+        if key.user_tag.is_empty() {
+            return Ok(false);
+        }
+
+        fast_l1_remove(&fast_hash_key(key.user_tag.as_ref()));
+        let l1_ok = self.l1.purge(key, purge_type, trace).await?;
+        let l2_ok = self.l2.purge(key, purge_type, trace).await?;
+        Ok(l1_ok || l2_ok)
     }
 
     async fn update_meta(
@@ -1430,6 +1755,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 compressed: false,
+                ..Default::default()
             },
         );
 
@@ -1479,6 +1805,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 compressed: true,
+                ..Default::default()
             },
         );
 

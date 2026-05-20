@@ -1129,7 +1129,7 @@ impl ConfigStore {
             lock.global_access_log
                 .as_ref()
                 .map(|cfg| cfg.is_on)
-                .unwrap_or(true),
+                .unwrap_or(false),
         );
         Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);

@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloud-node-runtime
+  namespace: cloud-node
+data:
+  runtime.yaml: |
+    runtime:
+      mode: rke2
+    cluster:
+      enabled: true
+      type: rke2
+      name: edge-rke2-01
+      namespace: cloud-node
+      serviceName: cloud-node-internal
+      podNameEnv: POD_NAME
+      podIpEnv: POD_IP
+      internalApi:
+        bind: 0.0.0.0:19090
+        tokenEnv: CLOUD_NODE_CLUSTER_INTERNAL_TOKEN
+      leaderElection:
+        leaseName: cloud-node-leader
+        leaseDurationSeconds: 15
+        renewDeadlineSeconds: 10
+        retryPeriodSeconds: 2
+      cache:
+        localMetaDir: /var/lib/cloud-node/cache-meta
+        maxFastL1Bytes: 0
+        sharedMaxBytes: 15TiB
+        minFreeBytes: 500GiB
+        ignoreControlPlaneStorageOptions: true
+        shardStrategy: hash_mod
+        shards:
+          - id: shard-00
+            path: /cache-shards/shard-00
+            weight: 1
+            replicas: 2
+          - id: shard-01
+            path: /cache-shards/shard-01
+            weight: 1
+            replicas: 2
