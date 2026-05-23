@@ -237,6 +237,46 @@ fn stop_running_instance(instance: RunningInstance) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn is_systemd_invocation() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+        || std::env::var_os("SYSTEMD_EXEC_PID").is_some()
+        || std::env::var_os("JOURNAL_STREAM").is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_service_is_active() -> bool {
+    Command::new("systemctl")
+        .arg("is-active")
+        .arg("--quiet")
+        .arg("cloud-node.service")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn run_systemctl(action: &str) -> anyhow::Result<bool> {
+    if is_systemd_invocation() || !systemd_service_is_active() {
+        return Ok(false);
+    }
+
+    println!("CloudNode is managed by systemd, running: systemctl {action} cloud-node.service");
+    let status = Command::new("systemctl")
+        .arg(action)
+        .arg("cloud-node.service")
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("systemctl {action} cloud-node.service failed with {status}");
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_systemctl(_action: &str) -> anyhow::Result<bool> {
+    Ok(false)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -307,10 +347,12 @@ fn main() -> anyhow::Result<()> {
             run_node(cli.monitor_port, cli.monitor_clear)?;
         }
         Some(Commands::Stop) => {
-            if let Some(instance) = check_running() {
-                stop_running_instance(instance)?;
-            } else {
-                println!("CloudNode is not running.");
+            if !run_systemctl("stop")? {
+                if let Some(instance) = check_running() {
+                    stop_running_instance(instance)?;
+                } else {
+                    println!("CloudNode is not running.");
+                }
             }
         }
         Some(Commands::Status) => {
@@ -323,12 +365,14 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Restart) => {
-            if let Some(instance) = check_running() {
-                stop_running_instance(instance)?;
+            if !run_systemctl("restart")? {
+                if let Some(instance) = check_running() {
+                    stop_running_instance(instance)?;
+                }
+                Command::new(std::env::current_exe()?)
+                    .arg("start")
+                    .status()?;
             }
-            Command::new(std::env::current_exe()?)
-                .arg("start")
-                .status()?;
         }
         Some(Commands::Install) => {
             #[cfg(target_os = "linux")]
@@ -374,7 +418,7 @@ fn main() -> anyhow::Result<()> {
                      ExecStop={} stop\n\
                      TimeoutStopSec=35\n\
                      KillMode=process\n\
-                     Restart=always\n\
+                     Restart=on-failure\n\
                      RestartSec=10\n\
                      LimitNOFILE=1048576\n\n\
                      [Install]\n\
