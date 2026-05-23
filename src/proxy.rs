@@ -5024,6 +5024,7 @@ impl ProxyHttp for EdgeProxy {
         ctx.host = host.clone();
         ctx.is_tls_downstream = self.tls_downstream;
         ctx.is_http3_downstream = session.req_header().version == http::Version::HTTP_3;
+        normalize_upstream_cookie_headers(session.req_header_mut());
 
         // Single lock acquisition for hot_path + server + upstream
         let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
@@ -7236,6 +7237,8 @@ impl ProxyHttp for EdgeProxy {
         upstream_request
             .insert_header("X-Forwarded-For", forwarded_for)
             .unwrap();
+
+        normalize_upstream_cookie_headers(upstream_request);
 
         Ok(())
     }
