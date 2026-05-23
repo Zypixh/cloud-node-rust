@@ -1957,11 +1957,11 @@ impl EdgeProxy {
             return None;
         }
         let server = server?;
+        if !server.http3_enabled() {
+            return None;
+        }
         if policy.port > 0 {
             let port = u16::try_from(policy.port).ok()?;
-            if !server.https.as_ref().is_some_and(|https| https.is_on) {
-                return None;
-            }
             let ua = session
                 .get_header("user-agent")
                 .and_then(|value| value.to_str().ok())
@@ -1970,9 +1970,6 @@ impl EdgeProxy {
                 return None;
             }
             return Some(port);
-        }
-        if !server.http3_enabled() {
-            return None;
         }
 
         let ua = session
