@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use image::AnimationDecoder;
+use http::header::{COOKIE, HeaderValue};
 use pingora_core::protocols::tls::CustomALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
@@ -33,6 +34,28 @@ use std::sync::atomic::{AtomicI32, Ordering};
 pub struct LazyBytes(Option<Vec<u8>>);
 
 static EMPTY_BYTES_VEC: LazyLock<Vec<u8>> = LazyLock::new(Vec::new);
+
+fn normalize_upstream_cookie_headers(upstream_request: &mut pingora_http::RequestHeader) {
+    let values = upstream_request
+        .headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    if values.len() <= 1 {
+        return;
+    }
+
+    let merged = values.join("; ");
+    upstream_request.remove_header(&COOKIE);
+    if let Ok(value) = HeaderValue::from_str(&merged) {
+        let _ = upstream_request.insert_header(COOKIE, value);
+    }
+}
 
 impl LazyBytes {
     fn take(&mut self) -> Vec<u8> {
@@ -6975,6 +6998,7 @@ impl ProxyHttp for EdgeProxy {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         let global_cfg = ctx.global_http_config.as_ref().unwrap();
+        normalize_upstream_cookie_headers(upstream_request);
 
         if let Some(oss_backend) = &ctx.oss_backend {
             let path = upstream_request.uri.path().to_string();
