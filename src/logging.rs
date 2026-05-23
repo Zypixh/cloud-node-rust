@@ -312,18 +312,17 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
 
     // Parse cookies from request header — gated by enableCookies
     let cookies: std::collections::HashMap<String, String> = if log_cookies {
-        if let Some(cookie_str) = req.headers.get("cookie").and_then(|v| v.to_str().ok()) {
-            cookie_str
-                .split(';')
-                .filter_map(|p| {
-                    let p = p.trim();
-                    p.split_once('=')
-                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-                })
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        }
+        req.headers
+            .get_all("cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|cookie_str| cookie_str.split(';'))
+            .filter_map(|p| {
+                let p = p.trim();
+                p.split_once('=')
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect()
     } else {
         std::collections::HashMap::new()
     };
@@ -352,12 +351,11 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
             if common_req_headers_only && !is_common_request_header(name.as_str()) {
                 continue;
             }
-            req_headers.insert(
-                name.to_string(),
-                pb::Strings {
-                    values: vec![value.to_str().unwrap_or("").to_string()],
-                },
-            );
+            req_headers
+                .entry(name.to_string())
+                .or_default()
+                .values
+                .push(value.to_str().unwrap_or("").to_string());
         }
     }
 
