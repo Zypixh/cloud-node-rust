@@ -54,6 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 - [功能说明](docs/features.md)
 - [配置说明](docs/configuration.md)
 - [部署与运维](docs/operations.md)
+- [RKE2 部署文档](docs/rke2-deployment.md)
 - [gRPC API 使用文档](docs/grpc-api.md)
 
 发布说明：
