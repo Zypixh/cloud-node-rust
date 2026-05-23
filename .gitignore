@@ -1,4 +1,6 @@
 /target
+/api_node.yaml
+/configs/
 /data/
 /runtime/
 cloud-node-rust
