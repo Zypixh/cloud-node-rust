@@ -8,12 +8,6 @@ on:
       - 'v*'
     paths:
       - '.cargo/**'
-      - '.github/workflows/release.yml'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'build.rs'
-      - 'src/**'
-      - 'proto_defs/**'
       - 'pingora-main/**'
       - 'toa-main/**'
       - 'toa-sender/**'
