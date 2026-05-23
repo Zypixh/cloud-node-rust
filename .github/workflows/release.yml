@@ -8,6 +8,12 @@ on:
       - 'v*'
     paths:
       - '.cargo/**'
+      - '.github/workflows/release.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'src/**'
+      - 'proto_defs/**'
       - 'pingora-main/**'
       - 'toa-main/**'
       - 'toa-sender/**'
@@ -154,13 +160,17 @@ jobs:
         shell: bash
         run: |
           mkdir -p .github/release-body
-          if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
-            cp "release-notes/${GITHUB_REF_NAME}.md" .github/release-body/body.md
+          RELEASE_NOTE="release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$RELEASE_NOTE" ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
+            RELEASE_NOTE="release-notes/${GITHUB_REF_NAME#v}.md"
+          fi
+          if [ -f "$RELEASE_NOTE" ]; then
+            cp "$RELEASE_NOTE" .github/release-body/body.md
           else
             {
               echo "# ${GITHUB_REF_NAME}"
               echo
-              echo "未找到对应的发布说明文件：release-notes/${GITHUB_REF_NAME}.md"
+              echo "未找到对应的发布说明文件：release-notes/${GITHUB_REF_NAME}.md 或 release-notes/${GITHUB_REF_NAME#v}.md"
             } > .github/release-body/body.md
           fi
 
