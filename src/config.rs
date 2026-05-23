@@ -8,7 +8,7 @@ use tokio::sync::Notify;
 use crate::config_models::{
     HTTP3Policy, HTTPCCPolicy, HTTPCachePolicy, HTTPFirewallPolicy, HTTPPageConfig,
     HTTPPagesPolicy, MetricItemConfig, ParentNodeConfig, SSLCertConfig, SSLPolicyConfig,
-    ServerConfig, TOAConfig, UAMPolicy, WebPImagePolicy,
+    ServerConfig, TOAConfig, UAMPolicy, WAFBlockOptions, WebPImagePolicy,
 };
 
 /// Configuration for the local EdgeNode.
@@ -87,8 +87,10 @@ pub struct NodeConfig {
     pub cache_policies: Arc<Vec<Arc<HTTPCachePolicy>>>,
     /// Global or node-specific firewall policies
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
+    pub compiled_plans: Arc<crate::compiled::CompiledPlanSet>,
     /// Global WAF action defaults
     pub waf_actions: Arc<Vec<crate::config_models::WAFActionConfig>>,
+    pub global_waf_block_options: Option<Arc<WAFBlockOptions>>,
     /// Global UAM policies keyed by cluster id
     pub uam_policies: HashMap<i64, UAMPolicy>,
     /// Global HTTP CC policies keyed by cluster id
@@ -170,7 +172,9 @@ impl Default for NodeConfig {
             global_http_config: Arc::default(),
             cache_policies: Arc::new(Vec::new()),
             firewall_policies: Arc::new(Vec::new()),
+            compiled_plans: Arc::new(crate::compiled::CompiledPlanSet::default()),
             waf_actions: Arc::new(Vec::new()),
+            global_waf_block_options: None,
             uam_policies: HashMap::new(),
             http_cc_policies: HashMap::new(),
             http3_policies: HashMap::new(),
@@ -217,10 +221,12 @@ pub struct HotPathSnapshot {
     pub is_on: bool,
     pub global_http: Arc<crate::config_models::GlobalHTTPAllConfig>,
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
+    pub compiled_plans: Arc<crate::compiled::CompiledPlanSet>,
     pub grpc_policy: Option<Arc<crate::config_models::GRPCConfig>>,
     pub has_any_sni_passthrough: bool,
     pub cache_policies: Arc<Vec<Arc<HTTPCachePolicy>>>,
     pub global_access_log: Option<Arc<crate::config_models::GlobalHTTPAccessLogConfig>>,
+    pub global_waf_block_options: Option<Arc<WAFBlockOptions>>,
     pub enabled_features: EnabledNodeFeatures,
 }
 
@@ -410,10 +416,12 @@ impl ConfigStore {
             is_on: lock.is_on,
             global_http: Arc::clone(&lock.global_http_config),
             firewall_policies: Arc::clone(&lock.firewall_policies),
+            compiled_plans: Arc::clone(&lock.compiled_plans),
             grpc_policy: lock.grpc_policy.clone(),
             has_any_sni_passthrough: lock.has_any_sni_passthrough,
             cache_policies: lock.cache_policies.clone(),
             global_access_log: lock.global_access_log.clone(),
+            global_waf_block_options: lock.global_waf_block_options.clone(),
             enabled_features: EnabledNodeFeatures {
                 dns_info: lock.dns_info_enabled,
                 cache_info: lock.cache_info_enabled,
@@ -1067,6 +1075,9 @@ impl ConfigStore {
         for server in &all_servers {
             server.compile_url_patterns();
         }
+        for policy in &firewall_policies {
+            policy.compile_url_patterns();
+        }
         let mut lock = self.inner.write();
         lock.id = id;
         lock.version = version;
@@ -1115,8 +1126,21 @@ impl ConfigStore {
         lock.xff_max_addresses = global_http.xff_max_addresses;
         lock.allow_lan_ip = global_http.allow_lan_ip;
         lock.global_http_config = global_http;
+        let compiled_plans = crate::compiled::CompiledPlanSet::compile(
+            &firewall_policies,
+            &cache_policy,
+            &lock.all_servers,
+        );
         lock.cache_policies = Arc::new(cache_policy);
         lock.firewall_policies = Arc::new(firewall_policies);
+        lock.compiled_plans = Arc::new(compiled_plans);
+        lock.global_waf_block_options = waf_actions
+            .iter()
+            .find(|action| action.code == "block")
+            .and_then(|action| {
+                serde_json::from_value::<WAFBlockOptions>(action.options.clone()).ok()
+            })
+            .map(Arc::new);
         lock.waf_actions = Arc::new(waf_actions);
         lock.uam_policies = uam_policies;
         lock.http_cc_policies = http_cc_policies;
@@ -1173,6 +1197,11 @@ impl ConfigStore {
             }
             lock.routes.insert(host, lb);
         }
+        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            lock.firewall_policies.as_ref().as_slice(),
+            lock.cache_policies.as_ref().as_slice(),
+            &lock.all_servers,
+        ));
         Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
@@ -1223,6 +1252,11 @@ impl ConfigStore {
         for (host, lb) in routes {
             lock.routes.insert(host, lb);
         }
+        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            lock.firewall_policies.as_ref().as_slice(),
+            lock.cache_policies.as_ref().as_slice(),
+            &lock.all_servers,
+        ));
         Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
@@ -1251,6 +1285,11 @@ impl ConfigStore {
                 lock.id_to_lb.remove(&server_id);
             }
         }
+        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            lock.firewall_policies.as_ref().as_slice(),
+            lock.cache_policies.as_ref().as_slice(),
+            &lock.all_servers,
+        ));
         Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
@@ -1273,6 +1312,11 @@ impl ConfigStore {
         if server_id > 0 {
             lock.id_to_lb.remove(&server_id);
         }
+        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            lock.firewall_policies.as_ref().as_slice(),
+            lock.cache_policies.as_ref().as_slice(),
+            &lock.all_servers,
+        ));
         Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
@@ -1294,6 +1338,11 @@ impl ConfigStore {
         lock.all_servers.push(server.clone());
         lock.servers.insert(host.clone(), server);
         lock.routes.insert(host, lb);
+        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            lock.firewall_policies.as_ref().as_slice(),
+            lock.cache_policies.as_ref().as_slice(),
+            &lock.all_servers,
+        ));
         Self::refresh_passthrough_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();

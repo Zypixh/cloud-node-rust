@@ -72,6 +72,7 @@ pub struct OriginH3ClientSession {
     request_stream: Option<Arc<Mutex<H3RequestStream>>>,
     response_header: Option<ResponseHeader>,
     response_finished: bool,
+    request_body_finished: bool,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
     digest: Digest,
@@ -145,6 +146,7 @@ async fn connect_h3<P: Peer + Send + Sync + 'static>(
         request_stream: None,
         response_header: None,
         response_finished: false,
+        request_body_finished: false,
         read_timeout: peer.get_peer_options().and_then(|opts| opts.read_timeout),
         write_timeout: peer.get_peer_options().and_then(|opts| opts.write_timeout),
         digest: Digest::default(),
@@ -240,7 +242,7 @@ impl CustomClientSession for OriginH3ClientSession {
     async fn write_request_header(
         &mut self,
         req: Box<RequestHeader>,
-        _end: bool,
+        end: bool,
     ) -> PingoraResult<()> {
         let request = build_h3_request(&req)?;
         let mut send_request = self.send_request.lock().await;
@@ -261,6 +263,10 @@ impl CustomClientSession for OriginH3ClientSession {
         drop(send_request);
 
         let stream = Arc::new(Mutex::new(stream));
+        if end {
+            finish_h3_body(stream.clone(), self.write_timeout).await?;
+            self.request_body_finished = true;
+        }
         self.request_stream = Some(stream);
         Ok(())
     }
@@ -276,10 +282,15 @@ impl CustomClientSession for OriginH3ClientSession {
     }
 
     async fn finish_request_body(&mut self) -> PingoraResult<()> {
+        if self.request_body_finished {
+            return Ok(());
+        }
         let Some(stream) = self.request_stream.as_ref().cloned() else {
             return Ok(());
         };
-        finish_h3_body(stream, self.write_timeout).await
+        finish_h3_body(stream, self.write_timeout).await?;
+        self.request_body_finished = true;
+        Ok(())
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) {

@@ -1,4 +1,6 @@
-use crate::config_models::{HTTPFirewallRule, HTTPFirewallRuleGroup, HTTPFirewallRuleSet};
+use crate::config_models::{
+    HTTPFirewallRule, HTTPFirewallRuleGroup, HTTPFirewallRuleSet, ServerConfig,
+};
 use crate::firewall::OutboundContext;
 use crate::metrics::analyzer;
 use base64::Engine as _;
@@ -8,11 +10,44 @@ use pingora_proxy::Session;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use std::cell::OnceCell;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 pub struct MatchResult<'a> {
     pub matched: bool,
     pub set: Option<&'a HTTPFirewallRuleSet>,
+}
+
+pub(crate) fn expression_uses_request_body(value: &str) -> bool {
+    value.contains("requestBody")
+        || value.contains("requestAll")
+        || value.contains("requestForm")
+        || value.contains("${form")
+        || value.contains("requestJSON")
+        || value.contains("${json")
+        || value.contains("requestUpload")
+}
+
+pub(crate) fn value_uses_request_body(value: &Value) -> bool {
+    match value {
+        Value::String(value) => expression_uses_request_body(value),
+        Value::Array(values) => values.iter().any(value_uses_request_body),
+        Value::Object(map) => map.values().any(value_uses_request_body),
+        _ => false,
+    }
+}
+
+pub(crate) fn expression_uses_response_body(value: &str) -> bool {
+    value.contains("responseBody")
+}
+
+pub(crate) fn value_uses_response_body(value: &Value) -> bool {
+    match value {
+        Value::String(value) => expression_uses_response_body(value),
+        Value::Array(values) => values.iter().any(value_uses_response_body),
+        Value::Object(map) => map.values().any(value_uses_response_body),
+        _ => false,
+    }
 }
 
 pub fn match_group<'a>(
@@ -21,21 +56,34 @@ pub fn match_group<'a>(
     request_body: &[u8],
     scheme: &str,
 ) -> Option<MatchResult<'a>> {
+    match_group_with_server(group, session, request_body, scheme, None)
+}
+
+pub fn match_group_with_server<'a>(
+    group: &'a HTTPFirewallRuleGroup,
+    session: &Session,
+    request_body: &[u8],
+    scheme: &str,
+    server: Option<&ServerConfig>,
+) -> Option<MatchResult<'a>> {
     if !group.is_on {
         return None;
     }
 
-    if let Some(code) = &group.code {
-        if match_preset_group(code, session, request_body) {
-            return Some(MatchResult {
-                matched: true,
-                set: None,
-            });
-        }
+    let facts = RequestFacts::new_with_server(session, request_body, scheme, server);
+    if group
+        .code
+        .as_deref()
+        .is_some_and(|code| preset_group_matches(code, &facts))
+    {
+        return Some(MatchResult {
+            matched: true,
+            set: None,
+        });
     }
 
     for set in &group.sets {
-        if match_set(set, session, request_body, scheme) {
+        if match_set_with_facts(set, session, &facts) {
             return Some(MatchResult {
                 matched: true,
                 set: Some(set),
@@ -44,6 +92,34 @@ pub fn match_group<'a>(
     }
 
     None
+}
+
+pub(crate) fn preset_group_matches(code: &str, facts: &RequestFacts<'_>) -> bool {
+    let (operator, strict) = match code {
+        "sqlInjection" => ("contains sql injection", false),
+        "sqlInjectionStrict" => ("contains sql injection strictly", true),
+        "xss" => ("contains xss", false),
+        "xssStrict" => ("contains xss strictly", true),
+        "cmdInjection" => ("contains cmd injection", false),
+        _ => return false,
+    };
+    let values = [
+        facts.request_uri(),
+        facts.request_args(),
+        facts.cookies_normalized(),
+        facts.headers(),
+        facts.request_body_text(),
+    ];
+    values.iter().any(|value| {
+        crate::firewall::matcher::evaluate_operator(value, operator, "", !strict)
+    })
+}
+
+pub(crate) fn preset_group_uses_request_body(code: &str) -> bool {
+    matches!(
+        code,
+        "sqlInjection" | "sqlInjectionStrict" | "xss" | "xssStrict" | "cmdInjection"
+    )
 }
 
 pub fn match_set(
@@ -72,14 +148,42 @@ pub fn match_set(
         return false;
     }
 
+    let facts = RequestFacts::new(session, request_body, scheme);
+    match_set_with_facts(set, session, &facts)
+}
+
+fn match_set_with_facts(
+    set: &HTTPFirewallRuleSet,
+    session: &Session,
+    facts: &RequestFacts<'_>,
+) -> bool {
+    if !set.is_on || set.rules.is_empty() {
+        return false;
+    }
+
+    let ip = facts.remote_ip();
+    if set.ignore_local && is_local_ip(&ip) {
+        return false;
+    }
+    if set.ignore_search_engine
+        && crate::firewall::matcher::evaluate_operator(
+            &header_value(session, "user-agent"),
+            "common bot",
+            "",
+            true,
+        )
+    {
+        return false;
+    }
+
     if set.connector == "and" {
         set.rules
             .iter()
-            .all(|rule| match_rule(rule, session, request_body, scheme))
+            .all(|rule| match_rule_with_facts(rule, facts))
     } else {
         set.rules
             .iter()
-            .any(|rule| match_rule(rule, session, request_body, scheme))
+            .any(|rule| match_rule_with_facts(rule, facts))
     }
 }
 
@@ -110,14 +214,42 @@ pub fn match_set_response(
         return false;
     }
 
+    let facts = ResponseFacts::new(session, request_body, response, scheme);
+    match_set_response_with_facts(set, session, &facts)
+}
+
+fn match_set_response_with_facts(
+    set: &HTTPFirewallRuleSet,
+    session: &Session,
+    facts: &ResponseFacts<'_, '_, '_>,
+) -> bool {
+    if !set.is_on || set.rules.is_empty() {
+        return false;
+    }
+
+    let ip = facts.request().remote_ip();
+    if set.ignore_local && is_local_ip(&ip) {
+        return false;
+    }
+    if set.ignore_search_engine
+        && crate::firewall::matcher::evaluate_operator(
+            &header_value(session, "user-agent"),
+            "common bot",
+            "",
+            true,
+        )
+    {
+        return false;
+    }
+
     if set.connector == "and" {
         set.rules
             .iter()
-            .all(|rule| match_rule_response(rule, session, request_body, response, scheme))
+            .all(|rule| match_rule_response_with_facts(rule, facts))
     } else {
         set.rules
             .iter()
-            .any(|rule| match_rule_response(rule, session, request_body, response, scheme))
+            .any(|rule| match_rule_response_with_facts(rule, facts))
     }
 }
 
@@ -128,12 +260,24 @@ pub fn match_group_response<'a>(
     response: &OutboundContext<'_>,
     scheme: &str,
 ) -> Option<MatchResult<'a>> {
+    match_group_response_with_server(group, session, request_body, response, scheme, None)
+}
+
+pub fn match_group_response_with_server<'a>(
+    group: &'a HTTPFirewallRuleGroup,
+    session: &Session,
+    request_body: &[u8],
+    response: &OutboundContext<'_>,
+    scheme: &str,
+    server: Option<&ServerConfig>,
+) -> Option<MatchResult<'a>> {
     if !group.is_on {
         return None;
     }
 
+    let facts = ResponseFacts::new_with_server(session, request_body, response, scheme, server);
     for set in &group.sets {
-        if match_set_response(set, session, request_body, response, scheme) {
+        if match_set_response_with_facts(set, session, &facts) {
             return Some(MatchResult {
                 matched: true,
                 set: Some(set),
@@ -144,7 +288,7 @@ pub fn match_group_response<'a>(
     None
 }
 
-fn is_local_ip(ip: &std::net::IpAddr) -> bool {
+pub(crate) fn is_local_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
         std::net::IpAddr::V6(v6) => {
@@ -161,7 +305,14 @@ pub fn match_rule(
     request_body: &[u8],
     scheme: &str,
 ) -> bool {
-    let param_value = get_rule_value(rule, session, request_body, scheme);
+    let facts = RequestFacts::new(session, request_body, scheme);
+    match_rule_with_facts(rule, &facts)
+}
+
+fn match_rule_with_facts(rule: &HTTPFirewallRule, facts: &RequestFacts<'_>) -> bool {
+    crate::metrics::METRICS.waf.record_rule_evaluation();
+    let param_value =
+        get_compiled_rule_value_with_facts(&rule.param, rule.checkpoint_options.as_ref(), facts);
     let matched = crate::firewall::matcher::evaluate_operator(
         &param_value,
         &rule.operator,
@@ -179,7 +330,20 @@ pub fn match_rule_response(
     response: &OutboundContext<'_>,
     scheme: &str,
 ) -> bool {
-    let param_value = get_response_rule_value(rule, session, request_body, response, scheme);
+    let facts = ResponseFacts::new(session, request_body, response, scheme);
+    match_rule_response_with_facts(rule, &facts)
+}
+
+fn match_rule_response_with_facts(
+    rule: &HTTPFirewallRule,
+    facts: &ResponseFacts<'_, '_, '_>,
+) -> bool {
+    crate::metrics::METRICS.waf.record_rule_evaluation();
+    let param_value = get_compiled_response_rule_value_with_facts(
+        &rule.param,
+        rule.checkpoint_options.as_ref(),
+        facts,
+    );
     let matched = crate::firewall::matcher::evaluate_operator(
         &param_value,
         &rule.operator,
@@ -190,56 +354,518 @@ pub fn match_rule_response(
     if rule.is_reverse { !matched } else { matched }
 }
 
-fn match_preset_group(code: &str, session: &Session, request_body: &[u8]) -> bool {
-    let check_str = get_full_request_data(session, request_body);
-    match code {
-        "sqlInjection" => crate::firewall::matcher::evaluate_operator(
-            &check_str,
-            "contains sql injection",
-            "",
-            true,
-        ),
-        "sqlInjectionStrict" => crate::firewall::matcher::evaluate_operator(
-            &check_str,
-            "contains sql injection strictly",
-            "",
-            true,
-        ),
-        "xss" => crate::firewall::matcher::evaluate_operator(&check_str, "contains xss", "", true),
-        "xssStrict" => crate::firewall::matcher::evaluate_operator(
-            &check_str,
-            "contains xss strictly",
-            "",
-            true,
-        ),
-        "cmdInjection" => crate::firewall::matcher::evaluate_operator(
-            &check_str,
-            "contains cmd injection",
-            "",
-            true,
-        ),
-        _ => false,
-    }
-}
-
 static CC_COUNTERS: Lazy<DashMap<String, crate::firewall::state::RollingCounter>> =
     Lazy::new(DashMap::new);
 static CC_COUNTER_LAST_SWEEP: AtomicI64 = AtomicI64::new(0);
 const CC_COUNTER_MAX_PERIOD_SECS: i64 = 7 * 86_400;
 const CC_COUNTER_SWEEP_INTERVAL_SECS: i64 = 60;
 
-fn get_full_request_data(session: &Session, request_body: &[u8]) -> String {
-    let mut data = session.req_header().uri.to_string();
-    if let Some(cookies) = session.get_header("cookie").and_then(|v| v.to_str().ok()) {
-        data.push_str(cookies);
-    }
-    if !request_body.is_empty() {
-        data.push_str(&String::from_utf8_lossy(request_body));
-    }
-    data
+pub(crate) struct RequestFacts<'a> {
+    session: &'a Session,
+    request_body: &'a [u8],
+    scheme: &'a str,
+    server: Option<&'a ServerConfig>,
+    remote_ip: OnceCell<std::net::IpAddr>,
+    raw_remote_addr: OnceCell<String>,
+    remote_port: OnceCell<String>,
+    local_addr: OnceCell<String>,
+    local_port: OnceCell<String>,
+    request_uri: OnceCell<String>,
+    request_path: OnceCell<String>,
+    request_url: OnceCell<String>,
+    host: OnceCell<String>,
+    remote_user: OnceCell<String>,
+    request_file_extension: OnceCell<String>,
+    referer_origin: OnceCell<String>,
+    request_body_text: OnceCell<String>,
+    request_all: OnceCell<String>,
+    cookies_normalized: OnceCell<String>,
+    headers: OnceCell<String>,
+    header_names: OnceCell<String>,
+    header_max_length: OnceCell<usize>,
+    general_header_length: OnceCell<usize>,
+    request_path_lower_extension: OnceCell<String>,
+    common_ai_bot: OnceCell<String>,
+    common_bot: OnceCell<String>,
+    geo_info: OnceCell<Option<analyzer::GeoInfo>>,
+    isp_name: OnceCell<String>,
+    query_params: OnceCell<Vec<(String, String)>>,
+    cookie_params: OnceCell<Vec<(String, String)>>,
+    form_params: OnceCell<Vec<(String, String)>>,
+    json_body: OnceCell<Option<Value>>,
+    upload_parts: OnceCell<Vec<UploadPart>>,
 }
 
-fn get_variable_value(session: &Session, param: &str, request_body: &[u8], scheme: &str) -> String {
+impl<'a> RequestFacts<'a> {
+    pub(crate) fn new(session: &'a Session, request_body: &'a [u8], scheme: &'a str) -> Self {
+        Self::new_with_server(session, request_body, scheme, None)
+    }
+
+    pub(crate) fn new_with_server(
+        session: &'a Session,
+        request_body: &'a [u8],
+        scheme: &'a str,
+        server: Option<&'a ServerConfig>,
+    ) -> Self {
+        Self {
+            session,
+            request_body,
+            scheme,
+            server,
+            remote_ip: OnceCell::new(),
+            raw_remote_addr: OnceCell::new(),
+            remote_port: OnceCell::new(),
+            local_addr: OnceCell::new(),
+            local_port: OnceCell::new(),
+            request_uri: OnceCell::new(),
+            request_path: OnceCell::new(),
+            request_url: OnceCell::new(),
+            host: OnceCell::new(),
+            remote_user: OnceCell::new(),
+            request_file_extension: OnceCell::new(),
+            referer_origin: OnceCell::new(),
+            request_body_text: OnceCell::new(),
+            request_all: OnceCell::new(),
+            cookies_normalized: OnceCell::new(),
+            headers: OnceCell::new(),
+            header_names: OnceCell::new(),
+            header_max_length: OnceCell::new(),
+            general_header_length: OnceCell::new(),
+            request_path_lower_extension: OnceCell::new(),
+            common_ai_bot: OnceCell::new(),
+            common_bot: OnceCell::new(),
+            geo_info: OnceCell::new(),
+            isp_name: OnceCell::new(),
+            query_params: OnceCell::new(),
+            cookie_params: OnceCell::new(),
+            form_params: OnceCell::new(),
+            json_body: OnceCell::new(),
+            upload_parts: OnceCell::new(),
+        }
+    }
+
+    pub(crate) fn remote_ip(&self) -> std::net::IpAddr {
+        *self.remote_ip.get_or_init(|| parse_remote_ip(self.session))
+    }
+
+    pub(crate) fn remote_addr(&self) -> String {
+        self.remote_ip().to_string()
+    }
+
+    pub(crate) fn raw_remote_addr(&self) -> String {
+        self.raw_remote_addr
+            .get_or_init(|| get_raw_remote_addr(self.session))
+            .clone()
+    }
+
+    pub(crate) fn remote_port(&self) -> String {
+        self.remote_port
+            .get_or_init(|| get_remote_port(self.session))
+            .clone()
+    }
+
+    pub(crate) fn local_addr(&self) -> String {
+        self.local_addr
+            .get_or_init(|| get_local_addr(self.session))
+            .clone()
+    }
+
+    pub(crate) fn local_port(&self) -> String {
+        self.local_port
+            .get_or_init(|| get_local_port(self.session))
+            .clone()
+    }
+
+    pub(crate) fn request_uri(&self) -> String {
+        self.request_uri
+            .get_or_init(|| get_request_uri(self.session))
+            .clone()
+    }
+
+    pub(crate) fn request_path(&self) -> String {
+        self.request_path
+            .get_or_init(|| self.session.req_header().uri.path().to_string())
+            .clone()
+    }
+
+    pub(crate) fn host(&self) -> String {
+        self.host
+            .get_or_init(|| {
+                self.session
+                    .req_header()
+                    .uri
+                    .host()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .clone()
+    }
+
+    pub(crate) fn cname(&self) -> String {
+        let host = ServerConfig::normalize_runtime_server_name(&self.host());
+        if host.is_empty() {
+            return String::new();
+        }
+        self.server
+            .and_then(|server| {
+                server.server_names.iter().find_map(|server_name| {
+                    let is_cname = server_name
+                        .r#type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("cname"));
+                    if !is_cname {
+                        return None;
+                    }
+                    std::iter::once(&server_name.name)
+                        .chain(server_name.sub_names.iter())
+                        .find_map(|name| {
+                            let normalized = ServerConfig::normalize_runtime_server_name(name);
+                            (normalized == host).then(|| normalized)
+                        })
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn is_cname(&self) -> String {
+        bool_string(!self.cname().is_empty())
+    }
+
+    pub(crate) fn remote_user(&self) -> String {
+        self.remote_user
+            .get_or_init(|| {
+                self.session
+                    .get_header("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Basic "))
+                    .and_then(|v| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(v.trim())
+                            .ok()
+                    })
+                    .and_then(|v| String::from_utf8(v).ok())
+                    .and_then(|v| v.split_once(':').map(|(u, _)| u.to_string()))
+                    .unwrap_or_default()
+            })
+            .clone()
+    }
+
+    pub(crate) fn request_file_extension(&self) -> String {
+        self.request_file_extension
+            .get_or_init(|| {
+                self.session
+                    .req_header()
+                    .uri
+                    .path()
+                    .split('.')
+                    .last()
+                    .filter(|ext| !ext.is_empty() && !ext.contains('/'))
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .clone()
+    }
+
+    pub(crate) fn referer_origin(&self) -> String {
+        self.referer_origin
+            .get_or_init(|| {
+                let mut val = header_value(self.session, "referer");
+                let origin = header_value(self.session, "origin");
+                if !origin.is_empty() {
+                    if !val.is_empty() {
+                        val.push(' ');
+                    }
+                    val.push_str(&origin);
+                }
+                val
+            })
+            .clone()
+    }
+
+    pub(crate) fn request_length(&self) -> String {
+        self.session
+            .get_header("content-length")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    pub(crate) fn request_method(&self) -> String {
+        self.session.req_header().method.as_str().to_string()
+    }
+
+    pub(crate) fn scheme(&self) -> String {
+        self.scheme.to_string()
+    }
+
+    pub(crate) fn proto(&self) -> String {
+        format!("{:?}", self.session.req_header().version)
+    }
+
+    pub(crate) fn request_args(&self) -> String {
+        self.session
+            .req_header()
+            .uri
+            .query()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    pub(crate) fn request_header(&self, name: &str) -> String {
+        header_value(self.session, name)
+    }
+
+    pub(crate) fn request_url(&self) -> String {
+        self.request_url
+            .get_or_init(|| {
+                format!(
+                    "{}://{}{}",
+                    self.scheme,
+                    self.session.req_header().uri.host().unwrap_or(""),
+                    self.request_uri()
+                )
+            })
+            .clone()
+    }
+
+    pub(crate) fn request_body_text(&self) -> String {
+        self.request_body_text
+            .get_or_init(|| String::from_utf8_lossy(self.request_body).to_string())
+            .clone()
+    }
+
+    pub(crate) fn request_all(&self) -> String {
+        self.request_all
+            .get_or_init(|| format!("{}{}", self.request_uri(), self.request_body_text()))
+            .clone()
+    }
+
+    pub(crate) fn cookies_normalized(&self) -> String {
+        self.cookies_normalized
+            .get_or_init(|| normalize_cookies(self.session))
+            .clone()
+    }
+
+    pub(crate) fn headers(&self) -> String {
+        self.headers
+            .get_or_init(|| all_headers(self.session))
+            .clone()
+    }
+
+    pub(crate) fn header_names(&self) -> String {
+        self.header_names
+            .get_or_init(|| header_names(self.session))
+            .clone()
+    }
+
+    pub(crate) fn header_max_length(&self) -> usize {
+        *self
+            .header_max_length
+            .get_or_init(|| header_max_length(self.session))
+    }
+
+    pub(crate) fn general_header_length(&self) -> usize {
+        *self
+            .general_header_length
+            .get_or_init(|| general_header_length(self.session))
+    }
+
+    pub(crate) fn request_path_lower_extension(&self) -> String {
+        self.request_path_lower_extension
+            .get_or_init(|| request_path_lower_extension(self.session))
+            .clone()
+    }
+
+    pub(crate) fn common_ai_bot(&self) -> String {
+        self.common_ai_bot
+            .get_or_init(|| {
+                bool_string(crate::firewall::matcher::evaluate_operator(
+                    &self.request_header("user-agent"),
+                    "common ai bot",
+                    "",
+                    true,
+                ))
+            })
+            .clone()
+    }
+
+    pub(crate) fn common_bot(&self) -> String {
+        self.common_bot
+            .get_or_init(|| {
+                bool_string(crate::firewall::matcher::evaluate_operator(
+                    &self.request_header("user-agent"),
+                    "common bot",
+                    "",
+                    true,
+                ))
+            })
+            .clone()
+    }
+
+    pub(crate) fn geo_country_name(&self) -> String {
+        self.geo_info()
+            .map(|g| g.country.to_string())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn geo_province_name(&self) -> String {
+        self.geo_info()
+            .map(|g| g.region.to_string())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn geo_city_name(&self) -> String {
+        self.geo_info()
+            .map(|g| g.city.to_string())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn isp_name(&self) -> String {
+        self.isp_name
+            .get_or_init(|| {
+                self.geo_info()
+                    .map(|g| g.provider.to_string())
+                    .unwrap_or_else(|| analyzer::lookup_isp_name(self.remote_ip()).to_string())
+            })
+            .clone()
+    }
+
+    pub(crate) fn query_param(&self, name: &str) -> String {
+        self.query_params
+            .get_or_init(|| parse_query_params(self.session.req_header().uri.query().unwrap_or("")))
+            .iter()
+            .find_map(|(key, value)| (key == name).then(|| value.clone()))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn cookie_param(&self, name: &str) -> String {
+        self.cookie_params
+            .get_or_init(|| {
+                self.session
+                    .get_header("cookie")
+                    .and_then(|v| v.to_str().ok())
+                    .map(parse_cookie_params)
+                    .unwrap_or_default()
+            })
+            .iter()
+            .find_map(|(key, value)| (key == name).then(|| value.clone()))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn form_param(&self, name: &str) -> String {
+        self.form_params
+            .get_or_init(|| parse_query_params(&String::from_utf8_lossy(self.request_body)))
+            .iter()
+            .find_map(|(key, value)| (key == name).then(|| value.clone()))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn json_param(&self, path: &str) -> String {
+        self.json_body()
+            .map(|value| json_value_from_root(value, path))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn upload_param(&self, name: &str) -> String {
+        resolve_upload_param(self.upload_parts(), name)
+    }
+
+    pub(crate) fn upload_summary(&self) -> String {
+        upload_summary(self.upload_parts())
+    }
+
+    fn upload_parts(&self) -> &[UploadPart] {
+        self.upload_parts
+            .get_or_init(|| parse_multipart_uploads(self.session, self.request_body))
+    }
+
+    fn geo_info(&self) -> Option<&analyzer::GeoInfo> {
+        self.geo_info
+            .get_or_init(|| analyzer::lookup_geo(self.remote_ip()))
+            .as_ref()
+    }
+
+    fn json_body(&self) -> Option<&Value> {
+        self.json_body
+            .get_or_init(|| serde_json::from_slice::<Value>(self.request_body).ok())
+            .as_ref()
+    }
+}
+
+pub(crate) struct ResponseFacts<'request, 'response_ref, 'response_data> {
+    request: RequestFacts<'request>,
+    response: &'response_ref OutboundContext<'response_data>,
+    response_body_text: OnceCell<String>,
+    response_general_header_length: OnceCell<usize>,
+}
+
+impl<'request, 'response_ref, 'response_data>
+    ResponseFacts<'request, 'response_ref, 'response_data>
+{
+    pub(crate) fn new(
+        session: &'request Session,
+        request_body: &'request [u8],
+        response: &'response_ref OutboundContext<'response_data>,
+        scheme: &'request str,
+    ) -> Self {
+        Self::new_with_server(session, request_body, response, scheme, None)
+    }
+
+    pub(crate) fn new_with_server(
+        session: &'request Session,
+        request_body: &'request [u8],
+        response: &'response_ref OutboundContext<'response_data>,
+        scheme: &'request str,
+        server: Option<&'request ServerConfig>,
+    ) -> Self {
+        Self {
+            request: RequestFacts::new_with_server(session, request_body, scheme, server),
+            response,
+            response_body_text: OnceCell::new(),
+            response_general_header_length: OnceCell::new(),
+        }
+    }
+
+    pub(crate) fn request(&self) -> &RequestFacts<'request> {
+        &self.request
+    }
+
+    pub(crate) fn status(&self) -> String {
+        self.response.status.to_string()
+    }
+
+    pub(crate) fn response_body_text(&self) -> String {
+        self.response_body_text
+            .get_or_init(|| String::from_utf8_lossy(self.response.body).to_string())
+            .clone()
+    }
+
+    pub(crate) fn bytes_sent(&self) -> String {
+        self.response.bytes_sent.to_string()
+    }
+
+    pub(crate) fn response_general_header_length(&self) -> usize {
+        *self.response_general_header_length.get_or_init(|| {
+            self.response
+                .headers
+                .iter()
+                .filter(|(name, _)| {
+                    !matches!(
+                        name.as_str(),
+                        "set-cookie" | "location" | "content-type" | "content-length"
+                    )
+                })
+                .map(|(name, value)| name.len() + value.len())
+                .sum()
+        })
+    }
+
+    pub(crate) fn response_header(&self, name: &str) -> String {
+        response_header_value(self.response, name)
+    }
+}
+
+fn get_variable_value_with_facts(param: &str, facts: &RequestFacts<'_>) -> String {
     if !param.contains("${") {
         return param.to_string();
     }
@@ -247,7 +873,7 @@ fn get_variable_value(session: &Session, param: &str, request_body: &[u8], schem
     static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
 
     if let Some(inner) = param.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        return resolve_variable(session, inner, request_body, scheme);
+        return resolve_variable_with_facts(inner, facts);
     }
 
     RE_VAR
@@ -257,52 +883,47 @@ fn get_variable_value(session: &Session, param: &str, request_body: &[u8], schem
                 .strip_prefix("${")
                 .and_then(|s| s.strip_suffix('}'))
                 .unwrap_or(inner);
-            resolve_variable(session, inner, request_body, scheme)
+            resolve_variable_with_facts(inner, facts)
         })
         .to_string()
 }
 
-fn get_rule_value(
-    rule: &HTTPFirewallRule,
-    session: &Session,
-    request_body: &[u8],
-    scheme: &str,
+pub(crate) fn get_compiled_rule_value_with_facts(
+    param: &str,
+    checkpoint_options: Option<&Value>,
+    facts: &RequestFacts<'_>,
 ) -> String {
-    if rule.param.starts_with("${cc.")
-        || rule.param == "${cc}"
-        || rule.param.starts_with("${cc2.")
-        || rule.param == "${cc2}"
+    if param.starts_with("${cc.")
+        || param == "${cc}"
+        || param.starts_with("${cc2.")
+        || param == "${cc2}"
     {
-        return cc_value(rule, session, request_body, true, scheme);
+        return cc_value_with_facts(param, checkpoint_options, facts, true);
     }
-    get_variable_value(session, &rule.param, request_body, scheme)
+    get_variable_value_with_facts(param, facts)
 }
 
-fn get_response_rule_value(
-    rule: &HTTPFirewallRule,
-    session: &Session,
-    request_body: &[u8],
-    response: &OutboundContext<'_>,
-    scheme: &str,
+pub(crate) fn get_compiled_response_rule_value_with_facts(
+    param: &str,
+    checkpoint_options: Option<&Value>,
+    facts: &ResponseFacts<'_, '_, '_>,
 ) -> String {
-    if rule.param.starts_with("${cc.")
-        || rule.param == "${cc}"
-        || rule.param.starts_with("${cc2.")
-        || rule.param == "${cc2}"
+    if param.starts_with("${cc.")
+        || param == "${cc}"
+        || param.starts_with("${cc2.")
+        || param == "${cc2}"
     {
-        return cc_value(rule, session, request_body, true, scheme);
+        return cc_value_with_facts(param, checkpoint_options, facts.request(), true);
     }
-    get_response_variable_value(session, &rule.param, request_body, response, scheme)
+    get_response_variable_value_with_facts(param, facts)
 }
 
-fn cc_value(
-    rule: &HTTPFirewallRule,
-    session: &Session,
-    request_body: &[u8],
+pub(crate) fn cc_value_with_facts(
+    param: &str,
+    options: Option<&Value>,
+    facts: &RequestFacts<'_>,
     is_cc2: bool,
-    scheme: &str,
 ) -> String {
-    let options = rule.checkpoint_options.as_ref();
     let period = options
         .and_then(|v| v.get("period"))
         .and_then(Value::as_i64)
@@ -318,17 +939,17 @@ fn cc_value(
         let key_values = keys
             .iter()
             .filter_map(Value::as_str)
-            .map(|template| get_variable_value(session, template, request_body, scheme))
+            .map(|template| get_variable_value_with_facts(template, facts))
             .collect::<Vec<_>>();
-        format!("WAF-CC2-{}-{}:{}", rule.param, period, key_values.join("@"))
+        format!("WAF-CC2-{}-{}:{}", param, period, key_values.join("@"))
     } else {
-        format!("WAF-CC:{}:{}", period, get_remote_addr(session))
+        format!("WAF-CC:{}:{}", period, facts.remote_addr())
     };
 
     increase_counter(key, period).to_string()
 }
 
-fn increase_counter(key: String, period_secs: i64) -> u64 {
+pub(crate) fn increase_counter(key: String, period_secs: i64) -> u64 {
     let now = crate::utils::time::now_timestamp();
     sweep_cc_counters(now);
     CC_COUNTERS
@@ -352,12 +973,9 @@ fn sweep_cc_counters(now: i64) {
     CC_COUNTERS.retain(|_, counter| !counter.is_stale(now, CC_COUNTER_MAX_PERIOD_SECS));
 }
 
-fn get_response_variable_value(
-    session: &Session,
+pub(crate) fn get_response_variable_value_with_facts(
     param: &str,
-    request_body: &[u8],
-    response: &OutboundContext<'_>,
-    scheme: &str,
+    facts: &ResponseFacts<'_, '_, '_>,
 ) -> String {
     if !param.contains("${") {
         return param.to_string();
@@ -366,7 +984,7 @@ fn get_response_variable_value(
     static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
 
     if let Some(inner) = param.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        return resolve_response_variable(session, inner, request_body, response, scheme);
+        return resolve_response_variable_with_facts(inner, facts);
     }
 
     RE_VAR
@@ -376,7 +994,7 @@ fn get_response_variable_value(
                 .strip_prefix("${")
                 .and_then(|s| s.strip_suffix('}'))
                 .unwrap_or(inner);
-            resolve_response_variable(session, inner, request_body, response, scheme)
+            resolve_response_variable_with_facts(inner, facts)
         })
         .to_string()
 }
@@ -477,6 +1095,7 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8], scheme:
             .unwrap_or_else(|| analyzer::lookup_isp_name(parse_remote_ip(session)).to_string()),
         "serverAddr" => get_local_addr(session),
         "serverPort" => get_local_port(session),
+        "requestUpload" => upload_summary(&parse_multipart_uploads(session, request_body)),
         "refererBlock" | "cname" => String::new(),
         "isCNAME" => "0".to_string(),
         _ => {
@@ -495,8 +1114,11 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8], scheme:
             if let Some(path) = dotted_arg(inner, &["requestJSON", "json"]) {
                 return json_value(request_body, path);
             }
-            if let Some(_field) = dotted_arg(inner, &["requestUpload"]) {
-                return String::new();
+            if let Some(field) = dotted_arg(inner, &["requestUpload"]) {
+                return resolve_upload_param(
+                    &parse_multipart_uploads(session, request_body),
+                    field,
+                );
             }
             if let Some(name) = colon_arg(inner, &["arg"]) {
                 return query_param(session, name);
@@ -512,6 +1134,139 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8], scheme:
     }
 }
 
+pub(crate) fn resolve_variable_with_facts(inner: &str, facts: &RequestFacts<'_>) -> String {
+    match inner {
+        "remoteAddr" => facts.remote_addr(),
+        "rawRemoteAddr" => facts.raw_remote_addr(),
+        "remotePort" => facts.remote_port(),
+        "remoteUser" => facts
+            .session
+            .get_header("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Basic "))
+            .and_then(|v| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(v.trim())
+                    .ok()
+            })
+            .and_then(|v| String::from_utf8(v).ok())
+            .and_then(|v| v.split_once(':').map(|(u, _)| u.to_string()))
+            .unwrap_or_default(),
+        "requestURI" => facts.request_uri(),
+        "requestPath" => facts.request_path(),
+        "requestURL" => facts.request_url(),
+        "requestFileExtension" => facts
+            .session
+            .req_header()
+            .uri
+            .path()
+            .split('.')
+            .last()
+            .filter(|ext| !ext.is_empty() && !ext.contains('/'))
+            .unwrap_or_default()
+            .to_string(),
+        "requestLength" => facts
+            .session
+            .get_header("content-length")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string(),
+        "requestBody" => facts.request_body_text(),
+        "requestAll" => facts.request_all(),
+        "requestMethod" => facts.session.req_header().method.as_str().to_string(),
+        "scheme" => facts.scheme.to_string(),
+        "proto" => format!("{:?}", facts.session.req_header().version),
+        "host" | "requestHost" => facts.host(),
+        "refererOrigin" => {
+            let mut val = header_value(facts.session, "referer");
+            let origin = header_value(facts.session, "origin");
+            if !origin.is_empty() {
+                if !val.is_empty() {
+                    val.push(' ');
+                }
+                val.push_str(&origin);
+            }
+            val
+        }
+        "referer" => header_value(facts.session, "referer"),
+        "userAgent" => header_value(facts.session, "user-agent"),
+        "contentType" => header_value(facts.session, "content-type"),
+        "cookies" => facts.cookies_normalized(),
+        "args" => facts
+            .session
+            .req_header()
+            .uri
+            .query()
+            .unwrap_or("")
+            .to_string(),
+        "headers" => facts.headers(),
+        "headerNames" => facts.header_names(),
+        "headerMaxLength" => facts.header_max_length().to_string(),
+        "requestGeneralHeaderLength" => facts.general_header_length().to_string(),
+        "requestPathLowerExtension" => facts.request_path_lower_extension(),
+        "commonAIBot" => bool_string(crate::firewall::matcher::evaluate_operator(
+            &header_value(facts.session, "user-agent"),
+            "common ai bot",
+            "",
+            true,
+        )),
+        "commonBot" => bool_string(crate::firewall::matcher::evaluate_operator(
+            &header_value(facts.session, "user-agent"),
+            "common bot",
+            "",
+            true,
+        )),
+        "geoCountryName" => analyzer::lookup_geo(facts.remote_ip())
+            .map(|g| g.country.to_string())
+            .unwrap_or_default(),
+        "geoProvinceName" => analyzer::lookup_geo(facts.remote_ip())
+            .map(|g| g.region.to_string())
+            .unwrap_or_default(),
+        "geoCityName" => analyzer::lookup_geo(facts.remote_ip())
+            .map(|g| g.city.to_string())
+            .unwrap_or_default(),
+        "ispName" => analyzer::lookup_geo(facts.remote_ip())
+            .map(|g| g.provider.to_string())
+            .unwrap_or_else(|| analyzer::lookup_isp_name(facts.remote_ip()).to_string()),
+        "serverAddr" => facts.local_addr(),
+        "serverPort" => facts.local_port(),
+        "requestUpload" => facts.upload_summary(),
+        "refererBlock" => String::new(),
+        "cname" => facts.cname(),
+        "isCNAME" => facts.is_cname(),
+        _ => {
+            if let Some(name) = dotted_arg(inner, &["arg", "requestArg"]) {
+                return facts.query_param(name);
+            }
+            if let Some(name) = dotted_arg(inner, &["header", "requestHeader"]) {
+                return header_value(facts.session, name);
+            }
+            if let Some(name) = dotted_arg(inner, &["cookie", "requestCookie"]) {
+                return facts.cookie_param(name);
+            }
+            if let Some(name) = dotted_arg(inner, &["requestForm", "form"]) {
+                return facts.form_param(name);
+            }
+            if let Some(path) = dotted_arg(inner, &["requestJSON", "json"]) {
+                return json_value_from_facts(facts, path);
+            }
+            if let Some(field) = dotted_arg(inner, &["requestUpload"]) {
+                return facts.upload_param(field);
+            }
+            if let Some(name) = colon_arg(inner, &["arg"]) {
+                return facts.query_param(name);
+            }
+            if let Some(name) = colon_arg(inner, &["header"]) {
+                return header_value(facts.session, name);
+            }
+            if let Some(name) = colon_arg(inner, &["cookie"]) {
+                return facts.cookie_param(name);
+            }
+            String::new()
+        }
+    }
+}
+
 fn resolve_response_variable(
     session: &Session,
     inner: &str,
@@ -519,30 +1274,27 @@ fn resolve_response_variable(
     response: &OutboundContext<'_>,
     scheme: &str,
 ) -> String {
+    let facts = ResponseFacts::new(session, request_body, response, scheme);
+    resolve_response_variable_with_facts(inner, &facts)
+}
+
+pub(crate) fn resolve_response_variable_with_facts(
+    inner: &str,
+    facts: &ResponseFacts<'_, '_, '_>,
+) -> String {
     match inner {
-        "status" => response.status.to_string(),
-        "responseBody" => String::from_utf8_lossy(response.body).to_string(),
-        "bytesSent" => response.bytes_sent.to_string(),
-        "responseGeneralHeaderLength" => response
-            .headers
-            .iter()
-            .filter(|(name, _)| {
-                !matches!(
-                    name.as_str(),
-                    "set-cookie" | "location" | "content-type" | "content-length"
-                )
-            })
-            .map(|(name, value)| name.len() + value.len())
-            .sum::<usize>()
-            .to_string(),
+        "status" => facts.status(),
+        "responseBody" => facts.response_body_text(),
+        "bytesSent" => facts.bytes_sent(),
+        "responseGeneralHeaderLength" => facts.response_general_header_length().to_string(),
         _ => {
             if let Some(name) = dotted_arg(inner, &["responseHeader"]) {
-                return response_header_value(response, name);
+                return facts.response_header(name);
             }
             if let Some(name) = colon_arg(inner, &["responseHeader"]) {
-                return response_header_value(response, name);
+                return facts.response_header(name);
             }
-            resolve_variable(session, inner, request_body, scheme)
+            resolve_variable_with_facts(inner, facts.request())
         }
     }
 }
@@ -592,7 +1344,7 @@ fn get_local_port(session: &Session) -> String {
         .unwrap_or_default()
 }
 
-fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
+pub(crate) fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
     for header in [
         "x-cloud-real-ip",
         "cf-connecting-ip",
@@ -804,6 +1556,35 @@ fn query_param(session: &Session, name: &str) -> String {
         .unwrap_or_default()
 }
 
+fn parse_query_params(input: &str) -> Vec<(String, String)> {
+    input
+        .split('&')
+        .filter_map(|part| {
+            if part.is_empty() {
+                return None;
+            }
+            let mut iter = part.splitn(2, '=');
+            let key = iter.next()?;
+            Some((key.to_string(), iter.next().unwrap_or("").to_string()))
+        })
+        .collect()
+}
+
+fn parse_cookie_params(input: &str) -> Vec<(String, String)> {
+    input
+        .split(';')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let mut iter = part.splitn(2, '=');
+            let key = iter.next()?;
+            Some((key.to_string(), iter.next().unwrap_or("").to_string()))
+        })
+        .collect()
+}
+
 fn cookie_value(session: &Session, name: &str) -> String {
     session
         .get_header("cookie")
@@ -837,11 +1618,142 @@ fn form_value(request_body: &[u8], name: &str) -> String {
         .unwrap_or_default()
 }
 
+#[derive(Clone, Debug)]
+struct UploadPart {
+    field_name: String,
+    filename: Option<String>,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+fn parse_multipart_uploads(session: &Session, request_body: &[u8]) -> Vec<UploadPart> {
+    let Some(boundary) = multipart_boundary(session) else {
+        return Vec::new();
+    };
+    if boundary.is_empty() || request_body.is_empty() {
+        return Vec::new();
+    }
+
+    let body = String::from_utf8_lossy(request_body);
+    let delimiter = format!("--{}", boundary);
+    body.split(&delimiter)
+        .filter_map(parse_multipart_part)
+        .collect()
+}
+
+fn multipart_boundary(session: &Session) -> Option<String> {
+    let content_type = header_value(session, "content-type");
+    let mut parts = content_type.split(';');
+    if !parts
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/form-data"))
+    {
+        return None;
+    }
+    parts.find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        name.trim().eq_ignore_ascii_case("boundary").then(|| {
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string()
+        })
+    })
+}
+
+fn parse_multipart_part(raw: &str) -> Option<UploadPart> {
+    let raw = raw.trim_start_matches("\r\n");
+    if raw.is_empty() || raw.starts_with("--") {
+        return None;
+    }
+    let (headers, body) = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))?;
+    let mut field_name = None;
+    let mut filename = None;
+    let mut content_type = None;
+    for header in headers.lines() {
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-disposition") {
+            for attr in value.split(';').map(str::trim) {
+                if let Some(value) = attr.strip_prefix("name=") {
+                    field_name = Some(value.trim_matches('"').to_string());
+                } else if let Some(value) = attr.strip_prefix("filename=") {
+                    filename = Some(value.trim_matches('"').to_string());
+                }
+            }
+        } else if name.trim().eq_ignore_ascii_case("content-type") {
+            content_type = Some(value.trim().to_string());
+        }
+    }
+    let field_name = field_name?;
+    let body = body
+        .trim_end_matches("\r\n")
+        .trim_end_matches('\n')
+        .as_bytes()
+        .to_vec();
+    Some(UploadPart {
+        field_name,
+        filename,
+        content_type,
+        body,
+    })
+}
+
+fn resolve_upload_param(parts: &[UploadPart], name: &str) -> String {
+    let (field, attr) = name.split_once('.').unwrap_or((name, ""));
+    parts
+        .iter()
+        .find(|part| part.field_name == field)
+        .map(|part| match attr {
+            "filename" => part.filename.clone().unwrap_or_default(),
+            "contentType" | "content-type" => part.content_type.clone().unwrap_or_default(),
+            "size" => part.body.len().to_string(),
+            _ => part
+                .filename
+                .clone()
+                .unwrap_or_else(|| String::from_utf8_lossy(&part.body).to_string()),
+        })
+        .unwrap_or_default()
+}
+
+fn upload_summary(parts: &[UploadPart]) -> String {
+    parts
+        .iter()
+        .map(|part| {
+            let filename = part.filename.as_deref().unwrap_or("");
+            let content_type = part.content_type.as_deref().unwrap_or("");
+            format!(
+                "{}:{}:{}:{}",
+                part.field_name,
+                filename,
+                content_type,
+                part.body.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn json_value(request_body: &[u8], path: &str) -> String {
     let Ok(value) = serde_json::from_slice::<Value>(request_body) else {
         return String::new();
     };
-    let mut current = &value;
+    json_value_from_root(&value, path)
+}
+
+fn json_value_from_facts(facts: &RequestFacts<'_>, path: &str) -> String {
+    facts
+        .json_body()
+        .map(|value| json_value_from_root(value, path))
+        .unwrap_or_default()
+}
+
+fn json_value_from_root(value: &Value, path: &str) -> String {
+    let mut current = value;
     for segment in path.split('.') {
         match current {
             Value::Object(map) => {

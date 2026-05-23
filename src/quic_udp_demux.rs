@@ -108,6 +108,11 @@ impl AsyncUdpSocket for SharedQuinnUdpSocket {
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+        debug!(
+            "HTTP/3 shared UDP socket sending {} bytes to {}",
+            transmit.contents.len(),
+            transmit.destination
+        );
         if let Some(segment_size) = transmit.segment_size {
             for segment in transmit.contents.chunks(segment_size) {
                 self.socket.try_send_to(segment, transmit.destination)?;
@@ -138,6 +143,11 @@ impl AsyncUdpSocket for SharedQuinnUdpSocket {
 
         match Pin::new(&mut *rx).poll_recv(cx) {
             Poll::Ready(Some(datagram)) => {
+                debug!(
+                    "HTTP/3 shared UDP socket received {} bytes from {}",
+                    datagram.data.len(),
+                    datagram.from
+                );
                 Poll::Ready(copy_datagram(datagram, &mut bufs[0], &mut meta[0]).map(|_| 1))
             }
             Poll::Ready(None) => Poll::Ready(Ok(0)),
@@ -404,14 +414,11 @@ fn server_has_http3_on_port(
     server: &crate::config_models::ServerConfig,
     port: u16,
 ) -> bool {
-    if !server.http3_enabled() {
-        return false;
-    }
     if config_store
         .get_global_http3_policy_sync()
         .is_some_and(|policy| policy.is_on && u16::try_from(policy.port).ok() == Some(port))
     {
-        return true;
+        return server.https.as_ref().is_some_and(|https| https.is_on);
     }
     server.supports_http3_on_port(port)
 }
@@ -724,6 +731,10 @@ impl QuicUdpDemuxManager {
                 result = socket.recv_from(&mut buf) => result,
             };
             let (len, client_addr) = recv_result?;
+            debug!(
+                "QUIC UDP demux: datagram received from {} on port {} bytes={} http3_enabled={}",
+                client_addr, port, len, http3_enabled
+            );
             let data = Bytes::copy_from_slice(&buf[..len]);
 
             let now = Instant::now();
@@ -880,6 +891,14 @@ impl QuicUdpDemuxManager {
     ) -> Result<Option<(RouteKind, Vec<Bytes>)>> {
         match crate::quic_probe::probe_quic_client_hello_fragment_result(&data) {
             QuicProbeFragmentResult::Found(client_hello) => {
+                debug!(
+                    "QUIC UDP demux: ClientHello found from {} on port {} sni={:?} alpn={:?} http3_enabled={}",
+                    client_addr,
+                    port,
+                    client_hello.server_name,
+                    client_hello.alpns,
+                    http3_enabled
+                );
                 let mut datagrams = pending_routes
                     .remove(&client_addr)
                     .map(|(_, pending)| {
@@ -903,6 +922,14 @@ impl QuicUdpDemuxManager {
                 .map(|route| route.map(|route| (route, datagrams)))
             }
             QuicProbeFragmentResult::Incomplete(fragment) => {
+                debug!(
+                    "QUIC UDP demux: incomplete ClientHello from {} on port {} fragment_bytes={} ranges={} http3_enabled={}",
+                    client_addr,
+                    port,
+                    fragment.data.len(),
+                    fragment.ranges.len(),
+                    http3_enabled
+                );
                 let is_new_pending_route = !pending_routes.contains_key(&client_addr);
                 if is_new_pending_route
                     && is_new_route_rate_limited(new_route_windows, client_addr.ip())
@@ -1016,6 +1043,14 @@ impl QuicUdpDemuxManager {
                 .map(|route| route.map(|route| (route, datagrams)))
             }
             QuicProbeFragmentResult::None => {
+                debug!(
+                    "QUIC UDP demux: no ClientHello from {} on port {} datagram_bytes={} first_byte={:?} http3_enabled={}",
+                    client_addr,
+                    port,
+                    data.len(),
+                    data.first().copied(),
+                    http3_enabled
+                );
                 if pending_routes.contains_key(&client_addr) {
                     debug!(
                         "QUIC UDP demux: waiting for QUIC ClientHello fragments from {} on port {}, dropping undecidable datagram",
@@ -1113,22 +1148,30 @@ impl QuicUdpDemuxManager {
                 return Ok(session.map(RouteKind::Passthrough));
             }
 
-            if http3_enabled
-                && client_hello_supports_h3(&client_hello)
-                && self
-                    .config_store
-                    .get_l7_server_for_tls_name_sync(server_name)
-                    .is_some_and(|server| {
-                        server_has_http3_on_port(&self.config_store, &server, port)
-                    })
-            {
+            if http3_enabled && client_hello_supports_h3(&client_hello) {
+                let l7_server = self.config_store.get_l7_server_for_tls_name_sync(server_name);
                 debug!(
-                    "QUIC UDP demux: L7 H3 {} on port {} matched alpn={:?}",
-                    server_name, port, client_hello.alpns
+                    "QUIC UDP demux: L7 H3 candidate {} on port {} server={:?} accepts_http3={} alpn={:?}",
+                    server_name,
+                    port,
+                    l7_server.as_ref().map(|server| server.numeric_id()),
+                    l7_server
+                        .as_ref()
+                        .is_some_and(|server| server_has_http3_on_port(&self.config_store, server, port)),
+                    client_hello.alpns
                 );
-                return Ok(Some(RouteKind::Http3(Arc::new(AtomicU64::new(
-                    udp_activity_now_ms(),
-                )))));
+                if l7_server
+                    .as_ref()
+                    .is_some_and(|server| server_has_http3_on_port(&self.config_store, server, port))
+                {
+                    debug!(
+                        "QUIC UDP demux: L7 H3 {} on port {} matched alpn={:?}",
+                        server_name, port, client_hello.alpns
+                    );
+                    return Ok(Some(RouteKind::Http3(Arc::new(AtomicU64::new(
+                        udp_activity_now_ms(),
+                    )))));
+                }
             }
 
             if let Some(server) = self

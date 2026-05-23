@@ -1,7 +1,7 @@
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
 use ipnet::IpNet;
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 const ROLLING_COUNTER_BUCKETS: usize = 256;
 const COUNTER_SWEEP_INTERVAL_SECS: i64 = 60;
 const COUNTER_MAX_PERIOD_SECS: i64 = 7 * 86_400;
+
+type NetworkSnapshot = HashMap<i64, Arc<Vec<(IpNet, i64)>>>;
 
 pub(crate) struct RollingCounter {
     buckets: [u64; ROLLING_COUNTER_BUCKETS],
@@ -101,9 +103,23 @@ impl RollingCounter {
 
 pub struct WafStateManager {
     pub blocks: DashMap<(i64, IpAddr), i64>,
-    pub block_networks: DashMap<(i64, IpNet), i64>, // Support CIDR/C-class blocks
-    block_network_snapshots: RwLock<HashMap<i64, Arc<Vec<(IpNet, i64)>>>>,
+    pub block_networks: DashMap<(i64, IpNet), i64>,
+    block_network_snapshots: ArcSwap<NetworkSnapshot>,
+    list_blocks: DashMap<(i64, IpAddr), i64>,
+    list_block_networks: DashMap<(i64, IpNet), i64>,
+    list_block_network_snapshots: ArcSwap<NetworkSnapshot>,
     pub whitelists: DashMap<(i64, IpAddr), i64>,
+    whitelist_networks: DashMap<(i64, IpNet), i64>,
+    whitelist_network_snapshots: ArcSwap<NetworkSnapshot>,
+    list_whitelists: DashMap<(i64, IpAddr), i64>,
+    list_whitelist_networks: DashMap<(i64, IpNet), i64>,
+    list_whitelist_network_snapshots: ArcSwap<NetworkSnapshot>,
+    graylists: DashMap<(i64, IpAddr), i64>,
+    gray_networks: DashMap<(i64, IpNet), i64>,
+    gray_network_snapshots: ArcSwap<NetworkSnapshot>,
+    list_graylists: DashMap<(i64, IpAddr), i64>,
+    list_gray_networks: DashMap<(i64, IpNet), i64>,
+    list_gray_network_snapshots: ArcSwap<NetworkSnapshot>,
     server_limiters: DashMap<i64, Arc<RateLimiter<i64, DashMapStateStore<i64>, DefaultClock>>>,
     ip_limiters:
         DashMap<(i64, IpAddr), Arc<RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>>>,
@@ -122,8 +138,22 @@ impl WafStateManager {
         Self {
             blocks: DashMap::new(),
             block_networks: DashMap::new(),
-            block_network_snapshots: RwLock::new(HashMap::new()),
+            block_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
+            list_blocks: DashMap::new(),
+            list_block_networks: DashMap::new(),
+            list_block_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
             whitelists: DashMap::new(),
+            whitelist_networks: DashMap::new(),
+            whitelist_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
+            list_whitelists: DashMap::new(),
+            list_whitelist_networks: DashMap::new(),
+            list_whitelist_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
+            graylists: DashMap::new(),
+            gray_networks: DashMap::new(),
+            gray_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
+            list_graylists: DashMap::new(),
+            list_gray_networks: DashMap::new(),
+            list_gray_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
             server_limiters: DashMap::new(),
             ip_limiters: DashMap::new(),
             counters: DashMap::new(),
@@ -132,90 +162,209 @@ impl WafStateManager {
     }
 
     pub fn has_rules(&self) -> bool {
-        !self.whitelists.is_empty() || !self.blocks.is_empty() || !self.block_networks.is_empty()
+        !self.blocks.is_empty()
+            || !self.block_networks.is_empty()
+            || !self.list_blocks.is_empty()
+            || !self.list_block_networks.is_empty()
+            || !self.whitelists.is_empty()
+            || !self.whitelist_networks.is_empty()
+            || !self.list_whitelists.is_empty()
+            || !self.list_whitelist_networks.is_empty()
+            || !self.graylists.is_empty()
+            || !self.gray_networks.is_empty()
+            || !self.list_graylists.is_empty()
+            || !self.list_gray_networks.is_empty()
     }
 
     pub fn is_whitelisted(&self, ip: IpAddr, server_id: i64) -> bool {
-        if let Some(expiry) = self.whitelists.get(&(0, ip)) {
-            if crate::utils::time::now_timestamp() < *expiry {
-                return true;
-            }
-        }
-        if let Some(expiry) = self.whitelists.get(&(server_id, ip)) {
-            if crate::utils::time::now_timestamp() < *expiry {
-                return true;
-            }
-        }
-        false
+        let now = crate::utils::time::now_timestamp();
+        Self::contains_scoped_ip(&self.whitelists, ip, server_id, now)
+            || Self::contains_scoped_ip(&self.list_whitelists, ip, server_id, now)
+            || Self::contains_scoped_network(&self.whitelist_network_snapshots, ip, server_id, now)
+            || Self::contains_scoped_network(
+                &self.list_whitelist_network_snapshots,
+                ip,
+                server_id,
+                now,
+            )
     }
 
     pub fn is_blocked(&self, ip: IpAddr, server_id: i64) -> bool {
         let now = crate::utils::time::now_timestamp();
-
-        // 1. Check IP-level blocks (Global and Site)
-        if self.check_block_expiry(0, ip, now) || self.check_block_expiry(server_id, ip, now) {
-            return true;
-        }
-
-        // 2. Check Network-level blocks (C-Class etc.) without scanning DashMap shards.
-        let snapshots = self.block_network_snapshots.read();
-        for sid in [0, server_id] {
-            let Some(networks) = snapshots.get(&sid) else {
-                continue;
-            };
-            for (net, expiry) in networks.iter() {
-                if now < *expiry && net.contains(&ip) {
-                    return true;
-                }
-            }
-        }
-
-        false
+        Self::contains_scoped_ip(&self.blocks, ip, server_id, now)
+            || Self::contains_scoped_ip(&self.list_blocks, ip, server_id, now)
+            || Self::contains_scoped_network(&self.block_network_snapshots, ip, server_id, now)
+            || Self::contains_scoped_network(&self.list_block_network_snapshots, ip, server_id, now)
     }
 
-    fn insert_block_network(&self, server_id: i64, net: IpNet, expiry: i64) {
-        self.block_networks.insert((server_id, net), expiry);
+    pub fn is_graylisted(&self, ip: IpAddr, server_id: i64) -> bool {
         let now = crate::utils::time::now_timestamp();
-        let mut snapshots = self.block_network_snapshots.write();
-        let mut networks = snapshots
-            .get(&server_id)
-            .map(|items| {
-                items
-                    .iter()
-                    .copied()
-                    .filter(|(_, exp)| now < *exp)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        networks.retain(|(existing, _)| *existing != net);
-        networks.push((net, expiry));
-        snapshots.insert(server_id, Arc::new(networks));
+        Self::contains_scoped_ip(&self.graylists, ip, server_id, now)
+            || Self::contains_scoped_ip(&self.list_graylists, ip, server_id, now)
+            || Self::contains_scoped_network(&self.gray_network_snapshots, ip, server_id, now)
+            || Self::contains_scoped_network(&self.list_gray_network_snapshots, ip, server_id, now)
     }
 
-    fn remove_block_network(&self, server_id: i64, net: IpNet) {
-        self.block_networks.remove(&(server_id, net));
-        let mut snapshots = self.block_network_snapshots.write();
-        if let Some(items) = snapshots.get(&server_id) {
-            let networks = items
-                .iter()
-                .copied()
-                .filter(|(existing, _)| *existing != net)
-                .collect::<Vec<_>>();
-            if networks.is_empty() {
-                snapshots.remove(&server_id);
-            } else {
-                snapshots.insert(server_id, Arc::new(networks));
-            }
-        }
+    pub fn apply_black_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
+        Self::apply_scoped_ip(&self.blocks, server_id, ip, expiry);
     }
 
-    fn check_block_expiry(&self, server_id: i64, ip: IpAddr, now: i64) -> bool {
-        if let Some(expiry) = self.blocks.get(&(server_id, ip)) {
-            if now < *expiry {
-                return true;
-            }
-        }
-        false
+    pub fn apply_black_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
+        Self::insert_scoped_network(
+            &self.block_networks,
+            &self.block_network_snapshots,
+            server_id,
+            net,
+            expiry,
+        );
+    }
+
+    pub fn remove_black_ip(&self, server_id: i64, ip: IpAddr) {
+        Self::remove_scoped_ip(&self.blocks, server_id, ip);
+    }
+
+    pub fn remove_black_network(&self, server_id: i64, net: IpNet) {
+        Self::remove_scoped_network(
+            &self.block_networks,
+            &self.block_network_snapshots,
+            server_id,
+            net,
+        );
+    }
+
+    pub fn apply_list_black_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
+        Self::apply_scoped_ip(&self.list_blocks, server_id, ip, expiry);
+    }
+
+    pub fn apply_list_black_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
+        Self::insert_scoped_network(
+            &self.list_block_networks,
+            &self.list_block_network_snapshots,
+            server_id,
+            net,
+            expiry,
+        );
+    }
+
+    pub fn remove_list_black_ip(&self, server_id: i64, ip: IpAddr) {
+        Self::remove_scoped_ip(&self.list_blocks, server_id, ip);
+    }
+
+    pub fn remove_list_black_network(&self, server_id: i64, net: IpNet) {
+        Self::remove_scoped_network(
+            &self.list_block_networks,
+            &self.list_block_network_snapshots,
+            server_id,
+            net,
+        );
+    }
+
+    pub fn apply_white_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
+        Self::apply_scoped_ip(&self.whitelists, server_id, ip, expiry);
+    }
+
+    pub fn apply_white_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
+        Self::insert_scoped_network(
+            &self.whitelist_networks,
+            &self.whitelist_network_snapshots,
+            server_id,
+            net,
+            expiry,
+        );
+    }
+
+    pub fn remove_white_ip(&self, server_id: i64, ip: IpAddr) {
+        Self::remove_scoped_ip(&self.whitelists, server_id, ip);
+    }
+
+    pub fn remove_white_network(&self, server_id: i64, net: IpNet) {
+        Self::remove_scoped_network(
+            &self.whitelist_networks,
+            &self.whitelist_network_snapshots,
+            server_id,
+            net,
+        );
+    }
+
+    pub fn apply_list_white_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
+        Self::apply_scoped_ip(&self.list_whitelists, server_id, ip, expiry);
+    }
+
+    pub fn apply_list_white_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
+        Self::insert_scoped_network(
+            &self.list_whitelist_networks,
+            &self.list_whitelist_network_snapshots,
+            server_id,
+            net,
+            expiry,
+        );
+    }
+
+    pub fn remove_list_white_ip(&self, server_id: i64, ip: IpAddr) {
+        Self::remove_scoped_ip(&self.list_whitelists, server_id, ip);
+    }
+
+    pub fn remove_list_white_network(&self, server_id: i64, net: IpNet) {
+        Self::remove_scoped_network(
+            &self.list_whitelist_networks,
+            &self.list_whitelist_network_snapshots,
+            server_id,
+            net,
+        );
+    }
+
+    pub fn apply_gray_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
+        Self::apply_scoped_ip(&self.graylists, server_id, ip, expiry);
+    }
+
+    pub fn apply_gray_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
+        Self::insert_scoped_network(
+            &self.gray_networks,
+            &self.gray_network_snapshots,
+            server_id,
+            net,
+            expiry,
+        );
+    }
+
+    pub fn remove_gray_ip(&self, server_id: i64, ip: IpAddr) {
+        Self::remove_scoped_ip(&self.graylists, server_id, ip);
+    }
+
+    pub fn remove_gray_network(&self, server_id: i64, net: IpNet) {
+        Self::remove_scoped_network(
+            &self.gray_networks,
+            &self.gray_network_snapshots,
+            server_id,
+            net,
+        );
+    }
+
+    pub fn apply_list_gray_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
+        Self::apply_scoped_ip(&self.list_graylists, server_id, ip, expiry);
+    }
+
+    pub fn apply_list_gray_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
+        Self::insert_scoped_network(
+            &self.list_gray_networks,
+            &self.list_gray_network_snapshots,
+            server_id,
+            net,
+            expiry,
+        );
+    }
+
+    pub fn remove_list_gray_ip(&self, server_id: i64, ip: IpAddr) {
+        Self::remove_scoped_ip(&self.list_graylists, server_id, ip);
+    }
+
+    pub fn remove_list_gray_network(&self, server_id: i64, net: IpNet) {
+        Self::remove_scoped_network(
+            &self.list_gray_networks,
+            &self.list_gray_network_snapshots,
+            server_id,
+            net,
+        );
     }
 
     pub fn block_ip(
@@ -236,13 +385,13 @@ impl WafStateManager {
 
         if block_c_class {
             if let Ok(net) = self.get_c_class_net(ip) {
-                self.insert_block_network(key_server_id, net, expiry);
+                self.apply_black_network_until(key_server_id, net, expiry);
                 if use_local_firewall {
                     self.exec_local_firewall(net.to_string(), timeout_secs);
                 }
             }
         } else {
-            self.blocks.insert((key_server_id, ip), expiry);
+            self.apply_black_ip_until(key_server_id, ip, expiry);
             if use_local_firewall {
                 self.exec_local_firewall(ip.to_string(), timeout_secs);
             }
@@ -250,7 +399,6 @@ impl WafStateManager {
     }
 
     fn exec_local_firewall(&self, target: String, timeout: i64) {
-        // Attempt ipset (Linux) or simply log for now on non-linux
         #[cfg(target_os = "linux")]
         {
             let _ = std::process::Command::new("ipset")
@@ -274,7 +422,7 @@ impl WafStateManager {
         }
     }
 
-    fn get_c_class_net(&self, ip: IpAddr) -> Result<IpNet, anyhow::Error> {
+    pub fn get_c_class_net(&self, ip: IpAddr) -> Result<IpNet, anyhow::Error> {
         match ip {
             IpAddr::V4(v4) => Ok(IpNet::V4(ipnet::Ipv4Net::new(v4, 24)?.trunc())),
             IpAddr::V6(v6) => Ok(IpNet::V6(ipnet::Ipv6Net::new(v6, 64)?.trunc())),
@@ -304,11 +452,10 @@ impl WafStateManager {
         } else {
             server_id
         };
-        self.blocks.remove(&(key_server_id, ip));
+        self.remove_black_ip(key_server_id, ip);
 
-        // Remove from network blocks as well (C-Class)
         if let Ok(net) = self.get_c_class_net(ip) {
-            self.remove_block_network(key_server_id, net);
+            self.remove_black_network(key_server_id, net);
             if use_local_firewall {
                 self.exec_local_unblock(net.to_string());
             }
@@ -319,7 +466,7 @@ impl WafStateManager {
         }
 
         let expiry = crate::utils::time::now_timestamp() + ttl_secs.max(1);
-        self.whitelists.insert((key_server_id, ip), expiry);
+        self.apply_white_ip_until(key_server_id, ip, expiry);
     }
 
     fn exec_local_unblock(&self, target: String) {
@@ -390,6 +537,120 @@ impl WafStateManager {
         }
         self.counters
             .retain(|_, counter| !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS));
+    }
+
+    fn apply_scoped_ip(map: &DashMap<(i64, IpAddr), i64>, server_id: i64, ip: IpAddr, expiry: i64) {
+        if crate::utils::time::now_timestamp() >= expiry {
+            map.remove(&(server_id, ip));
+        } else {
+            map.insert((server_id, ip), expiry);
+        }
+    }
+
+    fn remove_scoped_ip(map: &DashMap<(i64, IpAddr), i64>, server_id: i64, ip: IpAddr) {
+        map.remove(&(server_id, ip));
+    }
+
+    fn contains_scoped_ip(
+        map: &DashMap<(i64, IpAddr), i64>,
+        ip: IpAddr,
+        server_id: i64,
+        now: i64,
+    ) -> bool {
+        Self::contains_scoped_ip_for(map, 0, ip, now)
+            || (server_id != 0 && Self::contains_scoped_ip_for(map, server_id, ip, now))
+    }
+
+    fn contains_scoped_ip_for(
+        map: &DashMap<(i64, IpAddr), i64>,
+        server_id: i64,
+        ip: IpAddr,
+        now: i64,
+    ) -> bool {
+        map.get(&(server_id, ip))
+            .is_some_and(|expiry| now < *expiry)
+    }
+
+    fn insert_scoped_network(
+        map: &DashMap<(i64, IpNet), i64>,
+        snapshots: &ArcSwap<NetworkSnapshot>,
+        server_id: i64,
+        net: IpNet,
+        expiry: i64,
+    ) {
+        let now = crate::utils::time::now_timestamp();
+        if now >= expiry {
+            Self::remove_scoped_network(map, snapshots, server_id, net);
+            return;
+        }
+
+        map.insert((server_id, net), expiry);
+        let current = snapshots.load();
+        let mut next = current.as_ref().clone();
+        let mut networks = next
+            .get(&server_id)
+            .map(|items| {
+                items
+                    .iter()
+                    .copied()
+                    .filter(|(_, exp)| now < *exp)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        networks.retain(|(existing, _)| *existing != net);
+        networks.push((net, expiry));
+        next.insert(server_id, Arc::new(networks));
+        snapshots.store(Arc::new(next));
+    }
+
+    fn remove_scoped_network(
+        map: &DashMap<(i64, IpNet), i64>,
+        snapshots: &ArcSwap<NetworkSnapshot>,
+        server_id: i64,
+        net: IpNet,
+    ) {
+        map.remove(&(server_id, net));
+        let current = snapshots.load();
+        let Some(items) = current.get(&server_id) else {
+            return;
+        };
+        let mut next = current.as_ref().clone();
+        let networks = items
+            .iter()
+            .copied()
+            .filter(|(existing, _)| *existing != net)
+            .collect::<Vec<_>>();
+        if networks.is_empty() {
+            next.remove(&server_id);
+        } else {
+            next.insert(server_id, Arc::new(networks));
+        }
+        snapshots.store(Arc::new(next));
+    }
+
+    fn contains_scoped_network(
+        snapshots: &ArcSwap<NetworkSnapshot>,
+        ip: IpAddr,
+        server_id: i64,
+        now: i64,
+    ) -> bool {
+        Self::contains_scoped_network_for(snapshots, 0, ip, now)
+            || (server_id != 0 && Self::contains_scoped_network_for(snapshots, server_id, ip, now))
+    }
+
+    fn contains_scoped_network_for(
+        snapshots: &ArcSwap<NetworkSnapshot>,
+        server_id: i64,
+        ip: IpAddr,
+        now: i64,
+    ) -> bool {
+        let snapshot = snapshots.load();
+        let Some(networks) = snapshot.get(&server_id) else {
+            return false;
+        };
+        networks
+            .iter()
+            .any(|(net, expiry)| now < *expiry && net.contains(&ip))
     }
 
     pub fn flush_to_disk(&self) {}

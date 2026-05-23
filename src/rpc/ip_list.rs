@@ -79,11 +79,19 @@ pub async fn sync_ip_items_incremental(
     {
         Ok(resp) => {
             let inner = resp.into_inner();
+            let mut applied_all = true;
             for item in inner.ip_items {
-                ip_list_manager.apply_item(item.list_id, &item.value, item.is_deleted);
+                applied_all &= ip_list_manager.apply_item(item);
             }
-            ip_list_manager.update_last_version(inner.version);
-            true
+            if applied_all {
+                ip_list_manager.update_last_version(inner.version);
+            } else {
+                debug!(
+                    "IP item sync kept version {} because at least one item could not be applied",
+                    last_version
+                );
+            }
+            applied_all
         }
         Err(e) => {
             debug!("Failed to sync IP items incrementally: {}", e);

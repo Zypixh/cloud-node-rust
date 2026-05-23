@@ -238,23 +238,35 @@ where
     }
 
     async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> PingoraResult<bool> {
+        let mut done = false;
         for task in tasks {
             match task {
-                HttpTask::Header(resp, end) => self.write_response_header(resp, end).await?,
+                HttpTask::Header(resp, end) => {
+                    self.write_response_header(resp, end).await?;
+                    done |= end;
+                }
                 HttpTask::Body(Some(data), end) | HttpTask::UpgradedBody(Some(data), end) => {
                     self.write_body(data, end).await?;
+                    done |= end;
                 }
                 HttpTask::Body(None, end) | HttpTask::UpgradedBody(None, end) => {
                     if end {
                         self.finish().await?;
+                        done = true;
                     }
                 }
-                HttpTask::Trailer(Some(trailers)) => self.write_trailers(*trailers).await?,
-                HttpTask::Trailer(None) | HttpTask::Done => self.finish().await?,
+                HttpTask::Trailer(Some(trailers)) => {
+                    self.write_trailers(*trailers).await?;
+                    done = true;
+                }
+                HttpTask::Trailer(None) | HttpTask::Done => {
+                    self.finish().await?;
+                    done = true;
+                }
                 HttpTask::Failed(err) => return Err(err),
             }
         }
-        Ok(true)
+        Ok(done)
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>) {
@@ -321,15 +333,26 @@ where
     }
 
     fn is_body_empty(&mut self) -> bool {
-        self.req_header
-            .headers
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == "0")
+        self.body_bytes_read == 0
+            && (self.body_done
+                || self
+                    .req_header
+                    .headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .is_some_and(|value| value.as_bytes() == b"0")
+                || (self.req_header.method == http::Method::GET
+                    && !self
+                        .req_header
+                        .headers
+                        .contains_key(http::header::CONTENT_LENGTH)))
     }
 
-    async fn read_body_or_idle(&mut self, _no_body_expected: bool) -> PingoraResult<Option<Bytes>> {
-        self.read_body_bytes().await
+    async fn read_body_or_idle(&mut self, no_body_expected: bool) -> PingoraResult<Option<Bytes>> {
+        if no_body_expected || self.is_body_done() {
+            std::future::pending().await
+        } else {
+            self.read_body_bytes().await
+        }
     }
 
     fn body_bytes_sent(&self) -> usize {
@@ -425,7 +448,7 @@ fn build_request_header(request: Request<()>) -> PingoraResult<RequestHeader> {
         .unwrap_or("/");
     let mut req =
         RequestHeader::build_no_case(parts.method, path.as_bytes(), Some(parts.headers.len()))?;
-    req.set_version(Version::HTTP_3);
+    req.set_version(Version::HTTP_11);
 
     if let Some(authority) = parts.uri.authority()
         && !parts.headers.contains_key(http::header::HOST)

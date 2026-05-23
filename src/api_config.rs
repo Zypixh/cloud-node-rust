@@ -72,12 +72,20 @@ impl Default for AccessLogPipelineConfig {
     }
 }
 
+const MAX_ACCESS_LOG_UPLOAD_CONCURRENCY: usize = 32;
+
 impl AccessLogPipelineConfig {
     pub fn normalized(&self) -> Self {
         let batch_size = self.batch_size.max(1);
-        let upload_concurrency = self.upload_concurrency.max(1).min(32);
+        let queue_capacity = self.queue_capacity.max(batch_size);
+        let upload_concurrency = if self.upload_concurrency == 0 {
+            auto_access_log_upload_concurrency(queue_capacity, batch_size)
+        } else {
+            self.upload_concurrency
+        }
+        .clamp(1, MAX_ACCESS_LOG_UPLOAD_CONCURRENCY);
         Self {
-            queue_capacity: self.queue_capacity.max(batch_size),
+            queue_capacity,
             batch_size,
             flush_interval_ms: self.flush_interval_ms.max(100),
             upload_concurrency,
@@ -93,6 +101,27 @@ impl AccessLogPipelineConfig {
             warning_interval_ms: self.warning_interval_ms.max(1000),
         }
     }
+
+    pub fn batch_queue_capacity(&self) -> usize {
+        let batch_size = self.batch_size.max(1);
+        ceil_div(self.queue_capacity.max(batch_size), batch_size)
+            .max(self.upload_concurrency.saturating_mul(2))
+            .max(1)
+    }
+}
+
+fn ceil_div(value: usize, divisor: usize) -> usize {
+    value.saturating_add(divisor.saturating_sub(1)) / divisor.max(1)
+}
+
+fn auto_access_log_upload_concurrency(queue_capacity: usize, batch_size: usize) -> usize {
+    let queue_batches = ceil_div(queue_capacity, batch_size).max(1);
+    let cpu_parallelism = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    queue_batches
+        .min(cpu_parallelism.saturating_mul(2).max(1))
+        .clamp(1, MAX_ACCESS_LOG_UPLOAD_CONCURRENCY)
 }
 
 fn default_access_log_queue_capacity() -> usize {
@@ -108,7 +137,7 @@ fn default_access_log_flush_interval_ms() -> u64 {
 }
 
 fn default_access_log_upload_concurrency() -> usize {
-    1
+    0
 }
 
 fn default_access_log_request_timeout_ms() -> u64 {
@@ -117,6 +146,45 @@ fn default_access_log_request_timeout_ms() -> u64 {
 
 fn default_access_log_warning_interval_ms() -> u64 {
     5_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_access_log_pipeline_uses_auto_upload_concurrency() {
+        let normalized = AccessLogPipelineConfig::default().normalized();
+
+        assert!(normalized.upload_concurrency > 1);
+        assert!(normalized.upload_concurrency <= MAX_ACCESS_LOG_UPLOAD_CONCURRENCY);
+        assert_eq!(normalized.queue_capacity, 100_000);
+        assert_eq!(normalized.batch_queue_capacity(), 10);
+    }
+
+    #[test]
+    fn explicit_access_log_upload_concurrency_is_respected() {
+        let config = AccessLogPipelineConfig {
+            upload_concurrency: 3,
+            ..Default::default()
+        }
+        .normalized();
+
+        assert_eq!(config.upload_concurrency, 3);
+    }
+
+    #[test]
+    fn batch_queue_capacity_covers_main_queue_batches() {
+        let config = AccessLogPipelineConfig {
+            queue_capacity: 250_001,
+            batch_size: 10_000,
+            upload_concurrency: 2,
+            ..Default::default()
+        }
+        .normalized();
+
+        assert_eq!(config.batch_queue_capacity(), 26);
+    }
 }
 
 impl ApiConfig {

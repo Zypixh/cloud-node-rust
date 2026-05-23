@@ -22,6 +22,18 @@ where
     }
 }
 
+fn deserialize_flexible_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Value::deserialize(deserializer)?;
+    match v {
+        Value::Number(n) => Ok(n.as_i64().unwrap_or(0) as i32),
+        Value::String(s) => Ok(s.parse::<i32>().unwrap_or(0)),
+        _ => Ok(0),
+    }
+}
+
 fn deserialize_flexible_i64_opt<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: Deserializer<'de>,
@@ -135,12 +147,31 @@ pub struct WAFBlockOptions {
     pub max_timeout: i32,
     #[serde(rename = "failGlobal", default)]
     pub fail_global: bool,
+    #[serde(rename = "ipListId", default)]
+    pub ip_list_id: i64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub scope: String,
+    #[serde(
+        rename = "eventLevel",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub event_level: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct WAFPageOptions {
+    #[serde(
+        alias = "statusCode",
+        default,
+        deserialize_with = "deserialize_flexible_i32"
+    )]
     pub status: i32,
-    #[serde(default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        alias = "contentHTML",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub body: String,
 }
 
@@ -258,20 +289,32 @@ pub struct HTTPCCPolicy {
     pub is_on: bool,
     #[serde(rename = "maxQPS", default)]
     pub max_qps: i32,
-    #[serde(rename = "perIPMaxQPS", default)]
-    pub per_ip_max_qps: i32,
-    #[serde(rename = "maxBandwidth", default)]
-    pub max_bandwidth: f64,
-    #[serde(rename = "showPage", default)]
-    pub show_page: bool,
+    #[serde(rename = "maxQPSPerIP", default)]
+    pub max_qps_per_ip: i32,
+    #[serde(rename = "maxBandwidthPerIP", default)]
+    pub max_bandwidth_per_ip: f64,
+    #[serde(rename = "blockPage", default)]
+    pub block_page: HTTPCCBlockPageConfig,
     #[serde(rename = "blockIP", default)]
-    pub block_ip: bool,
-    #[serde(rename = "pageDuration", default)]
-    pub page_duration: i32,
-    #[serde(rename = "blockIPDuration", default)]
-    pub block_ip_duration: i32,
-    #[serde(rename = "noLog", default)]
-    pub no_log: bool,
+    pub block_ip: HTTPCCBlockIPConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPCCBlockPageConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(default)]
+    pub life: i32,
+    #[serde(rename = "disableAccessLog", default)]
+    pub disable_access_log: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPCCBlockIPConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(default)]
+    pub life: i32,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -1072,6 +1115,9 @@ impl WebConfig {
         if let Some(hls) = &self.hls {
             hls.compile_url_patterns();
         }
+        if let Some(firewall) = &self.firewall_policy {
+            firewall.compile_url_patterns();
+        }
     }
 }
 
@@ -1607,6 +1653,22 @@ pub struct CCPolicy {
     pub no_log: bool,
 }
 
+impl From<&HTTPCCPolicy> for CCPolicy {
+    fn from(policy: &HTTPCCPolicy) -> Self {
+        Self {
+            is_on: policy.is_on,
+            max_qps: policy.max_qps,
+            per_ip_max_qps: policy.max_qps_per_ip,
+            max_bandwidth: policy.max_bandwidth_per_ip,
+            show_page: policy.block_page.is_on,
+            block_ip: policy.block_ip.is_on,
+            page_duration: policy.block_page.life,
+            block_ip_duration: policy.block_ip.life,
+            no_log: policy.block_page.disable_access_log,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UserAgentConfig {
     #[serde(rename = "isPrior", default)]
@@ -1880,7 +1942,7 @@ pub struct WebCacheConfig {
     )]
     pub cache_refs: Vec<Arc<HTTPCacheRef>>,
     #[serde(rename = "cachePolicy")]
-    pub cache_policy: Option<HTTPCachePolicy>,
+    pub cache_policy: Option<Arc<HTTPCachePolicy>>,
     #[serde(rename = "disablePolicyRefs", default)]
     pub disable_policy_refs: bool,
 }
@@ -1991,7 +2053,7 @@ pub struct HTTPCacheRef {
     #[serde(rename = "expiresTime")]
     pub expires_time: Option<HTTPExpiresTimeConfig>,
     #[serde(rename = "cachePolicy")]
-    pub cache_policy: Option<HTTPCachePolicy>,
+    pub cache_policy: Option<Arc<HTTPCachePolicy>>,
 }
 
 impl HTTPCacheRef {
@@ -2022,6 +2084,8 @@ pub struct HTTPFirewallPolicy {
     pub empty_connection_flood: Option<EmptyConnectionFloodConfig>,
     #[serde(rename = "tlsExhaustionAttack", default)]
     pub tls_exhaustion_attack: Option<TLSExhaustionAttackConfig>,
+    #[serde(rename = "ccConfig", default)]
+    pub cc_config: Option<HTTPCCPolicy>,
 
     // Config Options from PB
     #[serde(rename = "blockOptions", default)]
@@ -2054,12 +2118,27 @@ pub struct HTTPFirewallPolicy {
     pub mode: String, // "defense" or "observe"
 }
 
+impl HTTPFirewallPolicy {
+    pub fn compile_url_patterns(&self) {
+        if let Some(inbound) = &self.inbound {
+            inbound.compile_url_patterns();
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HTTPFirewallRef {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(rename = "ignoreGlobalRules", default)]
     pub ignore_global_rules: bool,
+    #[serde(
+        alias = "Id",
+        alias = "firewallPolicyId",
+        alias = "FirewallPolicyId",
+        default,
+        deserialize_with = "deserialize_flexible_i64"
+    )]
     pub id: i64,
 }
 
@@ -2071,6 +2150,14 @@ pub struct HTTPFirewallInboundConfig {
     pub groups: Vec<HTTPFirewallRuleGroup>,
     #[serde(default)]
     pub region: Option<HTTPFirewallRegionConfig>,
+}
+
+impl HTTPFirewallInboundConfig {
+    pub fn compile_url_patterns(&self) {
+        if let Some(region) = &self.region {
+            region.compile_url_patterns();
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2121,8 +2208,50 @@ pub struct HTTPFirewallRegionConfig {
         deserialize_with = "deserialize_null_default"
     )]
     pub deny_province_html: String,
-    #[serde(default)]
+    #[serde(rename = "allowSearchEngine", default)]
     pub allow_search_engine: bool,
+    #[serde(
+        rename = "onlyURLPatterns",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub only_url_patterns: Vec<URLPattern>,
+    #[serde(
+        rename = "exceptURLPatterns",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub except_url_patterns: Vec<URLPattern>,
+}
+
+impl HTTPFirewallRegionConfig {
+    pub fn compile_url_patterns(&self) {
+        for pattern in self
+            .only_url_patterns
+            .iter()
+            .chain(self.except_url_patterns.iter())
+        {
+            pattern.compile();
+        }
+    }
+
+    pub fn matches_url(&self, url: &str) -> bool {
+        let path = url.split('?').next().unwrap_or(url);
+        if !self.except_url_patterns.is_empty()
+            && self
+                .except_url_patterns
+                .iter()
+                .any(|pattern| pattern.matches(path))
+        {
+            return false;
+        }
+        if self.only_url_patterns.is_empty() {
+            return true;
+        }
+        self.only_url_patterns
+            .iter()
+            .any(|pattern| pattern.matches(path))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2173,36 +2302,38 @@ pub struct HTTPFirewallRule {
 pub struct EmptyConnectionFloodConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
-    #[serde(default)]
-    pub threshold: u32,
+    #[serde(rename = "maxEmptyConnections", default)]
+    pub max_empty_connections: u32,
     #[serde(default)]
     pub period: i32,
-    #[serde(rename = "banDuration", default)]
-    pub ban_duration: i32,
+    #[serde(rename = "blockSeconds", default)]
+    pub block_seconds: i32,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TLSExhaustionAttackConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
-    #[serde(default)]
-    pub threshold: u32,
+    #[serde(rename = "maxHandshakeFails", default)]
+    pub max_handshake_fails: u32,
     #[serde(default)]
     pub period: i32,
-    #[serde(rename = "banDuration", default)]
-    pub ban_duration: i32,
+    #[serde(rename = "blockSeconds", default)]
+    pub block_seconds: i32,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct SynFloodConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
-    #[serde(default)]
-    pub threshold: u32,
-    #[serde(default)]
-    pub period: i32,
-    #[serde(rename = "banDuration", default)]
-    pub ban_duration: i32,
+    #[serde(rename = "minAttempts", default)]
+    pub min_attempts: u32,
+    #[serde(rename = "timeoutSeconds", default)]
+    pub timeout_seconds: i32,
+    #[serde(rename = "ignoreLocal", default)]
+    pub ignore_local: bool,
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2238,6 +2369,8 @@ pub struct HTTPRequestCondGroup {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HTTPRequestCond {
+    #[serde(rename = "isRequest", default = "default_true")]
+    pub is_request: bool,
     pub param: String,
     pub operator: String,
     pub value: String,
@@ -3073,6 +3206,18 @@ mod tests {
 
         assert!(http_443.is_https());
         assert!(!https_80.is_https());
+    }
+
+    #[test]
+    fn waf_page_options_accept_control_plane_aliases() {
+        let options: WAFPageOptions = serde_json::from_value(serde_json::json!({
+            "statusCode": 403,
+            "contentHTML": "<h1>Forbidden</h1>"
+        }))
+        .expect("WAF page options should parse control-plane aliases");
+
+        assert_eq!(options.status, 403);
+        assert_eq!(options.body, "<h1>Forbidden</h1>");
     }
 
     #[test]

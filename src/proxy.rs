@@ -19,6 +19,7 @@ use crate::config::ConfigStore;
 use crate::config_models::{HTTPCachePolicy, HTTPCacheRef, HTTPFirewallPolicy, ServerConfig};
 use crate::firewall::state::WafStateManager;
 use crate::rewrite::{RewriteResult, evaluate_host_redirects, evaluate_rewrites_with_cond};
+use crate::rpc::ip_report::{IpReportKind, IpReportMessage};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -107,8 +108,10 @@ pub struct ProxyCTX {
     pub metrics_recorded: bool,
     pub ttfb: Option<std::time::Duration>,
     pub response_status: u16,
-    pub cache_policy: Option<HTTPCachePolicy>,
+    pub cache_policy: Option<Arc<HTTPCachePolicy>>,
     pub cache_ref: Option<Arc<HTTPCacheRef>>,
+    pub compiled_cache_policy: Option<Arc<crate::cache::compiled::CompiledCachePolicy>>,
+    pub compiled_cache_ref: Option<Arc<crate::cache::compiled::CompiledCacheRef>>,
     pub cache_key: Option<String>,
     pub cache_hit: Option<bool>,
     pub cacheable: bool,
@@ -124,6 +127,7 @@ pub struct ProxyCTX {
     pub waf_rule_id: i64,
     pub rewrite_id: i64,
     pub waf_deferred: bool,
+    pub waf_whitelisted: bool,
     pub waf_action: Option<String>,
     pub errors: Option<Vec<String>>,
     pub tags: Option<Vec<String>>,
@@ -141,6 +145,7 @@ pub struct ProxyCTX {
     pub global_access_log_on: bool,
     pub global_access_log_config:
         Option<std::sync::Arc<crate::config_models::GlobalHTTPAccessLogConfig>>,
+    pub global_waf_block_options: Option<Arc<crate::config_models::WAFBlockOptions>>,
     pub access_log_module_enabled: bool,
     pub response_headers_size: usize,
     pub origin_address: String,
@@ -179,6 +184,7 @@ pub struct ProxyCTX {
     pub request_limit_out_bandwidth_sent: i64,
     pub request_limit_out_bandwidth_window_start: Option<std::time::Instant>,
     pub global_cache_policies: Arc<Vec<Arc<HTTPCachePolicy>>>,
+    pub compiled_plans: Arc<crate::compiled::CompiledPlanSet>,
     /// Cached during request_filter to avoid config lock in response_filter/body_filter
     pub global_http_config: Option<Arc<crate::config_models::GlobalHTTPAllConfig>>,
     pub firewall_policies_snapshot: Option<Arc<Vec<HTTPFirewallPolicy>>>,
@@ -202,6 +208,8 @@ impl Default for ProxyCTX {
             response_status: 0,
             cache_policy: None,
             cache_ref: None,
+            compiled_cache_policy: None,
+            compiled_cache_ref: None,
             cache_key: None,
             cache_hit: None,
             cacheable: false,
@@ -217,6 +225,7 @@ impl Default for ProxyCTX {
             waf_rule_id: 0,
             rewrite_id: 0,
             waf_deferred: false,
+            waf_whitelisted: false,
             waf_action: None,
             errors: None,
             tags: None,
@@ -233,6 +242,7 @@ impl Default for ProxyCTX {
             access_log_ref: None,
             global_access_log_on: true,
             global_access_log_config: None,
+            global_waf_block_options: None,
             access_log_module_enabled: true,
             response_headers_size: 0,
             origin_address: String::new(),
@@ -271,6 +281,7 @@ impl Default for ProxyCTX {
             request_limit_out_bandwidth_sent: 0,
             request_limit_out_bandwidth_window_start: None,
             global_cache_policies: Arc::new(Vec::new()),
+            compiled_plans: Arc::new(crate::compiled::CompiledPlanSet::default()),
             global_http_config: None,
             firewall_policies_snapshot: None,
             node_level: 0,
@@ -399,21 +410,23 @@ impl EdgeProxy {
         upstream_response: &pingora::http::ResponseHeader,
         ctx: &mut ProxyCTX,
     ) {
-        ctx.response_headers_size = upstream_response
-            .headers
-            .iter()
-            .map(|(name, value)| name.as_str().len() + value.len() + 4)
-            .sum();
+        let needs_response_headers =
+            ctx.response_headers.is_allocated() || Self::access_log_needs_response_headers(ctx);
 
-        if !ctx.response_headers.is_allocated() {
-            if !Self::access_log_needs_response_headers(ctx) {
-                return;
-            }
-            ctx.response_headers.ensure_allocated();
+        if !needs_response_headers {
+            ctx.response_headers_size = upstream_response
+                .headers
+                .iter()
+                .map(|(name, value)| name.as_str().len() + value.len() + 4)
+                .sum();
+            return;
         }
 
+        ctx.response_headers.ensure_allocated();
         ctx.response_headers.clear();
+        ctx.response_headers_size = 0;
         for (name, value) in upstream_response.headers.iter() {
+            ctx.response_headers_size += name.as_str().len() + value.len() + 4;
             if let Ok(value_str) = value.to_str() {
                 ctx.response_headers
                     .insert(name.to_string(), value_str.to_string());
@@ -452,19 +465,33 @@ impl EdgeProxy {
             bytes_sent,
         };
 
-        if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
-            for policy in global_policies.iter() {
-                if !policy.is_on {
-                    continue;
-                }
-                if let Some(action) = crate::firewall::evaluate_outbound_policy(
-                    policy,
-                    session,
-                    &ctx.request_body,
-                    &outbound_ctx,
-                    Self::forwarded_proto(session, ctx),
-                ) {
-                    return Some(action);
+        for policy in &ctx.compiled_plans.global_firewall {
+            if let Some(action) = crate::firewall::compiled::evaluate_compiled_outbound_policy(
+                policy,
+                session,
+                &ctx.request_body,
+                &outbound_ctx,
+                Self::forwarded_proto(session, ctx),
+            ) {
+                return Some(action);
+            }
+        }
+        if ctx.compiled_plans.global_firewall.is_empty() {
+            crate::metrics::METRICS.waf.record_legacy_fallback();
+            if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
+                for policy in global_policies.iter() {
+                    if !policy.is_on {
+                        continue;
+                    }
+                    if let Some(action) = crate::firewall::evaluate_outbound_policy(
+                        policy,
+                        session,
+                        &ctx.request_body,
+                        &outbound_ctx,
+                        Self::forwarded_proto(session, ctx),
+                    ) {
+                        return Some(action);
+                    }
                 }
             }
         }
@@ -475,13 +502,29 @@ impl EdgeProxy {
             && fw_ref.is_on
             && let Some(policy) = &web.firewall_policy
         {
-            return crate::firewall::evaluate_outbound_policy(
-                policy,
-                session,
-                &ctx.request_body,
-                &outbound_ctx,
-                Self::forwarded_proto(session, ctx),
-            );
+            let compiled_policy = server
+                .id
+                .and_then(|id| ctx.compiled_plans.server_firewall.get(&id));
+            return if let Some(compiled_policy) = compiled_policy {
+                crate::firewall::compiled::evaluate_compiled_outbound_policy_with_server(
+                    compiled_policy,
+                    session,
+                    &ctx.request_body,
+                    &outbound_ctx,
+                    Self::forwarded_proto(session, ctx),
+                    Some(server.as_ref()),
+                )
+            } else {
+                crate::metrics::METRICS.waf.record_legacy_fallback();
+                crate::firewall::evaluate_outbound_policy_with_server(
+                    policy,
+                    session,
+                    &ctx.request_body,
+                    &outbound_ctx,
+                    Self::forwarded_proto(session, ctx),
+                    Some(server.as_ref()),
+                )
+            };
         }
 
         None
@@ -490,17 +533,37 @@ impl EdgeProxy {
     fn disable_request_cache(session: &mut Session, ctx: &mut ProxyCTX, reason: &'static str) {
         ctx.cache_ref = None;
         ctx.cache_policy = None;
+        ctx.compiled_cache_ref = None;
+        ctx.compiled_cache_policy = None;
         ctx.cache_key = None;
         session
             .cache
             .disable(pingora_cache::NoCacheReason::Custom(reason));
     }
 
-    fn cache_ref_matches_request(
+    fn cache_eval_context<'a>(
+        session: &'a Session,
+        ctx: &ProxyCTX,
+        scheme: &'a str,
+    ) -> crate::cache::compiled::CacheEvalContext<'a> {
+        let mut cache_ctx = crate::cache::compiled::CacheEvalContext::new(session, scheme);
+        cache_ctx.server = ctx.server.clone();
+        cache_ctx.client_ip = Some(ctx.client_ip);
+        cache_ctx.client_port = Some(ctx.client_port);
+        cache_ctx.raw_remote_addr = Some(ctx.raw_remote_addr.clone());
+        cache_ctx.start_timestamp_millis = Some(ctx.start_timestamp_millis);
+        cache_ctx.is_http3_bridge = ctx.is_http3_bridge;
+        cache_ctx.host = Some(ctx.host.clone());
+        cache_ctx.analyzed = ctx.analyzed.clone();
+        cache_ctx
+    }
+
+    fn cache_ref_matches_request_with_context(
         cache_ref: &HTTPCacheRef,
-        session: &Session,
-        scheme: &str,
+        cache_ctx: &crate::cache::compiled::CacheEvalContext<'_>,
     ) -> bool {
+        let session = cache_ctx.session;
+        let scheme = cache_ctx.scheme;
         let path = session.req_header().uri.path();
         let mut url = None;
         if !cache_ref.except_url_patterns.is_empty()
@@ -524,11 +587,15 @@ impl EdgeProxy {
             && conds.is_on
             && !conds.groups.is_empty()
         {
-            return conds.match_request_with_scheme(session, scheme);
+            return conds
+                .request_match_with_context(cache_ctx)
+                .is_request_candidate();
         }
 
         if let Some(simple_cond) = &cache_ref.simple_cond {
-            return simple_cond.match_request_with_scheme(session, scheme);
+            return simple_cond
+                .request_match_with_context(cache_ctx)
+                .is_request_candidate();
         }
 
         true
@@ -1072,22 +1139,7 @@ impl EdgeProxy {
         server: &ServerConfig,
         host: &str,
     ) -> Option<(String, u16)> {
-        let redirect = server
-            .web
-            .as_ref()
-            .and_then(|web| web.redirect_to_https.as_ref())?;
-        if !redirect.is_on {
-            return None;
-        }
-
         if Self::is_https_downstream(session, ctx) {
-            return None;
-        }
-
-        if Self::domain_list_matches(&redirect.except_domains, host) {
-            return None;
-        }
-        if !redirect.domains.is_empty() && !Self::domain_list_matches(&redirect.domains, host) {
             return None;
         }
 
@@ -1097,6 +1149,29 @@ impl EdgeProxy {
             .path_and_query()
             .map(|value| value.as_str())
             .unwrap_or("/");
+
+        if let Some(target) = server
+            .id
+            .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+            .and_then(|plan| plan.redirect_to_https_target(host, request_uri))
+        {
+            return Some(target);
+        }
+
+        let redirect = server
+            .web
+            .as_ref()
+            .and_then(|web| web.redirect_to_https.as_ref())?;
+        if !redirect.is_on {
+            return None;
+        }
+
+        if Self::domain_list_matches(&redirect.except_domains, host) {
+            return None;
+        }
+        if !redirect.domains.is_empty() && !Self::domain_list_matches(&redirect.domains, host) {
+            return None;
+        }
 
         let target_host = if !redirect.host.is_empty() {
             if redirect.port > 0 && redirect.port != 443 {
@@ -1149,6 +1224,253 @@ impl EdgeProxy {
         }
     }
 
+    fn header_contains_ascii_case_insensitive(value: &str, needle: &[u8]) -> bool {
+        let bytes = value.as_bytes();
+        needle.is_empty()
+            || (bytes.len() >= needle.len()
+                && bytes
+                    .windows(needle.len())
+                    .any(|part| part.eq_ignore_ascii_case(needle)))
+    }
+
+    fn add_ctx_tag(ctx: &mut ProxyCTX, tag: &str) {
+        let tags = ctx.tags.get_or_insert_with(Vec::new);
+        if !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+
+    fn resolve_waf_block_runtime(
+        matched: &crate::firewall::MatchedAction,
+        global_block_options: Option<&crate::config_models::WAFBlockOptions>,
+    ) -> (i64, String, i64, String, bool) {
+        let mut final_timeout = matched.timeout_secs.unwrap_or(300);
+        let mut scope = matched
+            .scope
+            .clone()
+            .unwrap_or_else(|| "server".to_string());
+        let mut ip_list_id = matched.ip_list_id;
+        let mut event_level = matched.event_level.clone();
+        let mut max_timeout = matched.max_timeout_secs.unwrap_or(0) as i32;
+        let mut fail_global = matched.fail_global.unwrap_or(false);
+
+        if let Some(opts) = &matched.block_options {
+            if opts.timeout > 0 && matched.timeout_secs.is_none() {
+                final_timeout = opts.timeout as i64;
+            }
+            if ip_list_id <= 0 && opts.ip_list_id > 0 {
+                ip_list_id = opts.ip_list_id;
+            }
+            if matched.scope.is_none() && !opts.scope.is_empty() {
+                scope = opts.scope.clone();
+            }
+            if event_level.is_empty() && !opts.event_level.is_empty() {
+                event_level = opts.event_level.clone();
+            }
+            max_timeout = opts.max_timeout;
+            fail_global = fail_global || opts.fail_global;
+        } else if let Some(opts) = global_block_options {
+            if opts.timeout > 0 && matched.timeout_secs.is_none() {
+                final_timeout = opts.timeout as i64;
+            }
+            if ip_list_id <= 0 && opts.ip_list_id > 0 {
+                ip_list_id = opts.ip_list_id;
+            }
+            if matched.scope.is_none() && !opts.scope.is_empty() {
+                scope = opts.scope.clone();
+            }
+            if event_level.is_empty() && !opts.event_level.is_empty() {
+                event_level = opts.event_level.clone();
+            }
+            max_timeout = opts.max_timeout;
+            fail_global = fail_global || opts.fail_global;
+        }
+
+        if max_timeout > final_timeout as i32 {
+            final_timeout = rand::thread_rng().gen_range(final_timeout..=max_timeout as i64);
+        }
+        if fail_global {
+            scope = "global".to_string();
+        }
+        (
+            final_timeout.max(1),
+            scope,
+            ip_list_id,
+            event_level,
+            fail_global,
+        )
+    }
+
+    fn apply_waf_runtime_action(
+        &self,
+        session: &Session,
+        ctx: &mut ProxyCTX,
+        matched: &crate::firewall::MatchedAction,
+    ) {
+        if matches!(matched.action, crate::firewall::ActionResponse::Allow)
+            && !matches!(
+                matched.action_code.as_str(),
+                "tag" | "record_ip_white" | "record_ip_gray"
+            )
+        {
+            return;
+        }
+        match matched.action_code.as_str() {
+            "tag" => {
+                for tag in &matched.tags {
+                    Self::add_ctx_tag(ctx, tag);
+                }
+            }
+            "block" => {
+                let (timeout, scope, _, _, _) = Self::resolve_waf_block_runtime(
+                    matched,
+                    ctx.global_waf_block_options.as_deref(),
+                );
+                self.waf_state.block_ip(
+                    ctx.client_ip,
+                    ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+                    timeout,
+                    Some(scope.as_str()),
+                    matched.block_c_class,
+                    matched.use_local_firewall,
+                );
+            }
+            "record_ip" => {
+                let (timeout, scope, ip_list_id, event_level, _) = Self::resolve_waf_block_runtime(
+                    matched,
+                    ctx.global_waf_block_options.as_deref(),
+                );
+                let server_id = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
+                self.waf_state.block_ip(
+                    ctx.client_ip,
+                    server_id,
+                    timeout,
+                    Some(scope.as_str()),
+                    matched.block_c_class,
+                    matched.use_local_firewall,
+                );
+                let target = if matched.block_c_class {
+                    self.waf_state
+                        .get_c_class_net(ctx.client_ip)
+                        .map(|net| net.to_string())
+                        .unwrap_or_else(|_| ctx.client_ip_str.clone())
+                } else {
+                    ctx.client_ip_str.clone()
+                };
+                let target_server_id = if scope == "global" { 0 } else { server_id };
+                self.report_ip_list_item(
+                    Some(session),
+                    Some(ctx),
+                    IpReportKind::Black,
+                    ip_list_id,
+                    target,
+                    target_server_id,
+                    server_id,
+                    timeout,
+                    format!("WAF Action: {}", matched.action_code),
+                    event_level,
+                    "waf",
+                    matched.policy_id,
+                    matched.group_id,
+                    matched.set_id,
+                );
+            }
+            "record_ip_white" | "record_ip_gray" => {
+                let timeout = matched.timeout_secs.unwrap_or(3600).max(1);
+                let server_id = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
+                let target_server_id = if matches!(matched.scope.as_deref(), Some("global")) {
+                    0
+                } else {
+                    server_id
+                };
+                let expiry = crate::utils::time::now_timestamp() + timeout;
+                let kind = if matched.action_code == "record_ip_white" {
+                    self.waf_state
+                        .apply_white_ip_until(target_server_id, ctx.client_ip, expiry);
+                    IpReportKind::White
+                } else {
+                    self.waf_state
+                        .apply_gray_ip_until(target_server_id, ctx.client_ip, expiry);
+                    Self::add_ctx_tag(ctx, "graylist");
+                    IpReportKind::Gray
+                };
+                self.report_ip_list_item(
+                    Some(session),
+                    Some(ctx),
+                    kind,
+                    matched.ip_list_id,
+                    ctx.client_ip.to_string(),
+                    target_server_id,
+                    server_id,
+                    timeout,
+                    format!("WAF Action: {}", matched.action_code),
+                    matched.event_level.clone(),
+                    "waf",
+                    matched.policy_id,
+                    matched.group_id,
+                    matched.set_id,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn report_ip_list_item(
+        &self,
+        session: Option<&Session>,
+        ctx: Option<&ProxyCTX>,
+        kind: IpReportKind,
+        ip_list_id: i64,
+        value: String,
+        server_id: i64,
+        source_server_id: i64,
+        timeout_secs: i64,
+        reason: String,
+        event_level: String,
+        source_category: &str,
+        policy_id: i64,
+        group_id: i64,
+        set_id: i64,
+    ) {
+        let node_id = self.api_config.node_id.parse::<i64>().unwrap_or(0);
+        let (source_url, source_user_agent) = match session {
+            Some(session) => {
+                let source_url = ctx
+                    .map(|ctx| Self::request_full_url(session, ctx))
+                    .unwrap_or_else(|| session.req_header().uri.to_string());
+                let source_user_agent = session
+                    .get_header("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                (source_url, source_user_agent)
+            }
+            None => (String::new(), String::new()),
+        };
+
+        crate::rpc::ip_report::report_item(IpReportMessage {
+            ip_list_id,
+            value,
+            ip_from: String::new(),
+            ip_to: String::new(),
+            expired_at: crate::utils::time::now_timestamp() + timeout_secs.max(1),
+            reason,
+            r#type: String::new(),
+            list_kind: kind,
+            event_level,
+            node_id,
+            server_id,
+            source_node_id: node_id,
+            source_server_id,
+            source_http_firewall_policy_id: policy_id,
+            source_http_firewall_rule_group_id: group_id,
+            source_http_firewall_rule_set_id: set_id,
+            source_url,
+            source_user_agent,
+            source_category: source_category.to_string(),
+        });
+    }
+
     fn request_full_url(session: &Session, ctx: &ProxyCTX) -> String {
         let scheme = Self::forwarded_proto(session, ctx);
         let authority = session
@@ -1188,6 +1510,49 @@ impl EdgeProxy {
         }
 
         parts.join(", ")
+    }
+
+    async fn respond_compiled_shutdown(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        shutdown: &crate::compiled::CompiledShutdownPlan,
+    ) -> Result<bool> {
+        if let Some((target, redirect_status)) = shutdown.redirect_target() {
+            let mut resp = pingora_http::ResponseHeader::build(redirect_status, None).unwrap();
+            resp.insert_header("location", target).unwrap();
+            session.write_response_header(Box::new(resp), true).await?;
+            ctx.response_status = redirect_status;
+            return Ok(true);
+        }
+
+        let body = if shutdown.body_type == "html" {
+            self.render_page_template(session, ctx, &shutdown.body, shutdown.status)
+        } else if shutdown.url.is_empty() {
+            "The site have been shutdown.".to_string()
+        } else {
+            let path = std::path::Path::new(&shutdown.url);
+            if !path.starts_with("pages") && !path.starts_with("/pages") {
+                format!("404 page not found: '{}'", shutdown.url)
+            } else {
+                match tokio::fs::read_to_string(path).await {
+                    Ok(content) => {
+                        self.render_page_template(session, ctx, &content, shutdown.status)
+                    }
+                    Err(_) => format!("404 page not found: '{}'", shutdown.url),
+                }
+            }
+        };
+
+        let mut resp = pingora_http::ResponseHeader::build(shutdown.status, None).unwrap();
+        resp.insert_header("content-type", "text/html; charset=utf-8")
+            .unwrap();
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(Some(Bytes::from(body)), true)
+            .await?;
+        ctx.response_status = shutdown.status;
+        Ok(true)
     }
 
     async fn respond_shutdown(
@@ -1264,10 +1629,19 @@ impl EdgeProxy {
             .unwrap_or(false)
     }
 
-    fn global_cc_policy(&self) -> Option<crate::config_models::HTTPCCPolicy> {
+    fn global_cc_policy(&self) -> Option<crate::config_models::CCPolicy> {
         self.config
             .get_global_http_cc_policy_sync()
             .filter(|policy| policy.is_on)
+            .as_ref()
+            .map(crate::config_models::CCPolicy::from)
+            .or_else(|| {
+                self.config
+                    .get_firewall_policies_sync()
+                    .iter()
+                    .find_map(|policy| policy.cc_config.as_ref().filter(|cc| cc.is_on))
+                    .map(crate::config_models::CCPolicy::from)
+            })
     }
 
     fn global_http_pages(&self) -> Vec<crate::config_models::HTTPPageConfig> {
@@ -1340,6 +1714,16 @@ impl EdgeProxy {
         true
     }
 
+    fn compiled_site_webp_matches_request(ctx: &ProxyCTX, session: &Session) -> Option<bool> {
+        let server_id = ctx.server.as_ref()?.id?;
+        let feature_plan = ctx.compiled_plans.server_features.get(&server_id)?;
+        let accept = session
+            .get_header("accept")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        Some(feature_plan.webp_matches_request(session.req_header().uri.path(), accept))
+    }
+
     fn maybe_enable_webp_conversion(
         &self,
         session: &Session,
@@ -1364,7 +1748,9 @@ impl EdgeProxy {
         let Some(policy) = self.global_webp_policy() else {
             return;
         };
-        if !Self::site_webp_matches_request(site_webp, session) {
+        if !Self::compiled_site_webp_matches_request(ctx, session)
+            .unwrap_or_else(|| Self::site_webp_matches_request(site_webp, session))
+        {
             return;
         }
         // WebP conversion is treated as a transformed-cache feature. Without
@@ -1392,13 +1778,21 @@ impl EdgeProxy {
             return;
         }
 
-        if !site_webp.mime_types.is_empty()
-            && !site_webp.mime_types.iter().any(|mime| {
-                content_type
-                    .to_ascii_lowercase()
-                    .starts_with(&mime.to_ascii_lowercase())
-            })
-        {
+        let compiled_feature_plan = server
+            .id
+            .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id));
+        let mime_matches = compiled_feature_plan
+            .as_ref()
+            .map(|plan| plan.webp_mime_matches(&content_type))
+            .unwrap_or_else(|| {
+                site_webp.mime_types.is_empty()
+                    || site_webp.mime_types.iter().any(|mime| {
+                        content_type
+                            .to_ascii_lowercase()
+                            .starts_with(&mime.to_ascii_lowercase())
+                    })
+            });
+        if !mime_matches {
             return;
         }
 
@@ -1414,8 +1808,14 @@ impl EdgeProxy {
         if content_length_usize > MAX_WEBP_CONVERSION_BODY_BYTES {
             return;
         }
-        let site_min = Self::size_capacity_bytes(&site_webp.min_length);
-        let site_max = Self::size_capacity_bytes(&site_webp.max_length);
+        let site_min = compiled_feature_plan
+            .as_ref()
+            .and_then(|plan| plan.webp_min_bytes())
+            .unwrap_or_else(|| Self::size_capacity_bytes(&site_webp.min_length));
+        let site_max = compiled_feature_plan
+            .as_ref()
+            .and_then(|plan| plan.webp_max_bytes())
+            .unwrap_or_else(|| Self::size_capacity_bytes(&site_webp.max_length));
         let policy_min = Self::size_capacity_bytes(&policy.min_length);
         let policy_max = Self::size_capacity_bytes(&policy.max_length);
         let effective_min = site_min.max(policy_min);
@@ -1534,6 +1934,20 @@ impl EdgeProxy {
             return None;
         }
         let server = server?;
+        if policy.port > 0 {
+            let port = u16::try_from(policy.port).ok()?;
+            if !server.https.as_ref().is_some_and(|https| https.is_on) {
+                return None;
+            }
+            let ua = session
+                .get_header("user-agent")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            if Self::is_mobile_user_agent(ua) && !policy.support_mobile_browsers {
+                return None;
+            }
+            return Some(port);
+        }
         if !server.http3_enabled() {
             return None;
         }
@@ -1544,10 +1958,6 @@ impl EdgeProxy {
             .unwrap_or("");
         if Self::is_mobile_user_agent(ua) && !policy.support_mobile_browsers {
             return None;
-        }
-
-        if policy.port > 0 {
-            return u16::try_from(policy.port).ok();
         }
 
         session.req_header().uri.port_u16().or(Some(443))
@@ -1573,10 +1983,36 @@ impl EdgeProxy {
 
     fn find_custom_page(
         &self,
-        server: Option<&ServerConfig>,
+        ctx: &ProxyCTX,
         status: u16,
     ) -> Option<crate::config_models::HTTPPageConfig> {
-        self.collect_candidate_pages(server)
+        if let Some(server) = ctx.server.as_deref() {
+            let compiled_plan = server
+                .id
+                .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id));
+            if let Some(plan) = compiled_plan {
+                if let Some(page) = plan.custom_page_for_status(status) {
+                    return Some(page);
+                }
+            } else if let Some(page) = server.web.as_ref().and_then(|web| {
+                web.pages
+                    .iter()
+                    .find(|page| page.is_on && page.matches_status(status))
+                    .cloned()
+            }) {
+                return Some(page);
+            }
+
+            if server
+                .web
+                .as_ref()
+                .is_some_and(|web| !web.enable_global_pages)
+            {
+                return None;
+            }
+        }
+
+        self.collect_candidate_pages(None)
             .into_iter()
             .find(|page| page.is_on && page.matches_status(status))
     }
@@ -1643,7 +2079,7 @@ impl EdgeProxy {
         ctx: &mut ProxyCTX,
         status: u16,
     ) -> Result<bool> {
-        if let Some(page) = self.find_custom_page(ctx.server.as_deref(), status) {
+        if let Some(page) = self.find_custom_page(ctx, status) {
             if let Some(url) = page.url.as_ref().filter(|url| !url.is_empty()) {
                 let redirect_status = u16::try_from(page.new_status)
                     .ok()
@@ -1899,6 +2335,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             page_options: None,
             captcha_options: None,
             js_cookie_options: None,
+            chained_actions: vec![],
+            observe_only: false,
         };
         ctx.waf_action = Some(matched.action_code.clone());
         self.respond_waf_action(session, ctx, matched, ip.to_string())
@@ -1945,6 +2383,22 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         false,
                         true,
                     );
+                    self.report_ip_list_item(
+                        Some(session),
+                        Some(ctx),
+                        IpReportKind::Black,
+                        0,
+                        ctx.client_ip.to_string(),
+                        scope_server_id,
+                        ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0),
+                        ban,
+                        "CC policy block".to_string(),
+                        "error".to_string(),
+                        "cc",
+                        0,
+                        0,
+                        0,
+                    );
                 }
                 if policy.show_page {
                     ctx.no_log = policy.no_log;
@@ -1963,17 +2417,6 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let Some(policy) = self.global_cc_policy() else {
             return Ok(false);
         };
-        let policy = crate::config_models::CCPolicy {
-            is_on: policy.is_on,
-            max_qps: policy.max_qps,
-            per_ip_max_qps: policy.per_ip_max_qps,
-            max_bandwidth: policy.max_bandwidth,
-            show_page: policy.show_page,
-            block_ip: policy.block_ip,
-            page_duration: policy.page_duration,
-            block_ip_duration: policy.block_ip_duration,
-            no_log: policy.no_log,
-        };
         self.apply_cc_policy(session, ctx, &policy, 0).await
     }
 
@@ -1981,21 +2424,26 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let domain = crate::lb_factory::strip_addr_port(domain)
             .trim_end_matches('.')
             .to_ascii_lowercase();
-        patterns.iter().any(|pattern| {
-            let pattern = crate::lb_factory::strip_addr_port(pattern)
-                .trim_end_matches('.')
-                .to_ascii_lowercase();
-            if pattern == domain {
-                return true;
-            }
-            if let Some(suffix) = pattern.strip_prefix("*.") {
-                return domain == suffix || domain.ends_with(&format!(".{}", suffix));
-            }
-            if pattern.contains('*') {
-                return Self::cached_wildcard_domain_regex_matches(&pattern, &domain);
-            }
-            false
-        })
+        patterns
+            .iter()
+            .any(|pattern| Self::wildcard_domain_pattern_matches(pattern, &domain))
+    }
+
+    fn wildcard_domain_pattern_matches(pattern: &str, normalized_domain: &str) -> bool {
+        let pattern = crate::lb_factory::strip_addr_port(pattern)
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if pattern == normalized_domain {
+            return true;
+        }
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            return normalized_domain == suffix
+                || normalized_domain
+                    .strip_suffix(suffix)
+                    .is_some_and(|prefix| prefix.ends_with('.'));
+        }
+        pattern.contains('*')
+            && Self::cached_wildcard_domain_regex_matches(&pattern, normalized_domain)
     }
 
     fn hsts_header_value(hsts: &crate::config_models::HSTSConfig) -> String {
@@ -2093,35 +2541,37 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         session: &Session,
         params: &serde_json::Value,
     ) -> Option<(bool, String, Option<String>)> {
-        let domains = params
-            .get("domains")
-            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
-            .unwrap_or_default();
-        if !domains.is_empty() {
-            let host = session
-                .get_header("host")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default();
-            if !Self::wildcard_domain_matches(&domains, host) {
-                return None;
+        if let Some(domains) = params.get("domains").and_then(|v| v.as_array()) {
+            if !domains.is_empty() {
+                let host = session
+                    .get_header("host")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default();
+                let host = crate::lb_factory::strip_addr_port(host)
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase();
+                if !domains
+                    .iter()
+                    .filter_map(|domain| domain.as_str())
+                    .any(|domain| Self::wildcard_domain_pattern_matches(domain, &host))
+                {
+                    return None;
+                }
             }
         }
 
-        let exts = params
-            .get("exts")
-            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
-            .unwrap_or_default();
-        if !exts.is_empty() {
-            let path = session.req_header().uri.path().to_ascii_lowercase();
-            if !exts.iter().any(|ext| {
-                let ext = ext.to_ascii_lowercase();
-                if ext.starts_with('.') {
-                    path.ends_with(&ext)
-                } else {
-                    path.ends_with(&format!(".{}", ext))
+        if let Some(exts) = params.get("exts").and_then(|v| v.as_array()) {
+            if !exts.is_empty() {
+                let path = session.req_header().uri.path().to_ascii_lowercase();
+                if !exts.iter().filter_map(|ext| ext.as_str()).any(|ext| {
+                    let ext = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+                    !ext.is_empty()
+                        && path.len() > ext.len()
+                        && path.ends_with(&ext)
+                        && path.as_bytes()[path.len() - ext.len() - 1] == b'.'
+                }) {
+                    return None;
                 }
-            }) {
-                return None;
             }
         }
 
@@ -2178,6 +2628,47 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return Ok(false);
         }
 
+        let compiled_plan = ctx
+            .server
+            .as_ref()
+            .and_then(|server| server.id)
+            .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+            .filter(|plan| plan.has_auth());
+        if let Some(compiled_plan) = compiled_plan {
+            let authorization = session
+                .get_header("authorization")
+                .and_then(|value| value.to_str().ok());
+            if let Some(result) = compiled_plan.auth_result(
+                session
+                    .get_header("host")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default(),
+                session.req_header().uri.path(),
+                authorization,
+            ) {
+                ctx.waf_action = Some(format!("auth:{}", result.auth_type));
+                if result.ok {
+                    return Ok(false);
+                }
+                let realm = if result.realm.is_empty() {
+                    &ctx.host
+                } else {
+                    &result.realm
+                };
+                let mut header = format!("Basic realm=\"{}\"", realm.replace('"', ""));
+                if let Some(charset) = result.charset {
+                    header.push_str(&format!(", charset=\"{}\"", charset.replace('"', "")));
+                }
+                let mut resp = pingora_http::ResponseHeader::build(401, None).unwrap();
+                let _ = resp.insert_header("www-authenticate", header);
+                let _ = resp.insert_header("cache-control", "no-store");
+                session.write_response_header(Box::new(resp), true).await?;
+                ctx.response_status = 401;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
         for policy_ref in &auth.policy_refs {
             let Some(policy) = &policy_ref.auth_policy else {
                 continue;
@@ -2226,9 +2717,6 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return Ok(false);
         }
         let url = Self::current_request_url(session, ctx);
-        if !Self::url_patterns_match(&url, &config.only_url_patterns, &config.except_url_patterns) {
-            return Ok(false);
-        }
 
         let origin = session
             .get_header("origin")
@@ -2264,17 +2752,32 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 .unwrap_or_default()
         };
 
-        let allowed = if source_host.is_empty() {
-            config.allow_empty
-        } else if config.allow_same_domain && source_host.eq_ignore_ascii_case(&ctx.host) {
-            true
-        } else if config.allow_domains.is_empty() {
-            !config.deny_domains.is_empty()
-                && !Self::wildcard_domain_matches(&config.deny_domains, &source_host)
-        } else {
-            Self::wildcard_domain_matches(&config.allow_domains, &source_host)
-                && !Self::wildcard_domain_matches(&config.deny_domains, &source_host)
-        };
+        let compiled_allowed = ctx
+            .server
+            .as_ref()
+            .and_then(|server| server.id)
+            .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+            .and_then(|plan| plan.referer_allows(&url, &source_host, &ctx.host));
+        let allowed = compiled_allowed.unwrap_or_else(|| {
+            if !Self::url_patterns_match(
+                &url,
+                &config.only_url_patterns,
+                &config.except_url_patterns,
+            ) {
+                return true;
+            }
+            if source_host.is_empty() {
+                config.allow_empty
+            } else if config.allow_same_domain && source_host.eq_ignore_ascii_case(&ctx.host) {
+                true
+            } else if config.allow_domains.is_empty() {
+                !config.deny_domains.is_empty()
+                    && !Self::wildcard_domain_matches(&config.deny_domains, &source_host)
+            } else {
+                Self::wildcard_domain_matches(&config.allow_domains, &source_host)
+                    && !Self::wildcard_domain_matches(&config.deny_domains, &source_host)
+            }
+        });
 
         if allowed {
             return Ok(false);
@@ -2307,46 +2810,70 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return Ok(false);
         }
         let url = Self::current_request_url(session, ctx);
-        if !Self::url_patterns_match(&url, &config.only_url_patterns, &config.except_url_patterns) {
-            return Ok(false);
-        }
         let ua = session
             .get_header("user-agent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        for filter in &config.filters {
-            if filter.keywords.is_empty() {
-                continue;
+        let compiled_action = ctx
+            .server
+            .as_ref()
+            .and_then(|server| server.id)
+            .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+            .and_then(|plan| plan.user_agent_action(&url, ua));
+        let blocked = if let Some(action) = compiled_action {
+            match action {
+                Some(true) => return Ok(false),
+                Some(false) => true,
+                None => false,
             }
-            let matched = filter.keywords.iter().any(|keyword| {
-                if keyword.is_empty() {
-                    ua.is_empty()
-                } else if keyword.contains('*') {
-                    Self::cached_user_agent_wildcard_matches(keyword, ua)
-                } else {
-                    ua.to_ascii_lowercase()
-                        .contains(&keyword.to_ascii_lowercase())
-                }
-            });
-            if matched {
-                if filter.action == "allow" {
-                    return Ok(false);
-                }
-                ctx.waf_action = Some("userAgentCheck".to_string());
-                let mut resp = pingora_http::ResponseHeader::build(403, None).unwrap();
-                let _ = resp.insert_header("cache-control", "max-age=3600");
-                session.write_response_header(Box::new(resp), false).await?;
-                session
-                    .write_response_body(
-                        Some(bytes::Bytes::from_static(
-                            b"The User-Agent has been blocked.",
-                        )),
-                        true,
-                    )
-                    .await?;
-                ctx.response_status = 403;
-                return Ok(true);
+        } else {
+            if !Self::url_patterns_match(
+                &url,
+                &config.only_url_patterns,
+                &config.except_url_patterns,
+            ) {
+                return Ok(false);
             }
+            let mut blocked = false;
+            for filter in &config.filters {
+                if filter.keywords.is_empty() {
+                    continue;
+                }
+                let matched = filter.keywords.iter().any(|keyword| {
+                    if keyword.is_empty() {
+                        ua.is_empty()
+                    } else if keyword.contains('*') {
+                        Self::cached_user_agent_wildcard_matches(keyword, ua)
+                    } else {
+                        ua.to_ascii_lowercase()
+                            .contains(&keyword.to_ascii_lowercase())
+                    }
+                });
+                if matched {
+                    if filter.action == "allow" {
+                        return Ok(false);
+                    }
+                    blocked = true;
+                    break;
+                }
+            }
+            blocked
+        };
+        if blocked {
+            ctx.waf_action = Some("userAgentCheck".to_string());
+            let mut resp = pingora_http::ResponseHeader::build(403, None).unwrap();
+            let _ = resp.insert_header("cache-control", "max-age=3600");
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(
+                    Some(bytes::Bytes::from_static(
+                        b"The User-Agent has been blocked.",
+                    )),
+                    true,
+                )
+                .await?;
+            ctx.response_status = 403;
+            return Ok(true);
         }
         Ok(false)
     }
@@ -2388,6 +2915,22 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     Some("global"),
                     false,
                     false,
+                );
+                self.report_ip_list_item(
+                    Some(session),
+                    Some(ctx),
+                    IpReportKind::Black,
+                    0,
+                    ctx.client_ip.to_string(),
+                    0,
+                    ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0),
+                    3600,
+                    "Domain mismatch block".to_string(),
+                    "error".to_string(),
+                    "domain_mismatch",
+                    0,
+                    0,
+                    0,
                 );
             }
         }
@@ -2523,34 +3066,42 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let Some(server) = ctx.server.as_ref() else {
             return Ok(false);
         };
-        let Some(request_limit) = server
-            .web
-            .as_ref()
-            .and_then(|web| web.request_limit.as_ref())
-        else {
-            return Ok(false);
+        let compiled_request_limit = server
+            .id
+            .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+            .and_then(|plan| plan.request_limit());
+        let raw_request_limit = if compiled_request_limit.is_none() {
+            let request_limit = server
+                .web
+                .as_ref()
+                .and_then(|web| web.request_limit.as_ref());
+            match request_limit {
+                Some(request_limit) if request_limit.is_on => Some(request_limit),
+                _ => None,
+            }
+        } else {
+            None
         };
-        if !request_limit.is_on {
+        if compiled_request_limit.is_none() && raw_request_limit.is_none() {
             return Ok(false);
         }
 
-        if self
-            .waf_state
-            .is_whitelisted(ctx.client_ip, server.numeric_id())
-        {
-            ctx.request_limit_out_bandwidth_bytes = 0;
-            ctx.request_limit_out_bandwidth_sent = 0;
-            ctx.request_limit_out_bandwidth_window_start = None;
-            return Ok(false);
-        }
-
-        ctx.request_limit_out_bandwidth_bytes = request_limit.out_bandwidth_per_conn_bytes_value();
+        ctx.request_limit_out_bandwidth_bytes = compiled_request_limit
+            .map(|request_limit| request_limit.out_bandwidth_per_conn_bytes)
+            .or_else(|| {
+                raw_request_limit
+                    .map(|request_limit| request_limit.out_bandwidth_per_conn_bytes_value())
+            })
+            .unwrap_or(0);
         if ctx.request_limit_out_bandwidth_bytes <= 0 {
             ctx.request_limit_out_bandwidth_sent = 0;
             ctx.request_limit_out_bandwidth_window_start = None;
         }
 
-        let max_body_bytes = request_limit.max_body_bytes_value();
+        let max_body_bytes = compiled_request_limit
+            .map(|request_limit| request_limit.max_body_bytes)
+            .or_else(|| raw_request_limit.map(|request_limit| request_limit.max_body_bytes_value()))
+            .unwrap_or(0);
         if max_body_bytes > 0 {
             let content_length = session
                 .get_header("content-length")
@@ -2570,8 +3121,14 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             &ctx.raw_remote_addr,
             server.numeric_id(),
             ctx.client_ip,
-            request_limit.max_conns,
-            request_limit.max_conns_per_ip,
+            compiled_request_limit
+                .map(|request_limit| request_limit.max_conns)
+                .or_else(|| raw_request_limit.map(|request_limit| request_limit.max_conns))
+                .unwrap_or(0),
+            compiled_request_limit
+                .map(|request_limit| request_limit.max_conns_per_ip)
+                .or_else(|| raw_request_limit.map(|request_limit| request_limit.max_conns_per_ip))
+                .unwrap_or(0),
         ) {
             ctx.response_status = 429;
             return self.respond_status_with_pages(session, ctx, 429).await;
@@ -2624,13 +3181,6 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let Some(server) = ctx.server.as_ref() else {
             return;
         };
-        let Some(charset_cfg) = server.web.as_ref().and_then(|web| web.charset.as_ref()) else {
-            return;
-        };
-        if !charset_cfg.is_on || charset_cfg.charset.is_empty() {
-            return;
-        }
-
         let Some(current) = upstream_response
             .headers
             .get("content-type")
@@ -2641,26 +3191,40 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return;
         };
 
-        let mut mime = current.to_string();
-        if charset_cfg.force
-            && let Some((head, _)) = current.split_once(';')
+        let content_type = if let Some(content_type) = server
+            .id
+            .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+            .and_then(|plan| plan.charset_content_type(current))
         {
-            mime = head.trim().to_string();
-        }
-
-        if !TEXT_MIME_TYPES
-            .iter()
-            .any(|allowed| mime.eq_ignore_ascii_case(allowed))
-        {
-            return;
-        }
-
-        let charset = if charset_cfg.is_upper {
-            charset_cfg.charset.to_ascii_uppercase()
+            content_type
         } else {
-            charset_cfg.charset.clone()
+            let Some(charset_cfg) = server.web.as_ref().and_then(|web| web.charset.as_ref()) else {
+                return;
+            };
+            if !charset_cfg.is_on || charset_cfg.charset.is_empty() {
+                return;
+            }
+            let mut mime = current.to_string();
+            if charset_cfg.force
+                && let Some((head, _)) = current.split_once(';')
+            {
+                mime = head.trim().to_string();
+            }
+
+            if !TEXT_MIME_TYPES
+                .iter()
+                .any(|allowed| mime.eq_ignore_ascii_case(allowed))
+            {
+                return;
+            }
+
+            let charset = if charset_cfg.is_upper {
+                charset_cfg.charset.to_ascii_uppercase()
+            } else {
+                charset_cfg.charset.clone()
+            };
+            format!("{}; charset={}", mime, charset)
         };
-        let content_type = format!("{}; charset={}", mime, charset);
         upstream_response.remove_header("content-type");
         let _ = upstream_response.insert_header("content-type", content_type.clone());
         ctx.response_headers
@@ -2692,13 +3256,22 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .unwrap_or_else(|| session.req_header().uri.path().to_string())
     }
 
-    fn strip_hls_query_from_query(query: &str) -> String {
-        query
-            .split('&')
-            .filter(|item| !item.starts_with("hls_session=") && !item.starts_with("hls_exp="))
-            .filter(|item| !item.is_empty())
-            .collect::<Vec<_>>()
-            .join("&")
+    fn strip_hls_query_from_query(query: &str) -> std::borrow::Cow<'_, str> {
+        if !query.contains("hls_session=") && !query.contains("hls_exp=") {
+            return std::borrow::Cow::Borrowed(query);
+        }
+
+        let mut stripped = String::with_capacity(query.len());
+        for item in query.split('&') {
+            if item.is_empty() || item.starts_with("hls_session=") || item.starts_with("hls_exp=") {
+                continue;
+            }
+            if !stripped.is_empty() {
+                stripped.push('&');
+            }
+            stripped.push_str(item);
+        }
+        std::borrow::Cow::Owned(stripped)
     }
 
     fn default_cache_key_for_session(session: &Session, ctx: &ProxyCTX) -> String {
@@ -2713,14 +3286,21 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .req_header()
             .uri
             .query()
-            .map(Self::strip_hls_query_from_query)
-            .unwrap_or_default();
+            .map(Self::strip_hls_query_from_query);
 
-        if query.is_empty() {
-            format!("{scheme}://{host}{path}")
-        } else {
-            format!("{scheme}://{host}{path}?{query}")
+        let query_len = query.as_ref().map(|query| query.len() + 1).unwrap_or(0);
+        let mut key = String::with_capacity(scheme.len() + 3 + host.len() + path.len() + query_len);
+        key.push_str(scheme);
+        key.push_str("://");
+        key.push_str(host);
+        key.push_str(path);
+        if let Some(query) = query
+            && !query.is_empty()
+        {
+            key.push('?');
+            key.push_str(&query);
         }
+        key
     }
 
     fn query_param(session: &Session, name: &str) -> Option<String> {
@@ -3017,13 +3597,24 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 } else {
                     "server"
                 };
-                self.waf_state.block_ip(
-                    ip,
+                let timeout = failure_config.fail_block_timeout.max(1);
+                self.waf_state
+                    .block_ip(ip, server_id, timeout, Some(scope), false, true);
+                self.report_ip_list_item(
+                    Some(session),
+                    Some(ctx),
+                    IpReportKind::Black,
+                    0,
+                    ip.to_string(),
+                    failure_scope_id,
                     server_id,
-                    failure_config.fail_block_timeout.max(1),
-                    Some(scope),
-                    false,
-                    true,
+                    timeout,
+                    "WAF challenge failure block".to_string(),
+                    "error".to_string(),
+                    "challenge",
+                    0,
+                    0,
+                    0,
                 );
             }
         }
@@ -3332,17 +3923,6 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let Some(server) = ctx.server.as_ref() else {
             return;
         };
-        let Some(optimization) = server
-            .web
-            .as_ref()
-            .and_then(|web| web.optimization.as_ref())
-        else {
-            return;
-        };
-        if !optimization.is_on() {
-            return;
-        }
-
         let request_url = Self::current_request_url(session, ctx);
         let content_type = upstream_response
             .headers
@@ -3355,29 +3935,46 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .trim()
             .to_ascii_lowercase();
 
-        let kind = if content_type == "text/html" || content_type == "application/xhtml+xml" {
-            optimization
-                .html
-                .as_ref()
-                .filter(|cfg| cfg.is_on && cfg.base.matches_url(&request_url))
-                .map(|_| "html")
-        } else if content_type == "text/css" {
-            optimization
-                .css
-                .as_ref()
-                .filter(|cfg| cfg.is_on && cfg.base.matches_url(&request_url))
-                .map(|_| "css")
-        } else if content_type == "text/javascript"
-            || content_type == "application/javascript"
-            || content_type == "application/x-javascript"
-        {
-            optimization
-                .javascript
-                .as_ref()
-                .filter(|cfg| cfg.is_on && cfg.base.matches_url(&request_url))
-                .map(|_| "js")
+        let compiled_plan = server
+            .id
+            .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id));
+        let kind = if let Some(plan) = compiled_plan.filter(|plan| plan.has_optimization()) {
+            plan.optimization_kind(&content_type, &request_url)
         } else {
-            None
+            let Some(optimization) = server
+                .web
+                .as_ref()
+                .and_then(|web| web.optimization.as_ref())
+            else {
+                return;
+            };
+            if !optimization.is_on() {
+                return;
+            }
+            if content_type == "text/html" || content_type == "application/xhtml+xml" {
+                optimization
+                    .html
+                    .as_ref()
+                    .filter(|cfg| cfg.is_on && cfg.base.matches_url(&request_url))
+                    .map(|_| "html")
+            } else if content_type == "text/css" {
+                optimization
+                    .css
+                    .as_ref()
+                    .filter(|cfg| cfg.is_on && cfg.base.matches_url(&request_url))
+                    .map(|_| "css")
+            } else if content_type == "text/javascript"
+                || content_type == "application/javascript"
+                || content_type == "application/x-javascript"
+            {
+                optimization
+                    .javascript
+                    .as_ref()
+                    .filter(|cfg| cfg.is_on && cfg.base.matches_url(&request_url))
+                    .map(|_| "js")
+            } else {
+                None
+            }
         };
 
         if let Some(kind) = kind {
@@ -3403,18 +4000,30 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let Some(server) = ctx.server.as_ref() else {
             return;
         };
-        let Some(hls) = server.web.as_ref().and_then(|web| web.hls.as_ref()) else {
-            return;
-        };
-        let Some(encrypting) = hls.encrypting.as_ref() else {
-            return;
-        };
-        if !encrypting.is_on || upstream_response.status.as_u16() != 200 {
+        if upstream_response.status.as_u16() != 200 {
             return;
         }
 
         let request_url = Self::current_request_url(session, ctx);
-        if !encrypting.matches_url(&request_url) {
+        let compiled_plan = server
+            .id
+            .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id));
+        let hls_matches = if let Some(plan) = compiled_plan.filter(|plan| plan.has_hls_encrypting())
+        {
+            plan.hls_encrypting_matches(&request_url)
+        } else {
+            let Some(hls) = server.web.as_ref().and_then(|web| web.hls.as_ref()) else {
+                return;
+            };
+            let Some(encrypting) = hls.encrypting.as_ref() else {
+                return;
+            };
+            if !encrypting.is_on {
+                return;
+            }
+            encrypting.matches_url(&request_url)
+        };
+        if !hls_matches {
             return;
         }
         let Some(content_length) = Self::response_content_length(upstream_response) else {
@@ -3589,7 +4198,6 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         ip: String,
     ) -> Result<bool> {
         let action = matched.action;
-        let global_actions = self.config.get_waf_actions_sync();
 
         match action {
             crate::firewall::ActionResponse::Allow => Ok(false),
@@ -3609,12 +4217,6 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     matched.action_code,
                     matched.tags
                 );
-                let mut final_timeout = matched.timeout_secs.unwrap_or(300);
-                let mut scope = matched.scope.as_deref().unwrap_or("server");
-                let mut max_timeout = 0;
-                let mut fail_global = false;
-
-                // Priority 1: From MatchedAction (Policy/Website Level)
                 if let Some(opts) = &matched.block_options {
                     if opts.status_code > 0 {
                         status = opts.status_code;
@@ -3622,91 +4224,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     if !opts.body.is_empty() {
                         body = opts.body.clone();
                     }
-                    if opts.timeout > 0 {
-                        final_timeout = opts.timeout as i64;
+                } else if let Some(opts) = ctx.global_waf_block_options.as_deref() {
+                    if opts.status_code > 0 {
+                        status = opts.status_code;
                     }
-                    max_timeout = opts.max_timeout;
-                    fail_global = opts.fail_global;
-                }
-                // Priority 2: From Global Default WAF Actions
-                else if let Some(global) = global_actions.iter().find(|a| a.code == "block") {
-                    if let Ok(opts) = serde_json::from_value::<crate::config_models::WAFBlockOptions>(
-                        global.options.clone(),
-                    ) {
-                        if opts.status_code > 0 {
-                            status = opts.status_code;
-                        }
-                        if !opts.body.is_empty() {
-                            body = opts.body;
-                        }
-                        if opts.timeout > 0 {
-                            final_timeout = opts.timeout as i64;
-                        }
-                        max_timeout = opts.max_timeout;
-                        fail_global = opts.fail_global;
-                    }
-                }
-
-                // Apply randomized timeout logic
-                if max_timeout > final_timeout as i32 {
-                    use rand::Rng;
-                    final_timeout =
-                        rand::thread_rng().gen_range(final_timeout..=max_timeout as i64);
-                }
-                if fail_global {
-                    scope = "global";
-                }
-
-                // Apply Block
-                if let Ok(ip_addr) = ip.parse() {
-                    self.waf_state.block_ip(
-                        ip_addr,
-                        ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-                        final_timeout,
-                        Some(scope),
-                        matched.block_c_class,
-                        matched.use_local_firewall,
-                    );
-
-                    // Report to API if ip_list_id is set
-                    if matched.ip_list_id > 0 {
-                        let ua = session
-                            .get_header("user-agent")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("")
-                            .to_string();
-                        let url = format!(
-                            "{}{}",
-                            session.req_header().uri.host().unwrap_or(""),
-                            session.req_header().uri.path()
-                        );
-                        let node_id = self.config.get_node_id().await;
-                        crate::rpc::ip_report::report_block(
-                            crate::rpc::ip_report::IpReportMessage {
-                                ip_list_id: matched.ip_list_id,
-                                value: ip.clone(),
-                                ip_from: ip.clone(),
-                                ip_to: "".to_string(),
-                                expired_at: crate::utils::time::now_timestamp() + final_timeout,
-                                reason: format!("WAF Action: {}", matched.action_code),
-                                r#type: "black".to_string(),
-                                event_level: matched.event_level,
-                                node_id,
-                                server_id: ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-                                source_node_id: node_id,
-                                source_server_id: ctx
-                                    .server
-                                    .as_ref()
-                                    .and_then(|s| s.id)
-                                    .unwrap_or(0),
-                                source_http_firewall_policy_id: matched.policy_id,
-                                source_http_firewall_rule_group_id: matched.group_id,
-                                source_http_firewall_rule_set_id: matched.set_id,
-                                source_url: url,
-                                source_user_agent: ua,
-                                source_category: "waf".to_string(),
-                            },
-                        );
+                    if !opts.body.is_empty() {
+                        body = opts.body.clone();
                     }
                 }
 
@@ -3735,7 +4258,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     }
                 }
                 // Priority 2: From Global Default
-                else if let Some(global) = global_actions.iter().find(|a| a.code == "page") {
+                else if let Some(global) = self
+                    .config
+                    .get_waf_actions_sync()
+                    .iter()
+                    .find(|a| a.code == "page")
+                {
                     if let Ok(opts) = serde_json::from_value::<crate::config_models::WAFPageOptions>(
                         global.options.clone(),
                     ) {
@@ -3811,6 +4339,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     }
                     _ => None,
                 };
+                let global_actions = self.config.get_waf_actions_sync();
                 let global_values = global_actions
                     .iter()
                     .find(|global| global.code == matched.action_code)
@@ -4003,6 +4532,219 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         self.apply_global_cc_policy(session, ctx).await
     }
 
+    fn inbound_waf_needs_request_body(
+        ctx: &ProxyCTX,
+        global_policies: &[crate::config_models::HTTPFirewallPolicy],
+    ) -> bool {
+        let site_needs_body = ctx
+            .server
+            .as_ref()
+            .and_then(|server| {
+                let web = server.web.as_ref()?;
+                web.firewall_ref
+                    .as_ref()
+                    .filter(|firewall_ref| firewall_ref.is_on)?;
+                let server_id = server.id?;
+                ctx.compiled_plans.server_firewall.get(&server_id)
+            })
+            .map(|policy| crate::firewall::compiled::compiled_policy_uses_request_body(policy))
+            .or_else(|| {
+                ctx.server
+                    .as_ref()
+                    .and_then(|server| server.web.as_ref())
+                    .and_then(|web| {
+                        web.firewall_ref
+                            .as_ref()
+                            .filter(|firewall_ref| firewall_ref.is_on)
+                            .and_then(|_| web.firewall_policy.as_ref())
+                    })
+                    .map(crate::firewall::inbound_policy_uses_request_body)
+            })
+            .unwrap_or(false);
+        if site_needs_body {
+            return true;
+        }
+
+        let global_rules_enabled = ctx
+            .server
+            .as_ref()
+            .and_then(|server| server.web.as_ref())
+            .and_then(|web| web.firewall_ref.as_ref())
+            .is_some_and(|firewall_ref| firewall_ref.is_on && !firewall_ref.ignore_global_rules);
+        if !global_rules_enabled {
+            return false;
+        }
+
+        if ctx.compiled_plans.global_firewall.is_empty() {
+            global_policies
+                .iter()
+                .any(crate::firewall::inbound_policy_uses_request_body)
+        } else {
+            ctx.compiled_plans
+                .global_firewall
+                .iter()
+                .any(|policy| crate::firewall::compiled::compiled_policy_uses_request_body(policy))
+        }
+    }
+
+    fn first_inbound_body_waf_policy<'a>(
+        ctx: &'a ProxyCTX,
+        global_policies: &'a [crate::config_models::HTTPFirewallPolicy],
+    ) -> Option<&'a crate::config_models::HTTPFirewallPolicy> {
+        let site_policy = ctx
+            .server
+            .as_ref()
+            .and_then(|server| server.web.as_ref())
+            .and_then(|web| {
+                web.firewall_ref
+                    .as_ref()
+                    .filter(|firewall_ref| firewall_ref.is_on)
+                    .and_then(|_| web.firewall_policy.as_ref())
+            })
+            .filter(|policy| {
+                policy.is_on
+                    && policy.mode != "bypass"
+                    && crate::firewall::inbound_policy_uses_request_body(policy)
+            });
+        if site_policy.is_some() {
+            return site_policy;
+        }
+
+        let global_rules_enabled = ctx
+            .server
+            .as_ref()
+            .and_then(|server| server.web.as_ref())
+            .and_then(|web| web.firewall_ref.as_ref())
+            .is_some_and(|firewall_ref| firewall_ref.is_on && !firewall_ref.ignore_global_rules);
+        if !global_rules_enabled {
+            return None;
+        }
+
+        global_policies.iter().find(|policy| {
+            policy.is_on
+                && policy.mode != "bypass"
+                && crate::firewall::inbound_policy_uses_request_body(policy)
+        })
+    }
+
+    fn inbound_waf_body_buffer_limit(
+        ctx: &ProxyCTX,
+        global_policies: &[crate::config_models::HTTPFirewallPolicy],
+    ) -> usize {
+        const DEFAULT_LIMIT: usize = 2 * 1024 * 1024;
+        let mut limit = DEFAULT_LIMIT;
+
+        let mut apply_policy = |policy: &crate::config_models::HTTPFirewallPolicy| {
+            if policy.is_on
+                && policy.mode != "bypass"
+                && crate::firewall::inbound_policy_uses_request_body(policy)
+                && policy.max_request_body_size > 0
+            {
+                limit = limit.max(policy.max_request_body_size as usize);
+            }
+        };
+
+        if let Some(web) = ctx.server.as_ref().and_then(|server| server.web.as_ref()) {
+            if web.firewall_ref.as_ref().is_some_and(|firewall_ref| firewall_ref.is_on) {
+                if let Some(policy) = &web.firewall_policy {
+                    apply_policy(policy);
+                }
+                if !web
+                    .firewall_ref
+                    .as_ref()
+                    .is_some_and(|firewall_ref| firewall_ref.ignore_global_rules)
+                {
+                    for policy in global_policies {
+                        apply_policy(policy);
+                    }
+                }
+            }
+        }
+
+        limit
+    }
+
+    async fn buffer_request_body_for_waf(
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        limit: usize,
+    ) -> Result<bool> {
+        let content_length = session
+            .get_header("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok());
+        if content_length.is_some_and(|len| len > limit) {
+            return Ok(true);
+        }
+        if content_length == Some(0) {
+            return Ok(false);
+        }
+        if content_length.is_none()
+            && !session
+                .get_header("transfer-encoding")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+            && matches!(session.req_header().method, http::Method::GET | http::Method::HEAD)
+        {
+            return Ok(false);
+        }
+
+        session.as_mut().enable_retry_buffering();
+        let mut buffered = Vec::with_capacity(content_length.unwrap_or(0).min(limit));
+        while let Some(chunk) = session.read_request_body().await? {
+            if buffered.len().saturating_add(chunk.len()) > limit {
+                return Ok(true);
+            }
+            buffered.extend_from_slice(&chunk);
+            if content_length.is_some_and(|len| buffered.len() >= len) {
+                break;
+            }
+        }
+        crate::metrics::METRICS
+            .waf
+            .record_request_body_buffer(buffered.len());
+        ctx.request_body.set(buffered);
+        Ok(false)
+    }
+
+    fn request_body_too_large_action(
+        policy: &crate::config_models::HTTPFirewallPolicy,
+    ) -> crate::firewall::MatchedAction {
+        let mut action = crate::firewall::MatchedAction {
+            action: crate::firewall::ActionResponse::Block {
+                status: 413,
+                body: "Request Entity Too Large".to_string(),
+            },
+            policy_id: policy.id,
+            group_id: 0,
+            set_id: 0,
+            action_code: "block".to_string(),
+            timeout_secs: Some(3600),
+            max_timeout_secs: None,
+            life_seconds: None,
+            max_fails: None,
+            fail_block_timeout: None,
+            fail_global: None,
+            scope: None,
+            block_c_class: false,
+            use_local_firewall: false,
+            next_group_id: None,
+            next_set_id: None,
+            allow_scope: None,
+            tags: vec![],
+            ip_list_id: 0,
+            event_level: "error".to_string(),
+            block_options: None,
+            page_options: None,
+            captcha_options: None,
+            js_cookie_options: None,
+            chained_actions: vec![],
+            observe_only: false,
+        };
+        crate::firewall::apply_observe_mode(policy, &mut action);
+        action
+    }
+
     /// Request-body WAF checks deferred to cache-miss path. See request_filter for rationale.
     async fn run_miss_only_body_waf(
         &self,
@@ -4011,6 +4753,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         global_policies: &[crate::config_models::HTTPFirewallPolicy],
     ) -> Result<(bool, Option<String>)> {
         let mut waf_action: Option<String> = None;
+        if ctx.waf_whitelisted {
+            if self.enforce_plan_max_upload(session, ctx).await? {
+                return Ok((true, None));
+            }
+            return Ok((false, waf_action));
+        }
 
         // NOTE: Empty Connection Flood, TLS Exhaustion, and SYN Flood are
         // connection-level attacks. By the time request_filter runs, a complete
@@ -4019,23 +4767,14 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         // These defenses belong at the TCP connection accept layer.
 
         let mut waf_match: Option<crate::firewall::MatchedAction> = None;
+        let request_body_needed = Self::inbound_waf_needs_request_body(ctx, global_policies);
 
-        if ctx.request_body.is_empty() {
-            let content_length = session
-                .get_header("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-            if content_length > 0 && content_length <= 2 * 1024 * 1024 {
-                session.as_mut().enable_retry_buffering();
-                let mut buffered = Vec::with_capacity(content_length);
-                while let Some(chunk) = session.read_request_body().await? {
-                    buffered.extend_from_slice(&chunk);
-                    if buffered.len() >= content_length {
-                        break;
-                    }
-                }
-                ctx.request_body.set(buffered);
+        if request_body_needed && ctx.request_body.is_empty() {
+            let body_limit = Self::inbound_waf_body_buffer_limit(ctx, global_policies);
+            if Self::buffer_request_body_for_waf(session, ctx, body_limit).await?
+                && let Some(policy) = Self::first_inbound_body_waf_policy(ctx, global_policies)
+            {
+                waf_match = Some(Self::request_body_too_large_action(policy));
             }
         }
 
@@ -4049,7 +4788,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             && firewall_ref.is_on
         {
             if let Some(policy) = &web.firewall_policy {
-                if policy.is_on {
+                if policy.is_on && policy.mode != "bypass" {
+                    let compiled_policy = server
+                        .id
+                        .and_then(|id| ctx.compiled_plans.server_firewall.get(&id));
                     if let Some(inbound) = &policy.inbound
                         && let Some(region) = &inbound.region
                     {
@@ -4057,13 +4799,27 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                             .get_header("user-agent")
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("");
-                        waf_match = crate::firewall::check_region_deny(
-                            region,
-                            ctx.client_ip,
-                            policy.id,
-                            &policy.deny_country_html,
-                            ua,
-                        );
+                        waf_match = if let Some(compiled_policy) = compiled_policy {
+                            crate::firewall::compiled::evaluate_compiled_region_deny(
+                                compiled_policy,
+                                ctx.client_ip,
+                                ua,
+                                session.req_header().uri.path(),
+                            )
+                        } else {
+                            let mut action = crate::firewall::check_region_deny(
+                                region,
+                                ctx.client_ip,
+                                policy.id,
+                                &policy.deny_country_html,
+                                ua,
+                                session.req_header().uri.path(),
+                            );
+                            if let Some(action) = &mut action {
+                                crate::firewall::apply_observe_mode(policy, action);
+                            }
+                            action
+                        };
                     }
                     if waf_match.is_none() && policy.max_request_body_size > 0 {
                         let content_length = session
@@ -4074,76 +4830,91 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         if content_length > policy.max_request_body_size
                             || (ctx.request_body.len() as i64) > policy.max_request_body_size
                         {
-                            waf_match = Some(crate::firewall::MatchedAction {
-                                action: crate::firewall::ActionResponse::Block {
-                                    status: 413,
-                                    body: "Request Entity Too Large".to_string(),
-                                },
-                                policy_id: policy.id,
-                                group_id: 0,
-                                set_id: 0,
-                                action_code: "block".to_string(),
-                                timeout_secs: Some(3600),
-                                max_timeout_secs: None,
-                                life_seconds: None,
-                                max_fails: None,
-                                fail_block_timeout: None,
-                                fail_global: None,
-                                scope: None,
-                                block_c_class: false,
-                                use_local_firewall: false,
-                                next_group_id: None,
-                                next_set_id: None,
-                                allow_scope: None,
-                                tags: vec![],
-                                ip_list_id: 0,
-                                event_level: "error".to_string(),
-                                block_options: None,
-                                page_options: None,
-                                captcha_options: None,
-                                js_cookie_options: None,
-                            });
+                            waf_match = Some(Self::request_body_too_large_action(policy));
                         }
                     }
                     if waf_match.is_none() {
-                        waf_match = crate::firewall::evaluate_policy(
-                            policy,
-                            session,
-                            &ctx.request_body,
-                            Self::forwarded_proto(session, ctx),
-                        );
+                        waf_match = if let Some(compiled_policy) = compiled_policy {
+                            crate::firewall::compiled::evaluate_compiled_policy_with_server(
+                                compiled_policy,
+                                session,
+                                &ctx.request_body,
+                                Self::forwarded_proto(session, ctx),
+                                ctx.server.as_deref(),
+                            )
+                        } else {
+                            crate::metrics::METRICS.waf.record_legacy_fallback();
+                            crate::firewall::evaluate_policy_with_server(
+                                policy,
+                                session,
+                                &ctx.request_body,
+                                Self::forwarded_proto(session, ctx),
+                                ctx.server.as_deref(),
+                            )
+                        };
                     }
                 }
             }
             if waf_match.is_none() && !firewall_ref.ignore_global_rules {
-                for gp in global_policies {
-                    if gp.is_on {
-                        if let Some(inbound) = &gp.inbound
-                            && let Some(region) = &inbound.region
-                        {
-                            let ua = session
-                                .get_header("user-agent")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            waf_match = crate::firewall::check_region_deny(
-                                region,
-                                ctx.client_ip,
-                                gp.id,
-                                &gp.deny_country_html,
-                                ua,
-                            );
-                            if waf_match.is_some() {
+                for compiled_policy in &ctx.compiled_plans.global_firewall {
+                    let ua = session
+                        .get_header("user-agent")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    waf_match = crate::firewall::compiled::evaluate_compiled_region_deny(
+                        compiled_policy,
+                        ctx.client_ip,
+                        ua,
+                        session.req_header().uri.path(),
+                    );
+                    if waf_match.is_some() {
+                        break;
+                    }
+                    if let Some(action) = crate::firewall::compiled::evaluate_compiled_policy(
+                        compiled_policy,
+                        session,
+                        &ctx.request_body,
+                        Self::forwarded_proto(session, ctx),
+                    ) {
+                        waf_match = Some(action);
+                        break;
+                    }
+                }
+                if waf_match.is_none() && ctx.compiled_plans.global_firewall.is_empty() {
+                    crate::metrics::METRICS.waf.record_legacy_fallback();
+                    for gp in global_policies {
+                        if gp.is_on && gp.mode != "bypass" {
+                            if let Some(inbound) = &gp.inbound
+                                && let Some(region) = &inbound.region
+                            {
+                                let ua = session
+                                    .get_header("user-agent")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("");
+                                waf_match = crate::firewall::check_region_deny(
+                                    region,
+                                    ctx.client_ip,
+                                    gp.id,
+                                    &gp.deny_country_html,
+                                    ua,
+                                    session.req_header().uri.path(),
+                                );
+                                if let Some(action) = &mut waf_match {
+                                    crate::firewall::apply_observe_mode(gp, action);
+                                }
+                                if waf_match.is_some() {
+                                    break;
+                                }
+                            }
+                            if let Some(action) = crate::firewall::evaluate_policy(
+                                gp,
+                                session,
+                                &ctx.request_body,
+                                Self::forwarded_proto(session, ctx),
+                            ) {
+                                waf_match = Some(action);
                                 break;
                             }
-                        }
-                        if let Some(action) = crate::firewall::evaluate_policy(
-                            gp,
-                            session,
-                            &ctx.request_body,
-                            Self::forwarded_proto(session, ctx),
-                        ) {
-                            waf_match = Some(action);
-                            break;
                         }
                     }
                 }
@@ -4163,32 +4934,25 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 matched.set_id,
             );
 
-            if matched.action_code == "record_ip_white" {
-                self.waf_state.unblock_ip(
-                    ctx.client_ip,
-                    ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-                    matched.scope.as_deref(),
-                    matched.use_local_firewall,
-                );
+            if matched.observe_only {
                 return Ok((false, waf_action));
             }
 
-            if matches!(matched.action_code.as_str(), "block" | "record_ip") {
-                let mut final_timeout = matched.timeout_secs.unwrap_or(300);
-                if let Some(max_t) = matched.max_timeout_secs {
-                    if max_t > final_timeout {
-                        final_timeout = rand::thread_rng().gen_range(final_timeout..=max_t);
-                    }
+            if matched.chained_actions.is_empty() {
+                self.apply_waf_runtime_action(session, ctx, &matched);
+            } else {
+                for action in &matched.chained_actions {
+                    self.apply_waf_runtime_action(session, ctx, action);
                 }
-                self.waf_state.block_ip(
-                    ctx.client_ip,
-                    ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-                    final_timeout,
-                    matched.scope.as_deref(),
-                    matched.block_c_class,
-                    matched.use_local_firewall,
-                );
             }
+
+            if matches!(
+                matched.action_code.as_str(),
+                "record_ip_white" | "record_ip_gray" | "tag" | "log" | "notify" | "allow"
+            ) {
+                return Ok((false, waf_action));
+            }
+
             if self
                 .respond_waf_action(session, ctx, matched, ctx.client_ip_str.clone())
                 .await?
@@ -4254,7 +5018,9 @@ impl ProxyHttp for EdgeProxy {
         ctx.global_http_config = Some(Arc::clone(&hot_path.global_http));
         ctx.firewall_policies_snapshot = Some(Arc::clone(&hot_path.firewall_policies));
         ctx.global_cache_policies = hot_path.cache_policies.clone();
+        ctx.compiled_plans = Arc::clone(&hot_path.compiled_plans);
         ctx.global_access_log_config = hot_path.global_access_log.clone();
+        ctx.global_waf_block_options = hot_path.global_waf_block_options.clone();
         // Always enable access logging — the management plane's has_access_log_settings
         // flag indicates whether custom field filters exist, not whether logging is on.
         ctx.access_log_module_enabled = true;
@@ -4340,7 +5106,14 @@ impl ProxyHttp for EdgeProxy {
                     if let Some(origin_host) = Self::origin_header_host(origin) {
                         let same_origin = crate::lb_factory::strip_addr_port(origin_host)
                             .eq_ignore_ascii_case(&crate::lb_factory::strip_addr_port(&host));
-                        if !same_origin && !Self::websocket_origin_allowed(ws, origin_host) {
+                        let origin_allowed = server
+                            .id
+                            .and_then(|server_id| {
+                                ctx.compiled_plans.server_features.get(&server_id)
+                            })
+                            .and_then(|plan| plan.websocket_origin_allowed(origin_host))
+                            .unwrap_or_else(|| Self::websocket_origin_allowed(ws, origin_host));
+                        if !same_origin && !origin_allowed {
                             return self.respond_status_with_pages(session, ctx, 403).await;
                         }
                     }
@@ -4416,43 +5189,71 @@ impl ProxyHttp for EdgeProxy {
                 return Ok(true);
             }
 
-            if let Some(ref shutdown) = web.shutdown
+            if let Some(plan) = server
+                .id
+                .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+                .and_then(|plan| plan.shutdown())
+                .cloned()
+            {
+                if self.respond_compiled_shutdown(session, ctx, &plan).await? {
+                    return Ok(true);
+                }
+            } else if let Some(ref shutdown) = web.shutdown
                 && self.respond_shutdown(session, ctx, &shutdown).await?
             {
                 return Ok(true);
             }
 
             // CORS preflight: handle OPTIONS immediately without proxying to origin
-            if let Some(ref rhp) = web.response_header_policy {
+            let is_options = session.req_header().method == http::method::Method::OPTIONS;
+            let compiled_cors = server
+                .id
+                .and_then(|server_id| ctx.compiled_plans.server_headers.get(&server_id))
+                .and_then(|plan| plan.cors.as_ref());
+            if let Some(cors) = compiled_cors {
+                if is_options && cors.applies_to_request(true) {
+                    let mut resp = pingora_http::ResponseHeader::build(204, None).unwrap();
+                    cors.apply(&mut resp, session);
+                    resp.remove_header("content-length");
+                    resp.remove_header("transfer-encoding");
+                    debug!(
+                        "OPTIONS preflight: host='{}' origin='{}' resp_headers={:?}",
+                        host,
+                        session
+                            .get_header("origin")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or(""),
+                        resp.headers
+                            .iter()
+                            .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap_or("?")))
+                            .collect::<Vec<_>>()
+                    );
+                    session.write_response_header(Box::new(resp), true).await?;
+                    ctx.response_status = 204;
+                    return Ok(true);
+                }
+            } else if let Some(ref rhp) = web.response_header_policy {
                 if let Some(ref cors) = rhp.cors {
-                    if cors.is_on
-                        && (!cors.options_method_only
-                            || session.req_header().method == http::method::Method::OPTIONS)
-                    {
-                        let is_options =
-                            session.req_header().method == http::method::Method::OPTIONS;
-                        if is_options {
-                            let mut resp = pingora_http::ResponseHeader::build(204, None).unwrap();
-                            Self::set_cors_headers(&mut resp, session, cors);
-                            // Ensure no body-related headers on 204
-                            resp.remove_header("content-length");
-                            resp.remove_header("transfer-encoding");
-                            debug!(
-                                "OPTIONS preflight: host='{}' origin='{}' resp_headers={:?}",
-                                host,
-                                session
-                                    .get_header("origin")
-                                    .and_then(|v| v.to_str().ok())
-                                    .unwrap_or(""),
-                                resp.headers
-                                    .iter()
-                                    .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap_or("?")))
-                                    .collect::<Vec<_>>()
-                            );
-                            session.write_response_header(Box::new(resp), true).await?;
-                            ctx.response_status = 204;
-                            return Ok(true);
-                        }
+                    if cors.is_on && (!cors.options_method_only || is_options) && is_options {
+                        let mut resp = pingora_http::ResponseHeader::build(204, None).unwrap();
+                        Self::set_cors_headers(&mut resp, session, cors);
+                        resp.remove_header("content-length");
+                        resp.remove_header("transfer-encoding");
+                        debug!(
+                            "OPTIONS preflight: host='{}' origin='{}' resp_headers={:?}",
+                            host,
+                            session
+                                .get_header("origin")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or(""),
+                            resp.headers
+                                .iter()
+                                .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap_or("?")))
+                                .collect::<Vec<_>>()
+                        );
+                        session.write_response_header(Box::new(resp), true).await?;
+                        ctx.response_status = 204;
+                        return Ok(true);
                     }
                 }
             }
@@ -4501,11 +5302,26 @@ impl ProxyHttp for EdgeProxy {
             }
         }
 
-        if self.waf_state.is_whitelisted(
+        let waf_enabled = ctx
+            .server
+            .as_ref()
+            .and_then(|server| server.web.as_ref())
+            .and_then(|web| web.firewall_ref.as_ref())
+            .is_some_and(|firewall_ref| firewall_ref.is_on);
+        if waf_enabled
+            && self.waf_state.is_whitelisted(
+                ctx.client_ip,
+                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+            )
+        {
+            ctx.waf_whitelisted = true;
+        }
+
+        if self.waf_state.is_graylisted(
             ctx.client_ip,
             ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
         ) {
-            return Ok(false);
+            Self::add_ctx_tag(ctx, "graylist");
         }
 
         let ua = session
@@ -4565,10 +5381,12 @@ impl ProxyHttp for EdgeProxy {
             return Ok(true);
         }
 
-        if self.waf_state.is_blocked(
-            ctx.client_ip,
-            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-        ) {
+        if !ctx.waf_whitelisted
+            && self.waf_state.is_blocked(
+                ctx.client_ip,
+                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+            )
+        {
             warn!(
                 "BLOCKED: IP {} is blocked by WAF state (host={}, method={}, uri={})",
                 ctx.client_ip_str,
@@ -4583,27 +5401,11 @@ impl ProxyHttp for EdgeProxy {
             return Ok(true);
         }
 
-        // Check if cache is configured for this server — if so, defer heavy WAF
-        // to upstream_peer (runs only on cache MISS, saving ~50 lines of CPU work
-        // on every cache HIT).
-        let cache_configured = ctx
-            .server
-            .as_ref()
-            .and_then(|s| s.web.as_ref())
-            .and_then(|w| w.cache.as_ref())
-            .map(|c| c.is_on)
-            .unwrap_or(false)
-            || !hot_path.cache_policies.is_empty();
-
-        if cache_configured {
-            ctx.waf_deferred = true;
-        } else {
-            let (blocked, _action) = self
-                .run_miss_only_body_waf(session, ctx, &hot_path.firewall_policies)
-                .await?;
-            if blocked {
-                return Ok(true);
-            }
+        let (blocked, _action) = self
+            .run_miss_only_body_waf(session, ctx, &hot_path.firewall_policies)
+            .await?;
+        if blocked {
+            return Ok(true);
         }
 
         if self.enforce_referers(session, ctx).await? {
@@ -4639,14 +5441,30 @@ impl ProxyHttp for EdgeProxy {
                     .get_header("user-agent")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
-                if let Some((location, status)) = evaluate_host_redirects(
-                    &redirect_host,
-                    Self::forwarded_proto(session, ctx),
-                    uri_str,
-                    query,
-                    user_agent,
-                    host_redirects,
-                ) {
+                let scheme = Self::forwarded_proto(session, ctx);
+                let compiled_plan = server
+                    .id
+                    .and_then(|server_id| ctx.compiled_plans.server_rewrite.get(&server_id));
+                let redirect = if let Some(plan) = compiled_plan {
+                    crate::rewrite::evaluate_compiled_host_redirects(
+                        &redirect_host,
+                        scheme,
+                        uri_str,
+                        query,
+                        user_agent,
+                        plan,
+                    )
+                } else {
+                    evaluate_host_redirects(
+                        &redirect_host,
+                        scheme,
+                        uri_str,
+                        query,
+                        user_agent,
+                        host_redirects,
+                    )
+                };
+                if let Some((location, status)) = redirect {
                     let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
                     resp.insert_header("location", location).unwrap();
                     session.write_response_header(Box::new(resp), true).await?;
@@ -4656,19 +5474,34 @@ impl ProxyHttp for EdgeProxy {
 
             if !rewrite_rules.is_empty() {
                 let scheme = Self::forwarded_proto(session, ctx);
-                let rewrite_result = evaluate_rewrites_with_cond(
-                    uri_str,
-                    query,
-                    Some(&host),
-                    rewrite_refs,
-                    rewrite_rules,
-                    |rule| {
-                        rule.conds
-                            .as_ref()
-                            .map(|conds| conds.match_request_with_scheme(session, scheme))
-                            .unwrap_or(true)
-                    },
-                );
+                let rewrite_result = server
+                    .id
+                    .and_then(|server_id| ctx.compiled_plans.server_rewrite.get(&server_id))
+                    .map(|plan| {
+                        crate::rewrite::evaluate_compiled_rewrites(
+                            uri_str,
+                            query,
+                            Some(&host),
+                            plan,
+                            session,
+                            scheme,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        evaluate_rewrites_with_cond(
+                            uri_str,
+                            query,
+                            Some(&host),
+                            rewrite_refs,
+                            rewrite_rules,
+                            |rule| {
+                                rule.conds
+                                    .as_ref()
+                                    .map(|conds| conds.match_request_with_scheme(session, scheme))
+                                    .unwrap_or(true)
+                            },
+                        )
+                    });
                 match rewrite_result {
                     RewriteResult::Redirect {
                         location,
@@ -4830,19 +5663,10 @@ impl ProxyHttp for EdgeProxy {
                     bypass_l2,
                     ln_by_url_mapping,
                     node_cluster_id,
-                    firewall_policies,
+                    _,
                 ) = self
                     .config
                     .get_upstream_peer_context_with_firewall_policies_sync();
-
-                // Run deferred heavy WAF checks (skipped in request_filter when cache was configured).
-                // This ensures WAF only runs on cache MISS, not on every cache HIT.
-                let (blocked, _action) = self
-                    .run_miss_only_body_waf(session, ctx, firewall_policies.as_ref().as_slice())
-                    .await?;
-                if blocked {
-                    return Err(Error::new(HTTPStatus(403)));
-                }
                 (
                     node_level,
                     force_ln,
@@ -5124,8 +5948,8 @@ impl ProxyHttp for EdgeProxy {
             let server_id = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
             if server_id > 0 {
                 let bytes_received = session.body_bytes_read() as u64;
-                let bytes_sent =
-                    session.body_bytes_sent() as u64 + ctx.response_headers_size as u64 + 20;
+                let body_bytes_sent = session.body_bytes_sent() as u64;
+                let bytes_sent = body_bytes_sent + ctx.response_headers_size as u64 + 20;
                 let is_cached = ctx.cache_hit.unwrap_or(false);
                 let is_attack = ctx.waf_action.is_some();
                 crate::metrics::record::request_end(
@@ -5141,7 +5965,7 @@ impl ProxyHttp for EdgeProxy {
                 if !ctx.origin_address.is_empty() {
                     crate::metrics::record::record_origin_traffic(
                         server_id,
-                        session.body_bytes_read() as u64,
+                        bytes_received,
                         ctx.response_body_len as u64,
                         ctx.server_metrics.as_ref(),
                     );
@@ -5152,16 +5976,17 @@ impl ProxyHttp for EdgeProxy {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
 
-                // Deferred GeoIP + UA analysis — off hot path, runs after response sent
-                if ctx.analyzed.is_none() && !user_agent.is_empty() {
-                    ctx.analyzed = Some(crate::metrics::analyzer::analyze_request(
-                        ctx.client_ip,
-                        user_agent,
-                    ));
+                if !user_agent.is_empty() {
+                    if ctx.analyzed.is_none() && crate::logging::access_log_needs_attrs(ctx) {
+                        ctx.analyzed = Some(crate::metrics::analyzer::analyze_request(
+                            ctx.client_ip,
+                            user_agent,
+                        ));
+                    }
                     crate::client_agent::maybe_report_client_agent(
-                        (*self.api_config).clone(),
-                        ctx.client_ip_str.clone(),
-                        user_agent.to_string(),
+                        &self.api_config,
+                        &ctx.client_ip_str,
+                        user_agent,
                     );
                 }
 
@@ -5208,79 +6033,117 @@ impl ProxyHttp for EdgeProxy {
             && let Some(cache) = &web.cache
             && cache.is_on
         {
-            let mut matched_ref = None;
-            let mut matched_policy: Option<std::sync::Arc<crate::config_models::HTTPCachePolicy>> =
-                None;
             let scheme = Self::forwarded_proto(session, ctx);
-            for cache_ref in &cache.cache_refs {
-                if !cache_ref.is_on {
-                    continue;
-                }
-                let is_match = Self::cache_ref_matches_request(cache_ref, session, scheme);
-
-                if is_match {
-                    if cache_ref.is_reverse {
-                        tracing::debug!("Website Cache Rule matched: SKIP");
-                        Self::disable_request_cache(session, ctx, "RuleSkipped");
-                        return Ok(());
+            let cache_ctx = Self::cache_eval_context(session, ctx, scheme);
+            let mut compiled_cache_plan_available = false;
+            let mut compiled_match = None;
+            if let Some(server_id) = s.id {
+                match crate::cache::compiled::select_cache_ref_compiled_with_context(
+                    &ctx.compiled_plans,
+                    server_id,
+                    &cache_ctx,
+                ) {
+                    crate::cache::compiled::CompiledCacheSelection::NoPlan => {}
+                    crate::cache::compiled::CompiledCacheSelection::NoMatch => {
+                        compiled_cache_plan_available = true;
                     }
-                    matched_ref = Some(cache_ref.clone());
-                    tracing::debug!("Website Cache Rule matched: ENABLE");
-                    break;
+                    crate::cache::compiled::CompiledCacheSelection::Matched(matched) => {
+                        compiled_cache_plan_available = true;
+                        compiled_match = Some(matched);
+                    }
                 }
             }
+            if compiled_match
+                .as_ref()
+                .is_some_and(|matched| matched.cache_ref.is_reverse)
+            {
+                tracing::debug!("Compiled cache rule matched: SKIP");
+                Self::disable_request_cache(session, ctx, "RuleSkipped");
+                return Ok(());
+            }
 
-            if matched_ref.is_none() && !cache.disable_policy_refs {
-                if let Some(p) = &cache.cache_policy {
-                    for cache_ref in &p.cache_refs {
-                        if !cache_ref.is_on {
-                            continue;
-                        }
-                        let is_match = Self::cache_ref_matches_request(cache_ref, session, scheme);
-                        if is_match {
-                            if cache_ref.is_reverse {
-                                tracing::debug!(
-                                    "Server Cache Policy '{}' rule matched: SKIP",
-                                    p.name
-                                );
-                                Self::disable_request_cache(session, ctx, "RuleSkipped");
-                                return Ok(());
-                            }
-                            matched_ref = Some(cache_ref.clone());
-                            matched_policy = Some(std::sync::Arc::new(p.clone()));
-                            tracing::debug!(
-                                "Server Cache Policy '{}' rule matched: ENABLE (Path: {})",
-                                p.name,
-                                session.req_header().uri.path()
-                            );
-                            break;
-                        }
+            let mut matched_ref = compiled_match
+                .as_ref()
+                .map(|matched| Arc::clone(&matched.cache_ref));
+            let mut matched_policy: Option<std::sync::Arc<crate::config_models::HTTPCachePolicy>> =
+                compiled_match
+                    .as_ref()
+                    .and_then(|matched| matched.cache_policy.as_ref().map(Arc::clone));
+
+            if matched_ref.is_none() && !compiled_cache_plan_available {
+                for cache_ref in &cache.cache_refs {
+                    if !cache_ref.is_on {
+                        continue;
                     }
-                } else {
-                    'policy_loop: for policy in ctx.global_cache_policies.iter() {
-                        for cache_ref in &policy.cache_refs {
+                    let is_match =
+                        Self::cache_ref_matches_request_with_context(cache_ref, &cache_ctx);
+
+                    if is_match {
+                        if cache_ref.is_reverse {
+                            tracing::debug!("Website Cache Rule matched: SKIP");
+                            Self::disable_request_cache(session, ctx, "RuleSkipped");
+                            return Ok(());
+                        }
+                        matched_ref = Some(cache_ref.clone());
+                        tracing::debug!("Website Cache Rule matched: ENABLE");
+                        break;
+                    }
+                }
+
+                if matched_ref.is_none() && !cache.disable_policy_refs {
+                    if let Some(p) = &cache.cache_policy {
+                        for cache_ref in &p.cache_refs {
                             if !cache_ref.is_on {
                                 continue;
                             }
                             let is_match =
-                                Self::cache_ref_matches_request(cache_ref, session, scheme);
+                                Self::cache_ref_matches_request_with_context(cache_ref, &cache_ctx);
                             if is_match {
                                 if cache_ref.is_reverse {
                                     tracing::debug!(
-                                        "GLOBAL Cluster Policy '{}' rule matched: SKIP",
-                                        policy.name
+                                        "Server Cache Policy '{}' rule matched: SKIP",
+                                        p.name
                                     );
                                     Self::disable_request_cache(session, ctx, "RuleSkipped");
                                     return Ok(());
                                 }
                                 matched_ref = Some(cache_ref.clone());
-                                matched_policy = Some(policy.clone());
+                                matched_policy = Some(p.clone());
                                 tracing::debug!(
-                                    "GLOBAL Cluster Policy '{}' rule matched: ENABLE (Path: {})",
-                                    policy.name,
+                                    "Server Cache Policy '{}' rule matched: ENABLE (Path: {})",
+                                    p.name,
                                     session.req_header().uri.path()
                                 );
-                                break 'policy_loop;
+                                break;
+                            }
+                        }
+                    } else {
+                        'policy_loop: for policy in ctx.global_cache_policies.iter() {
+                            for cache_ref in &policy.cache_refs {
+                                if !cache_ref.is_on {
+                                    continue;
+                                }
+                                let is_match = Self::cache_ref_matches_request_with_context(
+                                    cache_ref, &cache_ctx,
+                                );
+                                if is_match {
+                                    if cache_ref.is_reverse {
+                                        tracing::debug!(
+                                            "GLOBAL Cluster Policy '{}' rule matched: SKIP",
+                                            policy.name
+                                        );
+                                        Self::disable_request_cache(session, ctx, "RuleSkipped");
+                                        return Ok(());
+                                    }
+                                    matched_ref = Some(cache_ref.clone());
+                                    matched_policy = Some(policy.clone());
+                                    tracing::debug!(
+                                        "GLOBAL Cluster Policy '{}' rule matched: ENABLE (Path: {})",
+                                        policy.name,
+                                        session.req_header().uri.path()
+                                    );
+                                    break 'policy_loop;
+                                }
                             }
                         }
                     }
@@ -5315,23 +6178,35 @@ impl ProxyHttp for EdgeProxy {
                     }
                 }
 
-                // cache_ref.cache_policy is a per-rule override; fall back to parent policy
-                ctx.cache_policy = if let Some(ref child) = cache_ref.cache_policy {
-                    Some(child.clone())
+                if let Some(matched) = compiled_match.take() {
+                    ctx.cache_policy = matched.cache_policy;
+                    ctx.compiled_cache_policy = matched.compiled_policy;
+                    ctx.compiled_cache_ref = Some(matched.compiled_ref);
                 } else {
-                    matched_policy.as_ref().map(|p| p.as_ref().clone())
-                };
+                    ctx.cache_policy = if let Some(ref child) = cache_ref.cache_policy {
+                        Some(child.clone())
+                    } else {
+                        matched_policy.clone()
+                    };
+                    ctx.compiled_cache_policy = None;
+                    ctx.compiled_cache_ref = None;
+                }
                 ctx.cache_ref = Some(cache_ref.clone());
 
                 // --- PROTOCOL PARITY: Salted Key Generation ---
-                let mut key = if let Some(key_template) = &cache_ref.key {
+                let mut key = if let Some(compiled_ref) = &ctx.compiled_cache_ref {
+                    compiled_ref
+                        .key_template
+                        .as_ref()
+                        .map(|key_template| key_template.format_with_context(&cache_ctx))
+                        .unwrap_or_else(|| Self::default_cache_key_for_session(session, ctx))
+                } else if let Some(key_template) = &cache_ref.key {
                     if key_template.is_empty() {
                         Self::default_cache_key_for_session(session, ctx)
                     } else {
-                        crate::cache::matching::format_variables_with_scheme(
-                            session,
+                        crate::cache::matching::format_variables_with_context(
+                            &cache_ctx,
                             key_template,
-                            scheme,
                         )
                     }
                 } else {
@@ -5347,11 +6222,13 @@ impl ProxyHttp for EdgeProxy {
 
                 // 2. WebP Suffix (if applicable)
                 if Self::request_path_has_webp_image_extension(session)
-                    && s.web
-                        .as_ref()
-                        .and_then(|web| web.webp.as_ref())
-                        .map(|webp| Self::site_webp_matches_request(webp, session))
-                        .unwrap_or(false)
+                    && Self::compiled_site_webp_matches_request(ctx, session).unwrap_or_else(|| {
+                        s.web
+                            .as_ref()
+                            .and_then(|web| web.webp.as_ref())
+                            .map(|webp| Self::site_webp_matches_request(webp, session))
+                            .unwrap_or(false)
+                    })
                 {
                     key.push_str("@webp");
                 }
@@ -5409,36 +6286,60 @@ impl ProxyHttp for EdgeProxy {
         debug!("ACCESS_LOG: origin_status set to {}", ctx.origin_status);
 
         if let Some(cache_ref) = &ctx.cache_ref {
-            let mut force_cache = false;
-            let mut seconds = 0;
+            let (force_cache, seconds, status_allows_cache) =
+                if let Some(compiled_ref) = &ctx.compiled_cache_ref {
+                    let seconds = compiled_ref
+                        .response_policy
+                        .force_ttl_seconds()
+                        .unwrap_or(0);
+                    let force_partial = ctx
+                        .compiled_cache_policy
+                        .as_ref()
+                        .map(|policy| policy.force_partial_content)
+                        .unwrap_or(false);
+                    (
+                        seconds > 0,
+                        seconds,
+                        crate::cache::compiled::cache_ref_allows_method_status_compiled(
+                            compiled_ref,
+                            upstream_response.status.as_u16(),
+                            session.req_header().method.as_str(),
+                            force_partial,
+                        ),
+                    )
+                } else {
+                    let mut force_cache = false;
+                    let mut seconds = 0;
 
-            if let Some(expires_cfg) = &cache_ref.expires_time
-                && expires_cfg.is_on
-            {
-                if let Some(duration_val) = &expires_cfg.duration {
-                    seconds = crate::config_models::parse_life_to_seconds(duration_val);
-                    if seconds > 0 {
-                        force_cache = true;
+                    if let Some(expires_cfg) = &cache_ref.expires_time
+                        && expires_cfg.is_on
+                    {
+                        if let Some(duration_val) = &expires_cfg.duration {
+                            seconds = crate::config_models::parse_life_to_seconds(duration_val);
+                            if seconds > 0 {
+                                force_cache = true;
+                            }
+                        }
+                    } else if let Some(life) = &cache_ref.life {
+                        seconds = crate::config_models::parse_life_to_seconds(life);
+                        if seconds > 0 {
+                            force_cache = true;
+                        }
                     }
-                }
-            } else if let Some(life) = &cache_ref.life {
-                seconds = crate::config_models::parse_life_to_seconds(life);
-                if seconds > 0 {
-                    force_cache = true;
-                }
-            }
 
-            let force_partial = ctx
-                .cache_policy
-                .as_ref()
-                .map(|p| p.force_partial_content)
-                .unwrap_or(false);
-            let status_allows_cache = crate::cache::cache_ref_allows_method_status(
-                upstream_response.status.as_u16(),
-                cache_ref,
-                session.req_header().method.as_str(),
-                force_partial,
-            );
+                    let force_partial = ctx
+                        .cache_policy
+                        .as_ref()
+                        .map(|p| p.force_partial_content)
+                        .unwrap_or(false);
+                    let status_allows_cache = crate::cache::cache_ref_allows_method_status(
+                        upstream_response.status.as_u16(),
+                        cache_ref,
+                        session.req_header().method.as_str(),
+                        force_partial,
+                    );
+                    (force_cache, seconds, status_allows_cache)
+                };
 
             if force_cache && status_allows_cache {
                 // 1. Sanitize Cache-Control (Robust Split-Filter-Join)
@@ -5556,50 +6457,130 @@ impl ProxyHttp for EdgeProxy {
                 if let Some(web) = &server.web {
                     if let Some(ref rhp) = web.response_header_policy {
                         if rhp.is_on {
-                            let request_uri = session
-                                .req_header()
-                                .uri
-                                .path_and_query()
-                                .map(|pq| pq.as_str().to_string())
-                                .unwrap_or_else(|| "/".to_string());
-                            let port = Self::downstream_local_port(session)
-                                .map(|port| port.to_string())
-                                .unwrap_or_default();
-                            let referer = session
-                                .get_header("referer")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            let user_agent = session
-                                .get_header("user-agent")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            let content_type = session
-                                .get_header("content-type")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
+                            let compiled_policy = server
+                                .id
+                                .and_then(|server_id| {
+                                    ctx.compiled_plans.server_headers.get(&server_id)
+                                })
+                                .and_then(|plan| plan.response.as_ref());
+                            let uses_template_vars = compiled_policy
+                                .map(|policy| policy.uses_template_vars())
+                                .unwrap_or_else(|| {
+                                    crate::headers::response_policy_uses_template_vars(rhp)
+                                });
+                            let request_uri = if uses_template_vars
+                                && compiled_policy
+                                    .map(|policy| policy.needs_request_uri())
+                                    .unwrap_or_else(|| {
+                                        crate::headers::response_policy_needs_request_uri(rhp)
+                                    }) {
+                                session
+                                    .req_header()
+                                    .uri
+                                    .path_and_query()
+                                    .map(|pq| pq.as_str())
+                                    .unwrap_or("/")
+                            } else {
+                                ""
+                            };
+                            let port_storage;
+                            let port = if uses_template_vars
+                                && compiled_policy
+                                    .map(|policy| policy.needs_port())
+                                    .unwrap_or_else(|| {
+                                        crate::headers::response_policy_needs_port(rhp)
+                                    }) {
+                                port_storage = Self::downstream_local_port(session)
+                                    .map(|port| port.to_string())
+                                    .unwrap_or_default();
+                                port_storage.as_str()
+                            } else {
+                                ""
+                            };
+                            let referer = if uses_template_vars {
+                                session
+                                    .get_header("referer")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                            } else {
+                                ""
+                            };
+                            let user_agent = if uses_template_vars {
+                                session
+                                    .get_header("user-agent")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                            } else {
+                                ""
+                            };
+                            let content_type = if uses_template_vars {
+                                session
+                                    .get_header("content-type")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                            } else {
+                                ""
+                            };
                             let vars = crate::headers::RequestTemplateVars {
-                                scheme: Self::forwarded_proto(session, ctx),
-                                method: session.req_header().method.as_str(),
-                                host: &ctx.host,
-                                request_uri: &request_uri,
-                                path: session.req_header().uri.path(),
-                                query: session.req_header().uri.query().unwrap_or(""),
-                                port: &port,
+                                scheme: if uses_template_vars {
+                                    Self::forwarded_proto(session, ctx)
+                                } else {
+                                    ""
+                                },
+                                method: if uses_template_vars {
+                                    session.req_header().method.as_str()
+                                } else {
+                                    ""
+                                },
+                                host: if uses_template_vars { &ctx.host } else { "" },
+                                request_uri,
+                                path: if uses_template_vars {
+                                    session.req_header().uri.path()
+                                } else {
+                                    ""
+                                },
+                                query: if uses_template_vars {
+                                    session.req_header().uri.query().unwrap_or("")
+                                } else {
+                                    ""
+                                },
+                                port,
                                 referer,
                                 user_agent,
                                 content_type,
-                                remote_addr: &ctx.client_ip_str,
+                                remote_addr: if uses_template_vars {
+                                    &ctx.client_ip_str
+                                } else {
+                                    ""
+                                },
                             };
-                            crate::headers::apply_response_header_policy(
-                                upstream_response,
-                                rhp,
-                                &vars,
-                                upstream_response.status.as_u16(),
-                                session.req_header().method.as_str(),
-                                &ctx.host,
-                            );
+                            if let Some(compiled_policy) = compiled_policy {
+                                crate::headers::apply_compiled_response_header_policy(
+                                    upstream_response,
+                                    compiled_policy,
+                                    &vars,
+                                    upstream_response.status.as_u16(),
+                                    session.req_header().method.as_str(),
+                                    &ctx.host,
+                                );
+                            } else {
+                                crate::headers::apply_response_header_policy(
+                                    upstream_response,
+                                    rhp,
+                                    &vars,
+                                    upstream_response.status.as_u16(),
+                                    session.req_header().method.as_str(),
+                                    &ctx.host,
+                                );
+                            }
                         }
-                        if let Some(ref cors) = rhp.cors {
+                        let compiled_cors = server
+                            .id
+                            .and_then(|server_id| ctx.compiled_plans.server_headers.get(&server_id))
+                            .and_then(|plan| plan.cors.as_ref());
+                        if let Some(cors) = compiled_cors {
+                            cors.apply(upstream_response, session);
+                        } else if let Some(ref cors) = rhp.cors {
                             if cors.is_on {
                                 Self::set_cors_headers(upstream_response, session, cors);
                             }
@@ -5647,20 +6628,31 @@ impl ProxyHttp for EdgeProxy {
         }
 
         if Self::forwarded_proto(session, ctx) == "https" {
-            if let Some(server) = &ctx.server
-                && let Some(https) = &server.https
-                && let Some(ssl_policy) = &https.ssl_policy
-                && let Some(hsts) = &ssl_policy.hsts
-                && hsts.is_on
-                && (hsts.domains.is_empty()
-                    || Self::wildcard_domain_matches(&hsts.domains, &ctx.host))
-            {
-                let value = Self::hsts_header_value(hsts);
-                upstream_response
-                    .insert_header("strict-transport-security", value.clone())
-                    .unwrap();
-                ctx.response_headers
-                    .insert("strict-transport-security".to_string(), value);
+            if let Some(server) = &ctx.server {
+                let compiled_value = server
+                    .id
+                    .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+                    .and_then(|plan| plan.hsts_header_value(&ctx.host).map(str::to_string));
+                let raw_value = || {
+                    server
+                        .https
+                        .as_ref()
+                        .and_then(|https| https.ssl_policy.as_ref())
+                        .and_then(|ssl_policy| ssl_policy.hsts.as_ref())
+                        .filter(|hsts| {
+                            hsts.is_on
+                                && (hsts.domains.is_empty()
+                                    || Self::wildcard_domain_matches(&hsts.domains, &ctx.host))
+                        })
+                        .map(Self::hsts_header_value)
+                };
+                if let Some(value) = compiled_value.or_else(raw_value) {
+                    upstream_response
+                        .insert_header("strict-transport-security", value.clone())
+                        .unwrap();
+                    ctx.response_headers
+                        .insert("strict-transport-security".to_string(), value);
+                }
             }
         }
 
@@ -5670,6 +6662,10 @@ impl ProxyHttp for EdgeProxy {
             if let Some(web) = &server.web {
                 if let Some(ref rhp) = web.response_header_policy {
                     if rhp.is_on {
+                        let compiled_policy = server
+                            .id
+                            .and_then(|server_id| ctx.compiled_plans.server_headers.get(&server_id))
+                            .and_then(|plan| plan.response.as_ref());
                         let request_uri = session
                             .req_header()
                             .uri
@@ -5704,16 +6700,39 @@ impl ProxyHttp for EdgeProxy {
                             content_type,
                             remote_addr: &ctx.client_ip_str,
                         };
-                        crate::headers::apply_response_header_policy(
-                            upstream_response,
-                            rhp,
-                            &vars,
-                            upstream_response.status.as_u16(),
-                            session.req_header().method.as_str(),
-                            &ctx.host,
-                        );
+                        if let Some(compiled_policy) = compiled_policy {
+                            crate::headers::apply_compiled_response_header_policy(
+                                upstream_response,
+                                compiled_policy,
+                                &vars,
+                                upstream_response.status.as_u16(),
+                                session.req_header().method.as_str(),
+                                &ctx.host,
+                            );
+                        } else {
+                            crate::headers::apply_response_header_policy(
+                                upstream_response,
+                                rhp,
+                                &vars,
+                                upstream_response.status.as_u16(),
+                                session.req_header().method.as_str(),
+                                &ctx.host,
+                            );
+                        }
                     }
-                    if let Some(ref cors) = rhp.cors {
+                    let compiled_cors = server
+                        .id
+                        .and_then(|server_id| ctx.compiled_plans.server_headers.get(&server_id))
+                        .and_then(|plan| plan.cors.as_ref());
+                    if let Some(cors) = compiled_cors {
+                        debug!(
+                            "CORS: adding headers for {} {} (status={})",
+                            session.req_header().method,
+                            session.req_header().uri.path(),
+                            upstream_response.status.as_u16()
+                        );
+                        cors.apply(upstream_response, session);
+                    } else if let Some(ref cors) = rhp.cors {
                         if cors.is_on {
                             debug!(
                                 "CORS: adding headers for {} {} (status={})",
@@ -5732,27 +6751,43 @@ impl ProxyHttp for EdgeProxy {
         ctx.response_body_buffer.clear();
         ctx.outbound_waf_body_evaluated = false;
 
-        ctx.has_outbound_waf_body_rules = ctx
-            .firewall_policies_snapshot
-            .as_ref()
-            .map(|policies| {
-                policies
-                    .iter()
-                    .any(crate::firewall::outbound_policy_uses_response_body)
-            })
-            .unwrap_or(false)
-            || ctx
-                .server
+        ctx.has_outbound_waf_body_rules = if ctx.compiled_plans.global_firewall.is_empty() {
+            ctx.firewall_policies_snapshot
                 .as_ref()
-                .and_then(|server| server.web.as_ref())
-                .and_then(|web| {
-                    web.firewall_ref
-                        .as_ref()
-                        .filter(|fw_ref| fw_ref.is_on)
-                        .and_then(|_| web.firewall_policy.as_ref())
+                .map(|policies| {
+                    policies
+                        .iter()
+                        .any(crate::firewall::outbound_policy_uses_response_body)
                 })
-                .map(crate::firewall::outbound_policy_uses_response_body)
-                .unwrap_or(false);
+                .unwrap_or(false)
+        } else {
+            ctx.compiled_plans
+                .global_firewall
+                .iter()
+                .any(|policy| crate::firewall::compiled::compiled_policy_uses_response_body(policy))
+        } || ctx
+            .server
+            .as_ref()
+            .and_then(|server| {
+                let web = server.web.as_ref()?;
+                web.firewall_ref.as_ref().filter(|fw_ref| fw_ref.is_on)?;
+                let server_id = server.id?;
+                ctx.compiled_plans.server_firewall.get(&server_id)
+            })
+            .map(|policy| crate::firewall::compiled::compiled_policy_uses_response_body(policy))
+            .or_else(|| {
+                ctx.server
+                    .as_ref()
+                    .and_then(|server| server.web.as_ref())
+                    .and_then(|web| {
+                        web.firewall_ref
+                            .as_ref()
+                            .filter(|fw_ref| fw_ref.is_on)
+                            .and_then(|_| web.firewall_policy.as_ref())
+                    })
+                    .map(crate::firewall::outbound_policy_uses_response_body)
+            })
+            .unwrap_or(false);
 
         // 1. Initial Outbound WAF (Status & Headers)
         let outbound_ctx = crate::firewall::OutboundContext {
@@ -5763,23 +6798,38 @@ impl ProxyHttp for EdgeProxy {
         };
 
         let mut matched_outbound = None;
-        if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
-            for gp in global_policies.iter() {
-                if !gp.is_on {
-                    continue;
-                }
-                if let Some(action) = crate::firewall::evaluate_outbound_policy(
-                    gp,
-                    session,
-                    &ctx.request_body,
-                    &outbound_ctx,
-                    Self::forwarded_proto(session, ctx),
-                ) {
-                    matched_outbound = Some(action);
-                    break;
+        for policy in &ctx.compiled_plans.global_firewall {
+            if let Some(action) = crate::firewall::compiled::evaluate_compiled_outbound_policy(
+                policy,
+                session,
+                &ctx.request_body,
+                &outbound_ctx,
+                Self::forwarded_proto(session, ctx),
+            ) {
+                matched_outbound = Some(action);
+                break;
+            }
+        }
+        if matched_outbound.is_none() && ctx.compiled_plans.global_firewall.is_empty() {
+            crate::metrics::METRICS.waf.record_legacy_fallback();
+            if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
+                for gp in global_policies.iter() {
+                    if !gp.is_on {
+                        continue;
+                    }
+                    if let Some(action) = crate::firewall::evaluate_outbound_policy(
+                        gp,
+                        session,
+                        &ctx.request_body,
+                        &outbound_ctx,
+                        Self::forwarded_proto(session, ctx),
+                    ) {
+                        matched_outbound = Some(action);
+                        break;
+                    }
                 }
             }
-        } // end if let Some(ref global_policies)
+        }
         if matched_outbound.is_none() {
             if let Some(server) = &ctx.server
                 && let Some(web) = &server.web
@@ -5787,15 +6837,29 @@ impl ProxyHttp for EdgeProxy {
                 && fw_ref.is_on
             {
                 if let Some(policy) = &web.firewall_policy {
-                    if let Some(action) = crate::firewall::evaluate_outbound_policy(
-                        policy,
-                        session,
-                        &ctx.request_body,
-                        &outbound_ctx,
-                        Self::forwarded_proto(session, ctx),
-                    ) {
-                        matched_outbound = Some(action);
-                    }
+                    let compiled_policy = server
+                        .id
+                        .and_then(|id| ctx.compiled_plans.server_firewall.get(&id));
+                    matched_outbound = if let Some(compiled_policy) = compiled_policy {
+                        crate::firewall::compiled::evaluate_compiled_outbound_policy_with_server(
+                            compiled_policy,
+                            session,
+                            &ctx.request_body,
+                            &outbound_ctx,
+                            Self::forwarded_proto(session, ctx),
+                            ctx.server.as_deref(),
+                        )
+                    } else {
+                        crate::metrics::METRICS.waf.record_legacy_fallback();
+                        crate::firewall::evaluate_outbound_policy_with_server(
+                            policy,
+                            session,
+                            &ctx.request_body,
+                            &outbound_ctx,
+                            Self::forwarded_proto(session, ctx),
+                            ctx.server.as_deref(),
+                        )
+                    };
                 }
             }
         }
@@ -5864,7 +6928,22 @@ impl ProxyHttp for EdgeProxy {
         self.maybe_enable_optimization(session, upstream_response, ctx);
         self.maybe_enable_hls(session, upstream_response, ctx);
 
-        if let Some(cache_ref) = &ctx.cache_ref
+        if let Some(compiled_ref) = &ctx.compiled_cache_ref
+            && compiled_ref.response_policy.auto_expires()
+        {
+            if compiled_ref.response_policy.overwrite_expires()
+                || upstream_response.headers.get("expires").is_none()
+            {
+                let ttl = compiled_ref.response_policy.ttl_seconds();
+                let expires = crate::utils::time::now_utc() + chrono::Duration::seconds(ttl as i64);
+                upstream_response
+                    .insert_header("expires", expires.to_rfc2822().replace("+0000", "GMT"))
+                    .unwrap();
+                upstream_response
+                    .insert_header("cache-control", format!("max-age={}", ttl))
+                    .unwrap();
+            }
+        } else if let Some(cache_ref) = &ctx.cache_ref
             && let Some(expires_cfg) = &cache_ref.expires_time
             && expires_cfg.is_on
             && expires_cfg.auto_calculate
@@ -5995,11 +7074,23 @@ impl ProxyHttp for EdgeProxy {
                             content_type,
                             remote_addr: &ctx.client_ip_str,
                         };
-                        crate::headers::apply_request_header_policy_to_upstream(
-                            upstream_request,
-                            policy,
-                            &vars,
-                        );
+                        let compiled_policy = server
+                            .id
+                            .and_then(|server_id| ctx.compiled_plans.server_headers.get(&server_id))
+                            .and_then(|plan| plan.request.as_ref());
+                        if let Some(compiled_policy) = compiled_policy {
+                            crate::headers::apply_compiled_request_header_policy_to_upstream(
+                                upstream_request,
+                                compiled_policy,
+                                &vars,
+                            );
+                        } else {
+                            crate::headers::apply_request_header_policy_to_upstream(
+                                upstream_request,
+                                policy,
+                                &vars,
+                            );
+                        }
                         debug!(
                             "UPSTREAM: applied requestHeaderPolicy (set={}, add={}, delete={})",
                             policy.set_headers.len(),
@@ -6445,35 +7536,124 @@ impl ProxyHttp for EdgeProxy {
                 .unwrap_or(0);
             let host = session.req_header().uri.host().unwrap_or("");
 
-            let allow_chunked = ctx
-                .cache_policy
-                .as_ref()
-                .map(|p| p.allow_chunked_encoding)
-                .unwrap_or(false);
-            let is_chunked = resp
-                .headers
-                .get("transfer-encoding")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.to_lowercase().contains("chunked"))
-                .unwrap_or(false);
-            let skip_size_checks = allow_chunked && is_chunked && body_size == 0;
-
-            let force_partial = ctx
-                .cache_policy
-                .as_ref()
-                .map(|p| p.force_partial_content)
-                .unwrap_or(false);
-            if !should_cache_response(
-                resp.status.as_u16(),
-                cache_ref,
-                session.req_header().method.as_str(),
-                &resp.headers,
-                host,
-                body_size,
-                force_partial,
-                skip_size_checks,
-            ) {
-                if resp.status.as_u16() == 206 && (cache_ref.allow_partial_content || force_partial)
+            let (force_partial, policy_matches, max_object_size, ttl) =
+                if let Some(compiled_ref) = &ctx.compiled_cache_ref {
+                    let compiled_policy = ctx.compiled_cache_policy.as_deref();
+                    let allow_chunked = compiled_policy
+                        .map(|policy| policy.allow_chunked_encoding)
+                        .unwrap_or(false);
+                    let is_chunked = resp
+                        .headers
+                        .get("transfer-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| Self::header_contains_ascii_case_insensitive(v, b"chunked"))
+                        .unwrap_or(false);
+                    let skip_size_checks = allow_chunked && is_chunked && body_size == 0;
+                    let force_partial = compiled_policy
+                        .map(|policy| policy.force_partial_content)
+                        .unwrap_or(false);
+                    let response_cache_ctx =
+                        Self::cache_eval_context(session, ctx, Self::forwarded_proto(session, ctx))
+                            .with_response(resp.status.as_u16(), &resp.headers);
+                    let policy_matches = crate::cache::compiled::should_cache_response_compiled(
+                        compiled_ref,
+                        compiled_policy,
+                        resp.status.as_u16(),
+                        session.req_header().method.as_str(),
+                        &resp.headers,
+                        body_size,
+                        skip_size_checks,
+                    )
+                        && crate::cache::compiled::cache_ref_response_conditions_match(
+                            compiled_ref,
+                            &response_cache_ctx,
+                        );
+                    (
+                        force_partial,
+                        policy_matches,
+                        compiled_ref
+                            .response_policy
+                            .max_object_size_bytes(compiled_policy),
+                        compiled_ref.response_policy.ttl_seconds(),
+                    )
+                } else {
+                    let allow_chunked = ctx
+                        .cache_policy
+                        .as_ref()
+                        .map(|p| p.allow_chunked_encoding)
+                        .unwrap_or(false);
+                    let is_chunked = resp
+                        .headers
+                        .get("transfer-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| Self::header_contains_ascii_case_insensitive(v, b"chunked"))
+                        .unwrap_or(false);
+                    let skip_size_checks = allow_chunked && is_chunked && body_size == 0;
+                    let force_partial = ctx
+                        .cache_policy
+                        .as_ref()
+                        .map(|p| p.force_partial_content)
+                        .unwrap_or(false);
+                    let response_cache_ctx =
+                        Self::cache_eval_context(session, ctx, Self::forwarded_proto(session, ctx))
+                            .with_response(resp.status.as_u16(), &resp.headers);
+                    let response_conditions_match = if let Some(conds) = &cache_ref.conds
+                        && conds.is_on
+                        && !conds.groups.is_empty()
+                    {
+                        conds.match_request_with_context(&response_cache_ctx)
+                    } else if let Some(simple_cond) = &cache_ref.simple_cond {
+                        simple_cond.match_request_with_context(&response_cache_ctx)
+                    } else {
+                        true
+                    };
+                    let policy_matches = should_cache_response(
+                        resp.status.as_u16(),
+                        cache_ref,
+                        session.req_header().method.as_str(),
+                        &resp.headers,
+                        host,
+                        body_size,
+                        force_partial,
+                        skip_size_checks,
+                    ) && response_conditions_match;
+                    let mut max_bytes = i64::MAX;
+                    if let Some(policy) = &ctx.cache_policy {
+                        if let Some(cap) = &policy.max_item_size {
+                            let b = crate::config_models::SizeCapacity::from_json(cap).to_bytes();
+                            if b > 0 {
+                                max_bytes = b;
+                            }
+                        }
+                        if let Some(cap) = &policy.max_size {
+                            let b = crate::config_models::SizeCapacity::from_json(cap).to_bytes();
+                            if b > 0 && b < max_bytes {
+                                max_bytes = b;
+                            }
+                        }
+                    }
+                    if let Some(cap) = &cache_ref.max_size {
+                        let b = crate::config_models::SizeCapacity::from_json(cap).to_bytes();
+                        if b > 0 && b < max_bytes {
+                            max_bytes = b;
+                        }
+                    }
+                    let max_object_size = (max_bytes != i64::MAX).then_some(max_bytes);
+                    let ttl = cache_ref
+                        .life
+                        .as_ref()
+                        .map(crate::config_models::parse_life_to_seconds)
+                        .unwrap_or(3600);
+                    (force_partial, policy_matches, max_object_size, ttl)
+                };
+            if !policy_matches {
+                if resp.status.as_u16() == 206
+                    && (ctx
+                        .compiled_cache_ref
+                        .as_ref()
+                        .map(|compiled_ref| compiled_ref.response_policy.allows_partial_content())
+                        .unwrap_or(cache_ref.allow_partial_content)
+                        || force_partial)
                 {
                 } else {
                     return Ok(pingora_cache::RespCacheable::Uncacheable(
@@ -6482,38 +7662,11 @@ impl ProxyHttp for EdgeProxy {
                 }
             }
 
-            let mut max_bytes = i64::MAX;
-            if let Some(policy) = &ctx.cache_policy {
-                if let Some(cap) = &policy.max_item_size {
-                    let b = crate::config_models::SizeCapacity::from_json(cap).to_bytes();
-                    if b > 0 {
-                        max_bytes = b;
-                    }
-                }
-                if let Some(cap) = &policy.max_size {
-                    let b = crate::config_models::SizeCapacity::from_json(cap).to_bytes();
-                    if b > 0 && b < max_bytes {
-                        max_bytes = b;
-                    }
-                }
-            }
-            if let Some(cap) = &cache_ref.max_size {
-                let b = crate::config_models::SizeCapacity::from_json(cap).to_bytes();
-                if b > 0 && b < max_bytes {
-                    max_bytes = b;
-                }
-            }
-            if max_bytes > 0 && (body_size as i64) > max_bytes {
+            if max_object_size.is_some_and(|max_size| (body_size as i64) > max_size) {
                 return Ok(pingora_cache::RespCacheable::Uncacheable(
                     pingora_cache::NoCacheReason::Custom("FileTooLarge"),
                 ));
             }
-
-            let ttl = cache_ref
-                .life
-                .as_ref()
-                .map(crate::config_models::parse_life_to_seconds)
-                .unwrap_or(3600);
 
             let mut cached_header =
                 pingora_http::ResponseHeader::build(resp.status.as_u16(), Some(resp.headers.len()))

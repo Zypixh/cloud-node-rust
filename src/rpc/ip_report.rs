@@ -1,11 +1,21 @@
 use crate::api_config::ApiConfig;
 use crate::pb;
 use crate::rpc::client::RpcClient;
+use ipnet::IpNet;
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IpReportKind {
+    Black,
+    White,
+    Gray,
+}
 
 pub struct IpReportMessage {
     pub ip_list_id: i64,
@@ -15,6 +25,7 @@ pub struct IpReportMessage {
     pub expired_at: i64,
     pub reason: String,
     pub r#type: String,
+    pub list_kind: IpReportKind,
     pub event_level: String,
     pub node_id: i64,
     pub server_id: i64,
@@ -26,6 +37,15 @@ pub struct IpReportMessage {
     pub source_url: String,
     pub source_user_agent: String,
     pub source_category: String,
+}
+
+#[derive(Hash, Eq, PartialEq)]
+struct ReportKey {
+    ip_list_id: i64,
+    value: String,
+    r#type: String,
+    server_id: i64,
+    source_category: String,
 }
 
 static REPORT_CHAN: Lazy<(
@@ -74,12 +94,30 @@ pub async fn start_ip_report_service(api_config: ApiConfig) {
             }
         };
 
-        let mut ip_item_service = client.ip_item_service();
+        let mut ip_list_service = client.ip_list_service_with_type();
+        let mut merged = HashMap::new();
+        for item in items {
+            let Some(mut item) = normalize_item(item) else {
+                continue;
+            };
+            if item.ip_list_id <= 0 {
+                match resolve_ip_list_id(&mut ip_list_service, &item).await {
+                    Some(ip_list_id) => item.ip_list_id = ip_list_id,
+                    None => continue,
+                }
+            }
+            merge_item(&mut merged, item);
+        }
 
-        let item_count = items.len();
+        if merged.is_empty() {
+            continue;
+        }
+
+        let mut ip_item_service = client.ip_item_service();
+        let item_count = merged.len();
         let req = pb::CreateIpItemsRequest {
-            ip_items: items
-                .into_iter()
+            ip_items: merged
+                .into_values()
                 .map(|i| pb::create_ip_items_request::IpItem {
                     ip_list_id: i.ip_list_id,
                     value: i.value,
@@ -104,13 +142,202 @@ pub async fn start_ip_report_service(api_config: ApiConfig) {
         };
 
         match ip_item_service.create_ip_items(req).await {
-            Ok(_) => info!("Successfully reported {} IP block items to API", item_count),
+            Ok(_) => info!("Successfully reported {} IP list items to API", item_count),
             Err(e) => error!("Failed to report IP items: {}", e),
         }
     }
 }
 
 pub fn report_block(item: IpReportMessage) {
+    report_item(item);
+}
+
+pub fn report_item(item: IpReportMessage) {
     let tx = &REPORT_CHAN.0;
     let _ = tx.try_send(item);
+}
+
+pub fn list_kind(value: &str) -> Option<IpReportKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "black" | "deny" | "" => Some(IpReportKind::Black),
+        "white" | "allow" => Some(IpReportKind::White),
+        "gray" | "grey" => Some(IpReportKind::Gray),
+        _ => None,
+    }
+}
+
+pub fn canonical_type(kind: IpReportKind) -> &'static str {
+    match kind {
+        IpReportKind::Black => "black",
+        IpReportKind::White => "white",
+        IpReportKind::Gray => "gray",
+    }
+}
+
+pub fn default_list_code(kind: IpReportKind, server_id: i64) -> String {
+    match (kind, server_id) {
+        (IpReportKind::Black, 0) => "node-generated-global-blacklist".to_string(),
+        (IpReportKind::Black, server_id) => format!("node-generated-server-blacklist-{server_id}"),
+        (IpReportKind::White, 0) => "node-generated-global-whitelist".to_string(),
+        (IpReportKind::White, server_id) => format!("node-generated-server-whitelist-{server_id}"),
+        (IpReportKind::Gray, 0) => "node-generated-global-graylist".to_string(),
+        (IpReportKind::Gray, server_id) => format!("node-generated-server-graylist-{server_id}"),
+    }
+}
+
+fn normalize_item(mut item: IpReportMessage) -> Option<IpReportMessage> {
+    if let Ok(net) = item.value.trim().parse::<IpNet>() {
+        let (ip_from, ip_to) = ip_net_bounds(net);
+        item.value = net.to_string();
+        item.ip_from = ip_from;
+        item.ip_to = ip_to;
+        item.r#type = match net {
+            IpNet::V4(_) => "ipv4",
+            IpNet::V6(_) => "ipv6",
+        }
+        .to_string();
+        return Some(item);
+    }
+    if let Ok(ip) = item.value.trim().parse::<IpAddr>() {
+        let ip_type = match ip {
+            IpAddr::V4(_) => "ipv4",
+            IpAddr::V6(_) => "ipv6",
+        };
+        let ip = ip.to_string();
+        item.value = ip.clone();
+        item.ip_from = ip.clone();
+        item.ip_to = ip;
+        item.r#type = ip_type.to_string();
+        return Some(item);
+    }
+    if !item.ip_from.trim().is_empty()
+        && item.ip_from.trim() == item.ip_to.trim()
+        && let Ok(ip) = item.ip_from.trim().parse::<IpAddr>()
+    {
+        let ip_type = match ip {
+            IpAddr::V4(_) => "ipv4",
+            IpAddr::V6(_) => "ipv6",
+        };
+        let ip = ip.to_string();
+        item.value = ip.clone();
+        item.ip_from = ip.clone();
+        item.ip_to = ip;
+        item.r#type = ip_type.to_string();
+        return Some(item);
+    }
+
+    warn!("Skipping IP report with unsupported target {:?}", item.value);
+    None
+}
+
+fn merge_item(items: &mut HashMap<ReportKey, IpReportMessage>, item: IpReportMessage) {
+    let key = ReportKey {
+        ip_list_id: item.ip_list_id,
+        value: item.value.clone(),
+        r#type: item.r#type.clone(),
+        server_id: item.server_id,
+        source_category: item.source_category.clone(),
+    };
+    match items.get_mut(&key) {
+        Some(existing) if existing.expired_at < item.expired_at => *existing = item,
+        Some(_) => {}
+        None => {
+            items.insert(key, item);
+        }
+    }
+}
+
+async fn resolve_ip_list_id(
+    service: &mut pb::ip_list_service_client::IpListServiceClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>
+            + Clone
+            + Send
+            + 'static,
+        >,
+    >,
+    item: &IpReportMessage,
+) -> Option<i64> {
+    let kind = item.list_kind;
+    let server_id = item.server_id.max(0);
+    let code = default_list_code(kind, server_id);
+
+    match service
+        .find_ip_list_id_with_code(pb::FindIpListIdWithCodeRequest { code: code.clone() })
+        .await
+    {
+        Ok(resp) => {
+            let ip_list_id = resp.into_inner().ip_list_id;
+            if ip_list_id > 0 {
+                return Some(ip_list_id);
+            }
+        }
+        Err(e) => warn!("Failed to find IP list with code {}: {}", code, e),
+    }
+
+    let is_global = server_id == 0;
+    let name = default_list_name(kind, server_id);
+    match service
+        .create_ip_list(pb::CreateIpListRequest {
+            r#type: "cluster".to_string(),
+            name,
+            code: code.clone(),
+            timeout_json: Vec::new(),
+            is_public: false,
+            description: "Generated by cloud node runtime".to_string(),
+            is_global,
+            server_id,
+        })
+        .await
+    {
+        Ok(resp) => {
+            let ip_list_id = resp.into_inner().ip_list_id;
+            (ip_list_id > 0).then_some(ip_list_id)
+        }
+        Err(e) => {
+            warn!("Failed to create generated IP list {}: {}", code, e);
+            None
+        }
+    }
+}
+
+fn default_list_name(kind: IpReportKind, server_id: i64) -> String {
+    match (kind, server_id) {
+        (IpReportKind::Black, 0) => "Node Generated Global Blacklist".to_string(),
+        (IpReportKind::Black, server_id) => format!("Node Generated Server {server_id} Blacklist"),
+        (IpReportKind::White, 0) => "Node Generated Global Whitelist".to_string(),
+        (IpReportKind::White, server_id) => format!("Node Generated Server {server_id} Whitelist"),
+        (IpReportKind::Gray, 0) => "Node Generated Global Graylist".to_string(),
+        (IpReportKind::Gray, server_id) => format!("Node Generated Server {server_id} Graylist"),
+    }
+}
+
+fn ip_net_bounds(net: IpNet) -> (String, String) {
+    match net {
+        IpNet::V4(net) => {
+            let prefix = net.prefix_len();
+            let host_bits = 32 - u32::from(prefix);
+            let mask = if host_bits == 32 {
+                0
+            } else {
+                u32::MAX << host_bits
+            };
+            let start = u32::from(net.addr()) & mask;
+            let end = start | !mask;
+            (Ipv4Addr::from(start).to_string(), Ipv4Addr::from(end).to_string())
+        }
+        IpNet::V6(net) => {
+            let prefix = net.prefix_len();
+            let host_bits = 128 - u32::from(prefix);
+            let mask = if host_bits == 128 {
+                0
+            } else {
+                u128::MAX << host_bits
+            };
+            let start = u128::from_be_bytes(net.addr().octets()) & mask;
+            let end = start | !mask;
+            (Ipv6Addr::from(start).to_string(), Ipv6Addr::from(end).to_string())
+        }
+    }
 }

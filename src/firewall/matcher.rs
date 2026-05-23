@@ -290,6 +290,13 @@ fn split_terms(expected: &str) -> impl Iterator<Item = &str> {
 }
 
 fn contains_word(actual: &str, term: &str) -> bool {
+    if term
+        .bytes()
+        .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+    {
+        return actual.contains(term);
+    }
+
     let pattern = format!(r"\b{}\b", regex::escape(term));
     get_or_compile_regex(&pattern)
         .map(|re| re.is_match(actual))

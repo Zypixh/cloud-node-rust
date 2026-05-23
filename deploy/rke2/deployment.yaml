@@ -61,6 +61,26 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: TZ
+              value: Asia/Shanghai
+          startupProbe:
+            httpGet:
+              path: /internal/v1/health
+              port: internal
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /internal/v1/health
+              port: internal
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /internal/v1/health
+              port: internal
+            periodSeconds: 10
+            failureThreshold: 6
           volumeMounts:
             - name: api-config
               mountPath: /etc/cloud-node/configs/api_node.yaml
@@ -84,6 +104,16 @@ spec:
               memory: 4Gi
             limits:
               memory: 16Gi
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: cloud-node
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 60
       volumes:
         - name: api-config
           secret:

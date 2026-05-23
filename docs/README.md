@@ -9,6 +9,7 @@
 - [功能说明](features.md)：逐项介绍协议代理、缓存、WAF、内容处理、日志统计、证书和多级分发能力。
 - [配置说明](configuration.md)：说明 `configs/api_node.yaml`、运行目录、数据文件、缓存目录和控制面配置兼容。
 - [部署与运维](operations.md)：说明构建、安装、systemd、系统参数、监控、日志和排障建议。
+- [gRPC API 使用文档](grpc-api.md)：说明节点当前调用的控制面 gRPC 接口、请求、响应和配置应用方式。
 
 ## 阅读顺序
 

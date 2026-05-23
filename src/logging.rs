@@ -159,6 +159,23 @@ pub fn report_node_log(level: String, tag: String, message: String, server_id: i
     }
 }
 
+pub fn access_log_needs_attrs(ctx: &ProxyCTX) -> bool {
+    if !ctx.access_log_module_enabled || ctx.no_log || !ctx.global_access_log_on {
+        return false;
+    }
+    if ctx
+        .access_log_ref
+        .as_ref()
+        .is_some_and(|access_log| !access_log.is_on)
+    {
+        return false;
+    }
+    ctx.access_log_ref
+        .as_ref()
+        .map(|access_log| access_log.fields.is_empty() || access_log.fields.contains(&43))
+        .unwrap_or(true)
+}
+
 pub fn log_access(session: &Session, ctx: &ProxyCTX) {
     if !ctx.access_log_module_enabled {
         debug!("ACCESS_LOG: blocked by access_log_module_enabled=false");

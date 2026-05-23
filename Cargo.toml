@@ -1,6 +1,6 @@
 [package]
 name = "cloud-node-rust"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2024"
 
 [dependencies]
@@ -30,6 +30,7 @@ pingora-http = { path = "./pingora-main/pingora-http" }
 pingora-cache = { path = "./pingora-main/pingora-cache" }
 prost = "0.13.5"
 regex = "1.12.3"
+aho-corasick = "1.1.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 quinn = "0.11.9"
 rustls = { version = "0.23.23", default-features = false, features = ["ring", "std"] }

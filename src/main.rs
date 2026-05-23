@@ -604,6 +604,8 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         rpc::start_updating_server_list_syncer(ac_us, cs_us, hm_us, ds_us).await;
     });
 
+    cloud_node_rust::metrics::init_http_dimension_worker(100_000);
+
     // Reporters
     let ac_s = api_config.clone();
     let cs_s = config_store.clone();

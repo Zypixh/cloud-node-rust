@@ -1,6 +1,7 @@
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 use crate::proxy::EdgeProxy;
+use crate::rpc::ip_report::{IpReportKind, IpReportMessage};
 use crate::ssl::DynamicCertSelector;
 use anyhow::Context;
 use dashmap::DashMap;
@@ -12,7 +13,7 @@ use pingora_core::protocols::{GetSocketDigest, SocketDigest};
 use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpStream;
@@ -33,6 +34,14 @@ struct ListenerHandle {
 struct PassthroughBackendTarget {
     addr: String,
     origin_id: i64,
+}
+
+struct SpecialDefenseConfig {
+    threshold: u32,
+    period_secs: i64,
+    block_secs: i64,
+    use_local_firewall: bool,
+    policy_name: String,
 }
 
 pub struct HttpProxyManager {
@@ -263,6 +272,27 @@ impl HttpProxyManager {
             };
             let (client_stream, client_addr) = accept_result?;
 
+            if self.proxy_logic.waf_state.is_blocked(client_addr.ip(), 0) {
+                continue;
+            }
+
+            if !is_tls {
+                let proxy_inner = proxy_arc.clone();
+                let shutdown_inner = shutdown_rx.clone();
+                let manager = self.clone();
+                let downstream_read_timeout = manager.downstream_read_timeout();
+                tokio::spawn(async move {
+                    manager.record_empty_connection_if_no_payload(
+                        client_stream,
+                        client_addr,
+                        proxy_inner,
+                        shutdown_inner,
+                        downstream_read_timeout,
+                    ).await;
+                });
+                continue;
+            }
+
             // Optimization: TCP_NODELAY for small file performance
             let _ = client_stream.set_nodelay(true);
 
@@ -333,6 +363,7 @@ impl HttpProxyManager {
                                 {
                                     error!("TLS handshake failed: {}", e);
                                 }
+                                manager.record_tls_handshake_failure(client_addr.ip());
                                 return;
                             }
                             Err(_) => {
@@ -342,6 +373,7 @@ impl HttpProxyManager {
                                         tls_handshake_timeout
                                     );
                                 }
+                                manager.record_tls_handshake_failure(client_addr.ip());
                                 return;
                             }
                         }
@@ -399,29 +431,13 @@ impl HttpProxyManager {
                         }
                     }
                 } else {
-                    // HTTP/1.1 Logic
-                    let mut server_session = ServerSession::new_http1(stream);
-                    server_session.set_read_timeout(Some(downstream_read_timeout));
-                    if *shutdown_inner.borrow() {
-                        server_session.set_keepalive(None);
-                    } else {
-                        server_session.set_keepalive(Some(60));
-                    }
-                    let mut result = proxy_inner
-                        .process_new_http(server_session, &shutdown_inner)
-                        .await;
-
-                    while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
-                        let mut next_session = ServerSession::new_http1(stream);
-                        if let Some(persistent_settings) = persistent_settings {
-                            persistent_settings.apply_to_session(&mut next_session);
-                        }
-                        next_session.set_read_timeout(Some(downstream_read_timeout));
-
-                        result = proxy_inner
-                            .process_new_http(next_session, &shutdown_inner)
-                            .await;
-                    }
+                    process_http1_stream(
+                        stream,
+                        proxy_inner,
+                        shutdown_inner,
+                        downstream_read_timeout,
+                    )
+                    .await;
                 }
             });
         }
@@ -443,6 +459,150 @@ impl HttpProxyManager {
         crate::resource_budget::http2_handshake_timeout(
             &self.config_store.get_global_http_config_sync(),
         )
+    }
+
+    fn global_empty_connection_flood_config(&self) -> Option<SpecialDefenseConfig> {
+        let policies = self.config_store.get_firewall_policies_sync();
+        policies.iter().find_map(|policy| {
+            if !policy.is_on {
+                return None;
+            }
+            let config = policy.empty_connection_flood.as_ref()?;
+            if !config.is_on || config.max_empty_connections == 0 {
+                return None;
+            }
+            Some(SpecialDefenseConfig {
+                threshold: config.max_empty_connections,
+                period_secs: i64::from(config.period).max(1),
+                block_secs: i64::from(config.block_seconds).max(1),
+                use_local_firewall: policy.use_local_firewall,
+                policy_name: policy.name.clone(),
+            })
+        })
+    }
+
+    fn global_tls_exhaustion_config(&self) -> Option<SpecialDefenseConfig> {
+        let policies = self.config_store.get_firewall_policies_sync();
+        policies.iter().find_map(|policy| {
+            if !policy.is_on {
+                return None;
+            }
+            let config = policy.tls_exhaustion_attack.as_ref()?;
+            if !config.is_on || config.max_handshake_fails == 0 {
+                return None;
+            }
+            Some(SpecialDefenseConfig {
+                threshold: config.max_handshake_fails,
+                period_secs: i64::from(config.period).max(1),
+                block_secs: i64::from(config.block_seconds).max(1),
+                use_local_firewall: policy.use_local_firewall,
+                policy_name: policy.name.clone(),
+            })
+        })
+    }
+
+    async fn record_empty_connection_if_no_payload(
+        self: Arc<Self>,
+        client_stream: TcpStream,
+        client_addr: SocketAddr,
+        proxy_inner: Arc<pingora_proxy::HttpProxy<EdgeProxy>>,
+        shutdown_inner: watch::Receiver<bool>,
+        downstream_read_timeout: Duration,
+    ) {
+        let Some(config) = self.global_empty_connection_flood_config() else {
+            process_plain_http_connection(
+                client_stream,
+                client_addr,
+                proxy_inner,
+                shutdown_inner,
+                downstream_read_timeout,
+            )
+            .await;
+            return;
+        };
+        let mut first_byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), client_stream.peek(&mut first_byte)).await {
+            Ok(Ok(0)) => {
+                self.record_special_defense_hit("EMPTY_CONNECTION_FLOOD", client_addr.ip(), config);
+            }
+            Ok(Ok(_)) => {
+                process_plain_http_connection(
+                    client_stream,
+                    client_addr,
+                    proxy_inner,
+                    shutdown_inner,
+                    downstream_read_timeout,
+                )
+                .await;
+            }
+            Ok(Err(_)) | Err(_) => {
+                self.record_special_defense_hit("EMPTY_CONNECTION_FLOOD", client_addr.ip(), config);
+            }
+        }
+    }
+
+    fn record_tls_handshake_failure(&self, ip: IpAddr) {
+        let Some(config) = self.global_tls_exhaustion_config() else {
+            return;
+        };
+        self.record_special_defense_hit(
+            "TLS_EXHAUSTION_ATTACK",
+            ip,
+            config,
+        );
+    }
+
+    fn record_special_defense_hit(
+        &self,
+        defense: &str,
+        ip: IpAddr,
+        config: SpecialDefenseConfig,
+    ) {
+        let count = self.proxy_logic.waf_state.increase_counter(
+            format!("{}:{}", defense, ip),
+            config.period_secs,
+        );
+        if count > u64::from(config.threshold) {
+            self.proxy_logic.waf_state.block_ip(
+                ip,
+                0,
+                config.block_secs,
+                Some("global"),
+                false,
+                config.use_local_firewall,
+            );
+            let node_id = self.proxy_logic.api_config.node_id.parse::<i64>().unwrap_or(0);
+            crate::rpc::ip_report::report_item(IpReportMessage {
+                ip_list_id: 0,
+                value: ip.to_string(),
+                ip_from: String::new(),
+                ip_to: String::new(),
+                expired_at: crate::utils::time::now_timestamp() + config.block_secs.max(1),
+                reason: format!("{} special defense block", defense),
+                r#type: String::new(),
+                list_kind: IpReportKind::Black,
+                event_level: "error".to_string(),
+                node_id,
+                server_id: 0,
+                source_node_id: node_id,
+                source_server_id: 0,
+                source_http_firewall_policy_id: 0,
+                source_http_firewall_rule_group_id: 0,
+                source_http_firewall_rule_set_id: 0,
+                source_url: String::new(),
+                source_user_agent: String::new(),
+                source_category: "special_defense".to_string(),
+            });
+            warn!(
+                "{} blocked {} for {}s after {} hits in {}s by policy {}",
+                defense,
+                ip,
+                config.block_secs,
+                count,
+                config.period_secs,
+                config.policy_name
+            );
+        }
     }
 
     async fn inspect_tls_host(
@@ -704,6 +864,52 @@ impl HttpProxyManager {
             addr: normalize_passthrough_target(&peer.addr.to_string()),
             origin_id: crate::lb_factory::peer_origin_id(&peer),
         })
+    }
+}
+
+async fn process_plain_http_connection(
+    client_stream: TcpStream,
+    client_addr: SocketAddr,
+    proxy_inner: Arc<pingora_proxy::HttpProxy<EdgeProxy>>,
+    shutdown_inner: watch::Receiver<bool>,
+    downstream_read_timeout: Duration,
+) {
+    let _ = client_stream.set_nodelay(true);
+    let l4_stream = stream_with_socket_digest(client_stream, client_addr);
+    process_http1_stream(
+        Box::new(l4_stream),
+        proxy_inner,
+        shutdown_inner,
+        downstream_read_timeout,
+    )
+    .await;
+}
+
+async fn process_http1_stream(
+    stream: pingora_core::protocols::Stream,
+    proxy_inner: Arc<pingora_proxy::HttpProxy<EdgeProxy>>,
+    shutdown_inner: watch::Receiver<bool>,
+    downstream_read_timeout: Duration,
+) {
+    let mut server_session = ServerSession::new_http1(stream);
+    server_session.set_read_timeout(Some(downstream_read_timeout));
+    if *shutdown_inner.borrow() {
+        server_session.set_keepalive(None);
+    } else {
+        server_session.set_keepalive(Some(60));
+    }
+    let mut result = proxy_inner
+        .process_new_http(server_session, &shutdown_inner)
+        .await;
+
+    while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
+        let mut next_session = ServerSession::new_http1(stream);
+        if let Some(persistent_settings) = persistent_settings {
+            persistent_settings.apply_to_session(&mut next_session);
+        }
+        next_session.set_read_timeout(Some(downstream_read_timeout));
+
+        result = proxy_inner.process_new_http(next_session, &shutdown_inner).await;
     }
 }
 

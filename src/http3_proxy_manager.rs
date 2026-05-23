@@ -15,7 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::ConfigStore;
 use crate::h3_downstream::H3DownstreamSession;
@@ -191,6 +191,7 @@ impl Http3ProxyManager {
             let Some(connecting) = connecting else {
                 continue;
             };
+            debug!("HTTP/3 incoming connection on UDP port {}", port);
 
             let manager = self.clone();
             let proxy = proxy.clone();
@@ -312,13 +313,25 @@ impl Http3ProxyManager {
     ) -> Result<()> {
         let conn = connecting.await?;
         let remote_addr = conn.remote_address();
+        debug!(
+            "HTTP/3 connection accepted on port {} from {}",
+            listen_port, remote_addr
+        );
         let mut h3_conn = h3::server::builder()
             .build(h3_quinn::Connection::new(conn))
             .await?;
+        debug!(
+            "HTTP/3 connection ready on port {} from {}",
+            listen_port, remote_addr
+        );
 
         loop {
             match h3_conn.accept().await {
                 Ok(Some(resolver)) => {
+                    debug!(
+                        "HTTP/3 request stream accepted on port {} from {}",
+                        listen_port, remote_addr
+                    );
                     let manager = self.clone();
                     let proxy = proxy.clone();
                     let shutdown = shutdown_rx.clone();
@@ -361,10 +374,20 @@ impl Http3ProxyManager {
         let (request, mut stream) = resolver.resolve_request().await?;
         let host = Self::request_host(&request, listen_port)
             .context("missing host/authority in HTTP/3 request")?;
+        debug!(
+            "HTTP/3 request resolved on port {} from {} host={} path={}",
+            listen_port,
+            remote_addr,
+            host,
+            request.uri().path()
+        );
         let server = self
             .config_store
             .get_l7_server_for_tls_name_sync(authority_host_for_lookup(&host).as_str());
-        if !server.is_some_and(|server| server.http3_enabled()) {
+        if !server
+            .as_ref()
+            .is_some_and(|server| self.server_accepts_http3(server, listen_port))
+        {
             let response = http::Response::builder().status(421).body(())?;
             stream.send_response(response).await?;
             stream
@@ -389,6 +412,17 @@ impl Http3ProxyManager {
         let server_session = ServerSession::new_custom(Box::new(h3_session));
         proxy.process_new_http(server_session, &shutdown_rx).await;
         Ok(())
+    }
+
+    fn server_accepts_http3(&self, server: &crate::config_models::ServerConfig, port: u16) -> bool {
+        if self
+            .config_store
+            .get_global_http3_policy_sync()
+            .is_some_and(|policy| policy.is_on && u16::try_from(policy.port).ok() == Some(port))
+        {
+            return server.https.as_ref().is_some_and(|https| https.is_on);
+        }
+        server.http3_enabled()
     }
 
     fn should_reject_mobile_h3(&self, request: &http::Request<()>) -> bool {

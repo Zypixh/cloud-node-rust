@@ -1,5 +1,6 @@
 use dashmap::{DashMap, DashSet};
 use once_cell::sync::Lazy;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -88,7 +89,7 @@ impl DailyDomainTracker {
 }
 
 pub struct UniqueIpTracker {
-    ips: DashSet<(i64, String, String)>,
+    ips: DashSet<(i64, String, IpAddr)>,
 }
 
 impl Default for UniqueIpTracker {
@@ -104,12 +105,11 @@ impl UniqueIpTracker {
         }
     }
 
-    pub fn record(&self, server_id: i64, day: &str, ip: &str) {
-        if server_id <= 0 || day.is_empty() || ip.is_empty() {
+    pub fn record(&self, server_id: i64, day: &str, ip: IpAddr) {
+        if server_id <= 0 || day.is_empty() {
             return;
         }
-        self.ips
-            .insert((server_id, day.to_string(), ip.to_string()));
+        self.ips.insert((server_id, day.to_string(), ip));
     }
 
     pub fn count(&self, server_id: i64, day: &str) -> i64 {

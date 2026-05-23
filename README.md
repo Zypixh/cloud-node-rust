@@ -72,9 +72,11 @@ cloud-node --monitor-port 8888
 - [功能说明](docs/features.md)
 - [配置说明](docs/configuration.md)
 - [部署与运维](docs/operations.md)
+- [gRPC API 使用文档](docs/grpc-api.md)
 
 发布说明：
 
+- [1.1.2](release-notes/v1.1.2.md)
 - [1.1.1](release-notes/v1.1.1.md)
 - [1.1.0](release-notes/v1.1.0.md)
 - [1.0.9](release-notes/v1.0.9.md)

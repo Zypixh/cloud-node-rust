@@ -1,3 +1,4 @@
+pub mod compiled;
 pub mod lists;
 pub mod matcher;
 pub mod matcher_plus;
@@ -5,7 +6,7 @@ pub mod state;
 pub mod verifier;
 
 use crate::config_models::{
-    HTTPFirewallPolicy, HTTPFirewallRegionConfig, WAFBlockOptions, WAFCaptchaOptions,
+    HTTPFirewallPolicy, HTTPFirewallRegionConfig, ServerConfig, WAFBlockOptions, WAFCaptchaOptions,
     WAFJSCookieOptions, WAFPageOptions,
 };
 use crate::metrics::analyzer;
@@ -13,6 +14,7 @@ use pingora_proxy::Session;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub enum ActionResponse {
@@ -74,6 +76,8 @@ pub struct MatchedAction {
     pub page_options: Option<WAFPageOptions>,
     pub captcha_options: Option<WAFCaptchaOptions>,
     pub js_cookie_options: Option<WAFJSCookieOptions>,
+    pub chained_actions: Vec<MatchedAction>,
+    pub observe_only: bool,
 }
 
 pub struct OutboundContext<'a> {
@@ -88,6 +92,31 @@ pub fn evaluate_policy(
     session: &Session,
     request_body: &[u8],
     scheme: &str,
+) -> Option<MatchedAction> {
+    evaluate_policy_with_server(policy, session, request_body, scheme, None)
+}
+
+pub fn evaluate_policy_with_server(
+    policy: &HTTPFirewallPolicy,
+    session: &Session,
+    request_body: &[u8],
+    scheme: &str,
+    server: Option<&ServerConfig>,
+) -> Option<MatchedAction> {
+    let started = Instant::now();
+    let matched = evaluate_policy_inner(policy, session, request_body, scheme, server);
+    crate::metrics::METRICS
+        .waf
+        .record_legacy_evaluation(matched.is_some(), started.elapsed());
+    matched
+}
+
+fn evaluate_policy_inner(
+    policy: &HTTPFirewallPolicy,
+    session: &Session,
+    request_body: &[u8],
+    scheme: &str,
+    server: Option<&ServerConfig>,
 ) -> Option<MatchedAction> {
     if !policy.is_on || policy.mode == "bypass" {
         return None;
@@ -106,24 +135,29 @@ pub fn evaluate_policy(
                 continue;
             }
 
-            if let Some(result) = matcher_plus::match_group(group, session, request_body, scheme) {
+            if let Some(result) =
+                matcher_plus::match_group_with_server(group, session, request_body, scheme, server)
+            {
                 if let Some(set) = result.set {
                     if let Some(mut matched) = perform_actions(&set.actions) {
-                        matched.policy_id = policy.id;
-                        matched.group_id = group.id;
-                        matched.set_id = set.id;
-                        matched.block_options = policy.block_options.clone();
-                        matched.page_options = policy.page_options.clone();
-                        matched.captcha_options = policy.captcha_options.clone();
-                        matched.js_cookie_options = policy.js_cookie_options.clone();
-                        matched.use_local_firewall = policy.use_local_firewall;
+                        fill_action_context(
+                            &mut matched,
+                            policy.id,
+                            group.id,
+                            set.id,
+                            policy.use_local_firewall,
+                        );
+                        fill_action_options(policy, &mut matched);
 
                         apply_observe_mode(policy, &mut matched);
 
                         // Flow Control: ALLOW Scope
                         if matched.action_code == "allow" {
                             match matched.allow_scope.as_deref() {
-                                Some("group") => { /* continue to next group */ }
+                                Some("group") => {
+                                    current_group_idx += 1;
+                                    continue;
+                                }
                                 Some("server") | Some("policy") => return Some(matched),
                                 _ => {}
                             }
@@ -177,6 +211,32 @@ pub fn evaluate_policy(
     None
 }
 
+pub fn inbound_policy_uses_request_body(policy: &HTTPFirewallPolicy) -> bool {
+    if !policy.is_on || policy.mode == "bypass" {
+        return false;
+    }
+    let Some(inbound) = &policy.inbound else {
+        return false;
+    };
+    if !inbound.is_on {
+        return false;
+    }
+
+    inbound.groups.iter().any(|group| {
+        group.is_on
+            && (group.code.is_some()
+                || group.sets.iter().any(|set| {
+                    set.is_on
+                        && set.rules.iter().any(|rule| {
+                            crate::firewall::matcher_plus::expression_uses_request_body(&rule.param)
+                                || rule.checkpoint_options.as_ref().is_some_and(
+                                    crate::firewall::matcher_plus::value_uses_request_body,
+                                )
+                        })
+                }))
+    })
+}
+
 pub fn outbound_policy_uses_response_body(policy: &HTTPFirewallPolicy) -> bool {
     if !policy.is_on || policy.mode == "bypass" {
         return false;
@@ -193,7 +253,13 @@ pub fn outbound_policy_uses_response_body(policy: &HTTPFirewallPolicy) -> bool {
             && group.sets.iter().any(|set| {
                 set.is_on
                     && set.rules.iter().any(|rule| {
-                        rule.param.contains("responseBody") || rule.value.contains("responseBody")
+                        crate::firewall::matcher_plus::expression_uses_response_body(&rule.param)
+                            || crate::firewall::matcher_plus::expression_uses_response_body(
+                                &rule.value,
+                            )
+                            || rule.checkpoint_options.as_ref().is_some_and(
+                                crate::firewall::matcher_plus::value_uses_response_body,
+                            )
                     })
             })
     })
@@ -205,6 +271,34 @@ pub fn evaluate_outbound_policy(
     request_body: &[u8],
     response: &OutboundContext<'_>,
     scheme: &str,
+) -> Option<MatchedAction> {
+    evaluate_outbound_policy_with_server(policy, session, request_body, response, scheme, None)
+}
+
+pub fn evaluate_outbound_policy_with_server(
+    policy: &HTTPFirewallPolicy,
+    session: &Session,
+    request_body: &[u8],
+    response: &OutboundContext<'_>,
+    scheme: &str,
+    server: Option<&ServerConfig>,
+) -> Option<MatchedAction> {
+    let started = Instant::now();
+    let matched =
+        evaluate_outbound_policy_inner(policy, session, request_body, response, scheme, server);
+    crate::metrics::METRICS
+        .waf
+        .record_legacy_evaluation(matched.is_some(), started.elapsed());
+    matched
+}
+
+fn evaluate_outbound_policy_inner(
+    policy: &HTTPFirewallPolicy,
+    session: &Session,
+    request_body: &[u8],
+    response: &OutboundContext<'_>,
+    scheme: &str,
+    server: Option<&ServerConfig>,
 ) -> Option<MatchedAction> {
     if !policy.is_on || policy.mode == "bypass" {
         return None;
@@ -219,19 +313,24 @@ pub fn evaluate_outbound_policy(
             if !group.is_on {
                 continue;
             }
-            if let Some(result) =
-                matcher_plus::match_group_response(group, session, request_body, response, scheme)
-            {
+            if let Some(result) = matcher_plus::match_group_response_with_server(
+                group,
+                session,
+                request_body,
+                response,
+                scheme,
+                server,
+            ) {
                 if let Some(set) = result.set {
                     if let Some(mut matched) = perform_actions(&set.actions) {
-                        matched.policy_id = policy.id;
-                        matched.group_id = group.id;
-                        matched.set_id = set.id;
-                        matched.block_options = policy.block_options.clone();
-                        matched.page_options = policy.page_options.clone();
-                        matched.captcha_options = policy.captcha_options.clone();
-                        matched.js_cookie_options = policy.js_cookie_options.clone();
-                        matched.use_local_firewall = policy.use_local_firewall;
+                        fill_action_context(
+                            &mut matched,
+                            policy.id,
+                            group.id,
+                            set.id,
+                            policy.use_local_firewall,
+                        );
+                        fill_action_options(policy, &mut matched);
 
                         apply_observe_mode(policy, &mut matched);
 
@@ -249,10 +348,41 @@ pub fn evaluate_outbound_policy(
     None
 }
 
-fn apply_observe_mode(policy: &HTTPFirewallPolicy, matched: &mut MatchedAction) {
-    if policy.mode == "observe" && is_blocking_action_code(&matched.action_code) {
-        matched.action_code = "log".to_string();
-        matched.action = ActionResponse::Allow;
+pub(crate) fn fill_action_context(
+    matched: &mut MatchedAction,
+    policy_id: i64,
+    group_id: i64,
+    set_id: i64,
+    use_local_firewall: bool,
+) {
+    matched.policy_id = policy_id;
+    matched.group_id = group_id;
+    matched.set_id = set_id;
+    matched.use_local_firewall = use_local_firewall;
+    for chained in &mut matched.chained_actions {
+        fill_action_context(chained, policy_id, group_id, set_id, use_local_firewall);
+    }
+}
+
+pub(crate) fn fill_action_options(policy: &HTTPFirewallPolicy, matched: &mut MatchedAction) {
+    matched.block_options = policy.block_options.clone();
+    matched.page_options = policy.page_options.clone();
+    matched.captcha_options = policy.captcha_options.clone();
+    matched.js_cookie_options = policy.js_cookie_options.clone();
+    for chained in &mut matched.chained_actions {
+        fill_action_options(policy, chained);
+    }
+}
+
+pub(crate) fn apply_observe_mode(policy: &HTTPFirewallPolicy, matched: &mut MatchedAction) {
+    if policy.mode == "observe" {
+        matched.observe_only = true;
+        if is_blocking_action_code(&matched.action_code) {
+            matched.action = ActionResponse::Allow;
+        }
+    }
+    for chained in &mut matched.chained_actions {
+        apply_observe_mode(policy, chained);
     }
 }
 
@@ -260,6 +390,7 @@ fn is_blocking_action_code(action_code: &str) -> bool {
     matches!(
         action_code,
         "block"
+            | "page"
             | "record_ip"
             | "captcha"
             | "js_cookie"
@@ -270,7 +401,7 @@ fn is_blocking_action_code(action_code: &str) -> bool {
     )
 }
 
-fn default_block_action(policy_id: i64, group_id: i64) -> MatchedAction {
+pub(crate) fn default_block_action(policy_id: i64, group_id: i64) -> MatchedAction {
     MatchedAction {
         action: ActionResponse::Block {
             status: 403,
@@ -299,6 +430,8 @@ fn default_block_action(policy_id: i64, group_id: i64) -> MatchedAction {
         page_options: None,
         captcha_options: None,
         js_cookie_options: None,
+        chained_actions: vec![],
+        observe_only: false,
     }
 }
 
@@ -309,383 +442,599 @@ fn normalize_action_code(code: &str) -> String {
     }
 }
 
-fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
-    for action in actions {
-        let code = action
-            .get("code")
-            .or_else(|| action.get("action"))
-            .and_then(Value::as_str)
-            .map(normalize_action_code)?;
-        let options = action.get("options");
+pub(crate) fn parse_action_event_level(options: Option<&Value>) -> String {
+    let Some(options) = options else {
+        return "error".to_string();
+    };
+    ["eventLevel", "event_level", "level", "severity"]
+        .into_iter()
+        .find_map(|key| options.get(key).and_then(normalize_event_level_value))
+        .unwrap_or_else(|| "error".to_string())
+}
 
-        match code.as_str() {
-            "allow" => {
-                let scope = options
-                    .and_then(|v| v.get("scope"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("group")
-                    .to_string();
-                return Some(MatchedAction {
-                    action: ActionResponse::Allow,
-                    policy_id: 0,
-                    group_id: 0,
-                    set_id: 0,
-                    action_code: "allow".to_string(),
-                    timeout_secs: None,
-                    max_timeout_secs: None,
-                    life_seconds: None,
-                    max_fails: None,
-                    fail_block_timeout: None,
-                    fail_global: None,
-                    scope: None,
-                    block_c_class: false,
-                    use_local_firewall: false,
-                    next_group_id: None,
-                    next_set_id: None,
-                    allow_scope: Some(scope),
-                    tags: vec![],
-                    ip_list_id: 0,
-                    event_level: "".to_string(),
-                    block_options: None,
-                    page_options: None,
-                    captcha_options: None,
-                    js_cookie_options: None,
-                });
-            }
-            "log" => {
-                return Some(MatchedAction {
-                    action: ActionResponse::Allow,
-                    policy_id: 0,
-                    group_id: 0,
-                    set_id: 0,
-                    action_code: "log".to_string(),
-                    timeout_secs: None,
-                    max_timeout_secs: None,
-                    life_seconds: None,
-                    max_fails: None,
-                    fail_block_timeout: None,
-                    fail_global: None,
-                    scope: None,
-                    block_c_class: false,
-                    use_local_firewall: false,
-                    next_group_id: None,
-                    next_set_id: None,
-                    allow_scope: None,
-                    tags: vec![],
-                    ip_list_id: 0,
-                    event_level: "".to_string(),
-                    block_options: None,
-                    page_options: None,
-                    captcha_options: None,
-                    js_cookie_options: None,
-                });
-            }
-            "tag" => {
-                let tags: Vec<String> = options
-                    .and_then(|v| v.get("tags"))
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(Value::as_str)
-                            .map(|s| s.to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                return Some(MatchedAction {
-                    action: ActionResponse::Allow,
-                    policy_id: 0,
-                    group_id: 0,
-                    set_id: 0,
-                    action_code: "tag".to_string(),
-                    timeout_secs: None,
-                    max_timeout_secs: None,
-                    life_seconds: None,
-                    max_fails: None,
-                    fail_block_timeout: None,
-                    fail_global: None,
-                    scope: None,
-                    block_c_class: false,
-                    use_local_firewall: false,
-                    next_group_id: None,
-                    next_set_id: None,
-                    allow_scope: None,
-                    tags,
-                    ip_list_id: 0,
-                    event_level: "".to_string(),
-                    block_options: None,
-                    page_options: None,
-                    captcha_options: None,
-                    js_cookie_options: None,
-                });
-            }
-            "notify" => {
-                return Some(MatchedAction {
-                    action: ActionResponse::Allow,
-                    policy_id: 0,
-                    group_id: 0,
-                    set_id: 0,
-                    action_code: "notify".to_string(),
-                    timeout_secs: None,
-                    max_timeout_secs: None,
-                    life_seconds: None,
-                    max_fails: None,
-                    fail_block_timeout: None,
-                    fail_global: None,
-                    scope: None,
-                    block_c_class: false,
-                    use_local_firewall: false,
-                    next_group_id: None,
-                    next_set_id: None,
-                    allow_scope: None,
-                    tags: vec![],
-                    ip_list_id: 0,
-                    event_level: "".to_string(),
-                    block_options: None,
-                    page_options: None,
-                    captcha_options: None,
-                    js_cookie_options: None,
-                });
-            }
-            "record_ip" => {
-                let ip_type = options
-                    .and_then(|v| v.get("type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("black")
-                    .to_ascii_lowercase();
-                let timeout = options
-                    .and_then(|v| v.get("timeout"))
-                    .and_then(Value::as_i64);
-                let scope = options.and_then(|v| v.get("scope")).map(|v| v.to_string());
-                let ip_list_id = options
-                    .and_then(|v| v.get("ipListId"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                let event_level = options
-                    .and_then(|v| v.get("eventLevel"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("error")
-                    .to_string();
+fn normalize_event_level_value(value: &Value) -> Option<String> {
+    if let Some(value) = value.as_str() {
+        return normalize_event_level_str(value);
+    }
+    if let Some(value) = value.as_i64() {
+        return normalize_event_level_str(&value.to_string());
+    }
+    value.as_object().and_then(|object| {
+        ["code", "value", "name", "label"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(normalize_event_level_value))
+    })
+}
 
-                match ip_type.as_str() {
-                    "black" | "deny" => {
-                        return Some(MatchedAction {
-                            action: ActionResponse::Block {
-                                status: 403,
-                                body: "Blocked by WAF".to_string(),
-                            },
-                            policy_id: 0,
-                            group_id: 0,
-                            set_id: 0,
-                            action_code: "record_ip".to_string(),
-                            timeout_secs: timeout,
-                            max_timeout_secs: None,
-                            life_seconds: None,
-                            max_fails: None,
-                            fail_block_timeout: None,
-                            fail_global: None,
-                            scope,
-                            block_c_class: false,
-                            use_local_firewall: false,
-                            next_group_id: None,
-                            next_set_id: None,
-                            allow_scope: None,
-                            tags: vec![],
-                            ip_list_id,
-                            event_level,
-                            block_options: None,
-                            page_options: None,
-                            captcha_options: None,
-                            js_cookie_options: None,
-                        });
-                    }
-                    "white" => {
-                        return Some(MatchedAction {
-                            action: ActionResponse::Allow,
-                            policy_id: 0,
-                            group_id: 0,
-                            set_id: 0,
-                            action_code: "record_ip_white".to_string(),
-                            timeout_secs: timeout,
-                            max_timeout_secs: None,
-                            life_seconds: None,
-                            max_fails: None,
-                            fail_block_timeout: None,
-                            fail_global: None,
-                            scope,
-                            block_c_class: false,
-                            use_local_firewall: false,
-                            next_group_id: None,
-                            next_set_id: None,
-                            allow_scope: None,
-                            tags: vec![],
-                            ip_list_id,
-                            event_level,
-                            block_options: None,
-                            page_options: None,
-                            captcha_options: None,
-                            js_cookie_options: None,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            "redirect" => {
-                let status = options
-                    .and_then(|v| v.get("status"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(302) as i32;
-                let url = options
-                    .and_then(|v| v.get("url"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("/")
-                    .to_string();
-                return Some(MatchedAction {
-                    action: ActionResponse::Redirect {
-                        status,
-                        location: url,
-                    },
-                    policy_id: 0,
-                    group_id: 0,
-                    set_id: 0,
-                    action_code: "redirect".to_string(),
-                    timeout_secs: None,
-                    max_timeout_secs: None,
-                    life_seconds: None,
-                    max_fails: None,
-                    fail_block_timeout: None,
-                    fail_global: None,
-                    scope: None,
-                    block_c_class: false,
-                    use_local_firewall: false,
-                    next_group_id: None,
-                    next_set_id: None,
-                    allow_scope: None,
-                    tags: vec![],
-                    ip_list_id: 0,
-                    event_level: "".to_string(),
-                    block_options: None,
-                    page_options: None,
-                    captcha_options: None,
-                    js_cookie_options: None,
-                });
-            }
-            "captcha" | "js_cookie" | "get_302" | "post_307" => {
-                let life = options
-                    .and_then(|v| v.get("lifeSeconds"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0);
-                let max_fails = options
-                    .and_then(|v| v.get("maxFails"))
-                    .and_then(Value::as_i64)
-                    .map(|value| value as i32);
-                let fail_timeout = options
-                    .and_then(|v| v.get("failBlockTimeout"))
-                    .and_then(Value::as_i64);
-                let fail_global = options
+fn normalize_event_level_str(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let normalized = match value.to_ascii_lowercase().as_str() {
+        "critical" | "fatal" | "severe" | "serious" | "2" => "critical",
+        "warn" | "warning" | "1" => "warning",
+        "notice" | "notify" | "notification" | "info" | "0" => "notice",
+        "error" | "err" | "3" => "error",
+        _ => match value {
+            "严重" => "critical",
+            "警告" | "告警" => "warning",
+            "通知" | "信息" => "notice",
+            "错误" => "error",
+            other => other,
+        },
+    };
+    Some(normalized.to_string())
+}
+
+fn parse_action(action: &Value) -> Option<MatchedAction> {
+    let code = action
+        .get("code")
+        .or_else(|| action.get("action"))
+        .and_then(Value::as_str)
+        .map(normalize_action_code)?;
+    let options = action.get("options");
+
+    match code.as_str() {
+        "block" => {
+            let timeout = options
+                .and_then(|v| v.get("timeout"))
+                .and_then(Value::as_i64);
+            let scope = options
+                .and_then(|v| v.get("scope"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let ip_list_id = options
+                .and_then(|v| v.get("ipListId"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let event_level = parse_action_event_level(options);
+            return Some(MatchedAction {
+                action: ActionResponse::Block {
+                    status: options
+                        .and_then(|v| v.get("status").or_else(|| v.get("statusCode")))
+                        .and_then(Value::as_i64)
+                        .unwrap_or(403) as i32,
+                    body: options
+                        .and_then(|v| v.get("body").or_else(|| v.get("contentHTML")))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Blocked by WAF")
+                        .to_string(),
+                },
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: "block".to_string(),
+                timeout_secs: timeout,
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: options
                     .and_then(|v| v.get("failGlobal"))
-                    .and_then(Value::as_bool);
-                let action = match code.as_str() {
-                    "captcha" => ActionResponse::Captcha { life_seconds: life },
-                    "js_cookie" => ActionResponse::JsCookie { life_seconds: life },
-                    "get_302" => ActionResponse::Get302 { life_seconds: life },
-                    _ => ActionResponse::Post307 { life_seconds: life },
-                };
-                return Some(MatchedAction {
-                    action,
-                    policy_id: 0,
-                    group_id: 0,
-                    set_id: 0,
-                    action_code: code,
-                    timeout_secs: None,
-                    max_timeout_secs: None,
-                    life_seconds: Some(life),
-                    max_fails,
-                    fail_block_timeout: fail_timeout,
-                    fail_global,
-                    scope: None,
-                    block_c_class: false,
-                    use_local_firewall: false,
-                    next_group_id: None,
-                    next_set_id: None,
-                    allow_scope: None,
-                    tags: vec![],
-                    ip_list_id: 0,
-                    event_level: "".to_string(),
-                    block_options: None,
-                    page_options: None,
-                    captcha_options: None,
-                    js_cookie_options: None,
-                });
-            }
-            "go_group" => {
-                let gid = options
-                    .and_then(|v| v.get("groupId"))
-                    .and_then(Value::as_i64);
-                return Some(MatchedAction {
-                    action: ActionResponse::Allow,
-                    policy_id: 0,
-                    group_id: 0,
-                    set_id: 0,
-                    action_code: "go_group".to_string(),
-                    timeout_secs: None,
-                    max_timeout_secs: None,
-                    life_seconds: None,
-                    max_fails: None,
-                    fail_block_timeout: None,
-                    fail_global: None,
-                    scope: None,
-                    block_c_class: false,
-                    use_local_firewall: false,
-                    next_group_id: gid,
-                    next_set_id: None,
-                    allow_scope: None,
-                    tags: vec![],
-                    ip_list_id: 0,
-                    event_level: "".to_string(),
-                    block_options: None,
-                    page_options: None,
-                    captcha_options: None,
-                    js_cookie_options: None,
-                });
-            }
-            "go_set" => {
-                let gid = options
-                    .and_then(|v| v.get("groupId"))
-                    .and_then(Value::as_i64);
-                let sid = options
-                    .and_then(|v| v.get("ruleSetId"))
-                    .and_then(Value::as_i64);
-                return Some(MatchedAction {
-                    action: ActionResponse::Allow,
-                    policy_id: 0,
-                    group_id: 0,
-                    set_id: 0,
-                    action_code: "go_set".to_string(),
-                    timeout_secs: None,
-                    max_timeout_secs: None,
-                    life_seconds: None,
-                    max_fails: None,
-                    fail_block_timeout: None,
-                    fail_global: None,
-                    scope: None,
-                    block_c_class: false,
-                    use_local_firewall: false,
-                    next_group_id: gid,
-                    next_set_id: sid,
-                    allow_scope: None,
-                    tags: vec![],
-                    ip_list_id: 0,
-                    event_level: "".to_string(),
-                    block_options: None,
-                    page_options: None,
-                    captcha_options: None,
-                    js_cookie_options: None,
-                });
-            }
-            _ => {}
+                    .and_then(Value::as_bool),
+                scope,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: None,
+                tags: vec![],
+                ip_list_id,
+                event_level,
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
         }
+        "allow" => {
+            let scope = options
+                .and_then(|v| v.get("scope"))
+                .and_then(Value::as_str)
+                .unwrap_or("group")
+                .to_string();
+            return Some(MatchedAction {
+                action: ActionResponse::Allow,
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: "allow".to_string(),
+                timeout_secs: None,
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: Some(scope),
+                tags: vec![],
+                ip_list_id: 0,
+                event_level: "".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
+        }
+        "log" => {
+            return Some(MatchedAction {
+                action: ActionResponse::Allow,
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: "log".to_string(),
+                timeout_secs: None,
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: None,
+                tags: vec![],
+                ip_list_id: 0,
+                event_level: "".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
+        }
+        "tag" => {
+            let tags: Vec<String> = options
+                .and_then(|v| v.get("tags"))
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Some(MatchedAction {
+                action: ActionResponse::Allow,
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: "tag".to_string(),
+                timeout_secs: None,
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: None,
+                tags,
+                ip_list_id: 0,
+                event_level: "".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
+        }
+        "notify" => {
+            return Some(MatchedAction {
+                action: ActionResponse::Allow,
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: "notify".to_string(),
+                timeout_secs: None,
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: None,
+                tags: vec![],
+                ip_list_id: 0,
+                event_level: "".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
+        }
+        "record_ip" => {
+            let ip_type = options
+                .and_then(|v| v.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("black")
+                .to_ascii_lowercase();
+            let timeout = options
+                .and_then(|v| v.get("timeout"))
+                .and_then(Value::as_i64);
+            let scope = options
+                .and_then(|v| v.get("scope"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let ip_list_id = options
+                .and_then(|v| v.get("ipListId"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let event_level = parse_action_event_level(options);
+
+            match ip_type.as_str() {
+                "black" | "deny" => {
+                    return Some(MatchedAction {
+                        action: ActionResponse::Block {
+                            status: 403,
+                            body: "Blocked by WAF".to_string(),
+                        },
+                        policy_id: 0,
+                        group_id: 0,
+                        set_id: 0,
+                        action_code: "record_ip".to_string(),
+                        timeout_secs: timeout,
+                        max_timeout_secs: None,
+                        life_seconds: None,
+                        max_fails: None,
+                        fail_block_timeout: None,
+                        fail_global: None,
+                        scope,
+                        block_c_class: false,
+                        use_local_firewall: false,
+                        next_group_id: None,
+                        next_set_id: None,
+                        allow_scope: None,
+                        tags: vec![],
+                        ip_list_id,
+                        event_level,
+                        block_options: None,
+                        page_options: None,
+                        captcha_options: None,
+                        js_cookie_options: None,
+                        chained_actions: vec![],
+                        observe_only: false,
+                    });
+                }
+                "white" | "allow" => {
+                    return Some(MatchedAction {
+                        action: ActionResponse::Allow,
+                        policy_id: 0,
+                        group_id: 0,
+                        set_id: 0,
+                        action_code: "record_ip_white".to_string(),
+                        timeout_secs: timeout,
+                        max_timeout_secs: None,
+                        life_seconds: None,
+                        max_fails: None,
+                        fail_block_timeout: None,
+                        fail_global: None,
+                        scope,
+                        block_c_class: false,
+                        use_local_firewall: false,
+                        next_group_id: None,
+                        next_set_id: None,
+                        allow_scope: None,
+                        tags: vec![],
+                        ip_list_id,
+                        event_level,
+                        block_options: None,
+                        page_options: None,
+                        captcha_options: None,
+                        js_cookie_options: None,
+                        chained_actions: vec![],
+                        observe_only: false,
+                    });
+                }
+                "gray" | "grey" => {
+                    return Some(MatchedAction {
+                        action: ActionResponse::Allow,
+                        policy_id: 0,
+                        group_id: 0,
+                        set_id: 0,
+                        action_code: "record_ip_gray".to_string(),
+                        timeout_secs: timeout,
+                        max_timeout_secs: None,
+                        life_seconds: None,
+                        max_fails: None,
+                        fail_block_timeout: None,
+                        fail_global: None,
+                        scope,
+                        block_c_class: false,
+                        use_local_firewall: false,
+                        next_group_id: None,
+                        next_set_id: None,
+                        allow_scope: None,
+                        tags: vec![],
+                        ip_list_id,
+                        event_level,
+                        block_options: None,
+                        page_options: None,
+                        captcha_options: None,
+                        js_cookie_options: None,
+                        chained_actions: vec![],
+                        observe_only: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+        "page" => {
+            let status = options
+                .and_then(|v| v.get("status").or_else(|| v.get("statusCode")))
+                .and_then(Value::as_i64)
+                .unwrap_or(403) as i32;
+            let body = options
+                .and_then(|v| v.get("body").or_else(|| v.get("contentHTML")))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            return Some(MatchedAction {
+                action: ActionResponse::Page {
+                    status,
+                    body,
+                    content_type: "text/html; charset=utf-8".to_string(),
+                },
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: "page".to_string(),
+                timeout_secs: None,
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: None,
+                tags: vec![],
+                ip_list_id: 0,
+                event_level: "".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
+        }
+        "redirect" => {
+            let status = options
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_i64)
+                .unwrap_or(302) as i32;
+            let url = options
+                .and_then(|v| v.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or("/")
+                .to_string();
+            return Some(MatchedAction {
+                action: ActionResponse::Redirect {
+                    status,
+                    location: url,
+                },
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: "redirect".to_string(),
+                timeout_secs: None,
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: None,
+                tags: vec![],
+                ip_list_id: 0,
+                event_level: "".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
+        }
+        "captcha" | "js_cookie" | "get_302" | "post_307" => {
+            let life = options
+                .and_then(|v| v.get("lifeSeconds"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let max_fails = options
+                .and_then(|v| v.get("maxFails"))
+                .and_then(Value::as_i64)
+                .map(|value| value as i32);
+            let fail_timeout = options
+                .and_then(|v| v.get("failBlockTimeout"))
+                .and_then(Value::as_i64);
+            let fail_global = options
+                .and_then(|v| v.get("failGlobal"))
+                .and_then(Value::as_bool);
+            let action = match code.as_str() {
+                "captcha" => ActionResponse::Captcha { life_seconds: life },
+                "js_cookie" => ActionResponse::JsCookie { life_seconds: life },
+                "get_302" => ActionResponse::Get302 { life_seconds: life },
+                _ => ActionResponse::Post307 { life_seconds: life },
+            };
+            return Some(MatchedAction {
+                action,
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: code,
+                timeout_secs: None,
+                max_timeout_secs: None,
+                life_seconds: Some(life),
+                max_fails,
+                fail_block_timeout: fail_timeout,
+                fail_global,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: None,
+                next_set_id: None,
+                allow_scope: None,
+                tags: vec![],
+                ip_list_id: 0,
+                event_level: "".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
+        }
+        "go_group" => {
+            let gid = options
+                .and_then(|v| v.get("groupId"))
+                .and_then(Value::as_i64);
+            return Some(MatchedAction {
+                action: ActionResponse::Allow,
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: "go_group".to_string(),
+                timeout_secs: None,
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: gid,
+                next_set_id: None,
+                allow_scope: None,
+                tags: vec![],
+                ip_list_id: 0,
+                event_level: "".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
+        }
+        "go_set" => {
+            let gid = options
+                .and_then(|v| v.get("groupId"))
+                .and_then(Value::as_i64);
+            let sid = options
+                .and_then(|v| v.get("ruleSetId"))
+                .and_then(Value::as_i64);
+            return Some(MatchedAction {
+                action: ActionResponse::Allow,
+                policy_id: 0,
+                group_id: 0,
+                set_id: 0,
+                action_code: "go_set".to_string(),
+                timeout_secs: None,
+                max_timeout_secs: None,
+                life_seconds: None,
+                max_fails: None,
+                fail_block_timeout: None,
+                fail_global: None,
+                scope: None,
+                block_c_class: false,
+                use_local_firewall: false,
+                next_group_id: gid,
+                next_set_id: sid,
+                allow_scope: None,
+                tags: vec![],
+                ip_list_id: 0,
+                event_level: "".to_string(),
+                block_options: None,
+                page_options: None,
+                captcha_options: None,
+                js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
+            });
+        }
+        _ => {}
     }
     None
+}
+
+fn is_response_action_code(action_code: &str) -> bool {
+    matches!(
+        action_code,
+        "block"
+            | "page"
+            | "redirect"
+            | "record_ip"
+            | "captcha"
+            | "js_cookie"
+            | "jsCookie"
+            | "jscookie"
+            | "get_302"
+            | "post_307"
+    )
+}
+
+pub(crate) fn perform_actions(actions: &[Value]) -> Option<MatchedAction> {
+    let ordered_actions: Vec<MatchedAction> = actions.iter().filter_map(parse_action).collect();
+    let primary_index = ordered_actions
+        .iter()
+        .position(|action| is_response_action_code(&action.action_code))
+        .unwrap_or(0);
+    let mut primary = ordered_actions.get(primary_index)?.clone();
+    primary.chained_actions = ordered_actions;
+    Some(primary)
 }
 
 pub(crate) const SEARCH_ENGINE_BOTS: &[&str] = &[
@@ -740,6 +1089,11 @@ fn legacy_country_id_to_iso(id: i64) -> Option<&'static str> {
     }
 }
 
+fn geo_region_matches_id(geo: &analyzer::GeoInfo, id: i64) -> bool {
+    geo.region_id == id
+        || legacy_province_id_to_name(id).map_or(false, |name| name == geo.region.as_ref())
+}
+
 fn legacy_province_id_to_name(id: i64) -> Option<&'static str> {
     match id {
         1 => Some("Beijing"),
@@ -786,8 +1140,9 @@ pub fn check_region_deny(
     policy_id: i64,
     deny_html_fallback: &str,
     user_agent: &str,
+    url: &str,
 ) -> Option<MatchedAction> {
-    if !region.is_on {
+    if !region.is_on || !region.matches_url(url) {
         return None;
     }
     if region.allow_search_engine && is_search_engine_bot(user_agent) {
@@ -849,28 +1204,27 @@ pub fn check_region_deny(
                 page_options: None,
                 captcha_options: None,
                 js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
             });
         }
     }
 
     let geo_country_iso = geo.country_iso.as_ref();
-    let is_cn = geo_country_iso == "CN"
-        || geo_country_iso == "HK"
-        || geo_country_iso == "TW"
-        || geo_country_iso == "MO";
+    let is_cn = geo_country_iso == "CN";
 
     if is_cn && (has_allow_provinces || has_deny_provinces) {
-        let region_name = geo.region.as_ref();
-        let province_blocked =
-            if has_allow_provinces {
-                !region.allow_province_ids.iter().any(|&id| {
-                    legacy_province_id_to_name(id).map_or(false, |name| name == region_name)
-                })
-            } else {
-                region.deny_province_ids.iter().any(|&id| {
-                    legacy_province_id_to_name(id).map_or(false, |name| name == region_name)
-                })
-            };
+        let province_blocked = if has_allow_provinces {
+            !region
+                .allow_province_ids
+                .iter()
+                .any(|&id| geo_region_matches_id(&geo, id))
+        } else {
+            region
+                .deny_province_ids
+                .iter()
+                .any(|&id| geo_region_matches_id(&geo, id))
+        };
         if province_blocked {
             let html = if !region.deny_province_html.is_empty() {
                 region.deny_province_html.clone()
@@ -907,6 +1261,8 @@ pub fn check_region_deny(
                 page_options: None,
                 captcha_options: None,
                 js_cookie_options: None,
+                chained_actions: vec![],
+                observe_only: false,
             });
         }
     }

@@ -1,10 +1,16 @@
 /target
 /data/
+/runtime/
 cloud-node-rust
 .DS_Store
 configs/cache/disk/
 bench-cert.pem
 bench-key.pem
+GeoLite2-*.mmdb
+all_pb_rpcs.txt
+used_rust_rpcs.txt
+current_head.txt
+app-*.js
 
 # Ignore local hidden tool/editor directories and their contents.
 .*/

@@ -272,6 +272,16 @@ fn cache_relative_path(hash: &str) -> PathBuf {
     Path::new(&hash[0..2]).join(&hash[2..4]).join(hash)
 }
 
+fn status_allows_content_length(status: u16) -> bool {
+    !(status < 200 || status == 204 || status == 304)
+}
+
+fn restore_content_length(header: &mut ResponseHeader, status: u16, size: u64) {
+    if size > 0 && status_allows_content_length(status) && !header.headers.contains_key("content-length") {
+        let _ = header.insert_header("content-length", size.to_string());
+    }
+}
+
 fn parse_runtime_size_bytes(value: &str) -> anyhow::Result<u64> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -324,6 +334,7 @@ impl Storage for FileStorage {
         for (name, val) in &meta.headers {
             let _ = header.insert_header(name.to_string(), val.as_str());
         }
+        restore_content_length(&mut header, meta.status, meta.size);
 
         let Some(path) = self.find_existing_path_by_hash(&hash).await else {
             crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
@@ -612,14 +623,26 @@ impl Storage for FileStorage {
             .iter()
             .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
             .collect();
-        crate::metrics::storage::STORAGE.update_cache_meta(
-            &hash,
-            &k_str,
-            0,
-            ttl,
-            &header_pairs,
-            compressed,
-            status,
+        let now = crate::utils::time::now_timestamp();
+        let existing = crate::metrics::storage::STORAGE.get_cache_meta(&hash);
+        crate::metrics::storage::STORAGE.upsert_cache_meta_absolute(
+            crate::metrics::storage::CacheMetaUpsert {
+                hash: &hash,
+                cache_key: &k_str,
+                size: existing.as_ref().map(|meta| meta.size).unwrap_or(0),
+                expires: now + ttl as i64,
+                access_time: existing.as_ref().map(|meta| meta.access_time).unwrap_or(now),
+                access_count: existing.as_ref().map(|meta| meta.access_count).unwrap_or(1),
+                status,
+                headers: &header_pairs,
+                compressed,
+                shard_id: existing.as_ref().and_then(|meta| meta.shard_id.as_deref()),
+                relative_path: existing
+                    .as_ref()
+                    .and_then(|meta| meta.relative_path.as_deref()),
+                event_version: existing.as_ref().and_then(|meta| meta.event_version),
+                updated_at: Some(now),
+            },
         );
 
         Ok(true)
@@ -1760,12 +1783,19 @@ mod tests {
         );
 
         let trace = pingora_cache::trace::Span::inactive().handle();
-        let (_, handler) = storage
+        let (meta, handler) = storage
             .lookup(&key, &trace)
             .await
             .expect("lookup result")
             .expect("cache hit");
         assert!(handler.as_any().is::<MemoryHitHandler>());
+        assert_eq!(
+            meta.response_header()
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some("10")
+        );
 
         crate::metrics::storage::delete_cache_meta_for_test(&hash);
         let _ = tokio::fs::remove_dir_all(&root).await;
@@ -1810,12 +1840,20 @@ mod tests {
         );
 
         let trace = pingora_cache::trace::Span::inactive().handle();
-        let (_, mut handler) = storage
+        let (meta, mut handler) = storage
             .lookup(&key, &trace)
             .await
             .expect("lookup result")
             .expect("cache hit");
         assert!(handler.as_any().is::<MemoryHitHandler>());
+        let expected_len = body.len().to_string();
+        assert_eq!(
+            meta.response_header()
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_len.as_str())
+        );
         let chunk = handler
             .read_body()
             .await

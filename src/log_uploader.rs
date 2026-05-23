@@ -4,9 +4,8 @@ use crate::pb;
 use crate::rpc::client::RPC_MAX_MESSAGE_BYTES;
 use prost::Message;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tonic::Code;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
@@ -49,27 +48,64 @@ impl LogUploader {
     }
 
     pub async fn start(mut self) {
+        let batch_queue_capacity = self.config.batch_queue_capacity();
         info!(
-            "Log Uploader service started. Batch size: {}, Interval: {:?}, Workers: {}, Queue: {}",
+            "Log Uploader service started. Batch size: {}, Interval: {:?}, Workers: {}, Queue: {}, Batch queue: {}",
             self.config.batch_size,
             Duration::from_millis(self.config.flush_interval_ms),
             self.config.upload_concurrency,
-            self.config.queue_capacity
+            self.config.queue_capacity,
+            batch_queue_capacity
         );
 
-        let (batch_tx, batch_rx) = mpsc::channel::<Vec<pb::HttpAccessLog>>(
-            self.config.upload_concurrency.saturating_mul(4).max(1),
-        );
-        let shared_rx = Arc::new(Mutex::new(batch_rx));
-        for _ in 0..self.config.upload_concurrency {
-            let rx = Arc::clone(&shared_rx);
+        let (batch_tx, batch_rx) = mpsc::channel::<Vec<pb::HttpAccessLog>>(batch_queue_capacity);
+        self.start_upload_workers(batch_rx);
+        self.drain_to_batches(batch_tx).await;
+    }
+
+    fn start_upload_workers(&self, mut batch_rx: mpsc::Receiver<Vec<pb::HttpAccessLog>>) {
+        let worker_count = self.config.upload_concurrency.max(1);
+        let mut worker_txs = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let (worker_tx, worker_rx) = mpsc::channel::<Vec<pb::HttpAccessLog>>(1);
+            worker_txs.push(worker_tx);
             let worker = AccessLogUploadWorker::new(self.api_config.clone(), &self.config);
             tokio::spawn(async move {
-                worker.start(rx).await;
+                worker.start(worker_rx).await;
             });
         }
 
-        self.drain_to_batches(batch_tx).await;
+        tokio::spawn(async move {
+            let mut next_worker = 0usize;
+            while let Some(batch) = batch_rx.recv().await {
+                if worker_txs.is_empty() {
+                    break;
+                }
+                let mut batch = Some(batch);
+                for _ in 0..worker_txs.len() {
+                    let index = next_worker % worker_txs.len();
+                    next_worker = next_worker.wrapping_add(1);
+                    let Some(candidate) = batch.take() else {
+                        break;
+                    };
+                    match worker_txs[index].send(candidate).await {
+                        Ok(()) => break,
+                        Err(err) => {
+                            worker_txs.remove(index);
+                            if worker_txs.is_empty() {
+                                tracing::error!(
+                                    "ACCESS_LOG: all upload workers closed, dropped {} logs",
+                                    err.0.len()
+                                );
+                                break;
+                            }
+                            batch = Some(err.0);
+                            next_worker = index % worker_txs.len();
+                        }
+                    }
+                }
+            }
+        });
     }
 
     async fn drain_to_batches(&mut self, batch_tx: mpsc::Sender<Vec<pb::HttpAccessLog>>) {
@@ -136,15 +172,8 @@ impl AccessLogUploadWorker {
         }
     }
 
-    async fn start(mut self, rx: Arc<Mutex<mpsc::Receiver<Vec<pb::HttpAccessLog>>>>) {
-        loop {
-            let next_batch = {
-                let mut rx = rx.lock().await;
-                rx.recv().await
-            };
-            let Some(logs) = next_batch else {
-                return;
-            };
+    async fn start(mut self, mut rx: mpsc::Receiver<Vec<pb::HttpAccessLog>>) {
+        while let Some(logs) = rx.recv().await {
             self.upload_batch(logs).await;
         }
     }

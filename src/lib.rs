@@ -10,6 +10,7 @@ pub mod cache_hybrid;
 pub mod cache_manager;
 pub mod client_agent;
 pub mod cluster;
+pub mod compiled;
 pub mod config;
 pub mod config_models;
 pub mod firewall;

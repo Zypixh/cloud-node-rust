@@ -2,6 +2,7 @@ use crate::api_config::ApiConfig;
 use crate::rpc::client::RpcClient;
 use dashmap::DashSet;
 use once_cell::sync::Lazy;
+use std::sync::Arc;
 use tokio::process::Command;
 use tracing::debug;
 
@@ -106,15 +107,17 @@ async fn lookup_ptr(ip: &str) -> Option<String> {
     }
 }
 
-pub fn maybe_report_client_agent(api_config: ApiConfig, ip: String, user_agent: String) {
-    let Some(ua_agent) = detect_agent_by_ua(&user_agent) else {
+pub fn maybe_report_client_agent(api_config: &Arc<ApiConfig>, ip: &str, user_agent: &str) {
+    let Some(ua_agent) = detect_agent_by_ua(user_agent) else {
         return;
     };
 
-    if REPORTED_IPS.contains(&ip) || !INFLIGHT_IPS.insert(ip.clone()) {
+    if REPORTED_IPS.contains(ip) || !INFLIGHT_IPS.insert(ip.to_string()) {
         return;
     }
 
+    let api_config = Arc::clone(api_config);
+    let ip = ip.to_string();
     tokio::spawn(async move {
         async {
             let Some(ptr) = lookup_ptr(&ip).await else {

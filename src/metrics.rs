@@ -1,14 +1,19 @@
 use chrono::Timelike;
 use dashmap::DashMap;
 use lazy_static::lazy_static;
+use once_cell::sync::OnceCell;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 use std::sync::atomic::AtomicU32;
 
 static CACHED_PRESSURE: AtomicU32 = AtomicU32::new(0);
+static HTTP_DIMENSION_HANDLE: OnceCell<HttpDimensionHandle> = OnceCell::new();
 static EMPTY_ARC_STR: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
 static UNKNOWN_ARC_STR: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("Unknown"));
+static HTTP_DIMENSION_WARNING_INTERVAL_MS: u64 = 5_000;
 
 pub fn start_pressure_updater() {
     tokio::spawn(async {
@@ -50,6 +55,99 @@ pub mod daily;
 pub mod storage;
 pub mod top_ip;
 
+#[derive(Clone)]
+pub struct HttpDimensionEvent {
+    pub server_id: i64,
+    pub client_ip: std::net::IpAddr,
+    pub domain: Arc<str>,
+    pub user_agent: Arc<str>,
+    pub bytes_sent: i64,
+    pub cached_bytes: i64,
+    pub waf_group_id: i64,
+    pub waf_action: Option<Arc<str>>,
+    pub analyzed: Option<crate::metrics::analyzer::RequestStats>,
+    pub created_at: i64,
+}
+
+#[derive(Clone)]
+struct HttpDimensionHandle {
+    sender: mpsc::Sender<HttpDimensionEvent>,
+    queue_capacity: usize,
+    fallback_since_warning: Arc<AtomicU64>,
+    last_warning_at_ms: Arc<AtomicI64>,
+}
+
+impl HttpDimensionHandle {
+    fn new(sender: mpsc::Sender<HttpDimensionEvent>, queue_capacity: usize) -> Self {
+        Self {
+            sender,
+            queue_capacity,
+            fallback_since_warning: Arc::new(AtomicU64::new(0)),
+            last_warning_at_ms: Arc::new(AtomicI64::new(0)),
+        }
+    }
+
+    fn try_enqueue(&self, event: HttpDimensionEvent) -> Result<(), HttpDimensionEvent> {
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let event = err.into_inner();
+                let fallback = self.fallback_since_warning.fetch_add(1, Ordering::Relaxed) + 1;
+                let now = unix_epoch_millis_now();
+                let last = self.last_warning_at_ms.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= HTTP_DIMENSION_WARNING_INTERVAL_MS as i64
+                    && self
+                        .last_warning_at_ms
+                        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    let fallback =
+                        self.fallback_since_warning.swap(0, Ordering::Relaxed) + fallback;
+                    tracing::warn!(
+                        "METRICS: http dimension queue saturated fallback={} queue_capacity={} available_capacity={}",
+                        fallback,
+                        self.queue_capacity,
+                        self.sender.capacity()
+                    );
+                }
+                Err(event)
+            }
+        }
+    }
+}
+
+fn unix_epoch_millis_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+pub fn init_http_dimension_worker(queue_capacity: usize) {
+    let capacity = queue_capacity.max(1);
+    let (sender, mut receiver) = mpsc::channel::<HttpDimensionEvent>(capacity);
+    let handle = HttpDimensionHandle::new(sender, capacity);
+    let _ = HTTP_DIMENSION_HANDLE.set(handle);
+    tokio::spawn(async move {
+        let mut buffer = Vec::with_capacity(1024);
+        loop {
+            let Some(event) = receiver.recv().await else {
+                return;
+            };
+            record::record_http_dimension_event(event);
+            while buffer.len() < 1024 {
+                match receiver.try_recv() {
+                    Ok(event) => buffer.push(event),
+                    Err(_) => break,
+                }
+            }
+            for event in buffer.drain(..) {
+                record::record_http_dimension_event(event);
+            }
+        }
+    });
+}
+
 /// Metrics for a specific server (site)
 pub struct ServerMetrics {
     pub user_id: AtomicI64,
@@ -66,7 +164,7 @@ pub struct ServerMetrics {
     pub origin_bytes_received: AtomicU64,
     pub active_connections: AtomicI64,
     pub count_websocket_connections: AtomicU64,
-    pub distinct_ips: dashmap::DashSet<String>,
+    pub distinct_ips: dashmap::DashSet<std::net::IpAddr>,
 }
 
 impl ServerMetrics {
@@ -143,6 +241,100 @@ pub struct NodeMetrics {
     pub total_bytes_received: AtomicU64,
     pub servers: DashMap<i64, Arc<ServerMetrics>>,
     pub rpc: RpcMetrics,
+    pub waf: WafRuntimeMetrics,
+}
+
+pub struct WafRuntimeMetrics {
+    pub compiled_evaluations: AtomicU64,
+    pub compiled_matches: AtomicU64,
+    pub legacy_evaluations: AtomicU64,
+    pub legacy_matches: AtomicU64,
+    pub legacy_fallbacks: AtomicU64,
+    pub request_body_buffers: AtomicU64,
+    pub request_body_buffered_bytes: AtomicU64,
+    pub rule_evaluations: AtomicU64,
+    pub evaluation_latency_ns: AtomicU64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WafRuntimeSnapshot {
+    pub compiled_evaluations: u64,
+    pub compiled_matches: u64,
+    pub legacy_evaluations: u64,
+    pub legacy_matches: u64,
+    pub legacy_fallbacks: u64,
+    pub request_body_buffers: u64,
+    pub request_body_buffered_bytes: u64,
+    pub rule_evaluations: u64,
+    pub evaluation_latency_ns: u64,
+}
+
+impl WafRuntimeMetrics {
+    pub fn new() -> Self {
+        Self {
+            compiled_evaluations: AtomicU64::new(0),
+            compiled_matches: AtomicU64::new(0),
+            legacy_evaluations: AtomicU64::new(0),
+            legacy_matches: AtomicU64::new(0),
+            legacy_fallbacks: AtomicU64::new(0),
+            request_body_buffers: AtomicU64::new(0),
+            request_body_buffered_bytes: AtomicU64::new(0),
+            rule_evaluations: AtomicU64::new(0),
+            evaluation_latency_ns: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record_compiled_evaluation(&self, matched: bool, elapsed: Duration) {
+        self.compiled_evaluations.fetch_add(1, Ordering::Relaxed);
+        if matched {
+            self.compiled_matches.fetch_add(1, Ordering::Relaxed);
+        }
+        self.evaluation_latency_ns
+            .fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_legacy_evaluation(&self, matched: bool, elapsed: Duration) {
+        self.legacy_evaluations.fetch_add(1, Ordering::Relaxed);
+        if matched {
+            self.legacy_matches.fetch_add(1, Ordering::Relaxed);
+        }
+        self.evaluation_latency_ns
+            .fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_legacy_fallback(&self) {
+        self.legacy_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_request_body_buffer(&self, bytes: usize) {
+        self.request_body_buffers.fetch_add(1, Ordering::Relaxed);
+        self.request_body_buffered_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_rule_evaluation(&self) {
+        self.rule_evaluations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> WafRuntimeSnapshot {
+        WafRuntimeSnapshot {
+            compiled_evaluations: self.compiled_evaluations.load(Ordering::Relaxed),
+            compiled_matches: self.compiled_matches.load(Ordering::Relaxed),
+            legacy_evaluations: self.legacy_evaluations.load(Ordering::Relaxed),
+            legacy_matches: self.legacy_matches.load(Ordering::Relaxed),
+            legacy_fallbacks: self.legacy_fallbacks.load(Ordering::Relaxed),
+            request_body_buffers: self.request_body_buffers.load(Ordering::Relaxed),
+            request_body_buffered_bytes: self.request_body_buffered_bytes.load(Ordering::Relaxed),
+            rule_evaluations: self.rule_evaluations.load(Ordering::Relaxed),
+            evaluation_latency_ns: self.evaluation_latency_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for WafRuntimeMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct RpcMetrics {
@@ -206,6 +398,7 @@ lazy_static! {
             total_errors: AtomicU64::new(0),
             total_cost_ms: AtomicU64::new(0),
         },
+        waf: WafRuntimeMetrics::new(),
     });
 }
 
@@ -313,10 +506,13 @@ pub mod record {
         m.active_connections.fetch_add(1, Ordering::Relaxed);
 
         if !ip_recorded {
-            let day = get_current_day();
-            crate::metrics::daily::UNIQUE_IP_TRACKER.record(server_id, &day, remote_ip);
-            m.distinct_ips.insert(remote_ip.to_string());
-            return true;
+            if let Ok(remote_ip) = remote_ip.parse::<IpAddr>() {
+                let day = get_current_day();
+                crate::metrics::daily::UNIQUE_IP_TRACKER.record(server_id, &day, remote_ip);
+                m.distinct_ips.insert(remote_ip);
+                return true;
+            }
+            return false;
         }
         false
     }
@@ -428,11 +624,55 @@ pub mod record {
             return;
         }
 
-        let analyzed_owned;
-        let analyzed = if let Some(a) = cached_analyzed {
-            a
+        let event = HttpDimensionEvent {
+            server_id,
+            client_ip,
+            domain: if domain.is_empty() {
+                Arc::clone(&EMPTY_ARC_STR)
+            } else {
+                Arc::from(domain)
+            },
+            user_agent: if user_agent.is_empty() {
+                Arc::clone(&EMPTY_ARC_STR)
+            } else {
+                Arc::from(user_agent)
+            },
+            bytes_sent,
+            cached_bytes,
+            waf_group_id,
+            waf_action: waf_action.map(|action| {
+                if action.is_empty() {
+                    Arc::clone(&EMPTY_ARC_STR)
+                } else {
+                    Arc::from(action)
+                }
+            }),
+            analyzed: cached_analyzed.cloned(),
+            created_at: get_current_5min_ts(),
+        };
+
+        if let Some(handle) = HTTP_DIMENSION_HANDLE.get() {
+            if let Err(event) = handle.try_enqueue(event) {
+                record_http_dimension_event(event);
+            }
         } else {
-            analyzed_owned = crate::metrics::analyzer::analyze_request(client_ip, user_agent);
+            record_http_dimension_event(event);
+        }
+    }
+
+    pub(crate) fn record_http_dimension_event(event: HttpDimensionEvent) {
+        if event.server_id <= 0 {
+            return;
+        }
+
+        let analyzed_owned;
+        let analyzed = if let Some(ref analyzed) = event.analyzed {
+            analyzed
+        } else {
+            analyzed_owned = crate::metrics::analyzer::analyze_request(
+                event.client_ip,
+                event.user_agent.as_ref(),
+            );
             &analyzed_owned
         };
 
@@ -462,7 +702,7 @@ pub mod record {
                 },
             );
         let key = crate::metrics::aggregator::AggregationKey {
-            server_id,
+            server_id: event.server_id,
             country,
             country_id,
             province,
@@ -472,30 +712,36 @@ pub mod record {
             provider,
             browser: analyzed.browser.clone(),
             os: analyzed.os.clone(),
-            waf_group_id,
-            waf_action: Arc::from(waf_action.unwrap_or_default()),
+            waf_group_id: event.waf_group_id,
+            waf_action: event
+                .waf_action
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&EMPTY_ARC_STR)),
         };
-        let is_attack = waf_action.is_some();
+        let is_attack = event.waf_action.is_some();
 
         crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.record(
             key.clone(),
-            bytes_sent,
+            event.bytes_sent,
             is_attack,
         );
-        crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.record(key, bytes_sent, is_attack);
-        crate::metrics::top_ip::TOP_IP_TRACKER.record_addr(server_id, client_ip);
+        crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.record(
+            key,
+            event.bytes_sent,
+            is_attack,
+        );
+        crate::metrics::top_ip::TOP_IP_TRACKER.record_addr(event.server_id, event.client_ip);
 
-        let created_at = get_current_5min_ts();
         crate::metrics::daily::DAILY_DOMAIN_TRACKER.record(
-            server_id,
-            created_at,
-            domain,
-            bytes_sent,
-            cached_bytes,
+            event.server_id,
+            event.created_at,
+            event.domain.as_ref(),
+            event.bytes_sent,
+            event.cached_bytes,
             1,
-            if cached_bytes > 0 { 1 } else { 0 },
+            if event.cached_bytes > 0 { 1 } else { 0 },
             if is_attack { 1 } else { 0 },
-            if is_attack { bytes_sent } else { 0 },
+            if is_attack { event.bytes_sent } else { 0 },
         );
     }
 }

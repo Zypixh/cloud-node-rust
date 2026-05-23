@@ -84,8 +84,14 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.1.1 --yes
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo bash -s -- --version v1.1.2 --yes
 ```
+
+## 1.1.2 说明
+
+1.1.2 聚焦 WAF 正确性、HTTP/3 可用性和 RKE2 多副本部署：修复内置 WAF preset 漏匹配、缓存命中绕过 WAF、chunked/无 Content-Length 请求体 WAF 失效、IP 名单同步版本推进错误，并补齐 RKE2 内部服务、Leader 选举、Longhorn 缓存分片和健康探针。
+
+本版本同时优化 Basic Auth、rewrite replacement、模板渲染、访问日志上传和防火墙网络名单匹配热路径；完整更新见 [1.1.2 发布说明](../release-notes/v1.1.2.md)。
 
 ## 1.1.1 说明
 
