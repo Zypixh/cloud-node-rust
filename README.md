@@ -45,22 +45,6 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | bash -s -- --fresh --yes --api-endpoint http://127.0.0.1:8001 --node-id your-node-id --secret your-node-secret --geoip
 ```
 
-常用命令：
-
-```bash
-cloud-node start
-cloud-node stop
-cloud-node restart
-cloud-node status
-cloud-node test
-```
-
-启动本地性能监控页：
-
-```bash
-cloud-node --monitor-port 8888
-```
-
 ## 文档
 
 详细文档位于 [docs](docs/README.md)：
