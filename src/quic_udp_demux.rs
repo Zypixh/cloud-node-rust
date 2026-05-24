@@ -521,7 +521,6 @@ struct ListenerHandle {
     id: u64,
     shutdown_tx: watch::Sender<bool>,
     http3_enabled: bool,
-    cert_hash: u64,
 }
 
 pub struct QuicUdpDemuxManager {
@@ -553,17 +552,15 @@ impl QuicUdpDemuxManager {
         loop {
             let http3_ports = self.http3_manager.desired_ports().await;
             let udp_ports = self.udp_manager.desired_ports().await;
-            let cert_hash = self.http3_manager.current_cert_hash_for_demux().await;
             let desired_ports = http3_ports
                 .union(&udp_ports)
                 .copied()
                 .collect::<HashSet<_>>();
 
             for port in &desired_ports {
-                self.spawn_listener(*port, http3_ports.contains(port), cert_hash)
-                    .await;
+                self.spawn_listener(*port, http3_ports.contains(port)).await;
             }
-            self.reconcile_listeners(&desired_ports, &http3_ports, cert_hash);
+            self.reconcile_listeners(&desired_ports, &http3_ports);
             tokio::select! {
                 _ = self.config_store.wait_for_runtime_reload() => {}
                 _ = reconcile_tick.tick() => {}
@@ -571,10 +568,9 @@ impl QuicUdpDemuxManager {
         }
     }
 
-    async fn spawn_listener(self: &Arc<Self>, port: u16, http3_enabled: bool, cert_hash: u64) {
+    async fn spawn_listener(self: &Arc<Self>, port: u16, http3_enabled: bool) {
         if let Some(existing) = self.handled_ports.get(&port) {
-            let cert_changed = http3_enabled && existing.cert_hash != cert_hash;
-            if existing.http3_enabled == http3_enabled && !cert_changed {
+            if existing.http3_enabled == http3_enabled {
                 return;
             }
             let _ = existing.shutdown_tx.send(true);
@@ -590,14 +586,13 @@ impl QuicUdpDemuxManager {
                 id: listener_id,
                 shutdown_tx,
                 http3_enabled,
-                cert_hash,
             },
         );
         let manager = self.clone();
         tokio::spawn(async move {
             if let Err(err) = manager
                 .clone()
-                .run_listener(port, http3_enabled, cert_hash, shutdown_rx)
+                .run_listener(port, http3_enabled, shutdown_rx)
                 .await
             {
                 error!("QUIC UDP demux listener on port {} failed: {}", port, err);
@@ -612,28 +607,15 @@ impl QuicUdpDemuxManager {
         });
     }
 
-    fn reconcile_listeners(
-        &self,
-        desired_ports: &HashSet<u16>,
-        http3_ports: &HashSet<u16>,
-        cert_hash: u64,
-    ) {
+    fn reconcile_listeners(&self, desired_ports: &HashSet<u16>, http3_ports: &HashSet<u16>) {
         let active_ports = self
             .handled_ports
             .iter()
-            .map(|entry| {
-                (
-                    *entry.key(),
-                    entry.value().http3_enabled,
-                    entry.value().cert_hash,
-                )
-            })
+            .map(|entry| (*entry.key(), entry.value().http3_enabled))
             .collect::<Vec<_>>();
-        for (port, http3_enabled, active_hash) in active_ports {
+        for (port, http3_enabled) in active_ports {
             let desired_http3 = http3_ports.contains(&port);
-            let keep = desired_ports.contains(&port)
-                && http3_enabled == desired_http3
-                && (!http3_enabled || active_hash == cert_hash);
+            let keep = desired_ports.contains(&port) && http3_enabled == desired_http3;
             if keep {
                 continue;
             }
@@ -649,7 +631,6 @@ impl QuicUdpDemuxManager {
         self: Arc<Self>,
         port: u16,
         http3_enabled: bool,
-        _cert_hash: u64,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);

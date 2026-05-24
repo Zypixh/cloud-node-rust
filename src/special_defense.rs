@@ -16,6 +16,12 @@ pub(crate) struct SpecialDefenseConfig {
 pub(crate) fn global_tls_exhaustion_config(
     config_store: &ConfigStore,
 ) -> Option<SpecialDefenseConfig> {
+    global_malformed_http_config(config_store)
+}
+
+pub(crate) fn global_malformed_http_config(
+    config_store: &ConfigStore,
+) -> Option<SpecialDefenseConfig> {
     let policies = config_store.get_firewall_policies_sync();
     policies.iter().find_map(|policy| {
         if !policy.is_on {

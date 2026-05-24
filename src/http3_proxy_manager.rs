@@ -10,8 +10,6 @@ use pingora_proxy::http_proxy_custom;
 use quinn::Endpoint;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashSet;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -23,7 +21,6 @@ use crate::proxy::EdgeProxy;
 use crate::ssl::DynamicCertSelector;
 
 struct ListenerHandle {
-    cert_hash: u64,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -54,11 +51,10 @@ impl Http3ProxyManager {
     pub async fn start_listeners(self: Arc<Self>) {
         loop {
             let desired_ports = self.desired_ports().await;
-            let cert_hash = self.current_cert_hash().await;
             for port in &desired_ports {
-                self.spawn_listener(*port, cert_hash).await;
+                self.spawn_listener(*port).await;
             }
-            self.reconcile_listeners(&desired_ports, cert_hash);
+            self.reconcile_listeners(&desired_ports);
             self.config_store.wait_for_runtime_reload().await;
         }
     }
@@ -99,24 +95,14 @@ impl Http3ProxyManager {
         desired
     }
 
-    async fn spawn_listener(self: &Arc<Self>, port: u16, cert_hash: u64) {
-        if let Some(existing) = self.handled_ports.get(&port) {
-            if existing.cert_hash == cert_hash {
-                return;
-            }
-            let _ = existing.shutdown_tx.send(true);
-            drop(existing);
-            self.handled_ports.remove(&port);
+    async fn spawn_listener(self: &Arc<Self>, port: u16) {
+        if self.handled_ports.contains_key(&port) {
+            return;
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        self.handled_ports.insert(
-            port,
-            ListenerHandle {
-                cert_hash,
-                shutdown_tx,
-            },
-        );
+        self.handled_ports
+            .insert(port, ListenerHandle { shutdown_tx });
         let manager = self.clone();
         tokio::spawn(async move {
             if let Err(err) = manager.clone().run_listener(port, shutdown_rx).await {
@@ -126,18 +112,14 @@ impl Http3ProxyManager {
         });
     }
 
-    pub async fn current_cert_hash_for_demux(&self) -> u64 {
-        self.current_cert_hash().await
-    }
-
-    fn reconcile_listeners(&self, desired_ports: &HashSet<u16>, cert_hash: u64) {
-        let active_ports: Vec<(u16, u64)> = self
+    fn reconcile_listeners(&self, desired_ports: &HashSet<u16>) {
+        let active_ports: Vec<u16> = self
             .handled_ports
             .iter()
-            .map(|entry| (*entry.key(), entry.value().cert_hash))
+            .map(|entry| *entry.key())
             .collect();
-        for (port, active_hash) in active_ports {
-            if desired_ports.contains(&port) && active_hash == cert_hash {
+        for port in active_ports {
+            if desired_ports.contains(&port) {
                 continue;
             }
             if let Some((_, handle)) = self.handled_ports.remove(&port) {
@@ -211,35 +193,16 @@ impl Http3ProxyManager {
     }
 
     pub async fn build_quinn_server_config(&self) -> Result<quinn::ServerConfig> {
-        let (exact, wildcard, default_pair) = self
-            .cert_selector
-            .export_snapshot_pem()
-            .await
+        self.cert_selector
+            .export_default_pair_pem()
             .context("no certificate snapshot available for HTTP/3")?;
-
-        let mut resolver = rustls::server::ResolvesServerCertUsingSni::new();
-        for (name, (cert_pem, key_pem, ocsp)) in exact {
-            if let Some(certified_key) = Self::build_certified_key(&cert_pem, &key_pem, &ocsp)? {
-                let _ = resolver.add(&name, certified_key);
-            }
-        }
-        for (name, (cert_pem, key_pem, ocsp)) in wildcard {
-            if let Some(certified_key) = Self::build_certified_key(&cert_pem, &key_pem, &ocsp)? {
-                let _ = resolver.add(&name, certified_key);
-            }
-        }
-
-        let default_key =
-            Self::build_certified_key(&default_pair.0, &default_pair.1, &default_pair.2)?
-                .context("failed to build default HTTP/3 certified key")?;
         let mut rustls_config = rustls::ServerConfig::builder_with_provider(
             rustls::crypto::ring::default_provider().into(),
         )
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(FallbackResolver {
-            sni: resolver,
-            default: Arc::new(default_key),
+        .with_cert_resolver(Arc::new(DynamicH3CertResolver {
+            cert_selector: Arc::clone(&self.cert_selector),
         }));
         rustls_config.alpn_protocols = vec![b"h3".to_vec()];
         rustls_config.max_early_data_size = u32::MAX;
@@ -274,34 +237,6 @@ impl Http3ProxyManager {
             certified.ocsp = Some(ocsp.to_vec());
         }
         Ok(Some(certified))
-    }
-
-    async fn current_cert_hash(&self) -> u64 {
-        let Some((exact, wildcard, default_pair)) = self.cert_selector.export_snapshot_pem().await
-        else {
-            return 0;
-        };
-        let mut hasher = DefaultHasher::new();
-        let mut exact_entries = exact.into_iter().collect::<Vec<_>>();
-        exact_entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, (cert, key, ocsp)) in exact_entries {
-            name.hash(&mut hasher);
-            cert.hash(&mut hasher);
-            key.hash(&mut hasher);
-            ocsp.hash(&mut hasher);
-        }
-        let mut wildcard_entries = wildcard.into_iter().collect::<Vec<_>>();
-        wildcard_entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, (cert, key, ocsp)) in wildcard_entries {
-            name.hash(&mut hasher);
-            cert.hash(&mut hasher);
-            key.hash(&mut hasher);
-            ocsp.hash(&mut hasher);
-        }
-        default_pair.0.hash(&mut hasher);
-        default_pair.1.hash(&mut hasher);
-        default_pair.2.hash(&mut hasher);
-        hasher.finish()
     }
 
     async fn serve_connection(
@@ -471,19 +406,28 @@ fn authority_host_for_resolve(authority: &str) -> String {
     authority.to_string()
 }
 
-#[derive(Debug)]
-struct FallbackResolver {
-    sni: rustls::server::ResolvesServerCertUsingSni,
-    default: Arc<rustls::sign::CertifiedKey>,
+struct DynamicH3CertResolver {
+    cert_selector: Arc<DynamicCertSelector>,
 }
 
-impl rustls::server::ResolvesServerCert for FallbackResolver {
+impl std::fmt::Debug for DynamicH3CertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicH3CertResolver").finish_non_exhaustive()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for DynamicH3CertResolver {
     fn resolve(
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        self.sni
-            .resolve(client_hello)
-            .or_else(|| Some(self.default.clone()))
+        let pair = client_hello
+            .server_name()
+            .and_then(|name| self.cert_selector.export_pair_pem_for_host(name))
+            .or_else(|| self.cert_selector.export_default_pair_pem())?;
+        Http3ProxyManager::build_certified_key(&pair.0, &pair.1, &pair.2)
+            .ok()
+            .flatten()
+            .map(Arc::new)
     }
 }

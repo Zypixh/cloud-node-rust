@@ -8,7 +8,9 @@ use image::AnimationDecoder;
 use pingora_core::protocols::tls::CustomALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
-use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use pingora_proxy::{
+    DownstreamParseErrorAction, DownstreamParseErrorLogLevel, FailToProxy, ProxyHttp, Session,
+};
 use rand::Rng;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
@@ -577,6 +579,12 @@ impl EdgeProxy {
         ctx.compiled_cache_ref = None;
         ctx.compiled_cache_policy = None;
         ctx.cache_key = None;
+        if matches!(
+            session.cache.phase(),
+            pingora_cache::CachePhase::Disabled(pingora_cache::NoCacheReason::NeverEnabled)
+        ) {
+            return;
+        }
         session
             .cache
             .disable(pingora_cache::NoCacheReason::Custom(reason));
@@ -1055,8 +1063,13 @@ impl EdgeProxy {
     }
 
     fn socket_client_ip(session: &Session) -> (std::net::IpAddr, u16, String) {
+        Self::http_session_socket_client_ip(&session.downstream_session)
+    }
+
+    fn http_session_socket_client_ip(
+        session: &pingora_core::protocols::http::ServerSession,
+    ) -> (std::net::IpAddr, u16, String) {
         let socket_addr = session
-            .downstream_session
             .digest()
             .and_then(|d| d.socket_digest.as_ref())
             .and_then(|sd| sd.peer_addr().cloned())
@@ -1068,6 +1081,34 @@ impl EdgeProxy {
             }
             _ => ("127.0.0.1".parse().unwrap(), 0, String::new()),
         }
+    }
+
+    fn classify_downstream_parse_error(error: &Error) -> (&'static str, &'static str) {
+        if !matches!(error.etype(), InvalidHTTPHeader) {
+            return ("downstream_error", "DOWNSTREAM_PARSE_ERROR");
+        }
+        let message = error.to_string();
+        if message.contains("[22, 3,") || message.contains("\\x16\\x03") {
+            return ("tls_on_http", "TLS_ON_HTTP");
+        }
+        if message.contains("PRI * HTTP/2.0") || message.contains("HTTP/2.0") {
+            return ("h2c_probe", "H2C_PROBE");
+        }
+        ("malformed_http", "MALFORMED_HTTP")
+    }
+
+    fn record_malformed_http_defense(&self, defense: &'static str, ip: std::net::IpAddr) {
+        let Some(config) = crate::special_defense::global_malformed_http_config(&self.config) else {
+            return;
+        };
+        let node_id = self.api_config.node_id.parse::<i64>().unwrap_or(0);
+        crate::special_defense::record_special_defense_hit(
+            &self.waf_state,
+            node_id,
+            defense,
+            ip,
+            config,
+        );
     }
 
     fn parse_candidate_ip(raw: &str) -> Option<std::net::IpAddr> {
@@ -5050,6 +5091,29 @@ impl ProxyHttp for EdgeProxy {
         ProxyCTX::default()
     }
 
+    async fn downstream_request_parse_error(
+        &self,
+        session: &mut pingora_core::protocols::http::ServerSession,
+        error: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> DownstreamParseErrorAction {
+        let (reason, defense) = Self::classify_downstream_parse_error(error);
+        if matches!(error.etype(), InvalidHTTPHeader) {
+            let (ip, _, _) = Self::http_session_socket_client_ip(session);
+            self.record_malformed_http_defense(defense, ip);
+            return DownstreamParseErrorAction {
+                respond_status: Some(400),
+                log_level: DownstreamParseErrorLogLevel::Debug,
+                reason,
+            };
+        }
+        DownstreamParseErrorAction {
+            respond_status: None,
+            log_level: DownstreamParseErrorLogLevel::Debug,
+            reason,
+        }
+    }
+
     async fn early_request_filter(
         &self,
         session: &mut Session,
@@ -7633,6 +7697,7 @@ impl ProxyHttp for EdgeProxy {
                         session.req_header().method.as_str(),
                         &resp.headers,
                         body_size,
+                        force_partial,
                         skip_size_checks,
                     )
                         && crate::cache::compiled::cache_ref_response_conditions_match(

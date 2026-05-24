@@ -822,75 +822,126 @@ fn auto_tune_kernel_params() {
     info!("Starting automatic kernel parameter tuning...");
 
     let params = [
-        ("net.core.somaxconn", "32768"),
-        ("net.ipv4.tcp_max_syn_backlog", "16384"),
-        ("net.core.netdev_max_backlog", "16384"),
-        ("net.ipv4.ip_local_port_range", "1024 65535"),
-        ("net.ipv4.tcp_tw_reuse", "1"),
-        ("net.ipv4.tcp_fin_timeout", "15"),
-        ("net.ipv4.tcp_slow_start_after_idle", "0"),
-        ("net.ipv4.tcp_mtu_probing", "1"),
+        KernelParamTune::exact("net.core.somaxconn", "65535"),
+        KernelParamTune::exact("net.ipv4.tcp_max_syn_backlog", "65535"),
+        KernelParamTune::exact("net.core.netdev_max_backlog", "250000"),
+        KernelParamTune::exact("net.ipv4.ip_local_port_range", "1024 65535"),
+        KernelParamTune::exact("net.ipv4.tcp_tw_reuse", "1"),
+        KernelParamTune::exact("net.ipv4.tcp_fin_timeout", "10"),
+        KernelParamTune::exact("net.ipv4.tcp_slow_start_after_idle", "0"),
+        KernelParamTune::exact("net.ipv4.tcp_mtu_probing", "1"),
+        KernelParamTune::exact("net.core.rmem_max", "134217728"),
+        KernelParamTune::exact("net.core.wmem_max", "134217728"),
+        KernelParamTune::exact("net.ipv4.tcp_rmem", "4096 87380 134217728"),
+        KernelParamTune::exact("net.ipv4.tcp_wmem", "4096 65536 134217728"),
+        KernelParamTune::exact_optional("net.core.default_qdisc", "fq"),
+        KernelParamTune::exact_optional("net.ipv4.tcp_congestion_control", "bbr"),
     ];
 
-    for (key, target) in params {
-        tune_kernel_param(key, target);
+    for param in params {
+        tune_kernel_param(param);
     }
 }
 
 #[cfg(target_os = "linux")]
-fn tune_kernel_param(key: &str, target: &str) {
-    let path = format!("/proc/sys/{}", key.replace('.', "/"));
+#[derive(Clone, Copy)]
+struct KernelParamTune {
+    key: &'static str,
+    target: &'static str,
+    optional: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl KernelParamTune {
+    const fn exact(key: &'static str, target: &'static str) -> Self {
+        Self {
+            key,
+            target,
+            optional: false,
+        }
+    }
+
+    const fn exact_optional(key: &'static str, target: &'static str) -> Self {
+        Self {
+            key,
+            target,
+            optional: true,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tune_kernel_param(param: KernelParamTune) {
+    let path = format!("/proc/sys/{}", param.key.replace('.', "/"));
     let path_ref = std::path::Path::new(&path);
 
     if !path_ref.exists() {
-        info!(
+        tracing::debug!(
             "Kernel tuning skipped: {} is not available on this system",
-            key
+            param.key
         );
         return;
     }
 
     let current = match fs::read_to_string(path_ref) {
-        Ok(value) => value.split_whitespace().collect::<Vec<_>>().join(" "),
+        Ok(value) => normalize_sysctl_value(&value),
         Err(err) => {
-            warn!("Kernel tuning failed to read {}: {}", key, err);
+            warn!("Kernel tuning failed to read {}: {}", param.key, err);
             return;
         }
     };
 
+    let target = param.target;
     if current == target {
-        info!("Kernel tuning already satisfied: {}={}", key, current);
+        tracing::debug!("Kernel tuning already satisfied: {}={}", param.key, current);
         return;
     }
 
     match fs::write(path_ref, target) {
         Ok(_) => match fs::read_to_string(path_ref) {
             Ok(updated) => {
-                let updated = updated.split_whitespace().collect::<Vec<_>>().join(" ");
+                let updated = normalize_sysctl_value(&updated);
                 if updated == target {
                     info!(
                         "Kernel tuning applied successfully: {} {} -> {}",
-                        key, current, updated
+                        param.key, current, updated
+                    );
+                } else if param.optional {
+                    tracing::debug!(
+                        "Kernel tuning optional value {} remained {} after writing {}",
+                        param.key, updated, target
                     );
                 } else {
                     warn!(
                         "Kernel tuning wrote {} but value is {} (expected {})",
-                        key, updated, target
+                        param.key, updated, target
                     );
                 }
             }
             Err(err) => {
                 warn!(
                     "Kernel tuning wrote {} but failed to verify new value: {}",
-                    key, err
+                    param.key, err
                 );
             }
         },
         Err(err) => {
-            warn!(
-                "Kernel tuning failed for {} (current={}, target={}): {}",
-                key, current, target, err
-            );
+            if param.optional {
+                tracing::debug!(
+                    "Kernel tuning optional value skipped for {} (current={}, target={}): {}",
+                    param.key, current, target, err
+                );
+            } else {
+                warn!(
+                    "Kernel tuning failed for {} (current={}, target={}): {}",
+                    param.key, current, target, err
+                );
+            }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_sysctl_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }

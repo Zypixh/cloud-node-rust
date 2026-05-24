@@ -61,6 +61,16 @@ impl DynamicCertSelector {
         Some((cert_pem, key_pem))
     }
 
+    pub fn export_pair_pem_for_host(&self, host: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        self.find_pair_blocking(&host.to_ascii_lowercase())
+            .and_then(|pair| serialize_pair_pem(&pair))
+    }
+
+    pub fn export_default_pair_pem(&self) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let snapshot = self.snapshot.load();
+        serialize_pair_pem(snapshot.default.as_ref()?)
+    }
+
     pub async fn export_snapshot_pem(
         &self,
     ) -> Option<(
@@ -70,29 +80,21 @@ impl DynamicCertSelector {
     )> {
         let snapshot = self.snapshot.load();
 
-        let serialize = |pair: &Arc<CertPair>| -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-            Some((
-                pair.cert.to_pem().ok()?,
-                pair.key.private_key_to_pem_pkcs8().ok()?,
-                pair.ocsp.load().as_ref().clone(),
-            ))
-        };
-
         let mut exact_out = std::collections::HashMap::new();
         for (name, pair) in snapshot.exact.iter() {
-            if let Some(serialized) = serialize(pair) {
+            if let Some(serialized) = serialize_pair_pem(pair) {
                 exact_out.insert(name.clone(), serialized);
             }
         }
 
         let mut wildcard_out = std::collections::HashMap::new();
         for (name, pair) in snapshot.wildcard.iter() {
-            if let Some(serialized) = serialize(pair) {
+            if let Some(serialized) = serialize_pair_pem(pair) {
                 wildcard_out.insert(name.clone(), serialized);
             }
         }
 
-        let default_pair = serialize(snapshot.default.as_ref()?)?;
+        let default_pair = serialize_pair_pem(snapshot.default.as_ref()?)?;
         Some((exact_out, wildcard_out, default_pair))
     }
 
@@ -132,6 +134,14 @@ impl DynamicCertSelector {
     pub fn bench_find_pair(&self, host: &str) -> bool {
         self.find_pair_blocking(host).is_some()
     }
+}
+
+fn serialize_pair_pem(pair: &Arc<CertPair>) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    Some((
+        pair.cert.to_pem().ok()?,
+        pair.key.private_key_to_pem_pkcs8().ok()?,
+        pair.ocsp.load().as_ref().clone(),
+    ))
 }
 
 pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertConfig]) {

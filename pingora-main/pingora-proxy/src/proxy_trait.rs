@@ -36,6 +36,18 @@ pub trait ProxyHttp {
     /// Define how the `ctx` should be created.
     fn new_ctx(&self) -> Self::CTX;
 
+    async fn downstream_request_parse_error(
+        &self,
+        _session: &mut HttpSession,
+        error: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> DownstreamParseErrorAction
+    where
+        Self::CTX: Send + Sync,
+    {
+        DownstreamParseErrorAction::from_error(error)
+    }
+
     /// Define where the proxy should send the request to.
     ///
     /// The returned [HttpPeer] contains the information regarding where and how this request should
@@ -663,6 +675,38 @@ pub trait ProxyHttp {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+pub struct DownstreamParseErrorAction {
+    pub respond_status: Option<u16>,
+    pub log_level: DownstreamParseErrorLogLevel,
+    pub reason: &'static str,
+}
+
+impl DownstreamParseErrorAction {
+    pub fn from_error(error: &Error) -> Self {
+        if matches!(error.etype(), InvalidHTTPHeader) {
+            Self {
+                respond_status: Some(400),
+                log_level: DownstreamParseErrorLogLevel::Debug,
+                reason: "invalid_http_header",
+            }
+        } else {
+            Self {
+                respond_status: None,
+                log_level: DownstreamParseErrorLogLevel::Error,
+                reason: "downstream_error",
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownstreamParseErrorLogLevel {
+    Suppress,
+    Debug,
+    Warn,
+    Error,
 }
 
 /// Context struct returned by `fail_to_proxy`.

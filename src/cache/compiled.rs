@@ -835,7 +835,7 @@ impl CompiledCacheResponsePolicy {
             status == 200 || (status == 206 && (self.allow_partial_content || force_partial_content))
         } else {
             self.statuses.contains(&(status as i32))
-                || (status == 206 && self.allow_partial_content)
+                || (status == 206 && (self.allow_partial_content || force_partial_content))
         }
     }
 
@@ -846,11 +846,13 @@ impl CompiledCacheResponsePolicy {
         method: &str,
         headers: &HeaderMap,
         body_size: usize,
+        force_partial_content: bool,
         skip_size_checks: bool,
     ) -> bool {
-        let force_partial = policy
-            .map(|policy| policy.force_partial_content)
-            .unwrap_or(false);
+        let force_partial = force_partial_content
+            || policy
+                .map(|policy| policy.force_partial_content)
+                .unwrap_or(false);
         if !self.allows_method_status(status, method, force_partial) {
             return false;
         }
@@ -1054,6 +1056,7 @@ pub fn should_cache_response_compiled(
     method: &str,
     headers: &HeaderMap,
     body_size: usize,
+    force_partial_content: bool,
     skip_size_checks: bool,
 ) -> bool {
     cache_ref.response_policy.should_cache_response(
@@ -1062,6 +1065,7 @@ pub fn should_cache_response_compiled(
         method,
         headers,
         body_size,
+        force_partial_content,
         skip_size_checks,
     )
 }

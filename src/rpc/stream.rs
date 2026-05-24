@@ -501,7 +501,11 @@ async fn run_tonic_stream(
                         break;
                     }
                     Err(e) => {
-                        warn!("Node stream error: {}", e);
+                        if is_retryable_stream_transport_error(&e) {
+                            debug!("Node stream transport closed: {}", e);
+                        } else {
+                            warn!("Node stream error: {}", e);
+                        }
 
                         if let Some(id) = current_api_node_id {
                              crate::rpc::node::CONNECTED_API_NODE_IDS.write().remove(&id);
@@ -537,6 +541,18 @@ async fn run_tonic_stream(
     }
 
     Ok(stats)
+}
+
+fn is_retryable_stream_transport_error(error: &tonic::Status) -> bool {
+    if error.code() == tonic::Code::Unavailable {
+        return true;
+    }
+    let message = error.message().to_ascii_lowercase();
+    message.contains("invalid connection")
+        || message.contains("connection closed")
+        || message.contains("connection reset")
+        || message.contains("broken pipe")
+        || message.contains("goaway")
 }
 
 async fn handle_message(

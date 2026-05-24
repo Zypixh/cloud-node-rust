@@ -10,6 +10,11 @@ use tonic::{Request, Status};
 use std::time::Duration;
 
 pub const RPC_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const RPC_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const RPC_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+const RPC_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_PING_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone)]
 pub struct RpcClient {
@@ -53,10 +58,10 @@ impl RpcClient {
             };
 
             let channel = endpoint
-                .connect_timeout(Duration::from_secs(10))
-                .tcp_keepalive(Some(Duration::from_secs(15)))
-                .http2_keep_alive_interval(Duration::from_secs(30))
-                .keep_alive_timeout(Duration::from_secs(10))
+                .connect_timeout(RPC_CONNECT_TIMEOUT)
+                .tcp_keepalive(Some(RPC_TCP_KEEPALIVE))
+                .http2_keep_alive_interval(RPC_HTTP2_KEEPALIVE_INTERVAL)
+                .keep_alive_timeout(RPC_HTTP2_KEEPALIVE_TIMEOUT)
                 .keep_alive_while_idle(true)
                 .connect()
                 .await;
@@ -88,10 +93,10 @@ impl RpcClient {
         };
 
         let channel = match endpoint
-            .connect_timeout(Duration::from_secs(5))
-            .tcp_keepalive(Some(Duration::from_secs(15)))
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
+            .connect_timeout(RPC_PING_CONNECT_TIMEOUT)
+            .tcp_keepalive(Some(RPC_TCP_KEEPALIVE))
+            .http2_keep_alive_interval(RPC_HTTP2_KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(RPC_HTTP2_KEEPALIVE_TIMEOUT)
             .keep_alive_while_idle(true)
             .connect()
             .await

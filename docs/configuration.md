@@ -111,10 +111,22 @@ billing.countInboundTraffic: false
 ```bash
 ulimit -n 1048576
 sysctl -w net.core.somaxconn=65535
-sysctl -w net.ipv4.tcp_max_syn_backlog=16384
-sysctl -w net.core.netdev_max_backlog=16384
+sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+sysctl -w net.core.netdev_max_backlog=250000
 sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+sysctl -w net.ipv4.tcp_tw_reuse=1
+sysctl -w net.ipv4.tcp_fin_timeout=10
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+sysctl -w net.ipv4.tcp_mtu_probing=1
+sysctl -w net.core.rmem_max=134217728
+sysctl -w net.core.wmem_max=134217728
+sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728"
+sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728"
+sysctl -w net.core.default_qdisc=fq
+sysctl -w net.ipv4.tcp_congestion_control=bbr
 ```
+
+`net.core.default_qdisc=fq` 和 `net.ipv4.tcp_congestion_control=bbr` 依赖内核支持；不支持时节点会跳过该项，其他参数仍按健康目标值管理。
 
 具体值需要结合机器规格、连接规模、conntrack、负载均衡模式和上游连接池评估。
 

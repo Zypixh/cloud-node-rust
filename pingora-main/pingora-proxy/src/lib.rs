@@ -91,7 +91,9 @@ use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
-pub use proxy_trait::{FailToProxy, ProxyHttp};
+pub use proxy_trait::{
+    DownstreamParseErrorAction, DownstreamParseErrorLogLevel, FailToProxy, ProxyHttp,
+};
 
 pub mod prelude {
     pub use crate::{http_proxy, http_proxy_service, ProxyHttp, Session};
@@ -209,6 +211,7 @@ where
     async fn handle_new_request(
         &self,
         mut downstream_session: Box<HttpSession>,
+        ctx: &mut SV::CTX,
     ) -> Option<Box<HttpSession>>
     where
         SV: ProxyHttp + Send + Sync,
@@ -234,26 +237,30 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                // Downgrade TLS-on-HTTP probes to debug — they are noisy but harmless.
-                // Check for TLS ClientHello magic bytes (22 = 0x16 = handshake, 3 = 0x03 = TLS major version)
-                let is_tls_scan = matches!(e.etype, InvalidHTTPHeader)
-                    && {
-                        let s = format!("{e}");
-                        s.contains("[22, 3,") || s.contains("\\x16\\x03")
-                    };
-                if is_tls_scan {
-                    debug!("TLS probe on HTTP port: {e}");
-                } else {
-                    error!("Fail to proxy: {e}");
+                let action = self
+                    .inner
+                    .downstream_request_parse_error(&mut downstream_session, &e, ctx)
+                    .await;
+                match action.log_level {
+                    DownstreamParseErrorLogLevel::Suppress => {}
+                    DownstreamParseErrorLogLevel::Debug => {
+                        debug!("Downstream request parse error ({}): {e}", action.reason);
+                    }
+                    DownstreamParseErrorLogLevel::Warn => {
+                        warn!("Downstream request parse error ({}): {e}", action.reason);
+                    }
+                    DownstreamParseErrorLogLevel::Error => {
+                        error!("Fail to proxy ({}): {e}", action.reason);
+                    }
                 }
-                if matches!(e.etype, InvalidHTTPHeader) {
+                if let Some(status) = action.respond_status {
                     downstream_session
-                        .respond_error(400)
+                        .respond_error(status)
                         .await
                         .unwrap_or_else(|e| {
                             error!("failed to send error response to downstream: {e}");
                         });
-                } // otherwise the connection must be broken, no need to send anything
+                }
                 downstream_session.shutdown().await;
                 return None;
             }
@@ -1037,7 +1044,8 @@ where
     ) {
         debug!("starting subrequest");
 
-        let mut session = match self.handle_new_request(session).await {
+        let mut ctx = self.inner.new_ctx();
+        let mut session = match self.handle_new_request(session, &mut ctx).await {
             Some(downstream_session) => Session::new(
                 downstream_session,
                 &self.downstream_modules,
@@ -1052,7 +1060,6 @@ where
 
         session.subrequest_ctx.replace(sub_req_ctx);
         trace!("processing subrequest");
-        let ctx = self.inner.new_ctx();
         self.process_request(session, ctx).await;
         trace!("subrequest done");
     }
@@ -1163,8 +1170,9 @@ where
 
         let session = Box::new(session);
 
+        let mut ctx = self.inner.new_ctx();
         // TODO: keepalive pool, use stack
-        let mut session = match self.handle_new_request(session).await {
+        let mut session = match self.handle_new_request(session, &mut ctx).await {
             Some(downstream_session) => Session::new(
                 downstream_session,
                 &self.downstream_modules,
@@ -1178,7 +1186,6 @@ where
             session.set_keepalive(None);
         }
 
-        let mut ctx = self.inner.new_ctx();
 
         // Deliver user context from the previous request on this reused connection
         if let Some(prev_ctx) = prev_user_ctx {
