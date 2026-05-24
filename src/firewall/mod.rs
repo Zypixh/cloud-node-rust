@@ -1053,12 +1053,6 @@ pub(crate) const SEARCH_ENGINE_BOTS: &[&str] = &[
     "bytespider",
 ];
 
-fn is_search_engine_bot(user_agent: &str) -> bool {
-    SEARCH_ENGINE_BOTS
-        .iter()
-        .any(|bot| crate::firewall::matcher::contains_ascii_case_insensitive(user_agent, bot))
-}
-
 fn legacy_country_id_to_iso(id: i64) -> Option<&'static str> {
     match id {
         1 => Some("CN"),   // China
@@ -1145,7 +1139,9 @@ pub fn check_region_deny(
     if !region.is_on || !region.matches_url(url) {
         return None;
     }
-    if region.allow_search_engine && is_search_engine_bot(user_agent) {
+    if region.allow_search_engine
+        && crate::client_agent::is_verified_search_engine_ip(client_ip, user_agent)
+    {
         return None;
     }
     let geo = analyzer::lookup_geo(client_ip)?;

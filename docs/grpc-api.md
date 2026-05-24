@@ -317,12 +317,27 @@
 - 用途：检测 gRPC endpoint 可用性。
 - 应用：`RpcClient` 建连时选择可用控制面 endpoint。
 
-### ClientAgentIpService.CreateClientAgentIPs
+### ClientAgentIPService.CreateClientAgentIPs
 
 - 调用位置：`src/client_agent.rs`
-- 请求：`CreateClientAgentIPsRequest { ips[] }`
-- 用途：上报客户端代理 IP。
-- 应用：控制面维护 client agent IP 池。
+- 请求：`CreateClientAgentIPsRequest { agentIPs[] }`
+  - `agentIPs[].agentCode`
+  - `agentIPs[].ip`
+  - `agentIPs[].ptr`
+- 用途：后台 client-agent worker 完成 UA + PTR 校验后，上报已验证客户端代理 IP。
+- 应用：控制面维护 client agent IP 池；Rust 节点本地先写 RocksDB/内存索引，RPC 失败不阻塞本节点即时生效。
+
+### ClientAgentIPService.ListClientAgentIPsAfterId
+
+- 调用位置：`src/rpc/client_agent_ip.rs`
+- 请求：`ListClientAgentIPsAfterIdRequest { id, size }`
+- 响应：`ListClientAgentIPsAfterIdResponse { clientAgentIPs[] }`
+  - `clientAgentIPs[].id`
+  - `clientAgentIPs[].ip`
+  - `clientAgentIPs[].ptr`
+  - `clientAgentIPs[].clientAgent.code`
+- 用途：按自增 ID 从控制面增量同步已验证客户端代理 IP。
+- 应用：启动后的同步器分页拉取，批量写入 RocksDB `CAIP_IP_{ip}` 与 `CAIP_META_last_id`，再更新内存 verified-IP 索引；`allowSearchEngine` / `ignoreSearchEngine` 依赖该索引防止伪造搜索引擎 UA 绕过 WAF。
 
 ## 7. 运行时内部 API（RKE2 pod 间，不是控制面 gRPC）
 

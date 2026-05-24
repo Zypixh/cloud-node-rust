@@ -111,9 +111,9 @@ pub(crate) fn preset_group_matches(code: &str, facts: &RequestFacts<'_>) -> bool
         facts.headers(),
         facts.request_body_text(),
     ];
-    values.iter().any(|value| {
-        crate::firewall::matcher::evaluate_operator(value, operator, "", !strict)
-    })
+    values
+        .iter()
+        .any(|value| crate::firewall::matcher::evaluate_operator(value, operator, "", !strict))
 }
 
 pub(crate) fn preset_group_uses_request_body(code: &str) -> bool {
@@ -139,11 +139,9 @@ pub fn match_set(
         return false;
     }
     if set.ignore_search_engine
-        && crate::firewall::matcher::evaluate_operator(
+        && crate::client_agent::is_verified_search_engine_ip(
+            ip,
             &header_value(session, "user-agent"),
-            "common bot",
-            "",
-            true,
         )
     {
         return false;
@@ -167,11 +165,9 @@ fn match_set_with_facts(
         return false;
     }
     if set.ignore_search_engine
-        && crate::firewall::matcher::evaluate_operator(
+        && crate::client_agent::is_verified_search_engine_ip(
+            ip,
             &header_value(session, "user-agent"),
-            "common bot",
-            "",
-            true,
         )
     {
         return false;
@@ -205,11 +201,9 @@ pub fn match_set_response(
         return false;
     }
     if set.ignore_search_engine
-        && crate::firewall::matcher::evaluate_operator(
+        && crate::client_agent::is_verified_search_engine_ip(
+            ip,
             &header_value(session, "user-agent"),
-            "common bot",
-            "",
-            true,
         )
     {
         return false;
@@ -233,11 +227,9 @@ fn match_set_response_with_facts(
         return false;
     }
     if set.ignore_search_engine
-        && crate::firewall::matcher::evaluate_operator(
+        && crate::client_agent::is_verified_search_engine_ip(
+            ip,
             &header_value(session, "user-agent"),
-            "common bot",
-            "",
-            true,
         )
     {
         return false;

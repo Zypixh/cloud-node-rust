@@ -69,7 +69,7 @@ Implemented but not started from `main.rs`:
 | `FileChunkService` | `implemented_not_started` | `findAllFileChunkIds`, `downloadFileChunk` | Used only by IP library sync, which itself is not started. |
 | `ACMEAuthenticationService` | `stub_only` | helper exists | `find_acme_key()` exists but I did not find it wired into runtime request handling. |
 | `ServerEventService` | `stub_only` | helper exists | `report_server_event()` exists but no runtime call site was found. |
-| `ClientAgentIPService` | `stub_only` | helper exists | `maybe_report_client_agent()` exists but no runtime call site was found. |
+| `ClientAgentIPService` | `running` | `createClientAgentIPs`, `listClientAgentIPsAfterId` | Active. Runtime queues UA-matched candidates, verifies PTR locally, reports verified IPs, and incrementally syncs control-plane Agent IPs into RocksDB/memory. |
 | `AuthorityKeyService` | `stub_only` | client wrapper only | No runtime usage found and currently out of scope. |
 | `FileService` | `stub_only` | client wrapper only | No runtime usage found and currently out of scope. |
 | `PingService` | `partial` | `ping` | Used for API endpoint health verification before runtime endpoint switch. |
@@ -152,7 +152,6 @@ Impact:
 2. Decide whether helper-only services should be wired or removed:
 - `ACMEAuthenticationService`
 - `ServerEventService`
-- `ClientAgentIPService`
 
 ## Verification Rules
 

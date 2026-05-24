@@ -2,6 +2,7 @@ pub mod acme;
 pub mod api_node;
 pub mod cache;
 pub mod client;
+pub mod client_agent_ip;
 pub mod events;
 pub mod files;
 pub mod firewall;
@@ -20,6 +21,7 @@ pub mod utils;
 
 // Re-export syncers for main.rs
 pub use api_node::{start_api_node_syncer, start_updating_server_list_syncer};
+pub use client_agent_ip::start_client_agent_ip_syncer;
 pub use files::start_ip_library_syncer;
 pub use ip_list::start_ip_list_syncer;
 pub use ip_report::start_ip_report_service;

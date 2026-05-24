@@ -166,7 +166,9 @@ impl CompiledRegionDenyPlan {
     }
 
     fn evaluate(&self, client_ip: IpAddr, user_agent: &str, url: &str) -> Option<MatchedAction> {
-        if !self.matches_url(url) || (self.allow_search_engine && is_search_engine_bot(user_agent))
+        if !self.matches_url(url)
+            || (self.allow_search_engine
+                && crate::client_agent::is_verified_search_engine_ip(client_ip, user_agent))
         {
             return None;
         }
@@ -251,12 +253,6 @@ impl CompiledRegionDenyPlan {
             observe_only: false,
         }
     }
-}
-
-fn is_search_engine_bot(user_agent: &str) -> bool {
-    crate::firewall::SEARCH_ENGINE_BOTS
-        .iter()
-        .any(|bot| crate::firewall::matcher::contains_ascii_case_insensitive(user_agent, bot))
 }
 
 fn legacy_country_id_to_iso(id: i64) -> Option<&'static str> {
@@ -386,9 +382,7 @@ impl CompiledRuleGroup {
 
     fn uses_request_body(&self) -> bool {
         self.is_on
-            && (self
-                .preset
-                .is_some_and(PresetGroup::uses_request_body)
+            && (self.preset.is_some_and(PresetGroup::uses_request_body)
                 || self.sets.iter().any(CompiledRuleSet::uses_request_body))
     }
 
@@ -1796,17 +1790,13 @@ fn match_set_response(
 
 fn should_bypass_set(set: &CompiledRuleSet, session: &Session) -> bool {
     let ip = crate::firewall::matcher_plus::parse_remote_ip(session);
+    let user_agent = session
+        .get_header("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
     (set.ignore_local && crate::firewall::matcher_plus::is_local_ip(&ip))
         || (set.ignore_search_engine
-            && crate::firewall::matcher::evaluate_operator(
-                &session
-                    .get_header("user-agent")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default(),
-                "common bot",
-                "",
-                true,
-            ))
+            && crate::client_agent::is_verified_search_engine_ip(ip, user_agent))
 }
 
 fn fill_action_from_policy(
@@ -2298,6 +2288,9 @@ impl CompiledMultiContains {
     }
 
     fn matches_all(&self, actual: &str) -> bool {
+        if self.patterns.is_empty() {
+            return true;
+        }
         if let Some(automaton) = &self.automaton {
             let mut matched = vec![false; self.patterns.len()];
             let mut count = 0usize;
@@ -2520,7 +2513,13 @@ mod tests {
 
     #[test]
     fn compiled_preset_groups_require_request_body() {
-        for code in ["sqlInjection", "sqlInjectionStrict", "xss", "xssStrict", "cmdInjection"] {
+        for code in [
+            "sqlInjection",
+            "sqlInjectionStrict",
+            "xss",
+            "xssStrict",
+            "cmdInjection",
+        ] {
             let group = CompiledRuleGroup::compile(&HTTPFirewallRuleGroup {
                 id: 1,
                 is_on: true,
@@ -2528,7 +2527,10 @@ mod tests {
                 code: Some(code.to_string()),
                 sets: vec![],
             });
-            assert!(group.uses_request_body(), "preset {code} should read request body");
+            assert!(
+                group.uses_request_body(),
+                "preset {code} should read request body"
+            );
         }
     }
 

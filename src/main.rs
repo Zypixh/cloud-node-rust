@@ -599,6 +599,8 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     }
     cloud_node_rust::cluster::runtime::start(&runtime_config);
     let api_config_arc = Arc::new(api_config.clone());
+    cloud_node_rust::client_agent::load_client_agent_ip_index();
+    cloud_node_rust::client_agent::start_client_agent_queue(api_config_arc.clone());
 
     // 2. Initialize Managers
     let config_store = Arc::new(ConfigStore::new());
@@ -694,6 +696,11 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     let ac_ir = api_config.clone();
     spawn_staggered(&rt, Duration::from_secs(20), async move {
         rpc::start_ip_report_service(ac_ir).await;
+    });
+
+    let ac_ca = api_config_arc.clone();
+    spawn_staggered(&rt, Duration::from_secs(21), async move {
+        rpc::start_client_agent_ip_syncer(ac_ca).await;
     });
 
     spawn_staggered(&rt, Duration::from_secs(21), async move {

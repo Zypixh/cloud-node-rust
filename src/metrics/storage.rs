@@ -286,6 +286,73 @@ impl MetricStorage {
         let _ = db.delete(format!("CMETA_{}", hash).as_bytes());
     }
 
+    pub fn load_client_agent_ips(&self) -> Vec<crate::client_agent::ClientAgentIpRecord> {
+        let Some(db) = &self.db else {
+            return Vec::new();
+        };
+        let mut records = Vec::new();
+        let iter = db.prefix_iterator("CAIP_IP_".as_bytes());
+        for (key, val) in iter.flatten() {
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with("CAIP_IP_") {
+                break;
+            }
+            if let Some(record) = client_agent_ip_record_from_slice(&val) {
+                records.push(record);
+            }
+        }
+        records
+    }
+
+    pub fn get_client_agent_last_id(&self) -> i64 {
+        let Some(db) = &self.db else {
+            return 0;
+        };
+        db.get("CAIP_META_last_id".as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                if v.len() == 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&v);
+                    Some(i64::from_be_bytes(buf))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn save_client_agent_ip(&self, record: &crate::client_agent::ClientAgentIpRecord) -> bool {
+        let Some(db) = &self.db else {
+            return true;
+        };
+        db.put(
+            client_agent_ip_key(&record.ip).as_bytes(),
+            client_agent_ip_json(record).to_string().as_bytes(),
+        )
+        .is_ok()
+    }
+
+    pub fn save_client_agent_ip_batch(
+        &self,
+        records: &[crate::client_agent::ClientAgentIpRecord],
+        last_id: i64,
+    ) -> bool {
+        let Some(db) = &self.db else {
+            return true;
+        };
+        let mut batch = WriteBatch::default();
+        for record in records {
+            batch.put(
+                client_agent_ip_key(&record.ip).as_bytes(),
+                client_agent_ip_json(record).to_string().as_bytes(),
+            );
+        }
+        batch.put("CAIP_META_last_id".as_bytes(), last_id.to_be_bytes());
+        db.write(batch).is_ok()
+    }
+
     /// WAF Token Persistence
     pub fn save_waf_token(&self, token: &str, ip: &str, ua_hash: &str, expired_at: u64) {
         let Some(db) = &self.db else {
@@ -497,6 +564,35 @@ fn cache_meta_json(meta: &CacheMetaEntry) -> serde_json::Value {
         "rp": meta.relative_path,
         "v": meta.event_version,
         "u": meta.updated_at,
+    })
+}
+
+fn client_agent_ip_key(ip: &str) -> String {
+    format!("CAIP_IP_{}", ip)
+}
+
+fn client_agent_ip_json(record: &crate::client_agent::ClientAgentIpRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": record.id,
+        "ip": record.ip,
+        "ptr": record.ptr,
+        "code": record.agent_code,
+    })
+}
+
+fn client_agent_ip_record_from_slice(
+    val: &[u8],
+) -> Option<crate::client_agent::ClientAgentIpRecord> {
+    let raw = serde_json::from_slice::<serde_json::Value>(val).ok()?;
+    Some(crate::client_agent::ClientAgentIpRecord {
+        id: raw.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+        ip: raw.get("ip")?.as_str()?.to_string(),
+        ptr: raw
+            .get("ptr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        agent_code: raw.get("code")?.as_str()?.to_string(),
     })
 }
 
