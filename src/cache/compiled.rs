@@ -3,7 +3,7 @@ use crate::config_models::{
     HTTPCachePolicy, HTTPCacheRef, HTTPRequestCond, HTTPRequestCondGroup, HTTPRequestCondsConfig,
     ServerConfig, SizeCapacity, URLPattern,
 };
-use http::HeaderMap;
+use http::{HeaderMap, header::COOKIE};
 use pingora_proxy::Session;
 use regex::Regex;
 use std::net::IpAddr;
@@ -1324,17 +1324,19 @@ fn query_param(session: &Session, name: &str) -> String {
 
 fn cookie_value(session: &Session, name: &str) -> String {
     session
-        .get_header("cookie")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').map(str::trim).find_map(|cookie| {
-                let (key, value) = cookie.split_once('=')?;
-                if key == name {
-                    Some(value.to_string())
-                } else {
-                    None
-                }
-            })
+        .req_header()
+        .headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|cookies| cookies.split(';').map(str::trim))
+        .find_map(|cookie| {
+            let (key, value) = cookie.split_once('=')?;
+            if key == name {
+                Some(value.to_string())
+            } else {
+                None
+            }
         })
         .unwrap_or_default()
 }

@@ -5,6 +5,7 @@ use crate::firewall::OutboundContext;
 use crate::metrics::analyzer;
 use base64::Engine as _;
 use dashmap::DashMap;
+use http::header::COOKIE;
 use once_cell::sync::Lazy;
 use pingora_proxy::Session;
 use regex::Regex;
@@ -740,13 +741,7 @@ impl<'a> RequestFacts<'a> {
 
     pub(crate) fn cookie_param(&self, name: &str) -> String {
         self.cookie_params
-            .get_or_init(|| {
-                self.session
-                    .get_header("cookie")
-                    .and_then(|v| v.to_str().ok())
-                    .map(parse_cookie_params)
-                    .unwrap_or_default()
-            })
+            .get_or_init(|| parse_cookie_params(&merged_cookie_header(self.session)))
             .iter()
             .find_map(|(key, value)| (key == name).then(|| value.clone()))
             .unwrap_or_default()
@@ -1449,18 +1444,26 @@ fn response_header_value(response: &OutboundContext<'_>, name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn normalize_cookies(session: &Session) -> String {
+fn merged_cookie_header(session: &Session) -> String {
     session
-        .get_header("cookie")
-        .and_then(|v| v.to_str().ok())
-        .map(|cookies| {
-            cookies
-                .split(';')
-                .map(|part| part.trim())
-                .collect::<Vec<_>>()
-                .join("&")
-        })
-        .unwrap_or_default()
+        .req_header()
+        .headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn normalize_cookies(session: &Session) -> String {
+    merged_cookie_header(session)
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn all_headers(session: &Session) -> String {
@@ -1586,19 +1589,16 @@ fn parse_cookie_params(input: &str) -> Vec<(String, String)> {
 }
 
 fn cookie_value(session: &Session, name: &str) -> String {
-    session
-        .get_header("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|part| {
-                let mut iter = part.trim().splitn(2, '=');
-                let key = iter.next()?;
-                if key == name {
-                    Some(iter.next().unwrap_or("").to_string())
-                } else {
-                    None
-                }
-            })
+    merged_cookie_header(session)
+        .split(';')
+        .find_map(|part| {
+            let mut iter = part.trim().splitn(2, '=');
+            let key = iter.next()?;
+            if key == name {
+                Some(iter.next().unwrap_or("").to_string())
+            } else {
+                None
+            }
         })
         .unwrap_or_default()
 }

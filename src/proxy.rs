@@ -35,6 +35,20 @@ pub struct LazyBytes(Option<Vec<u8>>);
 
 static EMPTY_BYTES_VEC: LazyLock<Vec<u8>> = LazyLock::new(Vec::new);
 
+fn merged_session_cookie_header(session: &Session) -> Option<String> {
+    let values = session
+        .req_header()
+        .headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+
+    (!values.is_empty()).then(|| values.join("; "))
+}
+
 fn normalize_upstream_cookie_headers(upstream_request: &mut pingora_http::RequestHeader) {
     let values = upstream_request
         .headers
@@ -4157,7 +4171,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         ua: &str,
         ctx: &ProxyCTX,
     ) -> bool {
-        if let Some(cookies) = session.get_header("cookie").and_then(|v| v.to_str().ok()) {
+        if let Some(cookies) = merged_session_cookie_header(session) {
             if !cookies.contains("WAF-Token=") {
                 return false;
             }
