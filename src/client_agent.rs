@@ -3,7 +3,10 @@ use crate::rpc::client::RpcClient;
 use dashmap::DashSet;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
+use tokio::time::{Duration, timeout};
 use tracing::debug;
 
 struct KnownAgent {
@@ -70,8 +73,16 @@ const KNOWN_AGENTS: &[KnownAgent] = &[
     },
 ];
 
+const MAX_REPORTED_IPS: usize = 100_000;
+const MAX_INFLIGHT_IPS: usize = 1_024;
+const PTR_LOOKUP_CONCURRENCY: usize = 16;
+const PTR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+const CLIENT_AGENT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
 static REPORTED_IPS: Lazy<DashSet<String>> = Lazy::new(DashSet::new);
 static INFLIGHT_IPS: Lazy<DashSet<String>> = Lazy::new(DashSet::new);
+static INFLIGHT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static PTR_LOOKUP_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(PTR_LOOKUP_CONCURRENCY));
 
 fn detect_agent_by_ua(user_agent: &str) -> Option<&'static KnownAgent> {
     KNOWN_AGENTS.iter().find(|agent| {
@@ -89,7 +100,16 @@ fn detect_agent_by_ptr(ptr: &str) -> Option<&'static KnownAgent> {
 }
 
 async fn lookup_ptr(ip: &str) -> Option<String> {
-    let output = Command::new("/usr/bin/host").arg(ip).output().await.ok()?;
+    let _permit = PTR_LOOKUP_SEMAPHORE.acquire().await.ok()?;
+    let child = Command::new("/usr/bin/host")
+        .arg(ip)
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let output = timeout(PTR_LOOKUP_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -112,12 +132,23 @@ pub fn maybe_report_client_agent(api_config: &Arc<ApiConfig>, ip: &str, user_age
         return;
     };
 
-    if REPORTED_IPS.contains(ip) || !INFLIGHT_IPS.insert(ip.to_string()) {
+    if REPORTED_IPS.contains(ip) {
+        return;
+    }
+
+    let previous = INFLIGHT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if previous >= MAX_INFLIGHT_IPS {
+        INFLIGHT_COUNT.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+
+    let ip = ip.to_string();
+    if !INFLIGHT_IPS.insert(ip.clone()) {
+        INFLIGHT_COUNT.fetch_sub(1, Ordering::Relaxed);
         return;
     }
 
     let api_config = Arc::clone(api_config);
-    let ip = ip.to_string();
     tokio::spawn(async move {
         async {
             let Some(ptr) = lookup_ptr(&ip).await else {
@@ -130,31 +161,39 @@ pub fn maybe_report_client_agent(api_config: &Arc<ApiConfig>, ip: &str, user_age
                 return;
             }
 
-            let client = match RpcClient::new(&api_config).await {
-                Ok(c) => c,
-                Err(e) => {
+            let client = match timeout(CLIENT_AGENT_RPC_TIMEOUT, RpcClient::new(&api_config)).await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
                     debug!("Failed to connect for client agent reporting: {}", e);
+                    return;
+                }
+                Err(_) => {
+                    debug!("Timed out connecting for client agent reporting");
                     return;
                 }
             };
             let mut service = client.client_agent_ip_service();
-            if service
-                .create_client_agent_i_ps(pb::CreateClientAgentIPsRequest {
-                    agent_i_ps: vec![pb::create_client_agent_i_ps_request::AgentIpInfo {
-                        agent_code: ua_agent.code.to_string(),
-                        ip: ip.clone(),
-                        ptr: ptr.clone(),
-                    }],
-                })
+            let report = service.create_client_agent_i_ps(pb::CreateClientAgentIPsRequest {
+                agent_i_ps: vec![pb::create_client_agent_i_ps_request::AgentIpInfo {
+                    agent_code: ua_agent.code.to_string(),
+                    ip: ip.clone(),
+                    ptr: ptr.clone(),
+                }],
+            });
+            if timeout(CLIENT_AGENT_RPC_TIMEOUT, report)
                 .await
-                .is_ok()
+                .is_ok_and(|result| result.is_ok())
             {
-                REPORTED_IPS.insert(ip.clone());
+                if REPORTED_IPS.len() < MAX_REPORTED_IPS {
+                    REPORTED_IPS.insert(ip.clone());
+                }
             }
         }
         .await;
 
         INFLIGHT_IPS.remove(&ip);
+        INFLIGHT_COUNT.fetch_sub(1, Ordering::Relaxed);
     });
 }
 

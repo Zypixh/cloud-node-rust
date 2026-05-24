@@ -3,8 +3,8 @@ use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
-use image::AnimationDecoder;
 use http::header::{COOKIE, HeaderValue};
+use image::AnimationDecoder;
 use pingora_core::protocols::tls::CustomALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
@@ -220,6 +220,8 @@ pub struct ProxyCTX {
     pub request_limit_out_bandwidth_bytes: i64,
     pub request_limit_out_bandwidth_sent: i64,
     pub request_limit_out_bandwidth_window_start: Option<std::time::Instant>,
+    pub plan_max_upload_bytes: Option<i64>,
+    pub traffic_limit_notice_body: Option<Option<String>>,
     pub global_cache_policies: Arc<Vec<Arc<HTTPCachePolicy>>>,
     pub compiled_plans: Arc<crate::compiled::CompiledPlanSet>,
     /// Cached during request_filter to avoid config lock in response_filter/body_filter
@@ -317,6 +319,8 @@ impl Default for ProxyCTX {
             request_limit_out_bandwidth_bytes: 0,
             request_limit_out_bandwidth_sent: 0,
             request_limit_out_bandwidth_window_start: None,
+            plan_max_upload_bytes: None,
+            traffic_limit_notice_body: None,
             global_cache_policies: Arc::new(Vec::new()),
             compiled_plans: Arc::new(crate::compiled::CompiledPlanSet::default()),
             global_http_config: None,
@@ -751,12 +755,137 @@ impl EdgeProxy {
         }
     }
 
-    fn render_page_template(
+    fn template_value(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        raw: &str,
+        var_name: &str,
+        status: u16,
+    ) -> String {
+        match var_name {
+            "requestId" => ctx.request_id.clone(),
+            "status" => status.to_string(),
+            "statusMessage" => Self::status_message(status),
+            "rawRemoteAddr" => Self::raw_remote_ip(&ctx.raw_remote_addr, ctx.client_ip),
+            "remoteAddr" => ctx.client_ip.to_string(),
+            "remotePort" => ctx.client_port.to_string(),
+            "serverAddr" => {
+                if self
+                    .config
+                    .get_global_http_config_sync()
+                    .enable_server_addr_variable
+                {
+                    session
+                        .downstream_session
+                        .digest()
+                        .and_then(|d| d.socket_digest.as_ref())
+                        .and_then(|sd| sd.local_addr())
+                        .and_then(|addr| addr.as_inet())
+                        .map(|inet| inet.ip().to_string())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            }
+            "serverPort" => session
+                .downstream_session
+                .digest()
+                .and_then(|d| d.socket_digest.as_ref())
+                .and_then(|sd| sd.local_addr())
+                .and_then(|addr| addr.as_inet())
+                .map(|inet| inet.port().to_string())
+                .unwrap_or_default(),
+            "scheme" => Self::forwarded_proto(session, ctx).to_string(),
+            "proto" => {
+                if ctx.is_http3_bridge {
+                    "HTTP/3.0".to_string()
+                } else {
+                    match session.req_header().version {
+                        pingora::http::Version::HTTP_10 => "HTTP/1.0".to_string(),
+                        pingora::http::Version::HTTP_11 => "HTTP/1.1".to_string(),
+                        pingora::http::Version::HTTP_2 => "HTTP/2.0".to_string(),
+                        pingora::http::Version::HTTP_3 => "HTTP/3.0".to_string(),
+                        _ => "HTTP/1.1".to_string(),
+                    }
+                }
+            }
+            "requestTime" => format!("{:.3}", ctx.start_time.elapsed().as_secs_f64()),
+            "bytesSent" => {
+                (session.body_bytes_sent() as u64 + ctx.response_headers_size as u64 + 20)
+                    .to_string()
+            }
+            "bodyBytesSent" => session.body_bytes_sent().to_string(),
+            "timestamp" => (ctx.start_timestamp_millis / 1000).to_string(),
+            "msec" => format!("{:.3}", ctx.start_timestamp_millis as f64 / 1000.0),
+            "timeISO8601" => {
+                crate::utils::time::local_from_timestamp_millis(ctx.start_timestamp_millis)
+                    .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+                    .to_string()
+            }
+            "timeLocal" => {
+                crate::utils::time::local_from_timestamp_millis(ctx.start_timestamp_millis)
+                    .format("%d/%b/%Y:%H:%M:%S %z")
+                    .to_string()
+            }
+            "host" => session
+                .get_header("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.split(':').next().unwrap_or(v).to_string())
+                .unwrap_or_else(|| {
+                    session
+                        .req_header()
+                        .uri
+                        .host()
+                        .unwrap_or_default()
+                        .to_string()
+                }),
+            "requestURI" => session
+                .req_header()
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string()),
+            "requestPath" => session.req_header().uri.path().to_string(),
+            "requestMethod" => session.req_header().method.to_string(),
+            "request" => format!(
+                "{} {} {}",
+                session.req_header().method,
+                session
+                    .req_header()
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/"),
+                if ctx.is_http3_bridge {
+                    "HTTP/3.0"
+                } else {
+                    match session.req_header().version {
+                        pingora::http::Version::HTTP_10 => "HTTP/1.0",
+                        pingora::http::Version::HTTP_11 => "HTTP/1.1",
+                        pingora::http::Version::HTTP_2 => "HTTP/2.0",
+                        pingora::http::Version::HTTP_3 => "HTTP/3.0",
+                        _ => "HTTP/1.1",
+                    }
+                }
+            ),
+            "hostname" => HOSTNAME.clone(),
+            _ => crate::firewall::matcher_plus::format_variables(
+                session,
+                raw,
+                &ctx.request_body,
+                Self::forwarded_proto(session, ctx),
+            ),
+        }
+    }
+
+    fn render_template(
         &self,
         session: &Session,
         ctx: &ProxyCTX,
         template: &str,
         status: u16,
+        html_escape_by_default: bool,
     ) -> String {
         static RE_VAR: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
@@ -770,128 +899,47 @@ impl EdgeProxy {
                     .unwrap_or(raw);
                 let mut parts = inner.split('|');
                 let var_name = parts.next().unwrap_or("").trim();
-
-                let mut value = match var_name {
-                    "requestId" => ctx.request_id.clone(),
-                    "status" => status.to_string(),
-                    "statusMessage" => Self::status_message(status),
-                    "rawRemoteAddr" => Self::raw_remote_ip(&ctx.raw_remote_addr, ctx.client_ip),
-                    "remoteAddr" => ctx.client_ip.to_string(),
-                    "remotePort" => ctx.client_port.to_string(),
-                    "serverAddr" => {
-                        if self
-                            .config
-                            .get_global_http_config_sync()
-                            .enable_server_addr_variable
-                        {
-                            session
-                                .downstream_session
-                                .digest()
-                                .and_then(|d| d.socket_digest.as_ref())
-                                .and_then(|sd| sd.local_addr())
-                                .and_then(|addr| addr.as_inet())
-                                .map(|inet| inet.ip().to_string())
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    }
-                    "serverPort" => session
-                        .downstream_session
-                        .digest()
-                        .and_then(|d| d.socket_digest.as_ref())
-                        .and_then(|sd| sd.local_addr())
-                        .and_then(|addr| addr.as_inet())
-                        .map(|inet| inet.port().to_string())
-                        .unwrap_or_default(),
-                    "scheme" => Self::forwarded_proto(session, ctx).to_string(),
-                    "proto" => {
-                        if ctx.is_http3_bridge {
-                            "HTTP/3.0".to_string()
-                        } else {
-                            match session.req_header().version {
-                                pingora::http::Version::HTTP_10 => "HTTP/1.0".to_string(),
-                                pingora::http::Version::HTTP_11 => "HTTP/1.1".to_string(),
-                                pingora::http::Version::HTTP_2 => "HTTP/2.0".to_string(),
-                                pingora::http::Version::HTTP_3 => "HTTP/3.0".to_string(),
-                                _ => "HTTP/1.1".to_string(),
-                            }
-                        }
-                    }
-                    "requestTime" => format!("{:.3}", ctx.start_time.elapsed().as_secs_f64()),
-                    "bytesSent" => {
-                        (session.body_bytes_sent() as u64 + ctx.response_headers_size as u64 + 20)
-                            .to_string()
-                    }
-                    "bodyBytesSent" => session.body_bytes_sent().to_string(),
-                    "timestamp" => (ctx.start_timestamp_millis / 1000).to_string(),
-                    "msec" => format!("{:.3}", ctx.start_timestamp_millis as f64 / 1000.0),
-                    "timeISO8601" => {
-                        crate::utils::time::local_from_timestamp_millis(ctx.start_timestamp_millis)
-                            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-                            .to_string()
-                    }
-                    "timeLocal" => {
-                        crate::utils::time::local_from_timestamp_millis(ctx.start_timestamp_millis)
-                            .format("%d/%b/%Y:%H:%M:%S %z")
-                            .to_string()
-                    }
-                    "host" => session
-                        .get_header("host")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| v.split(':').next().unwrap_or(v).to_string())
-                        .unwrap_or_else(|| {
-                            session
-                                .req_header()
-                                .uri
-                                .host()
-                                .unwrap_or_default()
-                                .to_string()
-                        }),
-                    "requestURI" => session
-                        .req_header()
-                        .uri
-                        .path_and_query()
-                        .map(|pq| pq.as_str().to_string())
-                        .unwrap_or_else(|| "/".to_string()),
-                    "requestPath" => session.req_header().uri.path().to_string(),
-                    "requestMethod" => session.req_header().method.to_string(),
-                    "request" => format!(
-                        "{} {} {}",
-                        session.req_header().method,
-                        session
-                            .req_header()
-                            .uri
-                            .path_and_query()
-                            .map(|pq| pq.as_str())
-                            .unwrap_or("/"),
-                        if ctx.is_http3_bridge {
-                            "HTTP/3.0"
-                        } else {
-                            match session.req_header().version {
-                                pingora::http::Version::HTTP_10 => "HTTP/1.0",
-                                pingora::http::Version::HTTP_11 => "HTTP/1.1",
-                                pingora::http::Version::HTTP_2 => "HTTP/2.0",
-                                pingora::http::Version::HTTP_3 => "HTTP/3.0",
-                                _ => "HTTP/1.1",
-                            }
-                        }
-                    ),
-                    "hostname" => HOSTNAME.clone(),
-                    _ => crate::firewall::matcher_plus::format_variables(
-                        session,
-                        raw,
-                        &ctx.request_body,
-                        Self::forwarded_proto(session, ctx),
-                    ),
-                };
+                let mut value = self.template_value(session, ctx, raw, var_name, status);
+                let mut escape_html = html_escape_by_default;
 
                 for modifier in parts {
-                    value = Self::apply_template_modifier(value, modifier);
+                    match modifier.trim() {
+                        "raw" => escape_html = false,
+                        "escape" | "htmlEscape" => {
+                            value = Self::html_escape(&value);
+                            escape_html = false;
+                        }
+                        other => value = Self::apply_template_modifier(value, other),
+                    }
                 }
-                value
+
+                if escape_html {
+                    Self::html_escape(&value)
+                } else {
+                    value
+                }
             })
             .to_string()
+    }
+
+    fn render_page_template(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        template: &str,
+        status: u16,
+    ) -> String {
+        self.render_template(session, ctx, template, status, true)
+    }
+
+    fn render_raw_template(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        template: &str,
+        status: u16,
+    ) -> String {
+        self.render_template(session, ctx, template, status, false)
     }
 
     fn cleanup_request_limit_bindings() {
@@ -3010,7 +3058,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     .and_then(|a| a.options.get("url").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 if !location.is_empty() {
-                    let location = self.render_page_template(session, ctx, location, 307);
+                    let location = self.render_raw_template(session, ctx, location, 307);
                     let mut resp = pingora_http::ResponseHeader::build(307, None).unwrap();
                     let _ = resp.insert_header("location", location);
                     session.write_response_header(Box::new(resp), true).await?;
@@ -3030,7 +3078,21 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         Ok(true)
     }
 
-    fn resolve_plan_max_upload_bytes(&self, server: &ServerConfig) -> i64 {
+    fn resolve_plan_max_upload_bytes(&self, ctx: &mut ProxyCTX) -> i64 {
+        if let Some(bytes) = ctx.plan_max_upload_bytes {
+            return bytes;
+        }
+
+        let bytes = ctx
+            .server
+            .as_ref()
+            .map(|server| self.compute_plan_max_upload_bytes(server))
+            .unwrap_or(0);
+        ctx.plan_max_upload_bytes = Some(bytes);
+        bytes
+    }
+
+    fn compute_plan_max_upload_bytes(&self, server: &ServerConfig) -> i64 {
         if server.user_plan_id <= 0 {
             return 0;
         }
@@ -3067,11 +3129,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         session: &mut Session,
         ctx: &mut ProxyCTX,
     ) -> Result<bool> {
-        let Some(server) = ctx.server.as_ref() else {
+        if ctx.server.is_none() {
             return Ok(false);
-        };
+        }
 
-        let max_upload_bytes = self.resolve_plan_max_upload_bytes(server);
+        let max_upload_bytes = self.resolve_plan_max_upload_bytes(ctx);
         if max_upload_bytes <= 0 {
             return Ok(false);
         }
@@ -4105,14 +4167,24 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         }
     }
 
-    fn resolve_traffic_limit_config(
-        &self,
-        server: &ServerConfig,
-    ) -> Option<crate::config_models::TrafficLimitConfig> {
+    fn resolve_traffic_limit_notice_body(&self, ctx: &mut ProxyCTX) -> Option<String> {
+        if let Some(body) = ctx.traffic_limit_notice_body.as_ref() {
+            return body.clone();
+        }
+
+        let body = ctx
+            .server
+            .as_ref()
+            .and_then(|server| self.compute_traffic_limit_notice_body(server));
+        ctx.traffic_limit_notice_body = Some(body.clone());
+        body
+    }
+
+    fn compute_traffic_limit_notice_body(&self, server: &ServerConfig) -> Option<String> {
         if let Some(config) = server.traffic_limit.as_ref()
             && config.is_on
         {
-            return Some(config.clone());
+            return (!config.notice_page_body.is_empty()).then(|| config.notice_page_body.clone());
         }
 
         if server.user_plan_id <= 0 {
@@ -4130,7 +4202,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         )
         .ok()?;
 
-        config.is_on.then_some(config)
+        (config.is_on && !config.notice_page_body.is_empty()).then_some(config.notice_page_body)
     }
 
     async fn enforce_traffic_limit(
@@ -4146,10 +4218,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         }
 
         let body = self
-            .resolve_traffic_limit_config(server)
-            .and_then(|config| {
-                (!config.notice_page_body.is_empty()).then_some(config.notice_page_body)
-            })
+            .resolve_traffic_limit_notice_body(ctx)
             .unwrap_or_else(|| DEFAULT_TRAFFIC_LIMIT_NOTICE_PAGE_BODY.to_string());
 
         ctx.response_status = 509;
@@ -4319,8 +4388,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 Ok(true)
             }
             crate::firewall::ActionResponse::Redirect { status, location } => {
-                let resolved_url =
-                    self.render_page_template(session, ctx, &location, status as u16);
+                let resolved_url = self.render_raw_template(session, ctx, &location, status as u16);
                 let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
                 resp.insert_header("location", resolved_url).unwrap();
                 session.write_response_header(Box::new(resp), true).await?;
@@ -4679,7 +4747,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         };
 
         if let Some(web) = ctx.server.as_ref().and_then(|server| server.web.as_ref()) {
-            if web.firewall_ref.as_ref().is_some_and(|firewall_ref| firewall_ref.is_on) {
+            if web
+                .firewall_ref
+                .as_ref()
+                .is_some_and(|firewall_ref| firewall_ref.is_on)
+            {
                 if let Some(policy) = &web.firewall_policy {
                     apply_policy(policy);
                 }
@@ -4718,7 +4790,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 .get_header("transfer-encoding")
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
-            && matches!(session.req_header().method, http::Method::GET | http::Method::HEAD)
+            && matches!(
+                session.req_header().method,
+                http::Method::GET | http::Method::HEAD
+            )
         {
             return Ok(false);
         }
@@ -5692,14 +5767,7 @@ impl ProxyHttp for EdgeProxy {
     ) -> Result<Box<HttpPeer>> {
         let (node_level, force_ln, bypass_l2, ln_by_url_mapping, node_cluster_id) =
             if ctx.waf_deferred {
-                let (
-                    node_level,
-                    force_ln,
-                    bypass_l2,
-                    ln_by_url_mapping,
-                    node_cluster_id,
-                    _,
-                ) = self
+                let (node_level, force_ln, bypass_l2, ln_by_url_mapping, node_cluster_id, _) = self
                     .config
                     .get_upstream_peer_context_with_firewall_policies_sync();
                 (

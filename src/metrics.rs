@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicU32;
 
 static CACHED_PRESSURE: AtomicU32 = AtomicU32::new(0);
 static HTTP_DIMENSION_HANDLE: OnceCell<HttpDimensionHandle> = OnceCell::new();
+static HTTP_DIMENSION_DROPPED: AtomicU64 = AtomicU64::new(0);
 static EMPTY_ARC_STR: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
 static UNKNOWN_ARC_STR: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("Unknown"));
 static HTTP_DIMENSION_WARNING_INTERVAL_MS: u64 = 5_000;
@@ -73,7 +74,7 @@ pub struct HttpDimensionEvent {
 struct HttpDimensionHandle {
     sender: mpsc::Sender<HttpDimensionEvent>,
     queue_capacity: usize,
-    fallback_since_warning: Arc<AtomicU64>,
+    dropped_since_warning: Arc<AtomicU64>,
     last_warning_at_ms: Arc<AtomicI64>,
 }
 
@@ -82,36 +83,43 @@ impl HttpDimensionHandle {
         Self {
             sender,
             queue_capacity,
-            fallback_since_warning: Arc::new(AtomicU64::new(0)),
+            dropped_since_warning: Arc::new(AtomicU64::new(0)),
             last_warning_at_ms: Arc::new(AtomicI64::new(0)),
         }
     }
 
-    fn try_enqueue(&self, event: HttpDimensionEvent) -> Result<(), HttpDimensionEvent> {
+    fn try_enqueue(&self, event: HttpDimensionEvent) {
         match self.sender.try_send(event) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                let event = err.into_inner();
-                let fallback = self.fallback_since_warning.fetch_add(1, Ordering::Relaxed) + 1;
-                let now = unix_epoch_millis_now();
-                let last = self.last_warning_at_ms.load(Ordering::Relaxed);
-                if now.saturating_sub(last) >= HTTP_DIMENSION_WARNING_INTERVAL_MS as i64
-                    && self
-                        .last_warning_at_ms
-                        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    let fallback =
-                        self.fallback_since_warning.swap(0, Ordering::Relaxed) + fallback;
-                    tracing::warn!(
-                        "METRICS: http dimension queue saturated fallback={} queue_capacity={} available_capacity={}",
-                        fallback,
-                        self.queue_capacity,
-                        self.sender.capacity()
-                    );
-                }
-                Err(event)
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.record_drop("saturated");
             }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.record_drop("closed");
+            }
+        }
+    }
+
+    fn record_drop(&self, reason: &str) {
+        HTTP_DIMENSION_DROPPED.fetch_add(1, Ordering::Relaxed);
+        self.dropped_since_warning.fetch_add(1, Ordering::Relaxed);
+        let now = unix_epoch_millis_now();
+        let last = self.last_warning_at_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= HTTP_DIMENSION_WARNING_INTERVAL_MS as i64
+            && self
+                .last_warning_at_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let dropped = self.dropped_since_warning.swap(0, Ordering::Relaxed);
+            tracing::warn!(
+                "METRICS: http dimension queue {} dropped={} total_dropped={} queue_capacity={} available_capacity={}",
+                reason,
+                dropped,
+                HTTP_DIMENSION_DROPPED.load(Ordering::Relaxed),
+                self.queue_capacity,
+                self.sender.capacity()
+            );
         }
     }
 }
@@ -289,8 +297,10 @@ impl WafRuntimeMetrics {
         if matched {
             self.compiled_matches.fetch_add(1, Ordering::Relaxed);
         }
-        self.evaluation_latency_ns
-            .fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.evaluation_latency_ns.fetch_add(
+            elapsed.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     pub fn record_legacy_evaluation(&self, matched: bool, elapsed: Duration) {
@@ -298,8 +308,10 @@ impl WafRuntimeMetrics {
         if matched {
             self.legacy_matches.fetch_add(1, Ordering::Relaxed);
         }
-        self.evaluation_latency_ns
-            .fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        self.evaluation_latency_ns.fetch_add(
+            elapsed.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     pub fn record_legacy_fallback(&self) {
@@ -652,11 +664,9 @@ pub mod record {
         };
 
         if let Some(handle) = HTTP_DIMENSION_HANDLE.get() {
-            if let Err(event) = handle.try_enqueue(event) {
-                record_http_dimension_event(event);
-            }
+            handle.try_enqueue(event);
         } else {
-            record_http_dimension_event(event);
+            HTTP_DIMENSION_DROPPED.fetch_add(1, Ordering::Relaxed);
         }
     }
 
