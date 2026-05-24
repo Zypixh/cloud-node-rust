@@ -181,8 +181,8 @@ fn bench_tls_selector(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let selector = DynamicCertSelector::new();
     let certs = vec![ssl_cert_config()];
-    let policy = ssl_policy();
-    rt.block_on(sync_certs(&selector, &certs, Some(&policy)));
+    let _policy = ssl_policy();
+    rt.block_on(sync_certs(&selector, &certs));
 
     let mut group = c.benchmark_group("tls_selector");
     group.bench_function("lookup_exact", |b| {
@@ -196,7 +196,7 @@ fn bench_tls_selector(c: &mut Criterion) {
     });
     group.bench_function("sync_single_cert_reuse", |b| {
         b.to_async(&rt).iter(|| async {
-            sync_certs(&selector, black_box(&certs), Some(black_box(&policy))).await;
+            sync_certs(&selector, black_box(&certs)).await;
         })
     });
     group.finish();

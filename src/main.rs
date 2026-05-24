@@ -794,8 +794,12 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         quic_udp_demux.start_listeners().await;
     });
 
-    let tcp_manager =
-        tcp_proxy::TcpProxyManager::new((*config_store).clone(), cert_selector.clone());
+    let tcp_manager = tcp_proxy::TcpProxyManager::new(
+        (*config_store).clone(),
+        cert_selector.clone(),
+        waf_state.clone(),
+        api_config_arc.node_id.parse::<i64>().unwrap_or(0),
+    );
     spawn_staggered(&rt, Duration::from_secs(2), async move {
         tcp_manager.start_listeners().await;
     });

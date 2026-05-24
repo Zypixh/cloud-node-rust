@@ -11,7 +11,7 @@ fn bench_metrics_recording(c: &mut Criterion) {
         b.iter(|| {
             record::request_start(
                 black_box(server_id),
-                black_box(client_ip.to_string()),
+                black_box(client_ip),
                 black_box(0),
                 black_box(0),
                 black_box(0),

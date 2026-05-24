@@ -1,7 +1,6 @@
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 use crate::proxy::EdgeProxy;
-use crate::rpc::ip_report::{IpReportKind, IpReportMessage};
 use crate::ssl::DynamicCertSelector;
 use anyhow::Context;
 use dashmap::DashMap;
@@ -34,14 +33,6 @@ struct ListenerHandle {
 struct PassthroughBackendTarget {
     addr: String,
     origin_id: i64,
-}
-
-struct SpecialDefenseConfig {
-    threshold: u32,
-    period_secs: i64,
-    block_secs: i64,
-    use_local_firewall: bool,
-    policy_name: String,
 }
 
 pub struct HttpProxyManager {
@@ -282,13 +273,15 @@ impl HttpProxyManager {
                 let manager = self.clone();
                 let downstream_read_timeout = manager.downstream_read_timeout();
                 tokio::spawn(async move {
-                    manager.record_empty_connection_if_no_payload(
-                        client_stream,
-                        client_addr,
-                        proxy_inner,
-                        shutdown_inner,
-                        downstream_read_timeout,
-                    ).await;
+                    manager
+                        .record_empty_connection_if_no_payload(
+                            client_stream,
+                            client_addr,
+                            proxy_inner,
+                            shutdown_inner,
+                            downstream_read_timeout,
+                        )
+                        .await;
                 });
                 continue;
             }
@@ -307,6 +300,7 @@ impl HttpProxyManager {
 
             tokio::spawn(async move {
                 let mut configured_tls_host = false;
+                let mut count_tls_handshake_failure = true;
 
                 if is_tls {
                     match manager.inspect_tls_host(&client_stream, port).await {
@@ -333,6 +327,7 @@ impl HttpProxyManager {
                         }
                         Ok(None) => {}
                         Err(err) => {
+                            count_tls_handshake_failure = false;
                             debug!(
                                 "Failed to inspect SNI for {} on port {}: {}",
                                 client_addr, port, err
@@ -363,7 +358,9 @@ impl HttpProxyManager {
                                 {
                                     error!("TLS handshake failed: {}", e);
                                 }
-                                manager.record_tls_handshake_failure(client_addr.ip());
+                                if count_tls_handshake_failure {
+                                    manager.record_tls_handshake_failure(client_addr.ip());
+                                }
                                 return;
                             }
                             Err(_) => {
@@ -373,7 +370,9 @@ impl HttpProxyManager {
                                         tls_handshake_timeout
                                     );
                                 }
-                                manager.record_tls_handshake_failure(client_addr.ip());
+                                if count_tls_handshake_failure {
+                                    manager.record_tls_handshake_failure(client_addr.ip());
+                                }
                                 return;
                             }
                         }
@@ -461,7 +460,9 @@ impl HttpProxyManager {
         )
     }
 
-    fn global_empty_connection_flood_config(&self) -> Option<SpecialDefenseConfig> {
+    fn global_empty_connection_flood_config(
+        &self,
+    ) -> Option<crate::special_defense::SpecialDefenseConfig> {
         let policies = self.config_store.get_firewall_policies_sync();
         policies.iter().find_map(|policy| {
             if !policy.is_on {
@@ -471,28 +472,8 @@ impl HttpProxyManager {
             if !config.is_on || config.max_empty_connections == 0 {
                 return None;
             }
-            Some(SpecialDefenseConfig {
+            Some(crate::special_defense::SpecialDefenseConfig {
                 threshold: config.max_empty_connections,
-                period_secs: i64::from(config.period).max(1),
-                block_secs: i64::from(config.block_seconds).max(1),
-                use_local_firewall: policy.use_local_firewall,
-                policy_name: policy.name.clone(),
-            })
-        })
-    }
-
-    fn global_tls_exhaustion_config(&self) -> Option<SpecialDefenseConfig> {
-        let policies = self.config_store.get_firewall_policies_sync();
-        policies.iter().find_map(|policy| {
-            if !policy.is_on {
-                return None;
-            }
-            let config = policy.tls_exhaustion_attack.as_ref()?;
-            if !config.is_on || config.max_handshake_fails == 0 {
-                return None;
-            }
-            Some(SpecialDefenseConfig {
-                threshold: config.max_handshake_fails,
                 period_secs: i64::from(config.period).max(1),
                 block_secs: i64::from(config.block_seconds).max(1),
                 use_local_firewall: policy.use_local_firewall,
@@ -521,7 +502,9 @@ impl HttpProxyManager {
             return;
         };
         let mut first_byte = [0u8; 1];
-        match tokio::time::timeout(Duration::from_secs(2), client_stream.peek(&mut first_byte)).await {
+        match tokio::time::timeout(Duration::from_secs(2), client_stream.peek(&mut first_byte))
+            .await
+        {
             Ok(Ok(0)) => {
                 self.record_special_defense_hit("EMPTY_CONNECTION_FLOOD", client_addr.ip(), config);
             }
@@ -542,13 +525,17 @@ impl HttpProxyManager {
     }
 
     fn record_tls_handshake_failure(&self, ip: IpAddr) {
-        let Some(config) = self.global_tls_exhaustion_config() else {
-            return;
-        };
-        self.record_special_defense_hit(
-            "TLS_EXHAUSTION_ATTACK",
+        let node_id = self
+            .proxy_logic
+            .api_config
+            .node_id
+            .parse::<i64>()
+            .unwrap_or(0);
+        crate::special_defense::record_tls_handshake_failure(
+            &self.config_store,
+            &self.proxy_logic.waf_state,
+            node_id,
             ip,
-            config,
         );
     }
 
@@ -556,53 +543,21 @@ impl HttpProxyManager {
         &self,
         defense: &str,
         ip: IpAddr,
-        config: SpecialDefenseConfig,
+        config: crate::special_defense::SpecialDefenseConfig,
     ) {
-        let count = self.proxy_logic.waf_state.increase_counter(
-            format!("{}:{}", defense, ip),
-            config.period_secs,
+        let node_id = self
+            .proxy_logic
+            .api_config
+            .node_id
+            .parse::<i64>()
+            .unwrap_or(0);
+        crate::special_defense::record_special_defense_hit(
+            &self.proxy_logic.waf_state,
+            node_id,
+            defense,
+            ip,
+            config,
         );
-        if count > u64::from(config.threshold) {
-            self.proxy_logic.waf_state.block_ip(
-                ip,
-                0,
-                config.block_secs,
-                Some("global"),
-                false,
-                config.use_local_firewall,
-            );
-            let node_id = self.proxy_logic.api_config.node_id.parse::<i64>().unwrap_or(0);
-            crate::rpc::ip_report::report_item(IpReportMessage {
-                ip_list_id: 0,
-                value: ip.to_string(),
-                ip_from: String::new(),
-                ip_to: String::new(),
-                expired_at: crate::utils::time::now_timestamp() + config.block_secs.max(1),
-                reason: format!("{} special defense block", defense),
-                r#type: String::new(),
-                list_kind: IpReportKind::Black,
-                event_level: "error".to_string(),
-                node_id,
-                server_id: 0,
-                source_node_id: node_id,
-                source_server_id: 0,
-                source_http_firewall_policy_id: 0,
-                source_http_firewall_rule_group_id: 0,
-                source_http_firewall_rule_set_id: 0,
-                source_url: String::new(),
-                source_user_agent: String::new(),
-                source_category: "special_defense".to_string(),
-            });
-            warn!(
-                "{} blocked {} for {}s after {} hits in {}s by policy {}",
-                defense,
-                ip,
-                config.block_secs,
-                count,
-                config.period_secs,
-                config.policy_name
-            );
-        }
     }
 
     async fn inspect_tls_host(
@@ -737,7 +692,7 @@ impl HttpProxyManager {
         configure_passthrough_socket(&backend_stream);
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
 
-        let result = crate::tcp_proxy::stream_bidirectional_with_metrics(
+        let result = crate::tcp_proxy::stream_tcp_bidirectional_with_metrics(
             server_id,
             client_stream,
             backend_stream,
@@ -909,7 +864,9 @@ async fn process_http1_stream(
         }
         next_session.set_read_timeout(Some(downstream_read_timeout));
 
-        result = proxy_inner.process_new_http(next_session, &shutdown_inner).await;
+        result = proxy_inner
+            .process_new_http(next_session, &shutdown_inner)
+            .await;
     }
 }
 
@@ -991,8 +948,8 @@ fn configure_passthrough_socket(stream: &TcpStream) {
 }
 
 async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Option<String>> {
-    const CLIENT_HELLO_TOTAL_TIMEOUT: Duration = Duration::from_millis(500);
-    const CLIENT_HELLO_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+    const CLIENT_HELLO_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+    const CLIENT_HELLO_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
     const CLIENT_HELLO_READ_WAIT: Duration = Duration::from_millis(25);
     const CLIENT_HELLO_INITIAL_BUF: usize = 2048;
     const CLIENT_HELLO_MAX_BUF: usize = 16 * 1024;
@@ -1158,6 +1115,128 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> ClientHelloParse {
         ext_pos += ext_len;
     }
     ClientHelloParse::NotClientHello
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn tls_record(payload: &[u8]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(5 + payload.len());
+        record.push(22);
+        record.extend_from_slice(&[0x03, 0x03]);
+        record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        record.extend_from_slice(payload);
+        record
+    }
+
+    fn client_hello_body(host: Option<&str>) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[7u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.push(1);
+        body.push(0);
+
+        let mut extensions = Vec::new();
+        if let Some(host) = host {
+            let host = host.as_bytes();
+            let mut sni_ext = Vec::new();
+            sni_ext.extend_from_slice(&((3 + host.len()) as u16).to_be_bytes());
+            sni_ext.push(0);
+            sni_ext.extend_from_slice(&(host.len() as u16).to_be_bytes());
+            sni_ext.extend_from_slice(host);
+            extensions.extend_from_slice(&0u16.to_be_bytes());
+            extensions.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(&sni_ext);
+        }
+
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+        body
+    }
+
+    fn client_hello(host: Option<&str>) -> Vec<u8> {
+        let body = client_hello_body(host);
+        let mut handshake = Vec::with_capacity(4 + body.len());
+        handshake.push(1);
+        handshake.push(((body.len() >> 16) & 0xff) as u8);
+        handshake.push(((body.len() >> 8) & 0xff) as u8);
+        handshake.push((body.len() & 0xff) as u8);
+        handshake.extend_from_slice(&body);
+        tls_record(&handshake)
+    }
+
+    #[test]
+    fn parses_single_record_client_hello_sni_lowercase() {
+        match parse_tls_client_hello_sni(&client_hello(Some("EXAMPLE.COM"))) {
+            ClientHelloParse::Found(host) => assert_eq!(host, "example.com"),
+            _ => panic!("expected SNI"),
+        }
+    }
+
+    #[test]
+    fn parses_fragmented_client_hello_sni() {
+        let body = client_hello_body(Some("split.example.com"));
+        let mut handshake = Vec::new();
+        handshake.push(1);
+        handshake.push(((body.len() >> 16) & 0xff) as u8);
+        handshake.push(((body.len() >> 8) & 0xff) as u8);
+        handshake.push((body.len() & 0xff) as u8);
+        handshake.extend_from_slice(&body);
+
+        let split_at = 12;
+        let mut records = tls_record(&handshake[..split_at]);
+        records.extend_from_slice(&tls_record(&handshake[split_at..]));
+
+        match parse_tls_client_hello_sni(&records) {
+            ClientHelloParse::Found(host) => assert_eq!(host, "split.example.com"),
+            _ => panic!("expected fragmented SNI"),
+        }
+    }
+
+    #[test]
+    fn partial_record_needs_more() {
+        let hello = client_hello(Some("partial.example.com"));
+        assert!(matches!(
+            parse_tls_client_hello_sni(&hello[..hello.len() - 3]),
+            ClientHelloParse::NeedMore
+        ));
+    }
+
+    #[test]
+    fn non_tls_is_not_client_hello() {
+        assert!(matches!(
+            parse_tls_client_hello_sni(b"GET / HTTP/1.1\r\n"),
+            ClientHelloParse::NotClientHello
+        ));
+    }
+
+    #[tokio::test]
+    async fn peek_client_hello_sni_does_not_consume_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hello = client_hello(Some("peek.example.com"));
+        let expected = hello.clone();
+
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&hello).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        let host = peek_client_hello_sni(&server_stream).await.unwrap();
+        assert_eq!(host.as_deref(), Some("peek.example.com"));
+
+        let mut actual = Vec::new();
+        server_stream.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+        client.await.unwrap();
+    }
 }
 
 #[cfg(unix)]
