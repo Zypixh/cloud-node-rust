@@ -3096,32 +3096,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         if server.user_plan_id <= 0 {
             return 0;
         }
-
-        let Some(user_plan) = self.config.get_user_plan_sync(server.user_plan_id) else {
-            return 0;
-        };
-        let Some(plan) = self.config.get_plan_sync(user_plan.plan_id) else {
-            return 0;
-        };
-        if plan.max_upload_size_json.is_empty() {
-            return 0;
-        }
-
-        let value = match serde_json::from_slice::<Value>(&plan.max_upload_size_json) {
-            Ok(value) => value,
-            Err(_) => return 0,
-        };
-
-        if let Some(bytes) = value.as_i64() {
-            return bytes.max(0);
-        }
-        if let Some(bytes) = value.get("bytes").and_then(|v| v.as_i64()) {
-            return bytes.max(0);
-        }
-
-        crate::config_models::SizeCapacity::from_json(&value)
-            .to_bytes()
-            .max(0)
+        self.config
+            .get_plan_derived_sync(server.user_plan_id)
+            .map(|plan| plan.max_upload_bytes)
+            .unwrap_or(0)
     }
 
     async fn enforce_plan_max_upload(
@@ -4190,19 +4168,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         if server.user_plan_id <= 0 {
             return None;
         }
-
-        let user_plan = self.config.get_user_plan_sync(server.user_plan_id)?;
-        let plan = self.config.get_plan_sync(user_plan.plan_id)?;
-        if plan.traffic_limit_json.is_empty() {
-            return None;
-        }
-
-        let config = serde_json::from_slice::<crate::config_models::TrafficLimitConfig>(
-            &plan.traffic_limit_json,
-        )
-        .ok()?;
-
-        (config.is_on && !config.notice_page_body.is_empty()).then_some(config.notice_page_body)
+        self.config
+            .get_plan_derived_sync(server.user_plan_id)
+            .and_then(|plan| plan.traffic_limit_notice_body)
     }
 
     async fn enforce_traffic_limit(
@@ -5452,10 +5420,7 @@ impl ProxyHttp for EdgeProxy {
 
         let user_plan_id = ctx.server.as_ref().map(|s| s.user_plan_id).unwrap_or(0);
         let plan_id = if user_plan_id > 0 {
-            self.config
-                .get_user_plan_sync(user_plan_id)
-                .map(|user_plan| user_plan.plan_id)
-                .unwrap_or(0)
+            self.config.get_user_plan_id_sync(user_plan_id).unwrap_or(0)
         } else {
             0
         };

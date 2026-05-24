@@ -1300,7 +1300,7 @@ fn domain_pattern_matches(pattern: &str, domain: &str) -> bool {
         return true;
     }
     if let Some(regex_pattern) = pattern.strip_prefix('~') {
-        return Regex::new(regex_pattern)
+        return cached_host_redirect_regex(regex_pattern)
             .map(|re| re.is_match(domain))
             .unwrap_or(false);
     }

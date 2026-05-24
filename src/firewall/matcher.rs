@@ -24,18 +24,32 @@ static RE_XSS_STRICT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(<xml|<audio|<video|<svg|<iframe|<img|<link|<style|<form)").unwrap()
 });
 
-fn contains_sqli(value: &str, strict: bool) -> bool {
+pub(crate) fn contains_sqli(value: &str, strict: bool) -> bool {
     if libinjectionrs::detect_sqli(value.as_bytes()).is_injection() {
         return true;
     }
     RE_SQLI.is_match(value) || (strict && RE_SQLI_STRICT.is_match(value))
 }
 
-fn contains_xss(value: &str, strict: bool) -> bool {
+pub(crate) fn contains_xss(value: &str, strict: bool) -> bool {
     if libinjectionrs::detect_xss(value.as_bytes()).is_injection() {
         return true;
     }
     RE_XSS.is_match(value) || (strict && RE_XSS_STRICT.is_match(value))
+}
+
+pub(crate) fn contains_cmd(value: &str) -> bool {
+    const CMD_KEYWORDS: &[&str] = &[
+        "/bin/sh",
+        "/bin/bash",
+        "cmd.exe",
+        "powershell",
+        "curl ",
+        "wget ",
+    ];
+    CMD_KEYWORDS
+        .iter()
+        .any(|keyword| contains_ascii_case_insensitive(value, keyword))
 }
 
 pub fn evaluate_operator(
@@ -202,19 +216,7 @@ pub fn evaluate_operator(
             }
             None => compare_versions(&actual, &expected).is_some_and(|o| o.is_gt() || o.is_eq()),
         },
-        "contains cmd injection" | "contains cmd injection strictly" => {
-            const CMD_KEYWORDS: &[&str] = &[
-                "/bin/sh",
-                "/bin/bash",
-                "cmd.exe",
-                "powershell",
-                "curl ",
-                "wget ",
-            ];
-            CMD_KEYWORDS
-                .iter()
-                .any(|keyword| contains_ascii_case_insensitive(&actual, keyword))
-        }
+        "contains cmd injection" | "contains cmd injection strictly" => contains_cmd(&actual),
         "is bot" | "common bot" => is_common_bot(&actual),
         "common ai bot" => is_ai_bot(&actual),
         "ip mod" => {

@@ -8,7 +8,7 @@ use std::mem;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Duration, timeout};
 use tracing::debug;
 
@@ -184,28 +184,24 @@ pub fn is_verified_search_engine_ip(ip: IpAddr, user_agent: &str) -> bool {
 }
 
 pub fn start_client_agent_queue(api_config: Arc<ApiConfig>) {
-    let (tx, rx) = mpsc::channel(CLIENT_AGENT_QUEUE_CAPACITY);
+    let (tx, mut rx) = mpsc::channel(CLIENT_AGENT_QUEUE_CAPACITY);
     if CLIENT_AGENT_QUEUE.set(tx).is_err() {
         return;
     }
 
-    let rx = Arc::new(Mutex::new(rx));
-    for _ in 0..CLIENT_AGENT_WORKERS {
-        let rx = Arc::clone(&rx);
-        let api_config = Arc::clone(&api_config);
-        tokio::spawn(async move {
-            loop {
-                let candidate = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-                let Some(candidate) = candidate else {
-                    return;
-                };
+    let worker_semaphore = Arc::new(Semaphore::new(CLIENT_AGENT_WORKERS));
+    tokio::spawn(async move {
+        while let Some(candidate) = rx.recv().await {
+            let Ok(permit) = Arc::clone(&worker_semaphore).acquire_owned().await else {
+                return;
+            };
+            let api_config = Arc::clone(&api_config);
+            tokio::spawn(async move {
+                let _permit = permit;
                 process_client_agent_candidate(&api_config, candidate).await;
-            }
-        });
-    }
+            });
+        }
+    });
 }
 
 async fn process_client_agent_candidate(

@@ -1,6 +1,6 @@
 use crate::config_models::{
-    CORSConfig, HTTPHeaderConfig, HTTPHeaderPolicy, HTTPHeaderReplaceConfig, HTTPHeaderReplaceValue,
-    HTTPStatusConfig,
+    CORSConfig, HTTPHeaderConfig, HTTPHeaderPolicy, HTTPHeaderReplaceConfig,
+    HTTPHeaderReplaceValue, HTTPStatusConfig,
 };
 use crate::utils::template::format_template;
 use dashmap::DashMap;
@@ -9,6 +9,7 @@ use http::header::HeaderName;
 use once_cell::sync::Lazy;
 use pingora_proxy::Session;
 use regex::Regex;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -174,13 +175,10 @@ impl CompiledHeaderPolicy {
         let needs_request_uri = set_headers
             .iter()
             .chain(add_headers.iter())
-            .any(|header| {
-                header.is_on && header.value_template.contains_vars(&["requestURI"])
-            });
-        let needs_port = set_headers
-            .iter()
-            .chain(add_headers.iter())
-            .any(|header| header.is_on && header.value_template.contains_vars(&["port", "serverPort"]));
+            .any(|header| header.is_on && header.value_template.contains_vars(&["requestURI"]));
+        let needs_port = set_headers.iter().chain(add_headers.iter()).any(|header| {
+            header.is_on && header.value_template.contains_vars(&["port", "serverPort"])
+        });
         Self {
             raw: Arc::new(policy.clone()),
             delete_headers,
@@ -243,7 +241,7 @@ struct CompiledHeaderConfig {
     should_replace: bool,
     replace_values: Vec<CompiledHeaderReplaceValue>,
     methods: Vec<String>,
-    domains: Vec<String>,
+    domains: CompiledDomainMatcher,
 }
 
 impl CompiledHeaderConfig {
@@ -262,11 +260,11 @@ impl CompiledHeaderConfig {
                 .map(CompiledHeaderReplaceValue::compile)
                 .collect(),
             methods: header.methods.clone(),
-            domains: header.domains.clone(),
+            domains: CompiledDomainMatcher::compile(&header.domains),
         }
     }
 
-    fn condition_matches(&self, status: u16, method: &str, host: &str) -> bool {
+    fn condition_matches(&self, status: u16, method: &str, normalized_host: Option<&str>) -> bool {
         if !self.is_on {
             return false;
         }
@@ -284,10 +282,65 @@ impl CompiledHeaderConfig {
         {
             return false;
         }
-        if !self.domains.is_empty() && !domain_matches(&self.domains, host) {
+        if !self.domains.matches(normalized_host) {
             return false;
         }
         true
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompiledDomainMatcher {
+    configured: bool,
+    match_all: bool,
+    exact: HashSet<String>,
+    suffixes: Vec<String>,
+    wildcards: Vec<Arc<Regex>>,
+}
+
+impl CompiledDomainMatcher {
+    fn compile(patterns: &[String]) -> Self {
+        let mut matcher = Self {
+            configured: !patterns.is_empty(),
+            ..Self::default()
+        };
+        for pattern in patterns {
+            let pattern = normalize_domain_pattern(pattern);
+            if pattern == "*" {
+                matcher.match_all = true;
+                continue;
+            }
+            if let Some(suffix) = pattern.strip_prefix("*.") {
+                matcher.exact.insert(suffix.to_string());
+                matcher.suffixes.push(format!(".{suffix}"));
+                continue;
+            }
+            if let Some(suffix) = pattern.strip_prefix('.') {
+                matcher.suffixes.push(format!(".{suffix}"));
+                continue;
+            }
+            if pattern.contains('*') {
+                let regex = format!("^{}$", regex::escape(&pattern).replace("\\*", "[^.]*"));
+                if let Some(regex) = cached_header_regex(&regex) {
+                    matcher.wildcards.push(regex);
+                }
+                continue;
+            }
+            matcher.exact.insert(pattern);
+        }
+        matcher
+    }
+
+    fn matches(&self, normalized_domain: Option<&str>) -> bool {
+        if !self.configured || self.match_all {
+            return true;
+        }
+        let Some(domain) = normalized_domain else {
+            return false;
+        };
+        self.exact.contains(domain)
+            || self.suffixes.iter().any(|suffix| domain.ends_with(suffix))
+            || self.wildcards.iter().any(|regex| regex.is_match(domain))
     }
 }
 
@@ -356,7 +409,11 @@ impl CompiledHeaderReplaceValue {
         }
         self.regex
             .as_ref()
-            .map(|regex| regex.replace_all(&value, self.replacement.as_str()).into_owned())
+            .map(|regex| {
+                regex
+                    .replace_all(&value, self.replacement.as_str())
+                    .into_owned()
+            })
             .unwrap_or(value)
     }
 }
@@ -398,11 +455,15 @@ impl CompiledHeaderTemplate {
         let mut rest = template;
         while let Some(start) = rest.find("${") {
             if start > 0 {
-                parts.push(CompiledHeaderTemplatePart::Literal(rest[..start].to_string()));
+                parts.push(CompiledHeaderTemplatePart::Literal(
+                    rest[..start].to_string(),
+                ));
             }
             let after_start = &rest[start + 2..];
             let Some(end) = after_start.find('}') else {
-                parts.push(CompiledHeaderTemplatePart::Literal(rest[start..].to_string()));
+                parts.push(CompiledHeaderTemplatePart::Literal(
+                    rest[start..].to_string(),
+                ));
                 rest = "";
                 break;
             };
@@ -692,27 +753,18 @@ pub fn apply_request_header_policy_to_upstream(
     }
 }
 
+fn normalize_domain_pattern(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn normalize_domain_value(domain: &str) -> String {
+    domain.trim_end_matches('.').to_ascii_lowercase()
+}
+
 fn domain_matches(patterns: &[String], domain: &str) -> bool {
-    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-    patterns.iter().any(|pattern| {
-        let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
-        if pattern == domain || pattern == "*" {
-            return true;
-        }
-        if let Some(suffix) = pattern.strip_prefix('.') {
-            return domain.ends_with(&format!(".{}", suffix));
-        }
-        if let Some(suffix) = pattern.strip_prefix("*.") {
-            return domain == suffix || domain.ends_with(&format!(".{}", suffix));
-        }
-        if pattern.contains('*') {
-            let regex = format!("^{}$", regex::escape(&pattern).replace("\\*", "[^.]*"));
-            return cached_header_regex(&regex)
-                .map(|re| re.is_match(&domain))
-                .unwrap_or(false);
-        }
-        false
-    })
+    let domain = normalize_domain_value(domain);
+    let matcher = CompiledDomainMatcher::compile(patterns);
+    matcher.matches(Some(&domain))
 }
 
 fn header_condition_matches(
@@ -781,6 +833,9 @@ pub fn apply_compiled_response_header_policy(
     method: &str,
     host: &str,
 ) {
+    let normalized_host = normalize_domain_value(host);
+    let normalized_host = (!normalized_host.is_empty()).then_some(normalized_host);
+    let normalized_host = normalized_host.as_deref();
     for name in &policy.delete_headers {
         if let Some(header_name) = &name.parsed {
             headers.remove_header(header_name);
@@ -790,7 +845,9 @@ pub fn apply_compiled_response_header_policy(
     }
 
     for header in &policy.set_headers {
-        if !header.condition_matches(status, method, host) || policy.deletes_header(&header.name.raw) {
+        if !header.condition_matches(status, method, normalized_host)
+            || policy.deletes_header(&header.name.raw)
+        {
             continue;
         }
         let mut value = header.value_template.render(vars);
@@ -820,7 +877,7 @@ pub fn apply_compiled_response_header_policy(
     }
 
     for header in &policy.add_headers {
-        if !header.condition_matches(status, method, host)
+        if !header.condition_matches(status, method, normalized_host)
             || headers.headers.get(header.name.raw.as_str()).is_some()
         {
             continue;
@@ -980,5 +1037,65 @@ pub fn apply_response_header_policy_to_map(
             let replaced = current.replace(rh.old_value.as_str(), rh.new_value.as_str());
             headers.insert(key, replaced);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn patterns(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn domain_matcher_preserves_empty_pattern_semantics() {
+        let unrestricted = CompiledDomainMatcher::compile(&[]);
+        assert!(unrestricted.matches(Some("example.com")));
+
+        for domains in [patterns(&[""]), patterns(&["   "]), patterns(&["."]), patterns(&["..."])] {
+            let matcher = CompiledDomainMatcher::compile(&domains);
+            assert!(!matcher.matches(Some("example.com")));
+            assert!(matcher.matches(Some("")));
+        }
+    }
+
+    #[test]
+    fn domain_matcher_preserves_host_whitespace_semantics() {
+        let matcher = CompiledDomainMatcher::compile(&patterns(&["example.com"]));
+        assert!(matcher.matches(Some(&normalize_domain_value("example.com."))));
+        assert!(!matcher.matches(Some(&normalize_domain_value(" example.com "))));
+    }
+
+    #[test]
+    fn domain_matcher_matches_exact_wildcard_suffix_and_regex_patterns() {
+        let exact = CompiledDomainMatcher::compile(&patterns(&["Example.COM."]));
+        assert!(exact.matches(Some(&normalize_domain_value("example.com"))));
+
+        let any = CompiledDomainMatcher::compile(&patterns(&["*"]));
+        assert!(any.matches(Some("example.com")));
+        assert!(any.matches(Some("")));
+
+        let wildcard_suffix = CompiledDomainMatcher::compile(&patterns(&["*.example.com"]));
+        assert!(wildcard_suffix.matches(Some("example.com")));
+        assert!(wildcard_suffix.matches(Some("www.example.com")));
+        assert!(!wildcard_suffix.matches(Some("badexample.com")));
+
+        let leading_dot = CompiledDomainMatcher::compile(&patterns(&[".example.com"]));
+        assert!(!leading_dot.matches(Some("example.com")));
+        assert!(leading_dot.matches(Some("www.example.com")));
+
+        let mid_wildcard = CompiledDomainMatcher::compile(&patterns(&["api-*.example.com"]));
+        assert!(mid_wildcard.matches(Some("api-v1.example.com")));
+        assert!(!mid_wildcard.matches(Some("api-v1.foo.example.com")));
+    }
+
+    #[test]
+    fn fallback_domain_matches_uses_same_compiled_semantics() {
+        assert!(domain_matches(&patterns(&[]), "example.com"));
+        assert!(!domain_matches(&patterns(&[""]), "example.com"));
+        assert!(domain_matches(&patterns(&["*.example.com"]), "example.com"));
+        assert!(domain_matches(&patterns(&["*.example.com"]), "www.example.com"));
+        assert!(!domain_matches(&patterns(&["example.com"]), " example.com "));
     }
 }

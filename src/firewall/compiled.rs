@@ -1994,32 +1994,13 @@ impl CompiledOperator {
             Self::NotContainsBinary(needle) => !contains_bytes(actual.as_bytes(), needle),
             Self::HasKey(key) => key.evaluate(actual),
             Self::Version { op, expected } => op.evaluate(actual, expected),
-            Self::ContainsSqli { strict, expected } => crate::firewall::matcher::evaluate_operator(
-                actual,
-                if *strict {
-                    "contains sql injection strictly"
-                } else {
-                    "contains sql injection"
-                },
-                expected,
-                false,
-            ),
-            Self::ContainsXss { strict, expected } => crate::firewall::matcher::evaluate_operator(
-                actual,
-                if *strict {
-                    "contains xss strictly"
-                } else {
-                    "contains xss"
-                },
-                expected,
-                false,
-            ),
-            Self::ContainsCmd { expected } => crate::firewall::matcher::evaluate_operator(
-                actual,
-                "contains cmd injection",
-                expected,
-                false,
-            ),
+            Self::ContainsSqli { strict, .. } => {
+                crate::firewall::matcher::contains_sqli(actual, *strict)
+            }
+            Self::ContainsXss { strict, .. } => {
+                crate::firewall::matcher::contains_xss(actual, *strict)
+            }
+            Self::ContainsCmd { .. } => crate::firewall::matcher::contains_cmd(actual),
             Self::CommonBot { expected } => {
                 crate::firewall::matcher::evaluate_operator(actual, "common bot", expected, false)
             }

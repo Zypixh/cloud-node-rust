@@ -8,8 +8,15 @@ use tokio::sync::Notify;
 use crate::config_models::{
     HTTP3Policy, HTTPCCPolicy, HTTPCachePolicy, HTTPFirewallPolicy, HTTPPageConfig,
     HTTPPagesPolicy, MetricItemConfig, ParentNodeConfig, SSLCertConfig, SSLPolicyConfig,
-    ServerConfig, TOAConfig, UAMPolicy, WAFBlockOptions, WebPImagePolicy,
+    ServerConfig, SizeCapacity, TOAConfig, TrafficLimitConfig, UAMPolicy, WAFBlockOptions,
+    WebPImagePolicy,
 };
+
+#[derive(Clone, Default)]
+pub struct PlanDerivedConfig {
+    pub max_upload_bytes: i64,
+    pub traffic_limit_notice_body: Option<String>,
+}
 
 /// Configuration for the local EdgeNode.
 #[derive(Clone)]
@@ -108,6 +115,7 @@ pub struct NodeConfig {
     pub plans: HashMap<i64, crate::pb::Plan>,
     /// Cached user plans referenced by current runtime servers
     pub user_plans: HashMap<i64, crate::pb::UserPlan>,
+    pub plan_derived: HashMap<i64, PlanDerivedConfig>,
     /// Whether any SNI passthrough server is configured (fast check for TLS path)
     pub has_any_sni_passthrough: bool,
     pub sni_passthrough_exact: HashMap<(u16, String), Arc<ServerConfig>>,
@@ -124,6 +132,38 @@ pub struct TlsRouteInspection {
     pub host: String,
     pub has_l7_server: bool,
     pub sni_passthrough_server: Option<Arc<ServerConfig>>,
+}
+
+fn compile_plan_derived(plan: &crate::pb::Plan) -> PlanDerivedConfig {
+    PlanDerivedConfig {
+        max_upload_bytes: compile_plan_max_upload_bytes(plan),
+        traffic_limit_notice_body: compile_plan_traffic_limit_notice_body(plan),
+    }
+}
+
+fn compile_plan_max_upload_bytes(plan: &crate::pb::Plan) -> i64 {
+    if plan.max_upload_size_json.is_empty() {
+        return 0;
+    }
+    let value = match serde_json::from_slice::<serde_json::Value>(&plan.max_upload_size_json) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    if let Some(bytes) = value.as_i64() {
+        return bytes.max(0);
+    }
+    if let Some(bytes) = value.get("bytes").and_then(|v| v.as_i64()) {
+        return bytes.max(0);
+    }
+    SizeCapacity::from_json(&value).to_bytes().max(0)
+}
+
+fn compile_plan_traffic_limit_notice_body(plan: &crate::pb::Plan) -> Option<String> {
+    if plan.traffic_limit_json.is_empty() {
+        return None;
+    }
+    let config = serde_json::from_slice::<TrafficLimitConfig>(&plan.traffic_limit_json).ok()?;
+    (config.is_on && !config.notice_page_body.is_empty()).then_some(config.notice_page_body)
 }
 
 impl Default for NodeConfig {
@@ -184,6 +224,7 @@ impl Default for NodeConfig {
             global_access_log: None,
             plans: HashMap::new(),
             user_plans: HashMap::new(),
+            plan_derived: HashMap::new(),
             has_any_sni_passthrough: false,
             sni_passthrough_exact: HashMap::new(),
             sni_passthrough_wildcard: HashMap::new(),
@@ -825,6 +866,18 @@ impl ConfigStore {
         lock.user_plans.get(&user_plan_id).cloned()
     }
 
+    pub fn get_user_plan_id_sync(&self, user_plan_id: i64) -> Option<i64> {
+        let lock = self.inner.read();
+        lock.user_plans
+            .get(&user_plan_id)
+            .map(|user_plan| user_plan.plan_id)
+    }
+
+    pub fn get_plan_derived_sync(&self, user_plan_id: i64) -> Option<PlanDerivedConfig> {
+        let lock = self.inner.read();
+        lock.plan_derived.get(&user_plan_id).cloned()
+    }
+
     pub fn update_parent_pressure(&self, addr: &str, pressure: f32) {
         self.parent_pressure
             .insert(addr.to_string(), (pressure, std::time::Instant::now()));
@@ -1348,6 +1401,17 @@ impl ConfigStore {
         self.notify_runtime_reload();
     }
 
+    fn refresh_plan_derived(lock: &mut NodeConfig) {
+        lock.plan_derived = lock
+            .user_plans
+            .iter()
+            .filter_map(|(&user_plan_id, user_plan)| {
+                let plan = lock.plans.get(&user_plan.plan_id)?;
+                Some((user_plan_id, compile_plan_derived(plan)))
+            })
+            .collect();
+    }
+
     fn refresh_passthrough_indexes(lock: &mut NodeConfig) {
         lock.sni_passthrough_exact.clear();
         lock.sni_passthrough_wildcard.clear();
@@ -1504,11 +1568,13 @@ impl ConfigStore {
     pub async fn set_plans(&self, plans: HashMap<i64, crate::pb::Plan>) {
         let mut lock = self.inner.write();
         lock.plans = plans;
+        Self::refresh_plan_derived(&mut lock);
     }
 
     pub async fn set_user_plans(&self, user_plans: HashMap<i64, crate::pb::UserPlan>) {
         let mut lock = self.inner.write();
         lock.user_plans = user_plans;
+        Self::refresh_plan_derived(&mut lock);
     }
 
     pub async fn update_node_level_info(
