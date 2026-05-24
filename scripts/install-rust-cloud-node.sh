@@ -53,7 +53,7 @@ Options:
   --repo OWNER/REPO       GitHub repo. Default: Zypixh/cloud-node-rust
   --version VERSION      Release tag, for example v1.0.7. Default: latest
   --service NAME         systemd service name. Default: cloud-node
-  --install-dir DIR      Runtime working directory. Default: existing service WorkingDirectory or /opt/cloud-node-rust
+  --install-dir DIR      Runtime working directory. Default: existing runtime dir, or /opt/cloud-node-rust
   --install-binary PATH  Installed Rust binary path. Default: INSTALL_DIR/cloud-node-rust
   --backup-root DIR      Backup root. Default: /var/backups/cloud-node-rust-migration
   --lang zh|en           Interface language. Default: ask interactively.
@@ -604,6 +604,65 @@ sanitize_path() {
     printf '%s' "$1" | sed 's#/#_#g; s#^_##'
 }
 
+script_cd_workdir() {
+    local path="$1"
+    local line=""
+    local dir=""
+    [ -r "$path" ] || return 0
+    line="$(sed -n 's/^[[:space:]]*cd[[:space:]]\{1,\}\(.*\)$/\1/p' "$path" 2>/dev/null | head -n 1)"
+    [ -n "$line" ] || return 0
+    line="${line%%&&*}"
+    line="${line%%;*}"
+    line="$(trim_spaces "$line")"
+    line="${line%\"}"
+    line="${line#\"}"
+    line="${line%\'}"
+    line="${line#\'}"
+    [ -d "$line" ] || return 0
+    dir="$(cd "$line" 2>/dev/null && pwd -P)" || return 0
+    printf '%s\n' "$dir"
+}
+
+existing_binary_workdir() {
+    local path="$1"
+    local dir=""
+    [ -n "$path" ] || return 0
+
+    dir="$(script_cd_workdir "$path")"
+    if [ -n "$dir" ]; then
+        printf '%s\n' "$dir"
+        return
+    fi
+
+    case "$path" in
+        /usr/bin/cloud-node|/usr/local/bin/cloud-node|/usr/sbin/cloud-node)
+            return 0
+            ;;
+    esac
+
+    if [ -f "$path" ]; then
+        dir="$(dirname "$path")"
+        if [ -d "$dir" ]; then
+            (cd "$dir" 2>/dev/null && pwd -P) || true
+        fi
+    fi
+}
+
+first_existing_runtime_dir() {
+    local dir=""
+    for dir in "$@"; do
+        [ -n "$dir" ] || continue
+        [ "$dir" != "/" ] || continue
+        if [ -e "$dir/configs/api_node.yaml" ] \
+            || [ -e "$dir/api_node.yaml" ] \
+            || [ -e "$dir/cloud-node-rust" ] \
+            || [ -e "$dir/cloud-node" ]; then
+            printf '%s\n' "$dir"
+            return
+        fi
+    done
+}
+
 glibc_is_older_than_228() {
     local version=""
     local major=""
@@ -735,26 +794,67 @@ collect_fresh_api_config() {
 }
 
 migrate_runtime_layout() {
-    local legacy_config="$INSTALL_DIR/api_node.yaml"
     local config_path="$INSTALL_DIR/configs/api_node.yaml"
+    local config_candidate=""
+    local source_dir=""
     local legacy_data_dir="$INSTALL_DIR/../data"
+    local config_candidates=()
+    local data_dirs=()
+
+    add_config_candidates() {
+        local dir="$1"
+        [ -n "$dir" ] || return 0
+        config_candidates+=("$dir/configs/api_node.yaml" "$dir/api_node.yaml")
+    }
+
+    add_data_dir() {
+        local dir="$1"
+        [ -n "$dir" ] || return 0
+        data_dirs+=("$dir")
+    }
 
     run mkdir -p "$INSTALL_DIR/configs" "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
 
-    if [ -e "$legacy_config" ] && [ ! -e "$config_path" ]; then
-        run cp -a "$legacy_config" "$config_path"
-        run cp -a "$legacy_config" "$BACKUP_DIR/api_node.yaml.legacy-original"
+    add_config_candidates "$INSTALL_DIR"
+    add_config_candidates "$EXISTING_RUNTIME_DIR"
+    add_config_candidates "$EXISTING_BINARY_WORKDIR"
+    add_config_candidates /root/cloud-node
+    add_config_candidates /opt/cloud-node
+    add_config_candidates /opt/cloud-node-rust
+
+    if [ ! -e "$config_path" ]; then
+        for config_candidate in "${config_candidates[@]}"; do
+            if [ -e "$config_candidate" ]; then
+                run cp -a "$config_candidate" "$config_path"
+                run cp -a "$config_candidate" "$BACKUP_DIR/api_node.yaml.migrated-original"
+                break
+            fi
+        done
     fi
 
-    if [ -e "$legacy_data_dir/state.json" ] && [ ! -e "$INSTALL_DIR/data/state.json" ]; then
-        run cp -a "$legacy_data_dir/state.json" "$INSTALL_DIR/data/state.json"
+    add_data_dir "$INSTALL_DIR/data"
+    if [ -n "$EXISTING_RUNTIME_DIR" ]; then
+        add_data_dir "$EXISTING_RUNTIME_DIR/data"
     fi
-    if [ -e "$legacy_data_dir/blocked_ips.json" ] && [ ! -e "$INSTALL_DIR/data/blocked_ips.json" ]; then
-        run cp -a "$legacy_data_dir/blocked_ips.json" "$INSTALL_DIR/data/blocked_ips.json"
+    if [ -n "$EXISTING_BINARY_WORKDIR" ]; then
+        add_data_dir "$EXISTING_BINARY_WORKDIR/data"
     fi
-    if [ -d "$legacy_data_dir/metrics.db" ] && [ ! -e "$INSTALL_DIR/data/metrics.db" ]; then
-        run cp -a "$legacy_data_dir/metrics.db" "$INSTALL_DIR/data/metrics.db"
-    fi
+    add_data_dir "$legacy_data_dir"
+    add_data_dir /root/cloud-node/data
+    add_data_dir /opt/cloud-node/data
+    add_data_dir /opt/cloud-node-rust/data
+
+    for source_dir in "${data_dirs[@]}"; do
+        if [ -e "$source_dir/state.json" ] && [ ! -e "$INSTALL_DIR/data/state.json" ]; then
+            run cp -a "$source_dir/state.json" "$INSTALL_DIR/data/state.json"
+        fi
+        if [ -e "$source_dir/blocked_ips.json" ] && [ ! -e "$INSTALL_DIR/data/blocked_ips.json" ]; then
+            run cp -a "$source_dir/blocked_ips.json" "$INSTALL_DIR/data/blocked_ips.json"
+        fi
+        if [ -e "$source_dir/metrics.db" ] && [ ! -e "$INSTALL_DIR/data/metrics.db" ]; then
+            run cp -a "$source_dir/metrics.db" "$INSTALL_DIR/data/metrics.db"
+        fi
+    done
 }
 
 write_api_node_config() {
@@ -1009,14 +1109,22 @@ fi
 
 EXISTING_BINARY="$(find_existing_cloud_node || true)"
 SERVICE_WORKDIR="$(systemd_value WorkingDirectory || true)"
+EXISTING_BINARY_WORKDIR="$(existing_binary_workdir "$EXISTING_BINARY" || true)"
+EXISTING_RUNTIME_DIR="$(first_existing_runtime_dir \
+    "$SERVICE_WORKDIR" \
+    "$EXISTING_BINARY_WORKDIR" \
+    /root/cloud-node \
+    /opt/cloud-node \
+    /opt/cloud-node-rust \
+    || true)"
 if [ "$MODE" = "fresh" ]; then
     ALLOW_FRESH=1
 fi
 if [ -z "$INSTALL_DIR" ]; then
     if [ "$MODE" = "fresh" ]; then
         INSTALL_DIR="/root/cloud-node"
-    elif [ -n "$SERVICE_WORKDIR" ] && [ "$SERVICE_WORKDIR" != "/" ]; then
-        INSTALL_DIR="$SERVICE_WORKDIR"
+    elif [ -n "$EXISTING_RUNTIME_DIR" ]; then
+        INSTALL_DIR="$EXISTING_RUNTIME_DIR"
     else
         INSTALL_DIR="/opt/cloud-node-rust"
     fi

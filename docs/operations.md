@@ -66,12 +66,12 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 - 将找到的旧二进制、`/usr/bin/cloud-node` 和 systemd unit 备份到 `/var/backups/cloud-node-rust-migration/<timestamp>/`。
 - 从 Go 原版迁移时备份文件带有 `go-original` 标识；升级已有 Rust 版时备份文件带有 `rust-current` 标识。
 - 根据系统架构选择 GitHub 最新 Rust Release 包；`--upgrade` 默认解析并下载当前最新 Release。
-- 将 Rust 二进制原子替换到现有 service `WorkingDirectory`，没有旧 service 时默认安装到 `/opt/cloud-node-rust/cloud-node-rust`。
+- 将 Rust 二进制原子替换到现有运行目录；目录识别优先使用 service `WorkingDirectory`、`/usr/bin/cloud-node` wrapper 中的 `cd` 目录、旧二进制所在目录和常见旧目录，只有没有可识别旧目录时才默认安装到 `/opt/cloud-node-rust/cloud-node-rust`。
 - 执行 Rust 二进制内置的 `install` 命令，重新注册 `/usr/bin/cloud-node` wrapper 和 `cloud-node.service`。
 - 交互询问是否从 `https://github.com/P3TERX/GeoLite.mmdb` 下载 `GeoLite2-City.mmdb`、`GeoLite2-ASN.mmdb` 和 `GeoLite2-Country.mmdb`。
 - 安装/升级完成后交互询问是否立即重启或启动服务；自动化 `--yes` 场景保持原有 preserve 行为，迁移前服务运行则自动重启。
 
-显式 `--install` / `--upgrade` 要求找到现有 `cloud-node`，避免在未备份原版的情况下误装；其中 `--upgrade` 等价于升级现有节点到最新 Rust Release。全新安装使用 `--fresh`，会自动允许没有旧节点的环境。
+显式 `--install` / `--upgrade` 要求找到现有 `cloud-node`，避免在未备份原版的情况下误装；其中 `--upgrade` 等价于升级现有节点到最新 Rust Release。升级时会保留既有运行目录名称，例如 `/root/cloud-node` 不会被改成 `/opt/cloud-node-rust`，并会从旧运行目录迁移 `configs/api_node.yaml`、旧版根目录 `api_node.yaml` 和运行状态数据。全新安装使用 `--fresh`，会自动允许没有旧节点的环境。
 
 全新安装会默认创建 `/root/cloud-node`，并交互输入 API 连接配置，生成 `/root/cloud-node/configs/api_node.yaml`。
 
