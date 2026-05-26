@@ -186,7 +186,7 @@ fn cloud_slider_html(ctx: &UamIssueCtx) -> String {
     let ret_js = serde_json::to_string(ctx.return_path).unwrap_or_else(|_| "\"/\"".to_string());
     let route_js = serde_json::to_string(ctx.verify_route).unwrap_or_else(|_| "\"/\"".to_string());
     let prefix_js =
-        serde_json::to_string(&"0".repeat(ctx.pow_difficulty.clamp(1, 8) as usize))
+        serde_json::to_string(&"0".repeat(ctx.pow_difficulty.clamp(5, 8) as usize))
             .unwrap_or_else(|_| "\"0000\"".to_string());
     let target = ctx.slider_target.min(260);
     let body = format!(

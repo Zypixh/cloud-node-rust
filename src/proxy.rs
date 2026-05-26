@@ -4622,9 +4622,13 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "slider".to_string());
 
+        // PoW is only required for jscookie/pow challenge types; slider/click/captcha
+        // embed their own verification params (x/y, click_seq, captcha_hash) and skip PoW.
+        let pow_required = matches!(challenge_type.as_str(), "jscookie" | "pow" | "");
+        let pow_ok = !pow_required || (!pow.is_empty() && self.waf_verifier.verify_pow(&token, &pow, 4));
+
         let verified = token_remaining.is_some()
-            && !pow.is_empty()
-            && self.waf_verifier.verify_pow(&token, &pow, 4)
+            && pow_ok
             && match challenge_type.as_str() {
                 "click" => {
                     let sequence_str = Self::query_param(session, "__waf_click_seq").unwrap_or_default();
