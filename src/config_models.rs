@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -31,6 +32,18 @@ where
         Value::Number(n) => Ok(n.as_i64().unwrap_or(0) as i32),
         Value::String(s) => Ok(s.parse::<i32>().unwrap_or(0)),
         _ => Ok(0),
+    }
+}
+
+fn deserialize_flexible_u8_opt<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = Value::deserialize(deserializer)?;
+    match v {
+        Value::Number(n) => Ok(n.as_u64().and_then(|v| u8::try_from(v).ok())),
+        Value::String(s) => Ok(s.trim().parse::<u8>().ok()),
+        _ => Ok(None),
     }
 }
 
@@ -267,11 +280,7 @@ pub struct TOAConfig {
     pub max_port: Option<u16>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct UAMPolicy {
-    #[serde(rename = "isOn", default)]
-    pub is_on: bool,
-}
+pub type UAMPolicy = UAMConfig;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct HTTP3Policy {
@@ -496,6 +505,10 @@ pub struct GlobalHTTPAccessLogConfig {
     pub enable_cookies: bool,
     #[serde(rename = "enableServerNotFound", default = "default_true")]
     pub enable_server_not_found: bool,
+    #[serde(rename = "firewallOnly", default)]
+    pub firewall_only: bool,
+    #[serde(rename = "enableClientClosed", default)]
+    pub enable_client_closed: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -631,6 +644,8 @@ pub struct NodeConfigPayload {
     pub node_region: Option<NodeRegionConfig>,
     #[serde(rename = "nodeCluster", alias = "NodeCluster", default)]
     pub node_cluster: Option<NodeClusterConfig>,
+    #[serde(rename = "kernelFirewallMode", default)]
+    pub kernel_firewall_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -772,10 +787,42 @@ pub struct ServerConfig {
         deserialize_with = "deserialize_flexible_i64"
     )]
     pub user_plan_id: i64,
+    /// When enabled, the listener will attempt to parse an inbound PROXY
+    /// Protocol v1/v2 header and use the reported source address as the true
+    /// client IP.  Corresponds to the management-plane field
+    /// `enableProxyProtocol`.
+    #[serde(
+        rename = "enableProxyProtocol",
+        alias = "enable_proxy_protocol",
+        default,
+        deserialize_with = "deserialize_flexible_bool"
+    )]
+    pub enable_proxy_protocol: bool,
+    #[serde(default, rename = "locations")]
+    pub locations: Vec<LocationConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LocationConfig {
+    #[serde(default, rename = "isOn")]
+    pub is_on: bool,
+    #[serde(default)]
+    pub pattern: String,
+    #[serde(default, rename = "patternType")]
+    pub pattern_type: String,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default, rename = "reverseProxy")]
+    pub reverse_proxy: Option<ReverseProxyConfig>,
+    #[serde(default)]
+    pub cache: Option<WebCacheConfig>,
 }
 
 impl ServerConfig {
     pub fn compile_url_patterns(&self) {
+        if let Some(uam) = &self.uam {
+            uam.compile_url_patterns();
+        }
         if let Some(web) = &self.web {
             web.compile_url_patterns();
         }
@@ -1096,6 +1143,10 @@ pub struct WebConfig {
     #[serde(rename = "hls")]
     pub hls: Option<HLSConfig>,
     pub root: Option<Value>, // Root can be RootConfig object in Go
+    #[serde(rename = "preferWWW", default)]
+    pub prefer_www: Option<String>,
+    #[serde(rename = "trailingSlash", default)]
+    pub trailing_slash: Option<String>,
 }
 
 impl WebConfig {
@@ -1117,6 +1168,9 @@ impl WebConfig {
         }
         if let Some(firewall) = &self.firewall_policy {
             firewall.compile_url_patterns();
+        }
+        if let Some(uam) = &self.uam {
+            uam.compile_url_patterns();
         }
     }
 }
@@ -1212,10 +1266,34 @@ pub struct HTTPRemoteAddrConfig {
     pub value: String,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub values: Vec<String>,
+    /// When `type=requestHeader` and this field is non-empty, use this single
+    /// header name as the authoritative source for the client IP, ignoring
+    /// `value`/`values`.
+    #[serde(
+        rename = "requestHeaderName",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub request_header_name: String,
+    /// Reserved for future location-block priority semantics. When true this
+    /// config takes precedence over any enclosing scope's remote-addr rule.
+    /// Currently recorded but not yet enforced (location blocks not yet
+    /// implemented); enforcement will be added when the location-block system
+    /// is introduced.
+    #[serde(rename = "isPrior", default)]
+    pub is_prior: bool,
 }
 
 impl HTTPRemoteAddrConfig {
+    /// Returns the list of effective IP-source expressions.
+    ///
+    /// Priority: if `type=requestHeader` and `request_header_name` is set,
+    /// return that single name so callers treat it as the sole header source.
+    /// Otherwise fall back to `values` → `value`.
     pub fn configured_values(&self) -> Vec<String> {
+        if self.is_request_header_type() && !self.request_header_name.is_empty() {
+            return vec![self.request_header_name.clone()];
+        }
         if !self.values.is_empty() {
             self.values.clone()
         } else if !self.value.is_empty() {
@@ -1233,6 +1311,44 @@ impl HTTPRemoteAddrConfig {
 
     pub fn is_empty(&self) -> bool {
         self.configured_values().is_empty()
+    }
+
+    /// Expand header-name expressions from `value`/`values` (or
+    /// `request_header_name`) into a flat list of individual header names.
+    /// Supports the multi-header syntax `${header.X-Forwarded-For,CF-Connecting-IP}`.
+    pub fn expanded_header_names(&self) -> Vec<String> {
+        let raw_list = if self.is_request_header_type() && !self.request_header_name.is_empty() {
+            vec![self.request_header_name.clone()]
+        } else if !self.values.is_empty() {
+            self.values.clone()
+        } else if !self.value.is_empty() {
+            vec![self.value.clone()]
+        } else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for entry in raw_list {
+            let trimmed = entry.trim();
+            if let Some(inner) = trimmed
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+            {
+                let body = inner
+                    .strip_prefix("header.")
+                    .or_else(|| inner.strip_prefix("requestHeader."))
+                    .unwrap_or(inner);
+                for part in body.split(',') {
+                    let name = part.trim().to_string();
+                    if !name.is_empty() {
+                        out.push(name);
+                    }
+                }
+            } else if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+        out
     }
 }
 
@@ -1331,12 +1447,20 @@ impl HTTPPageOptimizationConfig {
 pub struct HTTPBaseOptimizationConfig {
     #[serde(
         rename = "onlyURLPatterns",
+        alias = "onlyUrlPatterns",
+        alias = "limitURLPatterns",
+        alias = "limitURLs",
+        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
+        alias = "exceptUrlPatterns",
+        alias = "exceptURLs",
+        alias = "exceptionURLPatterns",
+        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -1355,12 +1479,11 @@ impl HTTPBaseOptimizationConfig {
     }
 
     pub fn matches_url(&self, url: &str) -> bool {
-        let path = url.split('?').next().unwrap_or(url);
         if !self.except_url_patterns.is_empty()
             && self
                 .except_url_patterns
                 .iter()
-                .any(|pattern| pattern.matches(path))
+                .any(|pattern| pattern.matches(url))
         {
             return false;
         }
@@ -1369,7 +1492,7 @@ impl HTTPBaseOptimizationConfig {
         }
         self.only_url_patterns
             .iter()
-            .any(|pattern| pattern.matches(path))
+            .any(|pattern| pattern.matches(url))
     }
 }
 
@@ -1442,12 +1565,20 @@ pub struct HLSEncryptingConfig {
     pub is_on: bool,
     #[serde(
         rename = "onlyURLPatterns",
+        alias = "onlyUrlPatterns",
+        alias = "limitURLPatterns",
+        alias = "limitURLs",
+        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
+        alias = "exceptUrlPatterns",
+        alias = "exceptURLs",
+        alias = "exceptionURLPatterns",
+        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -1466,12 +1597,11 @@ impl HLSEncryptingConfig {
     }
 
     pub fn matches_url(&self, url: &str) -> bool {
-        let path = url.split('?').next().unwrap_or(url);
         if !self.except_url_patterns.is_empty()
             && self
                 .except_url_patterns
                 .iter()
-                .any(|pattern| pattern.matches(path))
+                .any(|pattern| pattern.matches(url))
         {
             return false;
         }
@@ -1480,7 +1610,7 @@ impl HLSEncryptingConfig {
         }
         self.only_url_patterns
             .iter()
-            .any(|pattern| pattern.matches(path))
+            .any(|pattern| pattern.matches(url))
     }
 }
 
@@ -1488,11 +1618,18 @@ impl HLSEncryptingConfig {
 pub struct URLPattern {
     #[serde(
         rename = "type",
+        alias = "patternType",
+        alias = "matchType",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub type_name: String,
-    #[serde(default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        default,
+        alias = "value",
+        alias = "url",
+        deserialize_with = "deserialize_null_default"
+    )]
     pub pattern: String,
     #[serde(skip)]
     pub compiled: OnceLock<Option<Arc<regex::Regex>>>,
@@ -1520,13 +1657,13 @@ impl URLPattern {
     }
 
     fn compile_regex(type_name: &str, pattern: &str) -> Option<Arc<regex::Regex>> {
-        let pattern = Self::compiled_pattern(type_name, pattern)?;
+        let pattern = Self::compiled_pattern(&Self::canonical_type(type_name), pattern)?;
         regex::Regex::new(&pattern).ok().map(Arc::new)
     }
 
     fn compiled_pattern(type_name: &str, pattern: &str) -> Option<String> {
         match type_name {
-            "images" | "audios" | "videos" => None,
+            "image" | "audio" | "video" => None,
             "regexp" => {
                 if pattern.starts_with("(?i)") {
                     Some(pattern.to_string())
@@ -1555,12 +1692,53 @@ impl URLPattern {
                 let escaped = regex::escape(pattern);
                 let wildcard = escaped.replace("\\*", "(.*)");
                 if wildcard.starts_with('/') {
-                    Some(format!("(?i)^(?:http|https)://[^/]+{}$", wildcard))
+                    Some(format!(
+                        "(?i)^(?:(?:http|https)://[^/]+)?{}$",
+                        wildcard
+                    ))
                 } else {
                     Some(format!("(?i)^{}$", wildcard))
                 }
             }
         }
+    }
+
+    fn canonical_type(type_name: &str) -> String {
+        let normalized: String = type_name
+            .trim()
+            .chars()
+            .filter(|ch| *ch != '-' && *ch != '_')
+            .flat_map(char::to_lowercase)
+            .collect();
+        match normalized.as_str() {
+            "regex" | "regexp" | "regular" | "regularexpression" => "regexp".to_string(),
+            "prefix" | "urlprefix" | "pathprefix" | "dir" | "directory" => "prefix".to_string(),
+            "image" | "images" | "img" | "commonimage" | "commonimages" => "image".to_string(),
+            "audio" | "audios" | "commonaudio" | "commonaudios" => "audio".to_string(),
+            "video" | "videos" | "commonvideo" | "commonvideos" => "video".to_string(),
+            _ => "wildcard".to_string(),
+        }
+    }
+
+    fn path_without_query_fragment(value: &str) -> &str {
+        value
+            .find(|ch| ch == '?' || ch == '#')
+            .map(|idx| &value[..idx])
+            .unwrap_or(value)
+    }
+
+    fn full_url_path(value: &str) -> Option<&str> {
+        let scheme_idx = value.find("://")?;
+        let after_scheme = &value[scheme_idx + 3..];
+        let path_idx = after_scheme.find('/')?;
+        Some(&after_scheme[path_idx..])
+    }
+
+    fn matches_regex_or_wildcard(&self, value: &str) -> bool {
+        self.compiled
+            .get_or_init(|| Self::compile_regex(&self.type_name, &self.pattern))
+            .as_ref()
+            .is_some_and(|re| re.is_match(value))
     }
 
     fn is_image_url(url: &str) -> bool {
@@ -1601,24 +1779,128 @@ impl URLPattern {
     }
 
     pub fn matches(&self, url: &str) -> bool {
-        match self.type_name.as_str() {
-            "images" => Self::is_image_url(url),
-            "audios" => Self::is_audio_url(url),
-            "videos" => Self::is_video_url(url),
-            _ if self.pattern.is_empty() => url.is_empty(),
-            _ => self
-                .compiled
-                .get_or_init(|| Self::compile_regex(&self.type_name, &self.pattern))
-                .as_ref()
-                .is_some_and(|re| re.is_match(url)),
+        let pattern_type = Self::canonical_type(&self.type_name);
+        let stripped = Self::path_without_query_fragment(url);
+        let path = Self::full_url_path(stripped)
+            .map(Self::path_without_query_fragment)
+            .unwrap_or(stripped);
+        match pattern_type.as_str() {
+            "image" => Self::is_image_url(path),
+            "audio" => Self::is_audio_url(path),
+            "video" => Self::is_video_url(path),
+            _ if self.pattern.is_empty() => stripped.is_empty() || path.is_empty(),
+            _ => {
+                self.matches_regex_or_wildcard(stripped)
+                    || (path != stripped && self.matches_regex_or_wildcard(path))
+            }
         }
     }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UAMConfig {
-    #[serde(rename = "isOn", default)]
+    #[serde(rename = "isPrior", alias = "is_prior", default)]
+    pub is_prior: bool,
+    #[serde(
+        rename = "isOn",
+        alias = "IsOn",
+        default,
+        deserialize_with = "deserialize_flexible_bool"
+    )]
     pub is_on: bool,
+    #[serde(
+        rename = "onlyURLPatterns",
+        alias = "onlyUrlPatterns",
+        alias = "limitURLPatterns",
+        alias = "limitURLs",
+        alias = "only_urls",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub only_url_patterns: Vec<URLPattern>,
+    #[serde(
+        rename = "exceptURLPatterns",
+        alias = "exceptUrlPatterns",
+        alias = "exceptURLs",
+        alias = "exceptionURLPatterns",
+        alias = "except_urls",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub except_url_patterns: Vec<URLPattern>,
+    #[serde(
+        rename = "minQPSPerIP",
+        alias = "perIPMinQPS",
+        alias = "singleIPMinQPS",
+        alias = "min_qps_per_ip",
+        default,
+        deserialize_with = "deserialize_flexible_i32"
+    )]
+    pub min_qps_per_ip: i32,
+    #[serde(default)]
+    pub conds: Option<HTTPRequestCondsConfig>,
+    #[serde(
+        rename = "keyLife",
+        alias = "lifeSeconds",
+        alias = "validSeconds",
+        alias = "verifyTTL",
+        alias = "key_life",
+        default,
+        deserialize_with = "deserialize_flexible_i32"
+    )]
+    pub key_life: i32,
+    #[serde(rename = "mode", default)]
+    pub mode: Option<String>,
+    #[serde(
+        rename = "powDifficulty",
+        alias = "pow_difficulty",
+        default,
+        deserialize_with = "deserialize_flexible_u8_opt"
+    )]
+    pub pow_difficulty: Option<u8>,
+}
+
+impl Default for UAMConfig {
+    fn default() -> Self {
+        Self {
+            is_prior: false,
+            is_on: false,
+            only_url_patterns: Vec::new(),
+            except_url_patterns: Vec::new(),
+            min_qps_per_ip: 0,
+            conds: None,
+            key_life: 0,
+            mode: None,
+            pow_difficulty: None,
+        }
+    }
+}
+
+impl UAMConfig {
+    pub fn compile_url_patterns(&self) {
+        for pattern in &self.only_url_patterns {
+            pattern.compile();
+        }
+        for pattern in &self.except_url_patterns {
+            pattern.compile();
+        }
+    }
+
+    pub fn matches_url(&self, url: &str) -> bool {
+        if self
+            .except_url_patterns
+            .iter()
+            .any(|pattern| pattern.matches(url))
+        {
+            return false;
+        }
+        if self.only_url_patterns.is_empty() {
+            return true;
+        }
+        self.only_url_patterns
+            .iter()
+            .any(|pattern| pattern.matches(url))
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -1679,12 +1961,20 @@ pub struct UserAgentConfig {
     pub filters: Vec<UserAgentFilter>,
     #[serde(
         rename = "onlyURLPatterns",
+        alias = "onlyUrlPatterns",
+        alias = "limitURLPatterns",
+        alias = "limitURLs",
+        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
+        alias = "exceptUrlPatterns",
+        alias = "exceptURLs",
+        alias = "exceptionURLPatterns",
+        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -1737,12 +2027,20 @@ pub struct ReferersConfig {
     pub check_origin: bool,
     #[serde(
         rename = "onlyURLPatterns",
+        alias = "onlyUrlPatterns",
+        alias = "limitURLPatterns",
+        alias = "limitURLs",
+        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
+        alias = "exceptUrlPatterns",
+        alias = "exceptURLs",
+        alias = "exceptionURLPatterns",
+        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -2021,8 +2319,12 @@ pub struct HTTPCacheRef {
     pub skip_cache_control_values: Vec<String>,
     #[serde(rename = "skipSetCookie", default)]
     pub skip_set_cookie: bool,
+    #[serde(rename = "allowChunkedEncoding", default)]
+    pub allow_chunked_encoding: bool,
     #[serde(rename = "allowPartialContent", default)]
     pub allow_partial_content: bool,
+    #[serde(rename = "forcePartialContent", default)]
+    pub force_partial_content: bool,
     #[serde(rename = "alwaysForwardRangeRequest", default)]
     pub always_forward_range_request: bool,
     #[serde(rename = "enableRequestCachePragma", default)]
@@ -2031,6 +2333,8 @@ pub struct HTTPCacheRef {
     pub enable_if_none_match: bool,
     #[serde(rename = "enableIfModifiedSince", default)]
     pub enable_if_modified_since: bool,
+    #[serde(rename = "enableReadingOriginAsync", default)]
+    pub enable_reading_origin_async: bool,
     #[serde(rename = "isReverse", default)]
     pub is_reverse: bool,
     pub conds: Option<HTTPRequestCondsConfig>,
@@ -2039,6 +2343,9 @@ pub struct HTTPCacheRef {
     #[serde(
         rename = "onlyURLPatterns",
         alias = "onlyUrlPatterns",
+        alias = "limitURLPatterns",
+        alias = "limitURLs",
+        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -2046,6 +2353,9 @@ pub struct HTTPCacheRef {
     #[serde(
         rename = "exceptURLPatterns",
         alias = "exceptUrlPatterns",
+        alias = "exceptURLs",
+        alias = "exceptionURLPatterns",
+        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -2116,6 +2426,12 @@ pub struct HTTPFirewallPolicy {
     pub syn_flood: Option<SynFloodConfig>,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub mode: String, // "defense" or "observe"
+    #[serde(rename = "candidateRules", default)]
+    pub candidate_rules: Option<Vec<HTTPFirewallRule>>,
+    #[serde(rename = "candidateTrafficPct", default)]
+    pub candidate_traffic_pct: u8,
+    #[serde(rename = "candidateVersion", default)]
+    pub candidate_version: i64,
 }
 
 impl HTTPFirewallPolicy {
@@ -2212,12 +2528,20 @@ pub struct HTTPFirewallRegionConfig {
     pub allow_search_engine: bool,
     #[serde(
         rename = "onlyURLPatterns",
+        alias = "onlyUrlPatterns",
+        alias = "limitURLPatterns",
+        alias = "limitURLs",
+        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
+        alias = "exceptUrlPatterns",
+        alias = "exceptURLs",
+        alias = "exceptionURLPatterns",
+        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -2236,12 +2560,11 @@ impl HTTPFirewallRegionConfig {
     }
 
     pub fn matches_url(&self, url: &str) -> bool {
-        let path = url.split('?').next().unwrap_or(url);
         if !self.except_url_patterns.is_empty()
             && self
                 .except_url_patterns
                 .iter()
-                .any(|pattern| pattern.matches(path))
+                .any(|pattern| pattern.matches(url))
         {
             return false;
         }
@@ -2250,7 +2573,7 @@ impl HTTPFirewallRegionConfig {
         }
         self.only_url_patterns
             .iter()
-            .any(|pattern| pattern.matches(path))
+            .any(|pattern| pattern.matches(url))
     }
 }
 
@@ -2285,6 +2608,14 @@ pub struct HTTPFirewallRuleSet {
     pub ignore_search_engine: bool,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPParamFilter {
+    #[serde(rename = "code", default)]
+    pub code: String, // "urlDecode" / "base64Decode" / "htmlDecode" / "toLowerCase" / "toUpperCase" / "md5" / "sha1" / "sha256" / "trim"
+    #[serde(default)]
+    pub options: HashMap<String, Value>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HTTPFirewallRule {
     pub param: String,
@@ -2296,6 +2627,8 @@ pub struct HTTPFirewallRule {
     pub is_reverse: bool,
     #[serde(rename = "isCaseInsensitive", default)]
     pub is_case_insensitive: bool,
+    #[serde(rename = "paramFilters", default, deserialize_with = "deserialize_null_default")]
+    pub param_filters: Vec<HTTPParamFilter>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -3048,7 +3381,62 @@ mod tests {
             ..Default::default()
         };
         assert!(wildcard.matches("https://example.com/static/a/image.jpg"));
-        assert!(!wildcard.matches("/static/a/image.jpg"));
+        assert!(wildcard.matches("/static/a/image.jpg"));
+        assert!((URLPattern {
+            type_name: "wildcard".to_string(),
+            pattern: "/hello/world/*".to_string(),
+            ..Default::default()
+        })
+        .matches("/hello/world/a"));
+        assert!((URLPattern {
+            type_name: "wildcard".to_string(),
+            pattern: "*/hello/world".to_string(),
+            ..Default::default()
+        })
+        .matches("/a/hello/world"));
+        assert!((URLPattern {
+            type_name: "wildcard".to_string(),
+            pattern: "*/article/*".to_string(),
+            ..Default::default()
+        })
+        .matches("/news/article/123"));
+        assert!((URLPattern {
+            type_name: "wildcard".to_string(),
+            pattern: "*example.com/*".to_string(),
+            ..Default::default()
+        })
+        .matches("https://example.com/a"));
+        assert!((URLPattern {
+            type_name: "wildcard".to_string(),
+            pattern: "*.js".to_string(),
+            ..Default::default()
+        })
+        .matches("https://example.com/assets/app.js?v=1"));
+
+        assert!((URLPattern {
+            type_name: "regexp".to_string(),
+            pattern: "^/hello/world".to_string(),
+            ..Default::default()
+        })
+        .matches("https://example.com/hello/world/a"));
+        assert!((URLPattern {
+            type_name: "regexp".to_string(),
+            pattern: "/hello/world$".to_string(),
+            ..Default::default()
+        })
+        .matches("/a/hello/world"));
+        assert!((URLPattern {
+            type_name: "regexp".to_string(),
+            pattern: "/article/(\\d+)".to_string(),
+            ..Default::default()
+        })
+        .matches("/article/123"));
+        assert!((URLPattern {
+            type_name: "regexp".to_string(),
+            pattern: "^(http|https)://example.com/".to_string(),
+            ..Default::default()
+        })
+        .matches("https://example.com/article/123"));
 
         let prefix = URLPattern {
             type_name: "prefix".to_string(),
@@ -3079,7 +3467,7 @@ mod tests {
             pattern: String::new(),
             ..Default::default()
         };
-        assert!(image.matches("/static/photo.JPG"));
+        assert!(image.matches("/static/photo.JPG?x=1"));
         assert!(!image.matches("/static/photo.txt"));
     }
 

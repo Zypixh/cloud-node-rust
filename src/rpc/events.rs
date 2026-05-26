@@ -1,29 +1,33 @@
 use crate::api_config::ApiConfig;
 use crate::pb;
 use crate::rpc::client::RpcClient;
-use serde_json::Value;
 
-pub async fn report_server_event(
-    api_config: &ApiConfig,
-    server_id: i64,
-    event_type: &str,
-    params: Value,
-) {
-    if server_id <= 0 {
-        return;
+#[derive(Debug, Clone, Default)]
+pub struct HttpFirewallEvent {
+    pub server_id: i64,
+    pub policy_id: i64,
+    pub group_id: i64,
+    pub set_id: i64,
+    pub url: String,
+    pub client_ip: String,
+    pub user_agent: String,
+}
+
+impl HttpFirewallEvent {
+    pub async fn notify(self, api_config: &ApiConfig) {
+        let client = match RpcClient::new(api_config).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut service = client.firewall_service();
+        let _ = service
+            .notify_http_firewall_event(pb::NotifyHttpFirewallEventRequest {
+                server_id: self.server_id,
+                http_firewall_policy_id: self.policy_id,
+                http_firewall_rule_group_id: self.group_id,
+                http_firewall_rule_set_id: self.set_id,
+                created_at: crate::utils::time::now_timestamp(),
+            })
+            .await;
     }
-
-    let client = match RpcClient::new(api_config).await {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let mut service = client.server_event_service();
-
-    let _ = service
-        .create_server_event(pb::CreateServerEventRequest {
-            server_id,
-            r#type: event_type.to_string(),
-            params_json: serde_json::to_vec(&params).unwrap_or_default(),
-        })
-        .await;
 }

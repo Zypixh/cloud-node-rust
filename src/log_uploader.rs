@@ -117,7 +117,17 @@ impl LogUploader {
         loop {
             let timeout = tokio::time::sleep_until((last_flush + flush_interval).into());
             tokio::select! {
-                Some(log) = self.rx.recv() => {
+                msg = self.rx.recv() => {
+                    // recv() returning None means every sender has been dropped;
+                    // the previous `Some(log) = ...` pattern silently disabled this
+                    // arm in select! and let `timeout` fire forever, pegging a
+                    // worker at 100%.
+                    let Some(log) = msg else {
+                        if !buffer.is_empty() {
+                            Self::send_batch(&batch_tx, &mut buffer).await;
+                        }
+                        return;
+                    };
                     buffer.push(log);
                     while buffer.len() < batch_size {
                         match self.rx.try_recv() {
@@ -543,7 +553,15 @@ impl NodeLogUploader {
             let timeout = tokio::time::sleep_until((last_flush + self.flush_interval).into());
 
             tokio::select! {
-                Some(log) = self.rx.recv() => {
+                msg = self.rx.recv() => {
+                    let Some(log) = msg else {
+                        // All senders dropped; flush remaining and exit so we
+                        // don't busy-loop on the timeout arm.
+                        if !buffer.is_empty() {
+                            self.flush_batch(&mut buffer).await;
+                        }
+                        return;
+                    };
                     buffer.push(log);
                     if buffer.len() >= self.batch_size {
                         self.flush_batch(&mut buffer).await;

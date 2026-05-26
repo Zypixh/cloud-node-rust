@@ -117,27 +117,15 @@ pub async fn sync_node_tasks(
                         .await
                     }
                     "upgradeNode" | "installNode" | "startNode" => {
+                        // updateNodeIsInstalled requires admin credentials on cloud API,
+                        // so we cannot mark this from the node side. cloud-node does not
+                        // execute these lifecycle tasks locally, so acknowledge them to
+                        // avoid retry loops.
                         info!(
-                            "Received node lifecycle task '{}'. Tracking as completed.",
+                            "Received node lifecycle task '{}'. Acknowledging locally.",
                             task.r#type
                         );
-                        let numeric_node_id = config_store.get_node_id().await;
-                        if numeric_node_id == 0 {
-                            warn!(
-                                "Skipping '{}' report because numeric node ID has not been synced yet.",
-                                task.r#type
-                            );
-                            false
-                        } else {
-                            let mut node_client = client.node_service();
-                            node_client
-                                .update_node_is_installed(pb::UpdateNodeIsInstalledRequest {
-                                    node_id: numeric_node_id,
-                                    is_installed: true,
-                                })
-                                .await
-                                .is_ok()
-                        }
+                        true
                     }
                     "scriptsChanged" => {
                         let unsupported = crate::unsupported::request_scripts::unsupported();

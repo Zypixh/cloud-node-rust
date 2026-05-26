@@ -36,7 +36,7 @@ impl FormatTime for LocalLogTimer {
 #[derive(Parser)]
 #[command(name = "cloud-node-rust")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "CloudNode - High Performance Edge Node written in Rust", long_about = None)]
+#[command(about = "CloudNode - High Performance Cloud Node written in Rust", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -58,15 +58,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the edge node in background
+    /// Start the cloud node in background
     Start,
-    /// Stop the background edge node
+    /// Stop the background cloud node
     Stop,
-    /// Check the status of the edge node
+    /// Check the status of the cloud node
     Status,
-    /// Restart the background edge node
+    /// Restart the background cloud node
     Restart,
-    /// Install the edge node as a systemd service and global command
+    /// Install the cloud node as a systemd service and global command
     Install,
     /// Test the configuration
     Test,
@@ -409,7 +409,7 @@ fn main() -> anyhow::Result<()> {
                 let service_path = "/etc/systemd/system/cloud-node.service";
                 let service_content = format!(
                     "[Unit]\n\
-                     Description=CloudNode High Performance Edge Node\n\
+                     Description=CloudNode High Performance Cloud Node\n\
                      After=network.target\n\n\
                      [Service]\n\
                      Type=simple\n\
@@ -605,6 +605,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     // 2. Initialize Managers
     let config_store = Arc::new(ConfigStore::new());
     let waf_state = Arc::new(WafStateManager::new());
+    cloud_node_rust::firewall::state::start_gc_task(waf_state.clone());
     let ip_list_manager = Arc::new(firewall::lists::GlobalIpListManager::new(waf_state.clone()));
     let health_manager = GlobalHealthManager::new(16);
     let cert_selector = Arc::new(DynamicCertSelector::new());
@@ -620,8 +621,9 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     let il = ip_list_manager.clone();
     let hm = health_manager.clone();
     let ds = cert_selector.clone();
+    let ws = waf_state.clone();
     spawn_staggered(&rt, Duration::ZERO, async move {
-        rpc::start_config_syncer(cs, ac, il, hm, ds).await;
+        rpc::start_config_syncer(cs, ac, il, hm, ds, ws).await;
     });
 
     let ac_ns = api_config.clone();

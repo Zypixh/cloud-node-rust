@@ -7,7 +7,7 @@ use tonic::Request;
 use tonic::transport::Channel;
 use tracing::{error, info};
 
-fn normalize_purge_prefix(key: &str) -> String {
+pub(crate) fn normalize_purge_prefix(key: &str) -> String {
     let trimmed = key.trim();
     if let Some((prefix, _)) = trimmed.split_once('*') {
         return format!("{}*", prefix);
@@ -20,7 +20,7 @@ fn normalize_purge_prefix(key: &str) -> String {
     }
 }
 
-fn is_prefix_purge(key_type: &str, key: &str) -> bool {
+pub(crate) fn is_prefix_purge(key_type: &str, key: &str) -> bool {
     let key_type = key_type.to_ascii_lowercase();
     key.contains('*')
         || key_type == "dir"
@@ -37,6 +37,11 @@ fn is_prefix_purge(key_type: &str, key: &str) -> bool {
         || key_type == "server"
 }
 
+pub(crate) fn is_tag_purge(key_type: &str) -> bool {
+    let kt = key_type.to_ascii_lowercase();
+    kt == "tag" || kt == "surrogate-key" || kt == "surrogatekey" || kt == "surrogate_key"
+}
+
 pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool {
     let node_id_clone = api_config.node_id.clone();
     let secret_clone = api_config.secret.clone();
@@ -46,9 +51,17 @@ pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool 
             move |mut req: Request<()>| {
                 let token =
                     generate_token(&node_id_clone, &secret_clone, "node").unwrap_or_default();
-                req.metadata_mut()
-                    .insert("nodeid", node_id_clone.parse().unwrap());
-                req.metadata_mut().insert("token", token.parse().unwrap());
+                // node_id / token come from runtime config; defensively avoid
+                // .unwrap() so a stray non-ASCII byte cannot panic the whole
+                // interceptor task.
+                let node_id_val = node_id_clone
+                    .parse()
+                    .unwrap_or_else(|_| tonic::metadata::MetadataValue::from_static("0"));
+                let token_val = token
+                    .parse()
+                    .unwrap_or_else(|_| tonic::metadata::MetadataValue::from_static(""));
+                req.metadata_mut().insert("nodeid", node_id_val);
+                req.metadata_mut().insert("token", token_val);
                 Ok(req)
             },
         );
@@ -69,7 +82,36 @@ pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool 
             for key_task in keys {
                 let mut error = String::new();
 
-                if key_task.r#type == "purge" {
+                if key_task.r#type == "purge" && is_tag_purge(&key_task.key_type) {
+                    info!(
+                        "Purging cache by surrogate tag: {}",
+                        key_task.key
+                    );
+                    let purge_ok = crate::cache_manager::CACHE
+                        .storage
+                        .purge_by_tag(key_task.key.trim())
+                        .await;
+                    if purge_ok && crate::runtime_mode::RuntimeConfig::current_is_rke2() {
+                        let purge_id = format!("{}:{}", key_task.id, uuid::Uuid::new_v4());
+                        if let Err(err) = crate::cluster::purge::fanout(
+                            crate::cluster::purge::PurgeFanoutRequest {
+                                purge_id,
+                                task_id: key_task.id,
+                                key: key_task.key.trim().to_string(),
+                                key_type: key_task.key_type.clone(),
+                                prefix: String::new(),
+                                leader_epoch: crate::cluster::leader::ROLE_STATE.epoch(),
+                            },
+                        )
+                        .await
+                        {
+                            error!("Tag purge fanout failed for {}: {}", key_task.key, err);
+                        }
+                    }
+                    if !purge_ok {
+                        error = "Tag purge failed".to_string();
+                    }
+                } else if key_task.r#type == "purge" {
                     info!(
                         "Purging cache key: {} (keyType: {})",
                         key_task.key, key_task.key_type
@@ -157,7 +199,7 @@ pub async fn sync_cache_tasks(channel: Channel, api_config: &ApiConfig) -> bool 
 
                 results.push(pb::update_http_cache_task_keys_status_request::KeyResult {
                     id: key_task.id,
-                    node_cluster_id: 0,
+                    node_cluster_id: key_task.node_cluster_id,
                     error,
                 });
             }

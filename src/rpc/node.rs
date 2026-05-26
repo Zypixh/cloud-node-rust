@@ -31,7 +31,6 @@ static LAST_WAF_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::ne
 static LAST_GLOBAL_CONFIG_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 static CONNECTED_API_NODE_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
 static ENABLED_FEATURES_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
-static UPDATE_NODE_UP_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn build_version_code() -> u32 {
     env!("CARGO_PKG_VERSION")
@@ -71,11 +70,20 @@ fn dedup_ssl_certs(
     let mut order = Vec::new();
     let mut by_id: std::collections::HashMap<i64, crate::config_models::SSLCertConfig> =
         std::collections::HashMap::new();
+    // Mirror of config::dedup_ssl_certs: id<=0 means the cert isn't backed
+    // by the control plane. Give each its own synthetic negative key so
+    // multiple in-line certs don't collide on `0` and silently drop all but
+    // the last one (which previously broke TLS handshakes for the dropped
+    // certs).
+    let mut synthetic_id: i64 = -1;
 
-    for cert in certs {
+    for mut cert in certs {
         if cert.id <= 0 {
-            order.push(cert.id);
-            by_id.insert(cert.id, cert);
+            let key = synthetic_id;
+            synthetic_id -= 1;
+            cert.id = key;
+            order.push(key);
+            by_id.insert(key, cert);
             continue;
         }
         if !by_id.contains_key(&cert.id) {
@@ -204,6 +212,7 @@ pub async fn start_config_syncer(
     ip_list_manager: Arc<crate::firewall::lists::GlobalIpListManager>,
     health_manager: Arc<crate::health_manager::GlobalHealthManager>,
     cert_selector: Arc<crate::ssl::DynamicCertSelector>,
+    waf_state: Arc<crate::firewall::state::WafStateManager>,
 ) {
     let mut state = crate::utils::persistence::load_state();
     let mut task_version = state.task_version;
@@ -240,6 +249,7 @@ pub async fn start_config_syncer(
             &api_config,
             &health_manager,
             &cert_selector,
+            waf_state.as_ref(),
             &mut task_version,
             &mut config_version,
         )
@@ -369,6 +379,7 @@ pub async fn fetch_and_apply_config<F>(
     api_config: &ApiConfig,
     health_manager: &crate::health_manager::GlobalHealthManager,
     cert_selector: &crate::ssl::DynamicCertSelector,
+    waf_state: &crate::firewall::state::WafStateManager,
     task_version: &mut i64,
     config_version: &mut i64,
 ) -> bool
@@ -392,9 +403,17 @@ where
     match client.find_current_node_config(req).await {
         Ok(resp) => {
             let config_resp = resp.into_inner();
+            let response_version = config_resp.timestamp;
             if config_resp.node_json.is_empty() {
                 if !config_resp.is_changed {
-                    debug!("RPC_NODE: No configuration changes reported by API.");
+                    if response_version > 0 {
+                        *config_version = response_version;
+                        config_store.update_config_version(response_version).await;
+                    }
+                    debug!(
+                        "RPC_NODE: No configuration changes reported by API. cursor={}",
+                        response_version
+                    );
                 } else {
                     warn!("RPC_NODE: API reported change but sent empty JSON!");
                     return false;
@@ -442,8 +461,9 @@ where
                     }
                 }
 
-                if !should_reload {
-                    *config_version = config_resp.timestamp;
+                if !should_reload && response_version > 0 {
+                    *config_version = response_version;
+                    config_store.update_config_version(response_version).await;
                 }
 
                 if should_reload {
@@ -452,7 +472,12 @@ where
                         &node_json,
                     ) {
                         Ok(mut payload) => {
-                            *config_version = config_resp.timestamp;
+                            let payload_version = if response_version > 0 {
+                                response_version
+                            } else {
+                                payload.version.unwrap_or(*config_version)
+                            };
+                            *config_version = payload_version;
                             {
                                 let mut last_hash = LAST_CONFIG_HASH.write();
                                 *last_hash = current_hash;
@@ -467,6 +492,13 @@ where
                             );
                             if let Some(gsc) = &payload.global_server_config {
                                 debug!("RPC_NODE: Found GlobalServerConfig: {:?}", gsc);
+                            }
+                            let kernel_filter = crate::firewall::kernel::build_filter(
+                                payload.kernel_firewall_mode.as_deref(),
+                            )
+                            .await;
+                            if kernel_filter.available() {
+                                waf_state.set_kernel_filter(kernel_filter);
                             }
                             config_store.update_id(numeric_id).await;
                             crate::logging::set_numeric_node_id(numeric_id);
@@ -1114,7 +1146,15 @@ where
                             tracing::debug!("Certificate sync completed");
 
                             // 4. gRPC Policy
-                            let grpc_policy = payload.primary_grpc_policy.clone();
+                            let node_cluster_id =
+                                payload.node_cluster.as_ref().map(|c| c.id).unwrap_or(0);
+                            let grpc_policy = payload
+                                .grpc_policies
+                                .get(&node_cluster_id.to_string())
+                                .or_else(|| payload.grpc_policies.get("0"))
+                                .or_else(|| payload.grpc_policies.values().next())
+                                .cloned()
+                                .or_else(|| payload.primary_grpc_policy.clone());
 
                             // --- GLOBAL SETTINGS LOGGING ---
                             log_global_settings(
@@ -1145,9 +1185,9 @@ where
                             config_store
                                 .update_config(
                                     numeric_id,
-                                    config_resp.timestamp,
+                                    payload_version,
                                     payload.node_region.as_ref().map(|r| r.id).unwrap_or(0),
-                                    payload.node_cluster.as_ref().map(|c| c.id).unwrap_or(0),
+                                    node_cluster_id,
                                     payload_servers.clone().into_iter().map(Arc::new).collect(),
                                     new_servers,
                                     new_routes,
@@ -1204,7 +1244,7 @@ where
 
                             info!(
                                 "RPC_NODE: Applied config version={} node_id={} servers={} domains={} port_only={} cache_policies={} waf_policies={} pages={}",
-                                config_resp.timestamp,
+                                payload_version,
                                 numeric_id,
                                 payload_servers.len(),
                                 loaded_domain_count,
@@ -1327,29 +1367,10 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         let mut rpc_total_requests = rpc_snap.total_requests;
         let mut rpc_total_errors = rpc_snap.total_errors;
         let mut rpc_total_cost_ms = rpc_snap.total_cost_ms;
-        if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
-            let aggregated = crate::cluster::stats::aggregate();
-            if aggregated.replica_count > 0 {
-                traffic_out = aggregated.traffic_out;
-                traffic_in = aggregated.traffic_in;
-                connections = aggregated.active_connections;
-                rpc_total_requests = aggregated.rpc_total_requests;
-                rpc_total_errors = aggregated.rpc_total_errors;
-                rpc_total_cost_ms = aggregated.rpc_total_cost_ms;
-            }
-        }
-        let api_success_percent = if rpc_total_requests > 0 {
-            (rpc_total_requests - rpc_total_errors) as f64 / rpc_total_requests as f64
-        } else {
-            1.0
-        };
-        let api_avg_cost = if rpc_total_requests > 0 {
-            rpc_total_cost_ms as f64 / rpc_total_requests as f64
-        } else {
-            0.0
-        };
-        let load = sysinfo::System::load_average();
 
+        // Local memory + cpu first; the cluster aggregator (if any) replaces these
+        // atomically below from a single snapshot so the report stays internally
+        // consistent.
         #[allow(unused_mut)]
         let mut total_memory = sys.total_memory() as i64;
         #[allow(unused_mut)]
@@ -1394,11 +1415,28 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
             let aggregated = crate::cluster::stats::aggregate();
             if aggregated.replica_count > 0 {
+                traffic_out = aggregated.traffic_out;
+                traffic_in = aggregated.traffic_in;
+                connections = aggregated.active_connections;
+                rpc_total_requests = aggregated.rpc_total_requests;
+                rpc_total_errors = aggregated.rpc_total_errors;
+                rpc_total_cost_ms = aggregated.rpc_total_cost_ms;
                 cpu_usage = aggregated.cpu_usage_avg;
                 total_memory = aggregated.memory_total;
                 used_memory = aggregated.memory_used;
             }
         }
+        let api_success_percent = if rpc_total_requests > 0 {
+            (rpc_total_requests - rpc_total_errors) as f64 / rpc_total_requests as f64
+        } else {
+            1.0
+        };
+        let api_avg_cost = if rpc_total_requests > 0 {
+            rpc_total_cost_ms as f64 / rpc_total_requests as f64
+        } else {
+            0.0
+        };
+        let load = sysinfo::System::load_average();
         let mem_usage = if total_memory > 0 {
             used_memory as f64 / total_memory as f64
         } else {
@@ -1583,40 +1621,10 @@ pub async fn report_node_online_once(
     });
 
     let client = RpcClient::new(api_config).await?;
+    // updateNodeUp / updateNodeIsInstalled require admin credentials on cloud API
+    // and will always fail with node credentials. UpdateNodeStatus already sets
+    // isActive=true server-side.
     let mut service = client.node_service();
-    if let Err(err) = service
-        .update_node_up(pb::UpdateNodeUpRequest {
-            node_id,
-            is_up: true,
-        })
-        .await
-    {
-        if is_unsupported_node_type_error(&err) {
-            if !UPDATE_NODE_UP_UNSUPPORTED_LOGGED.swap(true, Ordering::Relaxed) {
-                debug!(
-                    "RPC_NODE: updateNodeUp is not supported by this API node for node credentials: {}",
-                    err
-                );
-            }
-        } else {
-            debug!(
-                "RPC_NODE: updateNodeUp is not accepted by this API node: {}",
-                err
-            );
-        }
-    }
-    if let Err(err) = service
-        .update_node_is_installed(pb::UpdateNodeIsInstalledRequest {
-            node_id,
-            is_installed: true,
-        })
-        .await
-    {
-        debug!(
-            "RPC_NODE: updateNodeIsInstalled is not accepted by this API node: {}",
-            err
-        );
-    }
     service
         .update_node_status(pb::UpdateNodeStatusRequest {
             node_id,

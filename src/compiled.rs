@@ -11,6 +11,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::OnceLock;
+
 #[derive(Clone, Debug, Default)]
 pub struct CompiledPlanSet {
     pub global_firewall: Vec<Arc<crate::firewall::compiled::CompiledFirewallPolicy>>,
@@ -1034,6 +1037,13 @@ struct CompiledUrlPatternSet {
     except: Vec<CompiledUrlPattern>,
 }
 
+#[cfg(test)]
+impl CompiledUrlPatternSet {
+    fn test_compile(only: &[URLPattern], except: &[URLPattern]) -> Self {
+        Self::compile(only, except)
+    }
+}
+
 impl CompiledUrlPatternSet {
     fn compile_base(base: &HTTPBaseOptimizationConfig) -> Self {
         Self::compile(&base.only_url_patterns, &base.except_url_patterns)
@@ -1047,8 +1057,7 @@ impl CompiledUrlPatternSet {
     }
 
     fn matches_url(&self, url: &str) -> bool {
-        let path = url.split('?').next().unwrap_or(url);
-        self.matches_url_raw(path)
+        self.matches_url_raw(url)
     }
 
     fn matches_url_raw(&self, url: &str) -> bool {
@@ -1069,35 +1078,41 @@ enum CompiledUrlPattern {
 
 impl CompiledUrlPattern {
     fn compile(pattern: &URLPattern) -> Self {
-        match pattern.type_name.as_str() {
-            "images" => Self::Images,
-            "audios" => Self::Audios,
-            "videos" => Self::Videos,
+        match canonical_url_pattern_type(&pattern.type_name).as_str() {
+            "image" => Self::Images,
+            "audio" => Self::Audios,
+            "video" => Self::Videos,
             _ => Self::Regex(compile_url_pattern_regex(&pattern.type_name, &pattern.pattern)),
         }
     }
 
     fn matches(&self, url: &str) -> bool {
+        let stripped = url_without_query_fragment(url);
+        let path = full_url_path(stripped)
+            .map(url_without_query_fragment)
+            .unwrap_or(stripped);
         match self {
             Self::Images => has_any_ascii_suffix(
-                url,
+                path,
                 &[
                     ".apng", ".avif", ".gif", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp",
                     ".png", ".svg", ".webp", ".bmp", ".ico", ".cur", ".tif", ".tiff",
                 ],
             ),
             Self::Audios => has_any_ascii_suffix(
-                url,
+                path,
                 &[".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".m3u8"],
             ),
             Self::Videos => has_any_ascii_suffix(
-                url,
+                path,
                 &[
                     ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".mpeg", ".3gp", ".webm", ".ts",
                     ".m3u8",
                 ],
             ),
-            Self::Regex(regex) => regex.as_ref().is_some_and(|regex| regex.is_match(url)),
+            Self::Regex(regex) => regex.as_ref().is_some_and(|regex| {
+                regex.is_match(stripped) || (path != stripped && regex.is_match(path))
+            }),
         }
     }
 }
@@ -1106,7 +1121,7 @@ fn compile_url_pattern_regex(type_name: &str, pattern: &str) -> Option<Arc<Regex
     if pattern.is_empty() {
         return Regex::new("^$").ok().map(Arc::new);
     }
-    let pattern = match type_name {
+    let pattern = match canonical_url_pattern_type(type_name).as_str() {
         "regexp" => {
             if pattern.starts_with("(?i)") {
                 pattern.to_string()
@@ -1114,7 +1129,7 @@ fn compile_url_pattern_regex(type_name: &str, pattern: &str) -> Option<Arc<Regex
                 format!("(?i){}", pattern)
             }
         }
-        "prefix" | "urlPrefix" | "url_prefix" | "dir" | "directory" => {
+        "prefix" => {
             let escaped = regex::escape(pattern.trim_end_matches('*').trim_end_matches('/'));
             if escaped.starts_with('/') {
                 format!("(?i)^(?:(?:http|https)://[^/]+)?{}(?:/.*)?$", escaped)
@@ -1126,13 +1141,44 @@ fn compile_url_pattern_regex(type_name: &str, pattern: &str) -> Option<Arc<Regex
             let escaped = regex::escape(pattern);
             let wildcard = escaped.replace("\\*", "(.*)");
             if wildcard.starts_with('/') {
-                format!("(?i)^(?:http|https)://[^/]+{}$", wildcard)
+                format!("(?i)^(?:(?:http|https)://[^/]+)?{}$", wildcard)
             } else {
                 format!("(?i)^{}$", wildcard)
             }
         }
     };
     Regex::new(&pattern).ok().map(Arc::new)
+}
+
+fn canonical_url_pattern_type(type_name: &str) -> String {
+    let normalized: String = type_name
+        .trim()
+        .chars()
+        .filter(|ch| *ch != '-' && *ch != '_')
+        .flat_map(char::to_lowercase)
+        .collect();
+    match normalized.as_str() {
+        "regex" | "regexp" | "regular" | "regularexpression" => "regexp".to_string(),
+        "prefix" | "urlprefix" | "pathprefix" | "dir" | "directory" => "prefix".to_string(),
+        "image" | "images" | "img" | "commonimage" | "commonimages" => "image".to_string(),
+        "audio" | "audios" | "commonaudio" | "commonaudios" => "audio".to_string(),
+        "video" | "videos" | "commonvideo" | "commonvideos" => "video".to_string(),
+        _ => "wildcard".to_string(),
+    }
+}
+
+fn url_without_query_fragment(value: &str) -> &str {
+    value
+        .find(|ch| ch == '?' || ch == '#')
+        .map(|idx| &value[..idx])
+        .unwrap_or(value)
+}
+
+fn full_url_path(value: &str) -> Option<&str> {
+    let scheme_idx = value.find("://")?;
+    let after_scheme = &value[scheme_idx + 3..];
+    let path_idx = after_scheme.find('/')?;
+    Some(&after_scheme[path_idx..])
 }
 
 fn has_any_ascii_suffix(value: &str, suffixes: &[&str]) -> bool {
@@ -1229,5 +1275,39 @@ impl CompiledPlanSet {
             && self.server_headers.is_empty()
             && self.server_rewrite.is_empty()
             && self.server_features.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pattern(type_name: &str, value: &str) -> URLPattern {
+        URLPattern {
+            type_name: type_name.to_string(),
+            pattern: value.to_string(),
+            compiled: OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn compiled_url_patterns_support_mixed_only_and_except_rules() {
+        let patterns = CompiledUrlPatternSet::test_compile(
+            &[
+                pattern("wildcard", "*/article/*"),
+                pattern("regexp", r"/download/(\d+)"),
+                pattern("regexp", r"^(http|https)://example.com/files/"),
+                pattern("image", ""),
+            ],
+            &[pattern("wildcard", "*.js"), pattern("video", "")],
+        );
+
+        assert!(patterns.matches_url("https://example.com/news/article/123"));
+        assert!(patterns.matches_url("/download/42"));
+        assert!(patterns.matches_url("https://example.com/files/archive.zip"));
+        assert!(patterns.matches_url("/assets/photo.JPG?x=1"));
+        assert!(!patterns.matches_url("/assets/app.js?v=1"));
+        assert!(!patterns.matches_url("/assets/movie.mp4"));
+        assert!(!patterns.matches_url("/other/path"));
     }
 }

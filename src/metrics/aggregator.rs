@@ -16,6 +16,7 @@ pub struct AggregationKey {
     pub os: Arc<str>,
     pub waf_group_id: i64,
     pub waf_action: Arc<str>,
+    pub provider_id: i64,
 }
 
 #[derive(Debug, Default, Clone)]

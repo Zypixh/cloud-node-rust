@@ -30,6 +30,23 @@ const MEMORY_BUDGET_TTL_SECS: i64 = 30;
 const DISK_HIT_CHUNK_BYTES: usize = 128 * 1024;
 const MEMORY_SERVE_MAX: u64 = 50 * 1024 * 1024;
 
+/// Parse `stale-while-revalidate=N` from a Cache-Control header value.
+/// Returns `None` if the directive is absent.
+pub(crate) fn parse_swr_from_cache_control(cc: &str) -> Option<u64> {
+    for part in cc.split(',') {
+        let trimmed = part.trim();
+        if let Some(rest) = trimmed.to_ascii_lowercase().strip_prefix("stale-while-revalidate") {
+            let rest = rest.trim();
+            if let Some(num_str) = rest.strip_prefix('=') {
+                if let Ok(n) = num_str.trim().parse::<u64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn zstd_decompress_to_bytes(data: &[u8], capacity: usize) -> Option<Vec<u8>> {
     use std::io::Read;
     let decoder = zstd::Decoder::new(data).ok()?;
@@ -48,6 +65,12 @@ pub struct FileStorage {
 
 pub struct FileStorageInner {
     layout: FileStorageLayout,
+}
+
+#[derive(Clone)]
+pub struct PartialStorageLocation {
+    pub roots: Vec<PathBuf>,
+    pub write_root: PathBuf,
 }
 
 pub enum FileStorageLayout {
@@ -147,6 +170,25 @@ impl FileStorage {
             }
         }
         None
+    }
+
+    pub fn partial_location_for_key_str(&self, key: &str) -> PartialStorageLocation {
+        let root_key =
+            crate::cache::partial::partial_base_key(key).unwrap_or_else(|| key.to_string());
+        let hash = format!("{:x}", md5_legacy::compute(root_key.as_bytes()));
+        let inner = self.inner.load();
+        let (path, _, _) = inner.write_location(&hash);
+        let write_root = path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::paths::NodePaths::current().cache_dir());
+        let mut roots = inner.all_roots();
+        if !roots.iter().any(|root| root == &write_root) {
+            roots.insert(0, write_root.clone());
+        }
+        PartialStorageLocation { roots, write_root }
     }
 }
 
@@ -320,6 +362,16 @@ impl Storage for FileStorage {
         key: &CacheKey,
         _trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        if let Some(k_str) = key.primary_key_str()
+            && crate::cache::partial::is_partial_cache_key(k_str)
+        {
+            let location = self.partial_location_for_key_str(k_str);
+            return Ok(crate::cache::partial::lookup(k_str, &location.roots)
+                .await
+                .map_err(|_| Error::new(ErrorType::InternalError))?
+                .map(|hit| (hit.meta, hit.handler)));
+        }
+
         let hash = self.get_hash(key);
 
         let meta = match crate::metrics::storage::get_cache_meta_memory(&hash) {
@@ -451,6 +503,39 @@ impl Storage for FileStorage {
         meta: &CacheMeta,
         _trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<MissHandler> {
+        if let Some(k_str) = key.primary_key_str()
+            && crate::cache::partial::is_partial_cache_key(k_str)
+        {
+            let resp_headers = meta.response_header();
+            let Some(content_range) =
+                crate::cache::partial::content_range_from_headers(&resp_headers.headers)
+            else {
+                return Err(Error::new(ErrorType::InternalError));
+            };
+            let expires = meta
+                .fresh_until()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or_else(|_| crate::utils::time::now_timestamp());
+            let capture = crate::cache::partial::PartialCapture {
+                start: content_range.start,
+                end: content_range.end,
+                total: content_range.total,
+                expires,
+                headers: crate::cache::partial::response_headers_to_store(&resp_headers.headers),
+                min_size: None,
+                max_size: None,
+            };
+            let location = self.partial_location_for_key_str(k_str);
+            return Ok(Box::new(PartialMissHandler {
+                cache_key: k_str.to_string(),
+                capture,
+                writer: None,
+                location,
+                disabled: false,
+            }));
+        }
+
         let (path, shard_id, relative_path) = self.get_write_location(key);
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -491,6 +576,14 @@ impl Storage for FileStorage {
             || content_type.contains("javascript")
             || content_type.contains("xml"))
             && content_encoding.is_empty();
+
+        // Parse stale-while-revalidate from Cache-Control header
+        let swr_secs = resp_headers
+            .headers
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|cc| parse_swr_from_cache_control(cc))
+            .unwrap_or(0);
 
         let mut headers_json = serde_json::Map::new();
         let hop_by_hop = [
@@ -533,6 +626,7 @@ impl Storage for FileStorage {
             compressed: should_compress,
             shard_id,
             relative_path,
+            stale_while_revalidate_secs: swr_secs,
         }))
     }
 
@@ -559,8 +653,16 @@ impl Storage for FileStorage {
         meta: &CacheMeta,
         _trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<bool> {
+        if let Some(k_str) = key.primary_key_str()
+            && crate::cache::partial::is_partial_cache_key(k_str)
+        {
+            return Ok(true);
+        }
+
         let hash = self.get_hash(key);
         let k_str = key.primary_key_str().unwrap_or("unknown").to_string();
+        // Clear FAST_L1 so SWR revalidation does not serve stale fresh_until
+        fast_l1_remove(&fast_hash_key(&k_str));
         let ttl = meta
             .fresh_until()
             .duration_since(meta.created())
@@ -625,6 +727,19 @@ impl Storage for FileStorage {
             .collect();
         let now = crate::utils::time::now_timestamp();
         let existing = crate::metrics::storage::STORAGE.get_cache_meta(&hash);
+        // Preserve existing SWR and created_at when updating meta; re-parse SWR from new headers.
+        let swr_secs = resp_headers
+            .headers
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|cc| parse_swr_from_cache_control(cc))
+            .unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|m| m.stale_while_revalidate_secs)
+                    .unwrap_or(0)
+            });
+        let created_at = existing.as_ref().map(|m| m.created_at).unwrap_or(now);
         crate::metrics::storage::STORAGE.upsert_cache_meta_absolute(
             crate::metrics::storage::CacheMetaUpsert {
                 hash: &hash,
@@ -642,6 +757,8 @@ impl Storage for FileStorage {
                     .and_then(|meta| meta.relative_path.as_deref()),
                 event_version: existing.as_ref().and_then(|meta| meta.event_version),
                 updated_at: Some(now),
+                stale_while_revalidate_secs: swr_secs,
+                created_at,
             },
         );
 
@@ -743,6 +860,72 @@ struct FileMissHandler {
     compressed: bool,
     shard_id: Option<String>,
     relative_path: String,
+    stale_while_revalidate_secs: u64,
+}
+
+struct PartialMissHandler {
+    cache_key: String,
+    capture: crate::cache::partial::PartialCapture,
+    writer: Option<crate::cache::partial::PartialWriter>,
+    location: PartialStorageLocation,
+    disabled: bool,
+}
+
+#[async_trait]
+impl HandleMiss for PartialMissHandler {
+    async fn write_body(&mut self, data: bytes::Bytes, _eof: bool) -> Result<()> {
+        if self.disabled || data.is_empty() {
+            return Ok(());
+        }
+        if self.writer.is_none() {
+            self.writer = crate::cache::partial::open_writer(
+                &self.cache_key,
+                self.capture.clone(),
+                &self.location.roots,
+                self.location.write_root.clone(),
+            )
+            .await
+            .map_err(|_| Error::new(ErrorType::InternalError))?;
+            if self.writer.is_none() {
+                self.disabled = true;
+                return Ok(());
+            }
+        }
+        if let Some(writer) = &mut self.writer
+            && !writer
+                .write(&data)
+                .await
+                .map_err(|_| Error::new(ErrorType::InternalError))?
+        {
+            self.disabled = true;
+        }
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+        let PartialMissHandler {
+            cache_key: _,
+            capture,
+            writer,
+            location,
+            disabled,
+        } = *self;
+        if disabled {
+            return Err(Error::new(ErrorType::InternalError));
+        }
+        let Some(writer) = writer else {
+            return Err(Error::new(ErrorType::InternalError));
+        };
+        let written = capture.end - capture.start + 1;
+        if !writer
+            .finish(&location.roots, location.write_root.clone())
+            .await
+            .map_err(|_| Error::new(ErrorType::InternalError))?
+        {
+            return Err(Error::new(ErrorType::InternalError));
+        }
+        Ok(MissFinishType::Created(written as usize))
+    }
 }
 
 #[async_trait]
@@ -825,8 +1008,11 @@ impl HandleMiss for FileMissHandler {
                 relative_path: Some(&self.relative_path),
                 event_version: None,
                 updated_at: Some(now),
+                stale_while_revalidate_secs: self.stale_while_revalidate_secs,
+                created_at: now,
             },
         );
+        index_surrogate_keys(&self.headers, &self.hash);
         crate::cluster::metadata::emit_upsert(crate::cluster::metadata::CacheMetaUpsertEvent {
             hash: &self.hash,
             cache_key: &self.key_str,
@@ -837,10 +1023,41 @@ impl HandleMiss for FileMissHandler {
             status: self.status,
             headers: &self.headers,
             compressed: self.compressed,
+            stale_while_revalidate_secs: self.stale_while_revalidate_secs,
         });
 
         Ok(MissFinishType::Created(written))
     }
+}
+
+/// Reverse index: Surrogate-Key tag → set of cache-entry hashes.
+/// Capacity is bounded by the number of in-memory cache entries at the time
+/// a new tag is inserted; entries for evicted keys are pruned on purge.
+static SURROGATE_KEY_INDEX: Lazy<DashMap<String, dashmap::DashSet<String>>> =
+    Lazy::new(DashMap::new);
+
+pub(crate) fn index_surrogate_keys(headers: &[(String, String)], hash: &str) {
+    let tags = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("surrogate-key"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    if tags.is_empty() {
+        return;
+    }
+    for tag in tags.split_whitespace() {
+        SURROGATE_KEY_INDEX
+            .entry(tag.to_string())
+            .or_default()
+            .insert(hash.to_string());
+    }
+}
+
+pub(crate) fn remove_hash_from_surrogate_index(hash: &str) {
+    SURROGATE_KEY_INDEX.retain(|_, set| {
+        set.remove(hash);
+        !set.is_empty()
+    });
 }
 
 /// Fast lock-free L1 entry stored in a sharded DashMap.
@@ -981,6 +1198,10 @@ impl HybridStorage {
             max_fast_l1_bytes: std::sync::atomic::AtomicU64::new(0), // 0 = auto-detect
             policy_type: AtomicU8::new(POLICY_FILE),
         }
+    }
+
+    pub fn partial_location_for_key_str(&self, key: &str) -> PartialStorageLocation {
+        self.l2.partial_location_for_key_str(key)
     }
 
     fn compute_memory_budget() -> u64 {
@@ -1234,10 +1455,13 @@ impl HybridStorage {
     }
 
     async fn purge_exact_stored_key(&'static self, key: &str) -> bool {
+        let location = self.l2.partial_location_for_key_str(key);
+        crate::cache::partial::purge(key, &location.roots).await;
         let hash = format!("{:x}", md5_legacy::compute(key));
         let inner = self.l2.inner.load();
         remove_cache_file_from_roots(&inner, &hash).await;
         crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+        remove_hash_from_surrogate_index(&hash);
         fast_l1_remove(&fast_hash_key(key));
 
         let full_key = CacheKey::new("", key, key);
@@ -1269,8 +1493,46 @@ impl HybridStorage {
         true
     }
 
+    pub async fn purge_by_tag(&'static self, tag: &str) -> bool {
+        let location = self.l2.partial_location_for_key_str(tag);
+        let partial_deleted =
+            crate::cache::partial::purge_by_tag(tag, &location.roots).await;
+        let hashes: Vec<String> = SURROGATE_KEY_INDEX
+            .get(tag)
+            .map(|set| set.iter().map(|h| h.clone()).collect())
+            .unwrap_or_default();
+        if hashes.is_empty() {
+            if partial_deleted > 0 {
+                info!(
+                    "RPC_CACHE: Purged {} partial entries by surrogate tag: {}",
+                    partial_deleted, tag
+                );
+            }
+            return true;
+        }
+        let mut keys_to_purge = Vec::with_capacity(hashes.len());
+        for hash in &hashes {
+            if let Some(meta) = crate::metrics::storage::get_cache_meta_memory(hash) {
+                keys_to_purge.push(meta.cache_key.clone());
+            }
+        }
+        let deleted_count = keys_to_purge.len();
+        for key in keys_to_purge {
+            self.purge_exact_stored_key(&key).await;
+        }
+        SURROGATE_KEY_INDEX.remove(tag);
+        info!(
+            "RPC_CACHE: Purged {} entries and {} partial entries by surrogate tag: {}",
+            deleted_count, partial_deleted, tag
+        );
+        true
+    }
+
     pub async fn purge_by_prefix(&'static self, prefix: &str) -> bool {
         let clean_prefix = prefix.trim_end_matches('*');
+        let location = self.l2.partial_location_for_key_str(clean_prefix);
+        let partial_deleted =
+            crate::cache::partial::purge_prefix(clean_prefix, &location.roots).await;
         let mut to_delete = Vec::new();
 
         crate::metrics::storage::STORAGE.for_each_cache_meta(|_, meta| {
@@ -1284,8 +1546,8 @@ impl HybridStorage {
             self.purge_exact_stored_key(&key).await;
         }
         info!(
-            "RPC_CACHE: Purged {} items matching prefix: {}",
-            deleted_count, prefix
+            "RPC_CACHE: Purged {} items and {} partial items matching prefix: {}",
+            deleted_count, partial_deleted, prefix
         );
         true
     }
@@ -1323,7 +1585,12 @@ impl Storage for HybridStorage {
         let p_type = self.policy_type.load(Ordering::Relaxed);
 
         let k_str = key.primary_key_str().unwrap_or("unknown");
+        let is_partial_key = crate::cache::partial::is_partial_cache_key(k_str);
         let hash = fast_hash_key(k_str);
+
+        if is_partial_key {
+            return self.l2.lookup(key, trace).await;
+        }
 
         // Check lock-free FAST_L1 first for ALL policy types (DashMap, sharded, zero contention)
         if let Some(entry) = FAST_L1.get(&hash) {
@@ -1399,6 +1666,12 @@ impl Storage for HybridStorage {
     ) -> Result<MissHandler> {
         let p_type = self.policy_type.load(Ordering::Relaxed);
 
+        if let Some(k_str) = key.primary_key_str()
+            && crate::cache::partial::is_partial_cache_key(k_str)
+        {
+            return self.l2.get_miss_handler(key, meta, trace).await;
+        }
+
         if p_type == POLICY_FILE {
             let min_free = self
                 .min_free_bytes
@@ -1440,6 +1713,12 @@ impl Storage for HybridStorage {
         meta: &CacheMeta,
         trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<bool> {
+        if let Some(k_str) = key.primary_key_str()
+            && crate::cache::partial::is_partial_cache_key(k_str)
+        {
+            return self.l2.update_meta(key, meta, trace).await;
+        }
+
         let p_type = self.policy_type.load(Ordering::Relaxed);
         if p_type == POLICY_MEMORY {
             self.l1.update_meta(key, meta, trace).await?;

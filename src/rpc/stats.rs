@@ -4,9 +4,109 @@ use crate::metrics::ServerStatusSnapshot;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use chrono::{Datelike, Duration as ChronoDuration, Timelike};
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use tracing::{debug, error, info};
+
+const ORIGIN_HEALTH_STATUS_UNKNOWN: u8 = 0;
+const ORIGIN_HEALTH_STATUS_HEALTHY: u8 = 1;
+const ORIGIN_HEALTH_STATUS_DOWN: u8 = 2;
+
+struct OriginHealthEntry {
+    status: AtomicU8,
+    latency_ms: AtomicI64,
+    last_check_ts: AtomicI64,
+}
+
+static ORIGIN_HEALTH_MAP: Lazy<dashmap::DashMap<i64, Arc<OriginHealthEntry>>> =
+    Lazy::new(dashmap::DashMap::new);
+
+pub fn push_origin_health_event(origin_id: i64, healthy: bool, latency_ms: i64) {
+    if origin_id <= 0 {
+        return;
+    }
+    let now = crate::utils::time::now_timestamp();
+    let status = if healthy {
+        ORIGIN_HEALTH_STATUS_HEALTHY
+    } else {
+        ORIGIN_HEALTH_STATUS_DOWN
+    };
+    if let Some(entry) = ORIGIN_HEALTH_MAP.get(&origin_id) {
+        entry.status.store(status, Ordering::Relaxed);
+        entry.latency_ms.store(latency_ms, Ordering::Relaxed);
+        entry.last_check_ts.store(now, Ordering::Relaxed);
+    } else {
+        ORIGIN_HEALTH_MAP.insert(
+            origin_id,
+            Arc::new(OriginHealthEntry {
+                status: AtomicU8::new(status),
+                latency_ms: AtomicI64::new(latency_ms),
+                last_check_ts: AtomicI64::new(now),
+            }),
+        );
+    }
+}
+
+pub async fn start_origin_health_reporter(api_config: ApiConfig) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        if !crate::cluster::leader::require_leader("origin_health_reporter") {
+            continue;
+        }
+        if ORIGIN_HEALTH_MAP.is_empty() {
+            continue;
+        }
+        let created_at = crate::utils::time::now_timestamp();
+        let items: Vec<_> = ORIGIN_HEALTH_MAP
+            .iter()
+            .map(|entry| {
+                let origin_id = *entry.key();
+                let e = entry.value();
+                let status_str = match e.status.load(Ordering::Relaxed) {
+                    ORIGIN_HEALTH_STATUS_HEALTHY => "healthy",
+                    ORIGIN_HEALTH_STATUS_DOWN => "down",
+                    _ => "unknown",
+                };
+                pb::create_node_values_request::NodeValueItem {
+                    item: format!("originHealth_{}", origin_id),
+                    value_json: serde_json::json!({
+                        "originId": origin_id,
+                        "status": status_str,
+                        "latencyMs": e.latency_ms.load(Ordering::Relaxed),
+                        "lastCheckTs": e.last_check_ts.load(Ordering::Relaxed),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                    created_at,
+                }
+            })
+            .collect();
+
+        if items.is_empty() {
+            continue;
+        }
+
+        let client = match RpcClient::new(&api_config).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Origin health reporter failed to connect: {}", e);
+                continue;
+            }
+        };
+        let mut service = client.node_value_service();
+        if let Err(e) = service
+            .create_node_values(pb::CreateNodeValuesRequest {
+                node_value_items: items,
+            })
+            .await
+        {
+            debug!("Origin health report failed: {}", e);
+        }
+    }
+}
 
 fn billable_bytes(snapshot: &ServerStatusSnapshot, api_config: &ApiConfig) -> u64 {
     if api_config.billing_count_inbound_traffic {
@@ -544,7 +644,7 @@ pub async fn start_metric_stat_reporter(
     }
 }
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32};
 
 static LAST_NODE_LEVEL: AtomicI32 = AtomicI32::new(-1);
 static LAST_HAS_PARENTS: AtomicBool = AtomicBool::new(false);
@@ -657,13 +757,16 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
                     region_city_id: key.city_id,
                 });
 
-            req.region_providers.push(
-                pb::upload_server_http_request_stat_request::RegionProvider {
-                    server_id: key.server_id,
-                    count: val.count,
-                    region_provider_id: 0,
-                },
-            );
+            let provider_id = key.provider_id;
+            if provider_id != 0 {
+                req.region_providers.push(
+                    pb::upload_server_http_request_stat_request::RegionProvider {
+                        server_id: key.server_id,
+                        count: val.count,
+                        region_provider_id: provider_id,
+                    },
+                );
+            }
         }
 
         if let Err(e) = server_service.upload_server_http_request_stat(req).await {
@@ -705,7 +808,9 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
                 |(server_id, ip, count_requests)| pb::upload_server_top_ip_stats_request::Stat {
                     server_id: server_id as u64,
                     ip,
-                    count_requests: count_requests as u32,
+                    // u64 → u32 silent wraparound at 4.3B would mask runaway IPs;
+                    // saturate to u32::MAX so the upper bound stays visible.
+                    count_requests: u32::try_from(count_requests).unwrap_or(u32::MAX),
                     day: day.clone(),
                     time_at: time_at.clone(),
                 },

@@ -1,20 +1,25 @@
 pub mod compiled;
+pub mod kernel;
 pub mod lists;
 pub mod matcher;
 pub mod matcher_plus;
 pub mod state;
+pub mod uam;
 pub mod verifier;
 
 use crate::config_models::{
-    HTTPFirewallPolicy, HTTPFirewallRegionConfig, ServerConfig, WAFBlockOptions, WAFCaptchaOptions,
-    WAFJSCookieOptions, WAFPageOptions,
+    HTTPFirewallPolicy, HTTPFirewallRegionConfig, HTTPFirewallRule, ServerConfig, WAFBlockOptions,
+    WAFCaptchaOptions, WAFJSCookieOptions, WAFPageOptions,
 };
 use crate::metrics::analyzer;
+use ahash::AHasher;
 use pingora_proxy::Session;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::time::Instant;
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub enum ActionResponse {
@@ -87,6 +92,29 @@ pub struct OutboundContext<'a> {
     pub bytes_sent: usize,
 }
 
+pub fn pick_ruleset<'a>(
+    policy: &'a HTTPFirewallPolicy,
+    client_ip: IpAddr,
+    path: &str,
+) -> (&'a [HTTPFirewallRule], Option<i64>) {
+    let Some(candidate_rules) = &policy.candidate_rules else {
+        return (&[], None);
+    };
+    let pct = policy.candidate_traffic_pct.min(100) as u64;
+    if pct == 0 {
+        return (&[], None);
+    }
+    let mut hasher = AHasher::default();
+    client_ip.hash(&mut hasher);
+    path.hash(&mut hasher);
+    let bucket = hasher.finish() % 100;
+    if bucket < pct {
+        (candidate_rules.as_slice(), Some(policy.candidate_version))
+    } else {
+        (&[], None)
+    }
+}
+
 pub fn evaluate_policy(
     policy: &HTTPFirewallPolicy,
     session: &Session,
@@ -128,16 +156,36 @@ fn evaluate_policy_inner(
         }
 
         let mut current_group_idx = 0;
+        let mut next_start_set_id: Option<i64> = None;
+        // Bounded flow-control to defuse misconfigured GO_GROUP / GO_SET cycles
+        // (e.g. group A → group B → group A). Without a cap a single request
+        // can pin a worker thread indefinitely.
+        let mut remaining_jumps: usize = inbound.groups.len().saturating_mul(8).max(64);
         while current_group_idx < inbound.groups.len() {
+            if remaining_jumps == 0 {
+                warn!(
+                    "WAF: aborting policy {} due to flow-control jump limit (possible group cycle)",
+                    policy.id
+                );
+                return None;
+            }
+            remaining_jumps -= 1;
             let group = &inbound.groups[current_group_idx];
             if !group.is_on {
                 current_group_idx += 1;
+                next_start_set_id = None;
                 continue;
             }
 
-            if let Some(result) =
-                matcher_plus::match_group_with_server(group, session, request_body, scheme, server)
-            {
+            let start_set = next_start_set_id.take();
+            if let Some(result) = matcher_plus::match_group_from(
+                group,
+                session,
+                request_body,
+                scheme,
+                server,
+                start_set,
+            ) {
                 if let Some(set) = result.set {
                     if let Some(mut matched) = perform_actions(&set.actions) {
                         fill_action_context(
@@ -172,21 +220,17 @@ fn evaluate_policy_inner(
                             }
                         }
 
-                        // Flow Control: GO_SET
+                        // Flow Control: GO_SET — precise jump to the named set
                         if let Some(next_sid) = matched.next_set_id {
-                            // Find which group has this set
-                            let mut found = false;
-                            for (g_idx, g) in inbound.groups.iter().enumerate() {
-                                if g.sets.iter().any(|s| s.id == next_sid) {
-                                    current_group_idx = g_idx;
-                                    // Note: we can't easily jump to a specific set within match_group
-                                    // without refactoring it to take a start_set_id.
-                                    // For now, we jump to the group, which is usually correct in the legacy flow.
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if found {
+                            let target = inbound.groups.iter().enumerate().find_map(|(idx, g)| {
+                                g.sets
+                                    .iter()
+                                    .any(|s| s.id == next_sid)
+                                    .then_some(idx)
+                            });
+                            if let Some(idx) = target {
+                                current_group_idx = idx;
+                                next_start_set_id = Some(next_sid);
                                 continue;
                             }
                         }
@@ -386,12 +430,25 @@ pub(crate) fn apply_observe_mode(policy: &HTTPFirewallPolicy, matched: &mut Matc
     }
 }
 
-fn is_blocking_action_code(action_code: &str) -> bool {
+pub(crate) fn is_blocking_action_code(action_code: &str) -> bool {
+    // Anything that changes user/WAF state (block, captcha, record into an
+    // IP list, etc.) is "blocking" in the sense that observe mode must skip
+    // its side effects — observe is supposed to mean "log only, do not
+    // alter state". record_ip_white / record_ip_gray were previously not in
+    // this list, so an attacker could trigger a rule in observe mode and
+    // get themselves added to a whitelist or graylist — an actual
+    // observe-mode bypass.
     matches!(
         action_code,
         "block"
             | "page"
             | "record_ip"
+            | "record_ip_white"
+            | "recordIPWhite"
+            | "record_ip_gray"
+            | "recordIPGray"
+            | "record_ip_grey"
+            | "recordIPGrey"
             | "captcha"
             | "js_cookie"
             | "jsCookie"

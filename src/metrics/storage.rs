@@ -1,7 +1,9 @@
 use dashmap::DashMap;
+use maxminddb;
 use once_cell::sync::Lazy;
 use rocksdb::{DB, MergeOperands, Options, WriteBatch};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -204,6 +206,8 @@ impl MetricStorage {
             relative_path: None,
             event_version: None,
             updated_at: Some(now),
+            stale_while_revalidate_secs: 0,
+            created_at: now,
         });
     }
 
@@ -223,8 +227,11 @@ impl MetricStorage {
             updated_at: upsert
                 .updated_at
                 .unwrap_or_else(crate::utils::time::now_timestamp),
+            stale_while_revalidate_secs: upsert.stale_while_revalidate_secs,
+            created_at: upsert.created_at,
         };
         CACHE_META_INDEX.insert(upsert.hash.to_string(), meta.clone());
+        crate::cache_hybrid::index_surrogate_keys(&meta.headers, upsert.hash);
         let Some(db) = &self.db else {
             return;
         };
@@ -280,6 +287,11 @@ impl MetricStorage {
 
     pub fn delete_cache_meta(&self, hash: &str) {
         CACHE_META_INDEX.remove(hash);
+        crate::cache_hybrid::remove_hash_from_surrogate_index(hash);
+        // Also drop the access-log entry — otherwise CACHE_ACCESS_LOG keeps
+        // growing across the lifetime of the node every time a cache entry is
+        // purged or expired (DashMap shards never shrink on their own).
+        CACHE_ACCESS_LOG.remove(hash);
         let Some(db) = &self.db else {
             return;
         };
@@ -523,6 +535,10 @@ pub struct CacheMetaUpsert<'a> {
     pub relative_path: Option<&'a str>,
     pub event_version: Option<u64>,
     pub updated_at: Option<i64>,
+    /// Value parsed from `Cache-Control: stale-while-revalidate=N` (0 = not set).
+    pub stale_while_revalidate_secs: u64,
+    /// Unix timestamp when this entry was first created.
+    pub created_at: i64,
 }
 
 /// Typed cache metadata — avoids per-lookup JSON clone/parse overhead.
@@ -544,6 +560,13 @@ pub struct CacheMetaEntry {
     pub event_version: Option<u64>,
     #[serde(default)]
     pub updated_at: i64,
+    /// Seconds from `expires` during which the stale entry may be served while
+    /// a background revalidation is in flight (RFC 5861 stale-while-revalidate).
+    #[serde(default)]
+    pub stale_while_revalidate_secs: u64,
+    /// Unix timestamp when this entry was first created (used for weak ETag generation).
+    #[serde(default)]
+    pub created_at: i64,
 }
 
 /// In-memory cache metadata index: hash → typed metadata.
@@ -564,6 +587,8 @@ fn cache_meta_json(meta: &CacheMetaEntry) -> serde_json::Value {
         "rp": meta.relative_path,
         "v": meta.event_version,
         "u": meta.updated_at,
+        "swr": meta.stale_while_revalidate_secs,
+        "ca": meta.created_at,
     })
 }
 
@@ -663,6 +688,8 @@ pub fn load_cache_meta_index() {
                 relative_path: raw.get("rp").and_then(|v| v.as_str()).map(str::to_string),
                 event_version: raw.get("v").and_then(|v| v.as_u64()),
                 updated_at: raw.get("u").and_then(|v| v.as_i64()).unwrap_or(0),
+                stale_while_revalidate_secs: raw.get("swr").and_then(|v| v.as_u64()).unwrap_or(0),
+                created_at: raw.get("ca").and_then(|v| v.as_i64()).unwrap_or(0),
             };
             CACHE_META_INDEX.insert(hash, entry);
             count += 1;
@@ -681,4 +708,43 @@ pub fn start_cache_access_flusher() {
             STORAGE.flush_cache_accesses();
         }
     });
+}
+
+static ASN_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
+    let paths = crate::paths::NodePaths::current().geoip_asn_candidates();
+    for path in &paths {
+        if path.exists() {
+            return maxminddb::Reader::open_readfile(path).ok();
+        }
+    }
+    None
+});
+
+static ASN_NUMBER_CACHE: Lazy<DashMap<IpAddr, i64>> = Lazy::new(DashMap::new);
+
+pub fn lookup_asn_number(ip: IpAddr) -> i64 {
+    if let Some(cached) = ASN_NUMBER_CACHE.get(&ip) {
+        return *cached;
+    }
+    let asn = ASN_READER
+        .as_ref()
+        .and_then(|reader| reader.lookup::<serde_json::Value>(ip).ok())
+        .and_then(|val| val.get("autonomous_system_number").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
+    if ASN_NUMBER_CACHE.len() < 65536 {
+        ASN_NUMBER_CACHE.insert(ip, asn);
+    }
+    asn
+}
+
+pub fn provider_name_to_id(name: &str) -> i64 {
+    if name.is_empty() || name == "Unknown" {
+        return 0;
+    }
+    let h = crate::utils::fnv_hash64(name);
+    ((h >> 1) as i64).max(1)
+}
+
+pub fn lookup_region_provider_id(ip: IpAddr) -> i64 {
+    lookup_asn_number(ip)
 }

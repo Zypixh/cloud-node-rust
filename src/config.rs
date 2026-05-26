@@ -16,9 +16,12 @@ use crate::config_models::{
 pub struct PlanDerivedConfig {
     pub max_upload_bytes: i64,
     pub traffic_limit_notice_body: Option<String>,
+    pub cc_max_qps: i32,
+    pub cc_per_ip_max_qps: i32,
+    pub cc_max_bandwidth: i64,
 }
 
-/// Configuration for the local EdgeNode.
+/// Configuration for the local cloud node.
 #[derive(Clone)]
 pub struct NodeConfig {
     /// The numeric ID in the central database
@@ -135,10 +138,40 @@ pub struct TlsRouteInspection {
 }
 
 fn compile_plan_derived(plan: &crate::pb::Plan) -> PlanDerivedConfig {
+    let (cc_max_qps, cc_per_ip_max_qps, cc_max_bandwidth) = compile_plan_cc_limits(plan);
     PlanDerivedConfig {
         max_upload_bytes: compile_plan_max_upload_bytes(plan),
         traffic_limit_notice_body: compile_plan_traffic_limit_notice_body(plan),
+        cc_max_qps,
+        cc_per_ip_max_qps,
+        cc_max_bandwidth,
     }
+}
+
+fn compile_plan_cc_limits(plan: &crate::pb::Plan) -> (i32, i32, i64) {
+    if plan.features_json.is_empty() {
+        return (0, 0, 0);
+    }
+    let value = match serde_json::from_slice::<serde_json::Value>(&plan.features_json) {
+        Ok(v) => v,
+        Err(_) => return (0, 0, 0),
+    };
+    let max_qps = value
+        .get("ccMaxQPS")
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(0) as i32)
+        .unwrap_or(0);
+    let per_ip_max_qps = value
+        .get("ccPerIPMaxQPS")
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(0) as i32)
+        .unwrap_or(0);
+    let max_bandwidth = value
+        .get("ccMaxBandwidth")
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(0))
+        .unwrap_or(0);
+    (max_qps, per_ip_max_qps, max_bandwidth)
 }
 
 fn compile_plan_max_upload_bytes(plan: &crate::pb::Plan) -> i64 {
@@ -304,11 +337,18 @@ fn cert_data_score(cert: &SSLCertConfig) -> usize {
 fn dedup_ssl_certs(certs: Vec<SSLCertConfig>) -> Vec<SSLCertConfig> {
     let mut order = Vec::new();
     let mut by_id: HashMap<i64, SSLCertConfig> = HashMap::new();
+    // Certs with id<=0 are unsaved/local — they previously collided on the
+    // same map key (0 or -1), silently dropping all but the last one.
+    // Give each its own synthetic negative key so order/by_id stay in sync.
+    let mut synthetic_id: i64 = -1;
 
-    for cert in certs {
+    for mut cert in certs {
         if cert.id <= 0 {
-            order.push(cert.id);
-            by_id.insert(cert.id, cert);
+            let key = synthetic_id;
+            synthetic_id -= 1;
+            cert.id = key;
+            order.push(key);
+            by_id.insert(key, cert);
             continue;
         }
         if !by_id.contains_key(&cert.id) {
@@ -792,6 +832,25 @@ impl ConfigStore {
         )
     }
 
+    pub fn get_origin_build_context_sync(
+        &self,
+    ) -> (
+        i32,
+        Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
+        bool,
+        bool,
+        Option<crate::config_models::GlobalHTTPAllConfig>,
+    ) {
+        let lock = self.inner.read();
+        (
+            lock.level,
+            Arc::clone(&lock.parent_nodes),
+            lock.tiered_origin_bypass,
+            lock.allow_lan_ip,
+            Some((*lock.global_http_config).clone()),
+        )
+    }
+
     pub fn get_upstream_peer_context_with_firewall_policies_sync(
         &self,
     ) -> (i32, bool, bool, bool, i64, Arc<Vec<HTTPFirewallPolicy>>) {
@@ -1040,6 +1099,14 @@ impl ConfigStore {
         lock.version
     }
 
+    pub async fn update_config_version(&self, version: i64) {
+        if version <= 0 {
+            return;
+        }
+        let mut lock = self.inner.write();
+        lock.version = version;
+    }
+
     pub async fn get_updating_server_list_id(&self) -> i64 {
         let lock = self.inner.read();
         lock.updating_server_list_id
@@ -1131,6 +1198,10 @@ impl ConfigStore {
         for policy in &firewall_policies {
             policy.compile_url_patterns();
         }
+        for policy in uam_policies.values() {
+            policy.compile_url_patterns();
+        }
+        crate::routing::location::clear_compiled_locations();
         let mut lock = self.inner.write();
         lock.id = id;
         lock.version = version;
@@ -1223,6 +1294,7 @@ impl ConfigStore {
         for server in &all_servers {
             server.compile_url_patterns();
         }
+        crate::routing::location::clear_compiled_locations();
         let mut lock = self.inner.write();
         lock.all_servers
             .retain(|server| server.numeric_id() != server_id);
@@ -1270,6 +1342,7 @@ impl ConfigStore {
         for server in &all_servers {
             server.compile_url_patterns();
         }
+        crate::routing::location::clear_compiled_locations();
         let mut lock = self.inner.write();
         lock.all_servers.retain(|server| server.user_id != user_id);
         let stale_hosts = lock
@@ -1316,6 +1389,7 @@ impl ConfigStore {
     }
 
     pub async fn remove_user_servers(&self, user_id: i64) {
+        crate::routing::location::clear_compiled_locations();
         let mut lock = self.inner.write();
         let stale_server_ids = lock
             .all_servers
@@ -1349,6 +1423,7 @@ impl ConfigStore {
     }
 
     pub async fn remove_server(&self, server_id: i64) {
+        crate::routing::location::clear_compiled_locations();
         let mut lock = self.inner.write();
         lock.all_servers
             .retain(|server| server.numeric_id() != server_id);
@@ -1381,6 +1456,8 @@ impl ConfigStore {
         server: Arc<ServerConfig>,
         lb: Arc<crate::lb_factory::AnyLoadBalancer>,
     ) {
+        server.compile_url_patterns();
+        crate::routing::location::clear_compiled_locations();
         let mut lock = self.inner.write();
         let server_id = server.numeric_id();
         if server_id > 0 {
@@ -1673,6 +1750,8 @@ mod tests {
                     enable_response_headers: false,
                     enable_cookies: false,
                     enable_server_not_found: true,
+                    firewall_only: false,
+                    enable_client_closed: false,
                 }),
             )
             .await;

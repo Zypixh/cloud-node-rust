@@ -1,5 +1,5 @@
 use crate::config_models::{
-    HTTPFirewallRule, HTTPFirewallRuleGroup, HTTPFirewallRuleSet, ServerConfig,
+    HTTPFirewallRule, HTTPFirewallRuleGroup, HTTPFirewallRuleSet, HTTPParamFilter, ServerConfig,
 };
 use crate::firewall::OutboundContext;
 use crate::metrics::analyzer;
@@ -67,15 +67,29 @@ pub fn match_group_with_server<'a>(
     scheme: &str,
     server: Option<&ServerConfig>,
 ) -> Option<MatchResult<'a>> {
+    match_group_from(group, session, request_body, scheme, server, None)
+}
+
+pub fn match_group_from<'a>(
+    group: &'a HTTPFirewallRuleGroup,
+    session: &Session,
+    request_body: &[u8],
+    scheme: &str,
+    server: Option<&ServerConfig>,
+    start_set_id: Option<i64>,
+) -> Option<MatchResult<'a>> {
     if !group.is_on {
         return None;
     }
 
     let facts = RequestFacts::new_with_server(session, request_body, scheme, server);
-    if group
-        .code
-        .as_deref()
-        .is_some_and(|code| preset_group_matches(code, &facts))
+    // Preset group matchers (sqlInjection, xss, ...) sit outside the set list,
+    // so they only apply when iteration starts from the top.
+    if start_set_id.is_none()
+        && group
+            .code
+            .as_deref()
+            .is_some_and(|code| preset_group_matches(code, &facts))
     {
         return Some(MatchResult {
             matched: true,
@@ -83,7 +97,16 @@ pub fn match_group_with_server<'a>(
         });
     }
 
-    for set in &group.sets {
+    let start_idx = match start_set_id {
+        Some(sid) => group
+            .sets
+            .iter()
+            .position(|s| s.id == sid)
+            .unwrap_or(group.sets.len()),
+        None => 0,
+    };
+
+    for set in group.sets.iter().skip(start_idx) {
         if match_set_with_facts(set, session, &facts) {
             return Some(MatchResult {
                 matched: true,
@@ -104,16 +127,24 @@ pub(crate) fn preset_group_matches(code: &str, facts: &RequestFacts<'_>) -> bool
         "cmdInjection" => ("contains cmd injection", false),
         _ => return false,
     };
-    let values = [
+    let str_values = [
         facts.request_uri(),
         facts.request_args(),
         facts.cookies_normalized(),
         facts.headers(),
-        facts.request_body_text(),
     ];
-    values
+    if str_values
         .iter()
         .any(|value| crate::firewall::matcher::evaluate_operator(value, operator, "", !strict))
+    {
+        return true;
+    }
+    crate::firewall::matcher::evaluate_operator_bytes(
+        facts.request_body,
+        operator,
+        "",
+        !strict,
+    )
 }
 
 pub(crate) fn preset_group_uses_request_body(code: &str) -> bool {
@@ -283,13 +314,40 @@ pub fn match_group_response_with_server<'a>(
 
 pub(crate) fn is_local_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local()
+        }
         std::net::IpAddr::V6(v6) => {
+            // Canonicalize IPv4-mapped IPv6 (::ffff:a.b.c.d) before testing.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_private() || v4.is_loopback() || v4.is_link_local();
+            }
+            if v6.is_loopback() {
+                return true;
+            }
             let octets = v6.octets();
-            // Simple check for unique local and loopback
-            (octets[0] & 0xfe == 0xfc) || v6.is_loopback()
+            // ULA (fc00::/7): first byte high 7 bits == 0xfc (octet & 0xfe == 0xfc).
+            // Operator precedence requires explicit parens — the previous
+            // `octets[0] & 0xfe == 0xfc` parses as `octets[0] & (0xfe == 0xfc)`
+            // which is always 0.
+            if (octets[0] & 0xfe) == 0xfc {
+                return true;
+            }
+            // Link-local (fe80::/10): first 10 bits == 1111_1110_10
+            if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+                return true;
+            }
+            false
         }
     }
+}
+
+fn is_raw_body_param(param: &str) -> bool {
+    let inner = param
+        .strip_prefix("${")
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(param);
+    matches!(inner, "requestBody" | "requestAll")
 }
 
 pub fn match_rule(
@@ -304,8 +362,26 @@ pub fn match_rule(
 
 fn match_rule_with_facts(rule: &HTTPFirewallRule, facts: &RequestFacts<'_>) -> bool {
     crate::metrics::METRICS.waf.record_rule_evaluation();
-    let param_value =
+
+    // For body params with no filters applied, evaluate against raw bytes to
+    // avoid U+FFFD corruption from from_utf8_lossy.
+    if rule.param_filters.is_empty() && is_raw_body_param(&rule.param) {
+        let matched = crate::firewall::matcher::evaluate_operator_bytes(
+            facts.request_body,
+            &rule.operator,
+            &rule.value,
+            rule.is_case_insensitive,
+        );
+        return if rule.is_reverse { !matched } else { matched };
+    }
+
+    let raw_value =
         get_compiled_rule_value_with_facts(&rule.param, rule.checkpoint_options.as_ref(), facts);
+    let param_value = if rule.param_filters.is_empty() {
+        raw_value
+    } else {
+        apply_param_filters(&raw_value, &rule.param_filters)
+    };
     let matched = crate::firewall::matcher::evaluate_operator(
         &param_value,
         &rule.operator,
@@ -332,11 +408,43 @@ fn match_rule_response_with_facts(
     facts: &ResponseFacts<'_, '_, '_>,
 ) -> bool {
     crate::metrics::METRICS.waf.record_rule_evaluation();
-    let param_value = get_compiled_response_rule_value_with_facts(
+
+    if rule.param_filters.is_empty() {
+        if is_raw_body_param(&rule.param) {
+            let matched = crate::firewall::matcher::evaluate_operator_bytes(
+                facts.request().request_body,
+                &rule.operator,
+                &rule.value,
+                rule.is_case_insensitive,
+            );
+            return if rule.is_reverse { !matched } else { matched };
+        }
+        let resp_body_param = rule
+            .param
+            .strip_prefix("${")
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(&rule.param);
+        if resp_body_param == "responseBody" {
+            let matched = crate::firewall::matcher::evaluate_operator_bytes(
+                facts.response_body_bytes(),
+                &rule.operator,
+                &rule.value,
+                rule.is_case_insensitive,
+            );
+            return if rule.is_reverse { !matched } else { matched };
+        }
+    }
+
+    let raw_value = get_compiled_response_rule_value_with_facts(
         &rule.param,
         rule.checkpoint_options.as_ref(),
         facts,
     );
+    let param_value = if rule.param_filters.is_empty() {
+        raw_value
+    } else {
+        apply_param_filters(&raw_value, &rule.param_filters)
+    };
     let matched = crate::firewall::matcher::evaluate_operator(
         &param_value,
         &rule.operator,
@@ -345,6 +453,79 @@ fn match_rule_response_with_facts(
     );
 
     if rule.is_reverse { !matched } else { matched }
+}
+
+/// Apply a chain of param filters to a string value in order.
+///
+/// Bounded to defuse amplification attacks: a chain of decoders
+/// (`base64Decode` / `urlDecode`) can blow up the working string and stall
+/// the request thread. We cap both the number of filters that actually run
+/// and the maximum size of the intermediate string.
+pub(crate) fn apply_param_filters(value: &str, filters: &[HTTPParamFilter]) -> String {
+    /// Maximum filters honoured per rule. Reasonable real-world chains are
+    /// 2–3 long; anything beyond is almost certainly a misconfig or attack.
+    const MAX_FILTER_CHAIN: usize = 8;
+    /// Cap each intermediate string at ~1 MiB. Above this we stop and return
+    /// the truncated value so downstream operators still see something
+    /// meaningful for rule matching.
+    const MAX_FILTER_OUTPUT_BYTES: usize = 1024 * 1024;
+
+    let mut current = value.to_string();
+    for filter in filters.iter().take(MAX_FILTER_CHAIN) {
+        current = apply_single_filter(&current, filter);
+        if current.len() > MAX_FILTER_OUTPUT_BYTES {
+            // Truncate on a UTF-8 char boundary so the result stays valid.
+            let mut cut = MAX_FILTER_OUTPUT_BYTES;
+            while cut > 0 && !current.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            current.truncate(cut);
+            break;
+        }
+    }
+    current
+}
+
+fn apply_single_filter(value: &str, filter: &HTTPParamFilter) -> String {
+    match filter.code.as_str() {
+        "urlDecode" => urlencoding::decode(value)
+            .map(|v| v.into_owned())
+            .unwrap_or_else(|_| value.to_string()),
+        "base64Decode" => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(value.trim())
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_else(|| value.to_string())
+        }
+        "htmlDecode" => value
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'"),
+        "toLowerCase" => value.to_lowercase(),
+        "toUpperCase" => value.to_uppercase(),
+        "trim" => value.trim().to_string(),
+        "md5" => {
+            let digest = md5_legacy::compute(value.as_bytes());
+            format!("{:x}", digest)
+        }
+        "sha1" => {
+            use sha1::{Digest as _, Sha1};
+            let mut hasher = Sha1::new();
+            hasher.update(value.as_bytes());
+            hex::encode(hasher.finalize())
+        }
+        "sha256" => {
+            let mut hasher = Sha256::new();
+            hasher.update(value.as_bytes());
+            hex::encode(hasher.finalize())
+        }
+        _ => value.to_string(),
+    }
 }
 
 static CC_COUNTERS: Lazy<DashMap<String, crate::firewall::state::RollingCounter>> =
@@ -627,6 +808,10 @@ impl<'a> RequestFacts<'a> {
             .clone()
     }
 
+    pub(crate) fn request_body_bytes(&self) -> &'a [u8] {
+        self.request_body
+    }
+
     pub(crate) fn request_all(&self) -> String {
         self.request_all
             .get_or_init(|| format!("{}{}", self.request_uri(), self.request_body_text()))
@@ -827,6 +1012,10 @@ impl<'request, 'response_ref, 'response_data>
             .clone()
     }
 
+    pub(crate) fn response_body_bytes(&self) -> &[u8] {
+        self.response.body
+    }
+
     pub(crate) fn bytes_sent(&self) -> String {
         self.response.bytes_sent.to_string()
     }
@@ -880,11 +1069,10 @@ pub(crate) fn get_compiled_rule_value_with_facts(
     checkpoint_options: Option<&Value>,
     facts: &RequestFacts<'_>,
 ) -> String {
-    if param.starts_with("${cc.")
-        || param == "${cc}"
-        || param.starts_with("${cc2.")
-        || param == "${cc2}"
-    {
+    if param.starts_with("${cc.") || param == "${cc}" {
+        return cc_value_with_facts(param, checkpoint_options, facts, false);
+    }
+    if param.starts_with("${cc2.") || param == "${cc2}" {
         return cc_value_with_facts(param, checkpoint_options, facts, true);
     }
     get_variable_value_with_facts(param, facts)
@@ -895,11 +1083,10 @@ pub(crate) fn get_compiled_response_rule_value_with_facts(
     checkpoint_options: Option<&Value>,
     facts: &ResponseFacts<'_, '_, '_>,
 ) -> String {
-    if param.starts_with("${cc.")
-        || param == "${cc}"
-        || param.starts_with("${cc2.")
-        || param == "${cc2}"
-    {
+    if param.starts_with("${cc.") || param == "${cc}" {
+        return cc_value_with_facts(param, checkpoint_options, facts.request(), false);
+    }
+    if param.starts_with("${cc2.") || param == "${cc2}" {
         return cc_value_with_facts(param, checkpoint_options, facts.request(), true);
     }
     get_response_variable_value_with_facts(param, facts)
@@ -1332,44 +1519,66 @@ fn get_local_port(session: &Session) -> String {
 }
 
 pub(crate) fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
-    for header in [
-        "x-cloud-real-ip",
-        "cf-connecting-ip",
-        "true-client-ip",
-        "x-forwarded-for",
-        "x-real-ip",
-        "x-client-ip",
-        "x-original-forwarded-for",
-        "x-cluster-client-ip",
-        "fastly-client-ip",
-        "ali-cdn-real-ip",
-        "cdn-src-ip",
-        "forwarded",
-    ] {
-        if let Some(value) = session
-            .get_header(header)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.trim().trim_matches('"').trim_matches('\''))
-        {
-            let mut candidate = value;
-            if let Some(v) = candidate
-                .strip_prefix("for=")
-                .or_else(|| candidate.strip_prefix("For="))
+    let peer_ip = peer_socket_ip(session);
+    let canonicalize = |ip: std::net::IpAddr| -> std::net::IpAddr {
+        if let std::net::IpAddr::V6(v6) = ip {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return std::net::IpAddr::V4(v4);
+            }
+        }
+        ip
+    };
+    // Only trust forwarded-for-style headers when the immediate peer is local
+    // (loopback / private). Public clients can forge these headers to bypass
+    // CC counters, IP blacklists, and rule matches. The trust boundary mirrors
+    // proxy::resolve_client_ip.
+    let trust_headers = peer_ip
+        .map(|ip| is_local_ip(&ip))
+        .unwrap_or(false);
+    if trust_headers {
+        for header in [
+            "x-cloud-real-ip",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-forwarded-for",
+            "x-real-ip",
+            "x-client-ip",
+            "x-original-forwarded-for",
+            "x-cluster-client-ip",
+            "fastly-client-ip",
+            "ali-cdn-real-ip",
+            "cdn-src-ip",
+            "forwarded",
+        ] {
+            if let Some(value) = session
+                .get_header(header)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim().trim_matches('"').trim_matches('\''))
             {
-                candidate = v.trim();
-            }
-            if let Some((first, _)) = candidate.split_once(';') {
-                candidate = first.trim();
-            }
-            if let Some((first, _)) = candidate.split_once(',') {
-                candidate = first.trim();
-            }
-            let candidate = candidate.trim_matches(|c| c == '[' || c == ']');
-            if let Ok(ip) = candidate.parse() {
-                return ip;
+                let mut candidate = value;
+                if let Some(v) = candidate
+                    .strip_prefix("for=")
+                    .or_else(|| candidate.strip_prefix("For="))
+                {
+                    candidate = v.trim();
+                }
+                if let Some((first, _)) = candidate.split_once(';') {
+                    candidate = first.trim();
+                }
+                if let Some((first, _)) = candidate.split_once(',') {
+                    candidate = first.trim();
+                }
+                let candidate = candidate.trim_matches(|c| c == '[' || c == ']');
+                if let Ok(ip) = candidate.parse::<std::net::IpAddr>() {
+                    return canonicalize(ip);
+                }
             }
         }
     }
+    canonicalize(peer_ip.unwrap_or(std::net::IpAddr::from([127, 0, 0, 1])))
+}
+
+fn peer_socket_ip(session: &Session) -> Option<std::net::IpAddr> {
     session
         .downstream_session
         .digest()
@@ -1383,7 +1592,6 @@ pub(crate) fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
                 _ => None,
             })
         })
-        .unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]))
 }
 
 fn geo_info(session: &Session) -> Option<analyzer::GeoInfo> {
@@ -1541,8 +1749,15 @@ fn query_param(session: &Session, name: &str) -> String {
             q.split('&').find_map(|part| {
                 let mut iter = part.splitn(2, '=');
                 let key = iter.next()?;
-                if key == name {
-                    Some(iter.next().unwrap_or("").to_string())
+                let decoded_key = urlencoding::decode(key)
+                    .unwrap_or_else(|_| std::borrow::Cow::Borrowed(key));
+                if decoded_key == name {
+                    let value = iter.next().unwrap_or("");
+                    Some(
+                        urlencoding::decode(value)
+                            .unwrap_or_else(|_| std::borrow::Cow::Borrowed(value))
+                            .into_owned(),
+                    )
                 } else {
                     None
                 }
@@ -1560,7 +1775,14 @@ fn parse_query_params(input: &str) -> Vec<(String, String)> {
             }
             let mut iter = part.splitn(2, '=');
             let key = iter.next()?;
-            Some((key.to_string(), iter.next().unwrap_or("").to_string()))
+            let decoded_key = urlencoding::decode(key)
+                .unwrap_or_else(|_| std::borrow::Cow::Borrowed(key))
+                .into_owned();
+            let value = iter.next().unwrap_or("");
+            let decoded_value = urlencoding::decode(value)
+                .unwrap_or_else(|_| std::borrow::Cow::Borrowed(value))
+                .into_owned();
+            Some((decoded_key, decoded_value))
         })
         .collect()
 }

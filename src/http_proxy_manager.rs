@@ -1,6 +1,7 @@
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 use crate::proxy::EdgeProxy;
+use crate::proxy_protocol;
 use crate::ssl::DynamicCertSelector;
 use anyhow::Context;
 use dashmap::DashMap;
@@ -12,9 +13,11 @@ use pingora_core::protocols::{GetSocketDigest, SocketDigest};
 use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::Duration;
@@ -27,12 +30,44 @@ use std::os::windows::io::AsRawSocket;
 
 struct ListenerHandle {
     is_tls: bool,
+    enable_proxy_protocol: bool,
     shutdown_tx: watch::Sender<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ListenerConfig {
+    is_tls: bool,
+    enable_proxy_protocol: bool,
 }
 
 struct PassthroughBackendTarget {
     addr: String,
     origin_id: i64,
+}
+
+fn record_desired_listener(
+    desired_ports: &mut HashMap<u16, ListenerConfig>,
+    port: u16,
+    config: ListenerConfig,
+    server_id: i64,
+) {
+    match desired_ports.entry(port) {
+        Entry::Vacant(entry) => {
+            entry.insert(config);
+        }
+        Entry::Occupied(entry) if *entry.get() == config => {}
+        Entry::Occupied(entry) => {
+            warn!(
+                "HTTP/HTTPS Proxy Manager: ignoring conflicting listener config on port {} for server {} (existing TLS={}, proxy_protocol={}; requested TLS={}, proxy_protocol={})",
+                port,
+                server_id,
+                entry.get().is_tls,
+                entry.get().enable_proxy_protocol,
+                config.is_tls,
+                config.enable_proxy_protocol
+            );
+        }
+    }
 }
 
 pub struct HttpProxyManager {
@@ -72,6 +107,7 @@ impl HttpProxyManager {
             }
 
             for server in servers {
+                let enable_pp = server.enable_proxy_protocol;
                 // 1. Handle HTTP Ports
                 if let Some(http_cfg) = &server.http {
                     if http_cfg.is_on {
@@ -89,8 +125,15 @@ impl HttpProxyManager {
                                     .unwrap_or(port_str)
                                     .parse::<u16>();
                                 if let Ok(p) = port {
-                                    desired_ports.insert(p, false);
-                                    self.spawn_listener(p, false).await;
+                                    record_desired_listener(
+                                        &mut desired_ports,
+                                        p,
+                                        ListenerConfig {
+                                            is_tls: false,
+                                            enable_proxy_protocol: enable_pp,
+                                        },
+                                        server.numeric_id(),
+                                    );
                                 } else {
                                     error!("Failed to parse HTTP port: {:?}", port_str);
                                 }
@@ -125,8 +168,15 @@ impl HttpProxyManager {
                                     .unwrap_or(port_str)
                                     .parse::<u16>();
                                 if let Ok(p) = port {
-                                    desired_ports.insert(p, true);
-                                    self.spawn_listener(p, true).await;
+                                    record_desired_listener(
+                                        &mut desired_ports,
+                                        p,
+                                        ListenerConfig {
+                                            is_tls: true,
+                                            enable_proxy_protocol: enable_pp,
+                                        },
+                                        server.numeric_id(),
+                                    );
                                 } else {
                                     error!("Failed to parse HTTPS port: {:?}", port_str);
                                 }
@@ -146,6 +196,10 @@ impl HttpProxyManager {
                 }
             }
 
+            for (port, config) in &desired_ports {
+                self.spawn_listener(*port, config.is_tls, config.enable_proxy_protocol)
+                    .await;
+            }
             self.reconcile_listeners(&desired_ports);
             tokio::select! {
                 _ = self.config_store.wait_for_runtime_reload() => {
@@ -156,9 +210,11 @@ impl HttpProxyManager {
         }
     }
 
-    async fn spawn_listener(self: &Arc<Self>, port: u16, is_tls: bool) {
+    async fn spawn_listener(self: &Arc<Self>, port: u16, is_tls: bool, enable_proxy_protocol: bool) {
         if let Some(existing) = self.handled_ports.get(&port) {
-            if existing.is_tls == is_tls {
+            if existing.is_tls == is_tls
+                && existing.enable_proxy_protocol == enable_proxy_protocol
+            {
                 return;
             }
             let _ = existing.shutdown_tx.send(true);
@@ -171,19 +227,20 @@ impl HttpProxyManager {
             port,
             ListenerHandle {
                 is_tls,
+                enable_proxy_protocol,
                 shutdown_tx,
             },
         );
         info!(
-            "HTTP/HTTPS Proxy Manager: Initializing listener on port {} (TLS={})",
-            port, is_tls
+            "HTTP/HTTPS Proxy Manager: Initializing listener on port {} (TLS={}, proxy_protocol={})",
+            port, is_tls, enable_proxy_protocol
         );
 
         let manager = self.clone();
         tokio::spawn(async move {
             if let Err(e) = manager
                 .clone()
-                .run_http_listener(port, is_tls, shutdown_rx)
+                .run_http_listener(port, is_tls, enable_proxy_protocol, shutdown_rx)
                 .await
             {
                 error!("HTTP/HTTPS listener on port {} failed: {}", port, e);
@@ -192,21 +249,29 @@ impl HttpProxyManager {
         });
     }
 
-    fn reconcile_listeners(&self, desired_ports: &HashMap<u16, bool>) {
-        let active_ports: Vec<(u16, bool)> = self
+    fn reconcile_listeners(&self, desired_ports: &HashMap<u16, ListenerConfig>) {
+        let active_ports: Vec<(u16, ListenerConfig)> = self
             .handled_ports
             .iter()
-            .map(|entry| (*entry.key(), entry.value().is_tls))
+            .map(|entry| {
+                (
+                    *entry.key(),
+                    ListenerConfig {
+                        is_tls: entry.value().is_tls,
+                        enable_proxy_protocol: entry.value().enable_proxy_protocol,
+                    },
+                )
+            })
             .collect();
 
-        for (port, is_tls) in active_ports {
+        for (port, active) in active_ports {
             match desired_ports.get(&port) {
-                Some(desired_tls) if *desired_tls == is_tls => {}
+                Some(desired) if *desired == active => {}
                 _ => {
                     if let Some((_, handle)) = self.handled_ports.remove(&port) {
                         info!(
-                            "HTTP/HTTPS Proxy Manager: Stopping listener on port {} (TLS={})",
-                            port, is_tls
+                            "HTTP/HTTPS Proxy Manager: Stopping listener on port {} (TLS={}, proxy_protocol={})",
+                            port, active.is_tls, active.enable_proxy_protocol
                         );
                         let _ = handle.shutdown_tx.send(true);
                     }
@@ -219,6 +284,7 @@ impl HttpProxyManager {
         self: Arc<Self>,
         port: u16,
         is_tls: bool,
+        enable_proxy_protocol: bool,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let addr = format!("0.0.0.0:{}", port);
@@ -273,10 +339,16 @@ impl HttpProxyManager {
                 let manager = self.clone();
                 let downstream_read_timeout = manager.downstream_read_timeout();
                 tokio::spawn(async move {
+                    // Resolve the effective client address, consuming any PROXY header.
+                    let Some((effective_addr, client_stream)) =
+                        maybe_consume_proxy_protocol_header(client_stream, client_addr, enable_proxy_protocol).await
+                    else {
+                        return;
+                    };
                     manager
                         .record_empty_connection_if_no_payload(
                             client_stream,
-                            client_addr,
+                            effective_addr,
                             proxy_inner,
                             shutdown_inner,
                             downstream_read_timeout,
@@ -301,6 +373,14 @@ impl HttpProxyManager {
             tokio::spawn(async move {
                 let mut configured_tls_host = false;
                 let mut count_tls_handshake_failure = true;
+
+                // For TLS connections, consume any PROXY Protocol header before
+                // the TLS handshake so the TLS ClientHello is at byte 0.
+                let Some((client_addr, client_stream)) =
+                    maybe_consume_proxy_protocol_header(client_stream, client_addr, enable_proxy_protocol).await
+                else {
+                    return;
+                };
 
                 if is_tls {
                     match manager.inspect_tls_host(&client_stream, port).await {
@@ -676,6 +756,11 @@ impl HttpProxyManager {
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                crate::rpc::stats::push_origin_health_event(
+                    origin_id,
+                    false,
+                    started.elapsed().as_millis() as i64,
+                );
                 return Err(err).with_context(|| {
                     format!("failed to connect passthrough upstream {}", backend_addr)
                 });
@@ -691,6 +776,8 @@ impl HttpProxyManager {
         configure_passthrough_socket(&client_stream);
         configure_passthrough_socket(&backend_stream);
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
+        let connect_latency_ms = started.elapsed().as_millis() as i64;
+        crate::rpc::stats::push_origin_health_event(origin_id, true, connect_latency_ms);
 
         let result = crate::tcp_proxy::stream_tcp_bidirectional_with_metrics(
             server_id,
@@ -943,6 +1030,80 @@ fn configure_passthrough_socket(stream: &TcpStream) {
                 "bbr\0".as_ptr() as *const libc::c_void,
                 4,
             );
+        }
+    }
+}
+
+/// If `enable_proxy_protocol` is true, peek the first bytes of `stream` and
+/// attempt to parse a PROXY Protocol v1/v2 header.  When a valid header is
+/// found the header bytes are consumed from the stream and the reported source
+/// address is returned as a new `SocketAddr`. No header is still accepted for
+/// compatibility, but malformed or incomplete PROXY headers are rejected.
+async fn maybe_consume_proxy_protocol_header(
+    mut stream: TcpStream,
+    client_addr: SocketAddr,
+    enable_proxy_protocol: bool,
+) -> Option<(SocketAddr, TcpStream)> {
+    if !enable_proxy_protocol {
+        return Some((client_addr, stream));
+    }
+
+    // Peek up to PROXY_HEADER_PEEK_LEN bytes.  We may need to grow the buffer
+    // for v1 headers that are longer than 16 bytes; the spec limits v1 to
+    // 108 bytes so 128 is ample.
+    let mut peek_buf = [0u8; 128];
+    let peek_n = match tokio::time::timeout(
+        Duration::from_millis(200),
+        stream.peek(&mut peek_buf),
+    )
+    .await
+    {
+        Ok(Ok(n)) => n,
+        _ => return Some((client_addr, stream)),
+    };
+
+    if peek_n == 0 {
+        return Some((client_addr, stream));
+    }
+
+    match proxy_protocol::parse_proxy_v1_v2(&peek_buf[..peek_n]) {
+        Ok(addr) => {
+            // Consume the header bytes from the stream.
+            let mut discard = vec![0u8; addr.consumed];
+            match stream.read_exact(&mut discard).await {
+                Ok(_) => {
+                    let effective_addr = match (addr.src_ip, addr.src_port) {
+                        (Some(ip), Some(port)) => SocketAddr::new(ip, port),
+                        _ => client_addr,
+                    };
+                    debug!(
+                        "PROXY protocol: replaced {} with {}",
+                        client_addr, effective_addr
+                    );
+                    Some((effective_addr, stream))
+                }
+                Err(e) => {
+                    debug!("PROXY protocol: failed to drain header bytes: {}", e);
+                    None
+                }
+            }
+        }
+        Err(proxy_protocol::ProxyProtocolError::Incomplete) => {
+            debug!(
+                "PROXY protocol: dropping incomplete header from {}",
+                client_addr
+            );
+            None
+        }
+        Err(proxy_protocol::ProxyProtocolError::Invalid(err)) => {
+            debug!(
+                "PROXY protocol: dropping invalid header from {}: {}",
+                client_addr, err
+            );
+            None
+        }
+        Err(proxy_protocol::ProxyProtocolError::NotProxyProtocol) => {
+            Some((client_addr, stream))
         }
     }
 }

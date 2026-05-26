@@ -91,6 +91,10 @@ pub fn set_numeric_node_id(id: i64) {
     NUMERIC_NODE_ID.store(id, Ordering::Relaxed);
 }
 
+pub fn get_numeric_node_id() -> i64 {
+    NUMERIC_NODE_ID.load(Ordering::Relaxed)
+}
+
 pub fn set_global_access_log_on(is_on: bool) {
     GLOBAL_ACCESS_LOG_ON.store(is_on, Ordering::Relaxed);
 }
@@ -201,6 +205,16 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
                 debug!("ACCESS_LOG: blocked by enable_server_not_found=false (404)");
                 return;
             }
+        }
+    }
+    if let Some(ref cfg) = ctx.global_access_log_config {
+        if cfg.firewall_only && !ctx.firewall_blocked {
+            debug!("ACCESS_LOG: blocked by firewall_only=true (non-firewall request)");
+            return;
+        }
+        if !cfg.enable_client_closed && ctx.response_status == 499 {
+            debug!("ACCESS_LOG: blocked by enable_client_closed=false (499)");
+            return;
         }
     }
     let sender = match LOG_SENDER.get() {

@@ -1,4 +1,3 @@
-use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 use std::borrow::Cow;
@@ -8,8 +7,32 @@ use std::sync::Arc;
 /// Limit regex memory usage to 1MB to prevent catastrophic backtracking from user-controlled WAF patterns
 const REGEX_SIZE_LIMIT: usize = 1_048_576;
 
-/// Cache compiled user-defined regex patterns to avoid per-request compilation
-static WAF_RE_CACHE: Lazy<DashMap<String, std::sync::Arc<Regex>>> = Lazy::new(DashMap::new);
+/// Bound on how many distinct WAF regex patterns we keep compiled in memory.
+/// Each cached entry can hold a Regex up to REGEX_SIZE_LIMIT (1 MiB) bytes,
+/// so the worst-case footprint is ~MAX × ~1 MiB. The cache uses moka's
+/// W-TinyLFU eviction (the same algorithm behind Caffeine), which resists
+/// "scanning" attacks where an adversary streams unique patterns to flush
+/// hot entries — admission control gates a candidate against the historical
+/// frequency of the victim before evicting it.
+const WAF_RE_CACHE_MAX_ENTRIES: u64 = 16_384;
+
+/// Cache compiled user-defined regex patterns to avoid per-request
+/// compilation. moka::sync::Cache is concurrent (internally sharded) and
+/// implements W-TinyLFU admission + segmented LRU eviction, suitable for
+/// large-scale traffic where the hot set is a small subset of all patterns
+/// ever seen.
+static WAF_RE_CACHE: Lazy<moka::sync::Cache<String, Arc<Regex>>> = Lazy::new(|| {
+    moka::sync::Cache::builder()
+        .max_capacity(WAF_RE_CACHE_MAX_ENTRIES)
+        .build()
+});
+
+static WAF_BYTES_RE_CACHE: Lazy<moka::sync::Cache<String, Arc<regex::bytes::Regex>>> =
+    Lazy::new(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(WAF_RE_CACHE_MAX_ENTRIES)
+            .build()
+    });
 
 static RE_SQLI: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(union\s+select|select\s+.*\s+from|insert\s+into|update\s+.*\s+set|delete\s+from|drop\s+table|truncate\s+table|benchmark\(|sleep\()").unwrap()
@@ -393,18 +416,149 @@ fn is_ai_bot(ua: &str) -> bool {
 }
 
 /// Get or compile a regex from cache — avoids per-request regex compilation.
+///
+/// On a miss the compile is attempted once per pattern; if compilation fails
+/// we deliberately do not poison the cache, so a transient regex error in one
+/// request never punishes future ones.
 #[inline]
 fn get_or_compile_regex(pattern: &str) -> Option<Arc<Regex>> {
+    // Fast path: avoid allocating an owned String on every hit.
     if let Some(cached) = WAF_RE_CACHE.get(pattern) {
-        return Some(Arc::clone(&*cached));
+        return Some(cached);
     }
-    RegexBuilder::new(pattern)
-        .size_limit(REGEX_SIZE_LIMIT)
-        .build()
-        .ok()
-        .map(|re| {
-            let re = Arc::new(re);
-            WAF_RE_CACHE.insert(pattern.to_string(), Arc::clone(&re));
-            re
+    // Slow path: try_get_with deduplicates concurrent compilations of the
+    // same pattern (other waiters get the same Arc<Regex> without re-running
+    // RegexBuilder), and only inserts when compilation succeeds. Failures
+    // return Err and don't pollute the cache.
+    WAF_RE_CACHE
+        .try_get_with(pattern.to_string(), || {
+            RegexBuilder::new(pattern)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .build()
+                .map(Arc::new)
         })
+        .ok()
+}
+
+#[inline]
+fn get_or_compile_bytes_regex(
+    pattern: &str,
+    case_insensitive: bool,
+) -> Option<Arc<regex::bytes::Regex>> {
+    let cache_key = if case_insensitive {
+        format!("i:{pattern}")
+    } else {
+        format!("s:{pattern}")
+    };
+    if let Some(cached) = WAF_BYTES_RE_CACHE.get(&cache_key) {
+        return Some(cached);
+    }
+    WAF_BYTES_RE_CACHE
+        .try_get_with(cache_key, || {
+            regex::bytes::RegexBuilder::new(pattern)
+                .case_insensitive(case_insensitive)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .build()
+                .map(Arc::new)
+        })
+        .ok()
+}
+
+/// Evaluate a WAF operator against raw body bytes.
+/// Only the operators meaningful on binary/body data are handled; all others
+/// fall back to the lossy-string path so callers do not need to special-case
+/// operators that are inherently text-only.
+pub(crate) fn evaluate_operator_bytes(
+    body: &[u8],
+    operator: &str,
+    expected_value: &str,
+    case_insensitive: bool,
+) -> bool {
+    let operator_lower = normalize_operator(operator);
+    let pattern_bytes: Cow<'_, [u8]> = if case_insensitive {
+        Cow::Owned(expected_value.to_ascii_lowercase().into_bytes())
+    } else {
+        Cow::Borrowed(expected_value.as_bytes())
+    };
+    let subject: Cow<'_, [u8]> = if case_insensitive {
+        Cow::Owned(body.iter().map(|b| b.to_ascii_lowercase()).collect())
+    } else {
+        Cow::Borrowed(body)
+    };
+
+    match operator_lower.as_ref() {
+        "match" | "matches" | "regexp" => get_or_compile_bytes_regex(expected_value, case_insensitive)
+            .map_or(false, |re| re.is_match(body)),
+        "not match" | "notmatches" | "notregexp" => get_or_compile_bytes_regex(expected_value, case_insensitive)
+            .map_or(false, |re| !re.is_match(body)),
+        "wildcard match" => {
+            let escaped = regex::escape(expected_value).replace("\\*", ".*");
+            let re_str = format!("^{}$", escaped);
+            get_or_compile_bytes_regex(&re_str, case_insensitive)
+                .map_or(false, |re| re.is_match(body))
+        }
+        "wildcard not match" => {
+            let escaped = regex::escape(expected_value).replace("\\*", ".*");
+            let re_str = format!("^{}$", escaped);
+            get_or_compile_bytes_regex(&re_str, case_insensitive)
+                .map_or(false, |re| !re.is_match(body))
+        }
+        "contains" | "containsstring" => {
+            if pattern_bytes.is_empty() {
+                true
+            } else {
+                subject
+                    .windows(pattern_bytes.len())
+                    .any(|w| w == pattern_bytes.as_ref())
+            }
+        }
+        "not contains" | "notcontains" => {
+            if pattern_bytes.is_empty() {
+                false
+            } else {
+                !subject
+                    .windows(pattern_bytes.len())
+                    .any(|w| w == pattern_bytes.as_ref())
+            }
+        }
+        "contains binary" => decode_base64(expected_value)
+            .map(|needle| {
+                !needle.is_empty()
+                    && body.windows(needle.len()).any(|w| w == needle)
+            })
+            .unwrap_or(false),
+        "not contains binary" => decode_base64(expected_value)
+            .map(|needle| {
+                needle.is_empty()
+                    || !body.windows(needle.len()).any(|w| w == needle)
+            })
+            .unwrap_or(false),
+        "contains sql injection" | "contains sql injection strictly" => {
+            let strict = operator_lower.contains("strictly");
+            if let Ok(s) = std::str::from_utf8(body) {
+                contains_sqli(s, strict)
+            } else {
+                libinjectionrs::detect_sqli(body).is_injection()
+            }
+        }
+        "contains xss" | "contains xss strictly" => {
+            let strict = operator_lower.contains("strictly");
+            if let Ok(s) = std::str::from_utf8(body) {
+                contains_xss(s, strict)
+            } else {
+                libinjectionrs::detect_xss(body).is_injection()
+            }
+        }
+        "contains cmd injection" | "contains cmd injection strictly" => {
+            if let Ok(s) = std::str::from_utf8(body) {
+                contains_cmd(s)
+            } else {
+                false
+            }
+        }
+        _ => {
+            let lossy = String::from_utf8_lossy(body);
+            evaluate_operator(&lossy, operator, expected_value, case_insensitive)
+        }
+    }
 }

@@ -2,6 +2,7 @@ use crate::config::ConfigStore;
 use crate::config_models::SSLCertConfig;
 use crate::config_models::ServerConfig;
 use crate::firewall::state::WafStateManager;
+use crate::proxy_protocol;
 use crate::ssl::DynamicCertSelector;
 use base64::Engine;
 use dashmap::DashMap;
@@ -330,6 +331,13 @@ impl TcpProxyManager {
         }
 
         let _sid = server.id.unwrap_or(0);
+
+        // Apply PROXY Protocol header parsing before branching on TLS vs plain.
+        let Some((client_addr, client_stream)) =
+            maybe_consume_proxy_protocol_header(client_stream, client_addr, server.enable_proxy_protocol).await
+        else {
+            return Ok(());
+        };
 
         if !is_tls {
             return self
@@ -1377,6 +1385,67 @@ fn clean_pem_value(raw: &str) -> Vec<u8> {
         return decoded;
     }
     raw.replace("\\n", "\n").into_bytes()
+}
+
+/// If `enable_proxy_protocol` is true, peek the first bytes of `stream` and
+/// attempt to parse a PROXY Protocol v1/v2 header.  When a valid header is
+/// found the header bytes are consumed from the stream and the reported source
+/// address is returned. No header is still accepted for compatibility, but
+/// malformed or incomplete PROXY headers are rejected.
+async fn maybe_consume_proxy_protocol_header(
+    mut stream: TcpStream,
+    client_addr: SocketAddr,
+    enable_proxy_protocol: bool,
+) -> Option<(SocketAddr, TcpStream)> {
+    if !enable_proxy_protocol {
+        return Some((client_addr, stream));
+    }
+
+    let mut peek_buf = [0u8; 128];
+    let peek_n = match tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        stream.peek(&mut peek_buf),
+    )
+    .await
+    {
+        Ok(Ok(n)) => n,
+        _ => return Some((client_addr, stream)),
+    };
+
+    if peek_n == 0 {
+        return Some((client_addr, stream));
+    }
+
+    match proxy_protocol::parse_proxy_v1_v2(&peek_buf[..peek_n]) {
+        Ok(addr) => {
+            let mut discard = vec![0u8; addr.consumed];
+            match stream.read_exact(&mut discard).await {
+                Ok(_) => {
+                    let effective_addr = match (addr.src_ip, addr.src_port) {
+                        (Some(ip), Some(port)) => SocketAddr::new(ip, port),
+                        _ => client_addr,
+                    };
+                    debug!(
+                        "TCP PROXY protocol: replaced {} with {}",
+                        client_addr, effective_addr
+                    );
+                    Some((effective_addr, stream))
+                }
+                Err(e) => {
+                    debug!("TCP PROXY protocol: failed to drain header bytes: {}", e);
+                    None
+                }
+            }
+        }
+        Err(proxy_protocol::ProxyProtocolError::NotProxyProtocol) => Some((client_addr, stream)),
+        Err(err) => {
+            debug!(
+                "TCP PROXY protocol: dropping invalid header from {}: {}",
+                client_addr, err
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

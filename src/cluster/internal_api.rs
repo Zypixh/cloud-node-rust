@@ -1,9 +1,24 @@
+use serde::Deserialize;
 use serde_json::json;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
 const MAX_INTERNAL_BODY_BYTES: usize = 2 * 1024 * 1024;
+// Cap per-connection lifetime — a misbehaving / malicious peer that trickles
+// one byte at a time must not be able to permanently occupy a Tokio task.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Deserialize)]
+struct PurgeRequest {
+    #[serde(default)]
+    key: String,
+    #[serde(rename = "key_type", alias = "keyType", default)]
+    key_type: String,
+    #[serde(default)]
+    prefix: String,
+}
 
 #[derive(Clone)]
 pub struct InternalApiState {
@@ -45,11 +60,20 @@ async fn run(state: InternalApiState) -> anyhow::Result<()> {
         let (stream, peer) = listener.accept().await?;
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, state).await {
-                warn!(
-                    "CLUSTER_INTERNAL_API: request from {} failed: {}",
-                    peer, err
-                );
+            match tokio::time::timeout(CONNECTION_TIMEOUT, handle_connection(stream, state)).await {
+                Ok(Err(err)) => {
+                    warn!(
+                        "CLUSTER_INTERNAL_API: request from {} failed: {}",
+                        peer, err
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "CLUSTER_INTERNAL_API: connection from {} timed out (slow loris guard)",
+                        peer
+                    );
+                }
+                Ok(Ok(())) => {}
             }
         });
     }
@@ -103,6 +127,19 @@ async fn handle_connection(mut stream: TcpStream, state: InternalApiState) -> an
         }
     }
 
+    // The K8s kubelet probe cannot supply a Bearer token, so the health check
+    // must be reachable without authentication. Other endpoints (purge, stats,
+    // metadata) still require the token.
+    if method == "GET" && path == "/internal/v1/health" {
+        write_response(
+            &mut stream,
+            200,
+            json!({"ok":true,"cluster":state.cluster_name}),
+        )
+        .await?;
+        return Ok(());
+    }
+
     if !authorized(&auth, &state.token) {
         write_response(&mut stream, 401, json!({"error":"unauthorized"})).await?;
         return Ok(());
@@ -127,14 +164,8 @@ async fn handle_connection(mut stream: TcpStream, state: InternalApiState) -> an
     let body = &buffer[body_start..buffer.len().min(body_start + content_length)];
 
     match (method.as_str(), path.as_str()) {
-        ("GET", "/internal/v1/health") => {
-            write_response(
-                &mut stream,
-                200,
-                json!({"ok":true,"cluster":state.cluster_name}),
-            )
-            .await?;
-        }
+        // /internal/v1/health is handled above the auth check; this branch
+        // would never run. Keeping it removed avoids dead-code drift.
         ("POST", "/internal/v1/purge") => {
             handle_purge(&mut stream, body).await?;
         }
@@ -157,22 +188,34 @@ async fn handle_connection(mut stream: TcpStream, state: InternalApiState) -> an
 }
 
 async fn handle_purge(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()> {
-    let request: serde_json::Value = serde_json::from_slice(body)?;
-    let key = request
-        .get("key")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let prefix = request
-        .get("prefix")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
+    let request: PurgeRequest = serde_json::from_slice(body)?;
+    let key = request.key.trim();
+    let prefix = request.prefix.trim();
 
-    if !prefix.is_empty() {
+    if crate::rpc::cache::is_tag_purge(&request.key_type) {
+        if key.is_empty() {
+            write_response(stream, 400, json!({"error":"tag key required"})).await?;
+            return Ok(());
+        }
+        if !crate::cache_manager::CACHE
+            .storage
+            .purge_by_tag(key)
+            .await
+        {
+            write_response(stream, 500, json!({"error":"tag purge failed"})).await?;
+            return Ok(());
+        }
+    } else if !prefix.is_empty() {
         crate::cache_manager::CACHE.purge_prefix(prefix).await?;
     } else if !key.is_empty() {
-        crate::cache_manager::CACHE.purge_key(key).await?;
+        if crate::rpc::cache::is_prefix_purge(&request.key_type, key) {
+            let prefix = crate::rpc::cache::normalize_purge_prefix(key);
+            crate::cache_manager::CACHE.purge_prefix(&prefix).await?;
+        } else {
+            crate::cache_manager::CACHE.purge_key(key).await?;
+        }
     } else {
-        write_response(stream, 400, json!({"error":"key or prefix required"})).await?;
+        write_response(stream, 400, json!({"error":"key, tag or prefix required"})).await?;
         return Ok(());
     }
 

@@ -106,8 +106,12 @@ impl CompiledCorsPolicy {
     }
 
     pub fn apply(&self, resp: &mut pingora_http::ResponseHeader, session: &Session) {
+        // Fetch spec forbids combining `Allow-Origin: *` with
+        // `Allow-Credentials: true`; track whether the wildcard is emitted.
+        let mut origin_is_wildcard = false;
         if let Some(allow_origin) = &self.allow_origin {
             let _ = resp.insert_header("access-control-allow-origin", allow_origin.clone());
+            origin_is_wildcard = allow_origin.as_bytes() == b"*";
         } else {
             if let Some(origin) = session.get_header("origin") {
                 let _ = resp.insert_header("access-control-allow-origin", origin.clone());
@@ -126,10 +130,12 @@ impl CompiledCorsPolicy {
         if let Some(expose_headers) = &self.expose_headers {
             let _ = resp.insert_header("access-control-expose-headers", expose_headers.clone());
         }
-        let _ = resp.insert_header(
-            "access-control-allow-credentials",
-            HeaderValue::from_static("true"),
-        );
+        if !origin_is_wildcard {
+            let _ = resp.insert_header(
+                "access-control-allow-credentials",
+                HeaderValue::from_static("true"),
+            );
+        }
     }
 }
 
@@ -635,6 +641,7 @@ pub struct RequestTemplateVars<'a> {
     pub user_agent: &'a str,
     pub content_type: &'a str,
     pub remote_addr: &'a str,
+    pub referer_block: &'a str,
 }
 
 pub fn resolve_request_template_var(vars: &RequestTemplateVars<'_>, var_name: &str) -> String {
@@ -647,6 +654,7 @@ pub fn resolve_request_template_var(vars: &RequestTemplateVars<'_>, var_name: &s
         "query" | "args" | "queryString" => vars.query.to_string(),
         "port" | "serverPort" => vars.port.to_string(),
         "referer" | "httpReferer" => vars.referer.to_string(),
+        "requestRefererBlock" => vars.referer_block.to_string(),
         "userAgent" | "httpUserAgent" => vars.user_agent.to_string(),
         "contentType" => vars.content_type.to_string(),
         "remoteAddr" => vars.remote_addr.to_string(),
@@ -751,6 +759,18 @@ pub fn apply_request_header_policy_to_upstream(
             }
         }
     }
+}
+
+pub fn extract_referer_block(referer: &str) -> String {
+    let host = if let Some(after_scheme) = referer.find("://").map(|i| &referer[i + 3..]) {
+        after_scheme.split('/').next().unwrap_or("")
+    } else {
+        return String::new();
+    };
+    let host = host.split(':').next().unwrap_or(host);
+    let host = host.trim_end_matches('.');
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    host.to_ascii_lowercase()
 }
 
 fn normalize_domain_pattern(domain: &str) -> String {

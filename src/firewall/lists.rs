@@ -1,4 +1,4 @@
-use crate::firewall::state::WafStateManager;
+use crate::firewall::state::{IpAddrRange, WafStateManager};
 use crate::pb;
 use dashmap::DashMap;
 use ipnet::IpNet;
@@ -7,6 +7,17 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tracing::{debug, warn};
+
+// Canonicalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to IPv4 so the blacklist
+// state map keys stay consistent regardless of how the same IP was framed.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    if let IpAddr::V6(v6) = ip
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        return IpAddr::V4(v4);
+    }
+    ip
+}
 
 #[derive(Clone)]
 pub struct IpListMetadata {
@@ -22,10 +33,31 @@ enum IpListKind {
     Gray,
 }
 
+fn build_ip_addr_range(from: IpAddr, to: IpAddr) -> Option<IpAddrRange> {
+    let (from_n, to_n, v6) = match (from, to) {
+        (IpAddr::V4(f), IpAddr::V4(t)) => (
+            u32::from_be_bytes(f.octets()) as u128,
+            u32::from_be_bytes(t.octets()) as u128,
+            false,
+        ),
+        (IpAddr::V6(f), IpAddr::V6(t)) => (
+            u128::from_be_bytes(f.octets()),
+            u128::from_be_bytes(t.octets()),
+            true,
+        ),
+        _ => return None,
+    };
+    if from_n > to_n {
+        return None;
+    }
+    Some(IpAddrRange { from: from_n, to: to_n, v6 })
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum IpListTarget {
     Ip(IpAddr),
     Network(IpNet),
+    Range(IpAddrRange),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -218,17 +250,23 @@ impl GlobalIpListManager {
                 return Some(IpListTarget::Network(net));
             }
             if let Ok(ip) = value.parse::<IpAddr>() {
-                return Some(IpListTarget::Ip(ip));
+                return Some(IpListTarget::Ip(canonical_ip(ip)));
             }
         }
 
         let ip_from = item.ip_from.trim();
         let ip_to = item.ip_to.trim();
-        if !ip_from.is_empty()
-            && ip_from == ip_to
-            && let Ok(ip) = ip_from.parse::<IpAddr>()
-        {
-            return Some(IpListTarget::Ip(ip));
+        if !ip_from.is_empty() && !ip_to.is_empty() {
+            if let (Ok(from), Ok(to)) = (ip_from.parse::<IpAddr>(), ip_to.parse::<IpAddr>()) {
+                let from = canonical_ip(from);
+                let to = canonical_ip(to);
+                if from == to {
+                    return Some(IpListTarget::Ip(from));
+                }
+                if let Some(range) = build_ip_addr_range(from, to) {
+                    return Some(IpListTarget::Range(range));
+                }
+            }
         }
         None
     }
@@ -257,6 +295,10 @@ impl GlobalIpListManager {
                 self.waf_state
                     .apply_list_black_network_until(server_id, net, expiry);
             }
+            (IpListKind::Black, IpListTarget::Range(range), Some(expiry)) => {
+                self.waf_state
+                    .apply_list_black_range_until(server_id, range, expiry);
+            }
             (IpListKind::White, IpListTarget::Ip(ip), Some(expiry)) => {
                 self.waf_state
                     .apply_list_white_ip_until(server_id, ip, expiry);
@@ -264,6 +306,10 @@ impl GlobalIpListManager {
             (IpListKind::White, IpListTarget::Network(net), Some(expiry)) => {
                 self.waf_state
                     .apply_list_white_network_until(server_id, net, expiry);
+            }
+            (IpListKind::White, IpListTarget::Range(range), Some(expiry)) => {
+                self.waf_state
+                    .apply_list_white_range_until(server_id, range, expiry);
             }
             (IpListKind::Gray, IpListTarget::Ip(ip), Some(expiry)) => {
                 self.waf_state
@@ -273,11 +319,18 @@ impl GlobalIpListManager {
                 self.waf_state
                     .apply_list_gray_network_until(server_id, net, expiry);
             }
+            (IpListKind::Gray, IpListTarget::Range(range), Some(expiry)) => {
+                self.waf_state
+                    .apply_list_gray_range_until(server_id, range, expiry);
+            }
             (IpListKind::Black, IpListTarget::Ip(ip), None) => {
                 self.waf_state.remove_list_black_ip(server_id, ip);
             }
             (IpListKind::Black, IpListTarget::Network(net), None) => {
                 self.waf_state.remove_list_black_network(server_id, net);
+            }
+            (IpListKind::Black, IpListTarget::Range(range), None) => {
+                self.waf_state.remove_list_black_range(server_id, range);
             }
             (IpListKind::White, IpListTarget::Ip(ip), None) => {
                 self.waf_state.remove_list_white_ip(server_id, ip);
@@ -285,11 +338,17 @@ impl GlobalIpListManager {
             (IpListKind::White, IpListTarget::Network(net), None) => {
                 self.waf_state.remove_list_white_network(server_id, net);
             }
+            (IpListKind::White, IpListTarget::Range(range), None) => {
+                self.waf_state.remove_list_white_range(server_id, range);
+            }
             (IpListKind::Gray, IpListTarget::Ip(ip), None) => {
                 self.waf_state.remove_list_gray_ip(server_id, ip);
             }
             (IpListKind::Gray, IpListTarget::Network(net), None) => {
                 self.waf_state.remove_list_gray_network(server_id, net);
+            }
+            (IpListKind::Gray, IpListTarget::Range(range), None) => {
+                self.waf_state.remove_list_gray_range(server_id, range);
             }
         }
 

@@ -711,6 +711,7 @@ pub mod record {
                     )
                 },
             );
+        let provider_id = crate::metrics::storage::lookup_region_provider_id(event.client_ip);
         let key = crate::metrics::aggregator::AggregationKey {
             server_id: event.server_id,
             country,
@@ -727,6 +728,7 @@ pub mod record {
                 .waf_action
                 .clone()
                 .unwrap_or_else(|| Arc::clone(&EMPTY_ARC_STR)),
+            provider_id,
         };
         let is_attack = event.waf_action.is_some();
 

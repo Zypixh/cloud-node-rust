@@ -78,6 +78,17 @@ billing.countInboundTraffic: false
 
 生产场景建议将缓存目录放在独立磁盘或独立分区，便于容量管理和故障隔离。
 
+### `enableReadingOriginAsync`
+
+控制面缓存规则里的 `enableReadingOriginAsync` 字段目前在 cloud-node 中可以被接收和解析，但不会按单条 `cacheRef` 独立生效。
+
+cloud-node 的 HTTP 缓存写入由 Pingora cache 状态机接管。Pingora 的默认行为取决于底层 cache storage 是否支持 `support_streaming_partial_write()`：
+
+- 支持时，缓存 miss 的响应一旦判定可缓存，Pingora 会把源站读取和客户端写出解耦；客户端中断连接后，状态机会忽略 downstream error，继续读取源站并填充缓存。
+- 不支持时，客户端中断通常会结束当前代理链路，不会继续为了缓存单独读完整个源站响应。
+
+因此当前 cloud-node 中该能力是 storage 级别的统一行为，不是 `enableReadingOriginAsync` 可单独开启或关闭的规则级行为。严格按单条缓存规则控制该字段，需要后续改造 Pingora cache/代理状态机或在 cloud-node 中实现独立的响应体读取与缓存写入路径。
+
 ## 访问日志配置
 
 访问日志由全局配置和站点配置共同决定。可控制：

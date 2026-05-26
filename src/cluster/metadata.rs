@@ -24,6 +24,11 @@ pub struct CacheMetaEvent {
     pub compressed: bool,
     pub created_at: i64,
     pub version: u64,
+    // SWR window propagated to other pods in cluster mode so they can keep
+    // serving stale while the new leader-side revalidation happens.
+    // Older event payloads (without this field) default to 0 via serde(default).
+    #[serde(default)]
+    pub stale_while_revalidate_secs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,6 +49,7 @@ pub struct CacheMetaUpsertEvent<'a> {
     pub status: u16,
     pub headers: &'a [(String, String)],
     pub compressed: bool,
+    pub stale_while_revalidate_secs: u64,
 }
 
 pub fn emit_upsert(event: CacheMetaUpsertEvent<'_>) {
@@ -71,6 +77,7 @@ pub fn emit_upsert(event: CacheMetaUpsertEvent<'_>) {
         compressed: event.compressed,
         created_at: now,
         version,
+        stale_while_revalidate_secs: event.stale_while_revalidate_secs,
     };
 
     let Some(tx) = METADATA_EVENT_TX.get() else {
@@ -104,6 +111,8 @@ pub fn apply_remote_event(event: CacheMetaEvent) {
                     relative_path: event.relative_path.as_deref(),
                     event_version: Some(event.version),
                     updated_at: Some(event.created_at),
+                    stale_while_revalidate_secs: event.stale_while_revalidate_secs,
+                    created_at: event.created_at,
                 },
             );
         }

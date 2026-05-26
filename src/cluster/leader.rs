@@ -1,6 +1,6 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -9,25 +9,32 @@ const SERVICE_ACCOUNT_CA: &str = "/var/run/secrets/kubernetes.io/serviceaccount/
 
 pub static ROLE_STATE: Lazy<ClusterRoleState> = Lazy::new(ClusterRoleState::default);
 
+// Pack `is_leader` (1 bit) and `epoch` (63 bits) into a single AtomicU64 so
+// readers always see a consistent (role, epoch) pair. Previously the two
+// fields were independent atomics; another thread could observe the role
+// after it was flipped but before the new epoch was published, causing
+// downstream fan-outs to carry a stale epoch.
+const IS_LEADER_BIT: u64 = 1 << 63;
+const EPOCH_MASK: u64 = !IS_LEADER_BIT;
+
 pub struct ClusterRoleState {
-    is_leader: AtomicBool,
-    epoch: AtomicU64,
+    packed: AtomicU64,
 }
 
 impl Default for ClusterRoleState {
     fn default() -> Self {
         Self {
-            is_leader: AtomicBool::new(false),
-            epoch: AtomicU64::new(0),
+            packed: AtomicU64::new(0),
         }
     }
 }
 
 impl ClusterRoleState {
     pub fn set_leader(&self, is_leader: bool, epoch: u64) {
-        let previous = self.is_leader.swap(is_leader, Ordering::AcqRel);
-        self.epoch.store(epoch, Ordering::Release);
-        if previous != is_leader {
+        let next = (epoch & EPOCH_MASK) | (if is_leader { IS_LEADER_BIT } else { 0 });
+        let previous = self.packed.swap(next, Ordering::AcqRel);
+        let previously_leader = previous & IS_LEADER_BIT != 0;
+        if previously_leader != is_leader {
             if is_leader {
                 info!("CLUSTER_LEADER: this pod became leader at epoch {}", epoch);
             } else {
@@ -36,12 +43,38 @@ impl ClusterRoleState {
         }
     }
 
+    /// Atomically clear the leader bit while preserving the current epoch.
+    /// Avoids the `set_leader(false, ROLE_STATE.epoch())` TOCTOU race where
+    /// another thread could publish a new epoch between the two operations.
+    pub fn step_down(&self) {
+        let previous = self.packed.fetch_and(EPOCH_MASK, Ordering::AcqRel);
+        if previous & IS_LEADER_BIT != 0 {
+            info!(
+                "CLUSTER_LEADER: this pod is follower at epoch {}",
+                previous & EPOCH_MASK
+            );
+        }
+    }
+
+    fn snapshot(&self) -> (bool, u64) {
+        let raw = self.packed.load(Ordering::Acquire);
+        ((raw & IS_LEADER_BIT) != 0, raw & EPOCH_MASK)
+    }
+
     pub fn is_leader(&self) -> bool {
-        self.is_leader.load(Ordering::Acquire)
+        self.snapshot().0
     }
 
     pub fn epoch(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
+        self.snapshot().1
+    }
+
+    /// Read the (role, epoch) pair as a single atomic snapshot. Use this when
+    /// both fields must be consistent (e.g. when stamping outbound RPC with
+    /// the epoch of the leader that issued it).
+    #[allow(dead_code)]
+    pub fn current(&self) -> (bool, u64) {
+        self.snapshot()
     }
 }
 
@@ -64,7 +97,7 @@ pub fn start(runtime_config: &crate::runtime_mode::RuntimeConfig) {
     let config = runtime_config.clone();
     tokio::spawn(async move {
         if let Err(err) = run_election(config).await {
-            ROLE_STATE.set_leader(false, ROLE_STATE.epoch());
+            ROLE_STATE.step_down();
             error!("CLUSTER_LEADER: election stopped: {}", err);
         }
     });
@@ -121,7 +154,7 @@ async fn run_election(config: crate::runtime_mode::RuntimeConfig) -> anyhow::Res
                             updated.spec.lease_transitions.unwrap_or(transitions),
                         ),
                         Err(err) => {
-                            ROLE_STATE.set_leader(false, ROLE_STATE.epoch());
+                            ROLE_STATE.step_down();
                             warn!("CLUSTER_LEADER: failed to update Lease: {}", err);
                         }
                     }
@@ -136,12 +169,12 @@ async fn run_election(config: crate::runtime_mode::RuntimeConfig) -> anyhow::Res
             Ok(None) => match client.create_lease(&holder, lease_duration_seconds).await {
                 Ok(lease) => ROLE_STATE.set_leader(true, lease.spec.lease_transitions.unwrap_or(1)),
                 Err(err) => {
-                    ROLE_STATE.set_leader(false, ROLE_STATE.epoch());
+                    ROLE_STATE.step_down();
                     warn!("CLUSTER_LEADER: failed to create Lease: {}", err);
                 }
             },
             Err(err) => {
-                ROLE_STATE.set_leader(false, ROLE_STATE.epoch());
+                ROLE_STATE.step_down();
                 warn!("CLUSTER_LEADER: failed to read Lease: {}", err);
             }
         }

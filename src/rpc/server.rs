@@ -7,8 +7,10 @@ use crate::rpc::logs::report_node_log_with_context;
 use crate::rpc::plan::sync_active_plans;
 use crate::rpc::utils::build_runtime_maps;
 use once_cell::sync::Lazy;
+// parking_lot::RwLock does not poison on panic; the std variant would permanently
+// brick this config-sync path the moment any holder panics.
+use parking_lot::RwLock;
 use std::sync::Arc;
-use std::sync::RwLock;
 use tracing::{debug, error};
 
 static LAST_SINGLE_SERVER_JSON_HASH: Lazy<RwLock<String>> =
@@ -70,14 +72,14 @@ pub async fn sync_single_server_config(
             let current_hash = format!("{:x}", md5_legacy::compute(&payload.server_config_json));
             let mut should_log = true;
             {
-                let last_hash = LAST_SINGLE_SERVER_JSON_HASH.read().unwrap();
+                let last_hash = LAST_SINGLE_SERVER_JSON_HASH.read();
                 if *last_hash == current_hash {
                     should_log = false;
                 }
             }
             if should_log {
                 log_server_json_hints("server_config_json", &payload.server_config_json);
-                let mut last_hash = LAST_SINGLE_SERVER_JSON_HASH.write().unwrap();
+                let mut last_hash = LAST_SINGLE_SERVER_JSON_HASH.write();
                 *last_hash = current_hash;
             }
             match serde_json::from_slice::<ServerConfig>(&payload.server_config_json) {
@@ -226,14 +228,14 @@ pub async fn sync_user_servers_state(
             let current_hash = format!("{:x}", md5_legacy::compute(&payload.servers_config_json));
             let mut should_log = true;
             {
-                let last_hash = LAST_MULTI_SERVER_JSON_HASH.read().unwrap();
+                let last_hash = LAST_MULTI_SERVER_JSON_HASH.read();
                 if *last_hash == current_hash {
                     should_log = false;
                 }
             }
             if should_log {
                 log_server_json_hints("servers_config_json", &payload.servers_config_json);
-                let mut last_hash = LAST_MULTI_SERVER_JSON_HASH.write().unwrap();
+                let mut last_hash = LAST_MULTI_SERVER_JSON_HASH.write();
                 *last_hash = current_hash;
             }
             match serde_json::from_slice::<Vec<ServerConfig>>(&payload.servers_config_json) {

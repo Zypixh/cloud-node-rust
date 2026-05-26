@@ -1,6 +1,6 @@
 use crate::config_models::{
     HTTPFirewallPolicy, HTTPFirewallRegionConfig, HTTPFirewallRule, HTTPFirewallRuleGroup,
-    HTTPFirewallRuleSet, ServerConfig,
+    HTTPFirewallRuleSet, HTTPParamFilter, ServerConfig,
 };
 use crate::firewall::{ActionResponse, MatchedAction, OutboundContext};
 use aho_corasick::AhoCorasick;
@@ -206,12 +206,11 @@ impl CompiledRegionDenyPlan {
     }
 
     fn matches_url(&self, url: &str) -> bool {
-        let path = url.split('?').next().unwrap_or(url);
         if !self.except_url_patterns.is_empty()
             && self
                 .except_url_patterns
                 .iter()
-                .any(|pattern| pattern.matches(path))
+                .any(|pattern| pattern.matches(url))
         {
             return false;
         }
@@ -220,7 +219,7 @@ impl CompiledRegionDenyPlan {
         }
         self.only_url_patterns
             .iter()
-            .any(|pattern| pattern.matches(path))
+            .any(|pattern| pattern.matches(url))
     }
 
     fn block_action(&self, tag: &str, body: String) -> MatchedAction {
@@ -1025,8 +1024,11 @@ pub struct CompiledFirewallRule {
     value: CompiledValueExpr,
     cc_plan: Option<CompiledCcPlan>,
     pub operator: CompiledOperator,
+    operator_name: String,
+    expected_value: String,
     pub reverse: bool,
     case_insensitive: bool,
+    pub param_filters: Vec<HTTPParamFilter>,
 }
 
 #[derive(Clone, Debug)]
@@ -1441,8 +1443,11 @@ impl CompiledFirewallRule {
                 &rule.value,
                 rule.is_case_insensitive,
             ),
+            operator_name: rule.operator.clone(),
+            expected_value: rule.value.clone(),
             reverse: rule.is_reverse,
             case_insensitive: rule.is_case_insensitive,
+            param_filters: rule.param_filters.clone(),
         }
     }
 
@@ -1458,10 +1463,27 @@ impl CompiledFirewallRule {
 
     fn matches_request(&self, facts: &crate::firewall::matcher_plus::RequestFacts<'_>) -> bool {
         crate::metrics::METRICS.waf.record_rule_evaluation();
-        let value = if let Some(cc_plan) = &self.cc_plan {
+        if self.param_filters.is_empty()
+            && self.cc_plan.is_none()
+            && self.value == CompiledValueExpr::Variable(CompiledVariable::RequestBody)
+        {
+            let matched = crate::firewall::matcher::evaluate_operator_bytes(
+                facts.request_body_bytes(),
+                &self.operator_name,
+                &self.expected_value,
+                self.case_insensitive,
+            );
+            return if self.reverse { !matched } else { matched };
+        }
+        let raw = if let Some(cc_plan) = &self.cc_plan {
             cc_plan.evaluate(facts)
         } else {
             self.value.evaluate(facts)
+        };
+        let value = if self.param_filters.is_empty() {
+            raw
+        } else {
+            crate::firewall::matcher_plus::apply_param_filters(&raw, &self.param_filters)
         };
         self.matches_value(&value)
     }
@@ -1471,10 +1493,27 @@ impl CompiledFirewallRule {
         facts: &crate::firewall::matcher_plus::ResponseFacts<'_, '_, '_>,
     ) -> bool {
         crate::metrics::METRICS.waf.record_rule_evaluation();
-        let value = if let Some(cc_plan) = &self.cc_plan {
+        if self.param_filters.is_empty()
+            && self.cc_plan.is_none()
+            && self.value == CompiledValueExpr::Variable(CompiledVariable::ResponseBody)
+        {
+            let matched = crate::firewall::matcher::evaluate_operator_bytes(
+                facts.response_body_bytes(),
+                &self.operator_name,
+                &self.expected_value,
+                self.case_insensitive,
+            );
+            return if self.reverse { !matched } else { matched };
+        }
+        let raw = if let Some(cc_plan) = &self.cc_plan {
             cc_plan.evaluate(facts.request())
         } else {
             self.value.evaluate_response(facts)
+        };
+        let value = if self.param_filters.is_empty() {
+            raw
+        } else {
+            crate::firewall::matcher_plus::apply_param_filters(&raw, &self.param_filters)
         };
         self.matches_value(&value)
     }
@@ -1543,14 +1582,32 @@ fn evaluate_compiled_policy_inner(
         server,
     );
     let mut current_group_idx = 0;
+    // Track the precise set id requested by a GO_SET so the next match_group
+    // call lands on the named set rather than restarting the group from the
+    // top (the previous behavior silently re-matched earlier sets).
+    let mut next_start_set_id: Option<i64> = None;
+    // Same cycle-defuse as the legacy evaluator: bound the total number of
+    // flow-control jumps so a misconfigured GO_GROUP/GO_SET loop can't pin a
+    // worker thread.
+    let mut remaining_jumps: usize = inbound.groups.len().saturating_mul(8).max(64);
     while current_group_idx < inbound.groups.len() {
+        if remaining_jumps == 0 {
+            tracing::warn!(
+                "WAF(compiled): aborting policy {} due to flow-control jump limit",
+                policy.id
+            );
+            return None;
+        }
+        remaining_jumps -= 1;
         let group = &inbound.groups[current_group_idx];
         if !group.is_on {
             current_group_idx += 1;
+            next_start_set_id = None;
             continue;
         }
 
-        if let Some(result) = match_group(group, session, request_body, &facts) {
+        let start_set = next_start_set_id.take();
+        if let Some(result) = match_group_from(group, session, request_body, &facts, start_set) {
             if let Some(set) = result.set {
                 if let Some(mut matched) = perform_compiled_actions(set) {
                     fill_action_from_policy(&mut matched, policy, group.id, set.id);
@@ -1575,15 +1632,16 @@ fn evaluate_compiled_policy_inner(
                     }
 
                     if let Some(next_sid) = matched.next_set_id {
-                        let mut found = false;
-                        for (group_index, group) in inbound.groups.iter().enumerate() {
-                            if group.sets.iter().any(|set| set.id == next_sid) {
-                                current_group_idx = group_index;
-                                found = true;
-                                break;
-                            }
-                        }
-                        if found {
+                        let target = inbound
+                            .groups
+                            .iter()
+                            .enumerate()
+                            .find_map(|(idx, g)| {
+                                g.sets.iter().any(|set| set.id == next_sid).then_some(idx)
+                            });
+                        if let Some(idx) = target {
+                            current_group_idx = idx;
+                            next_start_set_id = Some(next_sid);
                             continue;
                         }
                     }
@@ -1705,20 +1763,31 @@ struct MatchResult<'a> {
     set: Option<&'a CompiledRuleSet>,
 }
 
-fn match_group<'a>(
+fn match_group_from<'a>(
     group: &'a CompiledRuleGroup,
     session: &Session,
     _request_body: &[u8],
     facts: &crate::firewall::matcher_plus::RequestFacts<'_>,
+    start_set_id: Option<i64>,
 ) -> Option<MatchResult<'a>> {
-    if group.preset.is_some_and(|preset| preset.matches(facts)) {
+    // Preset matchers live outside the set list; only consult them when
+    // iteration starts from the top (consistent with the legacy evaluator).
+    if start_set_id.is_none() && group.preset.is_some_and(|preset| preset.matches(facts)) {
         return Some(MatchResult {
             matched: true,
             set: None,
         });
     }
 
-    for set in &group.sets {
+    let start_idx = match start_set_id {
+        Some(sid) => group
+            .sets
+            .iter()
+            .position(|s| s.id == sid)
+            .unwrap_or(group.sets.len()),
+        None => 0,
+    };
+    for set in group.sets.iter().skip(start_idx) {
         if match_set(set, session, facts) {
             return Some(MatchResult {
                 matched: true,

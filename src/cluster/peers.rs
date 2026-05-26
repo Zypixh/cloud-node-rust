@@ -1,4 +1,14 @@
+use parking_lot::Mutex;
 use std::net::ToSocketAddrs;
+
+// Cache the URL of the peer that most recently accepted our stats snapshot
+// (i.e. the current leader). Subsequent fan-outs try it first to skip the
+// per-call O(N) probe over followers.
+static LEADER_HINT: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn remember_leader_hint(peer_url: String) {
+    *LEADER_HINT.lock() = Some(peer_url);
+}
 
 pub fn current_pod_ip() -> Option<String> {
     crate::runtime_mode::RuntimeConfig::current()
@@ -51,5 +61,12 @@ pub fn discover_peer_urls() -> Vec<String> {
     }
     peers.sort();
     peers.dedup();
+    // Pull the remembered leader to the front so leader-only RPCs (stats
+    // snapshot, purge) stop after one hit in the steady state.
+    if let Some(hint) = LEADER_HINT.lock().clone()
+        && let Some(idx) = peers.iter().position(|p| *p == hint)
+    {
+        peers.swap(0, idx);
+    }
     peers
 }

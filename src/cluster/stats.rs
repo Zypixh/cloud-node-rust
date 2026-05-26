@@ -57,9 +57,19 @@ pub fn start(runtime_config: &crate::runtime_mode::RuntimeConfig) {
         loop {
             interval.tick().await;
             seq = seq.wrapping_add(1);
+            // sysinfo::System::new_all() + refresh_all() walks /proc and can
+            // take tens of milliseconds. Run it off the runtime so we don't
+            // freeze a Tokio worker every 10s.
+            let snapshot = match tokio::task::spawn_blocking(move || local_snapshot(seq)).await {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::debug!("CLUSTER_STATS: local_snapshot panicked: {}", err);
+                    continue;
+                }
+            };
             if crate::cluster::leader::is_leader() {
-                insert_snapshot(local_snapshot(seq));
-            } else if let Err(err) = push_snapshot_to_peers(&config, local_snapshot(seq)).await {
+                insert_snapshot(snapshot);
+            } else if let Err(err) = push_snapshot_to_peers(&config, snapshot).await {
                 tracing::debug!("CLUSTER_STATS: follower snapshot push failed: {}", err);
             }
         }
@@ -211,16 +221,32 @@ async fn push_snapshot_to_peers(
         .timeout(Duration::from_secs(3))
         .build()?;
     let body = serde_json::to_vec(&snapshot)?;
+    // Only the leader accepts the snapshot — followers return 409. Instead of
+    // blasting every peer (which wastes CPU/network on follower-to-follower
+    // traffic), try peers in order and stop on the first 2xx success. The
+    // last-known leader is cached at the top of the list on the next call to
+    // amortize discovery cost.
+    let mut accepted_peer: Option<String> = None;
     for peer in peers {
         let url = format!("{}/internal/v1/stats/snapshot", peer);
-        let _ = client
-            .post(url)
+        match client
+            .post(&url)
             .bearer_auth(token.trim())
             .header("content-type", "application/json")
             .header("x-cloud-node-cluster", &config.cluster.name)
             .body(body.clone())
             .send()
-            .await;
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                accepted_peer = Some(peer);
+                break;
+            }
+            _ => continue,
+        }
+    }
+    if let Some(peer) = accepted_peer {
+        crate::cluster::peers::remember_leader_hint(peer);
     }
     Ok(())
 }
