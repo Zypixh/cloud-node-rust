@@ -122,10 +122,11 @@ fn get_pow_script(
 ///   3. WebGL renderer fingerprinting via canvas
 ///   4. Only on success: location.replace with __waf_uam=1 marker
 fn get_js_cookie_script(challenge: &str, verify_route: &str, return_path: &str) -> String {
-    let challenge = serde_json::to_string(challenge).unwrap_or_else(|_| "\"\"".to_string());
-    let route = serde_json::to_string(verify_route).unwrap_or_else(|_| "\"/\"".to_string());
-    let ret = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
-    // 核心验证逻辑 — 用 eval(atob("...")) 包装
+    // Escape for safe embedding in JS single-quoted strings
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
+    let token_js = esc(challenge);
+    let route_js = esc(verify_route);
+    let ret_js = esc(return_path);
     let inner = format!(
         r#"(function(){{
 var t0=Date.now();
@@ -137,13 +138,13 @@ setTimeout(function(){{
  if(!g){{return;}}
  var d=g.getExtension('WEBGL_debug_renderer_info');
  var r=d?g.getParameter(d.UNMASKED_RENDERER_WEBGL):'';
- var qs='__waf_token='+{token}+'&__waf_return='+{ret}+'&__waf_uam=1&__waf_fp='+encodeURIComponent(r)+'&__waf_ts='+(Date.now()-t0);
- location.replace({route}+'?'+qs);
+ var qs='__waf_token='+encodeURIComponent('{token_js}')+'&__waf_return='+encodeURIComponent('{ret_js}')+'&__waf_uam=1&__waf_fp='+encodeURIComponent(r)+'&__waf_ts='+(Date.now()-t0);
+ location.replace('{route_js}'+'?'+qs);
 }},100+Math.floor(Math.random()*300));
 }})();"#,
-        token = challenge,
-        ret = ret,
-        route = route,
+        token_js = token_js,
+        ret_js = ret_js,
+        route_js = route_js,
     );
     // base64 编码外层包装
     let encoded = base64::engine::general_purpose::STANDARD.encode(inner.as_bytes());
