@@ -409,10 +409,22 @@ pub(crate) fn fill_action_context(
 }
 
 pub(crate) fn fill_action_options(policy: &HTTPFirewallPolicy, matched: &mut MatchedAction) {
-    matched.block_options = policy.block_options.clone();
-    matched.page_options = policy.page_options.clone();
-    matched.captcha_options = policy.captcha_options.clone();
-    matched.js_cookie_options = policy.js_cookie_options.clone();
+    if matched.block_options.is_none() {
+        matched.block_options = policy.block_options.clone();
+    }
+    if matched.page_options.is_none() {
+        matched.page_options = policy.page_options.clone();
+    }
+    match (&mut matched.captcha_options, policy.captcha_options.as_ref()) {
+        (Some(action), Some(policy)) => merge_captcha_options(action, policy),
+        (None, Some(policy)) => matched.captcha_options = Some(policy.clone()),
+        _ => {}
+    }
+    match (&mut matched.js_cookie_options, policy.js_cookie_options.as_ref()) {
+        (Some(action), Some(policy)) => merge_js_cookie_options(action, policy),
+        (None, Some(policy)) => matched.js_cookie_options = Some(policy.clone()),
+        _ => {}
+    }
     for chained in &mut matched.chained_actions {
         fill_action_options(policy, chained);
     }
@@ -497,6 +509,68 @@ fn normalize_action_code(code: &str) -> String {
         "jsCookie" | "js-cookie" | "jscookie" | "JSCookie" => "js_cookie".to_string(),
         other => other.to_ascii_lowercase(),
     }
+}
+
+fn captcha_options_from_value(options: Option<&Value>) -> Option<WAFCaptchaOptions> {
+    serde_json::from_value(options?.clone()).ok()
+}
+
+fn js_cookie_options_from_value(options: Option<&Value>) -> Option<WAFJSCookieOptions> {
+    serde_json::from_value(options?.clone()).ok()
+}
+
+fn merge_captcha_options(
+    action: &mut WAFCaptchaOptions,
+    policy: &WAFCaptchaOptions,
+) {
+    if action.life_seconds <= 0 {
+        action.life_seconds = policy.life_seconds;
+    }
+    if action.max_fails <= 0 {
+        action.max_fails = policy.max_fails;
+    }
+    if action.fail_block_timeout <= 0 {
+        action.fail_block_timeout = policy.fail_block_timeout;
+    }
+    action.fail_global = action.fail_global || policy.fail_global;
+    if action.count <= 0 {
+        action.count = policy.count;
+    }
+    action.use_geetest = action.use_geetest || policy.use_geetest;
+    if action.geetest_id.trim().is_empty() {
+        action.geetest_id = policy.geetest_id.clone();
+    }
+    if action.geetest_key.trim().is_empty() {
+        action.geetest_key = policy.geetest_key.clone();
+    }
+    if action.method.trim().is_empty() {
+        action.method = policy.method.clone();
+    }
+    if action.challenge_lang.trim().is_empty() {
+        action.challenge_lang = policy.challenge_lang.clone();
+    }
+    if action.challenge_difficulty == 0 {
+        action.challenge_difficulty = policy.challenge_difficulty;
+    }
+    if action.ui.is_none() {
+        action.ui = policy.ui.clone();
+    }
+}
+
+fn merge_js_cookie_options(
+    action: &mut WAFJSCookieOptions,
+    policy: &WAFJSCookieOptions,
+) {
+    if action.life_seconds <= 0 {
+        action.life_seconds = policy.life_seconds;
+    }
+    if action.max_fails <= 0 {
+        action.max_fails = policy.max_fails;
+    }
+    if action.fail_block_timeout <= 0 {
+        action.fail_block_timeout = policy.fail_block_timeout;
+    }
+    action.fail_global = action.fail_global || policy.fail_global;
 }
 
 pub(crate) fn parse_action_event_level(options: Option<&Value>) -> String {
@@ -987,8 +1061,8 @@ fn parse_action(action: &Value) -> Option<MatchedAction> {
                 event_level: "".to_string(),
                 block_options: None,
                 page_options: None,
-                captcha_options: None,
-                js_cookie_options: None,
+                captcha_options: captcha_options_from_value(options),
+                js_cookie_options: js_cookie_options_from_value(options),
                 chained_actions: vec![],
                 observe_only: false,
             });

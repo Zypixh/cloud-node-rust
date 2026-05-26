@@ -1517,6 +1517,9 @@ mod tests {
                     use_local_firewall: false,
                     syn_flood: None,
                     mode: String::new(),
+                    candidate_rules: None,
+                    candidate_traffic_pct: 0,
+                    candidate_version: 0,
                 }],
                 vec![],
                 std::collections::HashMap::new(),
@@ -1598,6 +1601,8 @@ mod tests {
             traffic_limit: None,
             traffic_limit_status: None,
             user_plan_id: 0,
+            enable_proxy_protocol: false,
+            locations: vec![],
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

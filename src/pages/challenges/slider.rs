@@ -8,18 +8,20 @@ use rand::Rng;
 pub fn issue_html(
     lang: Lang,
     waf_token: &str,
+    verify_route: &str,
     return_path: &str,
     target_anchor: u32,
 ) -> String {
     let tx = (target_anchor % 260) as f64;
     let ty = ((target_anchor.wrapping_mul(17) % 160)) as f64;
-    issue_html_with_target(lang, waf_token, return_path, tx, ty)
+    issue_html_with_target(lang, waf_token, verify_route, return_path, tx, ty)
 }
 
 /// Low-level variant — accept explicit target coordinates.
 pub fn issue_html_with_target(
     lang: Lang,
     waf_token: &str,
+    verify_route: &str,
     return_path: &str,
     target_x: f64,
     target_y: f64,
@@ -36,6 +38,7 @@ pub fn issue_html_with_target(
         Lang::En => ("Drag the puzzle piece to the gap", "Verified", "Misaligned, try again"),
     };
     let rp_js = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
+    let route_js = serde_json::to_string(verify_route).unwrap_or_else(|_| "\"/\"".to_string());
 
     format!(
         r#"<div class="pzl" id="pzl_{sfx}">
@@ -69,9 +72,9 @@ function dm(e){{if(!d)return;e.preventDefault();var p=e.touches?e.touches[0]:e,n
 function de(e){{
 if(!d)return;d=!1;pc.style.cursor='grab';
 var el=Date.now()-t0,l=parseFloat(pc.style.left)||px,t=parseFloat(pc.style.top)||py;
-var q='__waf_token={wtok}&x='+l.toFixed(1)+'&y='+t.toFixed(1)+'&__waf_elapsed='+el+'&__waf_trace='+encodeURIComponent(tr.join(';'))+'&__waf_return='+encodeURIComponent({rp_js});
-location.href={rp_js}+'?'+q;
-}}
+	var q='__waf_token={wtok}&__waf_challenge_type=slider&x='+l.toFixed(1)+'&y='+t.toFixed(1)+'&__waf_elapsed='+el+'&__waf_trace='+encodeURIComponent(tr.join(';'))+'&__waf_return='+encodeURIComponent({rp_js});
+	location.href={route_js}+'?'+q;
+	}}
 dr();
 pc.addEventListener('mousedown',ds);document.addEventListener('mousemove',dm);document.addEventListener('mouseup',de);
 pc.addEventListener('touchstart',ds,{{passive:!0}});document.addEventListener('touchmove',dm,{{passive:!1}});document.addEventListener('touchend',de);
@@ -87,6 +90,7 @@ pc.addEventListener('touchstart',ds,{{passive:!0}});document.addEventListener('t
         prompt = prompt,
         wtok = waf_token,
         rp_js = rp_js,
+        route_js = route_js,
     )
 }
 

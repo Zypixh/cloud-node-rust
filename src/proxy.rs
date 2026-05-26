@@ -20,7 +20,7 @@ use crate::cache::should_cache_response;
 use crate::cache_manager::CACHE;
 use crate::config::ConfigStore;
 use crate::config_models::{
-    HTTPCachePolicy, HTTPCacheRef, HTTPFirewallPolicy, ServerConfig, UAMConfig,
+    HTTPCachePolicy, HTTPCacheRef, HTTPFirewallPolicy, ServerConfig, UAMConfig, WAFCaptchaOptions,
 };
 use crate::firewall::state::WafStateManager;
 use crate::rewrite::{RewriteResult, evaluate_host_redirects, evaluate_rewrites_with_cond};
@@ -2227,15 +2227,68 @@ impl EdgeProxy {
             .unwrap_or(crate::firewall::uam::UamMode::JsCookie)
     }
 
-    fn uam_requires_slider_trace(uam_cfg: Option<&UAMConfig>) -> bool {
+    fn uam_mode_requires_slider_trace(mode: crate::firewall::uam::UamMode) -> bool {
         matches!(
-            Self::uam_mode(uam_cfg),
+            mode,
             crate::firewall::uam::UamMode::Captcha | crate::firewall::uam::UamMode::Slider
         )
     }
 
-    fn uam_requires_pow(uam_cfg: Option<&UAMConfig>) -> bool {
-        !matches!(Self::uam_mode(uam_cfg), crate::firewall::uam::UamMode::JsCookie)
+    fn uam_mode_requires_pow(mode: crate::firewall::uam::UamMode) -> bool {
+        !matches!(mode, crate::firewall::uam::UamMode::JsCookie)
+    }
+
+    fn uam_mode_code(mode: crate::firewall::uam::UamMode) -> &'static str {
+        match mode {
+            crate::firewall::uam::UamMode::JsCookie => "jscookie",
+            crate::firewall::uam::UamMode::Pow => "pow",
+            crate::firewall::uam::UamMode::Captcha => "captcha",
+            crate::firewall::uam::UamMode::Slider => "slider",
+        }
+    }
+
+    fn normalize_waf_challenge_method(method: &str, action_code: &str) -> String {
+        let normalized = method
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|ch| !matches!(ch, '-' | '_' | ' '))
+            .collect::<String>();
+        match normalized.as_str() {
+            "click" | "clickcaptcha" | "sequenceclick" => "click".to_string(),
+            "captcha" | "imagecaptcha" | "visualcaptcha" => "captcha".to_string(),
+            "jscookie" | "javascriptcookie" | "js" | "cookie" | "pow" => "jscookie".to_string(),
+            "geetest" | "gee" => "geetest".to_string(),
+            "slider" | "slide" | "puzzle" | "puzzleslider" => "slider".to_string(),
+            _ if action_code == "js_cookie" => "jscookie".to_string(),
+            _ => "slider".to_string(),
+        }
+    }
+
+    fn waf_expected_challenge_method(&self, matched: &crate::firewall::MatchedAction) -> String {
+        let global_captcha_opts = self
+            .config
+            .get_waf_actions_sync()
+            .iter()
+            .find(|global| global.code == matched.action_code)
+            .and_then(|global| {
+                serde_json::from_value::<WAFCaptchaOptions>(global.options.clone()).ok()
+            });
+        let raw_method = matched
+            .captcha_options
+            .as_ref()
+            .and_then(|options| {
+                (!options.method.trim().is_empty()).then_some(options.method.as_str())
+            })
+            .or_else(|| {
+                global_captcha_opts
+                    .as_ref()
+                    .and_then(|options| {
+                        (!options.method.trim().is_empty()).then_some(options.method.as_str())
+                    })
+            })
+            .unwrap_or("");
+        Self::normalize_waf_challenge_method(raw_method, &matched.action_code)
     }
 
     fn uam_config_hash(
@@ -2376,12 +2429,15 @@ impl EdgeProxy {
         host_scope: &str,
         config_hash: &str,
         life_seconds: i64,
+        mode: crate::firewall::uam::UamMode,
     ) -> String {
         let exp = crate::utils::time::now_timestamp() + life_seconds.max(1);
         let nonce = general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 12]>());
         let host_hash = Self::sha256_hex(host_scope.as_bytes());
-        let payload =
-            format!("{UAM_COOKIE_VERSION}|{exp}|{scope_id}|{host_hash}|{config_hash}|{nonce}");
+        let mode_code = Self::uam_mode_code(mode);
+        let payload = format!(
+            "{UAM_COOKIE_VERSION}|{exp}|{scope_id}|{host_hash}|{config_hash}|{nonce}|{mode_code}"
+        );
         let encoded = general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let signature = self.uam_challenge_signature(&payload, ip, ua, host_scope);
         format!("{encoded}.{signature}")
@@ -2394,8 +2450,8 @@ impl EdgeProxy {
         ua: &str,
         scope_id: i64,
         host_scope: &str,
-        config_hash: &str,
-    ) -> Option<i64> {
+        _config_hash: &str,
+    ) -> Option<(i64, crate::firewall::uam::UamMode)> {
         let (encoded_payload, signature) = value.split_once('.')?;
         let decoded = general_purpose::URL_SAFE_NO_PAD
             .decode(encoded_payload.as_bytes())
@@ -2413,19 +2469,23 @@ impl EdgeProxy {
         let cookie_host_hash = parts.next()?;
         let cookie_hash = parts.next()?;
         let nonce = parts.next()?;
+        let mode = parts
+            .next()
+            .map(crate::firewall::uam::UamMode::from_str)
+            .unwrap_or(crate::firewall::uam::UamMode::JsCookie);
         let host_hash = Self::sha256_hex(host_scope.as_bytes());
         if parts.next().is_some()
             || version != UAM_COOKIE_VERSION
             || cookie_scope != scope_id
             || cookie_host_hash != host_hash
-            || cookie_hash != config_hash
+            || cookie_hash.is_empty()
             || nonce.is_empty()
         {
             return None;
         }
 
         let now = crate::utils::time::now_timestamp();
-        (now <= exp).then_some(exp.saturating_sub(now).max(1))
+        (now <= exp).then_some((exp.saturating_sub(now).max(1), mode))
     }
 
     fn global_cc_policy(&self) -> Option<crate::config_models::CCPolicy> {
@@ -3158,7 +3218,15 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let return_path = Self::current_request_path_query(session);
         let challenge_life_seconds = life_seconds.min(UAM_CHALLENGE_LIFE_SECONDS);
         let token =
-            self.issue_uam_challenge_token(ip, ua, scope_id, &host_scope, &config_hash, challenge_life_seconds);
+            self.issue_uam_challenge_token(
+                ip,
+                ua,
+                scope_id,
+                &host_scope,
+                &config_hash,
+                challenge_life_seconds,
+                mode,
+            );
 
         let issue_ctx = crate::firewall::uam::UamIssueCtx {
             token: &token,
@@ -4342,6 +4410,88 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         hex::encode(digest)
     }
 
+    fn waf_pass_signature(&self, token: &str, ip: &str, ua: &str, challenge_type: &str) -> String {
+        let digest = Self::hmac_sha256(
+            self.api_config.secret.as_bytes(),
+            format!("waf-pass|{token}|{ip}|{ua}|{challenge_type}").as_bytes(),
+        );
+        hex::encode(digest)
+    }
+
+    fn encode_waf_pass_cookie_value(challenge_type: &str, signature: &str) -> String {
+        let payload = format!("{challenge_type}|{signature}");
+        general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes())
+    }
+
+    fn decode_waf_pass_cookie_value(value: &str) -> Option<(String, String)> {
+        let decoded = general_purpose::URL_SAFE_NO_PAD
+            .decode(value.as_bytes())
+            .ok()?;
+        let payload = String::from_utf8(decoded).ok()?;
+        let (challenge_type, signature) = payload.split_once('|')?;
+        Some((challenge_type.to_string(), signature.to_string()))
+    }
+
+    fn waf_pass_cookie_verified_for_action(
+        &self,
+        session: &Session,
+        matched: &crate::firewall::MatchedAction,
+        ip: &str,
+        ua: &str,
+    ) -> bool {
+        if !matches!(
+            matched.action,
+            crate::firewall::ActionResponse::Captcha { .. }
+        ) {
+            return false;
+        }
+
+        let cookies = match merged_session_cookie_header(session) {
+            Some(cookies) => cookies,
+            None => return false,
+        };
+
+        let mut token = None;
+        let mut pass = None;
+        for part in cookies.split(';') {
+            let part = part.trim();
+            if let Some(raw_token) = part.strip_prefix("WAF-Token=") {
+                token = Some(
+                    raw_token
+                        .split_once(":type=")
+                        .map(|(token, _)| token)
+                        .unwrap_or(raw_token),
+                );
+            } else if let Some(raw_pass) = part.strip_prefix("WAF-Pass=") {
+                pass = Some(raw_pass);
+            }
+        }
+
+        let Some(token) = token else {
+            return false;
+        };
+        if self
+            .waf_verifier
+            .token_seconds_remaining(ip, ua, token, 3600)
+            .is_none()
+        {
+            return false;
+        }
+
+        let Some((challenge_type, signature)) = pass.and_then(Self::decode_waf_pass_cookie_value)
+        else {
+            return false;
+        };
+        if signature != self.waf_pass_signature(token, ip, ua, &challenge_type) {
+            return false;
+        }
+
+        let expected = self.waf_expected_challenge_method(matched);
+        challenge_type == expected
+            || (expected == "geetest"
+                && matches!(challenge_type.as_str(), "slider" | "click" | "captcha"))
+    }
+
     fn hmac_sha256(secret: &[u8], data: &[u8]) -> [u8; 32] {
         const BLOCK: usize = 64;
         let mut key = [0u8; BLOCK];
@@ -4531,7 +4681,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 let scope_id = Self::uam_scope_id(ctx, site_uam_enabled);
                 let host_scope = Self::uam_host_scope(ctx);
                 let config_hash = Self::uam_config_hash(site_uam, global_uam.as_ref());
-                let token_remaining = (!token.is_empty())
+                let token_result = (!token.is_empty())
                     .then(|| {
                         self.validate_uam_challenge_token(
                             &token,
@@ -4543,22 +4693,26 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         )
                     })
                     .flatten();
-                let trace_verified = !Self::uam_requires_slider_trace(uam_cfg)
+                let token_mode = token_result
+                    .as_ref()
+                    .map(|(_, mode)| *mode)
+                    .unwrap_or_else(|| Self::uam_mode(uam_cfg));
+                let trace_verified = !Self::uam_mode_requires_slider_trace(token_mode)
                     || self
                         .waf_verifier
                         .verify_slider_trace(&token, final_x, elapsed, &trace);
                 let pow_difficulty = Self::uam_pow_difficulty(uam_cfg) as u32;
-                let pow_verified = !Self::uam_requires_pow(uam_cfg)
+                let pow_verified = !Self::uam_mode_requires_pow(token_mode)
                     || (!pow.is_empty()
                         && self.waf_verifier.verify_pow(&token, &pow, pow_difficulty));
-                token_remaining
+                token_result
                     .filter(|_| pow_verified && trace_verified)
-                    .map(|_| (scope_id, host_scope, config_hash))
+                    .map(|(_, mode)| (scope_id, host_scope, config_hash, mode))
             } else {
                 None
             };
 
-            if let Some((scope_id, host_scope, config_hash)) = verified {
+            if let Some((scope_id, host_scope, config_hash, mode)) = verified {
                 let pass_life_seconds = Self::uam_life_seconds(uam_cfg);
                 let suffix = Self::waf_cookie_suffix(session, ctx, pass_life_seconds);
                 let uam_pass = self.issue_uam_pass_cookie(
@@ -4569,13 +4723,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     &config_hash,
                     pass_life_seconds,
                 );
-                let uam_challenge_type = if Self::uam_requires_slider_trace(uam_cfg) {
-                    "slider"
-                } else if !Self::uam_requires_pow(uam_cfg) {
-                    "jscookie"
-                } else {
-                    "pow"
-                };
+                let uam_challenge_type = Self::uam_mode_code(mode);
                 let mut resp = pingora_http::ResponseHeader::build(303, None).unwrap();
                 resp.insert_header("location", return_path).unwrap();
                 resp.append_header(
@@ -4621,6 +4769,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let challenge_type = Self::query_param(session, "__waf_challenge_type")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "slider".to_string());
+        let challenge_token = Self::query_param(session, "__waf_challenge_token")
+            .filter(|v| !v.is_empty());
 
         // PoW is only required for jscookie/pow challenge types; slider/click/captcha
         // embed their own verification params (x/y, click_seq, captcha_hash) and skip PoW.
@@ -4634,11 +4784,24 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     let sequence_str = Self::query_param(session, "__waf_click_seq").unwrap_or_default();
                     let seq: Vec<usize> = sequence_str.split(',').filter_map(|s| s.parse().ok()).collect();
                     let click_elapsed = Self::query_param(session, "__waf_elapsed").and_then(|v| v.parse().ok()).unwrap_or(0);
-                    crate::pages::challenges::click::verify(&token, &seq, click_elapsed, self.api_config.secret.as_bytes())
+                    challenge_token.as_deref().is_some_and(|challenge_token| {
+                        crate::pages::challenges::click::verify(
+                            challenge_token,
+                            &seq,
+                            click_elapsed,
+                            self.api_config.secret.as_bytes(),
+                        )
+                    })
                 }
                 "captcha" => {
                     let answer_hash = Self::query_param(session, "__waf_captcha_hash").unwrap_or_default();
-                    crate::pages::challenges::captcha::verify(&token, &answer_hash, self.api_config.secret.as_bytes())
+                    challenge_token.as_deref().is_some_and(|challenge_token| {
+                        crate::pages::challenges::captcha::verify(
+                            challenge_token,
+                            &answer_hash,
+                            self.api_config.secret.as_bytes(),
+                        )
+                    })
                 }
                 _ => {
                     // default: slider
@@ -4657,6 +4820,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     .unblock_ip_for(ip, server_id, Some("server"), true, remaining);
             }
             let suffix = Self::waf_cookie_suffix(session, ctx, remaining);
+            let pass_sig = self.waf_pass_signature(&token, &ctx.client_ip_str, ua, &challenge_type);
+            let pass_cookie = Self::encode_waf_pass_cookie_value(&challenge_type, &pass_sig);
             let mut resp = pingora_http::ResponseHeader::build(303, None).unwrap();
             resp.insert_header("location", return_path).unwrap();
             resp.append_header(
@@ -4666,6 +4831,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .unwrap();
             resp.append_header("set-cookie", format!("WAF-PoW={pow}; {suffix}"))
                 .unwrap();
+            resp.append_header(
+                "set-cookie",
+                format!("WAF-Pass={pass_cookie}; HttpOnly; {suffix}"),
+            )
+            .unwrap();
             resp.insert_header("cache-control", "no-store").unwrap();
             session.write_response_header(Box::new(resp), true).await?;
             ctx.response_status = 303;
@@ -5294,7 +5464,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         matched: crate::firewall::MatchedAction,
         ip: String,
     ) -> Result<bool> {
-        let action = matched.action;
+        let action = matched.action.clone();
 
         if !matches!(action, crate::firewall::ActionResponse::Allow) {
             ctx.firewall_blocked = true;
@@ -5472,7 +5642,6 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                                 .unwrap_or(false),
                         )
                     });
-
                 life_seconds = if rule_life_seconds > 0 {
                     rule_life_seconds
                 } else {
@@ -5568,15 +5737,15 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 // deterministic random choice (per-token stable) so a single
                 // pass cookie only clears the specific challenge type that was
                 // actually solved — each method must be passed independently.
-                let raw_method = captcha_opts.as_ref()
-                    .map(|o| if o.method.is_empty() { "slider" } else { o.method.as_str() })
-                    .unwrap_or("slider");
+                let raw_method = self.waf_expected_challenge_method(&matched);
                 let effective_method = if raw_method == "geetest" {
-                    let seed = token.as_bytes().iter().fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
+                    let seed = token.as_bytes().iter().fold(0u64, |a, &b| {
+                        a.wrapping_mul(31).wrapping_add(b as u64)
+                    });
                     let modes = ["slider", "click", "captcha"];
                     modes[(seed % 3) as usize]
                 } else {
-                    raw_method
+                    raw_method.as_str()
                 };
 
                 let challenge_secret = self.api_config.secret.as_bytes();
@@ -5585,13 +5754,27 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 let body_html = match effective_method {
                     "click" => {
                         use crate::pages::challenges::click;
-                        let body = click::issue_html(challenge_lang, &token, &return_path, challenge_secret, challenge_expiry);
+                        let body = click::issue_html(
+                            challenge_lang,
+                            &token,
+                            WAF_VERIFY_ROUTE,
+                            &return_path,
+                            challenge_secret,
+                            challenge_expiry,
+                        );
                         let page = crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id);
                         page
                     }
                     "captcha" => {
                         use crate::pages::challenges::captcha;
-                        let body = captcha::issue_html(challenge_lang, &token, &return_path, challenge_secret, challenge_expiry);
+                        let body = captcha::issue_html(
+                            challenge_lang,
+                            &token,
+                            WAF_VERIFY_ROUTE,
+                            &return_path,
+                            challenge_secret,
+                            challenge_expiry,
+                        );
                         let page = crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id);
                         page
                     }
@@ -5609,7 +5792,13 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         // default: slider
                         let target = verifier.slider_target(&token);
                         use crate::pages::challenges::slider;
-                        let body = slider::issue_html(challenge_lang, &token, &return_path, target);
+                        let body = slider::issue_html(
+                            challenge_lang,
+                            &token,
+                            WAF_VERIFY_ROUTE,
+                            &return_path,
+                            target,
+                        );
                         let page = crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id);
                         page
                     }
@@ -5623,7 +5812,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     .unwrap();
                 resp.insert_header("referrer-policy", "same-origin")
                     .unwrap();
-                if !matches!(action, crate::firewall::ActionResponse::Captcha { .. }) {
+                if !matches!(action, crate::firewall::ActionResponse::Captcha { .. })
+                    || effective_method == "jscookie"
+                {
                     resp.append_header(
                         "set-cookie",
                         format!("WAF-Token={token}; HttpOnly; {suffix}"),
@@ -6107,6 +6298,19 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         self.apply_waf_runtime_action(session, ctx, action);
                     }
                 }
+                return Ok((false, waf_action));
+            }
+
+            let ua = session
+                .get_header("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if self.waf_pass_cookie_verified_for_action(
+                session,
+                &matched,
+                &ctx.client_ip_str,
+                ua,
+            ) {
                 return Ok((false, waf_action));
             }
 
@@ -9484,6 +9688,37 @@ mod tests {
         assert_eq!(
             EdgeProxy::append_forwarded_for(None, "3.3.3.3", 0),
             "3.3.3.3"
+        );
+    }
+
+    #[test]
+    fn waf_challenge_method_normalization_uses_action_default() {
+        assert_eq!(
+            EdgeProxy::normalize_waf_challenge_method("", "js_cookie"),
+            "jscookie"
+        );
+        assert_eq!(
+            EdgeProxy::normalize_waf_challenge_method("js-cookie", "captcha"),
+            "jscookie"
+        );
+        assert_eq!(
+            EdgeProxy::normalize_waf_challenge_method("challengeType", "captcha"),
+            "slider"
+        );
+        assert_eq!(
+            EdgeProxy::normalize_waf_challenge_method("click", "captcha"),
+            "click"
+        );
+    }
+
+    #[test]
+    fn waf_pass_cookie_value_round_trips_without_cookie_delimiters() {
+        let encoded = EdgeProxy::encode_waf_pass_cookie_value("captcha", "abc123");
+        assert!(!encoded.contains('|'));
+        assert!(!encoded.contains(';'));
+        assert_eq!(
+            EdgeProxy::decode_waf_pass_cookie_value(&encoded),
+            Some(("captcha".to_string(), "abc123".to_string()))
         );
     }
 }

@@ -190,7 +190,13 @@ pub struct WAFPageOptions {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct WAFCaptchaOptions {
-    #[serde(default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        default,
+        alias = "challengeMethod",
+        alias = "challengeType",
+        alias = "captchaType",
+        deserialize_with = "deserialize_null_default"
+    )]
     pub method: String,
     #[serde(rename = "lifeSeconds", default)]
     pub life_seconds: i32,

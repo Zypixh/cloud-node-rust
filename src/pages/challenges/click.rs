@@ -9,7 +9,8 @@ use rand::Rng;
 /// instruction text tells the user which colour to follow.
 pub fn issue_html(
     lang: Lang,
-    _token: &str,
+    waf_token: &str,
+    verify_route: &str,
     return_path: &str,
     secret: &[u8],
     expiry: u64,
@@ -161,10 +162,9 @@ cv.addEventListener('click',function(e){{
   if(next===5){{
    st.textContent='{done_text}';st.style.color='var(--green)';
    var el=Date.now()-t0;
-   var f=document.createElement('form');f.method='GET';f.action='{rp}';
-   f.innerHTML='<input type="hidden" name="__waf_token" value="{tok}"><input type="hidden" name="__waf_challenge_type" value="click"><input type="hidden" name="__waf_click_seq" value=""><input type="hidden" name="__waf_elapsed" value="'+el+'">';
-   var seq=[];for(var j=0;j<5;j++)seq.push(order.indexOf(j));
-   f.querySelector('[name=__waf_click_seq]').value=seq.join(',');
+   var f=document.createElement('form');f.method='GET';f.action='{route}';
+   f.innerHTML='<input type="hidden" name="__waf_token" value="{wtok}"><input type="hidden" name="__waf_challenge_token" value="{tok}"><input type="hidden" name="__waf_challenge_type" value="click"><input type="hidden" name="__waf_click_seq" value=""><input type="hidden" name="__waf_elapsed" value="'+el+'"><input type="hidden" name="__waf_return" value="{rp}">';
+   f.querySelector('[name=__waf_click_seq]').value=order.join(',');
    bf.appendChild(f);f.submit();
   }}
  }}else{{
@@ -178,7 +178,7 @@ cv.addEventListener('click',function(e){{
         sfx=sfx, targets_json=targets_json, decoys_json=decoys_json,
         order_json=order_json, pos_json=pos_json,
         instr=instr, hint=hint, done_text=done_text,
-        rp=return_path, tok=enc_token,
+        route=verify_route, rp=return_path, wtok=waf_token, tok=enc_token,
     )
 }
 

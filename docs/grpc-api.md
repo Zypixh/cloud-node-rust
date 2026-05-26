@@ -1,6 +1,8 @@
 # cloud-node-rust gRPC API 使用文档
 
-本文档整理当前数据面会主动调用的控制面 gRPC 接口、请求内容、响应配置、解析方式和运行时用途。所有 gRPC 请求都会通过 `RpcClient` 注入认证 metadata：`nodeid`、`nodeId`、`token`，部分接口额外带 `type=edge`。默认开启 gzip 压缩，最大编码/解码消息大小为 512 MiB。
+本文档只覆盖当前 Rust 数据面会主动调用的控制面 gRPC 接口。字段说明以 2026-05-26 对真实控制面 `http://36.134.185.75:8001` 的节点凭据采样为准；写接口未为了文档造数据，因此写接口的响应按 proto 和运行时调用语义说明为准。
+
+认证由 `RpcClient` 统一注入 metadata：`nodeid`、`nodeId`、`token`。`*_with_type()` 客户端额外注入 `type=edge`，但 token 角色仍为 `node`。默认 gzip 压缩，最大编码/解码消息大小为 512 MiB。真实采样入口是 `tests/real_api_config.rs` 中的 `real_api_grpc_documentation_snapshot`，需要显式设置 `CLOUD_NODE_REAL_API_TEST=1` 与 `CLOUD_NODE_REAL_API_DOC_SNAPSHOT=1`。
 
 ## 1. 节点配置与控制流
 
@@ -8,68 +10,76 @@
 
 - 调用位置：`src/rpc/node.rs`
 - 请求：`FindCurrentNodeConfigRequest { version, compress: true, node_task_version, use_data_map: true }`
-- 用途：拉取当前节点完整配置。
-- 响应：`node_json`、`is_compressed`、`timestamp`、`is_changed`。
-- 解析：如 `is_compressed=true`，先 Brotli 解压；随后解析为 `NodeConfigPayload`。
-- 应用：更新节点 numeric id、全局 HTTP 配置、站点配置、缓存策略、WAF 策略、页面策略、证书、负载均衡、HTTP/3、UAM、CC、防火墙、访问日志、gRPC、WebP、TOA、DNS resolver 等运行时快照，并重建 compiled plan。
+- 响应 proto：`nodeJSON: bytes`、`isChanged: bool`、`isCompressed: bool`、`dataSize: int64`、`timestamp: int64`
+- 实测响应：`isChanged=true`、`isCompressed=true`、`dataSize=45562`、`nodeJSON` 压缩后 45562 bytes，Brotli 解压后 173818 bytes，`timestamp=1779809480`
+- `nodeJSON` 实测顶层字段：`id`、`nodeId`、`name`、`secret`、`version`、`edition`、`isOn`、`level`、`groupId`、`regionId`、`allowedIPs`、`ipAddresses`、`apiNodeAddrs`、`dataMap`、`globalServerConfig`、`servers`、`metricItems`、`plans`、`httpCachePolicies`、`httpFirewallPolicies`、`grpcPolicies`、`primaryGRPCPolicy`、`http3Policies`、`httpCCPolicies`、`httpPagesPolicies`、`uamPolicies`、`webpImagePolicies`、`toa`、`networkSecurityPolicy`、`systemServices`、`clock`、`commonScripts`、`productConfig`、`enableIPLists`、`enablePlans`、`updatingServerListId`、`ocspVersion`
+- 实测计数：`servers` 11 个，`metricItems` 8 个，`httpCachePolicies` 1 个，`httpFirewallPolicies` 1 个，`grpcPolicies` 1 个，`primaryGRPCPolicy` 非空，`sslCerts` 0 个
+- 关键 JSON 形状：
+  - `dataMap.Map`：key 形如 `CDN_DATA_MAP:<md5>`，value 为字符串
+  - `globalServerConfig.httpAll`：包含 `serverName`、`forceLnRequest`、`lnRequestSchedulingMethod`、`supportsLowVersionHTTP`、`matchCertFromAllServers`、`enableServerAddrVariable`、`requestOriginsWithEncodings`、`xffMaxAddresses`、`allowLocalOrigins`
+  - `grpcPolicies["2"]` 与 `primaryGRPCPolicy`：`isOn`、`maxReceiveMessageBytes`、`maxReceiveMessageSize`、`maxSendMessageBytes`、`maxSendMessageSize`
+  - `servers[]`：`id`、`userId`、`name`、`type`、`isOn`、`clusterId`、`serverNames[]`、`aliasServerNames[]`、`http`、`https`、`reverseProxy`、`reverseProxyRef`、`web`、`grpc`、`uam`、`tcp`、`udp`、`trafficLimit`、`trafficLimitStatus`
+- 应用：解析为 `NodeConfigPayload`，更新节点 numeric id、全局 HTTP 配置、站点配置、缓存策略、WAF 策略、页面策略、证书、负载均衡、HTTP/3、UAM、CC、防火墙、访问日志、gRPC、WebP、TOA、DNS resolver 等运行时快照，并重建 compiled plan。
 
 ### NodeTaskService.FindNodeTasks
 
 - 调用位置：`src/rpc/node_task.rs`
 - 请求：`FindNodeTasksRequest { version }`
-- 用途：按任务版本增量拉取控制面任务。
-- 响应：`node_tasks[]`，包含 `id`、`version`、`type`、`server_id`、`user_id` 等。
-- 解析和使用：
-  - `configChanged`、`firewallPolicyChanged`、`cachePolicyChanged` 等：同步单站或触发完整配置同步。
-  - `nodeLevelChanged`：同步节点层级和父节点。
-  - `planChanged`：同步套餐。
-  - `purgeServerCache`、`purgePathCache`、`preheatCache`：Leader 节点同步缓存任务。
-  - `ipItemChanged`：同步 IP 名单条目。
-  - `updatingServers`：同步正在更新的站点列表。
-  - `userServersStateChanged`：同步用户站点启停状态。
-  - `ipListDeleted@{...}`：本地删除名单元数据和已应用项目。
+- 响应 proto：`nodeTasks[]`
+- `nodeTasks[]` 字段：`id`、`type`、`isDone`、`isOk`、`error`、`updatedAt`、`version`、`isPrimary`、`serverId`、`userId`
+- 实测：以 `version=0` 拉取时返回空数组。
+- 运行时处理的任务类型：`configChanged`、`ddosProtectionChanged`、`globalServerConfigChanged`、`uamPolicyChanged`、`httpCCPolicyChanged`、`http3PolicyChanged`、`httpPagesPolicyChanged`、`toaChanged`、`networkSecurityPolicyChanged`、`webPPolicyChanged`、`accessLogChanged`、`dnsResolverChanged`、`grpcPolicyChanged`、`scheduleChanged`、`apiConfigChanged`、`indexNodeConfigChanged`、`cachePolicyChanged`、`firewallPolicyChanged`、`nodeLevelChanged`、`planChanged`、`purgeServerCache`、`purgePathCache`、`preheatCache`、`ipItemChanged`、`updatingServers`、`userServersStateChanged`、`upgradeNode`、`installNode`、`startNode`、`scriptsChanged`
 
 ### NodeTaskService.ReportNodeTaskDone
 
 - 调用位置：`src/rpc/node_task.rs`
 - 请求：`ReportNodeTaskDoneRequest { node_task_id, is_ok, error }`
-- 用途：任务处理完成后回报控制面。
-- 应用：只有回报成功后才推进本地 task version，避免任务失败被跳过。
-
-### NodeService.UpdateNodeUp
-
-- 调用位置：`src/rpc/node.rs`
-- 请求：`UpdateNodeUpRequest { node_id, is_up }`
-- 用途：报告节点上线状态。
-- 应用：启动或周期性维护节点在线状态。
+- 响应：`RPCSuccess {}` 空消息
+- 采样说明：未对真实任务做完成回报，避免改变控制面任务游标。
+- 应用：只有回报成功后才推进本地 task version。
 
 ### NodeService.UpdateNodeStatus
 
 - 调用位置：`src/rpc/node.rs`、`src/rpc/node-status.rs`、`src/rpc/node-status-full.rs`
-- 请求：`UpdateNodeStatusRequest`，包含节点 ID、系统负载、CPU、内存、连接数、流量、配置版本等状态字段。
-- 用途：上报节点运行状态。
-- RKE2 语义：只有 Leader 负责关键状态上报，避免多副本共用 nodeId 时重复覆盖。
+- 请求：`UpdateNodeStatusRequest { node_id, status_json }`
+- 响应：`RPCSuccess {}` 空消息
+- `status_json` 由运行时代码构造，字段包括：`buildVersion`、`buildVersionCode`、`configVersion`、`os`、`arch`、`hostname`、`hostIP`、`exePath`、`cpuUsage`、`cpuLogicalCount`、`cpuPhysicalCount`、`memoryUsage`、`memoryTotal`、`diskUsage`、`diskTotal`、`diskMaxUsage`、`diskMaxUsagePartition`、`load1m`、`load5m`、`load15m`、`trafficInBytes`、`trafficOutBytes`、`connectionCount`、`apiSuccessPercent`、`apiAvgCostSeconds`、`cacheTotalDiskSize`、`updatedAt`、`timestamp`、`isActive`、`isHealthy`
+- RKE2 语义：只有 Leader 负责关键状态上报，多副本统计会先在集群内部聚合。
 
-### NodeService.UpdateNodeIsInstalled
+### NodeService.FindNodeLevelInfo
 
-- 调用位置：`src/rpc/node.rs`、`src/rpc/node_task.rs`
-- 请求：`UpdateNodeIsInstalledRequest { node_id, is_installed }`
-- 用途：报告安装/升级类任务完成。
+- 调用位置：`src/rpc/mod.rs`、`src/rpc/stats.rs`
+- 请求：`FindNodeLevelInfoRequest {}`
+- 响应 proto：`level: int32`、`parentNodesMapJSON: bytes`
+- 实测响应：`level=1`，`parentNodesMapJSON` 为 `{}`，长度 2 bytes
+- 应用：更新节点层级、父节点映射、分层回源和统计聚合语义。
 
-### NodeService.UpdateNodeConnectedApiNodes
+### NodeService.FindEnabledNodeConfigInfo
 
 - 调用位置：`src/rpc/node.rs`
-- 请求：`UpdateNodeConnectedApiNodesRequest { node_id, api_node_ids }`
-- 用途：报告当前节点已连接的 API 节点列表。
-- 数据来源：node stream 连接成功后记录 API node id，断开后移除。
+- 请求：`FindEnabledNodeConfigInfoRequest { node_id }`
+- 预期响应字段：`hasDNSInfo`、`hasCacheInfo`、`hasThresholds`、`hasSSH`、`hasSystemSettings`、`hasDDoSProtection`、`hasScheduleSettings`、`hasAccessLogSettings`
+- 实测结果：节点凭据返回错误 `not supported node type: 'node'`。运行时已按 unsupported 处理，不把它作为必须成功的配置入口。
+
+### NodeService.UpdateNodeConnectedAPINodes
+
+- 调用位置：`src/rpc/node.rs`
+- 请求：`UpdateNodeConnectedAPINodesRequest { api_node_ids }`
+- 响应：`RPCSuccess {}` 空消息
+- 数据来源：node stream 连接成功后记录 API node id，断开后移除。仅有已连接 API node id 时上报。
+
+### NodeService.UpdateNodeUp / UpdateNodeIsInstalled
+
+- 当前状态：不再作为节点侧正常运行路径调用。
+- 原因：代码注释明确说明 `updateNodeUp` / `updateNodeIsInstalled` 在 cloud API 下需要管理端凭据，节点凭据会失败。节点侧使用 `UpdateNodeStatus` 表达在线/健康状态。
 
 ### NodeStream
 
 - 调用位置：`src/rpc/stream.rs`
-- 传输：手工构造 HTTP/2 gRPC stream，请求路径为 node stream 服务路径，metadata 注入 `nodeid` 和 `token`。
-- 发送：周期性 `NodeStreamMessage { node_id, code: "ping", is_ok: true }`。
-- 接收：控制面推送任务和配置变更事件，触发本地任务同步。
-- 用途：减少纯轮询延迟，让配置和任务更快生效。
+- 传输：手工构造 HTTP/2 gRPC stream，请求路径为 NodeService 的 `nodeStream`
+- 发送：周期性 `NodeStreamMessage { node_id, code: "ping", is_ok: true }`
+- 接收字段：`nodeId`、`requestId`、`timeoutSeconds`、`code`、`dataJSON`、`isOk`、`message`
+- 应用：接收控制面推送的任务和配置变更事件，触发本地任务同步。
 
 ## 2. 站点配置、状态和套餐
 
@@ -77,271 +87,285 @@
 
 - 调用位置：`src/rpc/server.rs`
 - 请求：`ComposeServerConfigRequest { server_id }`
-- 用途：同步单个站点完整运行配置。
-- 响应：`server_config_json`。
-- 解析：解析为 `ServerConfig`。
-- 应用：按 server/user scope 替换运行时站点、域名路由、负载均衡、健康检查、缓存/WAF/auth/rewrite/header/限速等配置，并同步套餐。
+- 响应 proto：`serverConfigJSON: bytes`
+- 实测：对 `server_id=22` 返回 `serverConfigJSON` 15225 bytes，可解析为单个 `ServerConfig`
+- 实测顶层字段：`id`、`userId`、`name`、`description`、`type`、`isOn`、`clusterId`、`supportCNAME`、`cnameAsDomain`、`cnameDomain`、`serverNames[]`、`aliasServerNames[]`、`http`、`https`、`reverseProxy`、`reverseProxyRef`、`group`、`web`、`grpc`、`uam`、`tcp`、`tls`、`udp`、`trafficLimit`、`trafficLimitStatus`、`httpCachePolicy`、`httpCachePolicyId`、`httpFirewallPolicy`、`httpFirewallPolicyId`、`userPlan`
+- 实测嵌套形状：
+  - `serverNames[]`：`name`、`type`、`subNames`
+  - `http`：`isOn`、`listen[]`
+  - `https`：`isOn`、`listen[]`、`sslPolicy`、`sslPolicyRef`
+  - `reverseProxy`：`id`、`isOn`、`primaryOrigins[]`、`backupOrigins`、`requestHost`、`requestURI`、`addHeaders[]`、`connTimeout`、`readTimeout`、`idleTimeout`、`maxConns`、`maxIdleConns`、`maxFails`、`followRedirects`、`retry40X`、`retry50X`、`stripPrefix`、`proxyProtocol`
+  - `web`：`accessLog`、`cache`、`remoteAddr`、`shutdown`、`statRef`、`websocket`、`websocketRef` 等；未配置项实测多为 `null`
+- 空响应语义：若 `serverConfigJSON` 为空，运行时会移除该 server。
 
 ### UserService.CheckUserServersState
 
 - 调用位置：`src/rpc/server.rs`
 - 请求：`CheckUserServersStateRequest { user_id }`
-- 用途：检查用户站点整体是否启用。
+- 响应 proto：`CheckUserServersStateResponse { is_enabled }`
+- 实测：`user_id=2` 返回 `isEnabled=true`
 - 应用：用户禁用时移除该用户所有运行时站点。
 
 ### ServerService.ComposeAllUserServersConfig
 
 - 调用位置：`src/rpc/server.rs`
 - 请求：`ComposeAllUserServersConfigRequest { user_id }`
-- 用途：同步某个用户的全部站点配置。
-- 响应：`servers_config_json`。
-- 解析：解析为 `Vec<ServerConfig>`。
-- 应用：批量替换用户站点运行时 map 和路由 map。
+- 响应 proto：`serversConfigJSON: bytes`
+- 实测：对 `user_id=2` 返回 628635 bytes，可解析为 `Vec<ServerConfig>`，数组长度 47
+- 实测 item 形状与 `ComposeServerConfig` 相同；本次数组样本中的 `web` 还出现了 `auth`、`cache`、`compression`、`redirectToHTTPS`、`locations[]`、`locationRefs[]`、`requestLimit`、`remoteAddr`、`websocket` 等非空对象。
+- 空响应语义：若 `serversConfigJSON` 为空，运行时移除该用户全部站点。
 
 ### UpdatingServerListService.FindUpdatingServerLists
 
 - 调用位置：`src/rpc/api_node.rs`
 - 请求：`FindUpdatingServerListsRequest { last_id }`
-- 用途：拉取正在更新中的站点列表。
-- 应用：对命中的站点使用维护/更新态处理，避免请求进入不稳定配置。
+- 响应 proto：`serversJSON: bytes`、`maxId: int64`
+- 实测：`maxId=0`，`serversJSON` 为空
+- 非空语义：`serversJSON` 解析为 `Vec<ServerConfig>`，用于替换更新中的站点运行时配置。
 
-### PlanService.FindServerUserPlan
+### ServerService.FindServerUserPlan
 
 - 调用位置：`src/rpc/plan.rs`
 - 请求：`FindServerUserPlanRequest { server_id }`
-- 用途：查询站点绑定的用户套餐关系。
-- 应用：用于上传大小限制、功能能力和资源限制判断。
+- 响应 proto：`FindServerUserPlanResponse { userPlan }`
+- 实测结果：对 `server_id=22` 使用节点凭据返回错误 `not supported node type: 'node'`
+- 运行时处理：`sync_active_plans()` 对该错误只记录一次 debug 并返回 false；当前主配置 `nodeJSON.plans` 已包含可用套餐摘要。
 
 ### PlanService.FindEnabledPlan / FindBasicPlan
 
 - 调用位置：`src/rpc/plan.rs`
-- 请求：`FindEnabledPlanRequest { plan_id }`，失败时回退 `FindBasicPlanRequest { plan_id }`。
-- 用途：同步套餐配置。
-- 应用：解析套餐容量、上传大小、功能开关等限制并写入 `ConfigStore`。
+- 请求：`FindEnabledPlanRequest { plan_id }`；失败后回退 `FindBasicPlanRequest { plan_id }`
+- 响应 proto：`FindEnabledPlanResponse { plan }` / `FindBasicPlanResponse { plan }`
+- 本次采样未触发成功响应：所选实测 server 的 `userPlanId` 为 0，且 `FindServerUserPlan` 已被节点凭据拒绝。
+- `Plan` 字段来自 proto，只有成功返回时才可视为控制面实测值：`id`、`isOn`、`name`、`description`、`clusterId`、`trafficLimitJSON`、`bandwidthLimitPerNodeJSON`、`featuresJSON`、`maxUploadSizeJSON`、`priceType`、`trafficPriceJSON`、`bandwidthPriceJSON`、`monthlyPrice`、`seasonallyPrice`、`yearlyPrice`、`hasFullFeatures`、`totalServers`、`lbMode`
 
-### ServerService.UploadServerHttpRequestStat
+## 3. 缓存任务、删除内容、文件和证书
 
-- 调用位置：`src/rpc/stats.rs`
-- 请求：`UploadServerHttpRequestStatRequest`，包含站点请求数、状态码分布、流量、缓存命中、延迟等聚合统计。
-- 用途：上报 HTTP 请求统计。
-- 应用：控制面展示站点请求和性能数据。
-
-### ServerEventService.CreateServerEvent
-
-- 调用位置：`src/rpc/events.rs`
-- 请求：`CreateServerEventRequest`，包含站点 ID、事件类型、级别、内容等。
-- 用途：上报站点运行事件。
-
-## 3. 缓存任务、缓存同步和文件
-
-### HttpCacheTaskKeyService.FindDoingHttpCacheTaskKeys
+### HTTPCacheTaskKeyService.FindDoingHTTPCacheTaskKeys
 
 - 调用位置：`src/rpc/cache.rs`
-- 请求：`FindDoingHttpCacheTaskKeysRequest { size: 100 }`
-- 用途：获取待处理缓存任务 key。
-- 任务类型：purge server/path/key、preheat 等。
-- 应用：Leader 节点执行本地 cache purge/preheat，并在 RKE2 下通过内部 API fanout 到其他 pod。
+- 请求：`FindDoingHTTPCacheTaskKeysRequest { size: 100 }`
+- 响应 proto：`httpCacheTaskKeys[]`
+- 实测：返回空数组
+- 非空 item 字段：`id`、`taskId`、`key`、`type`、`keyType`、`isDone`、`isDoing`、`errorsJSON`、`nodeClusterId`
+- 运行时处理：`type=purge` 执行 key/prefix/tag purge；`type=preheat` 发本地预热请求；RKE2 Leader 会 fanout 到其他 pod。
 
-### HttpCacheTaskKeyService.UpdateHttpCacheTaskKeysStatus
+### HTTPCacheTaskKeyService.UpdateHTTPCacheTaskKeysStatus
 
 - 调用位置：`src/rpc/cache.rs`
-- 请求：`UpdateHttpCacheTaskKeysStatusRequest { ids, status, error }`
-- 用途：回报缓存任务处理结果。
+- 请求：`UpdateHTTPCacheTaskKeysStatusRequest { key_results[] }`
+- `key_results[]` 字段：`id`、`node_cluster_id`、`error`
+- 响应：`RPCSuccess {}` 空消息
+- 采样说明：未构造缓存任务回报，避免改变控制面任务状态。
 
 ### ServerDeletedContentService.ListServerDeletedContentsAfterVersion
 
 - 调用位置：`src/rpc/utils.rs`
 - 请求：`ListServerDeletedContentsAfterVersionRequest { version, size }`
-- 用途：同步已删除内容版本。
-- 应用：构建 deleted content map，用于缓存和内容生命周期判断。
+- 响应 proto：`serverDeletedContents[]`
+- 实测：以 `version=0,size=5` 返回空数组
+- 非空 item 字段：`id`、`adminId`、`serverId`、`url`、`reasonType`、`version`、`createdAt`、`isDeleted`
+- 应用：构建本地 deleted content map，用于缓存和内容生命周期判断。
 
-### IpLibraryArtifactService.FindPublicIpLibraryArtifact
+### IPLibraryArtifactService.FindPublicIPLibraryArtifact
 
 - 调用位置：`src/rpc/files.rs`
-- 请求：`FindPublicIpLibraryArtifactRequest {}`
-- 用途：查找 GeoIP/IP 库制品。
-- 应用：决定是否下载/更新本地 IP 库。
+- 请求：`FindPublicIPLibraryArtifactRequest {}`
+- 响应 proto：`ipLibraryArtifact`
+- 实测：`ipLibraryArtifact=null`
+- 非空字段：`id`、`fileId`、`createdAt`、`metaJSON`、`isPublic`、`name`、`code`、`file`
+- `file` 字段：`id`、`filename`、`size`、`createdAt`、`isPublic`、`mimeType`、`type`
+- 应用：有公开制品且 `fileId` 变化时，下载 GeoIP/IP 库。
 
 ### FileChunkService.FindAllFileChunkIds / DownloadFileChunk
 
 - 调用位置：`src/rpc/files.rs`
-- 请求：`FindAllFileChunkIdsRequest`、`DownloadFileChunkRequest`。
-- 用途：按 chunk 下载控制面文件制品。
-- 应用：用于 GeoIP/IP 库等大文件分块同步。
+- 请求：`FindAllFileChunkIdsRequest { file_id, access_ticket }`、`DownloadFileChunkRequest { file_chunk_id, access_ticket }`
+- 响应：`FindAllFileChunkIdsResponse { file_chunk_ids[] }`、`DownloadFileChunkResponse { file_chunk.data }`
+- 本次采样未触发：公开 IP 库制品为 `null`，没有可下载 `fileId`。
+- 应用：按 chunk 下载大文件制品并写入本地目标文件。
 
-### SslCertService.ListUpdatedSslCertOcsp
+### SSLCertService.ListUpdatedSSLCertOCSP
 
 - 调用位置：`src/rpc/ssl.rs`
-- 请求：`ListUpdatedSslCertOcspRequest { version, size: 100 }`
-- 用途：增量同步 OCSP staple 数据。
-- 应用：更新动态证书选择器内的 OCSP 数据，TLS 握手时直接读取快照。
+- 请求：`ListUpdatedSSLCertOCSPRequest { version, size }`
+- 响应 proto：`sslCertOCSP[]`
+- 实测：以 `version=0,size=5` 返回 5 条；item 字段为 `sslCertId`、`data`、`version`、`expiresAt`
+- 实测样本：`sslCertId=50,dataBytes=0,version=10313,expiresAt=0`；其余样本 `dataBytes=504`，`version` 包括 `339650`、`445197`、`503708`、`507883`
+- 应用：按 `sslCertId` 更新动态证书选择器内的 OCSP staple 数据，并用最大 `version` 推进游标。
 
-### AcmeAuthenticationService.FindACMEAuthenticationKeyWithToken
+### ACMEAuthenticationService.FindACMEAuthenticationKeyWithToken
 
 - 调用位置：`src/rpc/acme.rs`
 - 请求：`FindACMEAuthenticationKeyWithTokenRequest { token }`
-- 用途：处理 `/.well-known/acme-challenge/` 请求时查找 ACME key authorization。
-- 应用：命中后直接由边缘节点返回挑战内容。
+- 响应 proto：`key: string`
+- 实测：探测 token 返回空字符串
+- 运行时语义：空字符串视为 `Missing`；非空时直接返回 ACME key authorization。
 
 ## 4. WAF、IP 名单和安全事件
 
-### FirewallService.NotifyHttpFirewallEvent
-
-- 调用位置：`src/rpc/firewall.rs`
-- 请求：`NotifyHttpFirewallEventRequest`，包含 node/server/policy/group/set/rule、客户端 IP、URL、action、level、tags 等。
-- 用途：WAF 命中事件上报。
-- 应用：控制面审计、告警和 WAF 日志展示。
-
-### IpListService.ListEnabledIpLists
+### IPItemService.ListIPItemsAfterVersion
 
 - 调用位置：`src/rpc/ip_list.rs`
-- 请求：`ListEnabledIpListsRequest { type: "cluster", offset, size }`
-- 用途：分页拉取启用的 IP 名单 metadata。
-- 响应：`ip_lists[]`，包含 id、code、type、is_global 等。
-- 应用：本地维护 list id -> 名单类型/作用域映射，供增量 IP item 应用时判断黑/白/灰和 global/site scope。
+- 请求：`ListIPItemsAfterVersionRequest { version, size }`
+- 响应 proto：`ipItems[]`、`version`
+- 实测：以 `version=0,size=10` 返回 10 条，响应 `version=1731077`
+- 实测 item 字段：`id`、`value`、`ipFrom`、`ipTo`、`version`、`expiredAt`、`reason`、`listId`、`isDeleted`、`type`、`eventLevel`、`listType`、`isGlobal`、`createdAt`、`nodeId`、`serverId`、`sourceNodeId`、`sourceServerId`、`sourceHTTPFirewallPolicyId`、`sourceHTTPFirewallRuleGroupId`、`sourceHTTPFirewallRuleSetId`、`sourceURL`、`sourceUserAgent`、`isRead`
+- 实测样本：`value` 为 IPv4，`type="ipv4"`，`listType` 包括 `white` / `black`，`eventLevel="error"`，样本均 `isDeleted=true`，`isGlobal=true`
+- 应用：解析 IP/CIDR/range、过期时间、删除标记、名单类型和 server scope，写入 `WafStateManager`。当前实现不再单独拉 `IPListService` metadata，`listType` 已随 item 返回。
 
-### IpItemService.ListIpItemsAfterVersion
-
-- 调用位置：`src/rpc/ip_list.rs`
-- 请求：`ListIpItemsAfterVersionRequest { version, size: 5000 }`
-- 用途：增量同步 IP 名单条目。
-- 响应：`ip_items[]` 和新版本号。
-- 解析：解析 IP、CIDR、过期时间、删除标记、list type、serverId、is_global。
-- 应用：写入 `WafStateManager` 黑/白/灰名单。所有 item 成功应用后才推进版本。
-
-### IpItemService.ListIpItemsWithListId
-
-- 调用位置：`src/rpc/ip_list.rs`
-- 请求：`ListIpItemsWithListIdRequest { ip_list_id }`
-- 用途：按名单 ID 拉取全部条目。
-- 应用：用于特定名单引用或调试/补偿同步。
-
-### IpListService.FindEnabledIpList
-
-- 调用位置：`src/rpc/ip_list.rs`
-- 请求：`FindEnabledIpListRequest { ip_list_id }`
-- 用途：按 ID 查找启用名单 metadata。
-- 应用：存在则更新 metadata，不存在则移除本地名单和对应条目。
-
-### IpItemService.CreateIpItem
-
-- 调用位置：`src/rpc/ip_list.rs`
-- 请求：`CreateIpItemRequest { ip_list_id, value, reason }`
-- 用途：单条记录 IP 到指定名单。
-- 应用：WAF action 或手动逻辑触发名单记录。
-
-### IpItemService.CreateIpItems
+### IPItemService.CreateIPItems
 
 - 调用位置：`src/rpc/ip_report.rs`
-- 请求：`CreateIpItemsRequest { ip_items[] }`
-- 用途：批量上报黑/白/灰名单 item。
-- 数据：包含 `ip_list_id`、IP、server scope、source node、过期时间、reason、level、trigger 等。
-- 应用：控制面持久化后由各节点增量同步，实现跨节点名单传播。
+- 请求：`CreateIPItemsRequest { ip_items[] }`
+- `ip_items[]` 字段：`ipListId`、`value`、`ipFrom`、`ipTo`、`expiredAt`、`reason`、`type`、`eventLevel`、`nodeId`、`serverId`、`sourceNodeId`、`sourceServerId`、`sourceHTTPFirewallPolicyId`、`sourceHTTPFirewallRuleGroupId`、`sourceHTTPFirewallRuleSetId`、`sourceURL`、`sourceUserAgent`、`sourceCategory`
+- 响应 proto：`CreateIPItemsResponse { ipItemIds[] }`
+- 采样说明：未创建真实名单项。
+- 运行时说明：当 `ipListId<=0` 且为全局名单时，使用内置 ID：黑名单 `2000000000`、白名单 `2000000001`、灰名单 `2000000002`；站点级名单没有显式 `ipListId` 会被丢弃。
 
-### IpListService.FindIpListIdWithCode / CreateIpList
+### IPListService 与 IPItemService.CreateIPItem/ListIPItemsWithListId
 
-- 调用位置：`src/rpc/ip_report.rs`
-- 请求：`FindIpListIdWithCodeRequest { code }`，必要时 `CreateIpListRequest { code, name, type, is_global }`。
-- 用途：当 WAF action 没有显式 `ipListId` 时，按 scope/type 解析或创建名单。
-- 应用：确保全局/站级黑白灰 action 能落到正确名单。
+- 当前状态：运行时代码没有主动调用这些接口。
+- 说明：`RpcClient` 仍保留 client helper，但 `src/rpc/ip_list.rs` 的同步路径只调用 `IPItemService.ListIPItemsAfterVersion`；`src/rpc/ip_report.rs` 也不再调用 `findIPListIdWithCode/createIPList`，因为这些接口在 cloud API 下属于 admin/user 凭据能力。
+
+### FirewallService.NotifyHTTPFirewallEvent
+
+- 调用位置：`src/rpc/firewall.rs`、`src/rpc/events.rs`
+- 请求：`NotifyHTTPFirewallEventRequest { server_id, http_firewall_policy_id, http_firewall_rule_group_id, http_firewall_rule_set_id, created_at }`
+- 响应：`RPCSuccess {}` 空消息
+- 采样说明：未上报真实 WAF 事件。
+- 注意：旧文档中提到的客户端 IP、URL、action、level、tags 不在当前 proto 请求内，当前 Rust 调用也没有发送这些字段。
 
 ## 5. 日志、指标和统计
 
-### HttpAccessLogService.CreateHttpAccessLogs
+本节主要是写接口。为避免污染控制面，文档采样未主动发送日志或统计；响应形状按 proto 均为空成功消息或空 response。
+
+### HTTPAccessLogService.CreateHTTPAccessLogs
 
 - 调用位置：`src/log_uploader.rs`
-- 请求：`CreateHttpAccessLogsRequest { logs[] }`
-- 用途：批量上传访问日志。
-- 数据：请求/响应状态、host、URL、method、客户端 IP、headers/cookies/attrs/tags、WAF 命中、缓存命中、延迟、流量、origin 信息等。
-- 应用：日志字段按控制面配置惰性生成；发送前按 protobuf 编码大小拆 chunk；失败进入 retry queue。
+- 请求：`CreateHTTPAccessLogsRequest { http_access_logs[] }`
+- 响应：`CreateHTTPAccessLogsResponse {}` 空消息
+- `http_access_logs[]` 字段：`requestId`、`serverId`、`nodeId`、`locationId`、`rewriteId`、`originId`、`remoteAddr`、`rawRemoteAddr`、`remotePort`、`remoteUser`、`requestURI`、`requestPath`、`requestLength`、`requestTime`、`requestMethod`、`requestFilename`、`requestBody`、`scheme`、`proto`、`bytesSent`、`bodyBytesSent`、`status`、`statusMessage`、`sentHeader`、`timeISO8601`、`timeLocal`、`msec`、`timestamp`、`host`、`referer`、`userAgent`、`request`、`contentType`、`cookie`、`args`、`queryString`、`header`、`serverName`、`serverPort`、`serverProtocol`、`hostname`、`originAddress`、`originStatus`、`originHeaderResponseTime`、`errors[]`、`attrs`、`firewallPolicyId`、`firewallRuleGroupId`、`firewallRuleSetId`、`firewallRuleId`、`firewallActions[]`、`tags[]`
+- 上传行为：按 protobuf 编码大小拆 chunk；失败进入 retry queue；ResourceExhausted 时二分拆批。
 
 ### NodeLogService.CreateNodeLogs
 
-- 调用位置：`src/log_uploader.rs`、`src/rpc/logs.rs`
+- 调用位置：`src/log_uploader.rs`
 - 请求：`CreateNodeLogsRequest { node_logs[] }`
-- 用途：上报节点运行日志、错误和诊断事件。
-- 应用：服务端配置同步失败、站点解析失败、运行时错误等通过该接口上报。
+- 响应：`CreateNodeLogsResponse {}` 空消息
+- `node_logs[]` 字段：`id`、`role`、`tag`、`description`、`level`、`nodeId`、`createdAt`、`count`、`serverId`、`isFixed`、`originId`、`isRead`、`paramsJSON`、`type`
+
+### NodeValueService.CreateNodeValues
+
+- 调用位置：`src/rpc/stats.rs`、`src/rpc/node.rs`、`src/rpc/node-status-full.rs`
+- 请求：`CreateNodeValuesRequest { node_value_items[] }`
+- 响应：`RPCSuccess {}` 空消息
+- `node_value_items[]` 字段：`item`、`valueJSON`、`createdAt`
+- `valueJSON` 由代码构造的实际形状：
+  - `originHealth_<origin_id>`：`originId`、`status`、`latencyMs`、`lastCheckTs`
+  - `cpu`：`usage`、`cores`、`logicalCount`、`physicalCount`
+  - `memory`：`usage`、`total`、`used`、`memUsage`
+  - `load`：`load1m`、`load5m`、`load15m`
+  - `connections`：`total`
+  - `trafficIn` / `trafficOut`：`total`
+  - `allTraffic`：`inBytes`、`outBytes`、`avgInBytes`、`avgOutBytes`
+  - `requests` / `attackRequests`：`total`
+  - `disk`：`usage`、`total`、`used`、`maxUsage`
+  - `traffic`：`in`、`out`、`total`
+  - `cache`：`diskSize`、`memorySize`
 
 ### ServerBandwidthStatService.UploadServerBandwidthStats
 
 - 调用位置：`src/rpc/stats.rs`
-- 请求：`UploadServerBandwidthStatsRequest { stats[] }`
-- 用途：上报按时间窗口聚合的站点带宽统计。
+- 请求：`UploadServerBandwidthStatsRequest { server_bandwidth_stats[] }`
+- 响应：`RPCSuccess {}` 空消息
+- item 字段：`userId`、`serverId`、`day`、`timeAt`、`bytes`、`bits`、`totalBytes`、`cachedBytes`、`attackBytes`、`countRequests`、`countCachedRequests`、`countAttackRequests`、`userPlanId`、`countWebsocketConnections`、`originTotalBytes`、`originAvgBytes`、`originAvgBits`、`countIPs`、`nodeRegionId`
 
 ### ServerDailyStatService.UploadServerDailyStats
 
 - 调用位置：`src/rpc/stats.rs`
-- 请求：`UploadServerDailyStatsRequest { stats[] }`
-- 用途：上报按天聚合的站点统计。
+- 请求：`UploadServerDailyStatsRequest { stats[], domain_stats[] }`
+- 响应：`RPCSuccess {}` 空消息
+- `stats[]` 字段：`serverId`、`userId`、`nodeRegionId`、`bytes`、`cachedBytes`、`countRequests`、`countCachedRequests`、`createdAt`、`countAttackRequests`、`attackBytes`、`checkTrafficLimiting`、`planId`、`day`、`hour`、`timeFrom`、`timeTo`、`countIPs`
+- `domain_stats[]` 字段：`serverId`、`domain`、`bytes`、`cachedBytes`、`countRequests`、`countCachedRequests`、`countAttackRequests`、`attackBytes`、`createdAt`
 
 ### MetricStatService.UploadMetricStats
 
 - 调用位置：`src/rpc/stats.rs`
-- 请求：`UploadMetricStatsRequest { stats[] }`
-- 用途：上报自定义 metric items。
-- 数据来源：控制面下发 metric item 配置，本地按配置采样/聚合。
+- 请求：`UploadMetricStatsRequest { server_id, time, count, total, version, item_id, metric_stats[], keep_keys[] }`
+- 响应：`RPCSuccess {}` 空消息
+- `metric_stats[]` 字段：`id`、`hash`、`keys[]`、`value`
+- `hash` 算法：`fnv_hash64("{server_id}@{keys.join(\"$EDGE$\")}@{time}@{version}@{item_id}")`
+- `keys[]` 来自控制面 `metricItems[].keys`，代码支持 `${country}`、`${province}`、`${city}`、`${provider}`、`${browser}`、`${os}`、`${wafGroup}`、`${wafAction}`
 
-### ServerTopIpStatService.UploadServerTopIpStats
+### ServerService.UploadServerHTTPRequestStat
 
 - 调用位置：`src/rpc/stats.rs`
-- 请求：`UploadServerTopIpStatsRequest { stats[] }`
-- 用途：上报站点 Top IP 统计。
+- 请求：`UploadServerHTTPRequestStatRequest { month, day, region_cities[], region_providers[], systems[], browsers[], http_firewall_rule_groups[] }`
+- 响应：`RPCSuccess {}` 空消息
+- `region_cities[]` 字段：`serverId`、`countRequests`、`bytes`、`countAttackRequests`、`attackBytes`、`regionCountryId`、`regionProvinceId`、`regionCityId`
+- `region_providers[]` 字段：`serverId`、`count`、`regionProviderId`
+- `systems[]` / `browsers[]` 字段：`serverId`、`name`、`version`、`count`
+- `http_firewall_rule_groups[]` 字段：`serverId`、`httpFirewallRuleGroupId`、`action`、`count`
 
-### NodeValueService.CreateNodeValues
+### ServerTopIPStatService.UploadServerTopIPStats
 
-- 调用位置：`src/rpc/node.rs`、`src/rpc/node-status-full.rs`
-- 请求：`CreateNodeValuesRequest { node_value_items[] }`
-- 用途：上报节点级时间序列指标。
-- 数据：CPU、内存、连接、流量、缓存等节点值。
-
-### NodeService.FindNodeLevelInfo
-
-- 调用位置：`src/rpc/mod.rs`、`src/rpc/stats.rs`
-- 请求：`FindNodeLevelInfoRequest {}`
-- 用途：查询节点层级、父节点和回源层级信息。
-- 应用：配置 `node_level`、父节点列表、分层回源策略和统计聚合语义。
+- 调用位置：`src/rpc/stats.rs`
+- 请求：`UploadServerTopIPStatsRequest { stats[] }`
+- 响应：`RPCSuccess {}` 空消息
+- `stats[]` 字段：`serverId`、`ip`、`countRequests`、`day`、`timeAt`
 
 ## 6. API 节点、客户端代理和连通性
-
-### ApiNodeService.FindAllEnabledApiNodes
-
-- 调用位置：`src/rpc/api_node.rs`
-- 请求：`FindAllEnabledApiNodesRequest {}`
-- 用途：获取所有可用 API 节点。
-- 应用：动态更新 runtime RPC endpoints，提升控制面连接容错能力。
 
 ### PingService.Ping
 
 - 调用位置：`src/rpc/client.rs`
 - 请求：`PingRequest {}`
-- 用途：检测 gRPC endpoint 可用性。
-- 应用：`RpcClient` 建连时选择可用控制面 endpoint。
+- 响应 proto：`PingResponse { result }`
+- 实测：`result="pong"`
+- 应用：检测 gRPC endpoint 可用性。
 
-### ClientAgentIPService.CreateClientAgentIPs
+### APINodeService.FindAllEnabledAPINodes
 
-- 调用位置：`src/client_agent.rs`
-- 请求：`CreateClientAgentIPsRequest { agentIPs[] }`
-  - `agentIPs[].agentCode`
-  - `agentIPs[].ip`
-  - `agentIPs[].ptr`
-- 用途：后台 client-agent worker 完成 UA + PTR 校验后，上报已验证客户端代理 IP。
-- 应用：控制面维护 client agent IP 池；Rust 节点本地先写 RocksDB/内存索引，RPC 失败不阻塞本节点即时生效。
+- 调用位置：`src/rpc/api_node.rs`
+- 请求：`FindAllEnabledAPINodesRequest {}`
+- 响应 proto：`apiNodes[]`
+- 实测：返回 1 个 API node
+- 实测字段：`id=1`、`isOn=true`、`nodeClusterId=0`、`name="默认API节点"`、`accessAddrs[]` 1 条、`accessAddrsJSON` 96 bytes、`httpJSON` 204 bytes、`httpsJSON` 100 bytes、`statusJSON` 为空、`isPrimary=true`、`instanceCode=""`
+- JSON 形状：
+  - `accessAddrsJSON`：数组，item 为 object
+  - `httpJSON`：`isOn`、`listen[]`
+  - `httpsJSON`：`isOn`、`listen`、`sslPolicy`、`sslPolicyRef`
+- 应用：动态更新 runtime RPC endpoints，并对发现的 endpoint 执行 `PingService.Ping` 健康检查。
 
 ### ClientAgentIPService.ListClientAgentIPsAfterId
 
 - 调用位置：`src/rpc/client_agent_ip.rs`
 - 请求：`ListClientAgentIPsAfterIdRequest { id, size }`
-- 响应：`ListClientAgentIPsAfterIdResponse { clientAgentIPs[] }`
-  - `clientAgentIPs[].id`
-  - `clientAgentIPs[].ip`
-  - `clientAgentIPs[].ptr`
-  - `clientAgentIPs[].clientAgent.code`
-- 用途：按自增 ID 从控制面增量同步已验证客户端代理 IP。
-- 应用：启动后的同步器分页拉取，批量写入 RocksDB `CAIP_IP_{ip}` 与 `CAIP_META_last_id`，再更新内存 verified-IP 索引；`allowSearchEngine` / `ignoreSearchEngine` 依赖该索引防止伪造搜索引擎 UA 绕过 WAF。
+- 响应 proto：`clientAgentIPs[]`
+- 实测：以 `id=0,size=5` 返回 5 条
+- item 字段：`id`、`ip`、`ptr`、`clientAgent`
+- `clientAgent` 字段：`id`、`name`、`code`、`description`、`countIPs`
+- 实测样本：`clientAgent.code="sm"`，`ptr` 为 `shenmaspider-...crawl.sm.cn.` 形态
+- 应用：写入 RocksDB `CAIP_IP_{ip}` 与 `CAIP_META_last_id`，更新内存 verified-IP 索引。
 
-## 7. 运行时内部 API（RKE2 pod 间，不是控制面 gRPC）
+### ClientAgentIPService.CreateClientAgentIPs
 
-RKE2 模式还启用 pod 内部 HTTP API，默认监听 `0.0.0.0:19090`，通过 `CLOUD_NODE_CLUSTER_INTERNAL_TOKEN` 鉴权，Headless Service 暴露给同 namespace 内其他 cloud-node pod。
+- 调用位置：`src/client_agent.rs`
+- 请求：`CreateClientAgentIPsRequest { agent_ips[] }`
+- `agent_ips[]` 字段：`agentCode`、`ip`、`ptr`
+- 响应：`RPCSuccess {}` 空消息
+- 采样说明：未创建真实 client-agent IP。
+
+## 7. 当前未主动调用的 client helper
+
+`RpcClient` 中还保留 `authority_key_service`、`file_service`、`script_service`、`ip_list_service`、`server_event_service` 等 helper，但当前 Rust 数据面没有主动调用对应 RPC。文档不把它们列为运行时依赖接口。
+
+`ServerEventService.CreateServerEvent` 旧文档中曾列为运行时上报接口；当前代码只构造了 client helper，没有实际调用。
+
+## 8. 运行时内部 API（RKE2 pod 间，不是控制面 gRPC）
+
+RKE2 模式启用 pod 内部 HTTP API，默认监听 `0.0.0.0:19090`，通过 `CLOUD_NODE_CLUSTER_INTERNAL_TOKEN` 鉴权，Headless Service 暴露给同 namespace 内其他 cloud-node pod。
 
 - `GET /internal/v1/health`：健康检查，Kubernetes probe 使用。
 - `POST /internal/v1/purge`：Leader 将 cache purge fanout 到其他 pod。
@@ -349,10 +373,17 @@ RKE2 模式还启用 pod 内部 HTTP API，默认监听 `0.0.0.0:19090`，通过
 - `POST /internal/v1/stats/snapshot`：上报 pod 本地统计快照给 Leader 聚合。
 - `GET /internal/v1/cache/stat`：查询 pod 本地缓存对象数量和大小。
 
-## 8. 配置解析总览
+## 9. 真实采样与复核
 
-- 控制面主配置通过 `NodeConfigPayload` 进入 `ConfigStore`，热路径读取 `HotPathSnapshot` 和 `CompiledPlanSet`。
-- 站点配置通过 `ServerConfig` 解析，重建域名路由、port-only 路由、负载均衡、缓存、WAF、rewrite、headers、auth、request limit、WebSocket、HLS、gRPC、HTTP/3 等模块。
-- WAF 配置通过 `HTTPFirewallPolicy`、`HTTPFirewallInboundConfig`、`HTTPFirewallRuleGroup`、`HTTPFirewallRuleSet` 解析；compiled path 用于请求热路径，legacy path 作为 fallback。
-- IP 名单配置分 metadata 和 item 两部分：metadata 决定名单类型/作用域，item 决定具体 IP/CIDR、过期时间、删除状态和 server scope。
-- RKE2 runtime 配置来自 `/etc/cloud-node/configs/runtime.yaml`，决定 cluster mode、Leader 选举、内部 API、缓存分片和本地 metadata 目录。
+复跑文档采样：
+
+```sh
+CLOUD_NODE_REAL_API_TEST=1 \
+CLOUD_NODE_REAL_API_DOC_SNAPSHOT=1 \
+CLOUD_NODE_TEST_RPC_ENDPOINT=http://36.134.185.75:8001 \
+CLOUD_NODE_TEST_NODE_ID=<node-id> \
+CLOUD_NODE_TEST_SECRET=<secret> \
+cargo test --test real_api_config real_api_grpc_documentation_snapshot -- --nocapture
+```
+
+采样测试只主动调用读接口和无副作用探测；写接口不会为了文档构造真实上报数据。若要验证写接口，请在隔离控制面或临时测试租户中执行。

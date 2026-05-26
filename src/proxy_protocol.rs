@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn v1_with_trailing_http_data() {
-        let mut data = b"PROXY TCP4 10.0.0.1 10.0.0.2 1000 80\r\nGET / HTTP/1.1\r\n".to_vec();
+        let data = b"PROXY TCP4 10.0.0.1 10.0.0.2 1000 80\r\nGET / HTTP/1.1\r\n".to_vec();
         let result = parse_proxy_v1_v2(&data).unwrap();
         assert_eq!(result.src_ip, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert_eq!(result.src_port, Some(1000));
@@ -329,7 +329,6 @@ mod tests {
         assert_eq!(result.consumed, proxy_hdr_bytes.len());
         // remaining bytes are the HTTP request
         assert_eq!(&data[result.consumed..], b"GET / HTTP/1.1\r\n");
-        let _ = data; // suppress warning
     }
 
     #[test]

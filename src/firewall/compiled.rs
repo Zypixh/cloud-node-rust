@@ -1,6 +1,6 @@
 use crate::config_models::{
     HTTPFirewallPolicy, HTTPFirewallRegionConfig, HTTPFirewallRule, HTTPFirewallRuleGroup,
-    HTTPFirewallRuleSet, HTTPParamFilter, ServerConfig,
+    HTTPFirewallRuleSet, HTTPParamFilter, ServerConfig, WAFCaptchaOptions, WAFJSCookieOptions,
 };
 use crate::firewall::{ActionResponse, MatchedAction, OutboundContext};
 use aho_corasick::AhoCorasick;
@@ -454,6 +454,8 @@ struct CompiledAction {
     tags: Vec<String>,
     ip_list_id: i64,
     event_level: String,
+    captcha_options: Option<WAFCaptchaOptions>,
+    js_cookie_options: Option<WAFJSCookieOptions>,
 }
 
 impl CompiledAction {
@@ -620,6 +622,10 @@ impl CompiledAction {
                     fail_global: options
                         .and_then(|v| v.get("failGlobal"))
                         .and_then(Value::as_bool),
+                    captcha_options: options
+                        .and_then(|value| serde_json::from_value(value.clone()).ok()),
+                    js_cookie_options: options
+                        .and_then(|value| serde_json::from_value(value.clone()).ok()),
                     ..Self::with_code(action, &code)
                 })
             }
@@ -665,6 +671,8 @@ impl CompiledAction {
             tags: vec![],
             ip_list_id: 0,
             event_level: String::new(),
+            captcha_options: None,
+            js_cookie_options: None,
         }
     }
 
@@ -692,8 +700,8 @@ impl CompiledAction {
             event_level: self.event_level.clone(),
             block_options: None,
             page_options: None,
-            captcha_options: None,
-            js_cookie_options: None,
+            captcha_options: self.captcha_options.clone(),
+            js_cookie_options: self.js_cookie_options.clone(),
             chained_actions: vec![],
             observe_only: false,
         }
@@ -2555,6 +2563,7 @@ mod tests {
             checkpoint_options: None,
             is_reverse: true,
             is_case_insensitive: false,
+            param_filters: vec![],
         };
         let compiled = CompiledFirewallRule::compile(&rule);
         assert!(!compiled.matches_value("/admin"));
@@ -2689,6 +2698,10 @@ mod tests {
         assert_eq!(expected.tags, actual.tags);
         assert_eq!(expected.ip_list_id, actual.ip_list_id);
         assert_eq!(expected.event_level, actual.event_level);
+        assert_eq!(
+            expected.captcha_options.as_ref().map(|opts| opts.method.as_str()),
+            actual.captcha_options.as_ref().map(|opts| opts.method.as_str())
+        );
     }
 
     fn assert_action_option_eq(expected: Option<MatchedAction>, actual: Option<MatchedAction>) {
@@ -2723,6 +2736,7 @@ mod tests {
             checkpoint_options: None,
             is_reverse: false,
             is_case_insensitive: false,
+            param_filters: vec![],
         }
     }
 
@@ -2769,6 +2783,9 @@ mod tests {
             use_local_firewall: false,
             syn_flood: None,
             mode: "defense".to_string(),
+            candidate_rules: None,
+            candidate_traffic_pct: 0,
+            candidate_version: 0,
         }
     }
 
@@ -2866,12 +2883,194 @@ mod tests {
                 "code":code,
                 "options":{
                     "lifeSeconds":120,
+                    "method":"click",
                     "maxFails":3,
                     "failBlockTimeout":600,
                     "failGlobal":true
                 }
             }));
         }
+    }
+
+    #[test]
+    fn action_captcha_options_do_not_blank_policy_defaults() {
+        let action = json!({
+            "code":"captcha",
+            "options":{"method":"click"}
+        });
+        let mut policy = test_policy(inbound_with_groups(vec![]));
+        policy.captcha_options = Some(WAFCaptchaOptions {
+            method: "slider".to_string(),
+            life_seconds: 120,
+            max_fails: 3,
+            fail_block_timeout: 600,
+            fail_global: true,
+            challenge_lang: "zh-CN".to_string(),
+            challenge_difficulty: 6,
+            ..Default::default()
+        });
+
+        let mut legacy = legacy_action(&action);
+        crate::firewall::fill_action_options(&policy, &mut legacy);
+        assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.method.as_str()),
+            Some("click")
+        );
+        assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.life_seconds),
+            Some(120)
+        );
+        assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.max_fails),
+            Some(3)
+        );
+        assert_eq!(
+            legacy
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.fail_block_timeout),
+            Some(600)
+        );
+        assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.fail_global),
+            Some(true)
+        );
+        assert_eq!(
+            legacy
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.challenge_lang.as_str()),
+            Some("zh-CN")
+        );
+        assert_eq!(
+            legacy
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.challenge_difficulty),
+            Some(6)
+        );
+
+        let compiled = CompiledFirewallPolicy::compile(&policy);
+        let mut compiled_action = compiled_action(&action);
+        super::fill_action_from_policy(&mut compiled_action, &compiled, 10, 20);
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str()),
+            Some("click")
+        );
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.life_seconds),
+            Some(120)
+        );
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.max_fails),
+            Some(3)
+        );
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.fail_block_timeout),
+            Some(600)
+        );
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.fail_global),
+            Some(true)
+        );
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.challenge_lang.as_str()),
+            Some("zh-CN")
+        );
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.challenge_difficulty),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn action_js_cookie_options_do_not_blank_policy_defaults() {
+        let action = json!({
+            "code":"jsCookie",
+            "options":{}
+        });
+        let mut policy = test_policy(inbound_with_groups(vec![]));
+        policy.js_cookie_options = Some(WAFJSCookieOptions {
+            life_seconds: 180,
+            max_fails: 4,
+            fail_block_timeout: 900,
+            fail_global: true,
+        });
+
+        let mut legacy = legacy_action(&action);
+        crate::firewall::fill_action_options(&policy, &mut legacy);
+        assert_eq!(
+            legacy.js_cookie_options.as_ref().map(|opts| opts.life_seconds),
+            Some(180)
+        );
+        assert_eq!(
+            legacy.js_cookie_options.as_ref().map(|opts| opts.max_fails),
+            Some(4)
+        );
+        assert_eq!(
+            legacy
+                .js_cookie_options
+                .as_ref()
+                .map(|opts| opts.fail_block_timeout),
+            Some(900)
+        );
+        assert_eq!(
+            legacy.js_cookie_options.as_ref().map(|opts| opts.fail_global),
+            Some(true)
+        );
+
+        let compiled = CompiledFirewallPolicy::compile(&policy);
+        let mut compiled_action = compiled_action(&action);
+        super::fill_action_from_policy(&mut compiled_action, &compiled, 10, 20);
+        assert_eq!(
+            compiled_action
+                .js_cookie_options
+                .as_ref()
+                .map(|opts| opts.life_seconds),
+            Some(180)
+        );
+        assert_eq!(
+            compiled_action
+                .js_cookie_options
+                .as_ref()
+                .map(|opts| opts.max_fails),
+            Some(4)
+        );
+        assert_eq!(
+            compiled_action
+                .js_cookie_options
+                .as_ref()
+                .map(|opts| opts.fail_block_timeout),
+            Some(900)
+        );
+        assert_eq!(
+            compiled_action
+                .js_cookie_options
+                .as_ref()
+                .map(|opts| opts.fail_global),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2952,6 +3151,7 @@ mod tests {
             checkpoint_options: None,
             is_reverse: false,
             is_case_insensitive: false,
+            param_filters: vec![],
         }
     }
 
@@ -3120,6 +3320,7 @@ mod tests {
             })),
             is_reverse: false,
             is_case_insensitive: false,
+            param_filters: vec![],
         };
         let compiled = CompiledFirewallRule::compile(&rule);
         let cc_plan = compiled.cc_plan.expect("cc2 should compile a counter plan");
@@ -3141,6 +3342,7 @@ mod tests {
             checkpoint_options: None,
             is_reverse: false,
             is_case_insensitive: false,
+            param_filters: vec![],
         };
         let compiled = CompiledFirewallRule::compile(&default_rule);
         let cc_plan = compiled.cc_plan.expect("cc should compile a counter plan");

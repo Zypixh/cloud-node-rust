@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 /// stroke style, and ghost offset.  The answer is never sent in plaintext.
 pub fn issue_html(
     lang: Lang,
-    _token: &str,
+    waf_token: &str,
+    verify_route: &str,
     return_path: &str,
     secret: &[u8],
     expiry: u64,
@@ -158,8 +159,8 @@ btn.onclick=function(){{
  var val=input.value.trim().toUpperCase().replace(/\s+/g,'');
  crypto.subtle.digest('SHA-256',new TextEncoder().encode(val)).then(function(hashBuffer){{
   var h=Array.from(new Uint8Array(hashBuffer)).map(b=>b.toString(16).padStart(2,'0')).join('');
-  var f=document.createElement('form');f.method='GET';f.action='{rp}';
-  f.innerHTML='<input type="hidden" name="__waf_token" value="{tok}"><input type="hidden" name="__waf_challenge_type" value="captcha"><input type="hidden" name="__waf_captcha_hash" value="'+h+'">';
+	  var f=document.createElement('form');f.method='GET';f.action='{route}';
+	  f.innerHTML='<input type="hidden" name="__waf_token" value="{wtok}"><input type="hidden" name="__waf_challenge_token" value="{tok}"><input type="hidden" name="__waf_challenge_type" value="captcha"><input type="hidden" name="__waf_captcha_hash" value="'+h+'"><input type="hidden" name="__waf_return" value="{rp}">';
   document.body.appendChild(f);f.submit();
  }}).catch(function(){{btn.disabled=!1}});
 }};
@@ -167,7 +168,7 @@ btn.onclick=function(){{
 </script>
 </div>"#,
         sfx=sfx, prompt=prompt, hint=hint, ph=ph, btn=btn, refresh=refresh,
-        rp=return_path, tok=enc_token, cjson=chars_json_str,
+        route=verify_route, rp=return_path, wtok=waf_token, tok=enc_token, cjson=chars_json_str,
     )
 }
 

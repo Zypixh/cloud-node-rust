@@ -1,6 +1,7 @@
 use base64::Engine;
 use sha2::{Digest, Sha256};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UamMode {
     JsCookie,
     Pow,
