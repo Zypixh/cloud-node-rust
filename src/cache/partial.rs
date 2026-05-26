@@ -295,6 +295,7 @@ pub async fn lookup(cache_key: &str, roots: &[PathBuf]) -> std::io::Result<Optio
     }))
 }
 
+#[allow(unused_variables)]
 pub async fn open_writer(
     cache_key: &str,
     capture: PartialCapture,

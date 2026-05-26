@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use tracing::{debug, error, info};
 
+#[allow(dead_code)]
 const ORIGIN_HEALTH_STATUS_UNKNOWN: u8 = 0;
 const ORIGIN_HEALTH_STATUS_HEALTHY: u8 = 1;
 const ORIGIN_HEALTH_STATUS_DOWN: u8 = 2;

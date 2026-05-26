@@ -1131,16 +1131,6 @@ impl EdgeProxy {
             .unwrap_or(0)
     }
 
-    fn increment_request_limit_count(server_id: i64, client_ip: std::net::IpAddr) {
-        REQUEST_LIMIT_SERVER_COUNTS
-            .entry(server_id)
-            .or_insert_with(|| Arc::new(AtomicI32::new(0)))
-            .fetch_add(1, Ordering::Relaxed);
-        REQUEST_LIMIT_IP_COUNTS
-            .entry(client_ip)
-            .or_insert_with(|| Arc::new(AtomicI32::new(0)))
-            .fetch_add(1, Ordering::Relaxed);
-    }
 
     fn decrement_request_limit_count(server_id: i64, client_ip: std::net::IpAddr) {
         if let Some(count) = REQUEST_LIMIT_SERVER_COUNTS.get(&server_id) {
@@ -1794,15 +1784,6 @@ impl EdgeProxy {
                     .any(|part| part.eq_ignore_ascii_case(needle)))
     }
 
-    fn content_range_total_size(headers: &http::HeaderMap) -> Option<usize> {
-        headers
-            .get("content-range")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.rsplit('/').next())
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != "*")
-            .and_then(|value| value.parse::<usize>().ok())
-    }
 
     fn add_ctx_tag(ctx: &mut ProxyCTX, tag: &str) {
         let tags = ctx.tags.get_or_insert_with(Vec::new);
@@ -2383,7 +2364,8 @@ impl EdgeProxy {
         ua_hasher.update(ua.as_bytes());
         let ua_hash = hex::encode(ua_hasher.finalize());
         let data = format!("uam-challenge|{payload}|{ip}|{ua_hash}|{host_scope}");
-        Self::hmac_sha256_hex(self.api_config.secret.as_bytes(), data.as_bytes())
+        let key = crate::firewall::uam::uam_hmac_key(self.api_config.secret.as_bytes());
+        Self::hmac_sha256_hex(&key, data.as_bytes())
     }
 
     fn issue_uam_challenge_token(
@@ -3148,7 +3130,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let life_seconds = Self::uam_life_seconds(uam_cfg);
         let config_hash = Self::uam_config_hash(site_uam, global_uam.as_ref());
         let cookies = merged_session_cookie_header(session).unwrap_or_default();
-        if let Some(pass) = Self::cookie_value(&cookies, "UAM-Pass")
+        if let Some(pass_value) = Self::cookie_value(&cookies, "UAM-Pass")
+            && let pass = pass_value.split_once(":type=").map(|(t, _)| t).unwrap_or(pass_value)
             && self
                 .validate_uam_pass_cookie(pass, ip, ua, scope_id, &host_scope, &config_hash)
                 .is_some()
@@ -4359,18 +4342,6 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         hex::encode(digest)
     }
 
-    fn waf_challenge_css() -> &'static str {
-        r#":root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:radial-gradient(circle at top left,#dbeafe,transparent 32rem),linear-gradient(135deg,#0f172a,#111827 55%,#1e293b);color:#e5e7eb}.waf-card{width:min(92vw,440px);padding:34px;border:1px solid rgba(255,255,255,.14);border-radius:28px;background:rgba(15,23,42,.78);box-shadow:0 24px 80px rgba(0,0,0,.35);backdrop-filter:blur(18px);text-align:center}.waf-mark{width:54px;height:54px;margin:0 auto 18px;border-radius:18px;background:linear-gradient(135deg,#38bdf8,#6366f1);box-shadow:0 12px 30px rgba(56,189,248,.35)}h1{margin:0 0 10px;font-size:24px}p{margin:0 0 22px;color:#b6c2d1;line-height:1.6}.waf-progress,.waf-track{height:46px;border-radius:999px;background:rgba(148,163,184,.18);overflow:hidden;position:relative}.waf-progress span{display:block;width:42%;height:100%;border-radius:999px;background:linear-gradient(90deg,#38bdf8,#818cf8);animation:wafPulse 1.4s ease-in-out infinite}.waf-track{touch-action:none;cursor:pointer;border:1px solid rgba(255,255,255,.12)}.waf-track:before{content:'';position:absolute;inset:0;background:repeating-linear-gradient(110deg,transparent 0 13px,rgba(255,255,255,.055) 14px 16px)}.waf-fill{position:absolute;inset:0 auto 0 0;width:0;background:linear-gradient(90deg,rgba(56,189,248,.85),rgba(129,140,248,.85));border-radius:999px}.waf-handle{position:absolute;top:3px;left:3px;width:40px;height:40px;border-radius:50%;display:grid;place-items:center;background:#f8fafc;color:#0f172a;font-weight:800;box-shadow:0 6px 20px rgba(0,0,0,.28);user-select:none}.waf-status{margin-top:14px;font-size:14px;color:#cbd5e1}.waf-error{color:#fecaca}@keyframes wafPulse{0%,100%{transform:translateX(-18%)}50%{transform:translateX(150%)}}@media (prefers-color-scheme:light){body{background:radial-gradient(circle at top left,#bae6fd,transparent 30rem),linear-gradient(135deg,#f8fafc,#e0e7ff);color:#0f172a}.waf-card{background:rgba(255,255,255,.82);border-color:rgba(15,23,42,.08)}p{color:#475569}.waf-status{color:#475569}}"#
-    }
-
-    fn waf_slider_body(token: &str, target: u32, return_path: &str) -> String {
-        let token_js = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
-        let return_js = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
-        format!(
-            r#"<main class="waf-card"><div class="waf-mark"></div><h1>Security verification</h1><p>Slide to complete the security check. This helps protect the site from automated abuse.</p><div id="wafTrack" class="waf-track" aria-label="Slide to verify"><div id="wafFill" class="waf-fill"></div><div id="wafHandle" class="waf-handle">›</div></div><div id="wafStatus" class="waf-status">Slide the handle to the highlighted zone</div><noscript><p class="waf-error">JavaScript is required for this verification.</p></noscript></main><script>(function(){{const token={token_js};const ret={return_js};const target={target};const track=document.getElementById('wafTrack');const handle=document.getElementById('wafHandle');const fill=document.getElementById('wafFill');const status=document.getElementById('wafStatus');const zone=document.createElement('div');zone.style.cssText='position:absolute;top:4px;height:38px;width:26px;border-radius:999px;background:rgba(34,197,94,.28);box-shadow:0 0 0 1px rgba(34,197,94,.4) inset;left:'+(target+10)+'px';';track.appendChild(zone);const enc=new TextEncoder();let dragging=false,startX=0,current=0,start=Date.now(),trace=[];async function pow(){{let n=0;while(true){{const h=await crypto.subtle.digest('SHA-256',enc.encode(token+n));const x=Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('');if(x.startsWith('0000'))return String(n);n++;if(n%200===0)await new Promise(r=>setTimeout(r,0));}}}}function setX(x){{current=Math.max(0,Math.min(260,x));handle.style.left=(current+3)+'px';fill.style.width=(current+43)+'px';trace.push(Math.round(current)+','+(Date.now()-start));}}track.addEventListener('pointerdown',e=>{{dragging=true;startX=e.clientX-current;track.setPointerCapture(e.pointerId);}});track.addEventListener('pointermove',e=>{{if(dragging)setX(e.clientX-startX);}});track.addEventListener('pointerup',async e=>{{if(!dragging)return;dragging=false;setX(e.clientX-startX);if(Math.abs(current-target)>16){{status.textContent='Not quite there, please try again';status.className='waf-status waf-error';return;}}status.textContent='Verifying browser...';try{{const nonce=await pow();const qs=new URLSearchParams({{__waf_token:token,__waf_pow:nonce,__waf_elapsed:String(Date.now()-start),__waf_x:String(Math.round(current)),__waf_trace:trace.slice(-80).join(';'),__waf_return:ret}});location.href='{WAF_VERIFY_ROUTE}?'+qs.toString();}}catch(_){{status.textContent='Verification failed, please retry';status.className='waf-status waf-error';}}}});}})();</script>"#
-        )
-    }
-
     fn hmac_sha256(secret: &[u8], data: &[u8]) -> [u8; 32] {
         const BLOCK: usize = 64;
         let mut key = [0u8; BLOCK];
@@ -4598,11 +4569,18 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     &config_hash,
                     pass_life_seconds,
                 );
+                let uam_challenge_type = if Self::uam_requires_slider_trace(uam_cfg) {
+                    "slider"
+                } else if !Self::uam_requires_pow(uam_cfg) {
+                    "jscookie"
+                } else {
+                    "pow"
+                };
                 let mut resp = pingora_http::ResponseHeader::build(303, None).unwrap();
                 resp.insert_header("location", return_path).unwrap();
                 resp.append_header(
                     "set-cookie",
-                    format!("UAM-Pass={uam_pass}; HttpOnly; {suffix}"),
+                    format!("UAM-Pass={uam_pass}:type={uam_challenge_type}; HttpOnly; {suffix}"),
                 )
                 .unwrap();
                 resp.append_header(
@@ -4639,12 +4617,33 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     .token_seconds_remaining(&ctx.client_ip_str, ua, &token, 3600)
             })
             .flatten();
+
+        let challenge_type = Self::query_param(session, "__waf_challenge_type")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "slider".to_string());
+
         let verified = token_remaining.is_some()
             && !pow.is_empty()
             && self.waf_verifier.verify_pow(&token, &pow, 4)
-            && self
-                .waf_verifier
-                .verify_slider_trace(&token, final_x, elapsed, &trace);
+            && match challenge_type.as_str() {
+                "click" => {
+                    let sequence_str = Self::query_param(session, "__waf_click_seq").unwrap_or_default();
+                    let seq: Vec<usize> = sequence_str.split(',').filter_map(|s| s.parse().ok()).collect();
+                    let click_elapsed = Self::query_param(session, "__waf_elapsed").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    crate::pages::challenges::click::verify(&token, &seq, click_elapsed, self.api_config.secret.as_bytes())
+                }
+                "captcha" => {
+                    let answer_hash = Self::query_param(session, "__waf_captcha_hash").unwrap_or_default();
+                    crate::pages::challenges::captcha::verify(&token, &answer_hash, self.api_config.secret.as_bytes())
+                }
+                _ => {
+                    // default: slider
+                    let sx = Self::query_param(session, "x").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                    let sy = Self::query_param(session, "y").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                    let target = self.waf_verifier.slider_target(&token);
+                    crate::pages::challenges::slider::verify_anchor(target, sx, sy, elapsed, &trace)
+                }
+            };
 
         if verified {
             let remaining = token_remaining.unwrap_or(1) as i64;
@@ -4658,7 +4657,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             resp.insert_header("location", return_path).unwrap();
             resp.append_header(
                 "set-cookie",
-                format!("WAF-Token={token}; HttpOnly; {suffix}"),
+                format!("WAF-Token={token}:type={challenge_type}; HttpOnly; {suffix}"),
             )
             .unwrap();
             resp.append_header("set-cookie", format!("WAF-PoW={pow}; {suffix}"))
@@ -4682,7 +4681,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 server_id
             };
             let failures = self.waf_state.record_failure(format!(
-                "WAF_CHALLENGE:{failure_scope_id}:{}",
+                "WAF_CHALLENGE:{challenge_type}:{failure_scope_id}:{}",
                 ctx.client_ip_str
             ));
             if failures >= failure_config.max_fails as u64
@@ -5244,7 +5243,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             for part in cookies.split(';') {
                 let part = part.trim();
                 // 1. Check AES-256-GCM Token
-                if let Some(token) = part.strip_prefix("WAF-Token=")
+                if let Some(raw_token) = part.strip_prefix("WAF-Token=")
+                    && let token = raw_token.split_once(":type=").map(|(t, _)| t).unwrap_or(raw_token)
                     && let Some(remaining) =
                         verifier.token_seconds_remaining(ip_str, ua, token, 3600)
                 {
@@ -5537,48 +5537,77 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     return Ok(true);
                 }
 
-                let body_html = if matches!(
-                    action,
-                    crate::firewall::ActionResponse::JsCookie { .. }
-                ) {
-                    let pow_script = verifier.get_pow_script_with_life(&token, 4, life_seconds);
-                    format!(
-                        "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}</style></head><body><main class='waf-card'><div class='waf-mark'></div><h1>Checking your browser</h1><p>Please wait while we verify your browser capability.</p><div class='waf-progress'><span></span></div></main><script>{}</script></body></html>",
-                        Self::waf_challenge_css(),
-                        pow_script
-                    )
+                let return_path =
+                    urlencoding::encode(&Self::current_request_path_query(session))
+                        .into_owned();
+                let challenge_lang = captcha_opts
+                    .as_ref()
+                    .and_then(|o| {
+                        if o.challenge_lang.is_empty() {
+                            None
+                        } else {
+                            Some(crate::pages::detect_lang(
+                                Some(&o.challenge_lang),
+                                session
+                                    .get_header("accept-language")
+                                    .and_then(|v| v.to_str().ok()),
+                            ))
+                        }
+                    })
+                    .unwrap_or(crate::pages::Lang::En);
+                let difficulty = captcha_opts
+                    .as_ref()
+                    .map(|o| o.challenge_difficulty.max(1) as u32)
+                    .unwrap_or(4);
+
+                // Determine the challenge method, resolving "geetest" into a
+                // deterministic random choice (per-token stable) so a single
+                // pass cookie only clears the specific challenge type that was
+                // actually solved — each method must be passed independently.
+                let raw_method = captcha_opts.as_ref()
+                    .map(|o| if o.method.is_empty() { "slider" } else { o.method.as_str() })
+                    .unwrap_or("slider");
+                let effective_method = if raw_method == "geetest" {
+                    let seed = token.as_bytes().iter().fold(0u64, |a, &b| a.wrapping_mul(31).wrapping_add(b as u64));
+                    let modes = ["slider", "click", "captcha"];
+                    modes[(seed % 3) as usize]
                 } else {
-                    let target = verifier.slider_target(&token);
-                    let return_path =
-                        urlencoding::encode(&Self::current_request_path_query(session))
-                            .into_owned();
-                    let slider = Self::waf_slider_body(&token, target, &return_path);
-                    if let Some(opts) = &captcha_opts
-                        && let Some(ui) = &opts.ui
-                        && !ui.template.is_empty()
-                    {
-                        ui.template
-                            .replace(
-                                "${title}",
-                                if ui.title.is_empty() {
-                                    "Security verification"
-                                } else {
-                                    &ui.title
-                                },
-                            )
-                            .replace(
-                                "${css}",
-                                &format!("{}{}", Self::waf_challenge_css(), ui.css),
-                            )
-                            .replace("${promptHeader}", &ui.prompt_header)
-                            .replace("${promptFooter}", &ui.prompt_footer)
-                            .replace("${body}", &slider)
-                    } else {
-                        format!(
-                            "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}</style></head><body>{}</body></html>",
-                            Self::waf_challenge_css(),
-                            slider
-                        )
+                    raw_method
+                };
+
+                let challenge_secret = self.api_config.secret.as_bytes();
+                let challenge_expiry = crate::utils::time::now_timestamp() as u64 + life_seconds.max(60) as u64;
+
+                let body_html = match effective_method {
+                    "click" => {
+                        use crate::pages::challenges::click;
+                        let body = click::issue_html(challenge_lang, &token, &return_path, challenge_secret, challenge_expiry);
+                        let page = crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id);
+                        page
+                    }
+                    "captcha" => {
+                        use crate::pages::challenges::captcha;
+                        let body = captcha::issue_html(challenge_lang, &token, &return_path, challenge_secret, challenge_expiry);
+                        let page = crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id);
+                        page
+                    }
+                    "jscookie" => {
+                        let pow_script = verifier.get_pow_script_with_life(&token, difficulty, life_seconds);
+                        let t = crate::pages::lang::text(challenge_lang);
+                        let body = format!(
+                            "<main class=\"card\"><div class=\"mark waf\"></div><h1>{}</h1><p>{}</p><div class=\"progress\"><span></span></div><div class=\"meta\">Request #{}</div></main>",
+                            t.checking, t.checking_sub, ctx.request_id
+                        );
+                        let page = crate::pages::uam_challenge_page(&body, &pow_script, challenge_lang, &ctx.request_id);
+                        page
+                    }
+                    _ => {
+                        // default: slider
+                        let target = verifier.slider_target(&token);
+                        use crate::pages::challenges::slider;
+                        let body = slider::issue_html(challenge_lang, &token, &return_path, target);
+                        let page = crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id);
+                        page
                     }
                 };
 

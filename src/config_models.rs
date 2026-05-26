@@ -216,6 +216,14 @@ pub struct WAFCaptchaOptions {
         deserialize_with = "deserialize_null_default"
     )]
     pub geetest_key: String,
+    #[serde(rename = "challengeDifficulty", default)]
+    pub challenge_difficulty: u8,
+    #[serde(
+        rename = "challengeLang",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub challenge_lang: String,
     pub ui: Option<WAFCaptchaUIOptions>,
 }
 

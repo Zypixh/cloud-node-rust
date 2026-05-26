@@ -869,7 +869,7 @@ impl CompiledCacheResponsePolicy {
 
     fn should_cache_response(
         &self,
-        policy: Option<&CompiledCachePolicy>,
+        _policy: Option<&CompiledCachePolicy>,
         status: u16,
         method: &str,
         headers: &HeaderMap,

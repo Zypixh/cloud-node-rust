@@ -29,6 +29,7 @@ pub mod origin_h3;
 pub mod origin_h3_state;
 pub mod origin_state;
 pub mod oss_origin;
+pub mod pages;
 pub mod paths;
 pub mod perf_monitor;
 pub mod proxy;

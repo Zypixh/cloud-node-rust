@@ -1,3 +1,6 @@
+use base64::Engine;
+use sha2::{Digest, Sha256};
+
 pub enum UamMode {
     JsCookie,
     Pow,
@@ -53,7 +56,7 @@ pub struct PowChallenge;
 
 impl UamChallenge for PowChallenge {
     fn issue_html(&self, ctx: &UamIssueCtx) -> String {
-        let difficulty = ctx.pow_difficulty.clamp(1, 8) as u32;
+        let difficulty = ctx.pow_difficulty.clamp(5, 8) as u32;
         let pow_script = get_pow_script(
             ctx.token,
             difficulty,
@@ -96,25 +99,81 @@ pub fn dispatch(mode: UamMode) -> Box<dyn UamChallenge + Send + Sync> {
 fn get_pow_script(
     challenge: &str,
     difficulty: u32,
-    _life_seconds: i64,
+    life_seconds: i64,
     verify_route: &str,
     return_path: &str,
 ) -> String {
     let challenge = serde_json::to_string(challenge).unwrap_or_else(|_| "\"\"".to_string());
     let route = serde_json::to_string(verify_route).unwrap_or_else(|_| "\"/\"".to_string());
     let ret = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
+    let timeout_ms = life_seconds * 1000;
     format!(
-        r#"(function(){{const challenge={challenge};const difficulty={difficulty};const route={route};const ret={ret};const prefix="0".repeat(difficulty);const encoder=new TextEncoder();let nonce=0;async function solve(){{while(true){{const data=encoder.encode(challenge+nonce);const hashBuffer=await crypto.subtle.digest('SHA-256',data);const hashArray=Array.from(new Uint8Array(hashBuffer));const hashHex=hashArray.map(b=>b.toString(16).padStart(2,'0')).join('');if(hashHex.startsWith(prefix)){{const qs=new URLSearchParams({{__waf_token:challenge,__waf_pow:String(nonce),__waf_return:ret,__waf_uam:'1'}});location.replace(route+'?'+qs.toString());return;}}nonce++;if(nonce%200===0){{await new Promise(resolve=>setTimeout(resolve,0));}}}}}}solve();}})();"#
+        r#"(function(){{const challenge={challenge};const difficulty={difficulty};const route={route};const ret={ret};const timeoutMs={timeout_ms};const prefix="0".repeat(difficulty);const encoder=new TextEncoder();const start=Date.now();let nonce=0;async function solve(){{while(true){{if(Date.now()-start>timeoutMs){{location.reload();return;}}const data=encoder.encode(challenge+nonce);const hashBuffer=await crypto.subtle.digest('SHA-256',data);const hashArray=Array.from(new Uint8Array(hashBuffer));const hashHex=hashArray.map(b=>b.toString(16).padStart(2,'0')).join('');if(hashHex.startsWith(prefix)){{const qs=new URLSearchParams({{__waf_token:challenge,__waf_pow:String(nonce),__waf_return:ret,__waf_uam:'1'}});location.replace(route+'?'+qs.toString());return;}}nonce++;if(nonce%200===0){{await new Promise(resolve=>setTimeout(resolve,0));}}}}}}solve();}})();"#
     )
 }
 
+/// Obfuscated JS cookie verification script.
+///
+/// Uses eval(atob("...")) wrapping with dynamic base64 encoding to harden
+/// against trivial source-reading bypass. The inner core performs multi-layer
+/// browser integrity checks:
+///   1. setTimeout random delay (100-400 ms)
+///   2. Screen dimension / webdriver flag detection
+///   3. WebGL renderer fingerprinting via canvas
+///   4. Only on success: location.replace with __waf_uam=1 marker
 fn get_js_cookie_script(challenge: &str, verify_route: &str, return_path: &str) -> String {
     let challenge = serde_json::to_string(challenge).unwrap_or_else(|_| "\"\"".to_string());
     let route = serde_json::to_string(verify_route).unwrap_or_else(|_| "\"/\"".to_string());
     let ret = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
-    format!(
-        r#"(function(){{const qs=new URLSearchParams({{__waf_token:{challenge},__waf_return:{ret},__waf_uam:'1'}});location.replace({route}+'?'+qs.toString());}})();"#
-    )
+    // 核心验证逻辑 — 用 eval(atob("...")) 包装
+    let inner = format!(
+        r#"(function(){{
+var t0=Date.now();
+setTimeout(function(){{
+ var w=screen.width,h=screen.height;
+ if(w<10||h<10||navigator.webdriver){{return;}}
+ var c=document.createElement('canvas');
+ var g=c.getContext('webgl')||c.getContext('experimental-webgl');
+ if(!g){{return;}}
+ var d=g.getExtension('WEBGL_debug_renderer_info');
+ var r=d?g.getParameter(d.UNMASKED_RENDERER_WEBGL):'';
+ var qs='__waf_token='+{token}+'&__waf_return='+{ret}+'&__waf_uam=1&__waf_fp='+encodeURIComponent(r)+'&__waf_ts='+(Date.now()-t0);
+ location.replace({route}+'?'+qs);
+}},100+Math.floor(Math.random()*300));
+}})();"#,
+        token = challenge,
+        ret = ret,
+        route = route,
+    );
+    // base64 编码外层包装
+    let encoded = base64::engine::general_purpose::STANDARD.encode(inner.as_bytes());
+    format!("eval(atob('{}'))", encoded)
+}
+
+/// Derives an UAM-specific key using SHA256.
+///
+/// Uses `SHA256("cloud-node-uam-v3:" + secret)` to produce a scoped key,
+/// separating UAM key space from WAF / other subsystems. UAM uses a
+/// different key prefix so a WAF-challenge pass cookie cannot satisfy
+/// a UAM challenge, and vice versa.
+pub fn uam_hmac_key(secret: &[u8]) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(b"cloud-node-uam-v3:");
+    h.update(secret);
+    h.finalize().to_vec()
+}
+
+/// Deterministically selects a challenge mode based on the token seed.
+///
+/// Returns 0 -> slider, 1 -> captcha, 2 -> click.
+/// Same `token_seed` always returns the same mode (no true randomness).
+pub fn random_challenge_mode(secret: &[u8], token_seed: u64) -> u8 {
+    let mut hasher = Sha256::new();
+    hasher.update(secret);
+    hasher.update(b"geetest-mode:");
+    hasher.update(token_seed.to_le_bytes());
+    let digest = hasher.finalize();
+    digest[0] % 3
 }
 
 fn cloud_challenge_css() -> &'static str {
