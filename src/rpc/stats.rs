@@ -98,11 +98,12 @@ pub async fn start_origin_health_reporter(api_config: ApiConfig) {
             }
         };
         let mut service = client.node_value_service();
-        if let Err(e) = service
-            .create_node_values(pb::CreateNodeValuesRequest {
+        if let Err(e) = crate::rpc::track_rpc(
+            service.create_node_values(pb::CreateNodeValuesRequest {
                 node_value_items: items,
-            })
-            .await
+            }),
+        )
+        .await
         {
             debug!("Origin health report failed: {}", e);
         }
@@ -205,10 +206,19 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
 
     loop {
         interval.tick().await;
-        if !crate::cluster::leader::require_leader("bandwidth_reporter") {
+        let is_leader = crate::cluster::leader::is_leader();
+        let snapshots = crate::metrics::METRICS.take_snapshots();
+
+        // Always refresh baselines so deltas are accurate when leadership
+        // resumes — otherwise the first delta after becoming leader spans the
+        // entire non-leader gap and produces a huge phantom bandwidth spike.
+        if !is_leader {
+            for snap_tuple in &snapshots {
+                let snap = &snap_tuple.1;
+                last_snapshots.insert(snap.server_id, snap.clone());
+            }
             continue;
         }
-        let snapshots = crate::metrics::METRICS.take_snapshots();
         let now = crate::utils::time::system_local();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
@@ -268,14 +278,14 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
                     }
                 };
                 let mut service = client.bandwidth_stat_service();
-                let start = std::time::Instant::now();
-                let result = service
-                    .upload_server_bandwidth_stats(pb::UploadServerBandwidthStatsRequest {
-                        server_bandwidth_stats: stats,
-                    })
-                    .await;
-                let cost = start.elapsed().as_millis() as u64;
-                crate::metrics::record::record_rpc_call(cost, result.is_err());
+                let result = crate::rpc::track_rpc(
+                    service.upload_server_bandwidth_stats(
+                        pb::UploadServerBandwidthStatsRequest {
+                            server_bandwidth_stats: stats,
+                        },
+                    ),
+                )
+                .await;
                 if let Err(e) = result {
                     error!("Failed to upload bandwidth stats: {}", e);
                     pending_stats = upload_items;
@@ -288,8 +298,13 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
 
         for snap_tuple in snapshots {
             let snap = &snap_tuple.1;
-            let delta = snapshot_delta(snap, last_snapshots.get(&snap.server_id));
-            last_snapshots.insert(snap.server_id, snap.clone());
+            let prior = last_snapshots.insert(snap.server_id, snap.clone());
+            // Skip first sample for a server — without a baseline the delta
+            // would be the cumulative total, producing a phantom bandwidth spike.
+            if prior.is_none() {
+                continue;
+            }
+            let delta = snapshot_delta(snap, prior.as_ref());
             if delta.server_id <= 0 {
                 continue;
             }
@@ -338,10 +353,18 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
 
     loop {
         interval.tick().await;
-        if !crate::cluster::leader::require_leader("daily_stat_reporter") {
+        let is_leader = crate::cluster::leader::is_leader();
+        let snapshots = crate::metrics::METRICS.take_snapshots();
+
+        // Keep baselines fresh even when not leader so that deltas are
+        // accurate when leadership resumes.
+        if !is_leader {
+            for snap_tuple in &snapshots {
+                let snap = &snap_tuple.1;
+                last_snapshots.insert(snap.server_id, snap.clone());
+            }
             continue;
         }
-        let snapshots = crate::metrics::METRICS.take_snapshots();
         let now = crate::utils::time::system_local();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
@@ -419,12 +442,13 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
                 };
                 let mut service = client.daily_stat_service();
 
-                if let Err(e) = service
-                    .upload_server_daily_stats(pb::UploadServerDailyStatsRequest {
+                if let Err(e) = crate::rpc::track_rpc(
+                    service.upload_server_daily_stats(pb::UploadServerDailyStatsRequest {
                         stats: stats.clone(),
                         domain_stats: domain_stats.clone(),
-                    })
-                    .await
+                    }),
+                )
+                .await
                 {
                     error!("Failed to upload daily stats: {}", e);
                     pending_stats = stats;
@@ -439,8 +463,13 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
 
         for snap_tuple in snapshots {
             let snap = &snap_tuple.1;
-            let delta = snapshot_delta(snap, last_snapshots.get(&snap.server_id));
-            last_snapshots.insert(snap.server_id, snap.clone());
+            let prior = last_snapshots.insert(snap.server_id, snap.clone());
+            // Skip first sample for a server — without a baseline the delta
+            // would be the cumulative total, producing phantom traffic.
+            if prior.is_none() {
+                continue;
+            }
+            let delta = snapshot_delta(snap, prior.as_ref());
             if delta.server_id <= 0 {
                 continue;
             }
@@ -622,8 +651,8 @@ pub async fn start_metric_stat_reporter(
                     });
                 }
 
-                if let Err(e) = service
-                    .upload_metric_stats(pb::UploadMetricStatsRequest {
+                if let Err(e) = crate::rpc::track_rpc(
+                    service.upload_metric_stats(pb::UploadMetricStatsRequest {
                         server_id,
                         time: time_key.clone(),
                         count,
@@ -632,7 +661,8 @@ pub async fn start_metric_stat_reporter(
                         item_id: item.id,
                         metric_stats,
                         keep_keys,
-                    })
+                    }),
+                )
                     .await
                 {
                     error!(
@@ -770,7 +800,9 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
             }
         }
 
-        if let Err(e) = server_service.upload_server_http_request_stat(req).await {
+        if let Err(e) =
+            crate::rpc::track_rpc(server_service.upload_server_http_request_stat(req)).await
+        {
             error!("Failed to upload HTTP request stats: {}", e);
         }
     }
@@ -818,9 +850,10 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
             )
             .collect();
 
-        if let Err(e) = service
-            .upload_server_top_ip_stats(pb::UploadServerTopIpStatsRequest { stats })
-            .await
+        if let Err(e) = crate::rpc::track_rpc(
+            service.upload_server_top_ip_stats(pb::UploadServerTopIpStatsRequest { stats }),
+        )
+        .await
         {
             error!("Failed to upload top IP stats: {}", e);
         }

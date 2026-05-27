@@ -50,6 +50,9 @@ struct CheckLocalFirewallMessage {
 
 pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigStore>) {
     let mut last_endpoints = api_config.effective_rpc_endpoints();
+    let mut fail_count: u32 = 0;
+    const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
     loop {
         if !crate::cluster::leader::require_leader("node_stream") {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -60,11 +63,13 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
             Ok(client) => client,
             Err(e) => {
                 last_endpoints = api_config.effective_rpc_endpoints();
+                fail_count = fail_count.saturating_add(1);
+                let delay = stream_backoff(fail_count, MAX_BACKOFF);
                 error!(
-                    "Failed to connect to API node for stream: {}. Retrying in 10s...",
-                    e
+                    "Failed to connect to API node for stream: {}. Retrying in {:?}...",
+                    e, delay
                 );
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -72,15 +77,37 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
 
         match stream_result {
             Ok(_) => {
+                fail_count = 0;
                 last_endpoints = api_config.effective_rpc_endpoints();
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             Err(e) => {
-                warn!("Node stream error: {}. Reconnecting...", e);
+                fail_count = fail_count.saturating_add(1);
+                let delay = stream_backoff(fail_count, MAX_BACKOFF);
+                warn!(
+                    "Node stream error: {}. Reconnecting in {:?}...",
+                    e, delay
+                );
                 last_endpoints = api_config.effective_rpc_endpoints();
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(delay).await;
             }
         }
+    }
+}
+
+fn stream_backoff(fail_count: u32, max: Duration) -> Duration {
+    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped).
+    // Add jitter (±25%) to avoid thundering herd.
+    use rand::Rng;
+    let base = Duration::from_secs(1)
+        .saturating_mul(1u32 << fail_count.saturating_sub(1).min(6));
+    let capped = base.min(max);
+    let jitter_ms = (capped.as_millis() as u64 / 4) as i64;
+    let offset = rand::thread_rng().gen_range(-jitter_ms..=jitter_ms);
+    if offset < 0 {
+        capped.saturating_sub(Duration::from_millis((-offset) as u64))
+    } else {
+        capped.saturating_add(Duration::from_millis(offset as u64)).min(max)
     }
 }
 

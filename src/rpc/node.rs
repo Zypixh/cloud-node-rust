@@ -183,11 +183,14 @@ async fn report_connected_api_nodes(api_config: &ApiConfig) {
 
     if let Ok(client) = RpcClient::new(api_config).await {
         let mut node_service = client.node_service_with_type();
-        match node_service
-            .update_node_connected_api_nodes(pb::UpdateNodeConnectedApiNodesRequest {
-                api_node_ids: api_node_ids.clone(),
-            })
-            .await
+        match crate::rpc::track_rpc(
+            node_service.update_node_connected_api_nodes(
+                pb::UpdateNodeConnectedApiNodesRequest {
+                    api_node_ids: api_node_ids.clone(),
+                },
+            ),
+        )
+        .await
         {
             Ok(_) => info!(
                 "Successfully reported connected API nodes: {:?}",
@@ -400,7 +403,7 @@ where
         use_data_map: true,
     });
 
-    match client.find_current_node_config(req).await {
+    match crate::rpc::track_rpc(client.find_current_node_config(req)).await {
         Ok(resp) => {
             let config_resp = resp.into_inner();
             let response_version = config_resp.timestamp;
@@ -1279,13 +1282,14 @@ where
                             if numeric_id > 0 {
                                 if let Ok(client) = RpcClient::new(api_config).await {
                                     let mut service = client.node_service_with_type();
-                                    match service
-                                        .find_enabled_node_config_info(
+                                    match crate::rpc::track_rpc(
+                                        service.find_enabled_node_config_info(
                                             pb::FindEnabledNodeConfigInfoRequest {
                                                 node_id: numeric_id,
                                             },
-                                        )
-                                        .await
+                                        ),
+                                    )
+                                    .await
                                     {
                                         Ok(resp) => {
                                             let info = resp.into_inner();
@@ -1519,12 +1523,16 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
 
         if let Ok(client) = RpcClient::new(&api_config).await {
             let mut service = client.node_service();
-            let _ = service
-                .update_node_status(pb::UpdateNodeStatusRequest {
+            if let Err(e) = crate::rpc::track_rpc(
+                service.update_node_status(pb::UpdateNodeStatusRequest {
                     node_id,
                     status_json: status.to_string().into_bytes(),
-                })
-                .await;
+                }),
+            )
+            .await
+            {
+                error!("Failed to report node status: {}", e);
+            }
         }
     }
 }
@@ -1625,12 +1633,13 @@ pub async fn report_node_online_once(
     // and will always fail with node credentials. UpdateNodeStatus already sets
     // isActive=true server-side.
     let mut service = client.node_service();
-    service
-        .update_node_status(pb::UpdateNodeStatusRequest {
+    crate::rpc::track_rpc(
+        service.update_node_status(pb::UpdateNodeStatusRequest {
             node_id,
             status_json: status.to_string().into_bytes(),
-        })
-        .await?;
+        }),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1907,9 +1916,10 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         let node_value_items_count = node_value_items.len();
         if let Ok(client) = RpcClient::new(&api_config).await {
             let mut service = client.node_value_service();
-            match service
-                .create_node_values(pb::CreateNodeValuesRequest { node_value_items })
-                .await
+            match crate::rpc::track_rpc(
+                service.create_node_values(pb::CreateNodeValuesRequest { node_value_items }),
+            )
+            .await
             {
                 Ok(_) => debug!(
                     "Successfully reported {} node values with items: {}",

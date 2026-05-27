@@ -80,9 +80,11 @@ pub async fn sync_updating_server_list_once(
     };
 
     let mut service = client.updating_server_list_service();
-    match service
-        .find_updating_server_lists(pb::FindUpdatingServerListsRequest { last_id: *last_id })
-        .await
+    match crate::rpc::track_rpc(
+        service
+            .find_updating_server_lists(pb::FindUpdatingServerListsRequest { last_id: *last_id }),
+    )
+    .await
     {
         Ok(resp) => {
             let resp = resp.into_inner();
@@ -213,9 +215,10 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
     };
     let mut api_node_service = client.api_node_service();
 
-    let resp = match api_node_service
-        .find_all_enabled_api_nodes(pb::FindAllEnabledApiNodesRequest {})
-        .await
+    let resp = match crate::rpc::track_rpc(
+        api_node_service.find_all_enabled_api_nodes(pb::FindAllEnabledApiNodesRequest {}),
+    )
+    .await
     {
         Ok(resp) => resp.into_inner(),
         Err(e) => {

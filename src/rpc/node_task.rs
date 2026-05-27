@@ -40,7 +40,7 @@ pub async fn sync_node_tasks(
     let req = pb::FindNodeTasksRequest {
         version: *task_version,
     };
-    match task_service.find_node_tasks(req).await {
+    match crate::rpc::track_rpc(task_service.find_node_tasks(req)).await {
         Ok(resp) => {
             let tasks = resp.into_inner().node_tasks;
             for task in tasks {
@@ -152,8 +152,8 @@ pub async fn sync_node_tasks(
                     ip_list_manager.remove_list(list_id);
                 }
 
-                let reported = task_service
-                    .report_node_task_done(pb::ReportNodeTaskDoneRequest {
+                let reported = crate::rpc::track_rpc(
+                    task_service.report_node_task_done(pb::ReportNodeTaskDoneRequest {
                         node_task_id: task.id,
                         is_ok: success,
                         error: if success {
@@ -161,9 +161,10 @@ pub async fn sync_node_tasks(
                         } else {
                             "Task failed".to_string()
                         },
-                    })
-                    .await
-                    .is_ok();
+                    }),
+                )
+                .await
+                .is_ok();
 
                 if reported {
                     if task.version > *task_version {

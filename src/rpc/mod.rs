@@ -33,6 +33,22 @@ pub use stats::{
 };
 pub use stream::start_node_stream;
 
+/// Wrap a gRPC unary call, recording its duration and whether it errored so
+/// `apiSuccessPercent` reflects actual communication health instead of just
+/// bandwidth-stat uploads.
+pub async fn track_rpc<F, T>(
+    fut: F,
+) -> Result<tonic::Response<T>, tonic::Status>
+where
+    F: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    let start = std::time::Instant::now();
+    let result = fut.await;
+    let cost = start.elapsed().as_millis() as u64;
+    crate::metrics::record::record_rpc_call(cost, result.is_err());
+    result
+}
+
 pub async fn find_node_level_info(
     api_config: &crate::api_config::ApiConfig,
     config_store: &crate::config::ConfigStore,
