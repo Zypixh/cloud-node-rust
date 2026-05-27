@@ -76,6 +76,8 @@ pub fn issue_html(
             "Browser verification failed. Please refresh and try again.",
         ),
     };
+    let failed_json = serde_json::to_string(failed)
+        .unwrap_or_else(|_| "\"Browser verification failed. Please refresh and try again.\"".to_string());
     let display_seconds = ((display_ms as f64) / 1000.0 * 10.0).round() / 10.0;
     let display_seconds = if display_seconds.fract() == 0.0 {
         format!("{display_seconds:.0}")
@@ -85,23 +87,24 @@ pub fn issue_html(
 
     format!(
         r##"<div id="jsck_{sfx}" class="jsck">
-<h1>{heading}</h1>
-<p>{sub}</p>
+<h1 data-i18n="js_heading">{heading}</h1>
+<p data-i18n="js_sub">{sub}</p>
 <div class="jsck-steps">
-  <div id="jsck_s1_{sfx}" class="jsck-step"><span></span>{runtime}</div>
-  <div id="jsck_s2_{sfx}" class="jsck-step"><span></span>{cookie}</div>
-  <div id="jsck_s3_{sfx}" class="jsck-step"><span></span>{fingerprint}</div>
-  <div id="jsck_s4_{sfx}" class="jsck-step"><span></span>{submit}</div>
+  <div id="jsck_s1_{sfx}" class="jsck-step"><span></span><b data-i18n="js_runtime">{runtime}</b></div>
+  <div id="jsck_s2_{sfx}" class="jsck-step"><span></span><b data-i18n="js_cookie">{cookie}</b></div>
+  <div id="jsck_s3_{sfx}" class="jsck-step"><span></span><b data-i18n="js_fingerprint">{fingerprint}</b></div>
+  <div id="jsck_s4_{sfx}" class="jsck-step"><span></span><b data-i18n="js_submit">{submit}</b></div>
 </div>
-<p id="jsck_status_{sfx}" class="status">Initializing browser check...</p>
+<p id="jsck_status_{sfx}" class="status" data-i18n="js_initializing">Initializing browser check...</p>
 <div class="progress jsck-progress"><span id="jsck_bar_{sfx}"></span></div>
-<p class="meta">Minimum display time: {display_seconds}s</p>
+<p class="meta" data-i18n="js_min_display" data-i18n-args='{{"seconds":"{display_seconds}"}}'>Minimum display time: {display_seconds}s</p>
 <div class="meta">Request #{sfx}</div>
 <style>
 #jsck_{sfx}.jsck{{text-align:left}}
 #jsck_{sfx} h1,#jsck_{sfx} p{{text-align:center}}
 #jsck_{sfx} .jsck-steps{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:20px 0 10px}}
 #jsck_{sfx} .jsck-step{{min-height:46px;display:flex;align-items:center;gap:9px;border:1px solid var(--card-border);border-radius:10px;padding:10px 11px;color:var(--muted);font-size:13px;background:rgba(148,163,184,.08)}}
+#jsck_{sfx} .jsck-step b{{font:inherit;font-weight:500}}
 #jsck_{sfx} .jsck-step span{{width:10px;height:10px;border-radius:50%;background:var(--dim);box-shadow:0 0 0 0 rgba(14,165,233,.28)}}
 #jsck_{sfx} .jsck-step.on span{{background:var(--blue);animation:jsckPulse_{sfx} 1s ease-in-out infinite}}
 #jsck_{sfx} .jsck-step.ok span{{background:var(--green);animation:none}}
@@ -113,6 +116,7 @@ pub fn issue_html(
 </style>
 <script>
 (function(){{
+function msg(k){{return window.cloudNodeText?window.cloudNodeText(k):({{js_check_runtime:"Checking JavaScript runtime...",js_check_cookie:"Checking cookie roundtrip...",js_collect:"Collecting browser signals...",js_submitting:"Submitting browser check...",js_failed:{failed_json}}}[k]||k)}}
 var sf="{sfx}",wt={waf_token_json},ct={challenge_token_json},cn={cookie_name_json},seed={seed_json};
 var route={route_json},ret={return_json},min={display_ms},max={MAX_DELAY_MS},secure="{secure}";
 var enc=new TextEncoder(),t0=Date.now(),p0=(performance&&performance.now)?performance.now():0;
@@ -144,14 +148,14 @@ function fp(){{var n=navigator||{{}},s=screen||{{}},tz="";try{{tz=Intl.DateTimeF
 async function run(){{
  try{{
   var timer=setInterval(function(){{var e=((performance&&performance.now)?performance.now()-p0:Date.now()-t0);setBar(Math.min(96,3+e/min*93))}},120);
-  step(1,"on");status("Checking JavaScript runtime...");
+  step(1,"on");status(msg("js_check_runtime"));
   if(!crypto||!crypto.subtle||!window.TextEncoder)throw new Error("crypto");
   var cv=(await digest("waf-js-cookie|"+wt+"|"+seed)).slice(0,40);
-  step(1,"ok");step(2,"on");status("Checking cookie roundtrip...");
+  step(1,"ok");step(2,"on");status(msg("js_check_cookie"));
   document.cookie=cn+"="+encodeURIComponent(cv)+"; Path=/; Max-Age={TEMP_COOKIE_MAX_AGE}; SameSite=Lax"+secure;
   await sleep(80);
   if(getCookie(cn)!==cv)throw new Error("cookie");
-  step(2,"ok");step(3,"on");status("Collecting browser signals...");
+  step(2,"ok");step(3,"on");status(msg("js_collect"));
   var signals=fp();
   if(signals.length<24)throw new Error("signals");
   step(3,"ok");
@@ -160,11 +164,11 @@ async function run(){{
   elapsed=Math.round(((performance&&performance.now)?performance.now()-p0:Date.now()-t0));
   if(elapsed>max)throw new Error("timeout");
   clearInterval(timer);setBar(100);
-  step(4,"on");status("Submitting browser check...");
+  step(4,"on");status(msg("js_submitting"));
   var dg=await digest("waf-js-digest|"+wt+"|"+ct+"|"+cv+"|"+signals+"|"+elapsed+"|"+seed);
   var qs=new URLSearchParams({{__waf_token:wt,__waf_challenge_token:ct,__waf_challenge_type:"jscookie",__waf_js_elapsed:String(elapsed),__waf_js_fp:signals,__waf_js_digest:dg,__waf_return:ret}});
   step(4,"ok");location.replace(route+"?"+qs.toString());
- }}catch(e){{status("{failed}")}}
+ }}catch(e){{status(msg("js_failed"))}}
 }}
 run();
 }})();
@@ -177,7 +181,7 @@ run();
         cookie = cookie,
         fingerprint = fingerprint,
         submit = submit,
-        failed = failed,
+        failed_json = failed_json,
         display_ms = display_ms,
         display_seconds = display_seconds,
         waf_token_json = waf_token_json,

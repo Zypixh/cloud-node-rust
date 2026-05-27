@@ -56,14 +56,14 @@ pub fn issue_html(
 
     format!(
         r#"<div class="cp" id="cp_{sfx}">
-<p style="margin:0 0 6px;font-size:14px;color:var(--muted)">{prompt}</p>
-<p style="margin:0 0 8px;font-size:11px;color:var(--dim)">{hint}</p>
+<p data-i18n="captcha_prompt" style="margin:0 0 6px;font-size:14px;color:var(--muted)">{prompt}</p>
+<p data-i18n="captcha_hint" style="margin:0 0 8px;font-size:11px;color:var(--dim)">{hint}</p>
 <div style="margin:0 auto 12px;display:flex;justify-content:center">
-<canvas id="ca_{sfx}" width="310" height="110" style="width:290px;height:103px;border-radius:10px;border:1px solid var(--card-border);cursor:pointer" title="{refresh}"></canvas>
+<canvas id="ca_{sfx}" width="310" height="110" style="width:290px;height:103px;border-radius:10px;border:1px solid var(--card-border);cursor:pointer" data-i18n-title="captcha_refresh" title="{refresh}"></canvas>
 </div>
 <div style="display:flex;gap:8px;justify-content:center;margin-bottom:10px">
-<input id="ci_{sfx}" type="text" autocomplete="off" autocorrect="off" spellcheck="false" maxlength="6" style="width:150px;padding:10px 14px;border-radius:10px;border:2px solid var(--card-border);background:var(--card-bg);color:var(--text);font-size:20px;font-family:ui-monospace,'SF Mono',monospace;letter-spacing:5px;text-align:center;outline:none" placeholder="{ph}">
-<button id="cb_{sfx}" style="padding:10px 22px;border-radius:10px;border:none;background:linear-gradient(135deg,#6366f1,#38bdf8);color:#fff;font-size:15px;font-weight:600;cursor:pointer">{btn}</button>
+<input id="ci_{sfx}" type="text" autocomplete="off" autocorrect="off" spellcheck="false" maxlength="6" style="width:150px;padding:10px 14px;border-radius:10px;border:2px solid var(--card-border);background:var(--card-bg);color:var(--text);font-size:20px;font-family:ui-monospace,'SF Mono',monospace;letter-spacing:5px;text-align:center;outline:none" data-i18n-placeholder="captcha_placeholder" placeholder="{ph}">
+<button id="cb_{sfx}" data-i18n="captcha_btn" style="padding:10px 22px;border-radius:10px;border:none;background:linear-gradient(135deg,#6366f1,#38bdf8);color:#fff;font-size:15px;font-weight:600;cursor:pointer">{btn}</button>
 </div>
 <p class="status" id="cs_{sfx}" style="font-size:13px">&#160;</p>
 <style>

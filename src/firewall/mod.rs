@@ -417,7 +417,11 @@ pub(crate) fn fill_action_options(policy: &HTTPFirewallPolicy, matched: &mut Mat
     }
     match (&mut matched.captcha_options, policy.captcha_options.as_ref()) {
         (Some(action), Some(policy)) => merge_captcha_options(action, policy),
-        (None, Some(policy)) => matched.captcha_options = Some(policy.clone()),
+        (None, Some(policy)) => {
+            let mut inherited = policy.clone();
+            inherited.method = inherited_captcha_method(policy);
+            matched.captcha_options = Some(inherited);
+        }
         _ => {}
     }
     match (&mut matched.js_cookie_options, policy.js_cookie_options.as_ref()) {
@@ -515,6 +519,22 @@ fn captcha_options_from_value(options: Option<&Value>) -> Option<WAFCaptchaOptio
     serde_json::from_value(options?.clone()).ok()
 }
 
+pub(crate) fn captcha_method_is_default(method: &str) -> bool {
+    let trimmed = method.trim();
+    if matches!(trimmed, "" | "默认") {
+        return true;
+    }
+    trimmed.eq_ignore_ascii_case("default")
+}
+
+fn inherited_captcha_method(policy: &WAFCaptchaOptions) -> String {
+    if policy.use_geetest {
+        "geetest".to_string()
+    } else {
+        policy.method.clone()
+    }
+}
+
 fn js_cookie_options_from_value(options: Option<&Value>) -> Option<WAFJSCookieOptions> {
     serde_json::from_value(options?.clone()).ok()
 }
@@ -523,6 +543,7 @@ fn merge_captcha_options(
     action: &mut WAFCaptchaOptions,
     policy: &WAFCaptchaOptions,
 ) {
+    let inherit_method = captcha_method_is_default(&action.method);
     if action.life_seconds <= 0 {
         action.life_seconds = policy.life_seconds;
     }
@@ -536,15 +557,17 @@ fn merge_captcha_options(
     if action.count <= 0 {
         action.count = policy.count;
     }
-    action.use_geetest = action.use_geetest || policy.use_geetest;
+    if inherit_method {
+        action.use_geetest = action.use_geetest || policy.use_geetest;
+    }
     if action.geetest_id.trim().is_empty() {
         action.geetest_id = policy.geetest_id.clone();
     }
     if action.geetest_key.trim().is_empty() {
         action.geetest_key = policy.geetest_key.clone();
     }
-    if action.method.trim().is_empty() {
-        action.method = policy.method.clone();
+    if inherit_method {
+        action.method = inherited_captcha_method(policy);
     }
     if action.challenge_lang.trim().is_empty() {
         action.challenge_lang = policy.challenge_lang.clone();

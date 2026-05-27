@@ -2936,6 +2936,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.use_geetest),
+            Some(false)
+        );
+        assert_eq!(
             legacy
                 .captcha_options
                 .as_ref()
@@ -2992,6 +2996,13 @@ mod tests {
             compiled_action
                 .captcha_options
                 .as_ref()
+                .map(|opts| opts.use_geetest),
+            Some(false)
+        );
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
                 .map(|opts| opts.challenge_lang.as_str()),
             Some("zh-CN")
         );
@@ -3001,6 +3012,124 @@ mod tests {
                 .as_ref()
                 .map(|opts| opts.challenge_difficulty),
             Some(6)
+        );
+    }
+
+    #[test]
+    fn explicit_action_captcha_method_does_not_inherit_policy_geetest() {
+        let action = json!({
+            "code":"captcha",
+            "options":{"method":"click"}
+        });
+        let mut policy = test_policy(inbound_with_groups(vec![]));
+        policy.captcha_options = Some(WAFCaptchaOptions {
+            method: "slider".to_string(),
+            use_geetest: true,
+            ..Default::default()
+        });
+
+        let mut legacy = legacy_action(&action);
+        crate::firewall::fill_action_options(&policy, &mut legacy);
+        assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.method.as_str()),
+            Some("click")
+        );
+        assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.use_geetest),
+            Some(false)
+        );
+
+        let compiled = CompiledFirewallPolicy::compile(&policy);
+        let mut compiled_action = compiled_action(&action);
+        super::fill_action_from_policy(&mut compiled_action, &compiled, 10, 20);
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str()),
+            Some("click")
+        );
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.use_geetest),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn default_action_captcha_method_inherits_policy_geetest() {
+        let action = json!({
+            "code":"captcha",
+            "options":{"method":"default"}
+        });
+        let mut policy = test_policy(inbound_with_groups(vec![]));
+        policy.captcha_options = Some(WAFCaptchaOptions {
+            method: "slider".to_string(),
+            use_geetest: true,
+            ..Default::default()
+        });
+
+        let mut legacy = legacy_action(&action);
+        crate::firewall::fill_action_options(&policy, &mut legacy);
+        assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.method.as_str()),
+            Some("geetest")
+        );
+        assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.use_geetest),
+            Some(true)
+        );
+
+        let compiled = CompiledFirewallPolicy::compile(&policy);
+        let mut compiled_action = compiled_action(&action);
+        super::fill_action_from_policy(&mut compiled_action, &compiled, 10, 20);
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str()),
+            Some("geetest")
+        );
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.use_geetest),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn empty_action_captcha_options_inherit_policy_geetest() {
+        let action = json!({
+            "code":"captcha",
+            "options":{}
+        });
+        let mut policy = test_policy(inbound_with_groups(vec![]));
+        policy.captcha_options = Some(WAFCaptchaOptions {
+            method: "slider".to_string(),
+            use_geetest: true,
+            ..Default::default()
+        });
+
+        let mut legacy = legacy_action(&action);
+        crate::firewall::fill_action_options(&policy, &mut legacy);
+        assert_eq!(
+            legacy.captcha_options.as_ref().map(|opts| opts.method.as_str()),
+            Some("geetest")
+        );
+
+        let compiled = CompiledFirewallPolicy::compile(&policy);
+        let mut compiled_action = compiled_action(&action);
+        super::fill_action_from_policy(&mut compiled_action, &compiled, 10, 20);
+        assert_eq!(
+            compiled_action
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str()),
+            Some("geetest")
         );
     }
 

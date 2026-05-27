@@ -51,7 +51,7 @@ pub fn issue_html_with_target(
 <div id="hl_{sfx}" class="pzl-hole" style="position:absolute;left:{tx:.0}px;top:{ty:.0}px;width:40px;height:40px;clip-path:{poly};background:rgba(0,0,0,.12);box-shadow:inset 0 0 0 2px rgba(0,0,0,.35),0 0 12px rgba(0,0,0,.25);pointer-events:none;border-radius:2px"></div>
 <div id="pc_{sfx}" class="pzl-piece" style="position:absolute;left:{ox:.0}px;top:{oy:.0}px;width:40px;height:40px;clip-path:{poly};background:linear-gradient(135deg,rgba(99,102,241,.65),rgba(56,189,248,.65));cursor:grab;border-radius:2px;z-index:2"></div>
 </div>
-<p class="status" id="st_{sfx}">{prompt}</p>
+<p class="status" id="st_{sfx}" data-i18n="slider_puzzle_prompt">{prompt}</p>
 <script>
 (function(){{
 var sf="{sfx}";var d=!1,sx=0,sy=0,px={ox:.0},py={oy:.0},tr=[],t0=Date.now();

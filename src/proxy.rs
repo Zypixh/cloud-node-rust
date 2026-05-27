@@ -546,7 +546,74 @@ impl EdgeProxy {
             }
         }
         let status = status.clamp(100, 599) as u16;
-        (status, self.render_page_template(session, ctx, &body, status))
+        let resolved_body = self.render_waf_block_body(session, ctx, &body, status);
+        (status, resolved_body)
+    }
+
+    fn render_waf_block_body(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        body: &str,
+        status: u16,
+    ) -> String {
+        let resolved = self.render_page_template(session, ctx, body, status);
+        Self::compose_waf_block_body(resolved, body, status, &ctx.request_id)
+    }
+
+    fn compose_waf_block_body(
+        resolved: String,
+        source_body: &str,
+        status: u16,
+        request_id: &str,
+    ) -> String {
+        if Self::looks_like_full_html_document(&resolved) {
+            return resolved;
+        }
+        let extra = if Self::is_default_waf_block_body(source_body) {
+            String::new()
+        } else {
+            format!(r#"<div class="block-custom" data-i18n-ignore>{resolved}</div>"#)
+        };
+        crate::pages::block_page(
+            crate::pages::Lang::En,
+            status,
+            "This request was blocked by the security policy.",
+            request_id,
+            &extra,
+        )
+    }
+
+    fn looks_like_full_html_document(body: &str) -> bool {
+        let trimmed = Self::trim_html_document_preamble(body).to_ascii_lowercase();
+        trimmed.starts_with("<!doctype html") || trimmed.starts_with("<html")
+    }
+
+    fn trim_html_document_preamble(mut body: &str) -> &str {
+        body = body.trim_start_matches('\u{feff}').trim_start();
+        loop {
+            let lower = body.to_ascii_lowercase();
+            if lower.starts_with("<!--") {
+                if let Some(end) = lower.find("-->") {
+                    body = body[end + 3..].trim_start_matches('\u{feff}').trim_start();
+                    continue;
+                }
+            }
+            if lower.starts_with("<?xml") {
+                if let Some(end) = lower.find("?>") {
+                    body = body[end + 2..].trim_start_matches('\u{feff}').trim_start();
+                    continue;
+                }
+            }
+            return body;
+        }
+    }
+
+    fn is_default_waf_block_body(body: &str) -> bool {
+        let normalized = body.trim();
+        normalized.is_empty()
+            || normalized.eq_ignore_ascii_case("Blocked by WAF")
+            || normalized.eq_ignore_ascii_case("Blocked by Outbound WAF")
     }
 
     fn status_message(status: u16) -> String {
@@ -2253,33 +2320,34 @@ impl EdgeProxy {
         }
     }
 
+    fn parse_waf_challenge_method(method: &str) -> Result<Option<&'static str>, ()> {
+        if crate::firewall::captcha_method_is_default(method) {
+            return Ok(None);
+        }
+        match method.trim().to_ascii_lowercase().as_str() {
+            "click" => Ok(Some("click")),
+            "captcha" => Ok(Some("captcha")),
+            "jscookie" => Ok(Some("jscookie")),
+            "pow" => Ok(Some("pow")),
+            "geetest" => Ok(Some("geetest")),
+            "slider" => Ok(Some("slider")),
+            _ => Err(()),
+        }
+    }
+
+    #[cfg(test)]
     fn normalize_waf_challenge_method(method: &str, action_code: &str) -> String {
-        let normalized = method
-            .trim()
-            .to_ascii_lowercase()
-            .chars()
-            .filter(|ch| !matches!(ch, '-' | '_' | ' '))
-            .collect::<String>();
-        match normalized.as_str() {
-            "click" | "clickcaptcha" | "sequenceclick" => "click".to_string(),
-            "captcha" | "imagecaptcha" | "visualcaptcha" => "captcha".to_string(),
-            "jscookie" | "javascriptcookie" | "js" | "cookie" => "jscookie".to_string(),
-            "pow" | "proofofwork" => "pow".to_string(),
-            "geetest" | "gee" => "geetest".to_string(),
-            "slider" | "slide" | "puzzle" | "puzzleslider" => "slider".to_string(),
-            _ if action_code == "js_cookie" => "jscookie".to_string(),
-            _ => "slider".to_string(),
+        if action_code == "js_cookie" && method.trim().is_empty() {
+            return "jscookie".to_string();
+        }
+        match Self::parse_waf_challenge_method(method) {
+            Ok(Some(method)) => method.to_string(),
+            Ok(None) => "default".to_string(),
+            Err(()) => String::new(),
         }
     }
 
     fn waf_expected_challenge_method(&self, matched: &crate::firewall::MatchedAction) -> String {
-        if matches!(
-            matched.action,
-            crate::firewall::ActionResponse::JsCookie { .. }
-        ) {
-            return "jscookie".to_string();
-        }
-
         let global_captcha_opts = self
             .config
             .get_waf_actions_sync()
@@ -2288,33 +2356,53 @@ impl EdgeProxy {
             .and_then(|global| {
                 serde_json::from_value::<WAFCaptchaOptions>(global.options.clone()).ok()
             });
-        let raw_method = matched
-            .captcha_options
-            .as_ref()
-            .and_then(|options| {
-                (!options.method.trim().is_empty()).then_some(options.method.as_str())
-            })
-            .or_else(|| {
-                global_captcha_opts
-                    .as_ref()
-                    .and_then(|options| {
-                        (!options.method.trim().is_empty()).then_some(options.method.as_str())
-                    })
-            })
-            .unwrap_or("");
-        let method = Self::normalize_waf_challenge_method(raw_method, &matched.action_code);
+        Self::resolve_waf_challenge_method(
+            &matched.action_code,
+            matches!(
+                matched.action,
+                crate::firewall::ActionResponse::JsCookie { .. }
+            ),
+            matched.captcha_options.as_ref(),
+            global_captcha_opts.as_ref(),
+        )
+    }
+
+    fn resolve_waf_challenge_method(
+        action_code: &str,
+        is_js_cookie_action: bool,
+        action_opts: Option<&WAFCaptchaOptions>,
+        global_opts: Option<&WAFCaptchaOptions>,
+    ) -> String {
+        if is_js_cookie_action || action_code == "js_cookie" {
+            return "jscookie".to_string();
+        }
+
+        if let Some(options) = action_opts {
+            match Self::parse_waf_challenge_method(&options.method) {
+                Ok(Some(method)) => return method.to_string(),
+                Ok(None) => {}
+                Err(()) => return "slider".to_string(),
+            }
+        }
+
+        let global_use_geetest = global_opts
+            .map(|options| options.use_geetest)
+            .unwrap_or(false);
+        let method = match global_opts {
+            Some(options) => match Self::parse_waf_challenge_method(&options.method) {
+                Ok(Some(method)) => method,
+                Ok(None) => "slider",
+                Err(()) => "slider",
+            },
+            None => "slider",
+        };
         if method == "slider"
-            && matched.action_code == "captcha"
-            && matched
-                .captcha_options
-                .as_ref()
-                .map(|options| options.use_geetest)
-                .or_else(|| global_captcha_opts.as_ref().map(|options| options.use_geetest))
-                .unwrap_or(false)
+            && action_code == "captcha"
+            && global_use_geetest
         {
             "geetest".to_string()
         } else {
-            method
+            method.to_string()
         }
     }
 
@@ -4817,9 +4905,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             resp.insert_header("cache-control", "no-store").unwrap();
             resp.insert_header("x-uam-verified", "0").unwrap();
             session.write_response_header(Box::new(resp), false).await?;
-            let body = Bytes::from_static(
-                b"<!doctype html><html><body><h1>Security verification failed</h1><p>Please go back and try again.</p></body></html>",
-            );
+            let body = Bytes::from(crate::pages::verification_failed_page());
             ctx.response_status = 403;
             ctx.response_body_len = body.len();
             session.write_response_body(Some(body), true).await?;
@@ -5004,12 +5090,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         resp.insert_header("cache-control", "no-store").unwrap();
         session.write_response_header(Box::new(resp), false).await?;
         session
-            .write_response_body(
-                Some(Bytes::from_static(
-                    b"<!doctype html><html><body><h1>Security verification failed</h1><p>Please go back and try again.</p></body></html>",
-                )),
-                true,
-            )
+            .write_response_body(Some(Bytes::from(crate::pages::verification_failed_page())), true)
             .await?;
         ctx.response_status = 403;
         Ok(true)
@@ -5602,7 +5683,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     }
                 }
 
-                let resolved_body = self.render_page_template(session, ctx, &body, status as u16);
+                let resolved_body =
+                    self.render_waf_block_body(session, ctx, &body, status as u16);
                 let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
                 resp.insert_header("content-type", "text/html; charset=utf-8")
                     .unwrap();
@@ -5819,16 +5901,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 let challenge_lang = captcha_opts
                     .as_ref()
                     .and_then(|o| {
-                        if o.challenge_lang.is_empty() {
-                            None
-                        } else {
-                            Some(crate::pages::detect_lang(
-                                Some(&o.challenge_lang),
-                                session
-                                    .get_header("accept-language")
-                                    .and_then(|v| v.to_str().ok()),
-                            ))
-                        }
+                        (!o.challenge_lang.trim().is_empty()).then(|| {
+                            crate::pages::detect_lang(Some(&o.challenge_lang), None)
+                        })
                     })
                     .unwrap_or(crate::pages::Lang::En);
                 // Determine the challenge method, resolving "geetest" into a
@@ -5891,7 +5966,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                             .waf_verifier
                             .get_pow_script_with_life(&token, difficulty, life_seconds);
                         let body = format!(
-                            "<h1>{}</h1><p>{}</p><div class=\"progress\"><span></span></div><div class=\"meta\">Request #{}</div>",
+                            "<h1 data-i18n=\"checking\">{}</h1><p data-i18n=\"checking_sub\">{}</p><div class=\"progress\"><span></span></div><div class=\"meta\">Request #{}</div>",
                             t.checking, t.checking_sub, ctx.request_id
                         );
                         crate::pages::uam_challenge_page(
@@ -9818,7 +9893,7 @@ mod tests {
         );
         assert_eq!(
             EdgeProxy::normalize_waf_challenge_method("js-cookie", "captcha"),
-            "jscookie"
+            ""
         );
         assert_eq!(
             EdgeProxy::normalize_waf_challenge_method("pow", "captcha"),
@@ -9826,11 +9901,133 @@ mod tests {
         );
         assert_eq!(
             EdgeProxy::normalize_waf_challenge_method("challengeType", "captcha"),
-            "slider"
+            ""
         );
         assert_eq!(
             EdgeProxy::normalize_waf_challenge_method("click", "captcha"),
             "click"
+        );
+    }
+
+    #[test]
+    fn waf_challenge_method_uses_site_method_unless_default() {
+        let site_click = crate::config_models::WAFCaptchaOptions {
+            method: "click".to_string(),
+            ..Default::default()
+        };
+        let cluster_geetest = crate::config_models::WAFCaptchaOptions {
+            method: "slider".to_string(),
+            use_geetest: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            EdgeProxy::resolve_waf_challenge_method(
+                "captcha",
+                false,
+                Some(&site_click),
+                Some(&cluster_geetest),
+            ),
+            "click"
+        );
+
+        let site_default = crate::config_models::WAFCaptchaOptions {
+            method: "default".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            EdgeProxy::resolve_waf_challenge_method(
+                "captcha",
+                false,
+                Some(&site_default),
+                Some(&cluster_geetest),
+            ),
+            "geetest"
+        );
+
+        let site_slider = crate::config_models::WAFCaptchaOptions {
+            method: "slider".to_string(),
+            use_geetest: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            EdgeProxy::resolve_waf_challenge_method(
+                "captcha",
+                false,
+                Some(&site_slider),
+                Some(&cluster_geetest),
+            ),
+            "slider"
+        );
+
+        let site_unknown = crate::config_models::WAFCaptchaOptions {
+            method: "inherit".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            EdgeProxy::resolve_waf_challenge_method(
+                "captcha",
+                false,
+                Some(&site_unknown),
+                Some(&cluster_geetest),
+            ),
+            "slider"
+        );
+
+        let site_dash_default = crate::config_models::WAFCaptchaOptions {
+            method: "de-fault".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            EdgeProxy::resolve_waf_challenge_method(
+                "captcha",
+                false,
+                Some(&site_dash_default),
+                Some(&cluster_geetest),
+            ),
+            "slider"
+        );
+    }
+
+    #[test]
+    fn waf_block_body_uses_modern_page_for_default_and_fragments() {
+        let default_page = EdgeProxy::compose_waf_block_body(
+            "Blocked by WAF".to_string(),
+            "Blocked by WAF",
+            403,
+            "req-1",
+        );
+        assert!(default_page.contains("block-panel"));
+        assert!(default_page.contains("data-i18n=\"block_reason\""));
+        assert!(default_page.contains("#req-1"));
+        assert!(!default_page.contains("block-custom"));
+
+        let fragment_page = EdgeProxy::compose_waf_block_body(
+            "<strong data-i18n=\"custom\">custom detail</strong>".to_string(),
+            "<strong data-i18n=\"custom\">custom detail</strong>",
+            403,
+            "req-2",
+        );
+        assert!(fragment_page.contains("block-panel"));
+        assert!(fragment_page.contains("class=\"block-custom\" data-i18n-ignore"));
+        assert!(fragment_page.contains("<strong data-i18n=\"custom\">custom detail</strong>"));
+
+        let full_html =
+            "<!doctype html><html><body><h1>Custom</h1></body></html>".to_string();
+        assert_eq!(
+            EdgeProxy::compose_waf_block_body(full_html.clone(), &full_html, 451, "req-3"),
+            full_html
+        );
+
+        let commented_full_html =
+            "<!-- built --><!doctype html><html><body><h1>Custom</h1></body></html>".to_string();
+        assert_eq!(
+            EdgeProxy::compose_waf_block_body(
+                commented_full_html.clone(),
+                &commented_full_html,
+                451,
+                "req-4",
+            ),
+            commented_full_html
         );
     }
 

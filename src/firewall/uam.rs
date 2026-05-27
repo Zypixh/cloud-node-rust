@@ -46,8 +46,9 @@ impl UamChallenge for JsCookieChallenge {
     fn issue_html(&self, ctx: &UamIssueCtx) -> String {
         let script = get_js_cookie_script(ctx.token, ctx.verify_route, ctx.return_path);
         format!(
-            "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}</style></head><body><main class='sl-card'><div class='sl-logo'>Cloud</div><h1>Checking your browser</h1><p>Please wait while we verify your browser capability.</p><div class='sl-progress'><span></span></div><div class='sl-meta'>Request ${{requestId}}</div></main><script>{}</script></body></html>",
+            "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security Verification</title><style>{}</style><script>{}</script></head><body><main class='sl-card'><div class='sl-logo'>Cloud</div><h1 data-i18n='checking'>Checking your browser</h1><p data-i18n='checking_sub'>Please wait while we verify your browser capability.</p><div class='sl-progress'><span></span></div><div class='sl-meta'>Request ${{requestId}}</div></main><script>{}</script></body></html>",
             cloud_challenge_css(),
+            crate::pages::browser_i18n_script(),
             script
         )
     }
@@ -66,9 +67,10 @@ impl UamChallenge for PowChallenge {
             ctx.return_path,
         );
         format!(
-            "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}{}</style></head><body><main class='sl-card'><div class='sl-logo'>Cloud</div><h1>Checking your browser</h1><p>Please wait while we compute proof of work ({difficulty}).</p><div class='sl-progress'><span id='slPowBar'></span></div><div id='slPowStatus' class='sl-status'>Preparing proof of work...</div><div class='sl-meta'>Request ${{requestId}}</div></main><script>{pow_script}</script></body></html>",
+            "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security Verification</title><style>{}{}</style><script>{}</script></head><body><main class='sl-card'><div class='sl-logo'>Cloud</div><h1 data-i18n='checking'>Checking your browser</h1><p data-i18n='computing_pow' data-i18n-args='{{\"difficulty\":\"{difficulty}\"}}'>Please wait while we compute proof of work ({difficulty}).</p><div class='sl-progress'><span id='slPowBar'></span></div><div id='slPowStatus' class='sl-status' data-i18n='pow_preparing'>Preparing proof of work...</div><div class='sl-meta'>Request ${{requestId}}</div></main><script>{pow_script}</script></body></html>",
             cloud_challenge_css(),
-            pow_progress_css()
+            pow_progress_css(),
+            crate::pages::browser_i18n_script()
         )
     }
 }
@@ -115,13 +117,14 @@ fn get_pow_script(
 	const P="0".repeat(D),E=new TextEncoder(),S=Date.now(),B=64;
 	let n=0,last=0,done=false;
 	const $=id=>document.getElementById(id),bar=$("slPowBar"),st=$("slPowStatus");
+	function msg(k){{return window.cloudNodeText?window.cloudNodeText(k):({{pow_status_computing:"Computing proof...",pow_status_done:"Proof complete, finishing browser check...",pow_difficulty:"difficulty"}}[k]||k);}}
 	function setPct(p){{if(bar)bar.style.width=Math.max(3,Math.min(100,p)).toFixed(2)+"%";}}
 	function tick(){{
 	 const dt=Math.max(1,Date.now()-S), rate=Math.floor(n*1000/dt);
 	 const timePct=Math.min(88,3+(Date.now()-S)/Math.max(MIN,T)*85);
 	 const workPct=Math.min(88,3+(n/Math.pow(16,D))*85);
 	 setPct(Math.max(timePct,workPct));
-	 if(st)st.textContent="Computing proof... nonce "+n.toLocaleString()+" | "+rate.toLocaleString()+"/s | difficulty "+D;
+	 if(st)st.textContent=msg("pow_status_computing")+" nonce "+n.toLocaleString()+" | "+rate.toLocaleString()+"/s | "+msg("pow_difficulty")+" "+D;
 	}}
 	async function h(x){{const b=new Uint8Array(await crypto.subtle.digest("SHA-256",E.encode(C+x)));return Array.from(b).map(v=>v.toString(16).padStart(2,"0")).join("")}}
 	async function batch(start){{
@@ -139,7 +142,7 @@ fn get_pow_script(
 	   done=true;
 	   const finishMs=Math.max(600,MIN-(Date.now()-S));
 	   setPct(92);
-	   if(st)st.textContent="Proof complete, finishing browser check...";
+	   if(st)st.textContent=msg("pow_status_done");
 	   const go=()=>{{setPct(100);const q=new URLSearchParams({{__waf_token:C,__waf_pow:String(found),__waf_return:RET,__waf_uam:"1"}});location.replace(R+"?"+q.toString());}};
 	   const finStart=Date.now();
 	   const fin=setInterval(()=>setPct(92+Math.min(8,(Date.now()-finStart)/Math.max(1,finishMs)*8)),120);
@@ -238,11 +241,12 @@ fn cloud_slider_html(ctx: &UamIssueCtx) -> String {
             .unwrap_or_else(|_| "\"0000\"".to_string());
     let target = ctx.slider_target.min(260);
     let body = format!(
-        r#"<main class="sl-card"><div class="sl-logo">Cloud</div><h1>Security verification</h1><p>Slide to complete the browser check.</p><div id="slTrack" class="sl-track" aria-label="Slide to verify"><div id="slFill" class="sl-fill"></div><div id="slHandle" class="sl-handle">&rsaquo;</div></div><div id="slStatus" class="sl-status">Slide the handle to the highlighted zone</div><div class="sl-meta">Request ${{requestId}}</div><noscript><p class="sl-error">JavaScript is required for this verification.</p></noscript></main><script>(function(){{const token={token_js};const ret={ret_js};const route={route_js};const target={target};const prefix={prefix_js};const track=document.getElementById('slTrack');const handle=document.getElementById('slHandle');const fill=document.getElementById('slFill');const status=document.getElementById('slStatus');const zone=document.createElement('div');zone.style.cssText='position:absolute;top:4px;height:36px;width:28px;border-radius:999px;background:rgba(34,197,94,.25);box-shadow:0 0 0 1px rgba(34,197,94,.38) inset;left:'+(target+9)+'px';';track.appendChild(zone);const enc=new TextEncoder();let dragging=false,startX=0,current=0,start=Date.now(),trace=[];async function pow(){{let n=0;while(true){{const h=await crypto.subtle.digest('SHA-256',enc.encode(token+n));const x=Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('');if(x.startsWith(prefix))return String(n);n++;if(n%200===0)await new Promise(r=>setTimeout(r,0));}}}}function setX(x){{current=Math.max(0,Math.min(260,x));handle.style.left=(current+3)+'px';fill.style.width=(current+42)+'px';trace.push(Math.round(current)+','+(Date.now()-start));}}track.addEventListener('pointerdown',e=>{{dragging=true;startX=e.clientX-current;track.setPointerCapture(e.pointerId);}});track.addEventListener('pointermove',e=>{{if(dragging)setX(e.clientX-startX);}});track.addEventListener('pointerup',async e=>{{if(!dragging)return;dragging=false;setX(e.clientX-startX);if(Math.abs(current-target)>16){{status.textContent='Not quite there, please try again';status.className='sl-status sl-error';return;}}status.textContent='Verifying browser...';try{{const nonce=await pow();const qs=new URLSearchParams({{__waf_token:token,__waf_pow:nonce,__waf_elapsed:String(Date.now()-start),__waf_x:String(Math.round(current)),__waf_trace:trace.slice(-80).join(';'),__waf_return:ret,__waf_uam:'1'}});location.href=route+'?'+qs.toString();}}catch(_){{status.textContent='Verification failed, please retry';status.className='sl-status sl-error';}}}});}})();</script>"#
+        r#"<main class="sl-card"><div class="sl-logo">Cloud</div><h1 data-i18n="title">Security verification</h1><p data-i18n="slide_prompt">Slide to complete the browser check.</p><div id="slTrack" class="sl-track" data-i18n-aria-label="slide_prompt" aria-label="Slide to verify"><div id="slFill" class="sl-fill"></div><div id="slHandle" class="sl-handle">&rsaquo;</div></div><div id="slStatus" class="sl-status" data-i18n="slide_status">Slide the handle to the highlighted zone</div><div class="sl-meta">Request ${{requestId}}</div><noscript><p class="sl-error" data-i18n="no_js">JavaScript is required for this verification.</p></noscript></main><script>(function(){{function msg(k){{return window.cloudNodeText?window.cloudNodeText(k):({{slide_retry:"Not quite there, please try again",verifying_browser:"Verifying browser...",verify_failed:"Verification failed, please retry"}}[k]||k)}}const token={token_js};const ret={ret_js};const route={route_js};const target={target};const prefix={prefix_js};const track=document.getElementById('slTrack');const handle=document.getElementById('slHandle');const fill=document.getElementById('slFill');const status=document.getElementById('slStatus');const zone=document.createElement('div');zone.style.cssText='position:absolute;top:4px;height:36px;width:28px;border-radius:999px;background:rgba(34,197,94,.25);box-shadow:0 0 0 1px rgba(34,197,94,.38) inset;left:'+(target+9)+'px';';track.appendChild(zone);const enc=new TextEncoder();let dragging=false,startX=0,current=0,start=Date.now(),trace=[];async function pow(){{let n=0;while(true){{const h=await crypto.subtle.digest('SHA-256',enc.encode(token+n));const x=Array.from(new Uint8Array(h)).map(b=>b.toString(16).padStart(2,'0')).join('');if(x.startsWith(prefix))return String(n);n++;if(n%200===0)await new Promise(r=>setTimeout(r,0));}}}}function setX(x){{current=Math.max(0,Math.min(260,x));handle.style.left=(current+3)+'px';fill.style.width=(current+42)+'px';trace.push(Math.round(current)+','+(Date.now()-start));}}track.addEventListener('pointerdown',e=>{{dragging=true;startX=e.clientX-current;track.setPointerCapture(e.pointerId);}});track.addEventListener('pointermove',e=>{{if(dragging)setX(e.clientX-startX);}});track.addEventListener('pointerup',async e=>{{if(!dragging)return;dragging=false;setX(e.clientX-startX);if(Math.abs(current-target)>16){{status.textContent=msg('slide_retry');status.className='sl-status sl-error';return;}}status.textContent=msg('verifying_browser');try{{const nonce=await pow();const qs=new URLSearchParams({{__waf_token:token,__waf_pow:nonce,__waf_elapsed:String(Date.now()-start),__waf_x:String(Math.round(current)),__waf_trace:trace.slice(-80).join(';'),__waf_return:ret,__waf_uam:'1'}});location.href=route+'?'+qs.toString();}}catch(_){{status.textContent=msg('verify_failed');status.className='sl-status sl-error';}}}});}})();</script>"#
     );
     format!(
-        "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}</style></head><body>{}</body></html>",
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security Verification</title><style>{}</style><script>{}</script></head><body>{}</body></html>",
         cloud_challenge_css(),
+        crate::pages::browser_i18n_script(),
         body
     )
 }

@@ -90,28 +90,27 @@ pub fn issue_html(
         format!("[{}]", items.join(","))
     };
 
-    let (instr, hint, done_text) = match lang {
+    let (instr, hint) = match lang {
         Lang::ZhCn => (
             "请按序号点击红色字符",
             "忽略灰色字符，只点红色",
-            "✓ 全部正确",
         ),
         Lang::En => (
             "Click the RED characters in numbered order",
             "Ignore grey — click only red",
-            "✓ All correct",
         ),
     };
 
     format!(
         r#"<div id="clk_{sfx}">
-<p style="margin:0 0 6px;font-size:14px;color:var(--muted)">{instr}</p>
-<p style="margin:0 0 6px;font-size:11px;color:var(--dim)">{hint}</p>
+<p data-i18n="click_instr" style="margin:0 0 6px;font-size:14px;color:var(--muted)">{instr}</p>
+<p data-i18n="click_hint" style="margin:0 0 6px;font-size:11px;color:var(--dim)">{hint}</p>
 <canvas id="cv_{sfx}" width="420" height="260" style="display:block;width:100%;max-width:420px;height:auto;margin:0 auto 10px;border-radius:14px;border:1px solid var(--card-border);cursor:crosshair;touch-action:none"></canvas>
 <p class="status" id="st_{sfx}" style="font-size:14px">&#160;</p>
 <div id="bf_{sfx}" style="display:none"></div>
 <script>
 (function(){{
+var msg=function(k){{return window.cloudNodeText?window.cloudNodeText(k):({{click_done:"All correct"}}[k]||k)}};
 var sf="{sfx}",tgts={targets_json},dcy={decoys_json},order={order_json},pos={pos_json};
 var clicked=Array(5).fill(!1),next=0,lastClick=0,t0=Date.now();
 var cv=document.getElementById('cv_'+sf),st=document.getElementById('st_'+sf),bf=document.getElementById('bf_'+sf);
@@ -176,7 +175,7 @@ cv.addEventListener('click',function(e){{
   ctx.fillStyle='#fff';ctx.font='bold 14px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
   ctx.fillText('✓',pos[best][0],pos[best][1]);
   if(next===5){{
-   st.textContent='{done_text}';st.style.color='var(--green)';
+   st.textContent='✓ '+msg('click_done');st.style.color='var(--green)';
    var el=Date.now()-t0;
    var f=document.createElement('form');f.method='GET';f.action='{route}';
    f.innerHTML='<input type="hidden" name="__waf_token" value="{wtok}"><input type="hidden" name="__waf_challenge_token" value="{tok}"><input type="hidden" name="__waf_challenge_type" value="click"><input type="hidden" name="__waf_click_seq" value=""><input type="hidden" name="__waf_elapsed" value="'+el+'"><input type="hidden" name="__waf_return" value="{rp}">';
@@ -198,7 +197,6 @@ cv.addEventListener('click',function(e){{
         pos_json = pos_json,
         instr = instr,
         hint = hint,
-        done_text = done_text,
         route = verify_route,
         rp = return_path,
         wtok = waf_token,
