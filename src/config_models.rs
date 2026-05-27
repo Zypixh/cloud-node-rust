@@ -198,15 +198,15 @@ pub struct WAFCaptchaOptions {
         deserialize_with = "deserialize_null_default"
     )]
     pub method: String,
-    #[serde(rename = "lifeSeconds", default)]
+    #[serde(rename = "lifeSeconds", alias = "life", default)]
     pub life_seconds: i32,
     #[serde(rename = "maxFails", default)]
     pub max_fails: i32,
     #[serde(rename = "failBlockTimeout", default)]
     pub fail_block_timeout: i32,
-    #[serde(rename = "failGlobal", default)]
+    #[serde(rename = "failGlobal", alias = "failBlockScopeAll", default)]
     pub fail_global: bool,
-    #[serde(default)]
+    #[serde(default, alias = "countLetters")]
     pub count: i32,
     #[serde(rename = "useGeetest", default)]
     pub use_geetest: bool,
@@ -226,11 +226,32 @@ pub struct WAFCaptchaOptions {
     pub challenge_difficulty: u8,
     #[serde(
         rename = "challengeLang",
+        alias = "lang",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub challenge_lang: String,
+    #[serde(rename = "geeTestConfig", default)]
+    pub geetest_config: Option<WAFGeeTestConfig>,
     pub ui: Option<WAFCaptchaUIOptions>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct WAFGeeTestConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(
+        rename = "captchaId",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub captcha_id: String,
+    #[serde(
+        rename = "captchaKey",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub captcha_key: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -265,13 +286,13 @@ pub struct WAFCaptchaUIOptions {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct WAFJSCookieOptions {
-    #[serde(rename = "lifeSeconds", default)]
+    #[serde(rename = "lifeSeconds", alias = "life", default)]
     pub life_seconds: i32,
     #[serde(rename = "maxFails", default)]
     pub max_fails: i32,
     #[serde(rename = "failBlockTimeout", default)]
     pub fail_block_timeout: i32,
-    #[serde(rename = "failGlobal", default)]
+    #[serde(rename = "failGlobal", alias = "failBlockScopeAll", default)]
     pub fail_global: bool,
 }
 
@@ -2496,6 +2517,12 @@ pub struct HTTPFirewallRef {
     pub is_on: bool,
     #[serde(rename = "ignoreGlobalRules", default)]
     pub ignore_global_rules: bool,
+    #[serde(
+        rename = "defaultCaptchaType",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub default_captcha_type: String,
     #[serde(
         alias = "Id",
         alias = "firewallPolicyId",

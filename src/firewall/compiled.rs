@@ -483,7 +483,7 @@ impl CompiledAction {
                     .and_then(|v| v.get("timeout"))
                     .and_then(Value::as_i64),
                 fail_global: options
-                    .and_then(|v| v.get("failGlobal"))
+                    .and_then(|v| v.get("failGlobal").or_else(|| v.get("failBlockScopeAll")))
                     .and_then(Value::as_bool),
                 scope: options
                     .and_then(|v| v.get("scope"))
@@ -601,7 +601,7 @@ impl CompiledAction {
             )),
             "captcha" | "js_cookie" | "get_302" | "post_307" => {
                 let life_seconds = options
-                    .and_then(|v| v.get("lifeSeconds"))
+                    .and_then(|v| v.get("lifeSeconds").or_else(|| v.get("life")))
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
                 let action = match code.as_str() {
@@ -620,10 +620,14 @@ impl CompiledAction {
                         .and_then(|v| v.get("failBlockTimeout"))
                         .and_then(Value::as_i64),
                     fail_global: options
-                        .and_then(|v| v.get("failGlobal"))
+                        .and_then(|v| v.get("failGlobal").or_else(|| v.get("failBlockScopeAll")))
                         .and_then(Value::as_bool),
-                    captcha_options: options
-                        .and_then(|value| serde_json::from_value(value.clone()).ok()),
+                    captcha_options: options.and_then(|value| {
+                        let mut parsed: WAFCaptchaOptions =
+                            serde_json::from_value(value.clone()).ok()?;
+                        crate::firewall::normalize_captcha_options(&mut parsed);
+                        Some(parsed)
+                    }),
                     js_cookie_options: options
                         .and_then(|value| serde_json::from_value(value.clone()).ok()),
                     ..Self::with_code(action, &code)
@@ -3099,6 +3103,87 @@ mod tests {
                 .map(|opts| opts.use_geetest),
             Some(true)
         );
+    }
+
+    #[test]
+    fn real_control_plane_captcha_fields_select_site_method() {
+        let action = json!({
+            "code":"captcha",
+            "options":{
+                "captchaType":"click",
+                "life":600,
+                "maxFails":100,
+                "failBlockTimeout":3600,
+                "failBlockScopeAll":true,
+                "countLetters":6,
+                "geeTestConfig":{
+                    "isOn":false,
+                    "captchaId":"",
+                    "captchaKey":""
+                },
+                "lang":""
+            }
+        });
+        let mut policy = test_policy(inbound_with_groups(vec![]));
+        policy.captcha_options = Some(WAFCaptchaOptions {
+            method: "geetest".to_string(),
+            use_geetest: true,
+            ..Default::default()
+        });
+
+        let mut legacy = legacy_action(&action);
+        crate::firewall::fill_action_options(&policy, &mut legacy);
+        let opts = legacy.captcha_options.as_ref().unwrap();
+        assert_eq!(opts.method, "click");
+        assert!(!opts.use_geetest);
+        assert_eq!(opts.life_seconds, 600);
+        assert_eq!(opts.max_fails, 100);
+        assert_eq!(opts.fail_block_timeout, 3600);
+        assert!(opts.fail_global);
+        assert_eq!(opts.count, 6);
+
+        let compiled = CompiledFirewallPolicy::compile(&policy);
+        let mut compiled_action = compiled_action(&action);
+        super::fill_action_from_policy(&mut compiled_action, &compiled, 10, 20);
+        let opts = compiled_action.captcha_options.as_ref().unwrap();
+        assert_eq!(opts.method, "click");
+        assert!(!opts.use_geetest);
+        assert_eq!(opts.life_seconds, 600);
+        assert_eq!(opts.max_fails, 100);
+        assert_eq!(opts.fail_block_timeout, 3600);
+        assert!(opts.fail_global);
+        assert_eq!(opts.count, 6);
+    }
+
+    #[test]
+    fn real_control_plane_geetest_fields_enable_geetest() {
+        let action = json!({
+            "code":"captcha",
+            "options":{}
+        });
+        let mut policy = test_policy(inbound_with_groups(vec![]));
+        policy.captcha_options = serde_json::from_value(json!({
+            "captchaType":"geetest",
+            "life":300,
+            "geeTestConfig":{
+                "isOn":true,
+                "captchaId":"gid",
+                "captchaKey":"gkey"
+            }
+        }))
+        .ok();
+        if let Some(options) = policy.captcha_options.as_mut() {
+            crate::firewall::normalize_captcha_options(options);
+        }
+
+        let mut legacy = legacy_action(&action);
+        crate::firewall::fill_action_options(&policy, &mut legacy);
+        let opts = legacy.captcha_options.as_ref().unwrap();
+        assert_eq!(opts.method, "geetest");
+        assert!(opts.use_geetest);
+        assert_eq!(opts.geetest_id, "gid");
+        assert_eq!(opts.geetest_key, "gkey");
+        assert_eq!(opts.life_seconds, 300);
     }
 
     #[test]

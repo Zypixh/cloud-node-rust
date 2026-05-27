@@ -2354,7 +2354,10 @@ impl EdgeProxy {
             .iter()
             .find(|global| global.code == matched.action_code)
             .and_then(|global| {
-                serde_json::from_value::<WAFCaptchaOptions>(global.options.clone()).ok()
+                let mut parsed: WAFCaptchaOptions =
+                    serde_json::from_value(global.options.clone()).ok()?;
+                crate::firewall::normalize_captcha_options(&mut parsed);
+                Some(parsed)
             });
         Self::resolve_waf_challenge_method(
             &matched.action_code,
@@ -2386,7 +2389,7 @@ impl EdgeProxy {
         }
 
         let global_use_geetest = global_opts
-            .map(|options| options.use_geetest)
+            .map(crate::firewall::captcha_options_use_geetest)
             .unwrap_or(false);
         let method = match global_opts {
             Some(options) => match Self::parse_waf_challenge_method(&options.method) {
@@ -2404,6 +2407,40 @@ impl EdgeProxy {
         } else {
             method.to_string()
         }
+    }
+
+    fn apply_site_default_captcha_type(
+        matched: &mut crate::firewall::MatchedAction,
+        firewall_ref: Option<&crate::config_models::HTTPFirewallRef>,
+        inherited_options: Option<&crate::config_models::WAFCaptchaOptions>,
+    ) {
+        if matched.action_code == "captcha" {
+            if let Some(default_type) = firewall_ref
+                .map(|fw_ref| fw_ref.default_captcha_type.trim())
+                .filter(|value| !crate::firewall::captcha_method_is_default(value))
+            {
+                let options = matched.captcha_options.get_or_insert_with(Default::default);
+                if crate::firewall::captcha_method_is_default(&options.method) {
+                    options.method = default_type.to_string();
+                }
+            }
+            if let Some(inherited_options) = inherited_options {
+                let options = matched.captcha_options.get_or_insert_with(Default::default);
+                crate::firewall::merge_captcha_options(options, inherited_options);
+            }
+        }
+        for chained in &mut matched.chained_actions {
+            Self::apply_site_default_captcha_type(chained, firewall_ref, inherited_options);
+        }
+    }
+
+    fn inherited_global_captcha_options(
+        global_policies: &[crate::config_models::HTTPFirewallPolicy],
+    ) -> Option<&crate::config_models::WAFCaptchaOptions> {
+        global_policies
+            .iter()
+            .filter(|policy| policy.is_on && policy.mode != "bypass")
+            .find_map(|policy| policy.captcha_options.as_ref())
     }
 
     fn uam_config_hash(
@@ -5803,6 +5840,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                             global
                                 .options
                                 .get("lifeSeconds")
+                                .or_else(|| global.options.get("life"))
                                 .and_then(serde_json::Value::as_i64)
                                 .unwrap_or(0),
                             global
@@ -5818,6 +5856,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                             global
                                 .options
                                 .get("failGlobal")
+                                .or_else(|| global.options.get("failBlockScopeAll"))
                                 .and_then(serde_json::Value::as_bool)
                                 .unwrap_or(false),
                         )
@@ -6395,6 +6434,13 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                                 ctx.server.as_deref(),
                             )
                         };
+                    }
+                    if let Some(action) = &mut waf_match {
+                        Self::apply_site_default_captcha_type(
+                            action,
+                            Some(firewall_ref),
+                            Self::inherited_global_captcha_options(global_policies),
+                        );
                     }
                 }
             }
@@ -9818,6 +9864,31 @@ mod tests {
     use super::EdgeProxy;
 
     #[test]
+    fn firewall_ref_parses_real_default_captcha_type_field() {
+        let server: crate::config_models::ServerConfig =
+            serde_json::from_value(serde_json::json!({
+                "id":826,
+                "serverNames":[{"name":"fuck.371458.xyz","type":"full"}],
+                "web":{
+                    "firewallRef":{
+                        "isOn":true,
+                        "firewallPolicyId":144,
+                        "ignoreGlobalRules":false,
+                        "defaultCaptchaType":"click"
+                    }
+                }
+            }))
+            .unwrap();
+        let firewall_ref = server
+            .web
+            .as_ref()
+            .and_then(|web| web.firewall_ref.as_ref())
+            .unwrap();
+        assert_eq!(firewall_ref.id, 144);
+        assert_eq!(firewall_ref.default_captcha_type, "click");
+    }
+
+    #[test]
     fn redirect_to_https_defaults_to_301_and_preserves_valid_status() {
         assert_eq!(EdgeProxy::redirect_to_https_status(0), 301);
         assert_eq!(EdgeProxy::redirect_to_https_status(999), 301);
@@ -9985,6 +10056,121 @@ mod tests {
                 Some(&cluster_geetest),
             ),
             "slider"
+        );
+    }
+
+    #[test]
+    fn waf_site_firewall_ref_default_captcha_type_overrides_empty_action_method() {
+        let firewall_ref = crate::config_models::HTTPFirewallRef {
+            is_on: true,
+            ignore_global_rules: false,
+            default_captcha_type: "click".to_string(),
+            id: 144,
+        };
+        let cluster_geetest = crate::config_models::WAFCaptchaOptions {
+            method: "geetest".to_string(),
+            use_geetest: true,
+            ..Default::default()
+        };
+        let mut matched = crate::firewall::MatchedAction {
+            action: crate::firewall::ActionResponse::Captcha { life_seconds: 0 },
+            policy_id: 144,
+            group_id: 206,
+            set_id: 218,
+            action_code: "captcha".to_string(),
+            timeout_secs: None,
+            max_timeout_secs: None,
+            life_seconds: Some(0),
+            max_fails: None,
+            fail_block_timeout: None,
+            fail_global: None,
+            scope: None,
+            block_c_class: false,
+            use_local_firewall: false,
+            next_group_id: None,
+            next_set_id: None,
+            allow_scope: None,
+            tags: vec![],
+            ip_list_id: 0,
+            event_level: String::new(),
+            block_options: None,
+            page_options: None,
+            captcha_options: Some(Default::default()),
+            js_cookie_options: None,
+            chained_actions: vec![],
+            observe_only: false,
+        };
+
+        EdgeProxy::apply_site_default_captcha_type(
+            &mut matched,
+            Some(&firewall_ref),
+            Some(&cluster_geetest),
+        );
+        assert_eq!(
+            EdgeProxy::resolve_waf_challenge_method(
+                "captcha",
+                false,
+                matched.captcha_options.as_ref(),
+                Some(&cluster_geetest),
+            ),
+            "click"
+        );
+    }
+
+    #[test]
+    fn waf_site_firewall_ref_default_captcha_type_default_follows_global() {
+        let firewall_ref = crate::config_models::HTTPFirewallRef {
+            is_on: true,
+            ignore_global_rules: false,
+            default_captcha_type: "default".to_string(),
+            id: 144,
+        };
+        let cluster_geetest = crate::config_models::WAFCaptchaOptions {
+            method: "geetest".to_string(),
+            ..Default::default()
+        };
+        let mut matched = crate::firewall::MatchedAction {
+            action: crate::firewall::ActionResponse::Captcha { life_seconds: 0 },
+            policy_id: 144,
+            group_id: 206,
+            set_id: 218,
+            action_code: "captcha".to_string(),
+            timeout_secs: None,
+            max_timeout_secs: None,
+            life_seconds: Some(0),
+            max_fails: None,
+            fail_block_timeout: None,
+            fail_global: None,
+            scope: None,
+            block_c_class: false,
+            use_local_firewall: false,
+            next_group_id: None,
+            next_set_id: None,
+            allow_scope: None,
+            tags: vec![],
+            ip_list_id: 0,
+            event_level: String::new(),
+            block_options: None,
+            page_options: None,
+            captcha_options: Some(Default::default()),
+            js_cookie_options: None,
+            chained_actions: vec![],
+            observe_only: false,
+        };
+
+        EdgeProxy::apply_site_default_captcha_type(
+            &mut matched,
+            Some(&firewall_ref),
+            Some(&cluster_geetest),
+        );
+        assert_eq!(
+            EdgeProxy::resolve_waf_challenge_method(
+                "captcha",
+                false,
+                matched.captcha_options.as_ref(),
+                Some(&cluster_geetest),
+            ),
+            "geetest"
         );
     }
 

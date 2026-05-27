@@ -516,7 +516,9 @@ fn normalize_action_code(code: &str) -> String {
 }
 
 fn captcha_options_from_value(options: Option<&Value>) -> Option<WAFCaptchaOptions> {
-    serde_json::from_value(options?.clone()).ok()
+    let mut parsed: WAFCaptchaOptions = serde_json::from_value(options?.clone()).ok()?;
+    normalize_captcha_options(&mut parsed);
+    Some(parsed)
 }
 
 pub(crate) fn captcha_method_is_default(method: &str) -> bool {
@@ -528,22 +530,45 @@ pub(crate) fn captcha_method_is_default(method: &str) -> bool {
 }
 
 fn inherited_captcha_method(policy: &WAFCaptchaOptions) -> String {
-    if policy.use_geetest {
+    if captcha_options_use_geetest(policy) {
         "geetest".to_string()
     } else {
         policy.method.clone()
     }
 }
 
+pub(crate) fn normalize_captcha_options(options: &mut WAFCaptchaOptions) {
+    if let Some(config) = &options.geetest_config {
+        options.use_geetest = options.use_geetest || config.is_on;
+        if options.geetest_id.trim().is_empty() {
+            options.geetest_id = config.captcha_id.clone();
+        }
+        if options.geetest_key.trim().is_empty() {
+            options.geetest_key = config.captcha_key.clone();
+        }
+    }
+}
+
+pub(crate) fn captcha_options_use_geetest(options: &WAFCaptchaOptions) -> bool {
+    options.use_geetest
+        || options
+            .geetest_config
+            .as_ref()
+            .map(|config| config.is_on)
+            .unwrap_or(false)
+}
+
 fn js_cookie_options_from_value(options: Option<&Value>) -> Option<WAFJSCookieOptions> {
     serde_json::from_value(options?.clone()).ok()
 }
 
-fn merge_captcha_options(
+pub(crate) fn merge_captcha_options(
     action: &mut WAFCaptchaOptions,
     policy: &WAFCaptchaOptions,
 ) {
     let inherit_method = captcha_method_is_default(&action.method);
+    let should_copy_geetest_config =
+        inherit_method || action.use_geetest || action.method.trim().eq_ignore_ascii_case("geetest");
     if action.life_seconds <= 0 {
         action.life_seconds = policy.life_seconds;
     }
@@ -558,13 +583,17 @@ fn merge_captcha_options(
         action.count = policy.count;
     }
     if inherit_method {
-        action.use_geetest = action.use_geetest || policy.use_geetest;
+        action.use_geetest = action.use_geetest || captcha_options_use_geetest(policy);
     }
-    if action.geetest_id.trim().is_empty() {
+    if should_copy_geetest_config && action.geetest_id.trim().is_empty() {
         action.geetest_id = policy.geetest_id.clone();
     }
-    if action.geetest_key.trim().is_empty() {
+    if should_copy_geetest_config && action.geetest_key.trim().is_empty() {
         action.geetest_key = policy.geetest_key.clone();
+    }
+    if should_copy_geetest_config && action.geetest_config.is_none() {
+        action.geetest_config = policy.geetest_config.clone();
+        normalize_captcha_options(action);
     }
     if inherit_method {
         action.method = inherited_captcha_method(policy);
@@ -685,7 +714,7 @@ fn parse_action(action: &Value) -> Option<MatchedAction> {
                 max_fails: None,
                 fail_block_timeout: None,
                 fail_global: options
-                    .and_then(|v| v.get("failGlobal"))
+                    .and_then(|v| v.get("failGlobal").or_else(|| v.get("failBlockScopeAll")))
                     .and_then(Value::as_bool),
                 scope,
                 block_c_class: false,
@@ -1042,7 +1071,7 @@ fn parse_action(action: &Value) -> Option<MatchedAction> {
         }
         "captcha" | "js_cookie" | "get_302" | "post_307" => {
             let life = options
-                .and_then(|v| v.get("lifeSeconds"))
+                .and_then(|v| v.get("lifeSeconds").or_else(|| v.get("life")))
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
             let max_fails = options
@@ -1053,7 +1082,7 @@ fn parse_action(action: &Value) -> Option<MatchedAction> {
                 .and_then(|v| v.get("failBlockTimeout"))
                 .and_then(Value::as_i64);
             let fail_global = options
-                .and_then(|v| v.get("failGlobal"))
+                .and_then(|v| v.get("failGlobal").or_else(|| v.get("failBlockScopeAll")))
                 .and_then(Value::as_bool);
             let action = match code.as_str() {
                 "captcha" => ActionResponse::Captcha { life_seconds: life },

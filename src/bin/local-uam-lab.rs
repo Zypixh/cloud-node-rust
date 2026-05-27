@@ -454,6 +454,7 @@ fn web_config_with_waf(action: &str, method: Option<&str>, life_seconds: i32) ->
     web.firewall_ref = Some(HTTPFirewallRef {
         is_on: true,
         ignore_global_rules: true,
+        default_captcha_type: String::new(),
         id: 0,
     });
     web.firewall_policy = Some(waf_policy(action, method, life_seconds));
