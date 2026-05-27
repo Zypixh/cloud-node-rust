@@ -39,12 +39,18 @@ pub fn issue_html(
 
     let (prompt, ph, btn, refresh, hint) = match lang {
         Lang::ZhCn => (
-            "请输入黑色字符（忽略灰色小字）", "输入验证码", "验证", "点击刷新",
+            "请输入黑色字符（忽略灰色小字）",
+            "输入验证码",
+            "验证",
+            "点击刷新",
             "只输入黑色大字，灰色小字是干扰项",
         ),
         Lang::En => (
-            "Enter the BLACK characters (ignore grey)", "Enter code", "Verify",
-            "Click to refresh", "Only enter the black characters — grey are decoys",
+            "Enter the BLACK characters (ignore grey)",
+            "Enter code",
+            "Verify",
+            "Click to refresh",
+            "Only enter the black characters — grey are decoys",
         ),
     };
 
@@ -167,18 +173,35 @@ btn.onclick=function(){{
 }})();
 </script>
 </div>"#,
-        sfx=sfx, prompt=prompt, hint=hint, ph=ph, btn=btn, refresh=refresh,
-        route=verify_route, rp=return_path, wtok=waf_token, tok=enc_token, cjson=chars_json_str,
+        sfx = sfx,
+        prompt = prompt,
+        hint = hint,
+        ph = ph,
+        btn = btn,
+        refresh = refresh,
+        route = verify_route,
+        rp = return_path,
+        wtok = waf_token,
+        tok = enc_token,
+        cjson = chars_json_str,
     )
 }
 
 pub fn verify(token: &str, answer_hash: &str, secret: &[u8]) -> bool {
     let payload = match crate::pages::challenges::decode_challenge_token(token, secret) {
-        Some(p) => p, None => return false
+        Some(p) => p,
+        None => return false,
     };
-    if is_token_expired(&payload) { return false; }
-    let stored = match payload.get("p").and_then(|v| v.get("ah")).and_then(|v| v.as_str()) {
-        Some(s) => s, None => return false
+    if is_token_expired(&payload) {
+        return false;
+    }
+    let stored = match payload
+        .get("p")
+        .and_then(|v| v.get("ah"))
+        .and_then(|v| v.as_str())
+    {
+        Some(s) => s,
+        None => return false,
     };
     stored.len() == 64 && answer_hash.len() == 64 && stored == answer_hash
 }

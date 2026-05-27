@@ -11,6 +11,7 @@ pub struct ChallengeFailureConfig {
     pub max_fails: i32,
     pub fail_block_timeout: i64,
     pub fail_global: bool,
+    pub pow_difficulty: u8,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -29,6 +30,8 @@ struct ChallengePayload {
     fail_block_timeout: i64,
     #[serde(default)]
     fail_global: bool,
+    #[serde(default)]
+    pow_difficulty: u8,
 }
 
 pub struct WafVerifier {
@@ -65,6 +68,7 @@ impl WafVerifier {
                 max_fails: 0,
                 fail_block_timeout: 0,
                 fail_global: false,
+                pow_difficulty: 4,
             },
         )
     }
@@ -96,6 +100,7 @@ impl WafVerifier {
             max_fails: failure_config.max_fails.max(0),
             fail_block_timeout: failure_config.fail_block_timeout.max(0),
             fail_global: failure_config.fail_global,
+            pow_difficulty: Self::normalize_pow_difficulty(failure_config.pow_difficulty),
         };
 
         let plaintext = serde_json::to_vec(&payload).unwrap();
@@ -185,7 +190,21 @@ impl WafVerifier {
             max_fails: payload.max_fails.max(0),
             fail_block_timeout: payload.fail_block_timeout.max(0),
             fail_global: payload.fail_global,
+            pow_difficulty: Self::normalize_pow_difficulty(payload.pow_difficulty),
         })
+    }
+
+    pub fn token_pow_difficulty(&self, ip: &str, ua: &str, token: &str) -> Option<u8> {
+        self.token_failure_config(ip, ua, token)
+            .map(|config| Self::normalize_pow_difficulty(config.pow_difficulty))
+    }
+
+    fn normalize_pow_difficulty(difficulty: u8) -> u8 {
+        if difficulty == 0 {
+            4
+        } else {
+            difficulty.clamp(1, 8)
+        }
     }
 
     fn decrypt_payload(

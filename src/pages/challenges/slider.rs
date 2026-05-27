@@ -13,7 +13,7 @@ pub fn issue_html(
     target_anchor: u32,
 ) -> String {
     let tx = (target_anchor % 260) as f64;
-    let ty = ((target_anchor.wrapping_mul(17) % 160)) as f64;
+    let ty = (target_anchor.wrapping_mul(17) % 160) as f64;
     issue_html_with_target(lang, waf_token, verify_route, return_path, tx, ty)
 }
 
@@ -35,7 +35,11 @@ pub fn issue_html_with_target(
 
     let (prompt, _ok, _fail) = match lang {
         Lang::ZhCn => ("拖动拼图块到缺口位置", "验证成功", "位置未对准，请重试"),
-        Lang::En => ("Drag the puzzle piece to the gap", "Verified", "Misaligned, try again"),
+        Lang::En => (
+            "Drag the puzzle piece to the gap",
+            "Verified",
+            "Misaligned, try again",
+        ),
     };
     let rp_js = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
     let route_js = serde_json::to_string(verify_route).unwrap_or_else(|_| "\"/\"".to_string());
@@ -100,23 +104,52 @@ const TOLERANCE: f64 = 6.0;
 const MIN_ELAPSED_MS: u64 = 1200;
 
 /// Re-derive the target from the verifier's `slider_target()` anchor.
-pub fn verify_anchor(target_anchor: u32, user_x: f64, user_y: f64, elapsed_ms: u64, trace: &str) -> bool {
+pub fn verify_anchor(
+    target_anchor: u32,
+    user_x: f64,
+    user_y: f64,
+    elapsed_ms: u64,
+    trace: &str,
+) -> bool {
     let tx = (target_anchor % 260) as f64;
-    let ty = ((target_anchor.wrapping_mul(17) % 160)) as f64;
-    (user_x - tx).abs() <= TOLERANCE && (user_y - ty).abs() <= TOLERANCE
-        && elapsed_ms >= MIN_ELAPSED_MS && verify_trace(trace)
+    let ty = (target_anchor.wrapping_mul(17) % 160) as f64;
+    (user_x - tx).abs() <= TOLERANCE
+        && (user_y - ty).abs() <= TOLERANCE
+        && elapsed_ms >= MIN_ELAPSED_MS
+        && verify_trace(trace)
 }
 
 /// Verify with explicit target from encrypted token (standalone / test).
-pub fn verify_explicit(token: &str, user_x: f64, user_y: f64, elapsed_ms: u64, trace: &str, secret: &[u8]) -> bool {
-    let payload = match crate::pages::challenges::decode_challenge_token(token, secret) { Some(p) => p, None => return false };
-    if crate::pages::challenges::is_token_expired(&payload) { return false; }
-    let p = match payload.get("p").and_then(|v| v.as_object()) { Some(p) => p, None => return false };
-    let (tx, ty) = match (p.get("tx").and_then(|v| v.as_f64()), p.get("ty").and_then(|v| v.as_f64())) {
-        (Some(x), Some(y)) => (x, y), _ => return false
+pub fn verify_explicit(
+    token: &str,
+    user_x: f64,
+    user_y: f64,
+    elapsed_ms: u64,
+    trace: &str,
+    secret: &[u8],
+) -> bool {
+    let payload = match crate::pages::challenges::decode_challenge_token(token, secret) {
+        Some(p) => p,
+        None => return false,
     };
-    (user_x - tx).abs() <= TOLERANCE && (user_y - ty).abs() <= TOLERANCE
-        && elapsed_ms >= MIN_ELAPSED_MS && verify_trace(trace)
+    if crate::pages::challenges::is_token_expired(&payload) {
+        return false;
+    }
+    let p = match payload.get("p").and_then(|v| v.as_object()) {
+        Some(p) => p,
+        None => return false,
+    };
+    let (tx, ty) = match (
+        p.get("tx").and_then(|v| v.as_f64()),
+        p.get("ty").and_then(|v| v.as_f64()),
+    ) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return false,
+    };
+    (user_x - tx).abs() <= TOLERANCE
+        && (user_y - ty).abs() <= TOLERANCE
+        && elapsed_ms >= MIN_ELAPSED_MS
+        && verify_trace(trace)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -125,7 +158,9 @@ fn random_js_id() -> String {
     use rand::Rng;
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
-    (0..8).map(|_| CHARS[rng.r#gen_range(0..CHARS.len())] as char).collect()
+    (0..8)
+        .map(|_| CHARS[rng.r#gen_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 fn generate_puzzle_polygon(rng: &mut impl Rng) -> String {
@@ -152,16 +187,23 @@ fn verify_trace(trace: &str) -> bool {
             Some((x, y))
         })
         .collect();
-    if points.len() < 5 { return false; }
+    if points.len() < 5 {
+        return false;
+    }
     let (x1, y1) = points[0];
     let (x2, y2) = points[points.len() - 1];
     let dx = x2 - x1;
     let dy = y2 - y1;
     let line_len = (dx * dx + dy * dy).sqrt();
-    if line_len < 10.0 { return false; }
-    let max_dev = points.iter().map(|(x, y)| {
-        let cross = ((x - x1) * dy - (y - y1) * dx).abs();
-        cross / line_len
-    }).fold(0.0f64, f64::max);
+    if line_len < 10.0 {
+        return false;
+    }
+    let max_dev = points
+        .iter()
+        .map(|(x, y)| {
+            let cross = ((x - x1) * dy - (y - y1) * dx).abs();
+            cross / line_len
+        })
+        .fold(0.0f64, f64::max);
     max_dev > 2.0
 }

@@ -1,6 +1,7 @@
-pub mod slider;
-pub mod click;
 pub mod captcha;
+pub mod click;
+pub mod jscookie;
+pub mod slider;
 
 use aes_gcm::{
     aead::{Aead, KeyInit},

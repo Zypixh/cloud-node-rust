@@ -19,10 +19,10 @@ impl UamMode {
             .collect::<String>();
         match normalized.as_str() {
             "pow" | "proofofwork" => Self::Pow,
-            "captcha" => Self::Captcha,
-            "slider" | "slide" => Self::Slider,
-            "jscookie" | "cookie" | "js" | "javascriptcookie" => Self::JsCookie,
-            _ => Self::JsCookie,
+            "captcha" => Self::Pow,
+            "slider" | "slide" => Self::Pow,
+            "jscookie" | "cookie" | "js" | "javascriptcookie" => Self::Pow,
+            _ => Self::Pow,
         }
     }
 }
@@ -66,8 +66,9 @@ impl UamChallenge for PowChallenge {
             ctx.return_path,
         );
         format!(
-            "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}</style></head><body><main class='sl-card'><div class='sl-logo'>Cloud</div><h1>Checking your browser</h1><p>Please wait while we compute proof of work ({difficulty}).</p><div class='sl-progress'><span></span></div><div class='sl-meta'>Request ${{requestId}}</div></main><script>{pow_script}</script></body></html>",
-            cloud_challenge_css()
+            "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Security verification</title><style>{}{}</style></head><body><main class='sl-card'><div class='sl-logo'>Cloud</div><h1>Checking your browser</h1><p>Please wait while we compute proof of work ({difficulty}).</p><div class='sl-progress'><span id='slPowBar'></span></div><div id='slPowStatus' class='sl-status'>Preparing proof of work...</div><div class='sl-meta'>Request ${{requestId}}</div></main><script>{pow_script}</script></body></html>",
+            cloud_challenge_css(),
+            pow_progress_css()
         )
     }
 }
@@ -107,10 +108,52 @@ fn get_pow_script(
     let challenge = serde_json::to_string(challenge).unwrap_or_else(|_| "\"\"".to_string());
     let route = serde_json::to_string(verify_route).unwrap_or_else(|_| "\"/\"".to_string());
     let ret = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
-    let timeout_ms = life_seconds * 1000;
-    format!(
-        r#"(function(){{const challenge={challenge};const difficulty={difficulty};const route={route};const ret={ret};const timeoutMs={timeout_ms};const prefix="0".repeat(difficulty);const encoder=new TextEncoder();const start=Date.now();let nonce=0;async function solve(){{while(true){{if(Date.now()-start>timeoutMs){{location.reload();return;}}const data=encoder.encode(challenge+nonce);const hashBuffer=await crypto.subtle.digest('SHA-256',data);const hashArray=Array.from(new Uint8Array(hashBuffer));const hashHex=hashArray.map(b=>b.toString(16).padStart(2,'0')).join('');if(hashHex.startsWith(prefix)){{const qs=new URLSearchParams({{__waf_token:challenge,__waf_pow:String(nonce),__waf_return:ret,__waf_uam:'1'}});location.replace(route+'?'+qs.toString());return;}}nonce++;if(nonce%200===0){{await new Promise(resolve=>setTimeout(resolve,0));}}}}}}solve();}})();"#
-    )
+    let timeout_ms = life_seconds.max(1) * 1000;
+    let inner = format!(
+        r#"(function(){{
+	const C={challenge},D={difficulty},R={route},RET={ret},T={timeout_ms},MIN=5000;
+	const P="0".repeat(D),E=new TextEncoder(),S=Date.now(),B=64;
+	let n=0,last=0,done=false;
+	const $=id=>document.getElementById(id),bar=$("slPowBar"),st=$("slPowStatus");
+	function setPct(p){{if(bar)bar.style.width=Math.max(3,Math.min(100,p)).toFixed(2)+"%";}}
+	function tick(){{
+	 const dt=Math.max(1,Date.now()-S), rate=Math.floor(n*1000/dt);
+	 const timePct=Math.min(88,3+(Date.now()-S)/Math.max(MIN,T)*85);
+	 const workPct=Math.min(88,3+(n/Math.pow(16,D))*85);
+	 setPct(Math.max(timePct,workPct));
+	 if(st)st.textContent="Computing proof... nonce "+n.toLocaleString()+" | "+rate.toLocaleString()+"/s | difficulty "+D;
+	}}
+	async function h(x){{const b=new Uint8Array(await crypto.subtle.digest("SHA-256",E.encode(C+x)));return Array.from(b).map(v=>v.toString(16).padStart(2,"0")).join("")}}
+	async function batch(start){{
+	 const jobs=[];
+	 for(let i=0;i<B;i++)jobs.push(h(start+i));
+	 const hashes=await Promise.all(jobs);
+	 for(let i=0;i<hashes.length;i++)if(hashes[i].startsWith(P))return start+i;
+	 return -1;
+	}}
+	async function run(){{
+	 while(!done){{
+	  if(Date.now()-S>T){{location.reload();return;}}
+	  const found=await batch(n);
+	  if(found>=0){{
+	   done=true;
+	   const finishMs=Math.max(600,MIN-(Date.now()-S));
+	   setPct(92);
+	   if(st)st.textContent="Proof complete, finishing browser check...";
+	   const go=()=>{{setPct(100);const q=new URLSearchParams({{__waf_token:C,__waf_pow:String(found),__waf_return:RET,__waf_uam:"1"}});location.replace(R+"?"+q.toString());}};
+	   const finStart=Date.now();
+	   const fin=setInterval(()=>setPct(92+Math.min(8,(Date.now()-finStart)/Math.max(1,finishMs)*8)),120);
+	   setTimeout(()=>{{clearInterval(fin);go();}},finishMs);return;
+	  }}
+	  n+=B;
+	  if(n-last>=512){{last=n;tick();await new Promise(r=>setTimeout(r,0));}}
+	 }}
+	}}
+tick();run();
+}})();"#
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(inner.as_bytes());
+    format!("eval(atob('{}'))", encoded)
 }
 
 /// Obfuscated JS cookie verification script.
@@ -180,6 +223,10 @@ pub fn random_challenge_mode(secret: &[u8], token_seed: u64) -> u8 {
 
 fn cloud_challenge_css() -> &'static str {
     r#":root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f8fb;color:#1f2937}.sl-card{width:min(92vw,430px);padding:36px 32px;border-radius:16px;background:#fff;border:1px solid #e5e7eb;box-shadow:0 18px 50px rgba(15,23,42,.12);text-align:center}.sl-logo{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 14px;border-radius:999px;background:#16a34a;color:#fff;font-weight:700;margin-bottom:22px}h1{margin:0 0 12px;font-size:24px;font-weight:700}p{margin:0 0 24px;color:#667085;line-height:1.6}.sl-progress,.sl-track{height:44px;border-radius:999px;background:#eef2f7;overflow:hidden;position:relative}.sl-progress span{display:block;width:38%;height:100%;border-radius:999px;background:linear-gradient(90deg,#22c55e,#0ea5e9);animation:slPulse 1.25s ease-in-out infinite}.sl-track{touch-action:none;cursor:pointer;border:1px solid #d8dee8}.sl-fill{position:absolute;inset:0 auto 0 0;width:0;background:linear-gradient(90deg,#22c55e,#0ea5e9);border-radius:999px}.sl-handle{position:absolute;top:3px;left:3px;width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:#fff;color:#16a34a;font-weight:800;box-shadow:0 4px 14px rgba(15,23,42,.2);user-select:none}.sl-status{margin-top:14px;font-size:14px;color:#667085}.sl-meta{margin-top:18px;font-size:12px;color:#98a2b3}.sl-error{color:#dc2626}@keyframes slPulse{0%,100%{transform:translateX(-22%)}50%{transform:translateX(180%)}}@media (prefers-color-scheme:dark){body{background:#111827;color:#f9fafb}.sl-card{background:#182230;border-color:#263244}.sl-progress,.sl-track{background:#263244}p,.sl-status{color:#aeb8c7}.sl-meta{color:#667085}}"#
+}
+
+fn pow_progress_css() -> &'static str {
+    r#"#slPowBar{width:3%;animation:none;position:relative;overflow:hidden;transition:width .22s linear}#slPowBar:after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.42),transparent);transform:translateX(-100%);animation:slPowShine 1.1s linear infinite}#slPowStatus{min-height:40px;display:flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums;line-height:1.35}@keyframes slPowShine{to{transform:translateX(100%)}}"#
 }
 
 fn cloud_slider_html(ctx: &UamIssueCtx) -> String {

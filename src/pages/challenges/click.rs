@@ -20,7 +20,8 @@ pub fn issue_html(
 
     let pool: Vec<char> = match lang {
         Lang::ZhCn => "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏"
-            .chars().collect(),
+            .chars()
+            .collect(),
         Lang::En => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".chars().collect(),
     };
 
@@ -29,13 +30,17 @@ pub fn issue_html(
     let mut used = std::collections::HashSet::new();
     while chosen.len() < 10 {
         let c = pool[rng.r#gen_range(0..pool.len())];
-        if used.insert(c) { chosen.push(c); }
+        if used.insert(c) {
+            chosen.push(c);
+        }
     }
     let targets: Vec<char> = chosen[..5].to_vec();
     let decoys: Vec<char> = chosen[5..].to_vec();
 
     let mut target_order: Vec<usize> = (0..5).collect();
-    for i in (1..5).rev() { target_order.swap(i, rng.r#gen_range(0..=i)); }
+    for i in (1..5).rev() {
+        target_order.swap(i, rng.r#gen_range(0..=i));
+    }
 
     // Scatter all 10 positions with minimum spacing
     let positions: Vec<(u32, u32)> = {
@@ -48,7 +53,10 @@ pub fn issue_html(
                     let dx = *px as i32 - x as i32;
                     let dy = *py as i32 - y as i32;
                     dx * dx + dy * dy > 2500
-                }) { pos.push((x, y)); break; }
+                }) {
+                    pos.push((x, y));
+                    break;
+                }
             }
         }
         pos
@@ -71,7 +79,10 @@ pub fn issue_html(
         format!("[{}]", items.join(","))
     };
     let pos_json: String = {
-        let items: Vec<String> = positions.iter().map(|(x, y)| format!("[{},{}]", x, y)).collect();
+        let items: Vec<String> = positions
+            .iter()
+            .map(|(x, y)| format!("[{},{}]", x, y))
+            .collect();
         format!("[{}]", items.join(","))
     };
     let order_json: String = {
@@ -81,14 +92,19 @@ pub fn issue_html(
 
     let (instr, hint, done_text) = match lang {
         Lang::ZhCn => (
-            "请按序号点击红色字符", "忽略灰色字符，只点红色", "✓ 全部正确",
+            "请按序号点击红色字符",
+            "忽略灰色字符，只点红色",
+            "✓ 全部正确",
         ),
         Lang::En => (
-            "Click the RED characters in numbered order", "Ignore grey — click only red", "✓ All correct",
+            "Click the RED characters in numbered order",
+            "Ignore grey — click only red",
+            "✓ All correct",
         ),
     };
 
-    format!(r#"<div id="clk_{sfx}">
+    format!(
+        r#"<div id="clk_{sfx}">
 <p style="margin:0 0 6px;font-size:14px;color:var(--muted)">{instr}</p>
 <p style="margin:0 0 6px;font-size:11px;color:var(--dim)">{hint}</p>
 <canvas id="cv_{sfx}" width="420" height="260" style="display:block;width:100%;max-width:420px;height:auto;margin:0 auto 10px;border-radius:14px;border:1px solid var(--card-border);cursor:crosshair;touch-action:none"></canvas>
@@ -175,24 +191,45 @@ cv.addEventListener('click',function(e){{
 }})();
 </script>
 </div>"#,
-        sfx=sfx, targets_json=targets_json, decoys_json=decoys_json,
-        order_json=order_json, pos_json=pos_json,
-        instr=instr, hint=hint, done_text=done_text,
-        route=verify_route, rp=return_path, wtok=waf_token, tok=enc_token,
+        sfx = sfx,
+        targets_json = targets_json,
+        decoys_json = decoys_json,
+        order_json = order_json,
+        pos_json = pos_json,
+        instr = instr,
+        hint = hint,
+        done_text = done_text,
+        route = verify_route,
+        rp = return_path,
+        wtok = waf_token,
+        tok = enc_token,
     )
 }
 
 pub fn verify(token: &str, sequence: &[usize], elapsed_ms: u64, secret: &[u8]) -> bool {
     let payload = match crate::pages::challenges::decode_challenge_token(token, secret) {
-        Some(p) => p, None => return false
+        Some(p) => p,
+        None => return false,
     };
-    if is_token_expired(&payload) { return false; }
-    let p = match payload.get("p").and_then(|v| v.as_object()) { Some(p) => p, None => return false };
+    if is_token_expired(&payload) {
+        return false;
+    }
+    let p = match payload.get("p").and_then(|v| v.as_object()) {
+        Some(p) => p,
+        None => return false,
+    };
     let target: Vec<usize> = match p.get("to").and_then(|v| v.as_array()) {
-        Some(a) => a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect(),
-        None => return false
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_u64().map(|x| x as usize))
+            .collect(),
+        None => return false,
     };
-    if target.len() != 5 || sequence.len() != 5 { return false; }
-    if elapsed_ms < 2000 { return false; }
+    if target.len() != 5 || sequence.len() != 5 {
+        return false;
+    }
+    if elapsed_ms < 2000 {
+        return false;
+    }
     sequence == target
 }

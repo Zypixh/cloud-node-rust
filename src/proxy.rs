@@ -12,6 +12,7 @@ use pingora_proxy::{
     DownstreamParseErrorAction, DownstreamParseErrorLogLevel, FailToProxy, ProxyHttp, Session,
 };
 use rand::Rng;
+use rand::seq::SliceRandom;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
@@ -404,6 +405,7 @@ const HLS_KEY_ROUTE: &str = "/.well-known/cloud-node/hls-key";
 const WAF_VERIFY_ROUTE: &str = "/.well-known/cloud-node/waf-verify";
 const UAM_DEFAULT_LIFE_SECONDS: i64 = 3600;
 const UAM_CHALLENGE_LIFE_SECONDS: i64 = 120;
+const UAM_MIN_VERIFY_SECONDS: i64 = 5;
 const UAM_COOKIE_VERSION: &str = "v2";
 
 #[derive(Clone)]
@@ -2216,15 +2218,15 @@ impl EdgeProxy {
     fn uam_pow_difficulty(uam_cfg: Option<&UAMConfig>) -> u8 {
         uam_cfg
             .and_then(|cfg| cfg.pow_difficulty)
-            .unwrap_or(4)
-            .clamp(1, 8)
+            .unwrap_or(5)
+            .clamp(5, 8)
     }
 
     fn uam_mode(uam_cfg: Option<&UAMConfig>) -> crate::firewall::uam::UamMode {
         uam_cfg
             .and_then(|cfg| cfg.mode.as_deref())
             .map(crate::firewall::uam::UamMode::from_str)
-            .unwrap_or(crate::firewall::uam::UamMode::JsCookie)
+            .unwrap_or(crate::firewall::uam::UamMode::Pow)
     }
 
     fn uam_mode_requires_slider_trace(mode: crate::firewall::uam::UamMode) -> bool {
@@ -2257,7 +2259,8 @@ impl EdgeProxy {
         match normalized.as_str() {
             "click" | "clickcaptcha" | "sequenceclick" => "click".to_string(),
             "captcha" | "imagecaptcha" | "visualcaptcha" => "captcha".to_string(),
-            "jscookie" | "javascriptcookie" | "js" | "cookie" | "pow" => "jscookie".to_string(),
+            "jscookie" | "javascriptcookie" | "js" | "cookie" => "jscookie".to_string(),
+            "pow" | "proofofwork" => "pow".to_string(),
             "geetest" | "gee" => "geetest".to_string(),
             "slider" | "slide" | "puzzle" | "puzzleslider" => "slider".to_string(),
             _ if action_code == "js_cookie" => "jscookie".to_string(),
@@ -2266,6 +2269,13 @@ impl EdgeProxy {
     }
 
     fn waf_expected_challenge_method(&self, matched: &crate::firewall::MatchedAction) -> String {
+        if matches!(
+            matched.action,
+            crate::firewall::ActionResponse::JsCookie { .. }
+        ) {
+            return "jscookie".to_string();
+        }
+
         let global_captcha_opts = self
             .config
             .get_waf_actions_sync()
@@ -2288,7 +2298,20 @@ impl EdgeProxy {
                     })
             })
             .unwrap_or("");
-        Self::normalize_waf_challenge_method(raw_method, &matched.action_code)
+        let method = Self::normalize_waf_challenge_method(raw_method, &matched.action_code);
+        if method == "slider"
+            && matched.action_code == "captcha"
+            && matched
+                .captcha_options
+                .as_ref()
+                .map(|options| options.use_geetest)
+                .or_else(|| global_captcha_opts.as_ref().map(|options| options.use_geetest))
+                .unwrap_or(false)
+        {
+            "geetest".to_string()
+        } else {
+            method
+        }
     }
 
     fn uam_config_hash(
@@ -2361,7 +2384,8 @@ impl EdgeProxy {
         config_hash: &str,
         life_seconds: i64,
     ) -> String {
-        let exp = crate::utils::time::now_timestamp() + life_seconds.max(1);
+        let issued_at = crate::utils::time::now_timestamp();
+        let exp = issued_at + life_seconds.max(1);
         let nonce = general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 12]>());
         let host_hash = Self::sha256_hex(host_scope.as_bytes());
         let payload =
@@ -2430,13 +2454,15 @@ impl EdgeProxy {
         config_hash: &str,
         life_seconds: i64,
         mode: crate::firewall::uam::UamMode,
+        pow_difficulty: u8,
     ) -> String {
-        let exp = crate::utils::time::now_timestamp() + life_seconds.max(1);
+        let issued_at = crate::utils::time::now_timestamp();
+        let exp = issued_at + life_seconds.max(1);
         let nonce = general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 12]>());
         let host_hash = Self::sha256_hex(host_scope.as_bytes());
         let mode_code = Self::uam_mode_code(mode);
         let payload = format!(
-            "{UAM_COOKIE_VERSION}|{exp}|{scope_id}|{host_hash}|{config_hash}|{nonce}|{mode_code}"
+            "{UAM_COOKIE_VERSION}|{exp}|{scope_id}|{host_hash}|{config_hash}|{nonce}|{mode_code}|{pow_difficulty}|{issued_at}"
         );
         let encoded = general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let signature = self.uam_challenge_signature(&payload, ip, ua, host_scope);
@@ -2451,7 +2477,7 @@ impl EdgeProxy {
         scope_id: i64,
         host_scope: &str,
         _config_hash: &str,
-    ) -> Option<(i64, crate::firewall::uam::UamMode)> {
+    ) -> Option<(i64, crate::firewall::uam::UamMode, u8)> {
         let (encoded_payload, signature) = value.split_once('.')?;
         let decoded = general_purpose::URL_SAFE_NO_PAD
             .decode(encoded_payload.as_bytes())
@@ -2472,20 +2498,31 @@ impl EdgeProxy {
         let mode = parts
             .next()
             .map(crate::firewall::uam::UamMode::from_str)
-            .unwrap_or(crate::firewall::uam::UamMode::JsCookie);
+            .unwrap_or(crate::firewall::uam::UamMode::Pow);
+        let pow_difficulty = parts
+            .next()
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or_else(|| Self::uam_pow_difficulty(None));
+        let issued_at = parts
+            .next()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
         let host_hash = Self::sha256_hex(host_scope.as_bytes());
         if parts.next().is_some()
             || version != UAM_COOKIE_VERSION
             || cookie_scope != scope_id
             || cookie_host_hash != host_hash
-            || cookie_hash.is_empty()
+            || cookie_hash != _config_hash
             || nonce.is_empty()
         {
             return None;
         }
 
         let now = crate::utils::time::now_timestamp();
-        (now <= exp).then_some((exp.saturating_sub(now).max(1), mode))
+        if issued_at > 0 && now.saturating_sub(issued_at) < UAM_MIN_VERIFY_SECONDS {
+            return None;
+        }
+        (now <= exp).then_some((exp.saturating_sub(now).max(1), mode, pow_difficulty.clamp(5, 8)))
     }
 
     fn global_cc_policy(&self) -> Option<crate::config_models::CCPolicy> {
@@ -3226,6 +3263,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 &config_hash,
                 challenge_life_seconds,
                 mode,
+                pow_difficulty,
             );
 
         let issue_ctx = crate::firewall::uam::UamIssueCtx {
@@ -4442,6 +4480,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         if !matches!(
             matched.action,
             crate::firewall::ActionResponse::Captcha { .. }
+                | crate::firewall::ActionResponse::JsCookie { .. }
         ) {
             return false;
         }
@@ -4490,6 +4529,23 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         challenge_type == expected
             || (expected == "geetest"
                 && matches!(challenge_type.as_str(), "slider" | "click" | "captcha"))
+    }
+
+    fn clear_waf_challenge_block(
+        &self,
+        ip: std::net::IpAddr,
+        server_id: i64,
+        failure_config: Option<crate::firewall::verifier::ChallengeFailureConfig>,
+    ) {
+        let scope_id = if failure_config.is_some_and(|config| config.fail_global) {
+            0
+        } else {
+            server_id
+        };
+        self.waf_state.remove_black_ip(scope_id, ip);
+        if let Ok(net) = self.waf_state.get_c_class_net(ip) {
+            self.waf_state.remove_black_network(scope_id, net);
+        }
     }
 
     fn hmac_sha256(secret: &[u8], data: &[u8]) -> [u8; 32] {
@@ -4695,24 +4751,31 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     .flatten();
                 let token_mode = token_result
                     .as_ref()
-                    .map(|(_, mode)| *mode)
+                    .map(|(_, mode, _)| *mode)
                     .unwrap_or_else(|| Self::uam_mode(uam_cfg));
+                let token_pow_difficulty = token_result
+                    .as_ref()
+                    .map(|(_, _, difficulty)| *difficulty)
+                    .unwrap_or_else(|| Self::uam_pow_difficulty(uam_cfg));
                 let trace_verified = !Self::uam_mode_requires_slider_trace(token_mode)
                     || self
                         .waf_verifier
                         .verify_slider_trace(&token, final_x, elapsed, &trace);
-                let pow_difficulty = Self::uam_pow_difficulty(uam_cfg) as u32;
                 let pow_verified = !Self::uam_mode_requires_pow(token_mode)
                     || (!pow.is_empty()
-                        && self.waf_verifier.verify_pow(&token, &pow, pow_difficulty));
+                        && self.waf_verifier.verify_pow(
+                            &token,
+                            &pow,
+                            token_pow_difficulty as u32,
+                        ));
                 token_result
                     .filter(|_| pow_verified && trace_verified)
-                    .map(|(_, mode)| (scope_id, host_scope, config_hash, mode))
+                    .map(|(_, mode, pow_difficulty)| (scope_id, host_scope, config_hash, mode, pow_difficulty))
             } else {
                 None
             };
 
-            if let Some((scope_id, host_scope, config_hash, mode)) = verified {
+            if let Some((scope_id, host_scope, config_hash, mode, _pow_difficulty)) = verified {
                 let pass_life_seconds = Self::uam_life_seconds(uam_cfg);
                 let suffix = Self::waf_cookie_suffix(session, ctx, pass_life_seconds);
                 let uam_pass = self.issue_uam_pass_cookie(
@@ -4772,11 +4835,20 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let challenge_token = Self::query_param(session, "__waf_challenge_token")
             .filter(|v| !v.is_empty());
 
-        // PoW is only required for jscookie/pow challenge types; slider/click/captcha
+        let token_pow_difficulty = self
+            .waf_verifier
+            .token_pow_difficulty(&ctx.client_ip_str, ua, &token)
+            .unwrap_or(4) as u32;
+        // PoW is only required for explicit pow challenge types; slider/click/captcha
         // embed their own verification params (x/y, click_seq, captcha_hash) and skip PoW.
-        let pow_required = matches!(challenge_type.as_str(), "jscookie" | "pow" | "");
-        let pow_ok = !pow_required || (!pow.is_empty() && self.waf_verifier.verify_pow(&token, &pow, 4));
+        let pow_required = matches!(challenge_type.as_str(), "pow" | "");
+        let pow_ok = !pow_required
+            || (!pow.is_empty()
+                && self
+                    .waf_verifier
+                    .verify_pow(&token, &pow, token_pow_difficulty));
 
+        let mut verified_js_cookie_name = None;
         let verified = token_remaining.is_some()
             && pow_ok
             && match challenge_type.as_str() {
@@ -4803,6 +4875,29 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         )
                     })
                 }
+                "jscookie" => {
+                    let elapsed = Self::query_param(session, "__waf_js_elapsed")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let fingerprint = Self::query_param(session, "__waf_js_fp").unwrap_or_default();
+                    let digest = Self::query_param(session, "__waf_js_digest").unwrap_or_default();
+                    let cookies = merged_session_cookie_header(session).unwrap_or_default();
+                    verified_js_cookie_name = challenge_token
+                        .as_deref()
+                        .and_then(|challenge_token| {
+                            crate::pages::challenges::jscookie::verify(
+                                challenge_token,
+                                &token,
+                                &cookies,
+                                elapsed,
+                                &fingerprint,
+                                &digest,
+                                self.api_config.secret.as_bytes(),
+                            )
+                        });
+                    verified_js_cookie_name.is_some()
+                }
+                "pow" => true,
                 _ => {
                     // default: slider
                     let sx = Self::query_param(session, "x").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
@@ -4816,8 +4911,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             let remaining = token_remaining.unwrap_or(1) as i64;
             if let Ok(ip) = ctx.client_ip_str.parse() {
                 let server_id = ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0);
-                self.waf_state
-                    .unblock_ip_for(ip, server_id, Some("server"), true, remaining);
+                let failure_config =
+                    self.waf_verifier
+                        .token_failure_config(&ctx.client_ip_str, ua, &token);
+                self.clear_waf_challenge_block(ip, server_id, failure_config);
             }
             let suffix = Self::waf_cookie_suffix(session, ctx, remaining);
             let pass_sig = self.waf_pass_signature(&token, &ctx.client_ip_str, ua, &challenge_type);
@@ -4829,13 +4926,22 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 format!("WAF-Token={token}:type={challenge_type}; HttpOnly; {suffix}"),
             )
             .unwrap();
-            resp.append_header("set-cookie", format!("WAF-PoW={pow}; {suffix}"))
-                .unwrap();
+            if challenge_type == "pow" {
+                resp.append_header("set-cookie", format!("WAF-PoW={pow}; {suffix}"))
+                    .unwrap();
+            }
             resp.append_header(
                 "set-cookie",
                 format!("WAF-Pass={pass_cookie}; HttpOnly; {suffix}"),
             )
             .unwrap();
+            if let Some(cookie_name) = verified_js_cookie_name {
+                resp.append_header(
+                    "set-cookie",
+                    format!("{cookie_name}=; Max-Age=0; Path=/; SameSite=Lax"),
+                )
+                .unwrap();
+            }
             resp.insert_header("cache-control", "no-store").unwrap();
             session.write_response_header(Box::new(resp), true).await?;
             ctx.response_status = 303;
@@ -5401,17 +5507,15 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         session: &Session,
         ip_str: &str,
         ua: &str,
-        ctx: &ProxyCTX,
+        ctx: &mut ProxyCTX,
     ) -> bool {
         if let Some(cookies) = merged_session_cookie_header(session) {
-            if !cookies.contains("WAF-Token=") {
+            if !cookies.contains("WAF-Token=") || !cookies.contains("WAF-Redirect=") {
                 return false;
             }
 
             let verifier = self.waf_verifier.as_ref();
             let mut current_token = None;
-            let mut token_remaining = 0;
-            let mut current_pow = None;
             let mut redirect_sig = None;
 
             for part in cookies.split(';') {
@@ -5419,15 +5523,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 // 1. Check AES-256-GCM Token
                 if let Some(raw_token) = part.strip_prefix("WAF-Token=")
                     && let token = raw_token.split_once(":type=").map(|(t, _)| t).unwrap_or(raw_token)
-                    && let Some(remaining) =
-                        verifier.token_seconds_remaining(ip_str, ua, token, 3600)
+                    && verifier
+                        .token_seconds_remaining(ip_str, ua, token, 3600)
+                        .is_some()
                 {
                     current_token = Some(token);
-                    token_remaining = remaining as i64;
-                }
-                // 2. Check PoW Solution
-                if let Some(pow) = part.strip_prefix("WAF-PoW=") {
-                    current_pow = Some(pow);
                 }
                 if let Some(sig) = part.strip_prefix("WAF-Redirect=") {
                     redirect_sig = Some(sig);
@@ -5437,19 +5537,13 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             if let Some(token) = current_token {
                 let redirect_verified = redirect_sig
                     .is_some_and(|sig| sig == self.waf_redirect_signature(token, ip_str, ua));
-                let pow_verified =
-                    current_pow.is_some_and(|nonce| verifier.verify_pow(token, nonce, 4));
-                if redirect_verified || pow_verified {
+                if redirect_verified {
                     if let Ok(ip) = ip_str.parse() {
                         let server_id = ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0);
-                        self.waf_state.unblock_ip_for(
-                            ip,
-                            server_id,
-                            Some("server"),
-                            true,
-                            token_remaining.max(1),
-                        );
+                        let failure_config = verifier.token_failure_config(ip_str, ua, token);
+                        self.clear_waf_challenge_block(ip, server_id, failure_config);
                     }
+                    ctx.waf_whitelisted = true;
                     return true;
                 }
             }
@@ -5672,6 +5766,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         .or_else(|| global_values.map(|values| values.3))
                         .unwrap_or(false)
                 });
+                let difficulty = captcha_opts
+                    .as_ref()
+                    .map(|o| o.challenge_difficulty.max(1) as u32)
+                    .unwrap_or(4);
                 life_seconds = Self::waf_life_seconds(life_seconds);
                 let token = verifier.generate_token_with_config(
                     &ip,
@@ -5681,6 +5779,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         max_fails,
                         fail_block_timeout,
                         fail_global,
+                        pow_difficulty: difficulty as u8,
                     },
                 );
                 let suffix = Self::waf_cookie_suffix(session, ctx, life_seconds);
@@ -5728,22 +5827,13 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         }
                     })
                     .unwrap_or(crate::pages::Lang::En);
-                let difficulty = captcha_opts
-                    .as_ref()
-                    .map(|o| o.challenge_difficulty.max(1) as u32)
-                    .unwrap_or(4);
-
                 // Determine the challenge method, resolving "geetest" into a
-                // deterministic random choice (per-token stable) so a single
-                // pass cookie only clears the specific challenge type that was
-                // actually solved — each method must be passed independently.
+                // true random choice across the local challenge implementations.
                 let raw_method = self.waf_expected_challenge_method(&matched);
                 let effective_method = if raw_method == "geetest" {
-                    let seed = token.as_bytes().iter().fold(0u64, |a, &b| {
-                        a.wrapping_mul(31).wrapping_add(b as u64)
-                    });
                     let modes = ["slider", "click", "captcha"];
-                    modes[(seed % 3) as usize]
+                    let mut rng = rand::thread_rng();
+                    modes.choose(&mut rng).copied().unwrap_or("slider")
                 } else {
                     raw_method.as_str()
                 };
@@ -5779,14 +5869,33 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         page
                     }
                     "jscookie" => {
-                        let pow_script = verifier.get_pow_script_with_life(&token, difficulty, life_seconds);
+                        use crate::pages::challenges::jscookie;
+                        let body = jscookie::issue_html(
+                            challenge_lang,
+                            &token,
+                            WAF_VERIFY_ROUTE,
+                            &return_path,
+                            challenge_secret,
+                            challenge_expiry,
+                            Self::is_https_downstream(session, ctx),
+                        );
+                        crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id)
+                    }
+                    "pow" => {
                         let t = crate::pages::lang::text(challenge_lang);
+                        let pow_script = self
+                            .waf_verifier
+                            .get_pow_script_with_life(&token, difficulty, life_seconds);
                         let body = format!(
-                            "<main class=\"card\"><div class=\"mark waf\"></div><h1>{}</h1><p>{}</p><div class=\"progress\"><span></span></div><div class=\"meta\">Request #{}</div></main>",
+                            "<h1>{}</h1><p>{}</p><div class=\"progress\"><span></span></div><div class=\"meta\">Request #{}</div>",
                             t.checking, t.checking_sub, ctx.request_id
                         );
-                        let page = crate::pages::uam_challenge_page(&body, &pow_script, challenge_lang, &ctx.request_id);
-                        page
+                        crate::pages::uam_challenge_page(
+                            &body,
+                            &format!("<script>{pow_script}</script>"),
+                            challenge_lang,
+                            &ctx.request_id,
+                        )
                     }
                     _ => {
                         // default: slider
@@ -5815,9 +5924,14 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 if !matches!(action, crate::firewall::ActionResponse::Captcha { .. })
                     || effective_method == "jscookie"
                 {
+                    let token_cookie = if effective_method == "jscookie" {
+                        format!("{token}:type=jscookie")
+                    } else {
+                        token.clone()
+                    };
                     resp.append_header(
                         "set-cookie",
-                        format!("WAF-Token={token}; HttpOnly; {suffix}"),
+                        format!("WAF-Token={token_cookie}; HttpOnly; {suffix}"),
                     )
                     .unwrap();
                 }
@@ -6768,7 +6882,8 @@ impl ProxyHttp for EdgeProxy {
             .get_header("user-agent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if self.check_waf_challenge(session, &ctx.client_ip_str, ua, ctx) {
+        let client_ip_str = ctx.client_ip_str.clone();
+        if self.check_waf_challenge(session, &client_ip_str, ua, ctx) {
             return Ok(false);
         }
 
@@ -9700,6 +9815,10 @@ mod tests {
         assert_eq!(
             EdgeProxy::normalize_waf_challenge_method("js-cookie", "captcha"),
             "jscookie"
+        );
+        assert_eq!(
+            EdgeProxy::normalize_waf_challenge_method("pow", "captcha"),
+            "pow"
         );
         assert_eq!(
             EdgeProxy::normalize_waf_challenge_method("challengeType", "captcha"),

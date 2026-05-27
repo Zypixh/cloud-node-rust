@@ -13,7 +13,7 @@ pub fn uam_challenge_page(
     let t = lang::text(lang);
     let css = shared_css();
     format!(
-        r#"<!doctype html><html lang="{lang_attr}"><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title><style>{css}</style></head><body>{lang_bar}<main class="card"><div class="mark waf"></div>{body_html}</main></body>{script}</html>"#,
+        r#"<!doctype html><html lang="{lang_attr}"><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title><style>{css}</style></head><body>{lang_bar}<main class="card"><div class="mark waf"></div>{body_html}</main>{script}</body></html>"#,
         lang_attr = lang.html_attr(),
         title    = t.title,
         css      = css,
@@ -33,7 +33,7 @@ pub fn waf_slider_page(
     let t = lang::text(lang);
     let css = shared_css();
     format!(
-        r#"<!doctype html><html lang="{lang_attr}"><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title><style>{css}</style></head><body>{lang_bar}{slider_html}<noscript><p class="error">{nojs}</p></noscript></body>{script}</html>"#,
+        r#"<!doctype html><html lang="{lang_attr}"><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title><style>{css}</style></head><body>{lang_bar}{slider_html}<noscript><p class="error">{nojs}</p></noscript>{script}</body></html>"#,
         lang_attr = lang.html_attr(),
         title    = t.title,
         css      = css,
