@@ -1299,6 +1299,41 @@ pub struct HTTPRemoteAddrConfig {
 }
 
 impl HTTPRemoteAddrConfig {
+    fn normalized_type(&self) -> String {
+        self.type_name
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    }
+
+    pub fn is_direct_type(&self) -> bool {
+        self.normalized_type() == "default"
+    }
+
+    pub fn is_upper_proxy_type(&self) -> bool {
+        self.normalized_type() == "proxy"
+    }
+
+    pub fn is_custom_variable_type(&self) -> bool {
+        self.normalized_type() == "custom"
+    }
+
+    fn default_upper_proxy_headers() -> Vec<String> {
+        [
+            "X-Real-IP",
+            "X-Forwarded-For",
+            "CF-Connecting-IP",
+            "True-Client-IP",
+            "Ali-CDN-Real-IP",
+            "CDN-Src-IP",
+            "Forwarded",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
     /// Returns the list of effective IP-source expressions.
     ///
     /// Priority: if `type=requestHeader` and `request_header_name` is set,
@@ -1307,6 +1342,9 @@ impl HTTPRemoteAddrConfig {
     pub fn configured_values(&self) -> Vec<String> {
         if self.is_request_header_type() && !self.request_header_name.is_empty() {
             return vec![self.request_header_name.clone()];
+        }
+        if self.is_upper_proxy_type() {
+            return Self::default_upper_proxy_headers();
         }
         if !self.values.is_empty() {
             self.values.clone()
@@ -1318,28 +1356,24 @@ impl HTTPRemoteAddrConfig {
     }
 
     pub fn is_request_header_type(&self) -> bool {
-        self.type_name.eq_ignore_ascii_case("requestHeader")
-            || self.type_name.eq_ignore_ascii_case("request-header")
-            || self.type_name.eq_ignore_ascii_case("header")
+        matches!(
+            self.normalized_type().as_str(),
+            "requestheader" | "header" | "httpheader"
+        ) || self.is_upper_proxy_type()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.configured_values().is_empty()
+        !self.is_direct_type() && self.configured_values().is_empty()
     }
 
     /// Expand header-name expressions from `value`/`values` (or
     /// `request_header_name`) into a flat list of individual header names.
     /// Supports the multi-header syntax `${header.X-Forwarded-For,CF-Connecting-IP}`.
     pub fn expanded_header_names(&self) -> Vec<String> {
-        let raw_list = if self.is_request_header_type() && !self.request_header_name.is_empty() {
-            vec![self.request_header_name.clone()]
-        } else if !self.values.is_empty() {
-            self.values.clone()
-        } else if !self.value.is_empty() {
-            vec![self.value.clone()]
-        } else {
+        let raw_list = self.configured_values();
+        if raw_list.is_empty() {
             return Vec::new();
-        };
+        }
 
         let mut out = Vec::new();
         for entry in raw_list {
@@ -3698,6 +3732,67 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("20")
         );
+    }
+
+    #[test]
+    fn remote_addr_proxy_type_defaults_to_real_ip_then_forwarded_headers() {
+        let cfg: HTTPRemoteAddrConfig = serde_json::from_value(serde_json::json!({
+            "isOn": true,
+            "type": "proxy",
+            "value": "${remoteAddr}"
+        }))
+        .expect("remoteAddr should parse proxy type");
+
+        assert!(cfg.is_request_header_type());
+        assert!(cfg.is_upper_proxy_type());
+        assert_eq!(
+            cfg.expanded_header_names(),
+            vec![
+                "X-Real-IP",
+                "X-Forwarded-For",
+                "CF-Connecting-IP",
+                "True-Client-IP",
+                "Ali-CDN-Real-IP",
+                "CDN-Src-IP",
+                "Forwarded",
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_addr_accepts_header_aliases() {
+        let cfg: HTTPRemoteAddrConfig = serde_json::from_value(serde_json::json!({
+            "isOn": true,
+            "type": "requestHeader",
+            "requestHeaderName": "X-Forwarded-For",
+            "value": "${header.X-Forwarded-For}"
+        }))
+        .expect("remoteAddr should parse request header type");
+
+        assert!(cfg.is_request_header_type());
+        assert_eq!(cfg.expanded_header_names(), vec!["X-Forwarded-For"]);
+    }
+
+    #[test]
+    fn remote_addr_default_and_custom_types_match_control_plane_modes() {
+        let direct: HTTPRemoteAddrConfig = serde_json::from_value(serde_json::json!({
+            "isOn": true,
+            "type": "default",
+            "value": "${rawRemoteAddr}"
+        }))
+        .expect("remoteAddr should parse default type");
+        assert!(direct.is_direct_type());
+        assert!(!direct.is_empty());
+
+        let custom: HTTPRemoteAddrConfig = serde_json::from_value(serde_json::json!({
+            "isOn": true,
+            "type": "custom",
+            "value": "${header.X-Client-IP}"
+        }))
+        .expect("remoteAddr should parse custom type");
+        assert!(custom.is_custom_variable_type());
+        assert!(!custom.is_request_header_type());
+        assert_eq!(custom.configured_values(), vec!["${header.X-Client-IP}"]);
     }
 
     #[test]

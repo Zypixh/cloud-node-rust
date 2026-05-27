@@ -1538,10 +1538,10 @@ pub(crate) fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
     if trust_headers {
         for header in [
             "x-cloud-real-ip",
+            "x-real-ip",
             "cf-connecting-ip",
             "true-client-ip",
             "x-forwarded-for",
-            "x-real-ip",
             "x-client-ip",
             "x-original-forwarded-for",
             "x-cluster-client-ip",

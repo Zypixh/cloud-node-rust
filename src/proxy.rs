@@ -1369,10 +1369,10 @@ impl EdgeProxy {
         }
         for header in [
             "x-cloud-real-ip",
+            "x-real-ip",
             "cf-connecting-ip",
             "true-client-ip",
             "x-forwarded-for",
-            "x-real-ip",
             "x-client-ip",
             "x-original-forwarded-for",
             "x-cluster-client-ip",
@@ -1568,6 +1568,10 @@ impl EdgeProxy {
             // location-block's remote-addr rule.  Location blocks are not yet
             // implemented; once they are, callers should consult `is_prior`
             // before falling back to an outer scope's config.
+
+            if remote_addr_cfg.is_direct_type() {
+                return raw_ip;
+            }
 
             if remote_addr_cfg.is_request_header_type() {
                 // If `request_header_name` is set it becomes the sole
