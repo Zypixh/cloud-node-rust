@@ -51,7 +51,7 @@ struct CheckLocalFirewallMessage {
 pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigStore>) {
     let mut last_endpoints = api_config.effective_rpc_endpoints();
     let mut fail_count: u32 = 0;
-    const MAX_BACKOFF: Duration = Duration::from_secs(60);
+    const MAX_BACKOFF: Duration = Duration::from_secs(15);
 
     loop {
         if !crate::cluster::leader::require_leader("node_stream") {
@@ -59,7 +59,8 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
             continue;
         }
 
-        let client = match RpcClient::new_with_endpoints(&api_config, &last_endpoints, false).await {
+        let client = match RpcClient::new_with_endpoints(&api_config, &last_endpoints, false).await
+        {
             Ok(client) => client,
             Err(e) => {
                 last_endpoints = api_config.effective_rpc_endpoints();
@@ -84,10 +85,7 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
             Err(e) => {
                 fail_count = fail_count.saturating_add(1);
                 let delay = stream_backoff(fail_count, MAX_BACKOFF);
-                warn!(
-                    "Node stream error: {}. Reconnecting in {:?}...",
-                    e, delay
-                );
+                warn!("Node stream error: {}. Reconnecting in {:?}...", e, delay);
                 last_endpoints = api_config.effective_rpc_endpoints();
                 tokio::time::sleep(delay).await;
             }
@@ -96,18 +94,19 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
 }
 
 fn stream_backoff(fail_count: u32, max: Duration) -> Duration {
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped).
+    // Exponential backoff with a cap; add jitter to avoid thundering herd.
     // Add jitter (±25%) to avoid thundering herd.
     use rand::Rng;
-    let base = Duration::from_secs(1)
-        .saturating_mul(1u32 << fail_count.saturating_sub(1).min(6));
+    let base = Duration::from_secs(1).saturating_mul(1u32 << fail_count.saturating_sub(1).min(6));
     let capped = base.min(max);
     let jitter_ms = (capped.as_millis() as u64 / 4) as i64;
     let offset = rand::thread_rng().gen_range(-jitter_ms..=jitter_ms);
     if offset < 0 {
         capped.saturating_sub(Duration::from_millis((-offset) as u64))
     } else {
-        capped.saturating_add(Duration::from_millis(offset as u64)).min(max)
+        capped
+            .saturating_add(Duration::from_millis(offset as u64))
+            .min(max)
     }
 }
 
@@ -124,13 +123,13 @@ async fn send_node_stream_ping(
     config_store: &ConfigStore,
     tx: &mpsc::Sender<pb::NodeStreamMessage>,
 ) -> bool {
-    let current_node_id = config_store.get_node_id().await;
-    if current_node_id <= 0 {
+    let node_id = config_store.get_node_id().await;
+    if node_id <= 0 {
         return false;
     }
 
     let ping = pb::NodeStreamMessage {
-        node_id: current_node_id,
+        node_id,
         request_id: 0,
         code: "ping".to_string(),
         is_ok: true,
@@ -660,7 +659,24 @@ fn interpret_systemd_is_enabled(success: bool, stdout: &str, stderr: &str) -> (b
 
 #[cfg(test)]
 mod tests {
-    use super::interpret_systemd_is_enabled;
+    use super::{interpret_systemd_is_enabled, send_node_stream_ping};
+    use crate::config::ConfigStore;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn node_stream_ping_uses_config_store_numeric_node_id() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let config_store = ConfigStore::new();
+        config_store.update_id(42).await;
+
+        assert!(send_node_stream_ping(&config_store, &tx).await);
+
+        let ping = rx.recv().await.expect("ping message");
+        assert_eq!(ping.node_id, 42);
+        assert_eq!(ping.request_id, 0);
+        assert_eq!(ping.code, "ping");
+        assert!(ping.is_ok);
+    }
 
     #[test]
     fn systemd_enabled_output_maps_to_ok() {

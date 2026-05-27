@@ -3287,6 +3287,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
 
     fn maybe_report_firewall_event(
         &self,
+        session: &Session,
         ctx: &mut ProxyCTX,
         policy_id: i64,
         group_id: i64,
@@ -3300,6 +3301,15 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return;
         }
         ctx.firewall_event_reported = true;
+        let source_url = Self::request_full_url(session, ctx);
+        let source_ip = ctx.client_ip_str.clone();
+        let source_user_agent = session
+            .req_header()
+            .headers
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let api_config = self.api_config.clone();
         tokio::spawn(async move {
             crate::rpc::firewall::notify_firewall_event(
@@ -3308,6 +3318,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 policy_id,
                 group_id,
                 set_id,
+                source_url,
+                source_ip,
+                source_user_agent,
             )
             .await;
         });
@@ -6517,6 +6530,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             waf_action = Some(matched.action_code.clone());
             ctx.waf_action = waf_action.clone();
             self.maybe_report_firewall_event(
+                session,
                 ctx,
                 matched.policy_id,
                 matched.group_id,
@@ -8882,6 +8896,7 @@ impl ProxyHttp for EdgeProxy {
                 ctx.waf_action = Some(action.action_code.clone());
                 ctx.firewall_blocked = true;
                 self.maybe_report_firewall_event(
+                    session,
                     ctx,
                     action.policy_id,
                     action.group_id,
@@ -9231,7 +9246,7 @@ impl ProxyHttp for EdgeProxy {
                 .unwrap();
 
             // 2.3 Security Token
-            if let Ok(token) = crate::auth::generate_token(node_id, secret, "edge") {
+            if let Ok(token) = crate::auth::generate_token(node_id, secret, "node") {
                 upstream_request
                     .insert_header("X-Cloud-Access-Token", token)
                     .unwrap();
@@ -9517,6 +9532,7 @@ impl ProxyHttp for EdgeProxy {
                         ctx.waf_action = Some(action.action_code.clone());
                         ctx.firewall_blocked = true;
                         self.maybe_report_firewall_event(
+                            session,
                             ctx,
                             action.policy_id,
                             action.group_id,
@@ -9578,6 +9594,7 @@ impl ProxyHttp for EdgeProxy {
                         ctx.waf_action = Some(action.action_code.clone());
                         ctx.firewall_blocked = true;
                         self.maybe_report_firewall_event(
+                            session,
                             ctx,
                             action.policy_id,
                             action.group_id,

@@ -8,6 +8,9 @@ pub async fn notify_firewall_event(
     policy_id: i64,
     group_id: i64,
     set_id: i64,
+    source_url: String,
+    source_ip: String,
+    source_user_agent: String,
 ) {
     let client = match RpcClient::new(api_config).await {
         Ok(c) => c,
@@ -15,13 +18,17 @@ pub async fn notify_firewall_event(
     };
     let mut service = client.firewall_service();
 
-    let _ = service
-        .notify_http_firewall_event(pb::NotifyHttpFirewallEventRequest {
+    let _ = crate::rpc::track_rpc(service.notify_http_firewall_event(
+        pb::NotifyHttpFirewallEventRequest {
             server_id,
             http_firewall_policy_id: policy_id,
             http_firewall_rule_group_id: group_id,
             http_firewall_rule_set_id: set_id,
             created_at: crate::utils::time::now_timestamp(),
-        })
-        .await;
+            source_url,
+            source_ip,
+            source_user_agent,
+        },
+    ))
+    .await;
 }

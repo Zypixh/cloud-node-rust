@@ -190,7 +190,7 @@ impl RpcClient {
     > {
         pb::node_service_client::NodeServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, Some("edge")),
+            Self::interceptor(&self.api_config, Some("node")),
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)
@@ -242,7 +242,7 @@ impl RpcClient {
     > {
         pb::server_service_client::ServerServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, Some("edge")),
+            Self::interceptor(&self.api_config, Some("node")),
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)
@@ -314,7 +314,7 @@ impl RpcClient {
     > {
         pb::node_value_service_client::NodeValueServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, Some("edge")),
+            Self::interceptor(&self.api_config, Some("node")),
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)
@@ -422,7 +422,7 @@ impl RpcClient {
     > {
         pb::ip_item_service_client::IpItemServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, Some("edge")),
+            Self::interceptor(&self.api_config, Some("node")),
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)
@@ -458,7 +458,7 @@ impl RpcClient {
     > {
         pb::ip_list_service_client::IpListServiceClient::with_interceptor(
             self.channel.clone(),
-            Self::interceptor(&self.api_config, Some("edge")),
+            Self::interceptor(&self.api_config, Some("node")),
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)

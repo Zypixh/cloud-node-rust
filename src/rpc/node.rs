@@ -183,13 +183,11 @@ async fn report_connected_api_nodes(api_config: &ApiConfig) {
 
     if let Ok(client) = RpcClient::new(api_config).await {
         let mut node_service = client.node_service_with_type();
-        match crate::rpc::track_rpc(
-            node_service.update_node_connected_api_nodes(
-                pb::UpdateNodeConnectedApiNodesRequest {
-                    api_node_ids: api_node_ids.clone(),
-                },
-            ),
-        )
+        match crate::rpc::track_rpc(node_service.update_node_connected_api_nodes(
+            pb::UpdateNodeConnectedApiNodesRequest {
+                api_node_ids: api_node_ids.clone(),
+            },
+        ))
         .await
         {
             Ok(_) => info!(
@@ -1435,8 +1433,8 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         } else {
             1.0
         };
-        let api_avg_cost = if rpc_total_requests > 0 {
-            rpc_total_cost_ms as f64 / rpc_total_requests as f64
+        let api_avg_cost_seconds = if rpc_total_requests > 0 {
+            rpc_total_cost_ms as f64 / rpc_total_requests as f64 / 1000.0
         } else {
             0.0
         };
@@ -1513,7 +1511,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "trafficOutBytes": traffic_out,
             "connectionCount": connections,
             "apiSuccessPercent": api_success_percent,
-            "apiAvgCostSeconds": api_avg_cost,
+            "apiAvgCostSeconds": api_avg_cost_seconds,
             "cacheTotalDiskSize": crate::metrics::storage::STORAGE.total_cache_size(),
             "updatedAt": now,
             "timestamp": now,
@@ -1523,13 +1521,12 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
 
         if let Ok(client) = RpcClient::new(&api_config).await {
             let mut service = client.node_service();
-            if let Err(e) = crate::rpc::track_rpc(
-                service.update_node_status(pb::UpdateNodeStatusRequest {
+            if let Err(e) =
+                crate::rpc::track_rpc(service.update_node_status(pb::UpdateNodeStatusRequest {
                     node_id,
                     status_json: status.to_string().into_bytes(),
-                }),
-            )
-            .await
+                }))
+                .await
             {
                 error!("Failed to report node status: {}", e);
             }
@@ -1570,8 +1567,8 @@ pub async fn report_node_online_once(
     } else {
         1.0
     };
-    let api_avg_cost = if rpc_total_requests > 0 {
-        rpc_total_cost_ms as f64 / rpc_total_requests as f64
+    let api_avg_cost_seconds = if rpc_total_requests > 0 {
+        rpc_total_cost_ms as f64 / rpc_total_requests as f64 / 1000.0
     } else {
         0.0
     };
@@ -1620,7 +1617,7 @@ pub async fn report_node_online_once(
         "trafficOutBytes": traffic_out,
         "connectionCount": connections,
         "apiSuccessPercent": api_success_percent,
-        "apiAvgCostSeconds": api_avg_cost,
+        "apiAvgCostSeconds": api_avg_cost_seconds,
         "cacheTotalDiskSize": crate::metrics::storage::STORAGE.total_cache_size(),
         "updatedAt": now,
         "timestamp": now,
@@ -1633,12 +1630,10 @@ pub async fn report_node_online_once(
     // and will always fail with node credentials. UpdateNodeStatus already sets
     // isActive=true server-side.
     let mut service = client.node_service();
-    crate::rpc::track_rpc(
-        service.update_node_status(pb::UpdateNodeStatusRequest {
-            node_id,
-            status_json: status.to_string().into_bytes(),
-        }),
-    )
+    crate::rpc::track_rpc(service.update_node_status(pb::UpdateNodeStatusRequest {
+        node_id,
+        status_json: status.to_string().into_bytes(),
+    }))
     .await?;
     Ok(())
 }

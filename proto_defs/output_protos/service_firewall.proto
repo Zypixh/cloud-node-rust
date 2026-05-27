@@ -82,6 +82,9 @@ message NotifyHTTPFirewallEventRequest {
     int64 httpFirewallRuleGroupId = 3;
     int64 httpFirewallRuleSetId = 4;
     int64 createdAt = 5;
+    string sourceURL = 6;
+    string sourceIP = 7;
+    string sourceUserAgent = 8;
 }
 
 message CountFirewallDailyBlocksRequest {

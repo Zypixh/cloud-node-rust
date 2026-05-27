@@ -20,14 +20,18 @@ impl HttpFirewallEvent {
             Err(_) => return,
         };
         let mut service = client.firewall_service();
-        let _ = service
-            .notify_http_firewall_event(pb::NotifyHttpFirewallEventRequest {
+        let _ = crate::rpc::track_rpc(service.notify_http_firewall_event(
+            pb::NotifyHttpFirewallEventRequest {
                 server_id: self.server_id,
                 http_firewall_policy_id: self.policy_id,
                 http_firewall_rule_group_id: self.group_id,
                 http_firewall_rule_set_id: self.set_id,
                 created_at: crate::utils::time::now_timestamp(),
-            })
-            .await;
+                source_url: self.url,
+                source_ip: self.client_ip,
+                source_user_agent: self.user_agent,
+            },
+        ))
+        .await;
     }
 }

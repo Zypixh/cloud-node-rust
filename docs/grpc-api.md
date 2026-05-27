@@ -2,7 +2,7 @@
 
 本文档只覆盖当前 Rust 数据面会主动调用的控制面 gRPC 接口。字段说明以 2026-05-26 对真实控制面 `http://36.134.185.75:8001` 的节点凭据采样为准；写接口未为了文档造数据，因此写接口的响应按 proto 和运行时调用语义说明为准。
 
-认证由 `RpcClient` 统一注入 metadata：`nodeid`、`nodeId`、`token`。`*_with_type()` 客户端额外注入 `type=edge`，但 token 角色仍为 `node`。默认 gzip 压缩，最大编码/解码消息大小为 512 MiB。真实采样入口是 `tests/real_api_config.rs` 中的 `real_api_grpc_documentation_snapshot`，需要显式设置 `CLOUD_NODE_REAL_API_TEST=1` 与 `CLOUD_NODE_REAL_API_DOC_SNAPSHOT=1`。
+认证由 `RpcClient` 统一注入 metadata：`nodeid`、`nodeId`、`token`。`*_with_type()` 客户端额外注入 `type=node`，token 角色也保持为 `node`。默认 gzip 压缩，最大编码/解码消息大小为 512 MiB。真实采样入口是 `tests/real_api_config.rs` 中的 `real_api_grpc_documentation_snapshot`，需要显式设置 `CLOUD_NODE_REAL_API_TEST=1` 与 `CLOUD_NODE_REAL_API_DOC_SNAPSHOT=1`。
 
 ## 1. 节点配置与控制流
 
