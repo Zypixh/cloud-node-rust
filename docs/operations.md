@@ -48,7 +48,7 @@ cloud-node restart
 cloud-node status
 ```
 
-systemd unit 会以 `Type=simple` 托管前台节点进程，用于开机自启、日志和状态排障。`cloud-node stop` 会等待进程真实退出，`cloud-node restart` 会在旧进程退出后再启动，避免旧实例仍占用监听端口或数据目录锁。
+systemd unit 会以 `Type=simple` 托管前台节点进程，用于开机自启、日志和状态排障。已注册 systemd unit 时，`cloud-node start/restart` 会优先委托给 `systemctl`；未注册 systemd 时才使用内置后台进程管理。节点自身会同时把运行日志追加到 `logs/run.log`。
 
 ## 从 Go 原版迁移安装 Rust 版
 
@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 - 从 Go 原版迁移时备份文件带有 `go-original` 标识；升级已有 Rust 版时备份文件带有 `rust-current` 标识。
 - 根据系统架构选择 GitHub 最新 Rust Release 包；`--upgrade` 默认解析并下载当前最新 Release。
 - 将 Rust 二进制原子替换到现有运行目录；目录识别优先使用 service `WorkingDirectory`、`/usr/bin/cloud-node` wrapper 中的 `cd` 目录、旧二进制所在目录和常见旧目录，只有没有可识别旧目录时才默认安装到 `/opt/cloud-node-rust/cloud-node-rust`。
-- 执行 Rust 二进制内置的 `install` 命令，重新注册 `/usr/bin/cloud-node` wrapper 和 `cloud-node.service`。
+- 执行 Rust 二进制内置的 `install` 命令，重新注册 `/usr/bin/cloud-node` wrapper 和 `cloud-node.service`，并设置 `CLOUD_NODE_HOME` 指向运行目录。
 - 交互询问是否从 `https://github.com/P3TERX/GeoLite.mmdb` 下载 `GeoLite2-City.mmdb`、`GeoLite2-ASN.mmdb` 和 `GeoLite2-Country.mmdb`。
 - 安装/升级完成后交互询问是否立即重启或启动服务；自动化 `--yes` 场景保持原有 preserve 行为，迁移前服务运行则自动重启。
 
@@ -200,7 +200,7 @@ cloud-node --monitor-port 8888
 常见日志来源：
 
 - systemd 日志：`journalctl -u cloud-node`
-- 后台 stdout/stderr：`logs/run.log`
+- 本地运行日志：`logs/run.log`
 - 控制面节点日志：由 NodeLogUploader 上报。
 - 访问日志：由 LogUploader 批量上报。
 

@@ -206,6 +206,11 @@ run() {
     fi
 }
 
+systemctl_available() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl show-environment >/dev/null 2>&1
+}
+
 prompt_language() {
     if [ -n "$LANGUAGE" ]; then
         case "$LANGUAGE" in
@@ -519,7 +524,7 @@ if [ "$MODE" != "list-backups" ] && [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]
 fi
 
 service_cat() {
-    if command -v systemctl >/dev/null 2>&1; then
+    if systemctl_available; then
         systemctl cat "$SERVICE_NAME" 2>/dev/null || true
     fi
 }
@@ -1050,7 +1055,7 @@ restore_go_original() {
     RESTORE_CURRENT_DIR="$BACKUP_ROOT/restore-current-$(date +%Y%m%d-%H%M%S)"
     run mkdir -p "$RESTORE_CURRENT_DIR"
 
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME"; then
+    if systemctl_available && systemctl is-active --quiet "$SERVICE_NAME"; then
         service_was_active=1
         run systemctl stop "$SERVICE_NAME"
     fi
@@ -1064,18 +1069,18 @@ restore_go_original() {
     restore_file "$backup_dir/usr_bin_cloud-node.go-original" "/usr/bin/cloud-node" "/usr/bin/cloud-node"
     restore_file "$backup_dir/${SERVICE_NAME}.service.go-original" "$service_file" "systemd service"
 
-    if command -v systemctl >/dev/null 2>&1; then
+    if systemctl_available; then
         run systemctl daemon-reload
     fi
 
     case "$START_MODE" in
         always)
-            if command -v systemctl >/dev/null 2>&1; then
+            if systemctl_available; then
                 run systemctl restart "$SERVICE_NAME"
             fi
             ;;
         preserve)
-            if [ "$service_was_active" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+            if [ "$service_was_active" -eq 1 ] && systemctl_available; then
                 run systemctl start "$SERVICE_NAME"
             fi
             ;;
@@ -1240,7 +1245,7 @@ if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
     run cp -a "/etc/systemd/system/${SERVICE_NAME}.service" "$BACKUP_DIR/${SERVICE_NAME}.service.$CURRENT_BACKUP_SUFFIX"
 fi
 
-if command -v systemctl >/dev/null 2>&1 && systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
+if systemctl_available && systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
     if [ "$DRY_RUN" -eq 0 ]; then
         systemctl cat "$SERVICE_NAME" > "$BACKUP_DIR/${SERVICE_NAME}.service.cat.$CURRENT_BACKUP_SUFFIX.txt"
     else
@@ -1282,7 +1287,7 @@ else
 fi
 
 SERVICE_WAS_ACTIVE=0
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME"; then
+if systemctl_available && systemctl is-active --quiet "$SERVICE_NAME"; then
     SERVICE_WAS_ACTIVE=1
 fi
 
@@ -1318,7 +1323,7 @@ if [ "$DOWNLOAD_GEOIP" = "yes" ]; then
     download_geoip_files
 fi
 
-if command -v systemctl >/dev/null 2>&1; then
+if systemctl_available; then
     run systemctl daemon-reload
 fi
 
@@ -1351,12 +1356,24 @@ esac
 
 if [ "$RESTART_SERVICE" -eq 1 ]; then
     if [ "$DRY_RUN" -eq 0 ]; then
-        if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+        if systemctl_available; then
+            if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+                run systemctl restart "$SERVICE_NAME"
+            else
+                run systemctl start "$SERVICE_NAME"
+            fi
+        elif [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
             log "+ cd $INSTALL_DIR && $INSTALL_BINARY restart"
             (cd "$INSTALL_DIR" && "$INSTALL_BINARY" restart)
         else
             log "+ cd $INSTALL_DIR && $INSTALL_BINARY start"
             (cd "$INSTALL_DIR" && "$INSTALL_BINARY" start)
+        fi
+    elif systemctl_available; then
+        if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+            log "+ systemctl restart $SERVICE_NAME"
+        else
+            log "+ systemctl start $SERVICE_NAME"
         fi
     elif [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
         log "+ cd $INSTALL_DIR && $INSTALL_BINARY restart"

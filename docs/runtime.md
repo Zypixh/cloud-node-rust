@@ -16,7 +16,7 @@ CloudNode Rust 的运行时由一个主进程和多个异步后台任务组成�
 8. 启动缓存、统计、日志上传和证书同步后台任务。
 9. 如指定 `--monitor-port`，启动本地性能监控页面。
 
-默认不带子命令时以前台方式运行。`start` 子命令会以单 fork 方式进入后台。
+默认不带子命令时以前台方式运行。已注册 systemd unit 时，`start/restart` 会优先委托给 `systemctl`；未注册 systemd 时，`start` 子命令会以单 fork 方式进入后台。
 
 ## CLI 命令
 
@@ -38,7 +38,7 @@ cloud-node --monitor-port 8888 --monitor-clear
 
 命令说明：
 
-- `start`：后台启动节点。
+- `start`：启动节点；已注册 systemd unit 时委托 `systemctl start`，否则使用内置后台进程管理。
 - `stop`：停止后台节点。
 - `restart`：先停止再启动。
 - `status`：读取 PID 文件和文件锁判断节点状态。
@@ -56,7 +56,7 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `data/metrics.db`：统计和缓存元数据持久化。
 - `data/cache`：默认磁盘缓存目录。
 - `data/GeoLite2-City.mmdb`、`data/GeoLite2-ASN.mmdb`：GeoIP 数据库。
-- `logs/run.log`：后台进程 stdout/stderr。
+- `logs/run.log`：节点运行日志；systemd 和内置后台模式都会追加写入。
 
 生产部署时应保持工作目录稳定。旧版 `../data/*`、根目录 `api_node.yaml` 和工作目录下的 GeoIP 文件仅作为迁移 fallback 读取。
 
@@ -150,13 +150,13 @@ cloud-node --monitor-port 8888
 
 ## 关闭和重启
 
-`stop` 会通过 PID 文件和 Linux `/proc` 识别当前运行实例，先发送 `SIGTERM` 并等待进程退出；超时未退出时会发送 `SIGKILL`，确认进程结束后才清理匹配的 PID 文件。`restart` 会等待旧进程真实退出后再执行 `start`，避免旧进程仍占用 80/443 或持有数据目录锁时启动新实例。
+未注册 systemd 时，`stop` 会通过 PID 文件和 Linux `/proc` 识别当前运行实例，先发送 `SIGTERM` 并等待进程退出；超时未退出时会发送 `SIGKILL`，确认进程结束后才清理匹配的 PID 文件。`restart` 会等待旧进程真实退出后再执行 `start`，避免旧进程仍占用 80/443 或持有数据目录锁时启动新实例。
 
 `status` 会清理陈旧 PID 文件；如果 PID 文件丢失但同一工作目录下仍有 cloud-node 进程，Linux 环境会继续识别为运行中，避免进程仍在监听端口但 CLI 误报 stopped。
 
-systemd 安装模式使用 `Type=simple` 直接托管前台进程，`TimeoutStopSec=35` 限制停止等待时间。Pingora 的 SIGTERM graceful shutdown 宽限期设置为 5 秒，避免 `systemctl stop cloud-node` 长时间停留在 deactivating。
+systemd 安装模式使用 `Type=simple` 直接托管前台进程，`TimeoutStopSec=35` 限制停止等待时间，并设置 `CLOUD_NODE_HOME` 指向运行目录。Pingora 的 SIGTERM graceful shutdown 宽限期设置为 5 秒，避免 `systemctl stop cloud-node` 长时间停留在 deactivating。
 
-如果进程异常退出，systemd 安装模式下会按 `Restart=always` 自动拉起。排障时优先查看：
+如果进程异常退出，systemd 安装模式下会按 `Restart=on-failure` 自动拉起。排障时优先查看：
 
 - `systemctl status cloud-node`
 - `journalctl -u cloud-node`

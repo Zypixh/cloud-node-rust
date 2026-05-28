@@ -6,9 +6,10 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 
@@ -30,6 +31,70 @@ impl FormatTime for LocalLogTimer {
             "{}",
             cloud_node_rust::utils::time::now_local_millis().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
         )
+    }
+}
+
+#[derive(Clone)]
+struct SharedLogWriter {
+    file: Arc<Mutex<fs::File>>,
+}
+
+impl SharedLogWriter {
+    fn new(file: fs::File) -> Self {
+        Self {
+            file: Arc::new(Mutex::new(file)),
+        }
+    }
+}
+
+struct SharedLogGuard {
+    file: Arc<Mutex<fs::File>>,
+    buffer: Vec<u8>,
+}
+
+impl SharedLogGuard {
+    fn flush_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "run log lock poisoned"))?;
+        use io::Write as _;
+        file.write_all(&self.buffer)?;
+        file.flush()?;
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+impl Drop for SharedLogGuard {
+    fn drop(&mut self) {
+        let _ = self.flush_buffer();
+    }
+}
+
+impl io::Write for SharedLogGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_buffer()
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedLogWriter {
+    type Writer = SharedLogGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedLogGuard {
+            file: Arc::clone(&self.file),
+            buffer: Vec::new(),
+        }
     }
 }
 
@@ -256,8 +321,29 @@ fn systemd_service_is_active() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn systemd_service_exists() -> bool {
+    Command::new("systemctl")
+        .arg("cat")
+        .arg("cloud-node.service")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 fn run_systemctl(action: &str) -> anyhow::Result<bool> {
-    if is_systemd_invocation() || !systemd_service_is_active() {
+    if is_systemd_invocation() {
+        return Ok(false);
+    }
+
+    let should_use_systemd = match action {
+        "start" | "restart" => systemd_service_exists(),
+        "stop" => systemd_service_is_active(),
+        _ => systemd_service_exists(),
+    };
+    if !should_use_systemd {
         return Ok(false);
     }
 
@@ -291,6 +377,10 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            if run_systemctl("start")? {
+                return Ok(());
+            }
+
             let node_paths = cloud_node_rust::paths::NodePaths::current();
             node_paths.ensure_runtime_dirs().ok();
 
@@ -310,7 +400,8 @@ fn main() -> anyhow::Result<()> {
                 // Child: detach from terminal
                 libc::setsid();
 
-                // Redirect stdin/stdout to /dev/null
+                // The tracing subscriber writes application logs to logs/run.log.
+                // Keep daemon stdout detached and reserve stderr for fatal errors.
                 let devnull =
                     libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
                 if devnull >= 0 {
@@ -329,7 +420,6 @@ fn main() -> anyhow::Result<()> {
                     0o644,
                 );
                 if log_fd >= 0 {
-                    libc::dup2(log_fd, libc::STDOUT_FILENO);
                     libc::dup2(log_fd, libc::STDERR_FILENO);
                     if log_fd > libc::STDERR_FILENO {
                         libc::close(log_fd);
@@ -365,6 +455,19 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Restart) => {
+            #[cfg(target_os = "linux")]
+            if !is_systemd_invocation() && systemd_service_exists() {
+                if systemd_service_is_active() {
+                    run_systemctl("restart")?;
+                } else {
+                    if let Some(instance) = check_running() {
+                        stop_running_instance(instance)?;
+                    }
+                    run_systemctl("start")?;
+                }
+                return Ok(());
+            }
+
             if !run_systemctl("restart")? {
                 if let Some(instance) = check_running() {
                     stop_running_instance(instance)?;
@@ -409,20 +512,22 @@ fn main() -> anyhow::Result<()> {
                 let service_path = "/etc/systemd/system/cloud-node.service";
                 let service_content = format!(
                     "[Unit]\n\
-                     Description=CloudNode High Performance Cloud Node\n\
-                     After=network.target\n\n\
-                     [Service]\n\
-                     Type=simple\n\
-                     WorkingDirectory={}\n\
-                     ExecStart={}\n\
-                     ExecStop={} stop\n\
-                     TimeoutStopSec=35\n\
-                     KillMode=process\n\
-                     Restart=on-failure\n\
-                     RestartSec=10\n\
-                     LimitNOFILE=1048576\n\n\
-                     [Install]\n\
-                     WantedBy=multi-user.target\n",
+Description=CloudNode High Performance Cloud Node\n\
+After=network.target\n\n\
+[Service]\n\
+Type=simple\n\
+WorkingDirectory={}\n\
+Environment=CLOUD_NODE_HOME={}\n\
+ExecStart={}\n\
+ExecStop={} stop\n\
+TimeoutStopSec=35\n\
+KillMode=process\n\
+Restart=on-failure\n\
+RestartSec=10\n\
+LimitNOFILE=1048576\n\n\
+[Install]\n\
+WantedBy=multi-user.target\n",
+                    work_dir.display(),
                     work_dir.display(),
                     exe_path.display(),
                     exe_path.display()
@@ -504,20 +609,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     // Keep the PID file open to maintain the lock
     std::mem::forget(pid_file);
 
-    // Initialize logging with custom filter to silence hardcoded frame-level noise
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    cloud_node_rust::utils::time::init_local_timezone();
-
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("info,pingora_proxy::proxy_cache=off")
-    });
-
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_timer(LocalLogTimer))
-        .init();
+    init_logging(&node_paths);
 
     info!("Starting CloudNode Rust v{}...", env!("CARGO_PKG_VERSION"));
 
@@ -819,6 +911,46 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     Ok(())
 }
 
+fn init_logging(node_paths: &cloud_node_rust::paths::NodePaths) {
+    // Initialize logging with custom filter to silence hardcoded frame-level noise.
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    cloud_node_rust::utils::time::init_local_timezone();
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("info,pingora_proxy::proxy_cache=off")
+    });
+
+    let stdout_layer = tracing_subscriber::fmt::layer().with_timer(LocalLogTimer);
+    let file_layer = match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(node_paths.run_log_file())
+    {
+        Ok(file) => Some(
+            tracing_subscriber::fmt::layer()
+                .with_timer(LocalLogTimer)
+                .with_ansi(false)
+                .with_writer(SharedLogWriter::new(file)),
+        ),
+        Err(err) => {
+            eprintln!(
+                "Failed to open run log file {}: {}",
+                node_paths.run_log_file().display(),
+                err
+            );
+            None
+        }
+    };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
+}
+
 #[cfg(target_os = "linux")]
 fn auto_tune_kernel_params() {
     info!("Starting automatic kernel parameter tuning...");
@@ -911,7 +1043,9 @@ fn tune_kernel_param(param: KernelParamTune) {
                 } else if param.optional {
                     tracing::debug!(
                         "Kernel tuning optional value {} remained {} after writing {}",
-                        param.key, updated, target
+                        param.key,
+                        updated,
+                        target
                     );
                 } else {
                     warn!(
@@ -931,7 +1065,10 @@ fn tune_kernel_param(param: KernelParamTune) {
             if param.optional {
                 tracing::debug!(
                     "Kernel tuning optional value skipped for {} (current={}, target={}): {}",
-                    param.key, current, target, err
+                    param.key,
+                    current,
+                    target,
+                    err
                 );
             } else {
                 warn!(
