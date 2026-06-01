@@ -9,7 +9,8 @@ use pingora_core::protocols::tls::CustomALPN;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_proxy::{
-    DownstreamParseErrorAction, DownstreamParseErrorLogLevel, FailToProxy, ProxyHttp, Session,
+    DownstreamParseErrorAction, DownstreamParseErrorLogLevel, FailToProxy, ProxyHttp, PurgeStatus,
+    Session,
 };
 use rand::Rng;
 use rand::seq::SliceRandom;
@@ -21,7 +22,8 @@ use crate::cache::should_cache_response;
 use crate::cache_manager::CACHE;
 use crate::config::ConfigStore;
 use crate::config_models::{
-    HTTPCachePolicy, HTTPCacheRef, HTTPFirewallPolicy, ServerConfig, UAMConfig, WAFCaptchaOptions,
+    HTTPCacheKeyConfig, HTTPCachePolicy, HTTPCacheRef, HTTPFirewallPolicy, ServerConfig, UAMConfig,
+    WAFCaptchaOptions, WebCacheConfig,
 };
 use crate::firewall::state::WafStateManager;
 use crate::rewrite::{RewriteResult, evaluate_host_redirects, evaluate_rewrites_with_cond};
@@ -158,6 +160,7 @@ pub struct ProxyCTX {
     pub cache_key: Option<String>,
     pub cache_partial_range: Option<String>,
     pub cache_hit: Option<bool>,
+    pub cache_purge_authorized: bool,
     pub cacheable: bool,
     pub response_headers: LazyResponseHeaders,
     pub response_body_len: usize,
@@ -273,6 +276,7 @@ impl Default for ProxyCTX {
             cache_key: None,
             cache_partial_range: None,
             cache_hit: None,
+            cache_purge_authorized: false,
             cacheable: false,
             response_headers: LazyResponseHeaders::default(),
             response_body_len: 0,
@@ -438,6 +442,8 @@ const MAX_HLS_PLAYLIST_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HLS_SEGMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 use pingora_cache::lock::CacheLock;
+use pingora_cache::storage::HitHandler;
+use pingora_cache::{CacheMeta, ForcedFreshness};
 
 static CACHE_LOCK: once_cell::sync::Lazy<CacheLock> =
     once_cell::sync::Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(1)));
@@ -496,6 +502,104 @@ impl EdgeProxy {
             .unwrap_or_else(|_| fallback.to_string())
     }
 
+    fn cache_fetch_action_requested(session: &Session, ctx: &ProxyCTX) -> bool {
+        if !ctx.is_loopback {
+            return false;
+        }
+        ["x-edge-cache-action", "x-cloud-cache-action"]
+            .iter()
+            .filter_map(|name| session.get_header(*name))
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| value.trim().eq_ignore_ascii_case("fetch"))
+    }
+
+    fn cache_purge_authorized(session: &Session, cache: &WebCacheConfig) -> bool {
+        if !session
+            .req_header()
+            .method
+            .as_str()
+            .eq_ignore_ascii_case("PURGE")
+            || !cache.purge_is_on
+        {
+            return false;
+        }
+        let purge_key = cache.purge_key.trim();
+        !purge_key.is_empty()
+            && session
+                .get_header("x-edge-purge-key")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == purge_key)
+    }
+
+    fn purge_cache_ref(
+        cache: &WebCacheConfig,
+        global_policies: &[Arc<HTTPCachePolicy>],
+    ) -> Option<(Arc<HTTPCacheRef>, Option<Arc<HTTPCachePolicy>>)> {
+        if let Some(cache_ref) = cache
+            .cache_refs
+            .iter()
+            .find(|cache_ref| cache_ref.is_on && !cache_ref.is_reverse)
+        {
+            return Some((cache_ref.clone(), None));
+        }
+
+        if !cache.disable_policy_refs {
+            if let Some(policy) = &cache.cache_policy {
+                if let Some(cache_ref) = policy
+                    .cache_refs
+                    .iter()
+                    .find(|cache_ref| cache_ref.is_on && !cache_ref.is_reverse)
+                {
+                    return Some((cache_ref.clone(), Some(policy.clone())));
+                }
+            } else {
+                for policy in global_policies {
+                    if let Some(cache_ref) = policy
+                        .cache_refs
+                        .iter()
+                        .find(|cache_ref| cache_ref.is_on && !cache_ref.is_reverse)
+                    {
+                        return Some((cache_ref.clone(), Some(policy.clone())));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn report_remote_purge(api_config: Arc<ApiConfig>, key: String) {
+        tokio::spawn(async move {
+            let client = match crate::rpc::client::RpcClient::new(&api_config).await {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!("CACHE_PURGE: create RPC client failed: {}", err);
+                    return;
+                }
+            };
+            let mut service = client.server_service();
+            match service
+                .purge_server_cache(crate::pb::PurgeServerCacheRequest {
+                    keys: vec![key.clone()],
+                    prefixes: Vec::new(),
+                    description: "local PURGE request".to_string(),
+                })
+                .await
+            {
+                Ok(resp) => {
+                    let resp = resp.into_inner();
+                    if !resp.is_ok {
+                        warn!(
+                            "CACHE_PURGE: remote purge task rejected for {}: {}",
+                            key, resp.message
+                        );
+                    }
+                }
+                Err(err) => warn!("CACHE_PURGE: remote purge task failed for {}: {}", key, err),
+            }
+        });
+    }
+
     fn build_location_lb_if_configured(
         &self,
         server_id: i64,
@@ -503,7 +607,9 @@ impl EdgeProxy {
     ) -> Option<Arc<crate::lb_factory::AnyLoadBalancer>> {
         let rp_cfg = location
             .and_then(|loc| loc.reverse_proxy.as_ref())
-            .filter(|rp| rp.is_on || !rp.primary_origins.is_empty() || !rp.backup_origins.is_empty())?
+            .filter(|rp| {
+                rp.is_on || !rp.primary_origins.is_empty() || !rp.backup_origins.is_empty()
+            })?
             .clone();
         let (level, parent_nodes, tiered_origin_bypass, allow_lan_ip, global_http) =
             self.config.get_origin_build_context_sync();
@@ -753,6 +859,7 @@ impl EdgeProxy {
         ctx.compiled_cache_ref = None;
         ctx.compiled_cache_policy = None;
         ctx.cache_key = None;
+        ctx.cache_purge_authorized = false;
         if matches!(
             session.cache.phase(),
             pingora_cache::CachePhase::Disabled(pingora_cache::NoCacheReason::NeverEnabled)
@@ -779,6 +886,45 @@ impl EdgeProxy {
         cache_ctx.host = Some(ctx.host.clone());
         cache_ctx.analyzed = ctx.analyzed.clone();
         cache_ctx
+    }
+
+    fn active_cache_key_config(cache: &WebCacheConfig) -> Option<&HTTPCacheKeyConfig> {
+        cache
+            .key
+            .as_ref()
+            .filter(|key| key.is_on && !key.host.trim().is_empty())
+    }
+
+    fn cache_key_scheme_host(
+        request_scheme: &str,
+        request_host: &str,
+        cache: &WebCacheConfig,
+    ) -> (String, String) {
+        let mut scheme = request_scheme.to_ascii_lowercase();
+        let mut host = Self::normalize_request_host(request_host);
+        if let Some(key_config) = Self::active_cache_key_config(cache) {
+            let configured_scheme = key_config.scheme.trim();
+            if !configured_scheme.is_empty() {
+                scheme = configured_scheme.to_ascii_lowercase();
+            }
+            host = Self::normalize_request_host(&key_config.host);
+        }
+        (scheme, host)
+    }
+
+    fn apply_cache_key_config_to_context(
+        cache_ctx: &mut crate::cache::compiled::CacheEvalContext<'_>,
+        cache: &WebCacheConfig,
+    ) {
+        let Some(key_config) = Self::active_cache_key_config(cache) else {
+            return;
+        };
+        let request_host = cache_ctx.host.as_deref().unwrap_or_default();
+        let (scheme, host) = Self::cache_key_scheme_host(cache_ctx.scheme, request_host, cache);
+        if !key_config.scheme.trim().is_empty() {
+            cache_ctx.cache_key_scheme = Some(scheme);
+        }
+        cache_ctx.cache_key_host = Some(host);
     }
 
     fn cache_ref_matches_request_with_context(
@@ -824,11 +970,7 @@ impl EdgeProxy {
         true
     }
 
-    fn uam_matches_request_url(
-        cfg: &UAMConfig,
-        session: &Session,
-        ctx: &ProxyCTX,
-    ) -> bool {
+    fn uam_matches_request_url(cfg: &UAMConfig, session: &Session, ctx: &ProxyCTX) -> bool {
         let path = session.req_header().uri.path();
         let mut url = None;
         if cfg.except_url_patterns.iter().any(|pattern| {
@@ -1200,7 +1342,6 @@ impl EdgeProxy {
             .unwrap_or(0)
     }
 
-
     fn decrement_request_limit_count(server_id: i64, client_ip: std::net::IpAddr) {
         if let Some(count) = REQUEST_LIMIT_SERVER_COUNTS.get(&server_id) {
             loop {
@@ -1382,7 +1523,8 @@ impl EdgeProxy {
     }
 
     fn record_malformed_http_defense(&self, defense: &'static str, ip: std::net::IpAddr) {
-        let Some(config) = crate::special_defense::global_malformed_http_config(&self.config) else {
+        let Some(config) = crate::special_defense::global_malformed_http_config(&self.config)
+        else {
             return;
         };
         let node_id = self.api_config.node_id.parse::<i64>().unwrap_or(0);
@@ -1507,8 +1649,7 @@ impl EdgeProxy {
         if inner.eq_ignore_ascii_case("rawRemoteAddr") {
             return raw_ip.to_string();
         }
-        if inner.eq_ignore_ascii_case("remoteAddr")
-            || inner.eq_ignore_ascii_case("remoteAddrValue")
+        if inner.eq_ignore_ascii_case("remoteAddr") || inner.eq_ignore_ascii_case("remoteAddrValue")
         {
             return Self::fallback_client_ip(session, raw_ip).to_string();
         }
@@ -1534,11 +1675,7 @@ impl EdgeProxy {
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.split(':').next().unwrap_or(v))
                 .unwrap_or("");
-            return host
-                .split('.')
-                .next()
-                .unwrap_or("")
-                .to_string();
+            return host.split('.').next().unwrap_or("").to_string();
         }
         if inner.eq_ignore_ascii_case("host.last") {
             let host = session
@@ -1546,11 +1683,7 @@ impl EdgeProxy {
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.split(':').next().unwrap_or(v))
                 .unwrap_or("");
-            return host
-                .split('.')
-                .last()
-                .unwrap_or("")
-                .to_string();
+            return host.split('.').last().unwrap_or("").to_string();
         }
 
         // ${node.id} — numeric node identifier from the control-plane config.
@@ -1763,9 +1896,7 @@ impl EdgeProxy {
             "add" if !bare_host.starts_with("www.") => {
                 format!("www.{}", bare_host)
             }
-            "remove" if bare_host.starts_with("www.") => {
-                bare_host[4..].to_string()
-            }
+            "remove" if bare_host.starts_with("www.") => bare_host[4..].to_string(),
             _ => bare_host.to_string(),
         };
 
@@ -1856,7 +1987,6 @@ impl EdgeProxy {
                     .windows(needle.len())
                     .any(|part| part.eq_ignore_ascii_case(needle)))
     }
-
 
     fn add_ctx_tag(ctx: &mut ProxyCTX, tag: &str) {
         let tags = ctx.tags.get_or_insert_with(Vec::new);
@@ -2399,10 +2529,7 @@ impl EdgeProxy {
             },
             None => "slider",
         };
-        if method == "slider"
-            && action_code == "captcha"
-            && global_use_geetest
-        {
+        if method == "slider" && action_code == "captcha" && global_use_geetest {
             "geetest".to_string()
         } else {
             method.to_string()
@@ -2443,10 +2570,7 @@ impl EdgeProxy {
             .find_map(|policy| policy.captcha_options.as_ref())
     }
 
-    fn uam_config_hash(
-        site_uam: Option<&UAMConfig>,
-        global_uam: Option<&UAMConfig>,
-    ) -> String {
+    fn uam_config_hash(site_uam: Option<&UAMConfig>, global_uam: Option<&UAMConfig>) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"uam-config|");
         if let Some(cfg) = site_uam {
@@ -2492,7 +2616,11 @@ impl EdgeProxy {
     }
 
     fn uam_host_scope(ctx: &ProxyCTX) -> String {
-        let server_id = ctx.server.as_ref().map(|server| server.numeric_id()).unwrap_or(0);
+        let server_id = ctx
+            .server
+            .as_ref()
+            .map(|server| server.numeric_id())
+            .unwrap_or(0);
         format!("{}|{}", Self::normalize_request_host(&ctx.host), server_id)
     }
 
@@ -2565,7 +2693,13 @@ impl EdgeProxy {
         (now <= exp).then_some(exp.saturating_sub(now).max(1))
     }
 
-    fn uam_challenge_signature(&self, payload: &str, ip: &str, ua: &str, host_scope: &str) -> String {
+    fn uam_challenge_signature(
+        &self,
+        payload: &str,
+        ip: &str,
+        ua: &str,
+        host_scope: &str,
+    ) -> String {
         let mut ua_hasher = Sha256::new();
         ua_hasher.update(ua.as_bytes());
         let ua_hash = hex::encode(ua_hasher.finalize());
@@ -2651,7 +2785,11 @@ impl EdgeProxy {
         if issued_at > 0 && now.saturating_sub(issued_at) < UAM_MIN_VERIFY_SECONDS {
             return None;
         }
-        (now <= exp).then_some((exp.saturating_sub(now).max(1), mode, pow_difficulty.clamp(5, 8)))
+        (now <= exp).then_some((
+            exp.saturating_sub(now).max(1),
+            mode,
+            pow_difficulty.clamp(5, 8),
+        ))
     }
 
     fn global_cc_policy(&self) -> Option<crate::config_models::CCPolicy> {
@@ -3370,7 +3508,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let config_hash = Self::uam_config_hash(site_uam, global_uam.as_ref());
         let cookies = merged_session_cookie_header(session).unwrap_or_default();
         if let Some(pass_value) = Self::cookie_value(&cookies, "UAM-Pass")
-            && let pass = pass_value.split_once(":type=").map(|(t, _)| t).unwrap_or(pass_value)
+            && let pass = pass_value
+                .split_once(":type=")
+                .map(|(t, _)| t)
+                .unwrap_or(pass_value)
             && self
                 .validate_uam_pass_cookie(pass, ip, ua, scope_id, &host_scope, &config_hash)
                 .is_some()
@@ -3396,17 +3537,16 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let challenge = crate::firewall::uam::dispatch(mode);
         let return_path = Self::current_request_path_query(session);
         let challenge_life_seconds = life_seconds.min(UAM_CHALLENGE_LIFE_SECONDS);
-        let token =
-            self.issue_uam_challenge_token(
-                ip,
-                ua,
-                scope_id,
-                &host_scope,
-                &config_hash,
-                challenge_life_seconds,
-                mode,
-                pow_difficulty,
-            );
+        let token = self.issue_uam_challenge_token(
+            ip,
+            ua,
+            scope_id,
+            &host_scope,
+            &config_hash,
+            challenge_life_seconds,
+            mode,
+            pow_difficulty,
+        );
 
         let issue_ctx = crate::firewall::uam::UamIssueCtx {
             token: &token,
@@ -3416,7 +3556,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             return_path: &return_path,
             slider_target: self.waf_verifier.slider_target(&token),
         };
-        let body_html = self.render_page_template(session, ctx, &challenge.issue_html(&issue_ctx), 200);
+        let body_html =
+            self.render_page_template(session, ctx, &challenge.issue_html(&issue_ctx), 200);
 
         let action_code = if site_uam_enabled {
             "site_uam"
@@ -3436,8 +3577,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .unwrap();
         resp.insert_header("referrer-policy", "same-origin")
             .unwrap();
-        resp.append_header("set-cookie", format!("UAM-Token={token}; HttpOnly; {suffix}"))
-            .unwrap();
+        resp.append_header(
+            "set-cookie",
+            format!("UAM-Token={token}; HttpOnly; {suffix}"),
+        )
+        .unwrap();
         ctx.response_status = 200;
         ctx.response_body_len = body_html.len();
         session.write_response_header(Box::new(resp), false).await?;
@@ -3511,8 +3655,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
 
         // Bandwidth enforcement: 1-second sliding window per (scope, IP).
         if policy.max_bandwidth > 0.0 {
-            let request_bytes = (session.body_bytes_sent() as u64)
-                .saturating_add(ctx.response_headers_size as u64);
+            let request_bytes =
+                (session.body_bytes_sent() as u64).saturating_add(ctx.response_headers_size as u64);
             let bw_limit = policy.max_bandwidth as u64;
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3533,7 +3677,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             if advanced {
                 byte_counter.store(request_bytes, Ordering::Relaxed);
             } else {
-                let total = byte_counter.fetch_add(request_bytes, Ordering::Relaxed) + request_bytes;
+                let total =
+                    byte_counter.fetch_add(request_bytes, Ordering::Relaxed) + request_bytes;
                 if total > bw_limit {
                     if policy.block_ip {
                         let ban = if policy.block_ip_duration > 0 {
@@ -4440,13 +4585,14 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         std::borrow::Cow::Owned(stripped)
     }
 
-    fn default_cache_key_for_session(session: &Session, ctx: &ProxyCTX) -> String {
-        let scheme = Self::forwarded_proto(session, ctx);
-        let host = session
-            .get_header("host")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.split(':').next().unwrap_or(v))
-            .unwrap_or_else(|| session.req_header().uri.host().unwrap_or(""));
+    fn default_cache_key_for_session(
+        session: &Session,
+        ctx: &ProxyCTX,
+        cache: &WebCacheConfig,
+    ) -> String {
+        let request_host = Self::request_host(session);
+        let (scheme, host) =
+            Self::cache_key_scheme_host(Self::forwarded_proto(session, ctx), &request_host, cache);
         let path = session.req_header().uri.path();
         let query = session
             .req_header()
@@ -4456,9 +4602,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
 
         let query_len = query.as_ref().map(|query| query.len() + 1).unwrap_or(0);
         let mut key = String::with_capacity(scheme.len() + 3 + host.len() + path.len() + query_len);
-        key.push_str(scheme);
+        key.push_str(&scheme);
         key.push_str("://");
-        key.push_str(host);
+        key.push_str(&host);
         key.push_str(path);
         if let Some(query) = query
             && !query.is_empty()
@@ -4867,8 +5013,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .get_header("user-agent")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let is_uam_verification =
-            Self::query_param(session, "__waf_uam").as_deref() == Some("1");
+        let is_uam_verification = Self::query_param(session, "__waf_uam").as_deref() == Some("1");
 
         if is_uam_verification {
             let site_uam = Self::site_uam_config(ctx);
@@ -4905,14 +5050,14 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         .verify_slider_trace(&token, final_x, elapsed, &trace);
                 let pow_verified = !Self::uam_mode_requires_pow(token_mode)
                     || (!pow.is_empty()
-                        && self.waf_verifier.verify_pow(
-                            &token,
-                            &pow,
-                            token_pow_difficulty as u32,
-                        ));
-                token_result
-                    .filter(|_| pow_verified && trace_verified)
-                    .map(|(_, mode, pow_difficulty)| (scope_id, host_scope, config_hash, mode, pow_difficulty))
+                        && self
+                            .waf_verifier
+                            .verify_pow(&token, &pow, token_pow_difficulty as u32));
+                token_result.filter(|_| pow_verified && trace_verified).map(
+                    |(_, mode, pow_difficulty)| {
+                        (scope_id, host_scope, config_hash, mode, pow_difficulty)
+                    },
+                )
             } else {
                 None
             };
@@ -4936,11 +5081,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     format!("UAM-Pass={uam_pass}:type={uam_challenge_type}; HttpOnly; {suffix}"),
                 )
                 .unwrap();
-                resp.append_header(
-                    "set-cookie",
-                    format!("UAM-Token=; Max-Age=0; {suffix}"),
-                )
-                .unwrap();
+                resp.append_header("set-cookie", format!("UAM-Token=; Max-Age=0; {suffix}"))
+                    .unwrap();
                 resp.insert_header("cache-control", "no-store").unwrap();
                 resp.insert_header("x-uam-verified", "1").unwrap();
                 session.write_response_header(Box::new(resp), true).await?;
@@ -4972,8 +5114,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let challenge_type = Self::query_param(session, "__waf_challenge_type")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "slider".to_string());
-        let challenge_token = Self::query_param(session, "__waf_challenge_token")
-            .filter(|v| !v.is_empty());
+        let challenge_token =
+            Self::query_param(session, "__waf_challenge_token").filter(|v| !v.is_empty());
 
         let token_pow_difficulty = self
             .waf_verifier
@@ -4993,9 +5135,15 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             && pow_ok
             && match challenge_type.as_str() {
                 "click" => {
-                    let sequence_str = Self::query_param(session, "__waf_click_seq").unwrap_or_default();
-                    let seq: Vec<usize> = sequence_str.split(',').filter_map(|s| s.parse().ok()).collect();
-                    let click_elapsed = Self::query_param(session, "__waf_elapsed").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let sequence_str =
+                        Self::query_param(session, "__waf_click_seq").unwrap_or_default();
+                    let seq: Vec<usize> = sequence_str
+                        .split(',')
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    let click_elapsed = Self::query_param(session, "__waf_elapsed")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
                     challenge_token.as_deref().is_some_and(|challenge_token| {
                         crate::pages::challenges::click::verify(
                             challenge_token,
@@ -5006,7 +5154,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     })
                 }
                 "captcha" => {
-                    let answer_hash = Self::query_param(session, "__waf_captcha_hash").unwrap_or_default();
+                    let answer_hash =
+                        Self::query_param(session, "__waf_captcha_hash").unwrap_or_default();
                     challenge_token.as_deref().is_some_and(|challenge_token| {
                         crate::pages::challenges::captcha::verify(
                             challenge_token,
@@ -5022,9 +5171,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     let fingerprint = Self::query_param(session, "__waf_js_fp").unwrap_or_default();
                     let digest = Self::query_param(session, "__waf_js_digest").unwrap_or_default();
                     let cookies = merged_session_cookie_header(session).unwrap_or_default();
-                    verified_js_cookie_name = challenge_token
-                        .as_deref()
-                        .and_then(|challenge_token| {
+                    verified_js_cookie_name =
+                        challenge_token.as_deref().and_then(|challenge_token| {
                             crate::pages::challenges::jscookie::verify(
                                 challenge_token,
                                 &token,
@@ -5040,8 +5188,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 "pow" => true,
                 _ => {
                     // default: slider
-                    let sx = Self::query_param(session, "x").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-                    let sy = Self::query_param(session, "y").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                    let sx = Self::query_param(session, "x")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let sy = Self::query_param(session, "y")
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0);
                     let target = self.waf_verifier.slider_target(&token);
                     crate::pages::challenges::slider::verify_anchor(target, sx, sy, elapsed, &trace)
                 }
@@ -5140,7 +5292,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         resp.insert_header("cache-control", "no-store").unwrap();
         session.write_response_header(Box::new(resp), false).await?;
         session
-            .write_response_body(Some(Bytes::from(crate::pages::verification_failed_page())), true)
+            .write_response_body(
+                Some(Bytes::from(crate::pages::verification_failed_page())),
+                true,
+            )
             .await?;
         ctx.response_status = 403;
         Ok(true)
@@ -5657,7 +5812,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 let part = part.trim();
                 // 1. Check AES-256-GCM Token
                 if let Some(raw_token) = part.strip_prefix("WAF-Token=")
-                    && let token = raw_token.split_once(":type=").map(|(t, _)| t).unwrap_or(raw_token)
+                    && let token = raw_token
+                        .split_once(":type=")
+                        .map(|(t, _)| t)
+                        .unwrap_or(raw_token)
                     && verifier
                         .token_seconds_remaining(ip_str, ua, token, 3600)
                         .is_some()
@@ -5733,8 +5891,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     }
                 }
 
-                let resolved_body =
-                    self.render_waf_block_body(session, ctx, &body, status as u16);
+                let resolved_body = self.render_waf_block_body(session, ctx, &body, status as u16);
                 let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
                 resp.insert_header("content-type", "text/html; charset=utf-8")
                     .unwrap();
@@ -5948,14 +6105,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 }
 
                 let return_path =
-                    urlencoding::encode(&Self::current_request_path_query(session))
-                        .into_owned();
+                    urlencoding::encode(&Self::current_request_path_query(session)).into_owned();
                 let challenge_lang = captcha_opts
                     .as_ref()
                     .and_then(|o| {
-                        (!o.challenge_lang.trim().is_empty()).then(|| {
-                            crate::pages::detect_lang(Some(&o.challenge_lang), None)
-                        })
+                        (!o.challenge_lang.trim().is_empty())
+                            .then(|| crate::pages::detect_lang(Some(&o.challenge_lang), None))
                     })
                     .unwrap_or(crate::pages::Lang::En);
                 // Determine the challenge method, resolving "geetest" into a
@@ -5970,7 +6125,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 };
 
                 let challenge_secret = self.api_config.secret.as_bytes();
-                let challenge_expiry = crate::utils::time::now_timestamp() as u64 + life_seconds.max(60) as u64;
+                let challenge_expiry =
+                    crate::utils::time::now_timestamp() as u64 + life_seconds.max(60) as u64;
 
                 let body_html = match effective_method {
                     "click" => {
@@ -5983,7 +6139,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                             challenge_secret,
                             challenge_expiry,
                         );
-                        let page = crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id);
+                        let page = crate::pages::uam_challenge_page(
+                            &body,
+                            "",
+                            challenge_lang,
+                            &ctx.request_id,
+                        );
                         page
                     }
                     "captcha" => {
@@ -5996,7 +6157,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                             challenge_secret,
                             challenge_expiry,
                         );
-                        let page = crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id);
+                        let page = crate::pages::uam_challenge_page(
+                            &body,
+                            "",
+                            challenge_lang,
+                            &ctx.request_id,
+                        );
                         page
                     }
                     "jscookie" => {
@@ -6014,9 +6180,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     }
                     "pow" => {
                         let t = crate::pages::lang::text(challenge_lang);
-                        let pow_script = self
-                            .waf_verifier
-                            .get_pow_script_with_life(&token, difficulty, life_seconds);
+                        let pow_script = self.waf_verifier.get_pow_script_with_life(
+                            &token,
+                            difficulty,
+                            life_seconds,
+                        );
                         let body = format!(
                             "<h1 data-i18n=\"checking\">{}</h1><p data-i18n=\"checking_sub\">{}</p><div class=\"progress\"><span></span></div><div class=\"meta\">Request #{}</div>",
                             t.checking, t.checking_sub, ctx.request_id
@@ -6039,7 +6207,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                             &return_path,
                             target,
                         );
-                        let page = crate::pages::uam_challenge_page(&body, "", challenge_lang, &ctx.request_id);
+                        let page = crate::pages::uam_challenge_page(
+                            &body,
+                            "",
+                            challenge_lang,
+                            &ctx.request_id,
+                        );
                         page
                     }
                 };
@@ -6112,7 +6285,10 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     cc.max_bandwidth = pd.cc_max_bandwidth as f64;
                 }
             }
-            if self.apply_cc_policy(session, ctx, &cc, site_server_id).await? {
+            if self
+                .apply_cc_policy(session, ctx, &cc, site_server_id)
+                .await?
+            {
                 return Ok(true);
             }
         }
@@ -6558,12 +6734,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 .get_header("user-agent")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            if self.waf_pass_cookie_verified_for_action(
-                session,
-                &matched,
-                &ctx.client_ip_str,
-                ua,
-            ) {
+            if self.waf_pass_cookie_verified_for_action(session, &matched, &ctx.client_ip_str, ua) {
                 return Ok((false, waf_action));
             }
 
@@ -6670,7 +6841,8 @@ impl ProxyHttp for EdgeProxy {
             && !s.locations.is_empty()
         {
             let server_id = s.id.unwrap_or(0);
-            let compiled = crate::routing::location::get_compiled_locations(server_id, &s.locations);
+            let compiled =
+                crate::routing::location::get_compiled_locations(server_id, &s.locations);
             let path = session.req_header().uri.path();
             if let Some(matched) = crate::routing::location::match_location(&compiled, path) {
                 ctx.matched_location = Some(matched.config.clone());
@@ -7318,9 +7490,7 @@ impl ProxyHttp for EdgeProxy {
         // refresh (thundering-herd protected by SWR_REVALIDATE_IN_FLIGHT).
         if let Some(cache_key) = &ctx.cache_key {
             let hash = format!("{:x}", md5_legacy::compute(cache_key.as_bytes()));
-            if let Some(meta) =
-                crate::metrics::storage::STORAGE.get_cache_meta(&hash)
-            {
+            if let Some(meta) = crate::metrics::storage::STORAGE.get_cache_meta(&hash) {
                 let now = crate::utils::time::now_timestamp();
                 // Entry is expired but within the SWR window?
                 if meta.expires < now
@@ -7340,9 +7510,16 @@ impl ProxyHttp for EdgeProxy {
                         if !ctx.origin_host.is_empty() {
                             let origin_url = format!(
                                 "{}://{}{}",
-                                if ctx.is_tls_downstream { "https" } else { "http" },
+                                if ctx.is_tls_downstream {
+                                    "https"
+                                } else {
+                                    "http"
+                                },
                                 ctx.origin_host,
-                                _session.req_header().uri.path_and_query()
+                                _session
+                                    .req_header()
+                                    .uri
+                                    .path_and_query()
                                     .map(|pq| pq.as_str())
                                     .unwrap_or("/")
                             );
@@ -7684,10 +7861,7 @@ impl ProxyHttp for EdgeProxy {
         if ctx.response_status == 0 {
             if let Some(err) = _re {
                 if matches!(err.esource(), ErrorSource::Downstream)
-                    && matches!(
-                        err.etype(),
-                        WriteError | ReadError | ConnectionClosed
-                    )
+                    && matches!(err.etype(), WriteError | ReadError | ConnectionClosed)
                 {
                     ctx.response_status = 499;
                 }
@@ -7777,16 +7951,61 @@ impl ProxyHttp for EdgeProxy {
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
-        let location_cache = ctx
-            .matched_location
-            .as_ref()
-            .and_then(|l| l.cache.clone());
+        let location_cache = ctx.matched_location.as_ref().and_then(|l| l.cache.clone());
         if let Some(s) = &ctx.server
             && let Some(cache) = location_cache
                 .as_ref()
                 .or_else(|| s.web.as_ref().and_then(|w| w.cache.as_ref()))
             && cache.is_on
         {
+            if Self::cache_purge_authorized(session, cache) {
+                let Some((cache_ref, matched_policy)) =
+                    Self::purge_cache_ref(cache, &ctx.global_cache_policies)
+                else {
+                    Self::disable_request_cache(session, ctx, "PurgeNoPolicy");
+                    return Ok(());
+                };
+
+                let scheme = Self::forwarded_proto(session, ctx);
+                let mut cache_key_ctx = Self::cache_eval_context(session, ctx, scheme);
+                Self::apply_cache_key_config_to_context(&mut cache_key_ctx, cache);
+                let key = if let Some(key_template) = &cache_ref.key {
+                    if key_template.is_empty() {
+                        Self::default_cache_key_for_session(session, ctx, cache)
+                    } else {
+                        crate::cache::matching::format_variables_with_context(
+                            &cache_key_ctx,
+                            key_template,
+                        )
+                    }
+                } else {
+                    Self::default_cache_key_for_session(session, ctx, cache)
+                };
+
+                ctx.cache_policy = if let Some(ref child) = cache_ref.cache_policy {
+                    Some(child.clone())
+                } else {
+                    matched_policy
+                };
+                ctx.compiled_cache_policy = None;
+                ctx.compiled_cache_ref = None;
+                ctx.cache_ref = Some(cache_ref);
+                ctx.cache_key = Some(key);
+                ctx.cache_purge_authorized = true;
+                session
+                    .cache
+                    .enable(CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
+                return Ok(());
+            } else if session
+                .req_header()
+                .method
+                .as_str()
+                .eq_ignore_ascii_case("PURGE")
+            {
+                Self::disable_request_cache(session, ctx, "PurgeUnauthorized");
+                return Ok(());
+            }
+
             let scheme = Self::forwarded_proto(session, ctx);
             let cache_ctx = Self::cache_eval_context(session, ctx, scheme);
             let mut compiled_cache_plan_available = false;
@@ -7949,29 +8168,32 @@ impl ProxyHttp for EdgeProxy {
                 }
                 ctx.cache_ref = Some(cache_ref.clone());
 
+                let mut cache_key_ctx = cache_ctx.clone();
+                Self::apply_cache_key_config_to_context(&mut cache_key_ctx, cache);
+
                 // --- PROTOCOL PARITY: Salted Key Generation ---
                 let mut key = if let Some(compiled_ref) = &ctx.compiled_cache_ref {
                     compiled_ref
                         .key_template
                         .as_ref()
-                        .map(|key_template| key_template.format_with_context(&cache_ctx))
-                        .unwrap_or_else(|| Self::default_cache_key_for_session(session, ctx))
+                        .map(|key_template| key_template.format_with_context(&cache_key_ctx))
+                        .unwrap_or_else(|| Self::default_cache_key_for_session(session, ctx, cache))
                 } else if let Some(key_template) = &cache_ref.key {
                     if key_template.is_empty() {
-                        Self::default_cache_key_for_session(session, ctx)
+                        Self::default_cache_key_for_session(session, ctx, cache)
                     } else {
                         crate::cache::matching::format_variables_with_context(
-                            &cache_ctx,
+                            &cache_key_ctx,
                             key_template,
                         )
                     }
                 } else {
-                    Self::default_cache_key_for_session(session, ctx)
+                    Self::default_cache_key_for_session(session, ctx, cache)
                 };
 
                 // 1. Method suffix used by the cloud cache key format.
                 let method = session.req_header().method.as_str();
-                if method != "GET" {
+                if method != "GET" && !ctx.cache_purge_authorized {
                     key.push_str("@method:");
                     key.push_str(method);
                 }
@@ -8005,8 +8227,9 @@ impl ProxyHttp for EdgeProxy {
                 // When it does not exist and partial caching is enabled, the cloud-node partial
                 // store keeps one aggregate sparse object and records covered byte ranges.
                 let full_object_hash = format!("{:x}", md5_legacy::compute(key.as_bytes()));
-                let full_object_cached =
-                    crate::metrics::storage::STORAGE.get_cache_meta(&full_object_hash).is_some();
+                let full_object_cached = crate::metrics::storage::STORAGE
+                    .get_cache_meta(&full_object_hash)
+                    .is_some();
                 let partial_cache_allowed = ctx
                     .compiled_cache_ref
                     .as_ref()
@@ -8063,8 +8286,7 @@ impl ProxyHttp for EdgeProxy {
                 //    rewrite if the origin returned a Vary header (see upstream_response_filter).
                 if !using_partial_key {
                     let base_hash = format!("{:x}", md5_legacy::compute(key.as_bytes()));
-                    if let Some(meta) =
-                        crate::metrics::storage::STORAGE.get_cache_meta(&base_hash)
+                    if let Some(meta) = crate::metrics::storage::STORAGE.get_cache_meta(&base_hash)
                     {
                         // Find the cached Vary header value from stored headers
                         let vary_val = meta
@@ -8108,6 +8330,43 @@ impl ProxyHttp for EdgeProxy {
         } else {
             tracing::debug!("Cache is OFF for this server or web config.");
             Self::disable_request_cache(session, ctx, "CacheConfigOff");
+        }
+        Ok(())
+    }
+
+    async fn cache_hit_filter(
+        &self,
+        session: &mut Session,
+        _meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
+        _is_fresh: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<ForcedFreshness>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if Self::cache_fetch_action_requested(session, ctx) {
+            return Ok(Some(ForcedFreshness::ForceMiss));
+        }
+        Ok(None)
+    }
+
+    fn is_purge(&self, _session: &Session, ctx: &Self::CTX) -> bool {
+        ctx.cache_purge_authorized
+    }
+
+    fn purge_response_filter(
+        &self,
+        _session: &Session,
+        ctx: &mut Self::CTX,
+        purge_status: PurgeStatus,
+        _purge_response: &mut std::borrow::Cow<'static, pingora_http::ResponseHeader>,
+    ) -> Result<()> {
+        if ctx.cache_purge_authorized
+            && matches!(purge_status, PurgeStatus::Found | PurgeStatus::NotFound)
+            && let Some(key) = ctx.cache_key.clone()
+        {
+            Self::report_remote_purge(self.api_config.clone(), key);
         }
         Ok(())
     }
@@ -8252,11 +8511,12 @@ impl ProxyHttp for EdgeProxy {
             .as_deref()
             .map(crate::cache::partial::is_partial_cache_key)
             .unwrap_or(false);
-        if !is_partial_cache_key && let Some(vary_raw) = upstream_response
-            .headers
-            .get("vary")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
+        if !is_partial_cache_key
+            && let Some(vary_raw) = upstream_response
+                .headers
+                .get("vary")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
         {
             match Self::vary_cache_key_suffix(&vary_raw, &session.req_header().headers) {
                 Some(Err(())) => {
@@ -8321,9 +8581,7 @@ impl ProxyHttp for EdgeProxy {
 
                 // Check If-None-Match
                 fn strip_etag(s: &str) -> &str {
-                    s.trim()
-                        .trim_start_matches("W/")
-                        .trim_matches('"')
+                    s.trim().trim_start_matches("W/").trim_matches('"')
                 }
                 let inm_match = session
                     .get_header("if-none-match")
@@ -8350,8 +8608,7 @@ impl ProxyHttp for EdgeProxy {
                         .and_then(|ims| {
                             cached_last_modified.as_ref().and_then(|lm| {
                                 let ims_dt = chrono::DateTime::parse_from_rfc2822(ims).ok()?;
-                                let lm_dt =
-                                    chrono::DateTime::parse_from_rfc2822(lm).ok()?;
+                                let lm_dt = chrono::DateTime::parse_from_rfc2822(lm).ok()?;
                                 // "not modified" if cached version is same age or older
                                 Some(lm_dt <= ims_dt)
                             })
@@ -8360,8 +8617,7 @@ impl ProxyHttp for EdgeProxy {
                 };
 
                 if inm_match || ims_match {
-                    upstream_response.status =
-                        pingora::http::StatusCode::NOT_MODIFIED;
+                    upstream_response.status = pingora::http::StatusCode::NOT_MODIFIED;
                     ctx.response_status = 304;
                     // Populate weak ETag if we generated one (RFC 7232 §4.1)
                     if cached_etag.is_none() {
@@ -9070,8 +9326,7 @@ impl ProxyHttp for EdgeProxy {
             upstream_request
                 .insert_header("range", range_value)
                 .map_err(|_| Error::new(InternalError))?;
-            if let Some(if_range) = _session.get_header("if-range")
-            {
+            if let Some(if_range) = _session.get_header("if-range") {
                 upstream_request
                     .insert_header("if-range", if_range.clone())
                     .unwrap_or(());
@@ -9560,7 +9815,8 @@ impl ProxyHttp for EdgeProxy {
                         passthrough_after_eval.extend_from_slice(&chunk[inspect_remaining..]);
                     }
                     if !passthrough_after_eval.is_empty() {
-                        ctx.response_body_buffer.extend_from_slice(&passthrough_after_eval);
+                        ctx.response_body_buffer
+                            .extend_from_slice(&passthrough_after_eval);
                     }
                 }
 
@@ -9678,7 +9934,11 @@ impl ProxyHttp for EdgeProxy {
                         pingora_cache::NoCacheReason::Custom("PartialRangeMissingContentRange"),
                     ));
                 }
-                if content_range.as_ref().and_then(|range| range.total).is_none() {
+                if content_range
+                    .as_ref()
+                    .and_then(|range| range.total)
+                    .is_none()
+                {
                     return Ok(pingora_cache::RespCacheable::Uncacheable(
                         pingora_cache::NoCacheReason::Custom("PartialRangeUnknownTotal"),
                     ));
@@ -9721,8 +9981,9 @@ impl ProxyHttp for EdgeProxy {
                         .map(|v| Self::header_contains_ascii_case_insensitive(v, b"chunked"))
                         .unwrap_or(false);
                     let skip_size_checks = allow_chunked && is_chunked && body_size == 0;
-                    let force_partial =
-                        compiled_ref.response_policy.force_partial_content(compiled_policy);
+                    let force_partial = compiled_ref
+                        .response_policy
+                        .force_partial_content(compiled_policy);
                     let response_cache_ctx =
                         Self::cache_eval_context(session, ctx, Self::forwarded_proto(session, ctx))
                             .with_response(resp.status.as_u16(), &resp.headers);
@@ -9885,7 +10146,7 @@ mod tests {
         let server: crate::config_models::ServerConfig =
             serde_json::from_value(serde_json::json!({
                 "id":826,
-                "serverNames":[{"name":"fuck.371458.xyz","type":"full"}],
+                "serverNames":[{"name":"captcha.example.com","type":"full"}],
                 "web":{
                     "firewallRef":{
                         "isOn":true,
@@ -9934,6 +10195,42 @@ mod tests {
             &patterns,
             "static.service.test"
         ));
+    }
+
+    #[test]
+    fn cache_key_main_domain_overrides_only_key_scheme_and_host() {
+        let cache: crate::config_models::WebCacheConfig =
+            serde_json::from_value(serde_json::json!({
+                "isOn": true,
+                "key": {
+                    "isOn": true,
+                    "scheme": "https",
+                    "host": "cache.example.com"
+                },
+                "cacheRefs": []
+            }))
+            .unwrap();
+
+        assert_eq!(
+            EdgeProxy::cache_key_scheme_host("http", "a.example.com", &cache),
+            ("https".to_string(), "cache.example.com".to_string())
+        );
+
+        let disabled: crate::config_models::WebCacheConfig =
+            serde_json::from_value(serde_json::json!({
+                "isOn": true,
+                "key": {
+                    "isOn": false,
+                    "scheme": "https",
+                    "host": "cache.example.com"
+                },
+                "cacheRefs": []
+            }))
+            .unwrap();
+        assert_eq!(
+            EdgeProxy::cache_key_scheme_host("http", "A.Example.com:8443", &disabled),
+            ("http".to_string(), "a.example.com".to_string())
+        );
     }
 
     #[test]
@@ -10214,8 +10511,7 @@ mod tests {
         assert!(fragment_page.contains("class=\"block-custom\" data-i18n-ignore"));
         assert!(fragment_page.contains("<strong data-i18n=\"custom\">custom detail</strong>"));
 
-        let full_html =
-            "<!doctype html><html><body><h1>Custom</h1></body></html>".to_string();
+        let full_html = "<!doctype html><html><body><h1>Custom</h1></body></html>".to_string();
         assert_eq!(
             EdgeProxy::compose_waf_block_body(full_html.clone(), &full_html, 451, "req-3"),
             full_html

@@ -1,22 +1,15 @@
 use crate::api_config::ApiConfig;
-use crate::auth::generate_token;
 use crate::config::ConfigStore;
+use crate::config_models::HTTPCachePolicy;
 use crate::pb;
 use crate::rpc::client::RpcClient;
-use bytes::{Buf, Bytes};
-use futures_util::StreamExt;
-use h2::client::SendRequest;
-use http::{HeaderValue, Request, Uri, Version};
-use prost::Message;
-use std::io::Read;
+use base64::{Engine as _, engine::general_purpose};
+use serde::Deserialize as _;
+use serde::de::Error as _;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-
-const NODE_STREAM_PATH: &str = "/pb.NodeService/nodeStream";
-const GRPC_FRAME_HEADER_LEN: usize = 5;
 
 #[derive(Debug, Default)]
 pub struct NodeStreamProbeResult {
@@ -41,20 +34,96 @@ struct ChangeAPINodeMessage {
 
 #[derive(Debug, serde::Deserialize)]
 struct WriteCacheMessage {
+    #[serde(
+        rename = "cachePolicyJSON",
+        default,
+        deserialize_with = "deserialize_go_json_bytes"
+    )]
+    cache_policy_json: Vec<u8>,
+    #[serde(rename = "key")]
+    key: String,
+    #[serde(default, deserialize_with = "deserialize_go_json_bytes")]
+    value: Vec<u8>,
+    #[serde(rename = "lifeSeconds", default)]
+    life_seconds: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReadCacheMessage {
+    #[serde(
+        rename = "cachePolicyJSON",
+        default,
+        deserialize_with = "deserialize_go_json_bytes"
+    )]
+    cache_policy_json: Vec<u8>,
     #[serde(rename = "key")]
     key: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ReadCacheMessage {
-    #[serde(rename = "key")]
-    key: String,
+struct StatCacheMessage {
+    #[serde(
+        rename = "cachePolicyJSON",
+        default,
+        deserialize_with = "deserialize_go_json_bytes"
+    )]
+    cache_policy_json: Vec<u8>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CleanCacheMessage {
+    #[serde(
+        rename = "cachePolicyJSON",
+        default,
+        deserialize_with = "deserialize_go_json_bytes"
+    )]
+    cache_policy_json: Vec<u8>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct CheckLocalFirewallMessage {
     #[serde(default)]
     name: String,
+}
+
+fn deserialize_go_json_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::String(encoded) => general_purpose::STANDARD
+            .decode(encoded.trim())
+            .map_err(D::Error::custom),
+        serde_json::Value::Array(values) => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let byte = value
+                    .as_u64()
+                    .filter(|value| *value <= u8::MAX as u64)
+                    .ok_or_else(|| D::Error::custom("byte array contains non-byte value"))?;
+                out.push(byte as u8);
+            }
+            Ok(out)
+        }
+        other => Err(D::Error::custom(format!(
+            "expected base64 string or byte array, got {other}"
+        ))),
+    }
+}
+
+async fn apply_stream_cache_policy(cache_policy_json: &[u8]) -> Result<(), String> {
+    if cache_policy_json.is_empty() {
+        return Err("missing cachePolicyJSON".to_string());
+    }
+    let policy = serde_json::from_slice::<HTTPCachePolicy>(cache_policy_json)
+        .map_err(|err| format!("decode cache policy config failed: {}", err))?;
+    crate::cache_manager::CACHE
+        .storage
+        .apply_policy(&policy)
+        .await;
+    Ok(())
 }
 
 pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigStore>) {
@@ -68,28 +137,24 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
             continue;
         }
 
-        let stream_result = if node_stream_uses_h2(&last_endpoints) {
-            try_run_h2_stream(&api_config, config_store.clone(), None).await
-        } else {
-            let client =
-                match RpcClient::new_with_endpoints(&api_config, &last_endpoints, false).await {
-                    Ok(client) => client,
-                    Err(e) => {
-                        last_endpoints = api_config.effective_rpc_endpoints();
-                        fail_count = fail_count.saturating_add(1);
-                        let delay = stream_backoff(fail_count, MAX_BACKOFF);
-                        error!(
-                            "Failed to connect to API node for stream: {}. Retrying in {:?}...",
-                            e, delay
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                };
-            run_stream(client, &api_config, config_store.clone())
-                .await
-                .map(|_| NodeStreamProbeResult::default())
+        let client = match RpcClient::new_with_endpoints(&api_config, &last_endpoints, false).await
+        {
+            Ok(client) => client,
+            Err(e) => {
+                last_endpoints = api_config.effective_rpc_endpoints();
+                fail_count = fail_count.saturating_add(1);
+                let delay = stream_backoff(fail_count, MAX_BACKOFF);
+                error!(
+                    "Failed to connect to API node for stream: {}. Retrying in {:?}...",
+                    e, delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
         };
+        let stream_result = run_stream(client, &api_config, config_store.clone())
+            .await
+            .map(|_| NodeStreamProbeResult::default());
 
         match stream_result {
             Ok(_) => {
@@ -129,354 +194,8 @@ pub async fn probe_node_stream(
     config_store: Arc<ConfigStore>,
     hold: Duration,
 ) -> anyhow::Result<NodeStreamProbeResult> {
-    let endpoints = api_config.effective_rpc_endpoints();
-    if node_stream_uses_h2(&endpoints) {
-        try_run_h2_stream(api_config, config_store, Some(hold)).await
-    } else {
-        let client = RpcClient::new(api_config).await?;
-        run_tonic_stream(client, api_config, config_store, Some(hold)).await
-    }
-}
-
-fn node_stream_uses_h2(endpoints: &[String]) -> bool {
-    endpoints
-        .first()
-        .is_some_and(|endpoint| endpoint.starts_with("http://"))
-}
-
-async fn try_run_h2_stream(
-    api_config: &ApiConfig,
-    config_store: Arc<ConfigStore>,
-    hold: Option<Duration>,
-) -> anyhow::Result<NodeStreamProbeResult> {
-    let endpoints = api_config.effective_rpc_endpoints();
-    let endpoint = endpoints
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No RPC endpoints configured"))?;
-    let uri: Uri = endpoint.parse()?;
-    let scheme = uri.scheme_str().unwrap_or("http");
-    if scheme != "http" {
-        anyhow::bail!("low-level node stream currently supports http endpoints only");
-    }
-    let host = uri
-        .host()
-        .ok_or_else(|| anyhow::anyhow!("RPC endpoint has no host: {}", endpoint))?;
-    let port = uri.port_u16().unwrap_or(80);
-    let authority = uri
-        .authority()
-        .map(|value| value.as_str().to_string())
-        .unwrap_or_else(|| format!("{}:{}", host, port));
-
-    let tcp = tokio::net::TcpStream::connect((host, port)).await?;
-    tcp.set_nodelay(true)?;
-    let (h2_client, connection) = h2::client::handshake(tcp).await?;
-    let connection_task = tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            debug!("Node stream HTTP/2 connection ended: {}", err);
-        }
-    });
-
-    let initial_node_id = config_store.get_node_id().await;
-    let (mut response_rx, send_stream, response_task, initial_ping_sent) =
-        match open_h2_node_stream(h2_client, &authority, api_config, initial_node_id).await {
-            Ok(stream) => stream,
-            Err(err) => {
-                connection_task.abort();
-                return Err(err);
-            }
-        };
-    let (out_tx, mut out_rx) = mpsc::channel::<pb::NodeStreamMessage>(100);
-    let writer = tokio::spawn(async move {
-        let mut send_stream = send_stream;
-        while let Some(message) = out_rx.recv().await {
-            match encode_grpc_message(&message) {
-                Ok(frame) => {
-                    if let Err(err) = send_stream.send_data(Bytes::from(frame), false) {
-                        debug!("Failed to write node stream message: {}", err);
-                        break;
-                    }
-                }
-                Err(err) => {
-                    debug!("Failed to encode node stream message: {}", err);
-                }
-            }
-        }
-    });
-
-    info!("Node stream transport opened.");
-
-    let connected_endpoints = endpoints;
-    let mut current_api_node_id = None;
-    let mut stats = NodeStreamProbeResult {
-        transport_opened: true,
-        pings_sent: usize::from(initial_ping_sent),
-        ..Default::default()
-    };
-    let mut recv_body = None;
-    let mut response_encoding = None;
-    let mut decode_buffer = Vec::with_capacity(8192);
-    let mut heartbeat_interval = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(30),
-        Duration::from_secs(30),
-    );
-    let mut endpoint_check_interval = tokio::time::interval(Duration::from_secs(15));
-    let deadline = hold.map(|duration| tokio::time::Instant::now() + duration);
-    let sleep_until_deadline = async {
-        match deadline {
-            Some(deadline) => tokio::time::sleep_until(deadline).await,
-            None => std::future::pending::<()>().await,
-        }
-    };
-    tokio::pin!(sleep_until_deadline);
-
-    loop {
-        if recv_body.is_none() {
-            tokio::select! {
-                response_result = &mut response_rx => {
-                    match response_result {
-                        Ok(Ok((body, encoding))) => {
-                            info!("Node stream response headers received.");
-                            stats.response_headers_received = true;
-                            response_encoding = encoding;
-                            recv_body = Some(body);
-                        }
-                        Ok(Err(err)) => {
-                            writer.abort();
-                            response_task.abort();
-                            connection_task.abort();
-                            return Err(err);
-                        }
-                        Err(_) => {
-                            writer.abort();
-                            response_task.abort();
-                            connection_task.abort();
-                            anyhow::bail!("nodeStream HTTP/2 response task ended unexpectedly");
-                        }
-                    }
-                }
-                _ = heartbeat_interval.tick() => {
-                    if send_node_stream_ping(&config_store, &out_tx).await {
-                        stats.pings_sent += 1;
-                    }
-                }
-                _ = endpoint_check_interval.tick() => {
-                    let latest_endpoints = api_config.effective_rpc_endpoints();
-                    if latest_endpoints != connected_endpoints {
-                        info!(
-                            "Detected runtime API endpoint change for node stream. Reconnecting from {:?} to {:?}",
-                            connected_endpoints,
-                            latest_endpoints
-                        );
-                        break;
-                    }
-                }
-                _ = &mut sleep_until_deadline => {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        tokio::select! {
-            next_message = read_next_h2_grpc_message(
-                recv_body.as_mut().expect("node stream body exists"),
-                &mut decode_buffer,
-                response_encoding.as_deref(),
-            ) => {
-                let message = match next_message {
-                    Ok(Some(message)) => message,
-                    Ok(None) => {
-                        debug!("Node stream connection closed by API node.");
-                        break;
-                    }
-                    Err(err) => {
-                        writer.abort();
-                        response_task.abort();
-                        connection_task.abort();
-                        if let Some(id) = current_api_node_id {
-                            crate::rpc::node::CONNECTED_API_NODE_IDS.write().remove(&id);
-                        }
-                        return Err(err);
-                    }
-                };
-
-                stats.inbound_messages += 1;
-                if message.code == "connectedAPINode" {
-                    match serde_json::from_slice::<ConnectedAPINodeMessage>(&message.data_json) {
-                        Ok(msg) => {
-                            info!("Successfully connected to API node via stream. API Node ID: {}", msg.api_node_id);
-                            current_api_node_id = Some(msg.api_node_id);
-                            stats.connected_api_node_id = Some(msg.api_node_id);
-                            crate::rpc::node::CONNECTED_API_NODE_IDS.write().insert(msg.api_node_id);
-                            crate::rpc::node::trigger_api_node_report();
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse connectedAPINode message: {}. Data: {}", e, String::from_utf8_lossy(&message.data_json));
-                        }
-                    }
-                }
-
-                let _ = handle_message(&message, &out_tx, api_config, config_store.clone()).await;
-            }
-            _ = heartbeat_interval.tick() => {
-                if send_node_stream_ping(&config_store, &out_tx).await {
-                    stats.pings_sent += 1;
-                }
-            }
-            _ = endpoint_check_interval.tick() => {
-                let latest_endpoints = api_config.effective_rpc_endpoints();
-                if latest_endpoints != connected_endpoints {
-                    info!(
-                        "Detected runtime API endpoint change for node stream. Reconnecting from {:?} to {:?}",
-                        connected_endpoints,
-                        latest_endpoints
-                    );
-                    break;
-                }
-            }
-            _ = &mut sleep_until_deadline => {
-                break;
-            }
-        }
-    }
-
-    writer.abort();
-    response_task.abort();
-    connection_task.abort();
-    if let Some(id) = current_api_node_id {
-        crate::rpc::node::CONNECTED_API_NODE_IDS.write().remove(&id);
-    }
-
-    Ok(stats)
-}
-
-async fn open_h2_node_stream(
-    h2_client: SendRequest<Bytes>,
-    authority: &str,
-    api_config: &ApiConfig,
-    initial_node_id: i64,
-) -> anyhow::Result<(
-    oneshot::Receiver<anyhow::Result<(h2::RecvStream, Option<String>)>>,
-    h2::SendStream<Bytes>,
-    tokio::task::JoinHandle<()>,
-    bool,
-)> {
-    let token = generate_token(&api_config.node_id, &api_config.secret, "node")?;
-    let node_id = HeaderValue::from_str(&api_config.node_id)?;
-    let token = HeaderValue::from_str(&token)?;
-    let request = Request::builder()
-        .method("POST")
-        .version(Version::HTTP_2)
-        .uri(format!("http://{}{}", authority, NODE_STREAM_PATH))
-        .header("content-type", "application/grpc")
-        .header("te", "trailers")
-        .header("user-agent", "grpc-go/1.0")
-        .header("nodeid", node_id)
-        .header("token", token)
-        .header("grpc-accept-encoding", "gzip")
-        .body(())?;
-
-    let mut ready = h2_client.ready().await?;
-    let (response, mut send_stream) = ready.send_request(request, false)?;
-    let initial_ping_sent = if initial_node_id > 0 {
-        let initial_ping = pb::NodeStreamMessage {
-            node_id: initial_node_id,
-            request_id: 0,
-            code: "ping".to_string(),
-            is_ok: true,
-            ..Default::default()
-        };
-        send_stream.send_data(Bytes::from(encode_grpc_message(&initial_ping)?), false)?;
-        true
-    } else {
-        false
-    };
-    let (response_tx, response_rx) = oneshot::channel();
-    let response_task = tokio::spawn(async move {
-        let result = async move {
-            let response = response.await?;
-            if response.status() != http::StatusCode::OK {
-                anyhow::bail!("nodeStream returned HTTP status {}", response.status());
-            }
-            let encoding = response
-                .headers()
-                .get("grpc-encoding")
-                .and_then(|value| value.to_str().ok())
-                .map(|value| value.to_ascii_lowercase());
-            Ok((response.into_body(), encoding))
-        }
-        .await;
-        let _ = response_tx.send(result);
-    });
-
-    Ok((response_rx, send_stream, response_task, initial_ping_sent))
-}
-
-fn encode_grpc_message(message: &pb::NodeStreamMessage) -> anyhow::Result<Vec<u8>> {
-    let mut encoded = Vec::new();
-    message.encode(&mut encoded)?;
-    let mut frame = Vec::with_capacity(GRPC_FRAME_HEADER_LEN + encoded.len());
-    frame.push(0);
-    frame.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&encoded);
-    Ok(frame)
-}
-
-async fn read_next_h2_grpc_message(
-    body: &mut h2::RecvStream,
-    buffer: &mut Vec<u8>,
-    encoding: Option<&str>,
-) -> anyhow::Result<Option<pb::NodeStreamMessage>> {
-    loop {
-        if let Some(message) = try_decode_grpc_message(buffer, encoding)? {
-            return Ok(Some(message));
-        }
-
-        match body.data().await {
-            Some(chunk) => {
-                let mut chunk = chunk?;
-                let len = chunk.remaining();
-                body.flow_control().release_capacity(len)?;
-                buffer.extend_from_slice(chunk.copy_to_bytes(len).as_ref());
-            }
-            None => {
-                if !buffer.is_empty() {
-                    anyhow::bail!("nodeStream ended with incomplete grpc frame");
-                }
-                return Ok(None);
-            }
-        }
-    }
-}
-
-fn try_decode_grpc_message(
-    buffer: &mut Vec<u8>,
-    encoding: Option<&str>,
-) -> anyhow::Result<Option<pb::NodeStreamMessage>> {
-    if buffer.len() < GRPC_FRAME_HEADER_LEN {
-        return Ok(None);
-    }
-    let compressed = buffer[0] != 0;
-    let len = u32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
-    if buffer.len() < GRPC_FRAME_HEADER_LEN + len {
-        return Ok(None);
-    }
-    let mut payload = buffer[GRPC_FRAME_HEADER_LEN..GRPC_FRAME_HEADER_LEN + len].to_vec();
-    buffer.drain(..GRPC_FRAME_HEADER_LEN + len);
-
-    if compressed {
-        match encoding.unwrap_or("gzip") {
-            "gzip" => {
-                let mut decoder = flate2::read::GzDecoder::new(payload.as_slice());
-                let mut decoded = Vec::new();
-                decoder.read_to_end(&mut decoded)?;
-                payload = decoded;
-            }
-            other => anyhow::bail!("unsupported compressed nodeStream encoding: {}", other),
-        }
-    }
-
-    Ok(Some(pb::NodeStreamMessage::decode(payload.as_slice())?))
+    let client = RpcClient::new(api_config).await?;
+    run_tonic_stream(client, api_config, config_store, Some(hold)).await
 }
 
 async fn send_node_stream_ping(
@@ -526,23 +245,28 @@ async fn run_tonic_stream(
     hold: Option<Duration>,
 ) -> anyhow::Result<NodeStreamProbeResult> {
     let connected_endpoints = api_config.effective_rpc_endpoints();
-    let (tx, rx) = mpsc::channel(100);
-    let initial_ping_sent = send_node_stream_ping(&config_store, &tx).await;
-    let rx_stream = ReceiverStream::new(rx);
-
-    let mut node_client = client.node_service();
-    let response =
-        tokio::time::timeout(Duration::from_secs(30), node_client.node_stream(rx_stream))
-            .await
-            .map_err(|_| anyhow::anyhow!("nodeStream response headers timed out"))??;
-    let mut inbound = response.into_inner();
-
-    info!("Node stream established.");
+    let initial_node_id = config_store.get_node_id().await;
+    let initial_ping = (initial_node_id > 0).then(|| pb::NodeStreamMessage {
+        node_id: initial_node_id,
+        request_id: 0,
+        code: "ping".to_string(),
+        is_ok: true,
+        ..Default::default()
+    });
+    let initial_ping_sent = initial_ping.is_some();
+    let (tx, mut rx) = mpsc::channel(100);
+    let rx_stream = async_stream::stream! {
+        if let Some(ping) = initial_ping {
+            yield ping;
+        }
+        while let Some(message) = rx.recv().await {
+            yield message;
+        }
+    };
 
     let mut current_api_node_id = None;
     let mut stats = NodeStreamProbeResult {
         transport_opened: true,
-        response_headers_received: true,
         pings_sent: usize::from(initial_ping_sent),
         ..Default::default()
     };
@@ -560,13 +284,51 @@ async fn run_tonic_stream(
     };
     tokio::pin!(sleep_until_deadline);
 
+    let mut node_client = client.node_service_plain();
+    let response = {
+        let response_future = node_client.node_stream(rx_stream);
+        tokio::pin!(response_future);
+
+        loop {
+            tokio::select! {
+                response = &mut response_future => {
+                    let response = response?;
+                    stats.response_headers_received = true;
+                    break response;
+                }
+                _ = heartbeat_interval.tick() => {
+                    if send_node_stream_ping(&config_store, &tx).await {
+                        stats.pings_sent += 1;
+                    }
+                }
+                _ = endpoint_check_interval.tick() => {
+                    let latest_endpoints = api_config.effective_rpc_endpoints();
+                    if latest_endpoints != connected_endpoints {
+                        info!(
+                            "Detected runtime API endpoint change before node stream response headers. Reconnecting from {:?} to {:?}",
+                            connected_endpoints,
+                            latest_endpoints
+                        );
+                        return Ok(stats);
+                    }
+                }
+                _ = &mut sleep_until_deadline => {
+                    return Ok(stats);
+                }
+            }
+        }
+    };
+    let mut inbound = response.into_inner();
+
+    info!("Node stream established.");
+
     loop {
         tokio::select! {
             msg_res = inbound.message() => {
                 match msg_res {
                     Ok(Some(message)) => {
                         stats.inbound_messages += 1;
-                        if message.code == "connectedAPINode" {
+                        if message.code.eq_ignore_ascii_case("connectedAPINode") {
                            match serde_json::from_slice::<ConnectedAPINodeMessage>(&message.data_json) {
                                Ok(msg) => {
                                    info!("Successfully connected to API node via stream. API Node ID: {}", msg.api_node_id);
@@ -661,19 +423,20 @@ async fn handle_message(
     let data_json = vec![];
     let node_id = config_store.get_node_id().await;
 
-    match message.code.as_str() {
-        "connectedAPINode" => {
+    let code = message.code.to_ascii_lowercase();
+    match code.as_str() {
+        "connectedapinode" => {
             // Already handled in run_stream to track connection state
             crate::rpc::node_task::trigger_task_sync();
         }
-        "newNodeTask" | "NewNodeTask" | "configChanged" => {
+        "newnodetask" | "configchanged" => {
             info!(
                 "Received notification: {}. Triggering immediate task sync...",
                 message.code
             );
             crate::rpc::node_task::trigger_task_sync();
         }
-        "writeCache" => {
+        "writecache" => {
             let tx_cloned = tx.clone();
             let msg_cloned = message.clone();
 
@@ -683,65 +446,21 @@ async fn handle_message(
 
                 match serde_json::from_slice::<WriteCacheMessage>(&msg_cloned.data_json) {
                     Ok(msg) => {
-                        let key = msg.key.clone();
-                        let full_key =
-                            if !key.starts_with("http://") && !key.starts_with("https://") {
-                                format!("http://{}", key)
-                            } else {
-                                key.clone()
-                            };
-
-                        if let Ok(url) = full_key.parse::<reqwest::Url>() {
-                            let host = url.host_str().unwrap_or("localhost");
-                            let is_https = url.scheme() == "https";
-                            let port = url.port().unwrap_or(if is_https { 443 } else { 80 });
-                            let scheme = if is_https { "https" } else { "http" };
-                            let preheat_url =
-                                format!("{}://127.0.0.1:{}{}", scheme, port, url.path());
-                            let query = url.query().map(|q| format!("?{}", q)).unwrap_or_default();
-                            let final_url = format!("{}{}", preheat_url, query);
-
-                            let client = reqwest::Client::builder()
-                                .timeout(std::time::Duration::from_secs(30))
-                                .build()
-                                .unwrap_or_default();
-
-                            match client
-                                .get(&final_url)
-                                .header("host", host)
-                                .header("x-cloud-cache-action", "fetch")
-                                .header("x-cloud-preheat", "1")
-                                .header("user-agent", "Mozilla/5.0 (compatible; CacheTest/1.0)")
-                                .send()
+                        if let Err(err) = apply_stream_cache_policy(&msg.cache_policy_json).await {
+                            reply_text = err;
+                        } else {
+                            match crate::cache_manager::CACHE
+                                .write_value(&msg.key, &msg.value, msg.life_seconds.max(0) as u64)
                                 .await
                             {
-                                Ok(resp) => {
-                                    let status = resp.status();
-                                    if status.is_success() {
-                                        let mut body = resp.bytes_stream();
-                                        let mut read_error = None;
-                                        while let Some(chunk) = body.next().await {
-                                            if let Err(e) = chunk {
-                                                read_error = Some(e);
-                                                break;
-                                            }
-                                        }
-                                        if let Some(e) = read_error {
-                                            reply_text = format!("body read failed: {}", e);
-                                        } else {
-                                            is_ok = true;
-                                            reply_text = "write ok".to_string();
-                                        }
-                                    } else {
-                                        reply_text = format!("upstream returned {}", status);
-                                    }
+                                Ok(_) => {
+                                    is_ok = true;
+                                    reply_text = "write ok".to_string();
                                 }
-                                Err(e) => {
-                                    reply_text = format!("request failed: {}", e);
+                                Err(err) => {
+                                    reply_text = format!("write failed: {}", err);
                                 }
                             }
-                        } else {
-                            reply_text = "invalid URL".to_string();
                         }
                     }
                     Err(e) => reply_text = format!("decode failed: {:?}", e),
@@ -759,7 +478,7 @@ async fn handle_message(
             });
             return Ok(());
         }
-        "readCache" => {
+        "readcache" => {
             let tx_cloned = tx.clone();
             let msg_cloned = message.clone();
 
@@ -769,21 +488,21 @@ async fn handle_message(
 
                 match serde_json::from_slice::<ReadCacheMessage>(&msg_cloned.data_json) {
                     Ok(msg) => {
-                        // Reconstruct cache key in the same format as proxy's
-                        // default_cache_key_for_session() which uses "http://{host}{path}"
-                        let full_key = if !msg.key.starts_with("http://")
-                            && !msg.key.starts_with("https://")
-                        {
-                            format!("http://{}", msg.key)
+                        if let Err(err) = apply_stream_cache_policy(&msg.cache_policy_json).await {
+                            reply_text = err;
                         } else {
-                            msg.key.clone()
-                        };
-                        let hash = format!("{:x}", md5_legacy::compute(&full_key));
-                        if let Some(meta) = crate::metrics::storage::STORAGE.get_cache_meta(&hash) {
-                            is_ok = true;
-                            reply_text = format!("value {} bytes", meta.size);
-                        } else {
-                            reply_text = "key not found".to_string();
+                            match crate::cache_manager::CACHE.read_value_size(&msg.key).await {
+                                Ok(Some(size)) => {
+                                    is_ok = true;
+                                    reply_text = format!("value {} bytes", size);
+                                }
+                                Ok(None) => {
+                                    reply_text = "key not found".to_string();
+                                }
+                                Err(err) => {
+                                    reply_text = format!("read key failed: {}", err);
+                                }
+                            }
                         }
                     }
                     Err(e) => reply_text = format!("decode failed: {:?}", e),
@@ -801,82 +520,90 @@ async fn handle_message(
             });
             return Ok(());
         }
-        "statCache" => {
+        "statcache" => {
             let tx_cloned = tx.clone();
             let msg_cloned = message.clone();
             let _config_store_cloned = config_store.clone();
 
             tokio::spawn(async move {
-                let total_size = crate::metrics::storage::STORAGE.total_cache_size();
-                let total_count = crate::metrics::storage::STORAGE.total_cache_count();
+                let mut is_ok = false;
+                let reply_text;
+                match serde_json::from_slice::<StatCacheMessage>(&msg_cloned.data_json) {
+                    Ok(msg) => {
+                        if let Err(err) = apply_stream_cache_policy(&msg.cache_policy_json).await {
+                            reply_text = err;
+                        } else {
+                            let total_size = crate::metrics::storage::STORAGE.total_cache_size();
+                            let total_count = crate::metrics::storage::STORAGE.total_cache_count();
 
-                let size_str = if total_size < 1024 {
-                    format!("{} Bytes", total_size)
-                } else if total_size < 1024 * 1024 {
-                    format!("{:.2} KB", total_size as f64 / 1024.0)
-                } else if total_size < 1024 * 1024 * 1024 {
-                    format!("{:.2} MB", total_size as f64 / (1024.0 * 1024.0))
-                } else if total_size < 1024 * 1024 * 1024 * 1024 {
-                    format!("{:.2} GB", total_size as f64 / (1024.0 * 1024.0 * 1024.0))
-                } else {
-                    format!(
-                        "{:.2} TB",
-                        total_size as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0)
-                    )
-                };
+                            let size_str = if total_size < 1024 {
+                                format!("{} Bytes", total_size)
+                            } else if total_size < 1024 * 1024 {
+                                format!("{:.2} KiB", total_size as f64 / 1024.0)
+                            } else if total_size < 1024 * 1024 * 1024 {
+                                format!("{:.2} MiB", total_size as f64 / (1024.0 * 1024.0))
+                            } else {
+                                format!("{:.2} GiB", total_size as f64 / (1024.0 * 1024.0 * 1024.0))
+                            };
+                            is_ok = true;
+                            reply_text = format!("size:{}, count:{}", size_str, total_count);
+                        }
+                    }
+                    Err(e) => reply_text = format!("decode failed: {:?}", e),
+                }
 
                 let reply = pb::NodeStreamMessage {
                     node_id,
                     request_id: msg_cloned.request_id,
                     code: msg_cloned.code.clone(),
-                    message: format!("size:{}, count:{}", size_str, total_count),
-                    is_ok: true,
+                    message: reply_text,
+                    is_ok,
                     ..Default::default()
                 };
                 let _ = tx_cloned.send(reply).await;
             });
             return Ok(());
         }
-        "cleanCache" => {
+        "cleancache" => {
             let tx_cloned = tx.clone();
             let msg_cloned = message.clone();
 
             tokio::spawn(async move {
-                let all_meta = crate::metrics::storage::STORAGE.scan_all_cache_meta();
-                let mut count = 0;
-                let roots = crate::cache_manager::CACHE
-                    .storage
-                    .l2
-                    .inner
-                    .load()
-                    .all_roots();
-
-                for (hash, _) in all_meta {
-                    for root in &roots {
-                        let file_path = root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
-                        if file_path.exists() {
-                            let _ = std::fs::remove_file(&file_path);
+                let mut is_ok = false;
+                let reply_text;
+                match serde_json::from_slice::<CleanCacheMessage>(&msg_cloned.data_json) {
+                    Ok(msg) => {
+                        if let Err(err) = apply_stream_cache_policy(&msg.cache_policy_json).await {
+                            reply_text = err;
+                        } else {
+                            match crate::cache_manager::CACHE.clean_all().await {
+                                Ok(count) => {
+                                    info!("Global cache cleaned: {} items removed.", count);
+                                    is_ok = true;
+                                    reply_text = "ok".to_string();
+                                }
+                                Err(err) => {
+                                    reply_text = format!("clean cache failed: {}", err);
+                                }
+                            }
                         }
                     }
-                    crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                    count += 1;
+                    Err(e) => reply_text = format!("decode failed: {:?}", e),
                 }
-
-                info!("Global cache cleaned: {} items removed.", count);
 
                 let reply = pb::NodeStreamMessage {
                     node_id,
                     request_id: msg_cloned.request_id,
                     code: msg_cloned.code.clone(),
-                    message: "ok".to_string(),
-                    is_ok: true,
+                    message: reply_text,
+                    is_ok,
                     ..Default::default()
                 };
                 let _ = tx_cloned.send(reply).await;
             });
             return Ok(()); // Handled asynchronously
         }
-        "getStat" => {
+        "getstat" => {
             let tx_cloned = tx.clone();
             let msg_cloned = message.clone();
 
@@ -923,7 +650,7 @@ async fn handle_message(
             });
             return Ok(()); // Handled asynchronously
         }
-        "changeAPINode" => {
+        "changeapinode" => {
             if let Ok(msg) = serde_json::from_slice::<ChangeAPINodeMessage>(&message.data_json) {
                 info!(
                     "Received request to change API node address to: {}",
@@ -932,12 +659,12 @@ async fn handle_message(
                 ApiConfig::set_runtime_rpc_endpoints(vec![msg.addr]);
             }
         }
-        "checkSystemdService" => {
+        "checksystemdservice" => {
             let (ok, reply) = check_systemd_service("cloud-node").await;
             is_ok = ok;
             message_reply = reply;
         }
-        "checkLocalFirewall" => {
+        "checklocalfirewall" => {
             let msg = serde_json::from_slice::<CheckLocalFirewallMessage>(&message.data_json)
                 .unwrap_or(CheckLocalFirewallMessage {
                     name: "nftables".to_string(),
@@ -964,7 +691,7 @@ async fn handle_message(
         }
     }
 
-    if message.request_id > 0 && message.code != "connectedAPINode" {
+    if message.request_id > 0 && !message.code.eq_ignore_ascii_case("connectedAPINode") {
         let reply = pb::NodeStreamMessage {
             node_id,
             request_id: message.request_id,
@@ -1022,7 +749,7 @@ fn interpret_systemd_is_enabled(success: bool, stdout: &str, stderr: &str) -> (b
 
 #[cfg(test)]
 mod tests {
-    use super::{interpret_systemd_is_enabled, send_node_stream_ping};
+    use super::{WriteCacheMessage, interpret_systemd_is_enabled, send_node_stream_ping};
     use crate::config::ConfigStore;
     use tokio::sync::mpsc;
 
@@ -1066,5 +793,20 @@ mod tests {
                 "'systemctl' command error: unit not found".to_string()
             )
         );
+    }
+
+    #[test]
+    fn write_cache_message_accepts_go_json_byte_base64() {
+        let msg: WriteCacheMessage = serde_json::from_value(serde_json::json!({
+            "cachePolicyJSON": "eyJpZCI6MX0=",
+            "key": "https://cache.example.com/a.js",
+            "value": "aGVsbG8=",
+            "lifeSeconds": 60
+        }))
+        .unwrap();
+
+        assert_eq!(msg.cache_policy_json, br#"{"id":1}"#);
+        assert_eq!(msg.value, b"hello");
+        assert_eq!(msg.life_seconds, 60);
     }
 }

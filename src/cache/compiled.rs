@@ -13,6 +13,8 @@ use std::sync::Arc;
 pub struct CacheEvalContext<'a> {
     pub session: &'a Session,
     pub scheme: &'a str,
+    pub cache_key_scheme: Option<String>,
+    pub cache_key_host: Option<String>,
     pub server: Option<Arc<ServerConfig>>,
     pub client_ip: Option<IpAddr>,
     pub client_port: Option<u16>,
@@ -30,6 +32,8 @@ impl<'a> CacheEvalContext<'a> {
         Self {
             session,
             scheme,
+            cache_key_scheme: None,
+            cache_key_host: None,
             server: None,
             client_ip: None,
             client_port: None,
@@ -90,7 +94,10 @@ impl CompiledWebCachePlan {
                 .iter()
                 .map(CompiledCacheRef::compile_arc)
                 .collect(),
-            policy: cache.cache_policy.as_ref().map(CompiledCachePolicy::compile_arc),
+            policy: cache
+                .cache_policy
+                .as_ref()
+                .map(CompiledCachePolicy::compile_arc),
         })
     }
 }
@@ -158,7 +165,10 @@ impl CompiledCacheRef {
                 .as_deref()
                 .filter(|key| !key.is_empty())
                 .map(CompiledCacheTemplate::compile),
-            child_policy: cache_ref.cache_policy.as_ref().map(CompiledCachePolicy::compile_arc),
+            child_policy: cache_ref
+                .cache_policy
+                .as_ref()
+                .map(CompiledCachePolicy::compile_arc),
             response_policy: CompiledCacheResponsePolicy::compile(cache_ref),
         })
     }
@@ -182,7 +192,9 @@ impl CompiledCacheRef {
         {
             return false;
         }
-        self.request_program.request_match_with_context(ctx).is_request_candidate()
+        self.request_program
+            .request_match_with_context(ctx)
+            .is_request_candidate()
     }
 }
 
@@ -204,7 +216,11 @@ impl CompiledCacheRequestProgram {
         {
             return Self::Groups {
                 connector: CacheConnector::compile(&config.connector),
-                groups: config.groups.iter().map(CompiledCacheCondGroup::compile).collect(),
+                groups: config
+                    .groups
+                    .iter()
+                    .map(CompiledCacheCondGroup::compile)
+                    .collect(),
             };
         }
         if let Some(simple) = simple {
@@ -226,7 +242,11 @@ impl CompiledCacheRequestProgram {
                             CacheMatchResult::NoMatch => return CacheMatchResult::NoMatch,
                         }
                     }
-                    if deferred { CacheMatchResult::Deferred } else { CacheMatchResult::Match }
+                    if deferred {
+                        CacheMatchResult::Deferred
+                    } else {
+                        CacheMatchResult::Match
+                    }
                 }
                 CacheConnector::Or => {
                     let mut deferred = false;
@@ -237,7 +257,11 @@ impl CompiledCacheRequestProgram {
                             CacheMatchResult::NoMatch => {}
                         }
                     }
-                    if deferred { CacheMatchResult::Deferred } else { CacheMatchResult::NoMatch }
+                    if deferred {
+                        CacheMatchResult::Deferred
+                    } else {
+                        CacheMatchResult::NoMatch
+                    }
                 }
             },
             Self::Simple(cond) => cond.request_match_with_context(ctx),
@@ -286,7 +310,11 @@ impl CompiledCacheCondGroup {
                         CacheMatchResult::NoMatch => return CacheMatchResult::NoMatch,
                     }
                 }
-                if deferred { CacheMatchResult::Deferred } else { CacheMatchResult::Match }
+                if deferred {
+                    CacheMatchResult::Deferred
+                } else {
+                    CacheMatchResult::Match
+                }
             }
             CacheConnector::Or => {
                 let mut deferred = false;
@@ -297,7 +325,11 @@ impl CompiledCacheCondGroup {
                         CacheMatchResult::NoMatch => {}
                     }
                 }
-                if deferred { CacheMatchResult::Deferred } else { CacheMatchResult::NoMatch }
+                if deferred {
+                    CacheMatchResult::Deferred
+                } else {
+                    CacheMatchResult::NoMatch
+                }
             }
         }
     }
@@ -429,8 +461,16 @@ impl CacheOperator {
             }
             "mimetype" => compile_mime_operator(expected),
             "versionrange" => compile_version_range(expected),
-            "eqint" => expected.parse::<i64>().map(|value| Self::Number(NumberOperator::EqInt(value))).unwrap_or(Self::NeverMatch),
-            "eqfloat" => expected.parse::<f64>().ok().filter(|value| value.is_finite()).map(|value| Self::Number(NumberOperator::EqFloat(value))).unwrap_or(Self::NeverMatch),
+            "eqint" => expected
+                .parse::<i64>()
+                .map(|value| Self::Number(NumberOperator::EqInt(value)))
+                .unwrap_or(Self::NeverMatch),
+            "eqfloat" => expected
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(|value| Self::Number(NumberOperator::EqFloat(value)))
+                .unwrap_or(Self::NeverMatch),
             "gt" => compile_number_compare(expected, NumberCompare::Gt),
             "gte" => compile_number_compare(expected, NumberCompare::Gte),
             "lt" => compile_number_compare(expected, NumberCompare::Lt),
@@ -467,7 +507,9 @@ impl CacheOperator {
             Self::Prefix(expected, ci) => starts_with_value(value, expected, *ci),
             Self::Suffix(expected, ci) => ends_with_value(value, expected, *ci),
             Self::Contains(expected, ci) => contains_value(value, expected, *ci),
-            Self::NotContains(expected, ci) => !expected.is_empty() && !contains_value(value, expected, *ci),
+            Self::NotContains(expected, ci) => {
+                !expected.is_empty() && !contains_value(value, expected, *ci)
+            }
             Self::In(values, ci) => value_in_list(value, values, *ci),
             Self::NotIn(values, ci) => !values.is_empty() && !value_in_list(value, values, *ci),
             Self::FileExt(values) => {
@@ -476,7 +518,9 @@ impl CacheOperator {
             }
             Self::MimeType(matchers) => mime_matches(value, matchers),
             Self::Number(operator) => number_matches(value, operator),
-            Self::VersionRange(min, max) => version_range_matches(value, min.as_deref(), max.as_deref()),
+            Self::VersionRange(min, max) => {
+                version_range_matches(value, min.as_deref(), max.as_deref())
+            }
             Self::Ip(operator) => ip_matches(value, operator),
             Self::NeverMatch => false,
         }
@@ -540,7 +584,10 @@ pub enum CacheVariable {
 
 impl CacheVariable {
     pub fn compile(param: &str) -> Self {
-        let Some(inner) = param.strip_prefix("${").and_then(|value| value.strip_suffix('}')) else {
+        let Some(inner) = param
+            .strip_prefix("${")
+            .and_then(|value| value.strip_suffix('}'))
+        else {
             return Self::Literal(param.to_string());
         };
         Self::compile_inner(inner)
@@ -635,7 +682,10 @@ impl CacheVariable {
             Self::RequestLength => request_length(ctx.session).to_string(),
             Self::RequestUri => request_uri(ctx.session),
             Self::RequestUrl => request_url(ctx),
-            Self::Host => request_host(ctx.session),
+            Self::Host => ctx
+                .cache_key_host
+                .clone()
+                .unwrap_or_else(|| request_host(ctx.session)),
             Self::ServerName => ctx
                 .server
                 .as_ref()
@@ -646,7 +696,10 @@ impl CacheVariable {
             Self::ServerPort => downstream_local_port(ctx.session)
                 .map(|port| port.to_string())
                 .unwrap_or_default(),
-            Self::Scheme => ctx.scheme.to_string(),
+            Self::Scheme => ctx
+                .cache_key_scheme
+                .clone()
+                .unwrap_or_else(|| ctx.scheme.to_string()),
             Self::Proto => request_proto(ctx.session, ctx.is_http3_bridge),
             Self::IsArgs => {
                 if ctx.session.req_header().uri.query().is_some() {
@@ -655,7 +708,13 @@ impl CacheVariable {
                     String::new()
                 }
             }
-            Self::Args => ctx.session.req_header().uri.query().unwrap_or("").to_string(),
+            Self::Args => ctx
+                .session
+                .req_header()
+                .uri
+                .query()
+                .unwrap_or("")
+                .to_string(),
             Self::RemoteAddr => ctx
                 .client_ip
                 .map(|ip| ip.to_string())
@@ -729,7 +788,10 @@ impl CacheVariable {
             Self::BrowserOsVersion => String::new(),
             Self::BrowserIsMobile => browser_is_mobile(ctx).to_string(),
             Self::ResponseContentType => response_header_value(ctx, "content-type"),
-            Self::ResponseStatus => ctx.response_status.map(|status| status.to_string()).unwrap_or_default(),
+            Self::ResponseStatus => ctx
+                .response_status
+                .map(|status| status.to_string())
+                .unwrap_or_default(),
             Self::ResponseHeader(key) => response_header_value(ctx, key),
             Self::Arg(key) => query_param(ctx.session, key),
             Self::Header(key) => header_value(ctx.session, key),
@@ -828,11 +890,18 @@ impl CompiledCacheResponsePolicy {
         self.overwrite_expires
     }
 
-    fn allows_method_status(&self, status: u16, method: &str, _force_partial_content: bool) -> bool {
+    fn allows_method_status(
+        &self,
+        status: u16,
+        method: &str,
+        _force_partial_content: bool,
+    ) -> bool {
         let method_allowed = if self.methods.is_empty() {
             method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")
         } else {
-            self.methods.iter().any(|item| item.eq_ignore_ascii_case(method))
+            self.methods
+                .iter()
+                .any(|item| item.eq_ignore_ascii_case(method))
         };
         if !method_allowed {
             return false;
@@ -844,8 +913,7 @@ impl CompiledCacheResponsePolicy {
         if self.statuses.is_empty() {
             true
         } else {
-            self.statuses.contains(&(status as i32))
-                || (status == 206 && partial_content_allowed)
+            self.statuses.contains(&(status as i32)) || (status == 206 && partial_content_allowed)
         }
     }
 
@@ -895,7 +963,10 @@ impl CompiledCacheResponsePolicy {
                 return false;
             }
         }
-        if let Some(cc) = headers.get("cache-control").and_then(|value| value.to_str().ok()) {
+        if let Some(cc) = headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok())
+        {
             if crate::cache::cache_control_has_skipped_value(cc, &self.skip_cache_control_values) {
                 return false;
             }
@@ -930,11 +1001,17 @@ impl CompiledCacheResponsePolicy {
             if let Some(size) = policy.max_item_size_bytes.filter(|size| *size > 0) {
                 max_bytes = size;
             }
-            if let Some(size) = policy.max_size_bytes.filter(|size| *size > 0 && *size < max_bytes) {
+            if let Some(size) = policy
+                .max_size_bytes
+                .filter(|size| *size > 0 && *size < max_bytes)
+            {
                 max_bytes = size;
             }
         }
-        if let Some(size) = self.max_size_bytes.filter(|size| *size > 0 && *size < max_bytes) {
+        if let Some(size) = self
+            .max_size_bytes
+            .filter(|size| *size > 0 && *size < max_bytes)
+        {
             max_bytes = size;
         }
         (max_bytes != i64::MAX).then_some(max_bytes)
@@ -965,7 +1042,9 @@ impl CompiledCacheTemplate {
                 break;
             };
             let inner = &after_start[..end];
-            parts.push(CacheTemplatePart::Variable(CacheVariable::compile_inner(inner)));
+            parts.push(CacheTemplatePart::Variable(CacheVariable::compile_inner(
+                inner,
+            )));
             rest = &after_start[end + 1..];
         }
         if !rest.is_empty() {
@@ -984,7 +1063,9 @@ impl CompiledCacheTemplate {
         for part in &self.parts {
             match part {
                 CacheTemplatePart::Literal(part) => value.push_str(part),
-                CacheTemplatePart::Variable(variable) => value.push_str(&variable.resolve_with_context(ctx)),
+                CacheTemplatePart::Variable(variable) => {
+                    value.push_str(&variable.resolve_with_context(ctx))
+                }
             }
         }
         value
@@ -1191,8 +1272,13 @@ fn request_uri(session: &Session) -> String {
 }
 
 fn request_url(ctx: &CacheEvalContext<'_>) -> String {
-    let host = ctx.host.clone().unwrap_or_else(|| request_host(ctx.session));
-    format!("{}://{}{}", ctx.scheme, host, request_uri(ctx.session))
+    let scheme = ctx.cache_key_scheme.as_deref().unwrap_or(ctx.scheme);
+    let host = ctx
+        .cache_key_host
+        .clone()
+        .or_else(|| ctx.host.clone())
+        .unwrap_or_else(|| request_host(ctx.session));
+    format!("{scheme}://{host}{}", request_uri(ctx.session))
 }
 
 fn request_host(session: &Session) -> String {
@@ -1225,7 +1311,9 @@ fn socket_remote_ip(session: &Session) -> String {
         .map(|inet| inet.ip().to_string())
         .or_else(|| {
             session.client_addr().and_then(|addr| match addr {
-                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => Some(addr.ip().to_string()),
+                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => {
+                    Some(addr.ip().to_string())
+                }
                 _ => None,
             })
         })
@@ -1254,7 +1342,11 @@ fn raw_remote_ip(ctx: &CacheEvalContext<'_>) -> String {
             .parse()
             .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]))
     });
-    let Some(raw) = ctx.raw_remote_addr.as_deref().filter(|value| !value.is_empty()) else {
+    let Some(raw) = ctx
+        .raw_remote_addr
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
         return fallback.to_string();
     };
     raw.parse::<std::net::SocketAddr>()
@@ -1313,7 +1405,11 @@ fn request_stats(ctx: &CacheEvalContext<'_>) -> Option<crate::metrics::analyzer:
 
 fn browser_is_mobile(ctx: &CacheEvalContext<'_>) -> &'static str {
     let ua = header_value(ctx.session, "user-agent").to_ascii_lowercase();
-    if ua.contains("mobile") || ua.contains("android") || ua.contains("iphone") || ua.contains("ipad") {
+    if ua.contains("mobile")
+        || ua.contains("android")
+        || ua.contains("iphone")
+        || ua.contains("ipad")
+    {
         "1"
     } else {
         "0"
@@ -1543,7 +1639,8 @@ fn compile_ip_range_operator(expected: &str) -> CacheOperator {
     let Some((start, end)) = parse_pair(expected) else {
         return CacheOperator::NeverMatch;
     };
-    let (Ok(start), Ok(end)) = (start.trim().parse::<IpAddr>(), end.trim().parse::<IpAddr>()) else {
+    let (Ok(start), Ok(end)) = (start.trim().parse::<IpAddr>(), end.trim().parse::<IpAddr>())
+    else {
         return CacheOperator::NeverMatch;
     };
     if ip_to_u128(start).is_none() || ip_to_u128(end).is_none() {
@@ -1626,12 +1723,25 @@ fn mime_matches(value: &str, matchers: &[MimeMatcher]) -> bool {
 
 fn number_matches(value: &str, operator: &NumberOperator) -> bool {
     match operator {
-        NumberOperator::EqInt(expected) => value.trim().parse::<i64>().is_ok_and(|actual| actual == *expected),
-        NumberOperator::EqFloat(expected) => parse_finite_f64(value).is_some_and(|actual| actual == *expected),
-        NumberOperator::Gt(expected) => parse_finite_f64(value).is_some_and(|actual| actual > *expected),
-        NumberOperator::Gte(expected) => parse_finite_f64(value).is_some_and(|actual| actual >= *expected),
-        NumberOperator::Lt(expected) => parse_finite_f64(value).is_some_and(|actual| actual < *expected),
-        NumberOperator::Lte(expected) => parse_finite_f64(value).is_some_and(|actual| actual <= *expected),
+        NumberOperator::EqInt(expected) => value
+            .trim()
+            .parse::<i64>()
+            .is_ok_and(|actual| actual == *expected),
+        NumberOperator::EqFloat(expected) => {
+            parse_finite_f64(value).is_some_and(|actual| actual == *expected)
+        }
+        NumberOperator::Gt(expected) => {
+            parse_finite_f64(value).is_some_and(|actual| actual > *expected)
+        }
+        NumberOperator::Gte(expected) => {
+            parse_finite_f64(value).is_some_and(|actual| actual >= *expected)
+        }
+        NumberOperator::Lt(expected) => {
+            parse_finite_f64(value).is_some_and(|actual| actual < *expected)
+        }
+        NumberOperator::Lte(expected) => {
+            parse_finite_f64(value).is_some_and(|actual| actual <= *expected)
+        }
         NumberOperator::Mod { divisor, remainder } => value
             .trim()
             .parse::<u64>()
@@ -1663,21 +1773,34 @@ fn ip_matches(value: &str, operator: &IpOperator) -> bool {
     };
     match operator {
         IpOperator::Eq(expected) => actual == *expected,
-        IpOperator::Gt(expected) => compare_ip(actual, *expected).is_some_and(|ordering| ordering.is_gt()),
-        IpOperator::Gte(expected) => compare_ip(actual, *expected).is_some_and(|ordering| ordering.is_ge()),
-        IpOperator::Lt(expected) => compare_ip(actual, *expected).is_some_and(|ordering| ordering.is_lt()),
-        IpOperator::Lte(expected) => compare_ip(actual, *expected).is_some_and(|ordering| ordering.is_le()),
+        IpOperator::Gt(expected) => {
+            compare_ip(actual, *expected).is_some_and(|ordering| ordering.is_gt())
+        }
+        IpOperator::Gte(expected) => {
+            compare_ip(actual, *expected).is_some_and(|ordering| ordering.is_ge())
+        }
+        IpOperator::Lt(expected) => {
+            compare_ip(actual, *expected).is_some_and(|ordering| ordering.is_lt())
+        }
+        IpOperator::Lte(expected) => {
+            compare_ip(actual, *expected).is_some_and(|ordering| ordering.is_le())
+        }
         IpOperator::Range(start, end) => {
             let (Some(actual), Some(start), Some(end)) =
                 (ip_to_u128(actual), ip_to_u128(*start), ip_to_u128(*end))
             else {
                 return false;
             };
-            let (start, end) = if start <= end { (start, end) } else { (end, start) };
+            let (start, end) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
             actual >= start && actual <= end
         }
-        IpOperator::Mod { divisor, remainder } => ip_to_u128(actual)
-            .is_some_and(|actual| actual % *divisor == *remainder),
+        IpOperator::Mod { divisor, remainder } => {
+            ip_to_u128(actual).is_some_and(|actual| actual % *divisor == *remainder)
+        }
     }
 }
 
@@ -1695,7 +1818,11 @@ fn parse_pair(value: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_finite_f64(value: &str) -> Option<f64> {
-    value.trim().parse::<f64>().ok().filter(|value| value.is_finite())
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
 }
 
 fn parse_u64(value: &str) -> Option<u64> {
@@ -1792,7 +1919,8 @@ fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
 fn ends_with_ascii_case_insensitive(value: &str, suffix: &str) -> bool {
     if value.is_ascii() && suffix.is_ascii() {
         return value.len() >= suffix.len()
-            && value.as_bytes()[value.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes());
+            && value.as_bytes()[value.len() - suffix.len()..]
+                .eq_ignore_ascii_case(suffix.as_bytes());
     }
     value.to_lowercase().ends_with(&suffix.to_lowercase())
 }
@@ -1828,13 +1956,19 @@ mod tests {
             CacheOperator::Prefix(expected, ci) => starts_with_value(actual, &expected, ci),
             CacheOperator::Suffix(expected, ci) => ends_with_value(actual, &expected, ci),
             CacheOperator::Contains(expected, ci) => contains_value(actual, &expected, ci),
-            CacheOperator::NotContains(expected, ci) => !expected.is_empty() && !contains_value(actual, &expected, ci),
+            CacheOperator::NotContains(expected, ci) => {
+                !expected.is_empty() && !contains_value(actual, &expected, ci)
+            }
             CacheOperator::In(values, ci) => value_in_list(actual, &values, ci),
-            CacheOperator::NotIn(values, ci) => !values.is_empty() && !value_in_list(actual, &values, ci),
+            CacheOperator::NotIn(values, ci) => {
+                !values.is_empty() && !value_in_list(actual, &values, ci)
+            }
             CacheOperator::FileExt(values) => values.iter().any(|value| value == actual),
             CacheOperator::MimeType(matchers) => mime_matches(actual, &matchers),
             CacheOperator::Number(operator) => number_matches(actual, &operator),
-            CacheOperator::VersionRange(min, max) => version_range_matches(actual, min.as_deref(), max.as_deref()),
+            CacheOperator::VersionRange(min, max) => {
+                version_range_matches(actual, min.as_deref(), max.as_deref())
+            }
             CacheOperator::Ip(operator) => ip_matches(actual, &operator),
             CacheOperator::NeverMatch => false,
         }
@@ -1845,7 +1979,11 @@ mod tests {
         assert!(matches("regexp", "^[a-z]+\\d+$", "abc123"));
         assert!(matches("not regexp", "^admin", "guest"));
         assert!(matches("wildcard match", "/assets/*.js", "/assets/app.js"));
-        assert!(matches("wildcard not match", "/assets/*.js", "/assets/app.css"));
+        assert!(matches(
+            "wildcard not match",
+            "/assets/*.js",
+            "/assets/app.css"
+        ));
         assert!(matches("eq", "admin", "admin"));
         assert!(matches("not", "admin", "guest"));
         assert!(!matches("not", "admin", "admin"));
@@ -1854,6 +1992,10 @@ mod tests {
         assert!(matches("contains", "public", "/static/public/app.js"));
         assert!(matches("not contains", "private", "/public/file"));
         assert!(!matches("not contains", "private", "/private/file"));
+        assert!(matches("fileExt", ".ts", ".ts"));
+        assert!(matches("fileExt", "ts", ".ts"));
+        assert!(matches("fileExtension", r#"[".m3u8","ts"]"#, ".ts"));
+        assert!(!matches("fileExt", ".ts", ".js"));
         assert!(matches("in", r#"["a","b"]"#, "a"));
         assert!(matches("not in", r#"["a","b"]"#, "c"));
         assert!(!matches("not in", r#"["a","b"]"#, "a"));
@@ -1863,9 +2005,21 @@ mod tests {
 
     #[test]
     fn cache_operator_supports_mime_version_number_mod_and_ip() {
-        assert!(matches("mime type", r#"["text/*","application/json"]"#, "text/html; charset=utf-8"));
-        assert!(matches("mime type", "application/json,text/plain", "text/plain; charset=utf-8"));
-        assert!(matches("mime type", "application/json", "application/json; charset=utf-8"));
+        assert!(matches(
+            "mime type",
+            r#"["text/*","application/json"]"#,
+            "text/html; charset=utf-8"
+        ));
+        assert!(matches(
+            "mime type",
+            "application/json,text/plain",
+            "text/plain; charset=utf-8"
+        ));
+        assert!(matches(
+            "mime type",
+            "application/json",
+            "application/json; charset=utf-8"
+        ));
         assert!(!matches("mime type", "image/*", "text/html"));
         assert!(matches("version range", "1.2.0,2.0.0", "1.5.1"));
         assert!(!matches("version range", "1.2.0,2.0.0", "2.1.0"));
@@ -1937,8 +2091,14 @@ mod tests {
         assert!(CacheVariable::compile("${responseHeader.Content-Type}").is_response_known());
         assert!(CacheVariable::compile("${status}").is_response_known());
         assert!(!CacheVariable::compile("${requestPath}").is_response_known());
-        assert!(matches!(CacheVariable::compile("${arg.token}"), CacheVariable::Arg(value) if value == "token"));
-        assert!(matches!(CacheVariable::compile("${header.User-Agent}"), CacheVariable::Header(value) if value == "User-Agent"));
-        assert!(matches!(CacheVariable::compile("${cookie.sid}"), CacheVariable::Cookie(value) if value == "sid"));
+        assert!(
+            matches!(CacheVariable::compile("${arg.token}"), CacheVariable::Arg(value) if value == "token")
+        );
+        assert!(
+            matches!(CacheVariable::compile("${header.User-Agent}"), CacheVariable::Header(value) if value == "User-Agent")
+        );
+        assert!(
+            matches!(CacheVariable::compile("${cookie.sid}"), CacheVariable::Cookie(value) if value == "sid")
+        );
     }
 }

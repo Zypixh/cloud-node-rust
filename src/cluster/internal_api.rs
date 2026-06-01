@@ -197,19 +197,23 @@ async fn handle_purge(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()>
             write_response(stream, 400, json!({"error":"tag key required"})).await?;
             return Ok(());
         }
-        if !crate::cache_manager::CACHE
-            .storage
-            .purge_by_tag(key)
-            .await
-        {
+        if !crate::cache_manager::CACHE.storage.purge_by_tag(key).await {
             write_response(stream, 500, json!({"error":"tag purge failed"})).await?;
             return Ok(());
         }
     } else if !prefix.is_empty() {
+        if crate::rpc::cache::is_dangerous_purge_prefix(prefix) {
+            write_response(stream, 400, json!({"error":"dangerous purge prefix"})).await?;
+            return Ok(());
+        }
         crate::cache_manager::CACHE.purge_prefix(prefix).await?;
     } else if !key.is_empty() {
         if crate::rpc::cache::is_prefix_purge(&request.key_type, key) {
             let prefix = crate::rpc::cache::normalize_purge_prefix(key);
+            if crate::rpc::cache::is_dangerous_purge_prefix(&prefix) {
+                write_response(stream, 400, json!({"error":"dangerous purge prefix"})).await?;
+                return Ok(());
+            }
             crate::cache_manager::CACHE.purge_prefix(&prefix).await?;
         } else {
             crate::cache_manager::CACHE.purge_key(key).await?;

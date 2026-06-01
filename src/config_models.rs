@@ -1399,10 +1399,7 @@ impl HTTPRemoteAddrConfig {
         let mut out = Vec::new();
         for entry in raw_list {
             let trimmed = entry.trim();
-            if let Some(inner) = trimmed
-                .strip_prefix("${")
-                .and_then(|s| s.strip_suffix('}'))
-            {
+            if let Some(inner) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
                 let body = inner
                     .strip_prefix("header.")
                     .or_else(|| inner.strip_prefix("requestHeader."))
@@ -1761,10 +1758,7 @@ impl URLPattern {
                 let escaped = regex::escape(pattern);
                 let wildcard = escaped.replace("\\*", "(.*)");
                 if wildcard.starts_with('/') {
-                    Some(format!(
-                        "(?i)^(?:(?:http|https)://[^/]+)?{}$",
-                        wildcard
-                    ))
+                    Some(format!("(?i)^(?:(?:http|https)://[^/]+)?{}$", wildcard))
                 } else {
                     Some(format!("(?i)^{}$", wildcard))
                 }
@@ -2302,6 +2296,15 @@ pub struct HTTPAuthPolicy {
 pub struct WebCacheConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(rename = "purgeIsOn", default)]
+    pub purge_is_on: bool,
+    #[serde(
+        rename = "purgeKey",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    pub purge_key: String,
+    pub key: Option<HTTPCacheKeyConfig>,
     #[serde(
         rename = "cacheRefs",
         default,
@@ -2323,6 +2326,16 @@ impl WebCacheConfig {
             policy.compile_url_patterns();
         }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HTTPCacheKeyConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub scheme: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub host: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -2702,7 +2715,11 @@ pub struct HTTPFirewallRule {
     pub is_reverse: bool,
     #[serde(rename = "isCaseInsensitive", default)]
     pub is_case_insensitive: bool,
-    #[serde(rename = "paramFilters", default, deserialize_with = "deserialize_null_default")]
+    #[serde(
+        rename = "paramFilters",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     pub param_filters: Vec<HTTPParamFilter>,
 }
 
@@ -3457,61 +3474,79 @@ mod tests {
         };
         assert!(wildcard.matches("https://example.com/static/a/image.jpg"));
         assert!(wildcard.matches("/static/a/image.jpg"));
-        assert!((URLPattern {
-            type_name: "wildcard".to_string(),
-            pattern: "/hello/world/*".to_string(),
-            ..Default::default()
-        })
-        .matches("/hello/world/a"));
-        assert!((URLPattern {
-            type_name: "wildcard".to_string(),
-            pattern: "*/hello/world".to_string(),
-            ..Default::default()
-        })
-        .matches("/a/hello/world"));
-        assert!((URLPattern {
-            type_name: "wildcard".to_string(),
-            pattern: "*/article/*".to_string(),
-            ..Default::default()
-        })
-        .matches("/news/article/123"));
-        assert!((URLPattern {
-            type_name: "wildcard".to_string(),
-            pattern: "*example.com/*".to_string(),
-            ..Default::default()
-        })
-        .matches("https://example.com/a"));
-        assert!((URLPattern {
-            type_name: "wildcard".to_string(),
-            pattern: "*.js".to_string(),
-            ..Default::default()
-        })
-        .matches("https://example.com/assets/app.js?v=1"));
+        assert!(
+            (URLPattern {
+                type_name: "wildcard".to_string(),
+                pattern: "/hello/world/*".to_string(),
+                ..Default::default()
+            })
+            .matches("/hello/world/a")
+        );
+        assert!(
+            (URLPattern {
+                type_name: "wildcard".to_string(),
+                pattern: "*/hello/world".to_string(),
+                ..Default::default()
+            })
+            .matches("/a/hello/world")
+        );
+        assert!(
+            (URLPattern {
+                type_name: "wildcard".to_string(),
+                pattern: "*/article/*".to_string(),
+                ..Default::default()
+            })
+            .matches("/news/article/123")
+        );
+        assert!(
+            (URLPattern {
+                type_name: "wildcard".to_string(),
+                pattern: "*example.com/*".to_string(),
+                ..Default::default()
+            })
+            .matches("https://example.com/a")
+        );
+        assert!(
+            (URLPattern {
+                type_name: "wildcard".to_string(),
+                pattern: "*.js".to_string(),
+                ..Default::default()
+            })
+            .matches("https://example.com/assets/app.js?v=1")
+        );
 
-        assert!((URLPattern {
-            type_name: "regexp".to_string(),
-            pattern: "^/hello/world".to_string(),
-            ..Default::default()
-        })
-        .matches("https://example.com/hello/world/a"));
-        assert!((URLPattern {
-            type_name: "regexp".to_string(),
-            pattern: "/hello/world$".to_string(),
-            ..Default::default()
-        })
-        .matches("/a/hello/world"));
-        assert!((URLPattern {
-            type_name: "regexp".to_string(),
-            pattern: "/article/(\\d+)".to_string(),
-            ..Default::default()
-        })
-        .matches("/article/123"));
-        assert!((URLPattern {
-            type_name: "regexp".to_string(),
-            pattern: "^(http|https)://example.com/".to_string(),
-            ..Default::default()
-        })
-        .matches("https://example.com/article/123"));
+        assert!(
+            (URLPattern {
+                type_name: "regexp".to_string(),
+                pattern: "^/hello/world".to_string(),
+                ..Default::default()
+            })
+            .matches("https://example.com/hello/world/a")
+        );
+        assert!(
+            (URLPattern {
+                type_name: "regexp".to_string(),
+                pattern: "/hello/world$".to_string(),
+                ..Default::default()
+            })
+            .matches("/a/hello/world")
+        );
+        assert!(
+            (URLPattern {
+                type_name: "regexp".to_string(),
+                pattern: "/article/(\\d+)".to_string(),
+                ..Default::default()
+            })
+            .matches("/article/123")
+        );
+        assert!(
+            (URLPattern {
+                type_name: "regexp".to_string(),
+                pattern: "^(http|https)://example.com/".to_string(),
+                ..Default::default()
+            })
+            .matches("https://example.com/article/123")
+        );
 
         let prefix = URLPattern {
             type_name: "prefix".to_string(),

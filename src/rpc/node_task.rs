@@ -90,7 +90,14 @@ pub async fn sync_node_tasks(
                     "planChanged" => sync_active_plans(api_config, config_store).await,
                     "purgeServerCache" | "purgePathCache" | "preheatCache" => {
                         if crate::cluster::leader::require_leader("cache_tasks") {
-                            sync_cache_tasks(client.channel(), api_config).await
+                            sync_cache_tasks(
+                                client.channel(),
+                                api_config,
+                                config_store,
+                                task.id,
+                                task.server_id,
+                            )
+                            .await
                         } else {
                             break;
                         }
@@ -152,8 +159,8 @@ pub async fn sync_node_tasks(
                     ip_list_manager.remove_list(list_id);
                 }
 
-                let reported = crate::rpc::track_rpc(
-                    task_service.report_node_task_done(pb::ReportNodeTaskDoneRequest {
+                let reported = crate::rpc::track_rpc(task_service.report_node_task_done(
+                    pb::ReportNodeTaskDoneRequest {
                         node_task_id: task.id,
                         is_ok: success,
                         error: if success {
@@ -161,8 +168,8 @@ pub async fn sync_node_tasks(
                         } else {
                             "Task failed".to_string()
                         },
-                    }),
-                )
+                    },
+                ))
                 .await
                 .is_ok();
 

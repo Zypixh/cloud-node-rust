@@ -50,7 +50,17 @@ impl RpcClient {
         let mut last_err = None;
         for api_endpoint in endpoints {
             let endpoint = match Channel::from_shared(api_endpoint.clone()) {
-                Ok(e) => e,
+                Ok(endpoint) => match endpoint.user_agent("grpc-go/1.0") {
+                    Ok(endpoint) => endpoint,
+                    Err(e) => {
+                        last_err = Some(anyhow::anyhow!(
+                            "Invalid user-agent for {}: {}",
+                            api_endpoint,
+                            e
+                        ));
+                        continue;
+                    }
+                },
                 Err(e) => {
                     last_err = Some(anyhow::anyhow!("Invalid URI {}: {}", api_endpoint, e));
                     continue;
@@ -88,7 +98,10 @@ impl RpcClient {
 
     pub async fn ping_endpoint(api_config: &ApiConfig, endpoint: &str) -> bool {
         let endpoint = match Channel::from_shared(endpoint.to_string()) {
-            Ok(endpoint) => endpoint,
+            Ok(endpoint) => match endpoint.user_agent("grpc-go/1.0") {
+                Ok(endpoint) => endpoint,
+                Err(_) => return false,
+            },
             Err(_) => return false,
         };
 

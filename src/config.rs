@@ -445,20 +445,11 @@ impl ConfigStore {
         let hot_path = Self::build_hot_path_snapshot(&lock);
         let normalized = Self::normalize_host(host);
 
-        // 1. Exact match
-        let mut server = lock.servers.get(&normalized).cloned();
-        let mut upstream = lock.routes.get(&normalized).cloned();
-
-        // 2. Wildcard match if no exact match
-        if server.is_none() {
-            if let Some(pos) = normalized.find('.') {
-                let wildcard = format!("*{}", &normalized[pos..]);
-                server = lock.servers.get(&wildcard).cloned();
-                upstream = lock.routes.get(&wildcard).cloned();
-            }
-        }
-
-        (hot_path, server, upstream)
+        (
+            hot_path,
+            Self::find_server_locked(&lock, &normalized),
+            Self::find_route_locked(&lock, &normalized),
+        )
     }
 
     fn normalize_host(host: &str) -> String {
@@ -471,9 +462,15 @@ impl ConfigStore {
         if let Some(server) = lock.servers.get(normalized_host) {
             return Some(server.clone());
         }
-        if let Some(pos) = normalized_host.find('.') {
-            let wildcard = format!("*{}", &normalized_host[pos..]);
-            return lock.servers.get(&wildcard).cloned();
+        if let Some(server) = lock.servers.get(&format!("*.{normalized_host}")) {
+            return Some(server.clone());
+        }
+        let mut suffix = normalized_host;
+        while let Some((_, rest)) = suffix.split_once('.') {
+            suffix = rest;
+            if let Some(server) = lock.servers.get(&format!("*.{suffix}")) {
+                return Some(server.clone());
+            }
         }
         None
     }
@@ -485,9 +482,15 @@ impl ConfigStore {
         if let Some(route) = lock.routes.get(normalized_host) {
             return Some(route.clone());
         }
-        if let Some(pos) = normalized_host.find('.') {
-            let wildcard = format!("*{}", &normalized_host[pos..]);
-            return lock.routes.get(&wildcard).cloned();
+        if let Some(route) = lock.routes.get(&format!("*.{normalized_host}")) {
+            return Some(route.clone());
+        }
+        let mut suffix = normalized_host;
+        while let Some((_, rest)) = suffix.split_once('.') {
+            suffix = rest;
+            if let Some(route) = lock.routes.get(&format!("*.{suffix}")) {
+                return Some(route.clone());
+            }
         }
         None
     }
@@ -553,21 +556,30 @@ impl ConfigStore {
         lock: &NodeConfig,
         normalized_host: &str,
     ) -> Option<Arc<ServerConfig>> {
-        lock.servers
-            .get(normalized_host)
-            .filter(|server| !server.is_sni_passthrough() && !server.is_quic_passthrough())
-            .cloned()
-            .or_else(|| {
-                normalized_host.find('.').and_then(|pos| {
-                    let wildcard = format!("*{}", &normalized_host[pos..]);
-                    lock.servers
-                        .get(&wildcard)
-                        .filter(|server| {
-                            !server.is_sni_passthrough() && !server.is_quic_passthrough()
-                        })
-                        .cloned()
-                })
-            })
+        let is_l7 = |server: &&Arc<ServerConfig>| {
+            !server.is_sni_passthrough() && !server.is_quic_passthrough()
+        };
+
+        if let Some(server) = lock.servers.get(normalized_host).filter(is_l7) {
+            return Some(server.clone());
+        }
+        if let Some(server) = lock
+            .servers
+            .get(&format!("*.{normalized_host}"))
+            .filter(is_l7)
+        {
+            return Some(server.clone());
+        }
+
+        let mut suffix = normalized_host;
+        while let Some((_, rest)) = suffix.split_once('.') {
+            suffix = rest;
+            if let Some(server) = lock.servers.get(&format!("*.{suffix}")).filter(is_l7) {
+                return Some(server.clone());
+            }
+        }
+
+        None
     }
 
     pub fn find_sni_passthrough_server_sync(
@@ -973,7 +985,20 @@ impl ConfigStore {
             .cloned()
     }
 
+    pub fn get_server_by_id_sync(&self, server_id: i64) -> Option<Arc<ServerConfig>> {
+        let lock = self.inner.read();
+        lock.all_servers
+            .iter()
+            .find(|server| server.id == Some(server_id))
+            .cloned()
+    }
+
     pub async fn get_all_servers(&self) -> Vec<Arc<ServerConfig>> {
+        let lock = self.inner.read();
+        lock.all_servers.clone()
+    }
+
+    pub fn get_all_servers_sync(&self) -> Vec<Arc<ServerConfig>> {
         let lock = self.inner.read();
         lock.all_servers.clone()
     }
@@ -1812,6 +1837,68 @@ mod tests {
         );
         assert!(snapshot.global_access_log.is_some());
         assert_eq!(store.get_updating_server_list_id().await, 55);
+    }
+
+    #[tokio::test]
+    async fn l7_wildcard_route_matches_root_and_nested_subdomains() {
+        let store = ConfigStore::new();
+        let server = Arc::new(ServerConfig {
+            id: Some(11),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "*.example.com".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let (lb, _) = crate::rpc::utils::fallback_runtime_lb();
+
+        store
+            .cache_server_route("*.example.com".to_string(), server, lb)
+            .await;
+
+        for host in ["example.com", "www.example.com", "a.b.example.com"] {
+            assert_eq!(
+                store
+                    .get_server_sync(host)
+                    .map(|server| server.numeric_id()),
+                Some(11),
+                "host should match wildcard route: {host}"
+            );
+            assert!(
+                store.get_upstream_sync(host).is_some(),
+                "host should resolve wildcard upstream: {host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn l7_tls_wildcard_route_matches_root_and_nested_subdomains() {
+        let store = ConfigStore::new();
+        let server = Arc::new(ServerConfig {
+            id: Some(12),
+            is_on: true,
+            server_names: vec![ServerNameConfig {
+                name: "*.example.com".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let (lb, _) = crate::rpc::utils::fallback_runtime_lb();
+
+        store
+            .cache_server_route("*.example.com".to_string(), server, lb)
+            .await;
+
+        for host in ["example.com", "www.example.com", "a.b.example.com"] {
+            assert_eq!(
+                store
+                    .get_l7_server_for_tls_name_sync(host)
+                    .map(|server| server.numeric_id()),
+                Some(12),
+                "TLS host should match L7 wildcard route: {host}"
+            );
+        }
     }
 
     #[tokio::test]

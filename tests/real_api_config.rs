@@ -73,6 +73,35 @@ fn require_real_doc_snapshot() -> bool {
         == Some("1")
 }
 
+fn require_real_cache_task_consume() -> bool {
+    std::env::var("CLOUD_NODE_REAL_API_CONSUME_CACHE_TASKS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+fn require_real_cache_task_list() -> bool {
+    std::env::var("CLOUD_NODE_REAL_API_LIST_CACHE_TASKS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+fn redacted_cache_task_key(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => {
+            let mut out = format!("{}://<host>", url.scheme());
+            out.push_str(url.path());
+            if let Some(query) = url.query() {
+                out.push('?');
+                out.push_str(query);
+            }
+            out
+        }
+        Err(_) => "<redacted>".to_string(),
+    }
+}
+
 async fn decode_node_json(resp: pb::FindCurrentNodeConfigResponse) -> anyhow::Result<Vec<u8>> {
     if resp.is_compressed {
         tokio::task::spawn_blocking(move || {
@@ -146,6 +175,167 @@ fn print_doc_sample(label: &str, value: serde_json::Value) -> anyhow::Result<()>
         label,
         serde_json::to_string_pretty(&value)?
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_api_list_cache_tasks_once() -> anyhow::Result<()> {
+    if !require_real_cache_task_list() {
+        eprintln!(
+            "skip real cache task list test: set CLOUD_NODE_REAL_API_LIST_CACHE_TASKS=1 to enable"
+        );
+        return Ok(());
+    }
+    let Some(api_config) = real_api_config_from_env()? else {
+        return Ok(());
+    };
+
+    let client = RpcClient::new(&api_config).await?;
+    let mut cache_service = client.cache_task_service();
+    let tasks = cache_service
+        .find_doing_http_cache_task_keys(pb::FindDoingHttpCacheTaskKeysRequest { size: 100 })
+        .await?
+        .into_inner()
+        .http_cache_task_keys;
+
+    let summary = tasks
+        .iter()
+        .map(|task| {
+            serde_json::json!({
+                "id": task.id,
+                "taskId": task.task_id,
+                "type": task.r#type,
+                "keyType": task.key_type,
+                "key": redacted_cache_task_key(&task.key),
+                "nodeClusterId": task.node_cluster_id,
+                "isDone": task.is_done,
+                "isDoing": task.is_doing,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "REAL_CACHE_TASKS {}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "count": tasks.len(),
+            "tasks": summary,
+        }))?
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_api_consume_prefix_purge_cache_tasks_once() -> anyhow::Result<()> {
+    if !require_real_cache_task_consume() {
+        eprintln!(
+            "skip real cache task consume test: set CLOUD_NODE_REAL_API_CONSUME_CACHE_TASKS=1 to enable"
+        );
+        return Ok(());
+    }
+    let Some(api_config) = real_api_config_from_env()? else {
+        return Ok(());
+    };
+
+    let config_store = ConfigStore::new();
+    let health_manager = GlobalHealthManager::new(4);
+    let cert_selector = Arc::new(DynamicCertSelector::new());
+    let waf_state = WafStateManager::new();
+    let client = RpcClient::new(&api_config).await?;
+
+    let mut node_service = client.node_service();
+    let mut task_version = 0;
+    let mut config_version = -1;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fetch_and_apply_config(
+            &mut node_service,
+            &config_store,
+            &api_config,
+            &health_manager,
+            &cert_selector,
+            &waf_state,
+            &mut task_version,
+            &mut config_version,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("real API config fetch timed out before cache task consume"))?;
+
+    let mut cache_service = client.cache_task_service();
+    let resp = cache_service
+        .find_doing_http_cache_task_keys(pb::FindDoingHttpCacheTaskKeysRequest { size: 100 })
+        .await?
+        .into_inner();
+    let prefix_purges = resp
+        .http_cache_task_keys
+        .into_iter()
+        .filter(|task| {
+            task.r#type.eq_ignore_ascii_case("purge")
+                && task.key_type.eq_ignore_ascii_case("prefix")
+        })
+        .collect::<Vec<_>>();
+
+    let pending_summary = prefix_purges
+        .iter()
+        .map(|task| {
+            serde_json::json!({
+                "id": task.id,
+                "taskId": task.task_id,
+                "type": task.r#type,
+                "keyType": task.key_type,
+                "key": redacted_cache_task_key(&task.key),
+                "nodeClusterId": task.node_cluster_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "REAL_PREFIX_PURGE_PENDING {}",
+        serde_json::to_string_pretty(&pending_summary)?
+    );
+
+    let mut task_ids = prefix_purges
+        .iter()
+        .filter_map(|task| (task.task_id > 0).then_some(task.task_id))
+        .collect::<Vec<_>>();
+    task_ids.sort_unstable();
+    task_ids.dedup();
+
+    if task_ids.is_empty() {
+        println!("REAL_PREFIX_PURGE_CONSUMED []");
+        return Ok(());
+    }
+
+    let mut consumed = Vec::new();
+    for task_id in task_ids {
+        let ok = cloud_node_rust::rpc::cache::sync_cache_tasks(
+            client.channel(),
+            &api_config,
+            &config_store,
+            task_id,
+            0,
+        )
+        .await;
+        consumed.push(serde_json::json!({ "taskId": task_id, "ok": ok }));
+    }
+    println!(
+        "REAL_PREFIX_PURGE_CONSUMED {}",
+        serde_json::to_string_pretty(&consumed)?
+    );
+
+    let mut cache_service = client.cache_task_service();
+    let remaining = cache_service
+        .find_doing_http_cache_task_keys(pb::FindDoingHttpCacheTaskKeysRequest { size: 100 })
+        .await?
+        .into_inner()
+        .http_cache_task_keys
+        .into_iter()
+        .filter(|task| {
+            task.r#type.eq_ignore_ascii_case("purge")
+                && task.key_type.eq_ignore_ascii_case("prefix")
+        })
+        .count();
+    println!("REAL_PREFIX_PURGE_REMAINING {}", remaining);
+
     Ok(())
 }
 

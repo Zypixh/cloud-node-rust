@@ -35,7 +35,10 @@ const MEMORY_SERVE_MAX: u64 = 50 * 1024 * 1024;
 pub(crate) fn parse_swr_from_cache_control(cc: &str) -> Option<u64> {
     for part in cc.split(',') {
         let trimmed = part.trim();
-        if let Some(rest) = trimmed.to_ascii_lowercase().strip_prefix("stale-while-revalidate") {
+        if let Some(rest) = trimmed
+            .to_ascii_lowercase()
+            .strip_prefix("stale-while-revalidate")
+        {
             let rest = rest.trim();
             if let Some(num_str) = rest.strip_prefix('=') {
                 if let Ok(n) = num_str.trim().parse::<u64>() {
@@ -319,7 +322,10 @@ fn status_allows_content_length(status: u16) -> bool {
 }
 
 fn restore_content_length(header: &mut ResponseHeader, status: u16, size: u64) {
-    if size > 0 && status_allows_content_length(status) && !header.headers.contains_key("content-length") {
+    if size > 0
+        && status_allows_content_length(status)
+        && !header.headers.contains_key("content-length")
+    {
         let _ = header.insert_header("content-length", size.to_string());
     }
 }
@@ -746,7 +752,10 @@ impl Storage for FileStorage {
                 cache_key: &k_str,
                 size: existing.as_ref().map(|meta| meta.size).unwrap_or(0),
                 expires: now + ttl as i64,
-                access_time: existing.as_ref().map(|meta| meta.access_time).unwrap_or(now),
+                access_time: existing
+                    .as_ref()
+                    .map(|meta| meta.access_time)
+                    .unwrap_or(now),
                 access_count: existing.as_ref().map(|meta| meta.access_count).unwrap_or(1),
                 status,
                 headers: &header_pairs,
@@ -1443,10 +1452,22 @@ impl HybridStorage {
     }
 
     fn cache_key_variants(key: &str) -> Vec<String> {
-        let mut variants = Vec::with_capacity(6);
+        let mut variants = Vec::with_capacity(12);
         variants.push(key.to_string());
 
-        let suffixes = ["@br", "@gzip", "@webp", "@webp@br", "@webp@gzip"];
+        let suffixes = [
+            "@br",
+            "@gzip",
+            "@webp",
+            "@webp@br",
+            "@webp@gzip",
+            "@method:HEAD",
+            "@method:HEAD@br",
+            "@method:HEAD@gzip",
+            "@method:HEAD@webp",
+            "@method:HEAD@webp@br",
+            "@method:HEAD@webp@gzip",
+        ];
         if !suffixes.iter().any(|suffix| key.ends_with(suffix)) {
             variants.extend(suffixes.iter().map(|suffix| format!("{key}{suffix}")));
         }
@@ -1495,8 +1516,7 @@ impl HybridStorage {
 
     pub async fn purge_by_tag(&'static self, tag: &str) -> bool {
         let location = self.l2.partial_location_for_key_str(tag);
-        let partial_deleted =
-            crate::cache::partial::purge_by_tag(tag, &location.roots).await;
+        let partial_deleted = crate::cache::partial::purge_by_tag(tag, &location.roots).await;
         let hashes: Vec<String> = SURROGATE_KEY_INDEX
             .get(tag)
             .map(|set| set.iter().map(|h| h.clone()).collect())
@@ -1530,6 +1550,13 @@ impl HybridStorage {
 
     pub async fn purge_by_prefix(&'static self, prefix: &str) -> bool {
         let clean_prefix = prefix.trim_end_matches('*');
+        if Self::is_dangerous_purge_prefix(clean_prefix) {
+            tracing::warn!(
+                "RPC_CACHE: Refusing dangerous prefix purge request: {:?}",
+                prefix
+            );
+            return false;
+        }
         let location = self.l2.partial_location_for_key_str(clean_prefix);
         let partial_deleted =
             crate::cache::partial::purge_prefix(clean_prefix, &location.roots).await;
@@ -1550,6 +1577,27 @@ impl HybridStorage {
             deleted_count, partial_deleted, prefix
         );
         true
+    }
+
+    fn is_dangerous_purge_prefix(prefix: &str) -> bool {
+        let normalized = prefix.trim().trim_end_matches('*').trim();
+        if normalized.is_empty()
+            || normalized == "/"
+            || normalized.eq_ignore_ascii_case("http://")
+            || normalized.eq_ignore_ascii_case("https://")
+        {
+            return true;
+        }
+
+        let lower = normalized.to_ascii_lowercase();
+        if let Some(after_scheme) = lower
+            .strip_prefix("http://")
+            .or_else(|| lower.strip_prefix("https://"))
+        {
+            return after_scheme.find('/').is_none_or(|index| index == 0);
+        }
+
+        false
     }
 
     pub async fn runtime_stats(&self) -> CacheRuntimeStats {
@@ -2025,6 +2073,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dangerous_prefix_detection_requires_url_host_boundary() {
+        assert!(HybridStorage::is_dangerous_purge_prefix("*"));
+        assert!(HybridStorage::is_dangerous_purge_prefix(""));
+        assert!(HybridStorage::is_dangerous_purge_prefix("https://"));
+        assert!(HybridStorage::is_dangerous_purge_prefix(
+            "https://cache.example.com"
+        ));
+        assert!(HybridStorage::is_dangerous_purge_prefix(
+            "https://cache.example.com*"
+        ));
+        assert!(!HybridStorage::is_dangerous_purge_prefix(
+            "https://cache.example.com/*"
+        ));
+    }
+
     #[tokio::test]
     async fn small_uncompressed_l2_hit_uses_memory_handler_for_fast_l1_promotion() {
         let key_str = format!(
@@ -2141,6 +2205,113 @@ mod tests {
         assert_eq!(chunk.as_ref(), body);
 
         crate::metrics::storage::delete_cache_meta_for_test(&hash);
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn purge_key_removes_fast_l1_memory_entry() {
+        let _guard = FAST_L1_TEST_LOCK.lock();
+        let key = format!(
+            "https://cache.example.com/key-purge-fast-l1-{}",
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        );
+        let hash = format!("{:x}", md5_legacy::compute(&key));
+        fast_l1_remove(&fast_hash_key(&key));
+        crate::metrics::storage::delete_cache_meta_for_test(&hash);
+
+        let header = ResponseHeader::build(200, None).expect("response header");
+        let meta = CacheMeta::new(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            std::time::SystemTime::now(),
+            0,
+            0,
+            header,
+        );
+        assert!(HybridStorage::bench_fast_l1_insert(
+            &key,
+            bytes::Bytes::from_static(b"body"),
+            &meta,
+            60,
+        ));
+        crate::metrics::storage::insert_cache_meta_for_test(
+            hash.clone(),
+            crate::metrics::storage::CacheMetaEntry {
+                cache_key: key.clone(),
+                size: 4,
+                expires: crate::utils::time::now_timestamp() + 60,
+                access_time: crate::utils::time::now_timestamp(),
+                access_count: 1,
+                status: 200,
+                headers: Vec::new(),
+                compressed: false,
+                ..Default::default()
+            },
+        );
+
+        assert!(fast_l1_lookup(&key).is_some());
+        let root = std::env::temp_dir().join(format!(
+            "cloud-node-rust-cache-purge-key-test-{}",
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let storage = Box::leak(Box::new(HybridStorage::new(0, &root)));
+        assert!(storage.purge_by_key(&key).await);
+        assert!(fast_l1_lookup(&key).is_none());
+        assert!(crate::metrics::storage::get_cache_meta_memory(&hash).is_none());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn purge_prefix_removes_fast_l1_memory_entry() {
+        let _guard = FAST_L1_TEST_LOCK.lock();
+        let prefix = format!(
+            "https://cache.example.com/prefix-purge-fast-l1-{}/",
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        );
+        let key = format!("{prefix}asset.js");
+        let hash = format!("{:x}", md5_legacy::compute(&key));
+        fast_l1_remove(&fast_hash_key(&key));
+        crate::metrics::storage::delete_cache_meta_for_test(&hash);
+
+        let header = ResponseHeader::build(200, None).expect("response header");
+        let meta = CacheMeta::new(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            std::time::SystemTime::now(),
+            0,
+            0,
+            header,
+        );
+        assert!(HybridStorage::bench_fast_l1_insert(
+            &key,
+            bytes::Bytes::from_static(b"body"),
+            &meta,
+            60,
+        ));
+        crate::metrics::storage::insert_cache_meta_for_test(
+            hash.clone(),
+            crate::metrics::storage::CacheMetaEntry {
+                cache_key: key.clone(),
+                size: 4,
+                expires: crate::utils::time::now_timestamp() + 60,
+                access_time: crate::utils::time::now_timestamp(),
+                access_count: 1,
+                status: 200,
+                headers: Vec::new(),
+                compressed: false,
+                ..Default::default()
+            },
+        );
+
+        assert!(fast_l1_lookup(&key).is_some());
+        let root = std::env::temp_dir().join(format!(
+            "cloud-node-rust-cache-purge-prefix-test-{}",
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let storage = Box::leak(Box::new(HybridStorage::new(0, &root)));
+        assert!(storage.purge_by_prefix(&prefix).await);
+        assert!(fast_l1_lookup(&key).is_none());
+        assert!(crate::metrics::storage::get_cache_meta_memory(&hash).is_none());
+
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
