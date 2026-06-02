@@ -2,6 +2,7 @@ use crate::config::ConfigStore;
 use crate::config_models::SSLCertConfig;
 use crate::config_models::ServerConfig;
 use crate::firewall::state::WafStateManager;
+use crate::net_bind::{bind_tcp_listener, dual_stack_bind_addrs};
 use crate::proxy_protocol;
 use crate::ssl::DynamicCertSelector;
 use base64::Engine;
@@ -19,7 +20,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -58,7 +59,7 @@ pub struct TcpProxyManager {
     _cert_selector: Arc<DynamicCertSelector>,
     waf_state: Arc<WafStateManager>,
     node_id: i64,
-    handled_ports: DashMap<u16, ListenerHandle>,
+    handled_ports: DashMap<SocketAddr, ListenerHandle>,
 }
 
 impl TcpProxyManager {
@@ -110,9 +111,16 @@ impl TcpProxyManager {
                                 .unwrap_or_default()
                                 .parse::<u16>()
                             {
-                                desired_ports.insert(port, false);
+                                for bind_addr in dual_stack_bind_addrs(port) {
+                                    desired_ports.insert(bind_addr, false);
+                                    self.spawn_listener(&server, bind_addr, false).await;
+                                }
+                            } else {
+                                error!(
+                                    "Failed to parse TCP port: {:?}",
+                                    addr_cfg.port_range.as_deref()
+                                );
                             }
-                            self.spawn_listener(&server, addr_cfg, false).await;
                         }
                     } else {
                         debug!(
@@ -142,9 +150,16 @@ impl TcpProxyManager {
                                 .unwrap_or_default()
                                 .parse::<u16>()
                             {
-                                desired_ports.insert(port, true);
+                                for bind_addr in dual_stack_bind_addrs(port) {
+                                    desired_ports.insert(bind_addr, true);
+                                    self.spawn_listener(&server, bind_addr, true).await;
+                                }
+                            } else {
+                                error!(
+                                    "Failed to parse TCP-TLS port: {:?}",
+                                    addr_cfg.port_range.as_deref()
+                                );
                             }
-                            self.spawn_listener(&server, addr_cfg, true).await;
                         }
                     } else {
                         debug!(
@@ -167,63 +182,56 @@ impl TcpProxyManager {
     async fn spawn_listener(
         self: &Arc<Self>,
         server: &Arc<ServerConfig>,
-        addr_cfg: &crate::config_models::NetworkAddressConfig,
+        bind_addr: SocketAddr,
         is_tls: bool,
     ) {
-        if let Ok(port) = addr_cfg
-            .port_range
-            .clone()
-            .unwrap_or_default()
-            .parse::<u16>()
-        {
-            if let Some(existing) = self.handled_ports.get(&port) {
-                if existing.is_tls == is_tls {
-                    return;
-                }
-                let _ = existing.shutdown_tx.send(true);
-                drop(existing);
-                self.handled_ports.remove(&port);
+        if let Some(existing) = self.handled_ports.get(&bind_addr) {
+            if existing.is_tls == is_tls {
+                return;
             }
-
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            self.handled_ports.insert(
-                port,
-                ListenerHandle {
-                    is_tls,
-                    shutdown_tx,
-                },
-            );
-
-            let manager = self.clone();
-            let server = server.clone();
-            tokio::spawn(async move {
-                if let Err(e) = manager
-                    .clone()
-                    .run_tcp_listener(port, server, is_tls, shutdown_rx)
-                    .await
-                {
-                    error!("TCP listener on port {} failed: {}", port, e);
-                    manager.handled_ports.remove(&port);
-                }
-            });
+            let _ = existing.shutdown_tx.send(true);
+            drop(existing);
+            self.handled_ports.remove(&bind_addr);
         }
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        self.handled_ports.insert(
+            bind_addr,
+            ListenerHandle {
+                is_tls,
+                shutdown_tx,
+            },
+        );
+
+        let manager = self.clone();
+        let server = server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = manager
+                .clone()
+                .run_tcp_listener(bind_addr, server, is_tls, shutdown_rx)
+                .await
+            {
+                error!("TCP listener on {} failed: {}", bind_addr, e);
+                manager.handled_ports.remove(&bind_addr);
+            }
+        });
     }
 
-    fn reconcile_listeners(&self, desired_ports: &std::collections::HashMap<u16, bool>) {
-        let active_ports: Vec<(u16, bool)> = self
+    fn reconcile_listeners(&self, desired_ports: &std::collections::HashMap<SocketAddr, bool>) {
+        let active_ports: Vec<(SocketAddr, bool)> = self
             .handled_ports
             .iter()
             .map(|entry| (*entry.key(), entry.value().is_tls))
             .collect();
 
-        for (port, is_tls) in active_ports {
-            match desired_ports.get(&port) {
+        for (bind_addr, is_tls) in active_ports {
+            match desired_ports.get(&bind_addr) {
                 Some(desired_tls) if *desired_tls == is_tls => {}
                 _ => {
-                    if let Some((_, handle)) = self.handled_ports.remove(&port) {
+                    if let Some((_, handle)) = self.handled_ports.remove(&bind_addr) {
                         info!(
-                            "TCP Proxy Manager: Stopping listener on port {} (TLS={})",
-                            port, is_tls
+                            "TCP Proxy Manager: Stopping listener on {} (TLS={})",
+                            bind_addr, is_tls
                         );
                         let _ = handle.shutdown_tx.send(true);
                     }
@@ -234,14 +242,13 @@ impl TcpProxyManager {
 
     async fn run_tcp_listener(
         self: Arc<Self>,
-        port: u16,
+        bind_addr: SocketAddr,
         server: Arc<ServerConfig>,
         is_tls: bool,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr).await?;
-        info!("TCP Proxy (TLS={}) listening on {}", is_tls, addr);
+        let listener = bind_tcp_listener(bind_addr, 4096)?;
+        info!("TCP Proxy (TLS={}) listening on {}", is_tls, bind_addr);
 
         let shared_ssl_acceptor = if is_tls {
             let selector = self._cert_selector.clone();
@@ -268,7 +275,7 @@ impl TcpProxyManager {
         loop {
             let accept_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
-                    info!("TCP listener on port {} shutting down", port);
+                    info!("TCP listener on {} shutting down", bind_addr);
                     return Ok(());
                 }
                 res = listener.accept() => res,
@@ -333,8 +340,12 @@ impl TcpProxyManager {
         let _sid = server.id.unwrap_or(0);
 
         // Apply PROXY Protocol header parsing before branching on TLS vs plain.
-        let Some((client_addr, client_stream)) =
-            maybe_consume_proxy_protocol_header(client_stream, client_addr, server.enable_proxy_protocol).await
+        let Some((client_addr, client_stream)) = maybe_consume_proxy_protocol_header(
+            client_stream,
+            client_addr,
+            server.enable_proxy_protocol,
+        )
+        .await
         else {
             return Ok(());
         };
@@ -1453,6 +1464,7 @@ mod tests {
     use super::*;
     use crate::config_models::{HTTPFirewallPolicy, TLSExhaustionAttackConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     async fn configure_tls_exhaustion(store: &ConfigStore) {
         store

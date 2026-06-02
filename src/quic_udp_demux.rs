@@ -5,7 +5,7 @@ use quinn::{AsyncUdpSocket, Endpoint, UdpPoller};
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io::{self, IoSliceMut};
-use std::net::{IpAddr, IpAddr as StdIpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr as StdIpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,7 @@ use tracing::{debug, error, info};
 
 use crate::config::ConfigStore;
 use crate::http3_proxy_manager::Http3ProxyManager;
+use crate::net_bind::{bind_udp_socket, dual_stack_bind_addrs};
 use crate::quic_probe::{QuicCryptoFragment, QuicProbeFragmentResult};
 use crate::udp_proxy::{
     UdpProxyManager, UdpSession, UdpSessionQuicCid, UdpSessionSendStatus, udp_activity_is_alive,
@@ -181,7 +182,7 @@ async fn bind_udp_with_retry(
 ) -> io::Result<UdpSocket> {
     let mut last_error = None;
     for _ in 0..100 {
-        match UdpSocket::bind(bind_addr).await {
+        match bind_udp_socket(bind_addr).await {
             Ok(socket) => return Ok(socket),
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
                 last_error = Some(err);
@@ -527,7 +528,7 @@ pub struct QuicUdpDemuxManager {
     config_store: ConfigStore,
     http3_manager: Arc<Http3ProxyManager>,
     udp_manager: Arc<UdpProxyManager>,
-    handled_ports: DashMap<u16, ListenerHandle>,
+    handled_ports: DashMap<SocketAddr, ListenerHandle>,
     next_listener_id: AtomicU64,
 }
 
@@ -556,11 +557,16 @@ impl QuicUdpDemuxManager {
                 .union(&udp_ports)
                 .copied()
                 .collect::<HashSet<_>>();
+            let desired_listeners = desired_ports
+                .iter()
+                .flat_map(|port| dual_stack_bind_addrs(*port))
+                .collect::<HashSet<_>>();
 
-            for port in &desired_ports {
-                self.spawn_listener(*port, http3_ports.contains(port)).await;
+            for bind_addr in &desired_listeners {
+                self.spawn_listener(*bind_addr, http3_ports.contains(&bind_addr.port()))
+                    .await;
             }
-            self.reconcile_listeners(&desired_ports, &http3_ports);
+            self.reconcile_listeners(&desired_listeners, &http3_ports);
             tokio::select! {
                 _ = self.config_store.wait_for_runtime_reload() => {}
                 _ = reconcile_tick.tick() => {}
@@ -568,20 +574,20 @@ impl QuicUdpDemuxManager {
         }
     }
 
-    async fn spawn_listener(self: &Arc<Self>, port: u16, http3_enabled: bool) {
-        if let Some(existing) = self.handled_ports.get(&port) {
+    async fn spawn_listener(self: &Arc<Self>, bind_addr: SocketAddr, http3_enabled: bool) {
+        if let Some(existing) = self.handled_ports.get(&bind_addr) {
             if existing.http3_enabled == http3_enabled {
                 return;
             }
             let _ = existing.shutdown_tx.send(true);
             drop(existing);
-            self.handled_ports.remove(&port);
+            self.handled_ports.remove(&bind_addr);
         }
 
         let listener_id = self.next_listener_id.fetch_add(1, Ordering::Relaxed);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.handled_ports.insert(
-            port,
+            bind_addr,
             ListenerHandle {
                 id: listener_id,
                 shutdown_tx,
@@ -592,35 +598,40 @@ impl QuicUdpDemuxManager {
         tokio::spawn(async move {
             if let Err(err) = manager
                 .clone()
-                .run_listener(port, http3_enabled, shutdown_rx)
+                .run_listener(bind_addr, http3_enabled, shutdown_rx)
                 .await
             {
-                error!("QUIC UDP demux listener on port {} failed: {}", port, err);
+                error!("QUIC UDP demux listener on {} failed: {}", bind_addr, err);
             }
             if manager
                 .handled_ports
-                .get(&port)
+                .get(&bind_addr)
                 .is_some_and(|entry| entry.id == listener_id)
             {
-                manager.handled_ports.remove(&port);
+                manager.handled_ports.remove(&bind_addr);
             }
         });
     }
 
-    fn reconcile_listeners(&self, desired_ports: &HashSet<u16>, http3_ports: &HashSet<u16>) {
-        let active_ports = self
+    fn reconcile_listeners(
+        &self,
+        desired_listeners: &HashSet<SocketAddr>,
+        http3_ports: &HashSet<u16>,
+    ) {
+        let active_listeners = self
             .handled_ports
             .iter()
             .map(|entry| (*entry.key(), entry.value().http3_enabled))
             .collect::<Vec<_>>();
-        for (port, http3_enabled) in active_ports {
+        for (bind_addr, http3_enabled) in active_listeners {
+            let port = bind_addr.port();
             let desired_http3 = http3_ports.contains(&port);
-            let keep = desired_ports.contains(&port) && http3_enabled == desired_http3;
+            let keep = desired_listeners.contains(&bind_addr) && http3_enabled == desired_http3;
             if keep {
                 continue;
             }
-            if let Some((_, handle)) = self.handled_ports.remove(&port) {
-                info!("QUIC UDP demux: stopping listener on port {}", port);
+            if let Some((_, handle)) = self.handled_ports.remove(&bind_addr) {
+                info!("QUIC UDP demux: stopping listener on {}", bind_addr);
                 let _ = handle.shutdown_tx.send(true);
                 self.udp_manager.remove_sessions_for_port(port);
             }
@@ -629,11 +640,11 @@ impl QuicUdpDemuxManager {
 
     async fn run_listener(
         self: Arc<Self>,
-        port: u16,
+        bind_addr: SocketAddr,
         http3_enabled: bool,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<()> {
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        let port = bind_addr.port();
         let socket = Arc::new(bind_udp_with_retry(bind_addr, &mut shutdown_rx).await?);
         let local_addr = socket.local_addr()?;
         let routes = Arc::new(DashMap::<SocketAddr, RouteKind>::new());
@@ -874,11 +885,7 @@ impl QuicUdpDemuxManager {
             QuicProbeFragmentResult::Found(client_hello) => {
                 debug!(
                     "QUIC UDP demux: ClientHello found from {} on port {} sni={:?} alpn={:?} http3_enabled={}",
-                    client_addr,
-                    port,
-                    client_hello.server_name,
-                    client_hello.alpns,
-                    http3_enabled
+                    client_addr, port, client_hello.server_name, client_hello.alpns, http3_enabled
                 );
                 let mut datagrams = pending_routes
                     .remove(&client_addr)
@@ -1130,7 +1137,9 @@ impl QuicUdpDemuxManager {
             }
 
             if http3_enabled && client_hello_supports_h3(&client_hello) {
-                let l7_server = self.config_store.get_l7_server_for_tls_name_sync(server_name);
+                let l7_server = self
+                    .config_store
+                    .get_l7_server_for_tls_name_sync(server_name);
                 debug!(
                     "QUIC UDP demux: L7 H3 candidate {} on port {} server={:?} accepts_http3={} alpn={:?}",
                     server_name,
@@ -1138,13 +1147,16 @@ impl QuicUdpDemuxManager {
                     l7_server.as_ref().map(|server| server.numeric_id()),
                     l7_server
                         .as_ref()
-                        .is_some_and(|server| server_has_http3_on_port(&self.config_store, server, port)),
+                        .is_some_and(|server| server_has_http3_on_port(
+                            &self.config_store,
+                            server,
+                            port
+                        )),
                     client_hello.alpns
                 );
-                if l7_server
-                    .as_ref()
-                    .is_some_and(|server| server_has_http3_on_port(&self.config_store, server, port))
-                {
+                if l7_server.as_ref().is_some_and(|server| {
+                    server_has_http3_on_port(&self.config_store, server, port)
+                }) {
                     debug!(
                         "QUIC UDP demux: L7 H3 {} on port {} matched alpn={:?}",
                         server_name, port, client_hello.alpns
@@ -1343,7 +1355,7 @@ mod tests {
         let session_routes = SessionRoutes::new();
         let cid_routes = CidRoutes::new();
         let (tx, _rx) = mpsc::channel(1);
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (shutdown_tx, shutdown) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: 77,
             client_addr: Arc::new(tokio::sync::RwLock::new("127.0.0.1:10000".parse().unwrap())),
@@ -1358,6 +1370,7 @@ mod tests {
             quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
+            shutdown_tx,
             shutdown,
         });
         session_routes.insert(77, RouteKind::Passthrough(session));
@@ -1387,7 +1400,7 @@ mod tests {
     fn rebind_alias_cleanup_keeps_single_socket_route_per_session() {
         let routes = DashMap::new();
         let (tx, _rx) = mpsc::channel(1);
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (shutdown_tx, shutdown) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: 77,
             client_addr: Arc::new(tokio::sync::RwLock::new("127.0.0.1:10000".parse().unwrap())),
@@ -1402,6 +1415,7 @@ mod tests {
             quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
+            shutdown_tx,
             shutdown,
         });
         let route = RouteKind::Passthrough(session);

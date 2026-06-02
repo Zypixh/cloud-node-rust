@@ -25,6 +25,7 @@ pub mod routing;
 pub mod log_uploader;
 pub mod logging;
 pub mod metrics;
+pub mod net_bind;
 pub mod origin_h3;
 pub mod origin_h3_state;
 pub mod origin_state;

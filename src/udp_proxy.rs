@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 use crate::lb_factory::BackendExtension;
+use crate::net_bind::{bind_udp_socket, dual_stack_bind_addrs};
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_QUEUE_SIZE: usize = 4096;
@@ -95,6 +96,7 @@ pub struct UdpSession {
     pub quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
     pub quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
     pub tx: mpsc::Sender<Bytes>,
+    pub shutdown_tx: watch::Sender<bool>,
     pub shutdown: watch::Receiver<bool>,
 }
 
@@ -106,7 +108,7 @@ pub struct UdpProxyManager {
     config_store: ConfigStore,
     /// (ClientAddr, ListenPort) -> Session
     sessions: Arc<DashMap<(SocketAddr, u16), Arc<UdpSession>>>,
-    handled_ports: DashMap<u16, ListenerHandle>,
+    handled_ports: DashMap<SocketAddr, ListenerHandle>,
     next_session_id: AtomicU64,
 }
 
@@ -128,11 +130,15 @@ impl UdpProxyManager {
 
         loop {
             let desired_ports = self.desired_ports().await;
-            for port in &desired_ports {
-                self.spawn_listener(*port).await;
+            let desired_listeners = desired_ports
+                .iter()
+                .flat_map(|port| dual_stack_bind_addrs(*port))
+                .collect::<HashSet<_>>();
+            for bind_addr in &desired_listeners {
+                self.spawn_listener(*bind_addr).await;
             }
 
-            self.reconcile_listeners(&desired_ports);
+            self.reconcile_listeners(&desired_listeners);
 
             // Cleanup idle sessions (Sticky Session Timeout)
             let timeout = Duration::from_secs(60); // Default 60s idle timeout
@@ -203,50 +209,49 @@ impl UdpProxyManager {
         desired_ports
     }
 
-    async fn spawn_listener(self: &Arc<Self>, port: u16) {
-        if self.handled_ports.contains_key(&port) {
+    async fn spawn_listener(self: &Arc<Self>, bind_addr: SocketAddr) {
+        if self.handled_ports.contains_key(&bind_addr) {
             return;
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.handled_ports
-            .insert(port, ListenerHandle { shutdown_tx });
+            .insert(bind_addr, ListenerHandle { shutdown_tx });
 
         let manager = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = manager.clone().run_listener(port, shutdown_rx).await {
-                error!("UDP listener on port {} failed: {}", port, e);
-                manager.handled_ports.remove(&port);
+            if let Err(e) = manager.clone().run_listener(bind_addr, shutdown_rx).await {
+                error!("UDP listener on {} failed: {}", bind_addr, e);
+                manager.handled_ports.remove(&bind_addr);
             }
         });
     }
 
-    fn reconcile_listeners(&self, desired_ports: &std::collections::HashSet<u16>) {
-        let active_ports: Vec<u16> = self
+    fn reconcile_listeners(&self, desired_listeners: &std::collections::HashSet<SocketAddr>) {
+        let active_listeners: Vec<SocketAddr> = self
             .handled_ports
             .iter()
             .map(|entry| *entry.key())
             .collect();
-        for port in active_ports {
-            if !desired_ports.contains(&port) {
-                if let Some((_, handle)) = self.handled_ports.remove(&port) {
-                    info!("UDP Proxy Manager: Stopping listener on port {}", port);
+        for bind_addr in active_listeners {
+            if !desired_listeners.contains(&bind_addr) {
+                if let Some((_, handle)) = self.handled_ports.remove(&bind_addr) {
+                    info!("UDP Proxy Manager: Stopping listener on {}", bind_addr);
                     let _ = handle.shutdown_tx.send(true);
                 }
-                self.sessions
-                    .retain(|(_, session_port), _| *session_port != port);
+                self.remove_sessions_for_port(bind_addr.port());
             }
         }
     }
 
     async fn run_listener(
         self: Arc<Self>,
-        port: u16,
+        bind_addr: SocketAddr,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let listen_addr = format!("0.0.0.0:{}", port);
-        let listen_socket = Arc::new(UdpSocket::bind(&listen_addr).await?);
-        info!("UDP Proxy listening on {}", listen_addr);
+        let port = bind_addr.port();
+        let listen_socket = Arc::new(bind_udp_socket(bind_addr).await?);
+        info!("UDP Proxy listening on {}", bind_addr);
 
         let mut buf = vec![0u8; 65535];
         loop {
@@ -423,6 +428,7 @@ impl UdpProxyManager {
         );
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(UDP_SESSION_QUEUE_SIZE);
+        let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: session_id,
             client_addr: Arc::new(RwLock::new(client_addr)),
@@ -437,7 +443,8 @@ impl UdpProxyManager {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: quic_cid_tx.clone(),
             tx,
-            shutdown: shutdown_rx.clone(),
+            shutdown_tx: session_shutdown_tx,
+            shutdown: session_shutdown_rx.clone(),
         });
 
         let client_ip = client_addr.ip().to_string();
@@ -453,7 +460,8 @@ impl UdpProxyManager {
 
         let backend_addr = session.backend_addr;
         let listen_port = session.listen_port;
-        let shutdown_rx_clone = session.shutdown.clone();
+        let listener_shutdown_rx = shutdown_rx.clone();
+        let session_shutdown_rx = session.shutdown.clone();
         let server_id = session.server_id;
         let origin_id = session.origin_id;
         let initial_client_addr = client_addr;
@@ -469,7 +477,8 @@ impl UdpProxyManager {
                 session_id,
                 backend_addr,
                 listen_port,
-                shutdown_rx_clone,
+                listener_shutdown_rx,
+                session_shutdown_rx,
                 server_id,
                 origin_id,
                 client_addr.clone(),
@@ -581,8 +590,13 @@ impl UdpProxyManager {
     }
 
     pub fn remove_sessions_for_port(&self, port: u16) {
-        self.sessions
-            .retain(|(_, session_port), _| *session_port != port);
+        self.sessions.retain(|(_, session_port), session| {
+            let keep = *session_port != port;
+            if !keep {
+                let _ = session.shutdown_tx.send(true);
+            }
+            keep
+        });
     }
 
     pub fn cleanup_idle_sessions(&self, timeout: Duration) {
@@ -590,6 +604,7 @@ impl UdpProxyManager {
             let keep = udp_activity_is_alive(&session.last_activity_ms, timeout);
             if !keep {
                 debug!("Cleaning up idle UDP session: {:?}", key);
+                let _ = session.shutdown_tx.send(true);
             }
             keep
         });
@@ -599,7 +614,8 @@ impl UdpProxyManager {
         session_id: u64,
         backend_addr: SocketAddr,
         _listen_port: u16,
-        mut shutdown_rx: watch::Receiver<bool>,
+        mut listener_shutdown_rx: watch::Receiver<bool>,
+        mut session_shutdown_rx: watch::Receiver<bool>,
         server_id: i64,
         origin_id: i64,
         client_addr: Arc<RwLock<SocketAddr>>,
@@ -635,6 +651,10 @@ impl UdpProxyManager {
                 return Err(err.into());
             }
         };
+        if let Err(err) = backend_socket.connect(backend_addr).await {
+            crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+            return Err(err.into());
+        }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
         let mut downstream_sent = 0u64;
         let mut result: anyhow::Result<()> = Ok(());
@@ -643,7 +663,10 @@ impl UdpProxyManager {
         idle_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => {
+                _ = listener_shutdown_rx.changed() => {
+                    break;
+                }
+                _ = session_shutdown_rx.changed() => {
                     break;
                 }
                 _ = idle_tick.tick() => {
@@ -657,7 +680,7 @@ impl UdpProxyManager {
                         break;
                     };
                     let len = data.len() as u64;
-                    if let Err(err) = backend_socket.send_to(&data, backend_addr).await {
+                    if let Err(err) = backend_socket.send(&data).await {
                         crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                         result = Err(err.into());
                         break;
@@ -666,17 +689,14 @@ impl UdpProxyManager {
                     crate::metrics::record::record_transfer(server_id, 0, len, None);
                     crate::metrics::record::record_origin_traffic(server_id, len, 0, None);
                 }
-                recv = backend_socket.recv_from(&mut buf) => {
-                    let (len, peer_addr) = match recv {
+                recv = backend_socket.recv(&mut buf) => {
+                    let len = match recv {
                         Ok(packet) => packet,
                         Err(err) => {
                             result = Err(err.into());
                             break;
                         }
                     };
-                    if peer_addr != backend_addr {
-                        continue;
-                    }
                     let len_u64 = len as u64;
                     for cid in crate::quic_probe::quic_packet_cids(&buf[..len], 0)
                         .into_iter()
@@ -785,7 +805,7 @@ mod tests {
         let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
         let second: SocketAddr = "127.0.0.1:10001".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (shutdown_tx, shutdown) = watch::channel(false);
         let session = UdpSession {
             id: 1,
             client_addr: Arc::new(RwLock::new(first)),
@@ -800,6 +820,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
+            shutdown_tx,
             shutdown,
         };
 
@@ -814,7 +835,7 @@ mod tests {
         let second: SocketAddr = "127.0.0.1:10001".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
         tx.try_send(Bytes::from_static(b"queued")).unwrap();
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (shutdown_tx, shutdown) = watch::channel(false);
         let session = UdpSession {
             id: 1,
             client_addr: Arc::new(RwLock::new(first)),
@@ -829,6 +850,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
+            shutdown_tx,
             shutdown,
         };
 
@@ -849,7 +871,7 @@ mod tests {
         let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(Bytes::from_static(b"queued")).unwrap();
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (shutdown_tx, shutdown) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: 1,
             client_addr: Arc::new(RwLock::new(first)),
@@ -864,6 +886,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
+            shutdown_tx,
             shutdown,
         });
         assert_eq!(
@@ -883,7 +906,7 @@ mod tests {
         let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (shutdown_tx, shutdown) = watch::channel(false);
         let session = UdpSession {
             id: 1,
             client_addr: Arc::new(RwLock::new(first)),
@@ -898,6 +921,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_cid_tx: None,
             tx,
+            shutdown_tx,
             shutdown,
         };
 
@@ -905,6 +929,58 @@ mod tests {
             UdpProxyManager::send_to_session(&session, Bytes::from_static(b"next")),
             UdpSessionSendStatus::Closed
         );
+    }
+
+    #[tokio::test]
+    async fn backend_session_relay_uses_connected_udp_and_stops_on_shutdown() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let listen_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
+        let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+
+        let task = tokio::spawn(UdpProxyManager::handle_session(
+            1,
+            backend_addr,
+            443,
+            listener_shutdown_rx,
+            session_shutdown_rx,
+            1,
+            1,
+            Arc::new(RwLock::new(client_addr)),
+            "udp.example.com".to_string(),
+            Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            Arc::new(RwLock::new(VecDeque::new())),
+            None,
+            listen_socket,
+            rx,
+        ));
+
+        tx.send(Bytes::from_static(b"ping")).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (len, backend_peer) =
+            tokio::time::timeout(Duration::from_secs(1), backend.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buf[..len], b"ping");
+
+        backend.send_to(b"pong", backend_peer).await.unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..len], b"pong");
+
+        session_shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
