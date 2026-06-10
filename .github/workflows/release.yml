@@ -65,6 +65,33 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Normalize Rust Toolchains
+        shell: bash
+        env:
+          RELEASE_RUST_VERSION: "1.96.0"
+        run: |
+          set -euo pipefail
+
+          rustup default "$RELEASE_RUST_VERSION"
+          rustup target add "${{ matrix.target }}" --toolchain "$RELEASE_RUST_VERSION"
+
+          while IFS= read -r line; do
+            toolchain="${line%% *}"
+            if [ -z "$toolchain" ]; then
+              continue
+            fi
+
+            case "$toolchain" in
+              "$RELEASE_RUST_VERSION"|"$RELEASE_RUST_VERSION"-*)
+                ;;
+              *)
+                rustup toolchain uninstall "$toolchain" || true
+                ;;
+            esac
+          done < <(rustup toolchain list --quiet)
+
+          rustup toolchain list --quiet
+
       - name: Install dependencies & Cross-Linkers
         timeout-minutes: 25
         run: |
