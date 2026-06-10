@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use core::range::Range;
 use dashmap::DashMap;
 use quinn::{AsyncUdpSocket, Endpoint, UdpPoller};
 use std::collections::{HashSet, VecDeque};
@@ -62,7 +63,7 @@ type SessionRoutes = DashMap<u64, RouteKind>;
 struct PendingQuicRoute {
     created_at: Instant,
     data: Vec<u8>,
-    ranges: Vec<(usize, usize)>,
+    ranges: Vec<Range<usize>>,
     datagrams: Vec<Bytes>,
 }
 
@@ -280,10 +281,10 @@ fn merge_quic_fragment(
     if pending.data.len() < fragment.data.len() {
         pending.data.resize(fragment.data.len(), 0);
     }
-    for (start, end) in fragment.ranges {
-        if let Some(data) = fragment.data.get(start..end) {
-            pending.data[start..end].copy_from_slice(data);
-            pending.ranges.push((start, end));
+    for range in fragment.ranges {
+        if let Some(data) = fragment.data.get(range.clone()) {
+            pending.data[range.clone()].copy_from_slice(data);
+            pending.ranges.push(range);
         }
     }
     pending.datagrams.push(datagram);

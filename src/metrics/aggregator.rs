@@ -1,6 +1,6 @@
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct AggregationKey {

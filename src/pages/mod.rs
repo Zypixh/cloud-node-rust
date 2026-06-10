@@ -4,47 +4,37 @@ pub mod lang;
 pub use lang::Lang;
 
 /// Top safety page wrapping `<html>` — UAM challenge family.
-pub fn uam_challenge_page(
-    body_html: &str,
-    script: &str,
-    lang: Lang,
-    request_id: &str,
-) -> String {
+pub fn uam_challenge_page(body_html: &str, script: &str, lang: Lang, request_id: &str) -> String {
     let t = lang::text(lang);
     let css = shared_css();
     let i18n = browser_i18n_script();
     format!(
         r#"<!doctype html><html lang="{lang_attr}" data-i18n-document-title="title"><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title><style>{css}</style><script>{i18n}</script></head><body>{lang_bar}<main class="card"><div class="mark waf"></div>{body_html}</main>{script}</body></html>"#,
         lang_attr = lang.html_attr(),
-        title    = t.title,
-        css      = css,
-        i18n     = i18n,
+        title = t.title,
+        css = css,
+        i18n = i18n,
         lang_bar = lang_bar_html(lang, request_id),
         body_html = body_html,
-        script   = script,
+        script = script,
     )
 }
 
 /// WAF slider challenge full page.
-pub fn waf_slider_page(
-    lang: Lang,
-    request_id: &str,
-    slider_html: &str,
-    script: &str,
-) -> String {
+pub fn waf_slider_page(lang: Lang, request_id: &str, slider_html: &str, script: &str) -> String {
     let t = lang::text(lang);
     let css = shared_css();
     let i18n = browser_i18n_script();
     format!(
         r#"<!doctype html><html lang="{lang_attr}" data-i18n-document-title="title"><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title><style>{css}</style><script>{i18n}</script></head><body>{lang_bar}{slider_html}<noscript><p class="error" data-i18n="no_js">{nojs}</p></noscript>{script}</body></html>"#,
         lang_attr = lang.html_attr(),
-        title    = t.title,
-        css      = css,
-        i18n     = i18n,
+        title = t.title,
+        css = css,
+        i18n = i18n,
         lang_bar = lang_bar_html(lang, request_id),
         slider_html = slider_html,
-        nojs    = t.no_js,
-        script  = script,
+        nojs = t.no_js,
+        script = script,
     )
 }
 
@@ -63,14 +53,14 @@ pub fn block_page(
     format!(
         r#"<!doctype html><html lang="{lang_attr}" data-i18n-document-title="block_title" data-i18n-args='{{"status":"{status}"}}'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{status} {status_text}</title><style>{css}</style><script>{i18n}</script></head><body class="block-page">{lang_bar}<main class="block-panel" role="alert"><section class="block-head"><div class="mark block" aria-hidden="true"></div><div class="block-summary"><div class="block-label" data-i18n="security_notice">Security notice</div><h1><span class="block-code">{status}</span> <span data-i18n="access_denied">{status_text}</span></h1></div></section><section class="block-content"><p class="block-reason" data-i18n="block_reason">{reason}</p><div class="block-extra">{body_extra}</div><div class="block-info"><div class="block-info-row"><span data-i18n="request_id">Request</span><code>#{request_id}</code></div></div><div class="block-footer" data-i18n="footer">{footer}</div></section></main></body></html>"#,
         lang_attr = lang.html_attr(),
-        css      = css,
-        i18n     = i18n,
+        css = css,
+        i18n = i18n,
         lang_bar = lang_bar_html(lang, request_id),
-        status   = status,
+        status = status,
         status_text = status_text,
-        reason   = reason,
+        reason = reason,
         body_extra = body_extra,
-        footer   = t.footer,
+        footer = t.footer,
         request_id = request_id,
     )
 }
@@ -95,8 +85,8 @@ pub(crate) fn lang_bar_html(lang: Lang, request_id: &str) -> String {
     format!(
         r#"<nav class="lang-bar"><span class="lang-req">#{request_id}</span><button class="lang-btn" type="button" data-i18n-lang-toggle onclick="window.cloudNodeSetLang&&window.cloudNodeSetLang(window.__cloudNodeLang==='zh'?'en':'zh')" title="{title}">{label}</button></nav>"#,
         request_id = request_id,
-        title   = title,
-        label   = label,
+        title = title,
+        label = label,
     )
 }
 
@@ -174,18 +164,21 @@ fn block_page_css() -> &'static str {
 
 /// Determine the preferred language from query param (`?lang=zh` / `?lang=en`)
 /// or Accept-Language header, falling back to English.
-pub fn detect_lang(
-    query_lang: Option<&str>,
-    accept_language: Option<&str>,
-) -> Lang {
+pub fn detect_lang(query_lang: Option<&str>, accept_language: Option<&str>) -> Lang {
     if let Some(q) = query_lang {
         let q = q.trim().to_lowercase();
-        if q.starts_with("zh") { return Lang::ZhCn; }
-        if q.starts_with("en") { return Lang::En; }
+        if q.starts_with("zh") {
+            return Lang::ZhCn;
+        }
+        if q.starts_with("en") {
+            return Lang::En;
+        }
     }
     if let Some(al) = accept_language {
         let al = al.to_lowercase();
-        if al.contains("zh") { return Lang::ZhCn; }
+        if al.contains("zh") {
+            return Lang::ZhCn;
+        }
     }
     Lang::En
 }

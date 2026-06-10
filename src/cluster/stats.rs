@@ -1,6 +1,6 @@
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::LazyLock as Lazy;
 use std::time::Duration;
 
 static REPLICA_STATS: Lazy<dashmap::DashMap<String, ReplicaStatsSnapshot>> =

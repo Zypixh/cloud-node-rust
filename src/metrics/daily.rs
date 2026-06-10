@@ -1,7 +1,7 @@
 use dashmap::{DashMap, DashSet};
-use once_cell::sync::Lazy;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct DomainKey {

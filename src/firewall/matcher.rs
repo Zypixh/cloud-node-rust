@@ -1,8 +1,8 @@
-use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder};
 use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 
 /// Limit regex memory usage to 1MB to prevent catastrophic backtracking from user-controlled WAF patterns
 const REGEX_SIZE_LIMIT: usize = 1_048_576;
@@ -487,10 +487,14 @@ pub(crate) fn evaluate_operator_bytes(
     };
 
     match operator_lower.as_ref() {
-        "match" | "matches" | "regexp" => get_or_compile_bytes_regex(expected_value, case_insensitive)
-            .map_or(false, |re| re.is_match(body)),
-        "not match" | "notmatches" | "notregexp" => get_or_compile_bytes_regex(expected_value, case_insensitive)
-            .map_or(false, |re| !re.is_match(body)),
+        "match" | "matches" | "regexp" => {
+            get_or_compile_bytes_regex(expected_value, case_insensitive)
+                .map_or(false, |re| re.is_match(body))
+        }
+        "not match" | "notmatches" | "notregexp" => {
+            get_or_compile_bytes_regex(expected_value, case_insensitive)
+                .map_or(false, |re| !re.is_match(body))
+        }
         "wildcard match" => {
             let escaped = regex::escape(expected_value).replace("\\*", ".*");
             let re_str = format!("^{}$", escaped);
@@ -522,16 +526,10 @@ pub(crate) fn evaluate_operator_bytes(
             }
         }
         "contains binary" => decode_base64(expected_value)
-            .map(|needle| {
-                !needle.is_empty()
-                    && body.windows(needle.len()).any(|w| w == needle)
-            })
+            .map(|needle| !needle.is_empty() && body.windows(needle.len()).any(|w| w == needle))
             .unwrap_or(false),
         "not contains binary" => decode_base64(expected_value)
-            .map(|needle| {
-                needle.is_empty()
-                    || !body.windows(needle.len()).any(|w| w == needle)
-            })
+            .map(|needle| needle.is_empty() || !body.windows(needle.len()).any(|w| w == needle))
             .unwrap_or(false),
         "contains sql injection" | "contains sql injection strictly" => {
             let strict = operator_lower.contains("strictly");

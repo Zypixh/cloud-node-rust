@@ -103,7 +103,18 @@ mod linux {
             let ttl = ttl_secs.to_string();
             tokio::spawn(async move {
                 let out = Command::new("iptables")
-                    .args(["-I", "INPUT", "-s", &ip_str, "-j", "DROP", "-m", "comment", "--comment", &format!("waf_ttl={}", ttl)])
+                    .args([
+                        "-I",
+                        "INPUT",
+                        "-s",
+                        &ip_str,
+                        "-j",
+                        "DROP",
+                        "-m",
+                        "comment",
+                        "--comment",
+                        &format!("waf_ttl={}", ttl),
+                    ])
                     .output()
                     .await;
                 if let Ok(out) = out {

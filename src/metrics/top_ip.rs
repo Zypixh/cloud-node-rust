@@ -1,7 +1,7 @@
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 
 pub struct TopIpTracker {
     counts: DashMap<(i64, IpAddr), u64>,

@@ -1,7 +1,7 @@
 use aes::Aes256;
 use base64::{Engine as _, engine::general_purpose};
 use cfb_mode::Encryptor;
-use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
+use cfb_mode::cipher::KeyIvInit;
 use md5::{Digest, Md5};
 use std::fmt::Write;
 

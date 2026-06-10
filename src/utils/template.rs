@@ -9,12 +9,10 @@ fn apply_modifier(value: String, modifier: &str) -> String {
         "urlEncode" => encode(&value).into_owned(),
         "urlDecode" => decode(&value).map(|c| c.into_owned()).unwrap_or(value),
         "base64Encode" => general_purpose::STANDARD.encode(&value),
-        "base64Decode" => String::from_utf8(
-            general_purpose::STANDARD
-                .decode(&value)
-                .unwrap_or_default(),
-        )
-        .unwrap_or_default(),
+        "base64Decode" => {
+            String::from_utf8(general_purpose::STANDARD.decode(&value).unwrap_or_default())
+                .unwrap_or_default()
+        }
         "md5" => format!("{:x}", md5_legacy::compute(value.as_bytes())),
         "sha1" => {
             let mut hasher = Sha1::new();
@@ -64,7 +62,10 @@ where
             return result;
         };
         let expr_end = expr_start + end_offset;
-        result.push_str(&resolve_template_variable(&template[expr_start..expr_end], &resolver));
+        result.push_str(&resolve_template_variable(
+            &template[expr_start..expr_end],
+            &resolver,
+        ));
         literal_start = expr_end + 1;
         let Some(next_offset) = template[literal_start..].find("${") else {
             result.push_str(&template[literal_start..]);

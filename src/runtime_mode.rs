@@ -1,6 +1,6 @@
-use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock as OnceCell;
 
 static RUNTIME_CONFIG: OnceCell<RuntimeConfig> = OnceCell::new();
 

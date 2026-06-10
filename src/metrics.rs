@@ -1,7 +1,6 @@
 use chrono::Timelike;
 use dashmap::DashMap;
-use lazy_static::lazy_static;
-use once_cell::sync::OnceCell;
+use std::sync::OnceLock as OnceCell;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -400,8 +399,8 @@ impl NodeMetrics {
     }
 }
 
-lazy_static! {
-    pub static ref METRICS: Arc<NodeMetrics> = Arc::new(NodeMetrics {
+pub static METRICS: LazyLock<Arc<NodeMetrics>> = LazyLock::new(|| {
+    Arc::new(NodeMetrics {
         total_bytes_sent: AtomicU64::new(0),
         total_bytes_received: AtomicU64::new(0),
         servers: DashMap::with_shard_amount(32),
@@ -411,8 +410,8 @@ lazy_static! {
             total_cost_ms: AtomicU64::new(0),
         },
         waf: WafRuntimeMetrics::new(),
-    });
-}
+    })
+});
 
 use std::sync::RwLock;
 
@@ -449,10 +448,8 @@ impl<T: Clone + Default> TimeCache<T> {
     }
 }
 
-lazy_static! {
-    static ref DAY_CACHE: TimeCache<String> = TimeCache::new();
-    static ref PERIOD_CACHE: TimeCache<i64> = TimeCache::new();
-}
+static DAY_CACHE: LazyLock<TimeCache<String>> = LazyLock::new(TimeCache::new);
+static PERIOD_CACHE: LazyLock<TimeCache<i64>> = LazyLock::new(TimeCache::new);
 
 fn get_current_day() -> String {
     let now = crate::utils::time::system_timestamp();

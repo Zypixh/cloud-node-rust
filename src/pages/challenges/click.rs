@@ -91,10 +91,7 @@ pub fn issue_html(
     };
 
     let (instr, hint) = match lang {
-        Lang::ZhCn => (
-            "请按序号点击红色字符",
-            "忽略灰色字符，只点红色",
-        ),
+        Lang::ZhCn => ("请按序号点击红色字符", "忽略灰色字符，只点红色"),
         Lang::En => (
             "Click the RED characters in numbered order",
             "Ignore grey — click only red",

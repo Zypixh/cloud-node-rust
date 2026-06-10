@@ -1,7 +1,8 @@
 use aes::Aes128;
-use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes128Gcm, Nonce, Tag};
+use core::range::Range;
 use hmac::digest::KeyInit as HmacKeyInit;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -41,7 +42,7 @@ pub enum QuicProbeResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicCryptoFragment {
     pub data: Vec<u8>,
-    pub ranges: Vec<(usize, usize)>,
+    pub ranges: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +282,7 @@ fn decrypt_and_parse(
     let tag = Tag::clone_from_slice(&payload[payload_len - 16..]);
     let ciphertext = &mut payload[..payload_len - 16];
     let nonce = packet_nonce(&iv, packet_number);
-    let Ok(cipher) = Aes128Gcm::new_from_slice(&key) else {
+    let Ok(cipher) = <Aes128Gcm as aes_gcm::aead::KeyInit>::new_from_slice(&key) else {
         return DecryptResult::None;
     };
     if cipher
@@ -353,8 +354,9 @@ fn hkdf_expand(secret: &[u8], info: &[u8], len: usize) -> Option<Vec<u8>> {
 
 fn remove_header_protection(packet: &mut [u8], pn_offset: usize, hp_key: &[u8; 16]) -> Option<()> {
     let sample = packet.get(pn_offset + 4..pn_offset + 20)?;
-    let cipher = Aes128::new(GenericArray::from_slice(hp_key));
-    let mut block = GenericArray::clone_from_slice(sample);
+    let key = Array::from(*hp_key);
+    let cipher = Aes128::new(&key);
+    let mut block = Array::from(<[u8; 16]>::try_from(sample).ok()?);
     cipher.encrypt_block(&mut block);
     packet[0] ^= block[0] & 0x0f;
     let pn_len = (packet[0] & 0x03) as usize + 1;
@@ -422,7 +424,7 @@ fn extract_crypto_stream(payload: &[u8]) -> CryptoExtract {
                     out.resize(frame_end, 0);
                 }
                 out[crypto_offset..frame_end].copy_from_slice(data);
-                ranges.push((crypto_offset, frame_end));
+                ranges.push((crypto_offset..frame_end).into());
             }
             0x1c | 0x1d => break,
             _ => break,
@@ -457,7 +459,7 @@ fn skip_ack_frame(data: &[u8], offset: &mut usize, has_ecn_counts: bool) -> Opti
     Some(())
 }
 
-fn incomplete_crypto(data: Vec<u8>, ranges: Vec<(usize, usize)>) -> CryptoExtract {
+fn incomplete_crypto(data: Vec<u8>, ranges: Vec<Range<usize>>) -> CryptoExtract {
     if data.is_empty() || ranges.is_empty() {
         CryptoExtract::None
     } else {
@@ -467,30 +469,30 @@ fn incomplete_crypto(data: Vec<u8>, ranges: Vec<(usize, usize)>) -> CryptoExtrac
 
 fn merge_crypto_fragment(
     data: &mut Vec<u8>,
-    ranges: &mut Vec<(usize, usize)>,
+    ranges: &mut Vec<Range<usize>>,
     fragment: QuicCryptoFragment,
 ) {
     if data.len() < fragment.data.len() {
         data.resize(fragment.data.len(), 0);
     }
-    for (start, end) in fragment.ranges {
-        if let Some(fragment_data) = fragment.data.get(start..end) {
-            data[start..end].copy_from_slice(fragment_data);
-            ranges.push((start, end));
+    for range in fragment.ranges {
+        if let Some(fragment_data) = fragment.data.get(range.clone()) {
+            data[range.clone()].copy_from_slice(fragment_data);
+            ranges.push(range);
         }
     }
 }
 
-fn ranges_cover(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+fn ranges_cover(ranges: &[Range<usize>], start: usize, end: usize) -> bool {
     let mut ranges = ranges.to_vec();
-    ranges.sort_unstable_by_key(|(range_start, _)| *range_start);
+    ranges.sort_unstable_by_key(|range| range.start);
     let mut covered = start;
-    for (range_start, range_end) in ranges {
-        if range_start > covered {
+    for range in ranges {
+        if range.start > covered {
             return false;
         }
-        if range_end > covered {
-            covered = range_end;
+        if range.end > covered {
+            covered = range.end;
             if covered >= end {
                 return true;
             }
@@ -511,7 +513,7 @@ fn tls_client_hello_is_complete(data: &[u8]) -> bool {
 
 pub fn parse_tls_client_hello_from_crypto(
     data: &[u8],
-    ranges: &[(usize, usize)],
+    ranges: &[Range<usize>],
 ) -> Option<QuicClientHello> {
     if data.first().copied() != Some(0x01) || data.len() < 4 {
         return None;
@@ -776,12 +778,14 @@ mod tests {
         let split = message.len() / 2;
         let mut partial = vec![0; message.len()];
         partial[..split].copy_from_slice(&message[..split]);
-        assert!(parse_tls_client_hello_from_crypto(&partial, &[(0, split)]).is_none());
+        assert!(parse_tls_client_hello_from_crypto(&partial, &[(0..split).into()]).is_none());
 
         partial[split..].copy_from_slice(&message[split..]);
-        let parsed =
-            parse_tls_client_hello_from_crypto(&partial, &[(split, message.len()), (0, split)])
-                .expect("merged client hello should parse");
+        let parsed = parse_tls_client_hello_from_crypto(
+            &partial,
+            &[(split..message.len()).into(), (0..split).into()],
+        )
+        .expect("merged client hello should parse");
         assert_eq!(parsed.server_name.as_deref(), Some("qq.com"));
         assert_eq!(parsed.alpns, vec!["h3"]);
     }
@@ -797,7 +801,7 @@ mod tests {
             &mut ranges,
             QuicCryptoFragment {
                 data: message[..split].to_vec(),
-                ranges: vec![(0, split)],
+                ranges: vec![(0..split).into()],
             },
         );
         assert!(parse_tls_client_hello_from_crypto(&data, &ranges).is_none());
@@ -807,7 +811,7 @@ mod tests {
             &mut ranges,
             QuicCryptoFragment {
                 data: message.clone(),
-                ranges: vec![(split, message.len())],
+                ranges: vec![(split..message.len()).into()],
             },
         );
         let parsed = parse_tls_client_hello_from_crypto(&data, &ranges)

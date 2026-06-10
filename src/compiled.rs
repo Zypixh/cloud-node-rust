@@ -1,8 +1,8 @@
 use crate::cache::compiled::{CompiledCachePolicy, CompiledWebCachePlan};
 use crate::config_models::{
-    HTTPAuthConfig, HTTPBaseOptimizationConfig, HTTPCharsetConfig, HTTPPageConfig,
-    HTTPRequestLimitConfig, HTTPShutdownConfig, HSTSConfig, HTTPCachePolicy, HTTPFirewallPolicy,
-    HTTPPageOptimizationConfig, HTTPRedirectToHttpsConfig, ReferersConfig, ServerConfig, SizeCapacity,
+    HSTSConfig, HTTPAuthConfig, HTTPBaseOptimizationConfig, HTTPCachePolicy, HTTPCharsetConfig,
+    HTTPFirewallPolicy, HTTPPageConfig, HTTPPageOptimizationConfig, HTTPRedirectToHttpsConfig,
+    HTTPRequestLimitConfig, HTTPShutdownConfig, ReferersConfig, ServerConfig, SizeCapacity,
     URLPattern, UserAgentConfig, WebPConfig, WebSocketConfig,
 };
 use base64::{Engine as _, engine::general_purpose};
@@ -55,10 +55,16 @@ impl CompiledServerFeaturePlan {
             .and_then(|hls| hls.encrypting.as_ref())
             .filter(|encrypting| encrypting.is_on)
             .map(|encrypting| {
-                CompiledUrlPatternSet::compile(&encrypting.only_url_patterns, &encrypting.except_url_patterns)
+                CompiledUrlPatternSet::compile(
+                    &encrypting.only_url_patterns,
+                    &encrypting.except_url_patterns,
+                )
             });
         let webp = web.webp.as_ref().and_then(CompiledWebPPlan::compile);
-        let referers = web.referer_config.as_ref().and_then(CompiledReferersPlan::compile);
+        let referers = web
+            .referer_config
+            .as_ref()
+            .and_then(CompiledReferersPlan::compile);
         let user_agent = web
             .user_agent_config
             .as_ref()
@@ -67,7 +73,10 @@ impl CompiledServerFeaturePlan {
             .redirect_to_https
             .as_ref()
             .and_then(CompiledRedirectToHttpsPlan::compile);
-        let websocket = web.websocket.as_ref().and_then(CompiledWebSocketPlan::compile);
+        let websocket = web
+            .websocket
+            .as_ref()
+            .and_then(CompiledWebSocketPlan::compile);
         let hsts = server
             .https
             .as_ref()
@@ -80,7 +89,10 @@ impl CompiledServerFeaturePlan {
             .as_ref()
             .and_then(CompiledRequestLimitPlan::compile);
         let charset = web.charset.as_ref().and_then(CompiledCharsetPlan::compile);
-        let shutdown = web.shutdown.as_ref().and_then(CompiledShutdownPlan::compile);
+        let shutdown = web
+            .shutdown
+            .as_ref()
+            .and_then(CompiledShutdownPlan::compile);
         let pages = CompiledPagePlan::compile(&web.pages);
         (optimization.is_some()
             || hls_encrypting.is_some()
@@ -615,7 +627,11 @@ impl CompiledRedirectToHttpsPlan {
     }
 
     fn target(&self, host: &str, request_uri: &str) -> Option<(String, u16)> {
-        if self.except_domains.iter().any(|domain| domain.matches(host)) {
+        if self
+            .except_domains
+            .iter()
+            .any(|domain| domain.matches(host))
+        {
             return None;
         }
         if !self.domains.is_empty() && !self.domains.iter().any(|domain| domain.matches(host)) {
@@ -632,7 +648,10 @@ impl CompiledRedirectToHttpsPlan {
         } else {
             host.to_string()
         };
-        Some((format!("https://{}{}", target_host, request_uri), self.status))
+        Some((
+            format!("https://{}{}", target_host, request_uri),
+            self.status,
+        ))
     }
 }
 
@@ -701,7 +720,8 @@ impl CompiledSuffixDomainPattern {
 
     fn matches(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
-        !self.suffix.is_empty() && (host == self.suffix || host.ends_with(&format!(".{}", self.suffix)))
+        !self.suffix.is_empty()
+            && (host == self.suffix || host.ends_with(&format!(".{}", self.suffix)))
     }
 }
 
@@ -1082,7 +1102,10 @@ impl CompiledUrlPattern {
             "image" => Self::Images,
             "audio" => Self::Audios,
             "video" => Self::Videos,
-            _ => Self::Regex(compile_url_pattern_regex(&pattern.type_name, &pattern.pattern)),
+            _ => Self::Regex(compile_url_pattern_regex(
+                &pattern.type_name,
+                &pattern.pattern,
+            )),
         }
     }
 
@@ -1095,13 +1118,15 @@ impl CompiledUrlPattern {
             Self::Images => has_any_ascii_suffix(
                 path,
                 &[
-                    ".apng", ".avif", ".gif", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp",
-                    ".png", ".svg", ".webp", ".bmp", ".ico", ".cur", ".tif", ".tiff",
+                    ".apng", ".avif", ".gif", ".jpg", ".jpeg", ".jfif", ".pjpeg", ".pjp", ".png",
+                    ".svg", ".webp", ".bmp", ".ico", ".cur", ".tif", ".tiff",
                 ],
             ),
             Self::Audios => has_any_ascii_suffix(
                 path,
-                &[".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".m3u8"],
+                &[
+                    ".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".m3u8",
+                ],
             ),
             Self::Videos => has_any_ascii_suffix(
                 path,
@@ -1214,13 +1239,20 @@ impl CompiledPlanSet {
                     .and_then(|web| web.firewall_policy.as_ref())?;
                 Some((
                     server.numeric_id(),
-                    Arc::new(crate::firewall::compiled::CompiledFirewallPolicy::compile(policy)),
+                    Arc::new(crate::firewall::compiled::CompiledFirewallPolicy::compile(
+                        policy,
+                    )),
                 ))
             })
             .collect();
         let server_cache = servers
             .iter()
-            .filter_map(|server| Some((server.numeric_id(), Arc::new(CompiledWebCachePlan::compile(server)?))))
+            .filter_map(|server| {
+                Some((
+                    server.numeric_id(),
+                    Arc::new(CompiledWebCachePlan::compile(server)?),
+                ))
+            })
             .collect();
         let server_headers = servers
             .iter()

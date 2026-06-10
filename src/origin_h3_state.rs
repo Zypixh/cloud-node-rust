@@ -1,7 +1,7 @@
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use lazy_static::lazy_static;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum OriginH3Key {
@@ -96,9 +96,8 @@ fn backoff(fail_count: u32) -> Duration {
     Duration::from_secs(seconds)
 }
 
-lazy_static! {
-    pub static ref ORIGIN_H3_STATE_MANAGER: OriginH3StateManager = OriginH3StateManager::new();
-}
+pub static ORIGIN_H3_STATE_MANAGER: LazyLock<OriginH3StateManager> =
+    LazyLock::new(OriginH3StateManager::new);
 
 #[cfg(test)]
 mod tests {

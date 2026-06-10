@@ -4,8 +4,8 @@ pub mod jscookie;
 pub mod slider;
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
 };
 use base64::Engine;
 use rand::RngCore;

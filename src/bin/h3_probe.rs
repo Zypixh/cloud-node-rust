@@ -99,7 +99,9 @@ async fn main() -> anyhow::Result<()> {
     for _ in 0..config.connections {
         let config = config.clone();
         let next = next.clone();
-        tasks.push(tokio::spawn(async move { run_connection(config, next).await }));
+        tasks.push(tokio::spawn(
+            async move { run_connection(config, next).await },
+        ));
     }
 
     let mut stats = ProbeStats::default();
@@ -126,10 +128,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_connection(
-    config: ProbeConfig,
-    next: Arc<AtomicUsize>,
-) -> anyhow::Result<ProbeStats> {
+async fn run_connection(config: ProbeConfig, next: Arc<AtomicUsize>) -> anyhow::Result<ProbeStats> {
     let mut tls = rustls::ClientConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into(),
     )
@@ -148,9 +147,7 @@ async fn run_connection(
     let connecting = endpoint.connect(config.addr, &config.host)?;
     let conn = tokio::time::timeout(Duration::from_secs(10), connecting).await??;
     let h3_conn = h3_quinn::Connection::new(conn);
-    let (mut driver, send_request) = h3::client::builder()
-        .build::<_, _, Bytes>(h3_conn)
-        .await?;
+    let (mut driver, send_request) = h3::client::builder().build::<_, _, Bytes>(h3_conn).await?;
     let driver_task = tokio::spawn(async move {
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
@@ -201,7 +198,9 @@ async fn run_request(
     send_request: &tokio::sync::Mutex<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
     uri: &str,
 ) -> anyhow::Result<(bool, usize)> {
-    let request = Request::get(uri).header("user-agent", "h3-probe").body(())?;
+    let request = Request::get(uri)
+        .header("user-agent", "h3-probe")
+        .body(())?;
     let mut sender = send_request.lock().await;
     let mut stream = sender.send_request(request).await?;
     drop(sender);

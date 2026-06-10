@@ -1,6 +1,6 @@
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};

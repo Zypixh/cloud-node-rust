@@ -1,10 +1,10 @@
 use lru::LruCache;
 use maxminddb::geoip2;
-use once_cell::sync::Lazy;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
+use std::sync::LazyLock as Lazy;
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 use woothee::parser::Parser;
@@ -192,13 +192,16 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
 
 fn get_isp_name(ip: IpAddr) -> String {
     if let Some(reader) = &*GEO_ASN_READER {
-        match reader.lookup::<serde_json::Value>(ip) {
-            Ok(val) => val
-                .get("autonomous_system_organization")
-                .and_then(|v| v.as_str())
+        match reader
+            .lookup(ip)
+            .and_then(|result| result.decode::<geoip2::Asn>())
+        {
+            Ok(Some(asn)) => asn
+                .autonomous_system_organization
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "Unknown".to_string()),
             Err(_) => "Unknown".to_string(),
+            Ok(None) => "Unknown".to_string(),
         }
     } else {
         "Unknown".to_string()
@@ -207,68 +210,38 @@ fn get_isp_name(ip: IpAddr) -> String {
 
 fn lookup_geo_internal(ip: IpAddr) -> Option<GeoInfo> {
     if let Some(reader) = &*GEO_CITY_READER {
-        match reader.lookup::<geoip2::City>(ip) {
-            Ok(city) => Some(GeoInfo {
-                country: Arc::from(
-                    city.country
-                        .as_ref()
-                        .and_then(|c| c.names.as_ref())
-                        .and_then(|n| n.get("en"))
-                        .map(|s| s.as_ref())
-                        .unwrap_or_default(),
-                ),
-                country_id: city
-                    .country
-                    .as_ref()
-                    .and_then(|c| c.geoname_id)
-                    .map(|id| id as i64)
-                    .unwrap_or(0),
-                country_iso: Arc::from(
-                    city.country
-                        .as_ref()
-                        .and_then(|c| c.iso_code)
-                        .unwrap_or_default(),
-                ),
+        match reader
+            .lookup(ip)
+            .and_then(|result| result.decode::<geoip2::City>())
+        {
+            Ok(Some(city)) => Some(GeoInfo {
+                country: Arc::from(city.country.names.english.unwrap_or_default()),
+                country_id: city.country.geoname_id.map(|id| id as i64).unwrap_or(0),
+                country_iso: Arc::from(city.country.iso_code.unwrap_or_default()),
                 region: Arc::from(
                     city.subdivisions
-                        .as_ref()
-                        .and_then(|s| s.first())
-                        .and_then(|sd| sd.names.as_ref())
-                        .and_then(|n| n.get("en"))
-                        .map(|s| s.as_ref())
+                        .first()
+                        .and_then(|sd| sd.names.english)
                         .unwrap_or_default(),
                 ),
                 region_id: city
                     .subdivisions
-                    .as_ref()
-                    .and_then(|s| s.first())
+                    .first()
                     .and_then(|sd| sd.geoname_id)
                     .map(|id| id as i64)
                     .unwrap_or(0),
                 region_iso: Arc::from(
                     city.subdivisions
-                        .as_ref()
-                        .and_then(|s| s.first())
+                        .first()
                         .and_then(|sd| sd.iso_code)
                         .unwrap_or_default(),
                 ),
-                city: Arc::from(
-                    city.city
-                        .as_ref()
-                        .and_then(|c| c.names.as_ref())
-                        .and_then(|n| n.get("en"))
-                        .map(|s| s.as_ref())
-                        .unwrap_or_default(),
-                ),
-                city_id: city
-                    .city
-                    .as_ref()
-                    .and_then(|c| c.geoname_id)
-                    .map(|id| id as i64)
-                    .unwrap_or(0),
+                city: Arc::from(city.city.names.english.unwrap_or_default()),
+                city_id: city.city.geoname_id.map(|id| id as i64).unwrap_or(0),
                 provider: Arc::from(get_isp_name(ip)),
             }),
             Err(_) => None,
+            Ok(None) => None,
         }
     } else {
         None

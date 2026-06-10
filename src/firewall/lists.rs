@@ -50,7 +50,11 @@ fn build_ip_addr_range(from: IpAddr, to: IpAddr) -> Option<IpAddrRange> {
     if from_n > to_n {
         return None;
     }
-    Some(IpAddrRange { from: from_n, to: to_n, v6 })
+    Some(IpAddrRange {
+        from: from_n,
+        to: to_n,
+        v6,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

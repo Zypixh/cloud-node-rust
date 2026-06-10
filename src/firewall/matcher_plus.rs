@@ -6,12 +6,12 @@ use crate::metrics::analyzer;
 use base64::Engine as _;
 use dashmap::DashMap;
 use http::header::COOKIE;
-use once_cell::sync::Lazy;
 use pingora_proxy::Session;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::cell::OnceCell;
+use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 pub struct MatchResult<'a> {
@@ -139,12 +139,7 @@ pub(crate) fn preset_group_matches(code: &str, facts: &RequestFacts<'_>) -> bool
     {
         return true;
     }
-    crate::firewall::matcher::evaluate_operator_bytes(
-        facts.request_body,
-        operator,
-        "",
-        !strict,
-    )
+    crate::firewall::matcher::evaluate_operator_bytes(facts.request_body, operator, "", !strict)
 }
 
 pub(crate) fn preset_group_uses_request_body(code: &str) -> bool {
@@ -314,9 +309,7 @@ pub fn match_group_response_with_server<'a>(
 
 pub(crate) fn is_local_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private() || v4.is_loopback() || v4.is_link_local()
-        }
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
         std::net::IpAddr::V6(v6) => {
             // Canonicalize IPv4-mapped IPv6 (::ffff:a.b.c.d) before testing.
             if let Some(v4) = v6.to_ipv4_mapped() {
@@ -1532,9 +1525,7 @@ pub(crate) fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
     // (loopback / private). Public clients can forge these headers to bypass
     // CC counters, IP blacklists, and rule matches. The trust boundary mirrors
     // proxy::resolve_client_ip.
-    let trust_headers = peer_ip
-        .map(|ip| is_local_ip(&ip))
-        .unwrap_or(false);
+    let trust_headers = peer_ip.map(|ip| is_local_ip(&ip)).unwrap_or(false);
     if trust_headers {
         for header in [
             "x-cloud-real-ip",
@@ -1749,8 +1740,8 @@ fn query_param(session: &Session, name: &str) -> String {
             q.split('&').find_map(|part| {
                 let mut iter = part.splitn(2, '=');
                 let key = iter.next()?;
-                let decoded_key = urlencoding::decode(key)
-                    .unwrap_or_else(|_| std::borrow::Cow::Borrowed(key));
+                let decoded_key =
+                    urlencoding::decode(key).unwrap_or_else(|_| std::borrow::Cow::Borrowed(key));
                 if decoded_key == name {
                     let value = iter.next().unwrap_or("");
                     Some(

@@ -1,8 +1,8 @@
 use crate::config_models::LocationConfig;
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 
 #[derive(Debug)]
 pub enum PatternType {
@@ -51,9 +51,7 @@ pub fn compile_locations(raw: &[LocationConfig]) -> Vec<CompiledLocation> {
         type_order(&a.pattern_type)
             .cmp(&type_order(&b.pattern_type))
             .then_with(|| match (&a.pattern_type, &b.pattern_type) {
-                (PatternType::Prefix, PatternType::Prefix) => {
-                    b.pattern.len().cmp(&a.pattern.len())
-                }
+                (PatternType::Prefix, PatternType::Prefix) => b.pattern.len().cmp(&a.pattern.len()),
                 _ => std::cmp::Ordering::Equal,
             })
             .then(b.priority.cmp(&a.priority))

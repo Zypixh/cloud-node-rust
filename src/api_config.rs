@@ -1,7 +1,7 @@
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock as Lazy;
 use std::sync::RwLock;
 
 static RUNTIME_RPC_ENDPOINTS: Lazy<RwLock<Option<Vec<String>>>> = Lazy::new(|| RwLock::new(None));
@@ -159,7 +159,10 @@ mod tests {
         assert!(normalized.upload_concurrency > 1);
         assert!(normalized.upload_concurrency <= MAX_ACCESS_LOG_UPLOAD_CONCURRENCY);
         assert_eq!(normalized.queue_capacity, 100_000);
-        assert_eq!(normalized.batch_queue_capacity(), 10);
+        assert_eq!(
+            normalized.batch_queue_capacity(),
+            10.max(normalized.upload_concurrency * 2)
+        );
     }
 
     #[test]

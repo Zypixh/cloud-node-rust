@@ -1,9 +1,9 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;

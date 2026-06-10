@@ -84,7 +84,7 @@ impl CacheManager {
 }
 
 /// Global cache manager singleton
-pub static CACHE: once_cell::sync::Lazy<CacheManager> = once_cell::sync::Lazy::new(|| {
+pub static CACHE: std::sync::LazyLock<CacheManager> = std::sync::LazyLock::new(|| {
     CacheManager::new(1024 * 1024 * 512) // Default 512MB memory cache
 });
 

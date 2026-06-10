@@ -1,5 +1,5 @@
-use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock as OnceCell;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};

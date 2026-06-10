@@ -6,12 +6,12 @@ use crate::utils::template::format_template;
 use dashmap::DashMap;
 use http::HeaderValue;
 use http::header::HeaderName;
-use once_cell::sync::Lazy;
 use pingora_proxy::Session;
 use regex::Regex;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 
 static HEADER_RE_CACHE: Lazy<DashMap<String, Arc<Regex>>> = Lazy::new(DashMap::new);
 static HEADER_NAME_CACHE: Lazy<DashMap<String, Option<HeaderName>>> = Lazy::new(DashMap::new);
@@ -1073,7 +1073,12 @@ mod tests {
         let unrestricted = CompiledDomainMatcher::compile(&[]);
         assert!(unrestricted.matches(Some("example.com")));
 
-        for domains in [patterns(&[""]), patterns(&["   "]), patterns(&["."]), patterns(&["..."])] {
+        for domains in [
+            patterns(&[""]),
+            patterns(&["   "]),
+            patterns(&["."]),
+            patterns(&["..."]),
+        ] {
             let matcher = CompiledDomainMatcher::compile(&domains);
             assert!(!matcher.matches(Some("example.com")));
             assert!(matcher.matches(Some("")));
@@ -1115,7 +1120,13 @@ mod tests {
         assert!(domain_matches(&patterns(&[]), "example.com"));
         assert!(!domain_matches(&patterns(&[""]), "example.com"));
         assert!(domain_matches(&patterns(&["*.example.com"]), "example.com"));
-        assert!(domain_matches(&patterns(&["*.example.com"]), "www.example.com"));
-        assert!(!domain_matches(&patterns(&["example.com"]), " example.com "));
+        assert!(domain_matches(
+            &patterns(&["*.example.com"]),
+            "www.example.com"
+        ));
+        assert!(!domain_matches(
+            &patterns(&["example.com"]),
+            " example.com "
+        ));
     }
 }

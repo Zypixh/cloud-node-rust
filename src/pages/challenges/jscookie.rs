@@ -2,7 +2,7 @@ use crate::pages::challenges::{
     decode_challenge_token, encode_challenge_token, is_token_expired, random_suffix,
 };
 use crate::pages::lang::Lang;
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use rand::Rng;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -76,8 +76,9 @@ pub fn issue_html(
             "Browser verification failed. Please refresh and try again.",
         ),
     };
-    let failed_json = serde_json::to_string(failed)
-        .unwrap_or_else(|_| "\"Browser verification failed. Please refresh and try again.\"".to_string());
+    let failed_json = serde_json::to_string(failed).unwrap_or_else(|_| {
+        "\"Browser verification failed. Please refresh and try again.\"".to_string()
+    });
     let display_seconds = ((display_ms as f64) / 1000.0 * 10.0).round() / 10.0;
     let display_seconds = if display_seconds.fract() == 0.0 {
         format!("{display_seconds:.0}")

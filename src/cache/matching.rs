@@ -186,12 +186,12 @@ pub fn get_variable_value_with_context(
         .strip_prefix("${")
         .and_then(|value| value.strip_suffix('}'))
     {
-        return crate::cache::compiled::CacheVariable::compile_inner(inner).resolve_with_context(ctx);
+        return crate::cache::compiled::CacheVariable::compile_inner(inner)
+            .resolve_with_context(ctx);
     }
 
     param.to_string()
 }
-
 
 pub fn format_variables_with_scheme(session: &Session, template: &str, scheme: &str) -> String {
     let ctx = crate::cache::compiled::CacheEvalContext::new(session, scheme);

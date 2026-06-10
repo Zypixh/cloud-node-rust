@@ -7,7 +7,6 @@
 ///   3. Start proxy:   cargo run --bin bench-proxy
 ///   4. Run oha:       oha -z 30s -c 200 --urls-from-file /tmp/urls.txt http://127.0.0.1:8080
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use pingora_cache::lock::CacheLock;
 use pingora_core::Result;
 use pingora_core::server::Server;
@@ -15,6 +14,7 @@ use pingora_core::server::configuration::ServerConf;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
+use std::sync::LazyLock as Lazy;
 use std::time::Duration;
 
 use cloud_node_rust::cache_manager::CACHE;
