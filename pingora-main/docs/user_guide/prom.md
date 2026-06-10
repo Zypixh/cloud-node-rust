@@ -8,13 +8,13 @@ Prometheus support is an optional feature in Pingora. To use it, you need to ena
 
 ```toml
 # If using the main pingora crate
-pingora = { version = "0.8.0", features = ["prometheus"] }
+pingora = { version = "0.8.1", features = ["prometheus"] }
 
 # If using pingora-core directly
-pingora-core = { version = "0.8.0", features = ["prometheus"] }
+pingora-core = { version = "0.8.1", features = ["prometheus"] }
 
 # If using pingora-proxy crate
-pingora-proxy = { version = "0.8.0", features = ["prometheus"] }
+pingora-proxy = { version = "0.8.1", features = ["prometheus"] }
 ```
 
 ## Setting up a Prometheus Metrics Endpoint
