@@ -1,5 +1,5 @@
 use crate::api_config::ApiConfig;
-use crate::config_models::{ParentNodeConfig, ServerConfig};
+use crate::config_models::{ParentNodeConfig, ProxyProtocolConfig, ServerConfig};
 use crate::health_manager::GlobalHealthManager;
 use futures_util::FutureExt;
 use pingora_load_balancing::{Backends, LoadBalancer, discovery::Static, selection::RoundRobin};
@@ -130,6 +130,7 @@ pub(crate) fn fallback_runtime_lb() -> (Arc<crate::lb_factory::AnyLoadBalancer>,
         tls_security_verify_mode: crate::config_models::OriginTlsSecurityVerifyMode::Force,
         legacy_tls_verify: None,
         request_host_excluding_port: false,
+        proxy_protocol: ProxyProtocolConfig::default(),
         connection_timeout: None,
         read_timeout: None,
         idle_timeout: None,

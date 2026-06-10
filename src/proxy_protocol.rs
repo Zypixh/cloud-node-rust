@@ -1,7 +1,9 @@
-/// PROXY Protocol v1 / v2 inbound header parser.
+/// PROXY Protocol v1 / v2 helpers.
 ///
 /// Reference: <https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt>
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use crate::config_models::ProxyProtocolConfig;
 
 /// Minimum bytes that let us decide whether a PROXY header is present at all.
 /// We need at least 6 bytes for v1 ("PROXY ") and exactly 12 for the v2 signature.
@@ -68,6 +70,93 @@ pub fn parse_proxy_v1_v2(buf: &[u8]) -> Result<ProxyAddr, ProxyProtocolError> {
     }
 
     Err(ProxyProtocolError::NotProxyProtocol)
+}
+
+/// Build a PROXY Protocol v1 header for forwarding the downstream client
+/// address to an origin server.
+pub fn build_v1_header(client_addr: SocketAddr, destination_addr: Option<SocketAddr>) -> Vec<u8> {
+    let family = match client_addr {
+        SocketAddr::V4(_) => "TCP4",
+        SocketAddr::V6(_) => "TCP6",
+    };
+    let dst_ip = destination_addr
+        .map(|addr| addr.ip())
+        .unwrap_or_else(|| match client_addr {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        });
+    let dst_port = destination_addr.map(|addr| addr.port()).unwrap_or(0);
+    format!(
+        "PROXY {} {} {} {} {}\r\n",
+        family,
+        client_addr.ip(),
+        dst_ip,
+        client_addr.port(),
+        dst_port
+    )
+    .into_bytes()
+}
+
+/// Build the configured PROXY Protocol header for forwarding the downstream
+/// client address to an origin server.
+pub fn build_header(
+    config: ProxyProtocolConfig,
+    client_addr: SocketAddr,
+    destination_addr: Option<SocketAddr>,
+) -> Option<Vec<u8>> {
+    if !config.enabled() {
+        return None;
+    }
+    Some(match config.normalized_version() {
+        2 => build_v2_header(client_addr, destination_addr),
+        _ => build_v1_header(client_addr, destination_addr),
+    })
+}
+
+/// Build a PROXY Protocol v2 header for forwarding the downstream client
+/// address to an origin server.
+pub fn build_v2_header(client_addr: SocketAddr, destination_addr: Option<SocketAddr>) -> Vec<u8> {
+    let mut header = Vec::with_capacity(52);
+    header.extend_from_slice(b"\r\n\r\n\x00\r\nQUIT\n");
+    header.push(0x21); // version=2, command=PROXY
+
+    match client_addr {
+        SocketAddr::V4(client) => {
+            let destination = match destination_addr {
+                Some(SocketAddr::V4(addr)) => *addr.ip(),
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            header.push(0x11); // AF_INET + STREAM
+            header.extend_from_slice(&12u16.to_be_bytes());
+            header.extend_from_slice(&client.ip().octets());
+            header.extend_from_slice(&destination.octets());
+            header.extend_from_slice(&client.port().to_be_bytes());
+            header.extend_from_slice(
+                &destination_addr
+                    .map(|addr| addr.port())
+                    .unwrap_or(0)
+                    .to_be_bytes(),
+            );
+        }
+        SocketAddr::V6(client) => {
+            let destination = match destination_addr {
+                Some(SocketAddr::V6(addr)) => *addr.ip(),
+                _ => Ipv6Addr::UNSPECIFIED,
+            };
+            header.push(0x21); // AF_INET6 + STREAM
+            header.extend_from_slice(&36u16.to_be_bytes());
+            header.extend_from_slice(&client.ip().octets());
+            header.extend_from_slice(&destination.octets());
+            header.extend_from_slice(&client.port().to_be_bytes());
+            header.extend_from_slice(
+                &destination_addr
+                    .map(|addr| addr.port())
+                    .unwrap_or(0)
+                    .to_be_bytes(),
+            );
+        }
+    }
+    header
 }
 
 // ---------------------------------------------------------------------------
@@ -148,9 +237,9 @@ fn parse_v1(buf: &[u8]) -> Result<ProxyAddr, ProxyProtocolError> {
             })?
     };
 
-    let src_port: u16 = src_port_str.parse().map_err(|_| {
-        ProxyProtocolError::Invalid(format!("invalid src port '{}'", src_port_str))
-    })?;
+    let src_port: u16 = src_port_str
+        .parse()
+        .map_err(|_| ProxyProtocolError::Invalid(format!("invalid src port '{}'", src_port_str)))?;
 
     Ok(ProxyAddr {
         src_ip: Some(src_ip),
@@ -295,7 +384,10 @@ mod tests {
     fn v1_tcp6_basic() {
         let hdr = b"PROXY TCP6 ::1 ::2 54321 443\r\n";
         let result = parse_proxy_v1_v2(hdr).unwrap();
-        assert_eq!(result.src_ip, Some(IpAddr::V6("::1".parse::<Ipv6Addr>().unwrap())));
+        assert_eq!(
+            result.src_ip,
+            Some(IpAddr::V6("::1".parse::<Ipv6Addr>().unwrap()))
+        );
         assert_eq!(result.src_port, Some(54321));
         assert_eq!(result.consumed, hdr.len());
     }
@@ -312,10 +404,7 @@ mod tests {
     #[test]
     fn v1_incomplete_no_crlf() {
         let hdr = b"PROXY TCP4 1.2.3.4 5.6.7.8 12345 80";
-        assert_eq!(
-            parse_proxy_v1_v2(hdr),
-            Err(ProxyProtocolError::Incomplete)
-        );
+        assert_eq!(parse_proxy_v1_v2(hdr), Err(ProxyProtocolError::Incomplete));
     }
 
     #[test]
@@ -329,6 +418,61 @@ mod tests {
         assert_eq!(result.consumed, proxy_hdr_bytes.len());
         // remaining bytes are the HTTP request
         assert_eq!(&data[result.consumed..], b"GET / HTTP/1.1\r\n");
+    }
+
+    #[test]
+    fn build_v1_tcp4_header() {
+        let client = "1.2.3.4:12345".parse().unwrap();
+        let destination = "5.6.7.8:443".parse().unwrap();
+        assert_eq!(
+            String::from_utf8(build_v1_header(client, Some(destination))).unwrap(),
+            "PROXY TCP4 1.2.3.4 5.6.7.8 12345 443\r\n"
+        );
+    }
+
+    #[test]
+    fn build_v1_tcp6_header() {
+        let client = "[2001:db8::1]:12345".parse().unwrap();
+        let destination = "[2001:db8::2]:443".parse().unwrap();
+        assert_eq!(
+            String::from_utf8(build_v1_header(client, Some(destination))).unwrap(),
+            "PROXY TCP6 2001:db8::1 2001:db8::2 12345 443\r\n"
+        );
+    }
+
+    #[test]
+    fn build_v2_tcp4_header() {
+        let client = "1.2.3.4:12345".parse().unwrap();
+        let destination = "5.6.7.8:443".parse().unwrap();
+        let header = build_v2_header(client, Some(destination));
+
+        assert_eq!(&header[..12], b"\r\n\r\n\x00\r\nQUIT\n");
+        assert_eq!(header[12], 0x21);
+        assert_eq!(header[13], 0x11);
+        assert_eq!(u16::from_be_bytes([header[14], header[15]]), 12);
+
+        let parsed = parse_proxy_v1_v2(&header).unwrap();
+        assert_eq!(parsed.src_ip, Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+        assert_eq!(parsed.src_port, Some(12345));
+        assert_eq!(parsed.consumed, header.len());
+    }
+
+    #[test]
+    fn configured_build_header_uses_v2() {
+        let client = "1.2.3.4:12345".parse().unwrap();
+        let destination = "5.6.7.8:443".parse().unwrap();
+        let header = build_header(
+            ProxyProtocolConfig {
+                is_on: true,
+                version: 2,
+            },
+            client,
+            Some(destination),
+        )
+        .expect("enabled proxy protocol should build a header");
+
+        assert_eq!(&header[..12], b"\r\n\r\n\x00\r\nQUIT\n");
+        assert_eq!(parse_proxy_v1_v2(&header).unwrap().src_port, Some(12345));
     }
 
     #[test]
@@ -362,12 +506,7 @@ mod tests {
         hdr
     }
 
-    fn build_v2_ipv6(
-        src: Ipv6Addr,
-        dst: Ipv6Addr,
-        src_port: u16,
-        dst_port: u16,
-    ) -> Vec<u8> {
+    fn build_v2_ipv6(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
         let mut hdr = Vec::new();
         hdr.extend_from_slice(b"\r\n\r\n\x00\r\nQUIT\n");
         hdr.push(0x21); // version=2, command=PROXY
@@ -419,10 +558,7 @@ mod tests {
     fn v2_incomplete_returns_incomplete() {
         // Only the 12-byte signature, missing the 4 fixed header bytes
         let sig = b"\r\n\r\n\x00\r\nQUIT\n";
-        assert_eq!(
-            parse_proxy_v1_v2(sig),
-            Err(ProxyProtocolError::Incomplete)
-        );
+        assert_eq!(parse_proxy_v1_v2(sig), Err(ProxyProtocolError::Incomplete));
     }
 
     #[test]

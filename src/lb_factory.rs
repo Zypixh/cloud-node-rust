@@ -1,6 +1,6 @@
 use crate::config_models::{
     GlobalHTTPAllConfig, OriginConfig, OriginTlsSecurityVerifyMode, ParentNodeConfig,
-    ReverseProxyConfig,
+    ProxyProtocolConfig, ReverseProxyConfig,
 };
 use futures_util::FutureExt;
 use http;
@@ -228,6 +228,7 @@ pub struct BackendExtension {
     pub tls_security_verify_mode: OriginTlsSecurityVerifyMode,
     pub legacy_tls_verify: Option<bool>,
     pub request_host_excluding_port: bool,
+    pub proxy_protocol: ProxyProtocolConfig,
     pub connection_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
     pub idle_timeout: Option<Duration>,
@@ -359,6 +360,7 @@ fn build_origin_lb(
             tls_security_verify_mode: origin.tls_security_verify_mode,
             legacy_tls_verify,
             request_host_excluding_port: rp_cfg.request_host_excluding_port,
+            proxy_protocol: rp_cfg.proxy_protocol,
             connection_timeout: origin_or_global_duration(
                 origin.conn_timeout.as_ref(),
                 global_http.and_then(|cfg| cfg.conn_timeout.as_ref()),
@@ -512,6 +514,7 @@ fn fallback_lb() -> (Arc<AnyLoadBalancer>, bool) {
         tls_security_verify_mode: OriginTlsSecurityVerifyMode::Force,
         legacy_tls_verify: None,
         request_host_excluding_port: false,
+        proxy_protocol: ProxyProtocolConfig::default(),
         connection_timeout: None,
         read_timeout: None,
         idle_timeout: None,
@@ -555,6 +558,7 @@ fn unsupported_origin_backend(
         tls_security_verify_mode: OriginTlsSecurityVerifyMode::Force,
         legacy_tls_verify: None,
         request_host_excluding_port: false,
+        proxy_protocol: ProxyProtocolConfig::default(),
         connection_timeout: origin.conn_timeout.as_ref().map(crate::utils::to_duration),
         read_timeout: origin.read_timeout.as_ref().map(crate::utils::to_duration),
         idle_timeout: origin.idle_timeout.as_ref().map(crate::utils::to_duration),
@@ -608,6 +612,7 @@ fn oss_origin_backend(
         tls_security_verify_mode: origin.tls_security_verify_mode,
         legacy_tls_verify,
         request_host_excluding_port: rp_cfg.request_host_excluding_port,
+        proxy_protocol: rp_cfg.proxy_protocol,
         connection_timeout: origin_or_global_duration(
             origin.conn_timeout.as_ref(),
             global_http.and_then(|cfg| cfg.conn_timeout.as_ref()),
@@ -809,6 +814,7 @@ pub fn build_parent_lb(
                     tls_security_verify_mode: OriginTlsSecurityVerifyMode::Skip,
                     legacy_tls_verify: None,
                     request_host_excluding_port: false,
+                    proxy_protocol: ProxyProtocolConfig::default(),
                     connection_timeout: None,
                     read_timeout: None,
                     idle_timeout: None,
@@ -963,6 +969,7 @@ mod tests {
             request_host: request_host.to_string(),
             request_host_type,
             request_host_excluding_port: false,
+            proxy_protocol: ProxyProtocolConfig::default(),
         }
     }
 
@@ -1047,6 +1054,7 @@ mod tests {
             tls_security_verify_mode: OriginTlsSecurityVerifyMode::Auto,
             legacy_tls_verify: None,
             request_host_excluding_port: false,
+            proxy_protocol: ProxyProtocolConfig::default(),
             connection_timeout: None,
             read_timeout: None,
             idle_timeout: None,

@@ -13,9 +13,9 @@ use cloud_node_rust::config::ConfigStore;
 use cloud_node_rust::config_models::{
     FlexibleAddr, GlobalHTTPAllConfig, HTTPConfig, HTTPFirewallInboundConfig, HTTPFirewallPolicy,
     HTTPFirewallRef, HTTPFirewallRule, HTTPFirewallRuleGroup, HTTPFirewallRuleSet,
-    NetworkAddressConfig, OriginConfig, OriginTlsSecurityVerifyMode, ReverseProxyConfig,
-    SchedulingConfig, ServerConfig, ServerNameConfig, UAMConfig, WAFCaptchaOptions,
-    WAFJSCookieOptions, WebConfig,
+    NetworkAddressConfig, OriginConfig, OriginTlsSecurityVerifyMode, ProxyProtocolConfig,
+    ReverseProxyConfig, SchedulingConfig, ServerConfig, ServerNameConfig, UAMConfig,
+    WAFCaptchaOptions, WAFJSCookieOptions, WebConfig,
 };
 use cloud_node_rust::firewall::state::WafStateManager;
 use cloud_node_rust::firewall::verifier::WafVerifier;
@@ -394,6 +394,7 @@ fn build_server(
             request_host: String::new(),
             request_host_type: 0,
             request_host_excluding_port: false,
+            proxy_protocol: ProxyProtocolConfig::default(),
         }),
         web: Some(web.unwrap_or_else(base_web_config)),
         ..Default::default()
