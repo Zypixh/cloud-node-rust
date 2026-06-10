@@ -6,7 +6,7 @@ use crate::rpc::client::RpcClient;
 use crate::rpc::logs::report_node_log_with_context;
 use crate::rpc::plan::sync_active_plans;
 use crate::rpc::utils::build_runtime_maps;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 // parking_lot::RwLock does not poison on panic; the std variant would permanently
 // brick this config-sync path the moment any holder panics.
 use parking_lot::RwLock;

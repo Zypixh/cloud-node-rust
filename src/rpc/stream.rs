@@ -137,21 +137,21 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
             continue;
         }
 
-        let client = match RpcClient::new_with_endpoints(&api_config, &last_endpoints, false).await
-        {
-            Ok(client) => client,
-            Err(e) => {
-                last_endpoints = api_config.effective_rpc_endpoints();
-                fail_count = fail_count.saturating_add(1);
-                let delay = stream_backoff(fail_count, MAX_BACKOFF);
-                error!(
-                    "Failed to connect to API node for stream: {}. Retrying in {:?}...",
-                    e, delay
-                );
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-        };
+        let client =
+            match RpcClient::new_stream_with_endpoints(&api_config, &last_endpoints, false).await {
+                Ok(client) => client,
+                Err(e) => {
+                    last_endpoints = api_config.effective_rpc_endpoints();
+                    fail_count = fail_count.saturating_add(1);
+                    let delay = stream_backoff(fail_count, MAX_BACKOFF);
+                    error!(
+                        "Failed to connect to API node for stream: {}. Retrying in {:?}...",
+                        e, delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
         let stream_result = run_stream(client, &api_config, config_store.clone())
             .await
             .map(|_| NodeStreamProbeResult::default());
@@ -194,7 +194,7 @@ pub async fn probe_node_stream(
     config_store: Arc<ConfigStore>,
     hold: Duration,
 ) -> anyhow::Result<NodeStreamProbeResult> {
-    let client = RpcClient::new(api_config).await?;
+    let client = RpcClient::new_stream(api_config).await?;
     run_tonic_stream(client, api_config, config_store, Some(hold)).await
 }
 
@@ -625,7 +625,7 @@ async fn handle_message(
                 let stat = serde_json::json!({
                     "cpuUsage": sys.global_cpu_usage() / 100.0,
                     "cpuLogicalCount": sys.cpus().len(),
-                    "cpuPhysicalCount": sys.physical_core_count().unwrap_or(sys.cpus().len()),
+                    "cpuPhysicalCount": sysinfo::System::physical_core_count().unwrap_or(sys.cpus().len()),
                     "memUsage": mem_usage,
                     "memoryTotal": total_memory,
                     "memoryUsed": used_memory,

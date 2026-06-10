@@ -4,9 +4,9 @@ use crate::metrics::ServerStatusSnapshot;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use chrono::{Datelike, Duration as ChronoDuration, Timelike};
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use tracing::{debug, error, info};
 
@@ -98,12 +98,11 @@ pub async fn start_origin_health_reporter(api_config: ApiConfig) {
             }
         };
         let mut service = client.node_value_service();
-        if let Err(e) = crate::rpc::track_rpc(
-            service.create_node_values(pb::CreateNodeValuesRequest {
+        if let Err(e) =
+            crate::rpc::track_rpc(service.create_node_values(pb::CreateNodeValuesRequest {
                 node_value_items: items,
-            }),
-        )
-        .await
+            }))
+            .await
         {
             debug!("Origin health report failed: {}", e);
         }
@@ -278,13 +277,11 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
                     }
                 };
                 let mut service = client.bandwidth_stat_service();
-                let result = crate::rpc::track_rpc(
-                    service.upload_server_bandwidth_stats(
-                        pb::UploadServerBandwidthStatsRequest {
-                            server_bandwidth_stats: stats,
-                        },
-                    ),
-                )
+                let result = crate::rpc::track_rpc(service.upload_server_bandwidth_stats(
+                    pb::UploadServerBandwidthStatsRequest {
+                        server_bandwidth_stats: stats,
+                    },
+                ))
                 .await;
                 if let Err(e) = result {
                     error!("Failed to upload bandwidth stats: {}", e);
@@ -442,12 +439,12 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
                 };
                 let mut service = client.daily_stat_service();
 
-                if let Err(e) = crate::rpc::track_rpc(
-                    service.upload_server_daily_stats(pb::UploadServerDailyStatsRequest {
+                if let Err(e) = crate::rpc::track_rpc(service.upload_server_daily_stats(
+                    pb::UploadServerDailyStatsRequest {
                         stats: stats.clone(),
                         domain_stats: domain_stats.clone(),
-                    }),
-                )
+                    },
+                ))
                 .await
                 {
                     error!("Failed to upload daily stats: {}", e);
@@ -651,8 +648,8 @@ pub async fn start_metric_stat_reporter(
                     });
                 }
 
-                if let Err(e) = crate::rpc::track_rpc(
-                    service.upload_metric_stats(pb::UploadMetricStatsRequest {
+                if let Err(e) = crate::rpc::track_rpc(service.upload_metric_stats(
+                    pb::UploadMetricStatsRequest {
                         server_id,
                         time: time_key.clone(),
                         count,
@@ -661,9 +658,9 @@ pub async fn start_metric_stat_reporter(
                         item_id: item.id,
                         metric_stats,
                         keep_keys,
-                    }),
-                )
-                    .await
+                    },
+                ))
+                .await
                 {
                     error!(
                         "Failed to upload metric stats for server {} item {}: {}",

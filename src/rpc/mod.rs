@@ -36,9 +36,7 @@ pub use stream::start_node_stream;
 /// Wrap a gRPC unary call, recording its duration and whether it errored so
 /// `apiSuccessPercent` reflects actual communication health instead of just
 /// bandwidth-stat uploads.
-pub async fn track_rpc<F, T>(
-    fut: F,
-) -> Result<tonic::Response<T>, tonic::Status>
+pub async fn track_rpc<F, T>(fut: F) -> Result<tonic::Response<T>, tonic::Status>
 where
     F: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
 {

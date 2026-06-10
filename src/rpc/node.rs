@@ -1,7 +1,7 @@
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
@@ -1497,7 +1497,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "exePath": exe_path,
             "cpuUsage": cpu_usage,
             "cpuLogicalCount": sys.cpus().len(),
-            "cpuPhysicalCount": sys.physical_core_count().unwrap_or(sys.cpus().len()),
+            "cpuPhysicalCount": sysinfo::System::physical_core_count().unwrap_or(sys.cpus().len()),
             "memoryUsage": mem_usage,
             "memoryTotal": total_memory,
             "diskUsage": disk_usage,
@@ -1607,7 +1607,7 @@ pub async fn report_node_online_once(
         "hostIP": host_ip,
         "cpuUsage": cpu_usage,
         "cpuLogicalCount": sys.cpus().len(),
-        "cpuPhysicalCount": sys.physical_core_count().unwrap_or(sys.cpus().len()),
+        "cpuPhysicalCount": sysinfo::System::physical_core_count().unwrap_or(sys.cpus().len()),
         "memoryUsage": memory_usage,
         "memoryTotal": total_memory,
         "load1m": load.one,
@@ -1770,7 +1770,7 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
                 "usage": cpu_usage,
                 "cores": sys.cpus().len(),
                 "logicalCount": sys.cpus().len(),
-                "physicalCount": sys.physical_core_count().unwrap_or(sys.cpus().len())
+                "physicalCount": sysinfo::System::physical_core_count().unwrap_or(sys.cpus().len())
             }),
         );
         value_map.insert(

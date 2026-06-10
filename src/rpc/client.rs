@@ -4,7 +4,7 @@ use crate::api_config::ApiConfig;
 use crate::auth::generate_token;
 use crate::pb;
 use tonic::codec::CompressionEncoding;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
 use std::time::Duration;
@@ -12,9 +12,39 @@ use std::time::Duration;
 pub const RPC_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
-const RPC_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+const RPC_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const RPC_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_PING_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RpcConnectionProfile {
+    Default,
+    NodeStream,
+    PingProbe,
+}
+
+impl RpcConnectionProfile {
+    fn connect_timeout(self) -> Duration {
+        match self {
+            Self::Default | Self::NodeStream => RPC_CONNECT_TIMEOUT,
+            Self::PingProbe => RPC_PING_CONNECT_TIMEOUT,
+        }
+    }
+
+    fn http2_keep_alive_interval(self) -> Option<Duration> {
+        match self {
+            // Keep ordinary unary channels conservative. The node stream uses
+            // application-level heartbeats and must not trigger gRPC-Go HTTP/2
+            // keepalive enforcement with client-side PING frames.
+            Self::Default => Some(RPC_HTTP2_KEEPALIVE_INTERVAL),
+            Self::NodeStream | Self::PingProbe => None,
+        }
+    }
+
+    fn keep_alive_while_idle(self) -> bool {
+        false
+    }
+}
 
 #[derive(Clone)]
 pub struct RpcClient {
@@ -25,7 +55,7 @@ pub struct RpcClient {
 impl RpcClient {
     pub async fn new(api_config: &ApiConfig) -> anyhow::Result<Self> {
         let endpoints = api_config.effective_rpc_endpoints();
-        Self::connect(api_config, &endpoints).await
+        Self::connect(api_config, &endpoints, RpcConnectionProfile::Default).await
     }
 
     /// Create a client for a stream, attempting all endpoints. If `force` is
@@ -40,10 +70,38 @@ impl RpcClient {
         } else {
             endpoints.to_vec()
         };
-        Self::connect(api_config, &list).await
+        Self::connect(api_config, &list, RpcConnectionProfile::Default).await
     }
 
-    async fn connect(api_config: &ApiConfig, endpoints: &[String]) -> anyhow::Result<Self> {
+    pub async fn new_stream(api_config: &ApiConfig) -> anyhow::Result<Self> {
+        let endpoints = api_config.effective_rpc_endpoints();
+        Self::connect(api_config, &endpoints, RpcConnectionProfile::NodeStream).await
+    }
+
+    /// Create a node stream client with a stream-safe transport profile.
+    ///
+    /// The bidirectional node stream already sends `NodeStreamMessage { code:
+    /// "ping" }` heartbeats. We intentionally avoid HTTP/2 keepalive PINGs on
+    /// this channel because Go gRPC servers commonly enforce a minimum client
+    /// ping interval and close streams that ping too aggressively.
+    pub async fn new_stream_with_endpoints(
+        api_config: &ApiConfig,
+        endpoints: &[String],
+        force: bool,
+    ) -> anyhow::Result<Self> {
+        let list: Vec<String> = if force || endpoints.is_empty() {
+            api_config.effective_rpc_endpoints()
+        } else {
+            endpoints.to_vec()
+        };
+        Self::connect(api_config, &list, RpcConnectionProfile::NodeStream).await
+    }
+
+    async fn connect(
+        api_config: &ApiConfig,
+        endpoints: &[String],
+        profile: RpcConnectionProfile,
+    ) -> anyhow::Result<Self> {
         if endpoints.is_empty() {
             anyhow::bail!("No RPC endpoints configured");
         }
@@ -67,14 +125,7 @@ impl RpcClient {
                 }
             };
 
-            let channel = endpoint
-                .connect_timeout(RPC_CONNECT_TIMEOUT)
-                .tcp_keepalive(Some(RPC_TCP_KEEPALIVE))
-                .http2_keep_alive_interval(RPC_HTTP2_KEEPALIVE_INTERVAL)
-                .keep_alive_timeout(RPC_HTTP2_KEEPALIVE_TIMEOUT)
-                .keep_alive_while_idle(true)
-                .connect()
-                .await;
+            let channel = Self::configure_endpoint(endpoint, profile).connect().await;
 
             match channel {
                 Ok(channel) => {
@@ -105,12 +156,7 @@ impl RpcClient {
             Err(_) => return false,
         };
 
-        let channel = match endpoint
-            .connect_timeout(RPC_PING_CONNECT_TIMEOUT)
-            .tcp_keepalive(Some(RPC_TCP_KEEPALIVE))
-            .http2_keep_alive_interval(RPC_HTTP2_KEEPALIVE_INTERVAL)
-            .keep_alive_timeout(RPC_HTTP2_KEEPALIVE_TIMEOUT)
-            .keep_alive_while_idle(true)
+        let channel = match Self::configure_endpoint(endpoint, RpcConnectionProfile::PingProbe)
             .connect()
             .await
         {
@@ -132,6 +178,21 @@ impl RpcClient {
 
     pub fn channel(&self) -> Channel {
         self.channel.clone()
+    }
+
+    fn configure_endpoint(endpoint: Endpoint, profile: RpcConnectionProfile) -> Endpoint {
+        let endpoint = endpoint
+            .connect_timeout(profile.connect_timeout())
+            .tcp_keepalive(Some(RPC_TCP_KEEPALIVE));
+
+        if let Some(interval) = profile.http2_keep_alive_interval() {
+            endpoint
+                .http2_keep_alive_interval(interval)
+                .keep_alive_timeout(RPC_HTTP2_KEEPALIVE_TIMEOUT)
+                .keep_alive_while_idle(profile.keep_alive_while_idle())
+        } else {
+            endpoint
+        }
     }
 
     fn interceptor(
@@ -780,5 +841,44 @@ impl RpcClient {
         .accept_compressed(CompressionEncoding::Gzip)
         .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        RPC_CONNECT_TIMEOUT, RPC_HTTP2_KEEPALIVE_INTERVAL, RPC_PING_CONNECT_TIMEOUT,
+        RpcConnectionProfile,
+    };
+
+    #[test]
+    fn rpc_connection_profiles_match_expected_keepalive_policy() {
+        assert_eq!(
+            RpcConnectionProfile::Default.http2_keep_alive_interval(),
+            Some(RPC_HTTP2_KEEPALIVE_INTERVAL)
+        );
+        assert_eq!(
+            RpcConnectionProfile::Default.connect_timeout(),
+            RPC_CONNECT_TIMEOUT
+        );
+        assert!(!RpcConnectionProfile::Default.keep_alive_while_idle());
+
+        assert_eq!(
+            RpcConnectionProfile::NodeStream.http2_keep_alive_interval(),
+            None
+        );
+        assert_eq!(
+            RpcConnectionProfile::NodeStream.connect_timeout(),
+            RPC_CONNECT_TIMEOUT
+        );
+
+        assert_eq!(
+            RpcConnectionProfile::PingProbe.http2_keep_alive_interval(),
+            None
+        );
+        assert_eq!(
+            RpcConnectionProfile::PingProbe.connect_timeout(),
+            RPC_PING_CONNECT_TIMEOUT
+        );
     }
 }

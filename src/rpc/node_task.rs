@@ -7,7 +7,7 @@ use crate::rpc::client::RpcClient;
 use crate::rpc::ip_list::sync_ip_items_incremental;
 use crate::rpc::plan::sync_active_plans;
 use crate::rpc::server::{sync_single_server_config, sync_user_servers_state};
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
