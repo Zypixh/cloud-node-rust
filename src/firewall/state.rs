@@ -1,3 +1,4 @@
+use crate::firewall::kernel::{KernelFilter, NoopFilter};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
@@ -5,9 +6,8 @@ use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
-use crate::firewall::kernel::{KernelFilter, NoopFilter};
+use std::sync::{Arc, RwLock};
 
 pub struct CandidateRulesetStats {
     pub hits: AtomicU64,
@@ -94,7 +94,10 @@ pub(crate) struct TrackedLimiter<K: std::hash::Hash + Eq + Clone + Send + Sync +
 }
 
 impl<K: std::hash::Hash + Eq + Clone + Send + Sync + 'static> TrackedLimiter<K> {
-    fn new(limiter: Arc<RateLimiter<K, DashMapStateStore<K>, DefaultClock>>, quota_value: u32) -> Self {
+    fn new(
+        limiter: Arc<RateLimiter<K, DashMapStateStore<K>, DefaultClock>>,
+        quota_value: u32,
+    ) -> Self {
         Self {
             limiter,
             last_seen: AtomicI64::new(crate::utils::time::now_timestamp()),
@@ -847,8 +850,7 @@ impl WafStateManager {
 
         self.server_limiters
             .retain(|_, tracked| !tracked.is_idle(now));
-        self.ip_limiters
-            .retain(|_, tracked| !tracked.is_idle(now));
+        self.ip_limiters.retain(|_, tracked| !tracked.is_idle(now));
         self.list_block_ranges.retain(|_, expiry| now < *expiry);
         self.list_white_ranges.retain(|_, expiry| now < *expiry);
         self.list_gray_ranges.retain(|_, expiry| now < *expiry);
@@ -910,7 +912,13 @@ impl WafStateManager {
     /// Sliding-window per-IP byte counter for CC bandwidth enforcement.
     /// Returns `true` if the IP has exceeded `limit_bytes` in the current
     /// 1-second window (caller decides what to do on breach).
-    pub fn check_ip_bandwidth(&self, server_id: i64, ip: IpAddr, bytes: u64, limit_bytes: u64) -> bool {
+    pub fn check_ip_bandwidth(
+        &self,
+        server_id: i64,
+        ip: IpAddr,
+        bytes: u64,
+        limit_bytes: u64,
+    ) -> bool {
         if limit_bytes == 0 {
             return false;
         }
@@ -934,7 +942,13 @@ impl WafStateManager {
         total > limit_bytes
     }
 
-    pub fn record_candidate_hit(&self, policy_id: i64, version: i64, blocked: bool, observed: bool) {
+    pub fn record_candidate_hit(
+        &self,
+        policy_id: i64,
+        version: i64,
+        blocked: bool,
+        observed: bool,
+    ) {
         let entry = self
             .candidate_stats
             .entry((policy_id, version))
@@ -952,13 +966,15 @@ impl WafStateManager {
         let keys: Vec<(i64, i64)> = self.candidate_stats.iter().map(|e| *e.key()).collect();
         keys.into_iter()
             .filter_map(|key| {
-                self.candidate_stats.remove(&key).map(|(k, arc)| CandidateStatsSnapshot {
-                    policy_id: k.0,
-                    version: k.1,
-                    hits: arc.hits.load(Ordering::Relaxed),
-                    blocks: arc.blocks.load(Ordering::Relaxed),
-                    observed: arc.observed.load(Ordering::Relaxed),
-                })
+                self.candidate_stats
+                    .remove(&key)
+                    .map(|(k, arc)| CandidateStatsSnapshot {
+                        policy_id: k.0,
+                        version: k.1,
+                        hits: arc.hits.load(Ordering::Relaxed),
+                        blocks: arc.blocks.load(Ordering::Relaxed),
+                        observed: arc.observed.load(Ordering::Relaxed),
+                    })
             })
             .collect()
     }
@@ -969,8 +985,7 @@ impl WafStateManager {
 /// Spawn a background tokio task that runs GC on the WAF state every 60 seconds.
 pub fn start_gc_task(state: Arc<WafStateManager>) {
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(GC_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(GC_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;

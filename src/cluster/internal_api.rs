@@ -14,7 +14,7 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 struct PurgeRequest {
     #[serde(default)]
     key: String,
-    #[serde(rename = "key_type", alias = "keyType", default)]
+    #[serde(rename = "key_type", default)]
     key_type: String,
     #[serde(default)]
     prefix: String,

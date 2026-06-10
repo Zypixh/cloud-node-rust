@@ -4,9 +4,9 @@ use crate::config_models::{
     HTTPRewriteRef, HTTPRewriteRule, ServerConfig,
 };
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use tracing::debug;
 
 #[derive(Debug)]
@@ -52,10 +52,16 @@ impl CompiledServerRewritePlan {
             .iter()
             .enumerate()
             .map(|(index, rule)| {
-                CompiledRewriteRule::compile(rule, web.rewrite_refs.get(index).map(|rule_ref| rule_ref.is_on))
+                CompiledRewriteRule::compile(
+                    rule,
+                    web.rewrite_refs.get(index).map(|rule_ref| rule_ref.is_on),
+                )
             })
             .collect();
-        Some(Self { host_redirects, rules })
+        Some(Self {
+            host_redirects,
+            rules,
+        })
     }
 }
 
@@ -115,7 +121,11 @@ impl CompiledRewriteConds {
         }
         Self::Groups {
             connector: CacheConnector::compile(&config.connector),
-            groups: config.groups.iter().map(CompiledRewriteCondGroup::compile).collect(),
+            groups: config
+                .groups
+                .iter()
+                .map(CompiledRewriteCondGroup::compile)
+                .collect(),
         }
     }
 
@@ -142,7 +152,11 @@ impl CompiledRewriteCondGroup {
         Self {
             is_on: group.is_on,
             connector: CacheConnector::compile(&group.connector),
-            conds: group.conds.iter().map(CompiledRewriteCond::compile).collect(),
+            conds: group
+                .conds
+                .iter()
+                .map(CompiledRewriteCond::compile)
+                .collect(),
         }
     }
 
@@ -310,7 +324,10 @@ struct CompiledDomainPatterns {
 impl CompiledDomainPatterns {
     fn compile(patterns: &[String]) -> Self {
         Self {
-            patterns: patterns.iter().map(|pattern| CompiledDomainPattern::compile(pattern)).collect(),
+            patterns: patterns
+                .iter()
+                .map(|pattern| CompiledDomainPattern::compile(pattern))
+                .collect(),
         }
     }
 
@@ -502,7 +519,10 @@ pub fn evaluate_compiled_host_redirects(
                     {
                         return None;
                     }
-                    return Some((append_current_query(after_url, query), redirect.status(user_agent)));
+                    return Some((
+                        append_current_query(after_url, query),
+                        redirect.status(user_agent),
+                    ));
                 }
             }
             CompiledHostRedirectKind::Port => {
@@ -531,7 +551,8 @@ pub fn evaluate_compiled_host_redirects(
                         new_host.push(':');
                         new_host.push_str(&port_after.to_string());
                     }
-                    let after_url = format!("{}://{}{}", after_scheme, new_host, request_uri(path, ""));
+                    let after_url =
+                        format!("{}://{}{}", after_scheme, new_host, request_uri(path, ""));
                     if full_request_url(scheme, host, path, "") == after_url {
                         return None;
                     }
@@ -543,7 +564,8 @@ pub fn evaluate_compiled_host_redirects(
                     continue;
                 }
 
-                let include_query_in_match = !redirect.match_regexp && redirect.before_url.contains('?');
+                let include_query_in_match =
+                    !redirect.match_regexp && redirect.before_url.contains('?');
                 let full_url = full_request_url(
                     scheme,
                     host,
@@ -569,7 +591,8 @@ pub fn evaluate_compiled_host_redirects(
                     let Some(captures) = regex.captures(&full_url) else {
                         continue;
                     };
-                    let mut location = expand_go_regex_replacement(regex, &captures, &redirect.after_url);
+                    let mut location =
+                        expand_go_regex_replacement(regex, &captures, &redirect.after_url);
                     if full_url == location {
                         return None;
                     }
@@ -1012,10 +1035,10 @@ mod tests {
         }];
         let refs = vec![HTTPRewriteRef { is_on: false }];
 
-        assert!(matches!(
+        std::assert_matches!(
             evaluate_rewrites("/MoyuNetworkApi/passport/auth/login", "", &refs, &rules),
             RewriteResult::NoMatch
-        ));
+        );
     }
 
     #[test]
@@ -1028,10 +1051,10 @@ mod tests {
             ..Default::default()
         }];
 
-        assert!(matches!(
+        std::assert_matches!(
             evaluate_rewrites_with_cond("/old", "", None, &[], &rules, |_| false),
             RewriteResult::NoMatch
-        ));
+        );
     }
 
     #[test]
@@ -1184,10 +1207,10 @@ mod tests {
             ..Default::default()
         }];
 
-        assert!(matches!(
+        std::assert_matches!(
             evaluate_rewrites_with_host("/api/users", "", Some("example.com"), &[], &rules),
             RewriteResult::NoMatch
-        ));
+        );
     }
 
     #[test]

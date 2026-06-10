@@ -59,23 +59,44 @@ where
     }
 }
 
-fn deserialize_flexible_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq)]
+pub struct ProxyProtocolConfig {
+    #[serde(rename = "isOn", default)]
+    pub is_on: bool,
+    #[serde(default = "default_proxy_protocol_version")]
+    pub version: u8,
+}
+
+impl Default for ProxyProtocolConfig {
+    fn default() -> Self {
+        Self {
+            is_on: false,
+            version: default_proxy_protocol_version(),
+        }
+    }
+}
+
+impl ProxyProtocolConfig {
+    pub fn enabled(self) -> bool {
+        self.is_on
+    }
+
+    pub fn normalized_version(self) -> u8 {
+        if self.version == 2 { 2 } else { 1 }
+    }
+}
+
+fn default_proxy_protocol_version() -> u8 {
+    1
+}
+
+fn deserialize_proxy_protocol_config<'de, D>(
+    deserializer: D,
+) -> Result<ProxyProtocolConfig, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let v = Value::deserialize(deserializer)?;
-    match v {
-        Value::Bool(b) => Ok(b),
-        Value::Number(n) => Ok(n.as_i64().unwrap_or(0) != 0),
-        Value::String(s) => {
-            let normalized = s.trim().to_ascii_lowercase();
-            Ok(matches!(
-                normalized.as_str(),
-                "1" | "true" | "yes" | "on" | "enabled"
-            ))
-        }
-        _ => Ok(false),
-    }
+    Ok(Option::<ProxyProtocolConfig>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn deserialize_origin_tls_security_verify_mode<'de, D>(
@@ -107,13 +128,10 @@ fn default_connector() -> String {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ServerNameConfig {
-    #[serde(alias = "Name")]
     pub name: String,
-    #[serde(alias = "Type")]
     pub r#type: Option<String>,
     #[serde(
         rename = "subNames",
-        alias = "SubNames",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -158,7 +176,7 @@ pub struct WAFBlockOptions {
     pub timeout: i32,
     #[serde(rename = "maxTimeout", default)]
     pub max_timeout: i32,
-    #[serde(rename = "failGlobal", default)]
+    #[serde(rename = "failBlockScopeAll", default)]
     pub fail_global: bool,
     #[serde(rename = "ipListId", default)]
     pub ip_list_id: i64,
@@ -174,39 +192,29 @@ pub struct WAFBlockOptions {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct WAFPageOptions {
-    #[serde(
-        alias = "statusCode",
-        default,
-        deserialize_with = "deserialize_flexible_i32"
-    )]
+    #[serde(default)]
     pub status: i32,
-    #[serde(
-        alias = "contentHTML",
-        default,
-        deserialize_with = "deserialize_null_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub body: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct WAFCaptchaOptions {
     #[serde(
+        rename = "captchaType",
         default,
-        alias = "challengeMethod",
-        alias = "challengeType",
-        alias = "captchaType",
         deserialize_with = "deserialize_null_default"
     )]
     pub method: String,
-    #[serde(rename = "lifeSeconds", alias = "life", default)]
+    #[serde(rename = "life", default)]
     pub life_seconds: i32,
     #[serde(rename = "maxFails", default)]
     pub max_fails: i32,
     #[serde(rename = "failBlockTimeout", default)]
     pub fail_block_timeout: i32,
-    #[serde(rename = "failGlobal", alias = "failBlockScopeAll", default)]
+    #[serde(rename = "failBlockScopeAll", default)]
     pub fail_global: bool,
-    #[serde(default, alias = "countLetters")]
+    #[serde(rename = "countLetters", default)]
     pub count: i32,
     #[serde(rename = "useGeetest", default)]
     pub use_geetest: bool,
@@ -225,8 +233,7 @@ pub struct WAFCaptchaOptions {
     #[serde(rename = "challengeDifficulty", default)]
     pub challenge_difficulty: u8,
     #[serde(
-        rename = "challengeLang",
-        alias = "lang",
+        rename = "lang",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -286,13 +293,13 @@ pub struct WAFCaptchaUIOptions {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct WAFJSCookieOptions {
-    #[serde(rename = "lifeSeconds", alias = "life", default)]
+    #[serde(rename = "life", default)]
     pub life_seconds: i32,
     #[serde(rename = "maxFails", default)]
     pub max_fails: i32,
     #[serde(rename = "failBlockTimeout", default)]
     pub fail_block_timeout: i32,
-    #[serde(rename = "failGlobal", alias = "failBlockScopeAll", default)]
+    #[serde(rename = "failBlockScopeAll", default)]
     pub fail_global: bool,
 }
 
@@ -301,17 +308,14 @@ pub struct TOAConfig {
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(
-        rename = "sockFile",
-        alias = "socketFile",
-        alias = "socketPath",
-        alias = "socket",
+        rename = "sockPath",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub sock_file: String,
-    #[serde(rename = "minPort", default)]
+    #[serde(rename = "minLocalPort", default)]
     pub min_port: Option<u16>,
-    #[serde(rename = "maxPort", default)]
+    #[serde(rename = "maxLocalPort", default)]
     pub max_port: Option<u16>,
 }
 
@@ -392,8 +396,7 @@ pub struct WebPConfig {
     )]
     pub mime_types: Vec<String>,
     #[serde(
-        rename = "fileExtensions",
-        alias = "extensions",
+        rename = "extensions",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -414,12 +417,7 @@ pub struct HTTPPagesPolicy {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DataMapConfig {
-    #[serde(
-        rename = "map",
-        alias = "Map",
-        default,
-        deserialize_with = "deserialize_null_default"
-    )]
+    #[serde(rename = "Map", default, deserialize_with = "deserialize_null_default")]
     pub r#map: std::collections::HashMap<String, Value>,
     #[serde(flatten, default)]
     pub extra: std::collections::HashMap<String, Value>,
@@ -461,12 +459,7 @@ pub struct GlobalHTTPAllConfig {
     pub request_origins_with_encodings: bool,
     #[serde(rename = "xffMaxAddresses", default)]
     pub xff_max_addresses: i32,
-    #[serde(
-        rename = "allowLANIP",
-        alias = "allowLocalOrigins",
-        default,
-        deserialize_with = "deserialize_flexible_bool"
-    )]
+    #[serde(rename = "allowLocalOrigins", default)]
     pub allow_lan_ip: bool,
     #[serde(rename = "matchDomainStrictly", default)]
     pub match_domain_strictly: bool,
@@ -480,33 +473,17 @@ pub struct GlobalHTTPAllConfig {
     pub node_ip_page_html: String,
     #[serde(rename = "domainMismatchAction", default)]
     pub domain_mismatch_action: Option<DomainMismatchActionConfig>,
-    #[serde(
-        rename = "connTimeout",
-        alias = "connectionTimeout",
-        alias = "originConnTimeout",
-        alias = "originConnectionTimeout",
-        default
-    )]
+    #[serde(rename = "connTimeout", default)]
     pub conn_timeout: Option<Value>,
-    #[serde(rename = "readTimeout", alias = "originReadTimeout", default)]
+    #[serde(rename = "readTimeout", default)]
     pub read_timeout: Option<Value>,
-    #[serde(rename = "idleTimeout", alias = "originIdleTimeout", default)]
+    #[serde(rename = "idleTimeout", default)]
     pub idle_timeout: Option<Value>,
-    #[serde(rename = "writeTimeout", alias = "originWriteTimeout", default)]
+    #[serde(rename = "writeTimeout", default)]
     pub write_timeout: Option<Value>,
-    #[serde(
-        rename = "autoReadTimeout",
-        alias = "autoReadDataTimeout",
-        alias = "clientReadTimeout",
-        default
-    )]
+    #[serde(rename = "autoReadTimeout", default)]
     pub auto_read_timeout: Option<Value>,
-    #[serde(
-        rename = "autoWriteTimeout",
-        alias = "autoWriteDataTimeout",
-        alias = "clientWriteTimeout",
-        default
-    )]
+    #[serde(rename = "autoWriteTimeout", default)]
     pub auto_write_timeout: Option<Value>,
 }
 
@@ -548,7 +525,6 @@ pub struct GlobalHTTPAccessLogConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct NodeConfigPayload {
-    #[serde(alias = "Id")]
     pub id: Option<i64>,
     #[serde(rename = "nodeId")]
     pub node_id: Option<String>,
@@ -557,16 +533,14 @@ pub struct NodeConfigPayload {
     pub edition: String,
     #[serde(
         rename = "servers",
-        alias = "Servers",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub servers: Vec<ServerConfig>,
-    #[serde(rename = "dataMap", alias = "dataMap", alias = "data_map")]
+    #[serde(rename = "dataMap")]
     pub data_map: Option<DataMapConfig>,
     #[serde(
         rename = "metricItems",
-        alias = "MetricItems",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -591,7 +565,6 @@ pub struct NodeConfigPayload {
     pub is_center: bool,
     #[serde(
         rename = "parentNodes",
-        alias = "ParentNodes",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -600,8 +573,6 @@ pub struct NodeConfigPayload {
     pub global_server_config: Option<GlobalServerConfig>,
     #[serde(
         rename = "globalPages",
-        alias = "pages",
-        alias = "Pages",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -616,21 +587,18 @@ pub struct NodeConfigPayload {
     pub primary_grpc_policy: Option<GRPCConfig>,
     #[serde(
         rename = "httpCachePolicies",
-        alias = "HTTPCachePolicies",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub http_cache_policies: Vec<HTTPCachePolicy>,
     #[serde(
         rename = "httpFirewallPolicies",
-        alias = "HTTPFirewallPolicies",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub http_firewall_policies: Vec<HTTPFirewallPolicy>,
     #[serde(
         rename = "wafActions",
-        alias = "WAFActions",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -668,16 +636,15 @@ pub struct NodeConfigPayload {
     pub http_pages_policies: std::collections::HashMap<String, HTTPPagesPolicy>,
     #[serde(
         rename = "sslCerts",
-        alias = "SSLCerts",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub ssl_certs: Vec<SSLCertConfig>,
-    #[serde(rename = "sslPolicy", alias = "SSLPolicy")]
+    #[serde(rename = "sslPolicy")]
     pub ssl_policy: Option<SSLPolicyConfig>,
-    #[serde(rename = "nodeRegion", alias = "NodeRegion", default)]
+    #[serde(rename = "nodeRegion", default)]
     pub node_region: Option<NodeRegionConfig>,
-    #[serde(rename = "nodeCluster", alias = "NodeCluster", default)]
+    #[serde(rename = "nodeCluster", default)]
     pub node_cluster: Option<NodeClusterConfig>,
     #[serde(rename = "kernelFirewallMode", default)]
     pub kernel_firewall_mode: Option<String>,
@@ -726,11 +693,9 @@ pub struct MetricItemConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct NetworkAddressConfig {
-    #[serde(alias = "protocol")]
     pub protocol: Option<String>,
-    #[serde(alias = "host")]
     pub host: Option<String>,
-    #[serde(rename = "portRange", alias = "port")]
+    #[serde(rename = "portRange")]
     pub port_range: Option<String>,
 }
 
@@ -762,62 +727,64 @@ impl NetworkAddressConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ServerConfig {
-    #[serde(
-        alias = "Id",
-        default,
-        deserialize_with = "deserialize_flexible_i64_opt"
-    )]
+    #[serde(default, deserialize_with = "deserialize_flexible_i64_opt")]
     pub id: Option<i64>,
     #[serde(
         rename = "description",
-        alias = "Description",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub description: String,
     #[serde(
         rename = "userId",
-        alias = "UserId",
         default,
         deserialize_with = "deserialize_flexible_i64"
     )]
     pub user_id: i64,
-    #[serde(rename = "isOn", alias = "IsOn", default)]
+    #[serde(
+        rename = "clusterId",
+        default,
+        deserialize_with = "deserialize_flexible_i64"
+    )]
+    pub cluster_id: i64,
+    #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(
         rename = "serverNames",
-        alias = "ServerNames",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub server_names: Vec<ServerNameConfig>,
-    #[serde(rename = "http", alias = "HTTP", alias = "Http")]
+    #[serde(rename = "http")]
     pub http: Option<HTTPConfig>,
-    #[serde(rename = "https", alias = "HTTPS", alias = "Https")]
+    #[serde(rename = "https")]
     pub https: Option<HTTPSConfig>,
-    #[serde(rename = "tcp", alias = "TCP", alias = "Tcp")]
+    #[serde(rename = "tcp")]
     pub tcp: Option<TCPConfig>,
-    #[serde(rename = "udp", alias = "UDP", alias = "Udp")]
+    #[serde(rename = "udp")]
     pub udp: Option<UDPConfig>,
-    #[serde(rename = "web", alias = "Web")]
+    #[serde(rename = "web")]
     pub web: Option<WebConfig>,
-    #[serde(
-        rename = "reverseProxy",
-        alias = "ReverseProxy",
-        alias = "reverseProxyConfig"
-    )]
+    #[serde(rename = "reverseProxy")]
     pub reverse_proxy: Option<ReverseProxyConfig>,
-    #[serde(rename = "grpc", alias = "grpcJSON", alias = "GRPC")]
+    #[serde(rename = "grpc")]
     pub grpc: Option<GRPCConfig>,
-    #[serde(rename = "uam", alias = "UAM", default)]
+    #[serde(rename = "uam", default)]
     pub uam: Option<UAMConfig>,
     #[serde(rename = "trafficLimit", default)]
     pub traffic_limit: Option<TrafficLimitConfig>,
     #[serde(rename = "trafficLimitStatus", default)]
     pub traffic_limit_status: Option<TrafficLimitStatus>,
     #[serde(
+        rename = "httpFirewallPolicyId",
+        default,
+        deserialize_with = "deserialize_flexible_i64"
+    )]
+    pub http_firewall_policy_id: i64,
+    #[serde(rename = "httpFirewallPolicy", default)]
+    pub http_firewall_policy: Option<HTTPFirewallPolicy>,
+    #[serde(
         rename = "userPlanId",
-        alias = "UserPlanId",
         default,
         deserialize_with = "deserialize_flexible_i64"
     )]
@@ -826,12 +793,7 @@ pub struct ServerConfig {
     /// Protocol v1/v2 header and use the reported source address as the true
     /// client IP.  Corresponds to the management-plane field
     /// `enableProxyProtocol`.
-    #[serde(
-        rename = "enableProxyProtocol",
-        alias = "enable_proxy_protocol",
-        default,
-        deserialize_with = "deserialize_flexible_bool"
-    )]
+    #[serde(rename = "enableProxyProtocol", default)]
     pub enable_proxy_protocol: bool,
     #[serde(default, rename = "locations")]
     pub locations: Vec<LocationConfig>,
@@ -1015,11 +977,10 @@ impl TrafficLimitStatus {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HTTPConfig {
-    #[serde(rename = "isOn", alias = "IsOn", default)]
+    #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(
         rename = "listen",
-        alias = "Listen",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -1057,24 +1018,17 @@ pub struct HSTSConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HTTPSConfig {
-    #[serde(rename = "isOn", alias = "IsOn", default)]
+    #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(
         rename = "listen",
-        alias = "Listen",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub listen: Vec<NetworkAddressConfig>,
-    #[serde(rename = "sslPolicy", alias = "ssl", alias = "SSLPolicy")]
+    #[serde(rename = "sslPolicy")]
     pub ssl_policy: Option<SSLPolicyConfig>,
-    #[serde(
-        rename = "supportsHTTP3",
-        alias = "http3Enabled",
-        alias = "enableHTTP3",
-        alias = "enableHttp3",
-        default
-    )]
+    #[serde(rename = "http3Enabled", default)]
     pub supports_http3: Option<bool>,
 }
 
@@ -1086,11 +1040,10 @@ impl HTTPSConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TCPConfig {
-    #[serde(rename = "isOn", alias = "IsOn", default)]
+    #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(
         rename = "listen",
-        alias = "Listen",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -1100,11 +1053,10 @@ pub struct TCPConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UDPConfig {
-    #[serde(rename = "isOn", alias = "IsOn", default)]
+    #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(
         rename = "listen",
-        alias = "Listen",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -1139,11 +1091,11 @@ pub struct WebConfig {
     pub uam: Option<UAMConfig>,
     #[serde(rename = "ccPolicy")]
     pub cc_policy: Option<CCPolicy>,
-    #[serde(rename = "webP", alias = "webp")]
+    #[serde(rename = "webp")]
     pub webp: Option<WebPConfig>,
-    #[serde(rename = "userAgentConfig", alias = "userAgent")]
+    #[serde(rename = "userAgent")]
     pub user_agent_config: Option<UserAgentConfig>,
-    #[serde(rename = "refererConfig", alias = "referers")]
+    #[serde(rename = "referers")]
     pub referer_config: Option<ReferersConfig>,
     #[serde(
         rename = "hostRedirects",
@@ -1246,17 +1198,12 @@ pub struct HTTPRedirectToHttpsConfig {
     pub status: i32,
     #[serde(
         rename = "domains",
-        alias = "allowedDomains",
-        alias = "allowDomains",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub domains: Vec<String>,
     #[serde(
         rename = "exceptDomains",
-        alias = "excludedDomains",
-        alias = "excludeDomains",
-        alias = "denyDomains",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -1513,20 +1460,12 @@ impl HTTPPageOptimizationConfig {
 pub struct HTTPBaseOptimizationConfig {
     #[serde(
         rename = "onlyURLPatterns",
-        alias = "onlyUrlPatterns",
-        alias = "limitURLPatterns",
-        alias = "limitURLs",
-        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
-        alias = "exceptUrlPatterns",
-        alias = "exceptURLs",
-        alias = "exceptionURLPatterns",
-        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -1631,20 +1570,12 @@ pub struct HLSEncryptingConfig {
     pub is_on: bool,
     #[serde(
         rename = "onlyURLPatterns",
-        alias = "onlyUrlPatterns",
-        alias = "limitURLPatterns",
-        alias = "limitURLs",
-        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
-        alias = "exceptUrlPatterns",
-        alias = "exceptURLs",
-        alias = "exceptionURLPatterns",
-        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -1684,18 +1615,11 @@ impl HLSEncryptingConfig {
 pub struct URLPattern {
     #[serde(
         rename = "type",
-        alias = "patternType",
-        alias = "matchType",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub type_name: String,
-    #[serde(
-        default,
-        alias = "value",
-        alias = "url",
-        deserialize_with = "deserialize_null_default"
-    )]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub pattern: String,
     #[serde(skip)]
     pub compiled: OnceLock<Option<Arc<regex::Regex>>>,
@@ -1862,40 +1786,24 @@ impl URLPattern {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct UAMConfig {
-    #[serde(rename = "isPrior", alias = "is_prior", default)]
+    #[serde(rename = "isPrior", default)]
     pub is_prior: bool,
-    #[serde(
-        rename = "isOn",
-        alias = "IsOn",
-        default,
-        deserialize_with = "deserialize_flexible_bool"
-    )]
+    #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(
         rename = "onlyURLPatterns",
-        alias = "onlyUrlPatterns",
-        alias = "limitURLPatterns",
-        alias = "limitURLs",
-        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
-        alias = "exceptUrlPatterns",
-        alias = "exceptURLs",
-        alias = "exceptionURLPatterns",
-        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub except_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "minQPSPerIP",
-        alias = "perIPMinQPS",
-        alias = "singleIPMinQPS",
-        alias = "min_qps_per_ip",
         default,
         deserialize_with = "deserialize_flexible_i32"
     )]
@@ -1904,10 +1812,6 @@ pub struct UAMConfig {
     pub conds: Option<HTTPRequestCondsConfig>,
     #[serde(
         rename = "keyLife",
-        alias = "lifeSeconds",
-        alias = "validSeconds",
-        alias = "verifyTTL",
-        alias = "key_life",
         default,
         deserialize_with = "deserialize_flexible_i32"
     )]
@@ -1916,7 +1820,6 @@ pub struct UAMConfig {
     pub mode: Option<String>,
     #[serde(
         rename = "powDifficulty",
-        alias = "pow_difficulty",
         default,
         deserialize_with = "deserialize_flexible_u8_opt"
     )]
@@ -2024,20 +1927,12 @@ pub struct UserAgentConfig {
     pub filters: Vec<UserAgentFilter>,
     #[serde(
         rename = "onlyURLPatterns",
-        alias = "onlyUrlPatterns",
-        alias = "limitURLPatterns",
-        alias = "limitURLs",
-        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
-        alias = "exceptUrlPatterns",
-        alias = "exceptURLs",
-        alias = "exceptionURLPatterns",
-        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -2090,20 +1985,12 @@ pub struct ReferersConfig {
     pub check_origin: bool,
     #[serde(
         rename = "onlyURLPatterns",
-        alias = "onlyUrlPatterns",
-        alias = "limitURLPatterns",
-        alias = "limitURLs",
-        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
-        alias = "exceptUrlPatterns",
-        alias = "exceptURLs",
-        alias = "exceptionURLPatterns",
-        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -2158,7 +2045,7 @@ pub struct HTTPHostRedirectConfig {
     pub keep_request_uri: bool,
     #[serde(rename = "keepArgs", default)]
     pub keep_args: bool,
-    #[serde(rename = "domainsAll", alias = "domainAll", default)]
+    #[serde(rename = "domainsAll", default)]
     pub domains_all: bool,
     #[serde(
         rename = "domainsBefore",
@@ -2188,7 +2075,7 @@ pub struct HTTPHostRedirectConfig {
         deserialize_with = "deserialize_null_default"
     )]
     pub ports_before: Vec<String>,
-    #[serde(rename = "portAfter", alias = "port", default)]
+    #[serde(rename = "portAfter", default)]
     pub port_after: i32,
     #[serde(
         rename = "portAfterScheme",
@@ -2229,16 +2116,9 @@ pub struct HTTPRewriteRule {
     pub id: Option<i64>,
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
-    #[serde(alias = "match", alias = "source", alias = "from")]
     pub pattern: Option<String>,
-    #[serde(
-        alias = "targetURL",
-        alias = "targetUrl",
-        alias = "target",
-        alias = "to"
-    )]
     pub replace: Option<String>,
-    #[serde(rename = "withQuery", alias = "keepArgs", alias = "keepQuery", default)]
+    #[serde(rename = "withQuery", default)]
     pub with_query: bool,
     pub mode: Option<String>,
     #[serde(rename = "redirectStatus", default)]
@@ -2399,7 +2279,7 @@ pub struct HTTPCacheRef {
         deserialize_with = "deserialize_null_default"
     )]
     pub skip_cache_control_values: Vec<String>,
-    #[serde(rename = "skipSetCookie", default)]
+    #[serde(rename = "skipSetCookie", default = "default_true")]
     pub skip_set_cookie: bool,
     #[serde(rename = "allowChunkedEncoding", default)]
     pub allow_chunked_encoding: bool,
@@ -2424,20 +2304,12 @@ pub struct HTTPCacheRef {
     pub simple_cond: Option<HTTPRequestCond>,
     #[serde(
         rename = "onlyURLPatterns",
-        alias = "onlyUrlPatterns",
-        alias = "limitURLPatterns",
-        alias = "limitURLs",
-        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
-        alias = "exceptUrlPatterns",
-        alias = "exceptURLs",
-        alias = "exceptionURLPatterns",
-        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -2536,13 +2408,7 @@ pub struct HTTPFirewallRef {
         deserialize_with = "deserialize_null_default"
     )]
     pub default_captcha_type: String,
-    #[serde(
-        alias = "Id",
-        alias = "firewallPolicyId",
-        alias = "FirewallPolicyId",
-        default,
-        deserialize_with = "deserialize_flexible_i64"
-    )]
+    #[serde(default, deserialize_with = "deserialize_flexible_i64")]
     pub id: i64,
 }
 
@@ -2616,20 +2482,12 @@ pub struct HTTPFirewallRegionConfig {
     pub allow_search_engine: bool,
     #[serde(
         rename = "onlyURLPatterns",
-        alias = "onlyUrlPatterns",
-        alias = "limitURLPatterns",
-        alias = "limitURLs",
-        alias = "only_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
     pub only_url_patterns: Vec<URLPattern>,
     #[serde(
         rename = "exceptURLPatterns",
-        alias = "exceptUrlPatterns",
-        alias = "exceptURLs",
-        alias = "exceptionURLPatterns",
-        alias = "except_urls",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -2889,13 +2747,13 @@ pub struct CORSConfig {
     )]
     pub allow_headers: Vec<String>,
     #[serde(skip)]
-    allow_methods_header: once_cell::sync::OnceCell<String>,
+    allow_methods_header: std::sync::OnceLock<String>,
     #[serde(skip)]
-    allow_headers_header: once_cell::sync::OnceCell<String>,
+    allow_headers_header: std::sync::OnceLock<String>,
     #[serde(skip)]
-    expose_headers_header: once_cell::sync::OnceCell<String>,
+    expose_headers_header: std::sync::OnceLock<String>,
     #[serde(skip)]
-    max_age_header: once_cell::sync::OnceCell<String>,
+    max_age_header: std::sync::OnceLock<String>,
 }
 
 impl CORSConfig {
@@ -3041,11 +2899,11 @@ pub struct IPListRef {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SSLCertConfig {
     pub id: i64,
-    #[serde(rename = "isOn", alias = "isOn", default)]
+    #[serde(rename = "isOn", default)]
     pub is_on: bool,
-    #[serde(rename = "certDataJSON", alias = "certData")]
+    #[serde(rename = "certData")]
     pub cert_data_json: Option<Value>,
-    #[serde(rename = "keyDataJSON", alias = "keyData")]
+    #[serde(rename = "keyData")]
     pub key_data_json: Option<Value>,
     #[serde(
         rename = "dnsNames",
@@ -3065,7 +2923,7 @@ pub struct SchedulingConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ReverseProxyConfig {
-    #[serde(rename = "isOn", alias = "IsOn", default)]
+    #[serde(rename = "isOn", default)]
     pub is_on: bool,
     #[serde(
         rename = "primaryOrigins",
@@ -3093,6 +2951,12 @@ pub struct ReverseProxyConfig {
     pub request_host_type: i8,
     #[serde(rename = "requestHostExcludingPort", default)]
     pub request_host_excluding_port: bool,
+    #[serde(
+        rename = "proxyProtocol",
+        default,
+        deserialize_with = "deserialize_proxy_protocol_config"
+    )]
+    pub proxy_protocol: ProxyProtocolConfig,
 }
 
 fn default_true() -> bool {
@@ -3305,22 +3169,19 @@ pub enum OriginTlsSecurityVerifyMode {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OriginConfig {
-    #[serde(alias = "id")]
     pub id: i64,
-    #[serde(alias = "name", default, deserialize_with = "deserialize_null_default")]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub name: String,
-    #[serde(rename = "addr", alias = "address", alias = "Addr")]
+    #[serde(rename = "addr")]
     pub addr: Option<FlexibleAddr>,
-    #[serde(rename = "isOn", alias = "IsOn", default = "default_true")]
+    #[serde(rename = "isOn", default = "default_true")]
     pub is_on: bool,
-    #[serde(alias = "weight", default)]
+    #[serde(default)]
     pub weight: u32,
-    #[serde(rename = "healthCheck", alias = "HealthCheck")]
+    #[serde(rename = "healthCheck")]
     pub health_check: Option<HealthCheckConfig>,
-    // Legacy API uses "requestHost" for per-origin custom Host header override.
     #[serde(
         rename = "requestHost",
-        alias = "host",
         default,
         deserialize_with = "deserialize_null_default"
     )]
@@ -3331,13 +3192,7 @@ pub struct OriginConfig {
     pub follow_port: bool,
     #[serde(rename = "http2Enabled", default)]
     pub http2_enabled: bool,
-    #[serde(
-        rename = "http3Enabled",
-        alias = "supportsHTTP3",
-        alias = "enableHTTP3",
-        alias = "enableHttp3",
-        default
-    )]
+    #[serde(rename = "http3Enabled", default)]
     pub http3_enabled: bool,
     #[serde(rename = "connTimeout", default)]
     pub conn_timeout: Option<Value>,
@@ -3373,9 +3228,8 @@ impl OriginConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HealthCheckConfig {
-    #[serde(rename = "isOn", alias = "IsOn", default)]
+    #[serde(rename = "isOn", default)]
     pub is_on: bool,
-    #[serde(alias = "protocol")]
     pub protocol: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub url: String,
@@ -3456,6 +3310,144 @@ pub fn parse_life_to_seconds(v: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_config_uses_exact_cluster_and_firewall_policy_fields() {
+        let server: ServerConfig = serde_json::from_value(serde_json::json!({
+            "id": 576,
+            "clusterId": "12",
+            "httpFirewallPolicyId": "34",
+            "httpFirewallPolicy": {
+                "id": 34,
+                "isOn": true,
+                "name": "embedded policy"
+            }
+        }))
+        .expect("server config should parse cluster and firewall policy fields");
+
+        assert_eq!(server.cluster_id, 12);
+        assert_eq!(server.http_firewall_policy_id, 34);
+        assert_eq!(
+            server.http_firewall_policy.as_ref().map(|policy| policy.id),
+            Some(34)
+        );
+
+        let legacy_server: ServerConfig = serde_json::from_value(serde_json::json!({
+            "nodeClusterId": "15",
+            "firewallPolicyId": "55"
+        }))
+        .expect("unknown legacy server keys should be ignored");
+        assert_eq!(legacy_server.cluster_id, 0);
+        assert_eq!(legacy_server.http_firewall_policy_id, 0);
+
+        let unknown: ServerConfig =
+            serde_json::from_value(serde_json::json!({})).expect("missing cluster should default");
+        assert_eq!(unknown.cluster_id, 0);
+    }
+
+    #[test]
+    fn http_cache_ref_parses_skip_set_cookie_as_exact_bool() {
+        let enabled: HTTPCacheRef = serde_json::from_value(serde_json::json!({
+            "skipSetCookie": true
+        }))
+        .expect("skipSetCookie should parse as a JSON bool");
+        assert!(enabled.skip_set_cookie);
+
+        let disabled: HTTPCacheRef = serde_json::from_value(serde_json::json!({
+            "skipSetCookie": false
+        }))
+        .expect("explicit false should allow caching Set-Cookie responses");
+        assert!(!disabled.skip_set_cookie);
+
+        let missing: HTTPCacheRef =
+            serde_json::from_value(serde_json::json!({})).expect("missing field should default");
+        assert!(missing.skip_set_cookie);
+
+        let string_false = serde_json::from_value::<HTTPCacheRef>(serde_json::json!({
+            "skipSetCookie": "false"
+        }));
+        assert!(string_false.is_err());
+    }
+
+    #[test]
+    fn http_cache_config_uses_exact_control_plane_field_names() {
+        let payload: NodeConfigPayload = serde_json::from_value(serde_json::json!({
+            "httpCachePolicies": [{
+                "id": 1,
+                "name": "policy",
+                "cacheRefs": []
+            }]
+        }))
+        .expect("exact httpCachePolicies should parse");
+        assert_eq!(payload.http_cache_policies.len(), 1);
+
+        let legacy_payload: NodeConfigPayload = serde_json::from_value(serde_json::json!({
+            "HTTPCachePolicies": [{
+                "id": 1,
+                "name": "legacy",
+                "cacheRefs": []
+            }]
+        }))
+        .expect("unknown legacy cache policy key should be ignored");
+        assert!(legacy_payload.http_cache_policies.is_empty());
+
+        let cache_ref: HTTPCacheRef = serde_json::from_value(serde_json::json!({
+            "onlyURLPatterns": [{"type": "prefix", "pattern": "/assets/"}],
+            "exceptURLPatterns": [{"type": "prefix", "pattern": "/private/"}]
+        }))
+        .expect("exact URL pattern fields should parse");
+        assert_eq!(cache_ref.only_url_patterns.len(), 1);
+        assert_eq!(cache_ref.except_url_patterns.len(), 1);
+
+        let legacy_cache_ref: HTTPCacheRef = serde_json::from_value(serde_json::json!({
+            "onlyUrlPatterns": [{"type": "prefix", "pattern": "/assets/"}],
+            "exceptUrlPatterns": [{"type": "prefix", "pattern": "/private/"}]
+        }))
+        .expect("unknown legacy URL pattern keys should be ignored");
+        assert!(legacy_cache_ref.only_url_patterns.is_empty());
+        assert!(legacy_cache_ref.except_url_patterns.is_empty());
+    }
+
+    #[test]
+    fn node_config_payload_parses_snapshot_from_env_when_set() {
+        let Ok(path) = std::env::var("CLOUD_NODE_CONFIG_SNAPSHOT") else {
+            return;
+        };
+        let raw = std::fs::read(path).expect("snapshot should be readable");
+        let payload: NodeConfigPayload =
+            serde_json::from_slice(&raw).expect("snapshot should parse as NodeConfigPayload");
+        assert!(!payload.servers.is_empty());
+    }
+
+    #[test]
+    fn reverse_proxy_config_parses_proxy_protocol() {
+        let v2: ReverseProxyConfig = serde_json::from_value(serde_json::json!({
+            "isOn": true,
+            "proxyProtocol": {
+                "isOn": true,
+                "version": 2
+            }
+        }))
+        .expect("reverse proxy config should parse object proxyProtocol");
+
+        assert!(v2.proxy_protocol.enabled());
+        assert_eq!(v2.proxy_protocol.normalized_version(), 2);
+
+        let disabled: ReverseProxyConfig = serde_json::from_value(serde_json::json!({}))
+            .expect("missing proxyProtocol should default to false");
+        assert!(!disabled.proxy_protocol.enabled());
+
+        let null_disabled: ReverseProxyConfig = serde_json::from_value(serde_json::json!({
+            "proxyProtocol": null
+        }))
+        .expect("null proxyProtocol should default to false");
+        assert!(!null_disabled.proxy_protocol.enabled());
+
+        let legacy_string = serde_json::from_value::<ReverseProxyConfig>(serde_json::json!({
+            "proxyProtocol": "true"
+        }));
+        assert!(legacy_string.is_err());
+    }
 
     #[test]
     fn url_pattern_preserves_match_semantics() {
@@ -3707,19 +3699,27 @@ mod tests {
     }
 
     #[test]
-    fn waf_page_options_accept_control_plane_aliases() {
+    fn waf_page_options_use_exact_control_plane_fields() {
         let options: WAFPageOptions = serde_json::from_value(serde_json::json!({
-            "statusCode": 403,
-            "contentHTML": "<h1>Forbidden</h1>"
+            "status": 403,
+            "body": "<h1>Forbidden</h1>"
         }))
-        .expect("WAF page options should parse control-plane aliases");
+        .expect("WAF page options should parse exact control-plane fields");
 
         assert_eq!(options.status, 403);
         assert_eq!(options.body, "<h1>Forbidden</h1>");
+
+        let legacy: WAFPageOptions = serde_json::from_value(serde_json::json!({
+            "statusCode": 403,
+            "contentHTML": "<h1>Forbidden</h1>"
+        }))
+        .expect("unknown legacy WAF page option keys should be ignored");
+        assert_eq!(legacy.status, 0);
+        assert_eq!(legacy.body, "");
     }
 
     #[test]
-    fn node_config_payload_parses_global_http_compat_fields() {
+    fn node_config_payload_parses_global_http_exact_fields() {
         let payload: NodeConfigPayload = serde_json::from_value(serde_json::json!({
             "id": 1001,
             "globalServerConfig": {
@@ -3732,7 +3732,7 @@ mod tests {
                     "enableServerAddrVariable": true,
                     "requestOriginsWithEncodings": true,
                     "xffMaxAddresses": 3,
-                    "allowLANIP": true,
+                    "allowLocalOrigins": true,
                     "matchDomainStrictly": true,
                     "nodeIPShowPage": true,
                     "nodeIPPageHTML": "<h1>${host}</h1>",
@@ -3822,7 +3822,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_addr_accepts_header_aliases() {
+    fn remote_addr_accepts_request_header_name() {
         let cfg: HTTPRemoteAddrConfig = serde_json::from_value(serde_json::json!({
             "isOn": true,
             "type": "requestHeader",
@@ -3889,7 +3889,7 @@ mod tests {
     }
 
     #[test]
-    fn web_config_parses_auth_referer_and_user_agent_aliases() {
+    fn web_config_parses_auth_referer_and_user_agent_exact_fields() {
         let web: WebConfig = serde_json::from_value(serde_json::json!({
             "isOn": true,
             "auth": {
@@ -3925,7 +3925,7 @@ mod tests {
                 }]
             }
         }))
-        .expect("web config should parse compatibility aliases");
+        .expect("web config should parse exact control-plane fields");
 
         let auth = web.auth.expect("auth should parse");
         assert!(auth.is_on);
@@ -3939,15 +3939,23 @@ mod tests {
             "basicAuth"
         );
 
-        let referers = web.referer_config.expect("referers alias should parse");
+        let referers = web.referer_config.expect("referers should parse");
         assert!(referers.is_on);
         assert!(referers.allow_same_domain);
         assert_eq!(referers.allow_domains, vec!["*.example.com"]);
         assert_eq!(referers.deny_domains, vec!["bad.example.com"]);
 
-        let ua = web.user_agent_config.expect("userAgent alias should parse");
+        let ua = web.user_agent_config.expect("userAgent should parse");
         assert!(ua.is_on);
         assert_eq!(ua.filters[0].keywords, vec!["curl*", "BadBot"]);
         assert_eq!(ua.filters[0].action, "deny");
+
+        let legacy: WebConfig = serde_json::from_value(serde_json::json!({
+            "refererConfig": {"isOn": true},
+            "userAgentConfig": {"isOn": true}
+        }))
+        .expect("unknown legacy web keys should be ignored");
+        assert!(legacy.referer_config.is_none());
+        assert!(legacy.user_agent_config.is_none());
     }
 }

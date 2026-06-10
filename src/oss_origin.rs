@@ -59,48 +59,31 @@ pub struct OssRequestTransform {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct LooseOssConfig {
-    #[serde(default, alias = "type", alias = "ossType", alias = "providerCode")]
+    #[serde(default)]
     r#type: String,
-    #[serde(default, alias = "bucketName")]
+    #[serde(default)]
     bucket: String,
-    #[serde(default, alias = "endpointURL", alias = "url")]
+    #[serde(default)]
     endpoint: String,
-    #[serde(default, alias = "domain", alias = "host")]
+    #[serde(default)]
     host: String,
-    #[serde(default, alias = "accessKeyId", alias = "accessID", alias = "secretId")]
+    #[serde(default)]
     access_key_id: String,
-    #[serde(
-        default,
-        alias = "accessKeySecret",
-        alias = "secretKey",
-        alias = "accessSecret"
-    )]
+    #[serde(default)]
     access_key_secret: String,
     #[serde(default)]
     region: String,
-    #[serde(default, alias = "dir", alias = "directory", alias = "root")]
+    #[serde(default)]
     prefix: String,
-    #[serde(default, alias = "forcePathStyle")]
+    #[serde(default)]
     path_style: Option<bool>,
-    #[serde(
-        default,
-        alias = "bucketMode",
-        alias = "bucketType",
-        alias = "bucketAccessType",
-        alias = "bucketParam"
-    )]
+    #[serde(default)]
     bucket_source: String,
-    #[serde(
-        default,
-        alias = "bucketArgName",
-        alias = "bucketParamName",
-        alias = "bucketArg",
-        alias = "bucketQuery"
-    )]
+    #[serde(default)]
     bucket_query_name: String,
-    #[serde(default, alias = "accessDomain", alias = "visitDomain")]
+    #[serde(default)]
     access_domain: String,
-    #[serde(default, alias = "acl", alias = "accessControl")]
+    #[serde(default)]
     access_control: String,
     #[serde(default)]
     options: Option<Value>,

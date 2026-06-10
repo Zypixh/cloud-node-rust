@@ -97,6 +97,8 @@ pub struct NodeConfig {
     pub cache_policies: Arc<Vec<Arc<HTTPCachePolicy>>>,
     /// Global or node-specific firewall policies
     pub firewall_policies: Arc<Vec<HTTPFirewallPolicy>>,
+    /// Firewall policies that can be attributed to a site cluster via server references.
+    pub firewall_policies_by_cluster: HashMap<i64, Arc<Vec<HTTPFirewallPolicy>>>,
     pub compiled_plans: Arc<crate::compiled::CompiledPlanSet>,
     /// Global WAF action defaults
     pub waf_actions: Arc<Vec<crate::config_models::WAFActionConfig>>,
@@ -245,6 +247,7 @@ impl Default for NodeConfig {
             global_http_config: Arc::default(),
             cache_policies: Arc::new(Vec::new()),
             firewall_policies: Arc::new(Vec::new()),
+            firewall_policies_by_cluster: HashMap::new(),
             compiled_plans: Arc::new(crate::compiled::CompiledPlanSet::default()),
             waf_actions: Arc::new(Vec::new()),
             global_waf_block_options: None,
@@ -752,6 +755,80 @@ impl ConfigStore {
         Arc::clone(&lock.firewall_policies)
     }
 
+    pub fn get_firewall_policies_for_cluster_sync(
+        &self,
+        cluster_id: i64,
+    ) -> Arc<Vec<HTTPFirewallPolicy>> {
+        if cluster_id <= 0 {
+            return Arc::new(Vec::new());
+        }
+        let lock = self.inner.read();
+        lock.firewall_policies_by_cluster
+            .get(&cluster_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    pub(crate) fn get_tls_exhaustion_config_for_cluster_sync(
+        &self,
+        cluster_id: i64,
+    ) -> Option<crate::special_defense::SpecialDefenseConfig> {
+        if cluster_id <= 0 {
+            return None;
+        }
+        let policies = self.get_firewall_policies_for_cluster_sync(cluster_id);
+        policies.iter().find_map(|policy| {
+            if !policy.is_on {
+                return None;
+            }
+            let config = policy.tls_exhaustion_attack.as_ref()?;
+            if !config.is_on || config.max_handshake_fails == 0 {
+                return None;
+            }
+            Some(crate::special_defense::SpecialDefenseConfig {
+                threshold: config.max_handshake_fails,
+                period_secs: i64::from(config.period).max(1),
+                block_secs: i64::from(config.block_seconds).max(1),
+                use_local_firewall: policy.use_local_firewall,
+                policy_name: policy.name.clone(),
+            })
+        })
+    }
+
+    pub(crate) fn get_empty_connection_flood_config_for_cluster_sync(
+        &self,
+        cluster_id: i64,
+    ) -> Option<crate::special_defense::SpecialDefenseConfig> {
+        if cluster_id <= 0 {
+            return None;
+        }
+        let policies = self.get_firewall_policies_for_cluster_sync(cluster_id);
+        policies.iter().find_map(|policy| {
+            if !policy.is_on {
+                return None;
+            }
+            let config = policy.empty_connection_flood.as_ref()?;
+            if !config.is_on || config.max_empty_connections == 0 {
+                return None;
+            }
+            Some(crate::special_defense::SpecialDefenseConfig {
+                threshold: config.max_empty_connections,
+                period_secs: i64::from(config.period).max(1),
+                block_secs: i64::from(config.block_seconds).max(1),
+                use_local_firewall: policy.use_local_firewall,
+                policy_name: policy.name.clone(),
+            })
+        })
+    }
+
+    pub fn get_http_cc_policy_for_cluster_sync(&self, cluster_id: i64) -> Option<HTTPCCPolicy> {
+        if cluster_id <= 0 {
+            return None;
+        }
+        let lock = self.inner.read();
+        lock.http_cc_policies.get(&cluster_id).cloned()
+    }
+
     pub fn get_waf_actions_sync(&self) -> Arc<Vec<crate::config_models::WAFActionConfig>> {
         let lock = self.inner.read();
         Arc::clone(&lock.waf_actions)
@@ -903,6 +980,11 @@ impl ConfigStore {
     pub fn get_node_is_on_sync(&self) -> bool {
         let lock = self.inner.read();
         lock.is_on
+    }
+
+    pub fn get_node_cluster_id_sync(&self) -> i64 {
+        let lock = self.inner.read();
+        lock.node_cluster_id
     }
 
     pub fn get_node_enable_ip_lists_sync(&self) -> bool {
@@ -1305,6 +1387,7 @@ impl ConfigStore {
                 .unwrap_or(false),
         );
         Self::refresh_passthrough_indexes(&mut lock);
+        Self::refresh_cluster_policy_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1353,6 +1436,7 @@ impl ConfigStore {
             &lock.all_servers,
         ));
         Self::refresh_passthrough_indexes(&mut lock);
+        Self::refresh_cluster_policy_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1409,6 +1493,7 @@ impl ConfigStore {
             &lock.all_servers,
         ));
         Self::refresh_passthrough_indexes(&mut lock);
+        Self::refresh_cluster_policy_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1443,6 +1528,7 @@ impl ConfigStore {
             &lock.all_servers,
         ));
         Self::refresh_passthrough_indexes(&mut lock);
+        Self::refresh_cluster_policy_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1471,6 +1557,7 @@ impl ConfigStore {
             &lock.all_servers,
         ));
         Self::refresh_passthrough_indexes(&mut lock);
+        Self::refresh_cluster_policy_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1499,6 +1586,7 @@ impl ConfigStore {
             &lock.all_servers,
         ));
         Self::refresh_passthrough_indexes(&mut lock);
+        Self::refresh_cluster_policy_indexes(&mut lock);
         drop(lock);
         self.notify_runtime_reload();
     }
@@ -1512,6 +1600,153 @@ impl ConfigStore {
                 Some((user_plan_id, compile_plan_derived(plan)))
             })
             .collect();
+    }
+
+    fn refresh_cluster_policy_indexes(lock: &mut NodeConfig) {
+        lock.firewall_policies_by_cluster = Self::build_firewall_policies_by_cluster(lock);
+    }
+
+    fn build_firewall_policies_by_cluster(
+        lock: &NodeConfig,
+    ) -> HashMap<i64, Arc<Vec<HTTPFirewallPolicy>>> {
+        let mut policy_by_id = HashMap::<i64, HTTPFirewallPolicy>::new();
+        for policy in lock.firewall_policies.iter() {
+            if policy.id > 0 {
+                policy_by_id.insert(policy.id, policy.clone());
+            }
+        }
+        for server in &lock.all_servers {
+            if let Some(policy) = server.http_firewall_policy.as_ref().filter(|p| p.id > 0) {
+                policy_by_id
+                    .entry(policy.id)
+                    .or_insert_with(|| policy.clone());
+            }
+            if let Some(policy) = server
+                .web
+                .as_ref()
+                .and_then(|web| web.firewall_policy.as_ref())
+                .filter(|p| p.id > 0)
+            {
+                policy_by_id
+                    .entry(policy.id)
+                    .or_insert_with(|| policy.clone());
+            }
+        }
+
+        let mut by_cluster = HashMap::<i64, Vec<HTTPFirewallPolicy>>::new();
+        let mut seen_by_cluster = HashMap::<i64, HashSet<i64>>::new();
+        let mut synthetic_id = -1_i64;
+
+        for server in &lock.all_servers {
+            let cluster_id = server.cluster_id;
+            if cluster_id <= 0 {
+                continue;
+            }
+
+            Self::add_cluster_policy_by_id(
+                &mut by_cluster,
+                &mut seen_by_cluster,
+                cluster_id,
+                server.http_firewall_policy_id,
+                &policy_by_id,
+            );
+
+            if let Some(policy) = &server.http_firewall_policy {
+                let policy = policy_by_id
+                    .get(&policy.id)
+                    .cloned()
+                    .unwrap_or_else(|| policy.clone());
+                Self::add_cluster_policy(
+                    &mut by_cluster,
+                    &mut seen_by_cluster,
+                    cluster_id,
+                    policy,
+                    &mut synthetic_id,
+                );
+            }
+
+            if let Some(web) = &server.web {
+                let firewall_ref_id = web
+                    .firewall_ref
+                    .as_ref()
+                    .map(|firewall_ref| firewall_ref.id)
+                    .unwrap_or(0);
+                Self::add_cluster_policy_by_id(
+                    &mut by_cluster,
+                    &mut seen_by_cluster,
+                    cluster_id,
+                    firewall_ref_id,
+                    &policy_by_id,
+                );
+
+                if let Some(policy) = &web.firewall_policy {
+                    let policy = policy_by_id
+                        .get(&policy.id)
+                        .cloned()
+                        .unwrap_or_else(|| policy.clone());
+                    Self::add_cluster_policy(
+                        &mut by_cluster,
+                        &mut seen_by_cluster,
+                        cluster_id,
+                        policy,
+                        &mut synthetic_id,
+                    );
+                }
+            }
+        }
+
+        by_cluster
+            .into_iter()
+            .map(|(cluster_id, policies)| (cluster_id, Arc::new(policies)))
+            .collect()
+    }
+
+    fn add_cluster_policy_by_id(
+        by_cluster: &mut HashMap<i64, Vec<HTTPFirewallPolicy>>,
+        seen_by_cluster: &mut HashMap<i64, HashSet<i64>>,
+        cluster_id: i64,
+        policy_id: i64,
+        policy_by_id: &HashMap<i64, HTTPFirewallPolicy>,
+    ) {
+        if policy_id <= 0 {
+            return;
+        }
+        if let Some(policy) = policy_by_id.get(&policy_id) {
+            let mut ignored_synthetic_id = -1;
+            Self::add_cluster_policy(
+                by_cluster,
+                seen_by_cluster,
+                cluster_id,
+                policy.clone(),
+                &mut ignored_synthetic_id,
+            );
+        }
+    }
+
+    fn add_cluster_policy(
+        by_cluster: &mut HashMap<i64, Vec<HTTPFirewallPolicy>>,
+        seen_by_cluster: &mut HashMap<i64, HashSet<i64>>,
+        cluster_id: i64,
+        policy: HTTPFirewallPolicy,
+        synthetic_id: &mut i64,
+    ) {
+        if cluster_id <= 0 {
+            return;
+        }
+        let policy_key = if policy.id > 0 {
+            policy.id
+        } else {
+            let id = *synthetic_id;
+            *synthetic_id -= 1;
+            id
+        };
+        if seen_by_cluster
+            .entry(cluster_id)
+            .or_default()
+            .insert(policy_key)
+        {
+            by_cluster.entry(cluster_id).or_default().push(policy);
+        }
     }
 
     fn refresh_passthrough_indexes(lock: &mut NodeConfig) {
@@ -1707,8 +1942,250 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_models::{HTTPSConfig, NetworkAddressConfig, ServerNameConfig, UDPConfig};
+    use crate::config_models::{
+        EmptyConnectionFloodConfig, HTTPSConfig, NetworkAddressConfig, ServerNameConfig,
+        TLSExhaustionAttackConfig, UDPConfig,
+    };
     use serde_json::json;
+
+    fn test_firewall_policy(id: i64) -> HTTPFirewallPolicy {
+        HTTPFirewallPolicy {
+            id,
+            is_on: true,
+            name: format!("policy-{id}"),
+            inbound: None,
+            outbound: None,
+            empty_connection_flood: Some(EmptyConnectionFloodConfig {
+                is_on: true,
+                max_empty_connections: 1,
+                period: 60,
+                block_seconds: 60,
+            }),
+            tls_exhaustion_attack: Some(TLSExhaustionAttackConfig {
+                is_on: true,
+                max_handshake_fails: 1,
+                period: 60,
+                block_seconds: 60,
+            }),
+            cc_config: None,
+            block_options: None,
+            page_options: None,
+            captcha_options: None,
+            js_cookie_options: None,
+            max_request_body_size: 0,
+            deny_country_html: String::new(),
+            deny_province_html: String::new(),
+            use_local_firewall: false,
+            syn_flood: None,
+            mode: String::new(),
+            candidate_rules: None,
+            candidate_traffic_pct: 0,
+            candidate_version: 0,
+        }
+    }
+
+    async fn update_store_for_cluster_policy_test(
+        store: &ConfigStore,
+        node_cluster_id: i64,
+        all_servers: Vec<Arc<ServerConfig>>,
+        firewall_policies: Vec<HTTPFirewallPolicy>,
+        http_cc_policies: HashMap<i64, HTTPCCPolicy>,
+    ) {
+        store
+            .update_config(
+                1,
+                1,
+                0,
+                node_cluster_id,
+                all_servers,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                1,
+                true,
+                true,
+                HashMap::new(),
+                false,
+                false,
+                "random".to_string(),
+                HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+                firewall_policies,
+                Vec::new(),
+                HashMap::new(),
+                http_cc_policies,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn firewall_policies_are_indexed_by_referenced_server_cluster() {
+        let store = ConfigStore::new();
+        let server = Arc::new(ServerConfig {
+            id: Some(100),
+            cluster_id: 12,
+            http_firewall_policy_id: 1,
+            ..Default::default()
+        });
+
+        update_store_for_cluster_policy_test(
+            &store,
+            12,
+            vec![server],
+            vec![test_firewall_policy(1), test_firewall_policy(2)],
+            HashMap::new(),
+        )
+        .await;
+
+        let cluster_12 = store.get_firewall_policies_for_cluster_sync(12);
+        assert_eq!(
+            cluster_12
+                .iter()
+                .map(|policy| policy.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(store.get_firewall_policies_for_cluster_sync(15).is_empty());
+        assert!(
+            store
+                .get_tls_exhaustion_config_for_cluster_sync(12)
+                .is_some()
+        );
+        assert!(
+            store
+                .get_tls_exhaustion_config_for_cluster_sync(15)
+                .is_none()
+        );
+        assert!(
+            store
+                .get_empty_connection_flood_config_for_cluster_sync(12)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn same_firewall_policy_can_belong_to_multiple_clusters() {
+        let store = ConfigStore::new();
+        let server_12 = Arc::new(ServerConfig {
+            id: Some(120),
+            cluster_id: 12,
+            http_firewall_policy_id: 1,
+            ..Default::default()
+        });
+        let server_15 = Arc::new(ServerConfig {
+            id: Some(150),
+            cluster_id: 15,
+            http_firewall_policy_id: 1,
+            ..Default::default()
+        });
+
+        update_store_for_cluster_policy_test(
+            &store,
+            12,
+            vec![server_12, server_15],
+            vec![test_firewall_policy(1)],
+            HashMap::new(),
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .get_firewall_policies_for_cluster_sync(12)
+                .iter()
+                .map(|policy| policy.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            store
+                .get_firewall_policies_for_cluster_sync(15)
+                .iter()
+                .map(|policy| policy.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[tokio::test]
+    async fn main_cluster_defense_config_ignores_other_cluster_references() {
+        let store = ConfigStore::new();
+        let slave_cluster_server = Arc::new(ServerConfig {
+            id: Some(150),
+            cluster_id: 15,
+            http_firewall_policy_id: 1,
+            ..Default::default()
+        });
+
+        update_store_for_cluster_policy_test(
+            &store,
+            12,
+            vec![slave_cluster_server],
+            vec![test_firewall_policy(1)],
+            {
+                let mut policies = HashMap::new();
+                policies.insert(
+                    15,
+                    HTTPCCPolicy {
+                        is_on: true,
+                        max_qps: 1,
+                        max_qps_per_ip: 1,
+                        ..Default::default()
+                    },
+                );
+                policies
+            },
+        )
+        .await;
+
+        assert_eq!(store.get_node_cluster_id_sync(), 12);
+        assert!(
+            store
+                .get_tls_exhaustion_config_for_cluster_sync(store.get_node_cluster_id_sync())
+                .is_none()
+        );
+        assert!(
+            store
+                .get_empty_connection_flood_config_for_cluster_sync(
+                    store.get_node_cluster_id_sync()
+                )
+                .is_none()
+        );
+        assert!(
+            store
+                .get_tls_exhaustion_config_for_cluster_sync(15)
+                .is_some()
+        );
+        assert!(
+            store
+                .get_http_cc_policy_for_cluster_sync(store.get_node_cluster_id_sync())
+                .is_none()
+        );
+        assert!(store.get_http_cc_policy_for_cluster_sync(15).is_some());
+    }
 
     #[tokio::test]
     async fn update_config_applies_global_http_compat_fields_to_hot_path() {

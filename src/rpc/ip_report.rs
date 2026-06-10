@@ -2,9 +2,9 @@ use crate::api_config::ApiConfig;
 use crate::pb;
 use crate::rpc::client::RpcClient;
 use ipnet::IpNet;
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::LazyLock as Lazy;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -222,7 +222,10 @@ fn normalize_item(mut item: IpReportMessage) -> Option<IpReportMessage> {
         return Some(item);
     }
 
-    warn!("Skipping IP report with unsupported target {:?}", item.value);
+    warn!(
+        "Skipping IP report with unsupported target {:?}",
+        item.value
+    );
     None
 }
 
@@ -275,7 +278,10 @@ fn ip_net_bounds(net: IpNet) -> (String, String) {
             };
             let start = u32::from(net.addr()) & mask;
             let end = start | !mask;
-            (Ipv4Addr::from(start).to_string(), Ipv4Addr::from(end).to_string())
+            (
+                Ipv4Addr::from(start).to_string(),
+                Ipv4Addr::from(end).to_string(),
+            )
         }
         IpNet::V6(net) => {
             let prefix = net.prefix_len();
@@ -287,7 +293,10 @@ fn ip_net_bounds(net: IpNet) -> (String, String) {
             };
             let start = u128::from_be_bytes(net.addr().octets()) & mask;
             let end = start | !mask;
-            (Ipv6Addr::from(start).to_string(), Ipv6Addr::from(end).to_string())
+            (
+                Ipv6Addr::from(start).to_string(),
+                Ipv6Addr::from(end).to_string(),
+            )
         }
     }
 }

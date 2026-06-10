@@ -470,11 +470,11 @@ impl CompiledAction {
             "block" => Some(Self {
                 action: ActionResponse::Block {
                     status: options
-                        .and_then(|v| v.get("status").or_else(|| v.get("statusCode")))
+                        .and_then(|v| v.get("status"))
                         .and_then(Value::as_i64)
                         .unwrap_or(403) as i32,
                     body: options
-                        .and_then(|v| v.get("body").or_else(|| v.get("contentHTML")))
+                        .and_then(|v| v.get("body"))
                         .and_then(Value::as_str)
                         .unwrap_or("Blocked by WAF")
                         .to_string(),
@@ -483,7 +483,7 @@ impl CompiledAction {
                     .and_then(|v| v.get("timeout"))
                     .and_then(Value::as_i64),
                 fail_global: options
-                    .and_then(|v| v.get("failGlobal").or_else(|| v.get("failBlockScopeAll")))
+                    .and_then(|v| v.get("failBlockScopeAll"))
                     .and_then(Value::as_bool),
                 scope: options
                     .and_then(|v| v.get("scope"))
@@ -573,11 +573,11 @@ impl CompiledAction {
             "page" => Some(Self::with_code(
                 ActionResponse::Page {
                     status: options
-                        .and_then(|v| v.get("status").or_else(|| v.get("statusCode")))
+                        .and_then(|v| v.get("status"))
                         .and_then(Value::as_i64)
                         .unwrap_or(403) as i32,
                     body: options
-                        .and_then(|v| v.get("body").or_else(|| v.get("contentHTML")))
+                        .and_then(|v| v.get("body"))
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string(),
@@ -601,7 +601,7 @@ impl CompiledAction {
             )),
             "captcha" | "js_cookie" | "get_302" | "post_307" => {
                 let life_seconds = options
-                    .and_then(|v| v.get("lifeSeconds").or_else(|| v.get("life")))
+                    .and_then(|v| v.get("life"))
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
                 let action = match code.as_str() {
@@ -620,7 +620,7 @@ impl CompiledAction {
                         .and_then(|v| v.get("failBlockTimeout"))
                         .and_then(Value::as_i64),
                     fail_global: options
-                        .and_then(|v| v.get("failGlobal").or_else(|| v.get("failBlockScopeAll")))
+                        .and_then(|v| v.get("failBlockScopeAll"))
                         .and_then(Value::as_bool),
                     captcha_options: options.and_then(|value| {
                         let mut parsed: WAFCaptchaOptions =
@@ -1644,13 +1644,9 @@ fn evaluate_compiled_policy_inner(
                     }
 
                     if let Some(next_sid) = matched.next_set_id {
-                        let target = inbound
-                            .groups
-                            .iter()
-                            .enumerate()
-                            .find_map(|(idx, g)| {
-                                g.sets.iter().any(|set| set.id == next_sid).then_some(idx)
-                            });
+                        let target = inbound.groups.iter().enumerate().find_map(|(idx, g)| {
+                            g.sets.iter().any(|set| set.id == next_sid).then_some(idx)
+                        });
                         if let Some(idx) = target {
                             current_group_idx = idx;
                             next_start_set_id = Some(next_sid);
@@ -2703,8 +2699,14 @@ mod tests {
         assert_eq!(expected.ip_list_id, actual.ip_list_id);
         assert_eq!(expected.event_level, actual.event_level);
         assert_eq!(
-            expected.captcha_options.as_ref().map(|opts| opts.method.as_str()),
-            actual.captcha_options.as_ref().map(|opts| opts.method.as_str())
+            expected
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str()),
+            actual
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str())
         );
     }
 
@@ -2828,8 +2830,8 @@ mod tests {
         assert_action_compile_parity(&json!({
             "code":"page",
             "options":{
-                "statusCode":403,
-                "contentHTML":"default page"
+                "status":403,
+                "body":"default page"
             }
         }));
         assert_action_compile_parity(&json!({
@@ -2886,11 +2888,11 @@ mod tests {
             assert_action_compile_parity(&json!({
                 "code":code,
                 "options":{
-                    "lifeSeconds":120,
-                    "method":"click",
+                    "life":120,
+                    "captchaType":"click",
                     "maxFails":3,
                     "failBlockTimeout":600,
-                    "failGlobal":true
+                    "failBlockScopeAll":true
                 }
             }));
         }
@@ -2900,7 +2902,7 @@ mod tests {
     fn action_captcha_options_do_not_blank_policy_defaults() {
         let action = json!({
             "code":"captcha",
-            "options":{"method":"click"}
+            "options":{"captchaType":"click"}
         });
         let mut policy = test_policy(inbound_with_groups(vec![]));
         policy.captcha_options = Some(WAFCaptchaOptions {
@@ -2917,11 +2919,17 @@ mod tests {
         let mut legacy = legacy_action(&action);
         crate::firewall::fill_action_options(&policy, &mut legacy);
         assert_eq!(
-            legacy.captcha_options.as_ref().map(|opts| opts.method.as_str()),
+            legacy
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str()),
             Some("click")
         );
         assert_eq!(
-            legacy.captcha_options.as_ref().map(|opts| opts.life_seconds),
+            legacy
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.life_seconds),
             Some(120)
         );
         assert_eq!(
@@ -3023,7 +3031,7 @@ mod tests {
     fn explicit_action_captcha_method_does_not_inherit_policy_geetest() {
         let action = json!({
             "code":"captcha",
-            "options":{"method":"click"}
+            "options":{"captchaType":"click"}
         });
         let mut policy = test_policy(inbound_with_groups(vec![]));
         policy.captcha_options = Some(WAFCaptchaOptions {
@@ -3035,7 +3043,10 @@ mod tests {
         let mut legacy = legacy_action(&action);
         crate::firewall::fill_action_options(&policy, &mut legacy);
         assert_eq!(
-            legacy.captcha_options.as_ref().map(|opts| opts.method.as_str()),
+            legacy
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str()),
             Some("click")
         );
         assert_eq!(
@@ -3066,7 +3077,7 @@ mod tests {
     fn default_action_captcha_method_inherits_policy_geetest() {
         let action = json!({
             "code":"captcha",
-            "options":{"method":"default"}
+            "options":{"captchaType":"default"}
         });
         let mut policy = test_policy(inbound_with_groups(vec![]));
         policy.captcha_options = Some(WAFCaptchaOptions {
@@ -3078,7 +3089,10 @@ mod tests {
         let mut legacy = legacy_action(&action);
         crate::firewall::fill_action_options(&policy, &mut legacy);
         assert_eq!(
-            legacy.captcha_options.as_ref().map(|opts| opts.method.as_str()),
+            legacy
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str()),
             Some("geetest")
         );
         assert_eq!(
@@ -3202,7 +3216,10 @@ mod tests {
         let mut legacy = legacy_action(&action);
         crate::firewall::fill_action_options(&policy, &mut legacy);
         assert_eq!(
-            legacy.captcha_options.as_ref().map(|opts| opts.method.as_str()),
+            legacy
+                .captcha_options
+                .as_ref()
+                .map(|opts| opts.method.as_str()),
             Some("geetest")
         );
 
@@ -3235,7 +3252,10 @@ mod tests {
         let mut legacy = legacy_action(&action);
         crate::firewall::fill_action_options(&policy, &mut legacy);
         assert_eq!(
-            legacy.js_cookie_options.as_ref().map(|opts| opts.life_seconds),
+            legacy
+                .js_cookie_options
+                .as_ref()
+                .map(|opts| opts.life_seconds),
             Some(180)
         );
         assert_eq!(
@@ -3250,7 +3270,10 @@ mod tests {
             Some(900)
         );
         assert_eq!(
-            legacy.js_cookie_options.as_ref().map(|opts| opts.fail_global),
+            legacy
+                .js_cookie_options
+                .as_ref()
+                .map(|opts| opts.fail_global),
             Some(true)
         );
 
@@ -3455,70 +3478,64 @@ mod tests {
             CompiledVariable::ResponseHeaderParam(name) => assert_eq!(name, "Content-Type"),
             other => panic!("unexpected variable: {other:?}"),
         }
-        assert!(matches!(
+        std::assert_matches!(
             CompiledVariable::compile("remoteUser"),
             CompiledVariable::RemoteUser
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             CompiledVariable::compile("requestFileExtension"),
             CompiledVariable::RequestFileExtension
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             CompiledVariable::compile("refererOrigin"),
             CompiledVariable::RefererOrigin
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             CompiledVariable::compile("commonAIBot"),
             CompiledVariable::CommonAiBot
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             CompiledVariable::compile("commonBot"),
             CompiledVariable::CommonBot
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             CompiledVariable::compile("geoCountryName"),
             CompiledVariable::GeoCountryName
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             CompiledVariable::compile("geoProvinceName"),
             CompiledVariable::GeoProvinceName
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             CompiledVariable::compile("geoCityName"),
             CompiledVariable::GeoCityName
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             CompiledVariable::compile("ispName"),
             CompiledVariable::IspName
-        ));
-        assert!(matches!(
+        );
+        std::assert_matches!(
             CompiledVariable::compile("refererBlock"),
             CompiledVariable::Empty
-        ));
-        assert!(
-            matches!(CompiledVariable::compile("cname"), CompiledVariable::Raw(value) if value == "cname")
         );
-        assert!(
-            matches!(CompiledVariable::compile("isCNAME"), CompiledVariable::Raw(value) if value == "isCNAME")
+        std::assert_matches!(
+            CompiledVariable::compile("cname"),
+            CompiledVariable::Raw(value) if value == "cname"
         );
-        assert!(matches!(
-            CompiledVariable::compile("cc"),
-            CompiledVariable::Cc
-        ));
-        assert!(matches!(
-            CompiledVariable::compile("cc.limit"),
-            CompiledVariable::Cc
-        ));
-        assert!(matches!(
-            CompiledVariable::compile("cc2"),
-            CompiledVariable::Cc2
-        ));
-        assert!(matches!(
+        std::assert_matches!(
+            CompiledVariable::compile("isCNAME"),
+            CompiledVariable::Raw(value) if value == "isCNAME"
+        );
+        std::assert_matches!(CompiledVariable::compile("cc"), CompiledVariable::Cc);
+        std::assert_matches!(CompiledVariable::compile("cc.limit"), CompiledVariable::Cc);
+        std::assert_matches!(CompiledVariable::compile("cc2"), CompiledVariable::Cc2);
+        std::assert_matches!(
             CompiledVariable::compile("cc2.limit"),
             CompiledVariable::Cc2
-        ));
-        assert!(
-            matches!(CompiledVariable::compile("unknownVariable"), CompiledVariable::Raw(value) if value == "unknownVariable")
+        );
+        std::assert_matches!(
+            CompiledVariable::compile("unknownVariable"),
+            CompiledVariable::Raw(value) if value == "unknownVariable"
         );
     }
 
@@ -3541,12 +3558,13 @@ mod tests {
         assert_eq!(cc_plan.param, "${cc2.rate}");
         assert_eq!(cc_plan.period, 120);
         assert_eq!(cc_plan.key_templates.len(), 2);
-        assert!(matches!(
+        std::assert_matches!(
             cc_plan.key_templates[0],
             CompiledValueExpr::Variable(CompiledVariable::RemoteAddr)
-        ));
-        assert!(
-            matches!(cc_plan.key_templates[1], CompiledValueExpr::Variable(CompiledVariable::HeaderParam(ref name)) if name == "User-Agent")
+        );
+        std::assert_matches!(
+            cc_plan.key_templates[1],
+            CompiledValueExpr::Variable(CompiledVariable::HeaderParam(ref name)) if name == "User-Agent"
         );
 
         let default_rule = HTTPFirewallRule {
@@ -3562,10 +3580,10 @@ mod tests {
         let cc_plan = compiled.cc_plan.expect("cc should compile a counter plan");
         assert_eq!(cc_plan.period, 60);
         assert_eq!(cc_plan.key_templates.len(), 1);
-        assert!(matches!(
+        std::assert_matches!(
             cc_plan.key_templates[0],
             CompiledValueExpr::Variable(CompiledVariable::RemoteAddr)
-        ));
+        );
     }
 
     #[test]

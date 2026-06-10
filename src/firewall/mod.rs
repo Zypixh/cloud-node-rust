@@ -223,10 +223,7 @@ fn evaluate_policy_inner(
                         // Flow Control: GO_SET — precise jump to the named set
                         if let Some(next_sid) = matched.next_set_id {
                             let target = inbound.groups.iter().enumerate().find_map(|(idx, g)| {
-                                g.sets
-                                    .iter()
-                                    .any(|s| s.id == next_sid)
-                                    .then_some(idx)
+                                g.sets.iter().any(|s| s.id == next_sid).then_some(idx)
                             });
                             if let Some(idx) = target {
                                 current_group_idx = idx;
@@ -415,7 +412,10 @@ pub(crate) fn fill_action_options(policy: &HTTPFirewallPolicy, matched: &mut Mat
     if matched.page_options.is_none() {
         matched.page_options = policy.page_options.clone();
     }
-    match (&mut matched.captcha_options, policy.captcha_options.as_ref()) {
+    match (
+        &mut matched.captcha_options,
+        policy.captcha_options.as_ref(),
+    ) {
         (Some(action), Some(policy)) => merge_captcha_options(action, policy),
         (None, Some(policy)) => {
             let mut inherited = policy.clone();
@@ -424,7 +424,10 @@ pub(crate) fn fill_action_options(policy: &HTTPFirewallPolicy, matched: &mut Mat
         }
         _ => {}
     }
-    match (&mut matched.js_cookie_options, policy.js_cookie_options.as_ref()) {
+    match (
+        &mut matched.js_cookie_options,
+        policy.js_cookie_options.as_ref(),
+    ) {
         (Some(action), Some(policy)) => merge_js_cookie_options(action, policy),
         (None, Some(policy)) => matched.js_cookie_options = Some(policy.clone()),
         _ => {}
@@ -562,13 +565,11 @@ fn js_cookie_options_from_value(options: Option<&Value>) -> Option<WAFJSCookieOp
     serde_json::from_value(options?.clone()).ok()
 }
 
-pub(crate) fn merge_captcha_options(
-    action: &mut WAFCaptchaOptions,
-    policy: &WAFCaptchaOptions,
-) {
+pub(crate) fn merge_captcha_options(action: &mut WAFCaptchaOptions, policy: &WAFCaptchaOptions) {
     let inherit_method = captcha_method_is_default(&action.method);
-    let should_copy_geetest_config =
-        inherit_method || action.use_geetest || action.method.trim().eq_ignore_ascii_case("geetest");
+    let should_copy_geetest_config = inherit_method
+        || action.use_geetest
+        || action.method.trim().eq_ignore_ascii_case("geetest");
     if action.life_seconds <= 0 {
         action.life_seconds = policy.life_seconds;
     }
@@ -609,10 +610,7 @@ pub(crate) fn merge_captcha_options(
     }
 }
 
-fn merge_js_cookie_options(
-    action: &mut WAFJSCookieOptions,
-    policy: &WAFJSCookieOptions,
-) {
+fn merge_js_cookie_options(action: &mut WAFJSCookieOptions, policy: &WAFJSCookieOptions) {
     if action.life_seconds <= 0 {
         action.life_seconds = policy.life_seconds;
     }
@@ -695,11 +693,11 @@ fn parse_action(action: &Value) -> Option<MatchedAction> {
             return Some(MatchedAction {
                 action: ActionResponse::Block {
                     status: options
-                        .and_then(|v| v.get("status").or_else(|| v.get("statusCode")))
+                        .and_then(|v| v.get("status"))
                         .and_then(Value::as_i64)
                         .unwrap_or(403) as i32,
                     body: options
-                        .and_then(|v| v.get("body").or_else(|| v.get("contentHTML")))
+                        .and_then(|v| v.get("body"))
                         .and_then(Value::as_str)
                         .unwrap_or("Blocked by WAF")
                         .to_string(),
@@ -714,7 +712,7 @@ fn parse_action(action: &Value) -> Option<MatchedAction> {
                 max_fails: None,
                 fail_block_timeout: None,
                 fail_global: options
-                    .and_then(|v| v.get("failGlobal").or_else(|| v.get("failBlockScopeAll")))
+                    .and_then(|v| v.get("failBlockScopeAll"))
                     .and_then(Value::as_bool),
                 scope,
                 block_c_class: false,
@@ -986,11 +984,11 @@ fn parse_action(action: &Value) -> Option<MatchedAction> {
         }
         "page" => {
             let status = options
-                .and_then(|v| v.get("status").or_else(|| v.get("statusCode")))
+                .and_then(|v| v.get("status"))
                 .and_then(Value::as_i64)
                 .unwrap_or(403) as i32;
             let body = options
-                .and_then(|v| v.get("body").or_else(|| v.get("contentHTML")))
+                .and_then(|v| v.get("body"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
@@ -1071,7 +1069,7 @@ fn parse_action(action: &Value) -> Option<MatchedAction> {
         }
         "captcha" | "js_cookie" | "get_302" | "post_307" => {
             let life = options
-                .and_then(|v| v.get("lifeSeconds").or_else(|| v.get("life")))
+                .and_then(|v| v.get("life"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
             let max_fails = options
@@ -1082,7 +1080,7 @@ fn parse_action(action: &Value) -> Option<MatchedAction> {
                 .and_then(|v| v.get("failBlockTimeout"))
                 .and_then(Value::as_i64);
             let fail_global = options
-                .and_then(|v| v.get("failGlobal").or_else(|| v.get("failBlockScopeAll")))
+                .and_then(|v| v.get("failBlockScopeAll"))
                 .and_then(Value::as_bool);
             let action = match code.as_str() {
                 "captcha" => ActionResponse::Captcha { life_seconds: life },

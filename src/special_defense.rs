@@ -13,48 +13,36 @@ pub(crate) struct SpecialDefenseConfig {
     pub policy_name: String,
 }
 
-pub(crate) fn global_tls_exhaustion_config(
-    config_store: &ConfigStore,
-) -> Option<SpecialDefenseConfig> {
-    global_malformed_http_config(config_store)
+pub(crate) fn cluster_block_scope_id(cluster_id: i64) -> i64 {
+    if cluster_id <= 0 { 0 } else { -cluster_id }
 }
 
-pub(crate) fn global_malformed_http_config(
+pub(crate) fn global_tls_exhaustion_config(
     config_store: &ConfigStore,
+    cluster_id: i64,
 ) -> Option<SpecialDefenseConfig> {
-    let policies = config_store.get_firewall_policies_sync();
-    policies.iter().find_map(|policy| {
-        if !policy.is_on {
-            return None;
-        }
-        let config = policy.tls_exhaustion_attack.as_ref()?;
-        if !config.is_on || config.max_handshake_fails == 0 {
-            return None;
-        }
-        Some(SpecialDefenseConfig {
-            threshold: config.max_handshake_fails,
-            period_secs: i64::from(config.period).max(1),
-            block_secs: i64::from(config.block_seconds).max(1),
-            use_local_firewall: policy.use_local_firewall,
-            policy_name: policy.name.clone(),
-        })
-    })
+    config_store.get_tls_exhaustion_config_for_cluster_sync(cluster_id)
 }
 
 pub(crate) fn record_special_defense_hit(
     waf_state: &Arc<WafStateManager>,
     node_id: i64,
+    cluster_id: i64,
     defense: &str,
     ip: IpAddr,
     config: SpecialDefenseConfig,
 ) {
-    let count = waf_state.increase_counter(format!("{}:{}", defense, ip), config.period_secs);
+    let scope_server_id = cluster_block_scope_id(cluster_id);
+    let count = waf_state.increase_counter(
+        format!("{}:cluster:{}:{}", defense, cluster_id, ip),
+        config.period_secs,
+    );
     if count > u64::from(config.threshold) {
         waf_state.block_ip(
             ip,
-            0,
+            scope_server_id,
             config.block_secs,
-            Some("global"),
+            Some("cluster"),
             false,
             config.use_local_firewall,
         );
@@ -64,7 +52,7 @@ pub(crate) fn record_special_defense_hit(
             ip_from: String::new(),
             ip_to: String::new(),
             expired_at: crate::utils::time::now_timestamp() + config.block_secs.max(1),
-            reason: format!("{} special defense block", defense),
+            reason: format!("{} special defense block cluster={}", defense, cluster_id),
             r#type: String::new(),
             list_kind: IpReportKind::Black,
             event_level: "error".to_string(),
@@ -77,11 +65,17 @@ pub(crate) fn record_special_defense_hit(
             source_http_firewall_rule_set_id: 0,
             source_url: String::new(),
             source_user_agent: String::new(),
-            source_category: "special_defense".to_string(),
+            source_category: format!("special_defense:cluster:{}", cluster_id),
         });
         warn!(
-            "{} blocked {} for {}s after {} hits in {}s by policy {}",
-            defense, ip, config.block_secs, count, config.period_secs, config.policy_name
+            "{} blocked {} in cluster {} for {}s after {} hits in {}s by policy {}",
+            defense,
+            ip,
+            cluster_id,
+            config.block_secs,
+            count,
+            config.period_secs,
+            config.policy_name
         );
     }
 }
@@ -92,8 +86,16 @@ pub(crate) fn record_tls_handshake_failure(
     node_id: i64,
     ip: IpAddr,
 ) {
-    let Some(config) = global_tls_exhaustion_config(config_store) else {
+    let cluster_id = config_store.get_node_cluster_id_sync();
+    let Some(config) = global_tls_exhaustion_config(config_store, cluster_id) else {
         return;
     };
-    record_special_defense_hit(waf_state, node_id, "TLS_EXHAUSTION_ATTACK", ip, config);
+    record_special_defense_hit(
+        waf_state,
+        node_id,
+        cluster_id,
+        "TLS_EXHAUSTION_ATTACK",
+        ip,
+        config,
+    );
 }
