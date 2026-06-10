@@ -1,10 +1,6 @@
 use crate::pages::Lang;
 use rand::Rng;
 
-// ── Public API ───────────────────────────────────────────────────
-
-/// Generate a puzzle-slider page using a deterministic target derived
-/// from the WAF token's `slider_target()` anchor.
 pub fn issue_html(
     lang: Lang,
     waf_token: &str,
@@ -17,7 +13,6 @@ pub fn issue_html(
     issue_html_with_target(lang, waf_token, verify_route, return_path, tx, ty)
 }
 
-/// Low-level variant — accept explicit target coordinates.
 pub fn issue_html_with_target(
     lang: Lang,
     waf_token: &str,
@@ -29,17 +24,13 @@ pub fn issue_html_with_target(
     let sfx = random_js_id();
     let mut rng = rand::thread_rng();
 
-    let off_x = (target_x + rng.r#gen_range(80.0f64..180.0)).clamp(0.0f64, 280.0);
-    let off_y = (target_y + rng.r#gen_range(-40.0f64..40.0)).clamp(0.0f64, 160.0);
+    let off_x = (target_x + rng.gen_range(80.0f64..180.0)).clamp(0.0, 280.0);
+    let off_y = (target_y + rng.gen_range(-40.0f64..40.0)).clamp(0.0, 160.0);
     let polygon = generate_puzzle_polygon(&mut rng);
 
-    let (prompt, _ok, _fail) = match lang {
-        Lang::ZhCn => ("拖动拼图块到缺口位置", "验证成功", "位置未对准，请重试"),
-        Lang::En => (
-            "Drag the puzzle piece to the gap",
-            "Verified",
-            "Misaligned, try again",
-        ),
+    let prompt = match lang {
+        Lang::ZhCn => "拖动拼图块到缺口位置",
+        Lang::En => "Drag the puzzle piece to the gap",
     };
     let rp_js = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
     let route_js = serde_json::to_string(verify_route).unwrap_or_else(|_| "\"/\"".to_string());
@@ -48,8 +39,8 @@ pub fn issue_html_with_target(
         r#"<div class="pzl" id="pzl_{sfx}">
 <div class="pzl-bg" style="position:relative;width:320px;height:200px;margin:0 auto 14px;border-radius:12px;overflow:hidden">
 <canvas id="bg_{sfx}" width="320" height="200" style="display:block;width:320px;height:200px"></canvas>
-<div id="hl_{sfx}" class="pzl-hole" style="position:absolute;left:{tx:.0}px;top:{ty:.0}px;width:40px;height:40px;clip-path:{poly};background:rgba(0,0,0,.12);box-shadow:inset 0 0 0 2px rgba(0,0,0,.35),0 0 12px rgba(0,0,0,.25);pointer-events:none;border-radius:2px"></div>
-<div id="pc_{sfx}" class="pzl-piece" style="position:absolute;left:{ox:.0}px;top:{oy:.0}px;width:40px;height:40px;clip-path:{poly};background:linear-gradient(135deg,rgba(99,102,241,.65),rgba(56,189,248,.65));cursor:grab;border-radius:2px;z-index:2"></div>
+<div id="hl_{sfx}" class="pzl-hole" style="position:absolute;left:{tx:.0}px;top:{ty:.0}px;width:40px;height:40px;clip-path:{poly};background:rgba(0,0,0,.22);box-shadow:inset 0 0 0 2px rgba(0,0,0,.35),0 0 12px rgba(0,0,0,.25);pointer-events:none;border-radius:2px"></div>
+<div id="pc_{sfx}" class="pzl-piece" style="position:absolute;left:{ox:.0}px;top:{oy:.0}px;width:40px;height:40px;clip-path:{poly};background:linear-gradient(135deg,rgba(99,102,241,.85),rgba(56,189,248,.85));cursor:grab;border-radius:2px;z-index:2;box-shadow:0 4px 12px rgba(0,0,0,.3)"></div>
 </div>
 <p class="status" id="st_{sfx}" data-i18n="slider_puzzle_prompt">{prompt}</p>
 <script>
@@ -58,27 +49,44 @@ var sf="{sfx}";var d=!1,sx=0,sy=0,px={ox:.0},py={oy:.0},tr=[],t0=Date.now();
 var pc=document.getElementById('pc_'+sf),bg=document.getElementById('bg_'+sf),st=document.getElementById('st_'+sf);
 function dr(){{
 var c=bg.getContext('2d'),w=320,h=200;
-var g=c.createLinearGradient(0,0,w,h);
-g.addColorStop(0,'#6366f1');g.addColorStop(.5,'#38bdf8');g.addColorStop(1,'#22c55e');
-c.fillStyle=g;c.fillRect(0,0,w,h);
-c.strokeStyle='rgba(255,255,255,.06)';c.lineWidth=.5;
-for(var x=0;x<w;x+=7){{c.beginPath();c.moveTo(x,0);c.lineTo(x,h);c.stroke()}}
-for(var y=0;y<h;y+=7){{c.beginPath();c.moveTo(0,y);c.lineTo(w,y);c.stroke()}}
-for(var i=0;i<24;i++){{c.fillStyle='rgba(255,255,255,'+(.04+Math.random()*.06)+')';c.beginPath();c.arc(Math.random()*w,Math.random()*h,3+Math.random()*14,0,Math.PI*2);c.fill()}}
-c.strokeStyle='rgba(255,255,255,.04)';c.lineWidth=.5;
-for(var i=0;i<w+h;i+=14){{c.beginPath();c.moveTo(i,0);c.lineTo(i-h,h);c.stroke()}}
-for(var i=0;i<45;i++){{c.fillStyle='rgba(255,255,255,'+(.05+Math.random()*.08)+')';c.fillRect(Math.random()*w,Math.random()*h,1+Math.random()*3,1+Math.random()*3)}}
-for(var i=0;i<5;i++){{c.strokeStyle='rgba(255,255,255,'+(.06+Math.random()*.06)+')';c.lineWidth=1.5+Math.random()*2;c.beginPath();c.arc(Math.random()*w,Math.random()*h,10+Math.random()*30,0,Math.PI*2);c.stroke()}}
+var g=c.createLinearGradient(0,0,0,h*.65);g.addColorStop(0,'#5b9bd5');g.addColorStop(1,'#c8e6f5');
+c.fillStyle=g;c.fillRect(0,0,w,h*.65);
+c.fillStyle='#5a8a3c';c.fillRect(0,h*.65,w,h*.35);
+c.fillStyle='#4a7a2c';
+c.beginPath();c.moveTo(0,h*.75);c.bezierCurveTo(60,h*.5,120,h*.55,180,h*.7);c.bezierCurveTo(230,h*.6,280,h*.65,w,h*.7);c.lineTo(w,h);c.lineTo(0,h);c.fill();
+c.fillStyle='#FFD700';c.beginPath();c.arc(w*.82,h*.18,16,0,Math.PI*2);c.fill();
+function cloud(cx,cy){{c.fillStyle='rgba(255,255,255,.82)';[[-12,0,14],[0,-4,18],[12,0,14]].forEach(function(p){{c.beginPath();c.arc(cx+p[0],cy+p[1],p[2]/2,0,Math.PI*2);c.fill()}})}}
+cloud(70,38);cloud(190,28);cloud(260,45);
+for(var i=0;i<30;i++){{c.fillStyle='rgba(255,255,255,'+(.03+Math.random()*.05)+')';c.fillRect(Math.random()*w,Math.random()*h,1+Math.random()*3,1+Math.random()*3)}}
 }}
 function ds(e){{d=!0;var p=e.touches?e.touches[0]:e;sx=p.clientX;sy=p.clientY;px=parseFloat(pc.style.left)||px;py=parseFloat(pc.style.top)||py;pc.style.cursor='grabbing'}}
-function dm(e){{if(!d)return;e.preventDefault();var p=e.touches?e.touches[0]:e,nx=Math.max(0,Math.min(280,px+p.clientX-sx)),ny=Math.max(0,Math.min(160,py+p.clientY-sy));pc.style.left=nx+'px';pc.style.top=ny+'px'}}
+function dm(e){{if(!d)return;e.preventDefault();var p=e.touches?e.touches[0]:e,nx=Math.max(0,Math.min(280,px+p.clientX-sx)),ny=Math.max(0,Math.min(160,py+p.clientY-sy));pc.style.left=nx+'px';pc.style.top=ny+'px';
+var dist=Math.sqrt(Math.pow(nx-{tx:.0},2)+Math.pow(ny-{ty:.0},2));
+var hl=document.getElementById('hl_'+sf);
+if(dist<30){{hl.style.boxShadow='inset 0 0 0 2px rgba(0,0,0,.35),0 0 18px 8px rgba(99,102,241,.75)';if(dist<15&&st)st.textContent=window.cloudNodeText?window.cloudNodeText('slider_near'):'Almost there!'}}
+else{{hl.style.boxShadow='inset 0 0 0 2px rgba(0,0,0,.35),0 0 12px rgba(0,0,0,.25)'}}
+}}
 (function cp(){{if(d){{var l=parseFloat(pc.style.left)||px,t=parseFloat(pc.style.top)||py;tr.push(Math.round(l)+','+Math.round(t))}}setTimeout(cp,20+40*Math.random())}})();
 function de(e){{
 if(!d)return;d=!1;pc.style.cursor='grab';
 var el=Date.now()-t0,l=parseFloat(pc.style.left)||px,t=parseFloat(pc.style.top)||py;
-	var q='__waf_token={wtok}&__waf_challenge_type=slider&x='+l.toFixed(1)+'&y='+t.toFixed(1)+'&__waf_elapsed='+el+'&__waf_trace='+encodeURIComponent(tr.join(';'))+'&__waf_return='+encodeURIComponent({rp_js});
-	location.href={route_js}+'?'+q;
-	}}
+var q='__waf_token={wtok}&__waf_challenge_type=slider&x='+l.toFixed(1)+'&y='+t.toFixed(1)+'&__waf_elapsed='+el+'&__waf_trace='+encodeURIComponent(tr.join(';'))+'&__waf_return='+encodeURIComponent({rp_js});
+if(st)st.textContent=window.cloudNodeText?window.cloudNodeText('slider_verifying'):'Verifying...';
+pc.style.pointerEvents='none';
+fetch({route_js}+'?'+q,{{redirect:'manual'}}).then(function(r){{
+  if(r.type==='opaqueredirect'||r.ok){{
+    pc.style.transition='left .18s ease,top .18s ease';
+    pc.style.left='{tx:.0}px';pc.style.top='{ty:.0}px';
+    setTimeout(function(){{location.href={route_js}+'?'+q}},200);
+  }}else{{
+    if(st)st.textContent=window.cloudNodeText?window.cloudNodeText('slider_retry'):'Please try again';
+    pc.style.left={ox:.0}+'px';pc.style.top={oy:.0}+'px';
+    px={ox:.0};py={oy:.0};pc.style.pointerEvents='';pc.style.transition='';
+    tr=[];t0=Date.now();
+    document.getElementById('hl_'+sf).style.boxShadow='inset 0 0 0 2px rgba(0,0,0,.35),0 0 12px rgba(0,0,0,.25)';
+  }}
+}}).catch(function(){{location.href={route_js}+'?'+q}});
+}}
 dr();
 pc.addEventListener('mousedown',ds);document.addEventListener('mousemove',dm);document.addEventListener('mouseup',de);
 pc.addEventListener('touchstart',ds,{{passive:!0}});document.addEventListener('touchmove',dm,{{passive:!1}});document.addEventListener('touchend',de);
@@ -98,12 +106,11 @@ pc.addEventListener('touchstart',ds,{{passive:!0}});document.addEventListener('t
     )
 }
 
-// ── Verification (wired into maybe_serve_waf_verify) ─────────────
+// ── Verification ─────────────────────────────────────────────────
 
 const TOLERANCE: f64 = 6.0;
 const MIN_ELAPSED_MS: u64 = 1200;
 
-/// Re-derive the target from the verifier's `slider_target()` anchor.
 pub fn verify_anchor(
     target_anchor: u32,
     user_x: f64,
@@ -119,7 +126,6 @@ pub fn verify_anchor(
         && verify_trace(trace)
 }
 
-/// Verify with explicit target from encrypted token (standalone / test).
 pub fn verify_explicit(
     token: &str,
     user_x: f64,
@@ -155,24 +161,54 @@ pub fn verify_explicit(
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn random_js_id() -> String {
-    use rand::Rng;
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
     (0..8)
-        .map(|_| CHARS[rng.r#gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
         .collect()
 }
 
 fn generate_puzzle_polygon(rng: &mut impl Rng) -> String {
-    let mut pts = Vec::with_capacity(24);
-    for i in 0..24 {
-        let a = 2.0 * std::f64::consts::PI * i as f64 / 24.0;
-        let base_r = 42.0;
-        let var = rng.r#gen_range(-10.0f64..12.0f64);
-        let r = (base_r + var).clamp(8.0f64, 50.0f64);
-        let x = (50.0f64 + r * a.cos()).clamp(2.0f64, 98.0f64);
-        let y = (50.0f64 + r * a.sin()).clamp(2.0f64, 98.0f64);
-        pts.push(format!("{:.1}% {:.1}%", x, y));
+    let tab_side: u8 = rng.gen_range(0..4u8);
+    let notch_side: u8 = (tab_side + 2) % 4;
+    let tab_pos: f64 = rng.gen_range(35.0f64..65.0);
+    let tab_r: f64 = rng.gen_range(20.0f64..28.0);
+
+    // (x%, y%) for a point on `edge` at `along`% with `perp`% outward offset
+    let edge_pt = |edge: u8, along: f64, perp: f64| -> (f64, f64) {
+        match edge {
+            0 => (along, -perp),
+            1 => (100.0 + perp, along),
+            2 => (100.0 - along, 100.0 + perp),
+            _ => (-perp, 100.0 - along),
+        }
+    };
+
+    let mut pts: Vec<String> = Vec::new();
+    let bump_start = tab_pos - tab_r;
+    let bump_end = tab_pos + tab_r;
+
+    for edge in 0u8..4 {
+        if edge == 0 {
+            let (x, y) = edge_pt(0, 0.0, 0.0);
+            pts.push(format!("{:.1}% {:.1}%", x.clamp(0.0, 100.0), y.clamp(0.0, 100.0)));
+        }
+
+        if edge == tab_side || edge == notch_side {
+            let sign: f64 = if edge == tab_side { 1.0 } else { -1.0 };
+            let (x, y) = edge_pt(edge, bump_start, 0.0);
+            pts.push(format!("{:.1}% {:.1}%", x.clamp(0.0, 100.0), y.clamp(0.0, 100.0)));
+            for i in 0..=4usize {
+                let a = std::f64::consts::PI * i as f64 / 4.0;
+                let (x, y) = edge_pt(edge, tab_pos + tab_r * a.cos(), sign * tab_r * a.sin());
+                pts.push(format!("{:.1}% {:.1}%", x.clamp(0.0, 100.0), y.clamp(0.0, 100.0)));
+            }
+            let (x, y) = edge_pt(edge, bump_end, 0.0);
+            pts.push(format!("{:.1}% {:.1}%", x.clamp(0.0, 100.0), y.clamp(0.0, 100.0)));
+        }
+
+        let (x, y) = edge_pt(edge, 100.0, 0.0);
+        pts.push(format!("{:.1}% {:.1}%", x.clamp(0.0, 100.0), y.clamp(0.0, 100.0)));
     }
     format!("polygon({})", pts.join(","))
 }
@@ -181,13 +217,13 @@ fn verify_trace(trace: &str) -> bool {
     let points: Vec<(f64, f64)> = trace
         .split(';')
         .filter_map(|s| {
-            let mut parts = s.split(',');
-            let x = parts.next()?.parse().ok()?;
-            let y = parts.next()?.parse().ok()?;
+            let mut p = s.split(',');
+            let x = p.next()?.parse().ok()?;
+            let y = p.next()?.parse().ok()?;
             Some((x, y))
         })
         .collect();
-    if points.len() < 5 {
+    if points.len() < 8 {
         return false;
     }
     let (x1, y1) = points[0];
@@ -198,12 +234,39 @@ fn verify_trace(trace: &str) -> bool {
     if line_len < 10.0 {
         return false;
     }
+    // Velocity variation: ≥2 adjacent segment pairs where speed differs >15%
+    let dists: Vec<f64> = points
+        .windows(2)
+        .map(|w| {
+            let ddx = w[1].0 - w[0].0;
+            let ddy = w[1].1 - w[0].1;
+            (ddx * ddx + ddy * ddy).sqrt()
+        })
+        .collect();
+    let vel_var = dists
+        .windows(2)
+        .filter(|w| {
+            let lg = w[0].max(w[1]);
+            let sm = w[0].min(w[1]);
+            lg > 0.1 && (lg - sm) / lg > 0.15
+        })
+        .count();
+    if vel_var < 2 {
+        return false;
+    }
+    // At least one micro-correction (small x reversal <8px — human tremor)
+    let has_micro = points.windows(3).any(|w| {
+        let dx1 = w[1].0 - w[0].0;
+        let dx2 = w[2].0 - w[1].0;
+        dx1 * dx2 < 0.0 && dx2.abs() < 8.0
+    });
+    if !has_micro {
+        return false;
+    }
+    // Non-straight line
     let max_dev = points
         .iter()
-        .map(|(x, y)| {
-            let cross = ((x - x1) * dy - (y - y1) * dx).abs();
-            cross / line_len
-        })
+        .map(|(x, y)| ((x - x1) * dy - (y - y1) * dx).abs() / line_len)
         .fold(0.0f64, f64::max);
     max_dev > 2.0
 }

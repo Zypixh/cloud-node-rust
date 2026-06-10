@@ -122,7 +122,7 @@ var sf="{sfx}",wt={waf_token_json},ct={challenge_token_json},cn={cookie_name_jso
 var route={route_json},ret={return_json},min={display_ms},max={MAX_DELAY_MS},secure="{secure}";
 var enc=new TextEncoder(),t0=Date.now(),p0=(performance&&performance.now)?performance.now():0;
 function el(id){{return document.getElementById(id+"_"+sf)}}
-function step(n,cls){{var x=el("jsck_s"+n);if(x)x.className="jsck-step "+cls}}
+function step(n,cls){{var x=el("jsck_s"+n);if(!x)return;x.className="jsck-step "+cls;if(cls==="ok"){{var b=x.querySelector("b");if(b&&b.textContent.indexOf("✓")<0)b.textContent="✓ "+b.textContent}}}}
 function status(s){{var x=el("jsck_status");if(x)x.textContent=s}}
 function setBar(p){{var x=el("jsck_bar");if(x)x.style.width=Math.max(3,Math.min(100,p)).toFixed(1)+"%"}}
 function sleep(ms){{return new Promise(function(r){{setTimeout(r,ms)}})}}
@@ -165,11 +165,17 @@ async function run(){{
   elapsed=Math.round(((performance&&performance.now)?performance.now()-p0:Date.now()-t0));
   if(elapsed>max)throw new Error("timeout");
   clearInterval(timer);setBar(100);
-  step(4,"on");status(msg("js_submitting"));
+  step(4,"on");status((window.cloudNodeText?window.cloudNodeText('js_submitting'):"Submitting")+" ("+Math.round(elapsed/100)/10+"s)");
   var dg=await digest("waf-js-digest|"+wt+"|"+ct+"|"+cv+"|"+signals+"|"+elapsed+"|"+seed);
   var qs=new URLSearchParams({{__waf_token:wt,__waf_challenge_token:ct,__waf_challenge_type:"jscookie",__waf_js_elapsed:String(elapsed),__waf_js_fp:signals,__waf_js_digest:dg,__waf_return:ret}});
   step(4,"ok");location.replace(route+"?"+qs.toString());
- }}catch(e){{status(msg("js_failed"))}}
+ }}catch(e){{
+  status(msg("js_failed"));
+  var rl=document.createElement("a");rl.href="javascript:location.reload()";
+  rl.style="display:block;margin-top:10px;font-size:13px;color:var(--blue);text-decoration:none;cursor:pointer";
+  rl.textContent=window.cloudNodeText?window.cloudNodeText('slide_retry'):"Retry";
+  var sb=el("jsck_status");if(sb&&sb.parentNode)sb.parentNode.insertBefore(rl,sb.nextSibling);
+ }}
 }}
 run();
 }})();
