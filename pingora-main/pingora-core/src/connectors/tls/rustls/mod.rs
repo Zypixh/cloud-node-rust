@@ -61,6 +61,9 @@ impl TlsConnector {
     where
         Self: Sized,
     {
+        // rustls 0.23+ requires an explicit CryptoProvider.
+        pingora_rustls::install_default_crypto_provider();
+
         // NOTE: Rustls only supports TLS 1.2 & 1.3
 
         // TODO: currently using Rustls defaults
@@ -219,39 +222,43 @@ where
     }
 
     let mut domain = peer.sni().to_string();
+    let verification_mode = if peer.sni().is_empty() {
+        Some(VerificationMode::SkipAll)
+    } else if !peer.verify_cert() {
+        Some(VerificationMode::SkipAll)
+    } else if !peer.verify_hostname() {
+        Some(VerificationMode::SkipHostname)
+    } else {
+        // if sni had underscores in leftmost label replace and add
+        if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
+            domain = sni_s;
+        }
+        None
+        // to use the custom verifier for the full verify:
+        // Some(VerificationMode::Full)
+    };
 
-    if let Some(updated_config) = updated_config_opt.as_mut() {
-        let verification_mode = if peer.sni().is_empty() {
+    // Builds the custom_verifier when verification_mode is set.
+    if let Some(mode) = verification_mode {
+        if updated_config_opt.is_none() {
+            updated_config_opt = Some(RusTlsClientConfig::clone(config));
+        }
+        let updated_config = updated_config_opt.as_mut().expect("config was just set");
+        if peer.sni().is_empty() {
             updated_config.enable_sni = false;
             /* NOTE: technically we can still verify who signs the cert but turn it off to be
             consistent with nginx's behavior */
-            Some(VerificationMode::SkipAll) // disable verification if sni does not exist
-        } else if !peer.verify_cert() {
-            Some(VerificationMode::SkipAll)
-        } else if !peer.verify_hostname() {
-            Some(VerificationMode::SkipHostname)
-        } else {
-            // if sni had underscores in leftmost label replace and add
-            if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
-                domain = sni_s;
-            }
-            None
-            // to use the custom verifier for the full verify:
-            // Some(VerificationMode::Full)
-        };
-
-        // Builds the custom_verifier when verification_mode is set.
-        if let Some(mode) = verification_mode {
-            let delegate = WebPkiServerVerifier::builder(Arc::clone(effective_ca_store))
-                .build()
-                .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
-
-            let custom_verifier = Arc::new(CustomServerCertVerifier::new(delegate, mode));
-
-            updated_config
-                .dangerous()
-                .set_certificate_verifier(custom_verifier);
         }
+
+        let delegate = WebPkiServerVerifier::builder(Arc::clone(effective_ca_store))
+            .build()
+            .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
+
+        let custom_verifier = Arc::new(CustomServerCertVerifier::new(delegate, mode));
+
+        updated_config
+            .dangerous()
+            .set_certificate_verifier(custom_verifier);
     }
 
     // TODO: curve setup from peer

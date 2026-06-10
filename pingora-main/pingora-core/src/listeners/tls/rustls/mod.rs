@@ -48,6 +48,9 @@ impl TlsSettings {
     ///
     /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
+        // rustls 0.23+ requires an explicit CryptoProvider.
+        pingora_rustls::install_default_crypto_provider();
+
         let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
         else {
             panic!(
@@ -120,6 +123,16 @@ impl TlsSettings {
 }
 
 impl Acceptor {
+    pub fn from_server_config(config: ServerConfig) -> Self {
+        // rustls 0.23+ requires an explicit CryptoProvider.
+        pingora_rustls::install_default_crypto_provider();
+
+        Acceptor {
+            acceptor: RusTlsAcceptor::from(Arc::new(config)),
+            callbacks: None,
+        }
+    }
+
     pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<TlsStream<S>> {
         debug!("new tls session");
         // TODO: be able to offload this handshake in a thread pool
