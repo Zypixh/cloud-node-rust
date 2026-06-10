@@ -1,5 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use serde_json;
+use std::hint::black_box;
 
 fn bench_serialization_large_list(c: &mut Criterion) {
     // Mock 10,000 blocked IPs with (IP, ServerID, ExpireTimestamp)

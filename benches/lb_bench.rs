@@ -1,5 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use pingora_load_balancing::{Backends, LoadBalancer, discovery::Static, selection::RoundRobin};
+use std::hint::black_box;
 use std::sync::Arc;
 
 fn bench_lb_selection(c: &mut Criterion) {

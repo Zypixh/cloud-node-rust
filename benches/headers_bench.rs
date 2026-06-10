@@ -1,7 +1,8 @@
 use cloud_node_rust::config_models::{HTTPHeaderConfig, HTTPHeaderPolicy};
 use cloud_node_rust::headers::apply_response_header_policy_to_map;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
+use std::hint::black_box;
 
 fn bench_headers_policy(c: &mut Criterion) {
     let mut headers = HashMap::new();

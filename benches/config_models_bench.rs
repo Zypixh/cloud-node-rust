@@ -1,8 +1,9 @@
 use cloud_node_rust::config_models::{
     ServerConfig, SizeCapacity, URLPattern, parse_life_to_seconds,
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use serde_json::Value;
+use std::hint::black_box;
 
 fn bench_parse_life_to_seconds(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse_life_to_seconds");

@@ -1,6 +1,7 @@
 use chrono::{Local, Utc};
 use cloud_node_rust::utils::time::{now_local, now_utc, update_time_offset};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn bench_time_functions(c: &mut Criterion) {
     let mut group = c.benchmark_group("time_resolution");

@@ -1,5 +1,6 @@
 use cloud_node_rust::auth::{UrlAuthConfig, generate_token, verify_url_auth};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn bench_generate_token(c: &mut Criterion) {

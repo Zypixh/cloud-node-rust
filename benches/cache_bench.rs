@@ -1,7 +1,8 @@
 use cloud_node_rust::cache_hybrid::HybridStorage;
 use cloud_node_rust::cache_manager::create_meta;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use pingora_cache::{CacheKey, Storage, trace::Span};
+use std::hint::black_box;
 use tokio::runtime::Runtime;
 
 async fn setup_hybrid_storage() -> HybridStorage {

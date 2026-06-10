@@ -1,5 +1,6 @@
 use cloud_node_rust::utils::template::format_template;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn bench_template_simple(c: &mut Criterion) {
     let template = "Hello, ${name}! Your ID is ${id}.";

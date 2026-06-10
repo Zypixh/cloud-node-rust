@@ -1,5 +1,6 @@
 use cloud_node_rust::utils::fnv_hash64;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn bench_utility_functions(c: &mut Criterion) {
     let mut group = c.benchmark_group("utils_operations");

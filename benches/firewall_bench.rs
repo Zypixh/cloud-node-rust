@@ -1,5 +1,6 @@
 use cloud_node_rust::firewall::matcher::evaluate_operator;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn bench_firewall_operators(c: &mut Criterion) {
     let sql_injection_payload =

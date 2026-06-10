@@ -1,7 +1,8 @@
 use cloud_node_rust::config::ConfigStore;
 use cloud_node_rust::config_models::ServerConfig;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
+use std::hint::black_box;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 

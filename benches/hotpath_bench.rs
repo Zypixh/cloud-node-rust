@@ -2,8 +2,9 @@ use cloud_node_rust::firewall::matcher::evaluate_operator;
 use cloud_node_rust::logging::{next_request_id, set_numeric_node_id};
 use cloud_node_rust::utils::fnv_hash64;
 use cloud_node_rust::utils::time::{local_from_timestamp_millis, now_timestamp_millis};
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::collections::HashMap;
+use std::hint::black_box;
 
 /// Simulates the full request processing pipeline in isolation
 fn bench_request_pipeline(c: &mut Criterion) {
