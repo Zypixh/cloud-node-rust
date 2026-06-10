@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use pingora_cache::key::CompactCacheKey;
 use pingora_cache::storage::{
     HandleHit, HandleMiss, HitHandler, MissFinishType, MissHandler, PurgeType, Storage,
@@ -11,6 +10,7 @@ use pingora_http::ResponseHeader;
 use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tracing::{info, warn};
@@ -592,21 +592,8 @@ impl Storage for FileStorage {
             .unwrap_or(0);
 
         let mut headers_json = serde_json::Map::new();
-        let hop_by_hop = [
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailers",
-            "transfer-encoding",
-            "upgrade",
-            "content-length",
-        ];
-
         for (name, value) in resp_headers.headers.iter() {
-            let name_s = name.to_string().to_lowercase();
-            if hop_by_hop.contains(&name_s.as_str()) {
+            if !crate::cache::should_store_response_header(name.as_str()) {
                 continue;
             }
             headers_json.insert(
@@ -677,22 +664,9 @@ impl Storage for FileStorage {
         let resp_headers = meta.response_header();
         let status = resp_headers.status.as_u16();
 
-        // Use the same header filtering logic as miss handler
         let mut headers_json = serde_json::Map::new();
-        let hop_by_hop = [
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailers",
-            "transfer-encoding",
-            "upgrade",
-            "content-length",
-        ];
         for (name, value) in resp_headers.headers.iter() {
-            let name_s = name.to_string().to_lowercase();
-            if hop_by_hop.contains(&name_s.as_str()) {
+            if !crate::cache::should_store_response_header(name.as_str()) {
                 continue;
             }
             headers_json.insert(

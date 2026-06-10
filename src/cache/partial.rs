@@ -1,8 +1,7 @@
-use bytes::Bytes;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
 use dashmap::DashSet;
 use http::HeaderMap;
-use once_cell::sync::Lazy;
 use pingora_cache::CacheMeta;
 use pingora_cache::storage::HitHandler;
 use pingora_http::ResponseHeader;
@@ -13,6 +12,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -89,7 +89,8 @@ pub fn partial_cache_key(base_key: &str, range_header: Option<&str>) -> Option<S
         None => "force".to_string(),
     };
     let encoded_base = URL_SAFE_NO_PAD.encode(base_key.as_bytes());
-    let mut key = String::with_capacity(PARTIAL_KEY_PREFIX.len() + encoded_base.len() + selector.len() + 1);
+    let mut key =
+        String::with_capacity(PARTIAL_KEY_PREFIX.len() + encoded_base.len() + selector.len() + 1);
     key.push_str(PARTIAL_KEY_PREFIX);
     key.push_str(&encoded_base);
     key.push(':');
@@ -165,11 +166,7 @@ pub fn parse_content_range(value: &str) -> Option<ContentRange> {
     if end < start {
         return None;
     }
-    let total = total
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|total| *total > 0);
+    let total = total.trim().parse::<u64>().ok().filter(|total| *total > 0);
     Some(ContentRange { start, end, total })
 }
 
@@ -181,27 +178,17 @@ pub fn content_range_from_headers(headers: &HeaderMap) -> Option<ContentRange> {
 }
 
 pub fn response_headers_to_store(headers: &HeaderMap) -> Vec<(String, String)> {
-    const SKIP: &[&str] = &[
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-        "content-range",
-    ];
-
     headers
         .iter()
         .filter_map(|(name, value)| {
             let name_s = name.as_str();
-            if SKIP.iter().any(|skip| name_s.eq_ignore_ascii_case(skip)) {
+            if !crate::cache::should_store_response_header(name_s) {
                 return None;
             }
-            Some((name_s.to_ascii_lowercase(), value.to_str().ok()?.to_string()))
+            Some((
+                name_s.to_ascii_lowercase(),
+                value.to_str().ok()?.to_string(),
+            ))
         })
         .collect()
 }
@@ -258,7 +245,11 @@ pub async fn lookup(cache_key: &str, roots: &[PathBuf]) -> std::io::Result<Optio
         Err(err) => return Err(err),
     };
     file.seek(std::io::SeekFrom::Start(start)).await?;
-    let file_len = file.metadata().await.map(|metadata| metadata.len()).unwrap_or(0);
+    let file_len = file
+        .metadata()
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     if file_len < start.saturating_add(len) {
         return Ok(None);
     }
@@ -274,7 +265,10 @@ pub async fn lookup(cache_key: &str, roots: &[PathBuf]) -> std::io::Result<Optio
         .total_size
         .map(|total| total.to_string())
         .unwrap_or_else(|| "*".to_string());
-    let _ = header.insert_header("content-range", format!("bytes {}-{}/{}", start, end, total));
+    let _ = header.insert_header(
+        "content-range",
+        format!("bytes {}-{}/{}", start, end, total),
+    );
     let _ = header.insert_header("content-length", len.to_string());
     let _ = header.insert_header("accept-ranges", "bytes");
 
@@ -309,7 +303,7 @@ pub async fn open_writer(
     }
 
     let _lock_arc = lock_for(root_key);
-let _guard = _lock_arc.lock().await;
+    let _guard = _lock_arc.lock().await;
     let data_path = data_path_in_root(root_key, &write_root);
     if let Some(parent) = data_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -402,7 +396,7 @@ pub async fn store(
     }
 
     let _lock_arc = lock_for(root_key);
-let _guard = _lock_arc.lock().await;
+    let _guard = _lock_arc.lock().await;
     let data_path = data_path_in_root(root_key, &write_root);
     if let Some(parent) = data_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -430,7 +424,7 @@ async fn merge_meta(
         return Ok(false);
     }
     let _lock_arc = lock_for(root_key);
-let _guard = _lock_arc.lock().await;
+    let _guard = _lock_arc.lock().await;
     merge_meta_locked(root_key, capture, roots, write_root).await
 }
 
@@ -443,8 +437,7 @@ async fn merge_meta_locked(
     let mut meta = load_meta(root_key, roots)
         .await?
         .filter(|meta| {
-            meta.expires > crate::utils::time::now_timestamp()
-                && meta.total_size == capture.total
+            meta.expires > crate::utils::time::now_timestamp() && meta.total_size == capture.total
         })
         .unwrap_or(PartialMeta {
             root_key: root_key.to_string(),
@@ -539,7 +532,7 @@ async fn load_meta(cache_key: &str, roots: &[PathBuf]) -> std::io::Result<Option
 
 async fn remove(cache_key: &str, roots: &[PathBuf]) {
     let _lock_arc = lock_for(cache_key);
-let _guard = _lock_arc.lock().await;
+    let _guard = _lock_arc.lock().await;
     FORCE_HIT_ROOT_KEYS.remove(cache_key);
     for root in roots {
         let _ = tokio::fs::remove_file(data_path_in_root(cache_key, root)).await;
@@ -608,7 +601,9 @@ fn select_requested_range(meta: &PartialMeta, requested: RequestedRange) -> Opti
         }
     } else {
         let start = requested.start?;
-        let end = requested.end.or_else(|| meta.total_size.map(|total| total.saturating_sub(1)))?;
+        let end = requested
+            .end
+            .or_else(|| meta.total_size.map(|total| total.saturating_sub(1)))?;
         (start, end)
     };
     if end < start {
@@ -673,8 +668,7 @@ fn partial_path_in_root(cache_key: &str, root: &PathBuf, suffix: &str) -> PathBu
     let hash = format!("{:x}", md5_legacy::compute(root_key.as_ref().as_bytes()));
     let first = hash.get(0..2).unwrap_or("00");
     let second = hash.get(2..4).unwrap_or("00");
-    root
-        .join("_partial")
+    root.join("_partial")
         .join(first)
         .join(second)
         .join(format!("{}.{}", hash, suffix))
@@ -746,5 +740,29 @@ impl pingora_cache::storage::HandleHit for PartialFileHitHandler {
 
     fn as_any_mut(&mut self) -> &mut (dyn std::any::Any + Send + Sync) {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_headers_to_store;
+    use http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn response_headers_to_store_excludes_set_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert("set-cookie", HeaderValue::from_static("sid=1"));
+        headers.insert("content-type", HeaderValue::from_static("text/html"));
+        headers.insert("content-length", HeaderValue::from_static("42"));
+
+        let stored = response_headers_to_store(&headers);
+
+        assert!(
+            stored
+                .iter()
+                .any(|(name, value)| { name == "content-type" && value == "text/html" })
+        );
+        assert!(!stored.iter().any(|(name, _)| name == "set-cookie"));
+        assert!(!stored.iter().any(|(name, _)| name == "content-length"));
     }
 }

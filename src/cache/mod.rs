@@ -4,6 +4,24 @@ pub mod compiled;
 pub mod matching;
 pub mod partial;
 
+pub(crate) fn should_store_response_header(name: &str) -> bool {
+    const SKIP: &[&str] = &[
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "content-range",
+        "set-cookie",
+    ];
+
+    !SKIP.iter().any(|skip| name.eq_ignore_ascii_case(skip))
+}
+
 pub(crate) fn cache_control_has_skipped_value(cache_control: &str, skipped: &[String]) -> bool {
     cache_control
         .split(',')
@@ -49,8 +67,7 @@ pub fn cache_ref_allows_method_status(
     if cache_ref.status.is_empty() {
         true
     } else {
-        cache_ref.status.contains(&(status as i32))
-            || (status == 206 && partial_content_allowed)
+        cache_ref.status.contains(&(status as i32)) || (status == 206 && partial_content_allowed)
     }
 }
 
@@ -124,8 +141,12 @@ pub fn parse_life_to_seconds(v: &serde_json::Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_ref_allows_method_status, should_cache_response};
-    use crate::cache::compiled::{cache_ref_allows_method_status_compiled, should_cache_response_compiled, CompiledCacheRef};
+    use super::{
+        cache_ref_allows_method_status, should_cache_response, should_store_response_header,
+    };
+    use crate::cache::compiled::{
+        CompiledCacheRef, cache_ref_allows_method_status_compiled, should_cache_response_compiled,
+    };
     use crate::config_models::{HTTPCacheRef, HTTPExpiresTimeConfig};
     use http::{HeaderMap, HeaderValue};
     use serde_json::json;
@@ -191,6 +212,15 @@ mod tests {
     }
 
     #[test]
+    fn stored_cache_headers_exclude_set_cookie() {
+        assert!(should_store_response_header("cache-control"));
+        assert!(should_store_response_header("content-type"));
+        assert!(!should_store_response_header("set-cookie"));
+        assert!(!should_store_response_header("Set-Cookie"));
+        assert!(!should_store_response_header("content-length"));
+    }
+
+    #[test]
     fn compiled_response_policy_matches_legacy_method_status_and_filters() {
         let mut cache_ref = cache_ref(vec![]);
         cache_ref.status = vec![];
@@ -218,11 +248,31 @@ mod tests {
             let headers = HeaderMap::new();
             let req_headers = HeaderMap::new();
             assert_eq!(
-                should_cache_response(status, &cache_ref, method, &headers, "example.com", size, force_partial, false, &req_headers),
+                should_cache_response(
+                    status,
+                    &cache_ref,
+                    method,
+                    &headers,
+                    "example.com",
+                    size,
+                    force_partial,
+                    false,
+                    &req_headers
+                ),
                 expected
             );
             assert_eq!(
-                should_cache_response_compiled(&compiled, None, status, method, &headers, size, force_partial, false, &req_headers),
+                should_cache_response_compiled(
+                    &compiled,
+                    None,
+                    status,
+                    method,
+                    &headers,
+                    size,
+                    force_partial,
+                    false,
+                    &req_headers
+                ),
                 expected
             );
             assert_eq!(
@@ -235,20 +285,104 @@ mod tests {
         cache_ref.allow_partial_content = true;
         let compiled = CompiledCacheRef::compile_arc(&Arc::new(cache_ref.clone()));
         let headers = HeaderMap::new();
-        assert!(cache_ref_allows_method_status(206, &cache_ref, "GET", false));
-        assert!(cache_ref_allows_method_status_compiled(&compiled, 206, "GET", false));
-        assert!(should_cache_response(206, &cache_ref, "GET", &headers, "example.com", 10, false, false, &headers));
-        assert!(should_cache_response_compiled(&compiled, None, 206, "GET", &headers, 10, false, false, &headers));
+        assert!(cache_ref_allows_method_status(
+            206, &cache_ref, "GET", false
+        ));
+        assert!(cache_ref_allows_method_status_compiled(
+            &compiled, 206, "GET", false
+        ));
+        assert!(should_cache_response(
+            206,
+            &cache_ref,
+            "GET",
+            &headers,
+            "example.com",
+            10,
+            false,
+            false,
+            &headers
+        ));
+        assert!(should_cache_response_compiled(
+            &compiled, None, 206, "GET", &headers, 10, false, false, &headers
+        ));
 
         let mut private_headers = HeaderMap::new();
-        private_headers.insert("cache-control", HeaderValue::from_static("max-age=60, private"));
-        assert!(!should_cache_response(200, &cache_ref, "GET", &private_headers, "example.com", 10, false, false, &headers));
-        assert!(!should_cache_response_compiled(&compiled, None, 200, "GET", &private_headers, 10, false, false, &headers));
+        private_headers.insert(
+            "cache-control",
+            HeaderValue::from_static("max-age=60, private"),
+        );
+        assert!(!should_cache_response(
+            200,
+            &cache_ref,
+            "GET",
+            &private_headers,
+            "example.com",
+            10,
+            false,
+            false,
+            &headers
+        ));
+        assert!(!should_cache_response_compiled(
+            &compiled,
+            None,
+            200,
+            "GET",
+            &private_headers,
+            10,
+            false,
+            false,
+            &headers
+        ));
 
         let mut cookie_headers = HeaderMap::new();
         cookie_headers.insert("set-cookie", HeaderValue::from_static("sid=1"));
-        assert!(!should_cache_response(200, &cache_ref, "GET", &cookie_headers, "example.com", 10, false, false, &headers));
-        assert!(!should_cache_response_compiled(&compiled, None, 200, "GET", &cookie_headers, 10, false, false, &headers));
+        assert!(!should_cache_response(
+            200,
+            &cache_ref,
+            "GET",
+            &cookie_headers,
+            "example.com",
+            10,
+            false,
+            false,
+            &headers
+        ));
+        assert!(!should_cache_response_compiled(
+            &compiled,
+            None,
+            200,
+            "GET",
+            &cookie_headers,
+            10,
+            false,
+            false,
+            &headers
+        ));
+
+        cache_ref.skip_set_cookie = false;
+        let compiled = CompiledCacheRef::compile_arc(&Arc::new(cache_ref.clone()));
+        assert!(should_cache_response(
+            200,
+            &cache_ref,
+            "GET",
+            &cookie_headers,
+            "example.com",
+            10,
+            false,
+            false,
+            &headers
+        ));
+        assert!(should_cache_response_compiled(
+            &compiled,
+            None,
+            200,
+            "GET",
+            &cookie_headers,
+            10,
+            false,
+            false,
+            &headers
+        ));
 
         assert_eq!(compiled.response_policy.ttl_seconds(), 3600);
         assert_eq!(compiled.response_policy.force_ttl_seconds(), Some(300));
