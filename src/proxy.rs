@@ -2596,6 +2596,7 @@ impl EdgeProxy {
             "jscookie" => Ok(Some("jscookie")),
             "pow" => Ok(Some("pow")),
             "geetest" => Ok(Some("geetest")),
+            "slide" => Ok(Some("slider")),
             "slider" => Ok(Some("slider")),
             _ => Err(()),
         }
@@ -3572,20 +3573,33 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
     }
 
     fn product_name(&self, ctx: &ProxyCTX) -> String {
-        if let Some(global_cfg) = ctx.global_http_config.as_ref() {
-            let name = global_cfg.server_name.trim();
-            if !name.is_empty() {
-                return name.to_string();
-            }
-        }
+        Self::resolve_product_name(
+            ctx.global_http_config.as_deref(),
+            &self.config.get_global_http_config_sync(),
+        )
+    }
 
-        let global_cfg = self.config.get_global_http_config_sync();
-        let name = global_cfg.server_name.trim();
-        if name.is_empty() {
-            "Cloud Node".to_string()
+    fn non_empty_display_value(value: &str) -> Option<String> {
+        let value = value.trim();
+        if value.is_empty() {
+            None
         } else {
-            name.to_string()
+            Some(value.to_string())
         }
+    }
+
+    fn resolve_product_name(
+        ctx_global: Option<&crate::config_models::GlobalHTTPAllConfig>,
+        store_global: &crate::config_models::GlobalHTTPAllConfig,
+    ) -> String {
+        ctx_global
+            .and_then(|config| Self::non_empty_display_value(&config.product_name))
+            .or_else(|| Self::non_empty_display_value(&store_global.product_name))
+            .or_else(|| {
+                ctx_global.and_then(|config| Self::non_empty_display_value(&config.server_name))
+            })
+            .or_else(|| Self::non_empty_display_value(&store_global.server_name))
+            .unwrap_or_else(|| "Cloud Node".to_string())
     }
 
     fn maybe_report_firewall_event(
@@ -10569,6 +10583,10 @@ mod tests {
             EdgeProxy::normalize_waf_challenge_method("click", "captcha"),
             "click"
         );
+        assert_eq!(
+            EdgeProxy::normalize_waf_challenge_method("slide", "captcha"),
+            "slider"
+        );
     }
 
     #[test]
@@ -10621,6 +10639,21 @@ mod tests {
             "slider"
         );
 
+        let site_slide = crate::config_models::WAFCaptchaOptions {
+            method: "slide".to_string(),
+            use_geetest: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            EdgeProxy::resolve_waf_challenge_method(
+                "captcha",
+                false,
+                Some(&site_slide),
+                Some(&cluster_geetest),
+            ),
+            "slider"
+        );
+
         let site_unknown = crate::config_models::WAFCaptchaOptions {
             method: "inherit".to_string(),
             ..Default::default()
@@ -10655,7 +10688,7 @@ mod tests {
         let firewall_ref = crate::config_models::HTTPFirewallRef {
             is_on: true,
             ignore_global_rules: false,
-            default_captcha_type: "click".to_string(),
+            default_captcha_type: "slide".to_string(),
             id: 144,
         };
         let cluster_geetest = crate::config_models::WAFCaptchaOptions {
@@ -10704,7 +10737,33 @@ mod tests {
                 matched.captcha_options.as_ref(),
                 Some(&cluster_geetest),
             ),
-            "click"
+            "slider"
+        );
+    }
+
+    #[test]
+    fn product_name_prefers_product_config_over_server_name() {
+        let ctx_global = crate::config_models::GlobalHTTPAllConfig {
+            server_name: "edge-node".to_string(),
+            ..Default::default()
+        };
+        let store_global = crate::config_models::GlobalHTTPAllConfig {
+            product_name: "摸鱼云CDN".to_string(),
+            server_name: "fallback-node".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            EdgeProxy::resolve_product_name(Some(&ctx_global), &store_global),
+            "摸鱼云CDN"
+        );
+
+        let ctx_product = crate::config_models::GlobalHTTPAllConfig {
+            product_name: "站点品牌".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            EdgeProxy::resolve_product_name(Some(&ctx_product), &store_global),
+            "站点品牌"
         );
     }
 

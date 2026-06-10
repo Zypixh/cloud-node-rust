@@ -105,7 +105,7 @@ btn.onclick=function(){{
   var url='{route}?__waf_token={wtok}&__waf_challenge_token={tok}&__waf_challenge_type=captcha&__waf_captcha_hash='+h+'&__waf_return='+encodeURIComponent({rp_js});
   st.textContent=msg('captcha_verifying');st.style.color='var(--muted)';
   fetch(url,{{redirect:'manual'}}).then(function(r){{
-   if(r.type==='opaqueredirect'||r.ok){{location.href=url;}}
+   if(r.type==='opaqueredirect'||r.ok||(r.status>=300&&r.status<400)){{location.href=url;}}
    else{{
     st.textContent=msg('captcha_wrong');st.style.color='var(--red)';
     input.value='';input.focus();

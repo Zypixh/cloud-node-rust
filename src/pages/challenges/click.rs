@@ -273,7 +273,7 @@ cv.addEventListener('click',function(e){{
    st.textContent=msg('click_verifying');st.style.color='var(--muted)';
    var el=Date.now()-t0;
    var url='{route}?__waf_token={wtok}&__waf_challenge_token={tok}&__waf_challenge_type=click&__waf_click_seq='+order.join(',')+'&__waf_elapsed='+el+'&__waf_return='+encodeURIComponent({rp_js});
-   fetch(url,{{redirect:'manual'}}).then(function(r){{if(r.type==='opaqueredirect'||r.ok)location.href=url;else{{st.textContent='✗';st.style.color='var(--red)'}}}}). catch(function(){{location.href=url}});
+   fetch(url,{{redirect:'manual'}}).then(function(r){{if(r.type==='opaqueredirect'||r.ok||(r.status>=300&&r.status<400))location.href=url;else{{st.textContent='✗';st.style.color='var(--red)'}}}}). catch(function(){{location.href=url}});
   }}
  }}else{{
   ctx.save();ctx.globalAlpha=.28;var rr=ctx.createRadialGradient(mx,my,0,mx,my,32);rr.addColorStop(0,'rgba(220,38,38,.9)');rr.addColorStop(1,'rgba(220,38,38,0)');ctx.fillStyle=rr;ctx.beginPath();ctx.arc(mx,my,32,0,Math.PI*2);ctx.fill();ctx.restore();

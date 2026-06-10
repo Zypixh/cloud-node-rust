@@ -453,6 +453,8 @@ pub struct GlobalHTTPAllConfig {
         deserialize_with = "deserialize_null_default"
     )]
     pub server_name: String,
+    #[serde(skip)]
+    pub product_name: String,
     #[serde(rename = "enableServerAddrVariable", default)]
     pub enable_server_addr_variable: bool,
     #[serde(rename = "requestOriginsWithEncodings", default)]
@@ -501,6 +503,14 @@ pub struct GlobalServerConfig {
     pub http_all: Option<GlobalHTTPAllConfig>,
     #[serde(rename = "httpAccessLog", default)]
     pub http_access_log: Option<GlobalHTTPAccessLogConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ProductConfig {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub name: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub version: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -571,6 +581,8 @@ pub struct NodeConfigPayload {
     pub parent_nodes: std::collections::HashMap<String, Vec<ParentNodeConfig>>, // Map keys in JSON are always strings
     #[serde(rename = "globalServerConfig", default)]
     pub global_server_config: Option<GlobalServerConfig>,
+    #[serde(rename = "productConfig", default)]
+    pub product_config: Option<ProductConfig>,
     #[serde(
         rename = "globalPages",
         default,
@@ -3798,6 +3810,23 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("20")
         );
+    }
+
+    #[test]
+    fn node_config_payload_parses_product_config_exact_field() {
+        let payload: NodeConfigPayload = serde_json::from_value(serde_json::json!({
+            "productConfig": {
+                "name": "摸鱼云CDN",
+                "version": "1.1.5"
+            }
+        }))
+        .expect("productConfig should parse");
+
+        let product = payload
+            .product_config
+            .expect("productConfig should be present");
+        assert_eq!(product.name, "摸鱼云CDN");
+        assert_eq!(product.version, "1.1.5");
     }
 
     #[test]

@@ -97,7 +97,7 @@ function de(e){{
     if(st)st.textContent=window.cloudNodeText?window.cloudNodeText('slider_verifying'):'Verifying...';
     pc.style.pointerEvents='none';
     fetch({route_js}+'?'+q,{{redirect:'manual'}}).then(function(r){{
-  if(r.type==='opaqueredirect'||r.ok){{
+  if(r.type==='opaqueredirect'||r.ok||(r.status>=300&&r.status<400)){{
     pc.style.transition='left .18s ease,top .18s ease';
     pc.style.left='{tx:.0}px';pc.style.top='{ty:.0}px';
     setTimeout(function(){{location.href={route_js}+'?'+q}},200);

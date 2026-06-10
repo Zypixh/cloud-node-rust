@@ -921,6 +921,20 @@ where
                                         http_all.domain_mismatch_action.clone();
                                 }
                             }
+                            let mut global_http_config = payload
+                                .global_server_config
+                                .as_ref()
+                                .and_then(|g| g.http_all.clone());
+                            if let Some(product_name) = payload
+                                .product_config
+                                .as_ref()
+                                .map(|config| config.name.trim())
+                                .filter(|name| !name.is_empty())
+                            {
+                                global_http_config
+                                    .get_or_insert_with(Default::default)
+                                    .product_name = product_name.to_string();
+                            }
 
                             for server in &payload_servers {
                                 server.compile_url_patterns();
@@ -1219,10 +1233,7 @@ where
                                     node_ip_show_page,
                                     node_ip_page_html,
                                     domain_mismatch_action,
-                                    payload
-                                        .global_server_config
-                                        .as_ref()
-                                        .and_then(|g| g.http_all.clone()),
+                                    global_http_config,
                                     payload
                                         .http_cache_policies
                                         .iter()
