@@ -1,10 +1,5 @@
 use crate::pages::Lang;
-use crate::pages::challenges::encode_challenge_token;
 use rand::Rng;
-use serde_json::json;
-
-const PIECE_SIZE: f64 = 40.0;
-const PIECE_HALF: f64 = PIECE_SIZE / 2.0;
 
 pub fn issue_html(
     lang: Lang,
@@ -12,21 +7,12 @@ pub fn issue_html(
     verify_route: &str,
     return_path: &str,
     target_anchor: u32,
-    secret: &[u8],
-    expiry: u64,
+    _secret: &[u8],
+    _expiry: u64,
 ) -> String {
     let tx = (target_anchor % 260) as f64;
     let ty = (target_anchor.wrapping_mul(17) % 160) as f64;
-    issue_html_with_target(
-        lang,
-        waf_token,
-        verify_route,
-        return_path,
-        tx,
-        ty,
-        secret,
-        expiry,
-    )
+    issue_html_with_target(lang, waf_token, verify_route, return_path, tx, ty)
 }
 
 pub fn issue_html_with_target(
@@ -36,98 +22,127 @@ pub fn issue_html_with_target(
     return_path: &str,
     target_x: f64,
     target_y: f64,
-    secret: &[u8],
-    expiry: u64,
 ) -> String {
     let sfx = random_js_id();
     let mut rng = rand::thread_rng();
+    let target_x = target_x.clamp(0.0, 280.0);
+    let target_y = target_y.clamp(0.0, 160.0);
 
-    let off_x = (target_x + rng.gen_range(80.0f64..180.0)).clamp(0.0, 280.0);
-    let off_y = (target_y + rng.gen_range(-40.0f64..40.0)).clamp(0.0, 160.0);
+    let offset = rng.gen_range(60.0f64..150.0);
+    let left_start = target_x - offset;
+    let right_start = target_x + offset;
+    let left_ok = (0.0..=280.0).contains(&left_start);
+    let right_ok = (0.0..=280.0).contains(&right_start);
+    let handle_start = match (left_ok, right_ok) {
+        (true, true) if rng.gen_bool(0.5) => left_start,
+        (true, true) => right_start,
+        (true, false) => left_start,
+        (false, true) => right_start,
+        (false, false) => target_x,
+    };
+
     let polygon = generate_puzzle_polygon(&mut rng);
-    let target_center_x = target_x + PIECE_HALF;
-    let target_center_y = target_y + PIECE_HALF;
-    let challenge_token =
-        encode_slider_challenge_token(target_center_x, target_center_y, secret, expiry);
 
-    let prompt = match lang {
-        Lang::ZhCn => "拖动拼图块到缺口位置",
-        Lang::En => "Drag the puzzle piece to the gap",
+    // Decoy hole: visually similar but clearly displaced (>55px away in x)
+    let decoy_x: f64 = {
+        let mut dx;
+        loop {
+            dx = rng.gen_range(10.0f64..270.0);
+            if (dx - target_x).abs() > 55.0 {
+                break;
+            }
+        }
+        dx
+    };
+    let decoy_y = (target_y + rng.gen_range(-50.0f64..50.0)).clamp(0.0, 155.0);
+
+    let (prompt, near_text) = match lang {
+        Lang::ZhCn => ("拖动下方滑块对齐缺口", "快到了！"),
+        Lang::En => ("Slide the handle to align the piece", "Almost there!"),
     };
     let rp_js = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
     let route_js = serde_json::to_string(verify_route).unwrap_or_else(|_| "\"/\"".to_string());
 
     format!(
-        r#"<div class="pzl" id="pzl_{sfx}">
-<div class="pzl-bg" style="position:relative;width:320px;height:200px;margin:0 auto 14px;border-radius:12px;overflow:hidden">
+        r#"<div class="pzl" id="pzl_{sfx}" style="user-select:none">
+<div class="pzl-bg" style="position:relative;width:320px;height:200px;margin:0 auto 10px;border-radius:12px;overflow:hidden">
 <canvas id="bg_{sfx}" width="320" height="200" style="display:block;width:320px;height:200px"></canvas>
-<div id="hl_{sfx}" class="pzl-hole" style="position:absolute;left:{tx:.0}px;top:{ty:.0}px;width:40px;height:40px;clip-path:{poly};background:rgba(0,0,0,.22);box-shadow:inset 0 0 0 2px rgba(0,0,0,.35),0 0 12px rgba(0,0,0,.25);pointer-events:none;border-radius:2px"></div>
-<div id="pc_{sfx}" class="pzl-piece" style="position:absolute;left:{ox:.0}px;top:{oy:.0}px;width:40px;height:40px;clip-path:{poly};background:linear-gradient(135deg,rgba(99,102,241,.85),rgba(56,189,248,.85));cursor:grab;border-radius:2px;z-index:2;box-shadow:0 4px 12px rgba(0,0,0,.3)"></div>
+<div id="dc_{sfx}" style="position:absolute;left:{dx:.0}px;top:{dy:.0}px;width:40px;height:40px;clip-path:{poly};background:rgba(0,0,0,.07);box-shadow:inset 0 0 0 1.5px rgba(120,120,120,.3);pointer-events:none"></div>
+<div id="hl_{sfx}" style="position:absolute;left:{tx:.0}px;top:{ty:.0}px;width:40px;height:40px;clip-path:{poly};background:rgba(0,0,0,.22);box-shadow:inset 0 0 0 2px rgba(0,0,0,.35),0 0 10px rgba(0,0,0,.2);pointer-events:none"></div>
+<div id="pc_{sfx}" style="position:absolute;left:{hx:.0}px;top:{ty:.0}px;width:40px;height:40px;clip-path:{poly};background:linear-gradient(135deg,rgba(99,102,241,.9),rgba(56,189,248,.9));pointer-events:none;box-shadow:0 3px 10px rgba(0,0,0,.28)"></div>
 </div>
-<p class="status" id="st_{sfx}" data-i18n="slider_puzzle_prompt">{prompt}</p>
+<p class="status" id="st_{sfx}" style="margin:4px 0 8px;font-size:13px;color:var(--muted)">{prompt}</p>
+<div style="position:relative;width:320px;margin:0 auto 4px;height:44px">
+  <div style="position:absolute;top:50%;left:20px;right:20px;height:6px;margin-top:-3px;border-radius:3px;background:rgba(148,163,184,.25);overflow:hidden">
+    <div id="fill_{sfx}" style="position:absolute;inset:0 auto 0 0;width:{hpct:.1}%;background:linear-gradient(90deg,#6366f1,#38bdf8);border-radius:3px;transition:width .02s linear"></div>
+  </div>
+  <div id="hd_{sfx}" style="position:absolute;top:50%;left:{hdleft:.1}px;width:36px;height:36px;margin-top:-18px;border-radius:50%;background:#fff;box-shadow:0 4px 14px rgba(0,0,0,.22);cursor:grab;display:flex;align-items:center;justify-content:center;touch-action:none">
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7h8M8 4l3 3-3 3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </div>
+</div>
 <script>
 (function(){{
-var sf="{sfx}";var d=!1,sx=0,sy=0,px={ox:.0},py={oy:.0},tr=[],t0=Date.now();
-var pc=document.getElementById('pc_'+sf),bg=document.getElementById('bg_'+sf),st=document.getElementById('st_'+sf);
-function dr(){{
-var c=bg.getContext('2d'),w=320,h=200;
+var sf="{sfx}",TARGET={tx:.1},TRACK_W=280,TRACK_LEFT=20;
+var dragging=!1,startX=0,hdPos={hx:.1},tr=[],t0=Date.now();
+var hd=document.getElementById('hd_'+sf),pc=document.getElementById('pc_'+sf);
+var fill=document.getElementById('fill_'+sf),st=document.getElementById('st_'+sf);
+var hl=document.getElementById('hl_'+sf);
+function setPos(x){{
+  x=Math.max(0,Math.min(TRACK_W,x));
+  hdPos=x;
+  hd.style.left=(TRACK_LEFT+x-18)+'px';
+  fill.style.width=(x/TRACK_W*100).toFixed(1)+'%';
+  pc.style.left=x+'px';
+  var dist=Math.abs(x-TARGET);
+  if(dist<30){{hl.style.boxShadow='inset 0 0 0 2px rgba(0,0,0,.35),0 0 16px 6px rgba(99,102,241,.7)';
+    if(dist<14&&st)st.textContent='{near_text}';
+  }}else{{hl.style.boxShadow='inset 0 0 0 2px rgba(0,0,0,.35),0 0 10px rgba(0,0,0,.2)'}}
+}}
+function start(e){{dragging=!0;hd.style.cursor='grabbing';var p=e.touches?e.touches[0]:e;startX=p.clientX-hdPos;}}
+function move(e){{if(!dragging)return;e.preventDefault();var p=e.touches?e.touches[0]:e;setPos(p.clientX-startX);tr.push(Math.round(hdPos));}}
+function end(){{
+  if(!dragging)return;dragging=!1;hd.style.cursor='grab';
+  var el=Date.now()-t0;
+  var q='__waf_token={wtok}&__waf_challenge_type=slider&x='+hdPos.toFixed(1)+'&y={ty:.1}&__waf_elapsed='+el+'&__waf_trace='+encodeURIComponent(tr.join(';'))+'&__waf_return='+encodeURIComponent({rp_js});
+  if(st)st.textContent=window.cloudNodeText?window.cloudNodeText('slider_verifying'):'Verifying...';
+  hd.style.pointerEvents='none';
+  fetch({route_js}+'?'+q,{{redirect:'manual'}}).then(function(r){{
+    if(r.type==='opaqueredirect'||r.ok){{
+      pc.style.transition='left .2s ease';pc.style.left=TARGET+'px';
+      setTimeout(function(){{location.href={route_js}+'?'+q}},220);
+    }}else{{
+      if(st)st.textContent=window.cloudNodeText?window.cloudNodeText('slider_retry'):'Please try again';
+      hd.style.pointerEvents='';setPos({hx:.1});tr=[];t0=Date.now();
+    }}
+  }}).catch(function(){{location.href={route_js}+'?'+q}});
+}}
+hd.addEventListener('mousedown',start);document.addEventListener('mousemove',move);document.addEventListener('mouseup',end);
+hd.addEventListener('touchstart',start,{{passive:!0}});document.addEventListener('touchmove',move,{{passive:!1}});document.addEventListener('touchend',end);
+(function(){{
+var c=document.getElementById('bg_'+sf).getContext('2d'),w=320,h=200;
 var g=c.createLinearGradient(0,0,0,h*.65);g.addColorStop(0,'#5b9bd5');g.addColorStop(1,'#c8e6f5');
 c.fillStyle=g;c.fillRect(0,0,w,h*.65);
 c.fillStyle='#5a8a3c';c.fillRect(0,h*.65,w,h*.35);
-c.fillStyle='#4a7a2c';
-c.beginPath();c.moveTo(0,h*.75);c.bezierCurveTo(60,h*.5,120,h*.55,180,h*.7);c.bezierCurveTo(230,h*.6,280,h*.65,w,h*.7);c.lineTo(w,h);c.lineTo(0,h);c.fill();
+c.fillStyle='#4a7a2c';c.beginPath();c.moveTo(0,h*.75);c.bezierCurveTo(60,h*.5,120,h*.55,180,h*.7);c.bezierCurveTo(230,h*.6,280,h*.65,w,h*.7);c.lineTo(w,h);c.lineTo(0,h);c.fill();
 c.fillStyle='#FFD700';c.beginPath();c.arc(w*.82,h*.18,16,0,Math.PI*2);c.fill();
-function cloud(cx,cy){{c.fillStyle='rgba(255,255,255,.82)';[[-12,0,14],[0,-4,18],[12,0,14]].forEach(function(p){{c.beginPath();c.arc(cx+p[0],cy+p[1],p[2]/2,0,Math.PI*2);c.fill()}})}}
-cloud(70,38);cloud(190,28);cloud(260,45);
-for(var i=0;i<30;i++){{c.fillStyle='rgba(255,255,255,'+(.03+Math.random()*.05)+')';c.fillRect(Math.random()*w,Math.random()*h,1+Math.random()*3,1+Math.random()*3)}}
-}}
-function ds(e){{d=!0;var p=e.touches?e.touches[0]:e;sx=p.clientX;sy=p.clientY;px=parseFloat(pc.style.left)||px;py=parseFloat(pc.style.top)||py;pc.style.cursor='grabbing'}}
-function dm(e){{if(!d)return;e.preventDefault();var p=e.touches?e.touches[0]:e,nx=Math.max(0,Math.min(280,px+p.clientX-sx)),ny=Math.max(0,Math.min(160,py+p.clientY-sy));pc.style.left=nx+'px';pc.style.top=ny+'px';
-var cx=nx+{half:.1},cy=ny+{half:.1},dist=Math.sqrt(Math.pow(cx-{tcx:.1},2)+Math.pow(cy-{tcy:.1},2));
-var hl=document.getElementById('hl_'+sf);
-if(dist<30){{hl.style.boxShadow='inset 0 0 0 2px rgba(0,0,0,.35),0 0 18px 8px rgba(99,102,241,.75)';if(dist<15&&st)st.textContent=window.cloudNodeText?window.cloudNodeText('slider_near'):'Almost there!'}}
-else{{hl.style.boxShadow='inset 0 0 0 2px rgba(0,0,0,.35),0 0 12px rgba(0,0,0,.25)'}}
-}}
-(function cp(){{if(d){{var l=parseFloat(pc.style.left)||px,t=parseFloat(pc.style.top)||py;tr.push(Math.round(l)+','+Math.round(t))}}setTimeout(cp,20+40*Math.random())}})();
-function de(e){{
-    if(!d)return;d=!1;pc.style.cursor='grab';
-    var el=Date.now()-t0,l=parseFloat(pc.style.left)||px,t=parseFloat(pc.style.top)||py;
-    var cx=l+{half:.1},cy=t+{half:.1};
-    var q='__waf_token={wtok}&__waf_challenge_token={ctok}&__waf_challenge_type=slider&__waf_x='+cx.toFixed(1)+'&__waf_y='+cy.toFixed(1)+'&x='+l.toFixed(1)+'&y='+t.toFixed(1)+'&__waf_elapsed='+el+'&__waf_trace='+encodeURIComponent(tr.join(';'))+'&__waf_return='+encodeURIComponent({rp_js});
-    if(st)st.textContent=window.cloudNodeText?window.cloudNodeText('slider_verifying'):'Verifying...';
-    pc.style.pointerEvents='none';
-    fetch({route_js}+'?'+q,{{redirect:'manual'}}).then(function(r){{
-  if(r.type==='opaqueredirect'||r.ok||(r.status>=300&&r.status<400)){{
-    pc.style.transition='left .18s ease,top .18s ease';
-    pc.style.left='{tx:.0}px';pc.style.top='{ty:.0}px';
-    setTimeout(function(){{location.href={route_js}+'?'+q}},200);
-  }}else{{
-    if(st)st.textContent=window.cloudNodeText?window.cloudNodeText('slider_retry'):'Please try again';
-    pc.style.left={ox:.0}+'px';pc.style.top={oy:.0}+'px';
-    px={ox:.0};py={oy:.0};pc.style.pointerEvents='';pc.style.transition='';
-    tr=[];t0=Date.now();
-    document.getElementById('hl_'+sf).style.boxShadow='inset 0 0 0 2px rgba(0,0,0,.35),0 0 12px rgba(0,0,0,.25)';
-  }}
-}}).catch(function(){{location.href={route_js}+'?'+q}});
-}}
-dr();
-pc.addEventListener('mousedown',ds);document.addEventListener('mousemove',dm);document.addEventListener('mouseup',de);
-pc.addEventListener('touchstart',ds,{{passive:!0}});document.addEventListener('touchmove',dm,{{passive:!1}});document.addEventListener('touchend',de);
+[[70,38],[190,28],[260,45]].forEach(function(p){{[[-12,0,14],[0,-4,18],[12,0,14]].forEach(function(q){{c.fillStyle='rgba(255,255,255,.82)';c.beginPath();c.arc(p[0]+q[0],p[1]+q[1],q[2]/2,0,Math.PI*2);c.fill()}})}});
+for(var i=0;i<25;i++){{c.fillStyle='rgba(255,255,255,'+(.03+Math.random()*.05)+')';c.fillRect(Math.random()*w,Math.random()*h,1+Math.random()*3,1+Math.random()*2)}}
+}})();
 }})();
 </script>
 </div>"#,
         sfx = sfx,
         tx = target_x,
         ty = target_y,
-        tcx = target_center_x,
-        tcy = target_center_y,
-        half = PIECE_HALF,
-        ox = off_x,
-        oy = off_y,
+        dx = decoy_x,
+        dy = decoy_y,
+        hx = handle_start,
+        hdleft = 20.0 + handle_start - 18.0,
+        hpct = handle_start / 280.0 * 100.0,
         poly = polygon,
         prompt = prompt,
+        near_text = near_text,
         wtok = waf_token,
-        ctok = challenge_token,
         rp_js = rp_js,
         route_js = route_js,
     )
@@ -135,26 +150,9 @@ pc.addEventListener('touchstart',ds,{{passive:!0}});document.addEventListener('t
 
 // ── Verification ─────────────────────────────────────────────────
 
-const TOLERANCE: f64 = 6.0;
-const MIN_ELAPSED_MS: u64 = 1200;
-
-fn encode_slider_challenge_token(
-    target_center_x: f64,
-    target_center_y: f64,
-    secret: &[u8],
-    expiry: u64,
-) -> String {
-    let payload = json!({
-        "t": "slider",
-        "p": {
-            "cx": target_center_x,
-            "cy": target_center_y,
-        },
-        "e": expiry,
-        "n": hex::encode(rand::random::<u64>().to_be_bytes()),
-    });
-    encode_challenge_token(&payload, secret)
-}
+const TOLERANCE: f64 = 8.0;
+const MIN_ELAPSED_MS: u64 = 300;
+const MIN_TRACE_POINTS: usize = 5;
 
 pub fn verify_anchor(
     target_anchor: u32,
@@ -193,15 +191,21 @@ pub fn verify_explicit(
         Some(p) => p,
         None => return false,
     };
-    let (cx, cy) = match (
+    let (tx, ty) = if let (Some(x), Some(y)) = (
+        p.get("tx").and_then(|v| v.as_f64()),
+        p.get("ty").and_then(|v| v.as_f64()),
+    ) {
+        (x, y)
+    } else if let (Some(x), Some(y)) = (
         p.get("cx").and_then(|v| v.as_f64()),
         p.get("cy").and_then(|v| v.as_f64()),
     ) {
-        (Some(x), Some(y)) => (x, y),
-        _ => return false,
+        (x, y)
+    } else {
+        return false;
     };
-    (user_x - cx).abs() <= TOLERANCE
-        && (user_y - cy).abs() <= TOLERANCE
+    (user_x - tx).abs() <= TOLERANCE
+        && (user_y - ty).abs() <= TOLERANCE
         && elapsed_ms >= MIN_ELAPSED_MS
         && verify_trace(trace)
 }
@@ -222,7 +226,6 @@ fn generate_puzzle_polygon(rng: &mut impl Rng) -> String {
     let tab_pos: f64 = rng.gen_range(35.0f64..65.0);
     let tab_r: f64 = rng.gen_range(20.0f64..28.0);
 
-    // (x%, y%) for a point on `edge` at `along`% with `perp`% outward offset
     let edge_pt = |edge: u8, along: f64, perp: f64| -> (f64, f64) {
         match edge {
             0 => (along, -perp),
@@ -245,7 +248,6 @@ fn generate_puzzle_polygon(rng: &mut impl Rng) -> String {
                 y.clamp(0.0, 100.0)
             ));
         }
-
         if edge == tab_side || edge == notch_side {
             let sign: f64 = if edge == tab_side { 1.0 } else { -1.0 };
             let (x, y) = edge_pt(edge, bump_start, 0.0);
@@ -270,7 +272,6 @@ fn generate_puzzle_polygon(rng: &mut impl Rng) -> String {
                 y.clamp(0.0, 100.0)
             ));
         }
-
         let (x, y) = edge_pt(edge, 100.0, 0.0);
         pts.push(format!(
             "{:.1}% {:.1}%",
@@ -282,70 +283,40 @@ fn generate_puzzle_polygon(rng: &mut impl Rng) -> String {
 }
 
 fn verify_trace(trace: &str) -> bool {
-    let points: Vec<(f64, f64)> = trace
-        .split(';')
-        .filter_map(|s| {
-            let mut p = s.split(',');
-            let x = p.next()?.parse().ok()?;
-            let y = p.next()?.parse().ok()?;
-            Some((x, y))
-        })
-        .collect();
-    if points.len() < 8 {
+    let positions: Vec<f64> = trace.split(';').filter_map(|s| s.parse().ok()).collect();
+
+    let mut moving_positions: Vec<f64> = Vec::with_capacity(positions.len());
+    for x in positions {
+        if moving_positions
+            .last()
+            .is_none_or(|last| (x - last).abs() >= 0.1)
+        {
+            moving_positions.push(x);
+        }
+    }
+
+    if moving_positions.len() < MIN_TRACE_POINTS {
         return false;
     }
-    let (x1, y1) = points[0];
-    let (x2, y2) = points[points.len() - 1];
-    let dx = x2 - x1;
-    let dy = y2 - y1;
-    let line_len = (dx * dx + dy * dy).sqrt();
-    if line_len < 10.0 {
+
+    let start = moving_positions[0];
+    let end = moving_positions[moving_positions.len() - 1];
+    if (end - start).abs() < 8.0 {
         return false;
     }
-    // Velocity variation: ≥2 adjacent segment pairs where speed differs >15%
-    let dists: Vec<f64> = points
-        .windows(2)
-        .map(|w| {
-            let ddx = w[1].0 - w[0].0;
-            let ddy = w[1].1 - w[0].1;
-            (ddx * ddx + ddy * ddy).sqrt()
-        })
-        .collect();
-    let vel_var = dists
-        .windows(2)
-        .filter(|w| {
-            let lg = w[0].max(w[1]);
-            let sm = w[0].min(w[1]);
-            lg > 0.1 && (lg - sm) / lg > 0.15
-        })
-        .count();
-    if vel_var < 2 {
-        return false;
-    }
-    // At least one micro-correction. Browser sampling often records repeated
-    // stationary points while the user pauses near the target, so ignore zero
-    // movement segments before checking for a small direction reversal.
-    let has_micro = points
-        .windows(2)
-        .filter_map(|w| {
-            let dx = w[1].0 - w[0].0;
-            (dx.abs() >= 0.1).then_some(dx)
-        })
-        .scan(None, |prev: &mut Option<f64>, dx| {
-            let reversed = prev.is_some_and(|last| last * dx < 0.0 && dx.abs() < 8.0);
-            *prev = Some(dx);
-            Some(reversed)
-        })
-        .any(|reversed| reversed);
-    if !has_micro {
-        return false;
-    }
-    // Non-straight line
-    let max_dev = points
-        .iter()
-        .map(|(x, y)| ((x - x1) * dy - (y - y1) * dx).abs() / line_len)
-        .fold(0.0f64, f64::max);
-    max_dev > 2.0
+
+    let deltas: Vec<f64> = moving_positions.windows(2).map(|w| w[1] - w[0]).collect();
+    let speed_var = deltas.windows(2).any(|w| {
+        let prev = w[0].abs();
+        let next = w[1].abs();
+        let lg = prev.max(next);
+        let sm = prev.min(next);
+        lg > 0.1 && (lg - sm) / lg > 0.12
+    });
+
+    let has_nonmonotonic = deltas.windows(2).any(|w| w[0] * w[1] < 0.0);
+
+    speed_var || has_nonmonotonic
 }
 
 #[cfg(test)]
@@ -361,64 +332,102 @@ mod tests {
             + 60
     }
 
-    fn valid_trace() -> &'static str {
-        "0,0;20,2;45,9;43,12;70,20;100,18;125,25;130,31"
-    }
-
-    fn pause_separated_micro_correction_trace() -> &'static str {
-        "280,76;280,76;277,76;261,76;249,73;239,71;232,68;229,67;225,65;\
-224,64;222,63;220,61;219,60;218,59;217,58;216,57;215,56;214,55;\
-213,55;212,54;211,53;210,52;209,52;209,52;209,52;210,51;210,51;\
-211,51;211,51;210,50;210,50"
+    fn slider_token(payload: serde_json::Value) -> String {
+        crate::pages::challenges::encode_challenge_token(&payload, b"slider-secret")
     }
 
     #[test]
-    fn explicit_slider_token_verifies_signed_center_coordinates() {
-        let secret = b"slider-secret";
-        let token = encode_slider_challenge_token(150.0, 51.0, secret, future_expiry());
+    fn slider_html_uses_anchor_verification_without_explicit_token() {
+        let html = issue_html(
+            Lang::En,
+            "waf-token",
+            "/.well-known/cloud-node/waf-verify",
+            "/return",
+            120,
+            b"slider-secret",
+            future_expiry(),
+        );
+
+        assert!(html.contains("__waf_challenge_type=slider"));
+        assert!(!html.contains("__waf_challenge_token="));
+    }
+
+    #[test]
+    fn anchor_slider_accepts_human_like_horizontal_trace() {
+        assert!(verify_anchor(
+            150,
+            150.0,
+            150.0,
+            MIN_ELAPSED_MS,
+            "70;84;103;126;141;149;152;151;150",
+        ));
+    }
+
+    #[test]
+    fn anchor_slider_rejects_fast_or_linear_trace() {
+        assert!(!verify_anchor(
+            150,
+            150.0,
+            150.0,
+            MIN_ELAPSED_MS - 1,
+            "70;84;103;126;141;149;152;151;150",
+        ));
+        assert!(!verify_anchor(
+            150,
+            150.0,
+            150.0,
+            MIN_ELAPSED_MS,
+            "70;80;90;100;110;120;130;140;150",
+        ));
+    }
+
+    #[test]
+    fn explicit_slider_token_verifies_type_and_coordinates() {
+        let token = slider_token(json!({
+            "t": "slider",
+            "p": {"tx": 150.0, "ty": 51.0},
+            "e": future_expiry(),
+        }));
 
         assert!(verify_explicit(
             &token,
             150.0,
             51.0,
             MIN_ELAPSED_MS,
-            valid_trace(),
-            secret,
+            "70;84;103;126;141;149;152;151;150",
+            b"slider-secret",
         ));
+
+        let wrong_type = slider_token(json!({
+            "t": "captcha",
+            "p": {"tx": 150.0, "ty": 51.0},
+            "e": future_expiry(),
+        }));
         assert!(!verify_explicit(
-            &token,
-            123.0,
-            111.0,
+            &wrong_type,
+            150.0,
+            51.0,
             MIN_ELAPSED_MS,
-            valid_trace(),
-            secret,
+            "70;84;103;126;141;149;152;151;150",
+            b"slider-secret",
         ));
     }
 
     #[test]
-    fn slider_trace_accepts_pause_separated_micro_correction() {
-        assert!(verify_trace(pause_separated_micro_correction_trace()));
-    }
+    fn explicit_slider_token_accepts_legacy_center_coordinates() {
+        let token = slider_token(json!({
+            "t": "slider",
+            "p": {"cx": 150.0, "cy": 51.0},
+            "e": future_expiry(),
+        }));
 
-    #[test]
-    fn explicit_slider_token_rejects_wrong_type() {
-        let secret = b"slider-secret";
-        let token = crate::pages::challenges::encode_challenge_token(
-            &json!({
-                "t": "captcha",
-                "p": {"cx": 150.0, "cy": 51.0},
-                "e": future_expiry(),
-            }),
-            secret,
-        );
-
-        assert!(!verify_explicit(
+        assert!(verify_explicit(
             &token,
             150.0,
             51.0,
             MIN_ELAPSED_MS,
-            valid_trace(),
-            secret,
+            "70;84;103;126;141;149;152;151;150",
+            b"slider-secret",
         ));
     }
 }
