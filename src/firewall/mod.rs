@@ -519,7 +519,8 @@ fn normalize_action_code(code: &str) -> String {
 }
 
 fn captcha_options_from_value(options: Option<&Value>) -> Option<WAFCaptchaOptions> {
-    let mut parsed: WAFCaptchaOptions = serde_json::from_value(options?.clone()).ok()?;
+    let mut parsed: WAFCaptchaOptions =
+        serde_json::from_str(&options?.to_string()).ok()?;
     normalize_captcha_options(&mut parsed);
     Some(parsed)
 }
@@ -562,7 +563,7 @@ pub(crate) fn captcha_options_use_geetest(options: &WAFCaptchaOptions) -> bool {
 }
 
 fn js_cookie_options_from_value(options: Option<&Value>) -> Option<WAFJSCookieOptions> {
-    serde_json::from_value(options?.clone()).ok()
+    serde_json::from_str(&options?.to_string()).ok()
 }
 
 pub(crate) fn merge_captcha_options(action: &mut WAFCaptchaOptions, policy: &WAFCaptchaOptions) {
@@ -630,15 +631,22 @@ pub(crate) fn parse_action_event_level(options: Option<&Value>) -> String {
     ["eventLevel", "event_level", "level", "severity"]
         .into_iter()
         .find_map(|key| options.get(key).and_then(normalize_event_level_value))
-        .unwrap_or_else(|| "error".to_string())
+        .unwrap_or("error")
+        .to_string()
 }
 
-fn normalize_event_level_value(value: &Value) -> Option<String> {
-    if let Some(value) = value.as_str() {
-        return normalize_event_level_str(value);
+fn normalize_event_level_value(value: &Value) -> Option<&'static str> {
+    if let Some(s) = value.as_str() {
+        return normalize_event_level_str(s);
     }
-    if let Some(value) = value.as_i64() {
-        return normalize_event_level_str(&value.to_string());
+    if let Some(n) = value.as_i64() {
+        return normalize_event_level_str(match n {
+            0 => "0",
+            1 => "1",
+            2 => "2",
+            3 => "3",
+            _ => return None,
+        });
     }
     value.as_object().and_then(|object| {
         ["code", "value", "name", "label"]
@@ -647,12 +655,12 @@ fn normalize_event_level_value(value: &Value) -> Option<String> {
     })
 }
 
-fn normalize_event_level_str(value: &str) -> Option<String> {
+fn normalize_event_level_str(value: &str) -> Option<&'static str> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
-    let normalized = match value.to_ascii_lowercase().as_str() {
+    Some(match value.to_ascii_lowercase().as_str() {
         "critical" | "fatal" | "severe" | "serious" | "2" => "critical",
         "warn" | "warning" | "1" => "warning",
         "notice" | "notify" | "notification" | "info" | "0" => "notice",
@@ -662,10 +670,9 @@ fn normalize_event_level_str(value: &str) -> Option<String> {
             "警告" | "告警" => "warning",
             "通知" | "信息" => "notice",
             "错误" => "error",
-            other => other,
+            _ => return None,
         },
-    };
-    Some(normalized.to_string())
+    })
 }
 
 fn parse_action(action: &Value) -> Option<MatchedAction> {
