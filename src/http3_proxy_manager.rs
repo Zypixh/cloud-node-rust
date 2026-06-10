@@ -8,7 +8,6 @@ use pingora_core::protocols::http::server::Session as ServerSession;
 use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy_custom;
 use quinn::Endpoint;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -193,18 +192,12 @@ impl Http3ProxyManager {
     }
 
     pub async fn build_quinn_server_config(&self) -> Result<quinn::ServerConfig> {
-        self.cert_selector
-            .export_default_pair_pem()
-            .context("no certificate snapshot available for HTTP/3")?;
-        let mut rustls_config = rustls::ServerConfig::builder_with_provider(
-            rustls::crypto::ring::default_provider().into(),
+        let mut rustls_config = crate::ssl::build_rustls_server_config(
+            Arc::clone(&self.cert_selector),
+            vec![b"h3".to_vec()],
+            true,
         )
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(DynamicH3CertResolver {
-            cert_selector: Arc::clone(&self.cert_selector),
-        }));
-        rustls_config.alpn_protocols = vec![b"h3".to_vec()];
+        .context("build HTTP/3 rustls server config")?;
         rustls_config.max_early_data_size = u32::MAX;
 
         let server_config = quinn::ServerConfig::with_crypto(Arc::new(
@@ -212,31 +205,6 @@ impl Http3ProxyManager {
         ));
         // Use Quinn's default max_concurrent_uni_streams (no artificial cap for CDN)
         Ok(server_config)
-    }
-
-    fn build_certified_key(
-        cert_pem: &[u8],
-        key_pem: &[u8],
-        ocsp: &[u8],
-    ) -> Result<Option<rustls::sign::CertifiedKey>> {
-        let mut cert_reader = std::io::BufReader::new(cert_pem);
-        let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_reader).collect::<std::result::Result<_, _>>()?;
-        if certs.is_empty() {
-            return Ok(None);
-        }
-
-        let mut key_reader = std::io::BufReader::new(key_pem);
-        let key: PrivateKeyDer<'static> = match rustls_pemfile::private_key(&mut key_reader)? {
-            Some(key) => key,
-            None => return Ok(None),
-        };
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)?;
-        let mut certified = rustls::sign::CertifiedKey::new(certs, signing_key);
-        if !ocsp.is_empty() {
-            certified.ocsp = Some(ocsp.to_vec());
-        }
-        Ok(Some(certified))
     }
 
     async fn serve_connection(
@@ -404,30 +372,4 @@ fn authority_host_for_resolve(authority: &str) -> String {
         return host.to_string();
     }
     authority.to_string()
-}
-
-struct DynamicH3CertResolver {
-    cert_selector: Arc<DynamicCertSelector>,
-}
-
-impl std::fmt::Debug for DynamicH3CertResolver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DynamicH3CertResolver").finish_non_exhaustive()
-    }
-}
-
-impl rustls::server::ResolvesServerCert for DynamicH3CertResolver {
-    fn resolve(
-        &self,
-        client_hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let pair = client_hello
-            .server_name()
-            .and_then(|name| self.cert_selector.export_pair_pem_for_host(name))
-            .or_else(|| self.cert_selector.export_default_pair_pem())?;
-        Http3ProxyManager::build_certified_key(&pair.0, &pair.1, &pair.2)
-            .ok()
-            .flatten()
-            .map(Arc::new)
-    }
 }

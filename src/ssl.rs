@@ -1,14 +1,14 @@
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
-use pingora_core::protocols::tls::TlsRef as SslRef;
-use pingora_core::tls::ext;
-use pingora_core::tls::pkey::{PKey, Private};
-use pingora_core::tls::ssl::NameType;
-use pingora_core::tls::x509::X509;
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::{Arc, RwLock};
+use x509_parser::prelude::*;
 
 use crate::config_models::SSLCertConfig;
 
@@ -18,6 +18,13 @@ pub struct DynamicCertSelector {
     cache: Arc<RwLock<HashMap<i64, (String, Arc<CertPair>)>>>,
 }
 
+impl std::fmt::Debug for DynamicCertSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicCertSelector")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Default)]
 struct CertSnapshot {
     exact: HashMap<String, Arc<CertPair>>,
@@ -25,17 +32,18 @@ struct CertSnapshot {
     default: Option<Arc<CertPair>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CertPair {
     pub id: i64,
-    pub cert: X509,
-    pub key: PKey<Private>,
-    pub chain: Vec<X509>,
-    pub ocsp: Arc<ArcSwap<Vec<u8>>>,
+    certified_key: Arc<CertifiedKey>,
+    cert_bytes: Vec<u8>,
+    key_bytes: Vec<u8>,
+    ocsp: Arc<ArcSwap<Vec<u8>>>,
 }
 
 impl DynamicCertSelector {
     pub fn new() -> Self {
+        let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
         Self {
             snapshot: Arc::new(ArcSwap::from_pointee(CertSnapshot::default())),
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -56,19 +64,17 @@ impl DynamicCertSelector {
     pub async fn export_default_pem(&self) -> Option<(Vec<u8>, Vec<u8>)> {
         let snapshot = self.snapshot.load();
         let pair = snapshot.default.as_ref()?.clone();
-        let cert_pem = pair.cert.to_pem().ok()?;
-        let key_pem = pair.key.private_key_to_pem_pkcs8().ok()?;
-        Some((cert_pem, key_pem))
+        Some((pair.cert_bytes.clone(), pair.key_bytes.clone()))
     }
 
     pub fn export_pair_pem_for_host(&self, host: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         self.find_pair_blocking(&host.to_ascii_lowercase())
-            .and_then(|pair| serialize_pair_pem(&pair))
+            .map(|pair| serialize_pair_pem(&pair))
     }
 
     pub fn export_default_pair_pem(&self) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         let snapshot = self.snapshot.load();
-        serialize_pair_pem(snapshot.default.as_ref()?)
+        Some(serialize_pair_pem(snapshot.default.as_ref()?))
     }
 
     pub async fn export_snapshot_pem(
@@ -82,33 +88,25 @@ impl DynamicCertSelector {
 
         let mut exact_out = std::collections::HashMap::new();
         for (name, pair) in snapshot.exact.iter() {
-            if let Some(serialized) = serialize_pair_pem(pair) {
-                exact_out.insert(name.clone(), serialized);
-            }
+            exact_out.insert(name.clone(), serialize_pair_pem(pair));
         }
 
         let mut wildcard_out = std::collections::HashMap::new();
         for (name, pair) in snapshot.wildcard.iter() {
-            if let Some(serialized) = serialize_pair_pem(pair) {
-                wildcard_out.insert(name.clone(), serialized);
-            }
+            wildcard_out.insert(name.clone(), serialize_pair_pem(pair));
         }
 
-        let default_pair = serialize_pair_pem(snapshot.default.as_ref()?)?;
+        let default_pair = serialize_pair_pem(snapshot.default.as_ref()?);
         Some((exact_out, wildcard_out, default_pair))
     }
 
-    pub fn apply_ocsp_for_ssl_blocking(&self, ssl: &mut SslRef) {
-        let host = ssl
-            .servername(NameType::HOST_NAME)
-            .unwrap_or("")
-            .to_lowercase();
-        if let Some(pair) = self.find_pair_blocking(&host) {
-            let ocsp = pair.ocsp.load();
-            if !ocsp.is_empty() {
-                let _ = ssl.set_ocsp_status(&ocsp);
-            }
-        }
+    pub fn resolve_certified_key_for_host(&self, host: &str) -> Option<Arc<CertifiedKey>> {
+        self.find_pair_blocking(&host.to_ascii_lowercase())
+            .map(|pair| pair.certified_key_with_ocsp())
+    }
+
+    pub fn has_default_cert(&self) -> bool {
+        self.snapshot.load().default.is_some()
     }
 
     fn find_pair_blocking(&self, host: &str) -> Option<Arc<CertPair>> {
@@ -136,28 +134,64 @@ impl DynamicCertSelector {
     }
 }
 
-fn serialize_pair_pem(pair: &Arc<CertPair>) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    Some((
-        pair.cert.to_pem().ok()?,
-        pair.key.private_key_to_pem_pkcs8().ok()?,
+impl ResolvesServerCert for DynamicCertSelector {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.resolve_certified_key_for_host(client_hello.server_name().unwrap_or(""))
+    }
+}
+
+pub fn build_rustls_server_config(
+    cert_selector: Arc<DynamicCertSelector>,
+    alpn_protocols: Vec<Vec<u8>>,
+    tls13_only: bool,
+) -> anyhow::Result<rustls::ServerConfig> {
+    anyhow::ensure!(
+        cert_selector.has_default_cert(),
+        "no certificate snapshot available for TLS listener"
+    );
+
+    let provider = rustls::crypto::ring::default_provider();
+    let builder = rustls::ServerConfig::builder_with_provider(provider.into());
+    let builder = if tls13_only {
+        builder.with_protocol_versions(&[&rustls::version::TLS13])?
+    } else {
+        builder.with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])?
+    };
+    let resolver: Arc<dyn ResolvesServerCert> = cert_selector;
+    let mut config = builder.with_no_client_auth().with_cert_resolver(resolver);
+    config.alpn_protocols = alpn_protocols;
+    Ok(config)
+}
+
+impl CertPair {
+    fn certified_key_with_ocsp(&self) -> Arc<CertifiedKey> {
+        let ocsp = self.ocsp.load();
+        if ocsp.is_empty() {
+            return Arc::clone(&self.certified_key);
+        }
+
+        let mut certified_key = (*self.certified_key).clone();
+        certified_key.ocsp = Some(ocsp.as_ref().clone());
+        Arc::new(certified_key)
+    }
+}
+
+fn serialize_pair_pem(pair: &Arc<CertPair>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    (
+        pair.cert_bytes.clone(),
+        pair.key_bytes.clone(),
         pair.ocsp.load().as_ref().clone(),
-    ))
+    )
 }
 
 pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertConfig]) {
     let mut new_exact = HashMap::new();
     let mut new_wildcard = HashMap::new();
     let mut first_pair: Option<Arc<CertPair>> = None;
-
-    // We'll prepare a new cache map based on existing one
     let mut new_cache = HashMap::new();
 
-    // Scoped read to avoid holding it during the whole loop if not needed,
-    // but we need it for fingerprint comparison.
-    // To fix the deadlock, we must ensure old_cache is dropped before write_lock.
     let (stats_parsed, stats_reused) = {
         let old_cache = cert_selector.cache.read().unwrap();
-
         let mut parsed = 0;
         let mut reused = 0;
 
@@ -167,123 +201,166 @@ pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertCon
             }
 
             let cert_id = cert_cfg.id;
+            let (Some(c), Some(k)) = (&cert_cfg.cert_data_json, &cert_cfg.key_data_json) else {
+                continue;
+            };
+            let (Some(cert_bytes), Some(key_bytes)) =
+                (cert_value_to_bytes(c), cert_value_to_bytes(k))
+            else {
+                tracing::error!(
+                    "SSL Parse Error for ID {}: unsupported certificate/key JSON shape (cert_type={}, key_type={})",
+                    cert_id,
+                    json_value_kind(c),
+                    json_value_kind(k)
+                );
+                continue;
+            };
 
-            if let (Some(c), Some(k)) = (&cert_cfg.cert_data_json, &cert_cfg.key_data_json) {
-                if let (Some(cert_bytes), Some(key_bytes)) =
-                    (cert_value_to_bytes(c), cert_value_to_bytes(k))
-                {
-                    // --- FINGERPRINT CHECK ---
-                    let current_fingerprint =
-                        fnv_hash64_bytes([cert_bytes.as_slice(), key_bytes.as_slice()].as_slice())
-                            .to_string();
+            let current_fingerprint =
+                fnv_hash64_bytes([cert_bytes.as_slice(), key_bytes.as_slice()].as_slice())
+                    .to_string();
 
-                    let pair = if let Some((old_fp, old_pair)) = old_cache.get(&cert_id)
-                        && *old_fp == current_fingerprint
-                    {
-                        reused += 1;
-                        old_pair.clone()
-                    } else {
-                        let cert_chain = X509::stack_from_pem(&cert_bytes).ok();
-                        let cert_res =
-                            X509::from_pem(&cert_bytes).or_else(|_| X509::from_der(&cert_bytes));
-                        let key_res = PKey::private_key_from_pem(&key_bytes)
-                            .or_else(|_| PKey::private_key_from_der(&key_bytes));
-
-                        match (cert_res, key_res) {
-                            (Ok(cert), Ok(key)) => Arc::new(CertPair {
-                                id: cert_id,
-                                cert,
-                                key,
-                                chain: cert_chain.unwrap_or_default(),
-                                ocsp: Arc::new(ArcSwap::from_pointee(Vec::new())),
-                            }),
-                            _ => {
-                                tracing::error!(
-                                    "SSL Parse Error for ID {}: certificate/key data invalid (cert_type={}, key_type={})",
-                                    cert_id,
-                                    json_value_kind(c),
-                                    json_value_kind(k)
-                                );
-                                continue;
-                            }
-                        }
-                    };
-
-                    parsed += 1;
-                    new_cache.insert(cert_id, (current_fingerprint, pair.clone()));
-
-                    if first_pair.is_none() {
-                        first_pair = Some(pair.clone());
+            let pair = if let Some((old_fp, old_pair)) = old_cache.get(&cert_id)
+                && *old_fp == current_fingerprint
+            {
+                reused += 1;
+                old_pair.clone()
+            } else {
+                match parse_cert_pair(cert_id, cert_bytes.clone(), key_bytes.clone()) {
+                    Ok(pair) => Arc::new(pair),
+                    Err(err) => {
+                        tracing::error!(
+                            "SSL Parse Error for ID {}: certificate/key data invalid (cert_type={}, key_type={}): {}",
+                            cert_id,
+                            json_value_kind(c),
+                            json_value_kind(k),
+                            err
+                        );
+                        continue;
                     }
+                }
+            };
 
-                    // Map to domain lookups
-                    let mut names = Vec::new();
-                    if let Some(cn) = pair
-                        .cert
-                        .subject_name()
-                        .entries_by_nid(pingora_core::tls::nid::Nid::COMMONNAME)
-                        .next()
-                        .and_then(|e| e.data().as_utf8().ok())
-                    {
-                        names.push(cn.to_string());
-                    }
-                    if let Some(sans) = pair.cert.subject_alt_names() {
-                        for san in sans {
-                            if let Some(dns) = san.dnsname() {
-                                names.push(dns.to_string());
-                            }
-                        }
-                    }
-                    names.extend(
-                        cert_cfg
-                            .dns_names
-                            .iter()
-                            .map(|name| name.trim())
-                            .filter(|name| !name.is_empty())
-                            .map(ToString::to_string),
-                    );
+            parsed += 1;
+            new_cache.insert(cert_id, (current_fingerprint, pair.clone()));
 
-                    for name in names {
-                        let name_low = name.to_lowercase();
-                        if name_low.starts_with("*.") {
-                            new_wildcard.insert(name_low, pair.clone());
-                        } else {
-                            new_exact.insert(name_low, pair.clone());
-                        }
-                    }
+            if first_pair.is_none() {
+                first_pair = Some(pair.clone());
+            }
+
+            let mut names = certificate_names_from_der(pair.certified_key.cert.first());
+            names.extend(
+                cert_cfg
+                    .dns_names
+                    .iter()
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map(ToString::to_string),
+            );
+
+            for name in names {
+                let name_low = name.to_lowercase();
+                if name_low.starts_with("*.") {
+                    new_wildcard.insert(name_low, pair.clone());
                 } else {
-                    tracing::error!(
-                        "SSL Parse Error for ID {}: unsupported certificate/key JSON shape (cert_type={}, key_type={})",
-                        cert_id,
-                        json_value_kind(c),
-                        json_value_kind(k)
-                    );
-                    continue;
+                    new_exact.insert(name_low, pair.clone());
                 }
             }
         }
         (parsed, reused)
-    }; // old_cache dropped here
+    };
 
-    {
-        let new_snapshot = CertSnapshot {
-            exact: new_exact,
-            wildcard: new_wildcard,
-            default: first_pair,
-        };
-        let default_present = new_snapshot.default.is_some();
-        let mut cache_lock = cert_selector.cache.write().unwrap();
-        *cache_lock = new_cache;
-        cert_selector.snapshot.store(Arc::new(new_snapshot));
+    let new_snapshot = CertSnapshot {
+        exact: new_exact,
+        wildcard: new_wildcard,
+        default: first_pair,
+    };
+    let default_present = new_snapshot.default.is_some();
+    let mut cache_lock = cert_selector.cache.write().unwrap();
+    *cache_lock = new_cache;
+    cert_selector.snapshot.store(Arc::new(new_snapshot));
 
-        tracing::info!(
-            "SSL Sync Result: {} certs processed (Reused: {}, Parsed: {}). Default Cert present: {}",
-            stats_parsed,
-            stats_reused,
-            stats_parsed - stats_reused,
-            default_present
-        );
+    tracing::info!(
+        "SSL Sync Result: {} certs processed (Reused: {}, Parsed: {}). Default Cert present: {}",
+        stats_parsed,
+        stats_reused,
+        stats_parsed - stats_reused,
+        default_present
+    );
+}
+
+fn parse_cert_pair(
+    cert_id: i64,
+    cert_bytes: Vec<u8>,
+    key_bytes: Vec<u8>,
+) -> anyhow::Result<CertPair> {
+    let cert_chain = parse_cert_chain(&cert_bytes)?;
+    let key = parse_private_key(&key_bytes)?;
+    let provider = rustls::crypto::ring::default_provider();
+    let certified_key = CertifiedKey::from_der(cert_chain, key, &provider)?;
+
+    Ok(CertPair {
+        id: cert_id,
+        certified_key: Arc::new(certified_key),
+        cert_bytes,
+        key_bytes,
+        ocsp: Arc::new(ArcSwap::from_pointee(Vec::new())),
+    })
+}
+
+pub(crate) fn parse_cert_chain(bytes: &[u8]) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    if looks_like_pem(bytes) {
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut Cursor::new(bytes)).collect::<Result<_, _>>()?;
+        anyhow::ensure!(!certs.is_empty(), "certificate chain is empty");
+        return Ok(certs);
     }
+
+    Ok(vec![CertificateDer::from(bytes.to_vec())])
+}
+
+pub(crate) fn parse_private_key(bytes: &[u8]) -> anyhow::Result<PrivateKeyDer<'static>> {
+    if looks_like_pem(bytes) {
+        return rustls_pemfile::private_key(&mut Cursor::new(bytes))?
+            .ok_or_else(|| anyhow::anyhow!("private key is missing from PEM"));
+    }
+
+    PrivateKeyDer::try_from(bytes.to_vec()).map_err(|err| anyhow::anyhow!(err))
+}
+
+fn looks_like_pem(bytes: &[u8]) -> bool {
+    bytes
+        .windows(b"-----BEGIN ".len())
+        .any(|w| w == b"-----BEGIN ")
+}
+
+fn certificate_names_from_der(cert: Option<&CertificateDer<'static>>) -> Vec<String> {
+    let Some(cert) = cert else {
+        return Vec::new();
+    };
+    let Ok((_, parsed)) = X509Certificate::from_der(cert.as_ref()) else {
+        return Vec::new();
+    };
+
+    let mut names = Vec::new();
+    if let Some(cn) = parsed
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|attr| attr.as_str().ok())
+    {
+        names.push(cn.to_string());
+    }
+
+    if let Ok(Some(sans)) = parsed.subject_alternative_name() {
+        for name in &sans.value.general_names {
+            if let GeneralName::DNSName(dns) = name {
+                names.push((*dns).to_string());
+            }
+        }
+    }
+
+    names
 }
 
 fn cert_value_to_bytes(value: &Value) -> Option<Vec<u8>> {
@@ -364,55 +441,4 @@ fn fnv_hash64_bytes(chunks: &[&[u8]]) -> u64 {
         }
     }
     hash
-}
-
-#[async_trait]
-impl pingora_core::listeners::TlsAccept for DynamicCertSelector {
-    async fn certificate_callback(&self, ssl: &mut SslRef) {
-        let host = ssl
-            .servername(NameType::HOST_NAME)
-            .unwrap_or("")
-            .to_lowercase();
-
-        if !host.is_empty() {
-            if let Some(pair) = self.find_pair_blocking(&host) {
-                apply_cert_pair(ssl, &pair);
-            } else {
-                tracing::error!(
-                    "No default certificate available for request (SNI: {})",
-                    host
-                );
-            }
-        } else {
-            tracing::debug!("No SNI provided, using default certificate");
-            if let Some(pair) = self.find_pair_blocking("") {
-                apply_cert_pair(ssl, &pair);
-            } else {
-                tracing::error!(
-                    "No default certificate available for request (SNI: {})",
-                    host
-                );
-            }
-        }
-    }
-}
-
-fn apply_cert_pair(ssl: &mut SslRef, pair: &CertPair) {
-    if let Err(e) = ext::ssl_use_certificate(ssl, &pair.cert) {
-        tracing::warn!("Failed to set SSL certificate (id={}): {:?}", pair.id, e);
-    }
-    if let Err(e) = ext::ssl_use_private_key(ssl, &pair.key) {
-        tracing::warn!("Failed to set SSL private key (id={}): {:?}", pair.id, e);
-    }
-    for cert in pair.chain.iter().skip(1) {
-        if let Err(e) = ext::ssl_add_chain_cert(ssl, cert) {
-            tracing::warn!("Failed to add chain cert (id={}): {:?}", pair.id, e);
-        }
-    }
-    let ocsp = pair.ocsp.load();
-    if !ocsp.is_empty() {
-        if let Err(e) = ssl.set_ocsp_status(&ocsp) {
-            tracing::debug!("Failed to set OCSP status (id={}): {:?}", pair.id, e);
-        }
-    }
 }

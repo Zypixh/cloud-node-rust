@@ -1,5 +1,5 @@
 use crate::config::ConfigStore;
-use crate::config_models::ServerConfig;
+use crate::config_models::{ProxyProtocolConfig, ServerConfig};
 use crate::net_bind::{bind_tcp_listener, dual_stack_bind_addrs};
 use crate::proxy::EdgeProxy;
 use crate::proxy_protocol;
@@ -9,8 +9,8 @@ use dashmap::DashMap;
 use pingora_core::apps::HttpServerApp;
 use pingora_core::protocols::http::server::Session as ServerSession;
 use pingora_core::protocols::l4::stream::Stream as L4Stream;
-use pingora_core::protocols::tls::server::handshake_with_callback;
-use pingora_core::protocols::{GetSocketDigest, SocketDigest};
+use pingora_core::protocols::tls::server::handshake;
+use pingora_core::protocols::{ALPN, GetSocketDigest, SocketDigest, Ssl};
 use pingora_core::server::configuration::ServerConf;
 use pingora_proxy::http_proxy;
 use std::collections::HashMap;
@@ -44,6 +44,7 @@ struct ListenerConfig {
 struct PassthroughBackendTarget {
     addr: String,
     origin_id: i64,
+    proxy_protocol: ProxyProtocolConfig,
 }
 
 fn record_desired_listener(
@@ -306,24 +307,15 @@ impl HttpProxyManager {
         let proxy_arc = Arc::new(proxy);
 
         let shared_ssl_acceptor = if is_tls {
-            let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
-                pingora_core::tls::ssl::SslMethod::tls(),
+            let rustls_config = crate::ssl::build_rustls_server_config(
+                Arc::clone(&self.cert_selector),
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                false,
             )
-            .expect("Failed to create SSL acceptor builder");
-            let selector_for_ocsp = self.cert_selector.clone();
-            let _ = builder.set_status_callback(move |ssl| {
-                selector_for_ocsp.apply_ocsp_for_ssl_blocking(ssl);
-                Ok(ssl.ocsp_status().is_some())
-            });
-
-            builder.set_alpn_select_callback(|_, client_alpn| {
-                pingora_core::tls::ssl::select_next_proto(b"\x02h2\x08http/1.1", client_alpn)
-                    .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
-            });
-            // Enable TLS session caching for faster repeat connections
-            builder.set_session_id_context(b"cloud-node-rust")?;
-            builder.set_session_cache_mode(pingora_core::tls::ssl::SslSessionCacheMode::SERVER);
-            Some(Arc::new(builder.build()))
+            .context("build rustls HTTP server config")?;
+            Some(Arc::new(
+                pingora_core::listeners::tls::Acceptor::from_server_config(rustls_config),
+            ))
         } else {
             None
         };
@@ -337,8 +329,17 @@ impl HttpProxyManager {
                 res = listener.accept() => res,
             };
             let (client_stream, client_addr) = accept_result?;
+            let main_cluster_scope = crate::special_defense::cluster_block_scope_id(
+                self.config_store.get_node_cluster_id_sync(),
+            );
 
-            if self.proxy_logic.waf_state.is_blocked(client_addr.ip(), 0) {
+            if self.proxy_logic.waf_state.is_blocked(client_addr.ip(), 0)
+                || (main_cluster_scope != 0
+                    && self
+                        .proxy_logic
+                        .waf_state
+                        .is_blocked(client_addr.ip(), main_cluster_scope))
+            {
                 continue;
             }
 
@@ -359,6 +360,14 @@ impl HttpProxyManager {
                     else {
                         return;
                     };
+                    if main_cluster_scope != 0
+                        && manager
+                            .proxy_logic
+                            .waf_state
+                            .is_blocked(effective_addr.ip(), main_cluster_scope)
+                    {
+                        return;
+                    }
                     manager
                         .record_empty_connection_if_no_payload(
                             client_stream,
@@ -376,7 +385,6 @@ impl HttpProxyManager {
             let _ = client_stream.set_nodelay(true);
 
             let proxy_inner = proxy_arc.clone();
-            let selector = self.cert_selector.clone();
             let shutdown_inner = shutdown_rx.clone();
             let manager = self.clone();
             let acceptor_clone = shared_ssl_acceptor.clone();
@@ -399,6 +407,14 @@ impl HttpProxyManager {
                 else {
                     return;
                 };
+                if main_cluster_scope != 0
+                    && manager
+                        .proxy_logic
+                        .waf_state
+                        .is_blocked(client_addr.ip(), main_cluster_scope)
+                {
+                    return;
+                }
 
                 if is_tls {
                     match manager.inspect_tls_host(&client_stream, port).await {
@@ -436,18 +452,16 @@ impl HttpProxyManager {
 
                 let l4_stream = stream_with_socket_digest(client_stream, client_addr);
                 let downstream_socket_digest = l4_stream.get_socket_digest();
-                let (stream, alpn): (pingora_core::protocols::Stream, Option<Vec<u8>>) =
+                let (stream, alpn): (pingora_core::protocols::Stream, Option<ALPN>) =
                     if let Some(ssl_acceptor) = &acceptor_clone {
-                        let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
-                            Box::new((*selector).clone());
                         match tokio::time::timeout(
                             tls_handshake_timeout,
-                            handshake_with_callback(ssl_acceptor, l4_stream, &callbacks),
+                            handshake(ssl_acceptor, l4_stream),
                         )
                         .await
                         {
                             Ok(Ok(s)) => {
-                                let alpn = s.ssl().selected_alpn_protocol().map(|v| v.to_vec());
+                                let alpn = s.selected_alpn_proto();
                                 (Box::new(s), alpn)
                             }
                             Ok(Err(e)) => {
@@ -478,7 +492,7 @@ impl HttpProxyManager {
                         (Box::new(l4_stream), None)
                     };
 
-                if alpn.as_deref() == Some(b"h2") {
+                if matches!(alpn, Some(ALPN::H2)) {
                     // HTTP/2 Logic
                     let digest = Arc::new(pingora_core::protocols::Digest {
                         socket_digest: downstream_socket_digest,
@@ -558,26 +572,12 @@ impl HttpProxyManager {
         )
     }
 
-    fn global_empty_connection_flood_config(
+    fn empty_connection_flood_config(
         &self,
+        cluster_id: i64,
     ) -> Option<crate::special_defense::SpecialDefenseConfig> {
-        let policies = self.config_store.get_firewall_policies_sync();
-        policies.iter().find_map(|policy| {
-            if !policy.is_on {
-                return None;
-            }
-            let config = policy.empty_connection_flood.as_ref()?;
-            if !config.is_on || config.max_empty_connections == 0 {
-                return None;
-            }
-            Some(crate::special_defense::SpecialDefenseConfig {
-                threshold: config.max_empty_connections,
-                period_secs: i64::from(config.period).max(1),
-                block_secs: i64::from(config.block_seconds).max(1),
-                use_local_firewall: policy.use_local_firewall,
-                policy_name: policy.name.clone(),
-            })
-        })
+        self.config_store
+            .get_empty_connection_flood_config_for_cluster_sync(cluster_id)
     }
 
     async fn record_empty_connection_if_no_payload(
@@ -588,7 +588,8 @@ impl HttpProxyManager {
         shutdown_inner: watch::Receiver<bool>,
         downstream_read_timeout: Duration,
     ) {
-        let Some(config) = self.global_empty_connection_flood_config() else {
+        let cluster_id = self.config_store.get_node_cluster_id_sync();
+        let Some(config) = self.empty_connection_flood_config(cluster_id) else {
             process_plain_http_connection(
                 client_stream,
                 client_addr,
@@ -604,7 +605,12 @@ impl HttpProxyManager {
             .await
         {
             Ok(Ok(0)) => {
-                self.record_special_defense_hit("EMPTY_CONNECTION_FLOOD", client_addr.ip(), config);
+                self.record_special_defense_hit(
+                    cluster_id,
+                    "EMPTY_CONNECTION_FLOOD",
+                    client_addr.ip(),
+                    config,
+                );
             }
             Ok(Ok(_)) => {
                 process_plain_http_connection(
@@ -617,7 +623,12 @@ impl HttpProxyManager {
                 .await;
             }
             Ok(Err(_)) | Err(_) => {
-                self.record_special_defense_hit("EMPTY_CONNECTION_FLOOD", client_addr.ip(), config);
+                self.record_special_defense_hit(
+                    cluster_id,
+                    "EMPTY_CONNECTION_FLOOD",
+                    client_addr.ip(),
+                    config,
+                );
             }
         }
     }
@@ -639,6 +650,7 @@ impl HttpProxyManager {
 
     fn record_special_defense_hit(
         &self,
+        cluster_id: i64,
         defense: &str,
         ip: IpAddr,
         config: crate::special_defense::SpecialDefenseConfig,
@@ -652,6 +664,7 @@ impl HttpProxyManager {
         crate::special_defense::record_special_defense_hit(
             &self.proxy_logic.waf_state,
             node_id,
+            cluster_id,
             defense,
             ip,
             config,
@@ -733,8 +746,9 @@ impl HttpProxyManager {
         let backend_target = self.select_passthrough_backend_target(&server).await?;
         let backend_addr = backend_target.addr;
         let origin_id = backend_target.origin_id;
+        let proxy_protocol_to_origin = backend_target.proxy_protocol;
         let toa_config = self.config_store.get_toa_config_sync();
-        let backend_stream = match crate::toa::connect_with_toa(
+        let mut backend_stream = match crate::toa::connect_with_toa(
             &backend_addr,
             client_addr,
             toa_config.clone(),
@@ -793,6 +807,119 @@ impl HttpProxyManager {
 
         configure_passthrough_socket(&client_stream);
         configure_passthrough_socket(&backend_stream);
+        if proxy_protocol_to_origin.enabled() {
+            let destination_addr = backend_stream.peer_addr().ok();
+            if let Some(header) = proxy_protocol::build_header(
+                proxy_protocol_to_origin,
+                client_addr,
+                destination_addr,
+            ) {
+                if let Err(err) =
+                    tokio::io::AsyncWriteExt::write_all(&mut backend_stream, &header).await
+                {
+                    crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                    if let Some(local_port) = toa_local_port {
+                        if let Err(err) =
+                            crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
+                        {
+                            debug!("failed to release TOA sender port {}: {}", local_port, err);
+                        }
+                    }
+                    crate::rpc::stats::push_origin_health_event(
+                        origin_id,
+                        false,
+                        started.elapsed().as_millis() as i64,
+                    );
+                    let reason = format!(
+                        "failed to write PROXY Protocol header to passthrough upstream {}: {}",
+                        backend_addr, err
+                    );
+                    crate::logging::log_sni_passthrough_access(
+                        request_id,
+                        &server,
+                        &sni_host,
+                        client_addr,
+                        listen_port,
+                        &backend_addr,
+                        started_at_millis,
+                        started.elapsed(),
+                        0,
+                        0,
+                        502,
+                        Some(&reason),
+                    );
+                    crate::metrics::record::record_http_dimensions(
+                        server_id,
+                        client_addr.ip(),
+                        &sni_host,
+                        "-",
+                        0,
+                        0,
+                        0,
+                        None,
+                        None,
+                    );
+                    crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to write PROXY Protocol header to passthrough upstream {}",
+                            backend_addr
+                        )
+                    });
+                }
+            }
+            if let Err(err) = tokio::io::AsyncWriteExt::flush(&mut backend_stream).await {
+                crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                if let Some(local_port) = toa_local_port {
+                    if let Err(err) =
+                        crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
+                    {
+                        debug!("failed to release TOA sender port {}: {}", local_port, err);
+                    }
+                }
+                crate::rpc::stats::push_origin_health_event(
+                    origin_id,
+                    false,
+                    started.elapsed().as_millis() as i64,
+                );
+                let reason = format!(
+                    "failed to flush PROXY Protocol header to passthrough upstream {}: {}",
+                    backend_addr, err
+                );
+                crate::logging::log_sni_passthrough_access(
+                    request_id,
+                    &server,
+                    &sni_host,
+                    client_addr,
+                    listen_port,
+                    &backend_addr,
+                    started_at_millis,
+                    started.elapsed(),
+                    0,
+                    0,
+                    502,
+                    Some(&reason),
+                );
+                crate::metrics::record::record_http_dimensions(
+                    server_id,
+                    client_addr.ip(),
+                    &sni_host,
+                    "-",
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                );
+                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to flush PROXY Protocol header to passthrough upstream {}",
+                        backend_addr
+                    )
+                });
+            }
+        }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
         let connect_latency_ms = started.elapsed().as_millis() as i64;
         crate::rpc::stats::push_origin_health_event(origin_id, true, connect_latency_ms);
@@ -888,6 +1015,11 @@ impl HttpProxyManager {
             return Ok(PassthroughBackendTarget {
                 addr: normalize_passthrough_target(&peer.addr.to_string()),
                 origin_id: crate::lb_factory::peer_origin_id(&peer),
+                proxy_protocol: peer
+                    .ext
+                    .get::<crate::lb_factory::BackendExtension>()
+                    .map(|ext| ext.proxy_protocol)
+                    .unwrap_or_default(),
             });
         }
 
@@ -923,6 +1055,11 @@ impl HttpProxyManager {
         Ok(PassthroughBackendTarget {
             addr: normalize_passthrough_target(&peer.addr.to_string()),
             origin_id: crate::lb_factory::peer_origin_id(&peer),
+            proxy_protocol: peer
+                .ext
+                .get::<crate::lb_factory::BackendExtension>()
+                .map(|ext| ext.proxy_protocol)
+                .unwrap_or_default(),
         })
     }
 }
@@ -1162,6 +1299,7 @@ async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Opti
     }
 }
 
+#[derive(Debug)]
 enum ClientHelloParse {
     Found(String),
     NeedMore,
@@ -1374,18 +1512,18 @@ mod tests {
     #[test]
     fn partial_record_needs_more() {
         let hello = client_hello(Some("partial.example.com"));
-        assert!(matches!(
+        std::assert_matches!(
             parse_tls_client_hello_sni(&hello[..hello.len() - 3]),
             ClientHelloParse::NeedMore
-        ));
+        );
     }
 
     #[test]
     fn non_tls_is_not_client_hello() {
-        assert!(matches!(
+        std::assert_matches!(
             parse_tls_client_hello_sni(b"GET / HTTP/1.1\r\n"),
             ClientHelloParse::NotClientHello
-        ));
+        );
     }
 
     #[tokio::test]

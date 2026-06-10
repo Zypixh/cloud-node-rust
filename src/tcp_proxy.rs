@@ -1,6 +1,6 @@
 use crate::config::ConfigStore;
-use crate::config_models::SSLCertConfig;
 use crate::config_models::ServerConfig;
+use crate::config_models::{ProxyProtocolConfig, SSLCertConfig};
 use crate::firewall::state::WafStateManager;
 use crate::net_bind::{bind_tcp_listener, dual_stack_bind_addrs};
 use crate::proxy_protocol;
@@ -8,16 +8,15 @@ use crate::ssl::DynamicCertSelector;
 use base64::Engine;
 use dashmap::DashMap;
 use lru::LruCache;
-use once_cell::sync::Lazy;
-use pingora_core::tls::ext;
-use pingora_core::tls::pkey::PKey;
-use pingora_core::tls::ssl::{SslConnector, SslMethod};
-use pingora_core::tls::x509::X509;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::sync::LazyLock as Lazy;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -31,8 +30,8 @@ struct ListenerHandle {
 
 #[derive(Clone)]
 struct ParsedClientCert {
-    cert_chain: Arc<Vec<X509>>,
-    key: Arc<PKey<pingora_core::tls::pkey::Private>>,
+    cert_chain: Arc<Vec<CertificateDer<'static>>>,
+    key: Arc<PrivateKeyDer<'static>>,
 }
 
 struct TcpForwardContext {
@@ -48,11 +47,6 @@ struct TcpForwardContext {
 
 static CLIENT_CERT_CACHE: Lazy<Mutex<LruCache<String, ParsedClientCert>>> =
     Lazy::new(|| Mutex::new(LruCache::new(NonZeroUsize::MIN)));
-static UPSTREAM_TLS_CONNECTOR: Lazy<SslConnector> = Lazy::new(|| {
-    SslConnector::builder(SslMethod::tls())
-        .expect("Failed to create SSL connector builder")
-        .build()
-});
 
 pub struct TcpProxyManager {
     config_store: ConfigStore,
@@ -251,23 +245,15 @@ impl TcpProxyManager {
         info!("TCP Proxy (TLS={}) listening on {}", is_tls, bind_addr);
 
         let shared_ssl_acceptor = if is_tls {
-            let selector = self._cert_selector.clone();
-            let mut builder = pingora_core::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
-                pingora_core::tls::ssl::SslMethod::tls(),
+            let rustls_config = crate::ssl::build_rustls_server_config(
+                Arc::clone(&self._cert_selector),
+                Vec::new(),
+                false,
             )
-            .expect("Failed to create SSL acceptor builder");
-            let selector_for_ocsp = selector.clone();
-            let _ = builder.set_status_callback(move |ssl| {
-                selector_for_ocsp.apply_ocsp_for_ssl_blocking(ssl);
-                Ok(ssl.ocsp_status().is_some())
-            });
-
-            // Set ALPN for H2
-            builder.set_alpn_select_callback(|_, client_alpn| {
-                pingora_core::tls::ssl::select_next_proto(b"\x02h2\x08http/1.1", client_alpn)
-                    .ok_or(pingora_core::tls::ssl::AlpnError::NOACK)
-            });
-            Some(Arc::new(builder.build()))
+            .map_err(|err| anyhow::anyhow!("build rustls TCP server config: {}", err))?;
+            Some(Arc::new(
+                pingora_core::listeners::tls::Acceptor::from_server_config(rustls_config),
+            ))
         } else {
             None
         };
@@ -322,7 +308,7 @@ impl TcpProxyManager {
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
         is_tls: bool,
-        shared_ssl_acceptor: Option<Arc<pingora_core::tls::ssl::SslAcceptor>>,
+        shared_ssl_acceptor: Option<Arc<pingora_core::listeners::tls::Acceptor>>,
     ) -> anyhow::Result<()> {
         if server.has_valid_traffic_limit() {
             debug!(
@@ -333,7 +319,15 @@ impl TcpProxyManager {
             return Ok(());
         }
 
-        if self.waf_state.is_blocked(client_addr.ip(), 0) {
+        let main_cluster_scope = crate::special_defense::cluster_block_scope_id(
+            self.config_store.get_node_cluster_id_sync(),
+        );
+        if self.waf_state.is_blocked(client_addr.ip(), 0)
+            || (main_cluster_scope != 0
+                && self
+                    .waf_state
+                    .is_blocked(client_addr.ip(), main_cluster_scope))
+        {
             return Ok(());
         }
 
@@ -349,6 +343,13 @@ impl TcpProxyManager {
         else {
             return Ok(());
         };
+        if main_cluster_scope != 0
+            && self
+                .waf_state
+                .is_blocked(client_addr.ip(), main_cluster_scope)
+        {
+            return Ok(());
+        }
 
         if !is_tls {
             return self
@@ -360,16 +361,10 @@ impl TcpProxyManager {
         let Some(ssl_acceptor) = shared_ssl_acceptor else {
             return Err(anyhow::anyhow!("Missing SSL Acceptor for TLS connection"));
         };
-        let selector = self._cert_selector.clone();
-        let callbacks: pingora_core::listeners::TlsAcceptCallbacks = Box::new((*selector).clone());
         let tls_handshake_timeout = self.tls_handshake_timeout();
         let res = match tokio::time::timeout(
             tls_handshake_timeout,
-            pingora_core::protocols::tls::server::handshake_with_callback(
-                &ssl_acceptor,
-                l4_stream,
-                &callbacks,
-            ),
+            pingora_core::protocols::tls::server::handshake(&ssl_acceptor, l4_stream),
         )
         .await
         {
@@ -510,24 +505,13 @@ impl TcpProxyManager {
                 server.get_first_host()
             };
 
-            let mut conn_config = UPSTREAM_TLS_CONNECTOR
-                .configure()
-                .expect("Failed to create connect configuration");
-
             let verify_origin_tls = crate::lb_factory::should_verify_origin_tls(ext, &host, None);
-            if !verify_origin_tls {
-                conn_config.set_verify(pingora_core::tls::ssl::SslVerifyMode::NONE);
-            } else {
-                conn_config.set_verify(pingora_core::tls::ssl::SslVerifyMode::PEER);
-            }
-
-            if let Some(client_cert) = &ext.client_cert {
-                apply_client_cert(&mut conn_config, client_cert)?;
-            }
+            let tls_connector =
+                build_upstream_tls_connector(verify_origin_tls, ext.client_cert.as_ref())?;
 
             self.record_request_start(client_addr, &context);
             let toa_config = self.config_store.get_toa_config_sync();
-            let backend_stream = match crate::toa::connect_with_toa(
+            let mut backend_stream = match crate::toa::connect_with_toa(
                 &context.backend_addr,
                 client_addr,
                 toa_config.clone(),
@@ -548,12 +532,26 @@ impl TcpProxyManager {
                 .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
 
             configure_backend_tcp_socket(&backend_stream);
+            let proxy_protocol = context
+                .backend_ext
+                .as_ref()
+                .map(|ext| ext.proxy_protocol)
+                .unwrap_or_default();
+            if proxy_protocol.enabled() {
+                if let Err(err) =
+                    write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol)
+                        .await
+                {
+                    release_toa_port(toa_config, toa_local_port).await;
+                    self.record_backend_connect_failure(client_addr, &server, &context);
+                    return Err(err.into());
+                }
+            }
             let backend_stream = pingora_core::protocols::l4::stream::Stream::from(backend_stream);
             let backend_stream = pingora_core::protocols::tls::client::handshake(
-                conn_config,
+                &tls_connector,
                 &host,
                 backend_stream,
-                None,
             )
             .await
             .map_err(|e| {
@@ -589,7 +587,7 @@ impl TcpProxyManager {
     {
         self.record_request_start(client_addr, &context);
         let toa_config = self.config_store.get_toa_config_sync();
-        let backend_stream = match crate::toa::connect_with_toa(
+        let mut backend_stream = match crate::toa::connect_with_toa(
             &context.backend_addr,
             client_addr,
             toa_config.clone(),
@@ -610,6 +608,20 @@ impl TcpProxyManager {
             .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
 
         configure_backend_tcp_socket(&backend_stream);
+        let proxy_protocol = context
+            .backend_ext
+            .as_ref()
+            .map(|ext| ext.proxy_protocol)
+            .unwrap_or_default();
+        if proxy_protocol.enabled() {
+            if let Err(err) =
+                write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol).await
+            {
+                release_toa_port(toa_config, toa_local_port).await;
+                self.record_backend_connect_failure(client_addr, &server, &context);
+                return Err(err.into());
+            }
+        }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
         let res =
             stream_bidirectional_with_metrics(context.sid, client_stream, backend_stream).await;
@@ -627,7 +639,7 @@ impl TcpProxyManager {
     ) -> anyhow::Result<()> {
         self.record_request_start(client_addr, &context);
         let toa_config = self.config_store.get_toa_config_sync();
-        let backend_stream = match crate::toa::connect_with_toa(
+        let mut backend_stream = match crate::toa::connect_with_toa(
             &context.backend_addr,
             client_addr,
             toa_config.clone(),
@@ -648,6 +660,20 @@ impl TcpProxyManager {
             .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
 
         configure_backend_tcp_socket(&backend_stream);
+        let proxy_protocol = context
+            .backend_ext
+            .as_ref()
+            .map(|ext| ext.proxy_protocol)
+            .unwrap_or_default();
+        if proxy_protocol.enabled() {
+            if let Err(err) =
+                write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol).await
+            {
+                release_toa_port(toa_config, toa_local_port).await;
+                self.record_backend_connect_failure(client_addr, &server, &context);
+                return Err(err.into());
+            }
+        }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
         let res =
             stream_tcp_bidirectional_with_metrics(context.sid, client_stream, backend_stream).await;
@@ -1325,22 +1351,46 @@ fn client_cert_key_for_cache(client_cert: &SSLCertConfig) -> Option<String> {
     Some(client_cert_cache_key(&cert_bytes, &key_bytes))
 }
 
-fn apply_client_cert(
-    conn_config: &mut pingora_core::tls::ssl::ConnectConfiguration,
-    client_cert: &SSLCertConfig,
-) -> anyhow::Result<()> {
-    let parsed = parsed_client_cert(client_cert)?;
-    let leaf = parsed
-        .cert_chain
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("client certificate chain is empty"))?;
+fn build_upstream_tls_connector(
+    verify_origin_tls: bool,
+    client_cert: Option<&SSLCertConfig>,
+) -> anyhow::Result<pingora_core::tls::TlsConnector> {
+    let provider = rustls::crypto::ring::default_provider();
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone().into())
+        .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])?;
 
-    ext::ssl_use_certificate(conn_config, leaf)?;
-    ext::ssl_use_private_key(conn_config, &parsed.key)?;
-    for cert in parsed.cert_chain.iter().skip(1) {
-        ext::ssl_add_chain_cert(conn_config, cert)?;
+    let mut roots = RootCertStore::empty();
+    if verify_origin_tls {
+        let native = rustls_native_certs::load_native_certs();
+        for cert in native.certs {
+            roots.add(cert)?;
+        }
+        if !native.errors.is_empty() {
+            warn!(
+                "TCP Proxy: ignored {} errors while loading native TLS roots",
+                native.errors.len()
+            );
+        }
     }
-    Ok(())
+
+    let builder = builder.with_root_certificates(roots);
+    let mut config = if let Some(client_cert) = client_cert {
+        let parsed = parsed_client_cert(client_cert)?;
+        builder.with_client_auth_cert(
+            parsed.cert_chain.as_ref().clone(),
+            parsed.key.as_ref().clone_key(),
+        )?
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    if !verify_origin_tls {
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoCertificateVerification::new(provider)));
+    }
+
+    Ok(pingora_core::tls::TlsConnector::from(Arc::new(config)))
 }
 
 fn parsed_client_cert(client_cert: &SSLCertConfig) -> anyhow::Result<ParsedClientCert> {
@@ -1367,11 +1417,11 @@ fn parsed_client_cert(client_cert: &SSLCertConfig) -> anyhow::Result<ParsedClien
         return Ok(parsed);
     }
 
-    let cert_chain = X509::stack_from_pem(&cert_bytes)?;
+    let cert_chain = crate::ssl::parse_cert_chain(&cert_bytes)?;
     if cert_chain.is_empty() {
         return Err(anyhow::anyhow!("client certificate chain is empty"));
     }
-    let key = PKey::private_key_from_pem(&key_bytes)?;
+    let key = crate::ssl::parse_private_key(&key_bytes)?;
     let parsed = ParsedClientCert {
         cert_chain: Arc::new(cert_chain),
         key: Arc::new(key),
@@ -1396,6 +1446,67 @@ fn clean_pem_value(raw: &str) -> Vec<u8> {
         return decoded;
     }
     raw.replace("\\n", "\n").into_bytes()
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification {
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl NoCertificateVerification {
+    fn new(provider: rustls::crypto::CryptoProvider) -> Self {
+        Self {
+            supported: provider.signature_verification_algorithms,
+        }
+    }
+}
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
+async fn write_proxy_protocol_header(
+    backend_stream: &mut TcpStream,
+    client_addr: SocketAddr,
+    config: ProxyProtocolConfig,
+) -> io::Result<()> {
+    let destination_addr = backend_stream.peer_addr().ok();
+    if let Some(header) = proxy_protocol::build_header(config, client_addr, destination_addr) {
+        backend_stream.write_all(&header).await?;
+        backend_stream.flush().await?;
+    }
+    Ok(())
 }
 
 /// If `enable_proxy_protocol` is true, peek the first bytes of `stream` and
@@ -1467,13 +1578,19 @@ mod tests {
     use tokio::net::TcpListener;
 
     async fn configure_tls_exhaustion(store: &ConfigStore) {
+        let server = Arc::new(ServerConfig {
+            id: Some(91_004),
+            cluster_id: 1,
+            http_firewall_policy_id: 1,
+            ..Default::default()
+        });
         store
             .update_config(
                 1,
                 1,
                 1,
                 1,
-                vec![],
+                vec![server],
                 std::collections::HashMap::new(),
                 std::collections::HashMap::new(),
                 std::collections::HashMap::new(),
@@ -1578,11 +1695,13 @@ mod tests {
             7,
         );
         let ip = "127.0.0.77".parse().unwrap();
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(1);
 
         manager.record_tls_handshake_failure(ip);
-        assert!(!waf_state.is_blocked(ip, 0));
+        assert!(!waf_state.is_blocked(ip, cluster_scope));
         manager.record_tls_handshake_failure(ip);
-        assert!(waf_state.is_blocked(ip, 0));
+        assert!(waf_state.is_blocked(ip, cluster_scope));
+        assert!(!waf_state.is_blocked(ip, 0));
     }
 
     #[tokio::test]
@@ -1600,6 +1719,7 @@ mod tests {
             id: Some(91_003),
             description: String::new(),
             user_id: 0,
+            cluster_id: 1,
             is_on: true,
             server_names: vec![],
             http: None,
@@ -1612,6 +1732,8 @@ mod tests {
             uam: None,
             traffic_limit: None,
             traffic_limit_status: None,
+            http_firewall_policy_id: 0,
+            http_firewall_policy: None,
             user_plan_id: 0,
             enable_proxy_protocol: false,
             locations: vec![],
@@ -1622,7 +1744,10 @@ mod tests {
         let (proxy_client, client_addr) = listener.accept().await.unwrap();
         manager.record_tls_handshake_failure(client_addr.ip());
         manager.record_tls_handshake_failure(client_addr.ip());
-        assert!(waf_state.is_blocked(client_addr.ip(), 0));
+        assert!(waf_state.is_blocked(
+            client_addr.ip(),
+            crate::special_defense::cluster_block_scope_id(1)
+        ));
 
         manager
             .handle_connection(proxy_client, client_addr, server, true, None)
