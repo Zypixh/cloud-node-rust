@@ -1496,6 +1496,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         } else {
             0.0
         };
+        let cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
 
         let status = serde_json::json!({
             "buildVersion": env!("CARGO_PKG_VERSION"),
@@ -1523,7 +1524,8 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "connectionCount": connections,
             "apiSuccessPercent": api_success_percent,
             "apiAvgCostSeconds": api_avg_cost_seconds,
-            "cacheTotalDiskSize": crate::metrics::storage::STORAGE.total_cache_size(),
+            "cacheTotalDiskSize": cache_stats.disk_bytes,
+            "cacheTotalMemorySize": cache_stats.memory_bytes,
             "updatedAt": now,
             "timestamp": now,
             "isActive": true,
@@ -1600,6 +1602,7 @@ pub async fn report_node_online_once(
     } else {
         0.0
     };
+    let cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
     let hostname = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
@@ -1629,7 +1632,8 @@ pub async fn report_node_online_once(
         "connectionCount": connections,
         "apiSuccessPercent": api_success_percent,
         "apiAvgCostSeconds": api_avg_cost_seconds,
-        "cacheTotalDiskSize": crate::metrics::storage::STORAGE.total_cache_size(),
+        "cacheTotalDiskSize": cache_stats.disk_bytes,
+        "cacheTotalMemorySize": cache_stats.memory_bytes,
         "updatedAt": now,
         "timestamp": now,
         "isActive": true,
@@ -1743,6 +1747,7 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         } else {
             0.0
         };
+        let cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
 
         let mut cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
         let snapshots = crate::metrics::METRICS.take_snapshots();
@@ -1862,8 +1867,8 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
         value_map.insert(
             "cache".to_string(),
             serde_json::json!({
-                "diskSize": crate::metrics::storage::STORAGE.total_cache_size(),
-                "memorySize": 0
+                "diskSize": cache_stats.disk_bytes,
+                "memorySize": cache_stats.memory_bytes
             }),
         );
 

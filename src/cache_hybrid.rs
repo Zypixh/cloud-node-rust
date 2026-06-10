@@ -1576,6 +1576,8 @@ impl HybridStorage {
 
     pub async fn runtime_stats(&self) -> CacheRuntimeStats {
         let (memory_count, memory_bytes) = self.l1.stats();
+        let fast_l1_count = FAST_L1.len();
+        let fast_l1_bytes = FAST_L1_BYTES.load(Ordering::Acquire);
         let (disk_count, disk_bytes) = crate::metrics::storage::STORAGE.cache_summary();
         CacheRuntimeStats {
             policy_type: if self.policy_type.load(Ordering::Relaxed) == POLICY_MEMORY {
@@ -1583,8 +1585,8 @@ impl HybridStorage {
             } else {
                 "file".to_string()
             },
-            memory_count,
-            memory_bytes: memory_bytes as u64,
+            memory_count: memory_count.saturating_add(fast_l1_count),
+            memory_bytes: (memory_bytes as u64).saturating_add(fast_l1_bytes),
             disk_count,
             disk_bytes,
             max_disk_bytes: self
@@ -2232,6 +2234,44 @@ mod tests {
         assert!(fast_l1_lookup(&key).is_none());
         assert!(crate::metrics::storage::get_cache_meta_memory(&hash).is_none());
 
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_stats_include_fast_l1_memory() {
+        let _guard = FAST_L1_TEST_LOCK.lock();
+        let key = format!(
+            "https://cache.example.com/runtime-stats-fast-l1-{}",
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        );
+        fast_l1_remove(&fast_hash_key(&key));
+        let root = std::env::temp_dir().join(format!(
+            "cloud-node-rust-cache-stats-test-{}",
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let storage = HybridStorage::new(0, &root);
+        let before = storage.runtime_stats().await;
+
+        let header = ResponseHeader::build(200, None).expect("response header");
+        let meta = CacheMeta::new(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            std::time::SystemTime::now(),
+            0,
+            0,
+            header,
+        );
+        assert!(HybridStorage::bench_fast_l1_insert(
+            &key,
+            bytes::Bytes::from_static(b"body"),
+            &meta,
+            60,
+        ));
+
+        let after = storage.runtime_stats().await;
+        assert!(after.memory_count >= before.memory_count.saturating_add(1));
+        assert!(after.memory_bytes >= before.memory_bytes.saturating_add(4));
+
+        fast_l1_remove(&fast_hash_key(&key));
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
