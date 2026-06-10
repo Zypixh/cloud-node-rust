@@ -322,12 +322,21 @@ fn verify_trace(trace: &str) -> bool {
     if vel_var < 2 {
         return false;
     }
-    // At least one micro-correction (small x reversal <8px — human tremor)
-    let has_micro = points.windows(3).any(|w| {
-        let dx1 = w[1].0 - w[0].0;
-        let dx2 = w[2].0 - w[1].0;
-        dx1 * dx2 < 0.0 && dx2.abs() < 8.0
-    });
+    // At least one micro-correction. Browser sampling often records repeated
+    // stationary points while the user pauses near the target, so ignore zero
+    // movement segments before checking for a small direction reversal.
+    let has_micro = points
+        .windows(2)
+        .filter_map(|w| {
+            let dx = w[1].0 - w[0].0;
+            (dx.abs() >= 0.1).then_some(dx)
+        })
+        .scan(None, |prev: &mut Option<f64>, dx| {
+            let reversed = prev.is_some_and(|last| last * dx < 0.0 && dx.abs() < 8.0);
+            *prev = Some(dx);
+            Some(reversed)
+        })
+        .any(|reversed| reversed);
     if !has_micro {
         return false;
     }
@@ -356,6 +365,13 @@ mod tests {
         "0,0;20,2;45,9;43,12;70,20;100,18;125,25;130,31"
     }
 
+    fn pause_separated_micro_correction_trace() -> &'static str {
+        "280,76;280,76;277,76;261,76;249,73;239,71;232,68;229,67;225,65;\
+224,64;222,63;220,61;219,60;218,59;217,58;216,57;215,56;214,55;\
+213,55;212,54;211,53;210,52;209,52;209,52;209,52;210,51;210,51;\
+211,51;211,51;210,50;210,50"
+    }
+
     #[test]
     fn explicit_slider_token_verifies_signed_center_coordinates() {
         let secret = b"slider-secret";
@@ -377,6 +393,11 @@ mod tests {
             valid_trace(),
             secret,
         ));
+    }
+
+    #[test]
+    fn slider_trace_accepts_pause_separated_micro_correction() {
+        assert!(verify_trace(pause_separated_micro_correction_trace()));
     }
 
     #[test]

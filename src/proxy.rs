@@ -2596,6 +2596,7 @@ impl EdgeProxy {
             "jscookie" => Ok(Some("jscookie")),
             "pow" => Ok(Some("pow")),
             "geetest" => Ok(Some("geetest")),
+            "oneclick" => Ok(Some("click")),
             "slide" => Ok(Some("slider")),
             "slider" => Ok(Some("slider")),
             _ => Err(()),
@@ -10412,7 +10413,7 @@ mod tests {
                         "isOn":true,
                         "firewallPolicyId":144,
                         "ignoreGlobalRules":false,
-                        "defaultCaptchaType":"click"
+                        "defaultCaptchaType":"oneClick"
                     }
                 }
             }))
@@ -10423,7 +10424,7 @@ mod tests {
             .and_then(|web| web.firewall_ref.as_ref())
             .unwrap();
         assert_eq!(firewall_ref.id, 144);
-        assert_eq!(firewall_ref.default_captcha_type, "click");
+        assert_eq!(firewall_ref.default_captcha_type, "oneClick");
     }
 
     #[test]
@@ -10584,6 +10585,10 @@ mod tests {
             "click"
         );
         assert_eq!(
+            EdgeProxy::normalize_waf_challenge_method("oneClick", "captcha"),
+            "click"
+        );
+        assert_eq!(
             EdgeProxy::normalize_waf_challenge_method("slide", "captcha"),
             "slider"
         );
@@ -10605,6 +10610,20 @@ mod tests {
                 "captcha",
                 false,
                 Some(&site_click),
+                Some(&cluster_geetest),
+            ),
+            "click"
+        );
+
+        let site_one_click = crate::config_models::WAFCaptchaOptions {
+            method: "oneClick".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            EdgeProxy::resolve_waf_challenge_method(
+                "captcha",
+                false,
+                Some(&site_one_click),
                 Some(&cluster_geetest),
             ),
             "click"
