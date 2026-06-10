@@ -47,13 +47,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if std::path::Path::new(proto_dir).exists() {
         let protos = find_protos(proto_dir)?;
+        let includes = vec![proto_dir.to_string(), models_dir.to_string()];
 
         println!("cargo:rerun-if-changed={}", proto_dir);
 
         // Compile with configure
-        tonic_build::configure()
+        tonic_prost_build::configure()
             .build_server(false)
-            .compile_protos(&protos, &[proto_dir, models_dir])?;
+            .compile_protos(&protos, &includes)?;
     }
     Ok(())
 }
