@@ -2408,7 +2408,11 @@ pub struct HTTPFirewallRef {
         deserialize_with = "deserialize_null_default"
     )]
     pub default_captcha_type: String,
-    #[serde(default, deserialize_with = "deserialize_flexible_i64")]
+    #[serde(
+        rename = "firewallPolicyId",
+        default,
+        deserialize_with = "deserialize_flexible_i64"
+    )]
     pub id: i64,
 }
 

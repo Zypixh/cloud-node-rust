@@ -14,9 +14,11 @@ pub fn issue_html(
     let mut rng = rand::thread_rng();
 
     let pool: Vec<char> = match lang {
-        Lang::ZhCn => "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏金木水火土山川风云雷电雨雪霜"
-            .chars()
-            .collect(),
+        Lang::ZhCn => {
+            "天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏金木水火土山川风云雷电雨雪霜"
+                .chars()
+                .collect()
+        }
         Lang::En => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".chars().collect(),
     };
 
@@ -65,14 +67,24 @@ pub fn issue_html(
     ];
     let red_variants = ["#dc2626", "#e11d48", "#c2410c", "#b91c1c", "#be123c"];
 
-    let target_colors: Vec<&str> = (0..5).map(|_| red_variants[rng.gen_range(0..red_variants.len())]).collect();
+    let target_colors: Vec<&str> = (0..5)
+        .map(|_| red_variants[rng.gen_range(0..red_variants.len())])
+        .collect();
     let target_fonts: Vec<String> = (0..5)
-        .map(|_| font_templates[rng.gen_range(0..font_templates.len())].replace("{s}", &rng.gen_range(32u32..44).to_string()))
+        .map(|_| {
+            font_templates[rng.gen_range(0..font_templates.len())]
+                .replace("{s}", &rng.gen_range(32u32..44).to_string())
+        })
         .collect();
     let decoy_fonts: Vec<String> = (0..5)
-        .map(|_| font_templates[rng.gen_range(0..font_templates.len())].replace("{s}", &rng.gen_range(18u32..36).to_string()))
+        .map(|_| {
+            font_templates[rng.gen_range(0..font_templates.len())]
+                .replace("{s}", &rng.gen_range(18u32..36).to_string())
+        })
         .collect();
-    let decoy_ops: Vec<f64> = (0..5).map(|_| rng.gen_range(28u32..60) as f64 / 100.0).collect();
+    let decoy_ops: Vec<f64> = (0..5)
+        .map(|_| rng.gen_range(28u32..60) as f64 / 100.0)
+        .collect();
     let decoy_flip: Vec<bool> = (0..5).map(|_| rng.gen_bool(0.3)).collect();
 
     // Ghost chars — faint tiny misleading chars scattered across canvas
@@ -83,23 +95,86 @@ pub fn issue_html(
     } else {
         "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".chars().collect()
     };
-    let ghost_chars: Vec<char> = (0..7).map(|_| ghost_pool[rng.gen_range(0..ghost_pool.len())]).collect();
+    let ghost_chars: Vec<char> = (0..7)
+        .map(|_| ghost_pool[rng.gen_range(0..ghost_pool.len())])
+        .collect();
     let ghost_x: Vec<u32> = (0..7).map(|_| rng.gen_range(10u32..410)).collect();
     let ghost_y: Vec<u32> = (0..7).map(|_| rng.gen_range(10u32..250)).collect();
     let ghost_sz: Vec<u32> = (0..7).map(|_| rng.gen_range(9u32..20)).collect();
 
     // Serialise to JS literals
-    let js_char_arr = |v: &[char]| format!("[{}]", v.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(","));
-    let js_str_arr = |v: &[String]| format!("[{}]", v.iter().map(|s| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())).collect::<Vec<_>>().join(","));
-    let js_u32_arr = |v: &[u32]| format!("[{}]", v.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","));
-    let js_f64_arr = |v: &[f64]| format!("[{}]", v.iter().map(|n| format!("{:.2}", n)).collect::<Vec<_>>().join(","));
-    let js_bool_arr = |v: &[bool]| format!("[{}]", v.iter().map(|b| if *b { "true" } else { "false" }).collect::<Vec<_>>().join(","));
+    let js_char_arr = |v: &[char]| {
+        format!(
+            "[{}]",
+            v.iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let js_str_arr = |v: &[String]| {
+        format!(
+            "[{}]",
+            v.iter()
+                .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let js_u32_arr = |v: &[u32]| {
+        format!(
+            "[{}]",
+            v.iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let js_f64_arr = |v: &[f64]| {
+        format!(
+            "[{}]",
+            v.iter()
+                .map(|n| format!("{:.2}", n))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let js_bool_arr = |v: &[bool]| {
+        format!(
+            "[{}]",
+            v.iter()
+                .map(|b| if *b { "true" } else { "false" })
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
 
     let targets_json = js_char_arr(&targets);
     let decoys_json = js_char_arr(&decoys);
-    let pos_json = format!("[{}]", positions.iter().map(|(x, y)| format!("[{},{}]", x, y)).collect::<Vec<_>>().join(","));
-    let order_json = format!("[{}]", target_order.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
-    let tcolors_js = format!("[{}]", target_colors.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(","));
+    let pos_json = format!(
+        "[{}]",
+        positions
+            .iter()
+            .map(|(x, y)| format!("[{},{}]", x, y))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let order_json = format!(
+        "[{}]",
+        target_order
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let tcolors_js = format!(
+        "[{}]",
+        target_colors
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let tfonts_js = js_str_arr(&target_fonts);
     let dfonts_js = js_str_arr(&decoy_fonts);
     let dops_js = js_f64_arr(&decoy_ops);
@@ -119,7 +194,10 @@ pub fn issue_html(
 
     let (instr, hint) = match lang {
         Lang::ZhCn => ("请按序号点击红色字符", "忽略灰色字符，只点红色"),
-        Lang::En => ("Click the RED characters in numbered order", "Ignore grey — click only red"),
+        Lang::En => (
+            "Click the RED characters in numbered order",
+            "Ignore grey — click only red",
+        ),
     };
     let rp_js = serde_json::to_string(return_path).unwrap_or_else(|_| "\"/\"".to_string());
 
@@ -246,7 +324,10 @@ pub fn verify(token: &str, sequence: &[usize], elapsed_ms: u64, secret: &[u8]) -
         None => return false,
     };
     let target: Vec<usize> = match p.get("to").and_then(|v| v.as_array()) {
-        Some(a) => a.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect(),
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_u64().map(|x| x as usize))
+            .collect(),
         None => return false,
     };
     if target.len() != 5 || sequence.len() != 5 || elapsed_ms < 2000 {

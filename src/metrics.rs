@@ -210,11 +210,23 @@ impl ServerMetrics {
             attack_bytes: self.attack_bytes.load(Ordering::Relaxed),
             origin_bytes_sent: self.origin_bytes_sent.load(Ordering::Relaxed),
             origin_bytes_received: self.origin_bytes_received.load(Ordering::Relaxed),
-            active_connections: self.active_connections.load(Ordering::Relaxed),
+            active_connections: self.active_connections.load(Ordering::Relaxed).max(0),
             count_websocket_connections: self.count_websocket_connections.load(Ordering::Relaxed),
             count_ips: self.distinct_ips.len() as u64,
         }
     }
+}
+
+fn decrement_active_connections(counter: &AtomicI64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        if current > 0 {
+            Some(current - 1)
+        } else if current < 0 {
+            Some(0)
+        } else {
+            None
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -385,7 +397,11 @@ impl NodeMetrics {
     pub fn get_node_totals(&self) -> (u64, u64, i64) {
         let mut total_conns = 0;
         for entry in self.servers.iter() {
-            total_conns += entry.value().active_connections.load(Ordering::Relaxed);
+            total_conns += entry
+                .value()
+                .active_connections
+                .load(Ordering::Relaxed)
+                .max(0);
         }
         (
             self.total_bytes_sent.load(Ordering::Relaxed),
@@ -540,7 +556,7 @@ pub mod record {
         } else {
             get_or_create(server_id)
         };
-        m.active_connections.fetch_sub(1, Ordering::Relaxed);
+        decrement_active_connections(&m.active_connections);
         m.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
         m.bytes_received
             .fetch_add(bytes_received, Ordering::Relaxed);

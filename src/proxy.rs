@@ -217,6 +217,7 @@ pub struct ProxyCTX {
     pub server: Option<Arc<ServerConfig>>,
     pub matched_location: Option<Arc<crate::config_models::LocationConfig>>,
     pub lb: Option<Arc<crate::lb_factory::AnyLoadBalancer>>,
+    pub metrics_started: bool,
     pub metrics_recorded: bool,
     pub ttfb: Option<std::time::Duration>,
     pub response_status: u16,
@@ -333,6 +334,7 @@ impl Default for ProxyCTX {
             server: None,
             matched_location: None,
             lb: None,
+            metrics_started: false,
             metrics_recorded: false,
             ttfb: None,
             response_status: 0,
@@ -731,7 +733,8 @@ impl EdgeProxy {
         status: u16,
     ) -> String {
         let resolved = self.render_page_template(session, ctx, body, status);
-        Self::compose_waf_block_body(resolved, body, status, &ctx.request_id)
+        let composed = Self::compose_waf_block_body(resolved, body, status, &ctx.request_id);
+        self.render_page_template(session, ctx, &composed, status)
     }
 
     fn compose_waf_block_body(
@@ -1219,6 +1222,7 @@ impl EdgeProxy {
     ) -> String {
         match var_name {
             "requestId" => ctx.request_id.clone(),
+            "product.name" => self.product_name(ctx),
             "status" => status.to_string(),
             "statusMessage" => Self::status_message(status),
             "rawRemoteAddr" => Self::raw_remote_ip(&ctx.raw_remote_addr, ctx.client_ip),
@@ -2674,13 +2678,19 @@ impl EdgeProxy {
         inherited_options: Option<&crate::config_models::WAFCaptchaOptions>,
     ) {
         if matched.action_code == "captcha" {
-            if let Some(default_type) = firewall_ref
+            let site_default_type = firewall_ref
                 .map(|fw_ref| fw_ref.default_captcha_type.trim())
-                .filter(|value| !crate::firewall::captcha_method_is_default(value))
-            {
+                .filter(|value| !crate::firewall::captcha_method_is_default(value));
+
+            if let Some(default_type) = site_default_type {
                 let options = matched.captcha_options.get_or_insert_with(Default::default);
                 if crate::firewall::captcha_method_is_default(&options.method) {
                     options.method = default_type.to_string();
+                }
+            } else {
+                let options = matched.captcha_options.get_or_insert_with(Default::default);
+                if crate::firewall::captcha_method_is_default(&options.method) {
+                    options.method = "captcha".to_string();
                 }
             }
             if let Some(inherited_options) = inherited_options {
@@ -3559,6 +3569,23 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             }
         }
         escaped
+    }
+
+    fn product_name(&self, ctx: &ProxyCTX) -> String {
+        if let Some(global_cfg) = ctx.global_http_config.as_ref() {
+            let name = global_cfg.server_name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+
+        let global_cfg = self.config.get_global_http_config_sync();
+        let name = global_cfg.server_name.trim();
+        if name.is_empty() {
+            "Cloud Node".to_string()
+        } else {
+            name.to_string()
+        }
     }
 
     fn maybe_report_firewall_event(
@@ -4894,6 +4921,37 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         )
     }
 
+    fn ensure_request_metrics_started(&self, ctx: &mut ProxyCTX) {
+        if ctx.metrics_started {
+            return;
+        }
+        let Some((server_id, user_id, user_plan_id)) = ctx.server.as_ref().and_then(|server| {
+            let server_id = server.id?;
+            (server_id > 0).then_some((server_id, server.user_id, server.user_plan_id))
+        }) else {
+            return;
+        };
+
+        if ctx.server_metrics.is_none() {
+            ctx.server_metrics = Some(crate::metrics::record::get_or_create(server_id));
+        }
+        let plan_id = if user_plan_id > 0 {
+            self.config.get_user_plan_id_sync(user_plan_id).unwrap_or(0)
+        } else {
+            0
+        };
+        ctx.ip_recorded = crate::metrics::record::request_start(
+            server_id,
+            &ctx.client_ip_str,
+            user_id,
+            user_plan_id,
+            plan_id,
+            ctx.server_metrics.as_ref(),
+            ctx.ip_recorded,
+        );
+        ctx.metrics_started = true;
+    }
+
     fn waf_redirect_signature(&self, token: &str, ip: &str, ua: &str) -> String {
         let digest = Self::hmac_sha256(
             self.api_config.secret.as_bytes(),
@@ -5263,7 +5321,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             resp.insert_header("cache-control", "no-store").unwrap();
             resp.insert_header("x-uam-verified", "0").unwrap();
             session.write_response_header(Box::new(resp), false).await?;
-            let body = Bytes::from(crate::pages::verification_failed_page());
+            let body = Bytes::from(self.render_page_template(
+                session,
+                ctx,
+                &crate::pages::verification_failed_page(),
+                403,
+            ));
             ctx.response_status = 403;
             ctx.response_body_len = body.len();
             session.write_response_body(Some(body), true).await?;
@@ -5354,14 +5417,29 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 "pow" => true,
                 _ => {
                     // default: slider
-                    let sx = Self::query_param(session, "x")
+                    let sx = Self::query_param(session, "__waf_x")
+                        .or_else(|| Self::query_param(session, "x"))
                         .and_then(|v| v.parse::<f64>().ok())
                         .unwrap_or(0.0);
-                    let sy = Self::query_param(session, "y")
+                    let sy = Self::query_param(session, "__waf_y")
+                        .or_else(|| Self::query_param(session, "y"))
                         .and_then(|v| v.parse::<f64>().ok())
                         .unwrap_or(0.0);
-                    let target = self.waf_verifier.slider_target(&token);
-                    crate::pages::challenges::slider::verify_anchor(target, sx, sy, elapsed, &trace)
+                    if let Some(challenge_token) = challenge_token.as_deref() {
+                        crate::pages::challenges::slider::verify_explicit(
+                            challenge_token,
+                            sx,
+                            sy,
+                            elapsed,
+                            &trace,
+                            self.api_config.secret.as_bytes(),
+                        )
+                    } else {
+                        let target = self.waf_verifier.slider_target(&token);
+                        crate::pages::challenges::slider::verify_anchor(
+                            target, sx, sy, elapsed, &trace,
+                        )
+                    }
                 }
             };
 
@@ -5457,11 +5535,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             .unwrap();
         resp.insert_header("cache-control", "no-store").unwrap();
         session.write_response_header(Box::new(resp), false).await?;
+        let body =
+            self.render_page_template(session, ctx, &crate::pages::verification_failed_page(), 403);
+        ctx.response_body_len = body.len();
         session
-            .write_response_body(
-                Some(Bytes::from(crate::pages::verification_failed_page())),
-                true,
-            )
+            .write_response_body(Some(Bytes::from(body)), true)
             .await?;
         ctx.response_status = 403;
         Ok(true)
@@ -6371,6 +6449,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                             WAF_VERIFY_ROUTE,
                             &return_path,
                             target,
+                            challenge_secret,
+                            challenge_expiry,
                         );
                         let page = crate::pages::uam_challenge_page(
                             &body,
@@ -6381,6 +6461,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         page
                     }
                 };
+                let body_html = self.render_page_template(session, ctx, &body_html, status as u16);
 
                 let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
                 resp.insert_header("content-type", "text/html; charset=utf-8")
@@ -7092,6 +7173,7 @@ impl ProxyHttp for EdgeProxy {
         ctx.client_ip_str = ctx.client_ip.to_string();
         // Generate request ID early for use in error pages and logging
         ctx.request_id = crate::logging::next_request_id();
+        self.ensure_request_metrics_started(ctx);
 
         // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
         ctx.is_on = hot_path.is_on;
@@ -7363,26 +7445,7 @@ impl ProxyHttp for EdgeProxy {
             return Ok(false);
         }
 
-        let sid = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
-        if sid > 0 && ctx.server_metrics.is_none() {
-            ctx.server_metrics = Some(crate::metrics::record::get_or_create(sid));
-        }
-
-        let user_plan_id = ctx.server.as_ref().map(|s| s.user_plan_id).unwrap_or(0);
-        let plan_id = if user_plan_id > 0 {
-            self.config.get_user_plan_id_sync(user_plan_id).unwrap_or(0)
-        } else {
-            0
-        };
-        ctx.ip_recorded = crate::metrics::record::request_start(
-            sid,
-            &ctx.client_ip_str,
-            ctx.server.as_ref().map(|s| s.user_id).unwrap_or(0),
-            user_plan_id,
-            plan_id,
-            ctx.server_metrics.as_ref(),
-            ctx.ip_recorded,
-        );
+        self.ensure_request_metrics_started(ctx);
 
         let full_url = Self::request_full_url(session, ctx);
         if self.config.is_deleted_content_exact_sync(&full_url) {
@@ -8069,7 +8132,7 @@ impl ProxyHttp for EdgeProxy {
         }
         if !ctx.metrics_recorded {
             let server_id = ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0);
-            if server_id > 0 {
+            if server_id > 0 && ctx.metrics_started {
                 let bytes_received = session.body_bytes_read() as u64;
                 let body_bytes_sent = session.body_bytes_sent() as u64;
                 let bytes_sent = body_bytes_sent + ctx.response_headers_size as u64 + 20;
@@ -10333,7 +10396,7 @@ mod tests {
                 "web":{
                     "firewallRef":{
                         "isOn":true,
-                        "id":144,
+                        "firewallPolicyId":144,
                         "ignoreGlobalRules":false,
                         "defaultCaptchaType":"click"
                     }
@@ -10646,7 +10709,7 @@ mod tests {
     }
 
     #[test]
-    fn waf_site_firewall_ref_default_captcha_type_default_follows_global() {
+    fn waf_site_captcha_action_default_type_keeps_site_captcha_mode() {
         let firewall_ref = crate::config_models::HTTPFirewallRef {
             is_on: true,
             ignore_global_rules: false,
@@ -10655,6 +10718,8 @@ mod tests {
         };
         let cluster_geetest = crate::config_models::WAFCaptchaOptions {
             method: "geetest".to_string(),
+            life_seconds: 300,
+            max_fails: 5,
             ..Default::default()
         };
         let mut matched = crate::firewall::MatchedAction {
@@ -10698,7 +10763,21 @@ mod tests {
                 matched.captcha_options.as_ref(),
                 Some(&cluster_geetest),
             ),
-            "geetest"
+            "captcha"
+        );
+        assert_eq!(
+            matched
+                .captcha_options
+                .as_ref()
+                .map(|options| options.life_seconds),
+            Some(cluster_geetest.life_seconds)
+        );
+        assert_eq!(
+            matched
+                .captcha_options
+                .as_ref()
+                .map(|options| options.max_fails),
+            Some(cluster_geetest.max_fails)
         );
     }
 

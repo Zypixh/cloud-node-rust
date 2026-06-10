@@ -95,7 +95,7 @@ pub(crate) fn browser_i18n_script() -> &'static str {
 var D={
  en:{
 	  title:"Security Verification",no_js:"JavaScript is required for this security check.",
-  access_denied:"Access Denied",footer:"Protected by Cloud Node Security",security_notice:"Security notice",request_id:"Request",block_title:"{status} Access Denied",block_reason:"This request was blocked by the security policy.",
+  access_denied:"Access Denied",footer:"Protected by ${product.name} Security",security_notice:"Security notice",request_id:"Request",block_title:"{status} Access Denied",block_reason:"This request was blocked by the security policy.",
   switch_label:"中文",switch_title:"切换到中文",
   checking:"Checking your browser",checking_sub:"Please wait while we verify your browser capability.",
   computing_pow:"Computing proof of work ({difficulty})",pow_preparing:"Preparing proof of work...",
@@ -118,7 +118,7 @@ var D={
  },
  zh:{
 	  title:"安全验证",no_js:"此安全验证需要启用 JavaScript。",
-  access_denied:"访问被拒绝",footer:"由 Cloud Node 安全防护提供",security_notice:"安全拦截",request_id:"请求编号",block_title:"{status} 访问被拒绝",block_reason:"此请求已被安全策略拦截。",
+  access_denied:"访问被拒绝",footer:"由 ${product.name} 安全防护提供",security_notice:"安全拦截",request_id:"请求编号",block_title:"{status} 访问被拒绝",block_reason:"此请求已被安全策略拦截。",
   switch_label:"English",switch_title:"Switch to English",
   checking:"正在检查您的浏览器",checking_sub:"请稍候，我们正在验证您的浏览器能力。",
   computing_pow:"正在计算工作量证明 ({difficulty})",pow_preparing:"正在准备工作量证明...",
@@ -187,4 +187,23 @@ pub fn detect_lang(query_lang: Option<&str>, accept_language: Option<&str>) -> L
         }
     }
     Lang::En
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_footer_uses_product_name_template_variable() {
+        assert_eq!(
+            lang::text(Lang::En).footer,
+            "Protected by ${product.name} Security"
+        );
+        assert_eq!(
+            lang::text(Lang::ZhCn).footer,
+            "由 ${product.name} 安全防护提供"
+        );
+        assert!(browser_i18n_script().contains("Protected by ${product.name} Security"));
+        assert!(browser_i18n_script().contains("由 ${product.name} 安全防护提供"));
+    }
 }
