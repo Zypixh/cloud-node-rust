@@ -1,11 +1,11 @@
 use dashmap::DashMap;
-use maxminddb;
-use once_cell::sync::Lazy;
-use rocksdb::{DB, MergeOperands, Options, WriteBatch};
+use maxminddb::{self, geoip2};
+use rust_rocksdb::{DB, IteratorMode, MergeOperands, Options, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tracing::error;
 
@@ -139,7 +139,7 @@ impl MetricStorage {
             node_received.to_be_bytes(),
         );
 
-        let _ = db.write(batch);
+        let _ = db.write(&batch);
     }
 
     /// Increments multiple counters in a single atomic batch.
@@ -151,7 +151,7 @@ impl MetricStorage {
         for (key, delta) in updates {
             batch.merge(key.as_bytes(), delta.to_be_bytes());
         }
-        let _ = db.write(batch);
+        let _ = db.write(&batch);
     }
 
     /// Deletes all data older than a specific timestamp.
@@ -165,7 +165,7 @@ impl MetricStorage {
         let mut batch = WriteBatch::default();
         let end_prefix = format!("S0_T{}", older_than_timestamp);
         // We use a manual scan and delete for now to ensure compatibility
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
+        let iter = db.iterator(IteratorMode::Start);
         for (key, _) in iter.flatten() {
             let key_str = String::from_utf8_lossy(&key);
             if (key_str.starts_with("S") && &*key_str < end_prefix.as_str())
@@ -177,7 +177,7 @@ impl MetricStorage {
                 break;
             }
         }
-        let _ = db.write(batch);
+        let _ = db.write(&batch);
     }
 
     /// Cache Metadata Management
@@ -278,7 +278,7 @@ impl MetricStorage {
                 );
             }
         }
-        let _ = db.write(batch);
+        let _ = db.write(&batch);
     }
 
     pub fn get_cache_meta(&self, hash: &str) -> Option<CacheMetaEntry> {
@@ -362,7 +362,7 @@ impl MetricStorage {
             );
         }
         batch.put("CAIP_META_last_id".as_bytes(), last_id.to_be_bytes());
-        db.write(batch).is_ok()
+        db.write(&batch).is_ok()
     }
 
     /// WAF Token Persistence
@@ -728,8 +728,9 @@ pub fn lookup_asn_number(ip: IpAddr) -> i64 {
     }
     let asn = ASN_READER
         .as_ref()
-        .and_then(|reader| reader.lookup::<serde_json::Value>(ip).ok())
-        .and_then(|val| val.get("autonomous_system_number").and_then(|v| v.as_i64()))
+        .and_then(|reader| reader.lookup(ip).ok())
+        .and_then(|result| result.decode::<geoip2::Asn>().ok().flatten())
+        .and_then(|asn| asn.autonomous_system_number.map(i64::from))
         .unwrap_or(0);
     if ASN_NUMBER_CACHE.len() < 65536 {
         ASN_NUMBER_CACHE.insert(ip, asn);
