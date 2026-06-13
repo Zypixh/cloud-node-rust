@@ -549,7 +549,7 @@ impl CompiledShutdownPlan {
         Some(Self {
             status: u16::try_from(config.status)
                 .ok()
-                .filter(|code| *code >= 100)
+                .filter(|code| (100..=599).contains(code))
                 .unwrap_or(200),
             body_type: config.body_type.to_ascii_lowercase(),
             url: config.url.clone(),

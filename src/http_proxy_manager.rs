@@ -1,6 +1,6 @@
 use crate::config::ConfigStore;
 use crate::config_models::{ProxyProtocolConfig, ServerConfig};
-use crate::net_bind::{bind_tcp_listener, dual_stack_bind_addrs};
+use crate::net_bind::{bind_tcp_listener_with_retry, dual_stack_bind_addrs};
 use crate::proxy::EdgeProxy;
 use crate::proxy_protocol;
 use crate::ssl::DynamicCertSelector;
@@ -298,7 +298,7 @@ impl HttpProxyManager {
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let port = bind_addr.port();
-        let listener = bind_tcp_listener(bind_addr, 4096)?;
+        let listener = bind_tcp_listener_with_retry(bind_addr, 4096, &mut shutdown_rx).await?;
         info!("HTTP Proxy (TLS={}) listening on {}", is_tls, bind_addr);
 
         let mut proxy_logic = self.proxy_logic.clone();

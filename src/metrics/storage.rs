@@ -218,7 +218,7 @@ impl MetricStorage {
             expires: upsert.expires,
             access_time: upsert.access_time,
             access_count: upsert.access_count,
-            status: upsert.status,
+            status: normalize_cache_status(upsert.status),
             headers: upsert.headers.to_vec(),
             compressed: upsert.compressed,
             shard_id: upsert.shard_id.map(str::to_string),
@@ -573,6 +573,21 @@ pub struct CacheMetaEntry {
 /// All cache lookups read from here, eliminating synchronous RocksDB reads on the hot path.
 static CACHE_META_INDEX: Lazy<DashMap<String, CacheMetaEntry>> = Lazy::new(DashMap::new);
 
+pub(crate) fn normalize_cache_status(status: u16) -> u16 {
+    if (100..=599).contains(&status) {
+        status
+    } else {
+        200
+    }
+}
+
+fn parse_cache_status(status: Option<u64>) -> u16 {
+    status
+        .and_then(|status| u16::try_from(status).ok())
+        .map(normalize_cache_status)
+        .unwrap_or(200)
+}
+
 fn cache_meta_json(meta: &CacheMetaEntry) -> serde_json::Value {
     serde_json::json!({
         "k": meta.cache_key,
@@ -681,7 +696,7 @@ pub fn load_cache_meta_index() {
                 expires: raw.get("e").and_then(|v| v.as_i64()).unwrap_or(0),
                 access_time: raw.get("a").and_then(|v| v.as_i64()).unwrap_or(0),
                 access_count: raw.get("f").and_then(|v| v.as_u64()).unwrap_or(0),
-                status: raw.get("st").and_then(|v| v.as_u64()).unwrap_or(200) as u16,
+                status: parse_cache_status(raw.get("st").and_then(|v| v.as_u64())),
                 headers,
                 compressed: raw.get("c").and_then(|v| v.as_bool()).unwrap_or(false),
                 shard_id: raw.get("sh").and_then(|v| v.as_str()).map(str::to_string),
@@ -748,4 +763,22 @@ pub fn provider_name_to_id(name: &str) -> i64 {
 
 pub fn lookup_region_provider_id(ip: IpAddr) -> i64 {
     lookup_asn_number(ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_cache_status, parse_cache_status};
+
+    #[test]
+    fn cache_status_normalization_rejects_invalid_http_codes() {
+        assert_eq!(normalize_cache_status(99), 200);
+        assert_eq!(normalize_cache_status(100), 100);
+        assert_eq!(normalize_cache_status(599), 599);
+        assert_eq!(normalize_cache_status(600), 200);
+
+        assert_eq!(parse_cache_status(Some(200)), 200);
+        assert_eq!(parse_cache_status(Some(700)), 200);
+        assert_eq!(parse_cache_status(Some(u64::from(u16::MAX) + 1)), 200);
+        assert_eq!(parse_cache_status(None), 200);
+    }
 }

@@ -171,11 +171,13 @@ fn process_exists(pid: u32) -> bool {
     exists || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn process_basename(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_string_lossy();
     Some(name.strip_suffix(" (deleted)").unwrap_or(&name).to_string())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn first_cmdline_arg_basename(cmdline: &[u8]) -> Option<String> {
     let arg0 = cmdline
         .split(|byte| *byte == 0)
@@ -184,15 +186,33 @@ fn first_cmdline_arg_basename(cmdline: &[u8]) -> Option<String> {
     process_basename(Path::new(arg0.as_ref()))
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn cmdline_contains_management_command(cmdline: &[u8]) -> bool {
+    cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .skip(1)
+        .filter_map(|arg| std::str::from_utf8(arg).ok())
+        .any(|arg| matches!(arg, "stop" | "status" | "restart" | "install" | "test"))
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn is_cloud_node_binary_name(name: &str) -> bool {
     matches!(name, "cloud-node-rust" | "cloud-node")
 }
 
+#[cfg(target_os = "linux")]
 fn is_cloud_node_process(pid: u32) -> bool {
     if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
-        return process_basename(&exe)
+        if !process_basename(&exe)
             .as_deref()
-            .is_some_and(is_cloud_node_binary_name);
+            .is_some_and(is_cloud_node_binary_name)
+        {
+            return false;
+        }
+        return fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|cmdline| !cmdline_contains_management_command(&cmdline))
+            .unwrap_or(true);
     }
 
     let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
@@ -202,6 +222,12 @@ fn is_cloud_node_process(pid: u32) -> bool {
     first_cmdline_arg_basename(&cmdline)
         .as_deref()
         .is_some_and(is_cloud_node_binary_name)
+        && !cmdline_contains_management_command(&cmdline)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_cloud_node_process(_pid: u32) -> bool {
+    true
 }
 
 fn read_pid(path: &Path) -> Option<u32> {
@@ -1111,7 +1137,10 @@ fn normalize_sysctl_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_cmdline_arg_basename, is_cloud_node_binary_name, process_basename};
+    use super::{
+        cmdline_contains_management_command, first_cmdline_arg_basename, is_cloud_node_binary_name,
+        process_basename,
+    };
     use std::path::Path;
 
     #[test]
@@ -1141,5 +1170,21 @@ mod tests {
             first_cmdline_arg_basename(b"bash\0/usr/bin/cloud-node\0status\0").as_deref(),
             Some("bash")
         );
+    }
+
+    #[test]
+    fn cmdline_detection_excludes_short_lived_management_commands() {
+        assert!(cmdline_contains_management_command(
+            b"/opt/cloud-node-rust/cloud-node-rust\0status\0"
+        ));
+        assert!(cmdline_contains_management_command(
+            b"/opt/cloud-node-rust/cloud-node-rust\0test\0"
+        ));
+        assert!(!cmdline_contains_management_command(
+            b"/opt/cloud-node-rust/cloud-node-rust\0start\0"
+        ));
+        assert!(!cmdline_contains_management_command(
+            b"/opt/cloud-node-rust/cloud-node-rust\0--monitor-port\08888\0"
+        ));
     }
 }

@@ -2,7 +2,7 @@ use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 use crate::config_models::{ProxyProtocolConfig, SSLCertConfig};
 use crate::firewall::state::WafStateManager;
-use crate::net_bind::{bind_tcp_listener, dual_stack_bind_addrs};
+use crate::net_bind::{bind_tcp_listener_with_retry, dual_stack_bind_addrs};
 use crate::proxy_protocol;
 use crate::ssl::DynamicCertSelector;
 use base64::Engine;
@@ -241,7 +241,7 @@ impl TcpProxyManager {
         is_tls: bool,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let listener = bind_tcp_listener(bind_addr, 4096)?;
+        let listener = bind_tcp_listener_with_retry(bind_addr, 4096, &mut shutdown_rx).await?;
         info!("TCP Proxy (TLS={}) listening on {}", is_tls, bind_addr);
 
         let shared_ssl_acceptor = if is_tls {

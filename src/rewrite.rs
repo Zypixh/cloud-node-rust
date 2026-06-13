@@ -90,11 +90,7 @@ impl CompiledRewriteRule {
             replace: rule.replace.clone(),
             with_query: rule.with_query,
             mode: rule.mode.as_deref().unwrap_or("proxy").to_string(),
-            redirect_status: if rule.redirect_status > 0 {
-                rule.redirect_status as u16
-            } else {
-                307
-            },
+            redirect_status: rewrite_redirect_status(rule.redirect_status),
             is_break: rule.is_break,
             proxy_host: rule.proxy_host.clone(),
             conds: CompiledRewriteConds::compile(rule.conds.as_ref()),
@@ -461,6 +457,13 @@ fn compile_host_redirect_status(redirect: &HTTPHostRedirectConfig) -> Option<u16
     u16::try_from(configured)
         .ok()
         .filter(|status| (300..=399).contains(status))
+}
+
+fn rewrite_redirect_status(status: i32) -> u16 {
+    u16::try_from(status)
+        .ok()
+        .filter(|status| (300..=399).contains(status))
+        .unwrap_or(307)
 }
 
 pub fn evaluate_compiled_host_redirects(
@@ -930,11 +933,7 @@ pub fn evaluate_rewrites_with_cond(
                 let mode = rule.mode.as_deref().unwrap_or("proxy");
                 match mode {
                     "redirect" => {
-                        let status = if rule.redirect_status > 0 {
-                            rule.redirect_status as u16
-                        } else {
-                            307
-                        };
+                        let status = rewrite_redirect_status(rule.redirect_status);
                         return RewriteResult::Redirect {
                             location: final_url,
                             status,
@@ -1260,6 +1259,15 @@ mod tests {
             }
             other => panic!("unexpected rewrite result: {:?}", other),
         }
+    }
+
+    #[test]
+    fn rewrite_redirect_status_rejects_invalid_http_codes() {
+        assert_eq!(rewrite_redirect_status(0), 307);
+        assert_eq!(rewrite_redirect_status(200), 307);
+        assert_eq!(rewrite_redirect_status(700), 307);
+        assert_eq!(rewrite_redirect_status(i32::from(u16::MAX) + 1), 307);
+        assert_eq!(rewrite_redirect_status(302), 302);
     }
 }
 

@@ -388,11 +388,12 @@ impl Storage for FileStorage {
         let now = crate::utils::time::now_timestamp();
         let ttl = (meta.expires - now).max(0) as u64;
 
-        let mut header = pingora_http::ResponseHeader::build(meta.status, None).unwrap();
+        let status = crate::metrics::storage::normalize_cache_status(meta.status);
+        let mut header = pingora_http::ResponseHeader::build(status, None).unwrap();
         for (name, val) in &meta.headers {
             let _ = header.insert_header(name.to_string(), val.as_str());
         }
-        restore_content_length(&mut header, meta.status, meta.size);
+        restore_content_length(&mut header, status, meta.size);
 
         let Some(path) = self.find_existing_path_by_hash(&hash).await else {
             crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
@@ -2115,6 +2116,54 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("10")
         );
+
+        crate::metrics::storage::delete_cache_meta_for_test(&hash);
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn l2_hit_with_invalid_cached_status_falls_back_to_ok() {
+        let key_str = format!(
+            "invalid-status-l2-hit-{}-{}",
+            std::process::id(),
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        );
+        let root = std::env::temp_dir().join(format!(
+            "cloud-node-rust-cache-test-{}",
+            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let storage = Box::leak(Box::new(FileStorage::new(&root)));
+        let key = CacheKey::new("edge", key_str.as_str(), "");
+        let hash = storage.get_hash(&key);
+        let path = storage.get_path(&key);
+        tokio::fs::create_dir_all(path.parent().expect("cache path parent"))
+            .await
+            .expect("create cache dir");
+        tokio::fs::write(&path, b"cached-body")
+            .await
+            .expect("write cache file");
+        crate::metrics::storage::insert_cache_meta_for_test(
+            hash.clone(),
+            crate::metrics::storage::CacheMetaEntry {
+                cache_key: key_str.clone(),
+                size: 11,
+                expires: crate::utils::time::now_timestamp() + 60,
+                access_time: crate::utils::time::now_timestamp(),
+                access_count: 1,
+                status: 700,
+                headers: Vec::new(),
+                compressed: false,
+                ..Default::default()
+            },
+        );
+
+        let trace = pingora_cache::trace::Span::inactive().handle();
+        let (meta, _) = storage
+            .lookup(&key, &trace)
+            .await
+            .expect("lookup result")
+            .expect("cache hit");
+        assert_eq!(meta.response_header().status.as_u16(), 200);
 
         crate::metrics::storage::delete_cache_meta_for_test(&hash);
         let _ = tokio::fs::remove_dir_all(&root).await;

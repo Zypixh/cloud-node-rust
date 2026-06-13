@@ -799,6 +799,31 @@ impl EdgeProxy {
             .unwrap_or_default()
     }
 
+    fn response_status_from_i64(status: i64, default_status: u16) -> u16 {
+        u16::try_from(status)
+            .ok()
+            .filter(|code| (100..=599).contains(code))
+            .unwrap_or(default_status)
+    }
+
+    fn waf_response_status(status: i32, default_status: u16) -> u16 {
+        Self::response_status_from_i64(i64::from(status), default_status)
+    }
+
+    fn waf_redirect_status(status: i32) -> u16 {
+        u16::try_from(status)
+            .ok()
+            .filter(|code| (300..=399).contains(code))
+            .unwrap_or(302)
+    }
+
+    fn insert_location_header(resp: &mut pingora_http::ResponseHeader, location: impl AsRef<str>) {
+        if resp.insert_header("location", location.as_ref()).is_err() {
+            warn!("Invalid Location header value generated, falling back to /");
+            let _ = resp.insert_header("location", "/");
+        }
+    }
+
     fn sync_response_headers(
         upstream_response: &pingora::http::ResponseHeader,
         ctx: &mut ProxyCTX,
@@ -2411,7 +2436,7 @@ impl EdgeProxy {
     ) -> Result<bool> {
         if let Some((target, redirect_status)) = shutdown.redirect_target() {
             let mut resp = pingora_http::ResponseHeader::build(redirect_status, None).unwrap();
-            resp.insert_header("location", target).unwrap();
+            Self::insert_location_header(&mut resp, target);
             session.write_response_header(Box::new(resp), true).await?;
             ctx.response_status = redirect_status;
             return Ok(true);
@@ -2456,10 +2481,7 @@ impl EdgeProxy {
             return Ok(false);
         }
 
-        let status = u16::try_from(shutdown.status)
-            .ok()
-            .filter(|code| *code >= 100)
-            .unwrap_or(200);
+        let status = Self::response_status_from_i64(i64::from(shutdown.status), 200);
         let body_type = shutdown.body_type.to_ascii_lowercase();
 
         if body_type == "redirecturl" {
@@ -2474,7 +2496,7 @@ impl EdgeProxy {
                 307
             };
             let mut resp = pingora_http::ResponseHeader::build(redirect_status, None).unwrap();
-            resp.insert_header("location", target).unwrap();
+            Self::insert_location_header(&mut resp, &target);
             session.write_response_header(Box::new(resp), true).await?;
             ctx.response_status = redirect_status;
             return Ok(true);
@@ -3414,7 +3436,7 @@ impl EdgeProxy {
                 ctx.response_headers
                     .insert("location".to_string(), url.clone());
                 let mut resp = pingora_http::ResponseHeader::build(redirect_status, None).unwrap();
-                resp.insert_header("location", url.as_str()).unwrap();
+                Self::insert_location_header(&mut resp, url.as_str());
                 ctx.response_headers_size = resp
                     .headers
                     .iter()
@@ -3427,7 +3449,7 @@ impl EdgeProxy {
             if let Some(body) = page.body.as_ref().filter(|body| !body.is_empty()) {
                 let final_status = u16::try_from(page.new_status)
                     .ok()
-                    .filter(|code| *code >= 100)
+                    .filter(|code| (100..=599).contains(code))
                     .unwrap_or(status);
                 ctx.response_status = final_status;
                 let resolved_body = self.render_page_template(session, ctx, body, final_status);
@@ -4465,8 +4487,8 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let action = hot_path.global_http.domain_mismatch_action.as_ref();
         let status = action
             .and_then(|a| a.options.get("statusCode").and_then(|v| v.as_i64()))
-            .filter(|status| (100..1000).contains(status))
-            .unwrap_or(404) as u16;
+            .map(|status| Self::response_status_from_i64(status, 404))
+            .unwrap_or(404);
 
         if hot_path.global_http.node_ip_show_page && host.parse::<std::net::IpAddr>().is_ok() {
             let body = self.render_page_template(
@@ -4505,7 +4527,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 if !location.is_empty() {
                     let location = self.render_raw_template(session, ctx, location, 307);
                     let mut resp = pingora_http::ResponseHeader::build(307, None).unwrap();
-                    let _ = resp.insert_header("location", location);
+                    Self::insert_location_header(&mut resp, &location);
                     session.write_response_header(Box::new(resp), true).await?;
                     ctx.response_status = 307;
                     return Ok(true);
@@ -5314,7 +5336,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 );
                 let uam_challenge_type = Self::uam_mode_code(mode);
                 let mut resp = pingora_http::ResponseHeader::build(303, None).unwrap();
-                resp.insert_header("location", return_path).unwrap();
+                Self::insert_location_header(&mut resp, &return_path);
                 resp.append_header(
                     "set-cookie",
                     format!("UAM-Pass={uam_pass}:type={uam_challenge_type}; HttpOnly; {suffix}"),
@@ -5471,7 +5493,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             let pass_sig = self.waf_pass_signature(&token, &ctx.client_ip_str, ua, &challenge_type);
             let pass_cookie = Self::encode_waf_pass_cookie_value(&challenge_type, &pass_sig);
             let mut resp = pingora_http::ResponseHeader::build(303, None).unwrap();
-            resp.insert_header("location", return_path).unwrap();
+            Self::insert_location_header(&mut resp, &return_path);
             resp.append_header(
                 "set-cookie",
                 format!("WAF-Token={token}:type={challenge_type}; HttpOnly; {suffix}"),
@@ -6151,11 +6173,12 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                     }
                 }
 
-                let resolved_body = self.render_waf_block_body(session, ctx, &body, status as u16);
-                let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
+                let status = Self::waf_response_status(status, 403);
+                let resolved_body = self.render_waf_block_body(session, ctx, &body, status);
+                let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
                 resp.insert_header("content-type", "text/html; charset=utf-8")
                     .unwrap();
-                ctx.response_status = status as u16;
+                ctx.response_status = status;
                 ctx.response_body_len = resolved_body.len();
                 session.write_response_header(Box::new(resp), false).await?;
                 session
@@ -6195,10 +6218,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         }
                     }
                 }
-                let resolved_body = self.render_page_template(session, ctx, &body, status as u16);
-                let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
+                let status = Self::waf_response_status(status, 403);
+                let resolved_body = self.render_page_template(session, ctx, &body, status);
+                let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
                 resp.insert_header("content-type", content_type).unwrap();
-                ctx.response_status = status as u16;
+                ctx.response_status = status;
                 ctx.response_body_len = resolved_body.len();
                 session.write_response_header(Box::new(resp), false).await?;
                 session
@@ -6207,10 +6231,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 Ok(true)
             }
             crate::firewall::ActionResponse::Redirect { status, location } => {
-                let resolved_url = self.render_raw_template(session, ctx, &location, status as u16);
-                let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
-                resp.insert_header("location", resolved_url).unwrap();
-                ctx.response_status = status as u16;
+                let status = Self::waf_redirect_status(status);
+                let resolved_url = self.render_raw_template(session, ctx, &location, status);
+                let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
+                Self::insert_location_header(&mut resp, &resolved_url);
+                ctx.response_status = status;
                 session.write_response_header(Box::new(resp), true).await?;
                 Ok(true)
             }
@@ -6343,10 +6368,11 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         | crate::firewall::ActionResponse::Post307 { .. }
                 ) {
                     let redirect_sig = self.waf_redirect_signature(&token, &ip, ua);
-                    let mut resp =
-                        pingora_http::ResponseHeader::build(status as u16, None).unwrap();
-                    resp.insert_header("location", Self::current_request_path_query(session))
-                        .unwrap();
+                    let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
+                    Self::insert_location_header(
+                        &mut resp,
+                        Self::current_request_path_query(session),
+                    );
                     resp.append_header(
                         "set-cookie",
                         format!("WAF-Token={token}; HttpOnly; {suffix}"),
@@ -6476,9 +6502,9 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                         page
                     }
                 };
-                let body_html = self.render_page_template(session, ctx, &body_html, status as u16);
+                let body_html = self.render_page_template(session, ctx, &body_html, status);
 
-                let mut resp = pingora_http::ResponseHeader::build(status as u16, None).unwrap();
+                let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
                 resp.insert_header("content-type", "text/html; charset=utf-8")
                     .unwrap();
                 resp.insert_header("cache-control", "no-store").unwrap();
@@ -7297,7 +7323,7 @@ impl ProxyHttp for EdgeProxy {
                 self.should_redirect_to_https(session, ctx, &server, &host)
             {
                 let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
-                resp.insert_header("location", location).unwrap();
+                Self::insert_location_header(&mut resp, &location);
                 session.write_response_header(Box::new(resp), true).await?;
                 ctx.response_status = status;
                 return Ok(true);
@@ -7305,7 +7331,7 @@ impl ProxyHttp for EdgeProxy {
 
             if let Some(location) = Self::www_trailing_slash_redirect(&server, session, &host) {
                 let mut resp = pingora_http::ResponseHeader::build(301u16, None).unwrap();
-                resp.insert_header("location", location).unwrap();
+                Self::insert_location_header(&mut resp, &location);
                 session.write_response_header(Box::new(resp), true).await?;
                 ctx.response_status = 301;
                 return Ok(true);
@@ -7588,7 +7614,7 @@ impl ProxyHttp for EdgeProxy {
                 };
                 if let Some((location, status)) = redirect {
                     let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
-                    resp.insert_header("location", location).unwrap();
+                    Self::insert_location_header(&mut resp, &location);
                     session.write_response_header(Box::new(resp), true).await?;
                     return Ok(true);
                 }
@@ -7635,7 +7661,7 @@ impl ProxyHttp for EdgeProxy {
                             .get_or_insert_with(Vec::new)
                             .push("rewrite".to_string());
                         let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
-                        resp.insert_header("location", location).unwrap();
+                        Self::insert_location_header(&mut resp, &location);
                         session.write_response_header(Box::new(resp), true).await?;
                         return Ok(true);
                     }
@@ -10434,6 +10460,48 @@ mod tests {
         assert_eq!(EdgeProxy::redirect_to_https_status(302), 302);
         assert_eq!(EdgeProxy::redirect_to_https_status(307), 307);
         assert_eq!(EdgeProxy::redirect_to_https_status(308), 308);
+    }
+
+    #[test]
+    fn waf_status_helpers_reject_invalid_codes() {
+        assert_eq!(EdgeProxy::response_status_from_i64(99, 404), 404);
+        assert_eq!(EdgeProxy::response_status_from_i64(600, 404), 404);
+        assert_eq!(EdgeProxy::response_status_from_i64(-1, 404), 404);
+        assert_eq!(EdgeProxy::response_status_from_i64(100, 404), 100);
+        assert_eq!(EdgeProxy::response_status_from_i64(599, 404), 599);
+
+        assert_eq!(EdgeProxy::waf_response_status(99, 403), 403);
+        assert_eq!(EdgeProxy::waf_response_status(600, 403), 403);
+        assert_eq!(EdgeProxy::waf_response_status(-1, 403), 403);
+        assert_eq!(EdgeProxy::waf_response_status(200, 403), 200);
+        assert_eq!(EdgeProxy::waf_response_status(599, 403), 599);
+
+        assert_eq!(EdgeProxy::waf_redirect_status(200), 302);
+        assert_eq!(EdgeProxy::waf_redirect_status(600), 302);
+        assert_eq!(EdgeProxy::waf_redirect_status(-1), 302);
+        assert_eq!(EdgeProxy::waf_redirect_status(301), 301);
+        assert_eq!(EdgeProxy::waf_redirect_status(308), 308);
+    }
+
+    #[test]
+    fn insert_location_header_falls_back_for_invalid_values() {
+        let mut resp = pingora_http::ResponseHeader::build(302, None).unwrap();
+        EdgeProxy::insert_location_header(&mut resp, "https://example.com/ok");
+        assert_eq!(
+            resp.headers
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://example.com/ok")
+        );
+
+        let mut resp = pingora_http::ResponseHeader::build(302, None).unwrap();
+        EdgeProxy::insert_location_header(&mut resp, "https://example.com/\r\nbad");
+        assert_eq!(
+            resp.headers
+                .get("location")
+                .and_then(|value| value.to_str().ok()),
+            Some("/")
+        );
     }
 
     #[test]
