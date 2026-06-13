@@ -171,13 +171,37 @@ fn process_exists(pid: u32) -> bool {
     exists || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+fn process_basename(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    Some(name.strip_suffix(" (deleted)").unwrap_or(&name).to_string())
+}
+
+fn first_cmdline_arg_basename(cmdline: &[u8]) -> Option<String> {
+    let arg0 = cmdline
+        .split(|byte| *byte == 0)
+        .find(|arg| !arg.is_empty())?;
+    let arg0 = String::from_utf8_lossy(arg0);
+    process_basename(Path::new(arg0.as_ref()))
+}
+
+fn is_cloud_node_binary_name(name: &str) -> bool {
+    matches!(name, "cloud-node-rust" | "cloud-node")
+}
+
 fn is_cloud_node_process(pid: u32) -> bool {
+    if let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) {
+        return process_basename(&exe)
+            .as_deref()
+            .is_some_and(is_cloud_node_binary_name);
+    }
+
     let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-        return true;
+        return false;
     };
 
-    let cmdline = String::from_utf8_lossy(&cmdline);
-    cmdline.contains("cloud-node-rust") || cmdline.contains("cloud-node")
+    first_cmdline_arg_basename(&cmdline)
+        .as_deref()
+        .is_some_and(is_cloud_node_binary_name)
 }
 
 fn read_pid(path: &Path) -> Option<u32> {
@@ -1083,4 +1107,39 @@ fn tune_kernel_param(param: KernelParamTune) {
 #[cfg(target_os = "linux")]
 fn normalize_sysctl_value(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_cmdline_arg_basename, is_cloud_node_binary_name, process_basename};
+    use std::path::Path;
+
+    #[test]
+    fn cloud_node_binary_names_accept_real_binaries() {
+        assert!(is_cloud_node_binary_name("cloud-node"));
+        assert!(is_cloud_node_binary_name("cloud-node-rust"));
+        assert!(!is_cloud_node_binary_name("bash"));
+        assert!(!is_cloud_node_binary_name("install-rust-cloud-node.sh"));
+    }
+
+    #[test]
+    fn process_basename_strips_linux_deleted_suffix() {
+        assert_eq!(
+            process_basename(Path::new("/opt/cloud-node-rust/cloud-node-rust (deleted)"))
+                .as_deref(),
+            Some("cloud-node-rust")
+        );
+    }
+
+    #[test]
+    fn cmdline_detection_uses_argv0_not_wrapper_arguments() {
+        assert_eq!(
+            first_cmdline_arg_basename(b"/opt/cloud-node-rust/cloud-node-rust\0start\0").as_deref(),
+            Some("cloud-node-rust")
+        );
+        assert_eq!(
+            first_cmdline_arg_basename(b"bash\0/usr/bin/cloud-node\0status\0").as_deref(),
+            Some("bash")
+        );
+    }
 }
