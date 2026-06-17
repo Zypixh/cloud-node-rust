@@ -512,6 +512,9 @@ impl TcpProxyManager {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let _origin_connect_permit = MEMORY_GOVERNOR
+            .try_admit(AdmissionClass::OriginConnect)
+            .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         if context.use_tls_to_backend {
             let ext = context.backend_ext.as_ref().expect("Checked use_tls above");
             let host = if !ext.host.is_empty() {
@@ -600,6 +603,9 @@ impl TcpProxyManager {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let _origin_connect_permit = MEMORY_GOVERNOR
+            .try_admit(AdmissionClass::OriginConnect)
+            .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         self.record_request_start(client_addr, &context);
         let toa_config = self.config_store.get_toa_config_sync();
         let mut backend_stream = match crate::toa::connect_with_toa(
@@ -652,6 +658,9 @@ impl TcpProxyManager {
         server: Arc<ServerConfig>,
         context: TcpForwardContext,
     ) -> anyhow::Result<()> {
+        let _origin_connect_permit = MEMORY_GOVERNOR
+            .try_admit(AdmissionClass::OriginConnect)
+            .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         self.record_request_start(client_addr, &context);
         let toa_config = self.config_store.get_toa_config_sync();
         let mut backend_stream = match crate::toa::connect_with_toa(

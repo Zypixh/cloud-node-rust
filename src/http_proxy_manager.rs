@@ -812,6 +812,9 @@ impl HttpProxyManager {
         let backend_addr = backend_target.addr;
         let origin_id = backend_target.origin_id;
         let proxy_protocol_to_origin = backend_target.proxy_protocol;
+        let _origin_connect_permit = MEMORY_GOVERNOR
+            .try_admit(AdmissionClass::OriginConnect)
+            .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         let toa_config = self.config_store.get_toa_config_sync();
         let mut backend_stream = match crate::toa::connect_with_toa(
             &backend_addr,

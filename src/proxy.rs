@@ -29,6 +29,7 @@ use crate::config_models::{
     ServerConfig, UAMConfig, WAFCaptchaOptions, WebCacheConfig,
 };
 use crate::firewall::state::WafStateManager;
+use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR, StaticAdmissionPermit};
 use crate::rewrite::{RewriteResult, evaluate_host_redirects, evaluate_rewrites_with_cond};
 use crate::rpc::ip_report::{IpReportKind, IpReportMessage};
 use dashmap::DashMap;
@@ -268,6 +269,7 @@ pub struct ProxyCTX {
     pub response_headers_size: usize,
     pub origin_address: String,
     pub origin_id: i64,
+    pub origin_connect_permit: Option<StaticAdmissionPermit>,
     pub upstream_retries: u8,
     pub origin_status: i32,
     pub is_on: bool,
@@ -384,6 +386,7 @@ impl Default for ProxyCTX {
             response_headers_size: 0,
             origin_address: String::new(),
             origin_id: 0,
+            origin_connect_permit: None,
             upstream_retries: 0,
             origin_status: 0,
             is_on: true,
@@ -639,7 +642,10 @@ impl EdgeProxy {
 
     fn report_remote_purge(api_config: Arc<ApiConfig>, key: String) {
         tokio::spawn(async move {
-            let client = match crate::rpc::client::SharedRpcClient::get(&api_config).await.map(|s| s.as_rpc_client()) {
+            let client = match crate::rpc::client::SharedRpcClient::get(&api_config)
+                .await
+                .map(|s| s.as_rpc_client())
+            {
                 Ok(client) => client,
                 Err(err) => {
                     warn!("CACHE_PURGE: create RPC client failed: {}", err);
@@ -7723,6 +7729,35 @@ impl ProxyHttp for EdgeProxy {
         e
     }
 
+    async fn proxy_upstream_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if ctx.origin_connect_permit.is_some() {
+            return Ok(true);
+        }
+
+        if let Some(permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::OriginConnect) {
+            ctx.origin_connect_permit = Some(permit);
+            return Ok(true);
+        }
+
+        ctx.response_status = 503;
+        ctx.origin_status = 0;
+        ctx.errors
+            .get_or_insert_with(Vec::new)
+            .push("origin connect memory admission rejected".to_string());
+        let _ = session
+            .cache
+            .disable(pingora_cache::NoCacheReason::Custom("OriginMemoryPressure"));
+        self.respond_status_with_pages(session, ctx, 503).await?;
+        Ok(false)
+    }
+
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
@@ -8176,6 +8211,7 @@ impl ProxyHttp for EdgeProxy {
     }
 
     async fn logging(&self, session: &mut Session, _re: Option<&Error>, ctx: &mut Self::CTX) {
+        ctx.origin_connect_permit.take();
         if ctx.response_status == 0 {
             if let Some(err) = _re {
                 if matches!(err.esource(), ErrorSource::Downstream)

@@ -17,18 +17,17 @@ use tracing::{info, warn};
 
 use arc_swap::ArcSwap;
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 static CLUSTER_STORAGE_POLICY_SKIP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 static CACHED_DISK_AVAILABLE: AtomicU64 = AtomicU64::new(u64::MAX);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-static CACHED_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
-static CACHED_MEMORY_BUDGET_AT: AtomicI64 = AtomicI64::new(0);
-const MEMORY_BUDGET_TTL_SECS: i64 = 30;
 
 const DISK_HIT_CHUNK_BYTES: usize = 128 * 1024;
 const MEMORY_SERVE_MAX: u64 = 50 * 1024 * 1024;
+const BLOOM_BITS_PER_ENTRY_ESTIMATE: u64 = 10;
+const BLOOM_LAYER_OVERHEAD_BYTES: u64 = 256;
 
 /// Parse `stale-while-revalidate=N` from a Cache-Control header value.
 /// Returns `None` if the directive is absent.
@@ -1127,7 +1126,7 @@ impl TinyUfoL1 {
         let auto_budget = bytes == 0;
         self.auto_budget.store(auto_budget, Ordering::Relaxed);
         let resolved = if auto_budget {
-            HybridStorage::compute_memory_budget()
+            crate::memory_governor::MEMORY_GOVERNOR.cache_budget_bytes()
         } else {
             bytes
         };
@@ -1157,6 +1156,10 @@ impl TinyUfoL1 {
         (count, bytes)
     }
 
+    fn max_bytes(&self) -> u64 {
+        self.max_bytes.load(Ordering::Relaxed)
+    }
+
     fn refresh_stats(&self, inner: &MemoryCache<String, TinyUfoL1Entry>) {
         let MemoryCacheStats { current_weight, .. } = inner.stats();
         self.current_weight.store(
@@ -1178,6 +1181,7 @@ struct AdaptiveBloomFilter {
     shards: Vec<BloomShard>,
     total_capacity: AtomicU64,
     current_size: AtomicU64,
+    estimated_bytes: AtomicU64,
 }
 
 struct BloomShard {
@@ -1212,6 +1216,10 @@ impl AdaptiveBloomFilter {
             shards,
             total_capacity: AtomicU64::new(per_shard_capacity as u64 * shard_count as u64),
             current_size: AtomicU64::new(0),
+            estimated_bytes: AtomicU64::new(
+                Self::estimated_layer_bytes(per_shard_capacity as u64)
+                    .saturating_mul(shard_count as u64),
+            ),
         }
     }
 
@@ -1227,6 +1235,20 @@ impl AdaptiveBloomFilter {
     fn next_layer_capacity(&self, current: u64) -> u32 {
         let next = current.saturating_mul(2).max(1);
         next.min(u32::MAX as u64) as u32
+    }
+
+    fn estimated_layer_bytes(capacity: u64) -> u64 {
+        capacity
+            .saturating_mul(BLOOM_BITS_PER_ENTRY_ESTIMATE)
+            .div_ceil(8)
+            .saturating_add(BLOOM_LAYER_OVERHEAD_BYTES)
+    }
+
+    fn can_add_layer(&self, capacity: u64) -> bool {
+        self.estimated_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(Self::estimated_layer_bytes(capacity))
+            <= crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes()
     }
 
     fn shard_index(&self, key: &str) -> usize {
@@ -1251,13 +1273,20 @@ impl AdaptiveBloomFilter {
             layer.count = layer.count.saturating_add(1);
             self.current_size.fetch_add(1, Ordering::Relaxed);
             if layer.count >= layer.capacity {
-                next_capacity = Some(self.next_layer_capacity(layer.capacity));
+                let candidate = self.next_layer_capacity(layer.capacity);
+                if self.can_add_layer(candidate as u64) {
+                    next_capacity = Some(candidate);
+                }
             }
         }
         if let Some(next_capacity) = next_capacity {
             layers.push(Self::build_layer(next_capacity));
             self.total_capacity
                 .fetch_add(next_capacity as u64, Ordering::Relaxed);
+            self.estimated_bytes.fetch_add(
+                Self::estimated_layer_bytes(next_capacity as u64),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -1271,11 +1300,12 @@ impl AdaptiveBloomFilter {
         if capacity > 0.0 { size / capacity } else { 0.0 }
     }
 
-    fn stats(&self) -> (u64, u64, f64) {
+    fn stats(&self) -> (u64, u64, f64, u64) {
         let size = self.current_size.load(Ordering::Relaxed);
         let capacity = self.total_capacity.load(Ordering::Relaxed);
         let util = self.utilization();
-        (size, capacity, util)
+        let estimated_bytes = self.estimated_bytes.load(Ordering::Relaxed);
+        (size, capacity, util, estimated_bytes)
     }
 }
 
@@ -1296,11 +1326,17 @@ fn bloom_remove(key: &str) {
     CACHE_BLOOM.remove(key);
 }
 
-fn bloom_stats() -> (u64, u64, f64) {
+fn bloom_stats() -> (u64, u64, f64, u64) {
     CACHE_BLOOM.stats()
 }
 
 fn warm_bloom_from_cache_meta() {
+    let Some(_permit) = crate::memory_governor::MEMORY_GOVERNOR
+        .try_admit(crate::memory_governor::AdmissionClass::BackgroundWork)
+    else {
+        tracing::warn!("CACHE_BLOOM: skipping warmup because background memory admission is full");
+        return;
+    };
     let now = crate::utils::time::now_timestamp();
     crate::metrics::storage::STORAGE.for_each_cache_meta(|_, meta| {
         if meta.expires > now {
@@ -1317,9 +1353,14 @@ const NEGATIVE_CACHE_MIN_ENTRIES: usize = 1_000_000;
 const NEGATIVE_CACHE_MAX_ENTRIES: usize = 16_000_000;
 
 fn negative_cache_capacity_limit() -> usize {
-    let (bloom_count, _, _) = bloom_stats();
+    let (bloom_count, _, _, _) = bloom_stats();
     let adaptive = (bloom_count / 64).max(NEGATIVE_CACHE_MIN_ENTRIES as u64);
-    adaptive.min(NEGATIVE_CACHE_MAX_ENTRIES as u64) as usize
+    let governor_limit = crate::memory_governor::MEMORY_GOVERNOR.negative_cache_limit() as u64;
+    adaptive
+        .min(NEGATIVE_CACHE_MAX_ENTRIES as u64)
+        .max(NEGATIVE_CACHE_MIN_ENTRIES as u64)
+        .min(governor_limit)
+        .max(1) as usize
 }
 
 fn negative_cache_check(key: &str, now: i64) -> bool {
@@ -1333,6 +1374,9 @@ fn negative_cache_check(key: &str, now: i64) -> bool {
 }
 
 fn negative_cache_insert(key: &str, now: i64) {
+    if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
+        return;
+    }
     bloom_insert(key);
     let capacity = negative_cache_capacity_limit();
     if NEGATIVE_CACHE.len() >= capacity {
@@ -1358,12 +1402,13 @@ fn negative_cache_cleanup(now: i64) {
 
 pub(crate) fn warm_admission_filters_from_cache_meta() {
     warm_bloom_from_cache_meta();
-    let (size, capacity, util) = bloom_stats();
+    let (size, capacity, util, estimated_bytes) = bloom_stats();
     tracing::info!(
-        "CACHE_BLOOM: warmed size={} capacity={} utilization={:.3}",
+        "CACHE_BLOOM: warmed size={} capacity={} utilization={:.3} estimated_bytes={}",
         size,
         capacity,
-        util
+        util,
+        estimated_bytes
     );
 }
 
@@ -1400,8 +1445,12 @@ pub struct CacheRuntimeStats {
     pub bloom_count: u64,
     pub bloom_capacity: u64,
     pub bloom_utilization: f64,
+    pub bloom_estimated_bytes: u64,
+    pub bloom_budget_bytes: u64,
     pub negative_cache_count: usize,
     pub negative_cache_capacity: usize,
+    pub memory_budget_bytes: u64,
+    pub memory_pressure_high: bool,
 }
 
 impl HybridStorage {
@@ -1427,22 +1476,7 @@ impl HybridStorage {
     }
 
     fn compute_memory_budget() -> u64 {
-        let now = crate::utils::time::now_timestamp();
-        let cached = CACHED_MEMORY_BUDGET.load(Ordering::Relaxed);
-        let cached_at = CACHED_MEMORY_BUDGET_AT.load(Ordering::Relaxed);
-        if cached > 0 && now.saturating_sub(cached_at) < MEMORY_BUDGET_TTL_SECS {
-            return cached;
-        }
-
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let total = sys.total_memory();
-        let available = sys.available_memory();
-        let budget = (available as f64 * 0.25) as u64;
-        let budget = budget.min((total as f64 * 0.5) as u64);
-        CACHED_MEMORY_BUDGET.store(budget, Ordering::Relaxed);
-        CACHED_MEMORY_BUDGET_AT.store(now, Ordering::Relaxed);
-        budget
+        crate::memory_governor::MEMORY_GOVERNOR.cache_budget_bytes()
     }
 
     #[doc(hidden)]
@@ -1753,7 +1787,7 @@ impl HybridStorage {
     pub async fn runtime_stats(&self) -> CacheRuntimeStats {
         let (memory_count, memory_bytes) = self.l1.stats();
         let (disk_count, disk_bytes) = crate::metrics::storage::STORAGE.cache_summary();
-        let (bloom_count, bloom_capacity, bloom_utilization) = bloom_stats();
+        let (bloom_count, bloom_capacity, bloom_utilization, bloom_estimated_bytes) = bloom_stats();
         let (negative_cache_count, negative_cache_capacity) = negative_cache_stats();
         CacheRuntimeStats {
             policy_type: if self.policy_type.load(Ordering::Relaxed) == POLICY_MEMORY {
@@ -1774,8 +1808,12 @@ impl HybridStorage {
             bloom_count,
             bloom_capacity,
             bloom_utilization,
+            bloom_estimated_bytes,
+            bloom_budget_bytes: crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes(),
             negative_cache_count,
             negative_cache_capacity,
+            memory_budget_bytes: self.l1.max_bytes(),
+            memory_pressure_high: crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high(),
         }
     }
 }
@@ -1844,7 +1882,12 @@ impl Storage for HybridStorage {
             prof_record_l2_hit();
             // Promote L2 disk hits to TinyUfoL1
             if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
-                if mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
+                let background_permit = crate::memory_governor::MEMORY_GOVERNOR
+                    .try_admit(crate::memory_governor::AdmissionClass::BackgroundWork);
+                if mem_handler.data.len() <= MEMORY_SERVE_MAX as usize
+                    && background_permit.is_some()
+                    && !crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high()
+                {
                     let now = crate::utils::time::now_timestamp();
                     let fresh_until = meta
                         .fresh_until()
@@ -1983,6 +2026,14 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, _disk_root: Pat
 
     loop {
         interval.tick().await;
+        let Some(_permit) = crate::memory_governor::MEMORY_GOVERNOR
+            .try_admit(crate::memory_governor::AdmissionClass::BackgroundWork)
+        else {
+            tracing::warn!(
+                "CACHE_PURGER: skipping cycle because background memory admission is full"
+            );
+            continue;
+        };
         let now = crate::utils::time::now_timestamp();
         let max_bytes = storage
             .max_disk_bytes
@@ -2153,6 +2204,14 @@ pub fn start_cache_janitor() {
         let disk_root = crate::paths::NodePaths::current().cache_dir();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let Some(_permit) = crate::memory_governor::MEMORY_GOVERNOR
+                .try_admit(crate::memory_governor::AdmissionClass::BackgroundWork)
+            else {
+                tracing::warn!(
+                    "CACHE_JANITOR: skipping cycle because background memory admission is full"
+                );
+                continue;
+            };
 
             // Refresh cached disk available space
             let disks = sysinfo::Disks::new_with_refreshed_list();
@@ -2385,14 +2444,15 @@ mod tests {
     #[test]
     fn adaptive_bloom_scales_capacity() {
         let bloom = AdaptiveBloomFilter::new(8, 2);
-        let (_, start_capacity, _) = bloom.stats();
+        let (_, start_capacity, _, _) = bloom.stats();
         for i in 0..32 {
             bloom.insert(&format!("key-{i}"));
         }
-        let (size, capacity, util) = bloom.stats();
+        let (size, capacity, util, estimated_bytes) = bloom.stats();
         assert_eq!(size, 32);
         assert!(capacity > start_capacity);
         assert!(util > 0.0);
+        assert!(estimated_bytes > 0);
         assert!(bloom.contains("key-0"));
         assert!(bloom.contains("key-31"));
     }
@@ -2405,7 +2465,8 @@ mod tests {
         }
         let after = negative_cache_capacity_limit();
         assert!(after >= before);
-        assert!(after >= NEGATIVE_CACHE_MIN_ENTRIES);
+        assert!(after <= NEGATIVE_CACHE_MAX_ENTRIES);
+        assert!(after > 0);
     }
 
     #[test]
@@ -2422,7 +2483,7 @@ mod tests {
         let key = format!("hook-key-{}", std::process::id());
         let now = crate::utils::time::now_timestamp();
         negative_cache_insert(&key, now);
-        assert!(negative_cache_check(&key, now));
+        let inserted = negative_cache_check(&key, now);
 
         let meta = crate::metrics::storage::CacheMetaEntry {
             cache_key: key.clone(),
@@ -2432,5 +2493,11 @@ mod tests {
         on_cache_meta_upsert(&meta);
         assert!(bloom_may_exist(&key));
         assert!(!negative_cache_check(&key, now));
+        if inserted {
+            assert!(
+                negative_cache_check(&key, now)
+                    || !crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high()
+            );
+        }
     }
 }

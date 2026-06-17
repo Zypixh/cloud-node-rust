@@ -8,6 +8,8 @@ pub enum AdmissionClass {
     Http3Connection,
     Http2Stream,
     Http3Request,
+    OriginConnect,
+    BackgroundWork,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -22,11 +24,18 @@ pub struct GovernorSnapshot {
     pub estimated_h3_connections: u64,
     pub estimated_h2_streams: u64,
     pub estimated_h3_requests: u64,
+    pub estimated_origin_connects: u64,
+    pub estimated_background_work: u64,
     pub http_connection_limit: usize,
     pub tcp_connection_limit: usize,
     pub h3_connection_limit: usize,
     pub h2_stream_limit_per_connection: usize,
     pub h3_request_limit_per_connection: usize,
+    pub origin_connect_limit: usize,
+    pub background_work_limit: usize,
+    pub cache_budget_bytes: u64,
+    pub bloom_budget_bytes: u64,
+    pub negative_cache_limit: usize,
     pub listener_backlog: i32,
     pub pingora_keepalive_pool_size: usize,
 }
@@ -44,25 +53,40 @@ const MIN_MEMORY_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const RESERVE_HEADROOM_PCT: u64 = 30;
 const CONNECTION_BUDGET_PCT: u64 = 45;
 const KEEPALIVE_BUDGET_PCT: u64 = 12;
+const CACHE_BUDGET_PCT: u64 = 25;
+const BLOOM_BUDGET_PCT: u64 = 5;
 
 const HTTP_CONN_ESTIMATED_BYTES: u64 = 32 * 1024;
 const TCP_CONN_ESTIMATED_BYTES: u64 = 24 * 1024;
 const H3_CONN_ESTIMATED_BYTES: u64 = 48 * 1024;
 const H2_STREAM_ESTIMATED_BYTES: u64 = 16 * 1024;
 const H3_REQUEST_ESTIMATED_BYTES: u64 = 24 * 1024;
+const ORIGIN_CONNECT_ESTIMATED_BYTES: u64 = 32 * 1024;
+const BACKGROUND_WORK_ESTIMATED_BYTES: u64 = 64 * 1024;
 const KEEPALIVE_CONN_ESTIMATED_BYTES: u64 = 16 * 1024;
+const NEGATIVE_CACHE_ESTIMATED_BYTES: u64 = 160;
 
 const MIN_HTTP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_TCP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_H3_CONNECTION_LIMIT: usize = 4_096;
 const MIN_H2_STREAM_LIMIT_PER_CONNECTION: usize = 256;
 const MIN_H3_REQUEST_LIMIT_PER_CONNECTION: usize = 256;
+const MIN_ORIGIN_CONNECT_LIMIT: usize = 16_384;
+const MIN_BACKGROUND_WORK_LIMIT: usize = 256;
+const MIN_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+const MIN_BLOOM_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+const MIN_NEGATIVE_CACHE_ENTRIES: usize = 262_144;
 
 const MAX_HTTP_CONNECTION_LIMIT: usize = 100_000_000;
 const MAX_TCP_CONNECTION_LIMIT: usize = 100_000_000;
 const MAX_H3_CONNECTION_LIMIT: usize = 10_000_000;
 const MAX_H2_STREAM_LIMIT_PER_CONNECTION: usize = 65_535;
 const MAX_H3_REQUEST_LIMIT_PER_CONNECTION: usize = 65_535;
+const MAX_ORIGIN_CONNECT_LIMIT: usize = 100_000_000;
+const MAX_BACKGROUND_WORK_LIMIT: usize = 1_000_000;
+const MAX_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+const MAX_BLOOM_BUDGET_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_NEGATIVE_CACHE_ENTRIES: usize = 64_000_000;
 
 const MIN_LISTENER_BACKLOG: i32 = 32_768;
 const MAX_LISTENER_BACKLOG: i32 = 65_535;
@@ -75,6 +99,8 @@ pub struct MemoryGovernor {
     h3_connections: AtomicU64,
     h2_streams: AtomicU64,
     h3_requests: AtomicU64,
+    origin_connects: AtomicU64,
+    background_work: AtomicU64,
     cached_total_bytes: AtomicU64,
     cached_used_bytes: AtomicU64,
     cached_available_bytes: AtomicU64,
@@ -86,6 +112,8 @@ pub struct AdmissionPermit<'a> {
     class: AdmissionClass,
 }
 
+pub type StaticAdmissionPermit = AdmissionPermit<'static>;
+
 impl MemoryGovernor {
     pub const fn new() -> Self {
         Self {
@@ -94,6 +122,8 @@ impl MemoryGovernor {
             h3_connections: AtomicU64::new(0),
             h2_streams: AtomicU64::new(0),
             h3_requests: AtomicU64::new(0),
+            origin_connects: AtomicU64::new(0),
+            background_work: AtomicU64::new(0),
             cached_total_bytes: AtomicU64::new(0),
             cached_used_bytes: AtomicU64::new(0),
             cached_available_bytes: AtomicU64::new(0),
@@ -148,7 +178,41 @@ impl MemoryGovernor {
                 MIN_H3_REQUEST_LIMIT_PER_CONNECTION,
                 MAX_H3_REQUEST_LIMIT_PER_CONNECTION,
             ),
+            AdmissionClass::OriginConnect => connection_limit(
+                snapshot.connection_budget_bytes,
+                ORIGIN_CONNECT_ESTIMATED_BYTES,
+                MIN_ORIGIN_CONNECT_LIMIT,
+                MAX_ORIGIN_CONNECT_LIMIT,
+            ),
+            AdmissionClass::BackgroundWork => connection_limit(
+                snapshot.cache_budget_bytes / 8,
+                BACKGROUND_WORK_ESTIMATED_BYTES,
+                MIN_BACKGROUND_WORK_LIMIT,
+                MAX_BACKGROUND_WORK_LIMIT,
+            ),
         }
+    }
+
+    pub fn cache_budget_bytes(&self) -> u64 {
+        self.memory_snapshot().cache_budget_bytes
+    }
+
+    pub fn bloom_budget_bytes(&self) -> u64 {
+        self.memory_snapshot().bloom_budget_bytes
+    }
+
+    pub fn negative_cache_limit(&self) -> usize {
+        connection_limit(
+            self.memory_snapshot().bloom_budget_bytes,
+            NEGATIVE_CACHE_ESTIMATED_BYTES,
+            MIN_NEGATIVE_CACHE_ENTRIES,
+            MAX_NEGATIVE_CACHE_ENTRIES,
+        )
+    }
+
+    pub fn is_memory_pressure_high(&self) -> bool {
+        let snapshot = self.memory_snapshot();
+        snapshot.available_bytes < snapshot.total_bytes / 10
     }
 
     pub fn listener_backlog(&self) -> i32 {
@@ -196,11 +260,18 @@ impl MemoryGovernor {
             estimated_h3_connections: self.h3_connections.load(Ordering::Relaxed),
             estimated_h2_streams: self.h2_streams.load(Ordering::Relaxed),
             estimated_h3_requests: self.h3_requests.load(Ordering::Relaxed),
+            estimated_origin_connects: self.origin_connects.load(Ordering::Relaxed),
+            estimated_background_work: self.background_work.load(Ordering::Relaxed),
             http_connection_limit: self.limit_for(AdmissionClass::HttpConnection),
             tcp_connection_limit: self.limit_for(AdmissionClass::TcpConnection),
             h3_connection_limit: self.limit_for(AdmissionClass::Http3Connection),
             h2_stream_limit_per_connection: self.limit_for(AdmissionClass::Http2Stream),
             h3_request_limit_per_connection: self.limit_for(AdmissionClass::Http3Request),
+            origin_connect_limit: self.limit_for(AdmissionClass::OriginConnect),
+            background_work_limit: self.limit_for(AdmissionClass::BackgroundWork),
+            cache_budget_bytes: mem.cache_budget_bytes,
+            bloom_budget_bytes: mem.bloom_budget_bytes,
+            negative_cache_limit: self.negative_cache_limit(),
             listener_backlog: self.listener_backlog(),
             pingora_keepalive_pool_size: self.pingora_keepalive_pool_size(pingora_threads),
         }
@@ -213,6 +284,8 @@ impl MemoryGovernor {
             AdmissionClass::Http3Connection => &self.h3_connections,
             AdmissionClass::Http2Stream => &self.h2_streams,
             AdmissionClass::Http3Request => &self.h3_requests,
+            AdmissionClass::OriginConnect => &self.origin_connects,
+            AdmissionClass::BackgroundWork => &self.background_work,
         }
     }
 
@@ -233,6 +306,17 @@ impl MemoryGovernor {
                     self.cached_total_bytes.load(Ordering::Relaxed),
                     self.cached_available_bytes.load(Ordering::Relaxed),
                     KEEPALIVE_BUDGET_PCT,
+                ),
+                cache_budget_bytes: cache_budget_from_available(
+                    self.cached_total_bytes.load(Ordering::Relaxed),
+                    self.cached_available_bytes.load(Ordering::Relaxed),
+                ),
+                bloom_budget_bytes: bounded_budget_from_available(
+                    self.cached_total_bytes.load(Ordering::Relaxed),
+                    self.cached_available_bytes.load(Ordering::Relaxed),
+                    BLOOM_BUDGET_PCT,
+                    MIN_BLOOM_BUDGET_BYTES,
+                    MAX_BLOOM_BUDGET_BYTES,
                 ),
             };
         }
@@ -260,6 +344,17 @@ impl MemoryGovernor {
                 snapshot.available_bytes,
                 KEEPALIVE_BUDGET_PCT,
             ),
+            cache_budget_bytes: cache_budget_from_available(
+                snapshot.total_bytes,
+                snapshot.available_bytes,
+            ),
+            bloom_budget_bytes: bounded_budget_from_available(
+                snapshot.total_bytes,
+                snapshot.available_bytes,
+                BLOOM_BUDGET_PCT,
+                MIN_BLOOM_BUDGET_BYTES,
+                MAX_BLOOM_BUDGET_BYTES,
+            ),
         }
     }
 }
@@ -278,6 +373,8 @@ struct BudgetedMemorySnapshot {
     available_bytes: u64,
     connection_budget_bytes: u64,
     keepalive_budget_bytes: u64,
+    cache_budget_bytes: u64,
+    bloom_budget_bytes: u64,
 }
 
 fn read_memory_snapshot() -> MemorySnapshot {
@@ -344,6 +441,28 @@ fn budget_from_available(total_bytes: u64, available_bytes: u64, budget_pct: u64
     let by_available = available_bytes.saturating_mul(budget_pct) / 100;
     let by_total = total_bytes.saturating_mul(budget_pct) / 100;
     by_available.min(by_total).max(64 * 1024 * 1024)
+}
+
+fn bounded_budget_from_available(
+    total_bytes: u64,
+    available_bytes: u64,
+    budget_pct: u64,
+    min_budget: u64,
+    max_budget: u64,
+) -> u64 {
+    let by_available = available_bytes.saturating_mul(budget_pct) / 100;
+    let by_total = total_bytes.saturating_mul(budget_pct) / 100;
+    by_available.min(by_total).clamp(min_budget, max_budget)
+}
+
+fn cache_budget_from_available(total_bytes: u64, available_bytes: u64) -> u64 {
+    bounded_budget_from_available(
+        total_bytes,
+        available_bytes,
+        CACHE_BUDGET_PCT,
+        MIN_CACHE_BUDGET_BYTES,
+        MAX_CACHE_BUDGET_BYTES,
+    )
 }
 
 fn connection_limit(

@@ -17,12 +17,14 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
     let snapshot = MEMORY_GOVERNOR.snapshot(pingora_threads);
     MemoryPlan {
         summary: format!(
-            "memory total={} used={} available={} conn_budget={} keepalive_budget={}",
+            "memory total={} used={} available={} conn_budget={} keepalive_budget={} cache_budget={} bloom_budget={}",
             snapshot.memory_total_bytes,
             snapshot.memory_used_bytes,
             snapshot.memory_available_bytes,
             snapshot.connection_budget_bytes,
-            snapshot.keepalive_budget_bytes
+            snapshot.keepalive_budget_bytes,
+            snapshot.cache_budget_bytes,
+            snapshot.bloom_budget_bytes
         ),
         items: vec![
             MemoryPlanItem {
@@ -69,9 +71,26 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 ),
             },
             MemoryPlanItem {
+                area: "upstream_origin_connect",
+                purpose: "prioritize origin establishment for cache misses, passthrough, TCP and H3 origin",
+                policy: format!(
+                    "limit={} active={} est={}B/class",
+                    snapshot.origin_connect_limit,
+                    snapshot.estimated_origin_connects,
+                    32 * 1024
+                ),
+            },
+            MemoryPlanItem {
                 area: "cache_and_background",
-                purpose: "use remaining memory after headroom and connection budgets",
-                policy: "connection and origin-establishment paths win during pressure".to_string(),
+                purpose: "use remaining memory after headroom, connection and origin budgets",
+                policy: format!(
+                    "cache_budget={} bloom_budget={} negative_cache_limit={} background_limit={} active_background={}; connection and origin-establishment paths win during pressure",
+                    snapshot.cache_budget_bytes,
+                    snapshot.bloom_budget_bytes,
+                    snapshot.negative_cache_limit,
+                    snapshot.background_work_limit,
+                    snapshot.estimated_background_work
+                ),
             },
         ],
     }
