@@ -232,6 +232,7 @@ impl MetricStorage {
         };
         CACHE_META_INDEX.insert(upsert.hash.to_string(), meta.clone());
         crate::cache_hybrid::index_surrogate_keys(&meta.headers, upsert.hash);
+        crate::cache_hybrid::on_cache_meta_upsert(&meta);
         let Some(db) = &self.db else {
             return;
         };
@@ -286,7 +287,10 @@ impl MetricStorage {
     }
 
     pub fn delete_cache_meta(&self, hash: &str) {
-        CACHE_META_INDEX.remove(hash);
+        let removed = CACHE_META_INDEX.remove(hash);
+        if let Some((_, meta)) = &removed {
+            crate::cache_hybrid::on_cache_meta_delete(&meta.cache_key);
+        }
         crate::cache_hybrid::remove_hash_from_surrogate_index(hash);
         // Also drop the access-log entry — otherwise CACHE_ACCESS_LOG keeps
         // growing across the lifetime of the node every time a cache entry is
@@ -717,6 +721,7 @@ pub fn load_cache_meta_index() {
 pub fn start_cache_access_flusher() {
     // Load existing metadata into memory first
     load_cache_meta_index();
+    crate::cache_hybrid::warm_admission_filters_from_cache_meta();
     tokio::spawn(async {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;

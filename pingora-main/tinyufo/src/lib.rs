@@ -132,6 +132,7 @@ const SMALL_QUEUE_PERCENTAGE: f32 = 0.1;
 
 struct FiFoQueues<T> {
     total_weight_limit: usize,
+    item_count: AtomicUsize,
 
     small: SegQueue<Key>,
     small_weight: AtomicUsize,
@@ -220,6 +221,7 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
                     // find things to evict
                     self.small.push(key);
                     self.small_weight.fetch_add(weight as usize, SeqCst);
+                    self.item_count.fetch_add(1, SeqCst);
                 } // else: two threads are racing adding the item
                   // TODO: compare old.weight and update accordingly
                 return evicted;
@@ -305,6 +307,7 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
                         let data = bucket.data.clone();
                         let weight = bucket.weight;
                         buckets.remove(&to_evict);
+                        self.item_count.fetch_sub(1, SeqCst);
                         Some(KV {
                             key: to_evict,
                             data,
@@ -337,6 +340,7 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
                         self.main_weight.fetch_sub(weight as usize, SeqCst);
                         let data = bucket.data.clone();
                         buckets.remove(&to_evict);
+                        self.item_count.fetch_sub(1, SeqCst);
                         Some(KV {
                             key: to_evict,
                             data,
@@ -365,6 +369,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
     /// size limit of the ghost queue.
     pub fn new(total_weight_limit: usize, estimated_size: usize) -> Self {
         let queues = FiFoQueues {
+            item_count: 0.into(),
             small: SegQueue::new(),
             small_weight: 0.into(),
             main: SegQueue::new(),
@@ -387,6 +392,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
     /// more assets with the same memory.
     pub fn new_compact(total_weight_limit: usize, estimated_size: usize) -> Self {
         let queues = FiFoQueues {
+            item_count: 0.into(),
             small: SegQueue::new(),
             small_weight: 0.into(),
             main: SegQueue::new(),
@@ -448,6 +454,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
         // If we found and processed the item, remove it from buckets
         if result.is_some() {
             self.buckets.remove(&key);
+            self.queues.item_count.fetch_sub(1, SeqCst);
         }
 
         result
@@ -469,6 +476,21 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
     pub fn force_put(&self, key: K, data: T, weight: Weight) -> Vec<KV<T>> {
         let key = self.random_status.hash_one(&key);
         self.queues.admit(key, data, weight, true, &self.buckets)
+    }
+
+    /// Return the current total admitted weight across the small and main queues.
+    pub fn total_weight(&self) -> usize {
+        self.queues.small_weight.load(SeqCst) + self.queues.main_weight.load(SeqCst)
+    }
+
+    /// Return the current number of resident items.
+    pub fn item_count(&self) -> usize {
+        self.queues.item_count.load(SeqCst)
+    }
+
+    /// Return the configured total weight limit.
+    pub fn weight_limit(&self) -> usize {
+        self.queues.total_weight_limit
     }
 
     #[cfg(test)]

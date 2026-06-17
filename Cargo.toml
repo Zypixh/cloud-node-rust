@@ -28,6 +28,8 @@ pingora-load-balancing = { path = "./pingora-main/pingora-load-balancing", featu
 pingora-proxy = { path = "./pingora-main/pingora-proxy", features = ["rustls"] }
 pingora-http = { path = "./pingora-main/pingora-http" }
 pingora-cache = { path = "./pingora-main/pingora-cache", features = ["rustls"] }
+pingora-memory-cache = { path = "./pingora-main/pingora-memory-cache" }
+bloom = "0.3"
 prost = "0.14.4"
 regex = "1.12.3"
 aho-corasick = "1.1.4"

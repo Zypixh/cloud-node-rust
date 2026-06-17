@@ -108,6 +108,13 @@ pub struct MemoryCache<K: Hash, T: Clone> {
     pub(crate) hasher: RandomState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryCacheStats {
+    pub current_items: usize,
+    pub current_weight: usize,
+    pub weight_limit: usize,
+}
+
 impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     /// Create a new [MemoryCache] with the given size.
     pub fn new(size: usize) -> Self {
@@ -163,7 +170,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     /// Insert a key and value pair with an optional TTL into the cache.
     ///
     /// An item with zero TTL of zero will not be inserted.
-    pub fn put<Q>(&self, key: &Q, value: T, ttl: Option<Duration>)
+    pub fn put<Q>(&self, key: &Q, value: T, ttl: Option<Duration>, weight: u16)
     where
         K: Borrow<Q>,
         Q: Hash + ?Sized,
@@ -175,8 +182,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
         }
         let hashed_key = self.hasher.hash_one(key);
         let node = Node::new(value, ttl);
-        // weight is always 1 for now
-        self.store.put(hashed_key, node, 1);
+        self.store.put(hashed_key, node, weight);
     }
 
     /// Remove a key from the cache if it exists.
@@ -189,7 +195,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
         self.store.remove(&hashed_key);
     }
 
-    pub(crate) fn force_put(&self, key: &K, value: T, ttl: Option<Duration>) {
+    pub(crate) fn force_put(&self, key: &K, value: T, ttl: Option<Duration>, weight: u16) {
         if let Some(t) = ttl {
             if t.is_zero() {
                 return;
@@ -197,8 +203,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
         }
         let hashed_key = self.hasher.hash_one(key);
         let node = Node::new(value, ttl);
-        // weight is always 1 for now
-        self.store.force_put(hashed_key, node, 1);
+        self.store.force_put(hashed_key, node, weight);
     }
 
     /// This is equivalent to [MemoryCache::get] but for an arbitrary amount of keys.
@@ -237,6 +242,15 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
         (resp, missed)
     }
 
+    /// Return the current admitted weight and configured weight limit.
+    pub fn stats(&self) -> MemoryCacheStats {
+        MemoryCacheStats {
+            current_items: self.store.item_count(),
+            current_weight: self.store.total_weight(),
+            weight_limit: self.store.weight_limit(),
+        }
+    }
+
     // TODO: evict expired first
 }
 
@@ -259,7 +273,7 @@ mod tests {
         let (res, hit) = cache.get(&1);
         assert_eq!(res, None);
         assert_eq!(hit, CacheStatus::Miss);
-        cache.put(&1, 2, None);
+        cache.put(&1, 2, None, 1);
         let (res, hit) = cache.get(&1);
         assert_eq!(res.unwrap(), 2);
         assert_eq!(hit, CacheStatus::Hit);
@@ -271,9 +285,9 @@ mod tests {
         let (res, hit) = cache.get(&1);
         assert_eq!(res, None);
         assert_eq!(hit, CacheStatus::Miss);
-        cache.put(&1, 2, None);
-        cache.put(&3, 4, None);
-        cache.put(&5, 6, None);
+        cache.put(&1, 2, None, 1);
+        cache.put(&3, 4, None, 1);
+        cache.put(&5, 6, None, 1);
         let (res, hit) = cache.get(&1);
         assert_eq!(res.unwrap(), 2);
         assert_eq!(hit, CacheStatus::Hit);
@@ -296,7 +310,7 @@ mod tests {
         let (res, hit) = cache.get(&1);
         assert_eq!(res, None);
         assert_eq!(hit, CacheStatus::Miss);
-        cache.put(&1, 2, Some(Duration::from_secs(1)));
+        cache.put(&1, 2, Some(Duration::from_secs(1)), 1);
         sleep(Duration::from_millis(1100));
         let (res, hit) = cache.get(&1);
         assert_eq!(res, None);
@@ -309,7 +323,7 @@ mod tests {
         let (res, hit) = cache.get(&1);
         assert_eq!(res, None);
         assert_eq!(hit, CacheStatus::Miss);
-        cache.put(&1, 2, Some(Duration::from_secs(1)));
+        cache.put(&1, 2, Some(Duration::from_secs(1)), 1);
         sleep(Duration::from_millis(1100));
         let (res, hit) = cache.get_stale(&1);
         assert_eq!(res.unwrap(), 2);
@@ -320,9 +334,9 @@ mod tests {
     #[test]
     fn test_eviction() {
         let cache: MemoryCache<i32, i32> = MemoryCache::new(2);
-        cache.put(&1, 2, None);
-        cache.put(&2, 4, None);
-        cache.put(&3, 6, None);
+        cache.put(&1, 2, None, 1);
+        cache.put(&2, 4, None, 1);
+        cache.put(&3, 6, None, 1);
         let (res, hit) = cache.get(&1);
         assert_eq!(res, None);
         assert_eq!(hit, CacheStatus::Miss);
@@ -337,7 +351,7 @@ mod tests {
     #[test]
     fn test_multi_get() {
         let cache: MemoryCache<i32, i32> = MemoryCache::new(10);
-        cache.put(&2, -2, None);
+        cache.put(&2, -2, None, 1);
         let keys: Vec<i32> = vec![1, 2, 3];
         let resp = cache.multi_get(keys.iter());
         assert_eq!(resp[0].0, None);
@@ -372,7 +386,7 @@ mod tests {
         let (res, hit) = cache.get("1");
         assert_eq!(res, None);
         assert_eq!(hit, CacheStatus::Miss);
-        cache.put("1", 2, None);
+        cache.put("1", 2, None, 1);
         let (res, hit) = cache.get("1");
         assert_eq!(res.unwrap(), 2);
         assert_eq!(hit, CacheStatus::Hit);

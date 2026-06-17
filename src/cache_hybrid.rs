@@ -4,13 +4,13 @@ use pingora_cache::key::CompactCacheKey;
 use pingora_cache::storage::{
     HandleHit, HandleMiss, HitHandler, MissFinishType, MissHandler, PurgeType, Storage,
 };
-use pingora_cache::{CacheKey, CacheMeta, MemCache};
+use pingora_cache::{CacheKey, CacheMeta};
 use pingora_core::{Error, ErrorType, Result};
 use pingora_http::ResponseHeader;
 use std::any::Any;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
+use std::sync::{Arc, RwLock};
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tracing::{info, warn};
@@ -397,7 +397,6 @@ impl Storage for FileStorage {
 
         let Some(path) = self.find_existing_path_by_hash(&hash).await else {
             crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-            fast_l1_remove(&fast_hash_key(&meta.cache_key));
             return Ok(None);
         };
 
@@ -417,7 +416,6 @@ impl Storage for FileStorage {
                     Ok(data) => data,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                         crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                        fast_l1_remove(&fast_hash_key(&meta.cache_key));
                         return Ok(None);
                     }
                     Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -438,7 +436,6 @@ impl Storage for FileStorage {
                 Ok(file) => file,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                    fast_l1_remove(&fast_hash_key(&meta.cache_key));
                     return Ok(None);
                 }
                 Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -459,7 +456,6 @@ impl Storage for FileStorage {
                 Ok(data) => data,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                    fast_l1_remove(&fast_hash_key(&meta.cache_key));
                     return Ok(None);
                 }
                 Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -487,7 +483,6 @@ impl Storage for FileStorage {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
-                fast_l1_remove(&fast_hash_key(&meta.cache_key));
                 return Ok(None);
             }
             Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -655,8 +650,6 @@ impl Storage for FileStorage {
 
         let hash = self.get_hash(key);
         let k_str = key.primary_key_str().unwrap_or("unknown").to_string();
-        // Clear FAST_L1 so SWR revalidation does not serve stale fresh_until
-        fast_l1_remove(&fast_hash_key(&k_str));
         let ttl = meta
             .fresh_until()
             .duration_since(meta.created())
@@ -996,6 +989,7 @@ impl HandleMiss for FileMissHandler {
                 created_at: now,
             },
         );
+        negative_cache_remove(&self.key_str);
         index_surrogate_keys(&self.headers, &self.hash);
         crate::cluster::metadata::emit_upsert(crate::cluster::metadata::CacheMetaUpsertEvent {
             hash: &self.hash,
@@ -1044,119 +1038,354 @@ pub(crate) fn remove_hash_from_surrogate_index(hash: &str) {
     });
 }
 
-/// Fast lock-free L1 entry stored in a sharded DashMap.
-/// Bypasses Pingora's single-lock MemCache entirely.
-struct FastL1Entry {
+// ═══════════════════════════════════════════════════════════
+// TinyUfoL1: Production-grade lock-free L1 cache (TinyUFO)
+// ═══════════════════════════════════════════════════════════
+
+use bloom::{ASMS, BloomFilter};
+use pingora_memory_cache::{CacheStatus, MemoryCache, MemoryCacheStats};
+
+/// Entry stored in TinyUfoL1 (wrapper around MemoryCache<TinyUfo>)
+#[derive(Clone)]
+pub(crate) struct TinyUfoL1Entry {
     data: bytes::Bytes,
+    response_header: ResponseHeader,
     fresh_until: i64,
     created_at: i64,
-    generation: u64,
-    response_header: ResponseHeader,
 }
 
-/// Global lock-free L1 cache. Sharded by DashMap, no contention at 1000+ concurrent reads.
-static FAST_L1: Lazy<DashMap<u64, FastL1Entry>> = Lazy::new(DashMap::new);
-
-/// Max total bytes in FAST_L1. 0 = auto-detect from available system memory.
-static FAST_L1_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// Current total bytes in FAST_L1. Maintained by insert (+=len) and remove (-=len).
-static FAST_L1_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// Monotonic generation used to distinguish stale heap entries from replaced cache entries.
-static FAST_L1_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-/// Min-heap for O(log n) eviction: entries with smallest fresh_until are evicted first.
-/// Uses Reverse so BinaryHeap (max-heap) behaves as min-heap.
-static EVICTION_HEAP: Lazy<
-    parking_lot::Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(i64, u64, u64)>>>,
-> = Lazy::new(|| parking_lot::Mutex::new(std::collections::BinaryHeap::new()));
-
-fn fast_l1_remove(hash: &u64) {
-    if let Some((_, entry)) = FAST_L1.remove(hash) {
-        FAST_L1_BYTES.fetch_sub(entry.data.len() as u64, Ordering::Release);
-    }
+/// Lock-free L1 cache backed by TinyUFO (S3-FIFO + TinyLFU admission).
+/// Replaces the old FAST_L1 (DashMap + BinaryHeap).
+pub(crate) struct TinyUfoL1 {
+    inner: RwLock<Arc<MemoryCache<String, TinyUfoL1Entry>>>,
+    auto_budget: AtomicBool,
+    max_bytes: AtomicU64,
+    current_weight: AtomicU64,
 }
 
-fn fast_l1_remove_generation(hash: &u64, generation: u64) -> Option<FastL1Entry> {
-    let removed = FAST_L1.remove_if(hash, |_, entry| entry.generation == generation)?;
-    let entry = removed.1;
-    FAST_L1_BYTES.fetch_sub(entry.data.len() as u64, Ordering::Release);
-    Some(entry)
-}
-
-fn fast_l1_evict_expired(now: i64) -> (u64, usize) {
-    let mut expired_bytes = 0u64;
-    let mut evicted = 0usize;
-    let mut heap = EVICTION_HEAP.lock();
-    while let Some(&std::cmp::Reverse((fresh_until, _, _))) = heap.peek() {
-        if fresh_until > now {
-            break;
-        }
-        let std::cmp::Reverse((_, generation, victim_key)) = heap.pop().unwrap();
-        if let Some(entry) = fast_l1_remove_generation(&victim_key, generation) {
-            expired_bytes += entry.data.len() as u64;
-            evicted += 1;
-        }
-    }
-    (expired_bytes, evicted)
-}
-
-fn fast_l1_evict_over_budget(max_l1: u64, max_attempts: usize) -> (u64, usize) {
-    let mut freed = 0u64;
-    let mut evicted = 0usize;
-    let mut attempts = 0usize;
-    let mut heap = EVICTION_HEAP.lock();
-    while FAST_L1_BYTES.load(Ordering::Acquire) > max_l1 && attempts < max_attempts {
-        attempts += 1;
-        let Some(std::cmp::Reverse((_, generation, victim_key))) = heap.pop() else {
-            break;
+impl TinyUfoL1 {
+    fn new(max_bytes: u64) -> Self {
+        let auto_budget = max_bytes == 0;
+        let resolved_max_bytes = if auto_budget {
+            HybridStorage::compute_memory_budget()
+        } else {
+            max_bytes
         };
-        if let Some(entry) = fast_l1_remove_generation(&victim_key, generation) {
-            freed += entry.data.len() as u64;
-            evicted += 1;
+        let cache = Arc::new(Self::build_cache(resolved_max_bytes));
+        Self {
+            inner: RwLock::new(cache),
+            auto_budget: AtomicBool::new(auto_budget),
+            max_bytes: AtomicU64::new(resolved_max_bytes),
+            current_weight: AtomicU64::new(0),
         }
     }
-    (freed, evicted)
+
+    fn build_cache(max_bytes: u64) -> MemoryCache<String, TinyUfoL1Entry> {
+        let capacity = Self::weight_limit_for_bytes(max_bytes);
+        MemoryCache::new(capacity)
+    }
+
+    fn weight_limit_for_bytes(max_bytes: u64) -> usize {
+        (max_bytes / 1024).max(1).min(usize::MAX as u64) as usize
+    }
+
+    fn read_inner(&self) -> Arc<MemoryCache<String, TinyUfoL1Entry>> {
+        self.inner.read().expect("TinyUfoL1 lock poisoned").clone()
+    }
+
+    fn get(&self, key: &str) -> Option<TinyUfoL1Entry> {
+        let inner = self.read_inner();
+        let (value, status) = inner.get(key);
+        if status == CacheStatus::Hit {
+            value
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
+    fn get_stale(&self, key: &str) -> Option<(TinyUfoL1Entry, CacheStatus)> {
+        let inner = self.read_inner();
+        let (value, status) = inner.get_stale(key);
+        value.map(|v| (v, status))
+    }
+
+    fn put(&self, key: &str, entry: TinyUfoL1Entry, ttl: std::time::Duration) {
+        let weight = (entry.data.len().div_ceil(1024)).clamp(1, u16::MAX as usize) as u16;
+        let inner = self.read_inner();
+        inner.put(key, entry, Some(ttl), weight);
+        self.refresh_stats(&inner);
+    }
+
+    fn remove(&self, key: &str) {
+        let inner = self.read_inner();
+        inner.remove(key);
+        self.refresh_stats(&inner);
+    }
+
+    fn set_max_bytes(&self, bytes: u64) {
+        let auto_budget = bytes == 0;
+        self.auto_budget.store(auto_budget, Ordering::Relaxed);
+        let resolved = if auto_budget {
+            HybridStorage::compute_memory_budget()
+        } else {
+            bytes
+        };
+        let old = self.max_bytes.swap(resolved, Ordering::Relaxed);
+        if Self::weight_limit_for_bytes(old) == Self::weight_limit_for_bytes(resolved) {
+            return;
+        }
+        let new_cache = Arc::new(Self::build_cache(resolved));
+        self.current_weight.store(0, Ordering::Relaxed);
+        let mut guard = self.inner.write().expect("TinyUfoL1 lock poisoned");
+        *guard = new_cache;
+    }
+
+    fn refresh_auto_budget(&self) {
+        if !self.auto_budget.load(Ordering::Relaxed) {
+            return;
+        }
+        self.set_max_bytes(0);
+    }
+
+    fn stats(&self) -> (usize, u64) {
+        let inner = self.read_inner();
+        self.refresh_stats(&inner);
+        let stats = inner.stats();
+        let bytes = (stats.current_weight as u64).saturating_mul(1024);
+        let count = stats.current_items;
+        (count, bytes)
+    }
+
+    fn refresh_stats(&self, inner: &MemoryCache<String, TinyUfoL1Entry>) {
+        let MemoryCacheStats { current_weight, .. } = inner.stats();
+        self.current_weight.store(
+            current_weight.min(u64::MAX as usize) as u64,
+            Ordering::Relaxed,
+        );
+    }
 }
 
-fn fast_l1_cache_meta(entry: &FastL1Entry) -> CacheMeta {
-    let fresh_until_dur = std::time::Duration::from_secs(entry.fresh_until as u64);
-    let created_at_dur = std::time::Duration::from_secs(entry.created_at as u64);
-    CacheMeta::new(
-        std::time::UNIX_EPOCH + fresh_until_dur,
-        std::time::UNIX_EPOCH + created_at_dur,
-        0,
-        0,
-        entry.response_header.clone(),
-    )
+// ═══════════════════════════════════════════════════════════
+// Bloom Filter + Negative Cache (Anti-Penetration)
+// ═══════════════════════════════════════════════════════════
+
+/// Adaptive bloom filter with auto-scaling for billion-scale caches.
+/// Uses sharded layered BloomFilters so the filter can grow without a full rebuild
+/// while keeping read/write contention bounded.
+/// `current_size` is an approximate admission volume, not an exact distinct-key count.
+struct AdaptiveBloomFilter {
+    shards: Vec<BloomShard>,
+    total_capacity: AtomicU64,
+    current_size: AtomicU64,
+}
+
+struct BloomShard {
+    layers: parking_lot::RwLock<Vec<BloomLayer>>,
+}
+
+struct BloomLayer {
+    filter: BloomFilter,
+    capacity: u64,
+    count: u64,
+}
+
+impl BloomShard {
+    fn new(initial_capacity: u32) -> Self {
+        Self {
+            layers: parking_lot::RwLock::new(vec![AdaptiveBloomFilter::build_layer(
+                initial_capacity,
+            )]),
+        }
+    }
+}
+
+impl AdaptiveBloomFilter {
+    fn new(initial_capacity: u32, shard_count: usize) -> Self {
+        let shard_count = shard_count.max(1);
+        let per_shard_capacity = ((initial_capacity as usize).div_ceil(shard_count)) as u32;
+        let shards = (0..shard_count)
+            .map(|_| BloomShard::new(per_shard_capacity.max(1)))
+            .collect::<Vec<_>>();
+
+        Self {
+            shards,
+            total_capacity: AtomicU64::new(per_shard_capacity as u64 * shard_count as u64),
+            current_size: AtomicU64::new(0),
+        }
+    }
+
+    fn build_layer(expected_items: u32) -> BloomLayer {
+        let capacity = expected_items.max(1);
+        BloomLayer {
+            filter: BloomFilter::with_rate(0.01, capacity),
+            capacity: capacity as u64,
+            count: 0,
+        }
+    }
+
+    fn next_layer_capacity(&self, current: u64) -> u32 {
+        let next = current.saturating_mul(2).max(1);
+        next.min(u32::MAX as u64) as u32
+    }
+
+    fn shard_index(&self, key: &str) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.shards.len()
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        let idx = self.shard_index(key);
+        let layers = self.shards[idx].layers.read();
+        layers.iter().any(|layer| layer.filter.contains(&key))
+    }
+
+    fn insert(&self, key: &str) {
+        let idx = self.shard_index(key);
+        let mut layers = self.shards[idx].layers.write();
+        let mut next_capacity = None;
+        if let Some(layer) = layers.last_mut() {
+            let _ = layer.filter.insert(&key);
+            layer.count = layer.count.saturating_add(1);
+            self.current_size.fetch_add(1, Ordering::Relaxed);
+            if layer.count >= layer.capacity {
+                next_capacity = Some(self.next_layer_capacity(layer.capacity));
+            }
+        }
+        if let Some(next_capacity) = next_capacity {
+            layers.push(Self::build_layer(next_capacity));
+            self.total_capacity
+                .fetch_add(next_capacity as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn remove(&self, key: &str) {
+        let _ = key;
+    }
+
+    fn utilization(&self) -> f64 {
+        let size = self.current_size.load(Ordering::Relaxed) as f64;
+        let capacity = self.total_capacity.load(Ordering::Relaxed) as f64;
+        if capacity > 0.0 { size / capacity } else { 0.0 }
+    }
+
+    fn stats(&self) -> (u64, u64, f64) {
+        let size = self.current_size.load(Ordering::Relaxed);
+        let capacity = self.total_capacity.load(Ordering::Relaxed);
+        let util = self.utilization();
+        (size, capacity, util)
+    }
+}
+
+/// Billion-scale adaptive bloom filter: starts at 1M keys / 64 shards and grows by layer doubling.
+/// The capacity expands with admitted cache keys instead of preallocating for the worst case.
+static CACHE_BLOOM: Lazy<AdaptiveBloomFilter> =
+    Lazy::new(|| AdaptiveBloomFilter::new(1_000_000, 64));
+
+fn bloom_may_exist(key: &str) -> bool {
+    CACHE_BLOOM.contains(key)
+}
+
+fn bloom_insert(key: &str) {
+    CACHE_BLOOM.insert(key);
+}
+
+fn bloom_remove(key: &str) {
+    CACHE_BLOOM.remove(key);
+}
+
+fn bloom_stats() -> (u64, u64, f64) {
+    CACHE_BLOOM.stats()
+}
+
+fn warm_bloom_from_cache_meta() {
+    let now = crate::utils::time::now_timestamp();
+    crate::metrics::storage::STORAGE.for_each_cache_meta(|_, meta| {
+        if meta.expires > now {
+            CACHE_BLOOM.insert(&meta.cache_key);
+        }
+    });
+}
+
+/// Negative cache: tracks keys confirmed to not exist in the local cache set.
+/// This mainly absorbs stale Bloom positives after purge/expiry.
+static NEGATIVE_CACHE: Lazy<DashMap<String, i64>> = Lazy::new(DashMap::new);
+const NEGATIVE_CACHE_TTL_SECS: i64 = 60;
+const NEGATIVE_CACHE_MIN_ENTRIES: usize = 1_000_000;
+const NEGATIVE_CACHE_MAX_ENTRIES: usize = 16_000_000;
+
+fn negative_cache_capacity_limit() -> usize {
+    let (bloom_count, _, _) = bloom_stats();
+    let adaptive = (bloom_count / 64).max(NEGATIVE_CACHE_MIN_ENTRIES as u64);
+    adaptive.min(NEGATIVE_CACHE_MAX_ENTRIES as u64) as usize
+}
+
+fn negative_cache_check(key: &str, now: i64) -> bool {
+    if let Some(entry) = NEGATIVE_CACHE.get(key) {
+        if *entry > now {
+            return true;
+        }
+    }
+    NEGATIVE_CACHE.remove(key);
+    false
+}
+
+fn negative_cache_insert(key: &str, now: i64) {
+    bloom_insert(key);
+    let capacity = negative_cache_capacity_limit();
+    if NEGATIVE_CACHE.len() >= capacity {
+        negative_cache_cleanup(now);
+        if NEGATIVE_CACHE.len() >= capacity {
+            return;
+        }
+    }
+    NEGATIVE_CACHE.insert(key.to_string(), now + NEGATIVE_CACHE_TTL_SECS);
+}
+
+fn negative_cache_remove(key: &str) {
+    NEGATIVE_CACHE.remove(key);
+}
+
+fn negative_cache_stats() -> (usize, usize) {
+    (NEGATIVE_CACHE.len(), negative_cache_capacity_limit())
+}
+
+fn negative_cache_cleanup(now: i64) {
+    NEGATIVE_CACHE.retain(|_, &mut expires| expires > now);
+}
+
+pub(crate) fn warm_admission_filters_from_cache_meta() {
+    warm_bloom_from_cache_meta();
+    let (size, capacity, util) = bloom_stats();
+    tracing::info!(
+        "CACHE_BLOOM: warmed size={} capacity={} utilization={:.3}",
+        size,
+        capacity,
+        util
+    );
+}
+
+pub(crate) fn on_cache_meta_upsert(meta: &crate::metrics::storage::CacheMetaEntry) {
+    if meta.expires > crate::utils::time::now_timestamp() {
+        bloom_insert(&meta.cache_key);
+    }
+    negative_cache_remove(&meta.cache_key);
+}
+
+pub(crate) fn on_cache_meta_delete(cache_key: &str) {
+    negative_cache_insert(cache_key, crate::utils::time::now_timestamp());
 }
 
 const POLICY_FILE: u8 = 0;
 const POLICY_MEMORY: u8 = 1;
 
-#[inline]
-fn fast_hash_key(s: &str) -> u64 {
-    use std::hash::{BuildHasher, Hash, Hasher};
-    static HASHER: Lazy<ahash::RandomState> = Lazy::new(|| {
-        ahash::RandomState::with_seeds(
-            0x9ae16a3b2f90404f,
-            0x9e3779b97f4a7c15,
-            0xff51afd7ed558ccd,
-            0x517cc1b727220a95,
-        )
-    });
-    let mut h = HASHER.build_hasher();
-    s.hash(&mut h);
-    h.finish()
-}
-
 pub struct HybridStorage {
-    pub l1: Arc<MemCache>,
+    pub(crate) l1: Arc<TinyUfoL1>,
     pub l2: &'static FileStorage,
     pub max_disk_bytes: std::sync::atomic::AtomicU64,
     pub min_free_bytes: std::sync::atomic::AtomicU64,
-    pub max_fast_l1_bytes: std::sync::atomic::AtomicU64,
     pub policy_type: AtomicU8,
 }
 
@@ -1168,18 +1397,27 @@ pub struct CacheRuntimeStats {
     pub disk_bytes: u64,
     pub max_disk_bytes: u64,
     pub min_free_bytes: u64,
+    pub bloom_count: u64,
+    pub bloom_capacity: u64,
+    pub bloom_utilization: f64,
+    pub negative_cache_count: usize,
+    pub negative_cache_capacity: usize,
 }
 
 impl HybridStorage {
     pub fn new(_max_mem_bytes: usize, disk_root: impl Into<PathBuf>) -> Self {
-        let l1 = MemCache::new();
+        let l1_budget = if _max_mem_bytes == 0 {
+            0
+        } else {
+            _max_mem_bytes.min(u64::MAX as usize) as u64
+        };
+        let l1 = TinyUfoL1::new(l1_budget);
 
         Self {
             l1: Arc::new(l1),
             l2: Box::leak(Box::new(FileStorage::new(disk_root))),
             max_disk_bytes: std::sync::atomic::AtomicU64::new(10 * 1024 * 1024 * 1024),
             min_free_bytes: std::sync::atomic::AtomicU64::new(2 * 1024 * 1024 * 1024),
-            max_fast_l1_bytes: std::sync::atomic::AtomicU64::new(0), // 0 = auto-detect
             policy_type: AtomicU8::new(POLICY_FILE),
         }
     }
@@ -1212,64 +1450,6 @@ impl HybridStorage {
         Self::compute_memory_budget()
     }
 
-    #[doc(hidden)]
-    pub fn bench_fast_l1_insert(
-        key_str: &str,
-        data: bytes::Bytes,
-        meta: &CacheMeta,
-        ttl_secs: i64,
-    ) -> bool {
-        let now = crate::utils::time::now_timestamp();
-        let hash = fast_hash_key(key_str);
-        Self::promote_to_fast_l1(hash, data, meta, now.saturating_add(ttl_secs), now)
-    }
-
-    #[doc(hidden)]
-    pub fn bench_fast_l1_remove(key_str: &str) {
-        let hash = fast_hash_key(key_str);
-        fast_l1_remove(&hash);
-    }
-
-    /// Promote to FAST_L1 with capacity check and header extraction from CacheMeta.
-    /// When budget is exceeded, evicts the entry closest to expiry to make room.
-    /// Returns true if inserted, false if skipped (data too large).
-    fn promote_to_fast_l1(
-        hash: u64,
-        data: bytes::Bytes,
-        meta: &CacheMeta,
-        fresh_until: i64,
-        now: i64,
-    ) -> bool {
-        if data.len() > MEMORY_SERVE_MAX as usize {
-            return false;
-        }
-        let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
-        let len = data.len() as u64;
-        let generation = FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed);
-        if let Some(old_entry) = FAST_L1.insert(
-            hash,
-            FastL1Entry {
-                data,
-                fresh_until,
-                created_at: now,
-                generation,
-                response_header: meta.response_header().clone(),
-            },
-        ) {
-            FAST_L1_BYTES.fetch_sub(old_entry.data.len() as u64, Ordering::Release);
-        }
-        FAST_L1_BYTES.fetch_add(len, Ordering::Release);
-        EVICTION_HEAP
-            .lock()
-            .push(std::cmp::Reverse((fresh_until, generation, hash)));
-        if max_l1 > 0 && FAST_L1_BYTES.load(Ordering::Acquire) > max_l1 {
-            fast_l1_evict_over_budget(max_l1, 100);
-        }
-        FAST_L1
-            .get(&hash)
-            .is_some_and(|entry| entry.generation == generation)
-    }
-
     pub fn apply_cluster_cache_config(
         &self,
         config: &crate::runtime_mode::ClusterCacheConfig,
@@ -1286,9 +1466,7 @@ impl HybridStorage {
             self.min_free_bytes.store(bytes, Ordering::Relaxed);
         }
 
-        FAST_L1_MAX_BYTES.store(config.max_fast_l1_bytes, Ordering::Relaxed);
-        self.max_fast_l1_bytes
-            .store(config.max_fast_l1_bytes, Ordering::Relaxed);
+        self.l1.set_max_bytes(config.max_fast_l1_bytes);
 
         let shards = config
             .shards
@@ -1338,14 +1516,13 @@ impl HybridStorage {
         }
 
         if let Some(options) = &policy.options {
-            // Memory capacity for FAST_L1: 0 = auto-detect, explicit value = use directly
+            // Memory capacity for L1: 0 = auto-detect, explicit value = use directly
             if let Some(mem) = options
                 .get("memoryCapacity")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<u64>().ok())
             {
-                FAST_L1_MAX_BYTES.store(mem, Ordering::Relaxed);
-                self.max_fast_l1_bytes.store(mem, Ordering::Relaxed);
+                self.l1.set_max_bytes(mem);
             }
 
             let min_free_setting = if let Some(min_free) = options.get("minFreeSpace") {
@@ -1458,12 +1635,10 @@ impl HybridStorage {
         remove_cache_file_from_roots(&inner, &hash).await;
         crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
         remove_hash_from_surrogate_index(&hash);
-        fast_l1_remove(&fast_hash_key(key));
+        self.l1.remove(key);
+        bloom_remove(key);
+        negative_cache_remove(key);
 
-        let full_key = CacheKey::new("", key, key);
-        let ck = full_key.to_compact();
-        let trace = pingora_cache::trace::Span::inactive().handle();
-        let _ = self.l1.purge(&ck, PurgeType::Invalidation, &trace).await;
         true
     }
 
@@ -1577,17 +1752,17 @@ impl HybridStorage {
 
     pub async fn runtime_stats(&self) -> CacheRuntimeStats {
         let (memory_count, memory_bytes) = self.l1.stats();
-        let fast_l1_count = FAST_L1.len();
-        let fast_l1_bytes = FAST_L1_BYTES.load(Ordering::Acquire);
         let (disk_count, disk_bytes) = crate::metrics::storage::STORAGE.cache_summary();
+        let (bloom_count, bloom_capacity, bloom_utilization) = bloom_stats();
+        let (negative_cache_count, negative_cache_capacity) = negative_cache_stats();
         CacheRuntimeStats {
             policy_type: if self.policy_type.load(Ordering::Relaxed) == POLICY_MEMORY {
                 "memory".to_string()
             } else {
                 "file".to_string()
             },
-            memory_count: memory_count.saturating_add(fast_l1_count),
-            memory_bytes: (memory_bytes as u64).saturating_add(fast_l1_bytes),
+            memory_count,
+            memory_bytes,
             disk_count,
             disk_bytes,
             max_disk_bytes: self
@@ -1596,6 +1771,11 @@ impl HybridStorage {
             min_free_bytes: self
                 .min_free_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
+            bloom_count,
+            bloom_capacity,
+            bloom_utilization,
+            negative_cache_count,
+            negative_cache_capacity,
         }
     }
 }
@@ -1611,17 +1791,36 @@ impl Storage for HybridStorage {
 
         let k_str = key.primary_key_str().unwrap_or("unknown");
         let is_partial_key = crate::cache::partial::is_partial_cache_key(k_str);
-        let hash = fast_hash_key(k_str);
 
         if is_partial_key {
             return self.l2.lookup(key, trace).await;
         }
 
-        // Check lock-free FAST_L1 first for ALL policy types (DashMap, sharded, zero contention)
-        if let Some(entry) = FAST_L1.get(&hash) {
-            let now = crate::utils::time::now_timestamp();
+        let now = crate::utils::time::now_timestamp();
+
+        // Anti-penetration Layer 1: Bloom filter - reject keys never cached
+        if !bloom_may_exist(k_str) {
+            prof_record_bloom_reject();
+            return Ok(None);
+        }
+
+        // Anti-penetration Layer 2: short-lived local absence cache for stale Bloom positives
+        if negative_cache_check(k_str, now) {
+            return Ok(None);
+        }
+
+        // Check TinyUfoL1 (lock-free L1 cache with S3-FIFO + TinyLFU)
+        if let Some(entry) = self.l1.get(k_str) {
             if entry.fresh_until > now {
-                let meta = fast_l1_cache_meta(&entry);
+                let fresh_until_dur = std::time::Duration::from_secs(entry.fresh_until as u64);
+                let created_at_dur = std::time::Duration::from_secs(entry.created_at as u64);
+                let meta = CacheMeta::new(
+                    std::time::UNIX_EPOCH + fresh_until_dur,
+                    std::time::UNIX_EPOCH + created_at_dur,
+                    0,
+                    0,
+                    entry.response_header.clone(),
+                );
                 prof_record_l1_hit();
                 return Ok(Some((
                     meta,
@@ -1632,27 +1831,7 @@ impl Storage for HybridStorage {
                 )));
             }
             // Expired: remove and fall through
-            drop(entry);
-            fast_l1_remove(&hash);
-        }
-
-        // Fallback: try MemCache (for entries not yet in FAST_L1)
-        if let Some((meta, handler)) = self.l1.lookup(key, trace).await? {
-            prof_record_l1_hit();
-            // Promote to FAST_L1 for subsequent zero-lock hits
-            if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
-                let now = crate::utils::time::now_timestamp();
-                let fresh_until = meta
-                    .fresh_until()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or(std::time::Duration::from_secs(3600))
-                    .as_secs() as i64;
-                if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now)
-                {
-                    prof_record_l2_mem_promotion();
-                }
-            }
-            return Ok(Some((meta, handler)));
+            self.l1.remove(k_str);
         }
 
         // For memory-only policy, we're done (no L2 disk storage)
@@ -1660,19 +1839,34 @@ impl Storage for HybridStorage {
             return Ok(None);
         }
 
+        // Check L2 (disk)
         if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
             prof_record_l2_hit();
-            // Always promote L2 disk hits to FAST_L1 immediately.
-            // Memory budget + eviction control the total size, not an artificial threshold.
+            // Promote L2 disk hits to TinyUfoL1
             if let Some(mem_handler) = handler.as_any().downcast_ref::<MemoryHitHandler>() {
-                let now = crate::utils::time::now_timestamp();
-                let fresh_until = meta
-                    .fresh_until()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or(std::time::Duration::from_secs(3600))
-                    .as_secs() as i64;
-                if Self::promote_to_fast_l1(hash, mem_handler.data.clone(), &meta, fresh_until, now)
-                {
+                if mem_handler.data.len() <= MEMORY_SERVE_MAX as usize {
+                    let now = crate::utils::time::now_timestamp();
+                    let fresh_until = meta
+                        .fresh_until()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(std::time::Duration::from_secs(3600))
+                        .as_secs() as i64;
+                    let created_at = now;
+                    let ttl_secs = (fresh_until - now).max(1);
+
+                    let entry = TinyUfoL1Entry {
+                        data: mem_handler.data.clone(),
+                        response_header: meta.response_header().clone(),
+                        fresh_until,
+                        created_at,
+                    };
+                    self.l1.put(
+                        k_str,
+                        entry,
+                        std::time::Duration::from_secs(ttl_secs as u64),
+                    );
+                    bloom_insert(k_str);
+                    negative_cache_remove(k_str);
                     prof_record_l2_mem_promotion();
                 }
             }
@@ -1704,13 +1898,20 @@ impl Storage for HybridStorage {
             let available = CACHED_DISK_AVAILABLE.load(Ordering::Relaxed);
 
             if available < min_free {
-                warn!("RPC_CACHE: Disk space below threshold. Bypassing disk cache.");
-                return self.l1.get_miss_handler(key, meta, trace).await;
+                warn!(
+                    "RPC_CACHE: Disk space below threshold. Bypassing disk cache to memory-only."
+                );
+                // Fall through to L2, which will handle it
             }
         }
 
         if p_type == POLICY_MEMORY {
-            return self.l1.get_miss_handler(key, meta, trace).await;
+            // Memory-only mode: no persistent storage, just serve from L1
+            // Miss handler not needed for pure memory cache
+            return Err(Error::explain(
+                ErrorType::InternalError,
+                "Memory-only policy does not support miss handler",
+            ));
         }
 
         self.l2.get_miss_handler(key, meta, trace).await
@@ -1726,10 +1927,11 @@ impl Storage for HybridStorage {
             return Ok(false);
         }
 
-        fast_l1_remove(&fast_hash_key(key.user_tag.as_ref()));
-        let l1_ok = self.l1.purge(key, purge_type, trace).await?;
+        self.l1.remove(key.user_tag.as_ref());
+        bloom_remove(key.user_tag.as_ref());
+        negative_cache_remove(key.user_tag.as_ref());
         let l2_ok = self.l2.purge(key, purge_type, trace).await?;
-        Ok(l1_ok || l2_ok)
+        Ok(l2_ok)
     }
 
     async fn update_meta(
@@ -1746,7 +1948,8 @@ impl Storage for HybridStorage {
 
         let p_type = self.policy_type.load(Ordering::Relaxed);
         if p_type == POLICY_MEMORY {
-            self.l1.update_meta(key, meta, trace).await?;
+            // TinyUfoL1 doesn't need explicit update_meta (TTL managed internally)
+            return Ok(true);
         }
         self.l2.update_meta(key, meta, trace).await
     }
@@ -1865,25 +2068,11 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, _disk_root: Pat
 // Cache performance profiling — log hit/miss/promotion stats
 // ═══════════════════════════════════════════════════════════
 
-/// Public API: ultra-fast cache lookup for direct use in request_filter.
-/// Returns the cached body bytes if a valid entry exists.
-pub fn fast_l1_lookup(key_str: &str) -> Option<bytes::Bytes> {
-    let hash = fast_hash_key(key_str);
-    if let Some(entry) = FAST_L1.get(&hash) {
-        let now = crate::utils::time::now_timestamp();
-        if entry.fresh_until > now {
-            return Some(entry.data.clone());
-        }
-        drop(entry);
-        fast_l1_remove(&hash);
-    }
-    None
-}
-
 static PROF_L1_HITS: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_HITS: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_MEM_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_ASYNC_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
+static PROF_BLOOM_REJECTS: AtomicU64 = AtomicU64::new(0);
 /// Accumulated disk read time in microseconds for the current 10s window.
 static PROF_DISK_READ_US: AtomicU64 = AtomicU64::new(0);
 /// Accumulated request_filter wall time in microseconds for the current 10s window.
@@ -1905,6 +2094,9 @@ pub fn prof_record_l2_mem_promotion() {
 pub fn prof_record_l2_async_promotion() {
     PROF_L2_ASYNC_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
 }
+pub fn prof_record_bloom_reject() {
+    PROF_BLOOM_REJECTS.fetch_add(1, Ordering::Relaxed);
+}
 pub fn prof_record_reqfilter(us: u64) {
     PROF_REQFILT_US.fetch_add(us, Ordering::Relaxed);
     PROF_REQFILT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1923,12 +2115,13 @@ pub fn start_cache_profiler() {
             let l2 = PROF_L2_HITS.swap(0, Ordering::Relaxed);
             let sync_prom = PROF_L2_MEM_PROMOTIONS.swap(0, Ordering::Relaxed);
             let async_prom = PROF_L2_ASYNC_PROMOTIONS.swap(0, Ordering::Relaxed);
+            let bloom_rej = PROF_BLOOM_REJECTS.swap(0, Ordering::Relaxed);
             let disk_us = PROF_DISK_READ_US.swap(0, Ordering::Relaxed);
             let reqfil_us = PROF_REQFILT_US.swap(0, Ordering::Relaxed);
             let reqfil_cnt = PROF_REQFILT_COUNT.swap(0, Ordering::Relaxed);
             let fastpath = PROF_FASTPATH_COUNT.swap(0, Ordering::Relaxed);
             let total = l1 + l2;
-            if total == 0 && reqfil_cnt == 0 {
+            if total == 0 && reqfil_cnt == 0 && bloom_rej == 0 {
                 continue;
             }
             let l1_pct = if total > 0 {
@@ -1947,24 +2140,17 @@ pub fn start_cache_profiler() {
                 0.0
             };
             tracing::info!(
-                "CACHE_PROFILE: L1={l1}/s L2={l2}/s L1%={l1_pct:.1} sync_prom={sync_prom}/s async_prom={async_prom}/s total={total}/s disk={avg_disk_ms:.1}ms rf={avg_reqfil_ms:.1}ms fp={fastpath}/s"
+                "CACHE_PROFILE: L1={l1}/s L2={l2}/s L1%={l1_pct:.1} bloom_rej={bloom_rej}/s sync_prom={sync_prom}/s async_prom={async_prom}/s total={total}/s disk={avg_disk_ms:.1}ms rf={avg_reqfil_ms:.1}ms fp={fastpath}/s"
             );
         }
     });
 }
 
-/// Periodically evict expired entries from FAST_L1 and cap OPEN_FILE_CACHE size.
+/// Periodically refresh disk space and memory budget.
+/// TinyUFO handles eviction internally via S3-FIFO.
 pub fn start_cache_janitor() {
     tokio::spawn(async {
         let disk_root = crate::paths::NodePaths::current().cache_dir();
-        // Initialize memory budget immediately — don't wait 60s
-        if FAST_L1_MAX_BYTES.load(Ordering::Relaxed) == 0 {
-            let budget = HybridStorage::compute_memory_budget();
-            if budget > 0 {
-                FAST_L1_MAX_BYTES.store(budget, Ordering::Relaxed);
-                tracing::info!("FAST_L1 auto memory budget: {} bytes", budget);
-            }
-        }
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
@@ -1977,43 +2163,11 @@ pub fn start_cache_janitor() {
                 .unwrap_or(u64::MAX);
             CACHED_DISK_AVAILABLE.store(available, Ordering::Relaxed);
 
-            // Evict expired FAST_L1 entries via heap (avoids full-table retain() lock)
+            crate::cache_manager::CACHE.storage.l1.refresh_auto_budget();
+
+            // Clean expired negative cache entries
             let now = crate::utils::time::now_timestamp();
-            let (expired_bytes, evicted) = fast_l1_evict_expired(now);
-            if evicted > 0 {
-                tracing::debug!(
-                    "FAST_L1 janitor: evicted {} expired entries ({} bytes), {} remain",
-                    evicted,
-                    expired_bytes,
-                    FAST_L1.len()
-                );
-            }
-
-            // Enforce FAST_L1 memory budget via eviction heap
-            let max_l1 = FAST_L1_MAX_BYTES.load(Ordering::Relaxed);
-            if max_l1 > 0 {
-                let total = FAST_L1_BYTES.load(Ordering::Acquire);
-                if total > max_l1 {
-                    let (freed, _) = fast_l1_evict_over_budget(max_l1, usize::MAX);
-                    if freed > 0 {
-                        tracing::debug!(
-                            "FAST_L1 memory budget: {}/{} bytes, evicted {} bytes, {} entries remain",
-                            total,
-                            max_l1,
-                            freed,
-                            FAST_L1.len()
-                        );
-                    }
-                }
-            }
-
-            // Update auto memory budget from system
-            if max_l1 == 0 {
-                let budget = HybridStorage::compute_memory_budget();
-                if budget > 0 {
-                    FAST_L1_MAX_BYTES.store(budget, Ordering::Relaxed);
-                }
-            }
+            NEGATIVE_CACHE.retain(|_, &mut expires| expires > now);
         }
     });
 }
@@ -2021,34 +2175,6 @@ pub fn start_cache_janitor() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static FAST_L1_TEST_LOCK: Lazy<parking_lot::Mutex<()>> =
-        Lazy::new(|| parking_lot::Mutex::new(()));
-
-    #[test]
-    fn fast_l1_cache_meta_preserves_header_template() {
-        let mut header = ResponseHeader::build(206, None).expect("response header");
-        header
-            .insert_header("x-cache-status", "HIT")
-            .expect("insert header");
-        let entry = FastL1Entry {
-            data: bytes::Bytes::from_static(b"body"),
-            fresh_until: 1_700_000_100,
-            created_at: 1_700_000_000,
-            generation: 1,
-            response_header: header,
-        };
-
-        let meta = fast_l1_cache_meta(&entry);
-        assert_eq!(meta.response_header().status.as_u16(), 206);
-        assert_eq!(
-            meta.response_header()
-                .headers
-                .get("x-cache-status")
-                .and_then(|v| v.to_str().ok()),
-            Some("HIT")
-        );
-    }
 
     #[test]
     fn dangerous_prefix_detection_requires_url_host_boundary() {
@@ -2068,15 +2194,12 @@ mod tests {
 
     #[tokio::test]
     async fn small_uncompressed_l2_hit_uses_memory_handler_for_fast_l1_promotion() {
-        let key_str = format!(
-            "small-l2-hit-{}-{}",
-            std::process::id(),
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        );
-        let root = std::env::temp_dir().join(format!(
-            "cloud-node-rust-cache-test-{}",
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        ));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let key_str = format!("small-l2-hit-{}-{unique}", std::process::id());
+        let root = std::env::temp_dir().join(format!("cloud-node-rust-cache-test-{unique}"));
         let storage = Box::leak(Box::new(FileStorage::new(&root)));
         let key = CacheKey::new("edge", key_str.as_str(), "");
         let hash = storage.get_hash(&key);
@@ -2123,15 +2246,12 @@ mod tests {
 
     #[tokio::test]
     async fn l2_hit_with_invalid_cached_status_falls_back_to_ok() {
-        let key_str = format!(
-            "invalid-status-l2-hit-{}-{}",
-            std::process::id(),
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        );
-        let root = std::env::temp_dir().join(format!(
-            "cloud-node-rust-cache-test-{}",
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        ));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let key_str = format!("invalid-status-l2-hit-{}-{unique}", std::process::id());
+        let root = std::env::temp_dir().join(format!("cloud-node-rust-cache-test-{unique}"));
         let storage = Box::leak(Box::new(FileStorage::new(&root)));
         let key = CacheKey::new("edge", key_str.as_str(), "");
         let hash = storage.get_hash(&key);
@@ -2171,15 +2291,12 @@ mod tests {
 
     #[tokio::test]
     async fn small_compressed_l2_hit_uses_memory_handler_for_fast_l1_promotion() {
-        let key_str = format!(
-            "small-compressed-l2-hit-{}-{}",
-            std::process::id(),
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        );
-        let root = std::env::temp_dir().join(format!(
-            "cloud-node-rust-cache-test-{}",
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        ));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let key_str = format!("small-compressed-l2-hit-{}-{unique}", std::process::id());
+        let root = std::env::temp_dir().join(format!("cloud-node-rust-cache-test-{unique}"));
         let storage = Box::leak(Box::new(FileStorage::new(&root)));
         let key = CacheKey::new("edge", key_str.as_str(), "");
         let hash = storage.get_hash(&key);
@@ -2234,211 +2351,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn purge_key_removes_fast_l1_memory_entry() {
-        let _guard = FAST_L1_TEST_LOCK.lock();
+    async fn runtime_stats_include_tiny_ufo_l1_memory() {
         let key = format!(
-            "https://cache.example.com/key-purge-fast-l1-{}",
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+            "https://cache.example.com/runtime-stats-l1-{}",
+            std::process::id()
         );
-        let hash = format!("{:x}", md5_legacy::compute(&key));
-        fast_l1_remove(&fast_hash_key(&key));
-        crate::metrics::storage::delete_cache_meta_for_test(&hash);
-
-        let header = ResponseHeader::build(200, None).expect("response header");
-        let meta = CacheMeta::new(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
-            std::time::SystemTime::now(),
-            0,
-            0,
-            header,
-        );
-        assert!(HybridStorage::bench_fast_l1_insert(
-            &key,
-            bytes::Bytes::from_static(b"body"),
-            &meta,
-            60,
-        ));
-        crate::metrics::storage::insert_cache_meta_for_test(
-            hash.clone(),
-            crate::metrics::storage::CacheMetaEntry {
-                cache_key: key.clone(),
-                size: 4,
-                expires: crate::utils::time::now_timestamp() + 60,
-                access_time: crate::utils::time::now_timestamp(),
-                access_count: 1,
-                status: 200,
-                headers: Vec::new(),
-                compressed: false,
-                ..Default::default()
-            },
-        );
-
-        assert!(fast_l1_lookup(&key).is_some());
-        let root = std::env::temp_dir().join(format!(
-            "cloud-node-rust-cache-purge-key-test-{}",
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let storage = Box::leak(Box::new(HybridStorage::new(0, &root)));
-        assert!(storage.purge_by_key(&key).await);
-        assert!(fast_l1_lookup(&key).is_none());
-        assert!(crate::metrics::storage::get_cache_meta_memory(&hash).is_none());
-
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn runtime_stats_include_fast_l1_memory() {
-        let _guard = FAST_L1_TEST_LOCK.lock();
-        let key = format!(
-            "https://cache.example.com/runtime-stats-fast-l1-{}",
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        );
-        fast_l1_remove(&fast_hash_key(&key));
         let root = std::env::temp_dir().join(format!(
             "cloud-node-rust-cache-stats-test-{}",
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
+            std::process::id()
         ));
         let storage = HybridStorage::new(0, &root);
         let before = storage.runtime_stats().await;
 
-        let header = ResponseHeader::build(200, None).expect("response header");
-        let meta = CacheMeta::new(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
-            std::time::SystemTime::now(),
-            0,
-            0,
-            header,
-        );
-        assert!(HybridStorage::bench_fast_l1_insert(
+        storage.l1.put(
             &key,
-            bytes::Bytes::from_static(b"body"),
-            &meta,
-            60,
-        ));
+            TinyUfoL1Entry {
+                data: bytes::Bytes::from_static(b"body"),
+                response_header: ResponseHeader::build(200, None).expect("response header"),
+                fresh_until: crate::utils::time::now_timestamp() + 60,
+                created_at: crate::utils::time::now_timestamp(),
+            },
+            std::time::Duration::from_secs(60),
+        );
 
         let after = storage.runtime_stats().await;
-        assert!(after.memory_count >= before.memory_count.saturating_add(1));
         assert!(after.memory_bytes >= before.memory_bytes.saturating_add(4));
+        assert!(after.memory_count >= before.memory_count.saturating_add(1));
 
-        fast_l1_remove(&fast_hash_key(&key));
-        let _ = tokio::fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn purge_prefix_removes_fast_l1_memory_entry() {
-        let _guard = FAST_L1_TEST_LOCK.lock();
-        let prefix = format!(
-            "https://cache.example.com/prefix-purge-fast-l1-{}/",
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        );
-        let key = format!("{prefix}asset.js");
-        let hash = format!("{:x}", md5_legacy::compute(&key));
-        fast_l1_remove(&fast_hash_key(&key));
-        crate::metrics::storage::delete_cache_meta_for_test(&hash);
-
-        let header = ResponseHeader::build(200, None).expect("response header");
-        let meta = CacheMeta::new(
-            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
-            std::time::SystemTime::now(),
-            0,
-            0,
-            header,
-        );
-        assert!(HybridStorage::bench_fast_l1_insert(
-            &key,
-            bytes::Bytes::from_static(b"body"),
-            &meta,
-            60,
-        ));
-        crate::metrics::storage::insert_cache_meta_for_test(
-            hash.clone(),
-            crate::metrics::storage::CacheMetaEntry {
-                cache_key: key.clone(),
-                size: 4,
-                expires: crate::utils::time::now_timestamp() + 60,
-                access_time: crate::utils::time::now_timestamp(),
-                access_count: 1,
-                status: 200,
-                headers: Vec::new(),
-                compressed: false,
-                ..Default::default()
-            },
-        );
-
-        assert!(fast_l1_lookup(&key).is_some());
-        let root = std::env::temp_dir().join(format!(
-            "cloud-node-rust-cache-purge-prefix-test-{}",
-            FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed)
-        ));
-        let storage = Box::leak(Box::new(HybridStorage::new(0, &root)));
-        assert!(storage.purge_by_prefix(&prefix).await);
-        assert!(fast_l1_lookup(&key).is_none());
-        assert!(crate::metrics::storage::get_cache_meta_memory(&hash).is_none());
-
+        storage.l1.remove(&key);
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[test]
-    fn stale_heap_entry_does_not_remove_replaced_fast_l1_entry() {
-        let _guard = FAST_L1_TEST_LOCK.lock();
-        let hash = fast_hash_key("stale-heap-entry-test");
-        fast_l1_remove(&hash);
-
-        let old_generation = FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed);
-        EVICTION_HEAP
-            .lock()
-            .push(std::cmp::Reverse((1_700_000_000, old_generation, hash)));
-
-        let new_generation = FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let header = ResponseHeader::build(200, None).expect("response header");
-        FAST_L1.insert(
-            hash,
-            FastL1Entry {
-                data: bytes::Bytes::from_static(b"new"),
-                fresh_until: 1_800_000_000,
-                created_at: 1_700_000_100,
-                generation: new_generation,
-                response_header: header,
-            },
-        );
-        FAST_L1_BYTES.fetch_add(3, Ordering::Release);
-
-        let (_, evicted) = fast_l1_evict_expired(1_700_000_001);
-        assert_eq!(evicted, 0);
-        assert_eq!(
-            FAST_L1.get(&hash).map(|entry| entry.generation),
-            Some(new_generation)
-        );
-
-        fast_l1_remove(&hash);
+    fn adaptive_bloom_scales_capacity() {
+        let bloom = AdaptiveBloomFilter::new(8, 2);
+        let (_, start_capacity, _) = bloom.stats();
+        for i in 0..32 {
+            bloom.insert(&format!("key-{i}"));
+        }
+        let (size, capacity, util) = bloom.stats();
+        assert_eq!(size, 32);
+        assert!(capacity > start_capacity);
+        assert!(util > 0.0);
+        assert!(bloom.contains("key-0"));
+        assert!(bloom.contains("key-31"));
     }
 
     #[test]
-    fn current_generation_expired_heap_entry_removes_fast_l1_entry() {
-        let _guard = FAST_L1_TEST_LOCK.lock();
-        let hash = fast_hash_key("current-generation-expired-test");
-        fast_l1_remove(&hash);
+    fn negative_cache_capacity_tracks_bloom_size() {
+        let before = negative_cache_capacity_limit();
+        for i in 0..2_048 {
+            bloom_insert(&format!("cap-key-{i}"));
+        }
+        let after = negative_cache_capacity_limit();
+        assert!(after >= before);
+        assert!(after >= NEGATIVE_CACHE_MIN_ENTRIES);
+    }
 
-        let generation = FAST_L1_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let header = ResponseHeader::build(200, None).expect("response header");
-        FAST_L1.insert(
-            hash,
-            FastL1Entry {
-                data: bytes::Bytes::from_static(b"old"),
-                fresh_until: 1_700_000_000,
-                created_at: 1_699_999_900,
-                generation,
-                response_header: header,
-            },
-        );
-        FAST_L1_BYTES.fetch_add(3, Ordering::Release);
-        EVICTION_HEAP
-            .lock()
-            .push(std::cmp::Reverse((1_700_000_000, generation, hash)));
+    #[test]
+    fn negative_cache_expires_stale_entries() {
+        let key = format!("neg-expire-{}", std::process::id());
+        let now = crate::utils::time::now_timestamp();
+        NEGATIVE_CACHE.insert(key.clone(), now - 1);
+        assert!(!negative_cache_check(&key, now));
+        assert!(!NEGATIVE_CACHE.contains_key(&key));
+    }
 
-        let (expired_bytes, evicted) = fast_l1_evict_expired(1_700_000_001);
-        assert_eq!(expired_bytes, 3);
-        assert_eq!(evicted, 1);
-        assert!(FAST_L1.get(&hash).is_none());
+    #[test]
+    fn cache_meta_hooks_warm_bloom_and_clear_negative_cache() {
+        let key = format!("hook-key-{}", std::process::id());
+        let now = crate::utils::time::now_timestamp();
+        negative_cache_insert(&key, now);
+        assert!(negative_cache_check(&key, now));
+
+        let meta = crate::metrics::storage::CacheMetaEntry {
+            cache_key: key.clone(),
+            expires: now + 60,
+            ..Default::default()
+        };
+        on_cache_meta_upsert(&meta);
+        assert!(bloom_may_exist(&key));
+        assert!(!negative_cache_check(&key, now));
     }
 }

@@ -239,7 +239,7 @@ where
                 );
                 match CB::lookup(key, extra).await {
                     Ok((v, new_ttl)) => {
-                        self.inner.force_put(key, v.clone(), new_ttl.or(ttl));
+                        self.inner.force_put(key, v.clone(), new_ttl.or(ttl), 1);
                         (Ok(v), cache_state)
                     }
                     Err(e) => {
@@ -257,7 +257,7 @@ where
                 Ok((v, new_ttl)) => {
                     /* Don't put() if lock ago too old, to avoid too many concurrent writes */
                     if my_write.is_some() {
-                        self.inner.force_put(key, v.clone(), new_ttl.or(ttl));
+                        self.inner.force_put(key, v.clone(), new_ttl.or(ttl), 1);
                     }
                     (Ok(v), cache_state) // the original cache_state: Miss or Expired
                 }
@@ -377,7 +377,7 @@ where
                     /* put the misses into cache */
                     for item in misses.iter().zip(miss_results.iter()) {
                         self.inner
-                            .force_put(item.0, (item.1).0.clone(), (item.1).1.or(ttl));
+                            .force_put(item.0, (item.1).0.clone(), (item.1).1.or(ttl), 1);
                     }
                     miss_results
                 }
