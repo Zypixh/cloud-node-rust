@@ -82,7 +82,8 @@ impl ProxyHttp for BenchProxy {
 fn main() {
     let mut conf = ServerConf::default();
     conf.threads = num_cpus::get();
-    conf.upstream_keepalive_pool_size = 32768;
+    conf.upstream_keepalive_pool_size =
+        cloud_node_rust::memory_governor::MEMORY_GOVERNOR.pingora_keepalive_pool_size(conf.threads);
 
     let mut server = Server::new_with_opt_and_conf(None, conf);
     server.bootstrap();

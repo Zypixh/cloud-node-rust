@@ -1,5 +1,6 @@
 use crate::config::ConfigStore;
 use crate::config_models::{ProxyProtocolConfig, ServerConfig};
+use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR};
 use crate::net_bind::{bind_tcp_listener_with_retry, dual_stack_bind_addrs};
 use crate::proxy::EdgeProxy;
 use crate::proxy_protocol;
@@ -48,7 +49,7 @@ fn is_transient_accept_error(err: &std::io::Error) -> bool {
             {
                 false
             }
-        },
+        }
     }
 }
 
@@ -101,7 +102,6 @@ pub struct HttpProxyManager {
     proxy_logic: EdgeProxy,
     server_conf: Arc<ServerConf>,
     handled_ports: DashMap<SocketAddr, ListenerHandle>,
-    connection_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl HttpProxyManager {
@@ -117,7 +117,6 @@ impl HttpProxyManager {
             proxy_logic,
             server_conf,
             handled_ports: DashMap::new(),
-            connection_semaphore: Arc::new(tokio::sync::Semaphore::new(65536)),
         })
     }
 
@@ -323,7 +322,12 @@ impl HttpProxyManager {
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let port = bind_addr.port();
-        let listener = bind_tcp_listener_with_retry(bind_addr, 4096, &mut shutdown_rx).await?;
+        let listener = bind_tcp_listener_with_retry(
+            bind_addr,
+            MEMORY_GOVERNOR.listener_backlog(),
+            &mut shutdown_rx,
+        )
+        .await?;
         info!("HTTP Proxy (TLS={}) listening on {}", is_tls, bind_addr);
 
         let mut proxy_logic = self.proxy_logic.clone();
@@ -385,15 +389,13 @@ impl HttpProxyManager {
                 continue;
             }
 
-            let connection_permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    warn!(
-                        "Connection limit reached on {}, dropping connection from {}",
-                        bind_addr, client_addr
-                    );
-                    continue;
-                }
+            let Some(connection_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::HttpConnection)
+            else {
+                warn!(
+                    "HTTP connection admission limit reached on {}, dropping connection from {}",
+                    bind_addr, client_addr
+                );
+                continue;
             };
 
             if !is_tls {
@@ -560,18 +562,17 @@ impl HttpProxyManager {
                     .await
                     {
                         Ok(Ok(mut h2_conn)) => {
-                            let h2_stream_semaphore = Arc::new(tokio::sync::Semaphore::new(256));
+                            let h2_stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
+                                MEMORY_GOVERNOR.limit_for(AdmissionClass::Http2Stream),
+                            ));
                             loop {
                                 match pingora_core::protocols::http::v2::server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await {
                                     Ok(Some(h2_session)) => {
                                         let proxy_inner_h2 = proxy_inner.clone();
                                         let shutdown_inner_h2 = shutdown_inner.clone();
-                                        let stream_permit = match Arc::clone(&h2_stream_semaphore).try_acquire_owned() {
-                                            Ok(p) => p,
-                                            Err(_) => {
-                                                debug!("H2 stream limit reached for connection, refusing stream");
-                                                continue;
-                                            }
+                                        let Some(stream_permit) = Arc::clone(&h2_stream_semaphore).try_acquire_owned().ok() else {
+                                            debug!("H2 stream admission limit reached for connection, refusing stream");
+                                            continue;
                                         };
                                         tokio::spawn(async move {
                                             let _stream_permit = stream_permit;

@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::ConfigStore;
 use crate::h3_downstream::H3DownstreamSession;
+use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR};
 use crate::proxy::EdgeProxy;
 use crate::ssl::DynamicCertSelector;
 
@@ -29,7 +30,6 @@ pub struct Http3ProxyManager {
     proxy_logic: EdgeProxy,
     server_conf: Arc<ServerConf>,
     handled_ports: DashMap<u16, ListenerHandle>,
-    connection_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Http3ProxyManager {
@@ -45,7 +45,6 @@ impl Http3ProxyManager {
             proxy_logic,
             server_conf,
             handled_ports: DashMap::new(),
-            connection_semaphore: Arc::new(tokio::sync::Semaphore::new(16384)),
         })
     }
 
@@ -176,12 +175,14 @@ impl Http3ProxyManager {
             };
             debug!("HTTP/3 incoming connection on UDP port {}", port);
 
-            let connection_permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    warn!("H3 connection limit reached, rejecting connection on port {}", port);
-                    continue;
-                }
+            let Some(connection_permit) =
+                MEMORY_GOVERNOR.try_admit(AdmissionClass::Http3Connection)
+            else {
+                warn!(
+                    "H3 connection admission limit reached, rejecting connection on port {}",
+                    port
+                );
+                continue;
             };
 
             let manager = self.clone();
@@ -211,10 +212,16 @@ impl Http3ProxyManager {
         .context("build HTTP/3 rustls server config")?;
         rustls_config.max_early_data_size = u32::MAX;
 
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_config))?,
         ));
-        // Use Quinn's default max_concurrent_uni_streams (no artificial cap for CDN)
+        let per_conn_limit = MEMORY_GOVERNOR.limit_for(AdmissionClass::Http3Request);
+        if let Some(transport_config) = Arc::get_mut(&mut server_config.transport) {
+            let stream_cap = per_conn_limit.min(u32::MAX as usize) as u32;
+            let uni_cap = stream_cap.clamp(32, 256);
+            transport_config.max_concurrent_bidi_streams(stream_cap.into());
+            transport_config.max_concurrent_uni_streams(uni_cap.into());
+        }
         Ok(server_config)
     }
 
@@ -321,6 +328,15 @@ impl Http3ProxyManager {
             stream.finish().await?;
             return Ok(());
         }
+        let Some(_request_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::Http3Request) else {
+            let response = http::Response::builder().status(503).body(())?;
+            stream.send_response(response).await?;
+            stream
+                .send_data(Bytes::from_static(b"HTTP/3 server busy"))
+                .await?;
+            stream.finish().await?;
+            return Ok(());
+        };
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port);
         let h3_session = H3DownstreamSession::new(request, stream, remote_addr, local_addr)?;
         let server_session = ServerSession::new_custom(Box::new(h3_session));

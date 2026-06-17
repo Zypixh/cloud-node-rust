@@ -23,6 +23,8 @@ pub mod lb_factory;
 pub mod local_firewall;
 pub mod log_uploader;
 pub mod logging;
+pub mod memory_governor;
+pub mod memory_plan;
 pub mod metrics;
 pub mod net_bind;
 pub mod origin_h3;

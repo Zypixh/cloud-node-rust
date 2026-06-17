@@ -2,6 +2,7 @@ use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 use crate::config_models::{ProxyProtocolConfig, SSLCertConfig};
 use crate::firewall::state::WafStateManager;
+use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR};
 use crate::net_bind::{bind_tcp_listener_with_retry, dual_stack_bind_addrs};
 use crate::proxy_protocol;
 use crate::ssl::DynamicCertSelector;
@@ -241,7 +242,12 @@ impl TcpProxyManager {
         is_tls: bool,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let listener = bind_tcp_listener_with_retry(bind_addr, 4096, &mut shutdown_rx).await?;
+        let listener = bind_tcp_listener_with_retry(
+            bind_addr,
+            MEMORY_GOVERNOR.listener_backlog(),
+            &mut shutdown_rx,
+        )
+        .await?;
         info!("TCP Proxy (TLS={}) listening on {}", is_tls, bind_addr);
 
         let shared_ssl_acceptor = if is_tls {
@@ -290,8 +296,17 @@ impl TcpProxyManager {
             let manager = self.clone();
             let server = server.clone();
             let acceptor_clone = shared_ssl_acceptor.clone();
+            let Some(connection_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::TcpConnection)
+            else {
+                warn!(
+                    "TCP connection admission limit reached on {}, dropping connection from {}",
+                    bind_addr, client_addr
+                );
+                continue;
+            };
 
             tokio::spawn(async move {
+                let _connection_permit = connection_permit;
                 if let Err(e) = manager
                     .handle_connection(client_stream, client_addr, server, is_tls, acceptor_clone)
                     .await

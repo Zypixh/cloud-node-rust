@@ -886,13 +886,18 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     // 4. Initialize Pingora Server with multi-threading
     let mut conf = pingora_core::server::configuration::ServerConf::default();
     conf.threads = num_cpus::get_physical().min(32);
-    conf.upstream_keepalive_pool_size = 32768;
+    conf.upstream_keepalive_pool_size =
+        cloud_node_rust::memory_governor::MEMORY_GOVERNOR.pingora_keepalive_pool_size(conf.threads);
     conf.grace_period_seconds = Some(5);
     conf.graceful_shutdown_timeout_seconds = Some(5);
     let mut my_server = pingora_core::server::Server::new_with_opt_and_conf(None, conf);
+    let mem_plan =
+        cloud_node_rust::memory_plan::current_memory_plan(my_server.configuration.threads);
     info!(
-        "Pingora server configured with {} threads.",
-        my_server.configuration.threads
+        "Pingora server configured with {} threads, upstream keepalive pool per thread={}, memory plan={}",
+        my_server.configuration.threads,
+        my_server.configuration.upstream_keepalive_pool_size,
+        mem_plan.summary
     );
     my_server.bootstrap();
 
