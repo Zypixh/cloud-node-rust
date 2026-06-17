@@ -639,7 +639,7 @@ impl EdgeProxy {
 
     fn report_remote_purge(api_config: Arc<ApiConfig>, key: String) {
         tokio::spawn(async move {
-            let client = match crate::rpc::client::RpcClient::new(&api_config).await {
+            let client = match crate::rpc::client::SharedRpcClient::get(&api_config).await.map(|s| s.as_rpc_client()) {
                 Ok(client) => client,
                 Err(err) => {
                     warn!("CACHE_PURGE: create RPC client failed: {}", err);
@@ -1454,6 +1454,20 @@ impl EdgeProxy {
                 Self::decrement_request_limit_count(server_id, client_ip);
             }
         }
+        // Evict zero-count entries so counter maps don't grow unbounded.
+        REQUEST_LIMIT_SERVER_COUNTS.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+        REQUEST_LIMIT_IP_COUNTS.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+    }
+
+    fn cleanup_cc_bw_counters() {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        CC_BW_COUNTERS.retain(|_, entry| {
+            let win = entry.1.load(Ordering::Relaxed);
+            now_secs.saturating_sub(win) < 120
+        });
     }
 
     fn request_limit_count(map: &DashMap<i64, Arc<AtomicI32>>, key: i64) -> i32 {
@@ -10420,6 +10434,7 @@ pub fn start_request_limit_cleanup_task() {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             EdgeProxy::cleanup_request_limit_bindings();
+            EdgeProxy::cleanup_cc_bw_counters();
         }
     });
 }

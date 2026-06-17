@@ -51,8 +51,8 @@ pub async fn find_node_level_info(
     api_config: &crate::api_config::ApiConfig,
     config_store: &crate::config::ConfigStore,
 ) -> bool {
-    let client = match client::RpcClient::new(api_config).await {
-        Ok(client) => client,
+    let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
+        Ok(s) => s.as_rpc_client(),
         Err(err) => {
             tracing::debug!("Failed to connect for node level sync: {}", err);
             return false;

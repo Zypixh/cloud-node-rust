@@ -1,6 +1,5 @@
 use crate::api_config::ApiConfig;
 use crate::pb;
-use crate::rpc::client::RpcClient;
 
 pub enum AcmeKeyLookup {
     Found(String),
@@ -9,8 +8,8 @@ pub enum AcmeKeyLookup {
 }
 
 pub async fn find_acme_key(api_config: &ApiConfig, token: &str) -> AcmeKeyLookup {
-    let client = match RpcClient::new(api_config).await {
-        Ok(c) => c,
+    let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
+        Ok(s) => s.as_rpc_client(),
         Err(err) => return AcmeKeyLookup::RpcError(err.to_string()),
     };
     let mut service = client.acme_service();

@@ -159,8 +159,8 @@ pub async fn sync_deleted_contents(
     config_store: &crate::config::ConfigStore,
     version: &mut i64,
 ) {
-    let client = match crate::rpc::client::RpcClient::new(api_config).await {
-        Ok(client) => client,
+    let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
+        Ok(s) => s.as_rpc_client(),
         Err(err) => {
             tracing::debug!("Failed to connect for deleted content sync: {}", err);
             return;

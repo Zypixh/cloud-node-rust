@@ -1,6 +1,6 @@
 use crate::api_config::ApiConfig;
 use crate::pb;
-use crate::rpc::client::RpcClient;
+use crate::rpc::client::SharedRpcClient;
 use crate::rpc::logs::report_node_log_with_context;
 use crate::ssl::DynamicCertSelector;
 use std::sync::Arc;
@@ -15,8 +15,8 @@ pub async fn start_ocsp_syncer(api_config: ApiConfig, cert_selector: Arc<Dynamic
     loop {
         interval.tick().await;
 
-        let client = match RpcClient::new(&api_config).await {
-            Ok(client) => client,
+        let client = match SharedRpcClient::get(&api_config).await {
+            Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
                 warn!("Failed to connect for OCSP sync: {}", e);
                 report_node_log_with_context(

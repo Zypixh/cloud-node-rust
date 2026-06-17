@@ -1,6 +1,6 @@
 use crate::api_config::ApiConfig;
 use crate::pb;
-use crate::rpc::client::RpcClient;
+use crate::rpc::client::SharedRpcClient;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -32,8 +32,8 @@ pub async fn sync_ip_items_incremental(
     api_config: &ApiConfig,
     ip_list_manager: &crate::firewall::lists::GlobalIpListManager,
 ) -> bool {
-    let client = match RpcClient::new(api_config).await {
-        Ok(c) => c,
+    let client = match SharedRpcClient::get(api_config).await {
+        Ok(shared) => shared.as_rpc_client(),
         Err(e) => {
             debug!("Failed to connect for IP item sync: {}", e);
             return false;

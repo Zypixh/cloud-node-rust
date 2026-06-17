@@ -15,8 +15,8 @@ pub async fn start_ip_library_syncer(api_config: ApiConfig) {
     loop {
         interval.tick().await;
 
-        let client = match RpcClient::new(&api_config).await {
-            Ok(client) => client,
+        let client = match crate::rpc::client::SharedRpcClient::get(&api_config).await {
+            Ok(s) => s.as_rpc_client(),
             Err(e) => {
                 warn!("Failed to connect for IP library sync: {}", e);
                 report_node_log_with_context(

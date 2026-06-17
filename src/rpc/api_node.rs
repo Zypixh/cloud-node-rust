@@ -2,7 +2,7 @@ use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
 use crate::health_manager::GlobalHealthManager;
 use crate::pb;
-use crate::rpc::client::RpcClient;
+use crate::rpc::client::{RpcClient, SharedRpcClient};
 use crate::rpc::logs::report_node_log_with_context;
 use crate::rpc::utils::build_runtime_maps;
 use crate::ssl::DynamicCertSelector;
@@ -61,8 +61,8 @@ pub async fn sync_updating_server_list_once(
         *last_id = config_store.get_updating_server_list_id().await;
     }
 
-    let client = match RpcClient::new(api_config).await {
-        Ok(client) => client,
+    let client = match SharedRpcClient::get(api_config).await {
+        Ok(shared) => shared.as_rpc_client(),
         Err(e) => {
             warn!("Failed to connect for updating server sync: {}", e);
             report_node_log_with_context(
@@ -196,8 +196,8 @@ async fn refresh_certificates(config_store: &ConfigStore, cert_selector: &Dynami
 }
 
 pub async fn sync_api_nodes(api_config: &ApiConfig) {
-    let client = match RpcClient::new(api_config).await {
-        Ok(c) => c,
+    let client = match SharedRpcClient::get(api_config).await {
+        Ok(shared) => shared.as_rpc_client(),
         Err(e) => {
             debug!("Failed to connect for api-node sync: {}", e);
             report_node_log_with_context(
@@ -300,4 +300,7 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
         .await;
     }
     ApiConfig::set_runtime_rpc_endpoints(healthy_endpoints);
+    if let Err(e) = crate::rpc::client::SharedRpcClient::refresh(&api_config) {
+        warn!("Failed to refresh shared RPC channel after endpoint change: {}", e);
+    }
 }

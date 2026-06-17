@@ -2,7 +2,6 @@ use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 use crate::pb;
-use crate::rpc::client::RpcClient;
 use crate::rpc::logs::report_node_log_with_context;
 use crate::rpc::plan::sync_active_plans;
 use crate::rpc::utils::build_runtime_maps;
@@ -39,8 +38,8 @@ pub async fn sync_single_server_config(
     health_manager: &crate::health_manager::GlobalHealthManager,
     server_id: i64,
 ) -> bool {
-    let client = match RpcClient::new(api_config).await {
-        Ok(c) => c,
+    let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
+        Ok(s) => s.as_rpc_client(),
         Err(e) => {
             debug!("Failed to connect for server config sync: {}", e);
             report_node_log_with_context(
@@ -164,8 +163,8 @@ pub async fn sync_user_servers_state(
         return true;
     }
 
-    let client = match RpcClient::new(api_config).await {
-        Ok(c) => c,
+    let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
+        Ok(s) => s.as_rpc_client(),
         Err(e) => {
             debug!("Failed to connect for user server state sync: {}", e);
             report_node_log_with_context(

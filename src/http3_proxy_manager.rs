@@ -29,6 +29,7 @@ pub struct Http3ProxyManager {
     proxy_logic: EdgeProxy,
     server_conf: Arc<ServerConf>,
     handled_ports: DashMap<u16, ListenerHandle>,
+    connection_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Http3ProxyManager {
@@ -44,6 +45,7 @@ impl Http3ProxyManager {
             proxy_logic,
             server_conf,
             handled_ports: DashMap::new(),
+            connection_semaphore: Arc::new(tokio::sync::Semaphore::new(16384)),
         })
     }
 
@@ -174,10 +176,19 @@ impl Http3ProxyManager {
             };
             debug!("HTTP/3 incoming connection on UDP port {}", port);
 
+            let connection_permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    warn!("H3 connection limit reached, rejecting connection on port {}", port);
+                    continue;
+                }
+            };
+
             let manager = self.clone();
             let proxy = proxy.clone();
             let shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
+                let _connection_permit = connection_permit;
                 if let Err(err) = manager
                     .serve_connection(connecting, port, proxy, shutdown)
                     .await

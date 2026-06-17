@@ -1,6 +1,6 @@
 use crate::api_config::ApiConfig;
 use crate::pb;
-use crate::rpc::client::RpcClient;
+use crate::rpc::client::SharedRpcClient;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -82,8 +82,8 @@ pub async fn start_ip_report_service(api_config: ApiConfig) {
             continue;
         }
 
-        let client = match RpcClient::new(&api_config).await {
-            Ok(c) => c,
+        let client = match SharedRpcClient::get(&api_config).await {
+            Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
                 error!(
                     "Failed to connect to API for IP reporting: {}. Waiting 10s...",

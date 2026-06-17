@@ -1207,9 +1207,6 @@ impl ConfigStore {
     }
 
     pub async fn update_config_version(&self, version: i64) {
-        if version <= 0 {
-            return;
-        }
         let mut lock = self.inner.write();
         lock.version = version;
     }
@@ -1309,6 +1306,12 @@ impl ConfigStore {
             policy.compile_url_patterns();
         }
         crate::routing::location::clear_compiled_locations();
+        // Pre-compile plans outside the write lock to avoid blocking request processing.
+        let compiled_plans = crate::compiled::CompiledPlanSet::compile(
+            &firewall_policies,
+            &cache_policy,
+            &all_servers,
+        );
         let mut lock = self.inner.write();
         lock.id = id;
         lock.version = version;
@@ -1357,11 +1360,6 @@ impl ConfigStore {
         lock.xff_max_addresses = global_http.xff_max_addresses;
         lock.allow_lan_ip = global_http.allow_lan_ip;
         lock.global_http_config = global_http;
-        let compiled_plans = crate::compiled::CompiledPlanSet::compile(
-            &firewall_policies,
-            &cache_policy,
-            &lock.all_servers,
-        );
         lock.cache_policies = Arc::new(cache_policy);
         lock.firewall_policies = Arc::new(firewall_policies);
         lock.compiled_plans = Arc::new(compiled_plans);

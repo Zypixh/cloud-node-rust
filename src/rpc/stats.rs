@@ -2,7 +2,7 @@ use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
 use crate::metrics::ServerStatusSnapshot;
 use crate::pb;
-use crate::rpc::client::RpcClient;
+use crate::rpc::client::SharedRpcClient;
 use chrono::{Datelike, Duration as ChronoDuration, Timelike};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -90,8 +90,8 @@ pub async fn start_origin_health_reporter(api_config: ApiConfig) {
             continue;
         }
 
-        let client = match RpcClient::new(&api_config).await {
-            Ok(c) => c,
+        let client = match SharedRpcClient::get(&api_config).await {
+            Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
                 error!("Origin health reporter failed to connect: {}", e);
                 continue;
@@ -267,8 +267,8 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             }));
             if !upload_items.is_empty() {
                 let stats: Vec<_> = upload_items.iter().map(|item| item.stat.clone()).collect();
-                let client = match RpcClient::new(&api_config).await {
-                    Ok(c) => c,
+                let client = match SharedRpcClient::get(&api_config).await {
+                    Ok(shared) => shared.as_rpc_client(),
                     Err(e) => {
                         error!("Bandwidth reporter failed to connect: {}", e);
                         pending_stats = upload_items;
@@ -427,8 +427,8 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
             }
 
             if !stats.is_empty() || !domain_stats.is_empty() {
-                let client = match RpcClient::new(&api_config).await {
-                    Ok(c) => c,
+                let client = match SharedRpcClient::get(&api_config).await {
+                    Ok(shared) => shared.as_rpc_client(),
                     Err(e) => {
                         error!("Daily stat reporter failed to connect: {}", e);
                         pending_stats = stats;
@@ -557,8 +557,8 @@ pub async fn start_metric_stat_reporter(
             continue;
         }
 
-        let client = match RpcClient::new(&api_config).await {
-            Ok(c) => c,
+        let client = match SharedRpcClient::get(&api_config).await {
+            Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
                 error!("Metric stat reporter failed to connect: {}", e);
                 continue;
@@ -686,8 +686,8 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
             continue;
         }
 
-        let client = match RpcClient::new(&api_config).await {
-            Ok(c) => c,
+        let client = match SharedRpcClient::get(&api_config).await {
+            Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
                 error!("Metrics aggregator reporter failed to connect: {}", e);
                 continue;
@@ -818,8 +818,8 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
             continue;
         }
 
-        let client = match RpcClient::new(&api_config).await {
-            Ok(c) => c,
+        let client = match SharedRpcClient::get(&api_config).await {
+            Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
                 error!("Top IP stat reporter failed to connect: {}", e);
                 continue;

@@ -1,7 +1,6 @@
 use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
 use crate::pb;
-use crate::rpc::client::RpcClient;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::debug;
 
@@ -25,8 +24,8 @@ pub async fn sync_active_plans(api_config: &ApiConfig, config_store: &ConfigStor
         return true;
     }
 
-    let client = match RpcClient::new(api_config).await {
-        Ok(client) => client,
+    let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
+        Ok(s) => s.as_rpc_client(),
         Err(err) => {
             debug!("Failed to connect for plan sync: {}", err);
             return false;

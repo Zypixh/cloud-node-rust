@@ -410,7 +410,7 @@ fn is_retryable_stream_transport_error(error: &tonic::Status) -> bool {
 async fn handle_message(
     message: &pb::NodeStreamMessage,
     tx: &mpsc::Sender<pb::NodeStreamMessage>,
-    _api_config: &ApiConfig,
+    api_config: &ApiConfig,
     config_store: Arc<ConfigStore>,
 ) -> anyhow::Result<()> {
     debug!(
@@ -657,6 +657,9 @@ async fn handle_message(
                     msg.addr
                 );
                 ApiConfig::set_runtime_rpc_endpoints(vec![msg.addr]);
+                if let Err(e) = crate::rpc::client::SharedRpcClient::refresh(&api_config) {
+                    warn!("Failed to refresh shared RPC channel after endpoint change: {}", e);
+                }
             }
         }
         "checksystemdservice" => {

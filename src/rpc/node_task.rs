@@ -3,7 +3,7 @@ use crate::config::ConfigStore;
 use crate::pb;
 use crate::rpc::api_node::sync_updating_server_list_once;
 use crate::rpc::cache::sync_cache_tasks;
-use crate::rpc::client::RpcClient;
+use crate::rpc::client::SharedRpcClient;
 use crate::rpc::ip_list::sync_ip_items_incremental;
 use crate::rpc::plan::sync_active_plans;
 use crate::rpc::server::{sync_single_server_config, sync_user_servers_state};
@@ -31,8 +31,8 @@ pub async fn sync_node_tasks(
     task_version: &mut i64,
     config_synced: bool,
 ) {
-    let client = match RpcClient::new(api_config).await {
-        Ok(c) => c,
+    let client = match SharedRpcClient::get(api_config).await {
+        Ok(shared) => shared.as_rpc_client(),
         Err(_) => return,
     };
     let mut task_service = client.node_task_service();

@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
 use crate::pb;
-use crate::rpc::client::RpcClient;
+use crate::rpc::client::SharedRpcClient;
 use crate::rpc::node_task::sync_node_tasks;
 use crate::rpc::plan::sync_active_plans;
 use crate::rpc::utils::sync_deleted_contents;
@@ -181,7 +181,8 @@ async fn report_connected_api_nodes(api_config: &ApiConfig) {
         return;
     }
 
-    if let Ok(client) = RpcClient::new(api_config).await {
+    if let Ok(shared) = SharedRpcClient::get(api_config).await {
+        let client = shared.as_rpc_client();
         let mut node_service = client.node_service_with_type();
         match crate::rpc::track_rpc(node_service.update_node_connected_api_nodes(
             pb::UpdateNodeConnectedApiNodesRequest {
@@ -233,8 +234,8 @@ pub async fn start_config_syncer(
     loop {
         debug!("RPC_NODE: Starting periodic configuration sync check.");
 
-        let client = match RpcClient::new(&api_config).await {
-            Ok(c) => c,
+        let client = match SharedRpcClient::get(&api_config).await {
+            Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
                 error!("Failed to connect to API node: {}. Will retry...", e);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -404,16 +405,23 @@ where
     match crate::rpc::track_rpc(client.find_current_node_config(req)).await {
         Ok(resp) => {
             let config_resp = resp.into_inner();
-            let response_version = config_resp.timestamp;
+            // config_resp.timestamp is a Unix timestamp used as an RPC cursor
+            // (tells the API server "I've synced up to this point"), NOT the
+            // config version. The config version that the admin UI uses to
+            // determine "同步中" vs "在线" comes from payload.version (the
+            // edgeNodes.version column in the DB). We must separate these two
+            // concepts: rpc_cursor for next request, config_version for status.
+            let rpc_cursor = config_resp.timestamp;
             if config_resp.node_json.is_empty() {
                 if !config_resp.is_changed {
-                    if response_version > 0 {
-                        *config_version = response_version;
-                        config_store.update_config_version(response_version).await;
+                    // Config unchanged — config_version stays the same.
+                    // Only update rpc_cursor for next request.
+                    if rpc_cursor > 0 {
+                        *config_version = rpc_cursor; // used as request parameter next time
                     }
                     debug!(
                         "RPC_NODE: No configuration changes reported by API. cursor={}",
-                        response_version
+                        rpc_cursor
                     );
                 } else {
                     warn!("RPC_NODE: API reported change but sent empty JSON!");
@@ -462,9 +470,10 @@ where
                     }
                 }
 
-                if !should_reload && response_version > 0 {
-                    *config_version = response_version;
-                    config_store.update_config_version(response_version).await;
+                if !should_reload && rpc_cursor > 0 {
+                    // Content unchanged — config_version stays the same (from payload.version).
+                    // Update rpc_cursor for next request.
+                    *config_version = rpc_cursor;
                 }
 
                 if should_reload {
@@ -473,12 +482,22 @@ where
                         &node_json,
                     ) {
                         Ok(mut payload) => {
-                            let payload_version = if response_version > 0 {
-                                response_version
+                            // The config version reported to the control panel MUST come
+                            // from payload.version (the edgeNodes.version DB column),
+                            // NOT from the RPC timestamp. The admin UI compares
+                            // status.configVersion == node.Version to decide "在线" vs "同步中".
+                            let payload_config_version = payload.version.unwrap_or(0);
+                            // For the next FindCurrentNodeConfig request parameter, use
+                            // rpc_cursor if available, otherwise the payload version.
+                            *config_version = if rpc_cursor > 0 {
+                                rpc_cursor
+                            } else if payload_config_version > 0 {
+                                payload_config_version
                             } else {
-                                payload.version.unwrap_or(*config_version)
+                                *config_version
                             };
-                            *config_version = payload_version;
+                            // Store the actual config version for status reporting.
+                            config_store.update_config_version(payload_config_version).await;
                             {
                                 let mut last_hash = LAST_CONFIG_HASH.write();
                                 *last_hash = current_hash;
@@ -1200,7 +1219,7 @@ where
                             config_store
                                 .update_config(
                                     numeric_id,
-                                    payload_version,
+                                    payload_config_version,
                                     payload.node_region.as_ref().map(|r| r.id).unwrap_or(0),
                                     node_cluster_id,
                                     payload_servers.clone().into_iter().map(Arc::new).collect(),
@@ -1256,7 +1275,7 @@ where
 
                             info!(
                                 "RPC_NODE: Applied config version={} node_id={} servers={} domains={} port_only={} cache_policies={} waf_policies={} pages={}",
-                                payload_version,
+                                payload_config_version,
                                 numeric_id,
                                 payload_servers.len(),
                                 loaded_domain_count,
@@ -1289,7 +1308,8 @@ where
                             let _ = sync_active_plans(api_config, config_store).await;
                             // Fetch enabled features for management-plane reporting
                             if numeric_id > 0 {
-                                if let Ok(client) = RpcClient::new(api_config).await {
+                                if let Ok(shared) = SharedRpcClient::get(api_config).await {
+                                    let client = shared.as_rpc_client();
                                     let mut service = client.node_service_with_type();
                                     match crate::rpc::track_rpc(
                                         service.find_enabled_node_config_info(
@@ -1532,7 +1552,8 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "isHealthy": true,
         });
 
-        if let Ok(client) = RpcClient::new(&api_config).await {
+        if let Ok(shared) = SharedRpcClient::get(&api_config).await {
+            let client = shared.as_rpc_client();
             let mut service = client.node_service();
             if let Err(e) =
                 crate::rpc::track_rpc(service.update_node_status(pb::UpdateNodeStatusRequest {
@@ -1640,7 +1661,7 @@ pub async fn report_node_online_once(
         "isHealthy": true,
     });
 
-    let client = RpcClient::new(api_config).await?;
+    let client = SharedRpcClient::get(api_config).await?.as_rpc_client();
     // updateNodeUp / updateNodeIsInstalled require admin credentials on cloud API
     // and will always fail with node credentials. UpdateNodeStatus already sets
     // isActive=true server-side.
@@ -1925,7 +1946,8 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
             .collect();
 
         let node_value_items_count = node_value_items.len();
-        if let Ok(client) = RpcClient::new(&api_config).await {
+        if let Ok(shared) = SharedRpcClient::get(&api_config).await {
+            let client = shared.as_rpc_client();
             let mut service = client.node_value_service();
             match crate::rpc::track_rpc(
                 service.create_node_values(pb::CreateNodeValuesRequest { node_value_items }),

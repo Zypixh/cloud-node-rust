@@ -4,10 +4,15 @@ use crate::api_config::ApiConfig;
 use crate::auth::generate_token;
 use crate::pb;
 use tonic::codec::CompressionEncoding;
-use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
+use arc_swap::ArcSwap;
+use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use std::time::Duration;
+use tokio::sync::mpsc::Sender;
+use tonic::transport::channel::Change;
+use tonic::transport::{Channel, Endpoint};
 
 pub const RPC_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -842,6 +847,163 @@ impl RpcClient {
         .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
+}
+
+/// A shared, persistent RPC client that mirrors Go's SharedRPC() singleton architecture.
+///
+/// Uses tonic's `balance_channel` to create a single Channel that load-balances across
+/// multiple endpoints (p2c algorithm — power-of-two-choices, more advanced than Go's
+/// simple random selection). All 20+ syncers reuse this one Channel via HTTP/2 multiplexing.
+///
+/// Endpoints can be dynamically added/removed via `update_endpoints()` (mirrors Go's
+/// `UpdateConfig()`), without rebuilding the Channel — just like Go's `pickConn()` swap.
+static SHARED_RPC: Lazy<ArcSwap<Option<SharedRpcState>>> =
+    Lazy::new(|| ArcSwap::from_pointee(None));
+
+struct SharedRpcState {
+    channel: Channel,
+    endpoint_tx: Sender<Change<String, Endpoint>>,
+    current_endpoints: Vec<String>,
+}
+
+pub struct SharedRpcClient {
+    channel: Channel,
+    api_config: ApiConfig,
+}
+
+impl SharedRpcClient {
+    /// Get or lazily create a shared Channel for all unary RPC callers.
+    /// Mirrors Go's `SharedRPC()` — returns the same singleton instance every time.
+    /// Uses `balance_channel` so tonic load-balances across all configured endpoints,
+    /// with auto-reconnect and HTTP/2 multiplexing on each connection.
+    pub async fn get(api_config: &ApiConfig) -> anyhow::Result<Self> {
+        let endpoints = api_config.effective_rpc_endpoints();
+        if endpoints.is_empty() {
+            anyhow::bail!("No RPC endpoints configured");
+        }
+
+        // Fast path: reuse existing shared state.
+        // Unlike the previous single-endpoint approach, the balance_channel
+        // already includes all endpoints and tonic manages connection states internally.
+        let guard = SHARED_RPC.load();
+        if let Some(state) = guard.as_ref() {
+            // Check if endpoints have changed — if so, dynamically update (mirrors Go's UpdateConfig)
+            if state.current_endpoints != endpoints {
+                Self::apply_endpoint_changes(&state.endpoint_tx, &state.current_endpoints, &endpoints)?;
+                // Update the stored endpoint list under ArcSwap
+                let mut new_state = (*state).clone();
+                new_state.current_endpoints = endpoints.clone();
+                SHARED_RPC.store(Arc::new(Some(new_state)));
+            }
+            return Ok(Self {
+                channel: state.channel.clone(),
+                api_config: api_config.clone(),
+            });
+        }
+
+        // Slow path: build new balance_channel with all endpoints
+        let (channel, endpoint_tx) = Channel::balance_channel::<String>(1024);
+        Self::apply_endpoint_changes(&endpoint_tx, &[], &endpoints)?;
+
+        SHARED_RPC.store(Arc::new(Some(SharedRpcState {
+            channel: channel.clone(),
+            endpoint_tx,
+            current_endpoints: endpoints.clone(),
+        })));
+
+        Ok(Self {
+            channel,
+            api_config: api_config.clone(),
+        })
+    }
+
+    /// Force-refresh the shared channel endpoints when API node changes.
+    /// Mirrors Go's `UpdateConfig()` — replaces the endpoint list without
+    /// rebuilding the Channel. Existing in-flight RPCs continue on their
+    /// current connections; new RPCs route to the updated endpoints.
+    pub fn refresh(api_config: &ApiConfig) -> anyhow::Result<()> {
+        let endpoints = api_config.effective_rpc_endpoints();
+        if endpoints.is_empty() {
+            anyhow::bail!("No RPC endpoints configured");
+        }
+
+        let guard = SHARED_RPC.load();
+        if let Some(state) = guard.as_ref() {
+            Self::apply_endpoint_changes(&state.endpoint_tx, &state.current_endpoints, &endpoints)?;
+            let mut new_state = (*state).clone();
+            new_state.current_endpoints = endpoints.clone();
+            SHARED_RPC.store(Arc::new(Some(new_state)));
+            Ok(())
+        } else {
+            // No existing state — the next get() call will build it
+            Ok(())
+        }
+    }
+
+    /// Dynamically insert/remove endpoints on the balance_channel.
+    /// This mirrors Go's `init()` which replaces the `conns` slice.
+    fn apply_endpoint_changes(
+        endpoint_tx: &Sender<Change<String, Endpoint>>,
+        old_endpoints: &[String],
+        new_endpoints: &[String],
+    ) -> anyhow::Result<()> {
+        // Remove endpoints that are no longer in the list
+        for old_ep in old_endpoints {
+            if !new_endpoints.contains(old_ep) {
+                let _ = endpoint_tx.try_send(Change::Remove(old_ep.clone()));
+            }
+        }
+        // Insert new endpoints
+        for new_ep in new_endpoints {
+            if !old_endpoints.contains(new_ep) {
+                let endpoint = Self::build_endpoint(new_ep)?;
+                let _ = endpoint_tx.try_send(Change::Insert(
+                    new_ep.clone(),
+                    endpoint,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn build_endpoint(uri: &str) -> anyhow::Result<Endpoint> {
+        let endpoint = Channel::from_shared(uri.to_string())
+            .map_err(|e| anyhow::anyhow!("Invalid URI {}: {}", uri, e))?;
+        let endpoint = endpoint
+            .user_agent("grpc-go/1.0")
+            .map_err(|e| anyhow::anyhow!("Invalid user-agent for {}: {}", uri, e))?;
+        let endpoint = RpcClient::configure_endpoint(endpoint, RpcConnectionProfile::Default);
+        Ok(endpoint)
+    }
+
+    /// Convert to an RpcClient so all existing service factory methods work unchanged.
+    /// This is zero-cost — Channel::clone just increments an Arc refcount.
+    pub fn as_rpc_client(&self) -> RpcClient {
+        RpcClient {
+            channel: self.channel.clone(),
+            api_config: self.api_config.clone(),
+        }
+    }
+}
+
+impl Clone for SharedRpcState {
+    fn clone(&self) -> Self {
+        Self {
+            channel: self.channel.clone(),
+            endpoint_tx: self.endpoint_tx.clone(),
+            current_endpoints: self.current_endpoints.clone(),
+        }
+    }
+}
+
+/// Check if a tonic error is a connection error (mirrors Go's `IsConnError`).
+/// Returns true for Unavailable or Canceled status codes, which indicate
+/// transient network issues rather than application-level errors.
+pub fn is_conn_error(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Cancelled
+    ) || status.message().contains("code = Canceled")
 }
 
 #[cfg(test)]

@@ -1,6 +1,5 @@
 use crate::api_config::ApiConfig;
 use crate::pb;
-use crate::rpc::client::RpcClient;
 
 #[derive(Debug, Clone, Default)]
 pub struct HttpFirewallEvent {
@@ -15,8 +14,8 @@ pub struct HttpFirewallEvent {
 
 impl HttpFirewallEvent {
     pub async fn notify(self, api_config: &ApiConfig) {
-        let client = match RpcClient::new(api_config).await {
-            Ok(c) => c,
+        let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
+            Ok(s) => s.as_rpc_client(),
             Err(_) => return,
         };
         let mut service = client.firewall_service();

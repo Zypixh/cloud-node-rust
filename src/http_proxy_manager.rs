@@ -29,6 +29,29 @@ use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 
+/// Returns true if the accept error is transient and the listener should keep running
+/// rather than exiting permanently.
+fn is_transient_accept_error(err: &std::io::Error) -> bool {
+    match err.kind() {
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock => true,
+        _ => {
+            #[cfg(unix)]
+            {
+                match err.raw_os_error() {
+                    Some(libc::EMFILE) | Some(libc::ENFILE) => true,
+                    _ => false,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        },
+    }
+}
+
 struct ListenerHandle {
     is_tls: bool,
     enable_proxy_protocol: bool,
@@ -78,6 +101,7 @@ pub struct HttpProxyManager {
     proxy_logic: EdgeProxy,
     server_conf: Arc<ServerConf>,
     handled_ports: DashMap<SocketAddr, ListenerHandle>,
+    connection_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl HttpProxyManager {
@@ -93,6 +117,7 @@ impl HttpProxyManager {
             proxy_logic,
             server_conf,
             handled_ports: DashMap::new(),
+            connection_semaphore: Arc::new(tokio::sync::Semaphore::new(65536)),
         })
     }
 
@@ -328,7 +353,24 @@ impl HttpProxyManager {
                 }
                 res = listener.accept() => res,
             };
-            let (client_stream, client_addr) = accept_result?;
+            let (client_stream, client_addr) = match accept_result {
+                Ok(result) => result,
+                Err(err) if is_transient_accept_error(&err) => {
+                    warn!(
+                        "Transient accept error on {}: {}. Continuing.",
+                        bind_addr, err
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(err) => {
+                    error!(
+                        "Fatal accept error on {}: {}. Listener stopping.",
+                        bind_addr, err
+                    );
+                    return Err(err.into());
+                }
+            };
             let main_cluster_scope = crate::special_defense::cluster_block_scope_id(
                 self.config_store.get_node_cluster_id_sync(),
             );
@@ -343,12 +385,24 @@ impl HttpProxyManager {
                 continue;
             }
 
+            let connection_permit = match Arc::clone(&self.connection_semaphore).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    warn!(
+                        "Connection limit reached on {}, dropping connection from {}",
+                        bind_addr, client_addr
+                    );
+                    continue;
+                }
+            };
+
             if !is_tls {
                 let proxy_inner = proxy_arc.clone();
                 let shutdown_inner = shutdown_rx.clone();
                 let manager = self.clone();
                 let downstream_read_timeout = manager.downstream_read_timeout();
                 tokio::spawn(async move {
+                    let _connection_permit = connection_permit;
                     // Resolve the effective client address, consuming any PROXY header.
                     let Some((effective_addr, client_stream)) =
                         maybe_consume_proxy_protocol_header(
@@ -393,6 +447,7 @@ impl HttpProxyManager {
             let http2_handshake_timeout = manager.http2_handshake_timeout();
 
             tokio::spawn(async move {
+                let _connection_permit = connection_permit;
                 let mut configured_tls_host = false;
                 let mut count_tls_handshake_failure = true;
 
@@ -505,12 +560,21 @@ impl HttpProxyManager {
                     .await
                     {
                         Ok(Ok(mut h2_conn)) => {
+                            let h2_stream_semaphore = Arc::new(tokio::sync::Semaphore::new(256));
                             loop {
                                 match pingora_core::protocols::http::v2::server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await {
                                     Ok(Some(h2_session)) => {
                                         let proxy_inner_h2 = proxy_inner.clone();
                                         let shutdown_inner_h2 = shutdown_inner.clone();
+                                        let stream_permit = match Arc::clone(&h2_stream_semaphore).try_acquire_owned() {
+                                            Ok(p) => p,
+                                            Err(_) => {
+                                                debug!("H2 stream limit reached for connection, refusing stream");
+                                                continue;
+                                            }
+                                        };
                                         tokio::spawn(async move {
+                                            let _stream_permit = stream_permit;
                                             let server_session = ServerSession::new_http2(h2_session);
                                             proxy_inner_h2.process_new_http(server_session, &shutdown_inner_h2).await;
                                         });

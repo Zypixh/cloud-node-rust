@@ -1,6 +1,5 @@
 use crate::api_config::ApiConfig;
 use crate::pb;
-use crate::rpc::client::RpcClient;
 
 pub async fn notify_firewall_event(
     api_config: &ApiConfig,
@@ -12,8 +11,8 @@ pub async fn notify_firewall_event(
     source_ip: String,
     source_user_agent: String,
 ) {
-    let client = match RpcClient::new(api_config).await {
-        Ok(c) => c,
+    let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
+        Ok(s) => s.as_rpc_client(),
         Err(_) => return,
     };
     let mut service = client.firewall_service();

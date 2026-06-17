@@ -1,7 +1,7 @@
 use crate::api_config::ApiConfig;
 use crate::client_agent::{self, ClientAgentIpRecord};
 use crate::pb;
-use crate::rpc::client::RpcClient;
+use crate::rpc::client::SharedRpcClient;
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 use tracing::debug;
@@ -20,8 +20,8 @@ pub async fn start_client_agent_ip_syncer(api_config: Arc<ApiConfig>) {
 }
 
 pub async fn sync_client_agent_ips_incremental(api_config: &Arc<ApiConfig>) -> bool {
-    let client = match timeout(CLIENT_AGENT_SYNC_RPC_TIMEOUT, RpcClient::new(api_config)).await {
-        Ok(Ok(client)) => client,
+    let client = match timeout(CLIENT_AGENT_SYNC_RPC_TIMEOUT, SharedRpcClient::get(api_config)).await {
+        Ok(Ok(shared)) => shared.as_rpc_client(),
         Ok(Err(err)) => {
             debug!("Failed to connect for client agent IP sync: {}", err);
             return false;
