@@ -1322,6 +1322,12 @@ fn bloom_insert(key: &str) {
     CACHE_BLOOM.insert(key);
 }
 
+fn bloom_can_absorb_insert() -> bool {
+    let (_, _, _, estimated_bytes) = bloom_stats();
+    let budget = crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes();
+    estimated_bytes < budget.saturating_mul(95) / 100
+}
+
 fn bloom_remove(key: &str) {
     CACHE_BLOOM.remove(key);
 }
@@ -1374,17 +1380,27 @@ fn negative_cache_check(key: &str, now: i64) -> bool {
 }
 
 fn negative_cache_insert(key: &str, now: i64) {
+    negative_cache_insert_with_capacity(key, now, negative_cache_capacity_limit());
+}
+
+fn negative_cache_insert_with_capacity(key: &str, now: i64, capacity: usize) {
     if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
         return;
     }
-    bloom_insert(key);
-    let capacity = negative_cache_capacity_limit();
-    if NEGATIVE_CACHE.len() >= capacity {
+    let capacity = capacity.max(1);
+    let current_len = NEGATIVE_CACHE.len();
+    if current_len >= capacity {
         negative_cache_cleanup(now);
         if NEGATIVE_CACHE.len() >= capacity {
             return;
         }
     }
+    if NEGATIVE_CACHE.len().saturating_mul(100) >= capacity.saturating_mul(95)
+        && !bloom_can_absorb_insert()
+    {
+        return;
+    }
+    bloom_insert(key);
     NEGATIVE_CACHE.insert(key.to_string(), now + NEGATIVE_CACHE_TTL_SECS);
 }
 
@@ -2476,6 +2492,21 @@ mod tests {
         NEGATIVE_CACHE.insert(key.clone(), now - 1);
         assert!(!negative_cache_check(&key, now));
         assert!(!NEGATIVE_CACHE.contains_key(&key));
+    }
+
+    #[test]
+    fn negative_cache_refuses_insert_when_capacity_remains_full() {
+        let now = crate::utils::time::now_timestamp();
+        let prefix = format!("neg-full-{}-", std::process::id());
+        for i in 0..3 {
+            NEGATIVE_CACHE.insert(format!("{prefix}{i}"), now + NEGATIVE_CACHE_TTL_SECS);
+        }
+
+        let extra = format!("{prefix}extra");
+        negative_cache_insert_with_capacity(&extra, now, 3);
+        assert!(!NEGATIVE_CACHE.contains_key(&extra));
+
+        NEGATIVE_CACHE.retain(|key, _| !key.starts_with(&prefix));
     }
 
     #[test]

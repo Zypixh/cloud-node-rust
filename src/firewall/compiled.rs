@@ -8,7 +8,7 @@ use pingora_proxy::Session;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -39,6 +39,37 @@ pub struct CompiledFirewallPolicy {
     pub uses_request_body: bool,
     pub uses_response_body: bool,
     region: Option<CompiledRegionDenyPlan>,
+    stats: CompiledFirewallPolicyStats,
+    request_prefilter: CompiledRequestPrefilterSummary,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompiledFirewallPolicyStats {
+    pub inbound_groups: usize,
+    pub inbound_sets: usize,
+    pub inbound_rules: usize,
+    pub inbound_fast_rules: usize,
+    pub inbound_regex_prefilters: usize,
+    pub outbound_groups: usize,
+    pub outbound_sets: usize,
+    pub outbound_rules: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompiledRequestPrefilterSummary {
+    pub host_exact: Vec<String>,
+    pub host_prefix: Vec<String>,
+    pub host_suffix: Vec<String>,
+    pub path_exact: Vec<String>,
+    pub path_prefix: Vec<String>,
+    pub path_suffix: Vec<String>,
+    pub uri_exact: Vec<String>,
+    pub uri_prefix: Vec<String>,
+    pub uri_suffix: Vec<String>,
+    pub method_exact: Vec<String>,
+    pub header_exact: Vec<(String, String)>,
+    pub ip_exact: Vec<String>,
+    pub has_ip_range: bool,
 }
 
 impl CompiledFirewallPolicy {
@@ -78,6 +109,9 @@ impl CompiledFirewallPolicy {
         let uses_response_body = outbound
             .as_ref()
             .is_some_and(CompiledFirewallDirection::uses_response_body);
+        let stats =
+            CompiledFirewallPolicyStats::from_directions(inbound.as_ref(), outbound.as_ref());
+        let request_prefilter = CompiledRequestPrefilterSummary::from_inbound(inbound.as_ref());
         Self {
             id: policy.id,
             raw: Arc::new(policy.clone()),
@@ -89,7 +123,140 @@ impl CompiledFirewallPolicy {
             uses_request_body,
             uses_response_body,
             region,
+            stats,
+            request_prefilter,
         }
+    }
+
+    pub fn stats(&self) -> CompiledFirewallPolicyStats {
+        self.stats
+    }
+
+    pub fn request_prefilter(&self) -> &CompiledRequestPrefilterSummary {
+        &self.request_prefilter
+    }
+}
+
+impl CompiledFirewallPolicyStats {
+    fn from_directions(
+        inbound: Option<&CompiledFirewallDirection>,
+        outbound: Option<&CompiledFirewallDirection>,
+    ) -> Self {
+        let mut stats = Self::default();
+        if let Some(inbound) = inbound {
+            stats.inbound_groups = inbound.groups.len();
+            for group in &inbound.groups {
+                stats.inbound_sets += group.sets.len();
+                for set in &group.sets {
+                    stats.inbound_rules += set.rules.len();
+                    stats.inbound_fast_rules += set.fast_path.rules.len();
+                    if set.regex_prefilter.is_some() {
+                        stats.inbound_regex_prefilters += 1;
+                    }
+                }
+            }
+        }
+        if let Some(outbound) = outbound {
+            stats.outbound_groups = outbound.groups.len();
+            for group in &outbound.groups {
+                stats.outbound_sets += group.sets.len();
+                for set in &group.sets {
+                    stats.outbound_rules += set.rules.len();
+                }
+            }
+        }
+        stats
+    }
+}
+
+impl CompiledRequestPrefilterSummary {
+    fn from_inbound(inbound: Option<&CompiledFirewallDirection>) -> Self {
+        let mut summary = Self::default();
+        let Some(inbound) = inbound else {
+            return summary;
+        };
+        for group in &inbound.groups {
+            if !group.is_on {
+                continue;
+            }
+            for set in &group.sets {
+                if !set.is_on {
+                    continue;
+                }
+                for fast_rule in &set.fast_path.rules {
+                    match &fast_rule.condition {
+                        CompiledFastCondition::HostEq(value) => {
+                            summary.host_exact.push(value.clone())
+                        }
+                        CompiledFastCondition::HostPrefix(value) => {
+                            summary.host_prefix.push(value.clone())
+                        }
+                        CompiledFastCondition::HostSuffix(value) => {
+                            summary.host_suffix.push(value.clone())
+                        }
+                        CompiledFastCondition::UriEq(value) => {
+                            summary.uri_exact.push(value.clone())
+                        }
+                        CompiledFastCondition::UriPrefix(value) => {
+                            summary.uri_prefix.push(value.clone())
+                        }
+                        CompiledFastCondition::UriSuffix(value) => {
+                            summary.uri_suffix.push(value.clone())
+                        }
+                        CompiledFastCondition::PathEq(value) => {
+                            summary.path_exact.push(value.clone())
+                        }
+                        CompiledFastCondition::PathPrefix(value) => {
+                            summary.path_prefix.push(value.clone())
+                        }
+                        CompiledFastCondition::PathSuffix(value) => {
+                            summary.path_suffix.push(value.clone())
+                        }
+                        CompiledFastCondition::MethodEq(value) => {
+                            summary.method_exact.push(value.clone())
+                        }
+                        CompiledFastCondition::HeaderEq { name, value } => {
+                            summary.header_exact.push((name.clone(), value.clone()))
+                        }
+                        CompiledFastCondition::SrcIpEq(value) => {
+                            summary.ip_exact.push(value.clone())
+                        }
+                        CompiledFastCondition::SrcIpRange { .. } => summary.has_ip_range = true,
+                        CompiledFastCondition::HostContains(_)
+                        | CompiledFastCondition::UriContains(_)
+                        | CompiledFastCondition::PathContains(_)
+                        | CompiledFastCondition::MethodPrefix(_)
+                        | CompiledFastCondition::MethodSuffix(_)
+                        | CompiledFastCondition::MethodContains(_)
+                        | CompiledFastCondition::HeaderPrefix { .. }
+                        | CompiledFastCondition::HeaderSuffix { .. }
+                        | CompiledFastCondition::HeaderContains { .. } => {}
+                    }
+                }
+            }
+        }
+        summary.dedup();
+        summary
+    }
+
+    fn dedup(&mut self) {
+        fn dedup_vec(values: &mut Vec<String>) {
+            values.sort();
+            values.dedup();
+        }
+        dedup_vec(&mut self.host_exact);
+        dedup_vec(&mut self.host_prefix);
+        dedup_vec(&mut self.host_suffix);
+        dedup_vec(&mut self.path_exact);
+        dedup_vec(&mut self.path_prefix);
+        dedup_vec(&mut self.path_suffix);
+        dedup_vec(&mut self.uri_exact);
+        dedup_vec(&mut self.uri_prefix);
+        dedup_vec(&mut self.uri_suffix);
+        dedup_vec(&mut self.method_exact);
+        self.header_exact.sort();
+        self.header_exact.dedup();
+        dedup_vec(&mut self.ip_exact);
     }
 }
 
@@ -367,15 +534,19 @@ pub struct CompiledRuleGroup {
     pub is_on: bool,
     pub preset: Option<PresetGroup>,
     pub sets: Vec<CompiledRuleSet>,
+    request_prefilter: CompiledGroupRequestPrefilter,
 }
 
 impl CompiledRuleGroup {
     fn compile(group: &HTTPFirewallRuleGroup) -> Self {
+        let sets: Vec<_> = group.sets.iter().map(CompiledRuleSet::compile).collect();
+        let request_prefilter = CompiledGroupRequestPrefilter::compile(&sets);
         Self {
             id: group.id,
             is_on: group.is_on,
             preset: group.code.as_deref().and_then(PresetGroup::compile),
-            sets: group.sets.iter().map(CompiledRuleSet::compile).collect(),
+            sets,
+            request_prefilter,
         }
     }
 
@@ -401,6 +572,58 @@ pub struct CompiledRuleSet {
     fast_path: CompiledSetFastPath,
     regex_prefilter: Option<CompiledRegexPrefilter>,
     compiled_actions: Arc<[CompiledAction]>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CompiledGroupRequestPrefilter {
+    exact: HashMap<PrefilterExactKey, Vec<usize>>,
+    header_exact_names: Vec<String>,
+    scans: Vec<(PrefilterScanKey, usize)>,
+    always: Vec<usize>,
+    indexed_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum PrefilterExactKey {
+    Host(String),
+    Path(String),
+    Uri(String),
+    Method(String),
+    Header { name: String, value: String },
+    Ip(String),
+}
+
+#[derive(Clone, Debug)]
+enum PrefilterScanKey {
+    All(Vec<PrefilterScanKey>),
+    HostEq(String),
+    HostPrefix(String),
+    HostSuffix(String),
+    HostContains(String),
+    PathEq(String),
+    PathPrefix(String),
+    PathSuffix(String),
+    PathContains(String),
+    UriEq(String),
+    UriPrefix(String),
+    UriSuffix(String),
+    UriContains(String),
+    MethodEq(String),
+    MethodPrefix(String),
+    MethodSuffix(String),
+    MethodContains(String),
+    HeaderEq { name: String, value: String },
+    HeaderPrefix { name: String, value: String },
+    HeaderSuffix { name: String, value: String },
+    HeaderContains { name: String, value: String },
+    IpEq(String),
+    IpRange { items: Vec<IpMatcher>, not: bool },
+}
+
+#[derive(Clone, Debug)]
+enum SetPrefilter {
+    Always,
+    Any(Vec<PrefilterScanKey>),
 }
 
 #[derive(Clone, Debug)]
@@ -430,12 +653,277 @@ enum CompiledFastCondition {
     HostContains(String),
     UriEq(String),
     UriPrefix(String),
+    UriSuffix(String),
     UriContains(String),
     PathEq(String),
     PathPrefix(String),
+    PathSuffix(String),
     PathContains(String),
+    MethodEq(String),
+    MethodPrefix(String),
+    MethodSuffix(String),
+    MethodContains(String),
+    HeaderEq { name: String, value: String },
+    HeaderPrefix { name: String, value: String },
+    HeaderSuffix { name: String, value: String },
+    HeaderContains { name: String, value: String },
     SrcIpEq(String),
     SrcIpRange { items: Vec<IpMatcher>, not: bool },
+}
+
+impl CompiledGroupRequestPrefilter {
+    fn compile(sets: &[CompiledRuleSet]) -> Self {
+        let mut prefilter = Self::default();
+        for (set_index, set) in sets.iter().enumerate() {
+            if !set.is_on || set.rules.is_empty() {
+                continue;
+            }
+            match SetPrefilter::compile(set) {
+                SetPrefilter::Always => prefilter.always.push(set_index),
+                SetPrefilter::Any(keys) => {
+                    prefilter.indexed_count += 1;
+                    for key in keys {
+                        match key.as_exact_key() {
+                            Some(exact) => {
+                                if let PrefilterExactKey::Header { name, value: _ } = &exact {
+                                    prefilter.header_exact_names.push(name.clone());
+                                }
+                                prefilter.exact.entry(exact).or_default().push(set_index)
+                            }
+                            None => prefilter.scans.push((key, set_index)),
+                        }
+                    }
+                }
+            }
+        }
+        prefilter.header_exact_names.sort();
+        prefilter.header_exact_names.dedup();
+        prefilter
+    }
+
+    fn candidate_set_indexes<F: RequestPrefilterFacts + ?Sized>(
+        &self,
+        facts: &F,
+        start_idx: usize,
+    ) -> Option<Vec<usize>> {
+        if self.indexed_count == 0 {
+            return None;
+        }
+
+        let mut candidates = Vec::with_capacity(self.always.len().saturating_add(8));
+        candidates.extend(self.always.iter().copied().filter(|idx| *idx >= start_idx));
+
+        self.push_exact_candidates(&mut candidates, PrefilterExactKey::Host(facts.host()));
+        self.push_exact_candidates(
+            &mut candidates,
+            PrefilterExactKey::Path(facts.request_path()),
+        );
+        self.push_exact_candidates(&mut candidates, PrefilterExactKey::Uri(facts.request_uri()));
+        self.push_exact_candidates(
+            &mut candidates,
+            PrefilterExactKey::Method(facts.request_method()),
+        );
+        self.push_exact_candidates(&mut candidates, PrefilterExactKey::Ip(facts.remote_addr()));
+
+        for name in &self.header_exact_names {
+            let value = facts.request_header(name);
+            self.push_exact_candidates(
+                &mut candidates,
+                PrefilterExactKey::Header {
+                    name: name.clone(),
+                    value,
+                },
+            );
+        }
+
+        for (key, set_index) in &self.scans {
+            if *set_index >= start_idx && key.matches_request(facts) {
+                candidates.push(*set_index);
+            }
+        }
+
+        candidates.retain(|idx| *idx >= start_idx);
+        candidates.sort_unstable();
+        candidates.dedup();
+        Some(candidates)
+    }
+
+    fn push_exact_candidates(&self, candidates: &mut Vec<usize>, key: PrefilterExactKey) {
+        if let Some(indexes) = self.exact.get(&key) {
+            candidates.extend(indexes.iter().copied());
+        }
+    }
+}
+
+impl SetPrefilter {
+    fn compile(set: &CompiledRuleSet) -> Self {
+        if should_use_and_prefilter(set.connector) {
+            let keys = set
+                .fast_path
+                .rules
+                .iter()
+                .filter_map(|fast_rule| PrefilterScanKey::from_condition(&fast_rule.condition))
+                .collect::<Vec<_>>();
+            if keys.is_empty() {
+                Self::Always
+            } else {
+                // For AND sets each indexed rule is a necessary condition.  If
+                // any of these cheap predicates misses, the full set cannot
+                // match; unindexed heavy rules still run after the prefilter.
+                Self::Any(vec![PrefilterScanKey::All(keys)])
+            }
+        } else if set.fast_path.all_rules_indexed && !set.fast_path.rules.is_empty() {
+            let keys = set
+                .fast_path
+                .rules
+                .iter()
+                .filter_map(|fast_rule| PrefilterScanKey::from_condition(&fast_rule.condition))
+                .collect::<Vec<_>>();
+            if keys.is_empty() {
+                Self::Always
+            } else {
+                Self::Any(keys)
+            }
+        } else {
+            Self::Always
+        }
+    }
+}
+
+fn should_use_and_prefilter(connector: Connector) -> bool {
+    connector == Connector::And
+}
+
+impl PrefilterScanKey {
+    fn from_condition(condition: &CompiledFastCondition) -> Option<Self> {
+        match condition {
+            CompiledFastCondition::HostEq(value) => Some(Self::HostEq(value.clone())),
+            CompiledFastCondition::HostPrefix(value) => Some(Self::HostPrefix(value.clone())),
+            CompiledFastCondition::HostSuffix(value) => Some(Self::HostSuffix(value.clone())),
+            CompiledFastCondition::HostContains(value) => Some(Self::HostContains(value.clone())),
+            CompiledFastCondition::UriEq(value) => Some(Self::UriEq(value.clone())),
+            CompiledFastCondition::UriPrefix(value) => Some(Self::UriPrefix(value.clone())),
+            CompiledFastCondition::UriSuffix(value) => Some(Self::UriSuffix(value.clone())),
+            CompiledFastCondition::UriContains(value) => Some(Self::UriContains(value.clone())),
+            CompiledFastCondition::PathEq(value) => Some(Self::PathEq(value.clone())),
+            CompiledFastCondition::PathPrefix(value) => Some(Self::PathPrefix(value.clone())),
+            CompiledFastCondition::PathSuffix(value) => Some(Self::PathSuffix(value.clone())),
+            CompiledFastCondition::PathContains(value) => Some(Self::PathContains(value.clone())),
+            CompiledFastCondition::MethodEq(value) => Some(Self::MethodEq(value.clone())),
+            CompiledFastCondition::MethodPrefix(value) => Some(Self::MethodPrefix(value.clone())),
+            CompiledFastCondition::MethodSuffix(value) => Some(Self::MethodSuffix(value.clone())),
+            CompiledFastCondition::MethodContains(value) => {
+                Some(Self::MethodContains(value.clone()))
+            }
+            CompiledFastCondition::HeaderEq { name, value } => Some(Self::HeaderEq {
+                name: normalize_header_lookup_name(name),
+                value: value.clone(),
+            }),
+            CompiledFastCondition::HeaderPrefix { name, value } => Some(Self::HeaderPrefix {
+                name: normalize_header_lookup_name(name),
+                value: value.clone(),
+            }),
+            CompiledFastCondition::HeaderSuffix { name, value } => Some(Self::HeaderSuffix {
+                name: normalize_header_lookup_name(name),
+                value: value.clone(),
+            }),
+            CompiledFastCondition::HeaderContains { name, value } => Some(Self::HeaderContains {
+                name: normalize_header_lookup_name(name),
+                value: value.clone(),
+            }),
+            CompiledFastCondition::SrcIpEq(value) => Some(Self::IpEq(value.clone())),
+            CompiledFastCondition::SrcIpRange { items, not } => Some(Self::IpRange {
+                items: items.clone(),
+                not: *not,
+            }),
+        }
+    }
+
+    fn as_exact_key(&self) -> Option<PrefilterExactKey> {
+        match self {
+            Self::HostEq(value) => Some(PrefilterExactKey::Host(value.clone())),
+            Self::PathEq(value) => Some(PrefilterExactKey::Path(value.clone())),
+            Self::UriEq(value) => Some(PrefilterExactKey::Uri(value.clone())),
+            Self::MethodEq(value) => Some(PrefilterExactKey::Method(value.clone())),
+            Self::HeaderEq { name, value } => Some(PrefilterExactKey::Header {
+                name: name.clone(),
+                value: value.clone(),
+            }),
+            Self::IpEq(value) => Some(PrefilterExactKey::Ip(value.clone())),
+            _ => None,
+        }
+    }
+
+    fn matches_request<F: RequestPrefilterFacts + ?Sized>(&self, facts: &F) -> bool {
+        match self {
+            Self::All(keys) => keys.iter().all(|key| key.matches_request(facts)),
+            Self::HostEq(expected) => facts.host() == *expected,
+            Self::HostPrefix(expected) => facts.host().starts_with(expected),
+            Self::HostSuffix(expected) => facts.host().ends_with(expected),
+            Self::HostContains(expected) => facts.host().contains(expected),
+            Self::PathEq(expected) => facts.request_path() == *expected,
+            Self::PathPrefix(expected) => facts.request_path().starts_with(expected),
+            Self::PathSuffix(expected) => facts.request_path().ends_with(expected),
+            Self::PathContains(expected) => facts.request_path().contains(expected),
+            Self::UriEq(expected) => facts.request_uri() == *expected,
+            Self::UriPrefix(expected) => facts.request_uri().starts_with(expected),
+            Self::UriSuffix(expected) => facts.request_uri().ends_with(expected),
+            Self::UriContains(expected) => facts.request_uri().contains(expected),
+            Self::MethodEq(expected) => facts.request_method() == *expected,
+            Self::MethodPrefix(expected) => facts.request_method().starts_with(expected),
+            Self::MethodSuffix(expected) => facts.request_method().ends_with(expected),
+            Self::MethodContains(expected) => facts.request_method().contains(expected),
+            Self::HeaderEq { name, value } => facts.request_header(name) == *value,
+            Self::HeaderPrefix { name, value } => facts.request_header(name).starts_with(value),
+            Self::HeaderSuffix { name, value } => facts.request_header(name).ends_with(value),
+            Self::HeaderContains { name, value } => facts.request_header(name).contains(value),
+            Self::IpEq(expected) => facts.remote_addr() == *expected,
+            Self::IpRange { items, not } => {
+                let actual = facts.remote_addr();
+                let matched = ip_items_match(items, &actual);
+                if *not { !matched } else { matched }
+            }
+        }
+    }
+}
+
+trait RequestPrefilterFacts {
+    fn host(&self) -> String;
+    fn request_path(&self) -> String;
+    fn request_uri(&self) -> String;
+    fn request_method(&self) -> String;
+    fn remote_addr(&self) -> String;
+    fn request_header(&self, name: &str) -> String;
+}
+
+impl<'a> RequestPrefilterFacts for crate::firewall::matcher_plus::RequestFacts<'a> {
+    fn host(&self) -> String {
+        self.host()
+    }
+
+    fn request_path(&self) -> String {
+        self.request_path()
+    }
+
+    fn request_uri(&self) -> String {
+        self.request_uri()
+    }
+
+    fn request_method(&self) -> String {
+        self.request_method()
+    }
+
+    fn remote_addr(&self) -> String {
+        self.remote_addr()
+    }
+
+    fn request_header(&self, name: &str) -> String {
+        self.request_header(name)
+    }
+}
+
+fn normalize_header_lookup_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
 }
 
 #[derive(Clone, Debug)]
@@ -864,6 +1352,10 @@ impl CompiledFastCondition {
             CompiledVariable::Host => Self::compile_text(TextField::Host, rule),
             CompiledVariable::RequestUri => Self::compile_text(TextField::Uri, rule),
             CompiledVariable::RequestPath => Self::compile_text(TextField::Path, rule),
+            CompiledVariable::RequestMethod => Self::compile_text(TextField::Method, rule),
+            CompiledVariable::HeaderParam(name) => {
+                Self::compile_header(&normalize_header_lookup_name(name), rule)
+            }
             CompiledVariable::RemoteAddr => Self::compile_ip(rule),
             _ => None,
         }?;
@@ -879,21 +1371,56 @@ impl CompiledFastCondition {
                 TextField::Host => Some(Self::HostEq(expected.clone())),
                 TextField::Uri => Some(Self::UriEq(expected.clone())),
                 TextField::Path => Some(Self::PathEq(expected.clone())),
+                TextField::Method => Some(Self::MethodEq(expected.clone())),
             },
             CompiledOperator::Prefix(expected) if !rule.case_insensitive => match field {
                 TextField::Host => Some(Self::HostPrefix(expected.clone())),
                 TextField::Uri => Some(Self::UriPrefix(expected.clone())),
                 TextField::Path => Some(Self::PathPrefix(expected.clone())),
+                TextField::Method => Some(Self::MethodPrefix(expected.clone())),
             },
             CompiledOperator::Suffix(expected) if !rule.case_insensitive => match field {
                 TextField::Host => Some(Self::HostSuffix(expected.clone())),
-                _ => None,
+                TextField::Uri => Some(Self::UriSuffix(expected.clone())),
+                TextField::Path => Some(Self::PathSuffix(expected.clone())),
+                TextField::Method => Some(Self::MethodSuffix(expected.clone())),
             },
             CompiledOperator::Contains(expected) if !rule.case_insensitive => match field {
                 TextField::Host => Some(Self::HostContains(expected.clone())),
                 TextField::Uri => Some(Self::UriContains(expected.clone())),
                 TextField::Path => Some(Self::PathContains(expected.clone())),
+                TextField::Method => Some(Self::MethodContains(expected.clone())),
             },
+            _ => None,
+        }
+    }
+
+    fn compile_header(name: &str, rule: &CompiledFirewallRule) -> Option<Self> {
+        match &rule.operator {
+            CompiledOperator::EqString(expected) if !rule.case_insensitive => {
+                Some(Self::HeaderEq {
+                    name: name.to_string(),
+                    value: expected.clone(),
+                })
+            }
+            CompiledOperator::Prefix(expected) if !rule.case_insensitive => {
+                Some(Self::HeaderPrefix {
+                    name: name.to_string(),
+                    value: expected.clone(),
+                })
+            }
+            CompiledOperator::Suffix(expected) if !rule.case_insensitive => {
+                Some(Self::HeaderSuffix {
+                    name: name.to_string(),
+                    value: expected.clone(),
+                })
+            }
+            CompiledOperator::Contains(expected) if !rule.case_insensitive => {
+                Some(Self::HeaderContains {
+                    name: name.to_string(),
+                    value: expected.clone(),
+                })
+            }
             _ => None,
         }
     }
@@ -921,10 +1448,20 @@ impl CompiledFastCondition {
             Self::HostContains(expected) => facts.host().contains(expected),
             Self::UriEq(expected) => facts.request_uri() == *expected,
             Self::UriPrefix(expected) => facts.request_uri().starts_with(expected),
+            Self::UriSuffix(expected) => facts.request_uri().ends_with(expected),
             Self::UriContains(expected) => facts.request_uri().contains(expected),
             Self::PathEq(expected) => facts.request_path() == *expected,
             Self::PathPrefix(expected) => facts.request_path().starts_with(expected),
+            Self::PathSuffix(expected) => facts.request_path().ends_with(expected),
             Self::PathContains(expected) => facts.request_path().contains(expected),
+            Self::MethodEq(expected) => facts.request_method() == *expected,
+            Self::MethodPrefix(expected) => facts.request_method().starts_with(expected),
+            Self::MethodSuffix(expected) => facts.request_method().ends_with(expected),
+            Self::MethodContains(expected) => facts.request_method().contains(expected),
+            Self::HeaderEq { name, value } => facts.request_header(name) == *value,
+            Self::HeaderPrefix { name, value } => facts.request_header(name).starts_with(value),
+            Self::HeaderSuffix { name, value } => facts.request_header(name).ends_with(value),
+            Self::HeaderContains { name, value } => facts.request_header(name).contains(value),
             Self::SrcIpEq(expected) => facts.remote_addr() == *expected,
             Self::SrcIpRange { items, not } => {
                 let actual = facts.remote_addr();
@@ -940,6 +1477,7 @@ enum TextField {
     Host,
     Uri,
     Path,
+    Method,
 }
 
 impl CompiledRuleSet {
@@ -1047,51 +1585,64 @@ pub struct CompiledFirewallRule {
 struct CompiledCcPlan {
     param: String,
     period: i64,
+    is_cc2: bool,
     key_templates: Vec<CompiledValueExpr>,
 }
 
 impl CompiledCcPlan {
     fn compile(param: &str, value: &CompiledValueExpr, options: Option<&Value>) -> Option<Self> {
-        if !matches!(
-            value,
-            CompiledValueExpr::Variable(CompiledVariable::Cc | CompiledVariable::Cc2)
-        ) {
-            return None;
-        }
+        let is_cc2 = match value {
+            CompiledValueExpr::Variable(CompiledVariable::Cc) => false,
+            CompiledValueExpr::Variable(CompiledVariable::Cc2) => true,
+            _ => return None,
+        };
         let period = options
             .and_then(|v| v.get("period"))
             .and_then(Value::as_i64)
             .unwrap_or(60)
             .clamp(1, 7 * 86_400);
-        let key_templates = options
-            .and_then(|v| v.get("keys"))
-            .and_then(Value::as_array)
-            .map(|keys| {
-                keys.iter()
-                    .filter_map(Value::as_str)
-                    .map(CompiledValueExpr::compile)
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![CompiledValueExpr::compile("${remoteAddr}")]);
+        let key_templates = if is_cc2 {
+            options
+                .and_then(|v| v.get("keys"))
+                .and_then(Value::as_array)
+                .map(|keys| {
+                    keys.iter()
+                        .filter_map(Value::as_str)
+                        .map(CompiledValueExpr::compile)
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![CompiledValueExpr::compile("${remoteAddr}")])
+        } else {
+            Vec::new()
+        };
         Some(Self {
             param: param.to_string(),
             period,
+            is_cc2,
             key_templates,
         })
     }
 
     fn evaluate(&self, facts: &crate::firewall::matcher_plus::RequestFacts<'_>) -> String {
-        let key_values = self
-            .key_templates
-            .iter()
-            .map(|template| template.evaluate(facts))
-            .collect::<Vec<_>>();
-        let key = format!(
-            "WAF-CC2-{}-{}:{}",
-            self.param,
-            self.period,
-            key_values.join("@")
-        );
+        let key = if self.is_cc2 {
+            let key_values = self
+                .key_templates
+                .iter()
+                .map(|template| template.evaluate(facts))
+                .collect::<Vec<_>>();
+            format!(
+                "WAF-CC2-{}-{}:{}",
+                self.param,
+                self.period,
+                key_values.join("@")
+            )
+        } else {
+            format!(
+                "WAF-CC:{}:{}",
+                self.period,
+                crate::firewall::matcher_plus::aggregate_ip_counter_key(facts.remote_ip())
+            )
+        };
         crate::firewall::matcher_plus::increase_counter(key, self.period).to_string()
     }
 }
@@ -1795,6 +2346,25 @@ fn match_group_from<'a>(
             .unwrap_or(group.sets.len()),
         None => 0,
     };
+
+    if let Some(candidate_indexes) = group
+        .request_prefilter
+        .candidate_set_indexes(facts, start_idx)
+    {
+        for set_index in candidate_indexes {
+            let Some(set) = group.sets.get(set_index) else {
+                continue;
+            };
+            if match_set(set, session, facts) {
+                return Some(MatchResult {
+                    matched: true,
+                    set: Some(set),
+                });
+            }
+        }
+        return None;
+    }
+
     for set in group.sets.iter().skip(start_idx) {
         if match_set(set, session, facts) {
             return Some(MatchResult {
@@ -3392,6 +3962,55 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestFacts<'a> {
+        host: &'a str,
+        path: &'a str,
+        uri: &'a str,
+        method: &'a str,
+        ip: &'a str,
+        header_name: &'a str,
+        header_value: &'a str,
+    }
+
+    impl RequestPrefilterFacts for TestFacts<'_> {
+        fn host(&self) -> String {
+            self.host.to_string()
+        }
+
+        fn request_path(&self) -> String {
+            self.path.to_string()
+        }
+
+        fn request_uri(&self) -> String {
+            if self.uri.is_empty() {
+                self.path.to_string()
+            } else {
+                self.uri.to_string()
+            }
+        }
+
+        fn request_method(&self) -> String {
+            if self.method.is_empty() {
+                "GET".to_string()
+            } else {
+                self.method.to_string()
+            }
+        }
+
+        fn remote_addr(&self) -> String {
+            self.ip.to_string()
+        }
+
+        fn request_header(&self, name: &str) -> String {
+            if self.header_name.eq_ignore_ascii_case(name) {
+                self.header_value.to_string()
+            } else {
+                String::new()
+            }
+        }
+    }
+
     fn assert_fast_rule_parity(rule: HTTPFirewallRule, actual: &str) {
         let compiled = CompiledFirewallRule::compile(&rule);
         let fast =
@@ -3400,14 +4019,24 @@ mod tests {
             CompiledFastCondition::HostEq(expected)
             | CompiledFastCondition::UriEq(expected)
             | CompiledFastCondition::PathEq(expected)
+            | CompiledFastCondition::MethodEq(expected)
             | CompiledFastCondition::SrcIpEq(expected) => actual == expected,
             CompiledFastCondition::HostPrefix(expected)
             | CompiledFastCondition::UriPrefix(expected)
-            | CompiledFastCondition::PathPrefix(expected) => actual.starts_with(&expected),
-            CompiledFastCondition::HostSuffix(expected) => actual.ends_with(&expected),
+            | CompiledFastCondition::PathPrefix(expected)
+            | CompiledFastCondition::MethodPrefix(expected) => actual.starts_with(&expected),
+            CompiledFastCondition::HostSuffix(expected)
+            | CompiledFastCondition::UriSuffix(expected)
+            | CompiledFastCondition::PathSuffix(expected)
+            | CompiledFastCondition::MethodSuffix(expected) => actual.ends_with(&expected),
             CompiledFastCondition::HostContains(expected)
             | CompiledFastCondition::UriContains(expected)
-            | CompiledFastCondition::PathContains(expected) => actual.contains(&expected),
+            | CompiledFastCondition::PathContains(expected)
+            | CompiledFastCondition::MethodContains(expected) => actual.contains(&expected),
+            CompiledFastCondition::HeaderEq { name: _, value } => actual == value,
+            CompiledFastCondition::HeaderPrefix { name: _, value } => actual.starts_with(&value),
+            CompiledFastCondition::HeaderSuffix { name: _, value } => actual.ends_with(&value),
+            CompiledFastCondition::HeaderContains { name: _, value } => actual.contains(&value),
             CompiledFastCondition::SrcIpRange { items, not } => {
                 let matched = ip_items_match(&items, actual);
                 if not { !matched } else { matched }
@@ -3557,6 +4186,7 @@ mod tests {
         let cc_plan = compiled.cc_plan.expect("cc2 should compile a counter plan");
         assert_eq!(cc_plan.param, "${cc2.rate}");
         assert_eq!(cc_plan.period, 120);
+        assert!(cc_plan.is_cc2);
         assert_eq!(cc_plan.key_templates.len(), 2);
         std::assert_matches!(
             cc_plan.key_templates[0],
@@ -3579,11 +4209,8 @@ mod tests {
         let compiled = CompiledFirewallRule::compile(&default_rule);
         let cc_plan = compiled.cc_plan.expect("cc should compile a counter plan");
         assert_eq!(cc_plan.period, 60);
-        assert_eq!(cc_plan.key_templates.len(), 1);
-        std::assert_matches!(
-            cc_plan.key_templates[0],
-            CompiledValueExpr::Variable(CompiledVariable::RemoteAddr)
-        );
+        assert!(!cc_plan.is_cc2);
+        assert!(cc_plan.key_templates.is_empty());
     }
 
     #[test]
@@ -3676,6 +4303,197 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert!(prefilter.is_none());
+    }
+
+    #[test]
+    fn compiled_policy_stats_expose_prefilter_coverage() {
+        let policy = test_policy(inbound_with_groups(vec![test_group(
+            None,
+            vec![
+                test_set(
+                    20,
+                    vec![
+                        custom_rule("${host}", "eq string", "example.com"),
+                        custom_rule("${requestPath}", "prefix", "/static/"),
+                        custom_rule("${requestURI}", "prefix", "/assets/"),
+                        custom_rule("${remoteAddr}", "eq ip", "192.0.2.1"),
+                    ],
+                ),
+                test_set(
+                    21,
+                    vec![
+                        custom_rule("${requestURI}", "regexp", "^/api/"),
+                        custom_rule("${requestURI}", "regexp", "^/v1/"),
+                    ],
+                ),
+            ],
+        )]));
+        let compiled = CompiledFirewallPolicy::compile(&policy);
+        let stats = compiled.stats();
+
+        assert_eq!(stats.inbound_groups, 1);
+        assert_eq!(stats.inbound_sets, 2);
+        assert_eq!(stats.inbound_rules, 6);
+        assert_eq!(stats.inbound_fast_rules, 4);
+        assert_eq!(stats.inbound_regex_prefilters, 1);
+
+        let prefilter = compiled.request_prefilter();
+        assert_eq!(prefilter.host_exact, vec!["example.com"]);
+        assert_eq!(prefilter.path_prefix, vec!["/static/"]);
+        assert_eq!(prefilter.uri_prefix, vec!["/assets/"]);
+        assert_eq!(prefilter.ip_exact, vec!["192.0.2.1"]);
+    }
+
+    #[test]
+    fn compiled_request_prefilter_indexes_method_and_headers() {
+        let policy = test_policy(inbound_with_groups(vec![test_group(
+            None,
+            vec![test_set(
+                20,
+                vec![
+                    custom_rule("${requestMethod}", "eq string", "POST"),
+                    custom_rule("${header.User-Agent}", "eq string", "curl/8"),
+                ],
+            )],
+        )]));
+        let compiled = CompiledFirewallPolicy::compile(&policy);
+        let prefilter = compiled.request_prefilter();
+        assert_eq!(prefilter.method_exact, vec!["POST"]);
+        assert_eq!(
+            prefilter.header_exact,
+            vec![("user-agent".to_string(), "curl/8".to_string())]
+        );
+
+        let group = &compiled.inbound.as_ref().unwrap().groups[0];
+        let header_hit = TestFacts {
+            method: "GET",
+            header_name: "user-agent",
+            header_value: "curl/8",
+            ..Default::default()
+        };
+        assert_eq!(
+            group
+                .request_prefilter
+                .candidate_set_indexes(&header_hit, 0)
+                .unwrap(),
+            vec![0]
+        );
+
+        let method_hit = TestFacts {
+            method: "POST",
+            ..Default::default()
+        };
+        assert_eq!(
+            group
+                .request_prefilter
+                .candidate_set_indexes(&method_hit, 0)
+                .unwrap(),
+            vec![0]
+        );
+
+        let miss = TestFacts {
+            method: "GET",
+            header_name: "User-Agent",
+            header_value: "Mozilla",
+            ..Default::default()
+        };
+        assert_eq!(
+            group
+                .request_prefilter
+                .candidate_set_indexes(&miss, 0)
+                .unwrap(),
+            Vec::<usize>::new()
+        );
+
+        let mut and_set = test_set(
+            21,
+            vec![
+                custom_rule("${requestMethod}", "eq string", "POST"),
+                custom_rule("${header.User-Agent}", "eq string", "curl/8"),
+            ],
+        );
+        and_set.connector = "and".to_string();
+        let group = CompiledRuleGroup::compile(&test_group(None, vec![and_set]));
+        assert_eq!(
+            group
+                .request_prefilter
+                .candidate_set_indexes(&header_hit, 0)
+                .unwrap(),
+            Vec::<usize>::new()
+        );
+        let both_hit = TestFacts {
+            method: "POST",
+            header_name: "User-Agent",
+            header_value: "curl/8",
+            ..Default::default()
+        };
+        assert_eq!(
+            group
+                .request_prefilter
+                .candidate_set_indexes(&both_hit, 0)
+                .unwrap(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn compiled_group_prefilter_keeps_unindexed_or_sets_and_filters_indexed_sets() {
+        let indexed = test_set(
+            20,
+            vec![custom_rule("${requestPath}", "prefix", "/static/")],
+        );
+        let heavy = test_set(
+            21,
+            vec![custom_rule("${requestBody}", "contains", "needle")],
+        );
+        let group = CompiledRuleGroup::compile(&test_group(None, vec![indexed, heavy]));
+        let facts = TestFacts {
+            path: "/api/item",
+            ..Default::default()
+        };
+
+        let candidates = group
+            .request_prefilter
+            .candidate_set_indexes(&facts, 0)
+            .expect("mixed indexed/unindexed group should use candidate scan");
+        assert_eq!(candidates, vec![1]);
+    }
+
+    #[test]
+    fn compiled_group_prefilter_uses_and_rules_as_necessary_conditions_only() {
+        let mut set = test_set(
+            20,
+            vec![
+                custom_rule("${requestPath}", "prefix", "/admin/"),
+                custom_rule("${requestBody}", "contains", "token"),
+            ],
+        );
+        set.connector = "and".to_string();
+        let group = CompiledRuleGroup::compile(&test_group(None, vec![set]));
+
+        let miss = TestFacts {
+            path: "/public/",
+            ..Default::default()
+        };
+        assert_eq!(
+            group
+                .request_prefilter
+                .candidate_set_indexes(&miss, 0)
+                .unwrap(),
+            Vec::<usize>::new()
+        );
+
+        let hit = TestFacts {
+            path: "/admin/",
+            ..Default::default()
+        };
+        assert_eq!(
+            group
+                .request_prefilter
+                .candidate_set_indexes(&hit, 0)
+                .unwrap(),
+            vec![0]
+        );
     }
 
     #[test]

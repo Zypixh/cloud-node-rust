@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock as Lazy;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
@@ -270,6 +270,9 @@ pub struct ProxyCTX {
     pub origin_address: String,
     pub origin_id: i64,
     pub origin_connect_permit: Option<StaticAdmissionPermit>,
+    pub request_body_waf_permit: Option<StaticAdmissionPermit>,
+    pub response_body_waf_permit: Option<StaticAdmissionPermit>,
+    pub response_transform_permit: Option<StaticAdmissionPermit>,
     pub upstream_retries: u8,
     pub origin_status: i32,
     pub is_on: bool,
@@ -325,6 +328,33 @@ pub struct ProxyCTX {
     /// Set by `maybe_consume_proxy_protocol_header` when wired through.
     #[allow(dead_code)]
     pub proxy_protocol_ip: Option<std::net::IpAddr>,
+    pub request_phase: RequestPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestPhase {
+    Init,
+    Context,
+    LocalService,
+    ProtocolPolicy,
+    EarlyResponse,
+    SecurityState,
+    Limits,
+    LightweightWaf,
+    BodyWaf,
+    FeaturePolicy,
+    Rewrite,
+    Proxy,
+}
+
+struct RequestFilterState {
+    host: String,
+    hot_path: crate::config::HotPathSnapshot,
+}
+
+enum PhaseOutcome<T> {
+    Continue(T),
+    Done(bool),
 }
 
 impl Default for ProxyCTX {
@@ -387,6 +417,9 @@ impl Default for ProxyCTX {
             origin_address: String::new(),
             origin_id: 0,
             origin_connect_permit: None,
+            request_body_waf_permit: None,
+            response_body_waf_permit: None,
+            response_transform_permit: None,
             upstream_retries: 0,
             origin_status: 0,
             is_on: true,
@@ -433,6 +466,7 @@ impl Default for ProxyCTX {
             origin_host: String::new(),
             oss_backend: None,
             proxy_protocol_ip: None,
+            request_phase: RequestPhase::Init,
         }
     }
 }
@@ -508,6 +542,8 @@ static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
         .to_string()
 });
 const REQUEST_LIMIT_BINDING_IDLE_SECS: u64 = 180;
+const REQUEST_LIMIT_BINDINGS_MAX_NORMAL: usize = 1_000_000;
+const REQUEST_LIMIT_BINDINGS_MAX_PRESSURE: usize = 131_072;
 const MAX_OPTIMIZATION_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEBP_CONVERSION_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HLS_PLAYLIST_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -519,11 +555,6 @@ use pingora_cache::{CacheMeta, ForcedFreshness};
 
 static CACHE_LOCK: std::sync::LazyLock<CacheLock> =
     std::sync::LazyLock::new(|| CacheLock::new(std::time::Duration::from_secs(1)));
-
-/// Per-(scope_server_id, client_ip) sliding-window byte counters for CC bandwidth enforcement.
-/// Each entry is (cumulative_bytes_in_window: AtomicU64, window_start_unix_secs: AtomicU64).
-static CC_BW_COUNTERS: Lazy<DashMap<(i64, std::net::IpAddr), Arc<(AtomicU64, AtomicU64)>>> =
-    Lazy::new(|| DashMap::with_shard_amount(64));
 
 /// Tracks cache keys currently undergoing background SWR revalidation.
 /// Prevents thundering herd: only one background fetch per key at a time.
@@ -888,7 +919,14 @@ impl EdgeProxy {
             body,
             bytes_sent,
         };
+        Self::evaluate_outbound_waf_compiled_first(session, ctx, &outbound_ctx)
+    }
 
+    fn evaluate_outbound_waf_compiled_first(
+        session: &Session,
+        ctx: &ProxyCTX,
+        outbound_ctx: &crate::firewall::OutboundContext<'_>,
+    ) -> Option<crate::firewall::MatchedAction> {
         for policy in &ctx.compiled_plans.global_firewall {
             if let Some(action) = crate::firewall::compiled::evaluate_compiled_outbound_policy(
                 policy,
@@ -1465,15 +1503,31 @@ impl EdgeProxy {
         REQUEST_LIMIT_IP_COUNTS.retain(|_, count| count.load(Ordering::Relaxed) > 0);
     }
 
+    fn request_limit_binding_capacity() -> usize {
+        if MEMORY_GOVERNOR.is_memory_pressure_high() {
+            REQUEST_LIMIT_BINDINGS_MAX_PRESSURE
+        } else {
+            REQUEST_LIMIT_BINDINGS_MAX_NORMAL
+        }
+    }
+
+    fn request_limit_ip_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+        match ip {
+            std::net::IpAddr::V4(_) => ip,
+            std::net::IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return std::net::IpAddr::V4(v4);
+                }
+                let mut octets = v6.octets();
+                octets[8..].fill(0);
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
+            }
+        }
+    }
+
     fn cleanup_cc_bw_counters() {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        CC_BW_COUNTERS.retain(|_, entry| {
-            let win = entry.1.load(Ordering::Relaxed);
-            now_secs.saturating_sub(win) < 120
-        });
+        // WAF state now owns CC bandwidth counters so they share the same GC
+        // cadence, capacity policy, and IPv6 /64 aggregation as other WAF maps.
     }
 
     fn request_limit_count(map: &DashMap<i64, Arc<AtomicI32>>, key: i64) -> i32 {
@@ -1483,6 +1537,7 @@ impl EdgeProxy {
     }
 
     fn request_limit_ip_count(ip: std::net::IpAddr) -> i32 {
+        let ip = Self::request_limit_ip_key(ip);
         REQUEST_LIMIT_IP_COUNTS
             .get(&ip)
             .map(|count| count.load(Ordering::Relaxed))
@@ -1490,6 +1545,7 @@ impl EdgeProxy {
     }
 
     fn decrement_request_limit_count(server_id: i64, client_ip: std::net::IpAddr) {
+        let client_ip = Self::request_limit_ip_key(client_ip);
         if let Some(count) = REQUEST_LIMIT_SERVER_COUNTS.get(&server_id) {
             loop {
                 let cur = count.load(Ordering::Relaxed);
@@ -1534,10 +1590,18 @@ impl EdgeProxy {
         }
 
         let now = std::time::Instant::now();
+        let client_ip = Self::request_limit_ip_key(client_ip);
 
         if let Some(mut existing) = REQUEST_LIMIT_BINDINGS.get_mut(raw_remote_addr) {
             existing.last_seen = now;
             return true;
+        }
+
+        if REQUEST_LIMIT_BINDINGS.len() >= Self::request_limit_binding_capacity() {
+            Self::cleanup_request_limit_bindings();
+            if REQUEST_LIMIT_BINDINGS.len() >= Self::request_limit_binding_capacity() {
+                return false;
+            }
         }
 
         // Fast-path: non-atomic reads for early bailout
@@ -3211,8 +3275,13 @@ impl EdgeProxy {
         else {
             return;
         };
+        let Some(transform_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseTransform)
+        else {
+            return;
+        };
 
         ctx.webp_convert_enabled = true;
+        ctx.response_transform_permit = Some(transform_permit);
         ctx.webp_cpu_permit = Some(reservation);
         ctx.webp_source_content_type = Some(content_type);
         ctx.webp_source_content_length = Some(content_length_usize);
@@ -3259,6 +3328,10 @@ impl EdgeProxy {
 
         let encoder = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height());
         Ok(encoder.encode(quality.clamp(1, 100) as f32).to_vec())
+    }
+
+    fn release_response_transform(ctx: &mut ProxyCTX) {
+        ctx.response_transform_permit = None;
     }
 
     #[doc(hidden)]
@@ -3892,81 +3965,64 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             let request_bytes =
                 (session.body_bytes_sent() as u64).saturating_add(ctx.response_headers_size as u64);
             let bw_limit = policy.max_bandwidth as u64;
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let key = (scope_server_id, ctx.client_ip);
-            let entry = CC_BW_COUNTERS
-                .entry(key)
-                .or_insert_with(|| Arc::new((AtomicU64::new(0), AtomicU64::new(now_secs))));
-            let (byte_counter, window_start) = entry.as_ref();
-
-            let win = window_start.load(Ordering::Relaxed);
-            let advanced = now_secs > win
-                && window_start
-                    .compare_exchange(win, now_secs, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok();
-            if advanced {
-                byte_counter.store(request_bytes, Ordering::Relaxed);
-            } else {
-                let total =
-                    byte_counter.fetch_add(request_bytes, Ordering::Relaxed) + request_bytes;
-                if total > bw_limit {
-                    if policy.block_ip {
-                        let ban = if policy.block_ip_duration > 0 {
-                            policy.block_ip_duration as i64
+            if self.waf_state.check_ip_bandwidth(
+                scope_server_id,
+                ctx.client_ip,
+                request_bytes,
+                bw_limit,
+            ) {
+                if policy.block_ip {
+                    let ban = if policy.block_ip_duration > 0 {
+                        policy.block_ip_duration as i64
+                    } else {
+                        3600
+                    };
+                    let cluster_id = (scope_server_id < 0).then_some(-scope_server_id);
+                    let scope_label = if scope_server_id == 0 {
+                        "global"
+                    } else if scope_server_id < 0 {
+                        "cluster"
+                    } else {
+                        "server"
+                    };
+                    self.waf_state.block_ip(
+                        ctx.client_ip,
+                        scope_server_id,
+                        ban,
+                        Some(scope_label),
+                        false,
+                        true,
+                    );
+                    self.report_ip_list_item(
+                        Some(session),
+                        Some(ctx),
+                        IpReportKind::Black,
+                        0,
+                        ctx.client_ip.to_string(),
+                        if scope_server_id < 0 {
+                            0
                         } else {
-                            3600
-                        };
-                        let cluster_id = (scope_server_id < 0).then_some(-scope_server_id);
-                        let scope_label = if scope_server_id == 0 {
-                            "global"
-                        } else if scope_server_id < 0 {
-                            "cluster"
-                        } else {
-                            "server"
-                        };
-                        self.waf_state.block_ip(
-                            ctx.client_ip,
-                            scope_server_id,
-                            ban,
-                            Some(scope_label),
-                            false,
-                            true,
-                        );
-                        self.report_ip_list_item(
-                            Some(session),
-                            Some(ctx),
-                            IpReportKind::Black,
-                            0,
-                            ctx.client_ip.to_string(),
-                            if scope_server_id < 0 {
-                                0
-                            } else {
-                                scope_server_id
-                            },
-                            ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0),
-                            ban,
-                            cluster_id
-                                .map(|cluster_id| {
-                                    format!("CC policy bandwidth block cluster={cluster_id}")
-                                })
-                                .unwrap_or_else(|| "CC policy bandwidth block".to_string()),
-                            "error".to_string(),
-                            &cluster_id
-                                .map(|cluster_id| format!("cc:cluster:{cluster_id}"))
-                                .unwrap_or_else(|| "cc".to_string()),
-                            0,
-                            0,
-                            0,
-                        );
-                    }
-                    if policy.show_page {
-                        ctx.no_log = policy.no_log;
-                        return self.respond_status_with_pages(session, ctx, 429).await;
-                    }
+                            scope_server_id
+                        },
+                        ctx.server.as_ref().map(|s| s.numeric_id()).unwrap_or(0),
+                        ban,
+                        cluster_id
+                            .map(|cluster_id| {
+                                format!("CC policy bandwidth block cluster={cluster_id}")
+                            })
+                            .unwrap_or_else(|| "CC policy bandwidth block".to_string()),
+                        "error".to_string(),
+                        &cluster_id
+                            .map(|cluster_id| format!("cc:cluster:{cluster_id}"))
+                            .unwrap_or_else(|| "cc".to_string()),
+                        0,
+                        0,
+                        0,
+                    );
+                }
+                if policy.show_page {
+                    ctx.no_log = policy.no_log;
+                    return self.respond_status_with_pages(session, ctx, 429).await;
                 }
             }
         }
@@ -5945,7 +6001,13 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         };
 
         if let Some(kind) = kind {
+            let Some(transform_permit) =
+                MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseTransform)
+            else {
+                return;
+            };
             ctx.optimize_enabled = true;
+            ctx.response_transform_permit = Some(transform_permit);
             ctx.optimize_kind = Some(kind.to_string());
             upstream_response.remove_header("content-length");
             ctx.response_headers.remove("content-length");
@@ -6002,7 +6064,13 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             if content_length > MAX_HLS_PLAYLIST_BODY_BYTES {
                 return;
             }
+            let Some(transform_permit) =
+                MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseTransform)
+            else {
+                return;
+            };
             ctx.hls_playlist_enabled = true;
+            ctx.response_transform_permit = Some(transform_permit);
             upstream_response.remove_header("content-length");
             let _ =
                 upstream_response.insert_header("content-type", "application/vnd.apple.mpegurl");
@@ -6023,9 +6091,15 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             if content_length > MAX_HLS_SEGMENT_BODY_BYTES {
                 return;
             }
+            let Some(transform_permit) =
+                MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseTransform)
+            else {
+                return;
+            };
             let (key, iv, _) =
                 self.hls_key_material(server.numeric_id(), &target, &session_id, exp);
             ctx.hls_segment_encrypt_enabled = true;
+            ctx.response_transform_permit = Some(transform_permit);
             ctx.hls_segment_key = Some(key);
             ctx.hls_segment_iv = Some(iv);
             ctx.hls_session_id = Some(session_id);
@@ -6823,6 +6897,196 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         action
     }
 
+    fn evaluate_site_inbound_waf_compiled_first(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        server: &ServerConfig,
+        policy: &crate::config_models::HTTPFirewallPolicy,
+    ) -> Option<crate::firewall::MatchedAction> {
+        if !policy.is_on || policy.mode == "bypass" {
+            return None;
+        }
+        self.record_candidate_waf_sample(session, ctx, policy, Some(server));
+        let compiled_policy = server
+            .id
+            .and_then(|id| ctx.compiled_plans.server_firewall.get(&id));
+
+        if let Some(inbound) = &policy.inbound
+            && let Some(region) = &inbound.region
+        {
+            let ua = session
+                .get_header("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let region_match = if let Some(compiled_policy) = compiled_policy {
+                crate::firewall::compiled::evaluate_compiled_region_deny(
+                    compiled_policy,
+                    ctx.client_ip,
+                    ua,
+                    session.req_header().uri.path(),
+                )
+            } else {
+                let mut action = crate::firewall::check_region_deny(
+                    region,
+                    ctx.client_ip,
+                    policy.id,
+                    &policy.deny_country_html,
+                    ua,
+                    session.req_header().uri.path(),
+                );
+                if let Some(action) = &mut action {
+                    crate::firewall::apply_observe_mode(policy, action);
+                }
+                action
+            };
+            if region_match.is_some() {
+                return region_match;
+            }
+        }
+
+        if policy.max_request_body_size > 0 {
+            let content_length = session
+                .get_header("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            if content_length > policy.max_request_body_size
+                || (ctx.request_body.len() as i64) > policy.max_request_body_size
+            {
+                return Some(Self::request_body_too_large_action(policy));
+            }
+        }
+
+        if let Some(compiled_policy) = compiled_policy {
+            crate::firewall::compiled::evaluate_compiled_policy_with_server(
+                compiled_policy,
+                session,
+                &ctx.request_body,
+                Self::forwarded_proto(session, ctx),
+                Some(server),
+            )
+        } else {
+            crate::metrics::METRICS.waf.record_legacy_fallback();
+            crate::firewall::evaluate_policy_with_server(
+                policy,
+                session,
+                &ctx.request_body,
+                Self::forwarded_proto(session, ctx),
+                Some(server),
+            )
+        }
+    }
+
+    fn evaluate_global_inbound_waf_compiled_first(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        global_policies: &[crate::config_models::HTTPFirewallPolicy],
+    ) -> Option<crate::firewall::MatchedAction> {
+        for policy in global_policies
+            .iter()
+            .filter(|policy| policy.is_on && policy.mode != "bypass")
+        {
+            self.record_candidate_waf_sample(session, ctx, policy, None);
+        }
+
+        for compiled_policy in &ctx.compiled_plans.global_firewall {
+            let ua = session
+                .get_header("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if let Some(action) = crate::firewall::compiled::evaluate_compiled_region_deny(
+                compiled_policy,
+                ctx.client_ip,
+                ua,
+                session.req_header().uri.path(),
+            ) {
+                return Some(action);
+            }
+            if let Some(action) = crate::firewall::compiled::evaluate_compiled_policy(
+                compiled_policy,
+                session,
+                &ctx.request_body,
+                Self::forwarded_proto(session, ctx),
+            ) {
+                return Some(action);
+            }
+        }
+        if !ctx.compiled_plans.global_firewall.is_empty() {
+            return None;
+        }
+
+        crate::metrics::METRICS.waf.record_legacy_fallback();
+        for gp in global_policies {
+            if gp.is_on && gp.mode != "bypass" {
+                if let Some(inbound) = &gp.inbound
+                    && let Some(region) = &inbound.region
+                {
+                    let ua = session
+                        .get_header("user-agent")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let mut action = crate::firewall::check_region_deny(
+                        region,
+                        ctx.client_ip,
+                        gp.id,
+                        &gp.deny_country_html,
+                        ua,
+                        session.req_header().uri.path(),
+                    );
+                    if let Some(action) = &mut action {
+                        crate::firewall::apply_observe_mode(gp, action);
+                    }
+                    if action.is_some() {
+                        return action;
+                    }
+                }
+                if let Some(action) = crate::firewall::evaluate_policy(
+                    gp,
+                    session,
+                    &ctx.request_body,
+                    Self::forwarded_proto(session, ctx),
+                ) {
+                    return Some(action);
+                }
+            }
+        }
+        None
+    }
+
+    fn record_candidate_waf_sample(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        policy: &crate::config_models::HTTPFirewallPolicy,
+        server: Option<&ServerConfig>,
+    ) {
+        let (candidate_rules, Some(version)) =
+            crate::firewall::pick_ruleset(policy, ctx.client_ip, session.req_header().uri.path())
+        else {
+            return;
+        };
+        if candidate_rules.is_empty() {
+            return;
+        }
+        let matched = candidate_rules.iter().any(|rule| {
+            crate::firewall::matcher_plus::match_rule_with_server(
+                rule,
+                session,
+                &ctx.request_body,
+                Self::forwarded_proto(session, ctx),
+                server,
+            )
+        });
+        if matched {
+            let observed = policy.mode == "observe";
+            let blocked = !observed;
+            self.waf_state
+                .record_candidate_hit(policy.id, version, blocked, observed);
+        }
+    }
+
     /// Request-body WAF checks deferred to cache-miss path. See request_filter for rationale.
     async fn run_miss_only_body_waf(
         &self,
@@ -6848,6 +7112,17 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         let request_body_needed = Self::inbound_waf_needs_request_body(ctx, global_policies);
 
         if request_body_needed && ctx.request_body.is_empty() {
+            if ctx.request_body_waf_permit.is_none() {
+                let Some(permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::RequestBodyWaf) else {
+                    ctx.response_status = 503;
+                    ctx.errors
+                        .get_or_insert_with(Vec::new)
+                        .push("request body WAF memory admission rejected".to_string());
+                    self.respond_status_with_pages(session, ctx, 503).await?;
+                    return Ok((true, Some("request_body_waf_overloaded".to_string())));
+                };
+                ctx.request_body_waf_permit = Some(permit);
+            }
             let body_limit = Self::inbound_waf_body_buffer_limit(ctx, global_policies);
             if Self::buffer_request_body_for_waf(session, ctx, body_limit).await?
                 && let Some(policy) = Self::first_inbound_body_waf_policy(ctx, global_policies)
@@ -6866,143 +7141,19 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             && firewall_ref.is_on
         {
             if let Some(policy) = &web.firewall_policy {
-                if policy.is_on && policy.mode != "bypass" {
-                    let compiled_policy = server
-                        .id
-                        .and_then(|id| ctx.compiled_plans.server_firewall.get(&id));
-                    if let Some(inbound) = &policy.inbound
-                        && let Some(region) = &inbound.region
-                    {
-                        let ua = session
-                            .get_header("user-agent")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("");
-                        waf_match = if let Some(compiled_policy) = compiled_policy {
-                            crate::firewall::compiled::evaluate_compiled_region_deny(
-                                compiled_policy,
-                                ctx.client_ip,
-                                ua,
-                                session.req_header().uri.path(),
-                            )
-                        } else {
-                            let mut action = crate::firewall::check_region_deny(
-                                region,
-                                ctx.client_ip,
-                                policy.id,
-                                &policy.deny_country_html,
-                                ua,
-                                session.req_header().uri.path(),
-                            );
-                            if let Some(action) = &mut action {
-                                crate::firewall::apply_observe_mode(policy, action);
-                            }
-                            action
-                        };
-                    }
-                    if waf_match.is_none() && policy.max_request_body_size > 0 {
-                        let content_length = session
-                            .get_header("content-length")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        if content_length > policy.max_request_body_size
-                            || (ctx.request_body.len() as i64) > policy.max_request_body_size
-                        {
-                            waf_match = Some(Self::request_body_too_large_action(policy));
-                        }
-                    }
-                    if waf_match.is_none() {
-                        waf_match = if let Some(compiled_policy) = compiled_policy {
-                            crate::firewall::compiled::evaluate_compiled_policy_with_server(
-                                compiled_policy,
-                                session,
-                                &ctx.request_body,
-                                Self::forwarded_proto(session, ctx),
-                                ctx.server.as_deref(),
-                            )
-                        } else {
-                            crate::metrics::METRICS.waf.record_legacy_fallback();
-                            crate::firewall::evaluate_policy_with_server(
-                                policy,
-                                session,
-                                &ctx.request_body,
-                                Self::forwarded_proto(session, ctx),
-                                ctx.server.as_deref(),
-                            )
-                        };
-                    }
-                    if let Some(action) = &mut waf_match {
-                        Self::apply_site_default_captcha_type(
-                            action,
-                            Some(firewall_ref),
-                            Self::inherited_global_captcha_options(global_policies),
-                        );
-                    }
+                waf_match =
+                    self.evaluate_site_inbound_waf_compiled_first(session, ctx, server, policy);
+                if let Some(action) = &mut waf_match {
+                    Self::apply_site_default_captcha_type(
+                        action,
+                        Some(firewall_ref),
+                        Self::inherited_global_captcha_options(global_policies),
+                    );
                 }
             }
             if waf_match.is_none() && !firewall_ref.ignore_global_rules {
-                for compiled_policy in &ctx.compiled_plans.global_firewall {
-                    let ua = session
-                        .get_header("user-agent")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    waf_match = crate::firewall::compiled::evaluate_compiled_region_deny(
-                        compiled_policy,
-                        ctx.client_ip,
-                        ua,
-                        session.req_header().uri.path(),
-                    );
-                    if waf_match.is_some() {
-                        break;
-                    }
-                    if let Some(action) = crate::firewall::compiled::evaluate_compiled_policy(
-                        compiled_policy,
-                        session,
-                        &ctx.request_body,
-                        Self::forwarded_proto(session, ctx),
-                    ) {
-                        waf_match = Some(action);
-                        break;
-                    }
-                }
-                if waf_match.is_none() && ctx.compiled_plans.global_firewall.is_empty() {
-                    crate::metrics::METRICS.waf.record_legacy_fallback();
-                    for gp in global_policies {
-                        if gp.is_on && gp.mode != "bypass" {
-                            if let Some(inbound) = &gp.inbound
-                                && let Some(region) = &inbound.region
-                            {
-                                let ua = session
-                                    .get_header("user-agent")
-                                    .and_then(|v| v.to_str().ok())
-                                    .unwrap_or("");
-                                waf_match = crate::firewall::check_region_deny(
-                                    region,
-                                    ctx.client_ip,
-                                    gp.id,
-                                    &gp.deny_country_html,
-                                    ua,
-                                    session.req_header().uri.path(),
-                                );
-                                if let Some(action) = &mut waf_match {
-                                    crate::firewall::apply_observe_mode(gp, action);
-                                }
-                                if waf_match.is_some() {
-                                    break;
-                                }
-                            }
-                            if let Some(action) = crate::firewall::evaluate_policy(
-                                gp,
-                                session,
-                                &ctx.request_body,
-                                Self::forwarded_proto(session, ctx),
-                            ) {
-                                waf_match = Some(action);
-                                break;
-                            }
-                        }
-                    }
-                }
+                waf_match =
+                    self.evaluate_global_inbound_waf_compiled_first(session, ctx, global_policies);
             }
         }
 
@@ -7070,6 +7221,664 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
 
         Ok((false, waf_action))
     }
+
+    async fn run_request_context_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::Context;
+        let host = Self::request_host(session);
+        ctx.host = host.clone();
+        ctx.is_tls_downstream = self.tls_downstream;
+        ctx.is_http3_downstream = session.req_header().version == http::Version::HTTP_3;
+        normalize_upstream_cookie_headers(session.req_header_mut());
+
+        let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
+        debug!(
+            "REQUEST_FILTER: method={} host='{}' server_found={} lb_found={} uri='{}'",
+            session.req_header().method,
+            host,
+            server.is_some(),
+            upstream.is_some(),
+            session.req_header().uri
+        );
+        ctx.server = server;
+        if let Some(s) = ctx.server.as_ref()
+            && !s.locations.is_empty()
+        {
+            let server_id = s.id.unwrap_or(0);
+            let compiled =
+                crate::routing::location::get_compiled_locations(server_id, &s.locations);
+            let path = session.req_header().uri.path();
+            if let Some(matched) = crate::routing::location::match_location(&compiled, path) {
+                ctx.matched_location = Some(matched.config.clone());
+            }
+        }
+        ctx.lb = upstream;
+        if let Some(server_id) = ctx.server.as_ref().map(|server| server.numeric_id())
+            && let Some(location_lb) =
+                self.build_location_lb_if_configured(server_id, ctx.matched_location.as_deref())
+        {
+            ctx.lb = Some(location_lb);
+        }
+
+        ctx.global_http_config = Some(Arc::clone(&hot_path.global_http));
+        ctx.firewall_policies_snapshot = Some(Arc::clone(&hot_path.firewall_policies));
+        ctx.global_cache_policies = hot_path.cache_policies.clone();
+        ctx.compiled_plans = Arc::clone(&hot_path.compiled_plans);
+        ctx.global_access_log_config = hot_path.global_access_log.clone();
+        ctx.global_waf_block_options = hot_path.global_waf_block_options.clone();
+        ctx.access_log_module_enabled = true;
+        ctx.global_access_log_on = ctx
+            .global_access_log_config
+            .as_ref()
+            .map(|cfg| cfg.is_on)
+            .unwrap_or(true);
+
+        if self.maybe_serve_acme_challenge(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+
+        let is_loopback = session
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|i| i.ip().is_loopback())
+            .unwrap_or(false);
+        ctx.is_loopback = is_loopback;
+
+        let (mut detected_ip, detected_port, raw_remote_addr) = Self::socket_client_ip(session);
+        ctx.client_ip = detected_ip;
+        ctx.client_port = detected_port;
+        ctx.raw_remote_addr = raw_remote_addr;
+
+        if is_loopback {
+            ctx.is_http3_bridge = session.get_header("X-Cloud-Http3-Bridge").is_some();
+
+            if let Some(cloud_ip) = session.get_header("X-Cloud-Real-Ip")
+                && let Ok(ip_str) = cloud_ip.to_str()
+                && let Ok(parsed_ip) = ip_str.parse::<std::net::IpAddr>()
+            {
+                debug!("L2: Restoring real client IP {} from L1 header", parsed_ip);
+                detected_ip = parsed_ip;
+                ctx.client_ip = parsed_ip;
+            }
+            if let Some(cloud_port) = session.get_header("X-Cloud-Real-Port")
+                && let Ok(port_str) = cloud_port.to_str()
+                && let Ok(port) = port_str.parse::<u16>()
+            {
+                ctx.client_port = port;
+            }
+        }
+
+        if let Some(pp_ip) = ctx.proxy_protocol_ip {
+            detected_ip = pp_ip;
+            ctx.client_ip = pp_ip;
+        }
+
+        ctx.client_ip = self.resolve_client_ip(
+            session,
+            ctx.server.as_ref().map(|v| &**v),
+            detected_ip,
+            &ctx.raw_remote_addr,
+            ctx.client_port,
+        );
+        ctx.client_ip_str = ctx.client_ip.to_string();
+        ctx.request_id = crate::logging::next_request_id();
+        self.ensure_request_metrics_started(ctx);
+
+        Ok(PhaseOutcome::Continue(RequestFilterState {
+            host,
+            hot_path,
+        }))
+    }
+
+    async fn run_local_service_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        state: RequestFilterState,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::LocalService;
+        ctx.is_on = state.hot_path.is_on;
+        if !ctx.is_on {
+            warn!(
+                "BLOCKED: Node is DISABLED (isOn=false), rejecting {} {} from IP={}",
+                session.req_header().method,
+                session.req_header().uri,
+                ctx.client_ip_str
+            );
+            return self
+                .respond_status_with_pages(session, ctx, 403)
+                .await
+                .map(PhaseOutcome::Done);
+        }
+
+        if self.maybe_serve_hls_key(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+
+        if self.maybe_serve_waf_verify(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+
+        Ok(PhaseOutcome::Continue(state))
+    }
+
+    async fn run_protocol_policy_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        state: RequestFilterState,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::ProtocolPolicy;
+        if let Some(server) = &ctx.server {
+            if let Some(web) = &server.web
+                && let Some(ws) = &web.websocket
+                && ws.is_on
+                && Self::is_websocket_request(session)
+            {
+                if let Some(origin) = session.get_header("origin").and_then(|v| v.to_str().ok())
+                    && let Some(origin_host) = Self::origin_header_host(origin)
+                {
+                    let same_origin = crate::lb_factory::strip_addr_port(origin_host)
+                        .eq_ignore_ascii_case(&crate::lb_factory::strip_addr_port(&state.host));
+                    let origin_allowed = server
+                        .id
+                        .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+                        .and_then(|plan| plan.websocket_origin_allowed(origin_host))
+                        .unwrap_or_else(|| Self::websocket_origin_allowed(ws, origin_host));
+                    if !same_origin && !origin_allowed {
+                        return self
+                            .respond_status_with_pages(session, ctx, 403)
+                            .await
+                            .map(PhaseOutcome::Done);
+                    }
+                }
+                ctx.is_websocket = true;
+            }
+            if let Some(grpc) = &server.grpc {
+                ctx.is_grpc = grpc.is_on && Self::is_grpc_request(session);
+            }
+
+            if ctx.is_grpc {
+                let max_recv = state
+                    .hot_path
+                    .grpc_policy
+                    .as_ref()
+                    .and_then(|p| p.max_receive_message_size.as_ref())
+                    .map(|s| s.to_bytes())
+                    .unwrap_or(0);
+                let final_max_recv = if max_recv <= 0 {
+                    2 * 1024 * 1024
+                } else {
+                    max_recv
+                };
+                ctx.max_inspection_size = final_max_recv;
+                debug!(
+                    "gRPC enabled for request, setting max_inspection_size to {} bytes",
+                    final_max_recv
+                );
+            }
+
+            if let Some(web) = &server.web {
+                ctx.access_log_ref = web.access_log_ref.clone();
+            }
+        }
+
+        if !state.hot_path.global_http.supports_low_version_http
+            && session.req_header().version < pingora_http::Version::HTTP_11
+        {
+            debug!(
+                "Blocking low version HTTP request: {:?}",
+                session.req_header().version
+            );
+            return self
+                .respond_status_with_pages(session, ctx, 400)
+                .await
+                .map(PhaseOutcome::Done);
+        }
+
+        if ctx.server.is_none() {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(
+                    "Unbound domain for host: '{}'. Bound hosts: {:?}",
+                    state.host,
+                    self.config.get_all_hosts_sync()
+                );
+            }
+            return self
+                .respond_domain_mismatch(session, ctx, &state.hot_path, &state.host)
+                .await
+                .map(PhaseOutcome::Done);
+        }
+
+        Ok(PhaseOutcome::Continue(state))
+    }
+
+    async fn run_early_response_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        state: RequestFilterState,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::EarlyResponse;
+        if let Some(server) = ctx.server.clone()
+            && let Some(ref web) = server.web
+        {
+            if let Some((location, status)) =
+                self.should_redirect_to_https(session, ctx, &server, &state.host)
+            {
+                let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
+                Self::insert_location_header(&mut resp, &location);
+                session.write_response_header(Box::new(resp), true).await?;
+                ctx.response_status = status;
+                return Ok(PhaseOutcome::Done(true));
+            }
+
+            if let Some(location) = Self::www_trailing_slash_redirect(&server, session, &state.host)
+            {
+                let mut resp = pingora_http::ResponseHeader::build(301u16, None).unwrap();
+                Self::insert_location_header(&mut resp, &location);
+                session.write_response_header(Box::new(resp), true).await?;
+                ctx.response_status = 301;
+                return Ok(PhaseOutcome::Done(true));
+            }
+
+            if let Some(plan) = server
+                .id
+                .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
+                .and_then(|plan| plan.shutdown())
+                .cloned()
+            {
+                if self.respond_compiled_shutdown(session, ctx, &plan).await? {
+                    return Ok(PhaseOutcome::Done(true));
+                }
+            } else if let Some(ref shutdown) = web.shutdown
+                && self.respond_shutdown(session, ctx, shutdown).await?
+            {
+                return Ok(PhaseOutcome::Done(true));
+            }
+
+            let is_options = session.req_header().method == http::method::Method::OPTIONS;
+            let compiled_cors = server
+                .id
+                .and_then(|server_id| ctx.compiled_plans.server_headers.get(&server_id))
+                .and_then(|plan| plan.cors.as_ref());
+            if let Some(cors) = compiled_cors {
+                if is_options && cors.applies_to_request(true) {
+                    let mut resp = pingora_http::ResponseHeader::build(204, None).unwrap();
+                    cors.apply(&mut resp, session);
+                    resp.remove_header("content-length");
+                    resp.remove_header("transfer-encoding");
+                    session.write_response_header(Box::new(resp), true).await?;
+                    ctx.response_status = 204;
+                    return Ok(PhaseOutcome::Done(true));
+                }
+            } else if let Some(ref rhp) = web.response_header_policy
+                && let Some(ref cors) = rhp.cors
+                && cors.is_on
+                && (!cors.options_method_only || is_options)
+                && is_options
+            {
+                let mut resp = pingora_http::ResponseHeader::build(204, None).unwrap();
+                Self::set_cors_headers(&mut resp, session, cors);
+                resp.remove_header("content-length");
+                resp.remove_header("transfer-encoding");
+                session.write_response_header(Box::new(resp), true).await?;
+                ctx.response_status = 204;
+                return Ok(PhaseOutcome::Done(true));
+            }
+        }
+
+        if ctx.lb.is_none()
+            && let Some(server) = &ctx.server
+        {
+            warn!(
+                "LB missing for host '{}'; scheduling background rebuild and returning 502 for this request.",
+                state.host
+            );
+            let (level, parents) = self.config.get_tiered_origin_info().await;
+            let bypass = self.config.is_tiered_origin_bypass().await;
+
+            let rp_cfg = match ctx
+                .matched_location
+                .as_ref()
+                .and_then(|l| l.reverse_proxy.clone())
+                .or_else(|| server.reverse_proxy.clone())
+            {
+                Some(rp) => rp,
+                None => {
+                    session.respond_error(502).await?;
+                    return Ok(PhaseOutcome::Done(true));
+                }
+            };
+
+            let server_id = server.numeric_id();
+            let config = self.config.clone();
+            let host_c = state.host.clone();
+            let server_c = server.clone();
+            let allow_lan_ip = state.hot_path.global_http.allow_lan_ip;
+            tokio::spawn(async move {
+                let built = tokio::task::spawn_blocking(move || {
+                    crate::lb_factory::build_lb(
+                        server_id,
+                        &rp_cfg,
+                        level,
+                        parents.as_ref(),
+                        bypass,
+                        allow_lan_ip,
+                    )
+                })
+                .await;
+                if let Ok((lb_arc, _has_hc)) = built {
+                    config.cache_server_route(host_c, server_c, lb_arc).await;
+                }
+            });
+            session.respond_error(502).await?;
+            return Ok(PhaseOutcome::Done(true));
+        }
+
+        Ok(PhaseOutcome::Continue(state))
+    }
+
+    async fn run_security_state_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        state: RequestFilterState,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::SecurityState;
+        let waf_enabled = ctx
+            .server
+            .as_ref()
+            .and_then(|server| server.web.as_ref())
+            .and_then(|web| web.firewall_ref.as_ref())
+            .is_some_and(|firewall_ref| firewall_ref.is_on);
+        if waf_enabled
+            && self.waf_state.is_whitelisted(
+                ctx.client_ip,
+                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+            )
+        {
+            ctx.waf_whitelisted = true;
+        }
+
+        if self.waf_state.is_graylisted(
+            ctx.client_ip,
+            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+        ) {
+            Self::add_ctx_tag(ctx, "graylist");
+        }
+
+        let ua = session
+            .get_header("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let client_ip_str = ctx.client_ip_str.clone();
+        if self.check_waf_challenge(session, &client_ip_str, ua, ctx) {
+            return Ok(PhaseOutcome::Done(false));
+        }
+
+        self.ensure_request_metrics_started(ctx);
+        Ok(PhaseOutcome::Continue(state))
+    }
+
+    async fn run_limits_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        state: RequestFilterState,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::Limits;
+        let full_url = Self::request_full_url(session, ctx);
+        if self.config.is_deleted_content_exact_sync(&full_url) {
+            warn!(
+                "Deleted content matched exact URL, returning 451: server_id={} url={}",
+                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+                full_url
+            );
+            return self
+                .respond_status_with_pages(session, ctx, 451)
+                .await
+                .map(PhaseOutcome::Done);
+        }
+
+        if self.enforce_request_limit(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+        if self.enforce_traffic_limit(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+        if self.enforce_plan_max_upload(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+
+        if !ctx.waf_whitelisted
+            && self.waf_state.is_blocked(
+                ctx.client_ip,
+                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
+            )
+        {
+            warn!(
+                "BLOCKED: IP {} is blocked by WAF state (host={}, method={}, uri={})",
+                ctx.client_ip_str,
+                state.host,
+                session.req_header().method,
+                session.req_header().uri
+            );
+            return self
+                .respond_status_with_pages(session, ctx, 403)
+                .await
+                .map(PhaseOutcome::Done);
+        }
+
+        let main_cluster_id = self.config.get_node_cluster_id_sync();
+        if !ctx.waf_whitelisted
+            && main_cluster_id > 0
+            && self.waf_state.is_blocked(
+                ctx.client_ip,
+                crate::special_defense::cluster_block_scope_id(main_cluster_id),
+            )
+        {
+            warn!(
+                "BLOCKED: IP {} is blocked by main cluster WAF state (cluster_id={}, host={}, method={}, uri={})",
+                ctx.client_ip_str,
+                main_cluster_id,
+                state.host,
+                session.req_header().method,
+                session.req_header().uri
+            );
+            return self
+                .respond_status_with_pages(session, ctx, 403)
+                .await
+                .map(PhaseOutcome::Done);
+        }
+
+        Ok(PhaseOutcome::Continue(state))
+    }
+
+    async fn run_lightweight_waf_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        state: RequestFilterState,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::LightweightWaf;
+        if self.run_lightweight_request_security(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+        Ok(PhaseOutcome::Continue(state))
+    }
+
+    async fn run_body_waf_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        state: RequestFilterState,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::BodyWaf;
+        let (blocked, _action) = self
+            .run_miss_only_body_waf(session, ctx, &state.hot_path.firewall_policies)
+            .await?;
+        if blocked {
+            return Ok(PhaseOutcome::Done(true));
+        }
+        Ok(PhaseOutcome::Continue(state))
+    }
+
+    async fn run_feature_policy_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        state: RequestFilterState,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::FeaturePolicy;
+        if self.enforce_referers(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+        if self.enforce_user_agent(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+        if self.enforce_auth(session, ctx).await? {
+            return Ok(PhaseOutcome::Done(true));
+        }
+        Ok(PhaseOutcome::Continue(state))
+    }
+
+    async fn run_rewrite_phase(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCTX,
+        state: RequestFilterState,
+    ) -> Result<PhaseOutcome<RequestFilterState>> {
+        ctx.request_phase = RequestPhase::Rewrite;
+        if let Some(server) = &ctx.server
+            && let Some(web) = &server.web
+        {
+            let host_redirects = &web.host_redirects;
+            let rewrite_refs = &web.rewrite_refs;
+            let rewrite_rules = &web.rewrite_rules;
+
+            let uri_str = session.req_header().uri.path();
+            let query = session.req_header().uri.query().unwrap_or("");
+
+            if !host_redirects.is_empty() {
+                let redirect_host = if state.host.is_empty() {
+                    Self::request_host(session)
+                } else {
+                    state.host.clone()
+                };
+                let user_agent = session
+                    .get_header("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let scheme = Self::forwarded_proto(session, ctx);
+                let compiled_plan = server
+                    .id
+                    .and_then(|server_id| ctx.compiled_plans.server_rewrite.get(&server_id));
+                let redirect = if let Some(plan) = compiled_plan {
+                    crate::rewrite::evaluate_compiled_host_redirects(
+                        &redirect_host,
+                        scheme,
+                        uri_str,
+                        query,
+                        user_agent,
+                        plan,
+                    )
+                } else {
+                    evaluate_host_redirects(
+                        &redirect_host,
+                        scheme,
+                        uri_str,
+                        query,
+                        user_agent,
+                        host_redirects,
+                    )
+                };
+                if let Some((location, status)) = redirect {
+                    let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
+                    Self::insert_location_header(&mut resp, &location);
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(PhaseOutcome::Done(true));
+                }
+            }
+
+            if !rewrite_rules.is_empty() {
+                let scheme = Self::forwarded_proto(session, ctx);
+                let rewrite_result = server
+                    .id
+                    .and_then(|server_id| ctx.compiled_plans.server_rewrite.get(&server_id))
+                    .map(|plan| {
+                        crate::rewrite::evaluate_compiled_rewrites(
+                            uri_str,
+                            query,
+                            Some(&state.host),
+                            plan,
+                            session,
+                            scheme,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        evaluate_rewrites_with_cond(
+                            uri_str,
+                            query,
+                            Some(&state.host),
+                            rewrite_refs,
+                            rewrite_rules,
+                            |rule| {
+                                rule.conds
+                                    .as_ref()
+                                    .map(|conds| conds.match_request_with_scheme(session, scheme))
+                                    .unwrap_or(true)
+                            },
+                        )
+                    });
+                match rewrite_result {
+                    RewriteResult::Redirect {
+                        location,
+                        status,
+                        rewrite_id,
+                    } => {
+                        ctx.rewrite_id = rewrite_id;
+                        ctx.tags
+                            .get_or_insert_with(Vec::new)
+                            .push("rewrite".to_string());
+                        let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
+                        Self::insert_location_header(&mut resp, &location);
+                        session.write_response_header(Box::new(resp), true).await?;
+                        return Ok(PhaseOutcome::Done(true));
+                    }
+                    RewriteResult::Proxy {
+                        new_uri,
+                        proxy_host,
+                        rewrite_id,
+                    } => {
+                        ctx.rewrite_id = rewrite_id;
+                        ctx.tags
+                            .get_or_insert_with(Vec::new)
+                            .push("rewrite".to_string());
+                        let preserve_original_host = proxy_host.is_none();
+                        if let Ok(new_parsed) = new_uri.parse::<http::Uri>() {
+                            session.req_header_mut().set_uri(new_parsed);
+                            if preserve_original_host && !ctx.host.is_empty() {
+                                session
+                                    .req_header_mut()
+                                    .insert_header("host", ctx.host.clone())
+                                    .unwrap();
+                            }
+                        }
+                        if let Some(host) = proxy_host {
+                            ctx.origin_host = host;
+                        }
+                    }
+                    RewriteResult::NoMatch => {}
+                }
+            }
+        }
+
+        Ok(PhaseOutcome::Continue(state))
+    }
 }
 
 #[async_trait]
@@ -7127,592 +7936,48 @@ impl ProxyHttp for EdgeProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        let host = Self::request_host(session);
-        ctx.host = host.clone();
-        ctx.is_tls_downstream = self.tls_downstream;
-        ctx.is_http3_downstream = session.req_header().version == http::Version::HTTP_3;
-        normalize_upstream_cookie_headers(session.req_header_mut());
+        let mut state = match self.run_request_context_phase(session, ctx).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
+        state = match self.run_local_service_phase(session, ctx, state).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
+        state = match self.run_protocol_policy_phase(session, ctx, state).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
+        state = match self.run_early_response_phase(session, ctx, state).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
+        state = match self.run_security_state_phase(session, ctx, state).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
+        state = match self.run_limits_phase(session, ctx, state).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
+        state = match self.run_lightweight_waf_phase(session, ctx, state).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
+        state = match self.run_body_waf_phase(session, ctx, state).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
+        state = match self.run_feature_policy_phase(session, ctx, state).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
+        let _state = match self.run_rewrite_phase(session, ctx, state).await? {
+            PhaseOutcome::Continue(state) => state,
+            PhaseOutcome::Done(done) => return Ok(done),
+        };
 
-        // Single lock acquisition for hot_path + server + upstream
-        let (hot_path, server, upstream) = self.config.get_request_context_sync(&host);
-        debug!(
-            "REQUEST_FILTER: method={} host='{}' server_found={} lb_found={} uri='{}'",
-            session.req_header().method,
-            host,
-            server.is_some(),
-            upstream.is_some(),
-            session.req_header().uri
-        );
-        ctx.server = server;
-        if let Some(s) = ctx.server.as_ref()
-            && !s.locations.is_empty()
-        {
-            let server_id = s.id.unwrap_or(0);
-            let compiled =
-                crate::routing::location::get_compiled_locations(server_id, &s.locations);
-            let path = session.req_header().uri.path();
-            if let Some(matched) = crate::routing::location::match_location(&compiled, path) {
-                ctx.matched_location = Some(matched.config.clone());
-            }
-        }
-        ctx.lb = upstream;
-        if let Some(server_id) = ctx.server.as_ref().map(|server| server.numeric_id())
-            && let Some(location_lb) =
-                self.build_location_lb_if_configured(server_id, ctx.matched_location.as_deref())
-        {
-            ctx.lb = Some(location_lb);
-        }
-        // Cache these in ctx to avoid config lock acquisitions in response_filter / body_filter
-        ctx.global_http_config = Some(Arc::clone(&hot_path.global_http));
-        ctx.firewall_policies_snapshot = Some(Arc::clone(&hot_path.firewall_policies));
-        ctx.global_cache_policies = hot_path.cache_policies.clone();
-        ctx.compiled_plans = Arc::clone(&hot_path.compiled_plans);
-        ctx.global_access_log_config = hot_path.global_access_log.clone();
-        ctx.global_waf_block_options = hot_path.global_waf_block_options.clone();
-        // Always enable access logging — the management plane's has_access_log_settings
-        // flag indicates whether custom field filters exist, not whether logging is on.
-        ctx.access_log_module_enabled = true;
-        ctx.global_access_log_on = ctx
-            .global_access_log_config
-            .as_ref()
-            .map(|cfg| cfg.is_on)
-            .unwrap_or(true);
-
-        if self.maybe_serve_acme_challenge(session, ctx).await? {
-            return Ok(true);
-        }
-
-        // Resolve client IP early so it is available before any business logic checks
-        // that might use it (is_on, HTTPS redirect, domain mismatch, etc.).
-        let is_loopback = session
-            .client_addr()
-            .and_then(|a| a.as_inet())
-            .map(|i| i.ip().is_loopback())
-            .unwrap_or(false);
-        ctx.is_loopback = is_loopback;
-
-        let (mut detected_ip, detected_port, raw_remote_addr) = Self::socket_client_ip(session);
-        ctx.client_ip = detected_ip;
-        ctx.client_port = detected_port;
-        ctx.raw_remote_addr = raw_remote_addr;
-
-        // Only trust internal L1 headers when request originates from loopback
-        if is_loopback {
-            ctx.is_http3_bridge = session.get_header("X-Cloud-Http3-Bridge").is_some();
-
-            if let Some(cloud_ip) = session.get_header("X-Cloud-Real-Ip") {
-                if let Ok(ip_str) = cloud_ip.to_str() {
-                    if let Ok(parsed_ip) = ip_str.parse::<std::net::IpAddr>() {
-                        debug!("L2: Restoring real client IP {} from L1 header", parsed_ip);
-                        detected_ip = parsed_ip;
-                        ctx.client_ip = parsed_ip;
-                    }
-                }
-            }
-            if let Some(cloud_port) = session.get_header("X-Cloud-Real-Port")
-                && let Ok(port_str) = cloud_port.to_str()
-                && let Ok(port) = port_str.parse::<u16>()
-            {
-                ctx.client_port = port;
-            }
-        }
-
-        // PROXY Protocol: if the accept loop parsed an inbound PROXY header,
-        // override the socket IP with the true client address it reported.
-        if let Some(pp_ip) = ctx.proxy_protocol_ip {
-            detected_ip = pp_ip;
-            ctx.client_ip = pp_ip;
-        }
-
-        ctx.client_ip = self.resolve_client_ip(
-            session,
-            ctx.server.as_ref().map(|v| &**v),
-            detected_ip,
-            &ctx.raw_remote_addr,
-            ctx.client_port,
-        );
-        ctx.client_ip_str = ctx.client_ip.to_string();
-        // Generate request ID early for use in error pages and logging
-        ctx.request_id = crate::logging::next_request_id();
-        self.ensure_request_metrics_started(ctx);
-
-        // --- GLOBAL CLUSTER SETTINGS: Node Enabled (isOn) ---
-        ctx.is_on = hot_path.is_on;
-        if !ctx.is_on {
-            warn!(
-                "BLOCKED: Node is DISABLED (isOn=false), rejecting {} {} from IP={}",
-                session.req_header().method,
-                session.req_header().uri,
-                ctx.client_ip_str
-            );
-            return self.respond_status_with_pages(session, ctx, 403).await;
-        }
-
-        if self.maybe_serve_hls_key(session, ctx).await? {
-            return Ok(true);
-        }
-
-        if self.maybe_serve_waf_verify(session, ctx).await? {
-            return Ok(true);
-        }
-
-        if let Some(server) = &ctx.server {
-            if let Some(web) = &server.web
-                && let Some(ws) = &web.websocket
-                && ws.is_on
-                && Self::is_websocket_request(session)
-            {
-                if let Some(origin) = session.get_header("origin").and_then(|v| v.to_str().ok()) {
-                    if let Some(origin_host) = Self::origin_header_host(origin) {
-                        let same_origin = crate::lb_factory::strip_addr_port(origin_host)
-                            .eq_ignore_ascii_case(&crate::lb_factory::strip_addr_port(&host));
-                        let origin_allowed = server
-                            .id
-                            .and_then(|server_id| {
-                                ctx.compiled_plans.server_features.get(&server_id)
-                            })
-                            .and_then(|plan| plan.websocket_origin_allowed(origin_host))
-                            .unwrap_or_else(|| Self::websocket_origin_allowed(ws, origin_host));
-                        if !same_origin && !origin_allowed {
-                            return self.respond_status_with_pages(session, ctx, 403).await;
-                        }
-                    }
-                }
-                ctx.is_websocket = true;
-            }
-            if let Some(grpc) = &server.grpc {
-                ctx.is_grpc = grpc.is_on && Self::is_grpc_request(session);
-            }
-
-            // Apply gRPC message size limits if enabled
-            if ctx.is_grpc {
-                let max_recv = hot_path
-                    .grpc_policy
-                    .as_ref()
-                    .and_then(|p| p.max_receive_message_size.as_ref())
-                    .map(|s| s.to_bytes())
-                    .unwrap_or(0);
-                let final_max_recv = if max_recv <= 0 {
-                    2 * 1024 * 1024
-                } else {
-                    max_recv
-                };
-
-                // For gRPC, we increase the inspection limit to allow larger messages
-                ctx.max_inspection_size = final_max_recv;
-                debug!(
-                    "gRPC enabled for request, setting max_inspection_size to {} bytes",
-                    final_max_recv
-                );
-            }
-
-            // Load per-server access log config for runtime log control
-            if let Some(web) = &server.web {
-                ctx.access_log_ref = web.access_log_ref.clone();
-            }
-        }
-
-        // --- GLOBAL CLUSTER SETTINGS: Low Version HTTP ---
-        if !hot_path.global_http.supports_low_version_http {
-            if session.req_header().version < pingora_http::Version::HTTP_11 {
-                debug!(
-                    "Blocking low version HTTP request: {:?}",
-                    session.req_header().version
-                );
-                return self.respond_status_with_pages(session, ctx, 400).await;
-            }
-        }
-
-        if ctx.server.is_none() {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                debug!(
-                    "Unbound domain for host: '{}'. Bound hosts: {:?}",
-                    host,
-                    self.config.get_all_hosts_sync()
-                );
-            }
-            return self
-                .respond_domain_mismatch(session, ctx, &hot_path, &host)
-                .await;
-        }
-
-        if let Some(server) = ctx.server.clone()
-            && let Some(ref web) = server.web
-        {
-            if let Some((location, status)) =
-                self.should_redirect_to_https(session, ctx, &server, &host)
-            {
-                let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
-                Self::insert_location_header(&mut resp, &location);
-                session.write_response_header(Box::new(resp), true).await?;
-                ctx.response_status = status;
-                return Ok(true);
-            }
-
-            if let Some(location) = Self::www_trailing_slash_redirect(&server, session, &host) {
-                let mut resp = pingora_http::ResponseHeader::build(301u16, None).unwrap();
-                Self::insert_location_header(&mut resp, &location);
-                session.write_response_header(Box::new(resp), true).await?;
-                ctx.response_status = 301;
-                return Ok(true);
-            }
-
-            if let Some(plan) = server
-                .id
-                .and_then(|server_id| ctx.compiled_plans.server_features.get(&server_id))
-                .and_then(|plan| plan.shutdown())
-                .cloned()
-            {
-                if self.respond_compiled_shutdown(session, ctx, &plan).await? {
-                    return Ok(true);
-                }
-            } else if let Some(ref shutdown) = web.shutdown
-                && self.respond_shutdown(session, ctx, &shutdown).await?
-            {
-                return Ok(true);
-            }
-
-            // CORS preflight: handle OPTIONS immediately without proxying to origin
-            let is_options = session.req_header().method == http::method::Method::OPTIONS;
-            let compiled_cors = server
-                .id
-                .and_then(|server_id| ctx.compiled_plans.server_headers.get(&server_id))
-                .and_then(|plan| plan.cors.as_ref());
-            if let Some(cors) = compiled_cors {
-                if is_options && cors.applies_to_request(true) {
-                    let mut resp = pingora_http::ResponseHeader::build(204, None).unwrap();
-                    cors.apply(&mut resp, session);
-                    resp.remove_header("content-length");
-                    resp.remove_header("transfer-encoding");
-                    debug!(
-                        "OPTIONS preflight: host='{}' origin='{}' resp_headers={:?}",
-                        host,
-                        session
-                            .get_header("origin")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or(""),
-                        resp.headers
-                            .iter()
-                            .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap_or("?")))
-                            .collect::<Vec<_>>()
-                    );
-                    session.write_response_header(Box::new(resp), true).await?;
-                    ctx.response_status = 204;
-                    return Ok(true);
-                }
-            } else if let Some(ref rhp) = web.response_header_policy {
-                if let Some(ref cors) = rhp.cors {
-                    if cors.is_on && (!cors.options_method_only || is_options) && is_options {
-                        let mut resp = pingora_http::ResponseHeader::build(204, None).unwrap();
-                        Self::set_cors_headers(&mut resp, session, cors);
-                        resp.remove_header("content-length");
-                        resp.remove_header("transfer-encoding");
-                        debug!(
-                            "OPTIONS preflight: host='{}' origin='{}' resp_headers={:?}",
-                            host,
-                            session
-                                .get_header("origin")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or(""),
-                            resp.headers
-                                .iter()
-                                .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap_or("?")))
-                                .collect::<Vec<_>>()
-                        );
-                        session.write_response_header(Box::new(resp), true).await?;
-                        ctx.response_status = 204;
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-
-        if ctx.lb.is_none() {
-            if let Some(server) = &ctx.server {
-                warn!(
-                    "LB missing for host '{}'; scheduling background rebuild and returning 502 for this request.",
-                    host
-                );
-                let (level, parents) = self.config.get_tiered_origin_info().await;
-                let bypass = self.config.is_tiered_origin_bypass().await;
-
-                let rp_cfg = match ctx
-                    .matched_location
-                    .as_ref()
-                    .and_then(|l| l.reverse_proxy.clone())
-                    .or_else(|| server.reverse_proxy.clone())
-                {
-                    Some(rp) => rp,
-                    None => {
-                        session.respond_error(502).await?;
-                        return Ok(true);
-                    }
-                };
-
-                let server_id = server.numeric_id();
-                let config = self.config.clone();
-                let host_c = host.clone();
-                let server_c = server.clone();
-                let allow_lan_ip = hot_path.global_http.allow_lan_ip;
-                tokio::spawn(async move {
-                    let built = tokio::task::spawn_blocking(move || {
-                        crate::lb_factory::build_lb(
-                            server_id,
-                            &rp_cfg,
-                            level,
-                            parents.as_ref(),
-                            bypass,
-                            allow_lan_ip,
-                        )
-                    })
-                    .await;
-                    if let Ok((lb_arc, _has_hc)) = built {
-                        config.cache_server_route(host_c, server_c, lb_arc).await;
-                    }
-                });
-                session.respond_error(502).await?;
-                return Ok(true);
-            }
-        }
-
-        let waf_enabled = ctx
-            .server
-            .as_ref()
-            .and_then(|server| server.web.as_ref())
-            .and_then(|web| web.firewall_ref.as_ref())
-            .is_some_and(|firewall_ref| firewall_ref.is_on);
-        if waf_enabled
-            && self.waf_state.is_whitelisted(
-                ctx.client_ip,
-                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-            )
-        {
-            ctx.waf_whitelisted = true;
-        }
-
-        if self.waf_state.is_graylisted(
-            ctx.client_ip,
-            ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-        ) {
-            Self::add_ctx_tag(ctx, "graylist");
-        }
-
-        let ua = session
-            .get_header("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let client_ip_str = ctx.client_ip_str.clone();
-        if self.check_waf_challenge(session, &client_ip_str, ua, ctx) {
-            return Ok(false);
-        }
-
-        self.ensure_request_metrics_started(ctx);
-
-        let full_url = Self::request_full_url(session, ctx);
-        if self.config.is_deleted_content_exact_sync(&full_url) {
-            warn!(
-                "Deleted content matched exact URL, returning 451: server_id={} url={}",
-                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-                full_url
-            );
-            return self.respond_status_with_pages(session, ctx, 451).await;
-        }
-
-        if self.enforce_request_limit(session, ctx).await? {
-            return Ok(true);
-        }
-
-        if self.enforce_traffic_limit(session, ctx).await? {
-            return Ok(true);
-        }
-
-        if self.enforce_plan_max_upload(session, ctx).await? {
-            return Ok(true);
-        }
-
-        if !ctx.waf_whitelisted
-            && self.waf_state.is_blocked(
-                ctx.client_ip,
-                ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
-            )
-        {
-            warn!(
-                "BLOCKED: IP {} is blocked by WAF state (host={}, method={}, uri={})",
-                ctx.client_ip_str,
-                host,
-                session.req_header().method,
-                session.req_header().uri
-            );
-            return self.respond_status_with_pages(session, ctx, 403).await;
-        }
-
-        let main_cluster_id = self.config.get_node_cluster_id_sync();
-        if !ctx.waf_whitelisted
-            && main_cluster_id > 0
-            && self.waf_state.is_blocked(
-                ctx.client_ip,
-                crate::special_defense::cluster_block_scope_id(main_cluster_id),
-            )
-        {
-            warn!(
-                "BLOCKED: IP {} is blocked by main cluster WAF state (cluster_id={}, host={}, method={}, uri={})",
-                ctx.client_ip_str,
-                main_cluster_id,
-                host,
-                session.req_header().method,
-                session.req_header().uri
-            );
-            return self.respond_status_with_pages(session, ctx, 403).await;
-        }
-
-        if self.run_lightweight_request_security(session, ctx).await? {
-            return Ok(true);
-        }
-
-        let (blocked, _action) = self
-            .run_miss_only_body_waf(session, ctx, &hot_path.firewall_policies)
-            .await?;
-        if blocked {
-            return Ok(true);
-        }
-
-        if self.enforce_referers(session, ctx).await? {
-            return Ok(true);
-        }
-
-        if self.enforce_user_agent(session, ctx).await? {
-            return Ok(true);
-        }
-
-        if self.enforce_auth(session, ctx).await? {
-            return Ok(true);
-        }
-
-        // Redirect / rewrite checks — routing logic, must always run
-        if let Some(server) = &ctx.server
-            && let Some(web) = &server.web
-        {
-            let host_redirects = &web.host_redirects;
-            let rewrite_refs = &web.rewrite_refs;
-            let rewrite_rules = &web.rewrite_rules;
-
-            let uri_str = session.req_header().uri.path();
-            let query = session.req_header().uri.query().unwrap_or("");
-
-            if !host_redirects.is_empty() {
-                let redirect_host = if host.is_empty() {
-                    Self::request_host(session)
-                } else {
-                    host.clone()
-                };
-                let user_agent = session
-                    .get_header("user-agent")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                let scheme = Self::forwarded_proto(session, ctx);
-                let compiled_plan = server
-                    .id
-                    .and_then(|server_id| ctx.compiled_plans.server_rewrite.get(&server_id));
-                let redirect = if let Some(plan) = compiled_plan {
-                    crate::rewrite::evaluate_compiled_host_redirects(
-                        &redirect_host,
-                        scheme,
-                        uri_str,
-                        query,
-                        user_agent,
-                        plan,
-                    )
-                } else {
-                    evaluate_host_redirects(
-                        &redirect_host,
-                        scheme,
-                        uri_str,
-                        query,
-                        user_agent,
-                        host_redirects,
-                    )
-                };
-                if let Some((location, status)) = redirect {
-                    let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
-                    Self::insert_location_header(&mut resp, &location);
-                    session.write_response_header(Box::new(resp), true).await?;
-                    return Ok(true);
-                }
-            }
-
-            if !rewrite_rules.is_empty() {
-                let scheme = Self::forwarded_proto(session, ctx);
-                let rewrite_result = server
-                    .id
-                    .and_then(|server_id| ctx.compiled_plans.server_rewrite.get(&server_id))
-                    .map(|plan| {
-                        crate::rewrite::evaluate_compiled_rewrites(
-                            uri_str,
-                            query,
-                            Some(&host),
-                            plan,
-                            session,
-                            scheme,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        evaluate_rewrites_with_cond(
-                            uri_str,
-                            query,
-                            Some(&host),
-                            rewrite_refs,
-                            rewrite_rules,
-                            |rule| {
-                                rule.conds
-                                    .as_ref()
-                                    .map(|conds| conds.match_request_with_scheme(session, scheme))
-                                    .unwrap_or(true)
-                            },
-                        )
-                    });
-                match rewrite_result {
-                    RewriteResult::Redirect {
-                        location,
-                        status,
-                        rewrite_id,
-                    } => {
-                        ctx.rewrite_id = rewrite_id;
-                        ctx.tags
-                            .get_or_insert_with(Vec::new)
-                            .push("rewrite".to_string());
-                        let mut resp = pingora_http::ResponseHeader::build(status, None).unwrap();
-                        Self::insert_location_header(&mut resp, &location);
-                        session.write_response_header(Box::new(resp), true).await?;
-                        return Ok(true);
-                    }
-                    RewriteResult::Proxy {
-                        new_uri,
-                        proxy_host,
-                        rewrite_id,
-                    } => {
-                        ctx.rewrite_id = rewrite_id;
-                        ctx.tags
-                            .get_or_insert_with(Vec::new)
-                            .push("rewrite".to_string());
-                        let preserve_original_host = proxy_host.is_none();
-                        if let Ok(new_parsed) = new_uri.parse::<http::Uri>() {
-                            session.req_header_mut().set_uri(new_parsed);
-                            if preserve_original_host && !ctx.host.is_empty() {
-                                session
-                                    .req_header_mut()
-                                    .insert_header("host", ctx.host.clone())
-                                    .unwrap();
-                            }
-                        }
-                        if let Some(host) = proxy_host {
-                            ctx.origin_host = host;
-                        }
-                    }
-                    RewriteResult::NoMatch => {}
-                }
-            }
-        }
-
+        ctx.request_phase = RequestPhase::Proxy;
         Ok(false)
     }
 
@@ -7834,13 +8099,20 @@ impl ProxyHttp for EdgeProxy {
                     && meta.stale_while_revalidate_secs > 0
                     && now < meta.expires + meta.stale_while_revalidate_secs as i64
                 {
-                    let key = cache_key.clone();
                     // Global cap on in-flight revalidations to prevent
                     // amplification: unique cache keys × 1 task each could
                     // otherwise exhaust memory / fds.
                     if SWR_REVALIDATE_IN_FLIGHT.len() < SWR_REVALIDATE_INFLIGHT_MAX
-                        && SWR_REVALIDATE_IN_FLIGHT.insert(key.clone(), ()).is_none()
+                        && SWR_REVALIDATE_IN_FLIGHT
+                            .insert(cache_key.clone(), ())
+                            .is_none()
                     {
+                        let Some(revalidate_permit) =
+                            MEMORY_GOVERNOR.try_admit(AdmissionClass::CacheRevalidate)
+                        else {
+                            SWR_REVALIDATE_IN_FLIGHT.remove(cache_key);
+                            return true;
+                        };
                         // origin_host may not yet be set in cache-hit paths
                         // (upstream_peer hasn't run). Skip background refresh
                         // instead of issuing a GET to an empty host.
@@ -7860,8 +8132,9 @@ impl ProxyHttp for EdgeProxy {
                                     .map(|pq| pq.as_str())
                                     .unwrap_or("/")
                             );
-                            let cache_key_owned = key.clone();
+                            let cache_key_owned = cache_key.clone();
                             tokio::spawn(async move {
+                                let _revalidate_permit = revalidate_permit;
                                 // Reuse the shared client so DNS/TLS state and
                                 // the connection pool are amortized across all
                                 // SWR background refreshes.
@@ -7874,7 +8147,8 @@ impl ProxyHttp for EdgeProxy {
                             });
                         } else {
                             // Origin not yet known; release the in-flight slot.
-                            SWR_REVALIDATE_IN_FLIGHT.remove(&key);
+                            drop(revalidate_permit);
+                            SWR_REVALIDATE_IN_FLIGHT.remove(cache_key);
                         }
                     }
                     return true;
@@ -9399,6 +9673,19 @@ impl ProxyHttp for EdgeProxy {
                     .map(crate::firewall::outbound_policy_uses_response_body)
             })
             .unwrap_or(false);
+        if ctx.has_outbound_waf_body_rules {
+            if let Some(permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseBodyWaf) {
+                ctx.response_body_waf_permit = Some(permit);
+            } else {
+                ctx.has_outbound_waf_body_rules = false;
+                ctx.response_body_waf_permit = None;
+                ctx.errors
+                    .get_or_insert_with(Vec::new)
+                    .push("outbound body WAF memory admission rejected".to_string());
+            }
+        } else {
+            ctx.response_body_waf_permit = None;
+        }
 
         // 1. Initial Outbound WAF (Status & Headers)
         let outbound_ctx = crate::firewall::OutboundContext {
@@ -9408,72 +9695,8 @@ impl ProxyHttp for EdgeProxy {
             bytes_sent: 0,
         };
 
-        let mut matched_outbound = None;
-        for policy in &ctx.compiled_plans.global_firewall {
-            if let Some(action) = crate::firewall::compiled::evaluate_compiled_outbound_policy(
-                policy,
-                session,
-                &ctx.request_body,
-                &outbound_ctx,
-                Self::forwarded_proto(session, ctx),
-            ) {
-                matched_outbound = Some(action);
-                break;
-            }
-        }
-        if matched_outbound.is_none() && ctx.compiled_plans.global_firewall.is_empty() {
-            crate::metrics::METRICS.waf.record_legacy_fallback();
-            if let Some(ref global_policies) = ctx.firewall_policies_snapshot {
-                for gp in global_policies.iter() {
-                    if !gp.is_on {
-                        continue;
-                    }
-                    if let Some(action) = crate::firewall::evaluate_outbound_policy(
-                        gp,
-                        session,
-                        &ctx.request_body,
-                        &outbound_ctx,
-                        Self::forwarded_proto(session, ctx),
-                    ) {
-                        matched_outbound = Some(action);
-                        break;
-                    }
-                }
-            }
-        }
-        if matched_outbound.is_none() {
-            if let Some(server) = &ctx.server
-                && let Some(web) = &server.web
-                && let Some(fw_ref) = &web.firewall_ref
-                && fw_ref.is_on
-            {
-                if let Some(policy) = &web.firewall_policy {
-                    let compiled_policy = server
-                        .id
-                        .and_then(|id| ctx.compiled_plans.server_firewall.get(&id));
-                    matched_outbound = if let Some(compiled_policy) = compiled_policy {
-                        crate::firewall::compiled::evaluate_compiled_outbound_policy_with_server(
-                            compiled_policy,
-                            session,
-                            &ctx.request_body,
-                            &outbound_ctx,
-                            Self::forwarded_proto(session, ctx),
-                            ctx.server.as_deref(),
-                        )
-                    } else {
-                        crate::metrics::METRICS.waf.record_legacy_fallback();
-                        crate::firewall::evaluate_outbound_policy_with_server(
-                            policy,
-                            session,
-                            &ctx.request_body,
-                            &outbound_ctx,
-                            Self::forwarded_proto(session, ctx),
-                            ctx.server.as_deref(),
-                        )
-                    };
-                }
-            }
-        }
+        let matched_outbound =
+            Self::evaluate_outbound_waf_compiled_first(session, ctx, &outbound_ctx);
 
         if let Some(action) = matched_outbound {
             if action.action_code == "block" {
@@ -9931,6 +10154,7 @@ impl ProxyHttp for EdgeProxy {
         let result =
             tokio::task::block_in_place(|| Self::convert_to_webp(&source_type, &pending, quality));
         ctx.webp_convert_enabled = false;
+        Self::release_response_transform(ctx);
 
         match result {
             Ok(converted) => {
@@ -9964,6 +10188,7 @@ impl ProxyHttp for EdgeProxy {
             *body = Some(block_body);
             ctx.has_outbound_waf_body_rules = false;
             ctx.outbound_waf_body_evaluated = true;
+            ctx.response_body_waf_permit = None;
             ctx.response_body_buffer.clear();
             if let Some(chunk) = body.as_ref() {
                 ctx.response_body_len += chunk.len();
@@ -9990,6 +10215,7 @@ impl ProxyHttp for EdgeProxy {
                     pending.extend_from_slice(&chunk);
                     ctx.optimize_enabled = false;
                     ctx.optimize_kind = None;
+                    Self::release_response_transform(ctx);
                     *body = Some(Bytes::from(pending));
                 } else {
                     ctx.optimize_pending_body.extend_from_slice(&chunk);
@@ -10031,6 +10257,7 @@ impl ProxyHttp for EdgeProxy {
                 }
                 ctx.optimize_enabled = false;
                 ctx.optimize_kind = None;
+                Self::release_response_transform(ctx);
             }
         }
 
@@ -10048,11 +10275,13 @@ impl ProxyHttp for EdgeProxy {
             let pending = ctx.hls_playlist_pending_body.take();
             if pending.is_empty() {
                 ctx.hls_playlist_enabled = false;
+                Self::release_response_transform(ctx);
             } else {
                 let Some(_permit) = crate::adaptive_cpu::CPU_TRANSFORM_GATE
                     .acquire_required_blocking(std::time::Duration::from_millis(100))
                 else {
                     ctx.hls_playlist_enabled = false;
+                    Self::release_response_transform(ctx);
                     return Err(Error::explain(
                         Custom("HlsTransformOverloaded"),
                         "CPU transform gate overloaded while rewriting HLS playlist",
@@ -10079,6 +10308,7 @@ impl ProxyHttp for EdgeProxy {
                     .unwrap_or(body_text);
                 *body = Some(Bytes::from(rewritten));
                 ctx.hls_playlist_enabled = false;
+                Self::release_response_transform(ctx);
             }
         }
 
@@ -10093,6 +10323,7 @@ impl ProxyHttp for EdgeProxy {
             let (Some(key), Some(iv)) = (ctx.hls_segment_key, ctx.hls_segment_iv) else {
                 ctx.hls_segment_pending_body.clear();
                 ctx.hls_segment_encrypt_enabled = false;
+                Self::release_response_transform(ctx);
                 return Err(Error::explain(
                     Custom("HlsEncryptionMissingKey"),
                     "HLS segment encryption key is missing",
@@ -10103,6 +10334,7 @@ impl ProxyHttp for EdgeProxy {
             else {
                 ctx.hls_segment_pending_body.clear();
                 ctx.hls_segment_encrypt_enabled = false;
+                Self::release_response_transform(ctx);
                 return Err(Error::explain(
                     Custom("HlsTransformOverloaded"),
                     "CPU transform gate overloaded while encrypting HLS segment",
@@ -10113,6 +10345,7 @@ impl ProxyHttp for EdgeProxy {
                 tokio::task::block_in_place(|| Self::aes128_cbc_encrypt(&pending, key, iv));
             *body = Some(Bytes::from(encrypted));
             ctx.hls_segment_encrypt_enabled = false;
+            Self::release_response_transform(ctx);
         }
 
         if ctx.has_outbound_waf_body_rules && !ctx.outbound_waf_body_evaluated {
@@ -10140,6 +10373,7 @@ impl ProxyHttp for EdgeProxy {
                         ctx.waf_set_id = action.set_id;
                         ctx.waf_action = Some(action.action_code.clone());
                         ctx.firewall_blocked = true;
+                        ctx.response_body_waf_permit = None;
                         self.maybe_report_firewall_event(
                             session,
                             ctx,
@@ -10154,6 +10388,7 @@ impl ProxyHttp for EdgeProxy {
                         ));
                     }
                 }
+                ctx.response_body_waf_permit = None;
             } else {
                 if let Some(chunk) = body.take() {
                     let previous_len = ctx.response_body_buffer.len();
@@ -10203,6 +10438,7 @@ impl ProxyHttp for EdgeProxy {
                         ctx.waf_set_id = action.set_id;
                         ctx.waf_action = Some(action.action_code.clone());
                         ctx.firewall_blocked = true;
+                        ctx.response_body_waf_permit = None;
                         self.maybe_report_firewall_event(
                             session,
                             ctx,
@@ -10223,6 +10459,7 @@ impl ProxyHttp for EdgeProxy {
                 if buffered_len > 0 {
                     *body = Some(Bytes::from(ctx.response_body_buffer.take()));
                 }
+                ctx.response_body_waf_permit = None;
             }
         }
 
@@ -10511,6 +10748,30 @@ mod tests {
         assert_eq!(EdgeProxy::redirect_to_https_status(302), 302);
         assert_eq!(EdgeProxy::redirect_to_https_status(307), 307);
         assert_eq!(EdgeProxy::redirect_to_https_status(308), 308);
+    }
+
+    #[test]
+    fn request_limit_ip_key_aggregates_ipv6_to_64() {
+        let a: std::net::IpAddr = "2001:db8:abcd:12::1".parse().unwrap();
+        let b: std::net::IpAddr = "2001:db8:abcd:12:ffff:ffff:ffff:ffff".parse().unwrap();
+        let c: std::net::IpAddr = "2001:db8:abcd:13::1".parse().unwrap();
+        assert_eq!(
+            EdgeProxy::request_limit_ip_key(a),
+            EdgeProxy::request_limit_ip_key(b)
+        );
+        assert_ne!(
+            EdgeProxy::request_limit_ip_key(a),
+            EdgeProxy::request_limit_ip_key(c)
+        );
+    }
+
+    #[test]
+    fn proxy_ctx_starts_in_init_phase() {
+        let ctx = crate::proxy::ProxyCTX::default();
+        assert_eq!(ctx.request_phase, crate::proxy::RequestPhase::Init);
+        assert!(ctx.request_body_waf_permit.is_none());
+        assert!(ctx.response_body_waf_permit.is_none());
+        assert!(ctx.response_transform_permit.is_none());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::cell::OnceCell;
+use std::net::IpAddr;
 use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -349,7 +350,17 @@ pub fn match_rule(
     request_body: &[u8],
     scheme: &str,
 ) -> bool {
-    let facts = RequestFacts::new(session, request_body, scheme);
+    match_rule_with_server(rule, session, request_body, scheme, None)
+}
+
+pub fn match_rule_with_server(
+    rule: &HTTPFirewallRule,
+    session: &Session,
+    request_body: &[u8],
+    scheme: &str,
+    server: Option<&ServerConfig>,
+) -> bool {
+    let facts = RequestFacts::new_with_server(session, request_body, scheme, server);
     match_rule_with_facts(rule, &facts)
 }
 
@@ -526,6 +537,8 @@ static CC_COUNTERS: Lazy<DashMap<String, crate::firewall::state::RollingCounter>
 static CC_COUNTER_LAST_SWEEP: AtomicI64 = AtomicI64::new(0);
 const CC_COUNTER_MAX_PERIOD_SECS: i64 = 7 * 86_400;
 const CC_COUNTER_SWEEP_INTERVAL_SECS: i64 = 60;
+const CC_COUNTER_MAX_ENTRIES_NORMAL: usize = 1_000_000;
+const CC_COUNTER_MAX_ENTRIES_PRESSURE: usize = 131_072;
 
 pub(crate) struct RequestFacts<'a> {
     session: &'a Session,
@@ -1110,7 +1123,11 @@ pub(crate) fn cc_value_with_facts(
             .collect::<Vec<_>>();
         format!("WAF-CC2-{}-{}:{}", param, period, key_values.join("@"))
     } else {
-        format!("WAF-CC:{}:{}", period, facts.remote_addr())
+        format!(
+            "WAF-CC:{}:{}",
+            period,
+            aggregate_ip_counter_key(facts.remote_ip())
+        )
     };
 
     increase_counter(key, period).to_string()
@@ -1119,10 +1136,38 @@ pub(crate) fn cc_value_with_facts(
 pub(crate) fn increase_counter(key: String, period_secs: i64) -> u64 {
     let now = crate::utils::time::now_timestamp();
     sweep_cc_counters(now);
+    if !CC_COUNTERS.contains_key(&key) && CC_COUNTERS.len() >= cc_counter_capacity() {
+        sweep_cc_counters_force(now);
+        if CC_COUNTERS.len() >= cc_counter_capacity() {
+            return u64::MAX;
+        }
+    }
     CC_COUNTERS
         .entry(key)
         .or_default()
         .increment(now, period_secs)
+}
+
+pub(crate) fn aggregate_ip_counter_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            std::net::Ipv6Addr::from(octets).to_string()
+        }
+    }
+}
+
+fn cc_counter_capacity() -> usize {
+    if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
+        CC_COUNTER_MAX_ENTRIES_PRESSURE
+    } else {
+        CC_COUNTER_MAX_ENTRIES_NORMAL
+    }
 }
 
 fn sweep_cc_counters(now: i64) {
@@ -1137,6 +1182,10 @@ fn sweep_cc_counters(now: i64) {
         return;
     }
 
+    CC_COUNTERS.retain(|_, counter| !counter.is_stale(now, CC_COUNTER_MAX_PERIOD_SECS));
+}
+
+fn sweep_cc_counters_force(now: i64) {
     CC_COUNTERS.retain(|_, counter| !counter.is_stale(now, CC_COUNTER_MAX_PERIOD_SECS));
 }
 

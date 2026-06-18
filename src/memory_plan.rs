@@ -84,13 +84,27 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "cache_and_background",
                 purpose: "use remaining memory after headroom, connection and origin budgets",
                 policy: format!(
-                    "cache_budget={} bloom_budget={} negative_cache_limit={} background_limit={} active_background={}; connection and origin-establishment paths win during pressure",
+                    "cache_budget={} bloom_budget={} negative_cache_limit={} background_limit={} revalidate_limit={} active_background={}; connection and origin-establishment paths win during pressure",
                     snapshot.cache_budget_bytes,
                     snapshot.bloom_budget_bytes,
                     snapshot.negative_cache_limit,
                     snapshot.background_work_limit,
+                    snapshot.cache_revalidate_limit,
                     snapshot.estimated_background_work
                 ),
+            },
+            MemoryPlanItem {
+                area: "waf_body",
+                purpose: "bound request/response body inspection buffers so WAF cannot starve connection and origin establishment",
+                policy: format!(
+                    "request_body_limit={} response_body_limit={}",
+                    snapshot.request_body_waf_limit, snapshot.response_body_waf_limit
+                ),
+            },
+            MemoryPlanItem {
+                area: "response_transform",
+                purpose: "bound WebP, minify and HLS transformation buffers behind connection and origin paths",
+                policy: format!("limit={}", snapshot.response_transform_limit),
             },
         ],
     }

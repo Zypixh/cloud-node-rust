@@ -13,6 +13,7 @@ pub struct CandidateRulesetStats {
     pub hits: AtomicU64,
     pub blocks: AtomicU64,
     pub observed: AtomicU64,
+    pub last_seen: AtomicI64,
 }
 
 impl CandidateRulesetStats {
@@ -21,7 +22,16 @@ impl CandidateRulesetStats {
             hits: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
             observed: AtomicU64::new(0),
+            last_seen: AtomicI64::new(crate::utils::time::now_timestamp()),
         }
+    }
+
+    fn touch(&self, now: i64) {
+        self.last_seen.store(now, Ordering::Relaxed);
+    }
+
+    fn is_idle(&self, now: i64) -> bool {
+        now.saturating_sub(self.last_seen.load(Ordering::Relaxed)) >= CANDIDATE_STATS_IDLE_SECS
     }
 }
 
@@ -50,6 +60,18 @@ fn canonical_lookup_ip(ip: IpAddr) -> IpAddr {
         return IpAddr::V4(v4);
     }
     ip
+}
+
+fn rate_limit_key_ip(ip: IpAddr) -> IpAddr {
+    let ip = canonical_lookup_ip(ip);
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+    }
 }
 
 impl IpAddrRange {
@@ -83,6 +105,9 @@ const GC_INTERVAL_SECS: u64 = 60;
 /// Acceptable trade-off: benign long-tail sessions see their per-IP limiter
 /// reconstructed slightly more often, but quota enforcement is unaffected.
 const LIMITER_IDLE_SECS: i64 = 90;
+const LIMITER_SWEEP_INTERVAL_SECS: i64 = 30;
+const MAX_IP_LIMITERS_NORMAL: usize = 2_000_000;
+const MAX_IP_LIMITERS_PRESSURE: usize = 262_144;
 
 /// Wraps a RateLimiter with a last-seen timestamp for GC and the QPS value the
 /// quota was built from, so hot-reload can detect and replace stale limiters.
@@ -118,8 +143,16 @@ impl<K: std::hash::Hash + Eq + Clone + Send + Sync + 'static> TrackedLimiter<K> 
 const ROLLING_COUNTER_BUCKETS: usize = 256;
 const COUNTER_SWEEP_INTERVAL_SECS: i64 = 60;
 const COUNTER_MAX_PERIOD_SECS: i64 = 7 * 86_400;
+const MAX_ROLLING_COUNTERS_NORMAL: usize = 1_000_000;
+const MAX_ROLLING_COUNTERS_PRESSURE: usize = 131_072;
+const MAX_IP_BW_COUNTERS_NORMAL: usize = 1_000_000;
+const MAX_IP_BW_COUNTERS_PRESSURE: usize = 131_072;
+const CANDIDATE_STATS_IDLE_SECS: i64 = 6 * 3600;
+const MAX_CANDIDATE_STATS_NORMAL: usize = 131_072;
+const MAX_CANDIDATE_STATS_PRESSURE: usize = 16_384;
 
 type NetworkSnapshot = HashMap<i64, Arc<Vec<(IpNet, i64)>>>;
+type RangeSnapshot = HashMap<i64, Arc<Vec<(IpAddrRange, i64)>>>;
 
 pub(crate) struct RollingCounter {
     buckets: [u64; ROLLING_COUNTER_BUCKETS],
@@ -229,11 +262,15 @@ pub struct WafStateManager {
     list_gray_network_snapshots: ArcSwap<NetworkSnapshot>,
     server_limiters: DashMap<i64, TrackedLimiter<i64>>,
     ip_limiters: DashMap<(i64, IpAddr), TrackedLimiter<IpAddr>>,
+    limiter_last_sweep: AtomicI64,
     counters: DashMap<String, RollingCounter>,
     counter_last_sweep: AtomicI64,
     list_block_ranges: DashMap<(i64, IpAddrRange), i64>,
+    list_block_range_snapshots: ArcSwap<RangeSnapshot>,
     list_white_ranges: DashMap<(i64, IpAddrRange), i64>,
+    list_white_range_snapshots: ArcSwap<RangeSnapshot>,
     list_gray_ranges: DashMap<(i64, IpAddrRange), i64>,
+    list_gray_range_snapshots: ArcSwap<RangeSnapshot>,
     ip_bw_counters: DashMap<(i64, IpAddr), Arc<(AtomicU64, AtomicU64)>>,
     kernel_filter: RwLock<Arc<dyn KernelFilter>>,
     pub candidate_stats: DashMap<(i64, i64), Arc<CandidateRulesetStats>>,
@@ -268,11 +305,15 @@ impl WafStateManager {
             list_gray_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
             server_limiters: DashMap::new(),
             ip_limiters: DashMap::new(),
+            limiter_last_sweep: AtomicI64::new(0),
             counters: DashMap::new(),
             counter_last_sweep: AtomicI64::new(0),
             list_block_ranges: DashMap::new(),
+            list_block_range_snapshots: ArcSwap::from_pointee(HashMap::new()),
             list_white_ranges: DashMap::new(),
+            list_white_range_snapshots: ArcSwap::from_pointee(HashMap::new()),
             list_gray_ranges: DashMap::new(),
+            list_gray_range_snapshots: ArcSwap::from_pointee(HashMap::new()),
             ip_bw_counters: DashMap::with_shard_amount(64),
             kernel_filter: RwLock::new(Arc::new(NoopFilter)),
             candidate_stats: DashMap::new(),
@@ -319,7 +360,7 @@ impl WafStateManager {
                 server_id,
                 now,
             )
-            || Self::contains_scoped_range(&self.list_white_ranges, ip, server_id, now)
+            || Self::contains_scoped_range(&self.list_white_range_snapshots, ip, server_id, now)
     }
 
     pub fn is_blocked(&self, ip: IpAddr, server_id: i64) -> bool {
@@ -329,7 +370,7 @@ impl WafStateManager {
             || Self::contains_scoped_ip(&self.list_blocks, ip, server_id, now)
             || Self::contains_scoped_network(&self.block_network_snapshots, ip, server_id, now)
             || Self::contains_scoped_network(&self.list_block_network_snapshots, ip, server_id, now)
-            || Self::contains_scoped_range(&self.list_block_ranges, ip, server_id, now)
+            || Self::contains_scoped_range(&self.list_block_range_snapshots, ip, server_id, now)
     }
 
     pub fn is_graylisted(&self, ip: IpAddr, server_id: i64) -> bool {
@@ -339,7 +380,7 @@ impl WafStateManager {
             || Self::contains_scoped_ip(&self.list_graylists, ip, server_id, now)
             || Self::contains_scoped_network(&self.gray_network_snapshots, ip, server_id, now)
             || Self::contains_scoped_network(&self.list_gray_network_snapshots, ip, server_id, now)
-            || Self::contains_scoped_range(&self.list_gray_ranges, ip, server_id, now)
+            || Self::contains_scoped_range(&self.list_gray_range_snapshots, ip, server_id, now)
     }
 
     pub fn apply_black_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
@@ -632,6 +673,7 @@ impl WafStateManager {
         if max_qps == 0 {
             return true;
         }
+        self.sweep_limiters_if_needed();
         // Lazily insert a new limiter, then check whether max_qps has changed
         // since the limiter was created.  If it has, evict the stale entry and
         // insert a fresh one so the new quota takes effect immediately.
@@ -656,6 +698,16 @@ impl WafStateManager {
         if max_qps == 0 {
             return true;
         }
+        let ip = rate_limit_key_ip(ip);
+        self.sweep_limiters_if_needed();
+        if !self.ip_limiters.contains_key(&(server_id, ip))
+            && self.ip_limiters.len() >= self.ip_limiter_capacity()
+        {
+            self.sweep_limiters(crate::utils::time::now_timestamp());
+            if self.ip_limiters.len() >= self.ip_limiter_capacity() {
+                return false;
+            }
+        }
         // Same quota hot-reload logic as check_rate_limit.
         let entry = self.ip_limiters.entry((server_id, ip)).or_insert_with(|| {
             let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
@@ -674,6 +726,35 @@ impl WafStateManager {
         entry.limiter.check_key(&ip).is_ok()
     }
 
+    fn ip_limiter_capacity(&self) -> usize {
+        if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
+            MAX_IP_LIMITERS_PRESSURE
+        } else {
+            MAX_IP_LIMITERS_NORMAL
+        }
+    }
+
+    fn sweep_limiters_if_needed(&self) {
+        let now = crate::utils::time::now_timestamp();
+        let last = self.limiter_last_sweep.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < LIMITER_SWEEP_INTERVAL_SECS {
+            return;
+        }
+        if self
+            .limiter_last_sweep
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.sweep_limiters(now);
+        }
+    }
+
+    fn sweep_limiters(&self, now: i64) {
+        self.server_limiters
+            .retain(|_, tracked| !tracked.is_idle(now));
+        self.ip_limiters.retain(|_, tracked| !tracked.is_idle(now));
+    }
+
     pub fn record_failure(&self, key: String) -> u64 {
         self.increase_counter(format!("FAIL:{}", key), 3600)
     }
@@ -687,10 +768,25 @@ impl WafStateManager {
         let now = crate::utils::time::now_timestamp();
         let period_secs = period_secs.clamp(1, COUNTER_MAX_PERIOD_SECS);
         self.sweep_counters(now);
+        let key = format!("{}:{}", period_secs, key);
+        if !self.counters.contains_key(&key) && self.counters.len() >= self.counter_capacity() {
+            self.sweep_counters_force(now);
+            if self.counters.len() >= self.counter_capacity() {
+                return u64::MAX;
+            }
+        }
         self.counters
-            .entry(format!("{}:{}", period_secs, key))
+            .entry(key)
             .or_default()
             .increment(now, period_secs)
+    }
+
+    fn counter_capacity(&self) -> usize {
+        if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
+            MAX_ROLLING_COUNTERS_PRESSURE
+        } else {
+            MAX_ROLLING_COUNTERS_NORMAL
+        }
     }
 
     fn sweep_counters(&self, now: i64) {
@@ -705,6 +801,11 @@ impl WafStateManager {
         {
             return;
         }
+        self.counters
+            .retain(|_, counter| !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS));
+    }
+
+    fn sweep_counters_force(&self, now: i64) {
         self.counters
             .retain(|_, counter| !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS));
     }
@@ -847,6 +948,7 @@ impl WafStateManager {
         self.list_graylists.retain(|_, expiry| now < *expiry);
         self.counters
             .retain(|_, counter| !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS));
+        self.sweep_candidate_stats(now);
 
         self.server_limiters
             .retain(|_, tracked| !tracked.is_idle(now));
@@ -854,6 +956,17 @@ impl WafStateManager {
         self.list_block_ranges.retain(|_, expiry| now < *expiry);
         self.list_white_ranges.retain(|_, expiry| now < *expiry);
         self.list_gray_ranges.retain(|_, expiry| now < *expiry);
+        Self::rebuild_range_snapshot(
+            &self.list_block_ranges,
+            &self.list_block_range_snapshots,
+            now,
+        );
+        Self::rebuild_range_snapshot(
+            &self.list_white_ranges,
+            &self.list_white_range_snapshots,
+            now,
+        );
+        Self::rebuild_range_snapshot(&self.list_gray_ranges, &self.list_gray_range_snapshots, now);
         self.ip_bw_counters.retain(|_, entry| {
             let win = entry.1.load(Ordering::Relaxed);
             (now as u64).saturating_sub(win) < 120
@@ -861,51 +974,162 @@ impl WafStateManager {
     }
 
     pub fn apply_list_black_range_until(&self, server_id: i64, range: IpAddrRange, expiry: i64) {
-        Self::apply_scoped_range(&self.list_block_ranges, server_id, range, expiry);
+        Self::apply_scoped_range(
+            &self.list_block_ranges,
+            &self.list_block_range_snapshots,
+            server_id,
+            range,
+            expiry,
+        );
     }
 
     pub fn remove_list_black_range(&self, server_id: i64, range: IpAddrRange) {
-        self.list_block_ranges.remove(&(server_id, range));
+        Self::remove_scoped_range(
+            &self.list_block_ranges,
+            &self.list_block_range_snapshots,
+            server_id,
+            range,
+        );
     }
 
     pub fn apply_list_white_range_until(&self, server_id: i64, range: IpAddrRange, expiry: i64) {
-        Self::apply_scoped_range(&self.list_white_ranges, server_id, range, expiry);
+        Self::apply_scoped_range(
+            &self.list_white_ranges,
+            &self.list_white_range_snapshots,
+            server_id,
+            range,
+            expiry,
+        );
     }
 
     pub fn remove_list_white_range(&self, server_id: i64, range: IpAddrRange) {
-        self.list_white_ranges.remove(&(server_id, range));
+        Self::remove_scoped_range(
+            &self.list_white_ranges,
+            &self.list_white_range_snapshots,
+            server_id,
+            range,
+        );
     }
 
     pub fn apply_list_gray_range_until(&self, server_id: i64, range: IpAddrRange, expiry: i64) {
-        Self::apply_scoped_range(&self.list_gray_ranges, server_id, range, expiry);
+        Self::apply_scoped_range(
+            &self.list_gray_ranges,
+            &self.list_gray_range_snapshots,
+            server_id,
+            range,
+            expiry,
+        );
     }
 
     pub fn remove_list_gray_range(&self, server_id: i64, range: IpAddrRange) {
-        self.list_gray_ranges.remove(&(server_id, range));
+        Self::remove_scoped_range(
+            &self.list_gray_ranges,
+            &self.list_gray_range_snapshots,
+            server_id,
+            range,
+        );
     }
 
     fn apply_scoped_range(
         map: &DashMap<(i64, IpAddrRange), i64>,
+        snapshots: &ArcSwap<RangeSnapshot>,
         server_id: i64,
         range: IpAddrRange,
         expiry: i64,
     ) {
-        if crate::utils::time::now_timestamp() >= expiry {
-            map.remove(&(server_id, range));
+        let now = crate::utils::time::now_timestamp();
+        if now >= expiry {
+            Self::remove_scoped_range(map, snapshots, server_id, range);
         } else {
             map.insert((server_id, range), expiry);
+            Self::insert_range_snapshot(snapshots, server_id, range, expiry, now);
         }
     }
 
-    fn contains_scoped_range(
+    fn remove_scoped_range(
         map: &DashMap<(i64, IpAddrRange), i64>,
+        snapshots: &ArcSwap<RangeSnapshot>,
+        server_id: i64,
+        range: IpAddrRange,
+    ) {
+        map.remove(&(server_id, range));
+        let now = crate::utils::time::now_timestamp();
+        let current = snapshots.load();
+        let mut next = current.as_ref().clone();
+        if let Some(ranges) = next.get_mut(&server_id) {
+            let retained = ranges
+                .iter()
+                .copied()
+                .filter(|(candidate, expiry)| *candidate != range && now < *expiry)
+                .collect::<Vec<_>>();
+            if retained.is_empty() {
+                next.remove(&server_id);
+            } else {
+                next.insert(server_id, Arc::new(retained));
+            }
+        }
+        snapshots.store(Arc::new(next));
+    }
+
+    fn insert_range_snapshot(
+        snapshots: &ArcSwap<RangeSnapshot>,
+        server_id: i64,
+        range: IpAddrRange,
+        expiry: i64,
+        now: i64,
+    ) {
+        let current = snapshots.load();
+        let mut next = current.as_ref().clone();
+        let mut ranges = next
+            .get(&server_id)
+            .map(|ranges| ranges.as_ref().clone())
+            .unwrap_or_default();
+        ranges.retain(|(candidate, existing_expiry)| *candidate != range && now < *existing_expiry);
+        ranges.push((range, expiry));
+        next.insert(server_id, Arc::new(ranges));
+        snapshots.store(Arc::new(next));
+    }
+
+    fn rebuild_range_snapshot(
+        map: &DashMap<(i64, IpAddrRange), i64>,
+        snapshots: &ArcSwap<RangeSnapshot>,
+        now: i64,
+    ) {
+        let mut next: RangeSnapshot = HashMap::new();
+        for entry in map.iter() {
+            let (server_id, range) = *entry.key();
+            let expiry = *entry.value();
+            if now >= expiry {
+                continue;
+            }
+            let ranges = next
+                .entry(server_id)
+                .or_insert_with(|| Arc::new(Vec::new()));
+            Arc::make_mut(ranges).push((range, expiry));
+        }
+        snapshots.store(Arc::new(next));
+    }
+
+    fn contains_scoped_range(
+        snapshots: &ArcSwap<RangeSnapshot>,
         ip: IpAddr,
         server_id: i64,
         now: i64,
     ) -> bool {
-        map.iter().any(|entry| {
-            let (sid, range) = entry.key();
-            (*sid == 0 || *sid == server_id) && *entry.value() > now && range.contains(ip)
+        let snapshot = snapshots.load();
+        Self::ranges_contain_ip(snapshot.get(&0), ip, now)
+            || (server_id != 0 && Self::ranges_contain_ip(snapshot.get(&server_id), ip, now))
+    }
+
+    fn ranges_contain_ip(
+        ranges: Option<&Arc<Vec<(IpAddrRange, i64)>>>,
+        ip: IpAddr,
+        now: i64,
+    ) -> bool {
+        ranges.is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|(range, expiry)| now < *expiry && range.contains(ip))
         })
     }
 
@@ -922,8 +1146,19 @@ impl WafStateManager {
         if limit_bytes == 0 {
             return false;
         }
-        let ip = canonical_lookup_ip(ip);
+        let ip = rate_limit_key_ip(ip);
         let now_secs = crate::utils::time::now_timestamp() as u64;
+        if !self.ip_bw_counters.contains_key(&(server_id, ip))
+            && self.ip_bw_counters.len() >= self.ip_bw_counter_capacity()
+        {
+            self.ip_bw_counters.retain(|_, entry| {
+                let win = entry.1.load(Ordering::Relaxed);
+                (now_secs).saturating_sub(win) < 120
+            });
+            if self.ip_bw_counters.len() >= self.ip_bw_counter_capacity() {
+                return true;
+            }
+        }
         let entry = self
             .ip_bw_counters
             .entry((server_id, ip))
@@ -942,6 +1177,14 @@ impl WafStateManager {
         total > limit_bytes
     }
 
+    fn ip_bw_counter_capacity(&self) -> usize {
+        if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
+            MAX_IP_BW_COUNTERS_PRESSURE
+        } else {
+            MAX_IP_BW_COUNTERS_NORMAL
+        }
+    }
+
     pub fn record_candidate_hit(
         &self,
         policy_id: i64,
@@ -949,10 +1192,21 @@ impl WafStateManager {
         blocked: bool,
         observed: bool,
     ) {
+        let now = crate::utils::time::now_timestamp();
+        let key = (policy_id, version);
+        if !self.candidate_stats.contains_key(&key)
+            && self.candidate_stats.len() >= self.candidate_stats_capacity()
+        {
+            self.sweep_candidate_stats(now);
+            if self.candidate_stats.len() >= self.candidate_stats_capacity() {
+                return;
+            }
+        }
         let entry = self
             .candidate_stats
-            .entry((policy_id, version))
+            .entry(key)
             .or_insert_with(|| Arc::new(CandidateRulesetStats::new()));
+        entry.touch(now);
         entry.hits.fetch_add(1, Ordering::Relaxed);
         if blocked {
             entry.blocks.fetch_add(1, Ordering::Relaxed);
@@ -960,6 +1214,18 @@ impl WafStateManager {
         if observed {
             entry.observed.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn candidate_stats_capacity(&self) -> usize {
+        if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
+            MAX_CANDIDATE_STATS_PRESSURE
+        } else {
+            MAX_CANDIDATE_STATS_NORMAL
+        }
+    }
+
+    fn sweep_candidate_stats(&self, now: i64) {
+        self.candidate_stats.retain(|_, stats| !stats.is_idle(now));
     }
 
     pub fn take_candidate_stats(&self) -> Vec<CandidateStatsSnapshot> {
@@ -992,4 +1258,93 @@ pub fn start_gc_task(state: Arc<WafStateManager>) {
             state.gc_once();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv6Addr};
+
+    #[test]
+    fn ipv6_rate_limit_keys_are_aggregated_to_64() {
+        let a = IpAddr::V6("2001:db8:abcd:12::1".parse::<Ipv6Addr>().unwrap());
+        let b = IpAddr::V6(
+            "2001:db8:abcd:12:ffff:ffff:ffff:ffff"
+                .parse::<Ipv6Addr>()
+                .unwrap(),
+        );
+        let c = IpAddr::V6("2001:db8:abcd:13::1".parse::<Ipv6Addr>().unwrap());
+
+        assert_eq!(rate_limit_key_ip(a), rate_limit_key_ip(b));
+        assert_ne!(rate_limit_key_ip(a), rate_limit_key_ip(c));
+    }
+
+    #[test]
+    fn limiter_gc_removes_idle_entries() {
+        let state = WafStateManager::new();
+        assert!(state.check_ip_rate_limit(7, "192.0.2.1".parse().unwrap(), 10));
+        assert_eq!(state.ip_limiters.len(), 1);
+        for entry in state.ip_limiters.iter() {
+            entry.last_seen.store(
+                crate::utils::time::now_timestamp() - LIMITER_IDLE_SECS - 1,
+                Ordering::Relaxed,
+            );
+        }
+        state.sweep_limiters(crate::utils::time::now_timestamp());
+        assert_eq!(state.ip_limiters.len(), 0);
+    }
+
+    #[test]
+    fn range_snapshots_track_apply_remove_and_gc() {
+        let state = WafStateManager::new();
+        let now = crate::utils::time::now_timestamp();
+        let range = IpAddrRange {
+            from: u32::from_be_bytes([203, 0, 113, 0]) as u128,
+            to: u32::from_be_bytes([203, 0, 113, 255]) as u128,
+            v6: false,
+        };
+        let inside: IpAddr = "203.0.113.10".parse().unwrap();
+        let outside: IpAddr = "203.0.114.10".parse().unwrap();
+
+        state.apply_list_black_range_until(42, range, now + 60);
+        assert!(state.is_blocked(inside, 42));
+        assert!(!state.is_blocked(outside, 42));
+
+        state.remove_list_black_range(42, range);
+        assert!(!state.is_blocked(inside, 42));
+
+        state.apply_list_black_range_until(42, range, now - 1);
+        state.gc_once();
+        assert!(!state.is_blocked(inside, 42));
+    }
+
+    #[test]
+    fn bandwidth_counters_aggregate_ipv6_to_64() {
+        let state = WafStateManager::new();
+        let a = IpAddr::V6("2001:db8:abcd:12::1".parse::<Ipv6Addr>().unwrap());
+        let b = IpAddr::V6(
+            "2001:db8:abcd:12:ffff:ffff:ffff:ffff"
+                .parse::<Ipv6Addr>()
+                .unwrap(),
+        );
+
+        assert!(!state.check_ip_bandwidth(7, a, 60, 100));
+        assert!(state.check_ip_bandwidth(7, b, 60, 100));
+        assert_eq!(state.ip_bw_counters.len(), 1);
+    }
+
+    #[test]
+    fn candidate_stats_are_evicted_after_idle_window() {
+        let state = WafStateManager::new();
+        state.record_candidate_hit(42, 9, true, false);
+        assert_eq!(state.candidate_stats.len(), 1);
+        for entry in state.candidate_stats.iter() {
+            entry.last_seen.store(
+                crate::utils::time::now_timestamp() - CANDIDATE_STATS_IDLE_SECS - 1,
+                Ordering::Relaxed,
+            );
+        }
+        state.gc_once();
+        assert_eq!(state.candidate_stats.len(), 0);
+    }
 }

@@ -10,6 +10,10 @@ pub enum AdmissionClass {
     Http3Request,
     OriginConnect,
     BackgroundWork,
+    RequestBodyWaf,
+    ResponseBodyWaf,
+    ResponseTransform,
+    CacheRevalidate,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -33,6 +37,10 @@ pub struct GovernorSnapshot {
     pub h3_request_limit_per_connection: usize,
     pub origin_connect_limit: usize,
     pub background_work_limit: usize,
+    pub request_body_waf_limit: usize,
+    pub response_body_waf_limit: usize,
+    pub response_transform_limit: usize,
+    pub cache_revalidate_limit: usize,
     pub cache_budget_bytes: u64,
     pub bloom_budget_bytes: u64,
     pub negative_cache_limit: usize,
@@ -63,6 +71,10 @@ const H2_STREAM_ESTIMATED_BYTES: u64 = 16 * 1024;
 const H3_REQUEST_ESTIMATED_BYTES: u64 = 24 * 1024;
 const ORIGIN_CONNECT_ESTIMATED_BYTES: u64 = 32 * 1024;
 const BACKGROUND_WORK_ESTIMATED_BYTES: u64 = 64 * 1024;
+const REQUEST_BODY_WAF_ESTIMATED_BYTES: u64 = 2 * 1024 * 1024;
+const RESPONSE_BODY_WAF_ESTIMATED_BYTES: u64 = 512 * 1024;
+const RESPONSE_TRANSFORM_ESTIMATED_BYTES: u64 = 16 * 1024 * 1024;
+const CACHE_REVALIDATE_ESTIMATED_BYTES: u64 = 64 * 1024;
 const KEEPALIVE_CONN_ESTIMATED_BYTES: u64 = 16 * 1024;
 const NEGATIVE_CACHE_ESTIMATED_BYTES: u64 = 160;
 
@@ -73,6 +85,10 @@ const MIN_H2_STREAM_LIMIT_PER_CONNECTION: usize = 256;
 const MIN_H3_REQUEST_LIMIT_PER_CONNECTION: usize = 256;
 const MIN_ORIGIN_CONNECT_LIMIT: usize = 16_384;
 const MIN_BACKGROUND_WORK_LIMIT: usize = 256;
+const MIN_REQUEST_BODY_WAF_LIMIT: usize = 128;
+const MIN_RESPONSE_BODY_WAF_LIMIT: usize = 256;
+const MIN_RESPONSE_TRANSFORM_LIMIT: usize = 32;
+const MIN_CACHE_REVALIDATE_LIMIT: usize = 64;
 const MIN_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 const MIN_BLOOM_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 const MIN_NEGATIVE_CACHE_ENTRIES: usize = 262_144;
@@ -84,6 +100,10 @@ const MAX_H2_STREAM_LIMIT_PER_CONNECTION: usize = 65_535;
 const MAX_H3_REQUEST_LIMIT_PER_CONNECTION: usize = 65_535;
 const MAX_ORIGIN_CONNECT_LIMIT: usize = 100_000_000;
 const MAX_BACKGROUND_WORK_LIMIT: usize = 1_000_000;
+const MAX_REQUEST_BODY_WAF_LIMIT: usize = 1_000_000;
+const MAX_RESPONSE_BODY_WAF_LIMIT: usize = 1_000_000;
+const MAX_RESPONSE_TRANSFORM_LIMIT: usize = 1_000_000;
+const MAX_CACHE_REVALIDATE_LIMIT: usize = 100_000;
 const MAX_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_BLOOM_BUDGET_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_NEGATIVE_CACHE_ENTRIES: usize = 64_000_000;
@@ -101,6 +121,10 @@ pub struct MemoryGovernor {
     h3_requests: AtomicU64,
     origin_connects: AtomicU64,
     background_work: AtomicU64,
+    request_body_waf: AtomicU64,
+    response_body_waf: AtomicU64,
+    response_transform: AtomicU64,
+    cache_revalidate: AtomicU64,
     cached_total_bytes: AtomicU64,
     cached_used_bytes: AtomicU64,
     cached_available_bytes: AtomicU64,
@@ -124,6 +148,10 @@ impl MemoryGovernor {
             h3_requests: AtomicU64::new(0),
             origin_connects: AtomicU64::new(0),
             background_work: AtomicU64::new(0),
+            request_body_waf: AtomicU64::new(0),
+            response_body_waf: AtomicU64::new(0),
+            response_transform: AtomicU64::new(0),
+            cache_revalidate: AtomicU64::new(0),
             cached_total_bytes: AtomicU64::new(0),
             cached_used_bytes: AtomicU64::new(0),
             cached_available_bytes: AtomicU64::new(0),
@@ -189,6 +217,30 @@ impl MemoryGovernor {
                 BACKGROUND_WORK_ESTIMATED_BYTES,
                 MIN_BACKGROUND_WORK_LIMIT,
                 MAX_BACKGROUND_WORK_LIMIT,
+            ),
+            AdmissionClass::RequestBodyWaf => connection_limit(
+                snapshot.available_bytes / 8,
+                REQUEST_BODY_WAF_ESTIMATED_BYTES,
+                MIN_REQUEST_BODY_WAF_LIMIT,
+                MAX_REQUEST_BODY_WAF_LIMIT,
+            ),
+            AdmissionClass::ResponseBodyWaf => connection_limit(
+                snapshot.available_bytes / 8,
+                RESPONSE_BODY_WAF_ESTIMATED_BYTES,
+                MIN_RESPONSE_BODY_WAF_LIMIT,
+                MAX_RESPONSE_BODY_WAF_LIMIT,
+            ),
+            AdmissionClass::ResponseTransform => connection_limit(
+                snapshot.available_bytes / 6,
+                RESPONSE_TRANSFORM_ESTIMATED_BYTES,
+                MIN_RESPONSE_TRANSFORM_LIMIT,
+                MAX_RESPONSE_TRANSFORM_LIMIT,
+            ),
+            AdmissionClass::CacheRevalidate => connection_limit(
+                snapshot.available_bytes / 16,
+                CACHE_REVALIDATE_ESTIMATED_BYTES,
+                MIN_CACHE_REVALIDATE_LIMIT,
+                MAX_CACHE_REVALIDATE_LIMIT,
             ),
         }
     }
@@ -269,6 +321,10 @@ impl MemoryGovernor {
             h3_request_limit_per_connection: self.limit_for(AdmissionClass::Http3Request),
             origin_connect_limit: self.limit_for(AdmissionClass::OriginConnect),
             background_work_limit: self.limit_for(AdmissionClass::BackgroundWork),
+            request_body_waf_limit: self.limit_for(AdmissionClass::RequestBodyWaf),
+            response_body_waf_limit: self.limit_for(AdmissionClass::ResponseBodyWaf),
+            response_transform_limit: self.limit_for(AdmissionClass::ResponseTransform),
+            cache_revalidate_limit: self.limit_for(AdmissionClass::CacheRevalidate),
             cache_budget_bytes: mem.cache_budget_bytes,
             bloom_budget_bytes: mem.bloom_budget_bytes,
             negative_cache_limit: self.negative_cache_limit(),
@@ -286,6 +342,10 @@ impl MemoryGovernor {
             AdmissionClass::Http3Request => &self.h3_requests,
             AdmissionClass::OriginConnect => &self.origin_connects,
             AdmissionClass::BackgroundWork => &self.background_work,
+            AdmissionClass::RequestBodyWaf => &self.request_body_waf,
+            AdmissionClass::ResponseBodyWaf => &self.response_body_waf,
+            AdmissionClass::ResponseTransform => &self.response_transform,
+            AdmissionClass::CacheRevalidate => &self.cache_revalidate,
         }
     }
 
@@ -509,5 +569,22 @@ mod tests {
             (MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD..=MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD)
                 .contains(&keepalive)
         );
+    }
+
+    #[test]
+    fn high_cost_admission_classes_have_limits_and_release() {
+        let governor = MemoryGovernor::new();
+        for class in [
+            AdmissionClass::RequestBodyWaf,
+            AdmissionClass::ResponseBodyWaf,
+            AdmissionClass::ResponseTransform,
+            AdmissionClass::CacheRevalidate,
+        ] {
+            assert!(governor.limit_for(class) > 0);
+            let permit = governor.try_admit(class).expect("class should admit");
+            assert_eq!(governor.counter(class).load(Ordering::Acquire), 1);
+            drop(permit);
+            assert_eq!(governor.counter(class).load(Ordering::Acquire), 0);
+        }
     }
 }
