@@ -30,6 +30,16 @@ const MEMORY_SERVE_MAX: u64 = 50 * 1024 * 1024;
 const BLOOM_BITS_PER_ENTRY_ESTIMATE: u64 = 10;
 const BLOOM_LAYER_OVERHEAD_BYTES: u64 = 256;
 
+fn cache_memory_hit_limit_bytes() -> u64 {
+    MEMORY_GOVERNOR
+        .cache_read_memory_object_limit_bytes()
+        .min(MEMORY_SERVE_MAX)
+}
+
+fn try_admit_cache_memory_hit(bytes: u64) -> Option<StaticAdmissionPermit> {
+    MEMORY_GOVERNOR.try_admit_cache_read(bytes)
+}
+
 /// Parse `stale-while-revalidate=N` from a Cache-Control header value.
 /// Returns `None` if the directive is absent.
 pub(crate) fn parse_swr_from_cache_control(cc: &str) -> Option<u64> {
@@ -411,7 +421,12 @@ impl Storage for FileStorage {
         let io_start = std::time::Instant::now();
 
         if !meta.compressed {
-            if meta.size <= MEMORY_SERVE_MAX {
+            let memory_hit_permit = if meta.size <= cache_memory_hit_limit_bytes() {
+                try_admit_cache_memory_hit(meta.size)
+            } else {
+                None
+            };
+            if let Some(cache_read_permit) = memory_hit_permit {
                 let file_data = match tokio::fs::read(&path).await {
                     Ok(data) => data,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -428,6 +443,7 @@ impl Storage for FileStorage {
                     Box::new(MemoryHitHandler {
                         data: bytes::Bytes::from(file_data),
                         offset: 0,
+                        _cache_read_permit: Some(cache_read_permit),
                     }),
                 )));
             }
@@ -451,7 +467,17 @@ impl Storage for FileStorage {
             )));
         }
 
-        if meta.size > 0 && meta.size <= DISK_HIT_CHUNK_BYTES as u64 {
+        let compressed_memory_charge = meta
+            .size
+            .saturating_add(DISK_HIT_CHUNK_BYTES as u64)
+            .min(MEMORY_SERVE_MAX);
+        let compressed_memory_permit = if meta.size > 0 && meta.size <= DISK_HIT_CHUNK_BYTES as u64
+        {
+            try_admit_cache_memory_hit(compressed_memory_charge)
+        } else {
+            None
+        };
+        if let Some(cache_read_permit) = compressed_memory_permit {
             let file_data = match tokio::fs::read(&path).await {
                 Ok(data) => data,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -475,6 +501,7 @@ impl Storage for FileStorage {
                 Box::new(MemoryHitHandler {
                     data: body,
                     offset: 0,
+                    _cache_read_permit: Some(cache_read_permit),
                 }),
             )));
         }
@@ -763,6 +790,7 @@ impl Storage for FileStorage {
 struct MemoryHitHandler {
     data: bytes::Bytes,
     offset: usize,
+    _cache_read_permit: Option<StaticAdmissionPermit>,
 }
 
 #[async_trait]
@@ -1911,6 +1939,7 @@ impl Storage for HybridStorage {
                     Box::new(MemoryHitHandler {
                         data: entry.data.clone(),
                         offset: 0,
+                        _cache_read_permit: None,
                     }),
                 )));
             }
@@ -2343,6 +2372,60 @@ mod tests {
                 .get("content-length")
                 .and_then(|value| value.to_str().ok()),
             Some("10")
+        );
+
+        crate::metrics::storage::delete_cache_meta_for_test(&hash);
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn uncompressed_l2_hit_above_memory_read_limit_streams_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let key_str = format!("stream-l2-hit-{}-{unique}", std::process::id());
+        let root = std::env::temp_dir().join(format!("cloud-node-rust-cache-test-{unique}"));
+        let storage = Box::leak(Box::new(FileStorage::new(&root)));
+        let key = CacheKey::new("edge", key_str.as_str(), "");
+        let hash = storage.get_hash(&key);
+        let path = storage.get_path(&key);
+        tokio::fs::create_dir_all(path.parent().expect("cache path parent"))
+            .await
+            .expect("create cache dir");
+        tokio::fs::write(&path, b"stream-body")
+            .await
+            .expect("write cache file");
+        let advertised_size = cache_memory_hit_limit_bytes().saturating_add(1);
+        crate::metrics::storage::insert_cache_meta_for_test(
+            hash.clone(),
+            crate::metrics::storage::CacheMetaEntry {
+                cache_key: key_str.clone(),
+                size: advertised_size,
+                expires: crate::utils::time::now_timestamp() + 60,
+                access_time: crate::utils::time::now_timestamp(),
+                access_count: 1,
+                status: 200,
+                headers: Vec::new(),
+                compressed: false,
+                ..Default::default()
+            },
+        );
+
+        let trace = pingora_cache::trace::Span::inactive().handle();
+        let (meta, handler) = storage
+            .lookup(&key, &trace)
+            .await
+            .expect("lookup result")
+            .expect("cache hit");
+        assert!(handler.as_any().is::<FileHitHandler>());
+        let expected_len = advertised_size.to_string();
+        assert_eq!(
+            meta.response_header()
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_len.as_str())
         );
 
         crate::metrics::storage::delete_cache_meta_for_test(&hash);

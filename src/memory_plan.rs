@@ -103,13 +103,17 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "cache_and_background",
                 purpose: "use remaining memory after headroom, connection and origin budgets",
                 policy: format!(
-                    "cache_budget={} bloom_budget={} negative_cache_limit={} background_limit={} revalidate_limit={} cache_write_limit={} active_background={}; connection and origin-establishment paths win during pressure",
+                    "cache_budget={} bloom_budget={} negative_cache_limit={} background_limit={} revalidate_limit={} cache_write_limit={} cache_read_memory_limit={} cache_read_memory_used={} cache_read_memory_budget={} cache_read_memory_object_limit={} active_background={}; connection and origin-establishment paths win during pressure",
                     snapshot.cache_budget_bytes,
                     snapshot.bloom_budget_bytes,
                     snapshot.negative_cache_limit,
                     snapshot.background_work_limit,
                     snapshot.cache_revalidate_limit,
                     snapshot.cache_write_limit,
+                    snapshot.cache_read_memory_limit,
+                    snapshot.cache_read_memory_used_bytes,
+                    snapshot.cache_read_memory_budget_bytes,
+                    snapshot.cache_read_memory_object_limit_bytes,
                     snapshot.estimated_background_work
                 ),
             },

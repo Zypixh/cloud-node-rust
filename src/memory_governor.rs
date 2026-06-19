@@ -16,6 +16,7 @@ pub enum AdmissionClass {
     ResponseTransform,
     CacheRevalidate,
     CacheWrite,
+    CacheReadMemory,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +61,10 @@ pub struct GovernorSnapshot {
     pub response_transform_limit: usize,
     pub cache_revalidate_limit: usize,
     pub cache_write_limit: usize,
+    pub cache_read_memory_limit: usize,
+    pub cache_read_memory_used_bytes: u64,
+    pub cache_read_memory_budget_bytes: u64,
+    pub cache_read_memory_object_limit_bytes: u64,
     pub cache_budget_bytes: u64,
     pub bloom_budget_bytes: u64,
     pub negative_cache_limit: usize,
@@ -106,6 +111,7 @@ const RESPONSE_BODY_WAF_ESTIMATED_BYTES: u64 = 512 * 1024;
 const RESPONSE_TRANSFORM_ESTIMATED_BYTES: u64 = 16 * 1024 * 1024;
 const CACHE_REVALIDATE_ESTIMATED_BYTES: u64 = 64 * 1024;
 const CACHE_WRITE_ESTIMATED_BYTES: u64 = 1 * 1024 * 1024;
+const CACHE_READ_MEMORY_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024;
 const KEEPALIVE_CONN_ESTIMATED_BYTES: u64 = 16 * 1024;
 const NEGATIVE_CACHE_ESTIMATED_BYTES: u64 = 160;
 
@@ -127,6 +133,7 @@ const MIN_RESPONSE_BODY_WAF_LIMIT: usize = 256;
 const MIN_RESPONSE_TRANSFORM_LIMIT: usize = 32;
 const MIN_CACHE_REVALIDATE_LIMIT: usize = 64;
 const MIN_CACHE_WRITE_LIMIT: usize = 128;
+const MIN_CACHE_READ_MEMORY_LIMIT: usize = 8;
 const MIN_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 const MIN_BLOOM_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 const MIN_NEGATIVE_CACHE_ENTRIES: usize = 262_144;
@@ -149,6 +156,11 @@ const MAX_RESPONSE_BODY_WAF_LIMIT: usize = 1_000_000;
 const MAX_RESPONSE_TRANSFORM_LIMIT: usize = 1_000_000;
 const MAX_CACHE_REVALIDATE_LIMIT: usize = 100_000;
 const MAX_CACHE_WRITE_LIMIT: usize = 1_000_000;
+const MAX_CACHE_READ_MEMORY_LIMIT: usize = 1_000_000;
+const CACHE_READ_MEMORY_MAX_OBJECT_BYTES: u64 = 50 * 1024 * 1024;
+const CACHE_READ_MEMORY_MEDIUM_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
+const CACHE_READ_MEMORY_SMALL_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
+const CACHE_READ_MEMORY_PRESSURE_OBJECT_BYTES: u64 = 512 * 1024;
 const MAX_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_BLOOM_BUDGET_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_NEGATIVE_CACHE_ENTRIES: usize = 64_000_000;
@@ -173,6 +185,8 @@ pub struct MemoryGovernor {
     response_transform: AtomicU64,
     cache_revalidate: AtomicU64,
     cache_write: AtomicU64,
+    cache_read_memory: AtomicU64,
+    cache_read_memory_bytes: AtomicU64,
     cached_total_bytes: AtomicU64,
     cached_used_bytes: AtomicU64,
     cached_available_bytes: AtomicU64,
@@ -183,6 +197,7 @@ pub struct AdmissionPermit<'a> {
     governor: &'a MemoryGovernor,
     class: AdmissionClass,
     shared_connection_charge_bytes: u64,
+    cache_read_memory_charge_bytes: u64,
 }
 
 pub type StaticAdmissionPermit = AdmissionPermit<'static>;
@@ -204,6 +219,8 @@ impl MemoryGovernor {
             response_transform: AtomicU64::new(0),
             cache_revalidate: AtomicU64::new(0),
             cache_write: AtomicU64::new(0),
+            cache_read_memory: AtomicU64::new(0),
+            cache_read_memory_bytes: AtomicU64::new(0),
             cached_total_bytes: AtomicU64::new(0),
             cached_used_bytes: AtomicU64::new(0),
             cached_available_bytes: AtomicU64::new(0),
@@ -212,6 +229,27 @@ impl MemoryGovernor {
     }
 
     pub fn try_admit(&self, class: AdmissionClass) -> Option<AdmissionPermit<'_>> {
+        let cache_read_memory_charge_bytes = if class == AdmissionClass::CacheReadMemory {
+            CACHE_READ_MEMORY_ESTIMATED_BYTES
+        } else {
+            0
+        };
+        self.try_admit_with_charges(class, cache_read_memory_charge_bytes)
+    }
+
+    pub fn try_admit_cache_read(&self, bytes: u64) -> Option<AdmissionPermit<'_>> {
+        let bytes = bytes.max(1);
+        if bytes > self.cache_read_memory_object_limit_bytes() {
+            return None;
+        }
+        self.try_admit_with_charges(AdmissionClass::CacheReadMemory, bytes)
+    }
+
+    fn try_admit_with_charges(
+        &self,
+        class: AdmissionClass,
+        cache_read_memory_charge_bytes: u64,
+    ) -> Option<AdmissionPermit<'_>> {
         let counter = self.counter(class);
         let current = counter.fetch_add(1, Ordering::AcqRel) + 1;
         if current > self.limit_for(class) as u64 {
@@ -234,10 +272,29 @@ impl MemoryGovernor {
             }
         }
 
+        if cache_read_memory_charge_bytes > 0 {
+            let budget = cache_read_memory_budget_bytes(&self.memory_snapshot());
+            let used = self
+                .cache_read_memory_bytes
+                .fetch_add(cache_read_memory_charge_bytes, Ordering::AcqRel)
+                .saturating_add(cache_read_memory_charge_bytes);
+            if used > budget {
+                self.cache_read_memory_bytes
+                    .fetch_sub(cache_read_memory_charge_bytes, Ordering::AcqRel);
+                if shared_connection_charge_bytes > 0 {
+                    self.shared_connection_bytes
+                        .fetch_sub(shared_connection_charge_bytes, Ordering::AcqRel);
+                }
+                counter.fetch_sub(1, Ordering::AcqRel);
+                return None;
+            }
+        }
+
         Some(AdmissionPermit {
             governor: self,
             class,
             shared_connection_charge_bytes,
+            cache_read_memory_charge_bytes,
         })
     }
 
@@ -329,6 +386,16 @@ impl MemoryGovernor {
                     MIN_CACHE_WRITE_LIMIT
                 },
                 MAX_CACHE_WRITE_LIMIT,
+            ),
+            AdmissionClass::CacheReadMemory => connection_limit(
+                cache_read_memory_budget_bytes(&snapshot),
+                CACHE_READ_MEMORY_ESTIMATED_BYTES,
+                if memory_pressure_high(&snapshot) {
+                    MIN_CACHE_READ_MEMORY_LIMIT / 2
+                } else {
+                    MIN_CACHE_READ_MEMORY_LIMIT
+                },
+                MAX_CACHE_READ_MEMORY_LIMIT,
             ),
         }
     }
@@ -441,6 +508,10 @@ impl MemoryGovernor {
         }
     }
 
+    pub fn cache_read_memory_object_limit_bytes(&self) -> u64 {
+        cache_read_memory_object_limit_bytes(&self.memory_snapshot())
+    }
+
     pub fn pingora_keepalive_pool_size(&self, threads: usize) -> usize {
         let snapshot = self.memory_snapshot();
         let threads = threads.max(1);
@@ -504,6 +575,10 @@ impl MemoryGovernor {
             response_transform_limit: self.limit_for(AdmissionClass::ResponseTransform),
             cache_revalidate_limit: self.limit_for(AdmissionClass::CacheRevalidate),
             cache_write_limit: self.limit_for(AdmissionClass::CacheWrite),
+            cache_read_memory_limit: self.limit_for(AdmissionClass::CacheReadMemory),
+            cache_read_memory_used_bytes: self.cache_read_memory_bytes.load(Ordering::Relaxed),
+            cache_read_memory_budget_bytes: cache_read_memory_budget_bytes(&mem),
+            cache_read_memory_object_limit_bytes: cache_read_memory_object_limit_bytes(&mem),
             cache_budget_bytes: mem.cache_budget_bytes,
             bloom_budget_bytes: mem.bloom_budget_bytes,
             negative_cache_limit: self.negative_cache_limit(),
@@ -527,6 +602,7 @@ impl MemoryGovernor {
             AdmissionClass::ResponseTransform => &self.response_transform,
             AdmissionClass::CacheRevalidate => &self.cache_revalidate,
             AdmissionClass::CacheWrite => &self.cache_write,
+            AdmissionClass::CacheReadMemory => &self.cache_read_memory,
         }
     }
 
@@ -615,6 +691,11 @@ impl Drop for AdmissionPermit<'_> {
             self.governor
                 .shared_connection_bytes
                 .fetch_sub(self.shared_connection_charge_bytes, Ordering::AcqRel);
+        }
+        if self.cache_read_memory_charge_bytes > 0 {
+            self.governor
+                .cache_read_memory_bytes
+                .fetch_sub(self.cache_read_memory_charge_bytes, Ordering::AcqRel);
         }
     }
 }
@@ -723,6 +804,28 @@ fn cache_budget_from_available(total_bytes: u64, available_bytes: u64) -> u64 {
     )
 }
 
+fn cache_read_memory_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    if memory_pressure_high(snapshot) {
+        snapshot.available_bytes / 32
+    } else {
+        snapshot.available_bytes / 8
+    }
+    .max(CACHE_READ_MEMORY_ESTIMATED_BYTES)
+}
+
+fn cache_read_memory_object_limit_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    if memory_pressure_high(snapshot) {
+        return CACHE_READ_MEMORY_PRESSURE_OBJECT_BYTES;
+    }
+    if snapshot.total_bytes <= 4 * 1024 * 1024 * 1024 {
+        CACHE_READ_MEMORY_SMALL_OBJECT_BYTES
+    } else if snapshot.total_bytes <= 16 * 1024 * 1024 * 1024 {
+        CACHE_READ_MEMORY_MEDIUM_OBJECT_BYTES
+    } else {
+        CACHE_READ_MEMORY_MAX_OBJECT_BYTES
+    }
+}
+
 fn memory_pressure_high(snapshot: &BudgetedMemorySnapshot) -> bool {
     snapshot.available_bytes < snapshot.total_bytes / 10
 }
@@ -753,7 +856,8 @@ fn shared_connection_charge_bytes(class: AdmissionClass) -> u64 {
         | AdmissionClass::ResponseBodyWaf
         | AdmissionClass::ResponseTransform
         | AdmissionClass::CacheRevalidate
-        | AdmissionClass::CacheWrite => 0,
+        | AdmissionClass::CacheWrite
+        | AdmissionClass::CacheReadMemory => 0,
     }
 }
 
@@ -811,7 +915,8 @@ fn runtime_limit(
         | AdmissionClass::ResponseBodyWaf
         | AdmissionClass::ResponseTransform
         | AdmissionClass::CacheRevalidate
-        | AdmissionClass::CacheWrite => return min_limit,
+        | AdmissionClass::CacheWrite
+        | AdmissionClass::CacheReadMemory => return min_limit,
     };
     let memory_target = connection_limit(memory_budget, estimated_bytes, 1, max_limit);
     let cpu_floor = snapshot
@@ -955,6 +1060,7 @@ mod tests {
             AdmissionClass::ResponseTransform,
             AdmissionClass::CacheRevalidate,
             AdmissionClass::CacheWrite,
+            AdmissionClass::CacheReadMemory,
         ] {
             assert!(governor.limit_for(class) > 0);
             let permit = governor.try_admit(class).expect("class should admit");
@@ -963,6 +1069,52 @@ mod tests {
             assert_eq!(governor.counter(class).load(Ordering::Acquire), 0);
         }
         assert_eq!(governor.shared_connection_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cache_read_memory_admission_tracks_bytes_and_object_limit() {
+        let governor = MemoryGovernor::new();
+        let object_limit = governor.cache_read_memory_object_limit_bytes();
+        assert!(
+            governor
+                .try_admit_cache_read(object_limit.saturating_add(1))
+                .is_none()
+        );
+
+        let budget = cache_read_memory_budget_bytes(&governor.memory_snapshot());
+        let charge = object_limit.min(CACHE_READ_MEMORY_ESTIMATED_BYTES).max(1);
+        let baseline = budget.saturating_sub(charge / 2);
+        governor
+            .cache_read_memory_bytes
+            .store(baseline, Ordering::Release);
+        assert!(governor.try_admit_cache_read(charge).is_none());
+        assert_eq!(
+            governor
+                .counter(AdmissionClass::CacheReadMemory)
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            governor.cache_read_memory_bytes.load(Ordering::Acquire),
+            baseline
+        );
+
+        let baseline = budget.saturating_sub(charge);
+        governor
+            .cache_read_memory_bytes
+            .store(baseline, Ordering::Release);
+        let permit = governor
+            .try_admit_cache_read(charge)
+            .expect("cache read should fit exactly");
+        assert_eq!(
+            governor.cache_read_memory_bytes.load(Ordering::Acquire),
+            baseline + charge
+        );
+        drop(permit);
+        assert_eq!(
+            governor.cache_read_memory_bytes.load(Ordering::Acquire),
+            baseline
+        );
     }
 
     #[test]
