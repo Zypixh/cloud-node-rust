@@ -570,14 +570,30 @@ impl HttpProxyManager {
                                     Ok(Some(h2_session)) => {
                                         let proxy_inner_h2 = proxy_inner.clone();
                                         let shutdown_inner_h2 = shutdown_inner.clone();
-                                        let Some(stream_permit) = Arc::clone(&h2_stream_semaphore).try_acquire_owned().ok() else {
+                                        let Some(stream_permit) = Arc::clone(&h2_stream_semaphore)
+                                            .try_acquire_owned()
+                                            .ok()
+                                        else {
                                             debug!("H2 stream admission limit reached for connection, refusing stream");
+                                            continue;
+                                        };
+                                        let Some(global_stream_permit) =
+                                            MEMORY_GOVERNOR.try_admit(AdmissionClass::Http2Stream)
+                                        else {
+                                            debug!("Global H2 stream admission limit reached, refusing stream");
                                             continue;
                                         };
                                         tokio::spawn(async move {
                                             let _stream_permit = stream_permit;
-                                            let server_session = ServerSession::new_http2(h2_session);
-                                            proxy_inner_h2.process_new_http(server_session, &shutdown_inner_h2).await;
+                                            let _global_stream_permit = global_stream_permit;
+                                            let server_session =
+                                                ServerSession::new_http2(h2_session);
+                                            proxy_inner_h2
+                                                .process_new_http(
+                                                    server_session,
+                                                    &shutdown_inner_h2,
+                                                )
+                                                .await;
                                         });
                                     }
                                     Ok(None) => break, // Connection closed

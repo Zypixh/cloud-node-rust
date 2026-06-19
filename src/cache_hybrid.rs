@@ -1364,12 +1364,6 @@ fn bloom_insert(key: &str) {
     CACHE_BLOOM.insert(key);
 }
 
-fn bloom_can_absorb_insert() -> bool {
-    let (_, _, _, estimated_bytes) = bloom_stats();
-    let budget = crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes();
-    estimated_bytes < budget.saturating_mul(95) / 100
-}
-
 fn bloom_remove(key: &str) {
     CACHE_BLOOM.remove(key);
 }
@@ -1437,12 +1431,6 @@ fn negative_cache_insert_with_capacity(key: &str, now: i64, capacity: usize) {
             return;
         }
     }
-    if NEGATIVE_CACHE.len().saturating_mul(100) >= capacity.saturating_mul(95)
-        && !bloom_can_absorb_insert()
-    {
-        return;
-    }
-    bloom_insert(key);
     NEGATIVE_CACHE.insert(key.to_string(), now + NEGATIVE_CACHE_TTL_SECS);
 }
 
@@ -2549,6 +2537,20 @@ mod tests {
         assert!(!NEGATIVE_CACHE.contains_key(&extra));
 
         NEGATIVE_CACHE.retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    #[test]
+    fn negative_cache_does_not_pollute_positive_bloom() {
+        let now = crate::utils::time::now_timestamp();
+        let key = (0..10_000)
+            .map(|i| format!("neg-no-bloom-{}-{i}", std::process::id()))
+            .find(|key| !bloom_may_exist(key))
+            .expect("test key should avoid existing Bloom positives");
+
+        negative_cache_insert_with_capacity(&key, now, NEGATIVE_CACHE.len().saturating_add(1));
+
+        assert!(!bloom_may_exist(&key));
+        NEGATIVE_CACHE.remove(&key);
     }
 
     #[test]

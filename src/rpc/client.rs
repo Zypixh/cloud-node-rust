@@ -954,14 +954,22 @@ impl SharedRpcClient {
         // Remove endpoints that are no longer in the list
         for old_ep in old_endpoints {
             if !new_endpoints.contains(old_ep) {
-                let _ = endpoint_tx.try_send(Change::Remove(old_ep.clone()));
+                endpoint_tx
+                    .try_send(Change::Remove(old_ep.clone()))
+                    .map_err(|err| {
+                        anyhow::anyhow!("failed to remove RPC endpoint {}: {}", old_ep, err)
+                    })?;
             }
         }
         // Insert new endpoints
         for new_ep in new_endpoints {
             if !old_endpoints.contains(new_ep) {
                 let endpoint = Self::build_endpoint(new_ep)?;
-                let _ = endpoint_tx.try_send(Change::Insert(new_ep.clone(), endpoint));
+                endpoint_tx
+                    .try_send(Change::Insert(new_ep.clone(), endpoint))
+                    .map_err(|err| {
+                        anyhow::anyhow!("failed to insert RPC endpoint {}: {}", new_ep, err)
+                    })?;
             }
         }
         Ok(())
@@ -1011,8 +1019,9 @@ pub fn is_conn_error(status: &tonic::Status) -> bool {
 mod tests {
     use super::{
         RPC_CONNECT_TIMEOUT, RPC_HTTP2_KEEPALIVE_INTERVAL, RPC_PING_CONNECT_TIMEOUT,
-        RpcConnectionProfile,
+        RpcConnectionProfile, SharedRpcClient,
     };
+    use tonic::transport::channel::Change;
 
     #[test]
     fn rpc_connection_profiles_match_expected_keepalive_policy() {
@@ -1043,5 +1052,17 @@ mod tests {
             RpcConnectionProfile::PingProbe.connect_timeout(),
             RPC_PING_CONNECT_TIMEOUT
         );
+    }
+
+    #[test]
+    fn shared_rpc_endpoint_update_reports_channel_backpressure() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Change::Remove("filled".to_string())).unwrap();
+
+        let err =
+            SharedRpcClient::apply_endpoint_changes(&tx, &[], &["http://127.0.0.1:1".to_string()])
+                .unwrap_err();
+
+        assert!(err.to_string().contains("failed to insert RPC endpoint"));
     }
 }
