@@ -151,8 +151,72 @@ const CANDIDATE_STATS_IDLE_SECS: i64 = 6 * 3600;
 const MAX_CANDIDATE_STATS_NORMAL: usize = 131_072;
 const MAX_CANDIDATE_STATS_PRESSURE: usize = 16_384;
 
-type NetworkSnapshot = HashMap<i64, Arc<Vec<(IpNet, i64)>>>;
+type NetworkSnapshot = HashMap<i64, Arc<NetworkScopeSnapshot>>;
 type RangeSnapshot = HashMap<i64, Arc<Vec<(IpAddrRange, i64)>>>;
+
+#[derive(Clone, Debug, Default)]
+struct NetworkScopeSnapshot {
+    all: Vec<(IpNet, i64)>,
+    v4_by_octet: HashMap<u8, Vec<(IpNet, i64)>>,
+    v6_by_hextet: HashMap<u16, Vec<(IpNet, i64)>>,
+}
+
+impl NetworkScopeSnapshot {
+    fn from_items(items: Vec<(IpNet, i64)>) -> Self {
+        let mut snapshot = Self::default();
+        for item in items {
+            snapshot.push(item);
+        }
+        snapshot
+    }
+
+    fn push(&mut self, item: (IpNet, i64)) {
+        match item.0 {
+            IpNet::V4(net) if net.prefix_len() >= 8 => {
+                let bucket = net.network().octets()[0];
+                self.v4_by_octet.entry(bucket).or_default().push(item);
+            }
+            IpNet::V6(net) if net.prefix_len() >= 16 => {
+                let segments = net.network().segments();
+                self.v6_by_hextet.entry(segments[0]).or_default().push(item);
+            }
+            _ => self.all.push(item),
+        }
+    }
+
+    fn items(&self) -> Vec<(IpNet, i64)> {
+        let mut items = self.all.clone();
+        for bucket in self.v4_by_octet.values() {
+            items.extend(bucket.iter().copied());
+        }
+        for bucket in self.v6_by_hextet.values() {
+            items.extend(bucket.iter().copied());
+        }
+        items
+    }
+
+    fn contains(&self, ip: IpAddr, now: i64) -> bool {
+        if networks_contain(&self.all, ip, now) {
+            return true;
+        }
+        match ip {
+            IpAddr::V4(v4) => self
+                .v4_by_octet
+                .get(&v4.octets()[0])
+                .is_some_and(|items| networks_contain(items, ip, now)),
+            IpAddr::V6(v6) => self
+                .v6_by_hextet
+                .get(&v6.segments()[0])
+                .is_some_and(|items| networks_contain(items, ip, now)),
+        }
+    }
+}
+
+fn networks_contain(items: &[(IpNet, i64)], ip: IpAddr, now: i64) -> bool {
+    items
+        .iter()
+        .any(|(net, expiry)| now < *expiry && net.contains(&ip))
+}
 
 pub(crate) struct RollingCounter {
     buckets: [u64; ROLLING_COUNTER_BUCKETS],
@@ -862,6 +926,7 @@ impl WafStateManager {
             .get(&server_id)
             .map(|items| {
                 items
+                    .items()
                     .iter()
                     .copied()
                     .filter(|(_, exp)| now < *exp)
@@ -870,7 +935,10 @@ impl WafStateManager {
             .unwrap_or_default();
         networks.retain(|(existing, _)| *existing != net);
         networks.push((net, expiry));
-        next.insert(server_id, Arc::new(networks));
+        next.insert(
+            server_id,
+            Arc::new(NetworkScopeSnapshot::from_items(networks)),
+        );
         snapshots.store(Arc::new(next));
     }
 
@@ -887,6 +955,7 @@ impl WafStateManager {
         };
         let mut next = current.as_ref().clone();
         let networks = items
+            .items()
             .iter()
             .copied()
             .filter(|(existing, _)| *existing != net)
@@ -894,7 +963,10 @@ impl WafStateManager {
         if networks.is_empty() {
             next.remove(&server_id);
         } else {
-            next.insert(server_id, Arc::new(networks));
+            next.insert(
+                server_id,
+                Arc::new(NetworkScopeSnapshot::from_items(networks)),
+            );
         }
         snapshots.store(Arc::new(next));
     }
@@ -919,9 +991,30 @@ impl WafStateManager {
         let Some(networks) = snapshot.get(&server_id) else {
             return false;
         };
-        networks
-            .iter()
-            .any(|(net, expiry)| now < *expiry && net.contains(&ip))
+        networks.contains(ip, now)
+    }
+
+    fn rebuild_network_snapshot(
+        map: &DashMap<(i64, IpNet), i64>,
+        snapshots: &ArcSwap<NetworkSnapshot>,
+        now: i64,
+    ) {
+        let mut next_items: HashMap<i64, Vec<(IpNet, i64)>> = HashMap::new();
+        for entry in map.iter() {
+            let (server_id, net) = *entry.key();
+            let expiry = *entry.value();
+            if now >= expiry {
+                continue;
+            }
+            next_items.entry(server_id).or_default().push((net, expiry));
+        }
+        let next = next_items
+            .into_iter()
+            .map(|(server_id, items)| {
+                (server_id, Arc::new(NetworkScopeSnapshot::from_items(items)))
+            })
+            .collect::<HashMap<_, _>>();
+        snapshots.store(Arc::new(next));
     }
 
     /// Evict all expired entries from IP block/white/gray lists and idle rate limiters.
@@ -946,6 +1039,35 @@ impl WafStateManager {
         self.list_whitelists.retain(|_, expiry| now < *expiry);
         self.graylists.retain(|_, expiry| now < *expiry);
         self.list_graylists.retain(|_, expiry| now < *expiry);
+        self.block_networks.retain(|_, expiry| now < *expiry);
+        self.list_block_networks.retain(|_, expiry| now < *expiry);
+        self.whitelist_networks.retain(|_, expiry| now < *expiry);
+        self.list_whitelist_networks
+            .retain(|_, expiry| now < *expiry);
+        self.gray_networks.retain(|_, expiry| now < *expiry);
+        self.list_gray_networks.retain(|_, expiry| now < *expiry);
+        Self::rebuild_network_snapshot(&self.block_networks, &self.block_network_snapshots, now);
+        Self::rebuild_network_snapshot(
+            &self.list_block_networks,
+            &self.list_block_network_snapshots,
+            now,
+        );
+        Self::rebuild_network_snapshot(
+            &self.whitelist_networks,
+            &self.whitelist_network_snapshots,
+            now,
+        );
+        Self::rebuild_network_snapshot(
+            &self.list_whitelist_networks,
+            &self.list_whitelist_network_snapshots,
+            now,
+        );
+        Self::rebuild_network_snapshot(&self.gray_networks, &self.gray_network_snapshots, now);
+        Self::rebuild_network_snapshot(
+            &self.list_gray_networks,
+            &self.list_gray_network_snapshots,
+            now,
+        );
         self.counters
             .retain(|_, counter| !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS));
         self.sweep_candidate_stats(now);
@@ -1316,6 +1438,32 @@ mod tests {
         state.apply_list_black_range_until(42, range, now - 1);
         state.gc_once();
         assert!(!state.is_blocked(inside, 42));
+    }
+
+    #[test]
+    fn network_snapshots_bucket_ipv4_ipv6_and_gc_expired_entries() {
+        let state = WafStateManager::new();
+        let now = crate::utils::time::now_timestamp();
+        let v4_net: IpNet = "203.0.113.0/24".parse().unwrap();
+        let v6_net: IpNet = "2001:db8:abcd::/48".parse().unwrap();
+        let v4_inside: IpAddr = "203.0.113.9".parse().unwrap();
+        let v4_outside: IpAddr = "203.0.114.9".parse().unwrap();
+        let v6_inside: IpAddr = "2001:db8:abcd::1".parse().unwrap();
+        let v6_outside: IpAddr = "2001:db8:abce::1".parse().unwrap();
+
+        state.apply_black_network_until(42, v4_net, now + 60);
+        state.apply_black_network_until(42, v6_net, now + 60);
+
+        assert!(state.is_blocked(v4_inside, 42));
+        assert!(!state.is_blocked(v4_outside, 42));
+        assert!(state.is_blocked(v6_inside, 42));
+        assert!(!state.is_blocked(v6_outside, 42));
+
+        state.apply_black_network_until(42, v4_net, now - 1);
+        state.gc_once();
+
+        assert!(!state.is_blocked(v4_inside, 42));
+        assert!(state.is_blocked(v6_inside, 42));
     }
 
     #[test]

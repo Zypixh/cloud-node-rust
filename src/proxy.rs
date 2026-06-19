@@ -8099,6 +8099,11 @@ impl ProxyHttp for EdgeProxy {
                     && meta.stale_while_revalidate_secs > 0
                     && now < meta.expires + meta.stale_while_revalidate_secs as i64
                 {
+                    if MEMORY_GOVERNOR.is_memory_pressure_high()
+                        || crate::origin_state::ORIGIN_STATE_MANAGER.is_down(ctx.origin_id)
+                    {
+                        return true;
+                    }
                     // Global cap on in-flight revalidations to prevent
                     // amplification: unique cache keys × 1 task each could
                     // otherwise exhaust memory / fds.

@@ -1,3 +1,4 @@
+use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR, StaticAdmissionPermit};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use pingora_cache::key::CompactCacheKey;
@@ -528,14 +529,23 @@ impl Storage for FileStorage {
                 max_size: None,
             };
             let location = self.partial_location_for_key_str(k_str);
+            let Some(cache_write_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::CacheWrite)
+            else {
+                return Ok(Box::new(NoopMissHandler));
+            };
             return Ok(Box::new(PartialMissHandler {
                 cache_key: k_str.to_string(),
                 capture,
                 writer: None,
                 location,
                 disabled: false,
+                _cache_write_permit: cache_write_permit,
             }));
         }
+
+        let Some(cache_write_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::CacheWrite) else {
+            return Ok(Box::new(NoopMissHandler));
+        };
 
         let (path, shard_id, relative_path) = self.get_write_location(key);
         if let Some(parent) = path.parent() {
@@ -615,6 +625,7 @@ impl Storage for FileStorage {
             shard_id,
             relative_path,
             stale_while_revalidate_secs: swr_secs,
+            _cache_write_permit: cache_write_permit,
         }))
     }
 
@@ -837,6 +848,7 @@ struct FileMissHandler {
     shard_id: Option<String>,
     relative_path: String,
     stale_while_revalidate_secs: u64,
+    _cache_write_permit: StaticAdmissionPermit,
 }
 
 struct PartialMissHandler {
@@ -845,6 +857,20 @@ struct PartialMissHandler {
     writer: Option<crate::cache::partial::PartialWriter>,
     location: PartialStorageLocation,
     disabled: bool,
+    _cache_write_permit: StaticAdmissionPermit,
+}
+
+struct NoopMissHandler;
+
+#[async_trait]
+impl HandleMiss for NoopMissHandler {
+    async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+        Ok(MissFinishType::Created(0))
+    }
 }
 
 #[async_trait]
@@ -885,6 +911,7 @@ impl HandleMiss for PartialMissHandler {
             writer,
             location,
             disabled,
+            _cache_write_permit: _,
         } = *self;
         if disabled {
             return Err(Error::new(ErrorType::InternalError));
@@ -1012,6 +1039,16 @@ impl HandleMiss for FileMissHandler {
 /// a new tag is inserted; entries for evicted keys are pruned on purge.
 static SURROGATE_KEY_INDEX: Lazy<DashMap<String, dashmap::DashSet<String>>> =
     Lazy::new(DashMap::new);
+const SURROGATE_INDEX_MAX_TAGS_NORMAL: usize = 1_000_000;
+const SURROGATE_INDEX_MAX_TAGS_PRESSURE: usize = 131_072;
+
+fn surrogate_index_capacity() -> usize {
+    if MEMORY_GOVERNOR.is_memory_pressure_high() {
+        SURROGATE_INDEX_MAX_TAGS_PRESSURE
+    } else {
+        SURROGATE_INDEX_MAX_TAGS_NORMAL
+    }
+}
 
 pub(crate) fn index_surrogate_keys(headers: &[(String, String)], hash: &str) {
     let tags = headers
@@ -1023,6 +1060,11 @@ pub(crate) fn index_surrogate_keys(headers: &[(String, String)], hash: &str) {
         return;
     }
     for tag in tags.split_whitespace() {
+        if !SURROGATE_KEY_INDEX.contains_key(tag)
+            && SURROGATE_KEY_INDEX.len() >= surrogate_index_capacity()
+        {
+            continue;
+        }
         SURROGATE_KEY_INDEX
             .entry(tag.to_string())
             .or_default()
@@ -2507,6 +2549,13 @@ mod tests {
         assert!(!NEGATIVE_CACHE.contains_key(&extra));
 
         NEGATIVE_CACHE.retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    #[test]
+    fn surrogate_index_capacity_is_bounded() {
+        let capacity = surrogate_index_capacity();
+        assert!(capacity <= SURROGATE_INDEX_MAX_TAGS_NORMAL);
+        assert!(capacity >= SURROGATE_INDEX_MAX_TAGS_PRESSURE);
     }
 
     #[test]

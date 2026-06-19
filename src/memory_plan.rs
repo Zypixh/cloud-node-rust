@@ -17,10 +17,12 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
     let snapshot = MEMORY_GOVERNOR.snapshot(pingora_threads);
     MemoryPlan {
         summary: format!(
-            "memory total={} used={} available={} conn_budget={} keepalive_budget={} cache_budget={} bloom_budget={}",
+            "memory total={} used={} available={} fd_soft_limit={} cpu_parallelism={} conn_budget={} keepalive_budget={} cache_budget={} bloom_budget={}",
             snapshot.memory_total_bytes,
             snapshot.memory_used_bytes,
             snapshot.memory_available_bytes,
+            snapshot.fd_soft_limit,
+            snapshot.cpu_parallelism,
             snapshot.connection_budget_bytes,
             snapshot.keepalive_budget_bytes,
             snapshot.cache_budget_bytes,
@@ -50,16 +52,18 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "downstream_h3",
                 purpose: "QUIC connection establishment",
                 policy: format!(
-                    "conn_limit={} request_limit_per_conn={}",
-                    snapshot.h3_connection_limit, snapshot.h3_request_limit_per_connection
+                    "conn_limit={} request_global_limit={} request_limit_per_conn={}",
+                    snapshot.h3_connection_limit,
+                    snapshot.h3_request_global_limit,
+                    snapshot.h3_request_limit_per_connection
                 ),
             },
             MemoryPlanItem {
                 area: "downstream_h2",
                 purpose: "multiplexed request handling",
                 policy: format!(
-                    "stream_limit_per_conn={}",
-                    snapshot.h2_stream_limit_per_connection
+                    "stream_global_limit={} stream_limit_per_conn={}",
+                    snapshot.h2_stream_global_limit, snapshot.h2_stream_limit_per_connection
                 ),
             },
             MemoryPlanItem {
@@ -84,12 +88,13 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "cache_and_background",
                 purpose: "use remaining memory after headroom, connection and origin budgets",
                 policy: format!(
-                    "cache_budget={} bloom_budget={} negative_cache_limit={} background_limit={} revalidate_limit={} active_background={}; connection and origin-establishment paths win during pressure",
+                    "cache_budget={} bloom_budget={} negative_cache_limit={} background_limit={} revalidate_limit={} cache_write_limit={} active_background={}; connection and origin-establishment paths win during pressure",
                     snapshot.cache_budget_bytes,
                     snapshot.bloom_budget_bytes,
                     snapshot.negative_cache_limit,
                     snapshot.background_work_limit,
                     snapshot.cache_revalidate_limit,
+                    snapshot.cache_write_limit,
                     snapshot.estimated_background_work
                 ),
             },

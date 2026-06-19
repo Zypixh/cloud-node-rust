@@ -14,6 +14,7 @@ pub enum AdmissionClass {
     ResponseBodyWaf,
     ResponseTransform,
     CacheRevalidate,
+    CacheWrite,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +22,12 @@ pub struct GovernorSnapshot {
     pub memory_total_bytes: u64,
     pub memory_used_bytes: u64,
     pub memory_available_bytes: u64,
+    pub fd_soft_limit: u64,
+    pub http_fd_budget: u64,
+    pub tcp_fd_budget: u64,
+    pub origin_fd_budget: u64,
+    pub keepalive_fd_budget: u64,
+    pub cpu_parallelism: usize,
     pub connection_budget_bytes: u64,
     pub keepalive_budget_bytes: u64,
     pub estimated_http_connections: u64,
@@ -33,7 +40,9 @@ pub struct GovernorSnapshot {
     pub http_connection_limit: usize,
     pub tcp_connection_limit: usize,
     pub h3_connection_limit: usize,
+    pub h2_stream_global_limit: usize,
     pub h2_stream_limit_per_connection: usize,
+    pub h3_request_global_limit: usize,
     pub h3_request_limit_per_connection: usize,
     pub origin_connect_limit: usize,
     pub background_work_limit: usize,
@@ -41,6 +50,7 @@ pub struct GovernorSnapshot {
     pub response_body_waf_limit: usize,
     pub response_transform_limit: usize,
     pub cache_revalidate_limit: usize,
+    pub cache_write_limit: usize,
     pub cache_budget_bytes: u64,
     pub bloom_budget_bytes: u64,
     pub negative_cache_limit: usize,
@@ -52,6 +62,8 @@ struct MemorySnapshot {
     total_bytes: u64,
     used_bytes: u64,
     available_bytes: u64,
+    fd_soft_limit: u64,
+    cpu_parallelism: usize,
 }
 
 pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(MemoryGovernor::new);
@@ -63,6 +75,12 @@ const CONNECTION_BUDGET_PCT: u64 = 45;
 const KEEPALIVE_BUDGET_PCT: u64 = 12;
 const CACHE_BUDGET_PCT: u64 = 25;
 const BLOOM_BUDGET_PCT: u64 = 5;
+const FD_RESERVE: u64 = 512;
+const MIN_FD_SOFT_LIMIT: u64 = 1_024;
+const HTTP_FD_BUDGET_PCT: u64 = 35;
+const TCP_FD_BUDGET_PCT: u64 = 25;
+const ORIGIN_FD_BUDGET_PCT: u64 = 25;
+const KEEPALIVE_FD_BUDGET_PCT: u64 = 10;
 
 const HTTP_CONN_ESTIMATED_BYTES: u64 = 32 * 1024;
 const TCP_CONN_ESTIMATED_BYTES: u64 = 24 * 1024;
@@ -75,13 +93,16 @@ const REQUEST_BODY_WAF_ESTIMATED_BYTES: u64 = 2 * 1024 * 1024;
 const RESPONSE_BODY_WAF_ESTIMATED_BYTES: u64 = 512 * 1024;
 const RESPONSE_TRANSFORM_ESTIMATED_BYTES: u64 = 16 * 1024 * 1024;
 const CACHE_REVALIDATE_ESTIMATED_BYTES: u64 = 64 * 1024;
+const CACHE_WRITE_ESTIMATED_BYTES: u64 = 1 * 1024 * 1024;
 const KEEPALIVE_CONN_ESTIMATED_BYTES: u64 = 16 * 1024;
 const NEGATIVE_CACHE_ESTIMATED_BYTES: u64 = 160;
 
 const MIN_HTTP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_TCP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_H3_CONNECTION_LIMIT: usize = 4_096;
+const MIN_H2_STREAM_GLOBAL_LIMIT: usize = 4_096;
 const MIN_H2_STREAM_LIMIT_PER_CONNECTION: usize = 256;
+const MIN_H3_REQUEST_GLOBAL_LIMIT: usize = 4_096;
 const MIN_H3_REQUEST_LIMIT_PER_CONNECTION: usize = 256;
 const MIN_ORIGIN_CONNECT_LIMIT: usize = 16_384;
 const MIN_BACKGROUND_WORK_LIMIT: usize = 256;
@@ -89,6 +110,7 @@ const MIN_REQUEST_BODY_WAF_LIMIT: usize = 128;
 const MIN_RESPONSE_BODY_WAF_LIMIT: usize = 256;
 const MIN_RESPONSE_TRANSFORM_LIMIT: usize = 32;
 const MIN_CACHE_REVALIDATE_LIMIT: usize = 64;
+const MIN_CACHE_WRITE_LIMIT: usize = 128;
 const MIN_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 const MIN_BLOOM_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 const MIN_NEGATIVE_CACHE_ENTRIES: usize = 262_144;
@@ -96,7 +118,9 @@ const MIN_NEGATIVE_CACHE_ENTRIES: usize = 262_144;
 const MAX_HTTP_CONNECTION_LIMIT: usize = 100_000_000;
 const MAX_TCP_CONNECTION_LIMIT: usize = 100_000_000;
 const MAX_H3_CONNECTION_LIMIT: usize = 10_000_000;
+const MAX_H2_STREAM_GLOBAL_LIMIT: usize = 100_000_000;
 const MAX_H2_STREAM_LIMIT_PER_CONNECTION: usize = 65_535;
+const MAX_H3_REQUEST_GLOBAL_LIMIT: usize = 100_000_000;
 const MAX_H3_REQUEST_LIMIT_PER_CONNECTION: usize = 65_535;
 const MAX_ORIGIN_CONNECT_LIMIT: usize = 100_000_000;
 const MAX_BACKGROUND_WORK_LIMIT: usize = 1_000_000;
@@ -104,6 +128,7 @@ const MAX_REQUEST_BODY_WAF_LIMIT: usize = 1_000_000;
 const MAX_RESPONSE_BODY_WAF_LIMIT: usize = 1_000_000;
 const MAX_RESPONSE_TRANSFORM_LIMIT: usize = 1_000_000;
 const MAX_CACHE_REVALIDATE_LIMIT: usize = 100_000;
+const MAX_CACHE_WRITE_LIMIT: usize = 1_000_000;
 const MAX_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_BLOOM_BUDGET_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_NEGATIVE_CACHE_ENTRIES: usize = 64_000_000;
@@ -125,6 +150,7 @@ pub struct MemoryGovernor {
     response_body_waf: AtomicU64,
     response_transform: AtomicU64,
     cache_revalidate: AtomicU64,
+    cache_write: AtomicU64,
     cached_total_bytes: AtomicU64,
     cached_used_bytes: AtomicU64,
     cached_available_bytes: AtomicU64,
@@ -152,6 +178,7 @@ impl MemoryGovernor {
             response_body_waf: AtomicU64::new(0),
             response_transform: AtomicU64::new(0),
             cache_revalidate: AtomicU64::new(0),
+            cache_write: AtomicU64::new(0),
             cached_total_bytes: AtomicU64::new(0),
             cached_used_bytes: AtomicU64::new(0),
             cached_available_bytes: AtomicU64::new(0),
@@ -176,39 +203,39 @@ impl MemoryGovernor {
     pub fn limit_for(&self, class: AdmissionClass) -> usize {
         let snapshot = self.memory_snapshot();
         match class {
-            AdmissionClass::HttpConnection => connection_limit(
-                snapshot.connection_budget_bytes,
-                HTTP_CONN_ESTIMATED_BYTES,
+            AdmissionClass::HttpConnection => runtime_limit(
+                &snapshot,
+                AdmissionClass::HttpConnection,
                 MIN_HTTP_CONNECTION_LIMIT,
                 MAX_HTTP_CONNECTION_LIMIT,
             ),
-            AdmissionClass::TcpConnection => connection_limit(
-                snapshot.connection_budget_bytes,
-                TCP_CONN_ESTIMATED_BYTES,
+            AdmissionClass::TcpConnection => runtime_limit(
+                &snapshot,
+                AdmissionClass::TcpConnection,
                 MIN_TCP_CONNECTION_LIMIT,
                 MAX_TCP_CONNECTION_LIMIT,
             ),
-            AdmissionClass::Http3Connection => connection_limit(
-                snapshot.connection_budget_bytes / 2,
-                H3_CONN_ESTIMATED_BYTES,
+            AdmissionClass::Http3Connection => runtime_limit(
+                &snapshot,
+                AdmissionClass::Http3Connection,
                 MIN_H3_CONNECTION_LIMIT,
                 MAX_H3_CONNECTION_LIMIT,
             ),
-            AdmissionClass::Http2Stream => connection_limit(
-                snapshot.connection_budget_bytes / 32,
-                H2_STREAM_ESTIMATED_BYTES,
-                MIN_H2_STREAM_LIMIT_PER_CONNECTION,
-                MAX_H2_STREAM_LIMIT_PER_CONNECTION,
+            AdmissionClass::Http2Stream => runtime_limit(
+                &snapshot,
+                AdmissionClass::Http2Stream,
+                MIN_H2_STREAM_GLOBAL_LIMIT,
+                MAX_H2_STREAM_GLOBAL_LIMIT,
             ),
-            AdmissionClass::Http3Request => connection_limit(
-                snapshot.connection_budget_bytes / 32,
-                H3_REQUEST_ESTIMATED_BYTES,
-                MIN_H3_REQUEST_LIMIT_PER_CONNECTION,
-                MAX_H3_REQUEST_LIMIT_PER_CONNECTION,
+            AdmissionClass::Http3Request => runtime_limit(
+                &snapshot,
+                AdmissionClass::Http3Request,
+                MIN_H3_REQUEST_GLOBAL_LIMIT,
+                MAX_H3_REQUEST_GLOBAL_LIMIT,
             ),
-            AdmissionClass::OriginConnect => connection_limit(
-                snapshot.connection_budget_bytes,
-                ORIGIN_CONNECT_ESTIMATED_BYTES,
+            AdmissionClass::OriginConnect => runtime_limit(
+                &snapshot,
+                AdmissionClass::OriginConnect,
                 MIN_ORIGIN_CONNECT_LIMIT,
                 MAX_ORIGIN_CONNECT_LIMIT,
             ),
@@ -242,6 +269,20 @@ impl MemoryGovernor {
                 MIN_CACHE_REVALIDATE_LIMIT,
                 MAX_CACHE_REVALIDATE_LIMIT,
             ),
+            AdmissionClass::CacheWrite => connection_limit(
+                if memory_pressure_high(&snapshot) {
+                    snapshot.cache_budget_bytes / 32
+                } else {
+                    snapshot.cache_budget_bytes / 4
+                },
+                CACHE_WRITE_ESTIMATED_BYTES,
+                if memory_pressure_high(&snapshot) {
+                    MIN_CACHE_WRITE_LIMIT / 4
+                } else {
+                    MIN_CACHE_WRITE_LIMIT
+                },
+                MAX_CACHE_WRITE_LIMIT,
+            ),
         }
     }
 
@@ -264,7 +305,7 @@ impl MemoryGovernor {
 
     pub fn is_memory_pressure_high(&self) -> bool {
         let snapshot = self.memory_snapshot();
-        snapshot.available_bytes < snapshot.total_bytes / 10
+        memory_pressure_high(&snapshot)
     }
 
     pub fn listener_backlog(&self) -> i32 {
@@ -284,12 +325,37 @@ impl MemoryGovernor {
         clamp_i32(target, MIN_LISTENER_BACKLOG, MAX_LISTENER_BACKLOG)
     }
 
+    pub fn h2_stream_limit_per_connection(&self) -> usize {
+        let snapshot = self.memory_snapshot();
+        multiplexed_per_connection_limit(
+            &snapshot,
+            H2_STREAM_ESTIMATED_BYTES,
+            MIN_H2_STREAM_LIMIT_PER_CONNECTION,
+            MAX_H2_STREAM_LIMIT_PER_CONNECTION,
+        )
+    }
+
+    pub fn h3_request_limit_per_connection(&self) -> usize {
+        let snapshot = self.memory_snapshot();
+        multiplexed_per_connection_limit(
+            &snapshot,
+            H3_REQUEST_ESTIMATED_BYTES,
+            MIN_H3_REQUEST_LIMIT_PER_CONNECTION,
+            MAX_H3_REQUEST_LIMIT_PER_CONNECTION,
+        )
+    }
+
     pub fn pingora_keepalive_pool_size(&self, threads: usize) -> usize {
         let snapshot = self.memory_snapshot();
         let threads = threads.max(1);
-        let global_target = connection_limit(
+        let memory_target = connection_limit(
             snapshot.keepalive_budget_bytes,
             KEEPALIVE_CONN_ESTIMATED_BYTES,
+            1,
+            MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD.saturating_mul(threads),
+        );
+        let fd_target = fd_budget(&snapshot, KEEPALIVE_FD_BUDGET_PCT) as usize;
+        let global_target = memory_target.min(fd_target.max(1)).clamp(
             MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD * threads,
             MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD * threads,
         );
@@ -305,6 +371,12 @@ impl MemoryGovernor {
             memory_total_bytes: mem.total_bytes,
             memory_used_bytes: mem.used_bytes,
             memory_available_bytes: mem.available_bytes,
+            fd_soft_limit: mem.fd_soft_limit,
+            http_fd_budget: fd_budget(&mem, HTTP_FD_BUDGET_PCT),
+            tcp_fd_budget: fd_budget(&mem, TCP_FD_BUDGET_PCT),
+            origin_fd_budget: fd_budget(&mem, ORIGIN_FD_BUDGET_PCT),
+            keepalive_fd_budget: fd_budget(&mem, KEEPALIVE_FD_BUDGET_PCT),
+            cpu_parallelism: mem.cpu_parallelism,
             connection_budget_bytes: mem.connection_budget_bytes,
             keepalive_budget_bytes: mem.keepalive_budget_bytes,
             estimated_http_connections: self.http_connections.load(Ordering::Relaxed),
@@ -317,14 +389,17 @@ impl MemoryGovernor {
             http_connection_limit: self.limit_for(AdmissionClass::HttpConnection),
             tcp_connection_limit: self.limit_for(AdmissionClass::TcpConnection),
             h3_connection_limit: self.limit_for(AdmissionClass::Http3Connection),
-            h2_stream_limit_per_connection: self.limit_for(AdmissionClass::Http2Stream),
-            h3_request_limit_per_connection: self.limit_for(AdmissionClass::Http3Request),
+            h2_stream_global_limit: self.limit_for(AdmissionClass::Http2Stream),
+            h2_stream_limit_per_connection: self.h2_stream_limit_per_connection(),
+            h3_request_global_limit: self.limit_for(AdmissionClass::Http3Request),
+            h3_request_limit_per_connection: self.h3_request_limit_per_connection(),
             origin_connect_limit: self.limit_for(AdmissionClass::OriginConnect),
             background_work_limit: self.limit_for(AdmissionClass::BackgroundWork),
             request_body_waf_limit: self.limit_for(AdmissionClass::RequestBodyWaf),
             response_body_waf_limit: self.limit_for(AdmissionClass::ResponseBodyWaf),
             response_transform_limit: self.limit_for(AdmissionClass::ResponseTransform),
             cache_revalidate_limit: self.limit_for(AdmissionClass::CacheRevalidate),
+            cache_write_limit: self.limit_for(AdmissionClass::CacheWrite),
             cache_budget_bytes: mem.cache_budget_bytes,
             bloom_budget_bytes: mem.bloom_budget_bytes,
             negative_cache_limit: self.negative_cache_limit(),
@@ -346,6 +421,7 @@ impl MemoryGovernor {
             AdmissionClass::ResponseBodyWaf => &self.response_body_waf,
             AdmissionClass::ResponseTransform => &self.response_transform,
             AdmissionClass::CacheRevalidate => &self.cache_revalidate,
+            AdmissionClass::CacheWrite => &self.cache_write,
         }
     }
 
@@ -357,6 +433,10 @@ impl MemoryGovernor {
                 total_bytes: self.cached_total_bytes.load(Ordering::Relaxed),
                 used_bytes: self.cached_used_bytes.load(Ordering::Relaxed),
                 available_bytes: self.cached_available_bytes.load(Ordering::Relaxed),
+                fd_soft_limit: read_fd_soft_limit(),
+                cpu_parallelism: std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1),
                 connection_budget_bytes: budget_from_available(
                     self.cached_total_bytes.load(Ordering::Relaxed),
                     self.cached_available_bytes.load(Ordering::Relaxed),
@@ -394,6 +474,8 @@ impl MemoryGovernor {
             total_bytes: snapshot.total_bytes,
             used_bytes: snapshot.used_bytes,
             available_bytes: snapshot.available_bytes,
+            fd_soft_limit: snapshot.fd_soft_limit,
+            cpu_parallelism: snapshot.cpu_parallelism,
             connection_budget_bytes: budget_from_available(
                 snapshot.total_bytes,
                 snapshot.available_bytes,
@@ -431,6 +513,8 @@ struct BudgetedMemorySnapshot {
     total_bytes: u64,
     used_bytes: u64,
     available_bytes: u64,
+    fd_soft_limit: u64,
+    cpu_parallelism: usize,
     connection_budget_bytes: u64,
     keepalive_budget_bytes: u64,
     cache_budget_bytes: u64,
@@ -465,6 +549,10 @@ fn read_memory_snapshot() -> MemorySnapshot {
         total_bytes,
         used_bytes,
         available_bytes,
+        fd_soft_limit: read_fd_soft_limit(),
+        cpu_parallelism: std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
     }
 }
 
@@ -525,6 +613,99 @@ fn cache_budget_from_available(total_bytes: u64, available_bytes: u64) -> u64 {
     )
 }
 
+fn memory_pressure_high(snapshot: &BudgetedMemorySnapshot) -> bool {
+    snapshot.available_bytes < snapshot.total_bytes / 10
+}
+
+fn fd_budget(snapshot: &BudgetedMemorySnapshot, budget_pct: u64) -> u64 {
+    snapshot
+        .fd_soft_limit
+        .saturating_sub(FD_RESERVE)
+        .saturating_mul(budget_pct)
+        / 100
+}
+
+fn runtime_limit(
+    snapshot: &BudgetedMemorySnapshot,
+    class: AdmissionClass,
+    min_limit: usize,
+    max_limit: usize,
+) -> usize {
+    let (memory_budget, estimated_bytes, fd_pct, cpu_floor_per_core) = match class {
+        AdmissionClass::HttpConnection => (
+            snapshot.connection_budget_bytes,
+            HTTP_CONN_ESTIMATED_BYTES,
+            Some(HTTP_FD_BUDGET_PCT),
+            16_384,
+        ),
+        AdmissionClass::TcpConnection => (
+            snapshot.connection_budget_bytes,
+            TCP_CONN_ESTIMATED_BYTES,
+            Some(TCP_FD_BUDGET_PCT),
+            16_384,
+        ),
+        AdmissionClass::Http3Connection => (
+            snapshot.connection_budget_bytes / 2,
+            H3_CONN_ESTIMATED_BYTES,
+            None,
+            4_096,
+        ),
+        AdmissionClass::Http2Stream => (
+            snapshot.connection_budget_bytes / 8,
+            H2_STREAM_ESTIMATED_BYTES,
+            None,
+            4_096,
+        ),
+        AdmissionClass::Http3Request => (
+            snapshot.connection_budget_bytes / 8,
+            H3_REQUEST_ESTIMATED_BYTES,
+            None,
+            4_096,
+        ),
+        AdmissionClass::OriginConnect => (
+            snapshot.connection_budget_bytes,
+            ORIGIN_CONNECT_ESTIMATED_BYTES,
+            Some(ORIGIN_FD_BUDGET_PCT),
+            16_384,
+        ),
+        AdmissionClass::BackgroundWork
+        | AdmissionClass::RequestBodyWaf
+        | AdmissionClass::ResponseBodyWaf
+        | AdmissionClass::ResponseTransform
+        | AdmissionClass::CacheRevalidate
+        | AdmissionClass::CacheWrite => return min_limit,
+    };
+    let memory_target = connection_limit(memory_budget, estimated_bytes, 1, max_limit);
+    let cpu_floor = snapshot
+        .cpu_parallelism
+        .max(1)
+        .saturating_mul(cpu_floor_per_core);
+    let mut target = memory_target.max(cpu_floor).clamp(min_limit, max_limit);
+    if let Some(fd_pct) = fd_pct {
+        let fd_target = fd_budget(snapshot, fd_pct) as usize;
+        if fd_target > 0 {
+            target = target.min(fd_target);
+        }
+    }
+    target.clamp(1, max_limit)
+}
+
+fn multiplexed_per_connection_limit(
+    snapshot: &BudgetedMemorySnapshot,
+    estimated_unit_bytes: u64,
+    min_limit: usize,
+    max_limit: usize,
+) -> usize {
+    let memory_target = connection_limit(
+        snapshot.connection_budget_bytes / 64,
+        estimated_unit_bytes,
+        min_limit,
+        max_limit,
+    );
+    let cpu_target = snapshot.cpu_parallelism.max(1).saturating_mul(256);
+    memory_target.max(cpu_target).clamp(min_limit, max_limit)
+}
+
 fn connection_limit(
     budget_bytes: u64,
     estimated_unit_bytes: u64,
@@ -542,9 +723,63 @@ fn clamp_i32(value: usize, min_limit: i32, max_limit: i32) -> i32 {
     value as i32
 }
 
+#[cfg(unix)]
+fn read_fd_soft_limit() -> u64 {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) == 0 };
+    if ok {
+        (limits.rlim_cur as u64).max(MIN_FD_SOFT_LIMIT)
+    } else {
+        MIN_FD_SOFT_LIMIT
+    }
+}
+
+#[cfg(not(unix))]
+fn read_fd_soft_limit() -> u64 {
+    1_048_576
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_snapshot(
+        total_gib: u64,
+        available_gib: u64,
+        fd_soft_limit: u64,
+        cpu: usize,
+    ) -> BudgetedMemorySnapshot {
+        let total_bytes = total_gib * 1024 * 1024 * 1024;
+        let available_bytes = available_gib * 1024 * 1024 * 1024;
+        BudgetedMemorySnapshot {
+            total_bytes,
+            used_bytes: total_bytes.saturating_sub(available_bytes),
+            available_bytes,
+            fd_soft_limit,
+            cpu_parallelism: cpu,
+            connection_budget_bytes: budget_from_available(
+                total_bytes,
+                available_bytes,
+                CONNECTION_BUDGET_PCT,
+            ),
+            keepalive_budget_bytes: budget_from_available(
+                total_bytes,
+                available_bytes,
+                KEEPALIVE_BUDGET_PCT,
+            ),
+            cache_budget_bytes: cache_budget_from_available(total_bytes, available_bytes),
+            bloom_budget_bytes: bounded_budget_from_available(
+                total_bytes,
+                available_bytes,
+                BLOOM_BUDGET_PCT,
+                MIN_BLOOM_BUDGET_BYTES,
+                MAX_BLOOM_BUDGET_BYTES,
+            ),
+        }
+    }
 
     #[test]
     fn governor_rolls_back_when_limit_is_full() {
@@ -579,6 +814,7 @@ mod tests {
             AdmissionClass::ResponseBodyWaf,
             AdmissionClass::ResponseTransform,
             AdmissionClass::CacheRevalidate,
+            AdmissionClass::CacheWrite,
         ] {
             assert!(governor.limit_for(class) > 0);
             let permit = governor.try_admit(class).expect("class should admit");
@@ -586,5 +822,78 @@ mod tests {
             drop(permit);
             assert_eq!(governor.counter(class).load(Ordering::Acquire), 0);
         }
+    }
+
+    #[test]
+    fn admission_profile_scales_with_machine_size_and_fd_budget() {
+        let small = synthetic_snapshot(2, 1, 65_535, 2);
+        let medium = synthetic_snapshot(16, 8, 1_048_576, 4);
+        let large = synthetic_snapshot(1024, 768, 16_777_216, 128);
+
+        let small_http = runtime_limit(
+            &small,
+            AdmissionClass::HttpConnection,
+            MIN_HTTP_CONNECTION_LIMIT,
+            MAX_HTTP_CONNECTION_LIMIT,
+        );
+        let medium_http = runtime_limit(
+            &medium,
+            AdmissionClass::HttpConnection,
+            MIN_HTTP_CONNECTION_LIMIT,
+            MAX_HTTP_CONNECTION_LIMIT,
+        );
+        let large_http = runtime_limit(
+            &large,
+            AdmissionClass::HttpConnection,
+            MIN_HTTP_CONNECTION_LIMIT,
+            MAX_HTTP_CONNECTION_LIMIT,
+        );
+
+        assert!(small_http >= 16_000);
+        assert!(medium_http > small_http);
+        assert!(large_http > medium_http);
+        assert!(large_http > 65_535);
+
+        let large_h2_global = runtime_limit(
+            &large,
+            AdmissionClass::Http2Stream,
+            MIN_H2_STREAM_GLOBAL_LIMIT,
+            MAX_H2_STREAM_GLOBAL_LIMIT,
+        );
+        let large_h2_per_conn = multiplexed_per_connection_limit(
+            &large,
+            H2_STREAM_ESTIMATED_BYTES,
+            MIN_H2_STREAM_LIMIT_PER_CONNECTION,
+            MAX_H2_STREAM_LIMIT_PER_CONNECTION,
+        );
+        assert!(large_h2_global > MAX_H2_STREAM_LIMIT_PER_CONNECTION);
+        assert_eq!(large_h2_per_conn, MAX_H2_STREAM_LIMIT_PER_CONNECTION);
+    }
+
+    #[test]
+    fn low_fd_limit_reduces_connection_admission_without_touching_protocol_caps() {
+        let low_fd = synthetic_snapshot(16, 8, 4_096, 8);
+        let http = runtime_limit(
+            &low_fd,
+            AdmissionClass::HttpConnection,
+            MIN_HTTP_CONNECTION_LIMIT,
+            MAX_HTTP_CONNECTION_LIMIT,
+        );
+        let origin = runtime_limit(
+            &low_fd,
+            AdmissionClass::OriginConnect,
+            MIN_ORIGIN_CONNECT_LIMIT,
+            MAX_ORIGIN_CONNECT_LIMIT,
+        );
+        assert!(http <= fd_budget(&low_fd, HTTP_FD_BUDGET_PCT) as usize);
+        assert!(origin <= fd_budget(&low_fd, ORIGIN_FD_BUDGET_PCT) as usize);
+
+        let h3_per_conn = multiplexed_per_connection_limit(
+            &low_fd,
+            H3_REQUEST_ESTIMATED_BYTES,
+            MIN_H3_REQUEST_LIMIT_PER_CONNECTION,
+            MAX_H3_REQUEST_LIMIT_PER_CONNECTION,
+        );
+        assert!(h3_per_conn >= MIN_H3_REQUEST_LIMIT_PER_CONNECTION);
     }
 }

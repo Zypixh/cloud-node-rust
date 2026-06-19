@@ -215,7 +215,7 @@ impl Http3ProxyManager {
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_config))?,
         ));
-        let per_conn_limit = MEMORY_GOVERNOR.limit_for(AdmissionClass::Http3Request);
+        let per_conn_limit = MEMORY_GOVERNOR.h3_request_limit_per_connection();
         if let Some(transport_config) = Arc::get_mut(&mut server_config.transport) {
             let stream_cap = per_conn_limit.min(u32::MAX as usize) as u32;
             let uni_cap = stream_cap.clamp(32, 256);

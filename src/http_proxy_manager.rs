@@ -563,7 +563,7 @@ impl HttpProxyManager {
                     {
                         Ok(Ok(mut h2_conn)) => {
                             let h2_stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
-                                MEMORY_GOVERNOR.limit_for(AdmissionClass::Http2Stream),
+                                MEMORY_GOVERNOR.h2_stream_limit_per_connection(),
                             ));
                             loop {
                                 match pingora_core::protocols::http::v2::server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await {
