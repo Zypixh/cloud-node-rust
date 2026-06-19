@@ -319,6 +319,44 @@ impl HttpProxyManager {
         bind_addr: SocketAddr,
         is_tls: bool,
         enable_proxy_protocol: bool,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let worker_count = MEMORY_GOVERNOR.http_accept_worker_count();
+        info!(
+            "HTTP/HTTPS Proxy Manager: starting {} accept worker(s) on {} (TLS={}, proxy_protocol={})",
+            worker_count, bind_addr, is_tls, enable_proxy_protocol
+        );
+        for worker_id in 1..worker_count {
+            let manager = self.clone();
+            let worker_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = manager
+                    .run_http_listener_worker(
+                        bind_addr,
+                        is_tls,
+                        enable_proxy_protocol,
+                        worker_id,
+                        worker_shutdown,
+                    )
+                    .await
+                {
+                    error!(
+                        "HTTP/HTTPS accept worker {} on {} failed: {}",
+                        worker_id, bind_addr, err
+                    );
+                }
+            });
+        }
+        self.run_http_listener_worker(bind_addr, is_tls, enable_proxy_protocol, 0, shutdown_rx)
+            .await
+    }
+
+    async fn run_http_listener_worker(
+        self: Arc<Self>,
+        bind_addr: SocketAddr,
+        is_tls: bool,
+        enable_proxy_protocol: bool,
+        worker_id: usize,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let port = bind_addr.port();
@@ -328,7 +366,10 @@ impl HttpProxyManager {
             &mut shutdown_rx,
         )
         .await?;
-        info!("HTTP Proxy (TLS={}) listening on {}", is_tls, bind_addr);
+        info!(
+            "HTTP Proxy accept worker {} (TLS={}) listening on {}",
+            worker_id, is_tls, bind_addr
+        );
 
         let mut proxy_logic = self.proxy_logic.clone();
         proxy_logic.tls_downstream = is_tls;
@@ -352,7 +393,10 @@ impl HttpProxyManager {
         loop {
             let accept_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
-                    info!("HTTP/HTTPS listener on {} shutting down", bind_addr);
+                    info!(
+                        "HTTP/HTTPS accept worker {} on {} shutting down",
+                        worker_id, bind_addr
+                    );
                     return Ok(());
                 }
                 res = listener.accept() => res,

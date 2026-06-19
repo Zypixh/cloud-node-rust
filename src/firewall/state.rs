@@ -106,8 +106,6 @@ const GC_INTERVAL_SECS: u64 = 60;
 /// reconstructed slightly more often, but quota enforcement is unaffected.
 const LIMITER_IDLE_SECS: i64 = 90;
 const LIMITER_SWEEP_INTERVAL_SECS: i64 = 30;
-const MAX_IP_LIMITERS_NORMAL: usize = 2_000_000;
-const MAX_IP_LIMITERS_PRESSURE: usize = 262_144;
 
 /// Wraps a RateLimiter with a last-seen timestamp for GC and the QPS value the
 /// quota was built from, so hot-reload can detect and replace stale limiters.
@@ -143,13 +141,7 @@ impl<K: std::hash::Hash + Eq + Clone + Send + Sync + 'static> TrackedLimiter<K> 
 const ROLLING_COUNTER_BUCKETS: usize = 256;
 const COUNTER_SWEEP_INTERVAL_SECS: i64 = 60;
 const COUNTER_MAX_PERIOD_SECS: i64 = 7 * 86_400;
-const MAX_ROLLING_COUNTERS_NORMAL: usize = 1_000_000;
-const MAX_ROLLING_COUNTERS_PRESSURE: usize = 131_072;
-const MAX_IP_BW_COUNTERS_NORMAL: usize = 1_000_000;
-const MAX_IP_BW_COUNTERS_PRESSURE: usize = 131_072;
 const CANDIDATE_STATS_IDLE_SECS: i64 = 6 * 3600;
-const MAX_CANDIDATE_STATS_NORMAL: usize = 131_072;
-const MAX_CANDIDATE_STATS_PRESSURE: usize = 16_384;
 
 type NetworkSnapshot = HashMap<i64, Arc<NetworkScopeSnapshot>>;
 type RangeSnapshot = HashMap<i64, Arc<Vec<(IpAddrRange, i64)>>>;
@@ -791,11 +783,7 @@ impl WafStateManager {
     }
 
     fn ip_limiter_capacity(&self) -> usize {
-        if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
-            MAX_IP_LIMITERS_PRESSURE
-        } else {
-            MAX_IP_LIMITERS_NORMAL
-        }
+        crate::memory_governor::MEMORY_GOVERNOR.firewall_ip_limiter_capacity()
     }
 
     fn sweep_limiters_if_needed(&self) {
@@ -846,11 +834,7 @@ impl WafStateManager {
     }
 
     fn counter_capacity(&self) -> usize {
-        if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
-            MAX_ROLLING_COUNTERS_PRESSURE
-        } else {
-            MAX_ROLLING_COUNTERS_NORMAL
-        }
+        crate::memory_governor::MEMORY_GOVERNOR.firewall_rolling_counter_capacity()
     }
 
     fn sweep_counters(&self, now: i64) {
@@ -1300,11 +1284,7 @@ impl WafStateManager {
     }
 
     fn ip_bw_counter_capacity(&self) -> usize {
-        if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
-            MAX_IP_BW_COUNTERS_PRESSURE
-        } else {
-            MAX_IP_BW_COUNTERS_NORMAL
-        }
+        crate::memory_governor::MEMORY_GOVERNOR.firewall_ip_bw_counter_capacity()
     }
 
     pub fn record_candidate_hit(
@@ -1339,11 +1319,7 @@ impl WafStateManager {
     }
 
     fn candidate_stats_capacity(&self) -> usize {
-        if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
-            MAX_CANDIDATE_STATS_PRESSURE
-        } else {
-            MAX_CANDIDATE_STATS_NORMAL
-        }
+        crate::memory_governor::MEMORY_GOVERNOR.firewall_candidate_stats_capacity()
     }
 
     fn sweep_candidate_stats(&self, now: i64) {

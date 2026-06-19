@@ -794,7 +794,9 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         rpc::start_updating_server_list_syncer(ac_us, cs_us, hm_us, ds_us).await;
     });
 
-    cloud_node_rust::metrics::init_http_dimension_worker(100_000);
+    cloud_node_rust::metrics::init_http_dimension_worker(
+        cloud_node_rust::memory_governor::MEMORY_GOVERNOR.metrics_queue_capacity(),
+    );
 
     // Reporters
     let ac_s = api_config.clone();
@@ -860,7 +862,9 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     // Log Uploader
     let access_log_pipeline = api_config.access_log_pipeline.normalized();
     let (log_tx, log_rx) = tokio::sync::mpsc::channel(access_log_pipeline.queue_capacity);
-    let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(10000);
+    let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(
+        cloud_node_rust::memory_governor::MEMORY_GOVERNOR.node_log_queue_capacity(),
+    );
     logging::init_global_log_bus(
         log_tx,
         node_log_tx,
@@ -885,7 +889,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
 
     // 4. Initialize Pingora Server with multi-threading
     let mut conf = pingora_core::server::configuration::ServerConf::default();
-    conf.threads = num_cpus::get_physical().min(32);
+    conf.threads = cloud_node_rust::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads();
     conf.upstream_keepalive_pool_size =
         cloud_node_rust::memory_governor::MEMORY_GOVERNOR.pingora_keepalive_pool_size(conf.threads);
     conf.grace_period_seconds = Some(5);

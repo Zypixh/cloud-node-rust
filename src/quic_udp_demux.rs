@@ -52,6 +52,18 @@ struct H3Datagram {
     data: Bytes,
 }
 
+#[derive(Clone)]
+struct UdpDemuxSharedState {
+    routes: Arc<DashMap<SocketAddr, RouteKind>>,
+    cid_routes: Arc<CidRoutes>,
+    session_routes: Arc<SessionRoutes>,
+    pending_routes: Arc<DashMap<SocketAddr, PendingQuicRoute>>,
+    pending_reassembly_bytes: Arc<AtomicUsize>,
+    new_route_windows: Arc<DashMap<StdIpAddr, VecDeque<Instant>>>,
+    h3_tx: mpsc::Sender<H3Datagram>,
+    quic_cid_tx: mpsc::Sender<UdpSessionQuicCid>,
+}
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 struct QuicConnectionId(Vec<u8>);
 
@@ -646,15 +658,19 @@ impl QuicUdpDemuxManager {
         let port = bind_addr.port();
         let socket = Arc::new(bind_udp_with_retry(bind_addr, &mut shutdown_rx).await?);
         let local_addr = socket.local_addr()?;
-        let routes = Arc::new(DashMap::<SocketAddr, RouteKind>::new());
-        let cid_routes = Arc::new(CidRoutes::new());
-        let session_routes = Arc::new(SessionRoutes::new());
-        let pending_routes = Arc::new(DashMap::<SocketAddr, PendingQuicRoute>::new());
-        let pending_reassembly_bytes = AtomicUsize::new(0);
-        let new_route_windows = Arc::new(DashMap::<StdIpAddr, VecDeque<Instant>>::new());
         let h3_queue_size = MEMORY_GOVERNOR.h3_datagram_queue_size();
         let (h3_tx, h3_rx) = mpsc::channel(h3_queue_size);
-        let (quic_cid_tx, mut quic_cid_rx) = mpsc::channel(h3_queue_size);
+        let (quic_cid_tx, quic_cid_rx) = mpsc::channel(h3_queue_size);
+        let shared = Arc::new(UdpDemuxSharedState {
+            routes: Arc::new(DashMap::<SocketAddr, RouteKind>::new()),
+            cid_routes: Arc::new(CidRoutes::new()),
+            session_routes: Arc::new(SessionRoutes::new()),
+            pending_routes: Arc::new(DashMap::<SocketAddr, PendingQuicRoute>::new()),
+            pending_reassembly_bytes: Arc::new(AtomicUsize::new(0)),
+            new_route_windows: Arc::new(DashMap::<StdIpAddr, VecDeque<Instant>>::new()),
+            h3_tx,
+            quic_cid_tx,
+        });
 
         if http3_enabled {
             let server_config = self
@@ -687,38 +703,114 @@ impl QuicUdpDemuxManager {
         }
 
         info!(
-            "QUIC UDP demux listening on {} (http3={})",
-            local_addr, http3_enabled
+            "QUIC UDP demux listening on {} (http3={}, workers={})",
+            local_addr,
+            http3_enabled,
+            MEMORY_GOVERNOR.udp_demux_worker_count()
         );
+        self.spawn_udp_demux_maintenance(port, shared.clone(), quic_cid_rx, shutdown_rx.clone());
+
+        let worker_count = MEMORY_GOVERNOR.udp_demux_worker_count();
+        for worker_id in 1..worker_count {
+            let manager = self.clone();
+            let worker_shared = shared.clone();
+            let mut bind_shutdown = shutdown_rx.clone();
+            let worker_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let socket = match bind_udp_with_retry(bind_addr, &mut bind_shutdown).await {
+                    Ok(socket) => Arc::new(socket),
+                    Err(err) => {
+                        error!(
+                            "QUIC UDP demux worker {} failed to bind {}: {}",
+                            worker_id, bind_addr, err
+                        );
+                        return;
+                    }
+                };
+                if let Err(err) = manager
+                    .run_udp_demux_worker(
+                        bind_addr,
+                        http3_enabled,
+                        worker_id,
+                        socket,
+                        worker_shared,
+                        worker_shutdown,
+                    )
+                    .await
+                {
+                    error!(
+                        "QUIC UDP demux worker {} on {} failed: {}",
+                        worker_id, bind_addr, err
+                    );
+                }
+            });
+        }
+
+        self.run_udp_demux_worker(bind_addr, http3_enabled, 0, socket, shared, shutdown_rx)
+            .await
+    }
+
+    fn spawn_udp_demux_maintenance(
+        &self,
+        port: u16,
+        shared: Arc<UdpDemuxSharedState>,
+        mut quic_cid_rx: mpsc::Receiver<UdpSessionQuicCid>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        let udp_manager = self.udp_manager.clone();
+        tokio::spawn(async move {
+            let mut cleanup_tick = interval(ROUTE_CLEANUP_INTERVAL);
+            cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        return;
+                    }
+                    _ = cleanup_tick.tick() => {
+                        cleanup_routes(
+                            &udp_manager,
+                            &shared.routes,
+                            &shared.cid_routes,
+                            &shared.pending_routes,
+                            &shared.pending_reassembly_bytes,
+                            &shared.session_routes,
+                        );
+                        cleanup_new_route_windows(&shared.new_route_windows);
+                    }
+                    update = quic_cid_rx.recv() => {
+                        if let Some(update) = update {
+                            apply_session_cid_update(update, &shared.session_routes, &shared.cid_routes);
+                            drain_session_cid_updates(&mut quic_cid_rx, &shared.session_routes, &shared.cid_routes);
+                        } else {
+                            return;
+                        }
+                    }
+                }
+                debug!("QUIC UDP demux maintenance tick completed on port {}", port);
+            }
+        });
+    }
+
+    async fn run_udp_demux_worker(
+        self: Arc<Self>,
+        bind_addr: SocketAddr,
+        http3_enabled: bool,
+        worker_id: usize,
+        socket: Arc<UdpSocket>,
+        shared: Arc<UdpDemuxSharedState>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let port = bind_addr.port();
         let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
-        let mut cleanup_tick = interval(ROUTE_CLEANUP_INTERVAL);
-        cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut next_pressure_cleanup = Instant::now() + ROUTE_CLEANUP_PRESSURE_INTERVAL;
         loop {
-            drain_session_cid_updates(&mut quic_cid_rx, &session_routes, &cid_routes);
             let recv_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
-                    info!("QUIC UDP demux listener on port {} shutting down", port);
-                    return Ok(());
-                }
-                _ = cleanup_tick.tick() => {
-                    cleanup_routes(
-                        &self.udp_manager,
-                        &routes,
-                        &cid_routes,
-                        &pending_routes,
-                        &pending_reassembly_bytes,
-                        &session_routes,
+                    info!(
+                        "QUIC UDP demux worker {} on port {} shutting down",
+                        worker_id, port
                     );
-                    cleanup_new_route_windows(&new_route_windows);
-                    continue;
-                }
-                update = quic_cid_rx.recv() => {
-                    if let Some(update) = update {
-                        apply_session_cid_update(update, &session_routes, &cid_routes);
-                        drain_session_cid_updates(&mut quic_cid_rx, &session_routes, &cid_routes);
-                    }
-                    continue;
+                    return Ok(());
                 }
                 result = socket.recv_from(&mut buf) => result,
             };
@@ -732,85 +824,92 @@ impl QuicUdpDemuxManager {
             let now = Instant::now();
             let max_routes_per_port = MEMORY_GOVERNOR.udp_route_limit_per_port();
             let route_cleanup_pressure_threshold = max_routes_per_port.saturating_mul(9) / 10;
-            if routes.len() >= route_cleanup_pressure_threshold && now >= next_pressure_cleanup {
+            if shared.routes.len() >= route_cleanup_pressure_threshold
+                && now >= next_pressure_cleanup
+            {
                 cleanup_routes(
                     &self.udp_manager,
-                    &routes,
-                    &cid_routes,
-                    &pending_routes,
-                    &pending_reassembly_bytes,
-                    &session_routes,
+                    &shared.routes,
+                    &shared.cid_routes,
+                    &shared.pending_routes,
+                    &shared.pending_reassembly_bytes,
+                    &shared.session_routes,
                 );
-                cleanup_new_route_windows(&new_route_windows);
+                cleanup_new_route_windows(&shared.new_route_windows);
                 next_pressure_cleanup = now + ROUTE_CLEANUP_PRESSURE_INTERVAL;
             }
 
-            if let Some(route) = routes.get(&client_addr).map(|entry| entry.value().clone()) {
+            if let Some(route) = shared
+                .routes
+                .get(&client_addr)
+                .map(|entry| entry.value().clone())
+            {
                 if self
                     .dispatch_existing_route(
                         route.clone(),
                         client_addr,
                         data,
-                        &h3_tx,
+                        &shared.h3_tx,
                         http3_enabled,
                     )
                     .await
                     == DispatchStatus::Closed
                 {
-                    routes.remove(&client_addr);
-                    remove_session_route(&session_routes, &route);
-                    remove_cid_routes_for_route(&cid_routes, &route);
+                    shared.routes.remove(&client_addr);
+                    remove_session_route(&shared.session_routes, &route);
+                    remove_cid_routes_for_route(&shared.cid_routes, &route);
                 } else {
-                    insert_session_cids(&cid_routes, &route);
+                    insert_session_cids(&shared.cid_routes, &route);
                 }
                 continue;
             }
 
-            if let Some(route) = lookup_cid_route(&cid_routes, &data) {
+            if let Some(route) = lookup_cid_route(&shared.cid_routes, &data) {
                 match self
                     .dispatch_existing_route(
                         route.clone(),
                         client_addr,
                         data,
-                        &h3_tx,
+                        &shared.h3_tx,
                         http3_enabled,
                     )
                     .await
                 {
                     DispatchStatus::Closed => {
-                        remove_route_aliases(&routes, &route);
-                        remove_session_route(&session_routes, &route);
-                        remove_cid_routes_for_route(&cid_routes, &route);
+                        remove_route_aliases(&shared.routes, &route);
+                        remove_session_route(&shared.session_routes, &route);
+                        remove_cid_routes_for_route(&shared.cid_routes, &route);
                     }
                     DispatchStatus::Sent | DispatchStatus::Dropped => {
-                        remove_route_aliases(&routes, &route);
-                        insert_session_cids(&cid_routes, &route);
-                        insert_session_route(&session_routes, &route);
-                        routes.insert(client_addr, route);
+                        remove_route_aliases(&shared.routes, &route);
+                        insert_session_cids(&shared.cid_routes, &route);
+                        insert_session_route(&shared.session_routes, &route);
+                        shared.routes.insert(client_addr, route);
                     }
                 }
                 continue;
             }
 
-            if routes.len() >= max_routes_per_port {
+            if shared.routes.len() >= max_routes_per_port {
                 cleanup_routes(
                     &self.udp_manager,
-                    &routes,
-                    &cid_routes,
-                    &pending_routes,
-                    &pending_reassembly_bytes,
-                    &session_routes,
+                    &shared.routes,
+                    &shared.cid_routes,
+                    &shared.pending_routes,
+                    &shared.pending_reassembly_bytes,
+                    &shared.session_routes,
                 );
             }
-            if routes.len() >= max_routes_per_port {
+            if shared.routes.len() >= max_routes_per_port {
                 debug!(
                     "QUIC UDP demux: route limit reached on port {}, dropping new client {}",
                     port, client_addr
                 );
                 continue;
             }
-            let has_pending_route = pending_routes.contains_key(&client_addr);
-            if !has_pending_route && is_new_route_rate_limited(&new_route_windows, client_addr.ip())
+            let has_pending_route = shared.pending_routes.contains_key(&client_addr);
+            if !has_pending_route
+                && is_new_route_rate_limited(&shared.new_route_windows, client_addr.ip())
             {
                 debug!(
                     "QUIC UDP demux: new route rate limit reached for {} on port {}",
@@ -825,27 +924,27 @@ impl QuicUdpDemuxManager {
                     port,
                     client_addr,
                     data,
-                    &pending_routes,
-                    &pending_reassembly_bytes,
-                    &new_route_windows,
-                    &h3_tx,
+                    &shared.pending_routes,
+                    &shared.pending_reassembly_bytes,
+                    &shared.new_route_windows,
+                    &shared.h3_tx,
                     http3_enabled,
                     socket.clone(),
                     shutdown_rx.clone(),
-                    quic_cid_tx.clone(),
+                    shared.quic_cid_tx.clone(),
                 )
                 .await?;
             let Some((route, datagrams)) = route else {
                 continue;
             };
             if !has_pending_route {
-                record_new_route_for_ip(&new_route_windows, client_addr.ip());
+                record_new_route_for_ip(&shared.new_route_windows, client_addr.ip());
             }
-            routes.insert(client_addr, route.clone());
-            insert_session_route(&session_routes, &route);
+            shared.routes.insert(client_addr, route.clone());
+            insert_session_route(&shared.session_routes, &route);
             if let Some(first_datagram) = datagrams.first() {
                 for cid in route_cids(first_datagram) {
-                    insert_cid_route(&cid_routes, cid, route.clone());
+                    insert_cid_route(&shared.cid_routes, cid, route.clone());
                 }
             }
             for datagram in datagrams {
@@ -854,15 +953,15 @@ impl QuicUdpDemuxManager {
                         route.clone(),
                         client_addr,
                         datagram,
-                        &h3_tx,
+                        &shared.h3_tx,
                         http3_enabled,
                     )
                     .await
                     == DispatchStatus::Closed
                 {
-                    routes.remove(&client_addr);
-                    remove_session_route(&session_routes, &route);
-                    remove_cid_routes_for_route(&cid_routes, &route);
+                    shared.routes.remove(&client_addr);
+                    remove_session_route(&shared.session_routes, &route);
+                    remove_cid_routes_for_route(&shared.cid_routes, &route);
                     break;
                 }
             }

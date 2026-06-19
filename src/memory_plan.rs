@@ -17,12 +17,15 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
     let snapshot = MEMORY_GOVERNOR.snapshot(pingora_threads);
     MemoryPlan {
         summary: format!(
-            "memory total={} used={} available={} fd_soft_limit={} cpu_parallelism={} conn_budget={} conn_admission_used={} keepalive_budget={} cache_budget={} bloom_budget={}",
+            "memory total={} used={} available={} fd_soft_limit={} cpu_parallelism={} pingora_threads={} http_accept_workers={} udp_demux_workers={} conn_budget={} conn_admission_used={} keepalive_budget={} cache_budget={} bloom_budget={}",
             snapshot.memory_total_bytes,
             snapshot.memory_used_bytes,
             snapshot.memory_available_bytes,
             snapshot.fd_soft_limit,
             snapshot.cpu_parallelism,
+            snapshot.pingora_worker_threads,
+            snapshot.http_accept_workers,
+            snapshot.udp_demux_workers,
             snapshot.connection_budget_bytes,
             snapshot.connection_admission_used_bytes,
             snapshot.keepalive_budget_bytes,
@@ -85,8 +88,10 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "upstream_keepalive",
                 purpose: "prioritize origin reuse without starving new requests",
                 policy: format!(
-                    "per_thread_pool={} across {} pingora threads",
-                    snapshot.pingora_keepalive_pool_size, pingora_threads
+                    "per_thread_pool={} across {} pingora threads planned={}",
+                    snapshot.pingora_keepalive_pool_size,
+                    pingora_threads,
+                    snapshot.pingora_worker_threads
                 ),
             },
             MemoryPlanItem {
@@ -129,6 +134,39 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "response_transform",
                 purpose: "bound WebP, minify and HLS transformation buffers behind connection and origin paths",
                 policy: format!("limit={}", snapshot.response_transform_limit),
+            },
+            MemoryPlanItem {
+                area: "runtime_scheduler",
+                purpose: "scale accept, UDP demux and Pingora workers from one CPU/memory/FD plan",
+                policy: format!(
+                    "pingora_threads={} http_accept_workers_per_port={} udp_demux_workers_per_port={} listener_backlog={}",
+                    snapshot.pingora_worker_threads,
+                    snapshot.http_accept_workers,
+                    snapshot.udp_demux_workers,
+                    snapshot.listener_backlog
+                ),
+            },
+            MemoryPlanItem {
+                area: "firewall_state",
+                purpose: "bound WAF/CC local state continuously by machine scale instead of fixed normal/pressure tiers",
+                policy: format!(
+                    "ip_limiters={} rolling_counters={} ip_bw_counters={} candidate_stats={}",
+                    snapshot.firewall_ip_limiter_capacity,
+                    snapshot.firewall_rolling_counter_capacity,
+                    snapshot.firewall_ip_bw_counter_capacity,
+                    snapshot.firewall_candidate_stats_capacity
+                ),
+            },
+            MemoryPlanItem {
+                area: "async_events",
+                purpose: "keep log and metric queues non-blocking without oversized low-end defaults",
+                policy: format!(
+                    "access_log_queue={} access_log_batch={} node_log_queue={} metrics_queue={}",
+                    snapshot.access_log_queue_capacity,
+                    snapshot.access_log_batch_size,
+                    snapshot.node_log_queue_capacity,
+                    snapshot.metrics_queue_capacity
+                ),
             },
         ],
     }

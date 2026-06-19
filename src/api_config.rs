@@ -125,11 +125,11 @@ fn auto_access_log_upload_concurrency(queue_capacity: usize, batch_size: usize) 
 }
 
 fn default_access_log_queue_capacity() -> usize {
-    100_000
+    crate::memory_governor::MEMORY_GOVERNOR.access_log_queue_capacity()
 }
 
 fn default_access_log_batch_size() -> usize {
-    10_000
+    crate::memory_governor::MEMORY_GOVERNOR.access_log_batch_size()
 }
 
 fn default_access_log_flush_interval_ms() -> u64 {
@@ -158,10 +158,16 @@ mod tests {
 
         assert!(normalized.upload_concurrency > 1);
         assert!(normalized.upload_concurrency <= MAX_ACCESS_LOG_UPLOAD_CONCURRENCY);
-        assert_eq!(normalized.queue_capacity, 100_000);
+        assert_eq!(
+            normalized.queue_capacity,
+            crate::memory_governor::MEMORY_GOVERNOR
+                .access_log_queue_capacity()
+                .max(crate::memory_governor::MEMORY_GOVERNOR.access_log_batch_size())
+        );
         assert_eq!(
             normalized.batch_queue_capacity(),
-            10.max(normalized.upload_concurrency * 2)
+            ceil_div(normalized.queue_capacity, normalized.batch_size)
+                .max(normalized.upload_concurrency * 2)
         );
     }
 

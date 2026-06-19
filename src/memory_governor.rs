@@ -69,6 +69,17 @@ pub struct GovernorSnapshot {
     pub bloom_budget_bytes: u64,
     pub negative_cache_limit: usize,
     pub listener_backlog: i32,
+    pub pingora_worker_threads: usize,
+    pub http_accept_workers: usize,
+    pub udp_demux_workers: usize,
+    pub access_log_queue_capacity: usize,
+    pub access_log_batch_size: usize,
+    pub node_log_queue_capacity: usize,
+    pub metrics_queue_capacity: usize,
+    pub firewall_ip_limiter_capacity: usize,
+    pub firewall_rolling_counter_capacity: usize,
+    pub firewall_ip_bw_counter_capacity: usize,
+    pub firewall_candidate_stats_capacity: usize,
     pub pingora_keepalive_pool_size: usize,
 }
 
@@ -89,6 +100,8 @@ const CONNECTION_BUDGET_PCT: u64 = 45;
 const KEEPALIVE_BUDGET_PCT: u64 = 12;
 const CACHE_BUDGET_PCT: u64 = 25;
 const BLOOM_BUDGET_PCT: u64 = 5;
+const STATE_BUDGET_PCT: u64 = 8;
+const EVENT_QUEUE_BUDGET_PCT: u64 = 2;
 const FD_RESERVE: u64 = 512;
 const MIN_FD_SOFT_LIMIT: u64 = 1_024;
 const HTTP_FD_BUDGET_PCT: u64 = 35;
@@ -114,6 +127,13 @@ const CACHE_WRITE_ESTIMATED_BYTES: u64 = 1 * 1024 * 1024;
 const CACHE_READ_MEMORY_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024;
 const KEEPALIVE_CONN_ESTIMATED_BYTES: u64 = 16 * 1024;
 const NEGATIVE_CACHE_ESTIMATED_BYTES: u64 = 160;
+const FIREWALL_IP_LIMITER_ESTIMATED_BYTES: u64 = 1024;
+const FIREWALL_ROLLING_COUNTER_ESTIMATED_BYTES: u64 = 2304;
+const FIREWALL_IP_BW_COUNTER_ESTIMATED_BYTES: u64 = 256;
+const FIREWALL_CANDIDATE_STATS_ESTIMATED_BYTES: u64 = 128;
+const ACCESS_LOG_EVENT_ESTIMATED_BYTES: u64 = 1536;
+const NODE_LOG_EVENT_ESTIMATED_BYTES: u64 = 512;
+const HTTP_DIMENSION_EVENT_ESTIMATED_BYTES: u64 = 512;
 
 const MIN_HTTP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_TCP_CONNECTION_LIMIT: usize = 16_384;
@@ -167,8 +187,28 @@ const MAX_NEGATIVE_CACHE_ENTRIES: usize = 64_000_000;
 
 const MIN_LISTENER_BACKLOG: i32 = 32_768;
 const MAX_LISTENER_BACKLOG: i32 = 65_535;
+const MIN_PINGORA_THREADS: usize = 1;
+const MAX_PINGORA_THREADS: usize = 256;
+const MAX_HTTP_ACCEPT_WORKERS_PER_PORT: usize = 64;
+const MAX_UDP_DEMUX_WORKERS_PER_PORT: usize = 128;
 const MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD: usize = 256;
 const MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD: usize = 65_535;
+const MIN_ACCESS_LOG_QUEUE_CAPACITY: usize = 2_048;
+const MAX_ACCESS_LOG_QUEUE_CAPACITY: usize = 1_000_000;
+const MIN_ACCESS_LOG_BATCH_SIZE: usize = 512;
+const MAX_ACCESS_LOG_BATCH_SIZE: usize = 10_000;
+const MIN_NODE_LOG_QUEUE_CAPACITY: usize = 512;
+const MAX_NODE_LOG_QUEUE_CAPACITY: usize = 100_000;
+const MIN_METRICS_QUEUE_CAPACITY: usize = 2_048;
+const MAX_METRICS_QUEUE_CAPACITY: usize = 1_000_000;
+const MIN_FIREWALL_IP_LIMITERS: usize = 32_768;
+const MAX_FIREWALL_IP_LIMITERS: usize = 32_000_000;
+const MIN_FIREWALL_ROLLING_COUNTERS: usize = 16_384;
+const MAX_FIREWALL_ROLLING_COUNTERS: usize = 16_000_000;
+const MIN_FIREWALL_IP_BW_COUNTERS: usize = 32_768;
+const MAX_FIREWALL_IP_BW_COUNTERS: usize = 16_000_000;
+const MIN_FIREWALL_CANDIDATE_STATS: usize = 4_096;
+const MAX_FIREWALL_CANDIDATE_STATS: usize = 2_000_000;
 
 pub struct MemoryGovernor {
     http_connections: AtomicU64,
@@ -532,6 +572,50 @@ impl MemoryGovernor {
         )
     }
 
+    pub fn pingora_worker_threads(&self) -> usize {
+        pingora_worker_threads(&self.memory_snapshot())
+    }
+
+    pub fn http_accept_worker_count(&self) -> usize {
+        http_accept_worker_count(&self.memory_snapshot())
+    }
+
+    pub fn udp_demux_worker_count(&self) -> usize {
+        udp_demux_worker_count(&self.memory_snapshot())
+    }
+
+    pub fn access_log_queue_capacity(&self) -> usize {
+        access_log_queue_capacity(&self.memory_snapshot())
+    }
+
+    pub fn access_log_batch_size(&self) -> usize {
+        access_log_batch_size(&self.memory_snapshot())
+    }
+
+    pub fn node_log_queue_capacity(&self) -> usize {
+        node_log_queue_capacity(&self.memory_snapshot())
+    }
+
+    pub fn metrics_queue_capacity(&self) -> usize {
+        metrics_queue_capacity(&self.memory_snapshot())
+    }
+
+    pub fn firewall_ip_limiter_capacity(&self) -> usize {
+        firewall_ip_limiter_capacity(&self.memory_snapshot())
+    }
+
+    pub fn firewall_rolling_counter_capacity(&self) -> usize {
+        firewall_rolling_counter_capacity(&self.memory_snapshot())
+    }
+
+    pub fn firewall_ip_bw_counter_capacity(&self) -> usize {
+        firewall_ip_bw_counter_capacity(&self.memory_snapshot())
+    }
+
+    pub fn firewall_candidate_stats_capacity(&self) -> usize {
+        firewall_candidate_stats_capacity(&self.memory_snapshot())
+    }
+
     pub fn snapshot(&self, pingora_threads: usize) -> GovernorSnapshot {
         let mem = self.memory_snapshot();
         GovernorSnapshot {
@@ -583,6 +667,17 @@ impl MemoryGovernor {
             bloom_budget_bytes: mem.bloom_budget_bytes,
             negative_cache_limit: self.negative_cache_limit(),
             listener_backlog: self.listener_backlog(),
+            pingora_worker_threads: pingora_worker_threads(&mem),
+            http_accept_workers: http_accept_worker_count(&mem),
+            udp_demux_workers: udp_demux_worker_count(&mem),
+            access_log_queue_capacity: access_log_queue_capacity(&mem),
+            access_log_batch_size: access_log_batch_size(&mem),
+            node_log_queue_capacity: node_log_queue_capacity(&mem),
+            metrics_queue_capacity: metrics_queue_capacity(&mem),
+            firewall_ip_limiter_capacity: firewall_ip_limiter_capacity(&mem),
+            firewall_rolling_counter_capacity: firewall_rolling_counter_capacity(&mem),
+            firewall_ip_bw_counter_capacity: firewall_ip_bw_counter_capacity(&mem),
+            firewall_candidate_stats_capacity: firewall_candidate_stats_capacity(&mem),
             pingora_keepalive_pool_size: self.pingora_keepalive_pool_size(pingora_threads),
         }
     }
@@ -824,6 +919,157 @@ fn cache_read_memory_object_limit_bytes(snapshot: &BudgetedMemorySnapshot) -> u6
     } else {
         CACHE_READ_MEMORY_MAX_OBJECT_BYTES
     }
+}
+
+fn pingora_worker_threads(snapshot: &BudgetedMemorySnapshot) -> usize {
+    let cpu = snapshot.cpu_parallelism.max(1);
+    let memory_per_worker = if memory_pressure_high(snapshot) {
+        256 * 1024 * 1024
+    } else {
+        128 * 1024 * 1024
+    };
+    let memory_target = (snapshot.total_bytes / memory_per_worker).max(1) as usize;
+    cpu.min(memory_target)
+        .clamp(MIN_PINGORA_THREADS, MAX_PINGORA_THREADS)
+}
+
+fn http_accept_worker_count(snapshot: &BudgetedMemorySnapshot) -> usize {
+    let cpu = snapshot.cpu_parallelism.max(1);
+    let base = if cpu <= 4 {
+        1
+    } else if cpu <= 16 {
+        cpu / 4
+    } else {
+        cpu / 3
+    };
+    let memory_target = connection_limit(
+        snapshot.connection_budget_bytes / 512,
+        HTTP_CONN_ESTIMATED_BYTES,
+        1,
+        MAX_HTTP_ACCEPT_WORKERS_PER_PORT,
+    );
+    let pressure_cap = if memory_pressure_high(snapshot) {
+        MAX_HTTP_ACCEPT_WORKERS_PER_PORT / 4
+    } else {
+        MAX_HTTP_ACCEPT_WORKERS_PER_PORT
+    };
+    base.max(1).min(memory_target).clamp(1, pressure_cap.max(1))
+}
+
+fn udp_demux_worker_count(snapshot: &BudgetedMemorySnapshot) -> usize {
+    let cpu = snapshot.cpu_parallelism.max(1);
+    let base = if cpu <= 2 {
+        1
+    } else if cpu <= 8 {
+        cpu / 2
+    } else {
+        cpu.saturating_mul(3) / 4
+    };
+    let memory_target = connection_limit(
+        snapshot.connection_budget_bytes / 512,
+        UDP_SESSION_ESTIMATED_BYTES,
+        1,
+        MAX_UDP_DEMUX_WORKERS_PER_PORT,
+    );
+    let pressure_cap = if memory_pressure_high(snapshot) {
+        MAX_UDP_DEMUX_WORKERS_PER_PORT / 4
+    } else {
+        MAX_UDP_DEMUX_WORKERS_PER_PORT
+    };
+    base.max(1).min(memory_target).clamp(1, pressure_cap.max(1))
+}
+
+fn event_queue_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    bounded_budget_from_available(
+        snapshot.total_bytes,
+        snapshot.available_bytes,
+        EVENT_QUEUE_BUDGET_PCT,
+        8 * 1024 * 1024,
+        1024 * 1024 * 1024,
+    )
+}
+
+fn access_log_queue_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
+    connection_limit(
+        event_queue_budget_bytes(snapshot) / 2,
+        ACCESS_LOG_EVENT_ESTIMATED_BYTES,
+        MIN_ACCESS_LOG_QUEUE_CAPACITY,
+        MAX_ACCESS_LOG_QUEUE_CAPACITY,
+    )
+}
+
+fn access_log_batch_size(snapshot: &BudgetedMemorySnapshot) -> usize {
+    (access_log_queue_capacity(snapshot) / 10)
+        .clamp(MIN_ACCESS_LOG_BATCH_SIZE, MAX_ACCESS_LOG_BATCH_SIZE)
+}
+
+fn node_log_queue_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
+    connection_limit(
+        event_queue_budget_bytes(snapshot) / 16,
+        NODE_LOG_EVENT_ESTIMATED_BYTES,
+        MIN_NODE_LOG_QUEUE_CAPACITY,
+        MAX_NODE_LOG_QUEUE_CAPACITY,
+    )
+}
+
+fn metrics_queue_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
+    connection_limit(
+        event_queue_budget_bytes(snapshot) / 2,
+        HTTP_DIMENSION_EVENT_ESTIMATED_BYTES,
+        MIN_METRICS_QUEUE_CAPACITY,
+        MAX_METRICS_QUEUE_CAPACITY,
+    )
+}
+
+fn state_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    let budget = bounded_budget_from_available(
+        snapshot.total_bytes,
+        snapshot.available_bytes,
+        STATE_BUDGET_PCT,
+        32 * 1024 * 1024,
+        64 * 1024 * 1024 * 1024,
+    );
+    if memory_pressure_high(snapshot) {
+        budget / 4
+    } else {
+        budget
+    }
+}
+
+fn firewall_ip_limiter_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
+    connection_limit(
+        state_budget_bytes(snapshot) / 3,
+        FIREWALL_IP_LIMITER_ESTIMATED_BYTES,
+        MIN_FIREWALL_IP_LIMITERS,
+        MAX_FIREWALL_IP_LIMITERS,
+    )
+}
+
+fn firewall_rolling_counter_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
+    connection_limit(
+        state_budget_bytes(snapshot) / 3,
+        FIREWALL_ROLLING_COUNTER_ESTIMATED_BYTES,
+        MIN_FIREWALL_ROLLING_COUNTERS,
+        MAX_FIREWALL_ROLLING_COUNTERS,
+    )
+}
+
+fn firewall_ip_bw_counter_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
+    connection_limit(
+        state_budget_bytes(snapshot) / 4,
+        FIREWALL_IP_BW_COUNTER_ESTIMATED_BYTES,
+        MIN_FIREWALL_IP_BW_COUNTERS,
+        MAX_FIREWALL_IP_BW_COUNTERS,
+    )
+}
+
+fn firewall_candidate_stats_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
+    connection_limit(
+        state_budget_bytes(snapshot) / 16,
+        FIREWALL_CANDIDATE_STATS_ESTIMATED_BYTES,
+        MIN_FIREWALL_CANDIDATE_STATS,
+        MAX_FIREWALL_CANDIDATE_STATS,
+    )
 }
 
 fn memory_pressure_high(snapshot: &BudgetedMemorySnapshot) -> bool {
@@ -1255,5 +1501,38 @@ mod tests {
             MAX_H3_REQUEST_LIMIT_PER_CONNECTION,
         );
         assert!(h3_per_conn >= MIN_H3_REQUEST_LIMIT_PER_CONNECTION);
+    }
+
+    #[test]
+    fn scheduler_scales_workers_without_legacy_caps() {
+        let small = synthetic_snapshot(2, 1, 65_535, 2);
+        let large = synthetic_snapshot(256, 192, 16_777_216, 128);
+
+        assert_eq!(pingora_worker_threads(&small), 2);
+        assert!(pingora_worker_threads(&large) > 32);
+        assert_eq!(http_accept_worker_count(&small), 1);
+        assert!(http_accept_worker_count(&large) > http_accept_worker_count(&small));
+        assert_eq!(udp_demux_worker_count(&small), 1);
+        assert!(udp_demux_worker_count(&large) > http_accept_worker_count(&large));
+    }
+
+    #[test]
+    fn state_and_event_queues_scale_continuously_with_machine_size() {
+        let small = synthetic_snapshot(2, 1, 65_535, 2);
+        let medium = synthetic_snapshot(16, 8, 1_048_576, 8);
+        let large = synthetic_snapshot(1024, 768, 16_777_216, 128);
+
+        assert!(firewall_ip_limiter_capacity(&small) < 2_000_000);
+        assert!(firewall_rolling_counter_capacity(&small) < 1_000_000);
+        assert!(firewall_ip_limiter_capacity(&medium) > firewall_ip_limiter_capacity(&small));
+        assert!(
+            firewall_rolling_counter_capacity(&large) > firewall_rolling_counter_capacity(&medium)
+        );
+
+        assert!(access_log_queue_capacity(&small) < 100_000);
+        assert!(metrics_queue_capacity(&small) < 100_000);
+        assert!(access_log_queue_capacity(&large) > access_log_queue_capacity(&small));
+        assert!(metrics_queue_capacity(&large) > metrics_queue_capacity(&small));
+        assert!(access_log_batch_size(&small) <= access_log_batch_size(&large));
     }
 }

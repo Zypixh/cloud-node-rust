@@ -21,6 +21,9 @@ pub(crate) fn bind_tcp_listener(addr: SocketAddr, backlog: i32) -> anyhow::Resul
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .context("create TCP listener socket")?;
+    let _ = socket.set_reuse_address(true);
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
     if addr.is_ipv6() {
         socket
             .set_only_v6(true)
