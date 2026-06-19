@@ -658,7 +658,10 @@ async fn handle_message(
                 );
                 ApiConfig::set_runtime_rpc_endpoints(vec![msg.addr]);
                 if let Err(e) = crate::rpc::client::SharedRpcClient::refresh(&api_config) {
-                    warn!("Failed to refresh shared RPC channel after endpoint change: {}", e);
+                    warn!(
+                        "Failed to refresh shared RPC channel after endpoint change: {}",
+                        e
+                    );
                 }
             }
         }

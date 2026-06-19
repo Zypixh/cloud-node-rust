@@ -227,7 +227,13 @@ async fn process_client_agent_candidate(
         };
         persist_and_apply_client_agent_ip_record(record);
 
-        let client = match timeout(CLIENT_AGENT_RPC_TIMEOUT, crate::rpc::client::SharedRpcClient::get(api_config)).await.map(|r| r.map(|s| s.as_rpc_client())) {
+        let client = match timeout(
+            CLIENT_AGENT_RPC_TIMEOUT,
+            crate::rpc::client::SharedRpcClient::get(api_config),
+        )
+        .await
+        .map(|r| r.map(|s| s.as_rpc_client()))
+        {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
                 debug!("Failed to connect for client agent reporting: {}", e);

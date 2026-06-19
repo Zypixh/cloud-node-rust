@@ -301,6 +301,9 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
     }
     ApiConfig::set_runtime_rpc_endpoints(healthy_endpoints);
     if let Err(e) = crate::rpc::client::SharedRpcClient::refresh(&api_config) {
-        warn!("Failed to refresh shared RPC channel after endpoint change: {}", e);
+        warn!(
+            "Failed to refresh shared RPC channel after endpoint change: {}",
+            e
+        );
     }
 }

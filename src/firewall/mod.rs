@@ -519,8 +519,7 @@ fn normalize_action_code(code: &str) -> String {
 }
 
 fn captcha_options_from_value(options: Option<&Value>) -> Option<WAFCaptchaOptions> {
-    let mut parsed: WAFCaptchaOptions =
-        serde_json::from_str(&options?.to_string()).ok()?;
+    let mut parsed: WAFCaptchaOptions = serde_json::from_str(&options?.to_string()).ok()?;
     normalize_captcha_options(&mut parsed);
     Some(parsed)
 }

@@ -889,7 +889,11 @@ impl SharedRpcClient {
         if let Some(state) = guard.as_ref() {
             // Check if endpoints have changed — if so, dynamically update (mirrors Go's UpdateConfig)
             if state.current_endpoints != endpoints {
-                Self::apply_endpoint_changes(&state.endpoint_tx, &state.current_endpoints, &endpoints)?;
+                Self::apply_endpoint_changes(
+                    &state.endpoint_tx,
+                    &state.current_endpoints,
+                    &endpoints,
+                )?;
                 // Update the stored endpoint list under ArcSwap
                 let mut new_state = (*state).clone();
                 new_state.current_endpoints = endpoints.clone();
@@ -957,10 +961,7 @@ impl SharedRpcClient {
         for new_ep in new_endpoints {
             if !old_endpoints.contains(new_ep) {
                 let endpoint = Self::build_endpoint(new_ep)?;
-                let _ = endpoint_tx.try_send(Change::Insert(
-                    new_ep.clone(),
-                    endpoint,
-                ));
+                let _ = endpoint_tx.try_send(Change::Insert(new_ep.clone(), endpoint));
             }
         }
         Ok(())

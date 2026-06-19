@@ -497,7 +497,9 @@ where
                                 *config_version
                             };
                             // Store the actual config version for status reporting.
-                            config_store.update_config_version(payload_config_version).await;
+                            config_store
+                                .update_config_version(payload_config_version)
+                                .await;
                             {
                                 let mut last_hash = LAST_CONFIG_HASH.write();
                                 *last_hash = current_hash;
