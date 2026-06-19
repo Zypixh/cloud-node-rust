@@ -52,10 +52,24 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "downstream_h3",
                 purpose: "QUIC connection establishment",
                 policy: format!(
-                    "conn_limit={} request_global_limit={} request_limit_per_conn={}",
+                    "conn_limit={} request_global_limit={} request_limit_per_conn={} datagram_queue={}",
                     snapshot.h3_connection_limit,
                     snapshot.h3_request_global_limit,
-                    snapshot.h3_request_limit_per_connection
+                    snapshot.h3_request_limit_per_connection,
+                    snapshot.h3_datagram_queue_size
+                ),
+            },
+            MemoryPlanItem {
+                area: "downstream_udp",
+                purpose: "UDP and QUIC/hy2 pass-through session establishment",
+                policy: format!(
+                    "session_limit={} active={} route_limit_per_port={} queue_size={} socket_buffer={} fd_budget={}",
+                    snapshot.udp_session_limit,
+                    snapshot.estimated_udp_sessions,
+                    snapshot.udp_route_limit_per_port,
+                    snapshot.udp_session_queue_size,
+                    snapshot.udp_socket_buffer_size,
+                    snapshot.udp_fd_budget
                 ),
             },
             MemoryPlanItem {

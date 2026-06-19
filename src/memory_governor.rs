@@ -6,6 +6,7 @@ pub enum AdmissionClass {
     HttpConnection,
     TcpConnection,
     Http3Connection,
+    UdpSession,
     Http2Stream,
     Http3Request,
     OriginConnect,
@@ -25,6 +26,7 @@ pub struct GovernorSnapshot {
     pub fd_soft_limit: u64,
     pub http_fd_budget: u64,
     pub tcp_fd_budget: u64,
+    pub udp_fd_budget: u64,
     pub origin_fd_budget: u64,
     pub keepalive_fd_budget: u64,
     pub cpu_parallelism: usize,
@@ -33,6 +35,7 @@ pub struct GovernorSnapshot {
     pub estimated_http_connections: u64,
     pub estimated_tcp_connections: u64,
     pub estimated_h3_connections: u64,
+    pub estimated_udp_sessions: u64,
     pub estimated_h2_streams: u64,
     pub estimated_h3_requests: u64,
     pub estimated_origin_connects: u64,
@@ -40,6 +43,11 @@ pub struct GovernorSnapshot {
     pub http_connection_limit: usize,
     pub tcp_connection_limit: usize,
     pub h3_connection_limit: usize,
+    pub udp_session_limit: usize,
+    pub udp_route_limit_per_port: usize,
+    pub udp_session_queue_size: usize,
+    pub udp_socket_buffer_size: usize,
+    pub h3_datagram_queue_size: usize,
     pub h2_stream_global_limit: usize,
     pub h2_stream_limit_per_connection: usize,
     pub h3_request_global_limit: usize,
@@ -79,12 +87,15 @@ const FD_RESERVE: u64 = 512;
 const MIN_FD_SOFT_LIMIT: u64 = 1_024;
 const HTTP_FD_BUDGET_PCT: u64 = 35;
 const TCP_FD_BUDGET_PCT: u64 = 25;
+const UDP_FD_BUDGET_PCT: u64 = 25;
 const ORIGIN_FD_BUDGET_PCT: u64 = 25;
 const KEEPALIVE_FD_BUDGET_PCT: u64 = 10;
 
 const HTTP_CONN_ESTIMATED_BYTES: u64 = 32 * 1024;
 const TCP_CONN_ESTIMATED_BYTES: u64 = 24 * 1024;
 const H3_CONN_ESTIMATED_BYTES: u64 = 48 * 1024;
+const UDP_SESSION_ESTIMATED_BYTES: u64 = 96 * 1024;
+const UDP_DATAGRAM_ESTIMATED_BYTES: u64 = 2 * 1024;
 const H2_STREAM_ESTIMATED_BYTES: u64 = 16 * 1024;
 const H3_REQUEST_ESTIMATED_BYTES: u64 = 24 * 1024;
 const ORIGIN_CONNECT_ESTIMATED_BYTES: u64 = 32 * 1024;
@@ -100,6 +111,10 @@ const NEGATIVE_CACHE_ESTIMATED_BYTES: u64 = 160;
 const MIN_HTTP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_TCP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_H3_CONNECTION_LIMIT: usize = 4_096;
+const MIN_UDP_SESSION_LIMIT: usize = 4_096;
+const MIN_UDP_ROUTE_LIMIT_PER_PORT: usize = 4_096;
+const MIN_UDP_SESSION_QUEUE_SIZE: usize = 64;
+const MIN_H3_DATAGRAM_QUEUE_SIZE: usize = 1_024;
 const MIN_H2_STREAM_GLOBAL_LIMIT: usize = 4_096;
 const MIN_H2_STREAM_LIMIT_PER_CONNECTION: usize = 256;
 const MIN_H3_REQUEST_GLOBAL_LIMIT: usize = 4_096;
@@ -118,6 +133,10 @@ const MIN_NEGATIVE_CACHE_ENTRIES: usize = 262_144;
 const MAX_HTTP_CONNECTION_LIMIT: usize = 100_000_000;
 const MAX_TCP_CONNECTION_LIMIT: usize = 100_000_000;
 const MAX_H3_CONNECTION_LIMIT: usize = 10_000_000;
+const MAX_UDP_SESSION_LIMIT: usize = 100_000_000;
+const MAX_UDP_ROUTE_LIMIT_PER_PORT: usize = 100_000_000;
+const MAX_UDP_SESSION_QUEUE_SIZE: usize = 2_048;
+const MAX_H3_DATAGRAM_QUEUE_SIZE: usize = 65_536;
 const MAX_H2_STREAM_GLOBAL_LIMIT: usize = 100_000_000;
 const MAX_H2_STREAM_LIMIT_PER_CONNECTION: usize = 65_535;
 const MAX_H3_REQUEST_GLOBAL_LIMIT: usize = 100_000_000;
@@ -142,6 +161,7 @@ pub struct MemoryGovernor {
     http_connections: AtomicU64,
     tcp_connections: AtomicU64,
     h3_connections: AtomicU64,
+    udp_sessions: AtomicU64,
     h2_streams: AtomicU64,
     h3_requests: AtomicU64,
     origin_connects: AtomicU64,
@@ -170,6 +190,7 @@ impl MemoryGovernor {
             http_connections: AtomicU64::new(0),
             tcp_connections: AtomicU64::new(0),
             h3_connections: AtomicU64::new(0),
+            udp_sessions: AtomicU64::new(0),
             h2_streams: AtomicU64::new(0),
             h3_requests: AtomicU64::new(0),
             origin_connects: AtomicU64::new(0),
@@ -220,6 +241,12 @@ impl MemoryGovernor {
                 AdmissionClass::Http3Connection,
                 MIN_H3_CONNECTION_LIMIT,
                 MAX_H3_CONNECTION_LIMIT,
+            ),
+            AdmissionClass::UdpSession => runtime_limit(
+                &snapshot,
+                AdmissionClass::UdpSession,
+                MIN_UDP_SESSION_LIMIT,
+                MAX_UDP_SESSION_LIMIT,
             ),
             AdmissionClass::Http2Stream => runtime_limit(
                 &snapshot,
@@ -314,7 +341,8 @@ impl MemoryGovernor {
             .http_connections
             .load(Ordering::Relaxed)
             .saturating_add(self.tcp_connections.load(Ordering::Relaxed))
-            .saturating_add(self.h3_connections.load(Ordering::Relaxed));
+            .saturating_add(self.h3_connections.load(Ordering::Relaxed))
+            .saturating_add(self.udp_sessions.load(Ordering::Relaxed));
         let target = connection_limit(
             snapshot.connection_budget_bytes / 64,
             HTTP_CONN_ESTIMATED_BYTES,
@@ -343,6 +371,54 @@ impl MemoryGovernor {
             MIN_H3_REQUEST_LIMIT_PER_CONNECTION,
             MAX_H3_REQUEST_LIMIT_PER_CONNECTION,
         )
+    }
+
+    pub fn udp_route_limit_per_port(&self) -> usize {
+        let session_limit = self.limit_for(AdmissionClass::UdpSession);
+        session_limit.clamp(MIN_UDP_ROUTE_LIMIT_PER_PORT, MAX_UDP_ROUTE_LIMIT_PER_PORT)
+    }
+
+    pub fn udp_session_queue_size(&self) -> usize {
+        let snapshot = self.memory_snapshot();
+        let memory_target = connection_limit(
+            snapshot.connection_budget_bytes / 256,
+            UDP_DATAGRAM_ESTIMATED_BYTES,
+            MIN_UDP_SESSION_QUEUE_SIZE,
+            MAX_UDP_SESSION_QUEUE_SIZE,
+        );
+        let cpu_target = snapshot.cpu_parallelism.max(1).saturating_mul(64);
+        let target = memory_target.max(cpu_target);
+        if memory_pressure_high(&snapshot) {
+            target.clamp(MIN_UDP_SESSION_QUEUE_SIZE, 256)
+        } else {
+            target.clamp(MIN_UDP_SESSION_QUEUE_SIZE, MAX_UDP_SESSION_QUEUE_SIZE)
+        }
+    }
+
+    pub fn h3_datagram_queue_size(&self) -> usize {
+        let snapshot = self.memory_snapshot();
+        let target = connection_limit(
+            snapshot.connection_budget_bytes / 128,
+            UDP_DATAGRAM_ESTIMATED_BYTES,
+            MIN_H3_DATAGRAM_QUEUE_SIZE,
+            MAX_H3_DATAGRAM_QUEUE_SIZE,
+        );
+        if memory_pressure_high(&snapshot) {
+            target.clamp(MIN_H3_DATAGRAM_QUEUE_SIZE, 8_192)
+        } else {
+            target
+        }
+    }
+
+    pub fn udp_socket_buffer_size(&self) -> usize {
+        let snapshot = self.memory_snapshot();
+        if memory_pressure_high(&snapshot) {
+            2 * 1024 * 1024
+        } else if snapshot.total_bytes >= 32 * 1024 * 1024 * 1024 {
+            16 * 1024 * 1024
+        } else {
+            4 * 1024 * 1024
+        }
     }
 
     pub fn pingora_keepalive_pool_size(&self, threads: usize) -> usize {
@@ -374,6 +450,7 @@ impl MemoryGovernor {
             fd_soft_limit: mem.fd_soft_limit,
             http_fd_budget: fd_budget(&mem, HTTP_FD_BUDGET_PCT),
             tcp_fd_budget: fd_budget(&mem, TCP_FD_BUDGET_PCT),
+            udp_fd_budget: fd_budget(&mem, UDP_FD_BUDGET_PCT),
             origin_fd_budget: fd_budget(&mem, ORIGIN_FD_BUDGET_PCT),
             keepalive_fd_budget: fd_budget(&mem, KEEPALIVE_FD_BUDGET_PCT),
             cpu_parallelism: mem.cpu_parallelism,
@@ -382,6 +459,7 @@ impl MemoryGovernor {
             estimated_http_connections: self.http_connections.load(Ordering::Relaxed),
             estimated_tcp_connections: self.tcp_connections.load(Ordering::Relaxed),
             estimated_h3_connections: self.h3_connections.load(Ordering::Relaxed),
+            estimated_udp_sessions: self.udp_sessions.load(Ordering::Relaxed),
             estimated_h2_streams: self.h2_streams.load(Ordering::Relaxed),
             estimated_h3_requests: self.h3_requests.load(Ordering::Relaxed),
             estimated_origin_connects: self.origin_connects.load(Ordering::Relaxed),
@@ -389,6 +467,11 @@ impl MemoryGovernor {
             http_connection_limit: self.limit_for(AdmissionClass::HttpConnection),
             tcp_connection_limit: self.limit_for(AdmissionClass::TcpConnection),
             h3_connection_limit: self.limit_for(AdmissionClass::Http3Connection),
+            udp_session_limit: self.limit_for(AdmissionClass::UdpSession),
+            udp_route_limit_per_port: self.udp_route_limit_per_port(),
+            udp_session_queue_size: self.udp_session_queue_size(),
+            udp_socket_buffer_size: self.udp_socket_buffer_size(),
+            h3_datagram_queue_size: self.h3_datagram_queue_size(),
             h2_stream_global_limit: self.limit_for(AdmissionClass::Http2Stream),
             h2_stream_limit_per_connection: self.h2_stream_limit_per_connection(),
             h3_request_global_limit: self.limit_for(AdmissionClass::Http3Request),
@@ -413,6 +496,7 @@ impl MemoryGovernor {
             AdmissionClass::HttpConnection => &self.http_connections,
             AdmissionClass::TcpConnection => &self.tcp_connections,
             AdmissionClass::Http3Connection => &self.h3_connections,
+            AdmissionClass::UdpSession => &self.udp_sessions,
             AdmissionClass::Http2Stream => &self.h2_streams,
             AdmissionClass::Http3Request => &self.h3_requests,
             AdmissionClass::OriginConnect => &self.origin_connects,
@@ -650,6 +734,12 @@ fn runtime_limit(
             None,
             4_096,
         ),
+        AdmissionClass::UdpSession => (
+            snapshot.connection_budget_bytes / 2,
+            UDP_SESSION_ESTIMATED_BYTES,
+            Some(UDP_FD_BUDGET_PCT),
+            4_096,
+        ),
         AdmissionClass::Http2Stream => (
             snapshot.connection_budget_bytes / 8,
             H2_STREAM_ESTIMATED_BYTES,
@@ -810,6 +900,7 @@ mod tests {
     fn high_cost_admission_classes_have_limits_and_release() {
         let governor = MemoryGovernor::new();
         for class in [
+            AdmissionClass::UdpSession,
             AdmissionClass::RequestBodyWaf,
             AdmissionClass::ResponseBodyWaf,
             AdmissionClass::ResponseTransform,
@@ -885,8 +976,15 @@ mod tests {
             MIN_ORIGIN_CONNECT_LIMIT,
             MAX_ORIGIN_CONNECT_LIMIT,
         );
+        let udp = runtime_limit(
+            &low_fd,
+            AdmissionClass::UdpSession,
+            MIN_UDP_SESSION_LIMIT,
+            MAX_UDP_SESSION_LIMIT,
+        );
         assert!(http <= fd_budget(&low_fd, HTTP_FD_BUDGET_PCT) as usize);
         assert!(origin <= fd_budget(&low_fd, ORIGIN_FD_BUDGET_PCT) as usize);
+        assert!(udp <= fd_budget(&low_fd, UDP_FD_BUDGET_PCT) as usize);
 
         let h3_per_conn = multiplexed_per_connection_limit(
             &low_fd,

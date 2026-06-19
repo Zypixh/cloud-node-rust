@@ -77,6 +77,12 @@ pub(crate) async fn bind_udp_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
         SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    let _ = socket.set_reuse_address(true);
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
+    let buffer_size = crate::memory_governor::MEMORY_GOVERNOR.udp_socket_buffer_size();
+    let _ = socket.set_recv_buffer_size(buffer_size);
+    let _ = socket.set_send_buffer_size(buffer_size);
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;
     }

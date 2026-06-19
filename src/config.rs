@@ -4,6 +4,7 @@ use pingora_load_balancing::{LoadBalancer, selection::Consistent};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Notify;
+use tracing::warn;
 
 use crate::config_models::{
     HTTP3Policy, HTTPCCPolicy, HTTPCachePolicy, HTTPFirewallPolicy, HTTPPageConfig,
@@ -1758,9 +1759,18 @@ impl ConfigStore {
         for server in &lock.all_servers {
             if !server.is_quic_passthrough() {
                 for port in Self::server_udp_ports(server, false) {
-                    lock.udp_server_by_port
-                        .entry(port)
-                        .or_insert_with(|| server.clone());
+                    if let Some(existing) = lock.udp_server_by_port.get(&port) {
+                        if existing.numeric_id() != server.numeric_id() {
+                            warn!(
+                                "multiple ordinary UDP servers share port {}; server {} keeps routing precedence over server {}. Use @quic for SNI-aware QUIC/hy2 passthrough on a shared port.",
+                                port,
+                                existing.numeric_id(),
+                                server.numeric_id()
+                            );
+                        }
+                    } else {
+                        lock.udp_server_by_port.insert(port, server.clone());
+                    }
                 }
             }
             if server.is_sni_passthrough() {

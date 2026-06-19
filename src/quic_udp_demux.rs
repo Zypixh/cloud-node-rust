@@ -19,6 +19,7 @@ use tracing::{debug, error, info};
 
 use crate::config::ConfigStore;
 use crate::http3_proxy_manager::Http3ProxyManager;
+use crate::memory_governor::MEMORY_GOVERNOR;
 use crate::net_bind::{bind_udp_socket, dual_stack_bind_addrs};
 use crate::quic_probe::{QuicCryptoFragment, QuicProbeFragmentResult};
 use crate::udp_proxy::{
@@ -27,11 +28,9 @@ use crate::udp_proxy::{
 };
 
 const MAX_DATAGRAM_SIZE: usize = 65_535;
-const H3_QUEUE_SIZE: usize = 8192;
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const H3_ROUTE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 const PENDING_QUIC_ROUTE_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_ROUTES_PER_PORT: usize = 65_536;
 const MAX_NEW_ROUTES_PER_IP_WINDOW: usize = 128;
 const NEW_ROUTE_RATE_WINDOW: Duration = Duration::from_secs(10);
 const MAX_NEW_ROUTE_IP_WINDOWS_PER_PORT: usize = 16_384;
@@ -39,7 +38,6 @@ const MAX_PENDING_ROUTES_PER_PORT: usize = 2048;
 const MAX_PENDING_REASSEMBLY_BYTES_PER_PORT: usize = 16 * 1024 * 1024;
 const ROUTE_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 const ROUTE_CLEANUP_PRESSURE_INTERVAL: Duration = Duration::from_millis(200);
-const ROUTE_CLEANUP_PRESSURE_THRESHOLD: usize = MAX_ROUTES_PER_PORT * 9 / 10;
 const MAX_PENDING_DATAGRAMS_PER_CLIENT: usize = 4;
 const MAX_PENDING_RANGES_PER_CLIENT: usize = 16;
 
@@ -654,8 +652,9 @@ impl QuicUdpDemuxManager {
         let pending_routes = Arc::new(DashMap::<SocketAddr, PendingQuicRoute>::new());
         let pending_reassembly_bytes = AtomicUsize::new(0);
         let new_route_windows = Arc::new(DashMap::<StdIpAddr, VecDeque<Instant>>::new());
-        let (h3_tx, h3_rx) = mpsc::channel(H3_QUEUE_SIZE);
-        let (quic_cid_tx, mut quic_cid_rx) = mpsc::channel(H3_QUEUE_SIZE);
+        let h3_queue_size = MEMORY_GOVERNOR.h3_datagram_queue_size();
+        let (h3_tx, h3_rx) = mpsc::channel(h3_queue_size);
+        let (quic_cid_tx, mut quic_cid_rx) = mpsc::channel(h3_queue_size);
 
         if http3_enabled {
             let server_config = self
@@ -731,7 +730,9 @@ impl QuicUdpDemuxManager {
             let data = Bytes::copy_from_slice(&buf[..len]);
 
             let now = Instant::now();
-            if routes.len() >= ROUTE_CLEANUP_PRESSURE_THRESHOLD && now >= next_pressure_cleanup {
+            let max_routes_per_port = MEMORY_GOVERNOR.udp_route_limit_per_port();
+            let route_cleanup_pressure_threshold = max_routes_per_port.saturating_mul(9) / 10;
+            if routes.len() >= route_cleanup_pressure_threshold && now >= next_pressure_cleanup {
                 cleanup_routes(
                     &self.udp_manager,
                     &routes,
@@ -791,7 +792,7 @@ impl QuicUdpDemuxManager {
                 continue;
             }
 
-            if routes.len() >= MAX_ROUTES_PER_PORT {
+            if routes.len() >= max_routes_per_port {
                 cleanup_routes(
                     &self.udp_manager,
                     &routes,
@@ -801,7 +802,7 @@ impl QuicUdpDemuxManager {
                     &session_routes,
                 );
             }
-            if routes.len() >= MAX_ROUTES_PER_PORT {
+            if routes.len() >= max_routes_per_port {
                 debug!(
                     "QUIC UDP demux: route limit reached on port {}, dropping new client {}",
                     port, client_addr
@@ -1349,6 +1350,26 @@ mod tests {
         assert!(cid_routes.get(&4).is_some());
         assert!(lookup_cid_route(&cid_routes, &[0x40, 1, 2, 3, 4, 0xaa]).is_some());
         assert!(lookup_cid_route(&cid_routes, &[0x40, 1, 2, 3, 5, 0xaa]).is_none());
+    }
+
+    #[test]
+    fn non_h3_quic_alpns_do_not_match_http3() {
+        for alpn in ["hysteria", "hysteria2", "hy2", "hq-29", "masque"] {
+            let client_hello = crate::quic_probe::QuicClientHello {
+                server_name: Some("hy2.example.com".to_string()),
+                alpns: vec![alpn.to_string()],
+            };
+            assert!(
+                !client_hello_supports_h3(&client_hello),
+                "{alpn} must stay on UDP/@quic passthrough, not HTTP/3"
+            );
+        }
+
+        let h3_client_hello = crate::quic_probe::QuicClientHello {
+            server_name: Some("www.example.com".to_string()),
+            alpns: vec!["h3".to_string(), "h3-29".to_string()],
+        };
+        assert!(client_hello_supports_h3(&h3_client_hello));
     }
 
     #[test]

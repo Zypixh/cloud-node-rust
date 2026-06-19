@@ -14,10 +14,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 use crate::lb_factory::BackendExtension;
+use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR, StaticAdmissionPermit};
 use crate::net_bind::{bind_udp_socket, dual_stack_bind_addrs};
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const UDP_SESSION_QUEUE_SIZE: usize = 4096;
 const UDP_SESSION_MAX_QUIC_CIDS: usize = 8;
 
 static UDP_ACTIVITY_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
@@ -376,6 +376,15 @@ impl UdpProxyManager {
             );
             return Ok(None);
         }
+        let Some(session_permit): Option<StaticAdmissionPermit> =
+            MEMORY_GOVERNOR.try_admit(AdmissionClass::UdpSession)
+        else {
+            debug!(
+                "UDP session admission limit reached for client {} on port {}",
+                client_addr, port
+            );
+            return Ok(None);
+        };
         let sid = server.id.unwrap_or(0);
         let user_id = server.user_id;
         let user_plan_id = server.user_plan_id;
@@ -427,7 +436,8 @@ impl UdpProxyManager {
             client_addr, b_addr, sid
         );
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(UDP_SESSION_QUEUE_SIZE);
+        let queue_size = MEMORY_GOVERNOR.udp_session_queue_size();
+        let (tx, rx) = mpsc::channel(queue_size);
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: session_id,
@@ -473,6 +483,7 @@ impl UdpProxyManager {
         self.sessions.insert(key, session.clone());
 
         tokio::spawn(async move {
+            let _session_permit = session_permit;
             let result = Self::handle_session(
                 session_id,
                 backend_addr,
