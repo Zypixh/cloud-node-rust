@@ -17,13 +17,14 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
     let snapshot = MEMORY_GOVERNOR.snapshot(pingora_threads);
     MemoryPlan {
         summary: format!(
-            "memory total={} used={} available={} fd_soft_limit={} cpu_parallelism={} conn_budget={} keepalive_budget={} cache_budget={} bloom_budget={}",
+            "memory total={} used={} available={} fd_soft_limit={} cpu_parallelism={} conn_budget={} conn_admission_used={} keepalive_budget={} cache_budget={} bloom_budget={}",
             snapshot.memory_total_bytes,
             snapshot.memory_used_bytes,
             snapshot.memory_available_bytes,
             snapshot.fd_soft_limit,
             snapshot.cpu_parallelism,
             snapshot.connection_budget_bytes,
+            snapshot.connection_admission_used_bytes,
             snapshot.keepalive_budget_bytes,
             snapshot.cache_budget_bytes,
             snapshot.bloom_budget_bytes

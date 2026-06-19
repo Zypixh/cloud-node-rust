@@ -31,6 +31,7 @@ pub struct GovernorSnapshot {
     pub keepalive_fd_budget: u64,
     pub cpu_parallelism: usize,
     pub connection_budget_bytes: u64,
+    pub connection_admission_used_bytes: u64,
     pub keepalive_budget_bytes: u64,
     pub estimated_http_connections: u64,
     pub estimated_tcp_connections: u64,
@@ -165,6 +166,7 @@ pub struct MemoryGovernor {
     h2_streams: AtomicU64,
     h3_requests: AtomicU64,
     origin_connects: AtomicU64,
+    shared_connection_bytes: AtomicU64,
     background_work: AtomicU64,
     request_body_waf: AtomicU64,
     response_body_waf: AtomicU64,
@@ -180,6 +182,7 @@ pub struct MemoryGovernor {
 pub struct AdmissionPermit<'a> {
     governor: &'a MemoryGovernor,
     class: AdmissionClass,
+    shared_connection_charge_bytes: u64,
 }
 
 pub type StaticAdmissionPermit = AdmissionPermit<'static>;
@@ -194,6 +197,7 @@ impl MemoryGovernor {
             h2_streams: AtomicU64::new(0),
             h3_requests: AtomicU64::new(0),
             origin_connects: AtomicU64::new(0),
+            shared_connection_bytes: AtomicU64::new(0),
             background_work: AtomicU64::new(0),
             request_body_waf: AtomicU64::new(0),
             response_body_waf: AtomicU64::new(0),
@@ -210,15 +214,31 @@ impl MemoryGovernor {
     pub fn try_admit(&self, class: AdmissionClass) -> Option<AdmissionPermit<'_>> {
         let counter = self.counter(class);
         let current = counter.fetch_add(1, Ordering::AcqRel) + 1;
-        if current <= self.limit_for(class) as u64 {
-            Some(AdmissionPermit {
-                governor: self,
-                class,
-            })
-        } else {
+        if current > self.limit_for(class) as u64 {
             counter.fetch_sub(1, Ordering::AcqRel);
-            None
+            return None;
         }
+
+        let shared_connection_charge_bytes = shared_connection_charge_bytes(class);
+        if shared_connection_charge_bytes > 0 {
+            let budget = shared_connection_admission_budget(&self.memory_snapshot());
+            let used = self
+                .shared_connection_bytes
+                .fetch_add(shared_connection_charge_bytes, Ordering::AcqRel)
+                .saturating_add(shared_connection_charge_bytes);
+            if used > budget {
+                self.shared_connection_bytes
+                    .fetch_sub(shared_connection_charge_bytes, Ordering::AcqRel);
+                counter.fetch_sub(1, Ordering::AcqRel);
+                return None;
+            }
+        }
+
+        Some(AdmissionPermit {
+            governor: self,
+            class,
+            shared_connection_charge_bytes,
+        })
     }
 
     pub fn limit_for(&self, class: AdmissionClass) -> usize {
@@ -455,6 +475,7 @@ impl MemoryGovernor {
             keepalive_fd_budget: fd_budget(&mem, KEEPALIVE_FD_BUDGET_PCT),
             cpu_parallelism: mem.cpu_parallelism,
             connection_budget_bytes: mem.connection_budget_bytes,
+            connection_admission_used_bytes: self.shared_connection_bytes.load(Ordering::Relaxed),
             keepalive_budget_bytes: mem.keepalive_budget_bytes,
             estimated_http_connections: self.http_connections.load(Ordering::Relaxed),
             estimated_tcp_connections: self.tcp_connections.load(Ordering::Relaxed),
@@ -590,6 +611,11 @@ impl Drop for AdmissionPermit<'_> {
         self.governor
             .counter(self.class)
             .fetch_sub(1, Ordering::AcqRel);
+        if self.shared_connection_charge_bytes > 0 {
+            self.governor
+                .shared_connection_bytes
+                .fetch_sub(self.shared_connection_charge_bytes, Ordering::AcqRel);
+        }
     }
 }
 
@@ -707,6 +733,28 @@ fn fd_budget(snapshot: &BudgetedMemorySnapshot, budget_pct: u64) -> u64 {
         .saturating_sub(FD_RESERVE)
         .saturating_mul(budget_pct)
         / 100
+}
+
+fn shared_connection_admission_budget(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    snapshot.connection_budget_bytes
+}
+
+fn shared_connection_charge_bytes(class: AdmissionClass) -> u64 {
+    match class {
+        AdmissionClass::HttpConnection => HTTP_CONN_ESTIMATED_BYTES,
+        AdmissionClass::TcpConnection => TCP_CONN_ESTIMATED_BYTES,
+        AdmissionClass::Http3Connection => H3_CONN_ESTIMATED_BYTES,
+        AdmissionClass::UdpSession => UDP_SESSION_ESTIMATED_BYTES,
+        AdmissionClass::Http2Stream => H2_STREAM_ESTIMATED_BYTES,
+        AdmissionClass::Http3Request => H3_REQUEST_ESTIMATED_BYTES,
+        AdmissionClass::OriginConnect => ORIGIN_CONNECT_ESTIMATED_BYTES,
+        AdmissionClass::BackgroundWork
+        | AdmissionClass::RequestBodyWaf
+        | AdmissionClass::ResponseBodyWaf
+        | AdmissionClass::ResponseTransform
+        | AdmissionClass::CacheRevalidate
+        | AdmissionClass::CacheWrite => 0,
+    }
 }
 
 fn runtime_limit(
@@ -875,13 +923,14 @@ mod tests {
     fn governor_rolls_back_when_limit_is_full() {
         let governor = MemoryGovernor::new();
         let mut permits = Vec::new();
-        let limit = governor.limit_for(AdmissionClass::Http2Stream);
+        let class = AdmissionClass::ResponseTransform;
+        let limit = governor.limit_for(class);
         for _ in 0..limit {
-            permits.push(governor.try_admit(AdmissionClass::Http2Stream).unwrap());
+            permits.push(governor.try_admit(class).unwrap());
         }
-        assert!(governor.try_admit(AdmissionClass::Http2Stream).is_none());
+        assert!(governor.try_admit(class).is_none());
         drop(permits.pop());
-        assert!(governor.try_admit(AdmissionClass::Http2Stream).is_some());
+        assert!(governor.try_admit(class).is_some());
     }
 
     #[test]
@@ -913,6 +962,67 @@ mod tests {
             drop(permit);
             assert_eq!(governor.counter(class).load(Ordering::Acquire), 0);
         }
+        assert_eq!(governor.shared_connection_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn shared_connection_admission_rolls_back_when_budget_is_full() {
+        let governor = MemoryGovernor::new();
+        let budget = shared_connection_admission_budget(&governor.memory_snapshot());
+        let baseline = budget.saturating_sub(HTTP_CONN_ESTIMATED_BYTES / 2);
+
+        governor
+            .shared_connection_bytes
+            .store(baseline, Ordering::Release);
+        assert!(governor.try_admit(AdmissionClass::HttpConnection).is_none());
+        assert_eq!(
+            governor
+                .counter(AdmissionClass::HttpConnection)
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            governor.shared_connection_bytes.load(Ordering::Acquire),
+            baseline
+        );
+
+        let baseline = budget.saturating_sub(HTTP_CONN_ESTIMATED_BYTES);
+        governor
+            .shared_connection_bytes
+            .store(baseline, Ordering::Release);
+        let permit = governor
+            .try_admit(AdmissionClass::HttpConnection)
+            .expect("exactly one HTTP connection should fit");
+        assert_eq!(
+            governor.shared_connection_bytes.load(Ordering::Acquire),
+            baseline + HTTP_CONN_ESTIMATED_BYTES
+        );
+        drop(permit);
+        assert_eq!(
+            governor.shared_connection_bytes.load(Ordering::Acquire),
+            baseline
+        );
+    }
+
+    #[test]
+    fn shared_connection_budget_is_elastic_not_average_partitioned() {
+        let small = synthetic_snapshot(2, 1, 65_535, 2);
+        let full_budget = shared_connection_admission_budget(&small);
+        let averaged_budget = full_budget / 5;
+        let http_capacity_from_full_budget = full_budget / HTTP_CONN_ESTIMATED_BYTES;
+        let http_capacity_from_average = averaged_budget / HTTP_CONN_ESTIMATED_BYTES;
+
+        assert_eq!(full_budget, small.connection_budget_bytes);
+        assert!(http_capacity_from_full_budget > http_capacity_from_average);
+        assert!(
+            runtime_limit(
+                &small,
+                AdmissionClass::HttpConnection,
+                MIN_HTTP_CONNECTION_LIMIT,
+                MAX_HTTP_CONNECTION_LIMIT,
+            ) as u64
+                >= http_capacity_from_full_budget
+        );
     }
 
     #[test]
