@@ -655,6 +655,8 @@ impl UdpProxyManager {
                     0,
                     0,
                     0,
+                    0,
+                    None,
                     None,
                     None,
                 );
@@ -668,6 +670,7 @@ impl UdpProxyManager {
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
         let mut downstream_sent = 0u64;
+        let mut upstream_sent = 0u64;
         let mut result: anyhow::Result<()> = Ok(());
         let mut buf = vec![0u8; 65535];
         let mut idle_tick = interval(Duration::from_secs(5));
@@ -697,6 +700,7 @@ impl UdpProxyManager {
                         break;
                     }
                     last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
+                    upstream_sent += len;
                     crate::metrics::record::record_transfer(server_id, 0, len, None);
                     crate::metrics::record::record_origin_traffic(server_id, len, 0, None);
                 }
@@ -740,8 +744,10 @@ impl UdpProxyManager {
             &domain,
             "-",
             downstream_sent as i64,
+            upstream_sent as i64,
             0,
             0,
+            None,
             None,
             None,
         );

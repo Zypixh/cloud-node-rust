@@ -4,6 +4,7 @@ use crate::metrics::ServerStatusSnapshot;
 use crate::pb;
 use crate::rpc::client::SharedRpcClient;
 use chrono::{Datelike, Duration as ChronoDuration, Timelike};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
@@ -137,7 +138,7 @@ fn bandwidth_bytes_per_sec(stat: &BandwidthWindowStat, config_store: &ConfigStor
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct BandwidthWindowStat {
     day: String,
     time_at: String,
@@ -162,6 +163,157 @@ struct BandwidthWindowStat {
 struct PendingBandwidthStat {
     queued_at: i64,
     stat: pb::ServerBandwidthStat,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct StoredBandwidthState {
+    current_window: String,
+    window_stats: Vec<BandwidthWindowStat>,
+    pending_stats: Vec<StoredPendingBandwidthStat>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct StoredPendingBandwidthStat {
+    queued_at: i64,
+    user_id: i64,
+    server_id: i64,
+    day: String,
+    time_at: String,
+    bytes: i64,
+    bits: i64,
+    total_bytes: i64,
+    cached_bytes: i64,
+    attack_bytes: i64,
+    count_requests: i64,
+    count_cached_requests: i64,
+    count_attack_requests: i64,
+    user_plan_id: i64,
+    count_websocket_connections: i64,
+    origin_total_bytes: i64,
+    origin_avg_bytes: i64,
+    origin_avg_bits: i64,
+    count_i_ps: i64,
+    node_region_id: i64,
+}
+
+const BANDWIDTH_STATE_STORAGE_KEY: &str = "STAT_BANDWIDTH_STATE_V1";
+
+impl From<&PendingBandwidthStat> for StoredPendingBandwidthStat {
+    fn from(value: &PendingBandwidthStat) -> Self {
+        let stat = &value.stat;
+        Self {
+            queued_at: value.queued_at,
+            user_id: stat.user_id,
+            server_id: stat.server_id,
+            day: stat.day.clone(),
+            time_at: stat.time_at.clone(),
+            bytes: stat.bytes,
+            bits: stat.bits,
+            total_bytes: stat.total_bytes,
+            cached_bytes: stat.cached_bytes,
+            attack_bytes: stat.attack_bytes,
+            count_requests: stat.count_requests,
+            count_cached_requests: stat.count_cached_requests,
+            count_attack_requests: stat.count_attack_requests,
+            user_plan_id: stat.user_plan_id,
+            count_websocket_connections: stat.count_websocket_connections,
+            origin_total_bytes: stat.origin_total_bytes,
+            origin_avg_bytes: stat.origin_avg_bytes,
+            origin_avg_bits: stat.origin_avg_bits,
+            count_i_ps: stat.count_i_ps,
+            node_region_id: stat.node_region_id,
+        }
+    }
+}
+
+impl From<StoredPendingBandwidthStat> for PendingBandwidthStat {
+    fn from(value: StoredPendingBandwidthStat) -> Self {
+        Self {
+            queued_at: value.queued_at,
+            stat: pb::ServerBandwidthStat {
+                user_id: value.user_id,
+                server_id: value.server_id,
+                day: value.day,
+                time_at: value.time_at,
+                bytes: value.bytes,
+                bits: value.bits,
+                total_bytes: value.total_bytes,
+                cached_bytes: value.cached_bytes,
+                attack_bytes: value.attack_bytes,
+                count_requests: value.count_requests,
+                count_cached_requests: value.count_cached_requests,
+                count_attack_requests: value.count_attack_requests,
+                user_plan_id: value.user_plan_id,
+                count_websocket_connections: value.count_websocket_connections,
+                origin_total_bytes: value.origin_total_bytes,
+                origin_avg_bytes: value.origin_avg_bytes,
+                origin_avg_bits: value.origin_avg_bits,
+                count_i_ps: value.count_i_ps,
+                node_region_id: value.node_region_id,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+fn load_bandwidth_state() -> (
+    String,
+    HashMap<i64, BandwidthWindowStat>,
+    Vec<PendingBandwidthStat>,
+) {
+    let Some(state) = crate::metrics::storage::STORAGE
+        .get_json::<StoredBandwidthState>(BANDWIDTH_STATE_STORAGE_KEY)
+    else {
+        return (String::new(), HashMap::new(), Vec::new());
+    };
+
+    let now = crate::utils::time::system_local();
+    let today = now.format("%Y%m%d").to_string();
+    let available_time = (now - ChronoDuration::seconds(BANDWIDTH_REPORT_INTERVAL_SECS as i64))
+        .format("%H%M")
+        .to_string();
+    let mut window_stats = HashMap::new();
+    for stat in state.window_stats {
+        if stat.day == today && stat.time_at >= available_time {
+            window_stats.insert(stat.server_id, stat);
+        }
+    }
+    let current_window = if window_stats.is_empty() {
+        String::new()
+    } else {
+        state.current_window
+    };
+
+    let now_ts = crate::utils::time::system_timestamp();
+    let pending_stats = state
+        .pending_stats
+        .into_iter()
+        .map(PendingBandwidthStat::from)
+        .filter(|item| now_ts - item.queued_at <= STAT_RETRY_RETENTION_SECS)
+        .collect();
+
+    (current_window, window_stats, pending_stats)
+}
+
+fn persist_bandwidth_state(
+    current_window: &str,
+    window_stats: &HashMap<i64, BandwidthWindowStat>,
+    pending_stats: &[PendingBandwidthStat],
+) {
+    if current_window.is_empty() && window_stats.is_empty() && pending_stats.is_empty() {
+        let _ = crate::metrics::storage::STORAGE.delete_key(BANDWIDTH_STATE_STORAGE_KEY);
+        return;
+    }
+
+    let state = StoredBandwidthState {
+        current_window: current_window.to_string(),
+        window_stats: window_stats.values().cloned().collect(),
+        pending_stats: pending_stats
+            .iter()
+            .map(StoredPendingBandwidthStat::from)
+            .collect(),
+    };
+    let _ = crate::metrics::storage::STORAGE.put_json(BANDWIDTH_STATE_STORAGE_KEY, &state);
 }
 
 fn snapshot_delta(
@@ -199,9 +351,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
         BANDWIDTH_SAMPLE_INTERVAL_SECS,
     ));
     let mut last_snapshots: HashMap<i64, ServerStatusSnapshot> = HashMap::new();
-    let mut current_window = String::new();
-    let mut window_stats: HashMap<i64, BandwidthWindowStat> = HashMap::new();
-    let mut pending_stats: Vec<PendingBandwidthStat> = Vec::new();
+    let (mut current_window, mut window_stats, mut pending_stats) = load_bandwidth_state();
 
     loop {
         interval.tick().await;
@@ -273,6 +423,11 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
                         error!("Bandwidth reporter failed to connect: {}", e);
                         pending_stats = upload_items;
                         current_window = window_key;
+                        persist_bandwidth_state(
+                            &current_window,
+                            &window_stats,
+                            pending_stats.as_slice(),
+                        );
                         continue;
                     }
                 };
@@ -289,8 +444,10 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
                 } else {
                     pending_stats.clear();
                 }
+                persist_bandwidth_state(&current_window, &window_stats, pending_stats.as_slice());
             }
             current_window = window_key.clone();
+            persist_bandwidth_state(&current_window, &window_stats, pending_stats.as_slice());
         }
 
         for snap_tuple in snapshots {
@@ -334,6 +491,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             stat.origin_avg_bits = (stat.origin_total_bytes * 8) / BANDWIDTH_REPORT_INTERVAL_SECS;
             stat.count_ips = stat.count_ips.max(delta.count_ips);
         }
+        persist_bandwidth_state(&current_window, &window_stats, pending_stats.as_slice());
     }
 }
 
@@ -550,13 +708,6 @@ pub async fn start_metric_stat_reporter(
             continue;
         }
 
-        let samples = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.flush();
-        if samples.is_empty() {
-            // Even if no new samples, we might still want to report if we have cached keys
-            // But usually we skip
-            continue;
-        }
-
         let client = match SharedRpcClient::get(&api_config).await {
             Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
@@ -565,6 +716,13 @@ pub async fn start_metric_stat_reporter(
             }
         };
         let mut service = client.metric_stat_service();
+
+        let samples = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.flush();
+        if samples.is_empty() {
+            // Even if no new samples, we might still want to report if we have cached keys
+            // But usually we skip
+            continue;
+        }
 
         for item in metric_items {
             if !item.is_on {
@@ -598,8 +756,12 @@ pub async fn start_metric_stat_reporter(
                     count += value.count;
 
                     let val = match item.value.as_str() {
-                        Some("${bytesSent}") => value.bytes_sent as f32,
+                        Some("${bytesSent}") | Some("${countTrafficOut}") => {
+                            value.bytes_sent as f32
+                        }
+                        Some("${countTrafficIn}") => value.bytes_received as f32,
                         Some("${countRequest}") => value.count as f32,
+                        Some("${countConnection}") => value.count as f32,
                         Some("${countAttackRequest}") => value.count_attack as f32,
                         _ => value.count as f32,
                     };
@@ -607,18 +769,7 @@ pub async fn start_metric_stat_reporter(
 
                     let mut keys = Vec::new();
                     for k in &item.keys {
-                        let v = match k.as_str() {
-                            "${country}" => key.country.to_string(),
-                            "${province}" => key.province.to_string(),
-                            "${city}" => key.city.to_string(),
-                            "${provider}" => key.provider.to_string(),
-                            "${browser}" => key.browser.to_string(),
-                            "${os}" => key.os.to_string(),
-                            "${wafGroup}" => key.waf_group_id.to_string(),
-                            "${wafAction}" => key.waf_action.to_string(),
-                            _ => "".to_string(),
-                        };
-                        keys.push(v);
+                        keys.push(key.resolve_metric_key(k));
                     }
 
                     // GO ALGORITHM: hashString(serverId + "@" + keys.join("$EDGE$") + "@" + time + "@" + version + "@" + itemId)
@@ -677,7 +828,72 @@ use std::sync::atomic::{AtomicBool, AtomicI32};
 static LAST_NODE_LEVEL: AtomicI32 = AtomicI32::new(-1);
 static LAST_HAS_PARENTS: AtomicBool = AtomicBool::new(false);
 
-pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
+#[derive(Clone, Copy)]
+struct HttpRequestStatUploadLimits {
+    max_cities: usize,
+    max_providers: usize,
+    max_systems: usize,
+    max_browsers: usize,
+}
+
+impl HttpRequestStatUploadLimits {
+    fn from_config(config: &crate::config_models::GlobalStatUploadConfig) -> Self {
+        Self {
+            max_cities: positive_or_default(config.max_cities, 32),
+            max_providers: positive_or_default(config.max_providers, 32),
+            max_systems: positive_or_default(config.max_systems, 64),
+            max_browsers: positive_or_default(config.max_browsers, 64),
+        }
+    }
+}
+
+fn positive_or_default(value: i16, default_value: usize) -> usize {
+    if value > 0 {
+        value as usize
+    } else {
+        default_value
+    }
+}
+
+fn trim_http_request_stat_rows_with_limits(
+    req: &mut pb::UploadServerHttpRequestStatRequest,
+    limits: HttpRequestStatUploadLimits,
+) {
+    req.region_cities
+        .sort_by(|a, b| b.count_requests.cmp(&a.count_requests));
+    let mut server_counts = HashMap::<i64, usize>::new();
+    req.region_cities.retain(|row| {
+        let count = server_counts.entry(row.server_id).or_default();
+        *count += 1;
+        *count <= limits.max_cities
+    });
+
+    req.region_providers.sort_by(|a, b| b.count.cmp(&a.count));
+    server_counts.clear();
+    req.region_providers.retain(|row| {
+        let count = server_counts.entry(row.server_id).or_default();
+        *count += 1;
+        *count <= limits.max_providers
+    });
+
+    req.systems.sort_by(|a, b| b.count.cmp(&a.count));
+    server_counts.clear();
+    req.systems.retain(|row| {
+        let count = server_counts.entry(row.server_id).or_default();
+        *count += 1;
+        *count <= limits.max_systems
+    });
+
+    req.browsers.sort_by(|a, b| b.count.cmp(&a.count));
+    server_counts.clear();
+    req.browsers.retain(|row| {
+        let count = server_counts.entry(row.server_id).or_default();
+        *count += 1;
+        *count <= limits.max_browsers
+    });
+}
+
+pub async fn start_metrics_aggregator_reporter(config_store: ConfigStore, api_config: ApiConfig) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
 
     loop {
@@ -745,57 +961,114 @@ pub async fn start_metrics_aggregator_reporter(api_config: ApiConfig) {
             http_firewall_rule_groups: vec![],
         };
 
+        let mut city_map: HashMap<(i64, i64, i64, i64), (i64, i64, i64, i64)> = HashMap::new();
+        let mut provider_map: HashMap<(i64, i64), i64> = HashMap::new();
+        let mut system_map: HashMap<(i64, String, String), i64> = HashMap::new();
+        let mut browser_map: HashMap<(i64, String, String), i64> = HashMap::new();
+        let mut waf_map: HashMap<(i64, i64, String), i64> = HashMap::new();
+
         for (key, val) in samples {
-            req.systems
-                .push(pb::upload_server_http_request_stat_request::System {
-                    server_id: key.server_id,
-                    name: key.os.to_string(),
-                    version: "".to_string(),
-                    count: val.count,
-                });
-
-            req.browsers
-                .push(pb::upload_server_http_request_stat_request::Browser {
-                    server_id: key.server_id,
-                    name: key.browser.to_string(),
-                    version: "".to_string(),
-                    count: val.count,
-                });
-
-            if key.waf_group_id > 0 {
-                req.http_firewall_rule_groups.push(
-                    pb::upload_server_http_request_stat_request::HttpFirewallRuleGroup {
-                        server_id: key.server_id,
-                        http_firewall_rule_group_id: key.waf_group_id,
-                        action: key.waf_action.to_string(),
-                        count: val.count_attack,
-                    },
-                );
+            if key.country_id > 0 {
+                let entry = city_map
+                    .entry((key.server_id, key.country_id, key.province_id, key.city_id))
+                    .or_default();
+                entry.0 += val.count;
+                entry.1 += val.bytes_sent;
+                entry.2 += val.count_attack;
+                entry.3 += val.attack_bytes;
             }
 
-            req.region_cities
-                .push(pb::upload_server_http_request_stat_request::RegionCity {
-                    server_id: key.server_id,
-                    count_requests: val.count,
-                    bytes: val.bytes_sent,
-                    count_attack_requests: val.count_attack,
-                    attack_bytes: 0,
-                    region_country_id: key.country_id,
-                    region_province_id: key.province_id,
-                    region_city_id: key.city_id,
-                });
+            if key.provider_id > 0 {
+                *provider_map
+                    .entry((key.server_id, key.provider_id))
+                    .or_default() += val.count;
+            }
 
-            let provider_id = key.provider_id;
-            if provider_id != 0 {
-                req.region_providers.push(
-                    pb::upload_server_http_request_stat_request::RegionProvider {
-                        server_id: key.server_id,
-                        count: val.count,
-                        region_provider_id: provider_id,
-                    },
-                );
+            if !key.os.is_empty() {
+                *system_map
+                    .entry((
+                        key.server_id,
+                        key.os.to_string(),
+                        key.os_version.to_string(),
+                    ))
+                    .or_default() += val.count;
+            }
+
+            if !key.browser.is_empty() {
+                *browser_map
+                    .entry((
+                        key.server_id,
+                        key.browser.to_string(),
+                        key.browser_version.to_string(),
+                    ))
+                    .or_default() += val.count;
+            }
+
+            if key.waf_group_id > 0 && val.count_attack > 0 {
+                *waf_map
+                    .entry((key.server_id, key.waf_group_id, key.waf_action.to_string()))
+                    .or_default() += val.count_attack;
             }
         }
+
+        for ((server_id, country_id, province_id, city_id), value) in city_map {
+            req.region_cities
+                .push(pb::upload_server_http_request_stat_request::RegionCity {
+                    server_id,
+                    count_requests: value.0,
+                    bytes: value.1,
+                    count_attack_requests: value.2,
+                    attack_bytes: value.3,
+                    region_country_id: country_id,
+                    region_province_id: province_id,
+                    region_city_id: city_id,
+                });
+        }
+
+        for ((server_id, provider_id), count) in provider_map {
+            req.region_providers.push(
+                pb::upload_server_http_request_stat_request::RegionProvider {
+                    server_id,
+                    count,
+                    region_provider_id: provider_id,
+                },
+            );
+        }
+
+        for ((server_id, name, version), count) in system_map {
+            req.systems
+                .push(pb::upload_server_http_request_stat_request::System {
+                    server_id,
+                    name,
+                    version,
+                    count,
+                });
+        }
+
+        for ((server_id, name, version), count) in browser_map {
+            req.browsers
+                .push(pb::upload_server_http_request_stat_request::Browser {
+                    server_id,
+                    name,
+                    version,
+                    count,
+                });
+        }
+
+        for ((server_id, waf_group_id, action), count) in waf_map {
+            req.http_firewall_rule_groups.push(
+                pb::upload_server_http_request_stat_request::HttpFirewallRuleGroup {
+                    server_id,
+                    http_firewall_rule_group_id: waf_group_id,
+                    action,
+                    count,
+                },
+            );
+        }
+
+        let upload_limits =
+            HttpRequestStatUploadLimits::from_config(&config_store.get_global_stat_upload_sync());
+        trim_http_request_stat_rows_with_limits(&mut req, upload_limits);
 
         if let Err(e) =
             crate::rpc::track_rpc(server_service.upload_server_http_request_stat(req)).await
@@ -854,5 +1127,118 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
         {
             error!("Failed to upload top IP stats: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trims_http_request_dimension_rows_per_server() {
+        let mut req = pb::UploadServerHttpRequestStatRequest::default();
+        for count in [10, 30, 20] {
+            req.region_cities
+                .push(pb::upload_server_http_request_stat_request::RegionCity {
+                    server_id: 1,
+                    region_city_id: count,
+                    count_requests: count,
+                    ..Default::default()
+                });
+            req.region_providers.push(
+                pb::upload_server_http_request_stat_request::RegionProvider {
+                    server_id: 1,
+                    region_provider_id: count,
+                    count,
+                },
+            );
+            req.systems
+                .push(pb::upload_server_http_request_stat_request::System {
+                    server_id: 1,
+                    name: format!("os-{count}"),
+                    count,
+                    ..Default::default()
+                });
+            req.browsers
+                .push(pb::upload_server_http_request_stat_request::Browser {
+                    server_id: 1,
+                    name: format!("browser-{count}"),
+                    count,
+                    ..Default::default()
+                });
+        }
+        req.region_cities
+            .push(pb::upload_server_http_request_stat_request::RegionCity {
+                server_id: 2,
+                region_city_id: 5,
+                count_requests: 5,
+                ..Default::default()
+            });
+
+        trim_http_request_stat_rows_with_limits(
+            &mut req,
+            HttpRequestStatUploadLimits {
+                max_cities: 2,
+                max_providers: 2,
+                max_systems: 2,
+                max_browsers: 2,
+            },
+        );
+
+        assert_eq!(
+            req.region_cities
+                .iter()
+                .filter(|row| row.server_id == 1)
+                .map(|row| row.region_city_id)
+                .collect::<Vec<_>>(),
+            vec![30, 20]
+        );
+        assert_eq!(
+            req.region_cities
+                .iter()
+                .filter(|row| row.server_id == 2)
+                .count(),
+            1
+        );
+        assert_eq!(req.region_providers.len(), 2);
+        assert_eq!(req.systems.len(), 2);
+        assert_eq!(req.browsers.len(), 2);
+    }
+
+    #[test]
+    fn bandwidth_pending_stat_round_trips_storage_shape() {
+        let pending = PendingBandwidthStat {
+            queued_at: 123,
+            stat: pb::ServerBandwidthStat {
+                user_id: 1,
+                server_id: 2,
+                day: "20260621".to_string(),
+                time_at: "1200".to_string(),
+                bytes: 3,
+                bits: 24,
+                total_bytes: 4,
+                cached_bytes: 5,
+                attack_bytes: 6,
+                count_requests: 7,
+                count_cached_requests: 8,
+                count_attack_requests: 9,
+                user_plan_id: 10,
+                count_websocket_connections: 11,
+                origin_total_bytes: 12,
+                origin_avg_bytes: 13,
+                origin_avg_bits: 14,
+                count_i_ps: 15,
+                node_region_id: 16,
+                ..Default::default()
+            },
+        };
+
+        let restored = PendingBandwidthStat::from(StoredPendingBandwidthStat::from(&pending));
+
+        assert_eq!(restored.queued_at, pending.queued_at);
+        assert_eq!(restored.stat.server_id, pending.stat.server_id);
+        assert_eq!(restored.stat.total_bytes, pending.stat.total_bytes);
+        assert_eq!(restored.stat.count_i_ps, pending.stat.count_i_ps);
+        assert_eq!(restored.stat.node_region_id, pending.stat.node_region_id);
     }
 }

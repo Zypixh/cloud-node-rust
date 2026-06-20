@@ -535,8 +535,10 @@ fn apply_single_filter(value: &str, filter: &HTTPParamFilter) -> String {
 static CC_COUNTERS: Lazy<DashMap<String, crate::firewall::state::RollingCounter>> =
     Lazy::new(DashMap::new);
 static CC_COUNTER_LAST_SWEEP: AtomicI64 = AtomicI64::new(0);
+static CC_COUNTER_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
 const CC_COUNTER_MAX_PERIOD_SECS: i64 = 7 * 86_400;
 const CC_COUNTER_SWEEP_INTERVAL_SECS: i64 = 60;
+const CC_COUNTER_CAPACITY_WARN_INTERVAL_SECS: i64 = 60;
 const CC_COUNTER_MAX_ENTRIES_NORMAL: usize = 1_000_000;
 const CC_COUNTER_MAX_ENTRIES_PRESSURE: usize = 131_072;
 
@@ -1139,7 +1141,19 @@ pub(crate) fn increase_counter(key: String, period_secs: i64) -> u64 {
     if !CC_COUNTERS.contains_key(&key) && CC_COUNTERS.len() >= cc_counter_capacity() {
         sweep_cc_counters_force(now);
         if CC_COUNTERS.len() >= cc_counter_capacity() {
-            return u64::MAX;
+            let last = CC_COUNTER_CAPACITY_WARN_AT.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= CC_COUNTER_CAPACITY_WARN_INTERVAL_SECS
+                && CC_COUNTER_CAPACITY_WARN_AT
+                    .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                tracing::warn!(
+                    "WAF compiled CC counter capacity full; len={} capacity={}, fail-open for new keys",
+                    CC_COUNTERS.len(),
+                    cc_counter_capacity()
+                );
+            }
+            return 0;
         }
     }
     CC_COUNTERS

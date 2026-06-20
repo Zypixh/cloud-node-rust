@@ -19,11 +19,51 @@ pub enum AdmissionClass {
     CacheReadMemory,
 }
 
+const ADMISSION_CLASS_COUNT: usize = 14;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdmissionRejectSnapshot {
+    pub http_connection: u64,
+    pub tcp_connection: u64,
+    pub h3_connection: u64,
+    pub udp_session: u64,
+    pub h2_stream: u64,
+    pub h3_request: u64,
+    pub origin_connect: u64,
+    pub background_work: u64,
+    pub request_body_waf: u64,
+    pub response_body_waf: u64,
+    pub response_transform: u64,
+    pub cache_revalidate: u64,
+    pub cache_write: u64,
+    pub cache_read_memory: u64,
+}
+
+impl AdmissionRejectSnapshot {
+    pub fn total(self) -> u64 {
+        self.http_connection
+            .saturating_add(self.tcp_connection)
+            .saturating_add(self.h3_connection)
+            .saturating_add(self.udp_session)
+            .saturating_add(self.h2_stream)
+            .saturating_add(self.h3_request)
+            .saturating_add(self.origin_connect)
+            .saturating_add(self.background_work)
+            .saturating_add(self.request_body_waf)
+            .saturating_add(self.response_body_waf)
+            .saturating_add(self.response_transform)
+            .saturating_add(self.cache_revalidate)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.cache_read_memory)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct GovernorSnapshot {
     pub memory_total_bytes: u64,
     pub memory_used_bytes: u64,
     pub memory_available_bytes: u64,
+    pub memory_pressure_level: MemoryPressureLevel,
     pub fd_soft_limit: u64,
     pub http_fd_budget: u64,
     pub tcp_fd_budget: u64,
@@ -33,6 +73,7 @@ pub struct GovernorSnapshot {
     pub cpu_parallelism: usize,
     pub connection_budget_bytes: u64,
     pub connection_admission_used_bytes: u64,
+    pub admission_rejects: AdmissionRejectSnapshot,
     pub keepalive_budget_bytes: u64,
     pub estimated_http_connections: u64,
     pub estimated_tcp_connections: u64,
@@ -50,6 +91,9 @@ pub struct GovernorSnapshot {
     pub udp_session_queue_size: usize,
     pub udp_socket_buffer_size: usize,
     pub h3_datagram_queue_size: usize,
+    pub h3_datagram_queue_budget_bytes: usize,
+    pub quic_pending_route_limit_per_port: usize,
+    pub quic_pending_reassembly_budget_bytes: usize,
     pub h2_stream_global_limit: usize,
     pub h2_stream_limit_per_connection: usize,
     pub h3_request_global_limit: usize,
@@ -92,6 +136,14 @@ struct MemorySnapshot {
 }
 
 pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(MemoryGovernor::new);
+
+pub fn reported_memory_totals() -> (i64, i64) {
+    let snapshot = MEMORY_GOVERNOR.snapshot(MEMORY_GOVERNOR.pingora_worker_threads());
+    (
+        snapshot.memory_total_bytes.min(i64::MAX as u64) as i64,
+        snapshot.memory_used_bytes.min(i64::MAX as u64) as i64,
+    )
+}
 
 const SNAPSHOT_TTL_MS: i64 = 2_000;
 const MIN_MEMORY_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
@@ -139,9 +191,10 @@ const MIN_HTTP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_TCP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_H3_CONNECTION_LIMIT: usize = 4_096;
 const MIN_UDP_SESSION_LIMIT: usize = 4_096;
-const MIN_UDP_ROUTE_LIMIT_PER_PORT: usize = 4_096;
 const MIN_UDP_SESSION_QUEUE_SIZE: usize = 64;
 const MIN_H3_DATAGRAM_QUEUE_SIZE: usize = 1_024;
+const MIN_H3_DATAGRAM_QUEUE_SIZE_HIGH: usize = 256;
+const MIN_H3_DATAGRAM_QUEUE_SIZE_CRITICAL: usize = 64;
 const MIN_H2_STREAM_GLOBAL_LIMIT: usize = 4_096;
 const MIN_H2_STREAM_LIMIT_PER_CONNECTION: usize = 256;
 const MIN_H3_REQUEST_GLOBAL_LIMIT: usize = 4_096;
@@ -165,6 +218,10 @@ const MAX_UDP_SESSION_LIMIT: usize = 100_000_000;
 const MAX_UDP_ROUTE_LIMIT_PER_PORT: usize = 100_000_000;
 const MAX_UDP_SESSION_QUEUE_SIZE: usize = 2_048;
 const MAX_H3_DATAGRAM_QUEUE_SIZE: usize = 65_536;
+const MAX_QUIC_PENDING_ROUTE_LIMIT_PER_PORT: usize = 2_048;
+const MIN_QUIC_PENDING_ROUTE_LIMIT_PER_PORT: usize = 128;
+const MAX_QUIC_PENDING_REASSEMBLY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const MIN_QUIC_PENDING_REASSEMBLY_BUDGET_BYTES: usize = 512 * 1024;
 const MAX_H2_STREAM_GLOBAL_LIMIT: usize = 100_000_000;
 const MAX_H2_STREAM_LIMIT_PER_CONNECTION: usize = 65_535;
 const MAX_H3_REQUEST_GLOBAL_LIMIT: usize = 100_000_000;
@@ -210,6 +267,25 @@ const MAX_FIREWALL_IP_BW_COUNTERS: usize = 16_000_000;
 const MIN_FIREWALL_CANDIDATE_STATS: usize = 4_096;
 const MAX_FIREWALL_CANDIDATE_STATS: usize = 2_000_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryPressureLevel {
+    Normal,
+    Elevated,
+    High,
+    Critical,
+}
+
+impl MemoryPressureLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryPressureLevel::Normal => "normal",
+            MemoryPressureLevel::Elevated => "elevated",
+            MemoryPressureLevel::High => "high",
+            MemoryPressureLevel::Critical => "critical",
+        }
+    }
+}
+
 pub struct MemoryGovernor {
     http_connections: AtomicU64,
     tcp_connections: AtomicU64,
@@ -227,6 +303,7 @@ pub struct MemoryGovernor {
     cache_write: AtomicU64,
     cache_read_memory: AtomicU64,
     cache_read_memory_bytes: AtomicU64,
+    admission_rejects: [AtomicU64; ADMISSION_CLASS_COUNT],
     cached_total_bytes: AtomicU64,
     cached_used_bytes: AtomicU64,
     cached_available_bytes: AtomicU64,
@@ -243,7 +320,7 @@ pub struct AdmissionPermit<'a> {
 pub type StaticAdmissionPermit = AdmissionPermit<'static>;
 
 impl MemoryGovernor {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             http_connections: AtomicU64::new(0),
             tcp_connections: AtomicU64::new(0),
@@ -261,6 +338,7 @@ impl MemoryGovernor {
             cache_write: AtomicU64::new(0),
             cache_read_memory: AtomicU64::new(0),
             cache_read_memory_bytes: AtomicU64::new(0),
+            admission_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             cached_total_bytes: AtomicU64::new(0),
             cached_used_bytes: AtomicU64::new(0),
             cached_available_bytes: AtomicU64::new(0),
@@ -280,6 +358,7 @@ impl MemoryGovernor {
     pub fn try_admit_cache_read(&self, bytes: u64) -> Option<AdmissionPermit<'_>> {
         let bytes = bytes.max(1);
         if bytes > self.cache_read_memory_object_limit_bytes() {
+            self.record_reject(AdmissionClass::CacheReadMemory);
             return None;
         }
         self.try_admit_with_charges(AdmissionClass::CacheReadMemory, bytes)
@@ -294,6 +373,7 @@ impl MemoryGovernor {
         let current = counter.fetch_add(1, Ordering::AcqRel) + 1;
         if current > self.limit_for(class) as u64 {
             counter.fetch_sub(1, Ordering::AcqRel);
+            self.record_reject(class);
             return None;
         }
 
@@ -308,6 +388,7 @@ impl MemoryGovernor {
                 self.shared_connection_bytes
                     .fetch_sub(shared_connection_charge_bytes, Ordering::AcqRel);
                 counter.fetch_sub(1, Ordering::AcqRel);
+                self.record_reject(class);
                 return None;
             }
         }
@@ -326,6 +407,7 @@ impl MemoryGovernor {
                         .fetch_sub(shared_connection_charge_bytes, Ordering::AcqRel);
                 }
                 counter.fetch_sub(1, Ordering::AcqRel);
+                self.record_reject(class);
                 return None;
             }
         }
@@ -392,25 +474,25 @@ impl MemoryGovernor {
             AdmissionClass::RequestBodyWaf => connection_limit(
                 snapshot.available_bytes / 8,
                 REQUEST_BODY_WAF_ESTIMATED_BYTES,
-                MIN_REQUEST_BODY_WAF_LIMIT,
+                pressure_adjusted_min_limit(&snapshot, MIN_REQUEST_BODY_WAF_LIMIT, 32, 8),
                 MAX_REQUEST_BODY_WAF_LIMIT,
             ),
             AdmissionClass::ResponseBodyWaf => connection_limit(
                 snapshot.available_bytes / 8,
                 RESPONSE_BODY_WAF_ESTIMATED_BYTES,
-                MIN_RESPONSE_BODY_WAF_LIMIT,
+                pressure_adjusted_min_limit(&snapshot, MIN_RESPONSE_BODY_WAF_LIMIT, 64, 16),
                 MAX_RESPONSE_BODY_WAF_LIMIT,
             ),
             AdmissionClass::ResponseTransform => connection_limit(
                 snapshot.available_bytes / 6,
                 RESPONSE_TRANSFORM_ESTIMATED_BYTES,
-                MIN_RESPONSE_TRANSFORM_LIMIT,
+                pressure_adjusted_min_limit(&snapshot, MIN_RESPONSE_TRANSFORM_LIMIT, 8, 2),
                 MAX_RESPONSE_TRANSFORM_LIMIT,
             ),
             AdmissionClass::CacheRevalidate => connection_limit(
                 snapshot.available_bytes / 16,
                 CACHE_REVALIDATE_ESTIMATED_BYTES,
-                MIN_CACHE_REVALIDATE_LIMIT,
+                pressure_adjusted_min_limit(&snapshot, MIN_CACHE_REVALIDATE_LIMIT, 16, 4),
                 MAX_CACHE_REVALIDATE_LIMIT,
             ),
             AdmissionClass::CacheWrite => connection_limit(
@@ -420,21 +502,13 @@ impl MemoryGovernor {
                     snapshot.cache_budget_bytes / 4
                 },
                 CACHE_WRITE_ESTIMATED_BYTES,
-                if memory_pressure_high(&snapshot) {
-                    MIN_CACHE_WRITE_LIMIT / 4
-                } else {
-                    MIN_CACHE_WRITE_LIMIT
-                },
+                pressure_adjusted_min_limit(&snapshot, MIN_CACHE_WRITE_LIMIT, 16, 4),
                 MAX_CACHE_WRITE_LIMIT,
             ),
             AdmissionClass::CacheReadMemory => connection_limit(
                 cache_read_memory_budget_bytes(&snapshot),
                 CACHE_READ_MEMORY_ESTIMATED_BYTES,
-                if memory_pressure_high(&snapshot) {
-                    MIN_CACHE_READ_MEMORY_LIMIT / 2
-                } else {
-                    MIN_CACHE_READ_MEMORY_LIMIT
-                },
+                pressure_adjusted_min_limit(&snapshot, MIN_CACHE_READ_MEMORY_LIMIT, 4, 1),
                 MAX_CACHE_READ_MEMORY_LIMIT,
             ),
         }
@@ -502,7 +576,7 @@ impl MemoryGovernor {
 
     pub fn udp_route_limit_per_port(&self) -> usize {
         let session_limit = self.limit_for(AdmissionClass::UdpSession);
-        session_limit.clamp(MIN_UDP_ROUTE_LIMIT_PER_PORT, MAX_UDP_ROUTE_LIMIT_PER_PORT)
+        session_limit.clamp(1, MAX_UDP_ROUTE_LIMIT_PER_PORT)
     }
 
     pub fn udp_session_queue_size(&self) -> usize {
@@ -523,18 +597,19 @@ impl MemoryGovernor {
     }
 
     pub fn h3_datagram_queue_size(&self) -> usize {
-        let snapshot = self.memory_snapshot();
-        let target = connection_limit(
-            snapshot.connection_budget_bytes / 128,
-            UDP_DATAGRAM_ESTIMATED_BYTES,
-            MIN_H3_DATAGRAM_QUEUE_SIZE,
-            MAX_H3_DATAGRAM_QUEUE_SIZE,
-        );
-        if memory_pressure_high(&snapshot) {
-            target.clamp(MIN_H3_DATAGRAM_QUEUE_SIZE, 8_192)
-        } else {
-            target
-        }
+        h3_datagram_queue_size(&self.memory_snapshot())
+    }
+
+    pub fn h3_datagram_queue_budget_bytes(&self) -> usize {
+        h3_datagram_queue_budget_bytes(&self.memory_snapshot())
+    }
+
+    pub fn quic_pending_route_limit_per_port(&self) -> usize {
+        quic_pending_route_limit_per_port(&self.memory_snapshot(), self.udp_route_limit_per_port())
+    }
+
+    pub fn quic_pending_reassembly_budget_bytes(&self) -> usize {
+        quic_pending_reassembly_budget_bytes(&self.memory_snapshot())
     }
 
     pub fn udp_socket_buffer_size(&self) -> usize {
@@ -562,14 +637,16 @@ impl MemoryGovernor {
             MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD.saturating_mul(threads),
         );
         let fd_target = fd_budget(&snapshot, KEEPALIVE_FD_BUDGET_PCT) as usize;
-        let global_target = memory_target.min(fd_target.max(1)).clamp(
-            MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD * threads,
-            MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD * threads,
-        );
-        (global_target / threads).clamp(
-            MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD,
-            MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD,
-        )
+        let global_floor = if fd_target >= MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD * threads {
+            MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD * threads
+        } else {
+            threads
+        };
+        let global_ceiling = MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD * threads;
+        let global_target = memory_target
+            .min(fd_target.max(threads))
+            .clamp(global_floor, global_ceiling);
+        (global_target / threads).clamp(1, MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD)
     }
 
     pub fn pingora_worker_threads(&self) -> usize {
@@ -622,6 +699,7 @@ impl MemoryGovernor {
             memory_total_bytes: mem.total_bytes,
             memory_used_bytes: mem.used_bytes,
             memory_available_bytes: mem.available_bytes,
+            memory_pressure_level: memory_pressure_level(&mem),
             fd_soft_limit: mem.fd_soft_limit,
             http_fd_budget: fd_budget(&mem, HTTP_FD_BUDGET_PCT),
             tcp_fd_budget: fd_budget(&mem, TCP_FD_BUDGET_PCT),
@@ -631,6 +709,7 @@ impl MemoryGovernor {
             cpu_parallelism: mem.cpu_parallelism,
             connection_budget_bytes: mem.connection_budget_bytes,
             connection_admission_used_bytes: self.shared_connection_bytes.load(Ordering::Relaxed),
+            admission_rejects: self.admission_reject_snapshot(),
             keepalive_budget_bytes: mem.keepalive_budget_bytes,
             estimated_http_connections: self.http_connections.load(Ordering::Relaxed),
             estimated_tcp_connections: self.tcp_connections.load(Ordering::Relaxed),
@@ -647,7 +726,13 @@ impl MemoryGovernor {
             udp_route_limit_per_port: self.udp_route_limit_per_port(),
             udp_session_queue_size: self.udp_session_queue_size(),
             udp_socket_buffer_size: self.udp_socket_buffer_size(),
-            h3_datagram_queue_size: self.h3_datagram_queue_size(),
+            h3_datagram_queue_size: h3_datagram_queue_size(&mem),
+            h3_datagram_queue_budget_bytes: h3_datagram_queue_budget_bytes(&mem),
+            quic_pending_route_limit_per_port: quic_pending_route_limit_per_port(
+                &mem,
+                self.udp_route_limit_per_port(),
+            ),
+            quic_pending_reassembly_budget_bytes: quic_pending_reassembly_budget_bytes(&mem),
             h2_stream_global_limit: self.limit_for(AdmissionClass::Http2Stream),
             h2_stream_limit_per_connection: self.h2_stream_limit_per_connection(),
             h3_request_global_limit: self.limit_for(AdmissionClass::Http3Request),
@@ -698,6 +783,61 @@ impl MemoryGovernor {
             AdmissionClass::CacheRevalidate => &self.cache_revalidate,
             AdmissionClass::CacheWrite => &self.cache_write,
             AdmissionClass::CacheReadMemory => &self.cache_read_memory,
+        }
+    }
+
+    fn reject_counter(&self, class: AdmissionClass) -> &AtomicU64 {
+        &self.admission_rejects[class_index(class)]
+    }
+
+    fn record_reject(&self, class: AdmissionClass) {
+        self.reject_counter(class).fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn admission_reject_snapshot(&self) -> AdmissionRejectSnapshot {
+        AdmissionRejectSnapshot {
+            http_connection: self
+                .reject_counter(AdmissionClass::HttpConnection)
+                .load(Ordering::Relaxed),
+            tcp_connection: self
+                .reject_counter(AdmissionClass::TcpConnection)
+                .load(Ordering::Relaxed),
+            h3_connection: self
+                .reject_counter(AdmissionClass::Http3Connection)
+                .load(Ordering::Relaxed),
+            udp_session: self
+                .reject_counter(AdmissionClass::UdpSession)
+                .load(Ordering::Relaxed),
+            h2_stream: self
+                .reject_counter(AdmissionClass::Http2Stream)
+                .load(Ordering::Relaxed),
+            h3_request: self
+                .reject_counter(AdmissionClass::Http3Request)
+                .load(Ordering::Relaxed),
+            origin_connect: self
+                .reject_counter(AdmissionClass::OriginConnect)
+                .load(Ordering::Relaxed),
+            background_work: self
+                .reject_counter(AdmissionClass::BackgroundWork)
+                .load(Ordering::Relaxed),
+            request_body_waf: self
+                .reject_counter(AdmissionClass::RequestBodyWaf)
+                .load(Ordering::Relaxed),
+            response_body_waf: self
+                .reject_counter(AdmissionClass::ResponseBodyWaf)
+                .load(Ordering::Relaxed),
+            response_transform: self
+                .reject_counter(AdmissionClass::ResponseTransform)
+                .load(Ordering::Relaxed),
+            cache_revalidate: self
+                .reject_counter(AdmissionClass::CacheRevalidate)
+                .load(Ordering::Relaxed),
+            cache_write: self
+                .reject_counter(AdmissionClass::CacheWrite)
+                .load(Ordering::Relaxed),
+            cache_read_memory: self
+                .reject_counter(AdmissionClass::CacheReadMemory)
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -815,21 +955,22 @@ fn read_memory_snapshot() -> MemorySnapshot {
     let mut total_bytes = sys.total_memory().max(MIN_MEMORY_TOTAL_BYTES);
     #[allow(unused_mut)]
     let mut used_bytes = sys.used_memory().min(total_bytes);
+    #[allow(unused_mut)]
+    let mut available_before_reserve = total_bytes.saturating_sub(used_bytes);
 
     #[cfg(target_os = "linux")]
     {
         if let Some((cgroup_total, cgroup_used)) = linux_cgroup_memory_limit() {
-            total_bytes = cgroup_total.max(MIN_MEMORY_TOTAL_BYTES);
+            total_bytes = cgroup_total.max(1);
             used_bytes = cgroup_used.min(total_bytes);
+            available_before_reserve = total_bytes.saturating_sub(used_bytes);
+        } else if let Some(mem_available) = linux_mem_available_bytes() {
+            available_before_reserve = mem_available.min(total_bytes);
+            used_bytes = total_bytes.saturating_sub(available_before_reserve);
         }
     }
 
-    let hard_reserve = total_bytes.saturating_mul(RESERVE_HEADROOM_PCT) / 100;
-    let available_bytes = total_bytes
-        .saturating_sub(used_bytes)
-        .saturating_sub(hard_reserve)
-        .max(total_bytes / 100)
-        .max(256 * 1024 * 1024);
+    let available_bytes = available_after_reserve(total_bytes, available_before_reserve);
 
     MemorySnapshot {
         total_bytes,
@@ -844,37 +985,140 @@ fn read_memory_snapshot() -> MemorySnapshot {
 
 #[cfg(target_os = "linux")]
 fn linux_cgroup_memory_limit() -> Option<(u64, u64)> {
-    if let Ok(limit_str) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if let Some(limit_path) = linux_cgroup_v1_file("memory.limit_in_bytes")
+        && let Ok(limit_str) = std::fs::read_to_string(&limit_path)
         && let Ok(limit) = limit_str.trim().parse::<u64>()
         && limit > 0
-        && limit < 1024_u64.pow(4)
+        && !linux_cgroup_limit_is_unlimited(limit)
     {
-        let used = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        let used_path = linux_cgroup_v1_file("memory.usage_in_bytes")?;
+        let stat_path = linux_cgroup_v1_file("memory.stat")?;
+        let used = std::fs::read_to_string(used_path)
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(0);
-        return Some((limit, used));
+        let inactive_file =
+            linux_memory_stat_value(&stat_path, &["total_inactive_file", "inactive_file"]);
+        return Some((limit, used.saturating_sub(inactive_file)));
     }
 
-    let limit_str = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    let limit_path = linux_cgroup_v2_file("memory.max")?;
+    let limit_str = std::fs::read_to_string(limit_path).ok()?;
     if limit_str.trim().eq_ignore_ascii_case("max") {
         return None;
     }
     let limit = limit_str.trim().parse::<u64>().ok()?;
-    if limit == 0 {
+    if limit == 0 || linux_cgroup_limit_is_unlimited(limit) {
         return None;
     }
-    let used = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+    let current_path = linux_cgroup_v2_file("memory.current")?;
+    let stat_path = linux_cgroup_v2_file("memory.stat")?;
+    let used = std::fs::read_to_string(current_path)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    Some((limit, used))
+    let inactive_file = linux_memory_stat_value(&stat_path, &["inactive_file"]);
+    Some((limit, used.saturating_sub(inactive_file)))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mem_available_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        let Some(rest) = line.strip_prefix("MemAvailable:") else {
+            continue;
+        };
+        let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        return Some(kib.saturating_mul(1024));
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_v2_file(file: &str) -> Option<std::path::PathBuf> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        let hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        (hierarchy == "0" && controllers.is_empty()).then_some(path)
+    })?;
+    let relative = path.trim_start_matches('/');
+    Some(
+        std::path::Path::new("/sys/fs/cgroup")
+            .join(relative)
+            .join(file),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_v1_file(file: &str) -> Option<std::path::PathBuf> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        let _hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        controllers
+            .split(',')
+            .any(|controller| controller == "memory")
+            .then_some(path)
+    })?;
+    let relative = path.trim_start_matches('/');
+    Some(
+        std::path::Path::new("/sys/fs/cgroup/memory")
+            .join(relative)
+            .join(file),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_memory_stat_value(path: &std::path::Path, keys: &[&str]) -> u64 {
+    let Ok(stat) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    for key in keys {
+        for line in stat.lines() {
+            let mut parts = line.split_whitespace();
+            if parts.next() == Some(*key) {
+                return parts
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_limit_is_unlimited(limit: u64) -> bool {
+    // cgroup v1 reports "unlimited" as a value close to LONG_MAX. A real
+    // large-memory container can legitimately be 1-2 TiB, so keep the sentinel
+    // threshold far above practical configured limits.
+    limit >= (1_u64 << 60)
+}
+
+fn available_floor_bytes(total_bytes: u64) -> u64 {
+    (total_bytes / 100).clamp(8 * 1024 * 1024, 256 * 1024 * 1024)
+}
+
+fn available_after_reserve(total_bytes: u64, available_before_reserve: u64) -> u64 {
+    let hard_reserve = total_bytes.saturating_mul(RESERVE_HEADROOM_PCT) / 100;
+    let floor = available_floor_bytes(total_bytes).min(available_before_reserve.max(1));
+    available_before_reserve
+        .saturating_sub(hard_reserve)
+        .max(floor)
 }
 
 fn budget_from_available(total_bytes: u64, available_bytes: u64, budget_pct: u64) -> u64 {
     let by_available = available_bytes.saturating_mul(budget_pct) / 100;
     let by_total = total_bytes.saturating_mul(budget_pct) / 100;
-    by_available.min(by_total).max(64 * 1024 * 1024)
+    let floor = available_floor_bytes(total_bytes)
+        .min(64 * 1024 * 1024)
+        .min(available_bytes.max(1));
+    by_available.min(by_total).max(floor)
 }
 
 fn bounded_budget_from_available(
@@ -886,7 +1130,11 @@ fn bounded_budget_from_available(
 ) -> u64 {
     let by_available = available_bytes.saturating_mul(budget_pct) / 100;
     let by_total = total_bytes.saturating_mul(budget_pct) / 100;
-    by_available.min(by_total).clamp(min_budget, max_budget)
+    let floor = min_budget
+        .min(total_bytes / 4)
+        .min(available_bytes.max(1))
+        .max(available_floor_bytes(total_bytes).min(available_bytes.max(1)));
+    by_available.min(by_total).clamp(floor, max_budget)
 }
 
 fn cache_budget_from_available(total_bytes: u64, available_bytes: u64) -> u64 {
@@ -900,12 +1148,13 @@ fn cache_budget_from_available(total_bytes: u64, available_bytes: u64) -> u64 {
 }
 
 fn cache_read_memory_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
-    if memory_pressure_high(snapshot) {
+    let budget = if memory_pressure_high(snapshot) {
         snapshot.available_bytes / 32
     } else {
         snapshot.available_bytes / 8
-    }
-    .max(CACHE_READ_MEMORY_ESTIMATED_BYTES)
+    };
+    let floor = CACHE_READ_MEMORY_ESTIMATED_BYTES.min(snapshot.available_bytes.max(1));
+    budget.max(floor).min(snapshot.available_bytes.max(1))
 }
 
 fn cache_read_memory_object_limit_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
@@ -1036,6 +1285,75 @@ fn state_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
     }
 }
 
+fn h3_datagram_queue_size(snapshot: &BudgetedMemorySnapshot) -> usize {
+    let min_limit = match memory_pressure_level(snapshot) {
+        MemoryPressureLevel::Normal | MemoryPressureLevel::Elevated => MIN_H3_DATAGRAM_QUEUE_SIZE,
+        MemoryPressureLevel::High => MIN_H3_DATAGRAM_QUEUE_SIZE_HIGH,
+        MemoryPressureLevel::Critical => MIN_H3_DATAGRAM_QUEUE_SIZE_CRITICAL,
+    };
+    let target = connection_limit(
+        snapshot.connection_budget_bytes / 128,
+        UDP_DATAGRAM_ESTIMATED_BYTES,
+        min_limit,
+        MAX_H3_DATAGRAM_QUEUE_SIZE,
+    );
+    if memory_pressure_high(snapshot) {
+        target.clamp(min_limit, 8_192)
+    } else {
+        target
+    }
+}
+
+fn h3_datagram_queue_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> usize {
+    let target = if memory_pressure_high(snapshot) {
+        snapshot.available_bytes / 16
+    } else {
+        snapshot.connection_budget_bytes / 64
+    };
+    let queue_floor = (h3_datagram_queue_size(snapshot) as u64)
+        .saturating_mul(UDP_DATAGRAM_ESTIMATED_BYTES)
+        .min(snapshot.available_bytes.max(1));
+    let floor = queue_floor
+        .min(8 * 1024 * 1024)
+        .max(MIN_QUIC_PENDING_REASSEMBLY_BUDGET_BYTES as u64)
+        .min(snapshot.available_bytes.max(1));
+    target
+        .clamp(floor, MAX_QUIC_PENDING_REASSEMBLY_BUDGET_BYTES as u64)
+        .min(usize::MAX as u64) as usize
+}
+
+fn quic_pending_route_limit_per_port(
+    snapshot: &BudgetedMemorySnapshot,
+    udp_route_limit_per_port: usize,
+) -> usize {
+    let pressure_cap = match memory_pressure_level(snapshot) {
+        MemoryPressureLevel::Normal | MemoryPressureLevel::Elevated => {
+            MAX_QUIC_PENDING_ROUTE_LIMIT_PER_PORT
+        }
+        MemoryPressureLevel::High => MAX_QUIC_PENDING_ROUTE_LIMIT_PER_PORT / 2,
+        MemoryPressureLevel::Critical => MAX_QUIC_PENDING_ROUTE_LIMIT_PER_PORT / 4,
+    };
+    let ceiling = pressure_cap.min(udp_route_limit_per_port.max(1));
+    let floor = MIN_QUIC_PENDING_ROUTE_LIMIT_PER_PORT.min(ceiling).max(1);
+    (udp_route_limit_per_port / 8)
+        .max(1)
+        .clamp(floor, ceiling.max(1))
+}
+
+fn quic_pending_reassembly_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> usize {
+    let target = if memory_pressure_high(snapshot) {
+        snapshot.available_bytes / 32
+    } else {
+        snapshot.connection_budget_bytes / 128
+    };
+    let floor =
+        (MIN_QUIC_PENDING_REASSEMBLY_BUDGET_BYTES as u64).min(snapshot.available_bytes.max(1));
+    target
+        .clamp(floor, MAX_QUIC_PENDING_REASSEMBLY_BUDGET_BYTES as u64)
+        .min(snapshot.available_bytes.max(1))
+        .min(usize::MAX as u64) as usize
+}
+
 fn firewall_ip_limiter_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
     connection_limit(
         state_budget_bytes(snapshot) / 3,
@@ -1073,7 +1391,37 @@ fn firewall_candidate_stats_capacity(snapshot: &BudgetedMemorySnapshot) -> usize
 }
 
 fn memory_pressure_high(snapshot: &BudgetedMemorySnapshot) -> bool {
-    snapshot.available_bytes < snapshot.total_bytes / 10
+    matches!(
+        memory_pressure_level(snapshot),
+        MemoryPressureLevel::High | MemoryPressureLevel::Critical
+    )
+}
+
+fn memory_pressure_level(snapshot: &BudgetedMemorySnapshot) -> MemoryPressureLevel {
+    if snapshot.available_bytes <= snapshot.total_bytes / 50
+        || snapshot.available_bytes <= 64 * 1024 * 1024
+    {
+        MemoryPressureLevel::Critical
+    } else if snapshot.available_bytes < snapshot.total_bytes / 10 {
+        MemoryPressureLevel::High
+    } else if snapshot.available_bytes < snapshot.total_bytes / 5 {
+        MemoryPressureLevel::Elevated
+    } else {
+        MemoryPressureLevel::Normal
+    }
+}
+
+fn pressure_adjusted_min_limit(
+    snapshot: &BudgetedMemorySnapshot,
+    normal: usize,
+    high: usize,
+    critical: usize,
+) -> usize {
+    match memory_pressure_level(snapshot) {
+        MemoryPressureLevel::Normal | MemoryPressureLevel::Elevated => normal.max(1),
+        MemoryPressureLevel::High => high.max(1),
+        MemoryPressureLevel::Critical => critical.max(1),
+    }
 }
 
 fn fd_budget(snapshot: &BudgetedMemorySnapshot, budget_pct: u64) -> u64 {
@@ -1104,6 +1452,25 @@ fn shared_connection_charge_bytes(class: AdmissionClass) -> u64 {
         | AdmissionClass::CacheRevalidate
         | AdmissionClass::CacheWrite
         | AdmissionClass::CacheReadMemory => 0,
+    }
+}
+
+fn class_index(class: AdmissionClass) -> usize {
+    match class {
+        AdmissionClass::HttpConnection => 0,
+        AdmissionClass::TcpConnection => 1,
+        AdmissionClass::Http3Connection => 2,
+        AdmissionClass::UdpSession => 3,
+        AdmissionClass::Http2Stream => 4,
+        AdmissionClass::Http3Request => 5,
+        AdmissionClass::OriginConnect => 6,
+        AdmissionClass::BackgroundWork => 7,
+        AdmissionClass::RequestBodyWaf => 8,
+        AdmissionClass::ResponseBodyWaf => 9,
+        AdmissionClass::ResponseTransform => 10,
+        AdmissionClass::CacheRevalidate => 11,
+        AdmissionClass::CacheWrite => 12,
+        AdmissionClass::CacheReadMemory => 13,
     }
 }
 
@@ -1280,6 +1647,7 @@ mod tests {
             permits.push(governor.try_admit(class).unwrap());
         }
         assert!(governor.try_admit(class).is_none());
+        assert_eq!(governor.admission_reject_snapshot().response_transform, 1);
         drop(permits.pop());
         assert!(governor.try_admit(class).is_some());
     }
@@ -1289,11 +1657,17 @@ mod tests {
         let governor = MemoryGovernor::new();
         let backlog = governor.listener_backlog();
         assert!((MIN_LISTENER_BACKLOG..=MAX_LISTENER_BACKLOG).contains(&backlog));
+        let snapshot = governor.memory_snapshot();
         let keepalive = governor.pingora_keepalive_pool_size(16);
         assert!(
-            (MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD..=MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD)
-                .contains(&keepalive)
+            (1..=MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD).contains(&keepalive),
+            "keepalive pool should stay positive and under the hard max"
         );
+        if fd_budget(&snapshot, KEEPALIVE_FD_BUDGET_PCT) as usize
+            >= MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD * 16
+        {
+            assert!(keepalive >= MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD);
+        }
     }
 
     #[test]
@@ -1326,6 +1700,7 @@ mod tests {
                 .try_admit_cache_read(object_limit.saturating_add(1))
                 .is_none()
         );
+        assert_eq!(governor.admission_reject_snapshot().cache_read_memory, 1);
 
         let budget = cache_read_memory_budget_bytes(&governor.memory_snapshot());
         let charge = object_limit.min(CACHE_READ_MEMORY_ESTIMATED_BYTES).max(1);
@@ -1334,6 +1709,7 @@ mod tests {
             .cache_read_memory_bytes
             .store(baseline, Ordering::Release);
         assert!(governor.try_admit_cache_read(charge).is_none());
+        assert_eq!(governor.admission_reject_snapshot().cache_read_memory, 2);
         assert_eq!(
             governor
                 .counter(AdmissionClass::CacheReadMemory)
@@ -1373,6 +1749,7 @@ mod tests {
             .shared_connection_bytes
             .store(baseline, Ordering::Release);
         assert!(governor.try_admit(AdmissionClass::HttpConnection).is_none());
+        assert_eq!(governor.admission_reject_snapshot().http_connection, 1);
         assert_eq!(
             governor
                 .counter(AdmissionClass::HttpConnection)
@@ -1493,6 +1870,10 @@ mod tests {
         assert!(http <= fd_budget(&low_fd, HTTP_FD_BUDGET_PCT) as usize);
         assert!(origin <= fd_budget(&low_fd, ORIGIN_FD_BUDGET_PCT) as usize);
         assert!(udp <= fd_budget(&low_fd, UDP_FD_BUDGET_PCT) as usize);
+        assert!(fd_budget(&low_fd, UDP_FD_BUDGET_PCT) < 4_096);
+        let route_limit = udp.clamp(1, MAX_UDP_ROUTE_LIMIT_PER_PORT);
+        assert!(route_limit <= udp.max(1));
+        assert!(quic_pending_route_limit_per_port(&low_fd, route_limit) <= route_limit);
 
         let h3_per_conn = multiplexed_per_connection_limit(
             &low_fd,
@@ -1534,5 +1915,79 @@ mod tests {
         assert!(access_log_queue_capacity(&large) > access_log_queue_capacity(&small));
         assert!(metrics_queue_capacity(&large) > metrics_queue_capacity(&small));
         assert!(access_log_batch_size(&small) <= access_log_batch_size(&large));
+    }
+
+    #[test]
+    fn low_available_memory_does_not_expand_fixed_budget_floors() {
+        let total = 512 * 1024 * 1024;
+        let available = 16 * 1024 * 1024;
+
+        assert!(available_after_reserve(total, 1 * 1024 * 1024) <= 1024 * 1024);
+        assert!(budget_from_available(total, available, CONNECTION_BUDGET_PCT) <= available);
+        assert!(cache_budget_from_available(total, available) <= available);
+        let critical = BudgetedMemorySnapshot {
+            total_bytes: total,
+            used_bytes: total.saturating_sub(available),
+            available_bytes: available,
+            fd_soft_limit: 65_535,
+            cpu_parallelism: 4,
+            connection_budget_bytes: budget_from_available(total, available, CONNECTION_BUDGET_PCT),
+            keepalive_budget_bytes: budget_from_available(total, available, KEEPALIVE_BUDGET_PCT),
+            cache_budget_bytes: cache_budget_from_available(total, available),
+            bloom_budget_bytes: bounded_budget_from_available(
+                total,
+                available,
+                BLOOM_BUDGET_PCT,
+                MIN_BLOOM_BUDGET_BYTES,
+                MAX_BLOOM_BUDGET_BYTES,
+            ),
+        };
+        assert!(cache_read_memory_budget_bytes(&critical) <= available);
+        assert!(h3_datagram_queue_budget_bytes(&critical) <= available as usize);
+        assert!(quic_pending_reassembly_budget_bytes(&critical) <= available as usize);
+        assert!(
+            bounded_budget_from_available(
+                total,
+                available,
+                BLOOM_BUDGET_PCT,
+                MIN_BLOOM_BUDGET_BYTES,
+                MAX_BLOOM_BUDGET_BYTES,
+            ) <= available
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_unlimited_threshold_does_not_hide_large_real_limits() {
+        assert!(!linux_cgroup_limit_is_unlimited(2 * 1024_u64.pow(4)));
+        assert!(linux_cgroup_limit_is_unlimited(1_u64 << 60));
+    }
+
+    #[test]
+    fn pressure_reduces_high_cost_admission_minimums() {
+        let critical = BudgetedMemorySnapshot {
+            total_bytes: 1024 * 1024 * 1024,
+            used_bytes: 1008 * 1024 * 1024,
+            available_bytes: 16 * 1024 * 1024,
+            fd_soft_limit: 65_535,
+            cpu_parallelism: 4,
+            connection_budget_bytes: 16 * 1024 * 1024,
+            keepalive_budget_bytes: 8 * 1024 * 1024,
+            cache_budget_bytes: 16 * 1024 * 1024,
+            bloom_budget_bytes: 8 * 1024 * 1024,
+        };
+
+        assert_eq!(
+            memory_pressure_level(&critical),
+            MemoryPressureLevel::Critical
+        );
+        assert_eq!(
+            pressure_adjusted_min_limit(&critical, MIN_RESPONSE_TRANSFORM_LIMIT, 8, 2),
+            2
+        );
+        assert_eq!(
+            pressure_adjusted_min_limit(&critical, MIN_CACHE_READ_MEMORY_LIMIT, 4, 1),
+            1
+        );
     }
 }

@@ -40,7 +40,9 @@ impl Clone for GeoInfo {
 pub struct RequestStats {
     pub geo: Option<GeoInfo>,
     pub browser: Arc<str>,
+    pub browser_version: Arc<str>,
     pub os: Arc<str>,
+    pub os_version: Arc<str>,
 }
 
 impl Clone for RequestStats {
@@ -48,7 +50,9 @@ impl Clone for RequestStats {
         Self {
             geo: self.geo.clone(),
             browser: self.browser.clone(),
+            browser_version: self.browser_version.clone(),
             os: self.os.clone(),
+            os_version: self.os_version.clone(),
         }
     }
 }
@@ -147,9 +151,10 @@ static GEO_CACHE: Lazy<ShardedLru<IpAddr, Option<GeoInfo>>> = Lazy::new(|| {
 });
 
 // Cache for User-Agent results (UA string -> (Arc<str>, Arc<str>))
-static UA_CACHE: Lazy<ShardedLru<String, (Arc<str>, Arc<str>)>> = Lazy::new(|| {
-    ShardedLru::new(100) // 64 * 100 = ~6.4k entries
-});
+static UA_CACHE: Lazy<ShardedLru<String, (Arc<str>, Arc<str>, Arc<str>, Arc<str>)>> =
+    Lazy::new(|| {
+        ShardedLru::new(100) // 64 * 100 = ~6.4k entries
+    });
 
 static UA_PARSER: Lazy<Parser> = Lazy::new(Parser::new);
 
@@ -169,8 +174,8 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
         None
     };
 
-    let (browser, os) = if ua.is_empty() {
-        (Arc::from(""), Arc::from(""))
+    let (browser, browser_version, os, os_version) = if ua.is_empty() {
+        (Arc::from(""), Arc::from(""), Arc::from(""), Arc::from(""))
     } else {
         let mutex = UA_CACHE.get_shard_by(ua);
         let mut cache = mutex.lock().unwrap();
@@ -179,15 +184,31 @@ pub fn analyze_request(ip: IpAddr, ua: &str) -> RequestStats {
         } else {
             let parsed_ua = UA_PARSER.parse(ua);
             let res = match parsed_ua {
-                Some(p) => (Arc::from(p.name), Arc::from(p.os)),
-                None => (Arc::from("Unknown"), Arc::from("Unknown")),
+                Some(p) => (
+                    Arc::from(p.name),
+                    Arc::from(p.version),
+                    Arc::from(p.os),
+                    Arc::from(p.os_version.as_ref()),
+                ),
+                None => (
+                    Arc::from("Unknown"),
+                    Arc::from(""),
+                    Arc::from("Unknown"),
+                    Arc::from(""),
+                ),
             };
             cache.put(ua.to_string(), res.clone());
             res
         }
     };
 
-    RequestStats { geo, browser, os }
+    RequestStats {
+        geo,
+        browser,
+        browser_version,
+        os,
+        os_version,
+    }
 }
 
 fn get_isp_name(ip: IpAddr) -> String {

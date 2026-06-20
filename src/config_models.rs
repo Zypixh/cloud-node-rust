@@ -503,6 +503,26 @@ pub struct GlobalServerConfig {
     pub http_all: Option<GlobalHTTPAllConfig>,
     #[serde(rename = "httpAccessLog", default)]
     pub http_access_log: Option<GlobalHTTPAccessLogConfig>,
+    #[serde(default)]
+    pub stat: Option<GlobalStatConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct GlobalStatConfig {
+    #[serde(default)]
+    pub upload: GlobalStatUploadConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct GlobalStatUploadConfig {
+    #[serde(rename = "maxCities", default)]
+    pub max_cities: i16,
+    #[serde(rename = "maxProviders", default)]
+    pub max_providers: i16,
+    #[serde(rename = "maxSystems", default)]
+    pub max_systems: i16,
+    #[serde(rename = "maxBrowsers", default)]
+    pub max_browsers: i16,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -3990,5 +4010,32 @@ mod tests {
         .expect("unknown legacy web keys should be ignored");
         assert!(legacy.referer_config.is_none());
         assert!(legacy.user_agent_config.is_none());
+    }
+
+    #[test]
+    fn global_server_config_parses_stat_upload_limits() {
+        let payload: NodeConfigPayload = serde_json::from_value(serde_json::json!({
+            "globalServerConfig": {
+                "stat": {
+                    "upload": {
+                        "maxCities": 11,
+                        "maxProviders": 12,
+                        "maxSystems": 13,
+                        "maxBrowsers": 14
+                    }
+                }
+            }
+        }))
+        .expect("node config payload should parse stat upload config");
+
+        let upload = payload
+            .global_server_config
+            .and_then(|global| global.stat)
+            .map(|stat| stat.upload)
+            .expect("stat upload config should be present");
+        assert_eq!(upload.max_cities, 11);
+        assert_eq!(upload.max_providers, 12);
+        assert_eq!(upload.max_systems, 13);
+        assert_eq!(upload.max_browsers, 14);
     }
 }

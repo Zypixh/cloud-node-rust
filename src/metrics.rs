@@ -1,5 +1,6 @@
 use chrono::Timelike;
 use dashmap::DashMap;
+use std::collections::BTreeMap;
 use std::sync::OnceLock as OnceCell;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -62,11 +63,110 @@ pub struct HttpDimensionEvent {
     pub domain: Arc<str>,
     pub user_agent: Arc<str>,
     pub bytes_sent: i64,
+    pub bytes_received: i64,
     pub cached_bytes: i64,
     pub waf_group_id: i64,
     pub waf_action: Option<Arc<str>>,
     pub analyzed: Option<crate::metrics::analyzer::RequestStats>,
+    pub request_context: Arc<MetricRequestContext>,
     pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct MetricRequestContext {
+    pub values: BTreeMap<String, String>,
+}
+
+impl MetricRequestContext {
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.values.insert(key.into(), value.into());
+    }
+
+    pub fn resolve_key(&self, key: &str) -> String {
+        resolve_template_with(key, |var_name| self.resolve_variable(var_name))
+    }
+
+    pub fn resolve_variable(&self, var_name: &str) -> String {
+        if let Some(value) = self.values.get(var_name) {
+            return value.clone();
+        }
+
+        let Some((prefix, suffix)) = var_name.split_once('.') else {
+            return format!("${{{}}}", var_name);
+        };
+
+        match prefix {
+            "header" | "http" => lookup_case_insensitive(&self.values, &format!("header.{suffix}")),
+            "response" => {
+                if suffix == "contentType" {
+                    self.values
+                        .get("response.contentType")
+                        .cloned()
+                        .or_else(|| {
+                            Some(lookup_case_insensitive(
+                                &self.values,
+                                "response.header.Content-Type",
+                            ))
+                            .filter(|value| !value.is_empty())
+                        })
+                        .unwrap_or_default()
+                } else if let Some(header) = suffix.strip_prefix("header.") {
+                    lookup_case_insensitive(&self.values, &format!("response.header.{header}"))
+                } else {
+                    String::new()
+                }
+            }
+            "cookie" | "arg" | "origin" | "node" | "geo" | "isp" | "browser" | "product"
+            | "host" => self.values.get(var_name).cloned().unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+}
+
+pub fn resolve_template_with<F>(source: &str, mut resolve_variable: F) -> String
+where
+    F: FnMut(&str) -> String,
+{
+    let Some(mut cursor) = source.find("${") else {
+        return source.to_string();
+    };
+
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..cursor]);
+
+    while cursor < source.len() {
+        let var_start = cursor + 2;
+        let Some(relative_end) = source[var_start..].find('}') else {
+            out.push_str(&source[cursor..]);
+            return out;
+        };
+        let var_end = var_start + relative_end;
+        out.push_str(&resolve_variable(&source[var_start..var_end]));
+
+        let next_start = var_end + 1;
+        if let Some(next_relative) = source[next_start..].find("${") {
+            cursor = next_start + next_relative;
+            out.push_str(&source[next_start..cursor]);
+        } else {
+            out.push_str(&source[next_start..]);
+            return out;
+        }
+    }
+
+    out
+}
+
+fn lookup_case_insensitive(values: &BTreeMap<String, String>, key: &str) -> String {
+    values
+        .get(key)
+        .cloned()
+        .or_else(|| {
+            values
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value.clone())
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -640,10 +740,12 @@ pub mod record {
         domain: &str,
         user_agent: &str,
         bytes_sent: i64,
+        bytes_received: i64,
         cached_bytes: i64,
         waf_group_id: i64,
         waf_action: Option<&str>,
         cached_analyzed: Option<&crate::metrics::analyzer::RequestStats>,
+        request_context: Option<MetricRequestContext>,
     ) {
         if server_id <= 0 {
             return;
@@ -663,6 +765,7 @@ pub mod record {
                 Arc::from(user_agent)
             },
             bytes_sent,
+            bytes_received,
             cached_bytes,
             waf_group_id,
             waf_action: waf_action.map(|action| {
@@ -673,6 +776,7 @@ pub mod record {
                 }
             }),
             analyzed: cached_analyzed.cloned(),
+            request_context: Arc::new(request_context.unwrap_or_default()),
             created_at: get_current_5min_ts(),
         };
 
@@ -742,17 +846,22 @@ pub mod record {
                 .clone()
                 .unwrap_or_else(|| Arc::clone(&EMPTY_ARC_STR)),
             provider_id,
+            browser_version: analyzed.browser_version.clone(),
+            os_version: analyzed.os_version.clone(),
+            request_attrs: Arc::new(event.request_context.values.clone()),
         };
         let is_attack = event.waf_action.is_some();
 
         crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.record(
             key.clone(),
             event.bytes_sent,
+            event.bytes_received,
             is_attack,
         );
         crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.record(
             key,
             event.bytes_sent,
+            event.bytes_received,
             is_attack,
         );
         crate::metrics::top_ip::TOP_IP_TRACKER.record_addr(event.server_id, event.client_ip);
@@ -844,5 +953,46 @@ pub async fn start_persistence_flusher() {
         if now % 3600 < 30 {
             storage::STORAGE.cleanup_old_stats(now - 86400);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MetricRequestContext;
+
+    #[test]
+    fn metric_request_context_resolves_go_style_keys() {
+        let mut ctx = MetricRequestContext::default();
+        ctx.insert("status", "403");
+        ctx.insert("host", "cdn.example.com");
+        ctx.insert("header.User-Agent", "curl/8");
+        ctx.insert("cookie.sid", "abc");
+        ctx.insert("arg.page", "1");
+        ctx.insert("response.header.Content-Type", "text/html");
+
+        assert_eq!(ctx.resolve_key("${status}"), "403");
+        assert_eq!(ctx.resolve_key("${host}"), "cdn.example.com");
+        assert_eq!(ctx.resolve_key("${header.user-agent}"), "curl/8");
+        assert_eq!(ctx.resolve_key("${http.User-Agent}"), "curl/8");
+        assert_eq!(ctx.resolve_key("${cookie.sid}"), "abc");
+        assert_eq!(ctx.resolve_key("${arg.page}"), "1");
+        assert_eq!(ctx.resolve_key("${response.contentType}"), "text/html");
+        assert_eq!(
+            ctx.resolve_key("${response.header.content-type}"),
+            "text/html"
+        );
+        assert_eq!(
+            ctx.resolve_key("${host}-${status}-${header.user-agent}"),
+            "cdn.example.com-403-curl/8"
+        );
+    }
+
+    #[test]
+    fn metric_request_context_preserves_unknown_simple_vars() {
+        let ctx = MetricRequestContext::default();
+
+        assert_eq!(ctx.resolve_key("${unknownVar}"), "${unknownVar}");
+        assert_eq!(ctx.resolve_key("${unknown.prefix}"), "");
+        assert_eq!(ctx.resolve_key("literal"), "literal");
     }
 }

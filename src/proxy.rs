@@ -36,7 +36,7 @@ use dashmap::DashMap;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::LazyLock as Lazy;
 use std::sync::LazyLock;
@@ -1194,6 +1194,50 @@ impl EdgeProxy {
             .map(|inet| inet.port())
     }
 
+    fn downstream_local_ip(session: &Session) -> Option<String> {
+        session
+            .downstream_session
+            .digest()
+            .and_then(|d| d.socket_digest.as_ref())
+            .and_then(|sd| sd.local_addr())
+            .and_then(|addr| addr.as_inet())
+            .map(|inet| inet.ip().to_string())
+    }
+
+    fn web_document_root(server: Option<&crate::config_models::ServerConfig>) -> String {
+        server
+            .and_then(|server| server.web.as_ref())
+            .and_then(|web| web.root.as_ref())
+            .and_then(Self::document_root_from_value)
+            .unwrap_or_default()
+    }
+
+    fn document_root_from_value(value: &Value) -> Option<String> {
+        if let Some(raw) = value.as_str() {
+            return Some(raw.to_string()).filter(|value| !value.is_empty());
+        }
+        let object = value.as_object()?;
+        ["dir", "directory", "path", "root"]
+            .into_iter()
+            .filter_map(|key| object.get(key))
+            .find_map(|value| value.as_str().map(str::to_string))
+            .filter(|value| !value.is_empty())
+    }
+
+    fn infer_origin_protocol(origin_address: &str, downstream_scheme: &str) -> String {
+        if let Some((scheme, _)) = origin_address.split_once("://") {
+            return scheme.to_string();
+        }
+        let port = origin_address
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok());
+        match port {
+            Some(443) => "https".to_string(),
+            Some(80) => "http".to_string(),
+            _ => downstream_scheme.to_string(),
+        }
+    }
+
     fn maybe_strip_host_port(host: &str, strip: bool) -> String {
         if strip {
             crate::lb_factory::strip_addr_port(host)
@@ -1411,6 +1455,355 @@ impl EdgeProxy {
                 Self::forwarded_proto(session, ctx),
             ),
         }
+    }
+
+    fn metric_request_context(
+        &self,
+        session: &Session,
+        ctx: &ProxyCTX,
+        bytes_sent: u64,
+        bytes_received: u64,
+        user_agent: &str,
+    ) -> crate::metrics::MetricRequestContext {
+        let req = session.req_header();
+        let mut values = BTreeMap::new();
+        let scheme = Self::forwarded_proto(session, ctx);
+        let request_uri = req
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let host = session
+            .get_header("host")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(':').next().unwrap_or(v))
+            .or_else(|| req.uri.host())
+            .unwrap_or(ctx.host.as_str());
+        let proto = if ctx.is_http3_bridge {
+            "HTTP/3.0"
+        } else {
+            match req.version {
+                pingora::http::Version::HTTP_10 => "HTTP/1.0",
+                pingora::http::Version::HTTP_11 => "HTTP/1.1",
+                pingora::http::Version::HTTP_2 => "HTTP/2.0",
+                pingora::http::Version::HTTP_3 => "HTTP/3.0",
+                _ => "HTTP/1.1",
+            }
+        };
+        let status = ctx.response_status;
+        let started = crate::utils::time::local_from_timestamp_millis(ctx.start_timestamp_millis);
+        let remote_user = req
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|auth| {
+                auth.get(..6)
+                    .filter(|prefix| prefix.eq_ignore_ascii_case("basic "))
+                    .and_then(|_| {
+                        let encoded = auth[6..].trim();
+                        general_purpose::STANDARD
+                            .decode(encoded.as_bytes())
+                            .ok()
+                            .and_then(|decoded| String::from_utf8(decoded).ok())
+                            .and_then(|creds| {
+                                creds.split_once(':').map(|(user, _)| user.to_string())
+                            })
+                    })
+            })
+            .unwrap_or_default();
+
+        values.insert(
+            "edgeVersion".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        values.insert("remoteAddr".to_string(), ctx.client_ip_str.clone());
+        values.insert("remoteAddrValue".to_string(), ctx.client_ip_str.clone());
+        values.insert(
+            "rawRemoteAddr".to_string(),
+            Self::raw_remote_ip(&ctx.raw_remote_addr, ctx.client_ip),
+        );
+        values.insert("remotePort".to_string(), ctx.client_port.to_string());
+        values.insert("remoteUser".to_string(), remote_user);
+        values.insert("requestId".to_string(), ctx.request_id.clone());
+        values.insert("requestURI".to_string(), request_uri.to_string());
+        values.insert("requestUri".to_string(), request_uri.to_string());
+        values.insert(
+            "requestURL".to_string(),
+            format!("{}://{}{}", scheme, host, request_uri),
+        );
+        values.insert("requestPath".to_string(), req.uri.path().to_string());
+        let extension = std::path::Path::new(req.uri.path())
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| format!(".{ext}"))
+            .unwrap_or_default();
+        values.insert("requestPathExtension".to_string(), extension.clone());
+        values.insert(
+            "requestPathLowerExtension".to_string(),
+            extension.to_ascii_lowercase(),
+        );
+        values.insert("requestLength".to_string(), bytes_received.to_string());
+        values.insert(
+            "requestTime".to_string(),
+            format!("{:.6}", ctx.start_time.elapsed().as_secs_f64()),
+        );
+        values.insert("requestMethod".to_string(), req.method.to_string());
+        values.insert(
+            "requestFilename".to_string(),
+            ctx.cache_key
+                .clone()
+                .unwrap_or_else(|| req.uri.path().to_string()),
+        );
+        values.insert("scheme".to_string(), scheme.to_string());
+        values.insert("serverProtocol".to_string(), proto.to_string());
+        values.insert("proto".to_string(), proto.to_string());
+        values.insert("bytesSent".to_string(), bytes_sent.to_string());
+        values.insert(
+            "bodyBytesSent".to_string(),
+            session.body_bytes_sent().to_string(),
+        );
+        values.insert("status".to_string(), status.to_string());
+        values.insert("statusMessage".to_string(), Self::status_message(status));
+        values.insert(
+            "timeISO8601".to_string(),
+            started.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
+        );
+        values.insert(
+            "timeLocal".to_string(),
+            started.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
+        );
+        values.insert(
+            "msec".to_string(),
+            format!("{:.6}", ctx.start_timestamp_millis as f64 / 1000.0),
+        );
+        values.insert(
+            "timestamp".to_string(),
+            (ctx.start_timestamp_millis / 1000).to_string(),
+        );
+        values.insert("host".to_string(), host.to_string());
+        values.insert(
+            "cname".to_string(),
+            ctx.server
+                .as_ref()
+                .and_then(|server| {
+                    server
+                        .server_names
+                        .iter()
+                        .find(|name| {
+                            name.r#type
+                                .as_deref()
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("cname"))
+                        })
+                        .map(|name| name.name.clone())
+                })
+                .unwrap_or_default(),
+        );
+        let referer = session
+            .get_header("referer")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        values.insert("referer".to_string(), referer.to_string());
+        values.insert(
+            "referer.host".to_string(),
+            referer
+                .split_once("://")
+                .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+                .unwrap_or("")
+                .to_string(),
+        );
+        values.insert("userAgent".to_string(), user_agent.to_string());
+        values.insert(
+            "contentType".to_string(),
+            session
+                .get_header("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string(),
+        );
+        values.insert(
+            "request".to_string(),
+            format!("{} {} {}", req.method, request_uri, proto),
+        );
+        let cookies_header = merged_session_cookie_header(session).unwrap_or_default();
+        values.insert("cookies".to_string(), cookies_header.clone());
+        values.insert(
+            "isArgs".to_string(),
+            if req.uri.query().is_some() { "?" } else { "" }.to_string(),
+        );
+        let query = req.uri.query().unwrap_or("");
+        values.insert("args".to_string(), query.to_string());
+        values.insert("queryString".to_string(), query.to_string());
+        values.insert("serverName".to_string(), {
+            ctx.server
+                .as_ref()
+                .and_then(|server| server.server_names.first())
+                .map(|name| name.name.clone())
+                .unwrap_or_else(|| host.to_string())
+        });
+        values.insert(
+            "serverAddr".to_string(),
+            if ctx
+                .global_http_config
+                .as_ref()
+                .map(|config| config.enable_server_addr_variable)
+                .unwrap_or_else(|| {
+                    self.config
+                        .get_global_http_config_sync()
+                        .enable_server_addr_variable
+                })
+            {
+                Self::downstream_local_ip(session).unwrap_or_default()
+            } else {
+                String::new()
+            },
+        );
+        values.insert(
+            "serverPort".to_string(),
+            Self::downstream_local_port(session)
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+        );
+        values.insert("hostname".to_string(), HOSTNAME.clone());
+        values.insert(
+            "documentRoot".to_string(),
+            Self::web_document_root(ctx.server.as_deref()),
+        );
+        values.insert("node.id".to_string(), self.api_config.node_id.clone());
+        values.insert("node.name".to_string(), HOSTNAME.clone());
+        values.insert("node.role".to_string(), String::new());
+        values.insert("product.name".to_string(), self.product_name(ctx));
+        values.insert(
+            "product.version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        values.insert("origin.address".to_string(), ctx.origin_address.clone());
+        values.insert("origin.addr".to_string(), ctx.origin_address.clone());
+        values.insert(
+            "origin.host".to_string(),
+            ctx.origin_address
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        );
+        values.insert("origin.id".to_string(), ctx.origin_id.to_string());
+        let origin_protocol = Self::infer_origin_protocol(&ctx.origin_address, scheme);
+        values.insert("origin.scheme".to_string(), origin_protocol.clone());
+        values.insert("origin.protocol".to_string(), origin_protocol);
+        values.insert("origin.code".to_string(), String::new());
+
+        for (name, value) in req.headers.iter() {
+            if let Ok(value) = value.to_str() {
+                values
+                    .entry(format!("header.{}", name.as_str()))
+                    .or_insert_with(|| value.to_string());
+                values
+                    .entry(format!("http.{}", name.as_str()))
+                    .or_insert_with(|| value.to_string());
+            }
+        }
+        values.insert(
+            "headers".to_string(),
+            req.headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| format!("{}: {}", name.as_str(), value))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        for cookie in cookies_header.split(';').map(str::trim) {
+            if let Some((name, value)) = cookie.split_once('=') {
+                values.insert(format!("cookie.{}", name.trim()), value.trim().to_string());
+            }
+        }
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            if let Some((name, value)) = pair.split_once('=') {
+                let decoded = urlencoding::decode(value)
+                    .map(|value| value.into_owned())
+                    .unwrap_or_else(|_| value.to_string());
+                values.insert(format!("arg.{name}"), decoded);
+            }
+        }
+        for (name, value) in ctx.response_headers.iter() {
+            values.insert(format!("response.header.{name}"), value.clone());
+            if name.eq_ignore_ascii_case("content-type") {
+                values.insert("response.contentType".to_string(), value.clone());
+            }
+        }
+        values.insert(
+            "browser.isMobile".to_string(),
+            if Self::is_mobile_user_agent(user_agent) {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string(),
+        );
+
+        if let Some(analyzed) = ctx.analyzed.as_ref() {
+            values.insert("browser.name".to_string(), analyzed.browser.to_string());
+            values.insert(
+                "browser.version".to_string(),
+                analyzed.browser_version.to_string(),
+            );
+            values.insert("browser.os.name".to_string(), analyzed.os.to_string());
+            values.insert(
+                "browser.os.version".to_string(),
+                analyzed.os_version.to_string(),
+            );
+            if let Some(geo) = analyzed.geo.as_ref() {
+                values.insert("geo.country.name".to_string(), geo.country.to_string());
+                values.insert("geo.country.id".to_string(), geo.country_id.to_string());
+                values.insert("geo.province.name".to_string(), geo.region.to_string());
+                values.insert("geo.province.id".to_string(), geo.region_id.to_string());
+                values.insert("geo.city.name".to_string(), geo.city.to_string());
+                values.insert("geo.city.id".to_string(), geo.city_id.to_string());
+                values.insert("isp.name".to_string(), geo.provider.to_string());
+            }
+        }
+        values
+            .entry("geo.country.id".to_string())
+            .or_insert_with(|| "0".to_string());
+        values
+            .entry("geo.province.id".to_string())
+            .or_insert_with(|| "0".to_string());
+        values
+            .entry("geo.city.id".to_string())
+            .or_insert_with(|| "0".to_string());
+        values.entry("geo.town.name".to_string()).or_default();
+        values
+            .entry("geo.town.id".to_string())
+            .or_insert_with(|| "0".to_string());
+        values.entry("isp.id".to_string()).or_insert_with(|| {
+            crate::metrics::storage::lookup_region_provider_id(ctx.client_ip).to_string()
+        });
+
+        let host_parts = host.split('.').collect::<Vec<_>>();
+        if let Some(first) = host_parts.first() {
+            values.insert("host.first".to_string(), (*first).to_string());
+            values.insert("host.0".to_string(), (*first).to_string());
+        }
+        if let Some(last) = host_parts.last() {
+            values.insert("host.last".to_string(), (*last).to_string());
+            values.insert("host.-1".to_string(), (*last).to_string());
+        }
+        for idx in 1..=4 {
+            if let Some(part) = host_parts.get(idx) {
+                values.insert(format!("host.{idx}"), (*part).to_string());
+            }
+            if host_parts.len() > idx {
+                values.insert(
+                    format!("host.-{}", idx + 1),
+                    host_parts[host_parts.len() - idx - 1].to_string(),
+                );
+            }
+        }
+
+        crate::metrics::MetricRequestContext { values }
     }
 
     fn render_template(
@@ -8023,6 +8416,23 @@ impl ProxyHttp for EdgeProxy {
         Ok(false)
     }
 
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session,
+        _reused: bool,
+        _peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        _digest: Option<&pingora_core::protocols::Digest>,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        ctx.origin_connect_permit.take();
+        Ok(())
+    }
+
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
@@ -8546,6 +8956,14 @@ impl ProxyHttp for EdgeProxy {
                     );
                 }
 
+                let metric_context = self.metric_request_context(
+                    session,
+                    ctx,
+                    bytes_sent,
+                    bytes_received,
+                    user_agent,
+                );
+
                 crate::metrics::record::record_http_dimensions(
                     server_id,
                     ctx.client_ip,
@@ -8556,10 +8974,12 @@ impl ProxyHttp for EdgeProxy {
                         .unwrap_or_else(|| session.req_header().uri.host().unwrap_or("")),
                     user_agent,
                     bytes_sent as i64,
+                    bytes_received as i64,
                     if is_cached { bytes_sent as i64 } else { 0 },
                     ctx.waf_group_id,
                     ctx.waf_action.as_deref(),
                     ctx.analyzed.as_ref(),
+                    Some(metric_context),
                 );
             }
             ctx.metrics_recorded = true;

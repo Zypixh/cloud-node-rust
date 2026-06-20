@@ -106,6 +106,10 @@ const GC_INTERVAL_SECS: u64 = 60;
 /// reconstructed slightly more often, but quota enforcement is unaffected.
 const LIMITER_IDLE_SECS: i64 = 90;
 const LIMITER_SWEEP_INTERVAL_SECS: i64 = 30;
+const STATE_CAPACITY_WARN_INTERVAL_SECS: i64 = 60;
+static IP_LIMITER_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
+static COUNTER_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
+static IP_BW_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
 
 /// Wraps a RateLimiter with a last-seen timestamp for GC and the QPS value the
 /// quota was built from, so hot-reload can detect and replace stale limiters.
@@ -135,6 +139,25 @@ impl<K: std::hash::Hash + Eq + Clone + Send + Sync + 'static> TrackedLimiter<K> 
 
     fn is_idle(&self, now: i64) -> bool {
         now.saturating_sub(self.last_seen.load(Ordering::Relaxed)) >= LIMITER_IDLE_SECS
+    }
+}
+
+fn warn_state_capacity_full(last_warn: &AtomicI64, area: &str, len: usize, capacity: usize) {
+    let now = crate::utils::time::now_timestamp();
+    let last = last_warn.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < STATE_CAPACITY_WARN_INTERVAL_SECS {
+        return;
+    }
+    if last_warn
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        tracing::warn!(
+            "WAF state capacity full for {}; len={} capacity={}, fail-open for new keys",
+            area,
+            len,
+            capacity
+        );
     }
 }
 
@@ -761,7 +784,13 @@ impl WafStateManager {
         {
             self.sweep_limiters(crate::utils::time::now_timestamp());
             if self.ip_limiters.len() >= self.ip_limiter_capacity() {
-                return false;
+                warn_state_capacity_full(
+                    &IP_LIMITER_CAPACITY_WARN_AT,
+                    "per-IP rate limiters",
+                    self.ip_limiters.len(),
+                    self.ip_limiter_capacity(),
+                );
+                return true;
             }
         }
         // Same quota hot-reload logic as check_rate_limit.
@@ -824,7 +853,13 @@ impl WafStateManager {
         if !self.counters.contains_key(&key) && self.counters.len() >= self.counter_capacity() {
             self.sweep_counters_force(now);
             if self.counters.len() >= self.counter_capacity() {
-                return u64::MAX;
+                warn_state_capacity_full(
+                    &COUNTER_CAPACITY_WARN_AT,
+                    "rolling counters",
+                    self.counters.len(),
+                    self.counter_capacity(),
+                );
+                return 0;
             }
         }
         self.counters
@@ -1262,7 +1297,13 @@ impl WafStateManager {
                 (now_secs).saturating_sub(win) < 120
             });
             if self.ip_bw_counters.len() >= self.ip_bw_counter_capacity() {
-                return true;
+                warn_state_capacity_full(
+                    &IP_BW_CAPACITY_WARN_AT,
+                    "per-IP bandwidth counters",
+                    self.ip_bw_counters.len(),
+                    self.ip_bw_counter_capacity(),
+                );
+                return false;
             }
         }
         let entry = self
@@ -1277,7 +1318,7 @@ impl WafStateManager {
                 .is_ok()
         {
             byte_counter.store(bytes, Ordering::Relaxed);
-            return false;
+            return bytes > limit_bytes;
         }
         let total = byte_counter.fetch_add(bytes, Ordering::Relaxed) + bytes;
         total > limit_bytes
@@ -1390,6 +1431,27 @@ mod tests {
         }
         state.sweep_limiters(crate::utils::time::now_timestamp());
         assert_eq!(state.ip_limiters.len(), 0);
+    }
+
+    #[test]
+    fn bandwidth_counter_blocks_oversized_first_request_after_window_reset() {
+        let state = WafStateManager::new();
+        let server_id = 7;
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        assert!(!state.check_ip_bandwidth(server_id, ip, 50, 100));
+
+        let key = (server_id, rate_limit_key_ip(ip));
+        let entry = state
+            .ip_bw_counters
+            .get(&key)
+            .expect("bandwidth counter should exist");
+        entry.1.store(
+            crate::utils::time::now_timestamp() as u64 - 1,
+            Ordering::Relaxed,
+        );
+        drop(entry);
+
+        assert!(state.check_ip_bandwidth(server_id, ip, 101, 100));
     }
 
     #[test]

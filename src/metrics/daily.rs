@@ -1,3 +1,4 @@
+use chrono::Duration as ChronoDuration;
 use dashmap::{DashMap, DashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -100,16 +101,23 @@ impl Default for UniqueIpTracker {
 
 impl UniqueIpTracker {
     pub fn new() -> Self {
-        Self {
-            ips: DashSet::new(),
+        let min_day = (crate::utils::time::system_local() - ChronoDuration::days(2))
+            .format("%Y%m%d")
+            .to_string();
+        let ips = DashSet::new();
+        for (server_id, day, ip) in crate::metrics::storage::STORAGE.load_unique_ips(&min_day) {
+            ips.insert((server_id, day, ip));
         }
+        Self { ips }
     }
 
     pub fn record(&self, server_id: i64, day: &str, ip: IpAddr) {
         if server_id <= 0 || day.is_empty() {
             return;
         }
-        self.ips.insert((server_id, day.to_string(), ip));
+        if self.ips.insert((server_id, day.to_string(), ip)) {
+            crate::metrics::storage::STORAGE.record_unique_ip(server_id, day, ip);
+        }
     }
 
     pub fn count(&self, server_id: i64, day: &str) -> i64 {
@@ -129,6 +137,7 @@ impl UniqueIpTracker {
         for key in keys {
             self.ips.remove(&key);
         }
+        crate::metrics::storage::STORAGE.cleanup_unique_ips_before(min_day);
     }
 }
 

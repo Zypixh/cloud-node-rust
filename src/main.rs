@@ -835,8 +835,9 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     });
 
     let ac_ma = api_config.clone();
+    let cs_ma = (*config_store).clone();
     spawn_staggered(&rt, Duration::from_secs(15), async move {
-        rpc::start_metrics_aggregator_reporter(ac_ma).await;
+        rpc::start_metrics_aggregator_reporter(cs_ma, ac_ma).await;
     });
 
     let ac_ir = api_config.clone();

@@ -1274,6 +1274,13 @@ where
                                         .and_then(|g| g.http_access_log.clone()),
                                 )
                                 .await;
+                            config_store.set_global_stat_upload(
+                                payload
+                                    .global_server_config
+                                    .as_ref()
+                                    .and_then(|g| g.stat.as_ref())
+                                    .map(|stat| stat.upload.clone()),
+                            );
 
                             info!(
                                 "RPC_NODE: Applied config version={} node_id={} servers={} domains={} port_only={} cache_policies={} waf_policies={} pages={}",
@@ -1406,45 +1413,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         // Local memory + cpu first; the cluster aggregator (if any) replaces these
         // atomically below from a single snapshot so the report stays internally
         // consistent.
-        #[allow(unused_mut)]
-        let mut total_memory = sys.total_memory() as i64;
-        #[allow(unused_mut)]
-        let mut used_memory = sys.used_memory() as i64;
-
-        // Linux container cgroup memory limit detection
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(limit_str) =
-                std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-            {
-                if let Ok(limit) = limit_str.trim().parse::<i64>() {
-                    if limit > 0 && limit < 1024 * 1024 * 1024 * 1024 {
-                        total_memory = limit;
-                        // For used memory in CGroup V1
-                        if let Ok(usage_str) =
-                            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-                        {
-                            if let Ok(usage) = usage_str.trim().parse::<i64>() {
-                                used_memory = usage;
-                            }
-                        }
-                    }
-                }
-            } else if let Ok(limit_str) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-                if let Ok(limit) = limit_str.trim().parse::<i64>() {
-                    if limit > 0 {
-                        total_memory = limit;
-                        if let Ok(usage_str) =
-                            std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-                        {
-                            if let Ok(usage) = usage_str.trim().parse::<i64>() {
-                                used_memory = usage;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (mut total_memory, mut used_memory) = crate::memory_governor::reported_memory_totals();
 
         let mut cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
         if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
@@ -1609,8 +1578,7 @@ pub async fn report_node_online_once(
         0.0
     };
     let load = sysinfo::System::load_average();
-    let mut total_memory = sys.total_memory() as i64;
-    let mut used_memory = sys.used_memory() as i64;
+    let (mut total_memory, mut used_memory) = crate::memory_governor::reported_memory_totals();
     let mut cpu_usage = sys.global_cpu_usage() as f64 / 100.0;
     if crate::runtime_mode::RuntimeConfig::current_is_rke2() {
         let aggregated = crate::cluster::stats::aggregate();
@@ -1708,43 +1676,7 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
             crate::metrics::METRICS.get_node_totals();
         let load = sysinfo::System::load_average();
 
-        #[allow(unused_mut)]
-        let mut total_memory = sys.total_memory() as i64;
-        #[allow(unused_mut)]
-        let mut used_memory = sys.used_memory() as i64;
-
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(limit_str) =
-                std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-            {
-                if let Ok(limit) = limit_str.trim().parse::<i64>() {
-                    if limit > 0 && limit < 1024 * 1024 * 1024 * 1024 {
-                        total_memory = limit;
-                        if let Ok(usage_str) =
-                            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-                        {
-                            if let Ok(usage) = usage_str.trim().parse::<i64>() {
-                                used_memory = usage;
-                            }
-                        }
-                    }
-                }
-            } else if let Ok(limit_str) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-                if let Ok(limit) = limit_str.trim().parse::<i64>() {
-                    if limit > 0 {
-                        total_memory = limit;
-                        if let Ok(usage_str) =
-                            std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-                        {
-                            if let Ok(usage) = usage_str.trim().parse::<i64>() {
-                                used_memory = usage;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (mut total_memory, mut used_memory) = crate::memory_governor::reported_memory_totals();
 
         let mut disk_total = 0u64;
         let mut disk_used = 0u64;

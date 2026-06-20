@@ -78,6 +78,8 @@ billing.countInboundTraffic: false
 
 生产场景建议将缓存目录放在独立磁盘或独立分区，便于容量管理和故障隔离。
 
+当前 `openFileCache` 会影响小对象磁盘命中是否读入内存并参与 L1 提升；关闭后小对象也走文件流式读取。`enableSendfile` 会被记录到运行时统计，并影响磁盘命中读取块大小，但 Pingora cache storage 当前只向上返回 `Bytes` 分块，不向 storage handler 暴露下游 socket，因此节点现有路径还不能直接执行 Linux `sendfile(2)` 零拷贝。真正的内核 sendfile 需要扩展 Pingora cache serving path，或实现同时持有文件 FD 与下游连接的自定义响应路径。
+
 ### `enableReadingOriginAsync`
 
 控制面缓存规则里的 `enableReadingOriginAsync` 字段目前在 cloud-node 中可以被接收和解析，但不会按单条 `cacheRef` 独立生效。

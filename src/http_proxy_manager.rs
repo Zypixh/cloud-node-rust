@@ -872,7 +872,7 @@ impl HttpProxyManager {
         let backend_addr = backend_target.addr;
         let origin_id = backend_target.origin_id;
         let proxy_protocol_to_origin = backend_target.proxy_protocol;
-        let _origin_connect_permit = MEMORY_GOVERNOR
+        let origin_connect_permit = MEMORY_GOVERNOR
             .try_admit(AdmissionClass::OriginConnect)
             .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         let toa_config = self.config_store.get_toa_config_sync();
@@ -911,6 +911,8 @@ impl HttpProxyManager {
                     0,
                     0,
                     0,
+                    0,
+                    None,
                     None,
                     None,
                 );
@@ -984,6 +986,8 @@ impl HttpProxyManager {
                         0,
                         0,
                         0,
+                        0,
+                        None,
                         None,
                         None,
                     );
@@ -1036,6 +1040,8 @@ impl HttpProxyManager {
                     0,
                     0,
                     0,
+                    0,
+                    None,
                     None,
                     None,
                 );
@@ -1051,6 +1057,7 @@ impl HttpProxyManager {
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
         let connect_latency_ms = started.elapsed().as_millis() as i64;
         crate::rpc::stats::push_origin_health_event(origin_id, true, connect_latency_ms);
+        drop(origin_connect_permit);
 
         let result = crate::tcp_proxy::stream_tcp_bidirectional_with_metrics(
             server_id,
@@ -1072,8 +1079,10 @@ impl HttpProxyManager {
                     &sni_host,
                     "-",
                     bytes_sent as i64,
+                    bytes_received as i64,
                     0,
                     0,
+                    None,
                     None,
                     None,
                 );
@@ -1103,8 +1112,10 @@ impl HttpProxyManager {
                     &sni_host,
                     "-",
                     bytes_sent as i64,
+                    bytes_received as i64,
                     0,
                     0,
+                    None,
                     None,
                     None,
                 );

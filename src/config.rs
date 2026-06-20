@@ -117,6 +117,7 @@ pub struct NodeConfig {
     /// Global TOA config
     pub toa: Option<TOAConfig>,
     pub global_access_log: Option<Arc<crate::config_models::GlobalHTTPAccessLogConfig>>,
+    pub global_stat_upload: Arc<crate::config_models::GlobalStatUploadConfig>,
     /// Cached plans referenced by current runtime servers
     pub plans: HashMap<i64, crate::pb::Plan>,
     /// Cached user plans referenced by current runtime servers
@@ -259,6 +260,7 @@ impl Default for NodeConfig {
             webp_image_policies: HashMap::new(),
             toa: None,
             global_access_log: None,
+            global_stat_upload: Arc::default(),
             plans: HashMap::new(),
             user_plans: HashMap::new(),
             plan_derived: HashMap::new(),
@@ -1003,6 +1005,19 @@ impl ConfigStore {
     ) -> Option<Arc<crate::config_models::GlobalHTTPAccessLogConfig>> {
         let lock = self.inner.read();
         lock.global_access_log.clone()
+    }
+
+    pub fn get_global_stat_upload_sync(&self) -> Arc<crate::config_models::GlobalStatUploadConfig> {
+        let lock = self.inner.read();
+        Arc::clone(&lock.global_stat_upload)
+    }
+
+    pub fn set_global_stat_upload(
+        &self,
+        config: Option<crate::config_models::GlobalStatUploadConfig>,
+    ) {
+        let mut lock = self.inner.write();
+        lock.global_stat_upload = Arc::new(config.unwrap_or_default());
     }
 
     pub fn get_grpc_policy_sync(&self) -> Option<Arc<crate::config_models::GRPCConfig>> {

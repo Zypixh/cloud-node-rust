@@ -41,6 +41,7 @@ struct PerfSample {
     memory_used: u64,
     memory_total: u64,
     memory_usage: f64,
+    memory_pressure_level: &'static str,
     swap_used: u64,
     swap_total: u64,
     load1m: f64,
@@ -72,7 +73,11 @@ struct PerfSample {
     cache_bloom_budget_bytes: u64,
     cache_negative_count: usize,
     cache_negative_capacity: usize,
+    cache_file_cache_enabled: bool,
+    cache_sendfile_enabled: bool,
+    cache_disk_hit_chunk_bytes: usize,
     memory_pressure_high: bool,
+    admission_rejects_total: u64,
     top_servers: Vec<TopServer>,
     advice: Vec<Advice>,
 }
@@ -155,8 +160,10 @@ async fn sample_loop(store: SharedStore) {
         let request_delta = total_requests.saturating_sub(last_requests);
         let traffic_in_delta = traffic_in.saturating_sub(last_traffic_in);
         let traffic_out_delta = traffic_out.saturating_sub(last_traffic_out);
-        let memory_total = sys.total_memory();
-        let memory_used = sys.used_memory();
+        let governor = &crate::memory_governor::MEMORY_GOVERNOR;
+        let governor_snapshot = governor.snapshot(governor.pingora_worker_threads());
+        let memory_total = governor_snapshot.memory_total_bytes;
+        let memory_used = governor_snapshot.memory_used_bytes;
         let load = System::load_average();
         let (disk_used, disk_total) = disk_usage();
         let disk_usage = if disk_total > 0 {
@@ -171,6 +178,8 @@ async fn sample_loop(store: SharedStore) {
         } else {
             0.0
         };
+        let memory_pressure_level = governor_snapshot.memory_pressure_level.as_str();
+        let admission_rejects_total = governor_snapshot.admission_rejects.total();
         let snapshot_list: Vec<_> = snapshots.iter().map(|s| s.1.clone()).collect();
         let top_servers = top_servers(&snapshot_list);
         let request_per_sec = request_delta as f64 / elapsed as f64;
@@ -185,6 +194,7 @@ async fn sample_loop(store: SharedStore) {
             memory_used,
             memory_total,
             memory_usage,
+            memory_pressure_level,
             swap_used: sys.used_swap(),
             swap_total: sys.total_swap(),
             load1m: load.one,
@@ -216,12 +226,18 @@ async fn sample_loop(store: SharedStore) {
             cache_bloom_budget_bytes: cache_stats.bloom_budget_bytes,
             cache_negative_count: cache_stats.negative_cache_count,
             cache_negative_capacity: cache_stats.negative_cache_capacity,
+            cache_file_cache_enabled: cache_stats.file_cache_enabled,
+            cache_sendfile_enabled: cache_stats.sendfile_enabled,
+            cache_disk_hit_chunk_bytes: cache_stats.disk_hit_chunk_bytes,
             memory_pressure_high: cache_stats.memory_pressure_high,
+            admission_rejects_total,
             top_servers,
             advice: build_advice(
                 cpu_usage,
                 sys.cpus().len(),
                 memory_usage,
+                memory_pressure_level,
+                admission_rejects_total,
                 load.one,
                 disk_usage,
                 active_connections,
@@ -285,6 +301,8 @@ fn build_advice(
     cpu_usage: f64,
     cpu_count: usize,
     memory_usage: f64,
+    memory_pressure_level: &str,
+    admission_rejects_total: u64,
     load1m: f64,
     disk_usage: f64,
     active_connections: i64,
@@ -308,6 +326,26 @@ fn build_advice(
             title: "内存使用率过高",
             detail: "建议检查缓存元数据、连接数和日志队列；必要时降低缓存容量或提高实例内存。"
                 .to_string(),
+        });
+    }
+    if matches!(memory_pressure_level, "high" | "critical") {
+        advice.push(Advice {
+            level: "warning",
+            title: "内存治理进入压力模式",
+            detail: format!(
+                "当前压力等级为 {}，后台任务、缓存读入内存和高成本转换会被优先收缩。",
+                memory_pressure_level
+            ),
+        });
+    }
+    if admission_rejects_total > 0 {
+        advice.push(Advice {
+            level: "warning",
+            title: "已有内存准入拒绝",
+            detail: format!(
+                "累计 {} 次准入被拒绝；建议结合 memory_plan 查看具体资源类别。",
+                admission_rejects_total
+            ),
         });
     }
     if cpu_count > 0 && load1m > cpu_count as f64 * 1.5 {
@@ -484,7 +522,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .mini-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:10px; }
     .mini { border:1px solid var(--line); border-radius:8px; padding:12px; background:rgba(255,255,255,.03); min-height:78px; }
     .mini .label { font-size:11px; }
-    .mini .value { font-size:20px; margin-top:6px; }
+    .mini .value { font-size:20px; margin-top:6px; white-space:normal; overflow-wrap:anywhere; }
     .wide { grid-column:span 3; }
     .full { grid-column:span 6; }
     .chart { height:280px; margin-top:12px; position:relative; }
@@ -534,6 +572,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <div class="mini"><div class="label">Memory Cache Items</div><div class="value" id="cacheMemoryCount">-</div><div class="hint" id="cacheMemorySize">-</div></div>
       <div class="mini"><div class="label">Cache Policy</div><div class="value" id="cachePolicy">-</div></div>
       <div class="mini"><div class="label">Disk Cache Limit</div><div class="value" id="cacheLimit">-</div><div class="hint" id="cacheMinFree">-</div></div>
+      <div class="mini"><div class="label">L1 Budget</div><div class="value" id="cacheMemoryBudget">-</div><div class="hint" id="cachePressure">-</div></div>
+      <div class="mini"><div class="label">Bloom Filter</div><div class="value" id="cacheBloom">-</div><div class="hint" id="cacheBloomBytes">-</div></div>
+      <div class="mini"><div class="label">Negative Cache</div><div class="value" id="cacheNegative">-</div><div class="hint">short-lived misses</div></div>
+      <div class="mini"><div class="label">Disk Hit Mode</div><div class="value" id="cacheDiskMode">-</div><div class="hint" id="cacheChunk">-</div></div>
     </div></div>
     <div class="card full"><div class="label">优化建议</div><div class="advice" id="advice"></div></div>
     <div class="card full"><div class="label">Top Server</div><table><thead><tr><th>Server</th><th>Requests</th><th>Total</th><th>Out</th><th>In</th><th>Origin</th><th>Conns</th><th>Cache Hits</th><th>Attacks</th></tr></thead><tbody id="topServers"></tbody></table></div>
@@ -543,6 +585,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 const $ = id => document.getElementById(id);
 const fmtBytes = n => n >= 1073741824 ? (n/1073741824).toFixed(2)+' GB' : n >= 1048576 ? (n/1048576).toFixed(2)+' MB' : n >= 1024 ? (n/1024).toFixed(1)+' KB' : Math.round(n)+' B';
 const pct = n => (n*100).toFixed(1)+'%';
+const onOff = v => v ? 'on' : 'off';
 const chartState = new Map();
 const formatters = {
   bytes: v => fmtBytes(v) + '/s',
@@ -661,7 +704,7 @@ async function refresh() {
   $('cpu').textContent = last.cpu_usage.toFixed(1)+'%';
   $('load').textContent = `load ${last.load1m.toFixed(2)} / ${last.load5m.toFixed(2)} / ${last.load15m.toFixed(2)} · ${last.cpu_count} cores`;
   $('mem').textContent = pct(last.memory_usage);
-  $('memBytes').textContent = `${fmtBytes(last.memory_used)} / ${fmtBytes(last.memory_total)} · cache ${fmtBytes(last.cache_disk_bytes + last.cache_memory_bytes)}`;
+  $('memBytes').textContent = `${fmtBytes(last.memory_used)} / ${fmtBytes(last.memory_total)} · pressure ${last.memory_pressure_level} · rejects ${last.admission_rejects_total}`;
   $('out').textContent = fmtBytes(last.traffic_out_bps)+'/s';
   $('in').textContent = fmtBytes(last.traffic_in_bps)+'/s';
   $('rps').textContent = last.request_per_sec.toFixed(1)+'/s';
@@ -675,6 +718,13 @@ async function refresh() {
   $('cachePolicy').textContent = last.cache_policy_type || '-';
   $('cacheLimit').textContent = fmtBytes(last.cache_disk_limit_bytes);
   $('cacheMinFree').textContent = `min free ${fmtBytes(last.cache_min_free_bytes)}`;
+  $('cacheMemoryBudget').textContent = fmtBytes(last.cache_memory_budget_bytes);
+  $('cachePressure').textContent = last.memory_pressure_high ? 'memory pressure high' : 'memory pressure normal';
+  $('cacheBloom').textContent = `${last.cache_bloom_count.toLocaleString()} / ${last.cache_bloom_capacity.toLocaleString()}`;
+  $('cacheBloomBytes').textContent = `${fmtBytes(last.cache_bloom_estimated_bytes)} / ${fmtBytes(last.cache_bloom_budget_bytes)}`;
+  $('cacheNegative').textContent = `${last.cache_negative_count.toLocaleString()} / ${last.cache_negative_capacity.toLocaleString()}`;
+  $('cacheDiskMode').textContent = `file ${onOff(last.cache_file_cache_enabled)} · sendfile ${onOff(last.cache_sendfile_enabled)}`;
+  $('cacheChunk').textContent = `chunk ${fmtBytes(last.cache_disk_hit_chunk_bytes)}`;
   drawChart($('traffic'), [{name:'Out', color:'#56d68f', data:data.map(x=>x.traffic_out_bps)}, {name:'In', color:'#f5bd68', data:data.map(x=>x.traffic_in_bps)}], {unit:'Bytes/s', format:'bytes', samples:data});
   drawChart($('resource'), [{name:'CPU', color:'#56d68f', data:data.map(x=>x.cpu_usage)}, {name:'Memory', color:'#79b7ff', data:data.map(x=>x.memory_usage*100)}, {name:'Disk', color:'#f5bd68', data:data.map(x=>x.disk_usage*100)}], {unit:'Percent', format:'percent', max:100, samples:data});
   drawChart($('requests'), [{name:'Requests/s', color:'#f5bd68', data:data.map(x=>x.request_per_sec)}], {unit:'Requests/s', format:'number', samples:data});

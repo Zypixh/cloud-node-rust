@@ -369,6 +369,21 @@ impl AccessLogUploadWorker {
                 Ok(())
             }
             Err(e) if e.code() == Code::ResourceExhausted => {
+                if logs.iter().any(|log| !log.request_body.is_empty()) {
+                    for log in &mut logs {
+                        log.request_body.clear();
+                    }
+                    return match self.send_access_log_chunk(channel, &logs).await {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            error!(
+                                "Failed to upload access logs after dropping request bodies: {}",
+                                err
+                            );
+                            Err(AccessLogUploadError::Retry(logs))
+                        }
+                    };
+                }
                 if count > 1 {
                     let right = logs.split_off(count / 2);
                     Err(AccessLogUploadError::Split { left: logs, right })

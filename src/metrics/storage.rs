@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use maxminddb::{self, geoip2};
 use rust_rocksdb::{DB, IteratorMode, MergeOperands, Options, WriteBatch};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
@@ -175,6 +176,76 @@ impl MetricStorage {
                 batch.delete(&key);
             } else if &*key_str >= "Z" {
                 break;
+            }
+        }
+        let _ = db.write(&batch);
+    }
+
+    pub fn put_json<T: Serialize>(&self, key: &str, value: &T) -> bool {
+        let Some(db) = &self.db else {
+            return false;
+        };
+        match serde_json::to_vec(value) {
+            Ok(bytes) => db.put(key.as_bytes(), bytes).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    pub fn get_json<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let Some(db) = &self.db else {
+            return None;
+        };
+        db.get(key.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    }
+
+    pub fn record_unique_ip(&self, server_id: i64, day: &str, ip: IpAddr) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        if server_id <= 0 || day.is_empty() {
+            return;
+        }
+        let _ = db.put(unique_ip_key(server_id, day, ip).as_bytes(), []);
+    }
+
+    pub fn load_unique_ips(&self, min_day: &str) -> Vec<(i64, String, IpAddr)> {
+        let Some(db) = &self.db else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        let iter = db.prefix_iterator("UIP_".as_bytes());
+        for (key, _) in iter.flatten() {
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with("UIP_") {
+                break;
+            }
+            if let Some((server_id, day, ip)) = parse_unique_ip_key(&key_str)
+                && day.as_str() >= min_day
+            {
+                rows.push((server_id, day, ip));
+            }
+        }
+        rows
+    }
+
+    pub fn cleanup_unique_ips_before(&self, min_day: &str) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let mut batch = WriteBatch::default();
+        let iter = db.prefix_iterator("UIP_".as_bytes());
+        for (key, _) in iter.flatten() {
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with("UIP_") {
+                break;
+            }
+            if let Some((_, day, _)) = parse_unique_ip_key(&key_str)
+                && day.as_str() < min_day
+            {
+                batch.delete(&key);
             }
         }
         let _ = db.write(&batch);
@@ -640,6 +711,19 @@ fn client_agent_ip_record_from_slice(
     })
 }
 
+fn unique_ip_key(server_id: i64, day: &str, ip: IpAddr) -> String {
+    format!("UIP_{}_{}_{}", day, server_id, ip)
+}
+
+fn parse_unique_ip_key(key: &str) -> Option<(i64, String, IpAddr)> {
+    let rest = key.strip_prefix("UIP_")?;
+    let mut parts = rest.splitn(3, '_');
+    let day = parts.next()?.to_string();
+    let server_id = parts.next()?.parse::<i64>().ok()?;
+    let ip = parts.next()?.parse::<IpAddr>().ok()?;
+    Some((server_id, day, ip))
+}
+
 pub fn get_cache_meta_memory(hash: &str) -> Option<CacheMetaEntry> {
     CACHE_META_INDEX.get(hash).map(|v| v.clone())
 }
@@ -772,7 +856,7 @@ pub fn lookup_region_provider_id(ip: IpAddr) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_cache_status, parse_cache_status};
+    use super::{normalize_cache_status, parse_cache_status, parse_unique_ip_key, unique_ip_key};
 
     #[test]
     fn cache_status_normalization_rejects_invalid_http_codes() {
@@ -785,5 +869,16 @@ mod tests {
         assert_eq!(parse_cache_status(Some(700)), 200);
         assert_eq!(parse_cache_status(Some(u64::from(u16::MAX) + 1)), 200);
         assert_eq!(parse_cache_status(None), 200);
+    }
+
+    #[test]
+    fn unique_ip_key_round_trips_ipv4_and_ipv6() {
+        for ip in ["203.0.113.1", "2001:db8::1"] {
+            let parsed = parse_unique_ip_key(&unique_ip_key(7, "20260621", ip.parse().unwrap()))
+                .expect("unique ip key should parse");
+            assert_eq!(parsed.0, 7);
+            assert_eq!(parsed.1, "20260621");
+            assert_eq!(parsed.2.to_string(), ip);
+        }
     }
 }

@@ -145,7 +145,7 @@ pub fn local_snapshot(seq: u64) -> ReplicaStatsSnapshot {
     let (cache_count, cache_bytes) = crate::metrics::storage::STORAGE.cache_summary();
     let mut sys = sysinfo::System::new_all();
     sys.refresh_all();
-    let (memory_total, memory_used) = process_memory_totals(&sys);
+    let (memory_total, memory_used) = crate::memory_governor::reported_memory_totals();
     ReplicaStatsSnapshot {
         pod_name,
         seq,
@@ -164,47 +164,6 @@ pub fn local_snapshot(seq: u64) -> ReplicaStatsSnapshot {
         memory_total,
         memory_used,
     }
-}
-
-fn process_memory_totals(sys: &sysinfo::System) -> (i64, i64) {
-    #[allow(unused_mut)]
-    let mut total_memory = sys.total_memory() as i64;
-    #[allow(unused_mut)]
-    let mut used_memory = sys.used_memory() as i64;
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(limit_str) =
-            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        {
-            if let Ok(limit) = limit_str.trim().parse::<i64>() {
-                if limit > 0 && limit < 1024 * 1024 * 1024 * 1024 {
-                    total_memory = limit;
-                    if let Ok(usage_str) =
-                        std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-                    {
-                        if let Ok(usage) = usage_str.trim().parse::<i64>() {
-                            used_memory = usage;
-                        }
-                    }
-                }
-            }
-        } else if let Ok(limit_str) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
-            if let Ok(limit) = limit_str.trim().parse::<i64>() {
-                if limit > 0 {
-                    total_memory = limit;
-                    if let Ok(usage_str) = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-                    {
-                        if let Ok(usage) = usage_str.trim().parse::<i64>() {
-                            used_memory = usage;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    (total_memory, used_memory)
 }
 
 async fn push_snapshot_to_peers(

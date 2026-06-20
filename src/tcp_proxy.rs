@@ -512,10 +512,10 @@ impl TcpProxyManager {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let _origin_connect_permit = MEMORY_GOVERNOR
-            .try_admit(AdmissionClass::OriginConnect)
-            .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         if context.use_tls_to_backend {
+            let origin_connect_permit = MEMORY_GOVERNOR
+                .try_admit(AdmissionClass::OriginConnect)
+                .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
             let ext = context.backend_ext.as_ref().expect("Checked use_tls above");
             let host = if !ext.host.is_empty() {
                 ext.host.clone()
@@ -582,6 +582,7 @@ impl TcpProxyManager {
             })?;
 
             crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
+            drop(origin_connect_permit);
             let res =
                 stream_bidirectional_with_metrics(context.sid, client_stream, backend_stream).await;
             release_toa_port(toa_config, toa_local_port).await;
@@ -603,7 +604,7 @@ impl TcpProxyManager {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let _origin_connect_permit = MEMORY_GOVERNOR
+        let origin_connect_permit = MEMORY_GOVERNOR
             .try_admit(AdmissionClass::OriginConnect)
             .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         self.record_request_start(client_addr, &context);
@@ -644,6 +645,7 @@ impl TcpProxyManager {
             }
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
+        drop(origin_connect_permit);
         let res =
             stream_bidirectional_with_metrics(context.sid, client_stream, backend_stream).await;
         release_toa_port(toa_config, toa_local_port).await;
@@ -658,7 +660,7 @@ impl TcpProxyManager {
         server: Arc<ServerConfig>,
         context: TcpForwardContext,
     ) -> anyhow::Result<()> {
-        let _origin_connect_permit = MEMORY_GOVERNOR
+        let origin_connect_permit = MEMORY_GOVERNOR
             .try_admit(AdmissionClass::OriginConnect)
             .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         self.record_request_start(client_addr, &context);
@@ -699,6 +701,7 @@ impl TcpProxyManager {
             }
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
+        drop(origin_connect_permit);
         let res =
             stream_tcp_bidirectional_with_metrics(context.sid, client_stream, backend_stream).await;
         release_toa_port(toa_config, toa_local_port).await;
@@ -742,6 +745,8 @@ impl TcpProxyManager {
             0,
             0,
             0,
+            0,
+            None,
             None,
             None,
         );
@@ -756,7 +761,7 @@ impl TcpProxyManager {
         context: &TcpForwardContext,
         result: &Result<(u64, u64), BidirectionalStreamError>,
     ) {
-        let (_bytes_received, bytes_sent) = match result {
+        let (bytes_received, bytes_sent) = match result {
             Ok((r, s)) => (*r, *s),
             Err(e) => {
                 debug!("TCP Proxy: Bidirectional copy finished with error: {}", e);
@@ -774,8 +779,10 @@ impl TcpProxyManager {
             &domain,
             "-",
             bytes_sent as i64,
+            bytes_received as i64,
             0,
             0,
+            None,
             None,
             None,
         );

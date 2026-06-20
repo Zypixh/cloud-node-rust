@@ -610,10 +610,8 @@ async fn handle_message(
             tokio::spawn(async move {
                 let mut sys = sysinfo::System::new_all();
                 sys.refresh_cpu_all();
-                sys.refresh_memory();
                 let load = sysinfo::System::load_average();
-                let total_memory = sys.total_memory() as i64;
-                let used_memory = sys.used_memory() as i64;
+                let (total_memory, used_memory) = crate::memory_governor::reported_memory_totals();
                 let mem_usage = if total_memory > 0 {
                     used_memory as f64 / total_memory as f64
                 } else {

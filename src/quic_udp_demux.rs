@@ -34,8 +34,6 @@ const PENDING_QUIC_ROUTE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_NEW_ROUTES_PER_IP_WINDOW: usize = 128;
 const NEW_ROUTE_RATE_WINDOW: Duration = Duration::from_secs(10);
 const MAX_NEW_ROUTE_IP_WINDOWS_PER_PORT: usize = 16_384;
-const MAX_PENDING_ROUTES_PER_PORT: usize = 2048;
-const MAX_PENDING_REASSEMBLY_BYTES_PER_PORT: usize = 16 * 1024 * 1024;
 const ROUTE_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 const ROUTE_CLEANUP_PRESSURE_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_PENDING_DATAGRAMS_PER_CLIENT: usize = 4;
@@ -50,6 +48,15 @@ enum RouteKind {
 struct H3Datagram {
     from: SocketAddr,
     data: Bytes,
+    queued_bytes: Option<Arc<AtomicUsize>>,
+}
+
+impl Drop for H3Datagram {
+    fn drop(&mut self) {
+        if let Some(queued_bytes) = &self.queued_bytes {
+            release_h3_queued_bytes(queued_bytes, self.data.len());
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -59,6 +66,7 @@ struct UdpDemuxSharedState {
     session_routes: Arc<SessionRoutes>,
     pending_routes: Arc<DashMap<SocketAddr, PendingQuicRoute>>,
     pending_reassembly_bytes: Arc<AtomicUsize>,
+    h3_queued_bytes: Arc<AtomicUsize>,
     new_route_windows: Arc<DashMap<StdIpAddr, VecDeque<Instant>>>,
     h3_tx: mpsc::Sender<H3Datagram>,
     quic_cid_tx: mpsc::Sender<UdpSessionQuicCid>,
@@ -255,16 +263,62 @@ fn cleanup_new_route_windows(windows: &DashMap<StdIpAddr, VecDeque<Instant>>) {
     });
 }
 
-fn pending_retained_bytes(
+fn release_pending_reassembly_bytes(pending_reassembly_bytes: &AtomicUsize, bytes: usize) {
+    let mut current = pending_reassembly_bytes.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(bytes);
+        match pending_reassembly_bytes.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn try_reserve_pending_reassembly_bytes(
+    pending_reassembly_bytes: &AtomicUsize,
+    additional_bytes: usize,
+    pending_reassembly_budget_bytes: usize,
+) -> bool {
+    if additional_bytes == 0 {
+        return true;
+    }
+    loop {
+        let current = pending_reassembly_bytes.load(Ordering::Relaxed);
+        let next = current.saturating_add(additional_bytes);
+        if next > pending_reassembly_budget_bytes {
+            return false;
+        }
+        if pending_reassembly_bytes
+            .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+fn cleanup_pending_routes(
     pending_routes: &DashMap<SocketAddr, PendingQuicRoute>,
     pending_reassembly_bytes: &AtomicUsize,
-) -> usize {
-    let bytes = pending_routes
+    now: Instant,
+) {
+    let expired = pending_routes
         .iter()
-        .map(|entry| entry.value().retained_bytes())
-        .sum();
-    pending_reassembly_bytes.store(bytes, Ordering::Relaxed);
-    bytes
+        .filter_map(|entry| {
+            (now.duration_since(entry.value().created_at) >= PENDING_QUIC_ROUTE_TIMEOUT)
+                .then_some(*entry.key())
+        })
+        .collect::<Vec<_>>();
+    for client_addr in expired {
+        if let Some((_, pending)) = pending_routes.remove(&client_addr) {
+            release_pending_reassembly_bytes(pending_reassembly_bytes, pending.retained_bytes());
+        }
+    }
 }
 
 fn merge_quic_fragment(
@@ -272,6 +326,7 @@ fn merge_quic_fragment(
     fragment: QuicCryptoFragment,
     datagram: Bytes,
     pending_reassembly_bytes: &AtomicUsize,
+    pending_reassembly_budget_bytes: usize,
 ) -> bool {
     if pending.datagrams.len() >= MAX_PENDING_DATAGRAMS_PER_CLIENT
         || pending.ranges.len() + fragment.ranges.len() > MAX_PENDING_RANGES_PER_CLIENT
@@ -284,8 +339,11 @@ fn merge_quic_fragment(
     let new_bytes =
         new_data_len + pending.datagrams.iter().map(Bytes::len).sum::<usize>() + datagram.len();
     let additional_bytes = new_bytes.saturating_sub(old_bytes);
-    let current = pending_reassembly_bytes.load(Ordering::Relaxed);
-    if current.saturating_add(additional_bytes) > MAX_PENDING_REASSEMBLY_BYTES_PER_PORT {
+    if !try_reserve_pending_reassembly_bytes(
+        pending_reassembly_bytes,
+        additional_bytes,
+        pending_reassembly_budget_bytes,
+    ) {
         return false;
     }
     if pending.data.len() < fragment.data.len() {
@@ -298,7 +356,6 @@ fn merge_quic_fragment(
         }
     }
     pending.datagrams.push(datagram);
-    pending_reassembly_bytes.fetch_add(additional_bytes, Ordering::Relaxed);
     true
 }
 
@@ -488,9 +545,7 @@ fn cleanup_routes(
     session_routes: &SessionRoutes,
 ) {
     let now = Instant::now();
-    pending_routes
-        .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_QUIC_ROUTE_TIMEOUT);
-    pending_retained_bytes(pending_routes, pending_reassembly_bytes);
+    cleanup_pending_routes(pending_routes, pending_reassembly_bytes, now);
     udp_manager.cleanup_idle_sessions(UDP_SESSION_IDLE_TIMEOUT);
     routes.retain(|_, route| route_kind_is_active(route));
     session_routes.retain(|_, route| route_kind_is_active(route));
@@ -505,6 +560,67 @@ enum DispatchStatus {
     Sent,
     Dropped,
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H3QueueStatus {
+    Sent,
+    Full,
+    ByteLimited,
+    Closed,
+}
+
+fn release_h3_queued_bytes(h3_queued_bytes: &AtomicUsize, data_len: usize) {
+    let mut current = h3_queued_bytes.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(data_len);
+        match h3_queued_bytes.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn try_queue_h3_datagram(
+    h3_tx: &mpsc::Sender<H3Datagram>,
+    h3_queued_bytes: &Arc<AtomicUsize>,
+    client_addr: SocketAddr,
+    data: Bytes,
+    byte_budget: usize,
+) -> H3QueueStatus {
+    let data_len = data.len();
+    loop {
+        let current = h3_queued_bytes.load(Ordering::Relaxed);
+        if current.saturating_add(data_len) > byte_budget {
+            return H3QueueStatus::ByteLimited;
+        }
+        if h3_queued_bytes
+            .compare_exchange_weak(
+                current,
+                current.saturating_add(data_len),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            break;
+        }
+    }
+
+    match h3_tx.try_send(H3Datagram {
+        from: client_addr,
+        data,
+        queued_bytes: Some(Arc::clone(h3_queued_bytes)),
+    }) {
+        Ok(()) => H3QueueStatus::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => H3QueueStatus::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => H3QueueStatus::Closed,
+    }
 }
 
 fn copy_datagram(
@@ -667,6 +783,7 @@ impl QuicUdpDemuxManager {
             session_routes: Arc::new(SessionRoutes::new()),
             pending_routes: Arc::new(DashMap::<SocketAddr, PendingQuicRoute>::new()),
             pending_reassembly_bytes: Arc::new(AtomicUsize::new(0)),
+            h3_queued_bytes: Arc::new(AtomicUsize::new(0)),
             new_route_windows: Arc::new(DashMap::<StdIpAddr, VecDeque<Instant>>::new()),
             h3_tx,
             quic_cid_tx,
@@ -850,6 +967,7 @@ impl QuicUdpDemuxManager {
                         client_addr,
                         data,
                         &shared.h3_tx,
+                        &shared.h3_queued_bytes,
                         http3_enabled,
                     )
                     .await
@@ -871,6 +989,7 @@ impl QuicUdpDemuxManager {
                         client_addr,
                         data,
                         &shared.h3_tx,
+                        &shared.h3_queued_bytes,
                         http3_enabled,
                     )
                     .await
@@ -928,6 +1047,7 @@ impl QuicUdpDemuxManager {
                     &shared.pending_reassembly_bytes,
                     &shared.new_route_windows,
                     &shared.h3_tx,
+                    &shared.h3_queued_bytes,
                     http3_enabled,
                     socket.clone(),
                     shutdown_rx.clone(),
@@ -954,6 +1074,7 @@ impl QuicUdpDemuxManager {
                         client_addr,
                         datagram,
                         &shared.h3_tx,
+                        &shared.h3_queued_bytes,
                         http3_enabled,
                     )
                     .await
@@ -977,6 +1098,7 @@ impl QuicUdpDemuxManager {
         pending_reassembly_bytes: &AtomicUsize,
         new_route_windows: &DashMap<StdIpAddr, VecDeque<Instant>>,
         h3_tx: &mpsc::Sender<H3Datagram>,
+        h3_queued_bytes: &Arc<AtomicUsize>,
         http3_enabled: bool,
         socket: Arc<UdpSocket>,
         shutdown_rx: watch::Receiver<bool>,
@@ -991,8 +1113,10 @@ impl QuicUdpDemuxManager {
                 let mut datagrams = pending_routes
                     .remove(&client_addr)
                     .map(|(_, pending)| {
-                        pending_reassembly_bytes
-                            .fetch_sub(pending.retained_bytes(), Ordering::Relaxed);
+                        release_pending_reassembly_bytes(
+                            pending_reassembly_bytes,
+                            pending.retained_bytes(),
+                        );
                         pending.datagrams
                     })
                     .unwrap_or_default();
@@ -1030,7 +1154,8 @@ impl QuicUdpDemuxManager {
                     );
                     return Ok(None);
                 }
-                if is_new_pending_route && pending_routes.len() >= MAX_PENDING_ROUTES_PER_PORT {
+                let pending_route_limit = MEMORY_GOVERNOR.quic_pending_route_limit_per_port();
+                if is_new_pending_route && pending_routes.len() >= pending_route_limit {
                     debug!(
                         "QUIC UDP demux: pending route limit reached on port {}, dropping incomplete ClientHello from {}",
                         port, client_addr
@@ -1052,12 +1177,15 @@ impl QuicUdpDemuxManager {
                         &mut pending,
                         fragment,
                         data.clone(),
-                        &pending_reassembly_bytes,
+                        pending_reassembly_bytes,
+                        MEMORY_GOVERNOR.quic_pending_reassembly_budget_bytes(),
                     ) {
                         drop(pending);
                         if let Some((_, pending)) = pending_routes.remove(&client_addr) {
-                            pending_reassembly_bytes
-                                .fetch_sub(pending.retained_bytes(), Ordering::Relaxed);
+                            release_pending_reassembly_bytes(
+                                pending_reassembly_bytes,
+                                pending.retained_bytes(),
+                            );
                         }
                         return Ok(None);
                     }
@@ -1072,8 +1200,10 @@ impl QuicUdpDemuxManager {
                         let datagrams = pending_routes
                             .remove(&client_addr)
                             .map(|(_, pending)| {
-                                pending_reassembly_bytes
-                                    .fetch_sub(pending.retained_bytes(), Ordering::Relaxed);
+                                release_pending_reassembly_bytes(
+                                    pending_reassembly_bytes,
+                                    pending.retained_bytes(),
+                                );
                                 pending.datagrams
                             })
                             .unwrap_or_else(|| vec![data.clone()]);
@@ -1113,8 +1243,10 @@ impl QuicUdpDemuxManager {
                 let datagrams = pending_routes
                     .remove(&client_addr)
                     .map(|(_, pending)| {
-                        pending_reassembly_bytes
-                            .fetch_sub(pending.retained_bytes(), Ordering::Relaxed);
+                        release_pending_reassembly_bytes(
+                            pending_reassembly_bytes,
+                            pending.retained_bytes(),
+                        );
                         pending.datagrams
                     })
                     .unwrap_or_else(|| vec![data.clone()]);
@@ -1171,17 +1303,32 @@ impl QuicUdpDemuxManager {
                     return Ok(Some((RouteKind::Passthrough(session), vec![data])));
                 }
                 if http3_enabled && !self.config_store.has_quic_passthrough_on_port_sync(port) {
-                    if h3_tx
-                        .try_send(H3Datagram {
-                            from: client_addr,
-                            data,
-                        })
-                        .is_err()
-                    {
-                        debug!(
-                            "HTTP/3 shared UDP queue unavailable, dropping undecidable datagram from {}",
-                            client_addr
-                        );
+                    match try_queue_h3_datagram(
+                        h3_tx,
+                        h3_queued_bytes,
+                        client_addr,
+                        data,
+                        MEMORY_GOVERNOR.h3_datagram_queue_budget_bytes(),
+                    ) {
+                        H3QueueStatus::Sent => {}
+                        H3QueueStatus::Full => {
+                            debug!(
+                                "HTTP/3 shared UDP queue full, dropping undecidable datagram from {}",
+                                client_addr
+                            );
+                        }
+                        H3QueueStatus::ByteLimited => {
+                            debug!(
+                                "HTTP/3 shared UDP queue byte budget full, dropping undecidable datagram from {}",
+                                client_addr
+                            );
+                        }
+                        H3QueueStatus::Closed => {
+                            debug!(
+                                "HTTP/3 shared UDP queue unavailable, dropping undecidable datagram from {}",
+                                client_addr
+                            );
+                        }
                     }
                 }
                 Ok(None)
@@ -1370,6 +1517,7 @@ impl QuicUdpDemuxManager {
         client_addr: SocketAddr,
         data: Bytes,
         h3_tx: &mpsc::Sender<H3Datagram>,
+        h3_queued_bytes: &Arc<AtomicUsize>,
         http3_enabled: bool,
     ) -> DispatchStatus {
         match route {
@@ -1377,22 +1525,32 @@ impl QuicUdpDemuxManager {
                 if !http3_enabled {
                     return DispatchStatus::Closed;
                 }
-                match h3_tx.try_send(H3Datagram {
-                    from: client_addr,
+                match try_queue_h3_datagram(
+                    h3_tx,
+                    h3_queued_bytes,
+                    client_addr,
                     data,
-                }) {
-                    Ok(()) => {
+                    MEMORY_GOVERNOR.h3_datagram_queue_budget_bytes(),
+                ) {
+                    H3QueueStatus::Sent => {
                         last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
                         DispatchStatus::Sent
                     }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
+                    H3QueueStatus::Full => {
                         debug!(
                             "HTTP/3 shared UDP queue full, dropping datagram from {}",
                             client_addr
                         );
                         DispatchStatus::Dropped
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => DispatchStatus::Closed,
+                    H3QueueStatus::ByteLimited => {
+                        debug!(
+                            "HTTP/3 shared UDP queue byte budget full, dropping datagram from {}",
+                            client_addr
+                        );
+                        DispatchStatus::Dropped
+                    }
+                    H3QueueStatus::Closed => DispatchStatus::Closed,
                 }
             }
             RouteKind::Passthrough(session) => {
@@ -1515,6 +1673,77 @@ mod tests {
 
         assert!(lookup_cid_route(&cid_routes, &[0x40, 1, 2, 3, 4, 0xaa]).is_none());
         assert!(lookup_cid_route(&cid_routes, &[0x40, 5, 6, 7, 8, 0xaa]).is_some());
+    }
+
+    #[tokio::test]
+    async fn h3_queue_byte_accounting_releases_when_datagram_is_dropped() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        assert_eq!(
+            try_queue_h3_datagram(
+                &tx,
+                &queued_bytes,
+                client_addr,
+                Bytes::from_static(b"abcdef"),
+                5,
+            ),
+            H3QueueStatus::ByteLimited
+        );
+        assert_eq!(queued_bytes.load(Ordering::Acquire), 0);
+
+        assert_eq!(
+            try_queue_h3_datagram(
+                &tx,
+                &queued_bytes,
+                client_addr,
+                Bytes::from_static(b"abcdef"),
+                16,
+            ),
+            H3QueueStatus::Sent
+        );
+        assert_eq!(queued_bytes.load(Ordering::Acquire), 6);
+
+        let datagram = rx.recv().await.expect("queued datagram");
+        assert_eq!(datagram.data.as_ref(), b"abcdef");
+        drop(datagram);
+        assert_eq!(queued_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pending_reassembly_byte_accounting_is_bounded_and_saturating() {
+        let pending_bytes = AtomicUsize::new(9);
+
+        assert!(!try_reserve_pending_reassembly_bytes(&pending_bytes, 2, 10));
+        assert_eq!(pending_bytes.load(Ordering::Acquire), 9);
+
+        assert!(try_reserve_pending_reassembly_bytes(&pending_bytes, 1, 10));
+        assert_eq!(pending_bytes.load(Ordering::Acquire), 10);
+
+        release_pending_reassembly_bytes(&pending_bytes, 128);
+        assert_eq!(pending_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pending_route_cleanup_releases_retained_bytes() {
+        let pending_routes = DashMap::new();
+        let pending_bytes = AtomicUsize::new(0);
+        let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let pending = PendingQuicRoute {
+            created_at: Instant::now() - PENDING_QUIC_ROUTE_TIMEOUT - Duration::from_secs(1),
+            data: vec![0; 8],
+            ranges: Vec::new(),
+            datagrams: vec![Bytes::from_static(b"abcdef")],
+        };
+        let retained = pending.retained_bytes();
+        pending_bytes.store(retained, Ordering::Release);
+        pending_routes.insert(client_addr, pending);
+
+        cleanup_pending_routes(&pending_routes, &pending_bytes, Instant::now());
+
+        assert!(pending_routes.is_empty());
+        assert_eq!(pending_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]
