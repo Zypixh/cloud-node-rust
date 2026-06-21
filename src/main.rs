@@ -176,6 +176,28 @@ enum Commands {
         #[arg(long)]
         no_restart: bool,
     },
+    /// Synchronize internal time offset with NTP servers and optionally set system timezone
+    Ntp {
+        /// Set system timezone, for example Asia/Shanghai or UTC.
+        #[arg(long)]
+        timezone: Option<String>,
+
+        /// Do not prompt for or change system timezone.
+        #[arg(long)]
+        no_timezone: bool,
+
+        /// Confirm defaults and run non-interactively.
+        #[arg(long, alias = "non-interactive")]
+        yes: bool,
+
+        /// NTP server host. Can be repeated. Defaults to built-in global servers.
+        #[arg(long = "server")]
+        servers: Vec<String>,
+
+        /// Per-server NTP timeout in milliseconds.
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
+    },
     /// Test the configuration
     Test,
     /// Internal use only
@@ -201,6 +223,66 @@ fn build_time_display() -> String {
         .and_then(|timestamp| Local.timestamp_opt(timestamp, 0).single())
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S %z").to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn prompt_ntp_timezone() -> anyhow::Result<Option<String>> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(None);
+    }
+
+    let current = cloud_node_rust::utils::ntp::detect_system_timezone()
+        .unwrap_or_else(|| "Asia/Shanghai".to_string());
+    println!("Current timezone: {}", current);
+    println!("Enter a timezone to set, or press Enter to keep current.");
+    print!("Timezone [{}]: ", current);
+    use io::Write as _;
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let timezone = input.trim();
+    if timezone.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(timezone.to_string()))
+    }
+}
+
+fn run_ntp_command(
+    timezone: Option<String>,
+    no_timezone: bool,
+    yes: bool,
+    servers: Vec<String>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let timezone = if no_timezone {
+        None
+    } else if timezone.is_some() {
+        timezone
+    } else if yes {
+        None
+    } else {
+        prompt_ntp_timezone()?
+    };
+
+    if let Some(timezone) = timezone {
+        cloud_node_rust::utils::ntp::set_system_timezone(&timezone)?;
+        println!("System timezone set to {}", timezone);
+    }
+    cloud_node_rust::utils::time::init_local_timezone();
+
+    let servers = if servers.is_empty() {
+        cloud_node_rust::utils::ntp::default_servers_as_strings()
+    } else {
+        servers
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(1));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(cloud_node_rust::utils::ntp::sync_once(&servers, timeout))?;
+    println!("{}", result.log_message());
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1078,6 +1160,15 @@ WantedBy=multi-user.target\n",
                 no_restart,
             })?;
         }
+        Some(Commands::Ntp {
+            timezone,
+            no_timezone,
+            yes,
+            servers,
+            timeout_ms,
+        }) => {
+            run_ntp_command(timezone, no_timezone, yes, servers, timeout_ms)?;
+        }
         Some(Commands::Test) => {
             println!("Testing configuration...");
             let _ = ApiConfig::load_default()?;
@@ -1360,6 +1451,10 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     );
     spawn_staggered(&rt, Duration::from_secs(12), async move {
         node_uploader.start().await;
+    });
+
+    spawn_staggered(&rt, Duration::from_secs(16), async move {
+        cloud_node_rust::utils::ntp::start_auto_ntp_syncer().await;
     });
 
     // 4. Initialize Pingora Server with multi-threading

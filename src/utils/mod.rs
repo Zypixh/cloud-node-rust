@@ -1,3 +1,4 @@
+pub mod ntp;
 pub mod persistence;
 pub mod template;
 pub mod time;

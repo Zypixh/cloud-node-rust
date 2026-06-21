@@ -16,9 +16,11 @@ RESTORE_BACKUP="${RESTORE_BACKUP:-}"
 API_ENDPOINTS="${API_ENDPOINTS:-}"
 NODE_ID="${NODE_ID:-}"
 NODE_SECRET="${NODE_SECRET:-}"
+TIMEZONE="${TIMEZONE:-}"
 ASSUME_YES=0
 DRY_RUN=0
 ALLOW_FRESH=0
+SKIP_TIMEZONE=0
 
 usage() {
     cat <<'USAGE'
@@ -64,6 +66,8 @@ Options:
   --api-endpoints LIST   Comma-separated API RPC endpoints for fresh install.
   --node-id ID           nodeId for fresh install.
   --secret SECRET        secret for fresh install.
+  --timezone TZ          Set system timezone during fresh install, e.g. Asia/Shanghai.
+  --no-timezone          Do not prompt for or change system timezone during fresh install.
   --start                Restart/start service after install without prompting.
   --no-start             Do not restart/start service after install.
   --allow-fresh          Allow install when no existing cloud-node is found.
@@ -75,7 +79,7 @@ Options:
 Environment variables with the same names are also supported:
   REPO, VERSION, SERVICE_NAME, INSTALL_DIR, INSTALL_BINARY, BACKUP_ROOT,
   START_MODE, LANGUAGE, DOWNLOAD_GEOIP, GEOIP_DIR, MODE, RESTORE_BACKUP,
-  API_ENDPOINTS, NODE_ID, NODE_SECRET.
+  API_ENDPOINTS, NODE_ID, NODE_SECRET, TIMEZONE.
 USAGE
 }
 
@@ -370,6 +374,99 @@ trim_spaces() {
     printf '%s' "$value"
 }
 
+detect_system_timezone() {
+    local timezone=""
+    if command -v timedatectl >/dev/null 2>&1; then
+        timezone="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+        timezone="$(trim_spaces "$timezone")"
+        if [ -n "$timezone" ]; then
+            printf '%s\n' "$timezone"
+            return
+        fi
+    fi
+    if [ -r /etc/timezone ]; then
+        timezone="$(trim_spaces "$(head -n 1 /etc/timezone 2>/dev/null || true)")"
+        if [ -n "$timezone" ]; then
+            printf '%s\n' "$timezone"
+            return
+        fi
+    fi
+    if [ -L /etc/localtime ]; then
+        timezone="$(readlink /etc/localtime 2>/dev/null || true)"
+        timezone="${timezone#/usr/share/zoneinfo/}"
+        timezone="$(trim_spaces "$timezone")"
+        if [ -n "$timezone" ] && [ "$timezone" != "/etc/localtime" ]; then
+            printf '%s\n' "$timezone"
+        fi
+    fi
+}
+
+validate_timezone_name() {
+    local timezone="$1"
+    case "$timezone" in
+        ""|/*|*..*|*\\*|*" "*|*$'\t'*|*$'\n'*)
+            return 1
+            ;;
+    esac
+    [ -f "/usr/share/zoneinfo/$timezone" ]
+}
+
+collect_fresh_timezone_config() {
+    local current_timezone=""
+    if [ "$MODE" != "fresh" ] || [ "$SKIP_TIMEZONE" -eq 1 ]; then
+        return
+    fi
+
+    current_timezone="$(detect_system_timezone || true)"
+    if [ -z "$current_timezone" ]; then
+        current_timezone="UTC"
+    fi
+
+    if [ -z "$TIMEZONE" ] && prompt_available && [ "$ASSUME_YES" -eq 0 ]; then
+        section "$(is_zh && printf '系统时区' || printf 'System Timezone')"
+        if is_zh; then
+            printf '当前检测到的时区：%s\n' "$current_timezone"
+            printf '可填写例如 Asia/Shanghai、Asia/Hong_Kong、UTC；留空保持当前设置。\n'
+        else
+            printf 'Detected timezone: %s\n' "$current_timezone"
+            printf 'Examples: Asia/Shanghai, Asia/Hong_Kong, UTC. Leave blank to keep current.\n'
+        fi
+        TIMEZONE="$(prompt_text \
+            "系统时区" \
+            "System timezone" \
+            "$current_timezone")"
+    fi
+
+    if [ -n "$TIMEZONE" ] && ! validate_timezone_name "$TIMEZONE"; then
+        die "invalid timezone or missing zoneinfo file: $TIMEZONE"
+    fi
+}
+
+apply_fresh_timezone() {
+    local zoneinfo=""
+    if [ "$MODE" != "fresh" ] || [ "$SKIP_TIMEZONE" -eq 1 ] || [ -z "$TIMEZONE" ]; then
+        return
+    fi
+
+    zoneinfo="/usr/share/zoneinfo/$TIMEZONE"
+    validate_timezone_name "$TIMEZONE" || die "invalid timezone or missing zoneinfo file: $TIMEZONE"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "+ timedatectl set-timezone $TIMEZONE || ln -sfn $zoneinfo /etc/localtime"
+        log "+ write /etc/timezone"
+        return
+    fi
+
+    if command -v timedatectl >/dev/null 2>&1 && timedatectl set-timezone "$TIMEZONE"; then
+        ok "system timezone set to $TIMEZONE"
+        return
+    fi
+
+    ln -sfn "$zoneinfo" /etc/localtime
+    printf '%s\n' "$TIMEZONE" > /etc/timezone
+    ok "system timezone set to $TIMEZONE"
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --install)
@@ -458,6 +555,14 @@ while [ "$#" -gt 0 ]; do
         --secret)
             NODE_SECRET="${2:?missing secret}"
             shift 2
+            ;;
+        --timezone)
+            TIMEZONE="${2:?missing timezone}"
+            shift 2
+            ;;
+        --no-timezone)
+            SKIP_TIMEZONE=1
+            shift
             ;;
         --start)
             START_MODE="always"
@@ -1164,6 +1269,7 @@ if [ "$DOWNLOAD_GEOIP" = "ask" ]; then
 fi
 
 collect_fresh_api_config
+collect_fresh_timezone_config
 
 BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
 ASSET_NAME="$(detect_asset_name)"
@@ -1212,6 +1318,11 @@ if [ "$MODE" = "fresh" ]; then
     kv "api endpoints" "$API_ENDPOINTS"
     kv "nodeId" "$NODE_ID"
     kv "secret" "******"
+    if [ "$SKIP_TIMEZONE" -eq 1 ]; then
+        kv "timezone" "keep current"
+    else
+        kv "timezone" "${TIMEZONE:-keep current}"
+    fi
 fi
 
 if [ "$EXISTING_RUNTIME" = "rust" ] && [ "$NORMALIZED_VERSION" = "latest" ]; then
@@ -1223,6 +1334,7 @@ elif [ "$EXISTING_RUNTIME" = "unknown" ]; then
 fi
 
 confirm_install
+apply_fresh_timezone
 
 TMP_DIR="$(mktemp -d)"
 cleanup() {
@@ -1277,6 +1389,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
             printf 'api_config=%s\n' "$INSTALL_DIR/configs/api_node.yaml"
             printf 'api_endpoints=%s\n' "$API_ENDPOINTS"
             printf 'node_id=%s\n' "$NODE_ID"
+            printf 'timezone=%s\n' "${TIMEZONE:-keep current}"
         fi
     } > "$BACKUP_DIR/manifest.current.txt"
     if [ "$CURRENT_BACKUP_SUFFIX" = "go-original" ]; then

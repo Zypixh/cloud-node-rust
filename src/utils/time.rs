@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
 // We store the offset in SECONDS for maximum speed (raw integer math)
 pub static TIME_OFFSET_SECONDS: AtomicI64 = AtomicI64::new(0);
+pub static TIME_OFFSET_MILLIS: AtomicI64 = AtomicI64::new(0);
 // Cache the timezone offset to avoid expensive Local::now() calls
 pub static LOCAL_TZ_OFFSET_SECONDS: AtomicI32 = AtomicI32::new(8 * 3600);
 
@@ -14,9 +15,15 @@ pub fn update_time_offset(server_timestamp: i64) {
     let local_ts = Utc::now().timestamp();
     let diff = server_timestamp - local_ts;
     if diff.abs() > 1 {
-        TIME_OFFSET_SECONDS.store(diff, Ordering::Relaxed);
+        set_time_offset_millis(diff.saturating_mul(1000));
         tracing::info!("Time auto-synced. System clock drift: {}s", diff);
     }
+}
+
+pub fn set_time_offset_millis(offset_millis: i64) -> i64 {
+    TIME_OFFSET_MILLIS.store(offset_millis, Ordering::Relaxed);
+    TIME_OFFSET_SECONDS.store(offset_millis / 1000, Ordering::Relaxed);
+    offset_millis
 }
 
 #[inline]
@@ -31,12 +38,12 @@ pub fn system_timestamp_millis() -> i64 {
 
 #[inline]
 pub fn now_timestamp() -> i64 {
-    system_timestamp() + TIME_OFFSET_SECONDS.load(Ordering::Relaxed)
+    now_timestamp_millis() / 1000
 }
 
 #[inline]
 pub fn now_timestamp_millis() -> i64 {
-    system_timestamp_millis() + TIME_OFFSET_SECONDS.load(Ordering::Relaxed) * 1000
+    system_timestamp_millis() + TIME_OFFSET_MILLIS.load(Ordering::Relaxed)
 }
 
 #[inline]

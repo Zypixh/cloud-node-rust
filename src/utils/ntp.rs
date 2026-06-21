@@ -1,0 +1,317 @@
+use anyhow::{Context, Result, anyhow};
+use std::time::Duration;
+use tokio::net::UdpSocket;
+
+const NTP_UNIX_EPOCH_DELTA_SECONDS: u64 = 2_208_988_800;
+const NTP_PACKET_LEN: usize = 48;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
+const SUCCESS_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const FAILURE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+pub const DEFAULT_NTP_SERVERS: &[&str] = &[
+    "time.cloudflare.com",
+    "time.google.com",
+    "pool.ntp.org",
+    "time.apple.com",
+    "time.windows.com",
+    "ntp.ubuntu.com",
+    "ntp.aliyun.com",
+    "cn.pool.ntp.org",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtpSyncResult {
+    pub server: String,
+    pub offset_millis: i64,
+    pub round_trip_millis: i64,
+    pub applied_offset_millis: i64,
+}
+
+impl NtpSyncResult {
+    pub fn log_message(&self) -> String {
+        if self.applied_offset_millis == 0 {
+            format!(
+                "NTP sync completed via {}: no clock offset detected, rtt={}ms",
+                self.server, self.round_trip_millis
+            )
+        } else {
+            format!(
+                "NTP sync completed via {}: corrected internal clock offset by {}ms, measured_offset={}ms, rtt={}ms",
+                self.server, self.applied_offset_millis, self.offset_millis, self.round_trip_millis
+            )
+        }
+    }
+}
+
+pub async fn start_auto_ntp_syncer() {
+    loop {
+        crate::utils::time::init_local_timezone();
+        let sleep_for = match sync_once_default().await {
+            Ok(result) => {
+                let message = result.log_message();
+                tracing::info!("{}", message);
+                crate::logging::report_node_log("info".to_string(), "ntp".to_string(), message, 0);
+                SUCCESS_INTERVAL
+            }
+            Err(err) => {
+                let message = format!("NTP sync failed: {}", err);
+                tracing::warn!("{}", message);
+                crate::logging::report_node_log("warn".to_string(), "ntp".to_string(), message, 0);
+                FAILURE_INTERVAL
+            }
+        };
+        tokio::time::sleep(sleep_for).await;
+    }
+}
+
+pub async fn sync_once_default() -> Result<NtpSyncResult> {
+    let servers = DEFAULT_NTP_SERVERS
+        .iter()
+        .map(|server| (*server).to_string())
+        .collect::<Vec<_>>();
+    sync_once(&servers, DEFAULT_TIMEOUT).await
+}
+
+pub async fn sync_once(servers: &[String], timeout: Duration) -> Result<NtpSyncResult> {
+    let mut failures = Vec::new();
+    let timeout = if timeout.is_zero() {
+        DEFAULT_TIMEOUT
+    } else {
+        timeout
+    };
+
+    for server in servers.iter().filter(|server| !server.trim().is_empty()) {
+        match query_server(server.trim(), timeout).await {
+            Ok(mut result) => {
+                result.applied_offset_millis =
+                    crate::utils::time::set_time_offset_millis(result.offset_millis);
+                return Ok(result);
+            }
+            Err(err) => failures.push(format!("{}: {}", server, err)),
+        }
+    }
+
+    if failures.is_empty() {
+        Err(anyhow!("no NTP servers configured"))
+    } else {
+        Err(anyhow!("all NTP servers failed: {}", failures.join("; ")))
+    }
+}
+
+async fn query_server(server: &str, timeout: Duration) -> Result<NtpSyncResult> {
+    let mut addrs = tokio::net::lookup_host((server, 123))
+        .await
+        .with_context(|| format!("resolve {}", server))?;
+    let addr = addrs
+        .next()
+        .ok_or_else(|| anyhow!("resolve {} returned no addresses", server))?;
+
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("bind UDP socket")?;
+    socket
+        .connect(addr)
+        .await
+        .with_context(|| format!("connect {}", addr))?;
+
+    let mut packet = [0u8; NTP_PACKET_LEN];
+    packet[0] = 0x23; // LI=0, VN=4, Mode=3 client
+    let send_millis = crate::utils::time::system_timestamp_millis();
+    write_ntp_timestamp(&mut packet[40..48], send_millis);
+
+    tokio::time::timeout(timeout, socket.send(&packet))
+        .await
+        .context("send timeout")?
+        .with_context(|| format!("send NTP request to {}", server))?;
+
+    let mut response = [0u8; NTP_PACKET_LEN];
+    let received = tokio::time::timeout(timeout, socket.recv(&mut response))
+        .await
+        .context("receive timeout")?
+        .with_context(|| format!("receive NTP response from {}", server))?;
+    let receive_millis = crate::utils::time::system_timestamp_millis();
+    if received < NTP_PACKET_LEN {
+        return Err(anyhow!("short NTP response: {} bytes", received));
+    }
+
+    let mode = response[0] & 0b0000_0111;
+    if mode != 4 {
+        return Err(anyhow!("unexpected NTP response mode {}", mode));
+    }
+    if response[1] == 0 {
+        return Err(anyhow!("NTP server returned stratum 0"));
+    }
+
+    let server_receive_millis = read_ntp_timestamp(&response[32..40])
+        .ok_or_else(|| anyhow!("invalid NTP receive timestamp"))?;
+    let server_transmit_millis = read_ntp_timestamp(&response[40..48])
+        .ok_or_else(|| anyhow!("invalid NTP transmit timestamp"))?;
+    if server_transmit_millis == 0 {
+        return Err(anyhow!("empty NTP transmit timestamp"));
+    }
+
+    let offset_millis =
+        ((server_receive_millis - send_millis) + (server_transmit_millis - receive_millis)) / 2;
+    let round_trip_millis =
+        (receive_millis - send_millis) - (server_transmit_millis - server_receive_millis);
+
+    Ok(NtpSyncResult {
+        server: server.to_string(),
+        offset_millis,
+        round_trip_millis: round_trip_millis.max(0),
+        applied_offset_millis: 0,
+    })
+}
+
+fn write_ntp_timestamp(dst: &mut [u8], unix_millis: i64) {
+    if dst.len() != 8 {
+        return;
+    }
+    let unix_millis = unix_millis.max(0) as u64;
+    let unix_seconds = unix_millis / 1000;
+    let millis = unix_millis % 1000;
+    let ntp_seconds = unix_seconds.saturating_add(NTP_UNIX_EPOCH_DELTA_SECONDS);
+    let fraction = ((millis as u128) << 32) / 1000;
+    dst[..4].copy_from_slice(&(ntp_seconds as u32).to_be_bytes());
+    dst[4..].copy_from_slice(&(fraction as u32).to_be_bytes());
+}
+
+fn read_ntp_timestamp(src: &[u8]) -> Option<i64> {
+    if src.len() != 8 {
+        return None;
+    }
+    let seconds = u32::from_be_bytes(src[..4].try_into().ok()?) as u64;
+    let fraction = u32::from_be_bytes(src[4..].try_into().ok()?) as u64;
+    if seconds < NTP_UNIX_EPOCH_DELTA_SECONDS {
+        return None;
+    }
+    let unix_seconds = seconds - NTP_UNIX_EPOCH_DELTA_SECONDS;
+    let millis = (((fraction as u128) * 1000) + (1u128 << 31)) >> 32;
+    let unix_millis = (unix_seconds as u128)
+        .saturating_mul(1000)
+        .saturating_add(millis);
+    i64::try_from(unix_millis).ok()
+}
+
+pub fn default_servers_as_strings() -> Vec<String> {
+    DEFAULT_NTP_SERVERS
+        .iter()
+        .map(|server| (*server).to_string())
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub fn detect_system_timezone() -> Option<String> {
+    if let Ok(output) = std::process::Command::new("timedatectl")
+        .args(["show", "-p", "Timezone", "--value"])
+        .output()
+        && output.status.success()
+    {
+        let timezone = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !timezone.is_empty() {
+            return Some(timezone);
+        }
+    }
+
+    std::fs::read_to_string("/etc/timezone")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn detect_system_timezone() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_system_timezone(timezone: &str) -> Result<()> {
+    validate_timezone_name(timezone)?;
+    let zoneinfo = std::path::Path::new("/usr/share/zoneinfo").join(timezone);
+    if !zoneinfo.is_file() {
+        return Err(anyhow!("timezone not found: {}", timezone));
+    }
+
+    if let Ok(status) = std::process::Command::new("timedatectl")
+        .args(["set-timezone", timezone])
+        .status()
+        && status.success()
+    {
+        crate::utils::time::init_local_timezone();
+        return Ok(());
+    }
+
+    let _ = std::fs::remove_file("/etc/localtime");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&zoneinfo, "/etc/localtime")
+            .with_context(|| format!("link /etc/localtime to {}", zoneinfo.display()))?;
+    }
+    std::fs::write("/etc/timezone", format!("{}\n", timezone)).context("write /etc/timezone")?;
+    crate::utils::time::init_local_timezone();
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_system_timezone(_timezone: &str) -> Result<()> {
+    Err(anyhow!(
+        "setting system timezone is only supported on Linux"
+    ))
+}
+
+pub fn validate_timezone_name(timezone: &str) -> Result<()> {
+    if timezone.is_empty()
+        || timezone.starts_with('/')
+        || timezone.contains("..")
+        || timezone.contains('\\')
+        || timezone
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_whitespace())
+    {
+        return Err(anyhow!("invalid timezone name: {}", timezone));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ntp_timestamp_round_trips_millis() {
+        let millis = 1_700_000_000_123;
+        let mut raw = [0u8; 8];
+        write_ntp_timestamp(&mut raw, millis);
+        assert_eq!(read_ntp_timestamp(&raw).unwrap(), millis);
+    }
+
+    #[test]
+    fn timezone_validation_rejects_paths_and_whitespace() {
+        assert!(validate_timezone_name("Asia/Shanghai").is_ok());
+        assert!(validate_timezone_name("/etc/passwd").is_err());
+        assert!(validate_timezone_name("../UTC").is_err());
+        assert!(validate_timezone_name("Asia/ Shanghai").is_err());
+    }
+
+    #[test]
+    fn log_message_reports_correction_or_no_offset() {
+        let corrected = NtpSyncResult {
+            server: "time.example".to_string(),
+            offset_millis: -1200,
+            round_trip_millis: 15,
+            applied_offset_millis: -1200,
+        };
+        assert!(
+            corrected
+                .log_message()
+                .contains("corrected internal clock offset by -1200ms")
+        );
+
+        let no_offset = NtpSyncResult {
+            applied_offset_millis: 0,
+            offset_millis: 0,
+            ..corrected
+        };
+        assert!(no_offset.log_message().contains("no clock offset detected"));
+    }
+}
