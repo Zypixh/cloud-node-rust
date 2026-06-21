@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 const MAX_ORIGIN_STATES: usize = 512;
 const FAILS_TO_DOWN: u32 = 5;
-const AUTO_RECOVER_SECONDS: i64 = 300;
+const AUTO_RECOVER_SECONDS: i64 = 60;
 
 pub static ORIGIN_STATE_MANAGER: Lazy<OriginStateManager> = Lazy::new(OriginStateManager::new);
 

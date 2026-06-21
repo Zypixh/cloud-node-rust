@@ -756,12 +756,23 @@ impl TcpProxyManager {
         client_addr: SocketAddr,
         server: &ServerConfig,
         context: &TcpForwardContext,
-        result: &Result<(u64, u64), BidirectionalStreamError>,
+        result: &Result<RelayOutcome, BidirectionalStreamError>,
     ) {
         let (bytes_received, bytes_sent) = match result {
-            Ok((r, s)) => (*r, *s),
+            Ok(outcome) => {
+                if outcome.close_reason != RelayCloseReason::Clean {
+                    debug!(
+                        "TCP Proxy: Bidirectional relay completed with {:?}",
+                        outcome.close_reason
+                    );
+                }
+                (outcome.bytes_received, outcome.bytes_sent)
+            }
             Err(e) => {
-                debug!("TCP Proxy: Bidirectional copy finished with error: {}", e);
+                debug!(
+                    "TCP Proxy: Bidirectional relay finished with hard error: {}",
+                    e
+                );
                 (e.bytes_received, e.bytes_sent)
             }
         };
@@ -843,16 +854,64 @@ async fn release_toa_port(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayCloseReason {
+    Clean,
+    BenignIo,
+    DrainTimeoutAfterBenign,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RelayOutcome {
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
+    pub close_reason: RelayCloseReason,
+}
+
+impl RelayOutcome {
+    fn from_counters(
+        bytes_received_counter: &std::sync::atomic::AtomicU64,
+        bytes_sent_counter: &std::sync::atomic::AtomicU64,
+        close_reason: RelayCloseReason,
+    ) -> Self {
+        Self {
+            bytes_received: bytes_received_counter.load(std::sync::atomic::Ordering::Relaxed),
+            bytes_sent: bytes_sent_counter.load(std::sync::atomic::Ordering::Relaxed),
+            close_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamDirection {
+    ClientToBackend,
+    BackendToClient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayIoPhase {
+    Read,
+    Write,
+    Shutdown,
+}
+
 #[derive(Debug)]
 pub(crate) struct BidirectionalStreamError {
     pub bytes_received: u64,
     pub bytes_sent: u64,
+    pub direction: StreamDirection,
+    pub phase: RelayIoPhase,
+    pub raw_os_error: Option<i32>,
     source: std::io::Error,
 }
 
 impl std::fmt::Display for BidirectionalStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.source)
+        write!(
+            f,
+            "{} (direction={:?}, phase={:?}, raw_os_error={:?})",
+            self.source, self.direction, self.phase, self.raw_os_error
+        )
     }
 }
 
@@ -863,32 +922,55 @@ impl std::error::Error for BidirectionalStreamError {
 }
 
 impl BidirectionalStreamError {
-    fn from_source(
+    fn from_direction_error(
         bytes_received_counter: &std::sync::atomic::AtomicU64,
         bytes_sent_counter: &std::sync::atomic::AtomicU64,
-        source: io::Error,
+        error: DirectionTaskError,
     ) -> Self {
+        let raw_os_error = error.source.raw_os_error();
         Self {
             bytes_received: bytes_received_counter.load(std::sync::atomic::Ordering::Relaxed),
             bytes_sent: bytes_sent_counter.load(std::sync::atomic::Ordering::Relaxed),
-            source,
+            direction: error.direction,
+            phase: error.phase,
+            raw_os_error,
+            source: error.source,
         }
     }
 }
 
 const STREAM_METRICS_FLUSH_BYTES: u64 = 1024 * 1024;
+const RELAY_BENIGN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[derive(Clone, Copy)]
-enum StreamDirection {
-    ClientToBackend,
-    BackendToClient,
+#[derive(Debug)]
+struct DirectionSuccess {
+    close_reason: RelayCloseReason,
 }
+
+#[derive(Debug)]
+struct DirectionTaskError {
+    direction: StreamDirection,
+    phase: RelayIoPhase,
+    source: io::Error,
+}
+
+impl DirectionTaskError {
+    fn new(direction: StreamDirection, phase: RelayIoPhase, source: io::Error) -> Self {
+        Self {
+            direction,
+            phase,
+            source,
+        }
+    }
+}
+
+type DirectionTaskResult = Result<DirectionSuccess, DirectionTaskError>;
 
 pub(crate) async fn stream_tcp_bidirectional_with_metrics(
     server_id: i64,
     client: TcpStream,
     backend: TcpStream,
-) -> Result<(u64, u64), BidirectionalStreamError> {
+) -> Result<RelayOutcome, BidirectionalStreamError> {
     #[cfg(target_os = "linux")]
     {
         match zero_copy::stream_bidirectional(server_id, &client, &backend).await {
@@ -904,7 +986,7 @@ pub(crate) async fn stream_bidirectional_with_metrics<C, B>(
     server_id: i64,
     client: C,
     backend: B,
-) -> Result<(u64, u64), BidirectionalStreamError>
+) -> Result<RelayOutcome, BidirectionalStreamError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -928,12 +1010,55 @@ where
         bytes_sent_counter.clone(),
     );
 
-    match tokio::try_join!(client_to_backend, backend_to_client) {
-        Ok((bytes_received, bytes_sent)) => Ok((bytes_received, bytes_sent)),
-        Err(source) => Err(BidirectionalStreamError::from_source(
+    tokio::pin!(client_to_backend);
+    tokio::pin!(backend_to_client);
+
+    let (first_direction, first) = tokio::select! {
+        result = &mut client_to_backend => (StreamDirection::ClientToBackend, result),
+        result = &mut backend_to_client => (StreamDirection::BackendToClient, result),
+    };
+
+    match first {
+        Ok(first_success) => match first_success.close_reason {
+            RelayCloseReason::Clean => {
+                let second = if first_direction == StreamDirection::ClientToBackend {
+                    backend_to_client.await
+                } else {
+                    client_to_backend.await
+                };
+                finish_relay_after_second(
+                    first_success.close_reason,
+                    second,
+                    &bytes_received_counter,
+                    &bytes_sent_counter,
+                )
+            }
+            RelayCloseReason::BenignIo => {
+                let second = if first_direction == StreamDirection::ClientToBackend {
+                    tokio::time::timeout(RELAY_BENIGN_DRAIN_TIMEOUT, &mut backend_to_client).await
+                } else {
+                    tokio::time::timeout(RELAY_BENIGN_DRAIN_TIMEOUT, &mut client_to_backend).await
+                };
+                match second {
+                    Ok(second) => finish_relay_after_second(
+                        RelayCloseReason::BenignIo,
+                        second,
+                        &bytes_received_counter,
+                        &bytes_sent_counter,
+                    ),
+                    Err(_) => Ok(RelayOutcome::from_counters(
+                        &bytes_received_counter,
+                        &bytes_sent_counter,
+                        RelayCloseReason::DrainTimeoutAfterBenign,
+                    )),
+                }
+            }
+            RelayCloseReason::DrainTimeoutAfterBenign => unreachable!(),
+        },
+        Err(error) => Err(BidirectionalStreamError::from_direction_error(
             &bytes_received_counter,
             &bytes_sent_counter,
-            source,
+            error,
         )),
     }
 }
@@ -944,7 +1069,7 @@ async fn copy_stream_and_count<R, W>(
     mut reader: R,
     mut writer: W,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
-) -> std::io::Result<u64>
+) -> DirectionTaskResult
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -958,18 +1083,22 @@ where
             Ok(n) => n,
             Err(err) => {
                 record_stream_metrics_delta(server_id, direction, unflushed);
-                return Err(err);
+                return direction_error_or_benign(direction, RelayIoPhase::Read, err);
             }
         };
         if n == 0 {
             record_stream_metrics_delta(server_id, direction, unflushed);
-            writer.shutdown().await?;
-            return Ok(total);
+            if let Err(err) = writer.shutdown().await {
+                return direction_error_or_benign(direction, RelayIoPhase::Shutdown, err);
+            }
+            return Ok(DirectionSuccess {
+                close_reason: RelayCloseReason::Clean,
+            });
         }
 
         if let Err(err) = writer.write_all(&buf[..n]).await {
             record_stream_metrics_delta(server_id, direction, unflushed);
-            return Err(err);
+            return direction_error_or_benign(direction, RelayIoPhase::Write, err);
         }
         total += n as u64;
         unflushed += n as u64;
@@ -979,6 +1108,88 @@ where
             unflushed = 0;
         }
     }
+}
+
+fn finish_relay_after_second(
+    first_reason: RelayCloseReason,
+    second: DirectionTaskResult,
+    bytes_received_counter: &std::sync::atomic::AtomicU64,
+    bytes_sent_counter: &std::sync::atomic::AtomicU64,
+) -> Result<RelayOutcome, BidirectionalStreamError> {
+    match second {
+        Ok(second_success) => Ok(RelayOutcome::from_counters(
+            bytes_received_counter,
+            bytes_sent_counter,
+            combine_relay_close_reasons(first_reason, second_success.close_reason),
+        )),
+        Err(error) => Err(BidirectionalStreamError::from_direction_error(
+            bytes_received_counter,
+            bytes_sent_counter,
+            error,
+        )),
+    }
+}
+
+fn combine_relay_close_reasons(
+    first: RelayCloseReason,
+    second: RelayCloseReason,
+) -> RelayCloseReason {
+    if matches!(
+        (first, second),
+        (RelayCloseReason::DrainTimeoutAfterBenign, _)
+            | (_, RelayCloseReason::DrainTimeoutAfterBenign)
+    ) {
+        RelayCloseReason::DrainTimeoutAfterBenign
+    } else if matches!(
+        (first, second),
+        (RelayCloseReason::BenignIo, _) | (_, RelayCloseReason::BenignIo)
+    ) {
+        RelayCloseReason::BenignIo
+    } else {
+        RelayCloseReason::Clean
+    }
+}
+
+fn direction_error_or_benign(
+    direction: StreamDirection,
+    phase: RelayIoPhase,
+    err: io::Error,
+) -> DirectionTaskResult {
+    if is_benign_relay_io_error(&err) {
+        Ok(DirectionSuccess {
+            close_reason: RelayCloseReason::BenignIo,
+        })
+    } else {
+        Err(DirectionTaskError::new(direction, phase, err))
+    }
+}
+
+fn is_benign_relay_io_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+    ) || is_benign_relay_raw_os_error(err)
+}
+
+#[cfg(unix)]
+fn is_benign_relay_raw_os_error(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(code)
+            if code == libc::EPIPE
+                || code == libc::ECONNRESET
+                || code == libc::ENOTCONN
+                || code == libc::ECONNABORTED
+    )
+}
+
+#[cfg(not(unix))]
+fn is_benign_relay_raw_os_error(_err: &io::Error) -> bool {
+    false
 }
 
 fn record_stream_metrics_delta(server_id: i64, direction: StreamDirection, bytes: u64) {
@@ -1009,7 +1220,7 @@ mod zero_copy {
     const POLL_TIMEOUT_MS: libc::c_int = 1000;
 
     pub(super) enum ZeroCopyOutcome {
-        Completed(Result<(u64, u64), BidirectionalStreamError>),
+        Completed(Result<RelayOutcome, BidirectionalStreamError>),
         Fallback,
     }
 
@@ -1035,56 +1246,58 @@ mod zero_copy {
 
         let bytes_received_counter = Arc::new(AtomicU64::new(0));
         let bytes_sent_counter = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(RelayControl::default());
 
-        let c2b = spawn_direction(
+        let mut c2b = spawn_direction(
             server_id,
             StreamDirection::ClientToBackend,
             client_to_backend,
             bytes_received_counter.clone(),
-            stop.clone(),
-            shutdown_fds.clone(),
+            control.clone(),
         );
-        let b2c = spawn_direction(
+        let mut b2c = spawn_direction(
             server_id,
             StreamDirection::BackendToClient,
             backend_to_client,
             bytes_sent_counter.clone(),
-            stop,
-            shutdown_fds,
+            control.clone(),
         );
 
-        let (c2b, b2c) = tokio::join!(c2b, b2c);
-        let c2b = flatten_join_result(c2b);
-        let b2c = flatten_join_result(b2c);
+        let (first_direction, first) = tokio::select! {
+            result = &mut c2b => (
+                StreamDirection::ClientToBackend,
+                flatten_join_result(StreamDirection::ClientToBackend, result),
+            ),
+            result = &mut b2c => (
+                StreamDirection::BackendToClient,
+                flatten_join_result(StreamDirection::BackendToClient, result),
+            ),
+        };
 
-        match (c2b, b2c) {
-            (Ok(bytes_received), Ok(bytes_sent)) => {
-                ZeroCopyOutcome::Completed(Ok((bytes_received, bytes_sent)))
-            }
-            (Err(source), Ok(_)) | (Ok(_), Err(source)) if !is_stop_error(&source) => {
-                ZeroCopyOutcome::Completed(Err(BidirectionalStreamError::from_source(
-                    &bytes_received_counter,
-                    &bytes_sent_counter,
-                    source,
-                )))
-            }
-            (Err(_), Ok(_)) | (Ok(_), Err(_)) => ZeroCopyOutcome::Completed(Ok((
-                bytes_received_counter.load(Ordering::Relaxed),
-                bytes_sent_counter.load(Ordering::Relaxed),
-            ))),
-            (Err(first), Err(second)) => {
-                let source = match (is_stop_error(&first), is_stop_error(&second)) {
-                    (true, false) => second,
-                    _ => first,
-                };
-                ZeroCopyOutcome::Completed(Err(BidirectionalStreamError::from_source(
-                    &bytes_received_counter,
-                    &bytes_sent_counter,
-                    source,
-                )))
-            }
-        }
+        let result = if first_direction == StreamDirection::ClientToBackend {
+            finish_zero_copy_after_first(
+                first,
+                StreamDirection::BackendToClient,
+                b2c,
+                &control,
+                &shutdown_fds,
+                &bytes_received_counter,
+                &bytes_sent_counter,
+            )
+            .await
+        } else {
+            finish_zero_copy_after_first(
+                first,
+                StreamDirection::ClientToBackend,
+                c2b,
+                &control,
+                &shutdown_fds,
+                &bytes_received_counter,
+                &bytes_sent_counter,
+            )
+            .await
+        };
+        ZeroCopyOutcome::Completed(result)
     }
 
     fn spawn_direction(
@@ -1092,23 +1305,87 @@ mod zero_copy {
         direction: StreamDirection,
         fds: DirectionFds,
         counter: Arc<AtomicU64>,
-        stop: Arc<AtomicBool>,
-        shutdown_fds: Arc<ShutdownFds>,
-    ) -> tokio::task::JoinHandle<io::Result<u64>> {
+        control: Arc<RelayControl>,
+    ) -> tokio::task::JoinHandle<DirectionTaskResult> {
         tokio::task::spawn_blocking(move || {
-            let result = splice_direction_and_count(server_id, direction, fds, counter, &stop);
-            if result.is_err() {
-                stop.store(true, Ordering::Relaxed);
-                shutdown_fds.shutdown_all();
-            }
-            result
+            splice_direction_and_count(server_id, direction, fds, counter, &control)
         })
     }
 
     fn flatten_join_result(
-        result: Result<io::Result<u64>, tokio::task::JoinError>,
-    ) -> io::Result<u64> {
-        result.unwrap_or_else(|err| Err(io::Error::new(io::ErrorKind::Other, err.to_string())))
+        direction: StreamDirection,
+        result: Result<DirectionTaskResult, tokio::task::JoinError>,
+    ) -> DirectionTaskResult {
+        result.unwrap_or_else(|err| {
+            Err(DirectionTaskError::new(
+                direction,
+                RelayIoPhase::Read,
+                io::Error::new(io::ErrorKind::Other, err.to_string()),
+            ))
+        })
+    }
+
+    async fn finish_zero_copy_after_first(
+        first: DirectionTaskResult,
+        remaining_direction: StreamDirection,
+        mut remaining: tokio::task::JoinHandle<DirectionTaskResult>,
+        control: &RelayControl,
+        shutdown_fds: &ShutdownFds,
+        bytes_received_counter: &AtomicU64,
+        bytes_sent_counter: &AtomicU64,
+    ) -> Result<RelayOutcome, BidirectionalStreamError> {
+        match first {
+            Ok(first_success) => match first_success.close_reason {
+                RelayCloseReason::Clean => {
+                    let second = flatten_join_result(remaining_direction, remaining.await);
+                    finish_relay_after_second(
+                        RelayCloseReason::Clean,
+                        second,
+                        bytes_received_counter,
+                        bytes_sent_counter,
+                    )
+                }
+                RelayCloseReason::BenignIo => {
+                    match tokio::time::timeout(RELAY_BENIGN_DRAIN_TIMEOUT, &mut remaining).await {
+                        Ok(second) => finish_relay_after_second(
+                            RelayCloseReason::BenignIo,
+                            flatten_join_result(remaining_direction, second),
+                            bytes_received_counter,
+                            bytes_sent_counter,
+                        ),
+                        Err(_) => {
+                            control.stop();
+                            shutdown_fds.shutdown_all();
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(POLL_TIMEOUT_MS as u64 + 500),
+                                remaining,
+                            )
+                            .await;
+                            Ok(RelayOutcome::from_counters(
+                                bytes_received_counter,
+                                bytes_sent_counter,
+                                RelayCloseReason::DrainTimeoutAfterBenign,
+                            ))
+                        }
+                    }
+                }
+                RelayCloseReason::DrainTimeoutAfterBenign => unreachable!(),
+            },
+            Err(error) => {
+                control.stop();
+                shutdown_fds.shutdown_all();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(POLL_TIMEOUT_MS as u64 + 500),
+                    remaining,
+                )
+                .await;
+                Err(BidirectionalStreamError::from_direction_error(
+                    bytes_received_counter,
+                    bytes_sent_counter,
+                    error,
+                ))
+            }
+        }
     }
 
     fn splice_direction_and_count(
@@ -1116,33 +1393,60 @@ mod zero_copy {
         direction: StreamDirection,
         fds: DirectionFds,
         counter: Arc<AtomicU64>,
-        stop: &AtomicBool,
-    ) -> io::Result<u64> {
+        control: &RelayControl,
+    ) -> DirectionTaskResult {
         let mut total = 0u64;
         let mut unflushed = 0u64;
 
         loop {
-            if stop.load(Ordering::Relaxed) {
+            if control.should_stop() {
                 record_stream_metrics_delta(server_id, direction, unflushed);
-                return Err(stop_error());
+                return Ok(DirectionSuccess {
+                    close_reason: RelayCloseReason::BenignIo,
+                });
             }
 
-            let moved_to_pipe = splice_socket_to_pipe(fds.read.fd(), fds.pipe_write.fd(), stop)?;
+            let moved_to_pipe =
+                match splice_socket_to_pipe(fds.read.fd(), fds.pipe_write.fd(), control) {
+                    Ok(n) => n,
+                    Err(err) => {
+                        record_stream_metrics_delta(server_id, direction, unflushed);
+                        return direction_error_or_benign(direction, RelayIoPhase::Read, err);
+                    }
+                };
             if moved_to_pipe == 0 {
                 record_stream_metrics_delta(server_id, direction, unflushed);
-                shutdown_write(fds.write.fd())?;
-                return Ok(total);
+                if let Err(err) = shutdown_write(fds.write.fd()) {
+                    return direction_error_or_benign(direction, RelayIoPhase::Shutdown, err);
+                }
+                return Ok(DirectionSuccess {
+                    close_reason: RelayCloseReason::Clean,
+                });
             }
 
             let mut remaining = moved_to_pipe;
             while remaining > 0 {
-                let written =
-                    splice_pipe_to_socket(fds.pipe_read.fd(), fds.write.fd(), remaining, stop)?;
+                let written = match splice_pipe_to_socket(
+                    fds.pipe_read.fd(),
+                    fds.write.fd(),
+                    remaining,
+                    control,
+                ) {
+                    Ok(n) => n,
+                    Err(err) => {
+                        record_stream_metrics_delta(server_id, direction, unflushed);
+                        return direction_error_or_benign(direction, RelayIoPhase::Write, err);
+                    }
+                };
                 if written == 0 {
                     record_stream_metrics_delta(server_id, direction, unflushed);
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "zero-copy splice wrote zero bytes",
+                    return Err(DirectionTaskError::new(
+                        direction,
+                        RelayIoPhase::Write,
+                        io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "zero-copy splice wrote zero bytes",
+                        ),
                     ));
                 }
                 remaining -= written;
@@ -1160,11 +1464,11 @@ mod zero_copy {
     fn splice_socket_to_pipe(
         read_fd: RawFd,
         pipe_write_fd: RawFd,
-        stop: &AtomicBool,
+        control: &RelayControl,
     ) -> io::Result<usize> {
         loop {
             match splice_once(read_fd, pipe_write_fd, SPLICE_CHUNK_BYTES) {
-                Err(err) if is_would_block(&err) => poll_fd(read_fd, libc::POLLIN, stop)?,
+                Err(err) if is_would_block(&err) => poll_fd(read_fd, libc::POLLIN, control)?,
                 other => return other,
             }
         }
@@ -1174,11 +1478,11 @@ mod zero_copy {
         pipe_read_fd: RawFd,
         write_fd: RawFd,
         len: usize,
-        stop: &AtomicBool,
+        control: &RelayControl,
     ) -> io::Result<usize> {
         loop {
             match splice_once(pipe_read_fd, write_fd, len) {
-                Err(err) if is_would_block(&err) => poll_fd(write_fd, libc::POLLOUT, stop)?,
+                Err(err) if is_would_block(&err) => poll_fd(write_fd, libc::POLLOUT, control)?,
                 other => return other,
             }
         }
@@ -1207,9 +1511,9 @@ mod zero_copy {
         }
     }
 
-    fn poll_fd(fd: RawFd, events: libc::c_short, stop: &AtomicBool) -> io::Result<()> {
+    fn poll_fd(fd: RawFd, events: libc::c_short, control: &RelayControl) -> io::Result<()> {
         loop {
-            if stop.load(Ordering::Relaxed) {
+            if control.should_stop() {
                 return Err(stop_error());
             }
             let mut poll_fd = libc::pollfd {
@@ -1236,10 +1540,6 @@ mod zero_copy {
         matches!(err.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK)
     }
 
-    fn is_stop_error(err: &io::Error) -> bool {
-        err.kind() == io::ErrorKind::Interrupted && err.raw_os_error().is_none()
-    }
-
     fn stop_error() -> io::Error {
         io::Error::new(io::ErrorKind::Interrupted, "zero-copy relay stopped")
     }
@@ -1249,18 +1549,26 @@ mod zero_copy {
             return Ok(());
         }
         let err = io::Error::last_os_error();
-        if is_benign_shutdown_error(&err) {
+        if is_benign_relay_io_error(&err) {
             Ok(())
         } else {
             Err(err)
         }
     }
 
-    fn is_benign_shutdown_error(err: &io::Error) -> bool {
-        matches!(
-            err.raw_os_error(),
-            Some(code) if code == libc::ENOTCONN || code == libc::EPIPE || code == libc::ECONNRESET
-        )
+    #[derive(Default)]
+    struct RelayControl {
+        stop: AtomicBool,
+    }
+
+    impl RelayControl {
+        fn stop(&self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+
+        fn should_stop(&self) -> bool {
+            self.stop.load(Ordering::Relaxed)
+        }
     }
 
     struct DirectionFds {
@@ -1709,6 +2017,26 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn set_linger_zero(stream: &TcpStream) {
+        use std::os::fd::AsRawFd;
+
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&linger) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0);
+    }
+
     #[tokio::test]
     async fn tcp_tls_handshake_failure_uses_global_tls_exhaustion_defense() {
         let store = ConfigStore::new();
@@ -1807,13 +2135,13 @@ mod tests {
         assert_eq!(response, b"backend-response");
 
         backend_task.await.unwrap();
-        let (bytes_received, bytes_sent) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), relay)
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(bytes_received, b"request-body".len() as u64);
-        assert_eq!(bytes_sent, b"backend-response".len() as u64);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.close_reason, RelayCloseReason::Clean);
+        assert_eq!(outcome.bytes_received, b"request-body".len() as u64);
+        assert_eq!(outcome.bytes_sent, b"backend-response".len() as u64);
     }
 
     #[tokio::test]
@@ -1847,12 +2175,103 @@ mod tests {
         assert!(received_response.iter().all(|byte| *byte == 9));
 
         backend_task.await.unwrap();
-        let (bytes_received, bytes_sent) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.close_reason, RelayCloseReason::Clean);
+        assert_eq!(outcome.bytes_received, expected_request_len);
+        assert_eq!(outcome.bytes_sent, expected_response_len);
+    }
+
+    #[tokio::test]
+    async fn fallback_relay_delivers_backend_response_after_upload_side_closes() {
+        let (proxy_client, proxy_backend, client, mut backend) = connected_proxy_streams().await;
+        let relay = tokio::spawn(async move {
+            stream_bidirectional_with_metrics(91_005, proxy_client, proxy_backend)
                 .await
                 .unwrap()
-                .unwrap();
-        assert_eq!(bytes_received, expected_request_len);
-        assert_eq!(bytes_sent, expected_response_len);
+        });
+        let response = b"early-backend-response";
+        let backend_task = tokio::spawn(async move {
+            let mut first_chunk = [0u8; 4096];
+            let n = backend.read(&mut first_chunk).await.unwrap();
+            assert!(n > 0);
+            backend.write_all(response).await.unwrap();
+            backend.shutdown().await.unwrap();
+        });
+
+        let (mut client_reader, mut client_writer) = client.into_split();
+        let writer_task = tokio::spawn(async move {
+            let chunk = vec![7u8; 64 * 1024];
+            loop {
+                if client_writer.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let mut received_response = vec![0u8; response.len()];
+        client_reader
+            .read_exact(&mut received_response)
+            .await
+            .unwrap();
+        assert_eq!(received_response, response);
+        writer_task.abort();
+        drop(client_reader);
+
+        backend_task.await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(7), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                outcome.close_reason,
+                RelayCloseReason::BenignIo | RelayCloseReason::DrainTimeoutAfterBenign
+            ),
+            "unexpected close reason: {:?}",
+            outcome.close_reason
+        );
+        assert!(outcome.bytes_received > 0);
+        assert_eq!(outcome.bytes_sent, response.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn raw_tcp_relay_treats_client_abort_as_non_hard_close() {
+        let (proxy_client, proxy_backend, mut client, mut backend) =
+            connected_proxy_streams().await;
+        let relay = tokio::spawn(async move {
+            stream_tcp_bidirectional_with_metrics(91_006, proxy_client, proxy_backend)
+                .await
+                .unwrap()
+        });
+
+        client.write_all(b"partial-upload").await.unwrap();
+        #[cfg(unix)]
+        set_linger_zero(&client);
+        drop(client);
+
+        let mut received = [0u8; 64];
+        let n = backend.read(&mut received).await.unwrap();
+        assert!(n > 0);
+        drop(backend);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(7), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                outcome.close_reason,
+                RelayCloseReason::Clean
+                    | RelayCloseReason::BenignIo
+                    | RelayCloseReason::DrainTimeoutAfterBenign
+            ),
+            "unexpected close reason: {:?}",
+            outcome.close_reason
+        );
+        assert!(outcome.bytes_received > 0);
     }
 }
