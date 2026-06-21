@@ -866,6 +866,8 @@ pub(crate) struct RelayOutcome {
     pub bytes_received: u64,
     pub bytes_sent: u64,
     pub close_reason: RelayCloseReason,
+    pub close_detail: Option<RelayIoDetail>,
+    pub drain_duration_millis: Option<u64>,
 }
 
 impl RelayOutcome {
@@ -878,7 +880,42 @@ impl RelayOutcome {
             bytes_received: bytes_received_counter.load(std::sync::atomic::Ordering::Relaxed),
             bytes_sent: bytes_sent_counter.load(std::sync::atomic::Ordering::Relaxed),
             close_reason,
+            close_detail: None,
+            drain_duration_millis: None,
         }
+    }
+
+    fn with_close_detail(mut self, close_detail: Option<RelayIoDetail>) -> Self {
+        self.close_detail = close_detail;
+        self
+    }
+
+    fn with_drain_duration(mut self, drain_duration: std::time::Duration) -> Self {
+        self.drain_duration_millis = Some(drain_duration.as_millis().min(u64::MAX as u128) as u64);
+        self
+    }
+
+    pub(crate) fn close_note(&self) -> Option<String> {
+        let mut note = match self.close_reason {
+            RelayCloseReason::Clean => return None,
+            RelayCloseReason::BenignIo => String::from("benign relay close"),
+            RelayCloseReason::DrainTimeoutAfterBenign => {
+                String::from("relay drain timeout after benign close")
+            }
+        };
+        if let Some(detail) = self.close_detail {
+            note.push_str(&format!(
+                " direction={:?} phase={:?}",
+                detail.direction, detail.phase
+            ));
+            if let Some(raw_os_error) = detail.raw_os_error {
+                note.push_str(&format!(" raw_os_error={}", raw_os_error));
+            }
+        }
+        if let Some(drain_duration_millis) = self.drain_duration_millis {
+            note.push_str(&format!(" drain_ms={}", drain_duration_millis));
+        }
+        Some(note)
     }
 }
 
@@ -893,6 +930,23 @@ pub(crate) enum RelayIoPhase {
     Read,
     Write,
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RelayIoDetail {
+    pub direction: StreamDirection,
+    pub phase: RelayIoPhase,
+    pub raw_os_error: Option<i32>,
+}
+
+impl RelayIoDetail {
+    fn from_error(direction: StreamDirection, phase: RelayIoPhase, err: &io::Error) -> Self {
+        Self {
+            direction,
+            phase,
+            raw_os_error: err.raw_os_error(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -940,11 +994,14 @@ impl BidirectionalStreamError {
 }
 
 const STREAM_METRICS_FLUSH_BYTES: u64 = 1024 * 1024;
-const RELAY_BENIGN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RELAY_BENIGN_RESPONSE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RELAY_BENIGN_UPLOAD_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct DirectionSuccess {
     close_reason: RelayCloseReason,
+    close_detail: Option<RelayIoDetail>,
 }
 
 #[derive(Debug)]
@@ -1027,21 +1084,23 @@ where
                     client_to_backend.await
                 };
                 finish_relay_after_second(
-                    first_success.close_reason,
+                    first_success,
                     second,
                     &bytes_received_counter,
                     &bytes_sent_counter,
                 )
             }
             RelayCloseReason::BenignIo => {
+                let drain_timeout = benign_drain_timeout_after(first_direction);
+                let drain_started = std::time::Instant::now();
                 let second = if first_direction == StreamDirection::ClientToBackend {
-                    tokio::time::timeout(RELAY_BENIGN_DRAIN_TIMEOUT, &mut backend_to_client).await
+                    tokio::time::timeout(drain_timeout, &mut backend_to_client).await
                 } else {
-                    tokio::time::timeout(RELAY_BENIGN_DRAIN_TIMEOUT, &mut client_to_backend).await
+                    tokio::time::timeout(drain_timeout, &mut client_to_backend).await
                 };
                 match second {
                     Ok(second) => finish_relay_after_second(
-                        RelayCloseReason::BenignIo,
+                        first_success,
                         second,
                         &bytes_received_counter,
                         &bytes_sent_counter,
@@ -1050,7 +1109,9 @@ where
                         &bytes_received_counter,
                         &bytes_sent_counter,
                         RelayCloseReason::DrainTimeoutAfterBenign,
-                    )),
+                    )
+                    .with_close_detail(first_success.close_detail)
+                    .with_drain_duration(drain_started.elapsed())),
                 }
             }
             RelayCloseReason::DrainTimeoutAfterBenign => unreachable!(),
@@ -1093,6 +1154,7 @@ where
             }
             return Ok(DirectionSuccess {
                 close_reason: RelayCloseReason::Clean,
+                close_detail: None,
             });
         }
 
@@ -1111,7 +1173,7 @@ where
 }
 
 fn finish_relay_after_second(
-    first_reason: RelayCloseReason,
+    first_success: DirectionSuccess,
     second: DirectionTaskResult,
     bytes_received_counter: &std::sync::atomic::AtomicU64,
     bytes_sent_counter: &std::sync::atomic::AtomicU64,
@@ -1120,13 +1182,31 @@ fn finish_relay_after_second(
         Ok(second_success) => Ok(RelayOutcome::from_counters(
             bytes_received_counter,
             bytes_sent_counter,
-            combine_relay_close_reasons(first_reason, second_success.close_reason),
-        )),
+            combine_relay_close_reasons(first_success.close_reason, second_success.close_reason),
+        )
+        .with_close_detail(first_success.close_detail.or(second_success.close_detail))),
         Err(error) => Err(BidirectionalStreamError::from_direction_error(
             bytes_received_counter,
             bytes_sent_counter,
             error,
         )),
+    }
+}
+
+fn benign_drain_timeout_after(first_direction: StreamDirection) -> std::time::Duration {
+    match first_direction {
+        // Upload-side benign close can still be followed by a small upstream response.
+        StreamDirection::ClientToBackend => RELAY_BENIGN_RESPONSE_DRAIN_TIMEOUT,
+        // If the response path is already broken, do not keep the upload side alive for seconds.
+        StreamDirection::BackendToClient => RELAY_BENIGN_UPLOAD_DRAIN_TIMEOUT,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn opposite_direction(direction: StreamDirection) -> StreamDirection {
+    match direction {
+        StreamDirection::ClientToBackend => StreamDirection::BackendToClient,
+        StreamDirection::BackendToClient => StreamDirection::ClientToBackend,
     }
 }
 
@@ -1156,8 +1236,10 @@ fn direction_error_or_benign(
     err: io::Error,
 ) -> DirectionTaskResult {
     if is_benign_relay_io_error(&err) {
+        let close_detail = RelayIoDetail::from_error(direction, phase, &err);
         Ok(DirectionSuccess {
             close_reason: RelayCloseReason::BenignIo,
+            close_detail: Some(close_detail),
         })
     } else {
         Err(DirectionTaskError::new(direction, phase, err))
@@ -1339,16 +1421,23 @@ mod zero_copy {
                 RelayCloseReason::Clean => {
                     let second = flatten_join_result(remaining_direction, remaining.await);
                     finish_relay_after_second(
-                        RelayCloseReason::Clean,
+                        first_success,
                         second,
                         bytes_received_counter,
                         bytes_sent_counter,
                     )
                 }
                 RelayCloseReason::BenignIo => {
-                    match tokio::time::timeout(RELAY_BENIGN_DRAIN_TIMEOUT, &mut remaining).await {
+                    let drain_timeout = benign_drain_timeout_after(
+                        first_success
+                            .close_detail
+                            .map(|detail| detail.direction)
+                            .unwrap_or_else(|| opposite_direction(remaining_direction)),
+                    );
+                    let drain_started = std::time::Instant::now();
+                    match tokio::time::timeout(drain_timeout, &mut remaining).await {
                         Ok(second) => finish_relay_after_second(
-                            RelayCloseReason::BenignIo,
+                            first_success,
                             flatten_join_result(remaining_direction, second),
                             bytes_received_counter,
                             bytes_sent_counter,
@@ -1365,7 +1454,9 @@ mod zero_copy {
                                 bytes_received_counter,
                                 bytes_sent_counter,
                                 RelayCloseReason::DrainTimeoutAfterBenign,
-                            ))
+                            )
+                            .with_close_detail(first_success.close_detail)
+                            .with_drain_duration(drain_started.elapsed()))
                         }
                     }
                 }
@@ -1403,6 +1494,7 @@ mod zero_copy {
                 record_stream_metrics_delta(server_id, direction, unflushed);
                 return Ok(DirectionSuccess {
                     close_reason: RelayCloseReason::BenignIo,
+                    close_detail: None,
                 });
             }
 
@@ -1421,6 +1513,7 @@ mod zero_copy {
                 }
                 return Ok(DirectionSuccess {
                     close_reason: RelayCloseReason::Clean,
+                    close_detail: None,
                 });
             }
 
@@ -2035,6 +2128,50 @@ mod tests {
             )
         };
         assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn benign_relay_close_records_direction_phase_and_note() {
+        let success = direction_error_or_benign(
+            StreamDirection::ClientToBackend,
+            RelayIoPhase::Write,
+            io::Error::new(io::ErrorKind::BrokenPipe, "backend closed upload side"),
+        )
+        .unwrap();
+
+        assert_eq!(success.close_reason, RelayCloseReason::BenignIo);
+        let detail = success.close_detail.unwrap();
+        assert_eq!(detail.direction, StreamDirection::ClientToBackend);
+        assert_eq!(detail.phase, RelayIoPhase::Write);
+
+        let outcome = RelayOutcome {
+            bytes_received: 1024,
+            bytes_sent: 64,
+            close_reason: RelayCloseReason::BenignIo,
+            close_detail: success.close_detail,
+            drain_duration_millis: Some(12),
+        };
+        let note = outcome.close_note().unwrap();
+        assert!(note.contains("benign relay close"));
+        assert!(note.contains("direction=ClientToBackend"));
+        assert!(note.contains("phase=Write"));
+        assert!(note.contains("drain_ms=12"));
+    }
+
+    #[test]
+    fn response_path_benign_uses_short_upload_drain_window() {
+        assert_eq!(
+            benign_drain_timeout_after(StreamDirection::ClientToBackend),
+            RELAY_BENIGN_RESPONSE_DRAIN_TIMEOUT
+        );
+        assert_eq!(
+            benign_drain_timeout_after(StreamDirection::BackendToClient),
+            RELAY_BENIGN_UPLOAD_DRAIN_TIMEOUT
+        );
+        assert!(
+            RELAY_BENIGN_UPLOAD_DRAIN_TIMEOUT < RELAY_BENIGN_RESPONSE_DRAIN_TIMEOUT,
+            "response-path benign close should not keep upload alive for the full response drain"
+        );
     }
 
     #[tokio::test]

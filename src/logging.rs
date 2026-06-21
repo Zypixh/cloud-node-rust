@@ -881,11 +881,10 @@ fn l4_passthrough_time_fields(
     if fields.is_some_and(|fields| !fields.enabled(23) && !fields.enabled(24)) {
         return (String::new(), String::new());
     }
-    let start_dt = chrono::DateTime::from_timestamp_millis(request_started_at_millis)
-        .unwrap_or_else(chrono::Utc::now);
+    let start_dt = crate::utils::time::local_from_timestamp_millis(request_started_at_millis);
     (
-        start_dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-        start_dt.format("%d/%b/%Y:%H:%M:%S +0000").to_string(),
+        start_dt.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
+        start_dt.format("%d/%b/%Y:%H:%M:%S %z").to_string(),
     )
 }
 
@@ -979,12 +978,15 @@ fn log_l4_passthrough_access(
 mod tests {
     use super::*;
     #[test]
-    fn l4_time_fields_are_utc_when_enabled() {
+    fn l4_time_fields_use_cached_local_timezone_when_enabled() {
+        let previous =
+            crate::utils::time::LOCAL_TZ_OFFSET_SECONDS.swap(8 * 3600, Ordering::Relaxed);
         let fields = AccessLogFieldMask::from_fields(&[23, 24]);
         let (time_iso8601, time_local) =
             l4_passthrough_time_fields(1_700_000_000_123, Some(&fields));
-        assert!(time_iso8601.ends_with('Z'));
-        assert!(time_local.ends_with("+0000"));
+        crate::utils::time::LOCAL_TZ_OFFSET_SECONDS.store(previous, Ordering::Relaxed);
+        assert!(time_iso8601.ends_with("+08:00"));
+        assert!(time_local.ends_with("+0800"));
     }
 
     #[test]

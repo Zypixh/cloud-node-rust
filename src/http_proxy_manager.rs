@@ -1066,13 +1066,7 @@ impl HttpProxyManager {
             Ok(outcome) => {
                 let bytes_received = outcome.bytes_received;
                 let bytes_sent = outcome.bytes_sent;
-                let relay_note = match outcome.close_reason {
-                    crate::tcp_proxy::RelayCloseReason::Clean => None,
-                    crate::tcp_proxy::RelayCloseReason::BenignIo => Some("benign relay close"),
-                    crate::tcp_proxy::RelayCloseReason::DrainTimeoutAfterBenign => {
-                        Some("relay drain timeout after benign close")
-                    }
-                };
+                let relay_note = outcome.close_note();
                 crate::metrics::record::record_network_dimensions(
                     crate::metrics::METRIC_CATEGORY_TCP,
                     server_id,
@@ -1095,7 +1089,7 @@ impl HttpProxyManager {
                     bytes_received,
                     bytes_sent,
                     200,
-                    relay_note,
+                    relay_note.as_deref(),
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 Ok(())
