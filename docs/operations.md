@@ -46,9 +46,72 @@ cloud-node start
 cloud-node stop
 cloud-node restart
 cloud-node status
+cloud-node upgrade
 ```
 
 systemd unit 会以 `Type=simple` 托管前台节点进程，用于开机自启、日志和状态排障。已注册 systemd unit 时，`cloud-node start/restart` 会优先委托给 `systemctl`；未注册 systemd 时才使用内置后台进程管理。节点自身会同时把运行日志追加到 `logs/run.log`。
+
+## 内置升级命令
+
+已安装 Rust 版后，可以直接使用二进制内置升级命令从 GitHub Release 拉取最新版：
+
+```bash
+sudo cloud-node upgrade
+```
+
+默认行为：
+
+- 自动选择当前 CPU/架构匹配的官方 release 包。
+- 默认目标版本为 `latest`。
+- 显示升级摘要并交互确认。
+- 替换前把旧二进制备份到 `/var/backups/cloud-node-rust-upgrade/`。
+- 替换成功后，如果 `cloud-node.service` 正在运行则重启 systemd 服务；未使用 systemd 时会重启内置后台进程。
+
+非交互升级到最新版：
+
+```bash
+sudo cloud-node upgrade --yes
+```
+
+升级到指定版本：
+
+```bash
+sudo cloud-node upgrade --version v1.1.6 --yes
+```
+
+使用 GitHub 镜像/代理站：
+
+```bash
+sudo cloud-node upgrade --github-mirror https://gh-proxy.example --yes
+```
+
+如果镜像站需要把原始 URL 放到模板中，可使用 `{url}` 占位符：
+
+```bash
+sudo cloud-node upgrade --github-mirror 'https://mirror.example/download?url={url}' --yes
+```
+
+使用 GitHub Enterprise 或自建镜像作为基础站点：
+
+```bash
+sudo cloud-node upgrade \
+  --github-base-url https://github.example.com \
+  --repo Zypixh/cloud-node-rust \
+  --version v1.1.6 \
+  --yes
+```
+
+上线前查看升级计划：
+
+```bash
+sudo cloud-node upgrade --dry-run
+```
+
+只替换二进制，不立即重启：
+
+```bash
+sudo cloud-node upgrade --yes --no-restart
+```
 
 ## 从 Go 原版迁移安装 Rust 版
 

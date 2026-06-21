@@ -5,6 +5,7 @@ use std::sync::LazyLock as Lazy;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct AggregationKey {
+    pub category: Arc<str>,
     pub server_id: i64,
     pub country: Arc<str>,
     pub country_id: i64,
@@ -130,6 +131,7 @@ mod tests {
         attrs.insert("status".to_string(), "403".to_string());
 
         let key = AggregationKey {
+            category: Arc::from(crate::metrics::METRIC_CATEGORY_HTTP),
             server_id: 1,
             country: Arc::from("China"),
             country_id: 1,
@@ -153,5 +155,36 @@ mod tests {
             "cdn.example.com-403-Shenzhen-126"
         );
         assert_eq!(key.resolve_metric_key("${unknownVar}"), "${unknownVar}");
+    }
+
+    #[test]
+    fn metric_category_separates_otherwise_identical_rows() {
+        let request_attrs = Arc::new(BTreeMap::new());
+        let http_key = AggregationKey {
+            category: Arc::from(crate::metrics::METRIC_CATEGORY_HTTP),
+            server_id: 1,
+            country: Arc::from(""),
+            country_id: 0,
+            province: Arc::from(""),
+            province_id: 0,
+            city: Arc::from(""),
+            city_id: 0,
+            provider: Arc::from("Unknown"),
+            browser: Arc::from(""),
+            os: Arc::from(""),
+            waf_group_id: 0,
+            waf_action: Arc::from(""),
+            provider_id: 0,
+            browser_version: Arc::from(""),
+            os_version: Arc::from(""),
+            request_attrs: Arc::clone(&request_attrs),
+        };
+        let tcp_key = AggregationKey {
+            category: Arc::from(crate::metrics::METRIC_CATEGORY_TCP),
+            request_attrs,
+            ..http_key.clone()
+        };
+
+        assert_ne!(http_key, tcp_key);
     }
 }

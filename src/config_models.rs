@@ -35,6 +35,18 @@ where
     }
 }
 
+fn default_metric_category() -> String {
+    crate::metrics::METRIC_CATEGORY_HTTP.to_string()
+}
+
+fn deserialize_metric_category<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let category = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(crate::metrics::normalize_metric_category(&category))
+}
+
 fn deserialize_flexible_u8_opt<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
 where
     D: Deserializer<'de>,
@@ -707,6 +719,11 @@ pub struct MetricItemConfig {
     pub name: String,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub code: String,
+    #[serde(
+        default = "default_metric_category",
+        deserialize_with = "deserialize_metric_category"
+    )]
+    pub category: String,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub keys: Vec<String>,
     #[serde(default)]
@@ -3346,6 +3363,41 @@ pub fn parse_life_to_seconds(v: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metric_item_category_defaults_and_normalizes() {
+        let tcp_item: MetricItemConfig = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "period": 1,
+            "version": 1,
+            "category": "TCP"
+        }))
+        .expect("metric item with category should parse");
+        assert_eq!(tcp_item.category, crate::metrics::METRIC_CATEGORY_TCP);
+
+        let missing_category: MetricItemConfig = serde_json::from_value(serde_json::json!({
+            "id": 2,
+            "period": 1,
+            "version": 1
+        }))
+        .expect("missing metric category should default");
+        assert_eq!(
+            missing_category.category,
+            crate::metrics::METRIC_CATEGORY_HTTP
+        );
+
+        let empty_category: MetricItemConfig = serde_json::from_value(serde_json::json!({
+            "id": 3,
+            "period": 1,
+            "version": 1,
+            "category": ""
+        }))
+        .expect("empty metric category should default");
+        assert_eq!(
+            empty_category.category,
+            crate::metrics::METRIC_CATEGORY_HTTP
+        );
+    }
 
     #[test]
     fn server_config_uses_exact_cluster_and_firewall_policy_fields() {

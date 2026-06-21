@@ -647,18 +647,15 @@ impl UdpProxyManager {
             Err(err) => {
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                 let current_client_addr = *client_addr.read().await;
-                crate::metrics::record::record_http_dimensions(
+                crate::metrics::record::record_network_dimensions(
+                    crate::metrics::METRIC_CATEGORY_UDP,
                     server_id,
                     current_client_addr.ip(),
                     &domain,
                     "-",
                     0,
                     0,
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
+                    502,
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 return Err(err.into());
@@ -738,18 +735,16 @@ impl UdpProxyManager {
             }
         }
         let current_client_addr = *client_addr.read().await;
-        crate::metrics::record::record_http_dimensions(
+        let status = if result.is_ok() { 200 } else { 502 };
+        crate::metrics::record::record_network_dimensions(
+            crate::metrics::METRIC_CATEGORY_UDP,
             server_id,
             current_client_addr.ip(),
             &domain,
             "-",
             downstream_sent as i64,
             upstream_sent as i64,
-            0,
-            0,
-            None,
-            None,
-            None,
+            status,
         );
         crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
         result

@@ -16,6 +16,19 @@ static EMPTY_ARC_STR: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
 static UNKNOWN_ARC_STR: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("Unknown"));
 static HTTP_DIMENSION_WARNING_INTERVAL_MS: u64 = 5_000;
 
+pub const METRIC_CATEGORY_HTTP: &str = "http";
+pub const METRIC_CATEGORY_TCP: &str = "tcp";
+pub const METRIC_CATEGORY_UDP: &str = "udp";
+
+pub fn normalize_metric_category(category: &str) -> String {
+    let category = category.trim().to_ascii_lowercase();
+    if category.is_empty() {
+        METRIC_CATEGORY_HTTP.to_string()
+    } else {
+        category
+    }
+}
+
 pub fn start_pressure_updater() {
     tokio::spawn(async {
         let mut sys = sysinfo::System::new();
@@ -58,6 +71,7 @@ pub mod top_ip;
 
 #[derive(Clone)]
 pub struct HttpDimensionEvent {
+    pub category: Arc<str>,
     pub server_id: i64,
     pub client_ip: std::net::IpAddr,
     pub domain: Arc<str>,
@@ -121,6 +135,38 @@ impl MetricRequestContext {
             _ => String::new(),
         }
     }
+
+    pub fn network(
+        domain: &str,
+        client_ip: std::net::IpAddr,
+        user_agent: &str,
+        bytes_sent: i64,
+        bytes_received: i64,
+        status: u16,
+    ) -> Self {
+        let mut values = BTreeMap::new();
+        let domain = domain.trim();
+        let remote_addr = client_ip.to_string();
+        values.insert("host".to_string(), domain.to_string());
+        values.insert("serverName".to_string(), domain.to_string());
+        values.insert("remoteAddr".to_string(), remote_addr.clone());
+        values.insert("remoteAddrValue".to_string(), remote_addr.clone());
+        values.insert("rawRemoteAddr".to_string(), remote_addr);
+        values.insert("userAgent".to_string(), user_agent.to_string());
+        values.insert("status".to_string(), status.to_string());
+        values.insert("statusMessage".to_string(), status_message(status));
+        values.insert("bytesSent".to_string(), bytes_sent.to_string());
+        values.insert("bodyBytesSent".to_string(), bytes_sent.to_string());
+        values.insert("requestLength".to_string(), bytes_received.to_string());
+        Self { values }
+    }
+}
+
+pub fn status_message(status: u16) -> String {
+    http::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason().map(str::to_string))
+        .unwrap_or_default()
 }
 
 pub fn resolve_template_with<F>(source: &str, mut resolve_variable: F) -> String
@@ -747,11 +793,76 @@ pub mod record {
         cached_analyzed: Option<&crate::metrics::analyzer::RequestStats>,
         request_context: Option<MetricRequestContext>,
     ) {
+        record_dimensions(
+            crate::metrics::METRIC_CATEGORY_HTTP,
+            server_id,
+            client_ip,
+            domain,
+            user_agent,
+            bytes_sent,
+            bytes_received,
+            cached_bytes,
+            waf_group_id,
+            waf_action,
+            cached_analyzed,
+            request_context,
+        );
+    }
+
+    pub fn record_network_dimensions(
+        category: &str,
+        server_id: i64,
+        client_ip: IpAddr,
+        domain: &str,
+        user_agent: &str,
+        bytes_sent: i64,
+        bytes_received: i64,
+        status: u16,
+    ) {
+        record_dimensions(
+            category,
+            server_id,
+            client_ip,
+            domain,
+            user_agent,
+            bytes_sent,
+            bytes_received,
+            0,
+            0,
+            None,
+            None,
+            Some(MetricRequestContext::network(
+                domain,
+                client_ip,
+                user_agent,
+                bytes_sent,
+                bytes_received,
+                status,
+            )),
+        );
+    }
+
+    fn record_dimensions(
+        category: &str,
+        server_id: i64,
+        client_ip: IpAddr,
+        domain: &str,
+        user_agent: &str,
+        bytes_sent: i64,
+        bytes_received: i64,
+        cached_bytes: i64,
+        waf_group_id: i64,
+        waf_action: Option<&str>,
+        cached_analyzed: Option<&crate::metrics::analyzer::RequestStats>,
+        request_context: Option<MetricRequestContext>,
+    ) {
         if server_id <= 0 {
             return;
         }
 
+        let category = crate::metrics::normalize_metric_category(category);
         let event = HttpDimensionEvent {
+            category: Arc::from(category),
             server_id,
             client_ip,
             domain: if domain.is_empty() {
@@ -830,6 +941,7 @@ pub mod record {
             );
         let provider_id = crate::metrics::storage::lookup_region_provider_id(event.client_ip);
         let key = crate::metrics::aggregator::AggregationKey {
+            category: event.category.clone(),
             server_id: event.server_id,
             country,
             country_id,
@@ -858,25 +970,28 @@ pub mod record {
             event.bytes_received,
             is_attack,
         );
-        crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.record(
-            key,
-            event.bytes_sent,
-            event.bytes_received,
-            is_attack,
-        );
         crate::metrics::top_ip::TOP_IP_TRACKER.record_addr(event.server_id, event.client_ip);
 
-        crate::metrics::daily::DAILY_DOMAIN_TRACKER.record(
-            event.server_id,
-            event.created_at,
-            event.domain.as_ref(),
-            event.bytes_sent,
-            event.cached_bytes,
-            1,
-            if event.cached_bytes > 0 { 1 } else { 0 },
-            if is_attack { 1 } else { 0 },
-            if is_attack { event.bytes_sent } else { 0 },
-        );
+        if event.category.as_ref() == crate::metrics::METRIC_CATEGORY_HTTP {
+            crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.record(
+                key,
+                event.bytes_sent,
+                event.bytes_received,
+                is_attack,
+            );
+
+            crate::metrics::daily::DAILY_DOMAIN_TRACKER.record(
+                event.server_id,
+                event.created_at,
+                event.domain.as_ref(),
+                event.bytes_sent,
+                event.cached_bytes,
+                1,
+                if event.cached_bytes > 0 { 1 } else { 0 },
+                if is_attack { 1 } else { 0 },
+                if is_attack { event.bytes_sent } else { 0 },
+            );
+        }
     }
 }
 
@@ -994,5 +1109,25 @@ mod tests {
         assert_eq!(ctx.resolve_key("${unknownVar}"), "${unknownVar}");
         assert_eq!(ctx.resolve_key("${unknown.prefix}"), "");
         assert_eq!(ctx.resolve_key("literal"), "literal");
+    }
+
+    #[test]
+    fn network_metric_context_resolves_status_and_common_keys() {
+        let ctx = MetricRequestContext::network(
+            "edge.example.com",
+            "203.0.113.9".parse().expect("valid ip"),
+            "-",
+            1234,
+            56,
+            502,
+        );
+
+        assert_eq!(ctx.resolve_key("${status}"), "502");
+        assert_eq!(ctx.resolve_key("${statusMessage}"), "Bad Gateway");
+        assert_eq!(ctx.resolve_key("${host}"), "edge.example.com");
+        assert_eq!(ctx.resolve_key("${serverName}"), "edge.example.com");
+        assert_eq!(ctx.resolve_key("${remoteAddr}"), "203.0.113.9");
+        assert_eq!(ctx.resolve_key("${bytesSent}"), "1234");
+        assert_eq!(ctx.resolve_key("${requestLength}"), "56");
     }
 }

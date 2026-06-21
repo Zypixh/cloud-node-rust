@@ -690,6 +690,20 @@ fn get_period_time(period: i32, unit: &str) -> String {
     }
 }
 
+fn metric_item_category(item: &crate::config_models::MetricItemConfig) -> String {
+    crate::metrics::normalize_metric_category(&item.category)
+}
+
+fn sample_matches_metric_category(
+    sample: &(
+        crate::metrics::aggregator::AggregationKey,
+        crate::metrics::aggregator::AggregatedValue,
+    ),
+    category: &str,
+) -> bool {
+    sample.0.category.as_ref() == category
+}
+
 pub async fn start_metric_stat_reporter(
     config_store: Arc<crate::config::ConfigStore>,
     api_config: ApiConfig,
@@ -728,6 +742,7 @@ pub async fn start_metric_stat_reporter(
             if !item.is_on {
                 continue;
             }
+            let item_category = metric_item_category(&item);
 
             let time_key = get_period_time(item.period, &item.period_unit);
 
@@ -739,7 +754,10 @@ pub async fn start_metric_stat_reporter(
                     crate::metrics::aggregator::AggregatedValue,
                 )>,
             > = HashMap::new();
-            for sample in &samples {
+            for sample in samples
+                .iter()
+                .filter(|sample| sample_matches_metric_category(sample, &item_category))
+            {
                 by_server
                     .entry(sample.0.server_id)
                     .or_default()
@@ -1240,5 +1258,56 @@ mod tests {
         assert_eq!(restored.stat.total_bytes, pending.stat.total_bytes);
         assert_eq!(restored.stat.count_i_ps, pending.stat.count_i_ps);
         assert_eq!(restored.stat.node_region_id, pending.stat.node_region_id);
+    }
+
+    #[test]
+    fn metric_stat_category_filter_excludes_tcp_rows_from_http_items() {
+        fn sample(
+            category: &str,
+        ) -> (
+            crate::metrics::aggregator::AggregationKey,
+            crate::metrics::aggregator::AggregatedValue,
+        ) {
+            (
+                crate::metrics::aggregator::AggregationKey {
+                    category: std::sync::Arc::from(category),
+                    server_id: 1,
+                    country: std::sync::Arc::from(""),
+                    country_id: 0,
+                    province: std::sync::Arc::from(""),
+                    province_id: 0,
+                    city: std::sync::Arc::from(""),
+                    city_id: 0,
+                    provider: std::sync::Arc::from("Unknown"),
+                    browser: std::sync::Arc::from(""),
+                    os: std::sync::Arc::from(""),
+                    waf_group_id: 0,
+                    waf_action: std::sync::Arc::from(""),
+                    provider_id: 0,
+                    browser_version: std::sync::Arc::from(""),
+                    os_version: std::sync::Arc::from(""),
+                    request_attrs: std::sync::Arc::new(std::collections::BTreeMap::new()),
+                },
+                crate::metrics::aggregator::AggregatedValue {
+                    count: 1,
+                    ..Default::default()
+                },
+            )
+        }
+
+        let samples = vec![
+            sample(crate::metrics::METRIC_CATEGORY_HTTP),
+            sample(crate::metrics::METRIC_CATEGORY_TCP),
+        ];
+        let http_category = crate::metrics::METRIC_CATEGORY_HTTP.to_string();
+
+        let matching = samples
+            .iter()
+            .filter(|sample| sample_matches_metric_category(sample, &http_category))
+            .count();
+
+        assert_eq!(matching, 1);
+        assert!(sample_matches_metric_category(&samples[0], &http_category));
+        assert!(!sample_matches_metric_category(&samples[1], &http_category));
     }
 }

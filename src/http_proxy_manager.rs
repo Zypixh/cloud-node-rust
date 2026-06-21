@@ -903,18 +903,15 @@ impl HttpProxyManager {
                         backend_addr, err
                     )),
                 );
-                crate::metrics::record::record_http_dimensions(
+                crate::metrics::record::record_network_dimensions(
+                    crate::metrics::METRIC_CATEGORY_TCP,
                     server_id,
                     client_addr.ip(),
                     &sni_host,
                     "-",
                     0,
                     0,
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
+                    502,
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
@@ -978,18 +975,15 @@ impl HttpProxyManager {
                         502,
                         Some(&reason),
                     );
-                    crate::metrics::record::record_http_dimensions(
+                    crate::metrics::record::record_network_dimensions(
+                        crate::metrics::METRIC_CATEGORY_TCP,
                         server_id,
                         client_addr.ip(),
                         &sni_host,
                         "-",
                         0,
                         0,
-                        0,
-                        0,
-                        None,
-                        None,
-                        None,
+                        502,
                     );
                     crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                     return Err(err).with_context(|| {
@@ -1032,18 +1026,15 @@ impl HttpProxyManager {
                     502,
                     Some(&reason),
                 );
-                crate::metrics::record::record_http_dimensions(
+                crate::metrics::record::record_network_dimensions(
+                    crate::metrics::METRIC_CATEGORY_TCP,
                     server_id,
                     client_addr.ip(),
                     &sni_host,
                     "-",
                     0,
                     0,
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
+                    502,
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 return Err(err).with_context(|| {
@@ -1073,18 +1064,15 @@ impl HttpProxyManager {
         }
         match result {
             Ok((bytes_received, bytes_sent)) => {
-                crate::metrics::record::record_http_dimensions(
+                crate::metrics::record::record_network_dimensions(
+                    crate::metrics::METRIC_CATEGORY_TCP,
                     server_id,
                     client_addr.ip(),
                     &sni_host,
                     "-",
                     bytes_sent as i64,
                     bytes_received as i64,
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
+                    200,
                 );
                 crate::logging::log_sni_passthrough_access(
                     request_id,
@@ -1106,18 +1094,15 @@ impl HttpProxyManager {
             Err(err) => {
                 let bytes_received = err.bytes_received;
                 let bytes_sent = err.bytes_sent;
-                crate::metrics::record::record_http_dimensions(
+                crate::metrics::record::record_network_dimensions(
+                    crate::metrics::METRIC_CATEGORY_TCP,
                     server_id,
                     client_addr.ip(),
                     &sni_host,
                     "-",
                     bytes_sent as i64,
                     bytes_received as i64,
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
+                    502,
                 );
                 crate::logging::log_sni_passthrough_access(
                     request_id,

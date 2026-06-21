@@ -1,13 +1,14 @@
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs;
 use std::future::Future;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::format::Writer;
@@ -133,6 +134,48 @@ enum Commands {
     Restart,
     /// Install the cloud node as a systemd service and global command
     Install,
+    /// Upgrade the installed binary from GitHub Releases
+    Upgrade {
+        /// Release tag to install, for example v1.1.6. Defaults to latest.
+        #[arg(long, default_value = "latest")]
+        version: String,
+
+        /// GitHub repository in OWNER/REPO form.
+        #[arg(long, default_value = "Zypixh/cloud-node-rust")]
+        repo: String,
+
+        /// GitHub base URL used to construct release download URLs.
+        #[arg(long, default_value = "https://github.com")]
+        github_base_url: String,
+
+        /// Optional GitHub mirror/proxy. If it contains {url}, the original URL replaces it.
+        #[arg(long)]
+        github_mirror: Option<String>,
+
+        /// Override release asset name instead of auto-detecting CPU/architecture.
+        #[arg(long)]
+        asset: Option<String>,
+
+        /// Override the binary path to replace. Defaults to the current executable path.
+        #[arg(long)]
+        install_binary: Option<PathBuf>,
+
+        /// Directory for previous binary backups.
+        #[arg(long, default_value = "/var/backups/cloud-node-rust-upgrade")]
+        backup_dir: PathBuf,
+
+        /// Confirm all prompts and run non-interactively.
+        #[arg(long, alias = "non-interactive")]
+        yes: bool,
+
+        /// Download and show actions without replacing files or restarting service.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Do not restart/start cloud-node after replacing the binary.
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Test the configuration
     Test,
     /// Internal use only
@@ -413,6 +456,412 @@ fn run_systemctl(_action: &str) -> anyhow::Result<bool> {
     Ok(false)
 }
 
+#[derive(Debug)]
+struct UpgradeOptions {
+    version: String,
+    repo: String,
+    github_base_url: String,
+    github_mirror: Option<String>,
+    asset: Option<String>,
+    install_binary: Option<PathBuf>,
+    backup_dir: PathBuf,
+    yes: bool,
+    dry_run: bool,
+    no_restart: bool,
+}
+
+fn normalize_release_version(version: &str) -> String {
+    let trimmed = version.trim();
+    if trimmed.eq_ignore_ascii_case("latest") {
+        "latest".to_string()
+    } else if trimmed.starts_with('v') {
+        trimmed.to_string()
+    } else {
+        format!("v{trimmed}")
+    }
+}
+
+fn release_download_url(github_base_url: &str, repo: &str, version: &str, asset: &str) -> String {
+    let base = github_base_url.trim_end_matches('/');
+    if version == "latest" {
+        format!("{base}/{repo}/releases/latest/download/{asset}")
+    } else {
+        format!("{base}/{repo}/releases/download/{version}/{asset}")
+    }
+}
+
+fn apply_github_mirror(download_url: &str, github_mirror: Option<&str>) -> String {
+    let Some(mirror) = github_mirror
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return download_url.to_string();
+    };
+    if mirror.contains("{url}") {
+        return mirror.replace("{url}", download_url);
+    }
+    format!("{}/{}", mirror.trim_end_matches('/'), download_url)
+}
+
+fn cpuinfo_has_flag(cpuinfo: &str, flag: &str) -> bool {
+    cpuinfo
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ':')
+        .any(|part| part == flag)
+}
+
+fn select_release_asset(
+    arch: &str,
+    cpuinfo: &str,
+    glibc_older_than_228: bool,
+) -> anyhow::Result<&'static str> {
+    match arch {
+        "x86_64" | "amd64" => {
+            if glibc_older_than_228 {
+                anyhow::bail!(
+                    "x86_64 systems with glibc older than 2.28 are not supported by official release assets"
+                );
+            }
+            if !cpuinfo_has_flag(cpuinfo, "sse4_2") {
+                anyhow::bail!(
+                    "x86_64 CPU without SSE4.2 is not supported by official release assets"
+                );
+            }
+            if cpuinfo_has_flag(cpuinfo, "avx512f") {
+                Ok("cloud-node-rust-linux-x64-v4-avx512.tar.gz")
+            } else if cpuinfo_has_flag(cpuinfo, "avx2") {
+                Ok("cloud-node-rust-linux-x64-v3-avx2.tar.gz")
+            } else {
+                Ok("cloud-node-rust-linux-x64-v2-sse4.2.tar.gz")
+            }
+        }
+        "aarch64" | "arm64" => {
+            if cpuinfo.to_ascii_lowercase().contains("neoverse-n1") {
+                Ok("cloud-node-rust-linux-arm64-neoverse-n1.tar.gz")
+            } else {
+                Ok("cloud-node-rust-linux-arm64-generic.tar.gz")
+            }
+        }
+        other => anyhow::bail!("unsupported architecture for official release assets: {other}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn glibc_is_older_than_228() -> bool {
+    let Ok(output) = Command::new("ldd").arg("--version").output() else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(first_line) = stdout.lines().next() else {
+        return false;
+    };
+    let Some(version) = first_line.split_whitespace().find(|part| {
+        part.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && part.contains('.')
+    }) else {
+        return false;
+    };
+    let mut parts = version.split('.');
+    let major = parts
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(999);
+    let minor = parts
+        .next()
+        .and_then(|value| {
+            value
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u32>()
+                .ok()
+        })
+        .unwrap_or(999);
+    major < 2 || (major == 2 && minor < 28)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn glibc_is_older_than_228() -> bool {
+    false
+}
+
+fn detect_release_asset() -> anyhow::Result<&'static str> {
+    let arch = std::env::consts::ARCH;
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    select_release_asset(arch, &cpuinfo, glibc_is_older_than_228())
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+async fn download_to_file(url: &str, target: &Path) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(600))
+        .user_agent(format!("cloud-node-rust/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let mut response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("download failed with HTTP status {}", response.status());
+    }
+
+    let mut file = tokio::fs::File::create(target).await?;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+fn extract_release_binary(archive_path: &Path, target_dir: &Path) -> anyhow::Result<PathBuf> {
+    let archive_file = fs::File::open(archive_path)?;
+    let gz = flate2::read::GzDecoder::new(archive_file);
+    let mut archive = tar::Archive::new(gz);
+    let binary = target_dir.join("cloud-node");
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        if path.file_name() == Some(OsStr::new("cloud-node")) {
+            entry.unpack(&binary)?;
+            if !binary.is_file() {
+                anyhow::bail!("release archive cloud-node entry is not a regular file");
+            }
+            return Ok(binary);
+        }
+    }
+
+    anyhow::bail!("release archive does not contain cloud-node");
+}
+
+fn prompt_upgrade_confirmation() -> anyhow::Result<bool> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "interactive confirmation is unavailable; pass --yes for non-interactive upgrade"
+        );
+    }
+
+    println!("Proceed with upgrade? [y/N] ");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim(),
+        "y" | "Y" | "yes" | "YES" | "Yes" | "是" | "好" | "确认"
+    ))
+}
+
+fn backup_current_binary(
+    install_binary: &Path,
+    backup_dir: &Path,
+    version: &str,
+) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(backup_dir)?;
+    let file_name = install_binary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cloud-node");
+    let backup_path = backup_dir.join(format!("{file_name}.{version}.{}.backup", unix_timestamp()));
+    fs::copy(install_binary, &backup_path)?;
+    Ok(backup_path)
+}
+
+fn replace_binary(source: &Path, install_binary: &Path) -> anyhow::Result<()> {
+    let parent = install_binary
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("install binary has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let new_path = install_binary.with_extension("upgrade-new");
+    fs::copy(source, &new_path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&new_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&new_path, perms)?;
+    }
+
+    fs::rename(&new_path, install_binary)?;
+    Ok(())
+}
+
+fn restart_after_upgrade(install_binary: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    if systemd_service_exists() {
+        if systemd_service_is_active() {
+            run_systemctl("restart")?;
+        } else {
+            println!("cloud-node.service is installed but not active; leaving it stopped.");
+        }
+        return Ok(());
+    }
+
+    if check_running().is_some() {
+        println!("Restarting CloudNode with upgraded binary...");
+        let status = Command::new(install_binary).arg("restart").status()?;
+        if !status.success() {
+            anyhow::bail!("{} restart failed with {status}", install_binary.display());
+        }
+    } else {
+        println!("CloudNode is not running; leaving it stopped.");
+    }
+    Ok(())
+}
+
+fn upgrade_binary(options: UpgradeOptions) -> anyhow::Result<()> {
+    if !cfg!(target_os = "linux") {
+        anyhow::bail!("upgrade command is currently supported only on Linux release assets");
+    }
+
+    let version = normalize_release_version(&options.version);
+    let asset = match options.asset {
+        Some(asset) => asset,
+        None => detect_release_asset()?.to_string(),
+    };
+    let install_binary = options.install_binary.unwrap_or(std::env::current_exe()?);
+    let install_binary = install_binary.canonicalize().unwrap_or(install_binary);
+    let original_url =
+        release_download_url(&options.github_base_url, &options.repo, &version, &asset);
+    let download_url = apply_github_mirror(&original_url, options.github_mirror.as_deref());
+
+    println!("CloudNode upgrade summary:");
+    println!("  current version: {}", env!("CARGO_PKG_VERSION"));
+    println!("  target version:  {version}");
+    println!("  repository:      {}", options.repo);
+    println!("  asset:           {asset}");
+    println!("  download URL:    {download_url}");
+    println!("  install binary:  {}", install_binary.display());
+    println!("  backup dir:      {}", options.backup_dir.display());
+    println!(
+        "  restart:         {}",
+        if options.no_restart { "no" } else { "yes" }
+    );
+
+    if options.dry_run {
+        println!("Dry run only; no files will be changed.");
+        return Ok(());
+    }
+
+    if !options.yes && !prompt_upgrade_confirmation()? {
+        anyhow::bail!("upgrade aborted");
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "cloud-node-upgrade-{}-{}",
+        std::process::id(),
+        unix_timestamp()
+    ));
+    fs::create_dir_all(&tmp_dir)?;
+    let archive_path = tmp_dir.join(&asset);
+
+    let result = (|| -> anyhow::Result<()> {
+        println!("Downloading release asset...");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(download_to_file(&download_url, &archive_path))?;
+
+        println!("Extracting release archive...");
+        let extracted_binary = extract_release_binary(&archive_path, &tmp_dir)?;
+
+        let backup_path = backup_current_binary(&install_binary, &options.backup_dir, &version)?;
+        println!("Previous binary backup: {}", backup_path.display());
+
+        replace_binary(&extracted_binary, &install_binary)?;
+        println!("Installed upgraded binary: {}", install_binary.display());
+
+        if !options.no_restart {
+            restart_after_upgrade(&install_binary)?;
+        }
+
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+    result
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_release_versions() {
+        assert_eq!(normalize_release_version("latest"), "latest");
+        assert_eq!(normalize_release_version("LATEST"), "latest");
+        assert_eq!(normalize_release_version("v1.1.6"), "v1.1.6");
+        assert_eq!(normalize_release_version("1.1.6"), "v1.1.6");
+    }
+
+    #[test]
+    fn builds_release_download_urls() {
+        assert_eq!(
+            release_download_url(
+                "https://github.com/",
+                "Zypixh/cloud-node-rust",
+                "latest",
+                "cloud-node-rust-linux-x64-v3-avx2.tar.gz"
+            ),
+            "https://github.com/Zypixh/cloud-node-rust/releases/latest/download/cloud-node-rust-linux-x64-v3-avx2.tar.gz"
+        );
+        assert_eq!(
+            release_download_url(
+                "https://github.com",
+                "Zypixh/cloud-node-rust",
+                "v1.1.6",
+                "cloud-node-rust-linux-arm64-generic.tar.gz"
+            ),
+            "https://github.com/Zypixh/cloud-node-rust/releases/download/v1.1.6/cloud-node-rust-linux-arm64-generic.tar.gz"
+        );
+    }
+
+    #[test]
+    fn applies_github_mirror_urls() {
+        let url = "https://github.com/Zypixh/cloud-node-rust/releases/latest/download/cloud-node-rust-linux-x64-v2-sse4.2.tar.gz";
+        assert_eq!(apply_github_mirror(url, None), url);
+        assert_eq!(
+            apply_github_mirror(url, Some("https://gh-proxy.example")),
+            "https://gh-proxy.example/https://github.com/Zypixh/cloud-node-rust/releases/latest/download/cloud-node-rust-linux-x64-v2-sse4.2.tar.gz"
+        );
+        assert_eq!(
+            apply_github_mirror(url, Some("https://mirror.example/?target={url}")),
+            "https://mirror.example/?target=https://github.com/Zypixh/cloud-node-rust/releases/latest/download/cloud-node-rust-linux-x64-v2-sse4.2.tar.gz"
+        );
+    }
+
+    #[test]
+    fn selects_x64_release_assets_by_cpu_flags() {
+        assert_eq!(
+            select_release_asset("x86_64", "flags: sse4_2 avx2", false).unwrap(),
+            "cloud-node-rust-linux-x64-v3-avx2.tar.gz"
+        );
+        assert_eq!(
+            select_release_asset("x86_64", "flags: sse4_2 avx512f avx2", false).unwrap(),
+            "cloud-node-rust-linux-x64-v4-avx512.tar.gz"
+        );
+        assert_eq!(
+            select_release_asset("x86_64", "flags: sse4_2", false).unwrap(),
+            "cloud-node-rust-linux-x64-v2-sse4.2.tar.gz"
+        );
+        assert!(select_release_asset("x86_64", "flags: avx2", false).is_err());
+        assert!(select_release_asset("x86_64", "flags: sse4_2", true).is_err());
+    }
+
+    #[test]
+    fn selects_arm_release_assets_by_cpuinfo() {
+        assert_eq!(
+            select_release_asset("aarch64", "CPU part: neoverse-n1", false).unwrap(),
+            "cloud-node-rust-linux-arm64-neoverse-n1.tar.gz"
+        );
+        assert_eq!(
+            select_release_asset("aarch64", "processor: 0", false).unwrap(),
+            "cloud-node-rust-linux-arm64-generic.tar.gz"
+        );
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -603,6 +1052,31 @@ WantedBy=multi-user.target\n",
             {
                 println!("Install command is currently only supported on Linux.");
             }
+        }
+        Some(Commands::Upgrade {
+            version,
+            repo,
+            github_base_url,
+            github_mirror,
+            asset,
+            install_binary,
+            backup_dir,
+            yes,
+            dry_run,
+            no_restart,
+        }) => {
+            upgrade_binary(UpgradeOptions {
+                version,
+                repo,
+                github_base_url,
+                github_mirror,
+                asset,
+                install_binary,
+                backup_dir,
+                yes,
+                dry_run,
+                no_restart,
+            })?;
         }
         Some(Commands::Test) => {
             println!("Testing configuration...");

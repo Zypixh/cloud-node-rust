@@ -48,6 +48,7 @@ flate2 = "1.0"
 futures-util = "0.3"
 md5_legacy = { package = "md5", version = "0.8.0" }
 brotli = "8.0.3"
+tar = "0.4"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1.18"
 tonic = { version = "0.14.6", features = ["gzip"] }

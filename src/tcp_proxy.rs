@@ -737,18 +737,15 @@ impl TcpProxyManager {
             .first()
             .cloned()
             .unwrap_or_default();
-        crate::metrics::record::record_http_dimensions(
+        crate::metrics::record::record_network_dimensions(
+            crate::metrics::METRIC_CATEGORY_TCP,
             context.sid,
             client_addr.ip(),
             &domain,
             "-",
             0,
             0,
-            0,
-            0,
-            None,
-            None,
-            None,
+            502,
         );
         crate::metrics::record::request_end(context.sid, 0, 0, false, false, false, None);
         crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(context.origin_id);
@@ -773,18 +770,16 @@ impl TcpProxyManager {
             .first()
             .cloned()
             .unwrap_or_default();
-        crate::metrics::record::record_http_dimensions(
+        let status = if result.is_ok() { 200 } else { 502 };
+        crate::metrics::record::record_network_dimensions(
+            crate::metrics::METRIC_CATEGORY_TCP,
             context.sid,
             client_addr.ip(),
             &domain,
             "-",
             bytes_sent as i64,
             bytes_received as i64,
-            0,
-            0,
-            None,
-            None,
-            None,
+            status,
         );
         crate::metrics::record::request_end(context.sid, 0, 0, false, false, false, None);
     }

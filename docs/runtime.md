@@ -26,6 +26,7 @@ cloud-node stop
 cloud-node restart
 cloud-node status
 cloud-node install
+cloud-node upgrade
 cloud-node test
 ```
 
@@ -43,7 +44,36 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `restart`：先停止再启动。
 - `status`：读取 PID 文件和文件锁判断节点状态。
 - `install`：注册 `/usr/bin/cloud-node` wrapper 和 systemd service。
+- `upgrade`：从 GitHub Release 下载匹配当前 CPU/架构的最新版或指定版本，确认后备份并替换当前二进制。
 - `test`：验证 `configs/api_node.yaml` 是否可解析。
+
+`upgrade` 默认使用交互式确认，并在成功替换后重启正在运行的 `cloud-node.service` 或内置后台进程：
+
+```bash
+cloud-node upgrade
+```
+
+自动化场景可通过参数完整输入，跳过交互确认：
+
+```bash
+cloud-node upgrade --yes
+cloud-node upgrade --version v1.1.6 --yes
+cloud-node upgrade --version latest --github-mirror https://gh-proxy.example --yes
+cloud-node upgrade --version v1.1.6 --github-base-url https://github.example.com --repo Zypixh/cloud-node-rust --yes
+```
+
+常用参数：
+
+- `--version`：目标版本，默认 `latest`；可传 `v1.1.6` 或 `1.1.6`。
+- `--repo`：GitHub 仓库，默认 `Zypixh/cloud-node-rust`。
+- `--github-base-url`：GitHub 或 GitHub Enterprise 基础地址，默认 `https://github.com`。
+- `--github-mirror`：下载镜像/代理地址；如果包含 `{url}`，会用原始 GitHub 下载地址替换该占位符。
+- `--asset`：手动指定 release asset 文件名，覆盖自动 CPU/架构选择。
+- `--install-binary`：手动指定要替换的本地二进制路径，默认当前执行文件。
+- `--backup-dir`：旧二进制备份目录，默认 `/var/backups/cloud-node-rust-upgrade`。
+- `--yes` / `--non-interactive`：跳过确认，适合脚本和控制面调用。
+- `--no-restart`：只替换二进制，不重启服务。
+- `--dry-run`：只打印升级计划，不下载、不替换、不重启。
 
 ## 进程和目录
 
