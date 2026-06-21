@@ -1050,7 +1050,7 @@ impl HttpProxyManager {
         crate::rpc::stats::push_origin_health_event(origin_id, true, connect_latency_ms);
         drop(origin_connect_permit);
 
-        let result = crate::tcp_proxy::stream_tcp_bidirectional_with_metrics(
+        let result = crate::tcp_proxy::stream_sni_passthrough_bidirectional_with_metrics(
             server_id,
             client_stream,
             backend_stream,
