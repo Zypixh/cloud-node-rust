@@ -74,6 +74,8 @@ sudo cloud-node ntp --no-timezone --yes
 
 守护进程启动后的自动 NTP 同步只修正程序内部时间偏移，并通过节点日志上报偏差；显式执行 `cloud-node ntp` 才会修改系统时钟。
 
+如果服务器或机房禁用了 UDP/123，命令会在内置 NTP 源全部超时后自动回退到 HTTPS Date 时间源，继续通过 TCP/443 获取时间参考。
+
 ## 内置升级命令
 
 已安装 Rust 版后，可以直接使用二进制内置升级命令从 GitHub Release 拉取最新版：

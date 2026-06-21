@@ -190,7 +190,7 @@ enum Commands {
         #[arg(long, alias = "non-interactive")]
         yes: bool,
 
-        /// NTP server host. Can be repeated. Defaults to built-in global servers.
+        /// NTP server host or HTTPS time source URL. Can be repeated. Defaults to built-in global sources.
         #[arg(long = "server")]
         servers: Vec<String>,
 

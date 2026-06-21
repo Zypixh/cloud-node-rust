@@ -995,8 +995,7 @@ impl BidirectionalStreamError {
 
 const STREAM_METRICS_FLUSH_BYTES: u64 = 1024 * 1024;
 const RELAY_BENIGN_RESPONSE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const RELAY_BENIGN_UPLOAD_DRAIN_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(250);
+const RELAY_BENIGN_UPLOAD_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy)]
 struct DirectionSuccess {
@@ -1150,7 +1149,7 @@ where
         if n == 0 {
             record_stream_metrics_delta(server_id, direction, unflushed);
             if let Err(err) = writer.shutdown().await {
-                return direction_error_or_benign(direction, RelayIoPhase::Shutdown, err);
+                return direction_shutdown_error_or_clean(direction, err);
             }
             return Ok(DirectionSuccess {
                 close_reason: RelayCloseReason::Clean,
@@ -1243,6 +1242,24 @@ fn direction_error_or_benign(
         })
     } else {
         Err(DirectionTaskError::new(direction, phase, err))
+    }
+}
+
+fn direction_shutdown_error_or_clean(
+    direction: StreamDirection,
+    err: io::Error,
+) -> DirectionTaskResult {
+    if is_benign_relay_io_error(&err) {
+        Ok(DirectionSuccess {
+            close_reason: RelayCloseReason::Clean,
+            close_detail: None,
+        })
+    } else {
+        Err(DirectionTaskError::new(
+            direction,
+            RelayIoPhase::Shutdown,
+            err,
+        ))
     }
 }
 
@@ -2172,6 +2189,24 @@ mod tests {
             RELAY_BENIGN_UPLOAD_DRAIN_TIMEOUT < RELAY_BENIGN_RESPONSE_DRAIN_TIMEOUT,
             "response-path benign close should not keep upload alive for the full response drain"
         );
+        assert!(
+            RELAY_BENIGN_UPLOAD_DRAIN_TIMEOUT >= std::time::Duration::from_secs(2),
+            "response-path benign close needs enough room for cross-region AnyTLS upload RTT"
+        );
+    }
+
+    #[test]
+    fn benign_shutdown_after_eof_is_clean() {
+        let success = direction_shutdown_error_or_clean(
+            StreamDirection::BackendToClient,
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "client already closed after response eof",
+            ),
+        )
+        .unwrap();
+        assert_eq!(success.close_reason, RelayCloseReason::Clean);
+        assert_eq!(success.close_detail, None);
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use reqwest::header::{CACHE_CONTROL, DATE, PRAGMA};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -17,6 +18,14 @@ pub const DEFAULT_NTP_SERVERS: &[&str] = &[
     "ntp.ubuntu.com",
     "ntp.aliyun.com",
     "cn.pool.ntp.org",
+];
+
+pub const DEFAULT_HTTPS_TIME_SOURCES: &[&str] = &[
+    "https://www.cloudflare.com/",
+    "https://www.google.com/generate_204",
+    "https://www.apple.com/",
+    "https://www.microsoft.com/",
+    "https://www.aliyun.com/",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +77,7 @@ pub async fn start_auto_ntp_syncer() {
                 SUCCESS_INTERVAL
             }
             Err(err) => {
-                let message = format!("NTP sync failed: {}", err);
+                let message = format!("Time sync failed: {}", err);
                 tracing::warn!("{}", message);
                 crate::logging::report_node_log("warn".to_string(), "ntp".to_string(), message, 0);
                 FAILURE_INTERVAL
@@ -93,9 +102,17 @@ pub async fn sync_once(servers: &[String], timeout: Duration) -> Result<NtpSyncR
     } else {
         timeout
     };
+    let mut has_https_source = false;
 
     for server in servers.iter().filter(|server| !server.trim().is_empty()) {
-        match query_server(server.trim(), timeout).await {
+        let server = server.trim();
+        let result = if is_https_time_source(server) {
+            has_https_source = true;
+            query_https_time_source(server, timeout).await
+        } else {
+            query_ntp_server(server, timeout).await
+        };
+        match result {
             Ok(mut result) => {
                 result.applied_offset_millis =
                     crate::utils::time::set_time_offset_millis(result.offset_millis);
@@ -105,14 +122,31 @@ pub async fn sync_once(servers: &[String], timeout: Duration) -> Result<NtpSyncR
         }
     }
 
+    if !has_https_source {
+        for source in DEFAULT_HTTPS_TIME_SOURCES {
+            match query_https_time_source(source, timeout).await {
+                Ok(mut result) => {
+                    result.applied_offset_millis =
+                        crate::utils::time::set_time_offset_millis(result.offset_millis);
+                    return Ok(result);
+                }
+                Err(err) => failures.push(format!("{}: {}", source, err)),
+            }
+        }
+    }
+
     if failures.is_empty() {
-        Err(anyhow!("no NTP servers configured"))
+        Err(anyhow!("no time sources configured"))
     } else {
-        Err(anyhow!("all NTP servers failed: {}", failures.join("; ")))
+        Err(anyhow!("all time sources failed: {}", failures.join("; ")))
     }
 }
 
-async fn query_server(server: &str, timeout: Duration) -> Result<NtpSyncResult> {
+fn is_https_time_source(source: &str) -> bool {
+    source.starts_with("https://")
+}
+
+async fn query_ntp_server(server: &str, timeout: Duration) -> Result<NtpSyncResult> {
     let mut addrs = tokio::net::lookup_host((server, 123))
         .await
         .with_context(|| format!("resolve {}", server))?;
@@ -175,6 +209,49 @@ async fn query_server(server: &str, timeout: Duration) -> Result<NtpSyncResult> 
         round_trip_millis: round_trip_millis.max(0),
         applied_offset_millis: 0,
     })
+}
+
+async fn query_https_time_source(source: &str, timeout: Duration) -> Result<NtpSyncResult> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+        .context("build HTTPS time client")?;
+    let send_millis = crate::utils::time::system_timestamp_millis();
+    let response = client
+        .get(source)
+        .header(CACHE_CONTROL, "no-cache")
+        .header(PRAGMA, "no-cache")
+        .send()
+        .await
+        .with_context(|| format!("fetch HTTPS Date from {}", source))?;
+    let receive_millis = crate::utils::time::system_timestamp_millis();
+    let date = response
+        .headers()
+        .get(DATE)
+        .ok_or_else(|| anyhow!("missing Date header"))?
+        .to_str()
+        .context("Date header is not valid ASCII")?;
+    let (offset_millis, round_trip_millis) =
+        offset_from_http_date(date, send_millis, receive_millis)?;
+    Ok(NtpSyncResult {
+        server: source.to_string(),
+        offset_millis,
+        round_trip_millis,
+        applied_offset_millis: 0,
+    })
+}
+
+fn offset_from_http_date(date: &str, send_millis: i64, receive_millis: i64) -> Result<(i64, i64)> {
+    let server_millis = chrono::DateTime::parse_from_rfc2822(date)
+        .context("parse HTTPS Date header")?
+        .timestamp_millis();
+    let round_trip_millis = receive_millis.saturating_sub(send_millis).max(0);
+    let midpoint_millis = send_millis.saturating_add(round_trip_millis / 2);
+    Ok((
+        server_millis.saturating_sub(midpoint_millis),
+        round_trip_millis,
+    ))
 }
 
 fn write_ntp_timestamp(dst: &mut [u8], unix_millis: i64) {
@@ -342,6 +419,23 @@ mod tests {
         assert!(validate_timezone_name("/etc/passwd").is_err());
         assert!(validate_timezone_name("../UTC").is_err());
         assert!(validate_timezone_name("Asia/ Shanghai").is_err());
+    }
+
+    #[test]
+    fn https_time_source_detection_accepts_urls_only() {
+        assert!(is_https_time_source("https://www.cloudflare.com/"));
+        assert!(!is_https_time_source("http://example.com/"));
+        assert!(!is_https_time_source("time.cloudflare.com"));
+    }
+
+    #[test]
+    fn http_date_offset_uses_request_midpoint() {
+        let date = "Tue, 14 Nov 2023 22:13:20 GMT";
+        let send_millis = 1_699_999_999_800;
+        let receive_millis = 1_700_000_000_000;
+        let (offset, rtt) = offset_from_http_date(date, send_millis, receive_millis).unwrap();
+        assert_eq!(rtt, 200);
+        assert_eq!(offset, 100);
     }
 
     #[test]
