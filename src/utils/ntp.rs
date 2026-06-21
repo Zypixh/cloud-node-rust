@@ -41,6 +41,20 @@ impl NtpSyncResult {
             )
         }
     }
+
+    pub fn system_clock_log_message(&self, adjusted_millis: i64) -> String {
+        if adjusted_millis == 0 {
+            format!(
+                "NTP sync completed via {}: no system clock offset detected, rtt={}ms",
+                self.server, self.round_trip_millis
+            )
+        } else {
+            format!(
+                "NTP sync completed via {}: corrected system clock by {}ms, measured_offset={}ms, rtt={}ms",
+                self.server, adjusted_millis, self.offset_millis, self.round_trip_millis
+            )
+        }
+    }
 }
 
 pub async fn start_auto_ntp_syncer() {
@@ -201,6 +215,43 @@ pub fn default_servers_as_strings() -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn apply_system_clock_offset(offset_millis: i64) -> Result<i64> {
+    if offset_millis == 0 {
+        crate::utils::time::set_time_offset_millis(0);
+        return Ok(0);
+    }
+
+    let target_millis = crate::utils::time::system_timestamp_millis()
+        .saturating_add(offset_millis)
+        .max(0);
+    set_system_clock_millis(target_millis)?;
+    crate::utils::time::set_time_offset_millis(0);
+    Ok(offset_millis)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_system_clock_offset(_offset_millis: i64) -> Result<i64> {
+    Err(anyhow!("setting system clock is only supported on Linux"))
+}
+
+#[cfg(target_os = "linux")]
+fn set_system_clock_millis(unix_millis: i64) -> Result<()> {
+    let seconds = unix_millis.div_euclid(1000);
+    let nanos = unix_millis.rem_euclid(1000) * 1_000_000;
+    let ts = libc::timespec {
+        tv_sec: seconds as libc::time_t,
+        tv_nsec: nanos as libc::c_long,
+    };
+
+    // SAFETY: clock_settime only reads the provided timespec pointer.
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("set system clock with clock_settime")
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub fn detect_system_timezone() -> Option<String> {
     if let Ok(output) = std::process::Command::new("timedatectl")
         .args(["show", "-p", "Timezone", "--value"])
@@ -313,5 +364,25 @@ mod tests {
             ..corrected
         };
         assert!(no_offset.log_message().contains("no clock offset detected"));
+    }
+
+    #[test]
+    fn system_clock_log_message_reports_system_adjustment() {
+        let result = NtpSyncResult {
+            server: "time.example".to_string(),
+            offset_millis: 900,
+            round_trip_millis: 12,
+            applied_offset_millis: 900,
+        };
+        assert!(
+            result
+                .system_clock_log_message(900)
+                .contains("corrected system clock by 900ms")
+        );
+        assert!(
+            result
+                .system_clock_log_message(0)
+                .contains("no system clock offset detected")
+        );
     }
 }

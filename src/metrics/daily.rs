@@ -101,7 +101,7 @@ impl Default for UniqueIpTracker {
 
 impl UniqueIpTracker {
     pub fn new() -> Self {
-        let min_day = (crate::utils::time::system_local() - ChronoDuration::days(2))
+        let min_day = (crate::utils::time::now_local() - ChronoDuration::days(2))
             .format("%Y%m%d")
             .to_string();
         let ips = DashSet::new();

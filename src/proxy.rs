@@ -361,7 +361,7 @@ impl Default for ProxyCTX {
     fn default() -> Self {
         Self {
             start_time: std::time::Instant::now(),
-            start_timestamp_millis: crate::utils::time::system_timestamp_millis(),
+            start_timestamp_millis: crate::utils::time::now_timestamp_millis(),
             request_id: String::new(),
             server: None,
             matched_location: None,

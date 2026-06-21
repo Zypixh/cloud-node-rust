@@ -107,7 +107,8 @@ fn unix_epoch_millis_now() -> i64 {
 }
 
 fn access_log_started_at_millis(duration: Duration) -> i64 {
-    unix_epoch_millis_now().saturating_sub(duration.as_millis().min(i64::MAX as u128) as i64)
+    crate::utils::time::now_timestamp_millis()
+        .saturating_sub(duration.as_millis().min(i64::MAX as u128) as i64)
 }
 
 pub fn next_request_id() -> String {

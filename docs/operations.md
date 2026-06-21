@@ -47,9 +47,32 @@ cloud-node stop
 cloud-node restart
 cloud-node status
 cloud-node upgrade
+cloud-node ntp
 ```
 
 systemd unit 会以 `Type=simple` 托管前台节点进程，用于开机自启、日志和状态排障。已注册 systemd unit 时，`cloud-node start/restart` 会优先委托给 `systemctl`；未注册 systemd 时才使用内置后台进程管理。节点自身会同时把运行日志追加到 `logs/run.log`。
+
+## 内置 NTP 命令
+
+已安装 Rust 版后，可以用内置 NTP 命令交互式设置系统时区并校准系统时钟：
+
+```bash
+sudo cloud-node ntp
+```
+
+非交互设置时区并校时：
+
+```bash
+sudo cloud-node ntp --timezone Asia/Hong_Kong --yes
+```
+
+只校时、不修改时区：
+
+```bash
+sudo cloud-node ntp --no-timezone --yes
+```
+
+守护进程启动后的自动 NTP 同步只修正程序内部时间偏移，并通过节点日志上报偏差；显式执行 `cloud-node ntp` 才会修改系统时钟。
 
 ## 内置升级命令
 

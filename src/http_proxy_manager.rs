@@ -820,7 +820,7 @@ impl HttpProxyManager {
         server: Arc<ServerConfig>,
     ) -> anyhow::Result<()> {
         let started = Instant::now();
-        let started_at_millis = crate::utils::time::system_timestamp_millis();
+        let started_at_millis = crate::utils::time::now_timestamp_millis();
         let request_id = crate::logging::next_request_id();
         let server_id = server.numeric_id();
         anyhow::ensure!(server_id > 0, "SNI passthrough server is missing ID");

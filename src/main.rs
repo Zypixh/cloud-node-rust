@@ -176,7 +176,7 @@ enum Commands {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Synchronize internal time offset with NTP servers and optionally set system timezone
+    /// Synchronize system clock with NTP servers and optionally set system timezone
     Ntp {
         /// Set system timezone, for example Asia/Shanghai or UTC.
         #[arg(long)]
@@ -281,7 +281,9 @@ fn run_ntp_command(
         .enable_all()
         .build()?;
     let result = rt.block_on(cloud_node_rust::utils::ntp::sync_once(&servers, timeout))?;
-    println!("{}", result.log_message());
+    let adjusted_millis =
+        cloud_node_rust::utils::ntp::apply_system_clock_offset(result.offset_millis)?;
+    println!("{}", result.system_clock_log_message(adjusted_millis));
     Ok(())
 }
 

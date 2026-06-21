@@ -27,6 +27,7 @@ cloud-node restart
 cloud-node status
 cloud-node install
 cloud-node upgrade
+cloud-node ntp
 cloud-node test
 ```
 
@@ -45,6 +46,7 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `status`：读取 PID 文件和文件锁判断节点状态。
 - `install`：注册 `/usr/bin/cloud-node` wrapper 和 systemd service。
 - `upgrade`：从 GitHub Release 下载匹配当前 CPU/架构的最新版或指定版本，确认后备份并替换当前二进制。
+- `ntp`：交互式或非交互式设置系统时区，并按内置 NTP 源校准系统时钟；守护进程自动 NTP 只校准程序内部偏移。
 - `test`：验证 `configs/api_node.yaml` 是否可解析。
 
 `upgrade` 默认使用交互式确认，并在成功替换后重启正在运行的 `cloud-node.service` 或内置后台进程：

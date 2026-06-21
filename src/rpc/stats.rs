@@ -267,7 +267,7 @@ fn load_bandwidth_state() -> (
         return (String::new(), HashMap::new(), Vec::new());
     };
 
-    let now = crate::utils::time::system_local();
+    let now = crate::utils::time::now_local();
     let today = now.format("%Y%m%d").to_string();
     let available_time = (now - ChronoDuration::seconds(BANDWIDTH_REPORT_INTERVAL_SECS as i64))
         .format("%H%M")
@@ -284,7 +284,7 @@ fn load_bandwidth_state() -> (
         state.current_window
     };
 
-    let now_ts = crate::utils::time::system_timestamp();
+    let now_ts = crate::utils::time::now_timestamp();
     let pending_stats = state
         .pending_stats
         .into_iter()
@@ -368,7 +368,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             }
             continue;
         }
-        let now = crate::utils::time::system_local();
+        let now = crate::utils::time::now_local();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
         let time_at = format!("{:02}{:02}", now.hour(), minute_floor);
@@ -383,7 +383,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
             current_window = window_key.clone();
         } else if current_window != window_key {
             let node_region_id = config_store.get_node_region_id().await;
-            let now_ts = crate::utils::time::system_timestamp();
+            let now_ts = crate::utils::time::now_timestamp();
             pending_stats.retain(|item| now_ts - item.queued_at <= STAT_RETRY_RETENTION_SECS);
             let mut upload_items = std::mem::take(&mut pending_stats);
             upload_items.extend(window_stats.drain().map(|(_, stat)| {
@@ -520,7 +520,7 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
             }
             continue;
         }
-        let now = crate::utils::time::system_local();
+        let now = crate::utils::time::now_local();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
         let time_from = format!("{:02}{:02}", now.hour(), minute_floor);
@@ -538,7 +538,7 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
             let min_day = (now - ChronoDuration::days(2)).format("%Y%m%d").to_string();
             crate::metrics::daily::UNIQUE_IP_TRACKER.cleanup_before(&min_day);
 
-            let now_ts = crate::utils::time::system_timestamp();
+            let now_ts = crate::utils::time::now_timestamp();
             pending_stats.retain(|item| now_ts - item.created_at <= STAT_RETRY_RETENTION_SECS);
             pending_domain_stats
                 .retain(|item| now_ts - item.created_at <= STAT_RETRY_RETENTION_SECS);
@@ -662,7 +662,7 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
 }
 
 fn get_period_time(period: i32, unit: &str) -> String {
-    let now = crate::utils::time::system_local();
+    let now = crate::utils::time::now_local();
     match unit.to_lowercase().as_str() {
         "month" => now.format("%Y%m").to_string(),
         "week" => {
@@ -965,7 +965,7 @@ pub async fn start_metrics_aggregator_reporter(config_store: ConfigStore, api_co
             continue;
         }
 
-        let now = crate::utils::time::system_local();
+        let now = crate::utils::time::now_local();
         let month = now.format("%Y%m").to_string();
         let day = now.format("%Y%m%d").to_string();
 
@@ -1118,7 +1118,7 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
         };
         let mut service = client.server_top_ip_stat_service();
 
-        let now = crate::utils::time::system_local();
+        let now = crate::utils::time::now_local();
         let day = now.format("%Y%m%d").to_string();
         let minute_floor = (now.minute() / 5) * 5;
         let time_at = format!("{:02}{:02}", now.hour(), minute_floor);

@@ -614,22 +614,20 @@ static DAY_CACHE: LazyLock<TimeCache<String>> = LazyLock::new(TimeCache::new);
 static PERIOD_CACHE: LazyLock<TimeCache<i64>> = LazyLock::new(TimeCache::new);
 
 fn get_current_day() -> String {
-    let now = crate::utils::time::system_timestamp();
+    let now = crate::utils::time::now_timestamp();
     let now_day = now / 86400;
 
     DAY_CACHE.get_or_update(now_day, || {
-        crate::utils::time::system_local()
-            .format("%Y%m%d")
-            .to_string()
+        crate::utils::time::now_local().format("%Y%m%d").to_string()
     })
 }
 
 fn get_current_5min_ts() -> i64 {
-    let now = crate::utils::time::system_timestamp();
+    let now = crate::utils::time::now_timestamp();
     let now_5min = now / 300;
 
     PERIOD_CACHE.get_or_update(now_5min, || {
-        let dt = crate::utils::time::system_local();
+        let dt = crate::utils::time::now_local();
         let minute_floor = (dt.minute() / 5) * 5;
         dt.with_second(0)
             .and_then(|d| d.with_minute(minute_floor))
@@ -1005,7 +1003,7 @@ pub async fn start_persistence_flusher() {
     loop {
         interval.tick().await;
         let mut updates = Vec::new();
-        let now = crate::utils::time::system_timestamp();
+        let now = crate::utils::time::now_timestamp();
         let period = (now / 300) * 300;
 
         for entry in METRICS.servers.iter() {

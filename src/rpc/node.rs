@@ -1447,7 +1447,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             0.0
         };
 
-        let now = crate::utils::time::system_timestamp();
+        let now = crate::utils::time::now_timestamp();
         let hostname = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -1601,7 +1601,7 @@ pub async fn report_node_online_once(
     let host_ip = local_ip_address::local_ip()
         .map(|ip| ip.to_string())
         .unwrap_or_default();
-    let now = crate::utils::time::system_timestamp();
+    let now = crate::utils::time::now_timestamp();
     let status = serde_json::json!({
         "buildVersion": env!("CARGO_PKG_VERSION"),
         "buildVersionCode": build_version_code(),
