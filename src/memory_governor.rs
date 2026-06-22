@@ -186,6 +186,11 @@ const FIREWALL_CANDIDATE_STATS_ESTIMATED_BYTES: u64 = 128;
 const ACCESS_LOG_EVENT_ESTIMATED_BYTES: u64 = 1536;
 const NODE_LOG_EVENT_ESTIMATED_BYTES: u64 = 512;
 const HTTP_DIMENSION_EVENT_ESTIMATED_BYTES: u64 = 512;
+const MIN_RELAY_COPY_BUFFER_BYTES: usize = 16 * 1024;
+const LOW_RELAY_COPY_BUFFER_BYTES: usize = 32 * 1024;
+const DEFAULT_RELAY_COPY_BUFFER_BYTES: usize = 64 * 1024;
+const HIGH_RELAY_COPY_BUFFER_BYTES: usize = 128 * 1024;
+const MAX_RELAY_COPY_BUFFER_BYTES: usize = 256 * 1024;
 
 const MIN_HTTP_CONNECTION_LIMIT: usize = 16_384;
 const MIN_TCP_CONNECTION_LIMIT: usize = 16_384;
@@ -534,6 +539,11 @@ impl MemoryGovernor {
     pub fn is_memory_pressure_high(&self) -> bool {
         let snapshot = self.memory_snapshot();
         memory_pressure_high(&snapshot)
+    }
+
+    pub fn relay_copy_buffer_bytes(&self) -> usize {
+        let snapshot = self.memory_snapshot();
+        relay_copy_buffer_bytes(&snapshot, self.tcp_connections.load(Ordering::Relaxed))
     }
 
     pub fn listener_backlog(&self) -> i32 {
@@ -1167,6 +1177,45 @@ fn cache_read_memory_object_limit_bytes(snapshot: &BudgetedMemorySnapshot) -> u6
         CACHE_READ_MEMORY_MEDIUM_OBJECT_BYTES
     } else {
         CACHE_READ_MEMORY_MAX_OBJECT_BYTES
+    }
+}
+
+fn relay_copy_buffer_bytes(
+    snapshot: &BudgetedMemorySnapshot,
+    active_tcp_connections: u64,
+) -> usize {
+    let pressure_cap = match memory_pressure_level(snapshot) {
+        MemoryPressureLevel::Critical => MIN_RELAY_COPY_BUFFER_BYTES,
+        MemoryPressureLevel::High => LOW_RELAY_COPY_BUFFER_BYTES,
+        MemoryPressureLevel::Elevated => DEFAULT_RELAY_COPY_BUFFER_BYTES,
+        MemoryPressureLevel::Normal if snapshot.total_bytes >= 64 * 1024 * 1024 * 1024 => {
+            MAX_RELAY_COPY_BUFFER_BYTES
+        }
+        MemoryPressureLevel::Normal if snapshot.total_bytes >= 16 * 1024 * 1024 * 1024 => {
+            HIGH_RELAY_COPY_BUFFER_BYTES
+        }
+        MemoryPressureLevel::Normal => DEFAULT_RELAY_COPY_BUFFER_BYTES,
+    };
+    let active = active_tcp_connections.max(1);
+    let relay_budget = (snapshot.connection_budget_bytes / 6).min(snapshot.available_bytes / 8);
+    let per_direction_budget = (relay_budget / active / 2) as usize;
+    let budget_cap = relay_buffer_step(per_direction_budget);
+    pressure_cap
+        .min(budget_cap)
+        .max(MIN_RELAY_COPY_BUFFER_BYTES)
+}
+
+fn relay_buffer_step(bytes: usize) -> usize {
+    if bytes >= MAX_RELAY_COPY_BUFFER_BYTES {
+        MAX_RELAY_COPY_BUFFER_BYTES
+    } else if bytes >= HIGH_RELAY_COPY_BUFFER_BYTES {
+        HIGH_RELAY_COPY_BUFFER_BYTES
+    } else if bytes >= DEFAULT_RELAY_COPY_BUFFER_BYTES {
+        DEFAULT_RELAY_COPY_BUFFER_BYTES
+    } else if bytes >= LOW_RELAY_COPY_BUFFER_BYTES {
+        LOW_RELAY_COPY_BUFFER_BYTES
+    } else {
+        MIN_RELAY_COPY_BUFFER_BYTES
     }
 }
 
@@ -1844,6 +1893,36 @@ mod tests {
         );
         assert!(large_h2_global > MAX_H2_STREAM_LIMIT_PER_CONNECTION);
         assert_eq!(large_h2_per_conn, MAX_H2_STREAM_LIMIT_PER_CONNECTION);
+    }
+
+    #[test]
+    fn relay_copy_buffer_scales_with_memory_pressure_and_active_tcp() {
+        let small = synthetic_snapshot(2, 1, 65_535, 2);
+        let medium = synthetic_snapshot(16, 8, 1_048_576, 8);
+        let large = synthetic_snapshot(128, 96, 16_777_216, 64);
+        let high_pressure = synthetic_snapshot(16, 1, 1_048_576, 8);
+
+        assert_eq!(
+            relay_copy_buffer_bytes(&small, 1),
+            DEFAULT_RELAY_COPY_BUFFER_BYTES
+        );
+        assert_eq!(
+            relay_copy_buffer_bytes(&medium, 1),
+            HIGH_RELAY_COPY_BUFFER_BYTES
+        );
+        assert_eq!(
+            relay_copy_buffer_bytes(&large, 1),
+            MAX_RELAY_COPY_BUFFER_BYTES
+        );
+        assert_eq!(
+            relay_copy_buffer_bytes(&high_pressure, 1),
+            LOW_RELAY_COPY_BUFFER_BYTES
+        );
+        assert!(relay_copy_buffer_bytes(&large, 100_000) < relay_copy_buffer_bytes(&large, 1));
+        assert_eq!(
+            relay_copy_buffer_bytes(&large, u64::MAX),
+            MIN_RELAY_COPY_BUFFER_BYTES
+        );
     }
 
     #[test]

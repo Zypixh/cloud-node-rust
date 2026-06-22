@@ -41,6 +41,7 @@ fn real_api_config_from_env() -> anyhow::Result<Option<ApiConfig>> {
         secret,
         billing_count_inbound_traffic: false,
         access_log_pipeline: Default::default(),
+        relay: Default::default(),
     }))
 }
 

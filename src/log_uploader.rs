@@ -449,6 +449,7 @@ mod tests {
             secret: "secret".to_string(),
             billing_count_inbound_traffic: false,
             access_log_pipeline: Default::default(),
+            relay: Default::default(),
         }
     }
 

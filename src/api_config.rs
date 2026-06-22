@@ -20,6 +20,28 @@ pub struct ApiConfig {
     pub billing_count_inbound_traffic: bool,
     #[serde(rename = "accessLogPipeline", default)]
     pub access_log_pipeline: AccessLogPipelineConfig,
+    #[serde(rename = "relay", default)]
+    pub relay: RelayConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RelayConfig {
+    #[serde(rename = "zeroCopy", default)]
+    pub zero_copy: bool,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self { zero_copy: false }
+    }
+}
+
+impl RelayConfig {
+    pub fn normalized(&self) -> Self {
+        Self {
+            zero_copy: self.zero_copy,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -193,6 +215,13 @@ mod tests {
         .normalized();
 
         assert_eq!(config.batch_queue_capacity(), 26);
+    }
+
+    #[test]
+    fn relay_config_defaults_to_stable_copy_path() {
+        let config = RelayConfig::default().normalized();
+
+        assert!(!config.zero_copy);
     }
 }
 

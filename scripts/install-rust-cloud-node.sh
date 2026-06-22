@@ -1001,6 +1001,8 @@ write_api_node_config() {
             printf 'rpc.endpoints: %s\n' "$list"
             printf 'nodeId: %s\n' "$(yaml_quote "$NODE_ID")"
             printf 'secret: %s\n' "$(yaml_quote "$NODE_SECRET")"
+            printf 'relay:\n'
+            printf '  zeroCopy: false\n'
         } > "$config_path"
         chmod 0600 "$config_path" 2>/dev/null || true
     else
@@ -1008,6 +1010,7 @@ write_api_node_config() {
         printf '  rpc.endpoints: %s\n' "$list"
         printf '  nodeId: %s\n' "$(yaml_quote "$NODE_ID")"
         printf '  secret: ******\n'
+        printf '  relay.zeroCopy: false\n'
     fi
 }
 

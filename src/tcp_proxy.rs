@@ -18,6 +18,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::LazyLock as Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -27,6 +28,27 @@ use tracing::{debug, error, info, warn};
 struct ListenerHandle {
     is_tls: bool,
     shutdown_tx: watch::Sender<bool>,
+}
+
+static RELAY_ZERO_COPY_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn configure_relay_from_api(config: &crate::api_config::ApiConfig) {
+    let relay = config.relay.normalized();
+    RELAY_ZERO_COPY_ENABLED.store(relay.zero_copy, Ordering::Relaxed);
+    info!(
+        "TCP/SNI relay configured: zero_copy={}, copy_buffer=auto(current={} bytes)",
+        relay.zero_copy,
+        MEMORY_GOVERNOR.relay_copy_buffer_bytes()
+    );
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn relay_zero_copy_enabled() -> bool {
+    RELAY_ZERO_COPY_ENABLED.load(Ordering::Relaxed)
+}
+
+fn relay_copy_buffer_bytes() -> usize {
+    MEMORY_GOVERNOR.relay_copy_buffer_bytes()
 }
 
 #[derive(Clone)]
@@ -1076,9 +1098,11 @@ async fn stream_tcp_bidirectional_with_metrics_options(
 ) -> Result<RelayOutcome, BidirectionalStreamError> {
     #[cfg(target_os = "linux")]
     {
-        match zero_copy::stream_bidirectional(server_id, &client, &backend, options).await {
-            zero_copy::ZeroCopyOutcome::Completed(result) => return result,
-            zero_copy::ZeroCopyOutcome::Fallback => {}
+        if relay_zero_copy_enabled() {
+            match zero_copy::stream_bidirectional(server_id, &client, &backend, options).await {
+                zero_copy::ZeroCopyOutcome::Completed(result) => return result,
+                zero_copy::ZeroCopyOutcome::Fallback => {}
+            }
         }
     }
 
@@ -1198,7 +1222,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; 32 * 1024];
+    let mut buf = vec![0u8; relay_copy_buffer_bytes()];
     let mut total = 0u64;
     let mut unflushed = 0u64;
 

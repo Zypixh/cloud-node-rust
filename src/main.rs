@@ -198,6 +198,21 @@ enum Commands {
         #[arg(long, default_value_t = 3000)]
         timeout_ms: u64,
     },
+    /// View or change TCP/SNI relay zero-copy mode
+    #[command(name = "zerocopy", alias = "zero-copy")]
+    ZeroCopy {
+        /// Enable Linux splice zero-copy relay.
+        #[arg(long)]
+        enable: bool,
+
+        /// Disable Linux splice zero-copy relay.
+        #[arg(long)]
+        disable: bool,
+
+        /// Write the selected value without interactive confirmation.
+        #[arg(long, alias = "non-interactive")]
+        yes: bool,
+    },
     /// Test the configuration
     Test,
     /// Internal use only
@@ -225,27 +240,167 @@ fn build_time_display() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn prompt_ntp_timezone() -> anyhow::Result<Option<String>> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Ok(None);
+fn interactive_available() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn prompt_yes_no(prompt: &str, default: bool) -> anyhow::Result<bool> {
+    if !interactive_available() {
+        anyhow::bail!(
+            "interactive confirmation is unavailable; pass --yes for non-interactive use"
+        );
     }
 
-    let current = cloud_node_rust::utils::ntp::detect_system_timezone()
-        .unwrap_or_else(|| "Asia/Shanghai".to_string());
-    println!("Current timezone: {}", current);
-    println!("Enter a timezone to set, or press Enter to keep current.");
-    print!("Timezone [{}]: ", current);
+    let suffix = if default { "[Y/n]" } else { "[y/N]" };
+    print!("{prompt} {suffix} ");
     use io::Write as _;
     io::stdout().flush()?;
 
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    let timezone = input.trim();
-    if timezone.is_empty() {
+    let answer = input.trim();
+    if answer.is_empty() {
+        return Ok(default);
+    }
+    Ok(matches!(
+        answer,
+        "y" | "Y" | "yes" | "YES" | "Yes" | "是" | "好" | "确认" | "启用" | "开启"
+    ))
+}
+
+fn prompt_text(prompt: &str, default: &str) -> anyhow::Result<String> {
+    if !interactive_available() {
+        anyhow::bail!("interactive input is unavailable");
+    }
+
+    print!("{prompt} [{default}]: ");
+    use io::Write as _;
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let value = input.trim();
+    if value.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn prompt_ntp_timezone() -> anyhow::Result<Option<String>> {
+    if !interactive_available() {
+        return Ok(None);
+    }
+
+    let current = cloud_node_rust::utils::ntp::detect_system_timezone()
+        .unwrap_or_else(|| "Asia/Shanghai".to_string());
+    println!("CloudNode NTP");
+    println!("  current timezone: {}", current);
+    println!("  press Enter to keep current, or type a timezone such as Asia/Shanghai");
+    let timezone = prompt_text("Timezone", &current)?;
+    if timezone == current {
         Ok(None)
     } else {
-        Ok(Some(timezone.to_string()))
+        Ok(Some(timezone))
     }
+}
+
+fn api_config_existing_path() -> anyhow::Result<PathBuf> {
+    let paths = ApiConfig::default_paths();
+    paths
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| anyhow::anyhow!("no config file found in default paths"))
+}
+
+fn yaml_string_key(key: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(key.to_string())
+}
+
+fn set_yaml_bool(mapping: &mut serde_yaml::Mapping, key: &str, value: bool) {
+    mapping.insert(yaml_string_key(key), serde_yaml::Value::Bool(value));
+}
+
+fn write_relay_config(path: &Path, zero_copy: bool) -> anyhow::Result<()> {
+    let content = fs::read_to_string(path)?;
+    let mut value: serde_yaml::Value = serde_yaml::from_str(&content)?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a YAML mapping", path.display()))?;
+
+    let relay_key = yaml_string_key("relay");
+    if !root.contains_key(&relay_key) {
+        root.insert(
+            relay_key.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
+    }
+    let relay = root
+        .get_mut(&relay_key)
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .ok_or_else(|| anyhow::anyhow!("relay in {} is not a YAML mapping", path.display()))?;
+    set_yaml_bool(relay, "zeroCopy", zero_copy);
+
+    fs::write(path, serde_yaml::to_string(&value)?)?;
+    let _ = ApiConfig::load(path)?;
+    Ok(())
+}
+
+fn run_zerocopy_command(enable: bool, disable: bool, yes: bool) -> anyhow::Result<()> {
+    if enable && disable {
+        anyhow::bail!("--enable and --disable cannot be used together");
+    }
+
+    let path = api_config_existing_path()?;
+    let config = ApiConfig::load(&path)?;
+    let current = config.relay.normalized();
+    println!("CloudNode zero-copy relay");
+    println!("  config:            {}", path.display());
+    println!(
+        "  current zero-copy: {}",
+        if current.zero_copy {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "  copy buffer:       auto (current {} bytes)",
+        cloud_node_rust::memory_governor::MEMORY_GOVERNOR.relay_copy_buffer_bytes()
+    );
+
+    let requested_zero_copy = if enable {
+        Some(true)
+    } else if disable {
+        Some(false)
+    } else if interactive_available() {
+        Some(prompt_yes_no(
+            "Enable Linux splice zero-copy for TCP/SNI relay?",
+            current.zero_copy,
+        )?)
+    } else {
+        None
+    };
+
+    let Some(zero_copy) = requested_zero_copy else {
+        println!("No change requested. Use --enable or --disable in non-interactive mode.");
+        return Ok(());
+    };
+
+    println!(
+        "  new zero-copy:     {}",
+        if zero_copy { "enabled" } else { "disabled" }
+    );
+    println!("  copy buffer:       auto");
+
+    if !yes && (enable || disable) && !prompt_yes_no("Write this relay configuration?", true)? {
+        anyhow::bail!("zero-copy configuration aborted");
+    }
+
+    write_relay_config(&path, zero_copy)?;
+    println!("Relay configuration updated.");
+    println!("Restart cloud-node for running listeners to use the new relay mode.");
+    Ok(())
 }
 
 fn run_ntp_command(
@@ -320,7 +475,19 @@ fn cmdline_contains_management_command(cmdline: &[u8]) -> bool {
         .filter(|arg| !arg.is_empty())
         .skip(1)
         .filter_map(|arg| std::str::from_utf8(arg).ok())
-        .any(|arg| matches!(arg, "stop" | "status" | "restart" | "install" | "test"))
+        .any(|arg| {
+            matches!(
+                arg,
+                "stop"
+                    | "status"
+                    | "restart"
+                    | "install"
+                    | "test"
+                    | "ntp"
+                    | "zerocopy"
+                    | "zero-copy"
+            )
+        })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -721,19 +888,7 @@ fn extract_release_binary(archive_path: &Path, target_dir: &Path) -> anyhow::Res
 }
 
 fn prompt_upgrade_confirmation() -> anyhow::Result<bool> {
-    if !io::stdin().is_terminal() {
-        anyhow::bail!(
-            "interactive confirmation is unavailable; pass --yes for non-interactive upgrade"
-        );
-    }
-
-    println!("Proceed with upgrade? [y/N] ");
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(matches!(
-        input.trim(),
-        "y" | "Y" | "yes" | "YES" | "Yes" | "是" | "好" | "确认"
-    ))
+    prompt_yes_no("Proceed with upgrade?", false)
 }
 
 fn backup_current_binary(
@@ -1171,10 +1326,30 @@ WantedBy=multi-user.target\n",
         }) => {
             run_ntp_command(timezone, no_timezone, yes, servers, timeout_ms)?;
         }
+        Some(Commands::ZeroCopy {
+            enable,
+            disable,
+            yes,
+        }) => {
+            run_zerocopy_command(enable, disable, yes)?;
+        }
         Some(Commands::Test) => {
             println!("Testing configuration...");
-            let _ = ApiConfig::load_default()?;
+            let api_config = ApiConfig::load_default()?;
             let runtime_config = RuntimeConfig::load_default()?;
+            let relay = api_config.relay.normalized();
+            println!(
+                "Relay zero-copy: {}",
+                if relay.zero_copy {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
+                "Relay copy buffer: auto (current {} bytes)",
+                cloud_node_rust::memory_governor::MEMORY_GOVERNOR.relay_copy_buffer_bytes()
+            );
             println!("Runtime mode: {:?}", runtime_config.mode());
             println!("Configuration is valid.");
         }
@@ -1290,6 +1465,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
 
     // 1. Load API Config
     let api_config = ApiConfig::load_default().expect("Failed to load configs/api_node.yaml");
+    cloud_node_rust::tcp_proxy::configure_relay_from_api(&api_config);
     let runtime_config =
         RuntimeConfig::load_default().expect("Failed to load configs/runtime.yaml");
     if runtime_config.is_rke2() {
