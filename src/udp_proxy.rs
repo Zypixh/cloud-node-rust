@@ -13,8 +13,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
+use crate::firewall::state::WafStateManager;
+use crate::l4_defense::L4DefenseKind;
 use crate::lb_factory::BackendExtension;
-use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR, StaticAdmissionPermit};
+use crate::memory_governor::{
+    AdmissionClass, MEMORY_GOVERNOR, StaticAdmissionPermit, StaticUdpQueueBytePermit,
+};
 use crate::net_bind::{bind_udp_socket, dual_stack_bind_addrs};
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -95,9 +99,29 @@ pub struct UdpSession {
     pub last_activity_ms: Arc<AtomicU64>,
     pub quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
     pub quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
-    pub tx: mpsc::Sender<Bytes>,
+    pub tx: mpsc::Sender<QueuedUdpDatagram>,
     pub shutdown_tx: watch::Sender<bool>,
     pub shutdown: watch::Receiver<bool>,
+}
+
+pub struct QueuedUdpDatagram {
+    data: Bytes,
+    _byte_permit: StaticUdpQueueBytePermit,
+}
+
+impl QueuedUdpDatagram {
+    fn new(data: Bytes) -> Option<Self> {
+        MEMORY_GOVERNOR
+            .try_reserve_udp_queue_bytes(data.len())
+            .map(|permit| Self {
+                data,
+                _byte_permit: permit,
+            })
+    }
+
+    pub fn as_deref(&self) -> Option<&[u8]> {
+        Some(&self.data)
+    }
 }
 
 struct ListenerHandle {
@@ -106,6 +130,8 @@ struct ListenerHandle {
 
 pub struct UdpProxyManager {
     config_store: ConfigStore,
+    waf_state: Arc<WafStateManager>,
+    node_id: i64,
     /// (ClientAddr, ListenPort) -> Session
     sessions: Arc<DashMap<(SocketAddr, u16), Arc<UdpSession>>>,
     handled_ports: DashMap<SocketAddr, ListenerHandle>,
@@ -113,9 +139,15 @@ pub struct UdpProxyManager {
 }
 
 impl UdpProxyManager {
-    pub fn new(config_store: ConfigStore) -> Arc<Self> {
+    pub fn new(
+        config_store: ConfigStore,
+        waf_state: Arc<WafStateManager>,
+        node_id: i64,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config_store,
+            waf_state,
+            node_id,
             sessions: Arc::new(DashMap::new()),
             handled_ports: DashMap::new(),
             next_session_id: AtomicU64::new(1),
@@ -263,6 +295,13 @@ impl UdpProxyManager {
                 res = listen_socket.recv_from(&mut buf) => res,
             };
             let (len, client_addr) = recv_result?;
+            if crate::l4_defense::is_l4_blocked(
+                &self.config_store,
+                &self.waf_state,
+                client_addr.ip(),
+            ) {
+                continue;
+            }
             let data = Bytes::copy_from_slice(&buf[..len]);
 
             // 1. Get or create session (Session Sticky)
@@ -295,6 +334,11 @@ impl UdpProxyManager {
             match Self::send_to_session(&session, data) {
                 UdpSessionSendStatus::Sent => {}
                 UdpSessionSendStatus::Full => {
+                    self.record_l4_event(
+                        client_addr.ip(),
+                        L4DefenseKind::UdpQueueFull,
+                        format!("port={} peer={} session={}", port, client_addr, session.id),
+                    );
                     debug!("UDP session {} buffer full, dropping packet", client_addr);
                 }
                 UdpSessionSendStatus::Closed => {
@@ -368,6 +412,9 @@ impl UdpProxyManager {
         if let Some(session) = self.sessions.get(&key) {
             return Ok(Some(session.clone()));
         }
+        if crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, client_addr.ip()) {
+            return Ok(None);
+        }
         if server.has_valid_traffic_limit() {
             debug!(
                 "UDP server {} is traffic-limited for client {}",
@@ -376,9 +423,37 @@ impl UdpProxyManager {
             );
             return Ok(None);
         }
+        if matches!(
+            self.record_l4_event(
+                client_addr.ip(),
+                L4DefenseKind::UdpSessionFlood,
+                format!(
+                    "port={} peer={} server={} quic_cid_route={}",
+                    port,
+                    client_addr,
+                    server.numeric_id(),
+                    quic_cid_tx.is_some()
+                ),
+            ),
+            crate::l4_defense::L4DefenseVerdict::Blocked
+                | crate::l4_defense::L4DefenseVerdict::AggregateDropped
+                | crate::l4_defense::L4DefenseVerdict::AlreadyBlocked
+        ) {
+            return Ok(None);
+        }
         let Some(session_permit): Option<StaticAdmissionPermit> =
             MEMORY_GOVERNOR.try_admit(AdmissionClass::UdpSession)
         else {
+            self.record_l4_event(
+                client_addr.ip(),
+                L4DefenseKind::UdpAdmissionReject,
+                format!(
+                    "port={} peer={} server={}",
+                    port,
+                    client_addr,
+                    server.numeric_id()
+                ),
+            );
             debug!(
                 "UDP session admission limit reached for client {} on port {}",
                 client_addr, port
@@ -573,7 +648,10 @@ impl UdpProxyManager {
     }
 
     pub fn send_to_session(session: &UdpSession, data: Bytes) -> UdpSessionSendStatus {
-        match session.tx.try_send(data) {
+        let Some(item) = QueuedUdpDatagram::new(data) else {
+            return UdpSessionSendStatus::Full;
+        };
+        match session.tx.try_send(item) {
             Ok(()) => {
                 Self::update_session_activity(session);
                 UdpSessionSendStatus::Sent
@@ -588,10 +666,13 @@ impl UdpProxyManager {
         client_addr: SocketAddr,
         data: Bytes,
     ) -> UdpSessionSendStatus {
+        let Some(item) = QueuedUdpDatagram::new(data) else {
+            return UdpSessionSendStatus::Full;
+        };
         match session.tx.try_reserve() {
             Ok(permit) => {
                 Self::update_session_client_addr(session, client_addr).await;
-                permit.send(data);
+                permit.send(item);
                 Self::update_session_activity(session);
                 UdpSessionSendStatus::Sent
             }
@@ -635,7 +716,7 @@ impl UdpProxyManager {
         quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
         quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
         listen_socket: Arc<UdpSocket>,
-        mut rx: mpsc::Receiver<Bytes>,
+        mut rx: mpsc::Receiver<QueuedUdpDatagram>,
     ) -> anyhow::Result<()> {
         let backend_bind_addr = if backend_addr.is_ipv6() {
             "[::]:0"
@@ -686,10 +767,11 @@ impl UdpProxyManager {
                         break;
                     }
                 }
-                data = rx.recv() => {
-                    let Some(data) = data else {
+                item = rx.recv() => {
+                    let Some(item) = item else {
                         break;
                     };
+                    let data = item.data;
                     let len = data.len() as u64;
                     if let Err(err) = backend_socket.send(&data).await {
                         crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
@@ -791,6 +873,44 @@ impl UdpProxyManager {
     pub async fn find_server_by_port(&self, port: u16) -> Option<Arc<ServerConfig>> {
         self.config_store.find_udp_server_by_port_sync(port)
     }
+
+    pub(crate) fn is_l4_blocked(&self, ip: IpAddr) -> bool {
+        crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, ip)
+    }
+
+    pub(crate) fn record_l4_event(
+        &self,
+        ip: IpAddr,
+        kind: L4DefenseKind,
+        detail: impl Into<String>,
+    ) -> crate::l4_defense::L4DefenseVerdict {
+        crate::l4_defense::record_l4_event(
+            &self.config_store,
+            &self.waf_state,
+            self.node_id,
+            ip,
+            kind,
+            detail,
+        )
+    }
+
+    pub(crate) fn record_l4_event_with_pressure(
+        &self,
+        ip: IpAddr,
+        kind: L4DefenseKind,
+        detail: impl Into<String>,
+        pressure_level: crate::l4_defense::L4PressureLevel,
+    ) -> crate::l4_defense::L4DefenseVerdict {
+        crate::l4_defense::record_l4_event_with_pressure(
+            &self.config_store,
+            &self.waf_state,
+            self.node_id,
+            ip,
+            kind,
+            detail,
+            pressure_level,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -846,7 +966,8 @@ mod tests {
         let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
         let second: SocketAddr = "127.0.0.1:10001".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
-        tx.try_send(Bytes::from_static(b"queued")).unwrap();
+        tx.try_send(QueuedUdpDatagram::new(Bytes::from_static(b"queued")).unwrap())
+            .unwrap();
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = UdpSession {
             id: 1,
@@ -882,7 +1003,8 @@ mod tests {
     async fn send_to_session_reports_full_without_waiting() {
         let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(Bytes::from_static(b"queued")).unwrap();
+        tx.try_send(QueuedUdpDatagram::new(Bytes::from_static(b"queued")).unwrap())
+            .unwrap();
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: 1,
@@ -905,12 +1027,18 @@ mod tests {
             UdpProxyManager::send_to_session(&session, Bytes::from_static(b"next")),
             UdpSessionSendStatus::Full
         );
-        assert_eq!(rx.recv().await.as_deref(), Some(&b"queued"[..]));
+        assert_eq!(
+            rx.recv().await.as_ref().and_then(|item| item.as_deref()),
+            Some(&b"queued"[..])
+        );
         assert_eq!(
             UdpProxyManager::send_to_session(&session, Bytes::from_static(b"next")),
             UdpSessionSendStatus::Sent
         );
-        assert_eq!(rx.recv().await.as_deref(), Some(&b"next"[..]));
+        assert_eq!(
+            rx.recv().await.as_ref().and_then(|item| item.as_deref()),
+            Some(&b"next"[..])
+        );
     }
 
     #[test]
@@ -971,7 +1099,9 @@ mod tests {
             rx,
         ));
 
-        tx.send(Bytes::from_static(b"ping")).await.unwrap();
+        tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping")).unwrap())
+            .await
+            .unwrap();
         let mut buf = [0u8; 16];
         let (len, backend_peer) =
             tokio::time::timeout(Duration::from_secs(1), backend.recv_from(&mut buf))
@@ -1085,7 +1215,7 @@ mod tests {
             )
             .await;
 
-        let manager = UdpProxyManager::new(store);
+        let manager = UdpProxyManager::new(store, Arc::new(WafStateManager::new()), 1);
         let server = manager
             .find_server_for_packet(443, b"not a quic initial")
             .await

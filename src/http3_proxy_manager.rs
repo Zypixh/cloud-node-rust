@@ -11,11 +11,12 @@ use quinn::Endpoint;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use tokio::sync::{Semaphore, watch};
+use tracing::{debug, error, info};
 
 use crate::config::ConfigStore;
 use crate::h3_downstream::H3DownstreamSession;
+use crate::l4_defense::L4DefenseKind;
 use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR};
 use crate::proxy::EdgeProxy;
 use crate::ssl::DynamicCertSelector;
@@ -173,14 +174,27 @@ impl Http3ProxyManager {
             let Some(connecting) = connecting else {
                 continue;
             };
+            let remote_addr = connecting.remote_address();
+            if crate::l4_defense::is_l4_blocked(
+                &self.config_store,
+                &self.proxy_logic.waf_state,
+                remote_addr.ip(),
+            ) {
+                continue;
+            }
             debug!("HTTP/3 incoming connection on UDP port {}", port);
 
             let Some(connection_permit) =
                 MEMORY_GOVERNOR.try_admit(AdmissionClass::Http3Connection)
             else {
-                warn!(
-                    "H3 connection admission limit reached, rejecting connection on port {}",
-                    port
+                self.record_l4_event(
+                    remote_addr.ip(),
+                    L4DefenseKind::H3AdmissionReject,
+                    format!("port={} peer={} class=connection", port, remote_addr),
+                );
+                debug!(
+                    "H3 connection admission limit reached, rejecting connection from {} on port {}",
+                    remote_addr, port
                 );
                 continue;
             };
@@ -241,6 +255,8 @@ impl Http3ProxyManager {
         let mut h3_conn = h3::server::builder()
             .build(h3_quinn::Connection::new(conn))
             .await?;
+        let per_connection_limit = MEMORY_GOVERNOR.h3_request_limit_per_connection().max(1);
+        let stream_semaphore = Arc::new(Semaphore::new(per_connection_limit));
         debug!(
             "HTTP/3 connection ready on port {} from {}",
             listen_port, remote_addr
@@ -249,6 +265,38 @@ impl Http3ProxyManager {
         loop {
             match h3_conn.accept().await {
                 Ok(Some(resolver)) => {
+                    let Ok(stream_permit) = stream_semaphore.clone().try_acquire_owned() else {
+                        self.record_l4_event(
+                            remote_addr.ip(),
+                            L4DefenseKind::H3AdmissionReject,
+                            format!(
+                                "port={} peer={} class=per_connection_stream limit={}",
+                                listen_port, remote_addr, per_connection_limit
+                            ),
+                        );
+                        debug!(
+                            "HTTP/3 per-connection stream limit reached on port {} from {}",
+                            listen_port, remote_addr
+                        );
+                        continue;
+                    };
+                    let Some(request_permit) =
+                        MEMORY_GOVERNOR.try_admit(AdmissionClass::Http3Request)
+                    else {
+                        self.record_l4_event(
+                            remote_addr.ip(),
+                            L4DefenseKind::H3AdmissionReject,
+                            format!(
+                                "port={} peer={} class=request_pre_spawn",
+                                listen_port, remote_addr
+                            ),
+                        );
+                        debug!(
+                            "HTTP/3 request admission limit reached before spawn on port {} from {}",
+                            listen_port, remote_addr
+                        );
+                        continue;
+                    };
                     debug!(
                         "HTTP/3 request stream accepted on port {} from {}",
                         listen_port, remote_addr
@@ -257,8 +305,16 @@ impl Http3ProxyManager {
                     let proxy = proxy.clone();
                     let shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
+                        let _stream_permit = stream_permit;
                         if let Err(err) = manager
-                            .handle_request(resolver, listen_port, remote_addr, proxy, shutdown)
+                            .handle_request(
+                                resolver,
+                                listen_port,
+                                remote_addr,
+                                proxy,
+                                shutdown,
+                                request_permit,
+                            )
                             .await
                         {
                             debug!(
@@ -287,6 +343,7 @@ impl Http3ProxyManager {
         remote_addr: SocketAddr,
         proxy: Arc<pingora_proxy::HttpProxy<EdgeProxy, crate::origin_h3::OriginH3Connector>>,
         shutdown_rx: watch::Receiver<bool>,
+        _request_permit: crate::memory_governor::StaticAdmissionPermit,
     ) -> Result<()>
     where
         C: h3::quic::Connection<Bytes> + Send + 'static,
@@ -328,15 +385,6 @@ impl Http3ProxyManager {
             stream.finish().await?;
             return Ok(());
         }
-        let Some(_request_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::Http3Request) else {
-            let response = http::Response::builder().status(503).body(())?;
-            stream.send_response(response).await?;
-            stream
-                .send_data(Bytes::from_static(b"HTTP/3 server busy"))
-                .await?;
-            stream.finish().await?;
-            return Ok(());
-        };
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port);
         let h3_session = H3DownstreamSession::new(request, stream, remote_addr, local_addr)?;
         let server_session = ServerSession::new_custom(Box::new(h3_session));
@@ -380,6 +428,28 @@ impl Http3ProxyManager {
         } else {
             Some(format!("{}:{}", host, listen_port))
         }
+    }
+
+    fn record_l4_event(
+        &self,
+        ip: IpAddr,
+        kind: L4DefenseKind,
+        detail: impl Into<String>,
+    ) -> crate::l4_defense::L4DefenseVerdict {
+        let node_id = self
+            .proxy_logic
+            .api_config
+            .node_id
+            .parse::<i64>()
+            .unwrap_or(0);
+        crate::l4_defense::record_l4_event(
+            &self.config_store,
+            &self.proxy_logic.waf_state,
+            node_id,
+            ip,
+            kind,
+            detail,
+        )
     }
 }
 

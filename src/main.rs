@@ -1692,7 +1692,12 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     );
 
     // UDP & TCP
-    let udp_manager = udp_proxy::UdpProxyManager::new((*config_store).clone());
+    let numeric_node_id = api_config_arc.node_id.parse::<i64>().unwrap_or(0);
+    let udp_manager = udp_proxy::UdpProxyManager::new(
+        (*config_store).clone(),
+        waf_state.clone(),
+        numeric_node_id,
+    );
     let quic_udp_demux = cloud_node_rust::quic_udp_demux::QuicUdpDemuxManager::new(
         (*config_store).clone(),
         http3_manager,
@@ -1706,7 +1711,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         (*config_store).clone(),
         cert_selector.clone(),
         waf_state.clone(),
-        api_config_arc.node_id.parse::<i64>().unwrap_or(0),
+        numeric_node_id,
     );
     spawn_staggered(&rt, Duration::from_secs(2), async move {
         tcp_manager.start_listeners().await;

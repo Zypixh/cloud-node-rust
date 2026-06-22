@@ -2,8 +2,11 @@ use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
 use crate::config_models::{ProxyProtocolConfig, SSLCertConfig};
 use crate::firewall::state::WafStateManager;
+use crate::l4_defense::L4DefenseKind;
 use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR};
-use crate::net_bind::{bind_tcp_listener_with_retry, dual_stack_bind_addrs};
+use crate::net_bind::{
+    bind_tcp_listener_with_retry, dual_stack_bind_addrs, is_transient_accept_error,
+};
 use crate::proxy_protocol;
 use crate::ssl::DynamicCertSelector;
 use base64::Engine;
@@ -262,16 +265,8 @@ impl TcpProxyManager {
         bind_addr: SocketAddr,
         server: Arc<ServerConfig>,
         is_tls: bool,
-        mut shutdown_rx: watch::Receiver<bool>,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let listener = bind_tcp_listener_with_retry(
-            bind_addr,
-            MEMORY_GOVERNOR.listener_backlog(),
-            &mut shutdown_rx,
-        )
-        .await?;
-        info!("TCP Proxy (TLS={}) listening on {}", is_tls, bind_addr);
-
         let shared_ssl_acceptor = if is_tls {
             let rustls_config = crate::ssl::build_rustls_server_config(
                 Arc::clone(&self._cert_selector),
@@ -286,15 +281,103 @@ impl TcpProxyManager {
             None
         };
 
+        let worker_count = MEMORY_GOVERNOR.tcp_accept_worker_count();
+        info!(
+            "TCP Proxy (TLS={}) starting {} accept worker(s) on {}",
+            is_tls, worker_count, bind_addr
+        );
+        for worker_id in 1..worker_count {
+            let manager = self.clone();
+            let server = server.clone();
+            let acceptor = shared_ssl_acceptor.clone();
+            let worker_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = manager
+                    .run_tcp_listener_worker(
+                        bind_addr,
+                        server,
+                        is_tls,
+                        acceptor,
+                        worker_id,
+                        worker_shutdown,
+                    )
+                    .await
+                {
+                    error!(
+                        "TCP accept worker {} on {} failed: {}",
+                        worker_id, bind_addr, err
+                    );
+                }
+            });
+        }
+
+        self.run_tcp_listener_worker(
+            bind_addr,
+            server,
+            is_tls,
+            shared_ssl_acceptor,
+            0,
+            shutdown_rx,
+        )
+        .await
+    }
+
+    async fn run_tcp_listener_worker(
+        self: Arc<Self>,
+        bind_addr: SocketAddr,
+        server: Arc<ServerConfig>,
+        is_tls: bool,
+        shared_ssl_acceptor: Option<Arc<pingora_core::listeners::tls::Acceptor>>,
+        worker_id: usize,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let listener = bind_tcp_listener_with_retry(
+            bind_addr,
+            MEMORY_GOVERNOR.listener_backlog(),
+            &mut shutdown_rx,
+        )
+        .await?;
+        info!(
+            "TCP Proxy accept worker {} (TLS={}) listening on {}",
+            worker_id, is_tls, bind_addr
+        );
+
         loop {
             let accept_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
-                    info!("TCP listener on {} shutting down", bind_addr);
+                    info!(
+                        "TCP accept worker {} on {} shutting down",
+                        worker_id, bind_addr
+                    );
                     return Ok(());
                 }
                 res = listener.accept() => res,
             };
-            let (client_stream, client_addr) = accept_result?;
+            let (client_stream, client_addr) = match accept_result {
+                Ok(result) => result,
+                Err(err) if is_transient_accept_error(&err) => {
+                    debug!(
+                        "Transient TCP accept error on {} worker {}: {}",
+                        bind_addr, worker_id, err
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(err) => {
+                    error!(
+                        "Fatal TCP accept error on {} worker {}: {}",
+                        bind_addr, worker_id, err
+                    );
+                    return Err(err.into());
+                }
+            };
+            if crate::l4_defense::is_l4_blocked(
+                &self.config_store,
+                &self.waf_state,
+                client_addr.ip(),
+            ) {
+                continue;
+            }
 
             // --- OPTIMIZATION: Downstream TCP ---
             let _ = client_stream.set_nodelay(true);
@@ -318,16 +401,38 @@ impl TcpProxyManager {
             let manager = self.clone();
             let server = server.clone();
             let acceptor_clone = shared_ssl_acceptor.clone();
+            let per_ip_limit = crate::l4_defense::current_tcp_active_limit_per_ip();
+            let Some(client_permit) =
+                crate::l4_defense::try_acquire_tcp_active_ip(client_addr.ip(), per_ip_limit)
+            else {
+                crate::l4_defense::record_l4_event(
+                    &self.config_store,
+                    &self.waf_state,
+                    self.node_id,
+                    client_addr.ip(),
+                    L4DefenseKind::TcpActiveLimit,
+                    format!(
+                        "bind={} peer={} limit={}",
+                        bind_addr, client_addr, per_ip_limit
+                    ),
+                );
+                continue;
+            };
             let Some(connection_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::TcpConnection)
             else {
-                warn!(
-                    "TCP connection admission limit reached on {}, dropping connection from {}",
-                    bind_addr, client_addr
+                crate::l4_defense::record_l4_event(
+                    &self.config_store,
+                    &self.waf_state,
+                    self.node_id,
+                    client_addr.ip(),
+                    L4DefenseKind::TcpAdmissionReject,
+                    format!("bind={} peer={}", bind_addr, client_addr),
                 );
                 continue;
             };
 
             tokio::spawn(async move {
+                let _client_permit = client_permit;
                 let _connection_permit = connection_permit;
                 if let Err(e) = manager
                     .handle_connection(client_stream, client_addr, server, is_tls, acceptor_clone)
@@ -356,15 +461,7 @@ impl TcpProxyManager {
             return Ok(());
         }
 
-        let main_cluster_scope = crate::special_defense::cluster_block_scope_id(
-            self.config_store.get_node_cluster_id_sync(),
-        );
-        if self.waf_state.is_blocked(client_addr.ip(), 0)
-            || (main_cluster_scope != 0
-                && self
-                    .waf_state
-                    .is_blocked(client_addr.ip(), main_cluster_scope))
-        {
+        if crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, client_addr.ip()) {
             return Ok(());
         }
 
@@ -380,15 +477,17 @@ impl TcpProxyManager {
         else {
             return Ok(());
         };
-        if main_cluster_scope != 0
-            && self
-                .waf_state
-                .is_blocked(client_addr.ip(), main_cluster_scope)
-        {
+        if crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, client_addr.ip()) {
             return Ok(());
         }
 
         if !is_tls {
+            if self
+                .close_slow_first_byte_under_pressure(&client_stream, client_addr)
+                .await
+            {
+                return Ok(());
+            }
             return self
                 .continue_handle_raw_tcp_connection(client_stream, client_addr, server)
                 .await;
@@ -398,7 +497,11 @@ impl TcpProxyManager {
         let Some(ssl_acceptor) = shared_ssl_acceptor else {
             return Err(anyhow::anyhow!("Missing SSL Acceptor for TLS connection"));
         };
-        let tls_handshake_timeout = self.tls_handshake_timeout();
+        let pressure_level = crate::l4_defense::current_pressure_level();
+        let tls_handshake_timeout = crate::l4_defense::clamp_tls_handshake_timeout(
+            self.tls_handshake_timeout(),
+            pressure_level,
+        );
         let res = match tokio::time::timeout(
             tls_handshake_timeout,
             pingora_core::protocols::tls::server::handshake(&ssl_acceptor, l4_stream),
@@ -407,7 +510,19 @@ impl TcpProxyManager {
         {
             Ok(res) => res,
             Err(_) => {
-                self.record_tls_handshake_failure(client_addr.ip());
+                crate::l4_defense::record_l4_event(
+                    &self.config_store,
+                    &self.waf_state,
+                    self.node_id,
+                    client_addr.ip(),
+                    L4DefenseKind::TlsSlowClientHello,
+                    format!(
+                        "peer={} timeout_ms={} pressure={}",
+                        client_addr,
+                        tls_handshake_timeout.as_millis(),
+                        pressure_level.as_str()
+                    ),
+                );
                 return Err(anyhow::anyhow!(
                     "TLS handshake timed out after {:?}",
                     tls_handshake_timeout
@@ -425,6 +540,47 @@ impl TcpProxyManager {
 
         self.continue_handle_connection(tls_stream, client_addr, server)
             .await
+    }
+
+    async fn close_slow_first_byte_under_pressure(
+        &self,
+        client_stream: &TcpStream,
+        client_addr: SocketAddr,
+    ) -> bool {
+        let pressure_level = crate::l4_defense::current_pressure_level();
+        if pressure_level == crate::l4_defense::L4PressureLevel::Normal {
+            return false;
+        }
+
+        let first_byte_timeout = crate::l4_defense::first_byte_timeout(pressure_level);
+        let mut first_byte = [0u8; 1];
+        match tokio::time::timeout(first_byte_timeout, client_stream.peek(&mut first_byte)).await {
+            Ok(Ok(0)) => true,
+            Ok(Ok(_)) => false,
+            Ok(Err(err)) => {
+                debug!(
+                    "TCP first-byte peek failed for {} after {:?}: {}",
+                    client_addr, first_byte_timeout, err
+                );
+                true
+            }
+            Err(_) => {
+                crate::l4_defense::record_l4_event(
+                    &self.config_store,
+                    &self.waf_state,
+                    self.node_id,
+                    client_addr.ip(),
+                    L4DefenseKind::TcpSlowFirstByte,
+                    format!(
+                        "peer={} timeout_ms={} pressure={}",
+                        client_addr,
+                        first_byte_timeout.as_millis(),
+                        pressure_level.as_str()
+                    ),
+                );
+                true
+            }
+        }
     }
 
     async fn tcp_forward_context(
@@ -788,6 +944,19 @@ impl TcpProxyManager {
                         outcome.close_reason
                     );
                 }
+                if outcome.close_reason == RelayCloseReason::PressureIdleTimeout {
+                    crate::l4_defense::record_l4_event(
+                        &self.config_store,
+                        &self.waf_state,
+                        self.node_id,
+                        client_addr.ip(),
+                        L4DefenseKind::TcpPressureIdleClose,
+                        format!(
+                            "server={} peer={} backend={}",
+                            context.sid, client_addr, context.backend_addr
+                        ),
+                    );
+                }
                 (outcome.bytes_received, outcome.bytes_sent)
             }
             Err(e) => {
@@ -823,6 +992,14 @@ impl TcpProxyManager {
             &self.waf_state,
             self.node_id,
             ip,
+        );
+        crate::l4_defense::record_l4_event(
+            &self.config_store,
+            &self.waf_state,
+            self.node_id,
+            ip,
+            L4DefenseKind::TlsHandshakeFail,
+            "tcp_tls_handshake_failure",
         );
     }
 }
@@ -880,6 +1057,7 @@ async fn release_toa_port(
 pub(crate) enum RelayCloseReason {
     Clean,
     BenignIo,
+    PressureIdleTimeout,
     DrainTimeoutAfterBenign,
 }
 
@@ -921,6 +1099,9 @@ impl RelayOutcome {
         let mut note = match self.close_reason {
             RelayCloseReason::Clean => return None,
             RelayCloseReason::BenignIo => String::from("benign relay close"),
+            RelayCloseReason::PressureIdleTimeout => {
+                String::from("relay idle timeout under pressure")
+            }
             RelayCloseReason::DrainTimeoutAfterBenign => {
                 String::from("relay drain timeout after benign close")
             }
@@ -1098,9 +1279,14 @@ async fn stream_tcp_bidirectional_with_metrics_options(
 ) -> Result<RelayOutcome, BidirectionalStreamError> {
     #[cfg(target_os = "linux")]
     {
-        if relay_zero_copy_enabled() {
+        if relay_zero_copy_enabled()
+            && let Some(zero_copy_permit) = MEMORY_GOVERNOR.try_admit_zero_copy_relay()
+        {
             match zero_copy::stream_bidirectional(server_id, &client, &backend, options).await {
-                zero_copy::ZeroCopyOutcome::Completed(result) => return result,
+                zero_copy::ZeroCopyOutcome::Completed(result) => {
+                    drop(zero_copy_permit);
+                    return result;
+                }
                 zero_copy::ZeroCopyOutcome::Fallback => {}
             }
         }
@@ -1200,6 +1386,12 @@ where
                     .with_drain_duration(drain_started.elapsed())),
                 }
             }
+            RelayCloseReason::PressureIdleTimeout => Ok(RelayOutcome::from_counters(
+                &bytes_received_counter,
+                &bytes_sent_counter,
+                RelayCloseReason::PressureIdleTimeout,
+            )
+            .with_close_detail(first_success.close_detail)),
             RelayCloseReason::DrainTimeoutAfterBenign => unreachable!(),
         },
         Err(error) => Err(BidirectionalStreamError::from_direction_error(
@@ -1227,10 +1419,20 @@ where
     let mut unflushed = 0u64;
 
     loop {
-        let n = match reader.read(&mut buf).await {
+        let n = match read_with_pressure_idle_timeout(&mut reader, &mut buf).await {
             Ok(n) => n,
             Err(err) => {
                 record_stream_metrics_delta(server_id, direction, unflushed);
+                if err.kind() == io::ErrorKind::TimedOut {
+                    return Ok(DirectionSuccess {
+                        close_reason: RelayCloseReason::PressureIdleTimeout,
+                        close_detail: Some(RelayIoDetail {
+                            direction,
+                            phase: RelayIoPhase::Read,
+                            raw_os_error: None,
+                        }),
+                    });
+                }
                 return direction_error_or_benign(direction, RelayIoPhase::Read, err);
             }
         };
@@ -1257,6 +1459,33 @@ where
         if unflushed >= STREAM_METRICS_FLUSH_BYTES {
             record_stream_metrics_delta(server_id, direction, unflushed);
             unflushed = 0;
+        }
+    }
+}
+
+async fn read_with_pressure_idle_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    let mut idle = std::time::Duration::ZERO;
+    loop {
+        let poll_interval = MEMORY_GOVERNOR
+            .tcp_relay_pressure_idle_timeout()
+            .map(|timeout| timeout.min(std::time::Duration::from_secs(1)))
+            .unwrap_or_else(|| std::time::Duration::from_secs(1));
+        match tokio::time::timeout(poll_interval, reader.read(buf)).await {
+            Ok(result) => return result,
+            Err(_) => {
+                idle += poll_interval;
+                if let Some(timeout) = MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout()
+                    && idle >= timeout
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("TCP relay idle under connection pressure for {:?}", timeout),
+                    ));
+                }
+            }
         }
     }
 }
@@ -1309,6 +1538,11 @@ fn combine_relay_close_reasons(
             | (_, RelayCloseReason::DrainTimeoutAfterBenign)
     ) {
         RelayCloseReason::DrainTimeoutAfterBenign
+    } else if matches!(
+        (first, second),
+        (RelayCloseReason::PressureIdleTimeout, _) | (_, RelayCloseReason::PressureIdleTimeout)
+    ) {
+        RelayCloseReason::PressureIdleTimeout
     } else if matches!(
         (first, second),
         (RelayCloseReason::BenignIo, _) | (_, RelayCloseReason::BenignIo)
@@ -1571,6 +1805,21 @@ mod zero_copy {
                         }
                     }
                 }
+                RelayCloseReason::PressureIdleTimeout => {
+                    control.stop();
+                    shutdown_fds.shutdown_all();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(POLL_TIMEOUT_MS as u64 + 500),
+                        remaining,
+                    )
+                    .await;
+                    Ok(RelayOutcome::from_counters(
+                        bytes_received_counter,
+                        bytes_sent_counter,
+                        RelayCloseReason::PressureIdleTimeout,
+                    )
+                    .with_close_detail(first_success.close_detail))
+                }
                 RelayCloseReason::DrainTimeoutAfterBenign => unreachable!(),
             },
             Err(error) => {
@@ -1600,6 +1849,7 @@ mod zero_copy {
     ) -> DirectionTaskResult {
         let mut total = 0u64;
         let mut unflushed = 0u64;
+        let mut idle = std::time::Duration::ZERO;
 
         loop {
             if control.should_stop() {
@@ -1611,10 +1861,21 @@ mod zero_copy {
             }
 
             let moved_to_pipe =
-                match splice_socket_to_pipe(fds.read.fd(), fds.pipe_write.fd(), control) {
+                match splice_socket_to_pipe(fds.read.fd(), fds.pipe_write.fd(), control, &mut idle)
+                {
                     Ok(n) => n,
                     Err(err) => {
                         record_stream_metrics_delta(server_id, direction, unflushed);
+                        if err.kind() == io::ErrorKind::TimedOut {
+                            return Ok(DirectionSuccess {
+                                close_reason: RelayCloseReason::PressureIdleTimeout,
+                                close_detail: Some(RelayIoDetail {
+                                    direction,
+                                    phase: RelayIoPhase::Read,
+                                    raw_os_error: None,
+                                }),
+                            });
+                        }
                         return direction_error_or_benign(direction, RelayIoPhase::Read, err);
                     }
                 };
@@ -1630,6 +1891,7 @@ mod zero_copy {
                     close_detail: None,
                 });
             }
+            idle = std::time::Duration::ZERO;
 
             let mut remaining = moved_to_pipe;
             while remaining > 0 {
@@ -1672,10 +1934,13 @@ mod zero_copy {
         read_fd: RawFd,
         pipe_write_fd: RawFd,
         control: &RelayControl,
+        idle: &mut std::time::Duration,
     ) -> io::Result<usize> {
         loop {
             match splice_once(read_fd, pipe_write_fd, SPLICE_CHUNK_BYTES) {
-                Err(err) if is_would_block(&err) => poll_fd(read_fd, libc::POLLIN, control)?,
+                Err(err) if is_would_block(&err) => {
+                    poll_fd(read_fd, libc::POLLIN, control, Some(idle))?
+                }
                 other => return other,
             }
         }
@@ -1689,7 +1954,9 @@ mod zero_copy {
     ) -> io::Result<usize> {
         loop {
             match splice_once(pipe_read_fd, write_fd, len) {
-                Err(err) if is_would_block(&err) => poll_fd(write_fd, libc::POLLOUT, control)?,
+                Err(err) if is_would_block(&err) => {
+                    poll_fd(write_fd, libc::POLLOUT, control, None)?
+                }
                 other => return other,
             }
         }
@@ -1718,21 +1985,43 @@ mod zero_copy {
         }
     }
 
-    fn poll_fd(fd: RawFd, events: libc::c_short, control: &RelayControl) -> io::Result<()> {
+    fn poll_fd(
+        fd: RawFd,
+        events: libc::c_short,
+        control: &RelayControl,
+        mut idle: Option<&mut std::time::Duration>,
+    ) -> io::Result<()> {
         loop {
             if control.should_stop() {
                 return Err(stop_error());
             }
+            let pressure_timeout = MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout();
+            let poll_timeout_ms = pressure_timeout
+                .map(|timeout| {
+                    timeout.min(std::time::Duration::from_secs(1)).as_millis() as libc::c_int
+                })
+                .unwrap_or(POLL_TIMEOUT_MS);
             let mut poll_fd = libc::pollfd {
                 fd,
                 events,
                 revents: 0,
             };
-            let result = unsafe { libc::poll(&mut poll_fd, 1, POLL_TIMEOUT_MS) };
+            let result = unsafe { libc::poll(&mut poll_fd, 1, poll_timeout_ms) };
             if result > 0 {
                 return Ok(());
             }
             if result == 0 {
+                if let Some(idle) = idle.as_deref_mut() {
+                    *idle += std::time::Duration::from_millis(poll_timeout_ms.max(1) as u64);
+                    if let Some(timeout) = MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout()
+                        && *idle >= timeout
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("zero-copy TCP relay idle under pressure for {:?}", timeout),
+                        ));
+                    }
+                }
                 continue;
             }
             let err = io::Error::last_os_error();
@@ -2084,14 +2373,18 @@ async fn maybe_consume_proxy_protocol_header(
             let mut discard = vec![0u8; addr.consumed];
             match stream.read_exact(&mut discard).await {
                 Ok(_) => {
-                    let effective_addr = match (addr.src_ip, addr.src_port) {
-                        (Some(ip), Some(port)) => SocketAddr::new(ip, port),
-                        _ => client_addr,
-                    };
-                    debug!(
-                        "TCP PROXY protocol: replaced {} with {}",
-                        client_addr, effective_addr
-                    );
+                    let effective_addr = proxy_protocol::effective_client_addr(client_addr, &addr);
+                    if effective_addr == client_addr && addr.src_ip.is_some() {
+                        debug!(
+                            "TCP PROXY protocol: consumed untrusted header from {}; keeping socket peer",
+                            client_addr
+                        );
+                    } else {
+                        debug!(
+                            "TCP PROXY protocol: replaced {} with {}",
+                            client_addr, effective_addr
+                        );
+                    }
                     Some((effective_addr, stream))
                 }
                 Err(e) => {

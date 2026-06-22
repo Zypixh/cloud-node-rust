@@ -8305,6 +8305,23 @@ impl ProxyHttp for EdgeProxy {
         _ctx: &mut Self::CTX,
     ) -> DownstreamParseErrorAction {
         let (reason, defense) = Self::classify_downstream_parse_error(error);
+        if matches!(error.etype(), ReadTimedout) {
+            let (ip, _, raw_addr) = Self::http_session_socket_client_ip(session);
+            let node_id = self.api_config.node_id.parse::<i64>().unwrap_or(0);
+            crate::l4_defense::record_l4_event(
+                &self.config,
+                &self.waf_state,
+                node_id,
+                ip,
+                crate::l4_defense::L4DefenseKind::HttpSlowHeader,
+                format!("peer={} reason={}", raw_addr, reason),
+            );
+            return DownstreamParseErrorAction {
+                respond_status: None,
+                log_level: DownstreamParseErrorLogLevel::Debug,
+                reason,
+            };
+        }
         if matches!(error.etype(), InvalidHTTPHeader) {
             let (ip, _, _) = Self::http_session_socket_client_ip(session);
             self.record_malformed_http_defense(defense, ip);

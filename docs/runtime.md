@@ -108,9 +108,26 @@ cloud-node upgrade --version v1.1.6 --github-base-url https://github.example.com
 
 请求热路径避免执行慢速磁盘 I/O、同步 DNS、全表扫描和大对象深拷贝。WebP 图片转换只在缓存写入前执行一次，后续同一 WebP 变体命中缓存时不再重复转换。L2 磁盘缓存命中会优先使用内存索引；小对象返回内存命中以保持 Fast L1 晋升，大对象按块从文件读取，压缩对象支持流式 zstd 解压，避免大文件一次性读入内存。HTML/CSS/JS 优化、加密等响应体转换有大小边界，超过阈值时直接透传。
 
-WAF CC 计数器使用固定窗口滚动桶，单次更新不再对同一 key 的历史时间戳列表做线性 retain。动态 WAF 状态表会受内存治理容量约束；容量满且清理后仍无法释放空间时，新的 per-IP rate limiter、滚动计数器和带宽计数器会 fail-open 并限频告警，避免把状态内存耗尽扩大成全站误拦截。UDP/QUIC 会话活动时间使用原子时间戳更新，TLS 证书快照和 OCSP 数据走无锁读路径，上游 TLS 连接器和客户端证书解析结果会复用，减少高并发握手路径的重复初始化。
+WAF CC 计数器使用固定窗口滚动桶，单次更新不再对同一 key 的历史时间戳列表做线性 retain。动态 WAF 状态表会受内存治理容量约束；容量满且清理后仍无法释放空间时，新的 per-IP rate limiter、滚动计数器和带宽计数器会 fail-open 并限频告警，避免把状态内存耗尽扩大成全站误拦截。L4 强防的高置信事件另有独立保留计数器，通用滚动计数器容量满时不会让 TCP/UDP/H3 admission reject、单 IP 活跃连接超限、QUIC pending/reassembly reject 等事件 fail-open。UDP/QUIC 会话活动时间使用原子时间戳更新，TLS 证书快照和 OCSP 数据走无锁读路径，上游 TLS 连接器和客户端证书解析结果会复用，减少高并发握手路径的重复初始化。
 
 项目提供 `targeted_hotspots_bench` 用于服务器侧观察 Fast L1、响应体 CPU 处理、TLS selector、UA analyzer cache 和 WAF verifier 等热点。常规开发验证使用 `cargo check --all-targets`，bench 建议只在目标服务器上运行。
+
+## L4 防御和进程日志
+
+进程日志定位为系统和组件健康日志，不承载单次访问结果。可预期的请求级和连接级结果，例如上游超时、拒连、reset、下游断开、错误页回写失败、请求解析失败、客户端 TLS/HTTP2 握手失败，默认不打印 `error`/`warn`，由访问日志的状态码、源站信息、`errors` 字段和指标承接。真正的监听器退出、bind/accept 连续致命失败、worker 异常停止、存储或配置不可恢复错误仍保留进程 `error`。
+
+L4 自动防御复用已有 `emptyConnectionFlood` 配置作为总开关。开启条件是集群全局防火墙策略里 `emptyConnectionFlood.isOn=true` 且 `maxEmptyConnections>0`；关闭时节点仍执行本地 admission、drop、timeout 和指标，但不会自动上报黑名单。
+
+防御覆盖所有外部入口：
+
+- HTTP/HTTPS：accept 前检查集群黑名单，使用共享 TCP-like per-IP active tracker，pressure 下缩短首包、TLS ClientHello 和 HTTP header deadline。
+- TCP/TCP-TLS/SNI passthrough：连接 admission、单 IP 活跃连接、慢首包、慢 ClientHello、压力态 idle close 都进入 L4 事件；源站连接失败和源站超时不作为攻击。
+- UDP passthrough：新 session flood、admission reject 和 session queue full 计入事件；正常 idle cleanup 不计攻击。
+- QUIC passthrough/HY2/HTTP/3：QUIC incomplete ClientHello、pending/reassembly budget reject、new route flood、H3 admission reject 计入事件；有效 QUIC ClientHello 命中 `@quic` passthrough server 时不要求 ALPN 是 H3，也不计 H3 reject。
+
+压力态分为 `Normal`、`Elevated`、`High`、`Critical`，由连接 admission、内存、FD-equivalent、UDP queued bytes、QUIC route/pending/reassembly 和前缀/集群 surge 综合计算。`memory_plan` 摘要会输出 `l4_pressure`、`prefix_pressure`、`tcp_like_per_ip_limit`、`fd_used_pct`、`zero_copy_active`、`udp_queued`、`l4_top_kind`、`l4_top_prefix`、`l4_counter_saturated` 等字段；节点状态上报包含 `resourceGovernor` 和 `l4Defense` JSON，便于压测期间观察防御收紧情况。
+
+PROXY Protocol 入站只信任 loopback、private 或 link-local immediate peer。公网客户端伪造 PROXY header 时，节点会消费该头保持协议兼容，但不会用头里的地址替换真实 socket IP，因此不会绕过 L4 计数、WAF、访问日志和黑名单上报。
 
 ## 配置热更新
 

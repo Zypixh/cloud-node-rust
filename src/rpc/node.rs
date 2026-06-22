@@ -1488,6 +1488,40 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             0.0
         };
         let cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
+        let governor_snapshot = crate::memory_governor::MEMORY_GOVERNOR
+            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
+        let l4_metrics = crate::l4_defense::metrics_snapshot();
+        let resource_governor = serde_json::json!({
+            "memoryPressure": governor_snapshot.memory_pressure_level.as_str(),
+            "fdUsed": governor_snapshot.fd_used,
+            "fdSoftLimit": governor_snapshot.fd_soft_limit,
+            "fdUsedPercent": governor_snapshot.fd_used_pct,
+            "fdPressure": governor_snapshot.fd_pressure_level.as_str(),
+            "connectionBudgetBytes": governor_snapshot.connection_budget_bytes,
+            "connectionAdmissionUsedBytes": governor_snapshot.connection_admission_used_bytes,
+            "zeroCopyRelayActive": governor_snapshot.zero_copy_relay_active,
+            "zeroCopyRelayLimit": governor_snapshot.zero_copy_relay_limit,
+            "zeroCopyRelayUsedBytes": governor_snapshot.zero_copy_relay_used_bytes,
+            "zeroCopyRelayBudgetBytes": governor_snapshot.zero_copy_relay_budget_bytes,
+            "udpQueuedBytes": governor_snapshot.udp_queued_bytes,
+            "udpQueuedBytesBudget": governor_snapshot.udp_queued_bytes_budget,
+            "httpAcceptWorkers": governor_snapshot.http_accept_workers,
+            "listenerBacklog": governor_snapshot.listener_backlog,
+        });
+        let l4_defense = serde_json::json!({
+            "eventsTotal": l4_metrics.events_total,
+            "blockedTotal": l4_metrics.blocked_total,
+            "alreadyBlockedTotal": l4_metrics.already_blocked_total,
+            "prefixEventTotal": l4_metrics.prefix_event_total,
+            "prefixBlockedTotal": l4_metrics.prefix_blocked_total,
+            "aggregateDropTotal": l4_metrics.aggregate_drop_total,
+            "exactCounterSaturatedTotal": l4_metrics.exact_counter_saturated_total,
+            "distinctIpsRecent": l4_metrics.distinct_ips_recent,
+            "prefixPressure": l4_metrics.prefix_pressure_level.as_str(),
+            "topEventKind": l4_metrics.top_event_kind,
+            "topPrefix": l4_metrics.top_prefix,
+            "topPrefixEvents": l4_metrics.top_prefix_events,
+        });
 
         let status = serde_json::json!({
             "buildVersion": env!("CARGO_PKG_VERSION"),
@@ -1517,6 +1551,8 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "apiAvgCostSeconds": api_avg_cost_seconds,
             "cacheTotalDiskSize": cache_stats.disk_bytes,
             "cacheTotalMemorySize": cache_stats.memory_bytes,
+            "resourceGovernor": resource_governor,
+            "l4Defense": l4_defense,
             "updatedAt": now,
             "timestamp": now,
             "isActive": true,

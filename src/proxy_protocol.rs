@@ -20,6 +20,38 @@ pub struct ProxyAddr {
     pub consumed: usize,
 }
 
+/// Trust inbound PROXY Protocol only from the same boundary used for
+/// forwarded-for style HTTP headers: loopback, private, or link-local peers.
+///
+/// A public client can forge a syntactically valid PROXY header, so callers may
+/// consume the header for compatibility but must not replace the real socket IP
+/// unless the immediate peer is trusted.
+pub fn trusted_inbound_source(peer_ip: &IpAddr) -> bool {
+    match peer_ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_private() || v4.is_loopback() || v4.is_link_local();
+            }
+            if v6.is_loopback() {
+                return true;
+            }
+            let octets = v6.octets();
+            (octets[0] & 0xfe) == 0xfc || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
+}
+
+pub fn effective_client_addr(peer_addr: SocketAddr, parsed: &ProxyAddr) -> SocketAddr {
+    if !trusted_inbound_source(&peer_addr.ip()) {
+        return peer_addr;
+    }
+    match (parsed.src_ip, parsed.src_port) {
+        (Some(ip), Some(port)) => SocketAddr::new(ip, port),
+        _ => peer_addr,
+    }
+}
+
 /// Errors produced by the parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProtocolError {
@@ -473,6 +505,29 @@ mod tests {
 
         assert_eq!(&header[..12], b"\r\n\r\n\x00\r\nQUIT\n");
         assert_eq!(parse_proxy_v1_v2(&header).unwrap().src_port, Some(12345));
+    }
+
+    #[test]
+    fn inbound_proxy_header_only_replaces_addr_from_trusted_peer() {
+        let hdr = b"PROXY TCP4 198.51.100.10 10.0.0.2 12345 443\r\n";
+        let parsed = parse_proxy_v1_v2(hdr).unwrap();
+        let peer: SocketAddr = "10.0.0.9:55000".parse().unwrap();
+
+        assert!(trusted_inbound_source(&peer.ip()));
+        assert_eq!(
+            effective_client_addr(peer, &parsed),
+            "198.51.100.10:12345".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn inbound_proxy_header_from_public_peer_keeps_socket_addr() {
+        let hdr = b"PROXY TCP4 10.0.0.10 10.0.0.2 12345 443\r\n";
+        let parsed = parse_proxy_v1_v2(hdr).unwrap();
+        let peer: SocketAddr = "198.51.100.9:55000".parse().unwrap();
+
+        assert!(!trusted_inbound_source(&peer.ip()));
+        assert_eq!(effective_client_addr(peer, &parsed), peer);
     }
 
     #[test]

@@ -15,21 +15,43 @@ pub struct MemoryPlanItem {
 
 pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
     let snapshot = MEMORY_GOVERNOR.snapshot(pingora_threads);
+    let l4_pressure = crate::l4_defense::current_pressure_level();
+    let l4_metrics = crate::l4_defense::metrics_snapshot();
     MemoryPlan {
         summary: format!(
-            "memory total={} used={} available={} pressure={} fd_soft_limit={} cpu_parallelism={} pingora_threads={} http_accept_workers={} udp_demux_workers={} conn_budget={} conn_admission_used={} admission_rejects_total={} keepalive_budget={} cache_budget={} bloom_budget={}",
+            "memory total={} used={} available={} pressure={} l4_pressure={} prefix_pressure={} tcp_like_per_ip_limit={} fd_used={} fd_soft_limit={} fd_used_pct={} fd_pressure={} cpu_parallelism={} pingora_threads={} http_accept_workers={} tcp_accept_workers={} udp_demux_workers={} conn_budget={} conn_admission_used={} zero_copy_active={} zero_copy_limit={} udp_queued={} udp_queue_budget={} admission_rejects_total={} l4_events={} l4_blocked={} l4_prefix_events={} l4_prefix_blocked={} l4_counter_saturated={} l4_top_kind={} l4_top_prefix={} l4_top_prefix_events={} l4_distinct_ips_recent={} keepalive_budget={} cache_budget={} bloom_budget={}",
             snapshot.memory_total_bytes,
             snapshot.memory_used_bytes,
             snapshot.memory_available_bytes,
             snapshot.memory_pressure_level.as_str(),
+            l4_pressure.as_str(),
+            l4_metrics.prefix_pressure_level.as_str(),
+            crate::l4_defense::current_tcp_active_limit_per_ip(),
+            snapshot.fd_used,
             snapshot.fd_soft_limit,
+            snapshot.fd_used_pct,
+            snapshot.fd_pressure_level.as_str(),
             snapshot.cpu_parallelism,
             snapshot.pingora_worker_threads,
             snapshot.http_accept_workers,
+            snapshot.tcp_accept_workers,
             snapshot.udp_demux_workers,
             snapshot.connection_budget_bytes,
             snapshot.connection_admission_used_bytes,
+            snapshot.zero_copy_relay_active,
+            snapshot.zero_copy_relay_limit,
+            snapshot.udp_queued_bytes,
+            snapshot.udp_queued_bytes_budget,
             snapshot.admission_rejects.total(),
+            l4_metrics.events_total,
+            l4_metrics.blocked_total,
+            l4_metrics.prefix_event_total,
+            l4_metrics.prefix_blocked_total,
+            l4_metrics.exact_counter_saturated_total,
+            l4_metrics.top_event_kind,
+            l4_metrics.top_prefix,
+            l4_metrics.top_prefix_events,
+            l4_metrics.distinct_ips_recent,
             snapshot.keepalive_budget_bytes,
             snapshot.cache_budget_bytes,
             snapshot.bloom_budget_bytes
@@ -60,7 +82,7 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "downstream_h3",
                 purpose: "QUIC connection establishment",
                 policy: format!(
-                    "conn_limit={} request_global_limit={} request_limit_per_conn={} datagram_queue={} datagram_queue_bytes={} pending_route_limit={} pending_reassembly_bytes={} conn_rejected={} request_rejected={}",
+                    "conn_limit={} request_global_limit={} request_limit_per_conn={} datagram_queue={} datagram_queue_bytes={} pending_route_limit={} pending_reassembly_bytes={} adaptive_new_route_per_ip={} adaptive_pending_timeout_ms={} fd_pressure={} conn_rejected={} request_rejected={}",
                     snapshot.h3_connection_limit,
                     snapshot.h3_request_global_limit,
                     snapshot.h3_request_limit_per_connection,
@@ -68,6 +90,9 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                     snapshot.h3_datagram_queue_budget_bytes,
                     snapshot.quic_pending_route_limit_per_port,
                     snapshot.quic_pending_reassembly_budget_bytes,
+                    crate::l4_defense::quic_new_route_limit(l4_pressure),
+                    crate::l4_defense::quic_pending_route_timeout(l4_pressure).as_millis(),
+                    snapshot.fd_pressure_level.as_str(),
                     snapshot.admission_rejects.h3_connection,
                     snapshot.admission_rejects.h3_request
                 ),
@@ -76,11 +101,19 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "downstream_udp",
                 purpose: "UDP and QUIC/hy2 pass-through session establishment",
                 policy: format!(
-                    "session_limit={} active={} route_limit_per_port={} queue_size={} socket_buffer={} fd_budget={} rejected={}",
+                    "session_limit={} active={} route_limit_per_port={} queue_size={} queued_bytes={} queued_budget={} queued_pct={} socket_buffer={} fd_budget={} rejected={}",
                     snapshot.udp_session_limit,
                     snapshot.estimated_udp_sessions,
                     snapshot.udp_route_limit_per_port,
                     snapshot.udp_session_queue_size,
+                    snapshot.udp_queued_bytes,
+                    snapshot.udp_queued_bytes_budget,
+                    if snapshot.udp_queued_bytes_budget > 0 {
+                        snapshot.udp_queued_bytes.saturating_mul(100)
+                            / snapshot.udp_queued_bytes_budget
+                    } else {
+                        0
+                    },
                     snapshot.udp_socket_buffer_size,
                     snapshot.udp_fd_budget,
                     snapshot.admission_rejects.udp_session
@@ -163,9 +196,10 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                 area: "runtime_scheduler",
                 purpose: "scale accept, UDP demux and Pingora workers from one CPU/memory/FD plan",
                 policy: format!(
-                    "pingora_threads={} http_accept_workers_per_port={} udp_demux_workers_per_port={} listener_backlog={}",
+                    "pingora_threads={} http_accept_workers_per_port={} tcp_accept_workers_per_port={} udp_demux_workers_per_port={} listener_backlog={}",
                     snapshot.pingora_worker_threads,
                     snapshot.http_accept_workers,
+                    snapshot.tcp_accept_workers,
                     snapshot.udp_demux_workers,
                     snapshot.listener_backlog
                 ),

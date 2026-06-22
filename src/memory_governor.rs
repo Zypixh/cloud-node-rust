@@ -1,5 +1,6 @@
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdmissionClass {
@@ -65,6 +66,9 @@ pub struct GovernorSnapshot {
     pub memory_available_bytes: u64,
     pub memory_pressure_level: MemoryPressureLevel,
     pub fd_soft_limit: u64,
+    pub fd_used: u64,
+    pub fd_used_pct: u64,
+    pub fd_pressure_level: MemoryPressureLevel,
     pub http_fd_budget: u64,
     pub tcp_fd_budget: u64,
     pub udp_fd_budget: u64,
@@ -73,6 +77,12 @@ pub struct GovernorSnapshot {
     pub cpu_parallelism: usize,
     pub connection_budget_bytes: u64,
     pub connection_admission_used_bytes: u64,
+    pub zero_copy_relay_active: u64,
+    pub zero_copy_relay_limit: usize,
+    pub zero_copy_relay_used_bytes: u64,
+    pub zero_copy_relay_budget_bytes: u64,
+    pub udp_queued_bytes: u64,
+    pub udp_queued_bytes_budget: u64,
     pub admission_rejects: AdmissionRejectSnapshot,
     pub keepalive_budget_bytes: u64,
     pub estimated_http_connections: u64,
@@ -115,6 +125,7 @@ pub struct GovernorSnapshot {
     pub listener_backlog: i32,
     pub pingora_worker_threads: usize,
     pub http_accept_workers: usize,
+    pub tcp_accept_workers: usize,
     pub udp_demux_workers: usize,
     pub access_log_queue_capacity: usize,
     pub access_log_batch_size: usize,
@@ -167,6 +178,9 @@ const TCP_CONN_ESTIMATED_BYTES: u64 = 24 * 1024;
 const H3_CONN_ESTIMATED_BYTES: u64 = 48 * 1024;
 const UDP_SESSION_ESTIMATED_BYTES: u64 = 96 * 1024;
 const UDP_DATAGRAM_ESTIMATED_BYTES: u64 = 2 * 1024;
+const ZERO_COPY_RELAY_ESTIMATED_BYTES: u64 = 768 * 1024;
+const ZERO_COPY_RELAY_FD_EQUIVALENT: u64 = 10;
+const ZERO_COPY_RELAY_BLOCKING_TASKS: u64 = 2;
 const H2_STREAM_ESTIMATED_BYTES: u64 = 16 * 1024;
 const H3_REQUEST_ESTIMATED_BYTES: u64 = 24 * 1024;
 const ORIGIN_CONNECT_ESTIMATED_BYTES: u64 = 32 * 1024;
@@ -222,6 +236,8 @@ const MAX_H3_CONNECTION_LIMIT: usize = 10_000_000;
 const MAX_UDP_SESSION_LIMIT: usize = 100_000_000;
 const MAX_UDP_ROUTE_LIMIT_PER_PORT: usize = 100_000_000;
 const MAX_UDP_SESSION_QUEUE_SIZE: usize = 2_048;
+const MIN_UDP_QUEUED_BYTES_BUDGET: u64 = 8 * 1024 * 1024;
+const MAX_UDP_QUEUED_BYTES_BUDGET: u64 = 512 * 1024 * 1024;
 const MAX_H3_DATAGRAM_QUEUE_SIZE: usize = 65_536;
 const MAX_QUIC_PENDING_ROUTE_LIMIT_PER_PORT: usize = 2_048;
 const MIN_QUIC_PENDING_ROUTE_LIMIT_PER_PORT: usize = 128;
@@ -247,11 +263,12 @@ const MAX_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_BLOOM_BUDGET_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_NEGATIVE_CACHE_ENTRIES: usize = 64_000_000;
 
-const MIN_LISTENER_BACKLOG: i32 = 32_768;
+const MIN_LISTENER_BACKLOG: i32 = 8_192;
 const MAX_LISTENER_BACKLOG: i32 = 65_535;
 const MIN_PINGORA_THREADS: usize = 1;
 const MAX_PINGORA_THREADS: usize = 256;
 const MAX_HTTP_ACCEPT_WORKERS_PER_PORT: usize = 64;
+const MAX_TCP_ACCEPT_WORKERS_PER_PORT: usize = 64;
 const MAX_UDP_DEMUX_WORKERS_PER_PORT: usize = 128;
 const MIN_PINGORA_KEEPALIVE_POOL_PER_THREAD: usize = 256;
 const MAX_PINGORA_KEEPALIVE_POOL_PER_THREAD: usize = 65_535;
@@ -272,7 +289,7 @@ const MAX_FIREWALL_IP_BW_COUNTERS: usize = 16_000_000;
 const MIN_FIREWALL_CANDIDATE_STATS: usize = 4_096;
 const MAX_FIREWALL_CANDIDATE_STATS: usize = 2_000_000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MemoryPressureLevel {
     Normal,
     Elevated,
@@ -291,6 +308,12 @@ impl MemoryPressureLevel {
     }
 }
 
+impl Default for MemoryPressureLevel {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
 pub struct MemoryGovernor {
     http_connections: AtomicU64,
     tcp_connections: AtomicU64,
@@ -300,6 +323,9 @@ pub struct MemoryGovernor {
     h3_requests: AtomicU64,
     origin_connects: AtomicU64,
     shared_connection_bytes: AtomicU64,
+    zero_copy_relays: AtomicU64,
+    zero_copy_relay_bytes: AtomicU64,
+    udp_queued_bytes: AtomicU64,
     background_work: AtomicU64,
     request_body_waf: AtomicU64,
     response_body_waf: AtomicU64,
@@ -324,6 +350,28 @@ pub struct AdmissionPermit<'a> {
 
 pub type StaticAdmissionPermit = AdmissionPermit<'static>;
 
+pub struct ZeroCopyRelayPermit<'a> {
+    governor: &'a MemoryGovernor,
+    charge_bytes: u64,
+}
+
+pub type StaticZeroCopyRelayPermit = ZeroCopyRelayPermit<'static>;
+
+pub struct UdpQueueBytePermit<'a> {
+    governor: &'a MemoryGovernor,
+    bytes: u64,
+}
+
+pub type StaticUdpQueueBytePermit = UdpQueueBytePermit<'static>;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FdEquivalentSnapshot {
+    pub soft_limit: u64,
+    pub used: u64,
+    pub used_pct: u64,
+    pub pressure_level: MemoryPressureLevel,
+}
+
 impl MemoryGovernor {
     pub fn new() -> Self {
         Self {
@@ -335,6 +383,9 @@ impl MemoryGovernor {
             h3_requests: AtomicU64::new(0),
             origin_connects: AtomicU64::new(0),
             shared_connection_bytes: AtomicU64::new(0),
+            zero_copy_relays: AtomicU64::new(0),
+            zero_copy_relay_bytes: AtomicU64::new(0),
+            udp_queued_bytes: AtomicU64::new(0),
             background_work: AtomicU64::new(0),
             request_body_waf: AtomicU64::new(0),
             response_body_waf: AtomicU64::new(0),
@@ -367,6 +418,64 @@ impl MemoryGovernor {
             return None;
         }
         self.try_admit_with_charges(AdmissionClass::CacheReadMemory, bytes)
+    }
+
+    pub fn try_admit_zero_copy_relay(&self) -> Option<ZeroCopyRelayPermit<'_>> {
+        if self.is_connection_admission_pressure_high()
+            || self.fd_equivalent_snapshot().pressure_level >= MemoryPressureLevel::High
+        {
+            return None;
+        }
+
+        let limit = self.zero_copy_relay_limit() as u64;
+        let current = self.zero_copy_relays.fetch_add(1, Ordering::AcqRel) + 1;
+        if current > limit {
+            self.zero_copy_relays.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+
+        let budget = self.zero_copy_relay_budget_bytes().max(1);
+        let used = self
+            .zero_copy_relay_bytes
+            .fetch_add(ZERO_COPY_RELAY_ESTIMATED_BYTES, Ordering::AcqRel)
+            .saturating_add(ZERO_COPY_RELAY_ESTIMATED_BYTES);
+        if used > budget {
+            self.zero_copy_relay_bytes
+                .fetch_sub(ZERO_COPY_RELAY_ESTIMATED_BYTES, Ordering::AcqRel);
+            self.zero_copy_relays.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+
+        Some(ZeroCopyRelayPermit {
+            governor: self,
+            charge_bytes: ZERO_COPY_RELAY_ESTIMATED_BYTES,
+        })
+    }
+
+    pub fn try_reserve_udp_queue_bytes(&self, bytes: usize) -> Option<UdpQueueBytePermit<'_>> {
+        let bytes = bytes.max(1) as u64;
+        let budget = self.udp_queued_bytes_budget().max(1);
+        let mut current = self.udp_queued_bytes.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_add(bytes);
+            if next > budget {
+                return None;
+            }
+            match self.udp_queued_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(UdpQueueBytePermit {
+                        governor: self,
+                        bytes,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     fn try_admit_with_charges(
@@ -561,7 +670,17 @@ impl MemoryGovernor {
             MAX_LISTENER_BACKLOG as usize,
         )
         .max((estimated_live_conns / 32) as usize);
-        clamp_i32(target, MIN_LISTENER_BACKLOG, MAX_LISTENER_BACKLOG)
+        let pressure_cap = match self
+            .fd_equivalent_snapshot()
+            .pressure_level
+            .max(memory_pressure_level(&snapshot))
+        {
+            MemoryPressureLevel::Normal => MAX_LISTENER_BACKLOG,
+            MemoryPressureLevel::Elevated => 32_768,
+            MemoryPressureLevel::High => 16_384,
+            MemoryPressureLevel::Critical => 8_192,
+        };
+        clamp_i32(target, MIN_LISTENER_BACKLOG, pressure_cap)
     }
 
     pub fn h2_stream_limit_per_connection(&self) -> usize {
@@ -599,11 +718,35 @@ impl MemoryGovernor {
         );
         let cpu_target = snapshot.cpu_parallelism.max(1).saturating_mul(64);
         let target = memory_target.max(cpu_target);
-        if memory_pressure_high(&snapshot) {
-            target.clamp(MIN_UDP_SESSION_QUEUE_SIZE, 256)
+        let active_sessions = self.udp_sessions.load(Ordering::Relaxed).max(1);
+        let active_adjusted = if active_sessions >= 65_536 {
+            target.min(64)
+        } else if active_sessions >= 16_384 {
+            target.min(128)
+        } else if active_sessions >= 4_096 {
+            target.min(512)
         } else {
-            target.clamp(MIN_UDP_SESSION_QUEUE_SIZE, MAX_UDP_SESSION_QUEUE_SIZE)
+            target
+        };
+        if memory_pressure_high(&snapshot) || self.udp_queue_utilization_pct() >= 80 {
+            active_adjusted.clamp(MIN_UDP_SESSION_QUEUE_SIZE, 256)
+        } else {
+            active_adjusted.clamp(MIN_UDP_SESSION_QUEUE_SIZE, MAX_UDP_SESSION_QUEUE_SIZE)
         }
+    }
+
+    pub fn udp_queued_bytes(&self) -> u64 {
+        self.udp_queued_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn udp_queued_bytes_budget(&self) -> u64 {
+        udp_queued_bytes_budget(&self.memory_snapshot())
+    }
+
+    pub fn udp_queue_utilization_pct(&self) -> u64 {
+        self.udp_queued_bytes()
+            .saturating_mul(100)
+            .saturating_div(self.udp_queued_bytes_budget().max(1))
     }
 
     pub fn h3_datagram_queue_size(&self) -> usize {
@@ -667,8 +810,169 @@ impl MemoryGovernor {
         http_accept_worker_count(&self.memory_snapshot())
     }
 
+    pub fn tcp_accept_worker_count(&self) -> usize {
+        tcp_accept_worker_count(&self.memory_snapshot())
+    }
+
     pub fn udp_demux_worker_count(&self) -> usize {
         udp_demux_worker_count(&self.memory_snapshot())
+    }
+
+    pub fn connection_admission_used_bytes(&self) -> u64 {
+        self.shared_connection_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn connection_admission_budget_bytes(&self) -> u64 {
+        shared_connection_admission_budget(&self.memory_snapshot())
+    }
+
+    pub fn connection_admission_utilization_pct(&self) -> u64 {
+        let budget = self.connection_admission_budget_bytes().max(1);
+        self.connection_admission_used_bytes()
+            .saturating_mul(100)
+            .saturating_div(budget)
+    }
+
+    pub fn fd_equivalent_snapshot(&self) -> FdEquivalentSnapshot {
+        let snapshot = self.memory_snapshot();
+        let live_fd_count = read_current_fd_count().unwrap_or(0);
+        let estimated_extra = self.origin_connects.load(Ordering::Relaxed).saturating_add(
+            self.zero_copy_relays
+                .load(Ordering::Relaxed)
+                .saturating_mul(ZERO_COPY_RELAY_FD_EQUIVALENT),
+        );
+        let used = live_fd_count.saturating_add(estimated_extra);
+        let soft_limit = snapshot.fd_soft_limit.max(1);
+        let used_pct = used.saturating_mul(100).saturating_div(soft_limit);
+        FdEquivalentSnapshot {
+            soft_limit,
+            used,
+            used_pct,
+            pressure_level: pressure_level_from_pct(used_pct),
+        }
+    }
+
+    pub fn is_connection_admission_pressure_high(&self) -> bool {
+        let snapshot = self.memory_snapshot();
+        memory_pressure_high(&snapshot)
+            || self.fd_equivalent_snapshot().pressure_level >= MemoryPressureLevel::High
+            || self.connection_admission_used_bytes().saturating_mul(100)
+                >= shared_connection_admission_budget(&snapshot)
+                    .max(1)
+                    .saturating_mul(80)
+    }
+
+    pub fn tcp_relay_pressure_idle_timeout(&self) -> Option<Duration> {
+        let snapshot = self.memory_snapshot();
+        let budget = shared_connection_admission_budget(&snapshot).max(1);
+        let used_pct = self
+            .connection_admission_used_bytes()
+            .saturating_mul(100)
+            .saturating_div(budget);
+        let fd_level = self.fd_equivalent_snapshot().pressure_level;
+        match memory_pressure_level(&snapshot).max(fd_level) {
+            MemoryPressureLevel::Critical => Some(Duration::from_secs(2)),
+            MemoryPressureLevel::High => Some(Duration::from_secs(5)),
+            MemoryPressureLevel::Elevated => Some(Duration::from_secs(15)),
+            MemoryPressureLevel::Normal if used_pct >= 90 => Some(Duration::from_secs(15)),
+            MemoryPressureLevel::Normal if used_pct >= 80 => Some(Duration::from_secs(30)),
+            _ => None,
+        }
+    }
+
+    pub fn zero_copy_relay_limit(&self) -> usize {
+        let snapshot = self.memory_snapshot();
+        let memory_target = connection_limit(
+            zero_copy_relay_budget_bytes(&snapshot),
+            ZERO_COPY_RELAY_ESTIMATED_BYTES,
+            1,
+            MAX_TCP_CONNECTION_LIMIT,
+        );
+        let fd_target = fd_budget(&snapshot, TCP_FD_BUDGET_PCT)
+            .saturating_div(ZERO_COPY_RELAY_FD_EQUIVALENT.max(1))
+            .max(1) as usize;
+        let blocking_target = snapshot
+            .cpu_parallelism
+            .max(1)
+            .saturating_mul(128)
+            .saturating_div(ZERO_COPY_RELAY_BLOCKING_TASKS as usize)
+            .max(1);
+        memory_target.min(fd_target).min(blocking_target).max(1)
+    }
+
+    pub fn zero_copy_relay_active(&self) -> u64 {
+        self.zero_copy_relays.load(Ordering::Relaxed)
+    }
+
+    pub fn zero_copy_relay_used_bytes(&self) -> u64 {
+        self.zero_copy_relay_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn zero_copy_relay_budget_bytes(&self) -> u64 {
+        zero_copy_relay_budget_bytes(&self.memory_snapshot())
+    }
+
+    pub fn tcp_active_limit_per_ip(&self) -> usize {
+        let total_limit = self.limit_for(AdmissionClass::TcpConnection).max(1);
+        match self.tcp_like_pressure_level() {
+            MemoryPressureLevel::Normal => (total_limit / 16).clamp(8_192, 65_536),
+            MemoryPressureLevel::Elevated => (total_limit / 128).clamp(1_024, 8_192),
+            MemoryPressureLevel::High => (total_limit / 1_024).clamp(128, 2_048),
+            MemoryPressureLevel::Critical => (total_limit / 4_096).clamp(16, 512),
+        }
+    }
+
+    fn tcp_like_pressure_level(&self) -> MemoryPressureLevel {
+        let snapshot = self.memory_snapshot();
+        let connection_pct = self
+            .connection_admission_used_bytes()
+            .saturating_mul(100)
+            .saturating_div(shared_connection_admission_budget(&snapshot).max(1));
+        let connection_level = if connection_pct >= 95 {
+            MemoryPressureLevel::Critical
+        } else if connection_pct >= 85 {
+            MemoryPressureLevel::High
+        } else if connection_pct >= 70 {
+            MemoryPressureLevel::Elevated
+        } else {
+            MemoryPressureLevel::Normal
+        };
+        memory_pressure_level(&snapshot).max(connection_level)
+    }
+
+    pub fn admission_status_line(&self) -> String {
+        let snapshot = self.snapshot(self.pingora_worker_threads());
+        format!(
+            "conn_used={} conn_budget={} conn_used_pct={} pressure={} l4_pressure={} fd_used={} fd_soft_limit={} fd_used_pct={} fd_pressure={} zero_copy_active={} zero_copy_limit={} udp_queued={} udp_queue_budget={} udp_queue_pct={} http_active={} tcp_active={} h3_active={} udp_active={} http_limit={} tcp_limit={} h3_limit={} udp_limit={} tcp_per_ip_limit={} rejects={{http:{},tcp:{},h3:{},udp:{},origin:{}}}",
+            snapshot.connection_admission_used_bytes,
+            snapshot.connection_budget_bytes,
+            self.connection_admission_utilization_pct(),
+            snapshot.memory_pressure_level.as_str(),
+            self.tcp_like_pressure_level().as_str(),
+            snapshot.fd_used,
+            snapshot.fd_soft_limit,
+            snapshot.fd_used_pct,
+            snapshot.fd_pressure_level.as_str(),
+            snapshot.zero_copy_relay_active,
+            snapshot.zero_copy_relay_limit,
+            snapshot.udp_queued_bytes,
+            snapshot.udp_queued_bytes_budget,
+            self.udp_queue_utilization_pct(),
+            snapshot.estimated_http_connections,
+            snapshot.estimated_tcp_connections,
+            snapshot.estimated_h3_connections,
+            snapshot.estimated_udp_sessions,
+            snapshot.http_connection_limit,
+            snapshot.tcp_connection_limit,
+            snapshot.h3_connection_limit,
+            snapshot.udp_session_limit,
+            self.tcp_active_limit_per_ip(),
+            snapshot.admission_rejects.http_connection,
+            snapshot.admission_rejects.tcp_connection,
+            snapshot.admission_rejects.h3_connection,
+            snapshot.admission_rejects.udp_session,
+            snapshot.admission_rejects.origin_connect,
+        )
     }
 
     pub fn access_log_queue_capacity(&self) -> usize {
@@ -705,12 +1009,16 @@ impl MemoryGovernor {
 
     pub fn snapshot(&self, pingora_threads: usize) -> GovernorSnapshot {
         let mem = self.memory_snapshot();
+        let fd_snapshot = self.fd_equivalent_snapshot();
         GovernorSnapshot {
             memory_total_bytes: mem.total_bytes,
             memory_used_bytes: mem.used_bytes,
             memory_available_bytes: mem.available_bytes,
             memory_pressure_level: memory_pressure_level(&mem),
             fd_soft_limit: mem.fd_soft_limit,
+            fd_used: fd_snapshot.used,
+            fd_used_pct: fd_snapshot.used_pct,
+            fd_pressure_level: fd_snapshot.pressure_level,
             http_fd_budget: fd_budget(&mem, HTTP_FD_BUDGET_PCT),
             tcp_fd_budget: fd_budget(&mem, TCP_FD_BUDGET_PCT),
             udp_fd_budget: fd_budget(&mem, UDP_FD_BUDGET_PCT),
@@ -719,6 +1027,12 @@ impl MemoryGovernor {
             cpu_parallelism: mem.cpu_parallelism,
             connection_budget_bytes: mem.connection_budget_bytes,
             connection_admission_used_bytes: self.shared_connection_bytes.load(Ordering::Relaxed),
+            zero_copy_relay_active: self.zero_copy_relay_active(),
+            zero_copy_relay_limit: self.zero_copy_relay_limit(),
+            zero_copy_relay_used_bytes: self.zero_copy_relay_used_bytes(),
+            zero_copy_relay_budget_bytes: self.zero_copy_relay_budget_bytes(),
+            udp_queued_bytes: self.udp_queued_bytes(),
+            udp_queued_bytes_budget: self.udp_queued_bytes_budget(),
             admission_rejects: self.admission_reject_snapshot(),
             keepalive_budget_bytes: mem.keepalive_budget_bytes,
             estimated_http_connections: self.http_connections.load(Ordering::Relaxed),
@@ -764,6 +1078,7 @@ impl MemoryGovernor {
             listener_backlog: self.listener_backlog(),
             pingora_worker_threads: pingora_worker_threads(&mem),
             http_accept_workers: http_accept_worker_count(&mem),
+            tcp_accept_workers: tcp_accept_worker_count(&mem),
             udp_demux_workers: udp_demux_worker_count(&mem),
             access_log_queue_capacity: access_log_queue_capacity(&mem),
             access_log_batch_size: access_log_batch_size(&mem),
@@ -942,6 +1257,25 @@ impl Drop for AdmissionPermit<'_> {
                 .cache_read_memory_bytes
                 .fetch_sub(self.cache_read_memory_charge_bytes, Ordering::AcqRel);
         }
+    }
+}
+
+impl Drop for ZeroCopyRelayPermit<'_> {
+    fn drop(&mut self) {
+        self.governor
+            .zero_copy_relays
+            .fetch_sub(1, Ordering::AcqRel);
+        self.governor
+            .zero_copy_relay_bytes
+            .fetch_sub(self.charge_bytes, Ordering::AcqRel);
+    }
+}
+
+impl Drop for UdpQueueBytePermit<'_> {
+    fn drop(&mut self) {
+        self.governor
+            .udp_queued_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -1234,9 +1568,9 @@ fn pingora_worker_threads(snapshot: &BudgetedMemorySnapshot) -> usize {
 fn http_accept_worker_count(snapshot: &BudgetedMemorySnapshot) -> usize {
     let cpu = snapshot.cpu_parallelism.max(1);
     let base = if cpu <= 4 {
-        1
+        2
     } else if cpu <= 16 {
-        cpu / 4
+        (cpu / 3).max(2)
     } else {
         cpu / 3
     };
@@ -1250,6 +1584,29 @@ fn http_accept_worker_count(snapshot: &BudgetedMemorySnapshot) -> usize {
         MAX_HTTP_ACCEPT_WORKERS_PER_PORT / 4
     } else {
         MAX_HTTP_ACCEPT_WORKERS_PER_PORT
+    };
+    base.max(2).min(memory_target).clamp(2, pressure_cap.max(2))
+}
+
+fn tcp_accept_worker_count(snapshot: &BudgetedMemorySnapshot) -> usize {
+    let cpu = snapshot.cpu_parallelism.max(1);
+    let base = if cpu <= 2 {
+        1
+    } else if cpu <= 8 {
+        cpu / 2
+    } else {
+        cpu.saturating_mul(3) / 4
+    };
+    let memory_target = connection_limit(
+        snapshot.connection_budget_bytes / 512,
+        TCP_CONN_ESTIMATED_BYTES,
+        1,
+        MAX_TCP_ACCEPT_WORKERS_PER_PORT,
+    );
+    let pressure_cap = if memory_pressure_high(snapshot) {
+        MAX_TCP_ACCEPT_WORKERS_PER_PORT / 4
+    } else {
+        MAX_TCP_ACCEPT_WORKERS_PER_PORT
     };
     base.max(1).min(memory_target).clamp(1, pressure_cap.max(1))
 }
@@ -1371,6 +1728,31 @@ fn h3_datagram_queue_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> usize {
         .min(usize::MAX as u64) as usize
 }
 
+fn udp_queued_bytes_budget(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    let target = if memory_pressure_high(snapshot) {
+        snapshot.available_bytes / 32
+    } else {
+        snapshot.connection_budget_bytes / 32
+    };
+    target
+        .clamp(MIN_UDP_QUEUED_BYTES_BUDGET, MAX_UDP_QUEUED_BYTES_BUDGET)
+        .min(snapshot.available_bytes.max(1))
+}
+
+fn zero_copy_relay_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    let target = if memory_pressure_high(snapshot) {
+        snapshot.connection_budget_bytes / 64
+    } else {
+        snapshot.connection_budget_bytes / 16
+    };
+    target.clamp(
+        ZERO_COPY_RELAY_ESTIMATED_BYTES,
+        snapshot
+            .connection_budget_bytes
+            .max(ZERO_COPY_RELAY_ESTIMATED_BYTES),
+    )
+}
+
 fn quic_pending_route_limit_per_port(
     snapshot: &BudgetedMemorySnapshot,
     udp_route_limit_per_port: usize,
@@ -1454,6 +1836,18 @@ fn memory_pressure_level(snapshot: &BudgetedMemorySnapshot) -> MemoryPressureLev
     } else if snapshot.available_bytes < snapshot.total_bytes / 10 {
         MemoryPressureLevel::High
     } else if snapshot.available_bytes < snapshot.total_bytes / 5 {
+        MemoryPressureLevel::Elevated
+    } else {
+        MemoryPressureLevel::Normal
+    }
+}
+
+pub fn pressure_level_from_pct(pct: u64) -> MemoryPressureLevel {
+    if pct >= 95 {
+        MemoryPressureLevel::Critical
+    } else if pct >= 85 {
+        MemoryPressureLevel::High
+    } else if pct >= 70 {
         MemoryPressureLevel::Elevated
     } else {
         MemoryPressureLevel::Normal
@@ -1647,6 +2041,33 @@ fn read_fd_soft_limit() -> u64 {
     1_048_576
 }
 
+#[cfg(target_os = "linux")]
+fn read_current_fd_count() -> Option<u64> {
+    std::fs::read_dir("/proc/self/fd")
+        .ok()
+        .map(|entries| entries.count() as u64)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn read_current_fd_count() -> Option<u64> {
+    let pid = std::process::id();
+    let path = format!("/dev/fd");
+    std::fs::read_dir(path)
+        .ok()
+        .map(|entries| entries.count() as u64)
+        .or_else(|| {
+            let path = format!("/proc/{}/fd", pid);
+            std::fs::read_dir(path)
+                .ok()
+                .map(|entries| entries.count() as u64)
+        })
+}
+
+#[cfg(not(unix))]
+fn read_current_fd_count() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1786,6 +2207,53 @@ mod tests {
             governor.cache_read_memory_bytes.load(Ordering::Acquire),
             baseline
         );
+    }
+
+    #[test]
+    fn zero_copy_relay_admission_tracks_bytes_and_releases() {
+        let governor = MemoryGovernor::new();
+        let total = 64 * 1024 * 1024 * 1024;
+        let available = 48 * 1024 * 1024 * 1024;
+        governor.cached_total_bytes.store(total, Ordering::Release);
+        governor
+            .cached_used_bytes
+            .store(total - available, Ordering::Release);
+        governor
+            .cached_available_bytes
+            .store(available, Ordering::Release);
+        governor.cached_at_millis.store(
+            crate::utils::time::system_timestamp_millis() as u64,
+            Ordering::Release,
+        );
+        let permit = governor
+            .try_admit_zero_copy_relay()
+            .expect("zero-copy relay should fit in a fresh governor");
+        assert_eq!(governor.zero_copy_relay_active(), 1);
+        assert_eq!(
+            governor.zero_copy_relay_used_bytes(),
+            ZERO_COPY_RELAY_ESTIMATED_BYTES
+        );
+        drop(permit);
+        assert_eq!(governor.zero_copy_relay_active(), 0);
+        assert_eq!(governor.zero_copy_relay_used_bytes(), 0);
+    }
+
+    #[test]
+    fn udp_queue_byte_permit_tracks_budget_and_releases() {
+        let governor = MemoryGovernor::new();
+        let permit = governor
+            .try_reserve_udp_queue_bytes(4096)
+            .expect("UDP queue byte reservation should fit");
+        assert_eq!(governor.udp_queued_bytes(), 4096);
+        drop(permit);
+        assert_eq!(governor.udp_queued_bytes(), 0);
+
+        let budget = governor.udp_queued_bytes_budget();
+        governor
+            .udp_queued_bytes
+            .store(budget.saturating_sub(10), Ordering::Release);
+        assert!(governor.try_reserve_udp_queue_bytes(11).is_none());
+        assert_eq!(governor.udp_queued_bytes(), budget.saturating_sub(10));
     }
 
     #[test]
@@ -1970,7 +2438,7 @@ mod tests {
 
         assert_eq!(pingora_worker_threads(&small), 2);
         assert!(pingora_worker_threads(&large) > 32);
-        assert_eq!(http_accept_worker_count(&small), 1);
+        assert_eq!(http_accept_worker_count(&small), 2);
         assert!(http_accept_worker_count(&large) > http_accept_worker_count(&small));
         assert_eq!(udp_demux_worker_count(&small), 1);
         assert!(udp_demux_worker_count(&large) > http_accept_worker_count(&large));

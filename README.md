@@ -10,6 +10,7 @@ CloudNode Rust 是一个基于 [Pingora](https://github.com/cloudflare/pingora) 
 - **共享端口接入**：支持共享 `443` 端口下的 TLS、HTTP/2、HTTP/3、`@sni_passthrough` 和 `@quic` 流量分流。
 - **混合缓存系统**：Memory + Disk 缓存，RocksDB 元数据索引，多缓存策略匹配，支持大文件和高并发切片分发。
 - **站点安全能力**：WAF、UAM、CC、防盗链、访问限制、请求限制、带宽和流量限制、自定义拦截页面。
+- **L4 自适应强防**：复用 `emptyConnectionFlood` 开关覆盖 HTTP/HTTPS/TCP/SNI/UDP/QUIC/H3 的慢连接、队列和 admission 攻击防御，支持集群级 IP 上报拉黑。
 - **内容处理能力**：WebP 转换、HTML/CSS/JS 优化、HLS 播放列表和分片处理、自定义错误页和模板变量。
 - **动态运行时**：配置热更新、动态证书、OCSP 同步、源站健康检查、多级回源和父节点压力感知。
 - **日志与统计**：访问日志、节点日志、L7/L4 指标、日统计、域名统计、Top IP、缓存命中和攻击统计。
@@ -96,7 +97,7 @@ RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat" cargo build --rele
 
 - Linux。
 - 推荐内核 `5.x+`。
-- 大规模并发场景建议提高 `LimitNOFILE`、`somaxconn`、`tcp_max_syn_backlog`、本地端口范围和 conntrack 容量。
+- 大规模并发场景建议提高 `LimitNOFILE`、`somaxconn`、`tcp_max_syn_backlog`、本地端口范围和 conntrack 容量；SYN flood 和 pre-accept 半连接耗尽仍需要内核、nftables/ipset、云防火墙或上游清洗配合。
 - 启用 GeoIP、缓存和证书能力时，需要确保数据文件、缓存目录和运行目录权限正确。
 
 ## 项目状态

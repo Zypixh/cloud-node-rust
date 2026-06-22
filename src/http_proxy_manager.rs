@@ -1,7 +1,10 @@
 use crate::config::ConfigStore;
 use crate::config_models::{ProxyProtocolConfig, ServerConfig};
+use crate::l4_defense::L4DefenseKind;
 use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR};
-use crate::net_bind::{bind_tcp_listener_with_retry, dual_stack_bind_addrs};
+use crate::net_bind::{
+    bind_tcp_listener_with_retry, dual_stack_bind_addrs, is_transient_accept_error,
+};
 use crate::proxy::EdgeProxy;
 use crate::proxy_protocol;
 use crate::ssl::DynamicCertSelector;
@@ -30,29 +33,6 @@ use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 
-/// Returns true if the accept error is transient and the listener should keep running
-/// rather than exiting permanently.
-fn is_transient_accept_error(err: &std::io::Error) -> bool {
-    match err.kind() {
-        std::io::ErrorKind::ConnectionAborted
-        | std::io::ErrorKind::Interrupted
-        | std::io::ErrorKind::WouldBlock => true,
-        _ => {
-            #[cfg(unix)]
-            {
-                match err.raw_os_error() {
-                    Some(libc::EMFILE) | Some(libc::ENFILE) => true,
-                    _ => false,
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                false
-            }
-        }
-    }
-}
-
 struct ListenerHandle {
     is_tls: bool,
     enable_proxy_protocol: bool,
@@ -69,6 +49,12 @@ struct PassthroughBackendTarget {
     addr: String,
     origin_id: i64,
     proxy_protocol: ProxyProtocolConfig,
+}
+
+enum TlsHostInspection {
+    Route(crate::config::TlsRouteInspection),
+    None,
+    SlowClientHello,
 }
 
 fn record_desired_listener(
@@ -404,7 +390,7 @@ impl HttpProxyManager {
             let (client_stream, client_addr) = match accept_result {
                 Ok(result) => result,
                 Err(err) if is_transient_accept_error(&err) => {
-                    warn!(
+                    debug!(
                         "Transient accept error on {}: {}. Continuing.",
                         bind_addr, err
                     );
@@ -419,23 +405,41 @@ impl HttpProxyManager {
                     return Err(err.into());
                 }
             };
-            let main_cluster_scope = crate::special_defense::cluster_block_scope_id(
-                self.config_store.get_node_cluster_id_sync(),
-            );
-
-            if self.proxy_logic.waf_state.is_blocked(client_addr.ip(), 0)
-                || (main_cluster_scope != 0
-                    && self
-                        .proxy_logic
-                        .waf_state
-                        .is_blocked(client_addr.ip(), main_cluster_scope))
-            {
+            if crate::l4_defense::is_l4_blocked(
+                &self.config_store,
+                &self.proxy_logic.waf_state,
+                client_addr.ip(),
+            ) {
                 continue;
             }
 
+            let protocol_label = if is_tls { "https" } else { "http" };
+            let per_ip_limit = crate::l4_defense::current_tcp_active_limit_per_ip();
+            let Some(client_permit) =
+                crate::l4_defense::try_acquire_tcp_active_ip(client_addr.ip(), per_ip_limit)
+            else {
+                self.record_l4_event(
+                    client_addr.ip(),
+                    L4DefenseKind::TcpActiveLimit,
+                    format!(
+                        "bind={} peer={} protocol={} limit={}",
+                        bind_addr, client_addr, protocol_label, per_ip_limit
+                    ),
+                );
+                continue;
+            };
+
             let Some(connection_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::HttpConnection)
             else {
-                warn!(
+                self.record_l4_event(
+                    client_addr.ip(),
+                    L4DefenseKind::TcpAdmissionReject,
+                    format!(
+                        "bind={} peer={} protocol={}",
+                        bind_addr, client_addr, protocol_label
+                    ),
+                );
+                debug!(
                     "HTTP connection admission limit reached on {}, dropping connection from {}",
                     bind_addr, client_addr
                 );
@@ -446,8 +450,12 @@ impl HttpProxyManager {
                 let proxy_inner = proxy_arc.clone();
                 let shutdown_inner = shutdown_rx.clone();
                 let manager = self.clone();
-                let downstream_read_timeout = manager.downstream_read_timeout();
+                let downstream_read_timeout = crate::l4_defense::clamp_http_read_timeout(
+                    manager.downstream_read_timeout(),
+                    crate::l4_defense::current_pressure_level(),
+                );
                 tokio::spawn(async move {
+                    let _client_permit = client_permit;
                     let _connection_permit = connection_permit;
                     // Resolve the effective client address, consuming any PROXY header.
                     let Some((effective_addr, client_stream)) =
@@ -460,12 +468,11 @@ impl HttpProxyManager {
                     else {
                         return;
                     };
-                    if main_cluster_scope != 0
-                        && manager
-                            .proxy_logic
-                            .waf_state
-                            .is_blocked(effective_addr.ip(), main_cluster_scope)
-                    {
+                    if crate::l4_defense::is_l4_blocked(
+                        &manager.config_store,
+                        &manager.proxy_logic.waf_state,
+                        effective_addr.ip(),
+                    ) {
                         return;
                     }
                     manager
@@ -489,10 +496,14 @@ impl HttpProxyManager {
             let manager = self.clone();
             let acceptor_clone = shared_ssl_acceptor.clone();
             let tls_handshake_timeout = manager.tls_handshake_timeout();
-            let downstream_read_timeout = manager.downstream_read_timeout();
+            let downstream_read_timeout = crate::l4_defense::clamp_http_read_timeout(
+                manager.downstream_read_timeout(),
+                crate::l4_defense::current_pressure_level(),
+            );
             let http2_handshake_timeout = manager.http2_handshake_timeout();
 
             tokio::spawn(async move {
+                let _client_permit = client_permit;
                 let _connection_permit = connection_permit;
                 let mut configured_tls_host = false;
                 let mut count_tls_handshake_failure = true;
@@ -508,18 +519,17 @@ impl HttpProxyManager {
                 else {
                     return;
                 };
-                if main_cluster_scope != 0
-                    && manager
-                        .proxy_logic
-                        .waf_state
-                        .is_blocked(client_addr.ip(), main_cluster_scope)
-                {
+                if crate::l4_defense::is_l4_blocked(
+                    &manager.config_store,
+                    &manager.proxy_logic.waf_state,
+                    client_addr.ip(),
+                ) {
                     return;
                 }
 
                 if is_tls {
                     match manager.inspect_tls_host(&client_stream, port).await {
-                        Ok(Some(route)) => {
+                        Ok(TlsHostInspection::Route(route)) => {
                             configured_tls_host = route.has_l7_server;
                             if let Some(server) = route.sni_passthrough_server {
                                 if let Err(err) = manager
@@ -540,9 +550,22 @@ impl HttpProxyManager {
                                 return;
                             }
                         }
-                        Ok(None) => {}
+                        Ok(TlsHostInspection::None) => {}
+                        Ok(TlsHostInspection::SlowClientHello) => {
+                            manager.record_l4_event(
+                                client_addr.ip(),
+                                L4DefenseKind::TlsSlowClientHello,
+                                format!("port={} peer={} phase=sni_peek", port, client_addr),
+                            );
+                            return;
+                        }
                         Err(err) => {
                             count_tls_handshake_failure = false;
+                            manager.record_l4_event(
+                                client_addr.ip(),
+                                L4DefenseKind::SniProbeFail,
+                                format!("port={} peer={} inspect_error={}", port, client_addr, err),
+                            );
                             debug!(
                                 "Failed to inspect SNI for {} on port {}: {}",
                                 client_addr, port, err
@@ -553,10 +576,15 @@ impl HttpProxyManager {
 
                 let l4_stream = stream_with_socket_digest(client_stream, client_addr);
                 let downstream_socket_digest = l4_stream.get_socket_digest();
+                let effective_tls_handshake_timeout =
+                    crate::l4_defense::clamp_tls_handshake_timeout(
+                        tls_handshake_timeout,
+                        crate::l4_defense::current_pressure_level(),
+                    );
                 let (stream, alpn): (pingora_core::protocols::Stream, Option<ALPN>) =
                     if let Some(ssl_acceptor) = &acceptor_clone {
                         match tokio::time::timeout(
-                            tls_handshake_timeout,
+                            effective_tls_handshake_timeout,
                             handshake(ssl_acceptor, l4_stream),
                         )
                         .await
@@ -580,11 +608,20 @@ impl HttpProxyManager {
                                 if configured_tls_host {
                                     debug!(
                                         "TLS handshake timed out after {:?}",
-                                        tls_handshake_timeout
+                                        effective_tls_handshake_timeout
                                     );
                                 }
                                 if count_tls_handshake_failure {
-                                    manager.record_tls_handshake_failure(client_addr.ip());
+                                    manager.record_l4_event(
+                                        client_addr.ip(),
+                                        L4DefenseKind::TlsSlowClientHello,
+                                        format!(
+                                            "port={} peer={} timeout_ms={}",
+                                            port,
+                                            client_addr,
+                                            effective_tls_handshake_timeout.as_millis()
+                                        ),
+                                    );
                                 }
                                 return;
                             }
@@ -714,28 +751,20 @@ impl HttpProxyManager {
         downstream_read_timeout: Duration,
     ) {
         let cluster_id = self.config_store.get_node_cluster_id_sync();
-        let Some(config) = self.empty_connection_flood_config(cluster_id) else {
-            process_plain_http_connection(
-                client_stream,
-                client_addr,
-                proxy_inner,
-                shutdown_inner,
-                downstream_read_timeout,
-            )
-            .await;
-            return;
-        };
+        let config = self.empty_connection_flood_config(cluster_id);
+        let pressure_level = crate::l4_defense::current_pressure_level();
+        let first_byte_timeout = crate::l4_defense::first_byte_timeout(pressure_level);
         let mut first_byte = [0u8; 1];
-        match tokio::time::timeout(Duration::from_secs(2), client_stream.peek(&mut first_byte))
-            .await
-        {
+        match tokio::time::timeout(first_byte_timeout, client_stream.peek(&mut first_byte)).await {
             Ok(Ok(0)) => {
-                self.record_special_defense_hit(
-                    cluster_id,
-                    "EMPTY_CONNECTION_FLOOD",
-                    client_addr.ip(),
-                    config,
-                );
+                if let Some(config) = config {
+                    self.record_special_defense_hit(
+                        cluster_id,
+                        "EMPTY_CONNECTION_FLOOD",
+                        client_addr.ip(),
+                        config,
+                    );
+                }
             }
             Ok(Ok(_)) => {
                 process_plain_http_connection(
@@ -747,12 +776,22 @@ impl HttpProxyManager {
                 )
                 .await;
             }
-            Ok(Err(_)) | Err(_) => {
-                self.record_special_defense_hit(
-                    cluster_id,
-                    "EMPTY_CONNECTION_FLOOD",
+            Ok(Err(err)) => {
+                debug!(
+                    "HTTP first-byte peek failed for {} after {:?}: {}",
+                    client_addr, first_byte_timeout, err
+                );
+            }
+            Err(_) => {
+                self.record_l4_event(
                     client_addr.ip(),
-                    config,
+                    L4DefenseKind::TcpSlowFirstByte,
+                    format!(
+                        "peer={} timeout_ms={} pressure={}",
+                        client_addr,
+                        first_byte_timeout.as_millis(),
+                        pressure_level.as_str()
+                    ),
                 );
             }
         }
@@ -771,6 +810,33 @@ impl HttpProxyManager {
             node_id,
             ip,
         );
+        self.record_l4_event(
+            ip,
+            L4DefenseKind::TlsHandshakeFail,
+            "http_tls_handshake_failure",
+        );
+    }
+
+    fn record_l4_event(
+        &self,
+        ip: IpAddr,
+        kind: L4DefenseKind,
+        detail: impl Into<String>,
+    ) -> crate::l4_defense::L4DefenseVerdict {
+        let node_id = self
+            .proxy_logic
+            .api_config
+            .node_id
+            .parse::<i64>()
+            .unwrap_or(0);
+        crate::l4_defense::record_l4_event(
+            &self.config_store,
+            &self.proxy_logic.waf_state,
+            node_id,
+            ip,
+            kind,
+            detail,
+        )
     }
 
     fn record_special_defense_hit(
@@ -800,15 +866,22 @@ impl HttpProxyManager {
         &self,
         client_stream: &TcpStream,
         port: u16,
-    ) -> anyhow::Result<Option<crate::config::TlsRouteInspection>> {
+    ) -> anyhow::Result<TlsHostInspection> {
         if !self.config_store.has_any_sni_passthrough_sync() {
-            return Ok(None);
+            return Ok(TlsHostInspection::None);
         }
 
-        let Some(host) = peek_client_hello_sni(client_stream).await? else {
-            return Ok(None);
-        };
-        Ok(self.config_store.inspect_tls_route_sync(&host, port))
+        let timeouts =
+            crate::l4_defense::client_hello_timeouts(crate::l4_defense::current_pressure_level());
+        match peek_client_hello_sni(client_stream, timeouts).await? {
+            ClientHelloPeek::Found(host) => Ok(self
+                .config_store
+                .inspect_tls_route_sync(&host, port)
+                .map(TlsHostInspection::Route)
+                .unwrap_or(TlsHostInspection::None)),
+            ClientHelloPeek::Incomplete => Ok(TlsHostInspection::SlowClientHello),
+            ClientHelloPeek::NotClientHello => Ok(TlsHostInspection::None),
+        }
     }
 
     async fn handle_sni_passthrough(
@@ -1067,6 +1140,16 @@ impl HttpProxyManager {
                 let bytes_received = outcome.bytes_received;
                 let bytes_sent = outcome.bytes_sent;
                 let relay_note = outcome.close_note();
+                if outcome.close_reason == crate::tcp_proxy::RelayCloseReason::PressureIdleTimeout {
+                    self.record_l4_event(
+                        client_addr.ip(),
+                        L4DefenseKind::TcpPressureIdleClose,
+                        format!(
+                            "sni={} port={} peer={} backend={}",
+                            sni_host, listen_port, client_addr, backend_addr
+                        ),
+                    );
+                }
                 crate::metrics::record::record_network_dimensions(
                     crate::metrics::METRIC_CATEGORY_TCP,
                     server_id,
@@ -1349,14 +1432,18 @@ async fn maybe_consume_proxy_protocol_header(
             let mut discard = vec![0u8; addr.consumed];
             match stream.read_exact(&mut discard).await {
                 Ok(_) => {
-                    let effective_addr = match (addr.src_ip, addr.src_port) {
-                        (Some(ip), Some(port)) => SocketAddr::new(ip, port),
-                        _ => client_addr,
-                    };
-                    debug!(
-                        "PROXY protocol: replaced {} with {}",
-                        client_addr, effective_addr
-                    );
+                    let effective_addr = proxy_protocol::effective_client_addr(client_addr, &addr);
+                    if effective_addr == client_addr && addr.src_ip.is_some() {
+                        debug!(
+                            "PROXY protocol: consumed untrusted header from {}; keeping socket peer",
+                            client_addr
+                        );
+                    } else {
+                        debug!(
+                            "PROXY protocol: replaced {} with {}",
+                            client_addr, effective_addr
+                        );
+                    }
                     Some((effective_addr, stream))
                 }
                 Err(e) => {
@@ -1383,9 +1470,10 @@ async fn maybe_consume_proxy_protocol_header(
     }
 }
 
-async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Option<String>> {
-    const CLIENT_HELLO_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
-    const CLIENT_HELLO_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+async fn peek_client_hello_sni(
+    client_stream: &TcpStream,
+    timeouts: crate::l4_defense::ClientHelloTimeouts,
+) -> anyhow::Result<ClientHelloPeek> {
     const CLIENT_HELLO_READ_WAIT: Duration = Duration::from_millis(25);
     const CLIENT_HELLO_INITIAL_BUF: usize = 2048;
     const CLIENT_HELLO_MAX_BUF: usize = 16 * 1024;
@@ -1395,19 +1483,26 @@ async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Opti
     let mut peek_buf = vec![0u8; CLIENT_HELLO_INITIAL_BUF];
     let mut last_size = 0usize;
     loop {
-        if started.elapsed() >= CLIENT_HELLO_TOTAL_TIMEOUT
-            || last_progress.elapsed() >= CLIENT_HELLO_IDLE_TIMEOUT
-        {
-            return Ok(None);
+        if started.elapsed() >= timeouts.total || last_progress.elapsed() >= timeouts.idle {
+            return Ok(ClientHelloPeek::Incomplete);
         }
 
         let _ = tokio::time::timeout(CLIENT_HELLO_READ_WAIT, client_stream.readable()).await;
-        let size = client_stream.peek(&mut peek_buf).await?;
+        let size =
+            match tokio::time::timeout(CLIENT_HELLO_READ_WAIT, client_stream.peek(&mut peek_buf))
+                .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+            };
         if size == 0 {
-            return Ok(None);
+            return Ok(ClientHelloPeek::NotClientHello);
         }
         match parse_tls_client_hello_sni(&peek_buf[..size]) {
-            ClientHelloParse::Found(host) => return Ok(Some(host)),
+            ClientHelloParse::Found(host) => return Ok(ClientHelloPeek::Found(host)),
             ClientHelloParse::NeedMore => {
                 if size == peek_buf.len() && peek_buf.len() < CLIENT_HELLO_MAX_BUF {
                     peek_buf.resize((peek_buf.len() * 2).min(CLIENT_HELLO_MAX_BUF), 0);
@@ -1420,9 +1515,16 @@ async fn peek_client_hello_sni(client_stream: &TcpStream) -> anyhow::Result<Opti
                 }
                 last_size = size;
             }
-            ClientHelloParse::NotClientHello => return Ok(None),
+            ClientHelloParse::NotClientHello => return Ok(ClientHelloPeek::NotClientHello),
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ClientHelloPeek {
+    Found(String),
+    Incomplete,
+    NotClientHello,
 }
 
 #[derive(Debug)]
@@ -1666,12 +1768,45 @@ mod tests {
         });
 
         let (mut server_stream, _) = listener.accept().await.unwrap();
-        let host = peek_client_hello_sni(&server_stream).await.unwrap();
-        assert_eq!(host.as_deref(), Some("peek.example.com"));
+        let host = peek_client_hello_sni(
+            &server_stream,
+            crate::l4_defense::client_hello_timeouts(crate::l4_defense::L4PressureLevel::Normal),
+        )
+        .await
+        .unwrap();
+        assert_eq!(host, ClientHelloPeek::Found("peek.example.com".to_string()));
 
         let mut actual = Vec::new();
         server_stream.read_to_end(&mut actual).await.unwrap();
         assert_eq!(actual, expected);
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peek_client_hello_sni_times_out_slow_client_hello() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&[22]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let started = tokio::time::Instant::now();
+        let result = peek_client_hello_sni(
+            &server_stream,
+            crate::l4_defense::ClientHelloTimeouts {
+                total: Duration::from_millis(60),
+                idle: Duration::from_millis(30),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, ClientHelloPeek::Incomplete);
+        assert!(started.elapsed() < Duration::from_millis(150));
         client.await.unwrap();
     }
 }

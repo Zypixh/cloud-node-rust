@@ -19,6 +19,7 @@ use tracing::{debug, error, info};
 
 use crate::config::ConfigStore;
 use crate::http3_proxy_manager::Http3ProxyManager;
+use crate::l4_defense::L4DefenseKind;
 use crate::memory_governor::MEMORY_GOVERNOR;
 use crate::net_bind::{bind_udp_socket, dual_stack_bind_addrs};
 use crate::quic_probe::{QuicCryptoFragment, QuicProbeFragmentResult};
@@ -30,14 +31,10 @@ use crate::udp_proxy::{
 const MAX_DATAGRAM_SIZE: usize = 65_535;
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const H3_ROUTE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
-const PENDING_QUIC_ROUTE_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_NEW_ROUTES_PER_IP_WINDOW: usize = 128;
 const NEW_ROUTE_RATE_WINDOW: Duration = Duration::from_secs(10);
 const MAX_NEW_ROUTE_IP_WINDOWS_PER_PORT: usize = 16_384;
 const ROUTE_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 const ROUTE_CLEANUP_PRESSURE_INTERVAL: Duration = Duration::from_millis(200);
-const MAX_PENDING_DATAGRAMS_PER_CLIENT: usize = 4;
-const MAX_PENDING_RANGES_PER_CLIENT: usize = 16;
 
 #[derive(Clone)]
 enum RouteKind {
@@ -238,6 +235,7 @@ fn trim_new_route_window(window: &mut VecDeque<Instant>, now: Instant) {
 fn is_new_route_rate_limited(
     windows: &DashMap<StdIpAddr, VecDeque<Instant>>,
     ip: StdIpAddr,
+    max_new_routes_per_window: usize,
 ) -> bool {
     if !windows.contains_key(&ip) && windows.len() >= MAX_NEW_ROUTE_IP_WINDOWS_PER_PORT {
         return true;
@@ -245,7 +243,7 @@ fn is_new_route_rate_limited(
     let now = Instant::now();
     let mut window = windows.entry(ip).or_default();
     trim_new_route_window(&mut window, now);
-    window.len() >= MAX_NEW_ROUTES_PER_IP_WINDOW
+    window.len() >= max_new_routes_per_window.max(1)
 }
 
 fn record_new_route_for_ip(windows: &DashMap<StdIpAddr, VecDeque<Instant>>, ip: StdIpAddr) {
@@ -306,11 +304,12 @@ fn cleanup_pending_routes(
     pending_routes: &DashMap<SocketAddr, PendingQuicRoute>,
     pending_reassembly_bytes: &AtomicUsize,
     now: Instant,
+    pending_route_timeout: Duration,
 ) {
     let expired = pending_routes
         .iter()
         .filter_map(|entry| {
-            (now.duration_since(entry.value().created_at) >= PENDING_QUIC_ROUTE_TIMEOUT)
+            (now.duration_since(entry.value().created_at) >= pending_route_timeout)
                 .then_some(*entry.key())
         })
         .collect::<Vec<_>>();
@@ -327,9 +326,11 @@ fn merge_quic_fragment(
     datagram: Bytes,
     pending_reassembly_bytes: &AtomicUsize,
     pending_reassembly_budget_bytes: usize,
+    max_pending_datagrams_per_client: usize,
+    max_pending_ranges_per_client: usize,
 ) -> bool {
-    if pending.datagrams.len() >= MAX_PENDING_DATAGRAMS_PER_CLIENT
-        || pending.ranges.len() + fragment.ranges.len() > MAX_PENDING_RANGES_PER_CLIENT
+    if pending.datagrams.len() >= max_pending_datagrams_per_client.max(1)
+        || pending.ranges.len() + fragment.ranges.len() > max_pending_ranges_per_client.max(1)
         || fragment.data.len() > crate::quic_probe::MAX_CRYPTO_REASSEMBLY
     {
         return false;
@@ -525,14 +526,26 @@ fn route_kind_same(left: &RouteKind, right: &RouteKind) -> bool {
     }
 }
 
-fn route_kind_is_active(route: &RouteKind) -> bool {
+fn route_kind_is_active_with_pressure(
+    route: &RouteKind,
+    pressure_level: crate::l4_defense::L4PressureLevel,
+) -> bool {
     match route {
         RouteKind::Http3(last_activity_ms) => {
-            udp_activity_is_alive(last_activity_ms, H3_ROUTE_IDLE_TIMEOUT)
+            udp_activity_is_alive(last_activity_ms, h3_route_idle_timeout(pressure_level))
         }
         RouteKind::Passthrough(session) => {
             udp_activity_is_alive(&session.last_activity_ms, UDP_SESSION_IDLE_TIMEOUT)
         }
+    }
+}
+
+fn h3_route_idle_timeout(pressure_level: crate::l4_defense::L4PressureLevel) -> Duration {
+    match pressure_level {
+        crate::l4_defense::L4PressureLevel::Normal => H3_ROUTE_IDLE_TIMEOUT,
+        crate::l4_defense::L4PressureLevel::Elevated => Duration::from_secs(60),
+        crate::l4_defense::L4PressureLevel::High => Duration::from_secs(20),
+        crate::l4_defense::L4PressureLevel::Critical => Duration::from_secs(10),
     }
 }
 
@@ -544,13 +557,38 @@ fn cleanup_routes(
     pending_reassembly_bytes: &AtomicUsize,
     session_routes: &SessionRoutes,
 ) {
+    cleanup_routes_with_pressure(
+        udp_manager,
+        routes,
+        cid_routes,
+        pending_routes,
+        pending_reassembly_bytes,
+        session_routes,
+        crate::l4_defense::current_pressure_level(),
+    );
+}
+
+fn cleanup_routes_with_pressure(
+    udp_manager: &UdpProxyManager,
+    routes: &DashMap<SocketAddr, RouteKind>,
+    cid_routes: &CidRoutes,
+    pending_routes: &DashMap<SocketAddr, PendingQuicRoute>,
+    pending_reassembly_bytes: &AtomicUsize,
+    session_routes: &SessionRoutes,
+    pressure_level: crate::l4_defense::L4PressureLevel,
+) {
     let now = Instant::now();
-    cleanup_pending_routes(pending_routes, pending_reassembly_bytes, now);
+    cleanup_pending_routes(
+        pending_routes,
+        pending_reassembly_bytes,
+        now,
+        crate::l4_defense::quic_pending_route_timeout(pressure_level),
+    );
     udp_manager.cleanup_idle_sessions(UDP_SESSION_IDLE_TIMEOUT);
-    routes.retain(|_, route| route_kind_is_active(route));
-    session_routes.retain(|_, route| route_kind_is_active(route));
+    routes.retain(|_, route| route_kind_is_active_with_pressure(route, pressure_level));
+    session_routes.retain(|_, route| route_kind_is_active_with_pressure(route, pressure_level));
     cid_routes.retain(|_, bucket| {
-        bucket.retain(|_, route| route_kind_is_active(route));
+        bucket.retain(|_, route| route_kind_is_active_with_pressure(route, pressure_level));
         !bucket.is_empty()
     });
 }
@@ -937,20 +975,43 @@ impl QuicUdpDemuxManager {
                 client_addr, port, len, http3_enabled
             );
             let data = Bytes::copy_from_slice(&buf[..len]);
+            if self.udp_manager.is_l4_blocked(client_addr.ip()) {
+                if let Some((_, route)) = shared.routes.remove(&client_addr) {
+                    remove_session_route(&shared.session_routes, &route);
+                    remove_cid_routes_for_route(&shared.cid_routes, &route);
+                    if let RouteKind::Passthrough(session) = &route {
+                        let _ = session.shutdown_tx.send(true);
+                    }
+                }
+                continue;
+            }
 
             let now = Instant::now();
             let max_routes_per_port = MEMORY_GOVERNOR.udp_route_limit_per_port();
+            let pending_route_limit = MEMORY_GOVERNOR.quic_pending_route_limit_per_port();
+            let pending_reassembly_budget_bytes =
+                MEMORY_GOVERNOR.quic_pending_reassembly_budget_bytes();
+            let pressure_level = crate::l4_defense::current_pressure_level_with_quic_usage(
+                shared.routes.len(),
+                max_routes_per_port,
+                shared.pending_routes.len(),
+                pending_route_limit,
+                shared.pending_reassembly_bytes.load(Ordering::Relaxed),
+                pending_reassembly_budget_bytes,
+            );
+            let max_new_routes_per_ip = crate::l4_defense::quic_new_route_limit(pressure_level);
             let route_cleanup_pressure_threshold = max_routes_per_port.saturating_mul(9) / 10;
             if shared.routes.len() >= route_cleanup_pressure_threshold
                 && now >= next_pressure_cleanup
             {
-                cleanup_routes(
+                cleanup_routes_with_pressure(
                     &self.udp_manager,
                     &shared.routes,
                     &shared.cid_routes,
                     &shared.pending_routes,
                     &shared.pending_reassembly_bytes,
                     &shared.session_routes,
+                    pressure_level,
                 );
                 cleanup_new_route_windows(&shared.new_route_windows);
                 next_pressure_cleanup = now + ROUTE_CLEANUP_PRESSURE_INTERVAL;
@@ -969,6 +1030,7 @@ impl QuicUdpDemuxManager {
                         &shared.h3_tx,
                         &shared.h3_queued_bytes,
                         http3_enabled,
+                        pressure_level,
                     )
                     .await
                     == DispatchStatus::Closed
@@ -991,6 +1053,7 @@ impl QuicUdpDemuxManager {
                         &shared.h3_tx,
                         &shared.h3_queued_bytes,
                         http3_enabled,
+                        pressure_level,
                     )
                     .await
                 {
@@ -1010,16 +1073,30 @@ impl QuicUdpDemuxManager {
             }
 
             if shared.routes.len() >= max_routes_per_port {
-                cleanup_routes(
+                cleanup_routes_with_pressure(
                     &self.udp_manager,
                     &shared.routes,
                     &shared.cid_routes,
                     &shared.pending_routes,
                     &shared.pending_reassembly_bytes,
                     &shared.session_routes,
+                    pressure_level,
                 );
             }
             if shared.routes.len() >= max_routes_per_port {
+                self.record_l4_event_with_pressure(
+                    client_addr,
+                    L4DefenseKind::QuicNewRouteFlood,
+                    format!(
+                        "port={} peer={} routes={} limit={} pressure={}",
+                        port,
+                        client_addr,
+                        shared.routes.len(),
+                        max_routes_per_port,
+                        pressure_level.as_str()
+                    ),
+                    pressure_level,
+                );
                 debug!(
                     "QUIC UDP demux: route limit reached on port {}, dropping new client {}",
                     port, client_addr
@@ -1028,8 +1105,24 @@ impl QuicUdpDemuxManager {
             }
             let has_pending_route = shared.pending_routes.contains_key(&client_addr);
             if !has_pending_route
-                && is_new_route_rate_limited(&shared.new_route_windows, client_addr.ip())
+                && is_new_route_rate_limited(
+                    &shared.new_route_windows,
+                    client_addr.ip(),
+                    max_new_routes_per_ip,
+                )
             {
+                self.record_l4_event_with_pressure(
+                    client_addr,
+                    L4DefenseKind::QuicNewRouteFlood,
+                    format!(
+                        "port={} peer={} rate_limited=true per_ip_window={} pressure={}",
+                        port,
+                        client_addr,
+                        max_new_routes_per_ip,
+                        pressure_level.as_str()
+                    ),
+                    pressure_level,
+                );
                 debug!(
                     "QUIC UDP demux: new route rate limit reached for {} on port {}",
                     client_addr.ip(),
@@ -1052,6 +1145,7 @@ impl QuicUdpDemuxManager {
                     socket.clone(),
                     shutdown_rx.clone(),
                     shared.quic_cid_tx.clone(),
+                    pressure_level,
                 )
                 .await?;
             let Some((route, datagrams)) = route else {
@@ -1076,6 +1170,7 @@ impl QuicUdpDemuxManager {
                         &shared.h3_tx,
                         &shared.h3_queued_bytes,
                         http3_enabled,
+                        pressure_level,
                     )
                     .await
                     == DispatchStatus::Closed
@@ -1103,6 +1198,7 @@ impl QuicUdpDemuxManager {
         socket: Arc<UdpSocket>,
         shutdown_rx: watch::Receiver<bool>,
         quic_cid_tx: mpsc::Sender<UdpSessionQuicCid>,
+        pressure_level: crate::l4_defense::L4PressureLevel,
     ) -> Result<Option<(RouteKind, Vec<Bytes>)>> {
         match crate::quic_probe::probe_quic_client_hello_fragment_result(&data) {
             QuicProbeFragmentResult::Found(client_hello) => {
@@ -1130,6 +1226,7 @@ impl QuicUdpDemuxManager {
                     socket,
                     shutdown_rx,
                     quic_cid_tx.clone(),
+                    pressure_level,
                 )
                 .await
                 .map(|route| route.map(|route| (route, datagrams)))
@@ -1145,8 +1242,24 @@ impl QuicUdpDemuxManager {
                 );
                 let is_new_pending_route = !pending_routes.contains_key(&client_addr);
                 if is_new_pending_route
-                    && is_new_route_rate_limited(new_route_windows, client_addr.ip())
+                    && is_new_route_rate_limited(
+                        new_route_windows,
+                        client_addr.ip(),
+                        crate::l4_defense::quic_new_route_limit(pressure_level),
+                    )
                 {
+                    self.record_l4_event_with_pressure(
+                        client_addr,
+                        L4DefenseKind::QuicIncompleteClientHello,
+                        format!(
+                            "port={} peer={} pending_rate_limited=true per_ip_window={} pressure={}",
+                            port,
+                            client_addr,
+                            crate::l4_defense::quic_new_route_limit(pressure_level),
+                            pressure_level.as_str()
+                        ),
+                        pressure_level,
+                    );
                     debug!(
                         "QUIC UDP demux: pending route rate limit reached for {} on port {}",
                         client_addr.ip(),
@@ -1156,6 +1269,19 @@ impl QuicUdpDemuxManager {
                 }
                 let pending_route_limit = MEMORY_GOVERNOR.quic_pending_route_limit_per_port();
                 if is_new_pending_route && pending_routes.len() >= pending_route_limit {
+                    self.record_l4_event_with_pressure(
+                        client_addr,
+                        L4DefenseKind::QuicPendingReject,
+                        format!(
+                            "port={} peer={} pending={} limit={} pressure={}",
+                            port,
+                            client_addr,
+                            pending_routes.len(),
+                            pending_route_limit,
+                            pressure_level.as_str()
+                        ),
+                        pressure_level,
+                    );
                     debug!(
                         "QUIC UDP demux: pending route limit reached on port {}, dropping incomplete ClientHello from {}",
                         port, client_addr
@@ -1164,6 +1290,21 @@ impl QuicUdpDemuxManager {
                 }
 
                 let maybe_client_hello = {
+                    if is_new_pending_route {
+                        self.record_l4_event_with_pressure(
+                            client_addr,
+                            L4DefenseKind::QuicIncompleteClientHello,
+                            format!(
+                                "port={} peer={} fragment_bytes={} ranges={} pressure={}",
+                                port,
+                                client_addr,
+                                fragment.data.len(),
+                                fragment.ranges.len(),
+                                pressure_level.as_str()
+                            ),
+                            pressure_level,
+                        );
+                    }
                     let mut pending = pending_routes.entry(client_addr).or_insert_with(|| {
                         record_new_route_for_ip(new_route_windows, client_addr.ip());
                         PendingQuicRoute {
@@ -1179,7 +1320,22 @@ impl QuicUdpDemuxManager {
                         data.clone(),
                         pending_reassembly_bytes,
                         MEMORY_GOVERNOR.quic_pending_reassembly_budget_bytes(),
+                        crate::l4_defense::quic_pending_datagrams_limit(pressure_level),
+                        crate::l4_defense::quic_pending_ranges_limit(pressure_level),
                     ) {
+                        self.record_l4_event_with_pressure(
+                            client_addr,
+                            L4DefenseKind::QuicReassemblyReject,
+                            format!(
+                                "port={} peer={} pressure={} datagrams_limit={} ranges_limit={}",
+                                port,
+                                client_addr,
+                                pressure_level.as_str(),
+                                crate::l4_defense::quic_pending_datagrams_limit(pressure_level),
+                                crate::l4_defense::quic_pending_ranges_limit(pressure_level)
+                            ),
+                            pressure_level,
+                        );
                         drop(pending);
                         if let Some((_, pending)) = pending_routes.remove(&client_addr) {
                             release_pending_reassembly_bytes(
@@ -1259,6 +1415,7 @@ impl QuicUdpDemuxManager {
                     socket,
                     shutdown_rx,
                     quic_cid_tx.clone(),
+                    pressure_level,
                 )
                 .await
                 .map(|route| route.map(|route| (route, datagrams)))
@@ -1312,12 +1469,34 @@ impl QuicUdpDemuxManager {
                     ) {
                         H3QueueStatus::Sent => {}
                         H3QueueStatus::Full => {
+                            self.record_l4_event_with_pressure(
+                                client_addr,
+                                L4DefenseKind::H3AdmissionReject,
+                                format!(
+                                    "port={} peer={} reason=queue_full pressure={}",
+                                    port,
+                                    client_addr,
+                                    pressure_level.as_str()
+                                ),
+                                pressure_level,
+                            );
                             debug!(
                                 "HTTP/3 shared UDP queue full, dropping undecidable datagram from {}",
                                 client_addr
                             );
                         }
                         H3QueueStatus::ByteLimited => {
+                            self.record_l4_event_with_pressure(
+                                client_addr,
+                                L4DefenseKind::H3AdmissionReject,
+                                format!(
+                                    "port={} peer={} reason=byte_limited pressure={}",
+                                    port,
+                                    client_addr,
+                                    pressure_level.as_str()
+                                ),
+                                pressure_level,
+                            );
                             debug!(
                                 "HTTP/3 shared UDP queue byte budget full, dropping undecidable datagram from {}",
                                 client_addr
@@ -1346,6 +1525,7 @@ impl QuicUdpDemuxManager {
         socket: Arc<UdpSocket>,
         shutdown_rx: watch::Receiver<bool>,
         quic_cid_tx: mpsc::Sender<UdpSessionQuicCid>,
+        pressure_level: crate::l4_defense::L4PressureLevel,
     ) -> Result<Option<RouteKind>> {
         if let Some(server_name) = client_hello.server_name.as_deref() {
             if let Some(server) = self
@@ -1494,9 +1674,32 @@ impl QuicUdpDemuxManager {
             )))));
         }
 
+        let Some(server) = self.udp_manager.find_server_for_packet(port, data).await else {
+            self.record_l4_event_with_pressure(
+                client_addr,
+                L4DefenseKind::QuicNoRoute,
+                format!(
+                    "port={} peer={} sni={:?} alpn={:?} pressure={}",
+                    port,
+                    client_addr,
+                    client_hello.server_name,
+                    client_hello.alpns,
+                    pressure_level.as_str()
+                ),
+                pressure_level,
+            );
+            return Ok(None);
+        };
         let session = match self
             .udp_manager
-            .create_passthrough_session(client_addr, port, data, socket, shutdown_rx)
+            .create_passthrough_session_for_server(
+                client_addr,
+                port,
+                server,
+                client_hello.server_name.clone(),
+                socket,
+                shutdown_rx,
+            )
             .await
         {
             Ok(session) => session,
@@ -1519,6 +1722,7 @@ impl QuicUdpDemuxManager {
         h3_tx: &mpsc::Sender<H3Datagram>,
         h3_queued_bytes: &Arc<AtomicUsize>,
         http3_enabled: bool,
+        pressure_level: crate::l4_defense::L4PressureLevel,
     ) -> DispatchStatus {
         match route {
             RouteKind::Http3(last_activity_ms) => {
@@ -1537,6 +1741,16 @@ impl QuicUdpDemuxManager {
                         DispatchStatus::Sent
                     }
                     H3QueueStatus::Full => {
+                        self.record_l4_event_with_pressure(
+                            client_addr,
+                            L4DefenseKind::H3AdmissionReject,
+                            format!(
+                                "peer={} reason=queue_full pressure={}",
+                                client_addr,
+                                pressure_level.as_str()
+                            ),
+                            pressure_level,
+                        );
                         debug!(
                             "HTTP/3 shared UDP queue full, dropping datagram from {}",
                             client_addr
@@ -1544,6 +1758,16 @@ impl QuicUdpDemuxManager {
                         DispatchStatus::Dropped
                     }
                     H3QueueStatus::ByteLimited => {
+                        self.record_l4_event_with_pressure(
+                            client_addr,
+                            L4DefenseKind::H3AdmissionReject,
+                            format!(
+                                "peer={} reason=byte_limited pressure={}",
+                                client_addr,
+                                pressure_level.as_str()
+                            ),
+                            pressure_level,
+                        );
                         debug!(
                             "HTTP/3 shared UDP queue byte budget full, dropping datagram from {}",
                             client_addr
@@ -1559,6 +1783,17 @@ impl QuicUdpDemuxManager {
                 {
                     UdpSessionSendStatus::Sent => DispatchStatus::Sent,
                     UdpSessionSendStatus::Full => {
+                        self.record_l4_event_with_pressure(
+                            client_addr,
+                            L4DefenseKind::UdpQueueFull,
+                            format!(
+                                "peer={} session={} pressure={}",
+                                client_addr,
+                                session.id,
+                                pressure_level.as_str()
+                            ),
+                            pressure_level,
+                        );
                         debug!(
                             "UDP passthrough session {} buffer full, dropping packet",
                             client_addr
@@ -1569,6 +1804,21 @@ impl QuicUdpDemuxManager {
                 }
             }
         }
+    }
+
+    fn record_l4_event_with_pressure(
+        &self,
+        client_addr: SocketAddr,
+        kind: L4DefenseKind,
+        detail: impl Into<String>,
+        pressure_level: crate::l4_defense::L4PressureLevel,
+    ) -> crate::l4_defense::L4DefenseVerdict {
+        self.udp_manager.record_l4_event_with_pressure(
+            client_addr.ip(),
+            kind,
+            detail,
+            pressure_level,
+        )
     }
 }
 
@@ -1726,12 +1976,30 @@ mod tests {
     }
 
     #[test]
+    fn new_route_rate_limit_uses_adaptive_pressure_limit() {
+        let windows = DashMap::new();
+        let ip: StdIpAddr = "203.0.113.200".parse().unwrap();
+        let high_limit =
+            crate::l4_defense::quic_new_route_limit(crate::l4_defense::L4PressureLevel::High);
+
+        for _ in 0..high_limit {
+            assert!(!is_new_route_rate_limited(&windows, ip, high_limit));
+            record_new_route_for_ip(&windows, ip);
+        }
+
+        assert!(is_new_route_rate_limited(&windows, ip, high_limit));
+    }
+
+    #[test]
     fn pending_route_cleanup_releases_retained_bytes() {
         let pending_routes = DashMap::new();
         let pending_bytes = AtomicUsize::new(0);
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let pending_timeout = crate::l4_defense::quic_pending_route_timeout(
+            crate::l4_defense::L4PressureLevel::Normal,
+        );
         let pending = PendingQuicRoute {
-            created_at: Instant::now() - PENDING_QUIC_ROUTE_TIMEOUT - Duration::from_secs(1),
+            created_at: Instant::now() - pending_timeout - Duration::from_secs(1),
             data: vec![0; 8],
             ranges: Vec::new(),
             datagrams: vec![Bytes::from_static(b"abcdef")],
@@ -1740,7 +2008,12 @@ mod tests {
         pending_bytes.store(retained, Ordering::Release);
         pending_routes.insert(client_addr, pending);
 
-        cleanup_pending_routes(&pending_routes, &pending_bytes, Instant::now());
+        cleanup_pending_routes(
+            &pending_routes,
+            &pending_bytes,
+            Instant::now(),
+            pending_timeout,
+        );
 
         assert!(pending_routes.is_empty());
         assert_eq!(pending_bytes.load(Ordering::Acquire), 0);

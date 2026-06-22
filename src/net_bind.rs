@@ -3,9 +3,31 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::Context;
 use socket2::{Domain, Protocol, Socket, Type};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
+
+/// Returns true if an accept error is normally recoverable under load and the
+/// listener should keep accepting instead of exiting.
+pub(crate) fn is_transient_accept_error(err: &io::Error) -> bool {
+    match err.kind() {
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::Interrupted
+        | io::ErrorKind::WouldBlock => true,
+        _ => {
+            #[cfg(unix)]
+            {
+                matches!(err.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        }
+    }
+}
 
 pub(crate) fn dual_stack_bind_addrs(port: u16) -> [SocketAddr; 2] {
     [
@@ -24,6 +46,19 @@ pub(crate) fn bind_tcp_listener(addr: SocketAddr, backlog: i32) -> anyhow::Resul
     let _ = socket.set_reuse_address(true);
     #[cfg(unix)]
     let _ = socket.set_reuse_port(true);
+    #[cfg(target_os = "linux")]
+    {
+        let timeout_secs: libc::c_int = 1;
+        let _ = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_DEFER_ACCEPT,
+                &timeout_secs as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&timeout_secs) as libc::socklen_t,
+            )
+        };
+    }
     if addr.is_ipv6() {
         socket
             .set_only_v6(true)
