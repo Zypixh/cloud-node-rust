@@ -20,7 +20,7 @@
 //! underlying channel (sender or receiver) is closed.
 
 use bytes::Bytes;
-use log::{debug, trace, warn};
+use log::{debug, trace};
 use pingora_error::{
     Error,
     ErrorType::{self, *},
@@ -149,7 +149,7 @@ impl BodyReader {
                 }
                 if n >= to_read {
                     if n > to_read {
-                        warn!(
+                        debug!(
                             "Peer sent more data then expected: extra {}\
                                bytes, discarding them (subrequest)",
                             n - to_read
@@ -269,7 +269,7 @@ impl BodyWriter {
                 }
                 let mut to_write = total - written;
                 if to_write < bytes.len() {
-                    warn!("Trying to write data over content-length (subrequest): {total}");
+                    debug!("Trying to write data over content-length (subrequest): {total}");
                 } else {
                     to_write = bytes.len();
                 }

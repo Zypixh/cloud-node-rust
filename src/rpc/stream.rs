@@ -9,7 +9,7 @@ use serde::de::Error as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Default)]
 pub struct NodeStreamProbeResult {
@@ -144,7 +144,7 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
                     last_endpoints = api_config.effective_rpc_endpoints();
                     fail_count = fail_count.saturating_add(1);
                     let delay = stream_backoff(fail_count, MAX_BACKOFF);
-                    error!(
+                    warn!(
                         "Failed to connect to API node for stream: {}. Retrying in {:?}...",
                         e, delay
                     );

@@ -329,7 +329,7 @@ where
                             if wait_for_cache_fill {
                                 // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
-                                warn!(
+                                debug!(
                                     "Downstream Error ignored during caching: {}, {}",
                                     e,
                                     self.inner.request_summary(session, ctx)
@@ -348,7 +348,7 @@ where
                         },
                         Err(e) => {
                             // mark request done, attempt to drain receive
-                            warn!("body send error: {e}");
+                            debug!("body send error: {e}");
 
                             // upstream is what actually errored but we don't want to continue
                             // polling the downstream body
@@ -441,7 +441,7 @@ where
                             // give up writing to downstream but wait for upstream cache write to finish
                             downstream_state.to_errored();
                             response_state.maybe_set_cache_done(true);
-                            warn!(
+                            debug!(
                                 "Downstream Error ignored during caching: {}, {}",
                                 e,
                                 self.inner.request_summary(session, ctx)
@@ -453,7 +453,7 @@ where
                     }
                     if response_state.cached_done() {
                         if let Err(e) = session.cache.finish_hit_handler().await {
-                            warn!("Error during finish_hit_handler: {}", e);
+                            debug!("Error during finish_hit_handler: {}", e);
                         }
                     }
                 }
@@ -507,7 +507,7 @@ where
         // Re-raise the error then the loop is finished.
         if downstream_state.is_errored() {
             let err = Error::e_explain(WriteError, "downstream_state is_errored");
-            error!("custom_bidirection_down_to_up: downstream_state.is_errored",);
+            debug!("custom_bidirection_down_to_up: downstream_state.is_errored",);
             return err;
         }
 
@@ -520,7 +520,7 @@ where
                     debug!("finished sending body to downstream");
                 }
                 Err(e) => {
-                    error!("Error finish sending body to downstream: {}", e);
+                    debug!("Error finish sending body to downstream: {}", e);
                     reuse_downstream = false;
                 }
             }
@@ -558,7 +558,7 @@ where
                         return Err(e);
                     } else {
                         // otherwise, continue processing the response
-                        warn!(
+                        debug!(
                             "Fail to cache response: {}, {}",
                             e,
                             self.inner.request_summary(session, ctx)
@@ -643,7 +643,7 @@ where
                         {
                             Ok(buf) => buf,
                             Err(e) => {
-                                error!(
+                                debug!(
                                     "Encountered error while filtering upstream trailers {:?}",
                                     e
                                 );
@@ -871,7 +871,7 @@ impl CustomMessageForwarder<'_> {
                             Ok(data) => data,
                             Err(err) => {
                                 reader_status = false;
-                                warn!("{}: CustomMessageForwarder: reader returned err: {err:?}", self.ctx);
+                                debug!("{}: CustomMessageForwarder: reader returned err: {err:?}", self.ctx);
                                 continue;
                             },
                         };

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
-use tracing::{debug, error, info};
+use tracing::{debug, info, warn};
 
 #[allow(dead_code)]
 const ORIGIN_HEALTH_STATUS_UNKNOWN: u8 = 0;
@@ -94,7 +94,7 @@ pub async fn start_origin_health_reporter(api_config: ApiConfig) {
         let client = match SharedRpcClient::get(&api_config).await {
             Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
-                error!("Origin health reporter failed to connect: {}", e);
+                warn!("Origin health reporter failed to connect: {}", e);
                 continue;
             }
         };
@@ -420,7 +420,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
                 let client = match SharedRpcClient::get(&api_config).await {
                     Ok(shared) => shared.as_rpc_client(),
                     Err(e) => {
-                        error!("Bandwidth reporter failed to connect: {}", e);
+                        warn!("Bandwidth reporter failed to connect: {}", e);
                         pending_stats = upload_items;
                         current_window = window_key;
                         persist_bandwidth_state(
@@ -439,7 +439,7 @@ pub async fn start_bandwidth_reporter(config_store: ConfigStore, api_config: Api
                 ))
                 .await;
                 if let Err(e) = result {
-                    error!("Failed to upload bandwidth stats: {}", e);
+                    warn!("Failed to upload bandwidth stats: {}", e);
                     pending_stats = upload_items;
                 } else {
                     pending_stats.clear();
@@ -588,7 +588,7 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
                 let client = match SharedRpcClient::get(&api_config).await {
                     Ok(shared) => shared.as_rpc_client(),
                     Err(e) => {
-                        error!("Daily stat reporter failed to connect: {}", e);
+                        warn!("Daily stat reporter failed to connect: {}", e);
                         pending_stats = stats;
                         pending_domain_stats = domain_stats;
                         current_window = window_key;
@@ -605,7 +605,7 @@ pub async fn start_daily_stat_reporter(config_store: ConfigStore, api_config: Ap
                 ))
                 .await
                 {
-                    error!("Failed to upload daily stats: {}", e);
+                    warn!("Failed to upload daily stats: {}", e);
                     pending_stats = stats;
                     pending_domain_stats = domain_stats;
                 } else {
@@ -725,7 +725,7 @@ pub async fn start_metric_stat_reporter(
         let client = match SharedRpcClient::get(&api_config).await {
             Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
-                error!("Metric stat reporter failed to connect: {}", e);
+                warn!("Metric stat reporter failed to connect: {}", e);
                 continue;
             }
         };
@@ -831,7 +831,7 @@ pub async fn start_metric_stat_reporter(
                 ))
                 .await
                 {
-                    error!(
+                    warn!(
                         "Failed to upload metric stats for server {} item {}: {}",
                         server_id, item.id, e
                     );
@@ -923,7 +923,7 @@ pub async fn start_metrics_aggregator_reporter(config_store: ConfigStore, api_co
         let client = match SharedRpcClient::get(&api_config).await {
             Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
-                error!("Metrics aggregator reporter failed to connect: {}", e);
+                warn!("Metrics aggregator reporter failed to connect: {}", e);
                 continue;
             }
         };
@@ -955,7 +955,7 @@ pub async fn start_metrics_aggregator_reporter(config_store: ConfigStore, api_co
                 }
             }
             Err(e) => {
-                error!("Failed to fetch node level info: {}", e);
+                warn!("Failed to fetch node level info: {}", e);
             }
         }
 
@@ -1091,7 +1091,7 @@ pub async fn start_metrics_aggregator_reporter(config_store: ConfigStore, api_co
         if let Err(e) =
             crate::rpc::track_rpc(server_service.upload_server_http_request_stat(req)).await
         {
-            error!("Failed to upload HTTP request stats: {}", e);
+            warn!("Failed to upload HTTP request stats: {}", e);
         }
     }
 }
@@ -1112,7 +1112,7 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
         let client = match SharedRpcClient::get(&api_config).await {
             Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
-                error!("Top IP stat reporter failed to connect: {}", e);
+                warn!("Top IP stat reporter failed to connect: {}", e);
                 continue;
             }
         };
@@ -1143,7 +1143,7 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
         )
         .await
         {
-            error!("Failed to upload top IP stats: {}", e);
+            warn!("Failed to upload top IP stats: {}", e);
         }
     }
 }

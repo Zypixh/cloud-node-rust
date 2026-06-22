@@ -518,8 +518,47 @@ pub trait ProxyHttp {
     }
 
     /// A value of true means that the log message will be suppressed. The default value is false.
-    fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, _error: &Error) -> bool {
-        false
+    fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, error: &Error) -> bool {
+        if matches!(error.etype(), HTTPStatus(_)) {
+            return true;
+        }
+
+        match error.esource() {
+            ErrorSource::Upstream => matches!(
+                error.etype(),
+                ConnectTimedout
+                    | ConnectRefused
+                    | ConnectNoRoute
+                    | ConnectProxyFailure
+                    | ConnectError
+                    | TLSWantX509Lookup
+                    | TLSHandshakeFailure
+                    | TLSHandshakeTimedout
+                    | InvalidCert
+                    | HandshakeError
+                    | ReadError
+                    | WriteError
+                    | ReadTimedout
+                    | WriteTimedout
+                    | ConnectionClosed
+                    | H1Error
+                    | H2Error
+                    | InvalidH2
+            ),
+            ErrorSource::Downstream | ErrorSource::Unset => matches!(
+                error.etype(),
+                InvalidHTTPHeader
+                    | H1Error
+                    | H2Error
+                    | InvalidH2
+                    | ReadError
+                    | WriteError
+                    | ReadTimedout
+                    | WriteTimedout
+                    | ConnectionClosed
+            ),
+            ErrorSource::Internal => false,
+        }
     }
 
     /// This filter is called when there is an error **after** a connection is established (or reused)
@@ -594,7 +633,7 @@ pub trait ProxyHttp {
         };
         if code > 0 {
             session.respond_error(code).await.unwrap_or_else(|e| {
-                error!("failed to send error response to downstream: {e}");
+                debug!("failed to send error response to downstream: {e}");
             });
         }
 

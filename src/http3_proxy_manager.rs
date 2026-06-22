@@ -194,7 +194,7 @@ impl Http3ProxyManager {
                     .serve_connection(connecting, port, proxy, shutdown)
                     .await
                 {
-                    error!(
+                    debug!(
                         "HTTP/3 connection handling failed on port {}: {}",
                         port, err
                     );
@@ -261,7 +261,7 @@ impl Http3ProxyManager {
                             .handle_request(resolver, listen_port, remote_addr, proxy, shutdown)
                             .await
                         {
-                            error!(
+                            debug!(
                                 "HTTP/3 request handling failed on port {}: {}",
                                 listen_port, err
                             );
@@ -270,7 +270,7 @@ impl Http3ProxyManager {
                 }
                 Ok(None) => return Ok(()),
                 Err(err) => {
-                    warn!(
+                    debug!(
                         "HTTP/3 accept loop terminated on port {}: {}",
                         listen_port, err
                     );

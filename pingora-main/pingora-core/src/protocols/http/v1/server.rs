@@ -20,7 +20,7 @@ use bytes::{BufMut, BytesMut};
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, Method, Version};
-use log::{debug, trace, warn};
+use log::{debug, trace};
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
@@ -517,7 +517,7 @@ impl HttpSession {
 
         if let Some(resp) = self.response_written.as_ref() {
             if !resp.status.is_informational() || self.upgraded {
-                warn!("Respond header is already sent, cannot send again");
+                debug!("Respond header is already sent, cannot send again");
                 return Ok(());
             }
         }
@@ -2822,7 +2822,7 @@ Content-Length: 5\r\n\
 mod test_sync {
     use super::*;
     use http::StatusCode;
-    use log::{debug, error};
+    use log::debug;
     use std::str;
 
     fn init_log() {
@@ -2842,7 +2842,7 @@ mod test_sync {
         let result = resp.parse(wire.as_ref());
         match result {
             Ok(_) => {}
-            Err(e) => error!("{:?}", e),
+            Err(e) => debug!("{:?}", e),
         }
         assert!(result.unwrap().is_complete());
         // FIXME: the order is not guaranteed

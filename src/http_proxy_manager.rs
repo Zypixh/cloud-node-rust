@@ -569,7 +569,7 @@ impl HttpProxyManager {
                                 if !is_benign_tls_accept_error(&e.to_string())
                                     && configured_tls_host
                                 {
-                                    error!("TLS handshake failed: {}", e);
+                                    debug!("TLS handshake failed: {}", e);
                                 }
                                 if count_tls_handshake_failure {
                                     manager.record_tls_handshake_failure(client_addr.ip());
@@ -645,7 +645,7 @@ impl HttpProxyManager {
                                         if !is_benign_h2_error(&e.to_string())
                                             && configured_tls_host
                                         {
-                                            error!("HTTP/2 session error: {}", e);
+                                            debug!("HTTP/2 session error: {}", e);
                                         }
                                         break;
                                     }
@@ -654,7 +654,7 @@ impl HttpProxyManager {
                         }
                         Ok(Err(e)) => {
                             if !is_benign_h2_error(&e.to_string()) && configured_tls_host {
-                                error!("HTTP/2 handshake error: {}", e);
+                                debug!("HTTP/2 handshake error: {}", e);
                             }
                         }
                         Err(_) => {

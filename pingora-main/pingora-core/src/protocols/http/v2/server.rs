@@ -22,7 +22,7 @@ use h2::{RecvStream, SendStream};
 use http::header::HeaderName;
 use http::uri::PathAndQuery;
 use http::{header, HeaderMap, Response};
-use log::{debug, warn};
+use log::debug;
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::sync::Arc;
@@ -302,7 +302,7 @@ impl HttpSession {
         }
 
         if self.response_written.as_ref().is_some() {
-            warn!("Response header is already sent, cannot send again");
+            debug!("Response header is already sent, cannot send again");
             return Ok(());
         }
 
@@ -348,7 +348,7 @@ impl HttpSession {
         if self.ended {
             // NOTE: in h1, we also track to see if content-length matches the data
             // We have not tracked that in h2
-            warn!("Try to write body after end of stream, dropping the extra data");
+            debug!("Try to write body after end of stream, dropping the extra data");
             return Ok(());
         }
         let Some(writer) = self.send_response_body.as_mut() else {
@@ -369,7 +369,7 @@ impl HttpSession {
     /// Write response trailers to the client, this also closes the stream.
     pub fn write_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
         if self.ended {
-            warn!("Tried to write trailers after end of stream, dropping them");
+            debug!("Tried to write trailers after end of stream, dropping them");
             return Ok(());
         }
         let Some(writer) = self.send_response_body.as_mut() else {

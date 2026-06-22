@@ -283,7 +283,7 @@ impl UdpProxyManager {
                     Ok(Some(session)) => session,
                     Ok(None) => continue,
                     Err(err) => {
-                        warn!(
+                        debug!(
                             "UDP session creation failed for {} on port {}: {}",
                             client_addr, port, err
                         );

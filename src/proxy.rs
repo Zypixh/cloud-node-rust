@@ -18,7 +18,7 @@ use pingora_proxy::{
 use rand::Rng;
 use rand::seq::SliceRandom;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::api_config::ApiConfig;
 use crate::cache::should_cache_response;
@@ -577,6 +577,22 @@ static SWR_REVALIDATE_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 });
 
 impl EdgeProxy {
+    fn is_access_log_only_proxy_error(error: &Error) -> bool {
+        crate::process_log_policy::is_request_outcome_error(error, None)
+    }
+
+    fn record_access_log_error(ctx: &mut ProxyCTX, error: &Error, status: Option<u16>) {
+        if !crate::process_log_policy::is_request_outcome_error(error, status) {
+            return;
+        }
+
+        let label = crate::process_log_policy::access_log_error_label(error, status);
+        let errors = ctx.errors.get_or_insert_with(Vec::new);
+        if !errors.iter().any(|existing| existing == label) {
+            errors.push(label.to_string());
+        }
+    }
+
     fn is_grpc_request(session: &Session) -> bool {
         session
             .get_header("content-type")
@@ -856,7 +872,7 @@ impl EdgeProxy {
 
     fn insert_location_header(resp: &mut pingora_http::ResponseHeader, location: impl AsRef<str>) {
         if resp.insert_header("location", location.as_ref()).is_err() {
-            warn!("Invalid Location header value generated, falling back to /");
+            debug!("Invalid Location header value generated, falling back to /");
             let _ = resp.insert_header("location", "/");
         }
     }
@@ -6071,7 +6087,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             crate::rpc::acme::AcmeKeyLookup::Found(key) => key,
             crate::rpc::acme::AcmeKeyLookup::Missing => return Ok(false),
             crate::rpc::acme::AcmeKeyLookup::RpcError(err) => {
-                warn!(
+                debug!(
                     "ACME challenge key lookup failed for token={}: {}",
                     token, err
                 );
@@ -6632,7 +6648,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 mut status,
                 mut body,
             } => {
-                warn!(
+                debug!(
                     "WAF_BLOCK: IP={} host={} method={} uri={} status={} policy_id={} group_id={} action={} tags={:?}",
                     ip,
                     ctx.host,
@@ -7735,7 +7751,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         ctx.request_phase = RequestPhase::LocalService;
         ctx.is_on = state.hot_path.is_on;
         if !ctx.is_on {
-            warn!(
+            debug!(
                 "BLOCKED: Node is DISABLED (isOn=false), rejecting {} {} from IP={}",
                 session.req_header().method,
                 session.req_header().uri,
@@ -7927,7 +7943,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         if ctx.lb.is_none()
             && let Some(server) = &ctx.server
         {
-            warn!(
+            debug!(
                 "LB missing for host '{}'; scheduling background rebuild and returning 502 for this request.",
                 state.host
             );
@@ -8026,7 +8042,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         ctx.request_phase = RequestPhase::Limits;
         let full_url = Self::request_full_url(session, ctx);
         if self.config.is_deleted_content_exact_sync(&full_url) {
-            warn!(
+            debug!(
                 "Deleted content matched exact URL, returning 451: server_id={} url={}",
                 ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
                 full_url
@@ -8053,7 +8069,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
             )
         {
-            warn!(
+            debug!(
                 "BLOCKED: IP {} is blocked by WAF state (host={}, method={}, uri={})",
                 ctx.client_ip_str,
                 state.host,
@@ -8074,7 +8090,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 crate::special_defense::cluster_block_scope_id(main_cluster_id),
             )
         {
-            warn!(
+            debug!(
                 "BLOCKED: IP {} is blocked by main cluster WAF state (cluster_id={}, host={}, method={}, uri={})",
                 ctx.client_ip_str,
                 main_cluster_id,
@@ -8454,6 +8470,8 @@ impl ProxyHttp for EdgeProxy {
             },
         };
 
+        Self::record_access_log_error(ctx, e, (code > 0).then_some(code));
+
         if matches!(e.esource(), ErrorSource::Upstream) && (code == 0 || code >= 500) {
             crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(ctx.origin_id);
         }
@@ -8477,7 +8495,7 @@ impl ProxyHttp for EdgeProxy {
                     .map(|_| ())
             };
             if let Err(write_err) = write_result {
-                error!("failed to send error response to downstream: {}", write_err);
+                debug!("failed to send error response to downstream: {}", write_err);
             }
         }
 
@@ -8583,6 +8601,10 @@ impl ProxyHttp for EdgeProxy {
     }
 
     fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, e: &Error) -> bool {
+        if Self::is_access_log_only_proxy_error(e) {
+            return true;
+        }
+
         match e.etype() {
             // Silence common downstream disconnection errors to reduce log noise during load tests
             pingora::ErrorType::WriteError
@@ -8676,7 +8698,7 @@ impl ProxyHttp for EdgeProxy {
                     }
                 } else {
                     let available_keys = self.config.get_parent_route_keys_sync();
-                    warn!(
+                    debug!(
                         "No parent LB for cluster_id={}. Available cluster keys: {:?}. Falling back to origin.",
                         node_cluster_id, available_keys
                     );
@@ -8701,7 +8723,7 @@ impl ProxyHttp for EdgeProxy {
             {
                 ctx.origin_id = ext.origin_id;
                 ctx.origin_address = peer_addr.clone();
-                warn!(
+                debug!(
                     "Selected unsupported origin: server_id={} origin_id={} reason={}",
                     ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
                     ext.origin_id,
@@ -8712,7 +8734,7 @@ impl ProxyHttp for EdgeProxy {
             if let Some(ext) = backend_ext
                 && ext.origin_role == crate::lb_factory::OriginRole::Backup
             {
-                warn!(
+                debug!(
                     "Selected backup origin: server_id={} origin_id={} addr={}",
                     ctx.server.as_ref().and_then(|s| s.id).unwrap_or(0),
                     ext.origin_id,
@@ -11140,6 +11162,7 @@ pub fn start_request_limit_cleanup_task() {
 #[cfg(test)]
 mod tests {
     use super::EdgeProxy;
+    use pingora_core::{Error, ErrorType};
 
     #[test]
     fn firewall_ref_parses_real_default_captcha_type_field() {
@@ -11197,6 +11220,54 @@ mod tests {
         assert!(ctx.request_body_waf_permit.is_none());
         assert!(ctx.response_body_waf_permit.is_none());
         assert!(ctx.response_transform_permit.is_none());
+    }
+
+    #[test]
+    fn common_request_outcomes_are_access_log_only_errors() {
+        for error_type in [
+            ErrorType::ConnectTimedout,
+            ErrorType::ReadTimedout,
+            ErrorType::WriteTimedout,
+            ErrorType::ConnectRefused,
+            ErrorType::ConnectNoRoute,
+        ] {
+            let error = Error::new_up(error_type);
+            assert!(EdgeProxy::is_access_log_only_proxy_error(&error));
+        }
+
+        let downstream_closed = Error::new_down(ErrorType::ConnectionClosed);
+        assert!(EdgeProxy::is_access_log_only_proxy_error(
+            &downstream_closed
+        ));
+
+        let internal_error = Error::new_in(ErrorType::InternalError);
+        assert!(!EdgeProxy::is_access_log_only_proxy_error(&internal_error));
+    }
+
+    #[test]
+    fn upstream_timeouts_are_access_log_only_errors() {
+        for error_type in [
+            ErrorType::ConnectTimedout,
+            ErrorType::ReadTimedout,
+            ErrorType::WriteTimedout,
+        ] {
+            let error = Error::new_up(error_type);
+            assert!(EdgeProxy::is_access_log_only_proxy_error(&error));
+        }
+    }
+
+    #[test]
+    fn access_log_error_labels_are_recorded_once() {
+        let mut ctx = crate::proxy::ProxyCTX::default();
+        let error = Error::new_up(ErrorType::ReadTimedout);
+
+        EdgeProxy::record_access_log_error(&mut ctx, &error, Some(504));
+        EdgeProxy::record_access_log_error(&mut ctx, &error, Some(504));
+
+        assert_eq!(
+            ctx.errors,
+            Some(vec!["proxy: upstream_read_timeout".to_string()])
+        );
     }
 
     #[test]

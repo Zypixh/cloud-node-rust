@@ -20,7 +20,7 @@ use futures::FutureExt;
 use h2::client::{self, ResponseFuture, SendRequest};
 use h2::{Reason, RecvStream, SendStream};
 use http::HeaderMap;
-use log::{debug, error, warn};
+use log::debug;
 use pingora_error::{Error, ErrorType, ErrorType::*, OrErr, Result, RetryType};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
@@ -134,7 +134,7 @@ impl Http2Session {
     /// Write a request body chunk
     pub async fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
-            warn!("Try to write request body after end of stream, dropping the extra data");
+            debug!("Try to write request body after end of stream, dropping the extra data");
             return Ok(());
         }
 
@@ -557,7 +557,7 @@ pub async fn drive_connection<S>(
                 do_ping_pong(ping_pong, interval, tx, dropped2, id).await;
             });
         } else {
-            warn!("Cannot get ping-pong handler from h2 connection");
+            debug!("Cannot get ping-pong handler from h2 connection");
         }
 
         tokio::select! {
@@ -568,9 +568,9 @@ pub async fn drive_connection<S>(
             r = rx => match r {
                 Ok(_) => {
                     ping_timeout_occurred.store(true, Ordering::Relaxed);
-                    warn!("H2 connection Ping timeout/Error fd: {id}, closing conn");
+                    debug!("H2 connection Ping timeout/Error fd: {id}, closing conn");
                 },
-                Err(e) => warn!("H2 connection Ping Rx error {e:?}"),
+                Err(e) => debug!("H2 connection Ping Rx error {e:?}"),
             },
         };
 
@@ -603,7 +603,7 @@ async fn do_ping_pong(
         debug!("H2 fd: {id} ping sent");
         match tokio::time::timeout(PING_TIMEOUT, ping_fut).await {
             Err(_) => {
-                error!("H2 fd: {id} ping timeout");
+                debug!("H2 fd: {id} ping timeout");
                 let _ = tx.send(());
                 break;
             }
@@ -617,7 +617,7 @@ async fn do_ping_pong(
                         // drive_connection() exits first, no need to error again
                         break;
                     }
-                    error!("H2 fd: {id} ping error: {e}");
+                    debug!("H2 fd: {id} ping error: {e}");
                     let _ = tx.send(());
                     break;
                 }

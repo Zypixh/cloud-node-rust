@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tonic::Code;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub struct LogUploader {
     rx: mpsc::Receiver<pb::HttpAccessLog>,
@@ -210,7 +210,7 @@ impl AccessLogUploadWorker {
                     return self.channel.as_ref();
                 }
                 Err(err) => {
-                    error!(
+                    warn!(
                         "Failed to connect to Master gRPC for LogUploader endpoint {}: {}",
                         api_endpoint, err
                     );
@@ -376,7 +376,7 @@ impl AccessLogUploadWorker {
                     return match self.send_access_log_chunk(channel, &logs).await {
                         Ok(_) => Ok(()),
                         Err(err) => {
-                            error!(
+                            warn!(
                                 "Failed to upload access logs after dropping request bodies: {}",
                                 err
                             );
@@ -396,7 +396,7 @@ impl AccessLogUploadWorker {
                 }
             }
             Err(e) => {
-                error!("Failed to upload access logs: {}", e);
+                warn!("Failed to upload access logs: {}", e);
                 Err(AccessLogUploadError::Retry(logs))
             }
         }
@@ -622,7 +622,7 @@ impl NodeLogUploader {
                 self.channel.as_ref()
             }
             Err(err) => {
-                error!("Failed to connect for NodeLogUploader: {}", err);
+                warn!("Failed to connect for NodeLogUploader: {}", err);
                 None
             }
         }
@@ -673,7 +673,7 @@ impl NodeLogUploader {
         {
             Ok(_) => info!("Successfully uploaded {} node logs", count),
             Err(e) => {
-                error!("Failed to upload node logs: {}", e);
+                warn!("Failed to upload node logs: {}", e);
                 self.channel = None;
             }
         }

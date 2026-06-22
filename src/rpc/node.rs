@@ -5,7 +5,7 @@ use std::sync::LazyLock as Lazy;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::api_config::ApiConfig;
 use crate::config::ConfigStore;
@@ -237,7 +237,7 @@ pub async fn start_config_syncer(
         let client = match SharedRpcClient::get(&api_config).await {
             Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
-                error!("Failed to connect to API node: {}. Will retry...", e);
+                warn!("Failed to connect to API node: {}. Will retry...", e);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -446,11 +446,11 @@ where
                     match decoded {
                         Ok(Ok(decoded)) => node_json = decoded,
                         Ok(Err(e)) => {
-                            error!("Failed to decompress node_json: {}", e);
+                            warn!("Failed to decompress node_json: {}", e);
                             return false;
                         }
                         Err(e) => {
-                            error!("Failed to join node_json decompression task: {}", e);
+                            warn!("Failed to join node_json decompression task: {}", e);
                             return false;
                         }
                     }
@@ -1369,7 +1369,7 @@ where
                             }
                         }
                         Err(e) => {
-                            error!("Error parsing NodeConfigPayload: {}", e);
+                            warn!("Error parsing NodeConfigPayload: {}", e);
                             return false;
                         }
                     }
@@ -1377,7 +1377,7 @@ where
             }
         }
         Err(e) => {
-            error!("Error fetching node config: {}", e);
+            warn!("Error fetching node config: {}", e);
             return false;
         }
     }
@@ -1533,7 +1533,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
                 }))
                 .await
             {
-                error!("Failed to report node status: {}", e);
+                warn!("Failed to report node status: {}", e);
             }
         }
     }
@@ -1893,7 +1893,7 @@ pub async fn start_node_value_reporter(config_store: Arc<ConfigStore>, api_confi
                     node_value_items_count,
                     selected_items.join(",")
                 ),
-                Err(e) => error!("Error reporting node values: {}", e),
+                Err(e) => warn!("Error reporting node values: {}", e),
             }
         }
     }

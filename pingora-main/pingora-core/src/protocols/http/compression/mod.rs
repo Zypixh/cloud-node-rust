@@ -19,7 +19,7 @@
 use super::HttpTask;
 
 use bytes::Bytes;
-use log::{debug, warn};
+use log::debug;
 use pingora_error::{ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::time::Duration;
@@ -345,7 +345,7 @@ impl ResponseCompressionCtx {
                     })
                     .transpose();
                 result.unwrap_or_else(|e| {
-                    warn!("Failed to compress, compression disabled, {}", e);
+                    debug!("Failed to compress, compression disabled, {}", e);
                     // no point to transcode further data because bad data is already seen
                     self.0 = CtxInner::BodyPhase(None);
                     None
@@ -435,7 +435,7 @@ impl Algorithm {
                     {
                         Ok(c) => Some(Box::new(c)),
                         Err(e) => {
-                            warn!("Failed to create DCZ compressor: {e}");
+                            debug!("Failed to create DCZ compressor: {e}");
                             None
                         }
                     }
@@ -518,7 +518,7 @@ fn parse_accept_encoding(accept_encoding: Option<&http::HeaderValue>, list: &mut
                 }
             }
             Err(e) => {
-                warn!("Failed to parse accept-encoding {ac:?}, {e}")
+                debug!("Failed to parse accept-encoding {ac:?}, {e}")
             }
         }
     } else {

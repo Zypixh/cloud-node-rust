@@ -20,7 +20,7 @@ use crate::protocols::tls::TlsRef;
 use crate::protocols::IO;
 use crate::{listeners::tls::Acceptor, protocols::Shutdown};
 use async_trait::async_trait;
-use log::warn;
+use log::debug;
 use pingora_error::{ErrorType::*, OrErr, Result};
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -75,7 +75,7 @@ pub async fn handshake_with_callback<S: IO>(
     let done = Pin::new(&mut tls_stream).start_accept().await?;
     if !done {
         // TODO: verify if/how callback in handshake can be done using Rustls
-        warn!("Callacks are not supported with feature \"rustls\".");
+        debug!("Callacks are not supported with feature \"rustls\".");
 
         Pin::new(&mut tls_stream)
             .resume_accept()
@@ -102,7 +102,7 @@ where
         match <Self as AsyncWriteExt>::shutdown(self).await {
             Ok(()) => {}
             Err(e) => {
-                warn!("TLS shutdown failed, {e}");
+                debug!("TLS shutdown failed, {e}");
             }
         }
     }

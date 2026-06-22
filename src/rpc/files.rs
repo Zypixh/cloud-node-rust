@@ -4,7 +4,7 @@ use crate::rpc::client::RpcClient;
 use crate::rpc::logs::report_node_log_with_context;
 use std::fs;
 use std::path::Path;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub async fn start_ip_library_syncer(api_config: ApiConfig) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // Check every hour
@@ -56,10 +56,7 @@ pub async fn start_ip_library_syncer(api_config: ApiConfig) {
                                 last_file_id = file_id;
                             }
                             Err(e) => {
-                                error!(
-                                    "Failed to download IP library (FileId: {}): {}",
-                                    file_id, e
-                                );
+                                warn!("Failed to download IP library (FileId: {}): {}", file_id, e);
                                 report_node_log_with_context(
                                     &api_config,
                                     "error",

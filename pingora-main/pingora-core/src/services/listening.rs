@@ -220,15 +220,15 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                                     Err(e) => {
                                         // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
                                         if let Some(addr) = peer_addr {
-                                            error!("Downstream handshake error from {}: {e}", addr);
+                                            debug!("Downstream handshake error from {}: {e}", addr);
                                         } else {
-                                            error!("Downstream handshake error: {e}");
+                                            debug!("Downstream handshake error: {e}");
                                         }
                                     }
                                 }
                             }
                             Err(_) => {
-                                error!("Downstream handshake timeout");
+                                debug!("Downstream handshake timeout");
                             }
                         }
                     });

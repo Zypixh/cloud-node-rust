@@ -43,7 +43,7 @@ where
         // Cache logic request phase
         if let Err(e) = self.inner.request_cache_filter(session, ctx) {
             // TODO: handle this error
-            warn!(
+            debug!(
                 "Fail to request_cache_filter: {e}, {}",
                 self.inner.request_summary(session, ctx)
             );
@@ -58,7 +58,7 @@ where
                 Err(e) => {
                     // TODO: handle this error
                     session.cache.disable(NoCacheReason::StorageError);
-                    warn!(
+                    debug!(
                         "Fail to cache_key_callback: {e}, {}",
                         self.inner.request_summary(session, ctx)
                     );
@@ -96,7 +96,7 @@ where
                             // We've looked up a secondary slot.
                             // Adhoc double check that the variance found is the variance we want.
                             if Some(variance) != meta.variance() {
-                                warn!("Cache variance mismatch, {variance:?}, {cache_key:?}");
+                                debug!("Cache variance mismatch, {variance:?}, {cache_key:?}");
                                 session.cache.disable(NoCacheReason::InternalError);
                                 break None;
                             }
@@ -126,7 +126,7 @@ where
                             .await
                         {
                             Err(e) => {
-                                error!(
+                                debug!(
                                     "Failed to filter cache hit: {e}, {}",
                                     self.inner.request_summary(session, ctx)
                                 );
@@ -236,7 +236,7 @@ where
 
                     let (reuse, err) = self.proxy_cache_hit(session, ctx).await;
                     if let Some(e) = err.as_ref() {
-                        error!(
+                        debug!(
                             "Fail to serve cache: {e}, {}",
                             self.inner.request_summary(session, ctx)
                         );
@@ -250,7 +250,7 @@ where
                     // TODO: check error types
                     // session.cache.disable();
                     self.inner.cache_miss(session, ctx);
-                    warn!(
+                    debug!(
                         "Fail to cache lookup: {e}, {}",
                         self.inner.request_summary(session, ctx)
                     );
@@ -282,7 +282,7 @@ where
             Err(e) => {
                 // fail open if cache_not_modified_filter errors,
                 // just return the whole original response
-                warn!(
+                debug!(
                     "Failed to run cache not modified filter: {e}, {}",
                     self.inner.request_summary(session, ctx)
                 );
@@ -313,7 +313,7 @@ where
                     .response_header_filter(&mut header, header_only)
                     .await
                 {
-                    error!(
+                    debug!(
                         "Failed to run downstream modules response header filter in hit: {e}, {}",
                         self.inner.request_summary(session, ctx)
                     );
@@ -322,7 +322,7 @@ where
                         .respond_error(500)
                         .await
                         .unwrap_or_else(|e| {
-                            error!("failed to send error response to downstream: {e}");
+                            debug!("failed to send error response to downstream: {e}");
                         });
                     // we have not write anything dirty to downstream, it is still reusable
                     return (true, Some(e));
@@ -339,7 +339,7 @@ where
                 }
             }
             Err(e) => {
-                error!(
+                debug!(
                     "Failed to run response filter in hit: {e}, {}",
                     self.inner.request_summary(session, ctx)
                 );
@@ -348,7 +348,7 @@ where
                     .respond_error(500)
                     .await
                     .unwrap_or_else(|e| {
-                        error!("failed to send error response to downstream: {e}");
+                        debug!("failed to send error response to downstream: {e}");
                     });
                 // we have not write anything dirty to downstream, it is still reusable
                 return (true, Some(e));
@@ -488,7 +488,7 @@ where
         }
 
         if let Err(e) = session.cache.finish_hit_handler().await {
-            warn!("Error during finish_hit_handler: {}", e);
+            debug!("Error during finish_hit_handler: {}", e);
         }
 
         match session.as_mut().finish_body().await {
@@ -519,7 +519,7 @@ where
             Err(e) => {
                 // fail open if cache_not_modified_filter errors,
                 // just return the whole original response
-                warn!(
+                debug!(
                     "Failed to run cache not modified filter: {e}, {}",
                     self.inner.request_summary(session, ctx)
                 );
@@ -746,7 +746,7 @@ where
                             .upstream_response_filter(session, resp, ctx)
                             .await
                         {
-                            error!("upstream response filter error on 304: {err:?}");
+                            debug!("upstream response filter error on 304: {err:?}");
                             session.cache.revalidate_uncacheable(
                                 *resp.clone(),
                                 NoCacheReason::InternalError,
@@ -776,7 +776,7 @@ where
                                 if let Err(e) = session.cache.revalidate_cache_meta(meta).await {
                                     // Fail open: we can continue use the revalidated response even
                                     // if the meta failed to write to storage
-                                    warn!("revalidate_cache_meta failed {e:?}");
+                                    debug!("revalidate_cache_meta failed {e:?}");
                                 }
                             }
                             Ok(Uncacheable(reason)) => {
@@ -800,7 +800,7 @@ where
                                 // Error during revalidation, similarly to the reasons above
                                 // (avoid poisoning downstream cache with passthrough 304),
                                 // allow serving the stored response without updating cache
-                                warn!("Error {e:?} response_cache_filter during revalidation");
+                                debug!("Error {e:?} response_cache_filter during revalidation");
                                 session.cache.revalidate_uncacheable(
                                     merged_header,
                                     NoCacheReason::InternalError,
@@ -812,7 +812,7 @@ where
                         true
                     } else {
                         //TODO: log more
-                        warn!("304 received without cached asset, disable caching");
+                        debug!("304 received without cached asset, disable caching");
                         let reason = NoCacheReason::Custom("304 on miss");
                         session.cache.response_became_uncacheable(reason);
                         session.cache.disable(reason);
@@ -884,7 +884,7 @@ where
         }
 
         // log the original error
-        warn!(
+        debug!(
             "Fail to proxy: {}, serving stale, {}",
             error,
             self.inner.request_summary(session, ctx)

@@ -247,10 +247,10 @@ where
                         debug!("Downstream request parse error ({}): {e}", action.reason);
                     }
                     DownstreamParseErrorLogLevel::Warn => {
-                        warn!("Downstream request parse error ({}): {e}", action.reason);
+                        debug!("Downstream request parse error ({}): {e}", action.reason);
                     }
                     DownstreamParseErrorLogLevel::Error => {
-                        error!("Fail to proxy ({}): {e}", action.reason);
+                        debug!("Fail to proxy ({}): {e}", action.reason);
                     }
                 }
                 if let Some(status) = action.respond_status {
@@ -258,7 +258,7 @@ where
                         .respond_error(status)
                         .await
                         .unwrap_or_else(|e| {
-                            error!("failed to send error response to downstream: {e}");
+                            debug!("failed to send error response to downstream: {e}");
                         });
                 }
                 downstream_session.shutdown().await;
@@ -285,7 +285,7 @@ where
                 .respond_error(405)
                 .await
                 .unwrap_or_else(|e| {
-                    error!("failed to send error response to downstream: {e}");
+                    debug!("failed to send error response to downstream: {e}");
                 });
             downstream_session.shutdown().await;
             return None;
@@ -905,13 +905,19 @@ where
                         break;
                     }
                     // only log error that will be retried here, the final error will be logged below
-                    warn!(
-                        "Fail to proxy: {}, tries: {}, retry: {}, {}",
+                    if !self.inner.suppress_error_log(
+                        &session,
+                        &ctx,
                         proxy_error.as_ref().unwrap(),
-                        retries,
-                        retry,
-                        self.inner.request_summary(&session, &ctx)
-                    );
+                    ) {
+                        warn!(
+                            "Fail to proxy: {}, tries: {}, retry: {}, {}",
+                            proxy_error.as_ref().unwrap(),
+                            retries,
+                            retry,
+                            self.inner.request_summary(&session, &ctx)
+                        );
+                    }
                 }
                 None => {
                     proxy_error = None;

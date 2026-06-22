@@ -248,7 +248,7 @@ where
                             }
                         },
                         Err(e) => {
-                           warn!("send error, draining read buf: {e}");
+                           debug!("send error, draining read buf: {e}");
                            request_done = true;
 
                            send_error = Some(e);
@@ -388,7 +388,7 @@ where
                             if wait_for_cache_fill {
                                 // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
-                                warn!(
+                                debug!(
                                     "Downstream Error ignored during caching: {}, {}",
                                     e,
                                     self.inner.request_summary(session, ctx)
@@ -521,7 +521,7 @@ where
                             // give up writing to downstream but wait for upstream cache write to finish
                             downstream_state.to_errored();
                             response_state.maybe_set_cache_done(true);
-                            warn!(
+                            debug!(
                                 "Downstream Error ignored during caching: {}, {}",
                                 e,
                                 self.inner.request_summary(session, ctx)
@@ -536,7 +536,7 @@ where
                     }
                     if response_state.cached_done() {
                         if let Err(e) = session.cache.finish_hit_handler().await {
-                            warn!("Error during finish_hit_handler: {}", e);
+                            debug!("Error during finish_hit_handler: {}", e);
                         }
                     }
                 }
@@ -550,7 +550,7 @@ where
                     let data = match data {
                         Ok(data) => data,
                         Err(err) =>  {
-                            warn!("downstream_custom_message_reader got error: {err}");
+                            debug!("downstream_custom_message_reader got error: {err}");
                             downstream_custom_read = false;
                             continue;
                         },
@@ -598,7 +598,7 @@ where
                     debug!("finished sending body to downstream");
                 }
                 Err(e) => {
-                    error!("Error finish sending body to downstream: {}", e);
+                    debug!("Error finish sending body to downstream: {}", e);
                     reuse_downstream = false;
                 }
             }
@@ -640,7 +640,7 @@ where
                         return Err(e);
                     } else {
                         // otherwise, continue processing the response
-                        warn!(
+                        debug!(
                             "Fail to cache response: {}, {}",
                             e,
                             self.inner.request_summary(session, ctx)
@@ -838,7 +838,7 @@ pub(crate) async fn send_body_to1(
                                 debug!("Write {} bytes body to upstream", n);
                             }
                             None => {
-                                warn!("Upstream body is already finished. Nothing to write");
+                                debug!("Upstream body is already finished. Nothing to write");
                             }
                         },
                         Err(e) => {
@@ -860,7 +860,7 @@ pub(crate) async fn send_body_to1(
                                     debug!("Write {} bytes upgraded body to upstream", n);
                                 }
                                 None => {
-                                    warn!("Upstream upgraded body is already finished. Nothing to write");
+                                    debug!("Upstream upgraded body is already finished. Nothing to write");
                                 }
                             }
                         }
@@ -872,7 +872,7 @@ pub(crate) async fn send_body_to1(
             }
             _ => {
                 // should never happen, sender only sends body
-                warn!("Unexpected task sent to upstream");
+                debug!("Unexpected task sent to upstream");
                 body_done = true;
                 // error here,
                 // for client sessions that received upgrade but didn't

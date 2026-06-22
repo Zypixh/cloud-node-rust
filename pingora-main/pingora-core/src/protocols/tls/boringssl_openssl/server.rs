@@ -23,7 +23,7 @@ use crate::tls::ssl;
 use crate::tls::ssl::SslAcceptor;
 
 use async_trait::async_trait;
-use log::warn;
+use log::debug;
 use pingora_error::{ErrorType::*, OrErr, Result};
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -85,7 +85,7 @@ where
         match <Self as AsyncWriteExt>::shutdown(self).await {
             Ok(()) => {}
             Err(e) => {
-                warn!("TLS shutdown failed, {e}");
+                debug!("TLS shutdown failed, {e}");
             }
         }
     }

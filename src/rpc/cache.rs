@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tonic::Request;
 use tonic::transport::Channel;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub(crate) fn normalize_purge_prefix(key: &str) -> String {
     let trimmed = key.trim();
@@ -559,7 +559,7 @@ pub async fn sync_cache_tasks(
                         )
                         .await
                         {
-                            error!("Tag purge fanout failed for {}: {}", key_task.key, err);
+                            warn!("Tag purge fanout failed for {}: {}", key_task.key, err);
                         }
                     }
                     if !purge_ok {
@@ -622,7 +622,7 @@ pub async fn sync_cache_tasks(
                             )
                             .await
                             {
-                                error!("Purge fanout failed for {}: {}", key_task.key, err);
+                                warn!("Purge fanout failed for {}: {}", key_task.key, err);
                             }
                         }
                     }
@@ -636,7 +636,7 @@ pub async fn sync_cache_tasks(
                             info!("Preheat success: {}", key_task.key);
                         }
                         Err(err) => {
-                            error!("Preheat failed for {}: {}", key_task.key, err);
+                            warn!("Preheat failed for {}: {}", key_task.key, err);
                             error = err;
                         }
                     }
@@ -658,7 +658,7 @@ pub async fn sync_cache_tasks(
             true
         }
         Err(e) => {
-            error!("Failed to fetch cache tasks: {}", e);
+            warn!("Failed to fetch cache tasks: {}", e);
             false
         }
     }

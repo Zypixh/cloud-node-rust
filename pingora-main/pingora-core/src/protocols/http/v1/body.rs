@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use log::{debug, trace, warn};
+use log::{debug, trace};
 use pingora_error::{
     Error,
     ErrorType::{self, *},
@@ -316,7 +316,7 @@ impl BodyReader {
                     ))
                 } else if n >= to_read {
                     if n > to_read {
-                        warn!(
+                        debug!(
                             "Peer sent more data then expected: extra {}\
                                bytes, discarding them",
                             n - to_read
@@ -984,7 +984,7 @@ impl BodyWriter {
                 }
                 let mut to_write = total - written;
                 if to_write < buf.len() {
-                    warn!("Trying to write data over content-length: {total}");
+                    debug!("Trying to write data over content-length: {total}");
                 } else {
                     to_write = buf.len();
                 }

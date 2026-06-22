@@ -15,7 +15,7 @@
 //! Common functions and constants
 
 use http::{header, HeaderValue};
-use log::warn;
+use log::debug;
 use pingora_error::{Error, ErrorType::*, Result};
 use pingora_http::{HMap, RequestHeader, ResponseHeader};
 use std::str;
@@ -216,7 +216,7 @@ pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Result<Optio
                         if cl_length >= 0 {
                             Ok(Some(cl_length as usize))
                         } else {
-                            warn!("negative content-length header value {cl_length}");
+                            debug!("negative content-length header value {cl_length}");
                             Error::e_explain(
                                 InvalidHTTPHeader,
                                 format!("negative Content-Length header value: {cl_length}"),
@@ -224,7 +224,7 @@ pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Result<Optio
                         }
                     }
                     Err(_) => {
-                        warn!("invalid content-length header value {str_cl_value}");
+                        debug!("invalid content-length header value {str_cl_value}");
                         Error::e_explain(
                             InvalidHTTPHeader,
                             format!("invalid Content-Length header value: {str_cl_value}"),
@@ -232,7 +232,7 @@ pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Result<Optio
                     }
                 },
                 Err(_) => {
-                    warn!("invalid content-length header encoding");
+                    debug!("invalid content-length header encoding");
                     Error::e_explain(InvalidHTTPHeader, "invalid Content-Length header encoding")
                 }
             }

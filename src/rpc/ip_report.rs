@@ -8,7 +8,7 @@ use std::sync::LazyLock as Lazy;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IpReportKind {
@@ -85,7 +85,7 @@ pub async fn start_ip_report_service(api_config: ApiConfig) {
         let client = match SharedRpcClient::get(&api_config).await {
             Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
-                error!(
+                warn!(
                     "Failed to connect to API for IP reporting: {}. Waiting 10s...",
                     e
                 );
@@ -142,7 +142,7 @@ pub async fn start_ip_report_service(api_config: ApiConfig) {
 
         match ip_item_service.create_ip_items(req).await {
             Ok(_) => info!("Successfully reported {} IP list items to API", item_count),
-            Err(e) => error!("Failed to report IP items: {}", e),
+            Err(e) => warn!("Failed to report IP items: {}", e),
         }
     }
 }

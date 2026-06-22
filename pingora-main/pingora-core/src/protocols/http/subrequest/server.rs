@@ -35,7 +35,7 @@
 use bytes::Bytes;
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, HeaderMap, Method};
-use log::{debug, trace, warn};
+use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OkOrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
@@ -303,7 +303,7 @@ impl HttpSession {
     pub async fn write_response_header(&mut self, header: Box<ResponseHeader>) -> Result<()> {
         if let Some(resp) = self.response_written.as_ref() {
             if !resp.status.is_informational() || self.upgraded {
-                warn!("Respond header is already sent, cannot send again (subrequest)");
+                debug!("Respond header is already sent, cannot send again (subrequest)");
                 return Ok(());
             }
         }

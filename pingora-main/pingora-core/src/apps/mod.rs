@@ -20,7 +20,7 @@ pub mod prometheus_http_app;
 
 use crate::server::ShutdownWatch;
 use async_trait::async_trait;
-use log::{debug, error};
+use log::debug;
 use std::any::Any;
 use std::future::poll_fn;
 use std::sync::Arc;
@@ -255,7 +255,7 @@ where
             let h2_conn = server::handshake(stream, h2_options).await;
             let mut h2_conn = match h2_conn {
                 Err(e) => {
-                    error!("H2 handshake error {e}");
+                    debug!("H2 handshake error {e}");
                     return None;
                 }
                 Ok(c) => c,
@@ -269,7 +269,7 @@ where
                     _ = shutdown.changed() => {
                         h2_conn.graceful_shutdown();
                         let _ = poll_fn(|cx| h2_conn.poll_closed(cx))
-                            .await.map_err(|e| error!("H2 error waiting for shutdown {e}"));
+                            .await.map_err(|e| debug!("H2 error waiting for shutdown {e}"));
                         return None;
                     }
                     h2_stream = server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()) => h2_stream

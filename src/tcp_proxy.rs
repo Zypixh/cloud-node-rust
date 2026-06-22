@@ -595,7 +595,7 @@ impl TcpProxyManager {
             )
             .await
             .map_err(|e| {
-                error!(
+                debug!(
                     "TCP Proxy: TLS handshake with backend {} (SNI: {}) failed: {}",
                     context.backend_addr, host, e
                 );
@@ -750,7 +750,7 @@ impl TcpProxyManager {
         server: &ServerConfig,
         context: &TcpForwardContext,
     ) {
-        error!(
+        debug!(
             "TCP Proxy: Failed to connect to backend {}",
             context.backend_addr
         );

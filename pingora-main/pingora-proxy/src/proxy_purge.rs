@@ -83,7 +83,7 @@ where
                 }
                 Err(e) => {
                     session.cache.disable(NoCacheReason::StorageError);
-                    warn!(
+                    debug!(
                         "Fail to purge cache: {e}, {}",
                         self.inner.request_summary(session, ctx)
                     );
@@ -100,7 +100,7 @@ where
             self.inner
                 .purge_response_filter(session, ctx, purge_status, &mut purge_resp)
         {
-            error!(
+            debug!(
                 "Failed purge response filter: {e}, {}",
                 self.inner.request_summary(session, ctx)
             );
@@ -116,7 +116,7 @@ where
             // dirty, not reusable
             Err(e) => {
                 let e = e.into_down();
-                error!(
+                debug!(
                     "Failed to send purge response: {e}, {}",
                     self.inner.request_summary(session, ctx)
                 );

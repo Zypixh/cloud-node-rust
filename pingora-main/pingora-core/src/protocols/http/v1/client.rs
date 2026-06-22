@@ -2506,7 +2506,7 @@ hello";
 #[cfg(test)]
 mod test_sync {
     use super::*;
-    use log::error;
+    use log::debug;
 
     #[test]
     fn test_request_to_wire() {
@@ -2518,7 +2518,7 @@ mod test_sync {
         let result = req.parse(wire.as_ref());
         match result {
             Ok(_) => {}
-            Err(e) => error!("{:?}", e),
+            Err(e) => debug!("{:?}", e),
         }
         assert!(result.unwrap().is_complete());
         // FIXME: the order is not guaranteed

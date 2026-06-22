@@ -17,7 +17,7 @@ use crate::protocols::tls::{SslDigest, ALPN};
 use crate::protocols::{Peek, Ssl, UniqueID, UniqueIDType};
 use crate::tls::{self, ssl, tokio_ssl::SslStream as InnerSsl};
 use crate::utils::tls::{get_organization, get_serial};
-use log::warn;
+use log::debug;
 use pingora_error::{ErrorType::*, OrErr, Result};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -82,7 +82,7 @@ where
     fn clear_error() {
         let errs = tls::error::ErrorStack::get();
         if !errs.errors().is_empty() {
-            warn!("Clearing dirty TLS error stack: {}", errs);
+            debug!("Clearing dirty TLS error stack: {}", errs);
         }
     }
 }

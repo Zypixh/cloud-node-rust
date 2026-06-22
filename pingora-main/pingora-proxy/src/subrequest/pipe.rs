@@ -30,7 +30,7 @@ use crate::subrequest::*;
 use crate::{PreparedSubrequest, Session};
 use bytes::Bytes;
 use futures::FutureExt;
-use log::{debug, warn};
+use log::debug;
 use pingora_core::protocols::http::{subrequest::server::SubrequestHandle, HttpTask};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use tokio::sync::mpsc;
@@ -402,7 +402,7 @@ fn do_send_body_to_pipe(
 
     if let Some(capture) = saved_body.as_mut() {
         if capture.is_body_complete() {
-            warn!("subrequest trying to save body after body is complete");
+            debug!("subrequest trying to save body after body is complete");
         } else if let Some(d) = data.as_ref() {
             capture.save_body_bytes(d.clone());
         }

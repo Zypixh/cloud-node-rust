@@ -30,7 +30,7 @@ use crate::upstreams::peer::{Peer, ALPN};
 
 pub use l4::Connect as L4Connect;
 use l4::{connect as l4_connect, BindTo};
-use log::{debug, error, warn};
+use log::debug;
 use offload::OffloadRuntime;
 use parking_lot::RwLock;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
@@ -216,7 +216,7 @@ impl TransportConnector {
                         Err(arc) => {
                             attempts += 1;
                             if attempts >= 50 {
-                                error!("failed to acquire reusable stream after retries");
+                                debug!("failed to acquire reusable stream after retries");
                                 break None;
                             }
                             s_opt = Some(arc);
@@ -400,7 +400,7 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
                 if n == 0 {
                     debug!("Idle connection is closed");
                 } else {
-                    warn!("Unexpected data read in idle connection");
+                    debug!("Unexpected data read in idle connection");
                 }
             }
             Err(e) => {
