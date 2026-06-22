@@ -101,39 +101,7 @@ impl MetricRequestContext {
     }
 
     pub fn resolve_variable(&self, var_name: &str) -> String {
-        if let Some(value) = self.values.get(var_name) {
-            return value.clone();
-        }
-
-        let Some((prefix, suffix)) = var_name.split_once('.') else {
-            return format!("${{{}}}", var_name);
-        };
-
-        match prefix {
-            "header" | "http" => lookup_case_insensitive(&self.values, &format!("header.{suffix}")),
-            "response" => {
-                if suffix == "contentType" {
-                    self.values
-                        .get("response.contentType")
-                        .cloned()
-                        .or_else(|| {
-                            Some(lookup_case_insensitive(
-                                &self.values,
-                                "response.header.Content-Type",
-                            ))
-                            .filter(|value| !value.is_empty())
-                        })
-                        .unwrap_or_default()
-                } else if let Some(header) = suffix.strip_prefix("header.") {
-                    lookup_case_insensitive(&self.values, &format!("response.header.{header}"))
-                } else {
-                    String::new()
-                }
-            }
-            "cookie" | "arg" | "origin" | "node" | "geo" | "isp" | "browser" | "product"
-            | "host" => self.values.get(var_name).cloned().unwrap_or_default(),
-            _ => String::new(),
-        }
+        resolve_metric_variable_from_map(&self.values, var_name)
     }
 
     pub fn network(
@@ -160,6 +128,88 @@ impl MetricRequestContext {
         values.insert("requestLength".to_string(), bytes_received.to_string());
         Self { values }
     }
+}
+
+pub fn resolve_metric_variable_from_map(
+    values: &BTreeMap<String, String>,
+    var_name: &str,
+) -> String {
+    match var_name {
+        "requestMethod" | "method" | "request.method" => {
+            return metric_method_value(values);
+        }
+        _ => {}
+    }
+
+    if let Some(value) = values.get(var_name) {
+        return value.clone();
+    }
+
+    match var_name {
+        "path" => return values.get("requestPath").cloned().unwrap_or_default(),
+        "uri" => {
+            return values
+                .get("requestURI")
+                .or_else(|| values.get("requestUri"))
+                .cloned()
+                .unwrap_or_default();
+        }
+        _ => {}
+    }
+
+    let Some((prefix, suffix)) = var_name.split_once('.') else {
+        return format!("${{{}}}", var_name);
+    };
+
+    match prefix {
+        "header" | "http" => lookup_case_insensitive(values, &format!("header.{suffix}")),
+        "response" => {
+            if suffix == "contentType" {
+                values
+                    .get("response.contentType")
+                    .cloned()
+                    .or_else(|| {
+                        Some(lookup_case_insensitive(
+                            values,
+                            "response.header.Content-Type",
+                        ))
+                        .filter(|value| !value.is_empty())
+                    })
+                    .unwrap_or_default()
+            } else if let Some(header) = suffix.strip_prefix("header.") {
+                lookup_case_insensitive(values, &format!("response.header.{header}"))
+            } else {
+                String::new()
+            }
+        }
+        "request" => match suffix {
+            "method" => metric_method_value(values),
+            "path" => values.get("requestPath").cloned().unwrap_or_default(),
+            "uri" | "URI" => values
+                .get("requestURI")
+                .or_else(|| values.get("requestUri"))
+                .cloned()
+                .unwrap_or_default(),
+            _ => String::new(),
+        },
+        "cookie" | "arg" | "origin" | "node" | "geo" | "isp" | "browser" | "product" | "host" => {
+            values.get(var_name).cloned().unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+fn metric_method_value(values: &BTreeMap<String, String>) -> String {
+    values
+        .get("requestMethod")
+        .or_else(|| values.get("method"))
+        .or_else(|| values.get("request.method"))
+        .map(|method| normalize_metric_http_method(method))
+        .unwrap_or_default()
+}
+
+pub fn normalize_metric_http_method(method: &str) -> String {
+    method.trim().to_ascii_uppercase()
 }
 
 pub fn status_message(status: u16) -> String {
@@ -1078,6 +1128,9 @@ mod tests {
         let mut ctx = MetricRequestContext::default();
         ctx.insert("status", "403");
         ctx.insert("host", "cdn.example.com");
+        ctx.insert("requestMethod", "get");
+        ctx.insert("requestPath", "/index.html");
+        ctx.insert("requestURI", "/index.html?page=1");
         ctx.insert("header.User-Agent", "curl/8");
         ctx.insert("cookie.sid", "abc");
         ctx.insert("arg.page", "1");
@@ -1085,6 +1138,13 @@ mod tests {
 
         assert_eq!(ctx.resolve_key("${status}"), "403");
         assert_eq!(ctx.resolve_key("${host}"), "cdn.example.com");
+        assert_eq!(ctx.resolve_key("${method}"), "GET");
+        assert_eq!(ctx.resolve_key("${request.method}"), "GET");
+        assert_eq!(ctx.resolve_key("${requestMethod}"), "GET");
+        assert_eq!(ctx.resolve_key("${path}"), "/index.html");
+        assert_eq!(ctx.resolve_key("${request.path}"), "/index.html");
+        assert_eq!(ctx.resolve_key("${uri}"), "/index.html?page=1");
+        assert_eq!(ctx.resolve_key("${request.uri}"), "/index.html?page=1");
         assert_eq!(ctx.resolve_key("${header.user-agent}"), "curl/8");
         assert_eq!(ctx.resolve_key("${http.User-Agent}"), "curl/8");
         assert_eq!(ctx.resolve_key("${cookie.sid}"), "abc");

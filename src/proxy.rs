@@ -1563,7 +1563,10 @@ impl EdgeProxy {
             "requestTime".to_string(),
             format!("{:.6}", ctx.start_time.elapsed().as_secs_f64()),
         );
-        values.insert("requestMethod".to_string(), req.method.to_string());
+        values.insert(
+            "requestMethod".to_string(),
+            crate::metrics::normalize_metric_http_method(req.method.as_str()),
+        );
         values.insert(
             "requestFilename".to_string(),
             ctx.cache_key

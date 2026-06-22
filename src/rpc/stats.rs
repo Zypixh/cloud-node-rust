@@ -704,6 +704,131 @@ fn sample_matches_metric_category(
     sample.0.category.as_ref() == category
 }
 
+fn metric_sample_value(
+    item_value: &serde_json::Value,
+    value: &crate::metrics::aggregator::AggregatedRequestValue,
+) -> f32 {
+    match item_value.as_str() {
+        Some("${bytesSent}") | Some("${countTrafficOut}") => value.bytes_sent as f32,
+        Some("${countTrafficIn}") => value.bytes_received as f32,
+        Some("${countRequest}") => value.count as f32,
+        Some("${countConnection}") => value.count as f32,
+        Some("${countAttackRequest}") => value.count_attack as f32,
+        _ => value.count as f32,
+    }
+}
+
+fn build_metric_uploads_for_item(
+    item: &crate::config_models::MetricItemConfig,
+    time_key: &str,
+    samples: &[(
+        crate::metrics::aggregator::AggregationKey,
+        crate::metrics::aggregator::AggregatedValue,
+    )],
+    values_cache: &mut HashMap<String, f32>,
+) -> Vec<pb::UploadMetricStatsRequest> {
+    let item_category = metric_item_category(item);
+    let mut grouped: HashMap<(i64, Vec<String>), (i64, f32)> = HashMap::new();
+
+    for (key, value) in samples
+        .iter()
+        .filter(|sample| sample_matches_metric_category(sample, &item_category))
+    {
+        if value.request_samples.is_empty() {
+            let aggregate_value = crate::metrics::aggregator::AggregatedRequestValue {
+                count: value.count,
+                count_attack: value.count_attack,
+                bytes_sent: value.bytes_sent,
+                bytes_received: value.bytes_received,
+                attack_bytes: value.attack_bytes,
+            };
+            let keys = item
+                .keys
+                .iter()
+                .map(|configured_key| key.resolve_metric_key(configured_key))
+                .collect::<Vec<_>>();
+            let entry = grouped.entry((key.server_id, keys)).or_default();
+            entry.0 += aggregate_value.count;
+            entry.1 += metric_sample_value(&item.value, &aggregate_value);
+            continue;
+        }
+
+        for (request_attrs, request_value) in &value.request_samples {
+            let keys = item
+                .keys
+                .iter()
+                .map(|configured_key| {
+                    key.resolve_metric_key_with_attrs(configured_key, request_attrs.as_ref())
+                })
+                .collect::<Vec<_>>();
+            let entry = grouped.entry((key.server_id, keys)).or_default();
+            entry.0 += request_value.count;
+            entry.1 += metric_sample_value(&item.value, request_value);
+        }
+    }
+
+    let mut by_server: HashMap<i64, Vec<(Vec<String>, i64, f32)>> = HashMap::new();
+    for ((server_id, keys), (count, value)) in grouped {
+        by_server
+            .entry(server_id)
+            .or_default()
+            .push((keys, count, value));
+    }
+
+    let mut requests = Vec::with_capacity(by_server.len());
+    for (server_id, mut rows) in by_server {
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut metric_stats = Vec::with_capacity(rows.len());
+        let mut keep_keys = Vec::new();
+        let mut count = 0i64;
+        let mut total = 0f32;
+
+        for (keys, row_count, value) in rows {
+            count += row_count;
+            total += value;
+
+            // GO ALGORITHM: hashString(serverId + "@" + keys.join("$EDGE$") + "@" + time + "@" + version + "@" + itemId)
+            let keys_data = keys.join("$EDGE$");
+            let hash_raw = format!(
+                "{}@{}@{}@{}@{}",
+                server_id, keys_data, time_key, item.version, item.id
+            );
+            let hash = crate::utils::fnv_hash64(&hash_raw).to_string();
+
+            let cache_key = format!("{}_{}", item.id, hash);
+            if let Some(&old_val) = values_cache.get(&cache_key)
+                && (value - old_val).abs() < 0.001
+            {
+                keep_keys.push(hash);
+                continue;
+            }
+
+            values_cache.insert(cache_key, value);
+
+            metric_stats.push(pb::UploadingMetricStat {
+                id: 0,
+                hash,
+                keys,
+                value,
+            });
+        }
+
+        requests.push(pb::UploadMetricStatsRequest {
+            server_id,
+            time: time_key.to_string(),
+            count,
+            total,
+            version: item.version,
+            item_id: item.id,
+            metric_stats,
+            keep_keys,
+        });
+    }
+
+    requests
+}
+
 pub async fn start_metric_stat_reporter(
     config_store: Arc<crate::config::ConfigStore>,
     api_config: ApiConfig,
@@ -745,92 +870,17 @@ pub async fn start_metric_stat_reporter(
             let item_category = metric_item_category(&item);
 
             let time_key = get_period_time(item.period, &item.period_unit);
-
-            // Group samples by server_id
-            let mut by_server: HashMap<
-                i64,
-                Vec<(
-                    crate::metrics::aggregator::AggregationKey,
-                    crate::metrics::aggregator::AggregatedValue,
-                )>,
-            > = HashMap::new();
-            for sample in samples
+            if !samples
                 .iter()
-                .filter(|sample| sample_matches_metric_category(sample, &item_category))
+                .any(|sample| sample_matches_metric_category(sample, &item_category))
             {
-                by_server
-                    .entry(sample.0.server_id)
-                    .or_default()
-                    .push(sample.clone());
+                continue;
             }
 
-            for (server_id, rows) in by_server {
-                let mut metric_stats = Vec::with_capacity(rows.len());
-                let mut keep_keys = Vec::new();
-                let mut count = 0i64;
-                let mut total = 0f32;
-
-                for (key, value) in rows {
-                    count += value.count;
-
-                    let val = match item.value.as_str() {
-                        Some("${bytesSent}") | Some("${countTrafficOut}") => {
-                            value.bytes_sent as f32
-                        }
-                        Some("${countTrafficIn}") => value.bytes_received as f32,
-                        Some("${countRequest}") => value.count as f32,
-                        Some("${countConnection}") => value.count as f32,
-                        Some("${countAttackRequest}") => value.count_attack as f32,
-                        _ => value.count as f32,
-                    };
-                    total += val;
-
-                    let mut keys = Vec::new();
-                    for k in &item.keys {
-                        keys.push(key.resolve_metric_key(k));
-                    }
-
-                    // GO ALGORITHM: hashString(serverId + "@" + keys.join("$EDGE$") + "@" + time + "@" + version + "@" + itemId)
-                    let keys_data = keys.join("$EDGE$");
-                    let hash_raw = format!(
-                        "{}@{}@{}@{}@{}",
-                        server_id, keys_data, time_key, item.version, item.id
-                    );
-                    let hash = crate::utils::fnv_hash64(&hash_raw).to_string();
-
-                    // Check cache for keep_keys optimization
-                    let cache_key = format!("{}_{}", item.id, hash);
-                    if let Some(&old_val) = values_cache.get(&cache_key)
-                        && (val - old_val).abs() < 0.001
-                    {
-                        keep_keys.push(hash);
-                        continue;
-                    }
-
-                    values_cache.insert(cache_key, val);
-
-                    metric_stats.push(pb::UploadingMetricStat {
-                        id: 0,
-                        hash,
-                        keys,
-                        value: val,
-                    });
-                }
-
-                if let Err(e) = crate::rpc::track_rpc(service.upload_metric_stats(
-                    pb::UploadMetricStatsRequest {
-                        server_id,
-                        time: time_key.clone(),
-                        count,
-                        total,
-                        version: item.version,
-                        item_id: item.id,
-                        metric_stats,
-                        keep_keys,
-                    },
-                ))
-                .await
-                {
+            for req in build_metric_uploads_for_item(&item, &time_key, &samples, &mut values_cache)
+            {
+                let server_id = req.server_id;
+                if let Err(e) = crate::rpc::track_rpc(service.upload_metric_stats(req)).await {
                     warn!(
                         "Failed to upload metric stats for server {} item {}: {}",
                         server_id, item.id, e
@@ -1151,6 +1201,132 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metric_key_with_attrs(
+        request_attrs: std::collections::BTreeMap<String, String>,
+    ) -> crate::metrics::aggregator::AggregationKey {
+        crate::metrics::aggregator::AggregationKey {
+            category: std::sync::Arc::from(crate::metrics::METRIC_CATEGORY_HTTP),
+            server_id: 1,
+            country: std::sync::Arc::from(""),
+            country_id: 0,
+            province: std::sync::Arc::from(""),
+            province_id: 0,
+            city: std::sync::Arc::from(""),
+            city_id: 0,
+            provider: std::sync::Arc::from("Unknown"),
+            browser: std::sync::Arc::from(""),
+            os: std::sync::Arc::from(""),
+            waf_group_id: 0,
+            waf_action: std::sync::Arc::from(""),
+            provider_id: 0,
+            browser_version: std::sync::Arc::from(""),
+            os_version: std::sync::Arc::from(""),
+            request_attrs: std::sync::Arc::new(request_attrs),
+        }
+    }
+
+    fn metric_item(
+        id: i64,
+        keys: Vec<&str>,
+        value: &str,
+    ) -> crate::config_models::MetricItemConfig {
+        crate::config_models::MetricItemConfig {
+            id,
+            name: String::new(),
+            code: String::new(),
+            category: crate::metrics::METRIC_CATEGORY_HTTP.to_string(),
+            keys: keys.into_iter().map(str::to_string).collect(),
+            value: serde_json::Value::String(value.to_string()),
+            period: 1,
+            period_unit: "minute".to_string(),
+            version: 1,
+            is_on: true,
+        }
+    }
+
+    #[test]
+    fn metric_stat_upload_groups_request_count_by_resolved_ip() {
+        let aggregator = crate::metrics::aggregator::MetricAggregator::with_request_samples(true);
+        for request_id in ["a", "b"] {
+            let mut attrs = std::collections::BTreeMap::new();
+            attrs.insert("remoteAddr".to_string(), "203.0.113.9".to_string());
+            attrs.insert("requestId".to_string(), request_id.to_string());
+            attrs.insert(
+                "requestURI".to_string(),
+                format!("/index.html?rid={request_id}"),
+            );
+            aggregator.record(metric_key_with_attrs(attrs), 100, 10, false);
+        }
+
+        let samples = aggregator.flush();
+        assert_eq!(samples.len(), 1);
+
+        let item = metric_item(10, vec!["${remoteAddr}"], "${countRequest}");
+        let mut cache = HashMap::new();
+        let uploads = build_metric_uploads_for_item(&item, "202606221200", &samples, &mut cache);
+
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].count, 2);
+        assert_eq!(uploads[0].total, 2.0);
+        assert_eq!(uploads[0].metric_stats.len(), 1);
+        assert_eq!(uploads[0].metric_stats[0].keys, vec!["203.0.113.9"]);
+        assert_eq!(uploads[0].metric_stats[0].value, 2.0);
+    }
+
+    #[test]
+    fn metric_stat_upload_groups_paths_and_sums_bytes() {
+        let aggregator = crate::metrics::aggregator::MetricAggregator::with_request_samples(true);
+        for (request_id, bytes_sent) in [("a", 123), ("b", 456)] {
+            let mut attrs = std::collections::BTreeMap::new();
+            attrs.insert("remoteAddr".to_string(), "203.0.113.9".to_string());
+            attrs.insert("requestId".to_string(), request_id.to_string());
+            attrs.insert(
+                "requestURI".to_string(),
+                format!("/assets/app.js?rid={request_id}"),
+            );
+            attrs.insert("requestPath".to_string(), "/assets/app.js".to_string());
+            aggregator.record(metric_key_with_attrs(attrs), bytes_sent, 10, false);
+        }
+
+        let samples = aggregator.flush();
+        let item = metric_item(11, vec!["${requestPath}"], "${countTrafficOut}");
+        let mut cache = HashMap::new();
+        let uploads = build_metric_uploads_for_item(&item, "202606221200", &samples, &mut cache);
+
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].count, 2);
+        assert_eq!(uploads[0].total, 579.0);
+        assert_eq!(uploads[0].metric_stats.len(), 1);
+        assert_eq!(uploads[0].metric_stats[0].keys, vec!["/assets/app.js"]);
+        assert_eq!(uploads[0].metric_stats[0].value, 579.0);
+    }
+
+    #[test]
+    fn metric_stat_upload_resolves_method_aliases() {
+        let aggregator = crate::metrics::aggregator::MetricAggregator::with_request_samples(true);
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("requestMethod".to_string(), "POST".to_string());
+        attrs.insert("requestPath".to_string(), "/submit".to_string());
+        attrs.insert("requestURI".to_string(), "/submit?x=1".to_string());
+        aggregator.record(metric_key_with_attrs(attrs), 10, 100, false);
+
+        let samples = aggregator.flush();
+        let item = metric_item(
+            12,
+            vec!["${requestMethod}", "${method}", "${request.method}"],
+            "${countRequest}",
+        );
+        let mut cache = HashMap::new();
+        let uploads = build_metric_uploads_for_item(&item, "202606221200", &samples, &mut cache);
+
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(
+            uploads[0].metric_stats[0].keys,
+            vec!["POST", "POST", "POST"]
+        );
+        assert_eq!(uploads[0].metric_stats[0].value, 1.0);
+    }
 
     #[test]
     fn trims_http_request_dimension_rows_per_server() {

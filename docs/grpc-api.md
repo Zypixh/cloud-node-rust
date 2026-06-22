@@ -296,7 +296,8 @@
 - 响应：`RPCSuccess {}` 空消息
 - `metric_stats[]` 字段：`id`、`hash`、`keys[]`、`value`
 - `hash` 算法：`fnv_hash64("{server_id}@{keys.join(\"$EDGE$\")}@{time}@{version}@{item_id}")`
-- `keys[]` 来自控制面 `metricItems[].keys`，代码支持 `${country}`、`${province}`、`${city}`、`${provider}`、`${browser}`、`${os}`、`${wafGroup}`、`${wafAction}`
+- `keys[]` 来自控制面 `metricItems[].keys`，代码支持 `${country}`、`${province}`、`${city}`、`${provider}`、`${browser}`、`${os}`、`${wafGroup}`、`${wafAction}` 和请求上下文变量，如 `${remoteAddr}`、`${requestPath}`、`${requestMethod}`、`${method}`
+- 节点会先按解析后的 `keys[]` 本地聚合再上传，避免 `requestId`、query、header、请求耗时等单次请求字段把 IP、路径、方法和流量排行拆成一请求一条
 
 ### ServerService.UploadServerHTTPRequestStat
 
