@@ -19,6 +19,7 @@ pub mod headers;
 pub mod health_manager;
 pub mod http3_proxy_manager;
 pub mod http_proxy_manager;
+pub mod kernel_tuning;
 pub mod l4_defense;
 pub mod lb_factory;
 pub mod local_firewall;

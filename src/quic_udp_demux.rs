@@ -689,6 +689,32 @@ struct ListenerHandle {
     http3_enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UdpPortClassification {
+    demux_ports: HashSet<u16>,
+    plain_udp_ports: HashSet<u16>,
+}
+
+fn classify_udp_ports(
+    http3_ports: &HashSet<u16>,
+    udp_ports: &HashSet<u16>,
+    quic_passthrough_ports: &HashSet<u16>,
+) -> UdpPortClassification {
+    let demux_ports = http3_ports
+        .union(quic_passthrough_ports)
+        .copied()
+        .collect::<HashSet<_>>();
+    let plain_udp_ports = udp_ports
+        .difference(&demux_ports)
+        .copied()
+        .collect::<HashSet<_>>();
+
+    UdpPortClassification {
+        demux_ports,
+        plain_udp_ports,
+    }
+}
+
 pub struct QuicUdpDemuxManager {
     config_store: ConfigStore,
     http3_manager: Arc<Http3ProxyManager>,
@@ -715,23 +741,52 @@ impl QuicUdpDemuxManager {
     pub async fn start_listeners(self: Arc<Self>) {
         let mut reconcile_tick = interval(Duration::from_secs(5));
         reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_port_summary = None;
         loop {
             let http3_ports = self.http3_manager.desired_ports().await;
             let udp_ports = self.udp_manager.desired_ports().await;
-            let desired_ports = http3_ports
-                .union(&udp_ports)
-                .copied()
-                .collect::<HashSet<_>>();
-            let desired_listeners = desired_ports
+            let quic_passthrough_ports = self.config_store.quic_passthrough_ports_sync();
+            let classification =
+                classify_udp_ports(&http3_ports, &udp_ports, &quic_passthrough_ports);
+            let port_summary = (
+                classification.plain_udp_ports.len(),
+                classification.demux_ports.len(),
+                http3_ports.len(),
+                quic_passthrough_ports.len(),
+            );
+            if last_port_summary != Some(port_summary) {
+                let message = format!(
+                    "udp_direct_ports={} quic_demux_ports={} http3_ports={} quic_passthrough_ports={} udp_demux_workers={}",
+                    port_summary.0,
+                    port_summary.1,
+                    port_summary.2,
+                    port_summary.3,
+                    MEMORY_GOVERNOR.udp_demux_worker_count()
+                );
+                info!("L4 UDP performance summary: {}", message);
+                crate::logging::report_node_log(
+                    "info".to_string(),
+                    "l4_performance".to_string(),
+                    message,
+                    0,
+                );
+                last_port_summary = Some(port_summary);
+            }
+            let desired_listeners = classification
+                .demux_ports
                 .iter()
                 .flat_map(|port| dual_stack_bind_addrs(*port))
                 .collect::<HashSet<_>>();
+
+            self.reconcile_listeners(&desired_listeners, &http3_ports);
+            self.udp_manager
+                .sync_listeners_for_ports(&classification.plain_udp_ports)
+                .await;
 
             for bind_addr in &desired_listeners {
                 self.spawn_listener(*bind_addr, http3_ports.contains(&bind_addr.port()))
                     .await;
             }
-            self.reconcile_listeners(&desired_listeners, &http3_ports);
             tokio::select! {
                 _ = self.config_store.wait_for_runtime_reload() => {}
                 _ = reconcile_tick.tick() => {}
@@ -1826,7 +1881,11 @@ impl QuicUdpDemuxManager {
 mod tests {
     use super::*;
     use crate::config_models::{NetworkAddressConfig, ServerNameConfig, UDPConfig};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+
+    fn ports(values: &[u16]) -> HashSet<u16> {
+        values.iter().copied().collect()
+    }
 
     #[test]
     fn short_header_matches_registered_connection_id() {
@@ -1877,6 +1936,34 @@ mod tests {
             alpns: vec!["h3".to_string(), "h3-29".to_string()],
         };
         assert!(client_hello_supports_h3(&h3_client_hello));
+    }
+
+    #[test]
+    fn udp_port_classification_sends_plain_udp_directly() {
+        let classification = classify_udp_ports(&ports(&[]), &ports(&[5300]), &ports(&[]));
+
+        assert_eq!(classification.plain_udp_ports, ports(&[5300]));
+        assert!(classification.demux_ports.is_empty());
+    }
+
+    #[test]
+    fn udp_port_classification_demuxes_http3_and_quic_passthrough() {
+        let classification = classify_udp_ports(
+            &ports(&[443, 8443]),
+            &ports(&[5300, 8443, 9443]),
+            &ports(&[9443]),
+        );
+
+        assert_eq!(classification.demux_ports, ports(&[443, 8443, 9443]));
+        assert_eq!(classification.plain_udp_ports, ports(&[5300]));
+    }
+
+    #[test]
+    fn udp_port_classification_does_not_duplicate_mixed_ports() {
+        let classification = classify_udp_ports(&ports(&[443]), &ports(&[443]), &ports(&[443]));
+
+        assert_eq!(classification.demux_ports, ports(&[443]));
+        assert!(classification.plain_udp_ports.is_empty());
     }
 
     #[test]

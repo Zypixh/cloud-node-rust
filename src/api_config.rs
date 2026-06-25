@@ -22,6 +22,30 @@ pub struct ApiConfig {
     pub access_log_pipeline: AccessLogPipelineConfig,
     #[serde(rename = "relay", default)]
     pub relay: RelayConfig,
+    #[serde(rename = "kernelTuning", default)]
+    pub kernel_tuning: KernelTuningConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct KernelTuningConfig {
+    #[serde(rename = "enabled", default = "default_kernel_tuning_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for KernelTuningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_kernel_tuning_enabled(),
+        }
+    }
+}
+
+impl KernelTuningConfig {
+    pub fn normalized(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -170,6 +194,10 @@ fn default_access_log_warning_interval_ms() -> u64 {
     5_000
 }
 
+fn default_kernel_tuning_enabled() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +250,38 @@ mod tests {
         let config = RelayConfig::default().normalized();
 
         assert!(!config.zero_copy);
+    }
+
+    #[test]
+    fn kernel_tuning_defaults_to_enabled_for_legacy_config() {
+        let config: ApiConfig = serde_yaml::from_str(
+            r#"
+rpc.endpoints:
+  - https://api.example.com
+nodeId: "1"
+secret: "secret"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.kernel_tuning.normalized().enabled);
+    }
+
+    #[test]
+    fn kernel_tuning_can_be_disabled() {
+        let config: ApiConfig = serde_yaml::from_str(
+            r#"
+rpc.endpoints:
+  - https://api.example.com
+nodeId: "1"
+secret: "secret"
+kernelTuning:
+  enabled: false
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.kernel_tuning.normalized().enabled);
     }
 }
 

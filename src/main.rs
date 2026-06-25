@@ -1448,9 +1448,6 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         }
     }
 
-    #[cfg(target_os = "linux")]
-    auto_tune_kernel_params();
-
     // Create the runtime to spawn background tasks
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1484,6 +1481,8 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     }
     cloud_node_rust::cluster::runtime::start(&runtime_config);
     let api_config_arc = Arc::new(api_config.clone());
+    let numeric_node_id = api_config_arc.node_id.parse::<i64>().unwrap_or(0);
+    logging::set_numeric_node_id(numeric_node_id);
     cloud_node_rust::client_agent::load_client_agent_ip_index();
     cloud_node_rust::client_agent::start_client_agent_queue(api_config_arc.clone());
 
@@ -1616,6 +1615,19 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         Duration::from_millis(access_log_pipeline.warning_interval_ms),
     );
 
+    if api_config.kernel_tuning.normalized().enabled {
+        cloud_node_rust::kernel_tuning::apply_runtime_tuning_and_report();
+    } else {
+        info!("Runtime kernel tuning disabled by api_config.kernelTuning.enabled=false");
+        logging::report_node_log(
+            "info".to_string(),
+            "kernel_tuning".to_string(),
+            "key=\"kernelTuning.enabled\" old=\"-\" target=\"false\" final=\"false\" status=\"disabled\" reason=\"disabled by api_config\"".to_string(),
+            0,
+        );
+    }
+    report_l4_performance_summary(&api_config);
+
     let uploader = log_uploader::LogUploader::new(log_rx, api_config.clone(), access_log_pipeline);
     spawn_staggered(&rt, Duration::from_secs(10), async move {
         uploader.start().await;
@@ -1692,7 +1704,6 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     );
 
     // UDP & TCP
-    let numeric_node_id = api_config_arc.node_id.parse::<i64>().unwrap_or(0);
     let udp_manager = udp_proxy::UdpProxyManager::new(
         (*config_store).clone(),
         waf_state.clone(),
@@ -1763,138 +1774,30 @@ fn init_logging(node_paths: &cloud_node_rust::paths::NodePaths) {
         .init();
 }
 
-#[cfg(target_os = "linux")]
-fn auto_tune_kernel_params() {
-    info!("Starting automatic kernel parameter tuning...");
+fn report_l4_performance_summary(api_config: &ApiConfig) {
+    let relay = api_config.relay.normalized();
+    let governor = &cloud_node_rust::memory_governor::MEMORY_GOVERNOR;
+    let message = format!(
+        "zero_copy={} tcp_copy_buffer_bytes={} tcp_accept_workers={} udp_demux_workers={} udp_socket_buffer_bytes={}",
+        relay.zero_copy,
+        governor.relay_copy_buffer_bytes(),
+        governor.tcp_accept_worker_count(),
+        governor.udp_demux_worker_count(),
+        governor.udp_socket_buffer_size()
+    );
+    info!("L4 performance summary: {}", message);
+    logging::report_node_log("info".to_string(), "l4_performance".to_string(), message, 0);
 
-    let params = [
-        KernelParamTune::exact("net.core.somaxconn", "65535"),
-        KernelParamTune::exact("net.ipv4.tcp_max_syn_backlog", "65535"),
-        KernelParamTune::exact("net.core.netdev_max_backlog", "250000"),
-        KernelParamTune::exact("net.ipv4.ip_local_port_range", "1024 65535"),
-        KernelParamTune::exact("net.ipv4.tcp_tw_reuse", "1"),
-        KernelParamTune::exact("net.ipv4.tcp_fin_timeout", "10"),
-        KernelParamTune::exact("net.ipv4.tcp_slow_start_after_idle", "0"),
-        KernelParamTune::exact("net.ipv4.tcp_mtu_probing", "1"),
-        KernelParamTune::exact("net.core.rmem_max", "134217728"),
-        KernelParamTune::exact("net.core.wmem_max", "134217728"),
-        KernelParamTune::exact("net.ipv4.tcp_rmem", "4096 87380 134217728"),
-        KernelParamTune::exact("net.ipv4.tcp_wmem", "4096 65536 134217728"),
-        KernelParamTune::exact_optional("net.core.default_qdisc", "fq"),
-        KernelParamTune::exact_optional("net.ipv4.tcp_congestion_control", "bbr"),
-    ];
-
-    for param in params {
-        tune_kernel_param(param);
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy)]
-struct KernelParamTune {
-    key: &'static str,
-    target: &'static str,
-    optional: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl KernelParamTune {
-    const fn exact(key: &'static str, target: &'static str) -> Self {
-        Self {
-            key,
-            target,
-            optional: false,
-        }
-    }
-
-    const fn exact_optional(key: &'static str, target: &'static str) -> Self {
-        Self {
-            key,
-            target,
-            optional: true,
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn tune_kernel_param(param: KernelParamTune) {
-    let path = format!("/proc/sys/{}", param.key.replace('.', "/"));
-    let path_ref = std::path::Path::new(&path);
-
-    if !path_ref.exists() {
-        tracing::debug!(
-            "Kernel tuning skipped: {} is not available on this system",
-            param.key
+    if !relay.zero_copy {
+        let recommendation = "TCP pure L4 forwarding can reduce CPU by enabling zero-copy: cloud-node zerocopy --enable";
+        info!("{}", recommendation);
+        logging::report_node_log(
+            "info".to_string(),
+            "l4_performance".to_string(),
+            recommendation.to_string(),
+            0,
         );
-        return;
     }
-
-    let current = match fs::read_to_string(path_ref) {
-        Ok(value) => normalize_sysctl_value(&value),
-        Err(err) => {
-            warn!("Kernel tuning failed to read {}: {}", param.key, err);
-            return;
-        }
-    };
-
-    let target = param.target;
-    if current == target {
-        tracing::debug!("Kernel tuning already satisfied: {}={}", param.key, current);
-        return;
-    }
-
-    match fs::write(path_ref, target) {
-        Ok(_) => match fs::read_to_string(path_ref) {
-            Ok(updated) => {
-                let updated = normalize_sysctl_value(&updated);
-                if updated == target {
-                    info!(
-                        "Kernel tuning applied successfully: {} {} -> {}",
-                        param.key, current, updated
-                    );
-                } else if param.optional {
-                    tracing::debug!(
-                        "Kernel tuning optional value {} remained {} after writing {}",
-                        param.key,
-                        updated,
-                        target
-                    );
-                } else {
-                    warn!(
-                        "Kernel tuning wrote {} but value is {} (expected {})",
-                        param.key, updated, target
-                    );
-                }
-            }
-            Err(err) => {
-                warn!(
-                    "Kernel tuning wrote {} but failed to verify new value: {}",
-                    param.key, err
-                );
-            }
-        },
-        Err(err) => {
-            if param.optional {
-                tracing::debug!(
-                    "Kernel tuning optional value skipped for {} (current={}, target={}): {}",
-                    param.key,
-                    current,
-                    target,
-                    err
-                );
-            } else {
-                warn!(
-                    "Kernel tuning failed for {} (current={}, target={}): {}",
-                    param.key, current, target, err
-                );
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn normalize_sysctl_value(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

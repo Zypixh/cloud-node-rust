@@ -59,14 +59,14 @@ cloud-node upgrade
 
 ```bash
 cloud-node upgrade --yes
-cloud-node upgrade --version v1.1.6 --yes
+cloud-node upgrade --version v1.1.7 --yes
 cloud-node upgrade --version latest --github-mirror https://gh-proxy.example --yes
-cloud-node upgrade --version v1.1.6 --github-base-url https://github.example.com --repo Zypixh/cloud-node-rust --yes
+cloud-node upgrade --version v1.1.7 --github-base-url https://github.example.com --repo Zypixh/cloud-node-rust --yes
 ```
 
 常用参数：
 
-- `--version`：目标版本，默认 `latest`；可传 `v1.1.6` 或 `1.1.6`。
+- `--version`：目标版本，默认 `latest`；可传 `v1.1.7` 或 `1.1.7`。
 - `--repo`：GitHub 仓库，默认 `Zypixh/cloud-node-rust`。
 - `--github-base-url`：GitHub 或 GitHub Enterprise 基础地址，默认 `https://github.com`。
 - `--github-mirror`：下载镜像/代理地址；如果包含 `{url}`，会用原始 GitHub 下载地址替换该占位符。

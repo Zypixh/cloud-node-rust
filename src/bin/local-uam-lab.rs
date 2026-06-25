@@ -174,6 +174,7 @@ fn main() -> anyhow::Result<()> {
         billing_count_inbound_traffic: false,
         access_log_pipeline: AccessLogPipelineConfig::default(),
         relay: Default::default(),
+        kernel_tuning: Default::default(),
     });
     let cert_selector = Arc::new(DynamicCertSelector::new());
 

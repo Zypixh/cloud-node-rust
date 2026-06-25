@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 
 const MAX_SAMPLES: usize = 21_600;
 const TOP_SERVER_LIMIT: usize = 8;
+const SLOW_REFRESH_INTERVAL_SECS: i64 = 10;
 
 #[derive(Debug, Clone, Serialize)]
 struct Advice {
@@ -135,8 +136,12 @@ fn log_connection_error(err: std::io::Error) {
 
 async fn sample_loop(store: SharedStore) {
     let started_at = crate::utils::time::now_timestamp();
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
+    sys.refresh_memory();
+    let mut disk_totals = disk_usage_async().await;
+    let mut cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
+    let mut next_slow_refresh_at = started_at + SLOW_REFRESH_INTERVAL_SECS;
 
     let mut last_traffic_in = 0u64;
     let mut last_traffic_out = 0u64;
@@ -146,9 +151,16 @@ async fn sample_loop(store: SharedStore) {
 
     loop {
         interval.tick().await;
-        sys.refresh_all();
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
 
         let now = crate::utils::time::now_timestamp();
+        if now >= next_slow_refresh_at {
+            disk_totals = disk_usage_async().await;
+            cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
+            next_slow_refresh_at = now.saturating_add(SLOW_REFRESH_INTERVAL_SECS);
+        }
+
         let elapsed = now.saturating_sub(last_timestamp).max(1) as u64;
         let snapshots = crate::metrics::METRICS.take_snapshots();
         let (traffic_out, traffic_in, active_connections) =
@@ -165,13 +177,12 @@ async fn sample_loop(store: SharedStore) {
         let memory_total = governor_snapshot.memory_total_bytes;
         let memory_used = governor_snapshot.memory_used_bytes;
         let load = System::load_average();
-        let (disk_used, disk_total) = disk_usage();
+        let (disk_used, disk_total) = disk_totals;
         let disk_usage = if disk_total > 0 {
             disk_used as f64 / disk_total as f64
         } else {
             0.0
         };
-        let cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
         let cpu_usage = sys.global_cpu_usage() as f64;
         let memory_usage = if memory_total > 0 {
             memory_used as f64 / memory_total as f64
@@ -216,7 +227,7 @@ async fn sample_loop(store: SharedStore) {
             cache_disk_count: cache_stats.disk_count,
             cache_memory_bytes: cache_stats.memory_bytes,
             cache_memory_count: cache_stats.memory_count,
-            cache_policy_type: cache_stats.policy_type,
+            cache_policy_type: cache_stats.policy_type.clone(),
             cache_disk_limit_bytes: cache_stats.max_disk_bytes,
             cache_min_free_bytes: cache_stats.min_free_bytes,
             cache_memory_budget_bytes: cache_stats.memory_budget_bytes,
@@ -259,6 +270,12 @@ async fn sample_loop(store: SharedStore) {
             guard.samples.pop_front();
         }
     }
+}
+
+async fn disk_usage_async() -> (u64, u64) {
+    tokio::task::spawn_blocking(disk_usage)
+        .await
+        .unwrap_or((0, 0))
 }
 
 fn disk_usage() -> (u64, u64) {

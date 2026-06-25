@@ -641,6 +641,14 @@ impl ConfigStore {
         lock.unique_quic_passthrough_by_port.contains_key(&port)
     }
 
+    pub fn quic_passthrough_ports_sync(&self) -> HashSet<u16> {
+        let lock = self.inner.read();
+        lock.unique_quic_passthrough_by_port
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub fn find_udp_server_by_port_sync(&self, port: u16) -> Option<Arc<ServerConfig>> {
         self.inner.read().udp_server_by_port.get(&port).cloned()
     }

@@ -1467,19 +1467,31 @@ async fn read_with_pressure_idle_timeout<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
 ) -> io::Result<usize> {
+    read_with_optional_pressure_idle_timeout(
+        reader,
+        buf,
+        MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout(),
+    )
+    .await
+}
+
+async fn read_with_optional_pressure_idle_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    pressure_timeout: Option<std::time::Duration>,
+) -> io::Result<usize> {
+    let Some(timeout) = pressure_timeout else {
+        return reader.read(buf).await;
+    };
+
     let mut idle = std::time::Duration::ZERO;
     loop {
-        let poll_interval = MEMORY_GOVERNOR
-            .tcp_relay_pressure_idle_timeout()
-            .map(|timeout| timeout.min(std::time::Duration::from_secs(1)))
-            .unwrap_or_else(|| std::time::Duration::from_secs(1));
+        let poll_interval = timeout.min(std::time::Duration::from_secs(1));
         match tokio::time::timeout(poll_interval, reader.read(buf)).await {
             Ok(result) => return result,
             Err(_) => {
                 idle += poll_interval;
-                if let Some(timeout) = MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout()
-                    && idle >= timeout
-                {
+                if idle >= timeout {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         format!("TCP relay idle under connection pressure for {:?}", timeout),
@@ -2408,8 +2420,50 @@ async fn maybe_consume_proxy_protocol_header(
 mod tests {
     use super::*;
     use crate::config_models::{HTTPFirewallPolicy, TLSExhaustionAttackConfig};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
     use tokio::net::TcpListener;
+
+    struct PendingReader;
+
+    impl AsyncRead for PendingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_pressure_idle_normal_path_does_not_timeout() {
+        let mut reader = PendingReader;
+        let mut buf = [0u8; 8];
+        let read = read_with_optional_pressure_idle_timeout(&mut reader, &mut buf, None);
+        tokio::pin!(read);
+
+        tokio::select! {
+            result = &mut read => panic!("normal path unexpectedly completed: {:?}", result),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_pressure_idle_pressure_path_times_out() {
+        let mut reader = PendingReader;
+        let mut buf = [0u8; 8];
+        let err = read_with_optional_pressure_idle_timeout(
+            &mut reader,
+            &mut buf,
+            Some(std::time::Duration::from_millis(10)),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
 
     async fn configure_tls_exhaustion(store: &ConfigStore) {
         let server = Arc::new(ServerConfig {

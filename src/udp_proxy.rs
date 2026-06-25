@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, mpsc, watch};
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{Instant as TokioInstant, sleep_until};
 use tracing::{debug, error, info, warn};
 
 use crate::config::ConfigStore;
@@ -23,6 +23,8 @@ use crate::net_bind::{bind_udp_socket, dual_stack_bind_addrs};
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_MAX_QUIC_CIDS: usize = 8;
+const UDP_METRICS_FLUSH_BYTES: u64 = 1024 * 1024;
+const UDP_METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 static UDP_ACTIVITY_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
 
@@ -37,6 +39,113 @@ pub(crate) fn udp_activity_is_alive(last_activity_ms: &AtomicU64, timeout: Durat
     let last = last_activity_ms.load(Ordering::Relaxed);
     let now = udp_activity_now_ms();
     now.saturating_sub(last) < timeout.as_millis().min(u64::MAX as u128) as u64
+}
+
+fn udp_session_idle_remaining(last_activity_ms: u64, now_ms: u64, timeout: Duration) -> Duration {
+    let timeout_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
+    let elapsed_ms = now_ms.saturating_sub(last_activity_ms);
+    Duration::from_millis(timeout_ms.saturating_sub(elapsed_ms))
+}
+
+fn udp_session_idle_deadline(last_activity_ms: &AtomicU64, timeout: Duration) -> TokioInstant {
+    let remaining = udp_session_idle_remaining(
+        last_activity_ms.load(Ordering::Relaxed),
+        udp_activity_now_ms(),
+        timeout,
+    );
+    TokioInstant::now() + remaining
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UdpMetricsFlush {
+    downstream: u64,
+    upstream: u64,
+}
+
+#[derive(Debug)]
+struct UdpTransferAccumulator {
+    downstream_sent: u64,
+    upstream_sent: u64,
+    unflushed_downstream: u64,
+    unflushed_upstream: u64,
+    last_flush: Instant,
+}
+
+impl UdpTransferAccumulator {
+    fn new(now: Instant) -> Self {
+        Self {
+            downstream_sent: 0,
+            upstream_sent: 0,
+            unflushed_downstream: 0,
+            unflushed_upstream: 0,
+            last_flush: now,
+        }
+    }
+
+    fn record_downstream(&mut self, bytes: u64) {
+        self.downstream_sent = self.downstream_sent.saturating_add(bytes);
+        self.unflushed_downstream = self.unflushed_downstream.saturating_add(bytes);
+    }
+
+    fn record_upstream(&mut self, bytes: u64) {
+        self.upstream_sent = self.upstream_sent.saturating_add(bytes);
+        self.unflushed_upstream = self.unflushed_upstream.saturating_add(bytes);
+    }
+
+    fn totals(&self) -> (u64, u64) {
+        (self.downstream_sent, self.upstream_sent)
+    }
+
+    fn pending_bytes(&self) -> u64 {
+        self.unflushed_downstream
+            .saturating_add(self.unflushed_upstream)
+    }
+
+    fn next_flush_after(&self, now: Instant) -> Option<Duration> {
+        if self.pending_bytes() == 0 {
+            return None;
+        }
+        Some(UDP_METRICS_FLUSH_INTERVAL.saturating_sub(now.duration_since(self.last_flush)))
+    }
+
+    fn take_flush_due(&mut self, now: Instant, force: bool) -> Option<UdpMetricsFlush> {
+        let pending = self.pending_bytes();
+        if pending == 0 {
+            if force {
+                self.last_flush = now;
+            }
+            return None;
+        }
+
+        let due = force
+            || pending >= UDP_METRICS_FLUSH_BYTES
+            || now.duration_since(self.last_flush) >= UDP_METRICS_FLUSH_INTERVAL;
+        if !due {
+            return None;
+        }
+
+        let flush = UdpMetricsFlush {
+            downstream: self.unflushed_downstream,
+            upstream: self.unflushed_upstream,
+        };
+        self.unflushed_downstream = 0;
+        self.unflushed_upstream = 0;
+        self.last_flush = now;
+        Some(flush)
+    }
+
+    fn flush_if_due(&mut self, server_id: i64, force: bool) {
+        let Some(flush) = self.take_flush_due(Instant::now(), force) else {
+            return;
+        };
+        crate::metrics::record::record_transfer(server_id, flush.downstream, flush.upstream, None);
+        crate::metrics::record::record_origin_traffic(
+            server_id,
+            flush.upstream,
+            flush.downstream,
+            None,
+        );
+    }
 }
 
 async fn resolve_udp_backend_addr(
@@ -162,29 +271,24 @@ impl UdpProxyManager {
 
         loop {
             let desired_ports = self.desired_ports().await;
-            let desired_listeners = desired_ports
-                .iter()
-                .flat_map(|port| dual_stack_bind_addrs(*port))
-                .collect::<HashSet<_>>();
-            for bind_addr in &desired_listeners {
-                self.spawn_listener(*bind_addr).await;
-            }
-
-            self.reconcile_listeners(&desired_listeners);
-
-            // Cleanup idle sessions (Sticky Session Timeout)
-            let timeout = Duration::from_secs(60); // Default 60s idle timeout
-            self.sessions.retain(|key, session| {
-                let is_alive = udp_activity_is_alive(&session.last_activity_ms, timeout);
-                if !is_alive {
-                    debug!("Cleaning up idle UDP session: {:?}", key);
-                }
-                is_alive
-            });
+            self.sync_listeners_for_ports(&desired_ports).await;
 
             // Re-check config every minute or on notification
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
+    }
+
+    pub async fn sync_listeners_for_ports(self: &Arc<Self>, desired_ports: &HashSet<u16>) {
+        let desired_listeners = desired_ports
+            .iter()
+            .flat_map(|port| dual_stack_bind_addrs(*port))
+            .collect::<HashSet<_>>();
+
+        self.reconcile_listeners(&desired_listeners);
+        for bind_addr in &desired_listeners {
+            self.spawn_listener(*bind_addr).await;
+        }
+        self.cleanup_idle_sessions(UDP_SESSION_IDLE_TIMEOUT);
     }
 
     pub async fn desired_ports(&self) -> HashSet<u16> {
@@ -747,13 +851,16 @@ impl UdpProxyManager {
             return Err(err.into());
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
-        let mut downstream_sent = 0u64;
-        let mut upstream_sent = 0u64;
+        let mut transfer_metrics = UdpTransferAccumulator::new(Instant::now());
         let mut result: anyhow::Result<()> = Ok(());
         let mut buf = vec![0u8; 65535];
-        let mut idle_tick = interval(Duration::from_secs(5));
-        idle_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
+            let idle_deadline =
+                udp_session_idle_deadline(&last_activity_ms, UDP_SESSION_IDLE_TIMEOUT);
+            let metrics_flush_after = transfer_metrics.next_flush_after(Instant::now());
+            let metrics_flush_enabled = metrics_flush_after.is_some();
+            let metrics_flush_deadline =
+                TokioInstant::now() + metrics_flush_after.unwrap_or(UDP_SESSION_IDLE_TIMEOUT);
             tokio::select! {
                 _ = listener_shutdown_rx.changed() => {
                     break;
@@ -761,11 +868,14 @@ impl UdpProxyManager {
                 _ = session_shutdown_rx.changed() => {
                     break;
                 }
-                _ = idle_tick.tick() => {
+                _ = sleep_until(idle_deadline) => {
                     let idle = !udp_activity_is_alive(&last_activity_ms, UDP_SESSION_IDLE_TIMEOUT);
                     if idle {
                         break;
                     }
+                }
+                _ = sleep_until(metrics_flush_deadline), if metrics_flush_enabled => {
+                    transfer_metrics.flush_if_due(server_id, false);
                 }
                 item = rx.recv() => {
                     let Some(item) = item else {
@@ -779,9 +889,8 @@ impl UdpProxyManager {
                         break;
                     }
                     last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
-                    upstream_sent += len;
-                    crate::metrics::record::record_transfer(server_id, 0, len, None);
-                    crate::metrics::record::record_origin_traffic(server_id, len, 0, None);
+                    transfer_metrics.record_upstream(len);
+                    transfer_metrics.flush_if_due(server_id, false);
                 }
                 recv = backend_socket.recv(&mut buf) => {
                     let len = match recv {
@@ -810,12 +919,13 @@ impl UdpProxyManager {
                         break;
                     }
                     last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
-                    downstream_sent += len_u64;
-                    crate::metrics::record::record_transfer(server_id, len_u64, 0, None);
-                    crate::metrics::record::record_origin_traffic(server_id, 0, len_u64, None);
+                    transfer_metrics.record_downstream(len_u64);
+                    transfer_metrics.flush_if_due(server_id, false);
                 }
             }
         }
+        transfer_metrics.flush_if_due(server_id, true);
+        let (downstream_sent, upstream_sent) = transfer_metrics.totals();
         let current_client_addr = *client_addr.read().await;
         let status = if result.is_ok() { 200 } else { 502 };
         crate::metrics::record::record_network_dimensions(
@@ -918,6 +1028,76 @@ mod tests {
     use super::*;
     use crate::config_models::{NetworkAddressConfig, ServerNameConfig, UDPConfig};
     use std::collections::HashMap;
+
+    #[test]
+    fn udp_session_idle_deadline_uses_last_activity_remaining_time() {
+        assert_eq!(
+            udp_session_idle_remaining(1_000, 1_250, Duration::from_secs(1)),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            udp_session_idle_remaining(1_000, 2_000, Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn udp_metrics_accumulator_flushes_on_threshold() {
+        let start = Instant::now();
+        let mut accumulator = UdpTransferAccumulator::new(start);
+
+        accumulator.record_upstream(UDP_METRICS_FLUSH_BYTES - 1);
+        assert_eq!(accumulator.take_flush_due(start, false), None);
+
+        accumulator.record_downstream(1);
+        assert_eq!(
+            accumulator.take_flush_due(start, false),
+            Some(UdpMetricsFlush {
+                downstream: 1,
+                upstream: UDP_METRICS_FLUSH_BYTES - 1
+            })
+        );
+        assert_eq!(accumulator.take_flush_due(start, false), None);
+    }
+
+    #[test]
+    fn udp_metrics_accumulator_flushes_on_interval() {
+        let start = Instant::now();
+        let mut accumulator = UdpTransferAccumulator::new(start);
+
+        accumulator.record_downstream(512);
+        assert_eq!(
+            accumulator.next_flush_after(start + Duration::from_millis(250)),
+            Some(Duration::from_millis(750))
+        );
+        assert_eq!(
+            accumulator.take_flush_due(start + UDP_METRICS_FLUSH_INTERVAL, false),
+            Some(UdpMetricsFlush {
+                downstream: 512,
+                upstream: 0
+            })
+        );
+        assert_eq!(
+            accumulator.next_flush_after(start + UDP_METRICS_FLUSH_INTERVAL),
+            None
+        );
+    }
+
+    #[test]
+    fn udp_metrics_accumulator_flushes_on_session_close() {
+        let start = Instant::now();
+        let mut accumulator = UdpTransferAccumulator::new(start);
+
+        accumulator.record_upstream(128);
+        assert_eq!(
+            accumulator.take_flush_due(start + Duration::from_millis(10), true),
+            Some(UdpMetricsFlush {
+                downstream: 0,
+                upstream: 128
+            })
+        );
+        assert_eq!(accumulator.totals(), (0, 128));
+    }
 
     #[tokio::test]
     async fn udp_backend_resolution_prefers_client_ip_family_for_domain_origin() {
