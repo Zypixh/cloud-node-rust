@@ -514,6 +514,41 @@ impl MetricStorage {
         let _ = db.delete(key.as_bytes());
     }
 
+    pub fn write_raw_batch(&self, puts: Vec<(String, Vec<u8>)>, deletes: Vec<String>) -> bool {
+        let Some(db) = &self.db else {
+            return false;
+        };
+        if puts.is_empty() && deletes.is_empty() {
+            return true;
+        }
+        let mut batch = WriteBatch::default();
+        for (key, value) in puts {
+            batch.put(key.as_bytes(), value);
+        }
+        for key in deletes {
+            batch.delete(key.as_bytes());
+        }
+        db.write(&batch).is_ok()
+    }
+
+    pub fn scan_json_prefix<T: DeserializeOwned>(&self, prefix: &str) -> Vec<(String, T)> {
+        let Some(db) = &self.db else {
+            return Vec::new();
+        };
+        let mut results = Vec::new();
+        let iter = db.prefix_iterator(prefix.as_bytes());
+        for (key, val) in iter.flatten() {
+            let key_str = String::from_utf8_lossy(&key).to_string();
+            if !key_str.starts_with(prefix) {
+                break;
+            }
+            if let Ok(value) = serde_json::from_slice::<T>(&val) {
+                results.push((key_str, value));
+            }
+        }
+        results
+    }
+
     /// Iterates over all cache metadata efficiently using a closure.
     pub fn for_each_cache_meta<F>(&self, mut f: F)
     where

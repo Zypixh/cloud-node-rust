@@ -28,6 +28,8 @@ cloud-node status
 cloud-node install
 cloud-node upgrade
 cloud-node ntp
+cloud-node firewall list
+cloud-node firewall init
 cloud-node test
 ```
 
@@ -47,6 +49,9 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `install`：注册 `/usr/bin/cloud-node` wrapper 和 systemd service。
 - `upgrade`：从 GitHub Release 下载匹配当前 CPU/架构的最新版或指定版本，确认后备份并替换当前二进制。
 - `ntp`：交互式或非交互式设置系统时区，并按内置 NTP 源校准系统时钟；守护进程自动 NTP 只校准程序内部偏移。
+- `firewall init`：初始化本地 `nftables` table/set/chain/drop rule。
+- `firewall list`：合并展示本地 `nftables` 精确 IP 和 RocksDB 本地运行时黑名单；条目较多时按 IPv4 `/24`、IPv6 `/48` 聚合。
+- `firewall gc`：清理 RocksDB 中已过期的本地运行时封禁记录。
 - `test`：验证 `configs/api_node.yaml` 是否可解析。
 
 `upgrade` 默认使用交互式确认，并在成功替换后重启正在运行的 `cloud-node.service` 或内置后台进程：
@@ -84,8 +89,8 @@ cloud-node upgrade --version v1.1.7 --github-base-url https://github.example.com
 - `configs/api_node.yaml`：API 节点连接配置。
 - `data/cloud-node.pid`：后台进程 PID 文件。
 - `data/state.json`：部分运行状态持久化。
-- `data/blocked_ips.json`：本地封禁 IP 持久化。
-- `data/metrics.db`：统计和缓存元数据持久化。
+- `data/blocked_ips.json`：旧版本地封禁快照，仅作为一次性迁移输入；迁移到 RocksDB 成功后会自动删除。
+- `data/metrics.db`：统计、缓存元数据和本地运行时防火墙封禁状态持久化。
 - `data/cache`：默认磁盘缓存目录。
 - `data/GeoLite2-City.mmdb`、`data/GeoLite2-ASN.mmdb`：GeoIP 数据库。
 - `logs/run.log`：节点运行日志；systemd 和内置后台模式都会追加写入。

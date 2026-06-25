@@ -251,7 +251,7 @@ impl GlobalIpListManager {
         let value = item.value.trim();
         if !value.is_empty() {
             if let Ok(net) = value.parse::<IpNet>() {
-                return Some(IpListTarget::Network(net));
+                return Some(IpListTarget::Network(net.trunc()));
             }
             if let Ok(ip) = value.parse::<IpAddr>() {
                 return Some(IpListTarget::Ip(canonical_ip(ip)));
@@ -366,6 +366,57 @@ impl GlobalIpListManager {
         debug!(
             "Applied IP list target list-kind={:?} server={} target={:?} expiry={:?}",
             kind, server_id, target, expiry
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip_item() -> pb::IpItem {
+        pb::IpItem {
+            id: 1,
+            list_id: 10,
+            list_type: "black".to_string(),
+            is_global: true,
+            expired_at: crate::utils::time::now_timestamp() + 60,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ip_list_parse_target_accepts_single_ip() {
+        let mut item = ip_item();
+        item.value = "192.168.1.100".to_string();
+        assert_eq!(
+            GlobalIpListManager::parse_target(&item),
+            Some(IpListTarget::Ip("192.168.1.100".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn ip_list_parse_target_accepts_and_truncates_cidr() {
+        let mut item = ip_item();
+        item.value = "192.168.1.1/24".to_string();
+        assert_eq!(
+            GlobalIpListManager::parse_target(&item),
+            Some(IpListTarget::Network("192.168.1.0/24".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn ip_list_parse_target_accepts_ip_range() {
+        let mut item = ip_item();
+        item.ip_from = "192.168.1.1".to_string();
+        item.ip_to = "192.168.1.255".to_string();
+        assert_eq!(
+            GlobalIpListManager::parse_target(&item),
+            Some(IpListTarget::Range(IpAddrRange {
+                from: u32::from_be_bytes([192, 168, 1, 1]) as u128,
+                to: u32::from_be_bytes([192, 168, 1, 255]) as u128,
+                v6: false,
+            }))
         );
     }
 }

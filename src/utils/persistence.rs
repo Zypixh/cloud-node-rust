@@ -30,6 +30,10 @@ pub fn save_state(state: &PersistentState) {
     }
 }
 
+/// Legacy compatibility writer for pre-RocksDB firewall snapshots.
+///
+/// Runtime firewall state is persisted through `firewall::persistence`; new
+/// code should not call this as the source of truth.
 pub fn save_blocked_ips(ips: Vec<(String, i64, u64)>) {
     let node_paths = crate::paths::NodePaths::current();
     let _ = fs::create_dir_all(node_paths.data_dir());
@@ -67,6 +71,7 @@ fn atomic_write(path: &std::path::Path, data: &[u8]) {
     let _ = fs::rename(&tmp, path);
 }
 
+/// Legacy compatibility reader used by the one-time firewall migration.
 pub fn load_blocked_ips() -> Vec<(String, i64, u64)> {
     let node_paths = crate::paths::NodePaths::current();
     for path in node_paths.blocked_ips_file_candidates() {

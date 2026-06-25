@@ -1,9 +1,11 @@
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::future::Future;
 use std::io::{self, IsTerminal};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -213,11 +215,34 @@ enum Commands {
         #[arg(long, alias = "non-interactive")]
         yes: bool,
     },
+    /// Manage and inspect local kernel firewall state
+    Firewall {
+        #[command(subcommand)]
+        command: FirewallCommands,
+    },
     /// Test the configuration
     Test,
     /// Internal use only
     #[command(hide = true)]
     _StartInternal,
+}
+
+#[derive(Subcommand)]
+enum FirewallCommands {
+    /// Initialize nftables table, sets, chain and drop rules
+    Init,
+    /// Clean expired local firewall block records from RocksDB
+    Gc,
+    /// List nftables and CloudNode blacklist entries
+    List {
+        /// Aggregate exact IP rows when total entries exceed this threshold
+        #[arg(long, default_value_t = 200)]
+        aggregate_threshold: usize,
+
+        /// Always print exact IP rows instead of /24 and /48 aggregation
+        #[arg(long)]
+        no_aggregate: bool,
+    },
 }
 
 fn spawn_staggered<F>(rt: &tokio::runtime::Runtime, delay: Duration, task: F)
@@ -403,6 +428,193 @@ fn run_zerocopy_command(enable: bool, disable: bool, yes: bool) -> anyhow::Resul
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct FirewallListFlags {
+    nf_blocked: bool,
+    blacklist: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FirewallAggregate {
+    total: usize,
+    nf_blocked: usize,
+    blacklist: usize,
+    both: usize,
+}
+
+fn run_firewall_command(command: FirewallCommands) -> anyhow::Result<()> {
+    match command {
+        FirewallCommands::Init => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cloud_node_rust::firewall::kernel::ensure_nftables())?;
+            println!("nftables initialized: table=inet cloud_node sets=blocked_v4,blocked_v6");
+        }
+        FirewallCommands::Gc => {
+            let now = cloud_node_rust::utils::time::now_timestamp();
+            let removed = cloud_node_rust::firewall::persistence::cleanup_expired(now);
+            let _ = cloud_node_rust::firewall::persistence::flush_pending();
+            println!("firewall gc removed {} expired RocksDB records", removed);
+        }
+        FirewallCommands::List {
+            aggregate_threshold,
+            no_aggregate,
+        } => run_firewall_list(aggregate_threshold, no_aggregate)?,
+    }
+    Ok(())
+}
+
+fn run_firewall_list(aggregate_threshold: usize, no_aggregate: bool) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let nf_ips = rt.block_on(cloud_node_rust::firewall::kernel::nftables_blocked_ips())?;
+    let nf_ips = nf_ips.into_iter().collect::<BTreeSet<_>>();
+    let expired_cleaned = cloud_node_rust::firewall::persistence::cleanup_expired(
+        cloud_node_rust::utils::time::now_timestamp(),
+    );
+    let (black_ips, black_targets) = load_blacklist_snapshot();
+
+    let mut exact = BTreeMap::<IpAddr, FirewallListFlags>::new();
+    for ip in &nf_ips {
+        exact.entry(*ip).or_default().nf_blocked = true;
+    }
+    for ip in &black_ips {
+        exact.entry(*ip).or_default().blacklist = true;
+    }
+
+    println!("CloudNode firewall blacklist");
+    println!("  nftables exact IPs: {}", nf_ips.len());
+    println!("  blacklist exact IPs: {}", black_ips.len());
+    println!("  blacklist CIDR/range targets: {}", black_targets.len());
+    println!("  expired RocksDB records cleaned: {}", expired_cleaned);
+    println!();
+
+    let aggregate = !no_aggregate && exact.len() > aggregate_threshold.max(1);
+    if aggregate {
+        print_firewall_aggregates(&exact);
+    } else {
+        print_firewall_exact_rows(&exact);
+    }
+
+    if !black_targets.is_empty() {
+        println!();
+        println!("Blacklist CIDR/range targets");
+        for target in black_targets {
+            println!("{}\tnf拉黑=-\t黑名单=是", target);
+        }
+    }
+
+    Ok(())
+}
+
+fn load_blacklist_snapshot() -> (BTreeSet<IpAddr>, Vec<String>) {
+    let now = cloud_node_rust::utils::time::now_timestamp();
+    let mut ips = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+    for record in cloud_node_rust::firewall::persistence::load_active_blacklist_records(now) {
+        if let Ok(ip) = record.target.parse::<IpAddr>() {
+            ips.insert(ip);
+        } else {
+            targets.insert(record.target);
+        }
+    }
+    (ips, targets.into_iter().collect())
+}
+
+fn print_firewall_exact_rows(exact: &BTreeMap<IpAddr, FirewallListFlags>) {
+    let mut printed = false;
+    for (label, is_v4) in [("IPv4", true), ("IPv6", false)] {
+        let rows = exact
+            .iter()
+            .filter(|(ip, _)| ip.is_ipv4() == is_v4)
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            continue;
+        }
+        printed = true;
+        println!("{}", label);
+        println!("IP\tnf拉黑\t黑名单");
+        for (ip, flags) in rows {
+            println!(
+                "{}\t{}\t{}",
+                ip,
+                yes_no(flags.nf_blocked),
+                yes_no(flags.blacklist)
+            );
+        }
+        println!();
+    }
+    if !printed {
+        println!("No exact IP entries found.");
+    }
+}
+
+fn print_firewall_aggregates(exact: &BTreeMap<IpAddr, FirewallListFlags>) {
+    let mut v4 = BTreeMap::<Ipv4Addr, FirewallAggregate>::new();
+    let mut v6 = BTreeMap::<Ipv6Addr, FirewallAggregate>::new();
+
+    for (ip, flags) in exact {
+        match ip {
+            IpAddr::V4(ip) => record_firewall_aggregate(v4.entry(v4_24(*ip)).or_default(), *flags),
+            IpAddr::V6(ip) => record_firewall_aggregate(v6.entry(v6_48(*ip)).or_default(), *flags),
+        }
+    }
+
+    if !v4.is_empty() {
+        println!("IPv4 /24 aggregates");
+        println!("CIDR\t总数\tnf拉黑\t黑名单\t两者都有");
+        for (network, stats) in v4 {
+            println!(
+                "{}/24\t{}\t{}\t{}\t{}",
+                network, stats.total, stats.nf_blocked, stats.blacklist, stats.both
+            );
+        }
+        println!();
+    }
+
+    if !v6.is_empty() {
+        println!("IPv6 /48 aggregates");
+        println!("CIDR\t总数\tnf拉黑\t黑名单\t两者都有");
+        for (network, stats) in v6 {
+            println!(
+                "{}/48\t{}\t{}\t{}\t{}",
+                network, stats.total, stats.nf_blocked, stats.blacklist, stats.both
+            );
+        }
+    }
+}
+
+fn record_firewall_aggregate(stats: &mut FirewallAggregate, flags: FirewallListFlags) {
+    stats.total += 1;
+    if flags.nf_blocked {
+        stats.nf_blocked += 1;
+    }
+    if flags.blacklist {
+        stats.blacklist += 1;
+    }
+    if flags.nf_blocked && flags.blacklist {
+        stats.both += 1;
+    }
+}
+
+fn v4_24(ip: Ipv4Addr) -> Ipv4Addr {
+    let mut octets = ip.octets();
+    octets[3] = 0;
+    Ipv4Addr::from(octets)
+}
+
+fn v6_48(ip: Ipv6Addr) -> Ipv6Addr {
+    let mut segments = ip.segments();
+    segments[3..].fill(0);
+    Ipv6Addr::from(segments)
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "是" } else { "否" }
+}
+
 fn run_ntp_command(
     timezone: Option<String>,
     no_timezone: bool,
@@ -486,6 +698,7 @@ fn cmdline_contains_management_command(cmdline: &[u8]) -> bool {
                     | "ntp"
                     | "zerocopy"
                     | "zero-copy"
+                    | "firewall"
             )
         })
 }
@@ -1333,6 +1546,9 @@ WantedBy=multi-user.target\n",
         }) => {
             run_zerocopy_command(enable, disable, yes)?;
         }
+        Some(Commands::Firewall { command }) => {
+            run_firewall_command(command)?;
+        }
         Some(Commands::Test) => {
             println!("Testing configuration...");
             let api_config = ApiConfig::load_default()?;
@@ -1489,6 +1705,19 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     // 2. Initialize Managers
     let config_store = Arc::new(ConfigStore::new());
     let waf_state = Arc::new(WafStateManager::new());
+    let initial_kernel_filter = rt.block_on(cloud_node_rust::firewall::kernel::build_filter(None));
+    if initial_kernel_filter.available() {
+        waf_state.set_kernel_filter(initial_kernel_filter);
+    }
+    let migrated_blocks = cloud_node_rust::firewall::persistence::migrate_legacy_blocked_ips_once();
+    let restored_blocks = waf_state.restore_runtime_blocks_from_disk();
+    if migrated_blocks > 0 || restored_blocks > 0 {
+        info!(
+            "Firewall runtime state initialized: migrated_legacy={} restored_active={}",
+            migrated_blocks, restored_blocks
+        );
+    }
+    cloud_node_rust::firewall::persistence::start_flush_task();
     cloud_node_rust::firewall::state::start_gc_task(waf_state.clone());
     let ip_list_manager = Arc::new(firewall::lists::GlobalIpListManager::new(waf_state.clone()));
     let health_manager = GlobalHealthManager::new(16);
@@ -1803,9 +2032,11 @@ fn report_l4_performance_summary(api_config: &ApiConfig) {
 #[cfg(test)]
 mod tests {
     use super::{
-        cmdline_contains_management_command, first_cmdline_arg_basename, is_cloud_node_binary_name,
-        process_basename,
+        FirewallAggregate, FirewallListFlags, cmdline_contains_management_command,
+        first_cmdline_arg_basename, is_cloud_node_binary_name, process_basename,
+        record_firewall_aggregate, v4_24, v6_48,
     };
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::path::Path;
 
     #[test]
@@ -1851,5 +2082,38 @@ mod tests {
         assert!(!cmdline_contains_management_command(
             b"/opt/cloud-node-rust/cloud-node-rust\0--monitor-port\08888\0"
         ));
+    }
+
+    #[test]
+    fn firewall_list_aggregate_helpers_count_sources() {
+        assert_eq!(
+            v4_24(Ipv4Addr::new(203, 0, 113, 99)),
+            Ipv4Addr::new(203, 0, 113, 0)
+        );
+        assert_eq!(
+            v6_48("2001:db8:abcd:12::1".parse::<Ipv6Addr>().unwrap()),
+            "2001:db8:abcd::".parse::<Ipv6Addr>().unwrap()
+        );
+
+        let mut stats = FirewallAggregate::default();
+        record_firewall_aggregate(
+            &mut stats,
+            FirewallListFlags {
+                nf_blocked: true,
+                blacklist: false,
+            },
+        );
+        record_firewall_aggregate(
+            &mut stats,
+            FirewallListFlags {
+                nf_blocked: true,
+                blacklist: true,
+            },
+        );
+
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.nf_blocked, 2);
+        assert_eq!(stats.blacklist, 1);
+        assert_eq!(stats.both, 1);
     }
 }

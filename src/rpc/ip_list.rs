@@ -57,6 +57,7 @@ pub async fn sync_ip_items_incremental(
                     failed_count += 1;
                 }
             }
+            ip_list_manager.waf_state.persist_blocked_snapshot();
             if inner.version > last_version {
                 ip_list_manager.update_last_version(inner.version);
             }

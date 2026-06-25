@@ -3,6 +3,7 @@ pub mod kernel;
 pub mod lists;
 pub mod matcher;
 pub mod matcher_plus;
+pub mod persistence;
 pub mod state;
 pub mod uam;
 pub mod verifier;

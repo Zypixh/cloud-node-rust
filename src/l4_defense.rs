@@ -152,7 +152,7 @@ struct DistinctIpWindow {
 struct L4AggregateState {
     prefixes: DashMap<(i64, L4AggregateKey), Mutex<AggregateWindow>>,
     distinct_ips: DashMap<i64, Mutex<DistinctIpWindow>>,
-    prefix_counts: DashMap<String, AtomicU64>,
+    prefix_counts: DashMap<(i64, String), AtomicU64>,
 }
 
 struct ExactCounterWindow {
@@ -368,7 +368,7 @@ impl L4AggregateState {
         let label = key.label();
         let prefix_counter = self
             .prefix_counts
-            .entry(label.clone())
+            .entry((cluster_id, label))
             .or_insert_with(|| AtomicU64::new(0));
         let top_prefix_events = prefix_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -428,7 +428,7 @@ impl L4AggregateState {
         let (top_prefix, top_prefix_events) = self
             .prefix_counts
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+            .map(|entry| (entry.key().1.clone(), entry.value().load(Ordering::Relaxed)))
             .max_by_key(|(_, count)| *count)
             .unwrap_or_default();
         AggregateSnapshot {
@@ -923,12 +923,17 @@ pub fn is_l4_blocked(
     waf_state: &Arc<WafStateManager>,
     ip: IpAddr,
 ) -> bool {
+    if waf_state.is_whitelisted(ip, 0) {
+        return false;
+    }
     if waf_state.is_blocked(ip, 0) {
         return true;
     }
     let cluster_scope =
         crate::special_defense::cluster_block_scope_id(config_store.get_node_cluster_id_sync());
-    cluster_scope != 0 && waf_state.is_blocked(ip, cluster_scope)
+    cluster_scope != 0
+        && !waf_state.is_whitelisted(ip, cluster_scope)
+        && waf_state.is_blocked(ip, cluster_scope)
 }
 
 pub fn record_l4_event(
