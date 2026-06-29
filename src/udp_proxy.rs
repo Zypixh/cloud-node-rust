@@ -1,10 +1,12 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::{HashSet, VecDeque};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, mpsc, watch};
@@ -188,6 +190,15 @@ pub enum UdpSessionSendStatus {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpIngressDatagramStatus {
+    Sent,
+    Full,
+    Closed,
+    NoRoute,
+    Blocked,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UdpSessionQuicCid {
     pub session_id: u64,
@@ -211,6 +222,81 @@ pub struct UdpSession {
     pub tx: mpsc::Sender<QueuedUdpDatagram>,
     pub shutdown_tx: watch::Sender<bool>,
     pub shutdown: watch::Receiver<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub enum UdpDownstreamSender {
+    Socket(Arc<UdpSocket>),
+    Channel(Arc<ChannelUdpDownstreamSender>),
+}
+
+impl UdpDownstreamSender {
+    pub fn socket(socket: Arc<UdpSocket>) -> Self {
+        Self::Socket(socket)
+    }
+
+    pub fn channel(listen_addr: SocketAddr, tx: mpsc::Sender<DownstreamUdpDatagram>) -> Self {
+        Self::Channel(Arc::new(ChannelUdpDownstreamSender { listen_addr, tx }))
+    }
+
+    pub(crate) async fn send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<usize> {
+        match self {
+            Self::Socket(socket) => socket.send_to(data, target).await,
+            Self::Channel(sender) => sender.try_send_to(data, target),
+        }
+    }
+
+    pub(crate) fn try_send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<usize> {
+        match self {
+            Self::Socket(socket) => socket.try_send_to(data, target),
+            Self::Channel(sender) => sender.try_send_to(data, target),
+        }
+    }
+
+    pub(crate) fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self {
+            Self::Socket(socket) => socket.poll_send_ready(cx),
+            Self::Channel(_) => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownstreamUdpDatagram {
+    pub listen_addr: SocketAddr,
+    pub peer_addr: SocketAddr,
+    pub payload: Bytes,
+}
+
+#[derive(Debug)]
+pub struct ChannelUdpDownstreamSender {
+    listen_addr: SocketAddr,
+    tx: mpsc::Sender<DownstreamUdpDatagram>,
+}
+
+impl ChannelUdpDownstreamSender {
+    fn try_send_to(&self, data: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let len = data.len();
+        match self.tx.try_send(DownstreamUdpDatagram {
+            listen_addr: self.listen_addr,
+            peer_addr: target,
+            payload: Bytes::copy_from_slice(data),
+        }) {
+            Ok(()) => Ok(len),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "UDP downstream channel is full",
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "UDP downstream channel is closed",
+            )),
+        }
+    }
+}
+
+fn udp_socket_downstream(socket: Arc<UdpSocket>) -> UdpDownstreamSender {
+    UdpDownstreamSender::socket(socket)
 }
 
 pub struct QueuedUdpDatagram {
@@ -387,6 +473,7 @@ impl UdpProxyManager {
     ) -> anyhow::Result<()> {
         let port = bind_addr.port();
         let listen_socket = Arc::new(bind_udp_socket(bind_addr).await?);
+        let downstream_sender = udp_socket_downstream(listen_socket.clone());
         info!("UDP Proxy listening on {}", bind_addr);
 
         let mut buf = vec![0u8; 65535];
@@ -399,59 +486,100 @@ impl UdpProxyManager {
                 res = listen_socket.recv_from(&mut buf) => res,
             };
             let (len, client_addr) = recv_result?;
-            if crate::l4_defense::is_l4_blocked(
-                &self.config_store,
-                &self.waf_state,
-                client_addr.ip(),
-            ) {
-                continue;
-            }
             let data = Bytes::copy_from_slice(&buf[..len]);
 
-            // 1. Get or create session (Session Sticky)
-            let key = (client_addr, port);
-            let session = if let Some(s) = self.sessions.get(&key) {
-                s.clone()
-            } else {
-                match self
-                    .create_passthrough_session(
-                        client_addr,
-                        port,
-                        data.as_ref(),
-                        listen_socket.clone(),
-                        shutdown_rx.clone(),
-                    )
-                    .await
-                {
-                    Ok(Some(session)) => session,
-                    Ok(None) => continue,
-                    Err(err) => {
-                        debug!(
-                            "UDP session creation failed for {} on port {}: {}",
-                            client_addr, port, err
-                        );
-                        continue;
-                    }
-                }
-            };
-
-            match Self::send_to_session(&session, data) {
-                UdpSessionSendStatus::Sent => {}
-                UdpSessionSendStatus::Full => {
-                    self.record_l4_event(
-                        client_addr.ip(),
-                        L4DefenseKind::UdpQueueFull,
-                        format!("port={} peer={} session={}", port, client_addr, session.id),
-                    );
+            match self
+                .receive_datagram_with_downstream(
+                    client_addr,
+                    port,
+                    data,
+                    downstream_sender.clone(),
+                    shutdown_rx.clone(),
+                )
+                .await
+            {
+                Ok(UdpIngressDatagramStatus::Sent)
+                | Ok(UdpIngressDatagramStatus::Blocked)
+                | Ok(UdpIngressDatagramStatus::NoRoute) => {}
+                Ok(UdpIngressDatagramStatus::Full) => {
                     debug!("UDP session {} buffer full, dropping packet", client_addr);
                 }
-                UdpSessionSendStatus::Closed => {
+                Ok(UdpIngressDatagramStatus::Closed) => {
                     debug!("UDP session {} closed, dropping packet", client_addr);
-                    self.sessions
-                        .remove_if(&key, |_, existing| existing.id == session.id);
+                }
+                Err(err) => {
+                    debug!(
+                        "UDP session creation failed for {} on port {}: {}",
+                        client_addr, port, err
+                    );
                 }
             }
         }
+    }
+
+    pub async fn receive_datagram_with_downstream(
+        &self,
+        client_addr: SocketAddr,
+        port: u16,
+        data: Bytes,
+        downstream_sender: UdpDownstreamSender,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<UdpIngressDatagramStatus> {
+        if crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, client_addr.ip()) {
+            return Ok(UdpIngressDatagramStatus::Blocked);
+        }
+
+        let key = (client_addr, port);
+        let session = if let Some(session) = self.sessions.get(&key) {
+            session.clone()
+        } else {
+            let Some(session) = self
+                .create_passthrough_session_with_downstream(
+                    client_addr,
+                    port,
+                    data.as_ref(),
+                    downstream_sender,
+                    shutdown_rx,
+                )
+                .await?
+            else {
+                return Ok(UdpIngressDatagramStatus::NoRoute);
+            };
+            session
+        };
+
+        match Self::send_to_session_from_client(&session, client_addr, data).await {
+            UdpSessionSendStatus::Sent => Ok(UdpIngressDatagramStatus::Sent),
+            UdpSessionSendStatus::Full => {
+                self.record_l4_event(
+                    client_addr.ip(),
+                    L4DefenseKind::UdpQueueFull,
+                    format!("port={} peer={} session={}", port, client_addr, session.id),
+                );
+                Ok(UdpIngressDatagramStatus::Full)
+            }
+            UdpSessionSendStatus::Closed => {
+                self.sessions
+                    .remove_if(&key, |_, existing| existing.id == session.id);
+                Ok(UdpIngressDatagramStatus::Closed)
+            }
+        }
+    }
+
+    pub async fn receive_af_xdp_datagram(
+        &self,
+        datagram: crate::xdp::af_xdp::AfXdpDatagram,
+        downstream_tx: mpsc::Sender<DownstreamUdpDatagram>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<UdpIngressDatagramStatus> {
+        self.receive_datagram_with_downstream(
+            datagram.peer_addr,
+            datagram.listen_addr.port(),
+            datagram.payload,
+            UdpDownstreamSender::channel(datagram.listen_addr, downstream_tx),
+            shutdown_rx,
+        )
+        .await
     }
 
     pub async fn create_passthrough_session(
@@ -462,6 +590,24 @@ impl UdpProxyManager {
         listen_socket: Arc<UdpSocket>,
         shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<Option<Arc<UdpSession>>> {
+        self.create_passthrough_session_with_downstream(
+            client_addr,
+            port,
+            data,
+            udp_socket_downstream(listen_socket),
+            shutdown_rx,
+        )
+        .await
+    }
+
+    pub async fn create_passthrough_session_with_downstream(
+        &self,
+        client_addr: SocketAddr,
+        port: u16,
+        data: &[u8],
+        downstream_sender: UdpDownstreamSender,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<Option<Arc<UdpSession>>> {
         let key = (client_addr, port);
         if let Some(session) = self.sessions.get(&key) {
             return Ok(Some(session.clone()));
@@ -470,12 +616,12 @@ impl UdpProxyManager {
             Some(s) => s,
             None => return Ok(None),
         };
-        self.create_passthrough_session_for_server(
+        self.create_passthrough_session_for_server_with_downstream(
             client_addr,
             port,
             server,
             None,
-            listen_socket,
+            downstream_sender,
             shutdown_rx,
         )
         .await
@@ -490,12 +636,32 @@ impl UdpProxyManager {
         listen_socket: Arc<UdpSocket>,
         shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<Option<Arc<UdpSession>>> {
-        self.create_passthrough_session_for_server_with_cid_updates(
+        self.create_passthrough_session_for_server_with_downstream(
             client_addr,
             port,
             server,
             probed_server_name,
-            listen_socket,
+            udp_socket_downstream(listen_socket),
+            shutdown_rx,
+        )
+        .await
+    }
+
+    pub async fn create_passthrough_session_for_server_with_downstream(
+        &self,
+        client_addr: SocketAddr,
+        port: u16,
+        server: Arc<ServerConfig>,
+        probed_server_name: Option<String>,
+        downstream_sender: UdpDownstreamSender,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> anyhow::Result<Option<Arc<UdpSession>>> {
+        self.create_passthrough_session_for_server_with_cid_updates_and_downstream(
+            client_addr,
+            port,
+            server,
+            probed_server_name,
+            downstream_sender,
             shutdown_rx,
             None,
         )
@@ -509,6 +675,28 @@ impl UdpProxyManager {
         server: Arc<ServerConfig>,
         probed_server_name: Option<String>,
         listen_socket: Arc<UdpSocket>,
+        shutdown_rx: watch::Receiver<bool>,
+        quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
+    ) -> anyhow::Result<Option<Arc<UdpSession>>> {
+        self.create_passthrough_session_for_server_with_cid_updates_and_downstream(
+            client_addr,
+            port,
+            server,
+            probed_server_name,
+            udp_socket_downstream(listen_socket),
+            shutdown_rx,
+            quic_cid_tx,
+        )
+        .await
+    }
+
+    pub async fn create_passthrough_session_for_server_with_cid_updates_and_downstream(
+        &self,
+        client_addr: SocketAddr,
+        port: u16,
+        server: Arc<ServerConfig>,
+        probed_server_name: Option<String>,
+        downstream_sender: UdpDownstreamSender,
         shutdown_rx: watch::Receiver<bool>,
         quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
     ) -> anyhow::Result<Option<Arc<UdpSession>>> {
@@ -676,7 +864,7 @@ impl UdpProxyManager {
                 last_activity_ms,
                 quic_cids,
                 session_quic_cid_tx,
-                listen_socket,
+                downstream_sender,
                 rx,
             )
             .await;
@@ -819,7 +1007,7 @@ impl UdpProxyManager {
         last_activity_ms: Arc<AtomicU64>,
         quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
         quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
-        listen_socket: Arc<UdpSocket>,
+        downstream_sender: UdpDownstreamSender,
         mut rx: mpsc::Receiver<QueuedUdpDatagram>,
     ) -> anyhow::Result<()> {
         let backend_bind_addr = if backend_addr.is_ipv6() {
@@ -914,9 +1102,19 @@ impl UdpProxyManager {
                         .await;
                     }
                     let current_client_addr = *client_addr.read().await;
-                    if let Err(err) = listen_socket.send_to(&buf[..len], current_client_addr).await {
-                        result = Err(err.into());
-                        break;
+                    match downstream_sender.send_to(&buf[..len], current_client_addr).await {
+                        Ok(_) => {}
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            debug!(
+                                "UDP downstream sender queue full for {}, dropping backend packet",
+                                current_client_addr
+                            );
+                            continue;
+                        }
+                        Err(err) => {
+                            result = Err(err.into());
+                            break;
+                        }
                     }
                     last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
                     transfer_metrics.record_downstream(len_u64);
@@ -1275,7 +1473,7 @@ mod tests {
             Arc::new(AtomicU64::new(udp_activity_now_ms())),
             Arc::new(RwLock::new(VecDeque::new())),
             None,
-            listen_socket,
+            UdpDownstreamSender::socket(listen_socket),
             rx,
         ));
 
@@ -1303,6 +1501,153 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_session_relay_can_use_channel_downstream_sender() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let listen_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+        let (downstream_tx, mut downstream_rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
+        let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
+        let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+
+        let task = tokio::spawn(UdpProxyManager::handle_session(
+            1,
+            backend_addr,
+            443,
+            listener_shutdown_rx,
+            session_shutdown_rx,
+            1,
+            1,
+            Arc::new(RwLock::new(client_addr)),
+            "udp.example.com".to_string(),
+            Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            Arc::new(RwLock::new(VecDeque::new())),
+            None,
+            UdpDownstreamSender::channel(listen_addr, downstream_tx),
+            rx,
+        ));
+
+        tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping")).unwrap())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let (len, backend_peer) =
+            tokio::time::timeout(Duration::from_secs(1), backend.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buf[..len], b"ping");
+
+        backend.send_to(b"pong", backend_peer).await.unwrap();
+        let datagram = tokio::time::timeout(Duration::from_secs(1), downstream_rx.recv())
+            .await
+            .unwrap()
+            .expect("downstream datagram");
+        assert_eq!(datagram.listen_addr, listen_addr);
+        assert_eq!(datagram.peer_addr, client_addr);
+        assert_eq!(&datagram.payload[..], b"pong");
+
+        session_shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn channel_downstream_sender_reports_backpressure_without_waiting() {
+        let listen_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let peer_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(DownstreamUdpDatagram {
+            listen_addr,
+            peer_addr,
+            payload: Bytes::from_static(b"queued"),
+        })
+        .unwrap();
+        let sender = UdpDownstreamSender::channel(listen_addr, tx);
+
+        let err = sender.send_to(b"drop", peer_addr).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn af_xdp_datagram_reuses_existing_udp_session_queue() {
+        let store = ConfigStore::new();
+        let manager = UdpProxyManager::new(store, Arc::new(WafStateManager::new()), 1);
+        let listen_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let peer_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let session = Arc::new(UdpSession {
+            id: 77,
+            client_addr: Arc::new(RwLock::new(peer_addr)),
+            listen_port: listen_addr.port(),
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_cid_tx: None,
+            tx,
+            shutdown_tx,
+            shutdown,
+        });
+        manager
+            .sessions
+            .insert((peer_addr, listen_addr.port()), session);
+        let (downstream_tx, _downstream_rx) = mpsc::channel(4);
+        let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
+
+        let status = manager
+            .receive_af_xdp_datagram(
+                crate::xdp::af_xdp::AfXdpDatagram {
+                    listen_addr,
+                    peer_addr,
+                    payload: Bytes::from_static(b"hello"),
+                },
+                downstream_tx,
+                listener_shutdown_rx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(status, UdpIngressDatagramStatus::Sent);
+        assert_eq!(
+            rx.recv().await.as_ref().and_then(|item| item.as_deref()),
+            Some(&b"hello"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn af_xdp_datagram_without_route_is_reported() {
+        let store = ConfigStore::new();
+        let manager = UdpProxyManager::new(store, Arc::new(WafStateManager::new()), 1);
+        let (downstream_tx, _downstream_rx) = mpsc::channel(4);
+        let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
+
+        let status = manager
+            .receive_af_xdp_datagram(
+                crate::xdp::af_xdp::AfXdpDatagram {
+                    listen_addr: "127.0.0.1:443".parse().unwrap(),
+                    peer_addr: "127.0.0.1:53000".parse().unwrap(),
+                    payload: Bytes::from_static(b"hello"),
+                },
+                downstream_tx,
+                listener_shutdown_rx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(status, UdpIngressDatagramStatus::NoRoute);
     }
 
     #[tokio::test]

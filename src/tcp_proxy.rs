@@ -1,7 +1,8 @@
 use crate::config::ConfigStore;
 use crate::config_models::ServerConfig;
-use crate::config_models::{ProxyProtocolConfig, SSLCertConfig};
+use crate::config_models::{NetworkAddressConfig, ProxyProtocolConfig, SSLCertConfig};
 use crate::firewall::state::WafStateManager;
+use crate::l4_connection_registry::{self, L4ConnectionProtocol};
 use crate::l4_defense::L4DefenseKind;
 use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR};
 use crate::net_bind::{
@@ -20,13 +21,19 @@ use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::LazyLock as Lazy;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
+
+const TCP_PROXY_TINY_PAYLOAD_BYTES: u64 = 256;
 
 struct ListenerHandle {
     is_tls: bool,
@@ -34,6 +41,61 @@ struct ListenerHandle {
 }
 
 static RELAY_ZERO_COPY_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_ENTERED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_PREPARED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_CONTEXT_OK: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_START: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_OK: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_FAIL: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_RELAY_START: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_RELAY_DONE: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_RECEIVED: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_SENT: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_PROXY_DIAG_RELAY_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+pub(crate) fn reset_af_xdp_tcp_proxy_diag() {
+    AF_XDP_TCP_PROXY_DIAG_ENTERED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_PREPARED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_CONTEXT_OK.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_START.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_OK.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_FAIL.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_RELAY_START.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_RELAY_DONE.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_RECEIVED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_SENT.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_PROXY_DIAG_RELAY_ERRORS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn af_xdp_tcp_proxy_diag_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "entered": AF_XDP_TCP_PROXY_DIAG_ENTERED.load(Ordering::Relaxed),
+        "prepared": AF_XDP_TCP_PROXY_DIAG_PREPARED.load(Ordering::Relaxed),
+        "contextOk": AF_XDP_TCP_PROXY_DIAG_CONTEXT_OK.load(Ordering::Relaxed),
+        "backendConnectStart": AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_START.load(Ordering::Relaxed),
+        "backendConnectOk": AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_OK.load(Ordering::Relaxed),
+        "backendConnectFail": AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_FAIL.load(Ordering::Relaxed),
+        "relayStart": AF_XDP_TCP_PROXY_DIAG_RELAY_START.load(Ordering::Relaxed),
+        "relayDone": AF_XDP_TCP_PROXY_DIAG_RELAY_DONE.load(Ordering::Relaxed),
+        "relayBytesReceived": AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_RECEIVED.load(Ordering::Relaxed),
+        "relayBytesSent": AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_SENT.load(Ordering::Relaxed),
+        "relayErrors": AF_XDP_TCP_PROXY_DIAG_RELAY_ERRORS.load(Ordering::Relaxed),
+    })
+}
 
 pub fn configure_relay_from_api(config: &crate::api_config::ApiConfig) {
     let relay = config.relay.normalized();
@@ -52,6 +114,23 @@ fn relay_zero_copy_enabled() -> bool {
 
 fn relay_copy_buffer_bytes() -> usize {
     MEMORY_GOVERNOR.relay_copy_buffer_bytes()
+}
+
+fn listen_ports(addr_cfg: &NetworkAddressConfig) -> Vec<u16> {
+    addr_cfg
+        .port_range
+        .as_deref()
+        .map(crate::config_models::ports_in_range)
+        .unwrap_or_default()
+}
+
+fn listen_matches_port(listen: &[NetworkAddressConfig], port: u16) -> bool {
+    listen.iter().any(|addr_cfg| {
+        addr_cfg
+            .port_range
+            .as_deref()
+            .is_some_and(|range| crate::config_models::port_range_contains(range, port))
+    })
 }
 
 #[derive(Clone)]
@@ -74,12 +153,15 @@ struct TcpForwardContext {
 static CLIENT_CERT_CACHE: Lazy<Mutex<LruCache<String, ParsedClientCert>>> =
     Lazy::new(|| Mutex::new(LruCache::new(NonZeroUsize::MIN)));
 
+type TcpTlsAcceptor = pingora_core::listeners::tls::Acceptor;
+
 pub struct TcpProxyManager {
     config_store: ConfigStore,
     _cert_selector: Arc<DynamicCertSelector>,
     waf_state: Arc<WafStateManager>,
     node_id: i64,
     handled_ports: DashMap<SocketAddr, ListenerHandle>,
+    af_xdp_tls_acceptor: parking_lot::Mutex<Option<Arc<TcpTlsAcceptor>>>,
 }
 
 impl TcpProxyManager {
@@ -87,6 +169,22 @@ impl TcpProxyManager {
         crate::resource_budget::tls_handshake_timeout(
             &self.config_store.get_global_http_config_sync(),
         )
+    }
+
+    fn shared_af_xdp_tls_acceptor(&self) -> anyhow::Result<Arc<TcpTlsAcceptor>> {
+        let mut guard = self.af_xdp_tls_acceptor.lock();
+        if let Some(acceptor) = guard.as_ref() {
+            return Ok(acceptor.clone());
+        }
+        let rustls_config = crate::ssl::build_rustls_server_config(
+            Arc::clone(&self._cert_selector),
+            Vec::new(),
+            false,
+        )
+        .map_err(|err| anyhow::anyhow!("build AF_XDP TCP TLS server config: {}", err))?;
+        let acceptor = Arc::new(TcpTlsAcceptor::from_server_config(rustls_config));
+        *guard = Some(acceptor.clone());
+        Ok(acceptor)
     }
 
     pub fn new(
@@ -101,7 +199,302 @@ impl TcpProxyManager {
             waf_state,
             node_id,
             handled_ports: DashMap::new(),
+            af_xdp_tls_acceptor: parking_lot::Mutex::new(None),
         })
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn find_tcp_server_by_port_sync(
+        &self,
+        port: u16,
+    ) -> Option<(Arc<ServerConfig>, bool)> {
+        self.config_store
+            .get_all_servers_sync()
+            .into_iter()
+            .find_map(|server| {
+                let tcp_cfg = server.tcp.as_ref()?;
+                if tcp_cfg.is_on && listen_matches_port(&tcp_cfg.listen, port) {
+                    return Some((server.clone(), false));
+                }
+                if tcp_cfg.tls.as_ref().is_some_and(|tls_cfg| {
+                    tls_cfg.is_on && listen_matches_port(&tls_cfg.listen, port)
+                }) {
+                    return Some((server, true));
+                }
+                None
+            })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn handle_af_xdp_plain_stream<S>(
+        self: Arc<Self>,
+        client_stream: S,
+        client_addr: SocketAddr,
+        server: Arc<ServerConfig>,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        #[cfg(target_os = "linux")]
+        AF_XDP_TCP_PROXY_DIAG_ENTERED.fetch_add(1, Ordering::Relaxed);
+        let Some((
+            client_addr,
+            client_stream,
+            cancel_rx,
+            _connection_guard,
+            _client_permit,
+            _connection_permit,
+        )) = self
+            .prepare_bypass_tcp_connection(
+                client_stream,
+                client_addr,
+                &server,
+                "af_xdp",
+                server.enable_proxy_protocol,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+
+        self.continue_handle_connection(client_stream, client_addr, server, Some(cancel_rx))
+            .await
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    async fn prepare_bypass_tcp_connection<S>(
+        &self,
+        client_stream: S,
+        client_addr: SocketAddr,
+        server: &Arc<ServerConfig>,
+        source: &'static str,
+        consume_proxy_protocol: bool,
+    ) -> anyhow::Result<
+        Option<(
+            SocketAddr,
+            PrefixedStream<S>,
+            watch::Receiver<bool>,
+            crate::l4_connection_registry::L4ConnectionGuard,
+            crate::l4_defense::ActiveIpPermit,
+            crate::memory_governor::StaticAdmissionPermit,
+        )>,
+    >
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        if server.has_valid_traffic_limit() {
+            debug!(
+                "TCP Proxy: rejecting {} bypass connection from {} for traffic-limited server {}",
+                source,
+                client_addr,
+                server.numeric_id()
+            );
+            return Ok(None);
+        }
+
+        if crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, client_addr.ip()) {
+            return Ok(None);
+        }
+        if matches!(
+            crate::l4_defense::record_tcp_connection_churn_under_pressure(
+                &self.config_store,
+                &self.waf_state,
+                self.node_id,
+                client_addr.ip(),
+                || {
+                    format!(
+                        "peer={} protocol=plain phase=bypass_accept source={}",
+                        client_addr, source
+                    )
+                },
+            ),
+            Some(
+                crate::l4_defense::L4DefenseVerdict::Blocked
+                    | crate::l4_defense::L4DefenseVerdict::AggregateDropped
+                    | crate::l4_defense::L4DefenseVerdict::AlreadyBlocked
+            )
+        ) {
+            return Ok(None);
+        }
+
+        let per_ip_limit = crate::l4_defense::current_tcp_active_limit_per_ip();
+        let Some(client_permit) =
+            crate::l4_defense::try_acquire_tcp_active_ip(client_addr.ip(), per_ip_limit)
+        else {
+            crate::l4_defense::record_l4_event(
+                &self.config_store,
+                &self.waf_state,
+                self.node_id,
+                client_addr.ip(),
+                L4DefenseKind::TcpActiveLimit,
+                format!(
+                    "peer={} limit={} phase=bypass_accept source={}",
+                    client_addr, per_ip_limit, source
+                ),
+            );
+            return Ok(None);
+        };
+        let Some(connection_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::TcpConnection)
+        else {
+            crate::l4_defense::record_l4_event(
+                &self.config_store,
+                &self.waf_state,
+                self.node_id,
+                client_addr.ip(),
+                L4DefenseKind::TcpAdmissionReject,
+                format!("peer={} phase=bypass_accept source={}", client_addr, source),
+            );
+            return Ok(None);
+        };
+
+        let (client_addr, client_stream) = if consume_proxy_protocol {
+            let Some((addr, stream)) = maybe_consume_proxy_protocol_header_generic(
+                client_stream,
+                client_addr,
+                server.enable_proxy_protocol,
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            (addr, stream)
+        } else {
+            (client_addr, PrefixedStream::new(Vec::new(), client_stream))
+        };
+        if crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, client_addr.ip()) {
+            return Ok(None);
+        }
+
+        let connection_guard =
+            l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::SniTcp);
+        let connection_cancel_rx = connection_guard.cancel_receiver();
+        Ok(Some((
+            client_addr,
+            client_stream,
+            connection_cancel_rx,
+            connection_guard,
+            client_permit,
+            connection_permit,
+        )))
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) async fn handle_af_xdp_tcp_stream<S>(
+        self: Arc<Self>,
+        client_stream: S,
+        client_addr: SocketAddr,
+        server: Arc<ServerConfig>,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let Some((
+            client_addr,
+            client_stream,
+            cancel_rx,
+            _connection_guard,
+            _client_permit,
+            _connection_permit,
+        )) = self
+            .prepare_bypass_tcp_connection(
+                client_stream,
+                client_addr,
+                &server,
+                "af_xdp",
+                server.enable_proxy_protocol,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        #[cfg(target_os = "linux")]
+        AF_XDP_TCP_PROXY_DIAG_PREPARED.fetch_add(1, Ordering::Relaxed);
+
+        let context = self.tcp_forward_context(client_addr, &server).await?;
+        #[cfg(target_os = "linux")]
+        AF_XDP_TCP_PROXY_DIAG_CONTEXT_OK.fetch_add(1, Ordering::Relaxed);
+        self.continue_handle_generic_stream_with_options(
+            client_stream,
+            client_addr,
+            server,
+            context,
+            Some(cancel_rx),
+            RelayOptions::af_xdp_tcp(),
+        )
+        .await
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) async fn handle_af_xdp_tls_tcp_stream<S>(
+        self: Arc<Self>,
+        client_stream: S,
+        client_addr: SocketAddr,
+        server: Arc<ServerConfig>,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let Some((
+            client_addr,
+            client_stream,
+            cancel_rx,
+            _connection_guard,
+            _client_permit,
+            _connection_permit,
+        )) = self
+            .prepare_bypass_tcp_connection(
+                client_stream,
+                client_addr,
+                &server,
+                "af_xdp",
+                server.enable_proxy_protocol,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let l4_stream = crate::xdp::af_xdp::virtual_l4_stream(client_stream, client_addr);
+        let acceptor = self.shared_af_xdp_tls_acceptor()?;
+        let pressure_level = crate::l4_defense::current_pressure_level();
+        let timeout = crate::l4_defense::clamp_tls_handshake_timeout(
+            self.tls_handshake_timeout(),
+            pressure_level,
+        );
+        let tls_stream = match tokio::time::timeout(
+            timeout,
+            pingora_core::protocols::tls::server::handshake(&acceptor, l4_stream),
+        )
+        .await
+        {
+            Ok(Ok(tls_stream)) => tls_stream,
+            Ok(Err(err)) => {
+                debug!(
+                    "TCP Proxy: AF_XDP downstream TLS handshake failed peer={}: {}",
+                    client_addr, err
+                );
+                self.record_tls_handshake_failure(client_addr.ip());
+                return Ok(());
+            }
+            Err(_) => {
+                crate::l4_defense::record_l4_event(
+                    &self.config_store,
+                    &self.waf_state,
+                    self.node_id,
+                    client_addr.ip(),
+                    L4DefenseKind::TlsSlowClientHello,
+                    format!(
+                        "peer={} timeout_ms={} phase=af_xdp_tcp_tls_handshake",
+                        client_addr,
+                        timeout.as_millis()
+                    ),
+                );
+                return Ok(());
+            }
+        };
+
+        self.continue_handle_connection(tls_stream, client_addr, server, Some(cancel_rx))
+            .await
     }
 
     pub async fn start_listeners(self: Arc<Self>) {
@@ -125,21 +518,19 @@ impl TcpProxyManager {
                             );
                         }
                         for addr_cfg in &tcp_cfg.listen {
-                            if let Ok(port) = addr_cfg
-                                .port_range
-                                .clone()
-                                .unwrap_or_default()
-                                .parse::<u16>()
-                            {
-                                for bind_addr in dual_stack_bind_addrs(port) {
-                                    desired_ports.insert(bind_addr, false);
-                                    self.spawn_listener(&server, bind_addr, false).await;
-                                }
-                            } else {
+                            let ports = listen_ports(addr_cfg);
+                            if ports.is_empty() {
                                 error!(
                                     "Failed to parse TCP port: {:?}",
                                     addr_cfg.port_range.as_deref()
                                 );
+                                continue;
+                            }
+                            for port in ports {
+                                for bind_addr in dual_stack_bind_addrs(port) {
+                                    desired_ports.insert(bind_addr, false);
+                                    self.spawn_listener(&server, bind_addr, false).await;
+                                }
                             }
                         }
                     } else {
@@ -164,21 +555,19 @@ impl TcpProxyManager {
                             );
                         }
                         for addr_cfg in &tls_cfg.listen {
-                            if let Ok(port) = addr_cfg
-                                .port_range
-                                .clone()
-                                .unwrap_or_default()
-                                .parse::<u16>()
-                            {
-                                for bind_addr in dual_stack_bind_addrs(port) {
-                                    desired_ports.insert(bind_addr, true);
-                                    self.spawn_listener(&server, bind_addr, true).await;
-                                }
-                            } else {
+                            let ports = listen_ports(addr_cfg);
+                            if ports.is_empty() {
                                 error!(
                                     "Failed to parse TCP-TLS port: {:?}",
                                     addr_cfg.port_range.as_deref()
                                 );
+                                continue;
+                            }
+                            for port in ports {
+                                for bind_addr in dual_stack_bind_addrs(port) {
+                                    desired_ports.insert(bind_addr, true);
+                                    self.spawn_listener(&server, bind_addr, true).await;
+                                }
                             }
                         }
                     } else {
@@ -378,6 +767,29 @@ impl TcpProxyManager {
             ) {
                 continue;
             }
+            if matches!(
+                crate::l4_defense::record_tcp_connection_churn_under_pressure(
+                    &self.config_store,
+                    &self.waf_state,
+                    self.node_id,
+                    client_addr.ip(),
+                    || {
+                        format!(
+                            "bind={} peer={} protocol={} phase=accept",
+                            bind_addr,
+                            client_addr,
+                            if is_tls { "tls" } else { "plain" }
+                        )
+                    },
+                ),
+                Some(
+                    crate::l4_defense::L4DefenseVerdict::Blocked
+                        | crate::l4_defense::L4DefenseVerdict::AggregateDropped
+                        | crate::l4_defense::L4DefenseVerdict::AlreadyBlocked
+                )
+            ) {
+                continue;
+            }
 
             // --- OPTIMIZATION: Downstream TCP ---
             let _ = client_stream.set_nodelay(true);
@@ -480,6 +892,9 @@ impl TcpProxyManager {
         if crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, client_addr.ip()) {
             return Ok(());
         }
+        let connection_guard =
+            l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::SniTcp);
+        let connection_cancel_rx = connection_guard.cancel_receiver();
 
         if !is_tls {
             if self
@@ -489,7 +904,12 @@ impl TcpProxyManager {
                 return Ok(());
             }
             return self
-                .continue_handle_raw_tcp_connection(client_stream, client_addr, server)
+                .continue_handle_raw_tcp_connection(
+                    client_stream,
+                    client_addr,
+                    server,
+                    Some(connection_cancel_rx),
+                )
                 .await;
         }
 
@@ -538,7 +958,7 @@ impl TcpProxyManager {
             }
         };
 
-        self.continue_handle_connection(tls_stream, client_addr, server)
+        self.continue_handle_connection(tls_stream, client_addr, server, Some(connection_cancel_rx))
             .await
     }
 
@@ -655,12 +1075,13 @@ impl TcpProxyManager {
         client_stream: S,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
+        cancel_rx: Option<watch::Receiver<bool>>,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let context = self.tcp_forward_context(client_addr, &server).await?;
-        self.continue_handle_generic_stream(client_stream, client_addr, server, context)
+        self.continue_handle_generic_stream(client_stream, client_addr, server, context, cancel_rx)
             .await
     }
 
@@ -669,14 +1090,27 @@ impl TcpProxyManager {
         client_stream: TcpStream,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
+        cancel_rx: Option<watch::Receiver<bool>>,
     ) -> anyhow::Result<()> {
         let context = self.tcp_forward_context(client_addr, &server).await?;
         if context.use_tls_to_backend {
-            self.continue_handle_generic_stream(client_stream, client_addr, server, context)
-                .await
+            self.continue_handle_generic_stream(
+                client_stream,
+                client_addr,
+                server,
+                context,
+                cancel_rx,
+            )
+            .await
         } else {
-            self.continue_handle_raw_plain_stream(client_stream, client_addr, server, context)
-                .await
+            self.continue_handle_raw_plain_stream(
+                client_stream,
+                client_addr,
+                server,
+                context,
+                cancel_rx,
+            )
+            .await
         }
     }
 
@@ -686,6 +1120,30 @@ impl TcpProxyManager {
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
         context: TcpForwardContext,
+        cancel_rx: Option<watch::Receiver<bool>>,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.continue_handle_generic_stream_with_options(
+            client_stream,
+            client_addr,
+            server,
+            context,
+            cancel_rx,
+            RelayOptions::default(),
+        )
+        .await
+    }
+
+    async fn continue_handle_generic_stream_with_options<S>(
+        self: Arc<Self>,
+        client_stream: S,
+        client_addr: SocketAddr,
+        server: Arc<ServerConfig>,
+        context: TcpForwardContext,
+        cancel_rx: Option<watch::Receiver<bool>>,
+        relay_options: RelayOptions,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -761,14 +1219,26 @@ impl TcpProxyManager {
 
             crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
             drop(origin_connect_permit);
-            let res =
-                stream_bidirectional_with_metrics(context.sid, client_stream, backend_stream).await;
+            let res = stream_bidirectional_with_metrics_options(
+                context.sid,
+                client_stream,
+                backend_stream,
+                relay_options.with_cancel(cancel_rx),
+            )
+            .await;
             release_toa_port(toa_config, toa_local_port).await;
             self.finish_tcp_connection(client_addr, &server, &context, &res);
             res.map(|_| ()).map_err(Into::into)
         } else {
-            self.continue_handle_generic_plain_stream(client_stream, client_addr, server, context)
-                .await
+            self.continue_handle_generic_plain_stream(
+                client_stream,
+                client_addr,
+                server,
+                context,
+                cancel_rx,
+                relay_options,
+            )
+            .await
         }
     }
 
@@ -778,6 +1248,8 @@ impl TcpProxyManager {
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
         context: TcpForwardContext,
+        cancel_rx: Option<watch::Receiver<bool>>,
+        relay_options: RelayOptions,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -787,6 +1259,8 @@ impl TcpProxyManager {
             .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         self.record_request_start(client_addr, &context);
         let toa_config = self.config_store.get_toa_config_sync();
+        #[cfg(target_os = "linux")]
+        AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_START.fetch_add(1, Ordering::Relaxed);
         let mut backend_stream = match crate::toa::connect_with_toa(
             &context.backend_addr,
             client_addr,
@@ -797,10 +1271,14 @@ impl TcpProxyManager {
         {
             Ok(s) => s,
             Err(e) => {
+                #[cfg(target_os = "linux")]
+                AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_FAIL.fetch_add(1, Ordering::Relaxed);
                 self.record_backend_connect_failure(client_addr, &server, &context);
                 return Err(e.into());
             }
         };
+        #[cfg(target_os = "linux")]
+        AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_OK.fetch_add(1, Ordering::Relaxed);
         let toa_local_port = backend_stream
             .local_addr()
             .ok()
@@ -824,8 +1302,32 @@ impl TcpProxyManager {
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
         drop(origin_connect_permit);
-        let res =
-            stream_bidirectional_with_metrics(context.sid, client_stream, backend_stream).await;
+        #[cfg(target_os = "linux")]
+        AF_XDP_TCP_PROXY_DIAG_RELAY_START.fetch_add(1, Ordering::Relaxed);
+        let res = stream_bidirectional_with_metrics_options(
+            context.sid,
+            client_stream,
+            backend_stream,
+            relay_options.with_cancel(cancel_rx),
+        )
+        .await;
+        #[cfg(target_os = "linux")]
+        AF_XDP_TCP_PROXY_DIAG_RELAY_DONE.fetch_add(1, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        match &res {
+            Ok(outcome) => {
+                AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_RECEIVED
+                    .fetch_add(outcome.bytes_received, Ordering::Relaxed);
+                AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_SENT
+                    .fetch_add(outcome.bytes_sent, Ordering::Relaxed);
+            }
+            Err(err) => {
+                AF_XDP_TCP_PROXY_DIAG_RELAY_ERRORS.fetch_add(1, Ordering::Relaxed);
+                AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_RECEIVED
+                    .fetch_add(err.bytes_received, Ordering::Relaxed);
+                AF_XDP_TCP_PROXY_DIAG_RELAY_BYTES_SENT.fetch_add(err.bytes_sent, Ordering::Relaxed);
+            }
+        }
         release_toa_port(toa_config, toa_local_port).await;
         self.finish_tcp_connection(client_addr, &server, &context, &res);
         res.map(|_| ()).map_err(Into::into)
@@ -837,6 +1339,7 @@ impl TcpProxyManager {
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
         context: TcpForwardContext,
+        cancel_rx: Option<watch::Receiver<bool>>,
     ) -> anyhow::Result<()> {
         let origin_connect_permit = MEMORY_GOVERNOR
             .try_admit(AdmissionClass::OriginConnect)
@@ -880,8 +1383,13 @@ impl TcpProxyManager {
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
         drop(origin_connect_permit);
-        let res =
-            stream_tcp_bidirectional_with_metrics(context.sid, client_stream, backend_stream).await;
+        let res = stream_tcp_bidirectional_with_metrics_options(
+            context.sid,
+            client_stream,
+            backend_stream,
+            RelayOptions::default().with_cancel(cancel_rx),
+        )
+        .await;
         release_toa_port(toa_config, toa_local_port).await;
         self.finish_tcp_connection(client_addr, &server, &context, &res);
         res.map(|_| ()).map_err(Into::into)
@@ -936,7 +1444,7 @@ impl TcpProxyManager {
         context: &TcpForwardContext,
         result: &Result<RelayOutcome, BidirectionalStreamError>,
     ) {
-        let (bytes_received, bytes_sent) = match result {
+        let (bytes_received, bytes_sent, close_reason) = match result {
             Ok(outcome) => {
                 if outcome.close_reason != RelayCloseReason::Clean {
                     debug!(
@@ -957,16 +1465,42 @@ impl TcpProxyManager {
                         ),
                     );
                 }
-                (outcome.bytes_received, outcome.bytes_sent)
+                (
+                    outcome.bytes_received,
+                    outcome.bytes_sent,
+                    Some(outcome.close_reason),
+                )
             }
             Err(e) => {
                 debug!(
                     "TCP Proxy: Bidirectional relay finished with hard error: {}",
                     e
                 );
-                (e.bytes_received, e.bytes_sent)
+                (e.bytes_received, e.bytes_sent, None)
             }
         };
+        if should_record_tcp_proxy_early_close(bytes_received, bytes_sent, close_reason) {
+            crate::l4_defense::record_completed_handshake_event(
+                &self.config_store,
+                &self.waf_state,
+                self.node_id,
+                client_addr.ip(),
+                L4DefenseKind::TcpProxyEarlyCloseOrTinyPayload,
+                2,
+                || {
+                    format!(
+                        "server={} peer={} backend={} phase=relay_finish payload_len={} response_len={} close_reason={:?} pressure={}",
+                        context.sid,
+                        client_addr,
+                        context.backend_addr,
+                        bytes_received,
+                        bytes_sent,
+                        close_reason,
+                        crate::l4_defense::current_pressure_level().as_str()
+                    )
+                },
+            );
+        }
         let domain = server
             .get_plain_server_names()
             .first()
@@ -1058,6 +1592,7 @@ pub(crate) enum RelayCloseReason {
     Clean,
     BenignIo,
     PressureIdleTimeout,
+    L4Drain,
     DrainTimeoutAfterBenign,
 }
 
@@ -1102,6 +1637,7 @@ impl RelayOutcome {
             RelayCloseReason::PressureIdleTimeout => {
                 String::from("relay idle timeout under pressure")
             }
+            RelayCloseReason::L4Drain => String::from("relay closed by L4 defense drain"),
             RelayCloseReason::DrainTimeoutAfterBenign => {
                 String::from("relay drain timeout after benign close")
             }
@@ -1122,6 +1658,25 @@ impl RelayOutcome {
     }
 }
 
+fn should_record_tcp_proxy_early_close(
+    bytes_received: u64,
+    bytes_sent: u64,
+    close_reason: Option<RelayCloseReason>,
+) -> bool {
+    if bytes_received == 0 || bytes_received > TCP_PROXY_TINY_PAYLOAD_BYTES {
+        return false;
+    }
+    if bytes_sent > TCP_PROXY_TINY_PAYLOAD_BYTES {
+        return false;
+    }
+    matches!(
+        close_reason,
+        None | Some(RelayCloseReason::Clean)
+            | Some(RelayCloseReason::BenignIo)
+            | Some(RelayCloseReason::DrainTimeoutAfterBenign)
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamDirection {
     ClientToBackend,
@@ -1135,21 +1690,40 @@ pub(crate) enum RelayIoPhase {
     Shutdown,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct RelayOptions {
+    defer_client_to_backend_clean_shutdown: bool,
     defer_backend_to_client_clean_shutdown: bool,
+    cancel_rx: Option<watch::Receiver<bool>>,
 }
 
 impl RelayOptions {
     fn sni_passthrough() -> Self {
         Self {
+            defer_client_to_backend_clean_shutdown: false,
             defer_backend_to_client_clean_shutdown: true,
+            cancel_rx: None,
         }
     }
 
-    fn should_defer_clean_shutdown(self, direction: StreamDirection) -> bool {
-        self.defer_backend_to_client_clean_shutdown
-            && matches!(direction, StreamDirection::BackendToClient)
+    fn af_xdp_tcp() -> Self {
+        Self {
+            defer_client_to_backend_clean_shutdown: true,
+            defer_backend_to_client_clean_shutdown: false,
+            cancel_rx: None,
+        }
+    }
+
+    fn with_cancel(mut self, cancel_rx: Option<watch::Receiver<bool>>) -> Self {
+        self.cancel_rx = cancel_rx;
+        self
+    }
+
+    fn should_defer_clean_shutdown(&self, direction: StreamDirection) -> bool {
+        match direction {
+            StreamDirection::ClientToBackend => self.defer_client_to_backend_clean_shutdown,
+            StreamDirection::BackendToClient => self.defer_backend_to_client_clean_shutdown,
+        }
     }
 }
 
@@ -1243,6 +1817,7 @@ impl DirectionTaskError {
 
 type DirectionTaskResult = Result<DirectionSuccess, DirectionTaskError>;
 
+#[allow(dead_code)]
 pub(crate) async fn stream_tcp_bidirectional_with_metrics(
     server_id: i64,
     client: TcpStream,
@@ -1257,16 +1832,31 @@ pub(crate) async fn stream_tcp_bidirectional_with_metrics(
     .await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics(
     server_id: i64,
     client: TcpStream,
     backend: TcpStream,
 ) -> Result<RelayOutcome, BidirectionalStreamError> {
-    stream_tcp_bidirectional_with_metrics_options(
+    stream_sni_passthrough_bidirectional_with_metrics_cancelable(server_id, client, backend, None)
+        .await
+}
+
+pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics_cancelable<C, B>(
+    server_id: i64,
+    client: C,
+    backend: B,
+    cancel_rx: Option<watch::Receiver<bool>>,
+) -> Result<RelayOutcome, BidirectionalStreamError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    stream_bidirectional_with_metrics_options(
         server_id,
         client,
         backend,
-        RelayOptions::sni_passthrough(),
+        RelayOptions::sni_passthrough().with_cancel(cancel_rx),
     )
     .await
 }
@@ -1282,7 +1872,9 @@ async fn stream_tcp_bidirectional_with_metrics_options(
         if relay_zero_copy_enabled()
             && let Some(zero_copy_permit) = MEMORY_GOVERNOR.try_admit_zero_copy_relay()
         {
-            match zero_copy::stream_bidirectional(server_id, &client, &backend, options).await {
+            match zero_copy::stream_bidirectional(server_id, &client, &backend, options.clone())
+                .await
+            {
                 zero_copy::ZeroCopyOutcome::Completed(result) => {
                     drop(zero_copy_permit);
                     return result;
@@ -1295,6 +1887,7 @@ async fn stream_tcp_bidirectional_with_metrics_options(
     stream_bidirectional_with_metrics_options(server_id, client, backend, options).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn stream_bidirectional_with_metrics<C, B>(
     server_id: i64,
     client: C,
@@ -1322,13 +1915,14 @@ where
     let (backend_reader, backend_writer) = tokio::io::split(backend);
     let bytes_received_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let bytes_sent_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut cancel_rx = options.cancel_rx.clone();
     let client_to_backend = copy_stream_and_count(
         server_id,
         StreamDirection::ClientToBackend,
         client_reader,
         backend_writer,
         bytes_received_counter.clone(),
-        options,
+        options.clone(),
     );
     let backend_to_client = copy_stream_and_count(
         server_id,
@@ -1345,6 +1939,19 @@ where
     let (first_direction, first) = tokio::select! {
         result = &mut client_to_backend => (StreamDirection::ClientToBackend, result),
         result = &mut backend_to_client => (StreamDirection::BackendToClient, result),
+        _ = async {
+            if let Some(rx) = cancel_rx.as_mut() {
+                let _ = rx.changed().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => (
+            StreamDirection::ClientToBackend,
+            Ok(DirectionSuccess {
+                close_reason: RelayCloseReason::L4Drain,
+                close_detail: None,
+            }),
+        ),
     };
 
     match first {
@@ -1392,6 +1999,11 @@ where
                 RelayCloseReason::PressureIdleTimeout,
             )
             .with_close_detail(first_success.close_detail)),
+            RelayCloseReason::L4Drain => Ok(RelayOutcome::from_counters(
+                &bytes_received_counter,
+                &bytes_sent_counter,
+                RelayCloseReason::L4Drain,
+            )),
             RelayCloseReason::DrainTimeoutAfterBenign => unreachable!(),
         },
         Err(error) => Err(BidirectionalStreamError::from_direction_error(
@@ -1557,6 +2169,11 @@ fn combine_relay_close_reasons(
         RelayCloseReason::PressureIdleTimeout
     } else if matches!(
         (first, second),
+        (RelayCloseReason::L4Drain, _) | (_, RelayCloseReason::L4Drain)
+    ) {
+        RelayCloseReason::L4Drain
+    } else if matches!(
+        (first, second),
         (RelayCloseReason::BenignIo, _) | (_, RelayCloseReason::BenignIo)
     ) {
         RelayCloseReason::BenignIo
@@ -1684,13 +2301,14 @@ mod zero_copy {
         let bytes_sent_counter = Arc::new(AtomicU64::new(0));
         let control = Arc::new(RelayControl::default());
 
+        let mut cancel_rx = options.cancel_rx.clone();
         let mut c2b = spawn_direction(
             server_id,
             StreamDirection::ClientToBackend,
             client_to_backend,
             bytes_received_counter.clone(),
             control.clone(),
-            options,
+            options.clone(),
         );
         let mut b2c = spawn_direction(
             server_id,
@@ -1710,6 +2328,23 @@ mod zero_copy {
                 StreamDirection::BackendToClient,
                 flatten_join_result(StreamDirection::BackendToClient, result),
             ),
+            _ = async {
+                if let Some(rx) = cancel_rx.as_mut() {
+                    let _ = rx.changed().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                control.stop();
+                shutdown_fds.shutdown_all();
+                (
+                    StreamDirection::ClientToBackend,
+                    Ok(DirectionSuccess {
+                        close_reason: RelayCloseReason::L4Drain,
+                        close_detail: None,
+                    }),
+                )
+            },
         };
 
         let result = if first_direction == StreamDirection::ClientToBackend {
@@ -1831,6 +2466,20 @@ mod zero_copy {
                         RelayCloseReason::PressureIdleTimeout,
                     )
                     .with_close_detail(first_success.close_detail))
+                }
+                RelayCloseReason::L4Drain => {
+                    control.stop();
+                    shutdown_fds.shutdown_all();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(POLL_TIMEOUT_MS as u64 + 500),
+                        remaining,
+                    )
+                    .await;
+                    Ok(RelayOutcome::from_counters(
+                        bytes_received_counter,
+                        bytes_sent_counter,
+                        RelayCloseReason::L4Drain,
+                    ))
                 }
                 RelayCloseReason::DrainTimeoutAfterBenign => unreachable!(),
             },
@@ -2416,10 +3065,126 @@ async fn maybe_consume_proxy_protocol_header(
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct PrefixedStream<S> {
+    prefix: io::Cursor<Vec<u8>>,
+    inner: S,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl<S> PrefixedStream<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix: io::Cursor::new(prefix),
+            inner,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let prefix_pos = self.prefix.position() as usize;
+        let prefix = self.prefix.get_ref();
+        if prefix_pos < prefix.len() {
+            let available = &prefix[prefix_pos..];
+            let to_copy = available.len().min(buf.remaining());
+            buf.put_slice(&available[..to_copy]);
+            self.prefix.set_position((prefix_pos + to_copy) as u64);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+async fn maybe_consume_proxy_protocol_header_generic<S>(
+    mut stream: S,
+    client_addr: SocketAddr,
+    enable_proxy_protocol: bool,
+) -> anyhow::Result<Option<(SocketAddr, PrefixedStream<S>)>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if !enable_proxy_protocol {
+        return Ok(Some((client_addr, PrefixedStream::new(Vec::new(), stream))));
+    }
+
+    let mut peek_buf = [0u8; 128];
+    let peek_n = match tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        stream.read(&mut peek_buf),
+    )
+    .await
+    {
+        Ok(Ok(n)) => n,
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => return Ok(Some((client_addr, PrefixedStream::new(Vec::new(), stream)))),
+    };
+
+    if peek_n == 0 {
+        return Ok(Some((client_addr, PrefixedStream::new(Vec::new(), stream))));
+    }
+
+    let prefix = peek_buf[..peek_n].to_vec();
+    match proxy_protocol::parse_proxy_v1_v2(&prefix) {
+        Ok(addr) => {
+            let tail = prefix[addr.consumed..].to_vec();
+            let effective_addr = proxy_protocol::effective_client_addr(client_addr, &addr);
+            if effective_addr == client_addr && addr.src_ip.is_some() {
+                debug!(
+                    "TCP PROXY protocol: consumed untrusted generic header from {}; keeping stream peer",
+                    client_addr
+                );
+            } else {
+                debug!(
+                    "TCP PROXY protocol: replaced generic stream {} with {}",
+                    client_addr, effective_addr
+                );
+            }
+            Ok(Some((effective_addr, PrefixedStream::new(tail, stream))))
+        }
+        Err(proxy_protocol::ProxyProtocolError::NotProxyProtocol) => {
+            Ok(Some((client_addr, PrefixedStream::new(prefix, stream))))
+        }
+        Err(proxy_protocol::ProxyProtocolError::Incomplete) => Ok(None),
+        Err(err) => {
+            debug!(
+                "TCP PROXY protocol: dropping invalid generic header from {}: {}",
+                client_addr, err
+            );
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_models::{HTTPFirewallPolicy, TLSExhaustionAttackConfig};
+    use crate::config_models::{
+        HTTPFirewallPolicy, HTTPSConfig, NetworkAddressConfig, TCPConfig, TLSExhaustionAttackConfig,
+    };
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
@@ -2463,6 +3228,135 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn tcp_proxy_early_close_classifier_requires_tiny_client_payload() {
+        assert!(should_record_tcp_proxy_early_close(
+            32,
+            0,
+            Some(RelayCloseReason::Clean)
+        ));
+        assert!(should_record_tcp_proxy_early_close(
+            64,
+            64,
+            Some(RelayCloseReason::BenignIo)
+        ));
+        assert!(should_record_tcp_proxy_early_close(64, 0, None));
+        assert!(!should_record_tcp_proxy_early_close(
+            0,
+            0,
+            Some(RelayCloseReason::Clean)
+        ));
+        assert!(!should_record_tcp_proxy_early_close(
+            TCP_PROXY_TINY_PAYLOAD_BYTES + 1,
+            0,
+            Some(RelayCloseReason::Clean)
+        ));
+        assert!(!should_record_tcp_proxy_early_close(
+            64,
+            TCP_PROXY_TINY_PAYLOAD_BYTES + 1,
+            Some(RelayCloseReason::Clean)
+        ));
+        assert!(!should_record_tcp_proxy_early_close(
+            64,
+            0,
+            Some(RelayCloseReason::PressureIdleTimeout)
+        ));
+    }
+
+    async fn install_test_servers(store: &ConfigStore, servers: Vec<Arc<ServerConfig>>) {
+        store
+            .update_config(
+                1,
+                1,
+                1,
+                1,
+                servers,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                0,
+                1,
+                true,
+                false,
+                std::collections::HashMap::new(),
+                false,
+                false,
+                String::new(),
+                std::collections::HashMap::new(),
+                None,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                0,
+                false,
+                false,
+                false,
+                String::new(),
+                None,
+                None,
+                vec![],
+                vec![],
+                vec![],
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                None,
+                None,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn af_xdp_tcp_lookup_matches_plain_and_tls_port_ranges() {
+        let store = ConfigStore::new();
+        let server = Arc::new(ServerConfig {
+            id: Some(91_009),
+            tcp: Some(TCPConfig {
+                is_on: true,
+                listen: vec![NetworkAddressConfig {
+                    port_range: Some("30000-30002".to_string()),
+                    ..Default::default()
+                }],
+                tls: Some(HTTPSConfig {
+                    is_on: true,
+                    listen: vec![NetworkAddressConfig {
+                        port_range: Some("30443-30444".to_string()),
+                        ..Default::default()
+                    }],
+                    ssl_policy: None,
+                    supports_http3: None,
+                }),
+            }),
+            ..Default::default()
+        });
+        install_test_servers(&store, vec![server.clone()]).await;
+        let manager = TcpProxyManager::new(
+            store,
+            Arc::new(DynamicCertSelector::new()),
+            Arc::new(WafStateManager::new()),
+            7,
+        );
+
+        let (plain_server, plain_tls) = manager.find_tcp_server_by_port_sync(30001).unwrap();
+        assert_eq!(plain_server.id, server.id);
+        assert!(!plain_tls);
+
+        let (tls_server, tls_mode) = manager.find_tcp_server_by_port_sync(30444).unwrap();
+        assert_eq!(tls_server.id, server.id);
+        assert!(tls_mode);
+
+        assert!(manager.find_tcp_server_by_port_sync(30445).is_none());
     }
 
     async fn configure_tls_exhaustion(store: &ConfigStore) {
@@ -2651,6 +3545,36 @@ mod tests {
         .unwrap();
         assert_eq!(success.close_reason, RelayCloseReason::Clean);
         assert_eq!(success.close_detail, None);
+    }
+
+    #[tokio::test]
+    async fn relay_cancel_returns_l4_drain_without_losing_counters() {
+        let (proxy_client, proxy_backend, mut client, mut backend) =
+            connected_proxy_streams().await;
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let relay = tokio::spawn(async move {
+            stream_tcp_bidirectional_with_metrics_options(
+                91_008,
+                proxy_client,
+                proxy_backend,
+                RelayOptions::default().with_cancel(Some(cancel_rx)),
+            )
+            .await
+            .unwrap()
+        });
+
+        client.write_all(b"before-drain").await.unwrap();
+        let mut received = [0u8; 12];
+        backend.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"before-drain");
+        cancel_tx.send(true).unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.close_reason, RelayCloseReason::L4Drain);
+        assert_eq!(outcome.bytes_received, received.len() as u64);
     }
 
     #[tokio::test]

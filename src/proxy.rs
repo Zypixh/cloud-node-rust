@@ -560,6 +560,47 @@ static CACHE_LOCK: std::sync::LazyLock<CacheLock> =
 /// Prevents thundering herd: only one background fetch per key at a time.
 static SWR_REVALIDATE_IN_FLIGHT: Lazy<DashMap<String, ()>> =
     Lazy::new(|| DashMap::with_shard_amount(64));
+static HTTP_REQUEST_PARSE_MARKS: Lazy<DashMap<String, i64>> =
+    Lazy::new(|| DashMap::with_shard_amount(64));
+static HTTP_REQUEST_PARSE_MARK_SWEEP_AT_MS: LazyLock<std::sync::atomic::AtomicI64> =
+    LazyLock::new(|| std::sync::atomic::AtomicI64::new(0));
+const HTTP_REQUEST_PARSE_MARK_TTL_MS: i64 = 30_000;
+
+fn http_request_parse_mark_key(client_addr: impl ToString) -> String {
+    client_addr.to_string()
+}
+
+fn sweep_http_request_parse_marks() {
+    let now = crate::utils::time::now_timestamp_millis();
+    let last = HTTP_REQUEST_PARSE_MARK_SWEEP_AT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < HTTP_REQUEST_PARSE_MARK_TTL_MS {
+        return;
+    }
+    if HTTP_REQUEST_PARSE_MARK_SWEEP_AT_MS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        HTTP_REQUEST_PARSE_MARKS
+            .retain(|_, ts| now.saturating_sub(*ts) <= HTTP_REQUEST_PARSE_MARK_TTL_MS);
+    }
+}
+
+pub(crate) fn mark_http_request_parsed(session: &Session) {
+    sweep_http_request_parse_marks();
+    if let Some(client_addr) = session.downstream_session.client_addr() {
+        HTTP_REQUEST_PARSE_MARKS.insert(
+            http_request_parse_mark_key(client_addr),
+            crate::utils::time::now_timestamp_millis(),
+        );
+    }
+}
+
+pub(crate) fn take_http_request_parse_mark(client_addr: impl ToString) -> bool {
+    sweep_http_request_parse_marks();
+    HTTP_REQUEST_PARSE_MARKS
+        .remove(&http_request_parse_mark_key(client_addr))
+        .is_some()
+}
 
 /// Hard cap on how many SWR background tasks may be in flight simultaneously.
 /// Without it an attacker can spawn a task per unique cache key (each holding
@@ -2174,6 +2215,47 @@ impl EdgeProxy {
             return ("h2c_probe", "H2C_PROBE");
         }
         ("malformed_http", "MALFORMED_HTTP")
+    }
+
+    fn is_tls_http_session(session: &pingora_core::protocols::http::ServerSession) -> bool {
+        session
+            .digest()
+            .and_then(|digest| digest.ssl_digest.as_ref())
+            .is_some()
+    }
+
+    fn record_completed_handshake_parse_defense(
+        &self,
+        session: &pingora_core::protocols::http::ServerSession,
+        kind: crate::l4_defense::L4DefenseKind,
+        reason: &'static str,
+        error: &Error,
+    ) {
+        let (ip, _, raw_addr) = Self::http_session_socket_client_ip(session);
+        let node_id = self.api_config.node_id.parse::<i64>().unwrap_or(0);
+        let protocol = if Self::is_tls_http_session(session) {
+            "https"
+        } else {
+            "http"
+        };
+        crate::l4_defense::record_completed_handshake_event(
+            &self.config,
+            &self.waf_state,
+            node_id,
+            ip,
+            kind,
+            2,
+            || {
+                format!(
+                    "peer={} protocol={} phase=parse_error reason={} error_type={:?} pressure={}",
+                    raw_addr,
+                    protocol,
+                    reason,
+                    error.etype(),
+                    crate::l4_defense::current_pressure_level().as_str()
+                )
+            },
+        );
     }
 
     fn record_malformed_http_defense(&self, defense: &'static str, ip: std::net::IpAddr) {
@@ -8307,18 +8389,44 @@ impl ProxyHttp for EdgeProxy {
         error: &Error,
         _ctx: &mut Self::CTX,
     ) -> DownstreamParseErrorAction {
+        if let Some(client_addr) = session.client_addr() {
+            HTTP_REQUEST_PARSE_MARKS.insert(
+                http_request_parse_mark_key(client_addr),
+                crate::utils::time::now_timestamp_millis(),
+            );
+        }
         let (reason, defense) = Self::classify_downstream_parse_error(error);
         if matches!(error.etype(), ReadTimedout) {
             let (ip, _, raw_addr) = Self::http_session_socket_client_ip(session);
             let node_id = self.api_config.node_id.parse::<i64>().unwrap_or(0);
-            crate::l4_defense::record_l4_event(
-                &self.config,
-                &self.waf_state,
-                node_id,
-                ip,
-                crate::l4_defense::L4DefenseKind::HttpSlowHeader,
-                format!("peer={} reason={}", raw_addr, reason),
-            );
+            if Self::is_tls_http_session(session) {
+                crate::l4_defense::record_completed_handshake_event(
+                    &self.config,
+                    &self.waf_state,
+                    node_id,
+                    ip,
+                    crate::l4_defense::L4DefenseKind::TlsHandshakeThenNoHttp,
+                    2,
+                    || {
+                        format!(
+                            "peer={} protocol=https phase=read_header reason={} error_type={:?} pressure={}",
+                            raw_addr,
+                            reason,
+                            error.etype(),
+                            crate::l4_defense::current_pressure_level().as_str()
+                        )
+                    },
+                );
+            } else {
+                crate::l4_defense::record_l4_event(
+                    &self.config,
+                    &self.waf_state,
+                    node_id,
+                    ip,
+                    crate::l4_defense::L4DefenseKind::HttpSlowHeader,
+                    format!("peer={} protocol=http reason={}", raw_addr, reason),
+                );
+            }
             return DownstreamParseErrorAction {
                 respond_status: None,
                 log_level: DownstreamParseErrorLogLevel::Debug,
@@ -8326,13 +8434,48 @@ impl ProxyHttp for EdgeProxy {
             };
         }
         if matches!(error.etype(), InvalidHTTPHeader) {
-            let (ip, _, _) = Self::http_session_socket_client_ip(session);
+            let (ip, _, raw_addr) = Self::http_session_socket_client_ip(session);
             self.record_malformed_http_defense(defense, ip);
+            let kind = if Self::is_tls_http_session(session) {
+                crate::l4_defense::L4DefenseKind::TlsHandshakeThenNoHttp
+            } else {
+                crate::l4_defense::L4DefenseKind::HttpEarlyCloseOrTinyRequest
+            };
+            crate::l4_defense::record_completed_handshake_event(
+                &self.config,
+                &self.waf_state,
+                self.api_config.node_id.parse::<i64>().unwrap_or(0),
+                ip,
+                kind,
+                2,
+                || {
+                    format!(
+                        "peer={} protocol={} phase=parse_error reason={} error_type={:?} pressure={}",
+                        raw_addr,
+                        if Self::is_tls_http_session(session) {
+                            "https"
+                        } else {
+                            "http"
+                        },
+                        reason,
+                        error.etype(),
+                        crate::l4_defense::current_pressure_level().as_str()
+                    )
+                },
+            );
             return DownstreamParseErrorAction {
                 respond_status: Some(400),
                 log_level: DownstreamParseErrorLogLevel::Debug,
                 reason,
             };
+        }
+        if matches!(error.etype(), ConnectionClosed | ReadError) {
+            let kind = if Self::is_tls_http_session(session) {
+                crate::l4_defense::L4DefenseKind::TlsHandshakeThenNoHttp
+            } else {
+                crate::l4_defense::L4DefenseKind::HttpEarlyCloseOrTinyRequest
+            };
+            self.record_completed_handshake_parse_defense(session, kind, reason, error);
         }
         DownstreamParseErrorAction {
             respond_status: None,
@@ -8365,6 +8508,7 @@ impl ProxyHttp for EdgeProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        mark_http_request_parsed(session);
         let mut state = match self.run_request_context_phase(session, ctx).await? {
             PhaseOutcome::Continue(state) => state,
             PhaseOutcome::Done(done) => return Ok(done),

@@ -61,6 +61,10 @@ impl Http3ProxyManager {
     }
 
     pub async fn desired_ports(&self) -> HashSet<u16> {
+        self.desired_ports_sync()
+    }
+
+    pub fn desired_ports_sync(&self) -> HashSet<u16> {
         let mut desired = HashSet::new();
         let Some(policy) = self.config_store.get_global_http3_policy_sync() else {
             return desired;
@@ -76,7 +80,7 @@ impl Http3ProxyManager {
             }
         }
 
-        for server in self.config_store.get_all_servers().await {
+        for server in self.config_store.get_all_servers_sync() {
             if let Some(https) = &server.https
                 && https.is_on
                 && !server.is_sni_passthrough()

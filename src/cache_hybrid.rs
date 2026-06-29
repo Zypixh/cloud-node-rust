@@ -1675,6 +1675,33 @@ impl HybridStorage {
     }
 
     #[doc(hidden)]
+    pub fn bench_fast_l1_insert(
+        key: &str,
+        body: bytes::Bytes,
+        meta: &CacheMeta,
+        ttl_secs: u64,
+    ) -> bool {
+        let now = crate::utils::time::now_timestamp();
+        let entry = TinyUfoL1Entry {
+            data: body,
+            response_header: meta.response_header().clone(),
+            fresh_until: now + ttl_secs as i64,
+            created_at: now,
+        };
+        crate::cache_manager::CACHE.storage.l1.put(
+            key,
+            entry,
+            std::time::Duration::from_secs(ttl_secs.max(1)),
+        );
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn bench_fast_l1_remove(key: &str) {
+        crate::cache_manager::CACHE.storage.l1.remove(key);
+    }
+
+    #[doc(hidden)]
     pub fn bench_compute_memory_budget() -> u64 {
         Self::compute_memory_budget()
     }
@@ -2429,6 +2456,11 @@ pub fn start_cache_janitor() {
             NEGATIVE_CACHE.retain(|_, &mut expires| expires > now);
         }
     });
+}
+
+#[doc(hidden)]
+pub fn fast_l1_lookup(key: &str) -> bool {
+    crate::cache_manager::CACHE.storage.l1.get(key).is_some()
 }
 
 #[cfg(test)]
