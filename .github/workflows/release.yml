@@ -31,29 +31,29 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             cpu: x86-64-v2
             name: linux-x64-v2-sse4.2
-            rustflags: "-C target-cpu=x86-64-v2 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes -C target-feature=+pclmulqdq"
+            rustflags: "-C target-cpu=x86-64-v2 -C target-feature=+pclmulqdq"
             cxxflags: "-mpclmul -msse4.2"
           - target: x86_64-unknown-linux-gnu
             cpu: x86-64-v3
             name: linux-x64-v3-avx2
-            rustflags: "-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes -C target-feature=+pclmulqdq"
+            rustflags: "-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"
             cxxflags: "-mpclmul -msse4.2"
           - target: x86_64-unknown-linux-gnu
             cpu: x86-64-v4
             name: linux-x64-v4-avx512
-            rustflags: "-C target-cpu=x86-64-v4 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes -C target-feature=+pclmulqdq"
+            rustflags: "-C target-cpu=x86-64-v4 -C target-feature=+pclmulqdq"
             cxxflags: "-mpclmul -msse4.2"
 
           # --- ARM64 Variants ---
           - target: aarch64-unknown-linux-gnu
             cpu: generic
             name: linux-arm64-generic
-            rustflags: "-C opt-level=3 -C lto=fat -C codegen-units=1 -C target-feature=+neon,+aes,+sha2,+crc -C embed-bitcode=yes"
+            rustflags: "-C target-feature=+neon,+aes,+sha2,+crc"
             cxxflags: ""
           - target: aarch64-unknown-linux-gnu
             cpu: neoverse-n1
             name: linux-arm64-neoverse-n1
-            rustflags: "-C target-cpu=neoverse-n1 -C opt-level=3 -C lto=fat -C codegen-units=1 -C embed-bitcode=yes"
+            rustflags: "-C target-cpu=neoverse-n1"
             cxxflags: ""
 
     steps:
