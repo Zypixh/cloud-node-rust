@@ -26,12 +26,26 @@ const L4_EXACT_COUNTER_SWEEP_INTERVAL_MS: i64 = 10_000;
 pub enum L4DefenseKind {
     TcpActiveLimit,
     TcpAdmissionReject,
+    TcpConnectionChurn,
+    TcpAcceptedChurn,
     TcpPressureIdleClose,
     TcpSlowFirstByte,
+    TcpProxyEarlyCloseOrTinyPayload,
     TlsHandshakeFail,
+    TlsPartialClientHello,
+    TlsInvalidProbe,
+    TlsPlaintextConnectOnTls,
     TlsSlowClientHello,
+    TlsHandshakeThenNoHttp,
     HttpSlowHeader,
+    HttpEarlyCloseOrTinyRequest,
     SniProbeFail,
+    H2StreamAdmissionReject,
+    H2RapidReset,
+    H2DownstreamCancel,
+    H2RequestChurn,
+    H2ConnectionAbuse,
+    SynBacklogPressure,
     UdpSessionFlood,
     UdpAdmissionReject,
     UdpQueueFull,
@@ -87,6 +101,10 @@ pub struct L4DefenseMetricsSnapshot {
     pub active_limit_total: u64,
     pub admission_reject_total: u64,
     pub slow_close_total: u64,
+    pub completed_handshake_total: u64,
+    pub h2_defense_total: u64,
+    pub tls_probe_total: u64,
+    pub syn_pressure_total: u64,
     pub quic_pressure_total: u64,
     pub prefix_event_total: u64,
     pub prefix_blocked_total: u64,
@@ -108,6 +126,10 @@ struct L4DefenseMetrics {
     active_limit_total: AtomicU64,
     admission_reject_total: AtomicU64,
     slow_close_total: AtomicU64,
+    completed_handshake_total: AtomicU64,
+    h2_defense_total: AtomicU64,
+    tls_probe_total: AtomicU64,
+    syn_pressure_total: AtomicU64,
     quic_pressure_total: AtomicU64,
     prefix_event_total: AtomicU64,
     prefix_blocked_total: AtomicU64,
@@ -249,6 +271,10 @@ impl L4DefenseMetrics {
             active_limit_total: AtomicU64::new(0),
             admission_reject_total: AtomicU64::new(0),
             slow_close_total: AtomicU64::new(0),
+            completed_handshake_total: AtomicU64::new(0),
+            h2_defense_total: AtomicU64::new(0),
+            tls_probe_total: AtomicU64::new(0),
+            syn_pressure_total: AtomicU64::new(0),
             quic_pressure_total: AtomicU64::new(0),
             prefix_event_total: AtomicU64::new(0),
             prefix_blocked_total: AtomicU64::new(0),
@@ -291,6 +317,19 @@ impl L4DefenseMetrics {
         if kind.is_slow_close() {
             self.slow_close_total.fetch_add(1, Ordering::Relaxed);
         }
+        if kind.is_completed_handshake() {
+            self.completed_handshake_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if kind.is_h2_defense() {
+            self.h2_defense_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if kind.is_tls_probe() {
+            self.tls_probe_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if kind.is_syn_pressure() {
+            self.syn_pressure_total.fetch_add(1, Ordering::Relaxed);
+        }
         if kind.is_quic_pressure() {
             self.quic_pressure_total.fetch_add(1, Ordering::Relaxed);
         }
@@ -313,6 +352,10 @@ impl L4DefenseMetrics {
             active_limit_total: self.active_limit_total.load(Ordering::Relaxed),
             admission_reject_total: self.admission_reject_total.load(Ordering::Relaxed),
             slow_close_total: self.slow_close_total.load(Ordering::Relaxed),
+            completed_handshake_total: self.completed_handshake_total.load(Ordering::Relaxed),
+            h2_defense_total: self.h2_defense_total.load(Ordering::Relaxed),
+            tls_probe_total: self.tls_probe_total.load(Ordering::Relaxed),
+            syn_pressure_total: self.syn_pressure_total.load(Ordering::Relaxed),
             quic_pressure_total: self.quic_pressure_total.load(Ordering::Relaxed),
             prefix_event_total: self.prefix_event_total.load(Ordering::Relaxed),
             prefix_blocked_total: self.prefix_blocked_total.load(Ordering::Relaxed),
@@ -449,15 +492,17 @@ impl L4ExactCounterState {
         }
     }
 
-    fn increase(
+    fn increase_by(
         &self,
         cluster_id: i64,
         ip: IpAddr,
         kind: L4DefenseKind,
         period_secs: i64,
+        amount: u64,
     ) -> L4ExactCounterIncrement {
         let now = Instant::now();
         let period = Duration::from_secs(period_secs.max(1) as u64);
+        let amount = amount.max(1);
         self.sweep_if_needed(now);
 
         let key = (cluster_id, ip, kind.as_str());
@@ -487,7 +532,7 @@ impl L4ExactCounterState {
             window.count = 0;
             window.period = period;
         }
-        window.count = window.count.saturating_add(1);
+        window.count = window.count.saturating_add(amount);
         L4ExactCounterIncrement::Count(window.count)
     }
 
@@ -603,12 +648,26 @@ impl L4DefenseKind {
         match self {
             Self::TcpActiveLimit => "tcp_active_limit",
             Self::TcpAdmissionReject => "tcp_admission_reject",
+            Self::TcpConnectionChurn => "tcp_connection_churn",
+            Self::TcpAcceptedChurn => "tcp_accepted_churn",
             Self::TcpPressureIdleClose => "tcp_pressure_idle_close",
             Self::TcpSlowFirstByte => "tcp_slow_first_byte",
+            Self::TcpProxyEarlyCloseOrTinyPayload => "tcp_proxy_early_close_or_tiny_payload",
             Self::TlsHandshakeFail => "tls_handshake_fail",
+            Self::TlsPartialClientHello => "tls_partial_client_hello",
+            Self::TlsInvalidProbe => "tls_invalid_probe",
+            Self::TlsPlaintextConnectOnTls => "tls_plaintext_connect_on_tls",
             Self::TlsSlowClientHello => "tls_slow_client_hello",
+            Self::TlsHandshakeThenNoHttp => "tls_handshake_then_no_http",
             Self::HttpSlowHeader => "http_slow_header",
+            Self::HttpEarlyCloseOrTinyRequest => "http_early_close_or_tiny_request",
             Self::SniProbeFail => "sni_probe_fail",
+            Self::H2StreamAdmissionReject => "h2_stream_admission_reject",
+            Self::H2RapidReset => "h2_rapid_reset",
+            Self::H2DownstreamCancel => "h2_downstream_cancel",
+            Self::H2RequestChurn => "h2_request_churn",
+            Self::H2ConnectionAbuse => "h2_connection_abuse",
+            Self::SynBacklogPressure => "syn_backlog_pressure",
             Self::UdpSessionFlood => "udp_session_flood",
             Self::UdpAdmissionReject => "udp_admission_reject",
             Self::UdpQueueFull => "udp_queue_full",
@@ -625,7 +684,16 @@ impl L4DefenseKind {
         match self {
             Self::TcpActiveLimit
             | Self::TcpAdmissionReject
+            | Self::TcpConnectionChurn
+            | Self::TcpProxyEarlyCloseOrTinyPayload
             | Self::TcpSlowFirstByte
+            | Self::TlsHandshakeThenNoHttp
+            | Self::HttpEarlyCloseOrTinyRequest
+            | Self::H2StreamAdmissionReject
+            | Self::H2RapidReset
+            | Self::H2RequestChurn
+            | Self::H2ConnectionAbuse
+            | Self::SynBacklogPressure
             | Self::UdpSessionFlood
             | Self::UdpAdmissionReject
             | Self::QuicPendingReject
@@ -633,12 +701,16 @@ impl L4DefenseKind {
             | Self::H3AdmissionReject => 1,
             Self::TcpPressureIdleClose
             | Self::TlsHandshakeFail
+            | Self::TlsPartialClientHello
+            | Self::TlsInvalidProbe
+            | Self::TlsPlaintextConnectOnTls
             | Self::TlsSlowClientHello
             | Self::HttpSlowHeader
             | Self::SniProbeFail
+            | Self::H2DownstreamCancel
             | Self::UdpQueueFull
             | Self::QuicIncompleteClientHello => 2,
-            Self::QuicNewRouteFlood | Self::QuicNoRoute => 4,
+            Self::TcpAcceptedChurn | Self::QuicNewRouteFlood | Self::QuicNoRoute => 4,
         }
     }
 
@@ -650,8 +722,14 @@ impl L4DefenseKind {
         matches!(
             self,
             Self::TcpAdmissionReject
+                | Self::TcpConnectionChurn
+                | Self::TcpAcceptedChurn
+                | Self::TcpProxyEarlyCloseOrTinyPayload
+                | Self::TlsHandshakeThenNoHttp
+                | Self::HttpEarlyCloseOrTinyRequest
                 | Self::UdpAdmissionReject
                 | Self::H3AdmissionReject
+                | Self::H2StreamAdmissionReject
                 | Self::QuicPendingReject
         )
     }
@@ -661,9 +739,51 @@ impl L4DefenseKind {
             self,
             Self::TcpPressureIdleClose
                 | Self::TcpSlowFirstByte
+                | Self::TcpProxyEarlyCloseOrTinyPayload
+                | Self::TlsPartialClientHello
                 | Self::TlsSlowClientHello
+                | Self::TlsHandshakeThenNoHttp
                 | Self::HttpSlowHeader
+                | Self::HttpEarlyCloseOrTinyRequest
+                | Self::H2DownstreamCancel
         )
+    }
+
+    fn is_h2_defense(self) -> bool {
+        matches!(
+            self,
+            Self::H2StreamAdmissionReject
+                | Self::H2RapidReset
+                | Self::H2DownstreamCancel
+                | Self::H2RequestChurn
+                | Self::H2ConnectionAbuse
+        )
+    }
+
+    fn is_tls_probe(self) -> bool {
+        matches!(
+            self,
+            Self::TlsPartialClientHello
+                | Self::TlsInvalidProbe
+                | Self::TlsPlaintextConnectOnTls
+                | Self::TlsSlowClientHello
+                | Self::TlsHandshakeThenNoHttp
+                | Self::SniProbeFail
+        )
+    }
+
+    fn is_completed_handshake(self) -> bool {
+        matches!(
+            self,
+            Self::TcpAcceptedChurn
+                | Self::TcpProxyEarlyCloseOrTinyPayload
+                | Self::TlsHandshakeThenNoHttp
+                | Self::HttpEarlyCloseOrTinyRequest
+        )
+    }
+
+    fn is_syn_pressure(self) -> bool {
+        matches!(self, Self::SynBacklogPressure)
     }
 
     fn is_quic_pressure(self) -> bool {
@@ -717,6 +837,7 @@ pub fn pressure_level_from_utilization_pct_ext(
     pressure_level_from_utilization_pct(memory_pressure, connection_pct, quic_pct)
         .max(level_from_pct(fd_pct.unwrap_or(0)))
         .max(aggregate_level)
+        .max(crate::kernel_syn_defense::current_pressure_level())
 }
 
 pub fn current_pressure_level() -> L4PressureLevel {
@@ -955,6 +1076,81 @@ pub fn record_l4_event(
     )
 }
 
+pub fn record_tcp_connection_churn_under_pressure<F>(
+    config_store: &ConfigStore,
+    waf_state: &Arc<WafStateManager>,
+    node_id: i64,
+    ip: IpAddr,
+    detail: F,
+) -> Option<L4DefenseVerdict>
+where
+    F: FnOnce() -> String,
+{
+    let pressure_level = current_pressure_level();
+    if pressure_level == L4PressureLevel::Normal {
+        return None;
+    }
+    Some(record_l4_event_with_pressure(
+        config_store,
+        waf_state,
+        node_id,
+        ip,
+        L4DefenseKind::TcpConnectionChurn,
+        detail(),
+        pressure_level,
+    ))
+}
+
+pub fn record_tcp_accepted_churn<F>(
+    config_store: &ConfigStore,
+    waf_state: &Arc<WafStateManager>,
+    node_id: i64,
+    ip: IpAddr,
+    detail: F,
+) -> Option<L4DefenseVerdict>
+where
+    F: FnOnce() -> String,
+{
+    let cluster_id = config_store.get_node_cluster_id_sync();
+    config_store.get_empty_connection_flood_config_for_cluster_sync(cluster_id)?;
+    Some(record_l4_event_with_pressure(
+        config_store,
+        waf_state,
+        node_id,
+        ip,
+        L4DefenseKind::TcpAcceptedChurn,
+        detail(),
+        current_pressure_level(),
+    ))
+}
+
+pub fn record_completed_handshake_event<F>(
+    config_store: &ConfigStore,
+    waf_state: &Arc<WafStateManager>,
+    node_id: i64,
+    ip: IpAddr,
+    kind: L4DefenseKind,
+    amount: u64,
+    detail: F,
+) -> Option<L4DefenseVerdict>
+where
+    F: FnOnce() -> String,
+{
+    debug_assert!(kind.is_completed_handshake());
+    let cluster_id = config_store.get_node_cluster_id_sync();
+    config_store.get_empty_connection_flood_config_for_cluster_sync(cluster_id)?;
+    Some(record_l4_event_weighted_with_pressure(
+        config_store,
+        waf_state,
+        node_id,
+        ip,
+        kind,
+        amount,
+        detail(),
+        current_pressure_level(),
+    ))
+}
+
 pub fn record_l4_event_with_pressure(
     config_store: &ConfigStore,
     waf_state: &Arc<WafStateManager>,
@@ -964,12 +1160,35 @@ pub fn record_l4_event_with_pressure(
     detail: impl Into<String>,
     pressure_level: L4PressureLevel,
 ) -> L4DefenseVerdict {
+    record_l4_event_weighted_with_pressure(
+        config_store,
+        waf_state,
+        node_id,
+        ip,
+        kind,
+        1,
+        detail,
+        pressure_level,
+    )
+}
+
+pub fn record_l4_event_weighted_with_pressure(
+    config_store: &ConfigStore,
+    waf_state: &Arc<WafStateManager>,
+    node_id: i64,
+    ip: IpAddr,
+    kind: L4DefenseKind,
+    amount: u64,
+    detail: impl Into<String>,
+    pressure_level: L4PressureLevel,
+) -> L4DefenseVerdict {
     record_l4_event_scored(
         config_store,
         waf_state,
         node_id,
         ip,
         kind,
+        amount,
         L4EventContext::new(detail, pressure_level),
     )
 }
@@ -980,8 +1199,10 @@ pub fn record_l4_event_scored(
     node_id: i64,
     ip: IpAddr,
     kind: L4DefenseKind,
+    amount: u64,
     context: L4EventContext,
 ) -> L4DefenseVerdict {
+    let amount = amount.max(1);
     let cluster_id = config_store.get_node_cluster_id_sync();
     let Some(config) = config_store.get_empty_connection_flood_config_for_cluster_sync(cluster_id)
     else {
@@ -992,10 +1213,12 @@ pub fn record_l4_event_scored(
     let cluster_scope = crate::special_defense::cluster_block_scope_id(cluster_id);
     if cluster_scope != 0 && waf_state.is_blocked(ip, cluster_scope) {
         L4_METRICS.record(kind, L4DefenseVerdict::AlreadyBlocked);
+        drain_l4_connections_for_ip(ip, kind, "already_blocked_cluster");
         return L4DefenseVerdict::AlreadyBlocked;
     }
     if waf_state.is_blocked(ip, 0) {
         L4_METRICS.record(kind, L4DefenseVerdict::AlreadyBlocked);
+        drain_l4_connections_for_ip(ip, kind, "already_blocked_global");
         return L4DefenseVerdict::AlreadyBlocked;
     }
 
@@ -1021,10 +1244,12 @@ pub fn record_l4_event_scored(
         .pressure_level
         .max(surge_pressure_level(aggregate.distinct_ips_recent));
     let threshold = effective_l4_threshold(config.threshold, kind, pressure_level);
-    let exact_count = L4_EXACT_COUNTERS.increase(cluster_id, ip, kind, config.period_secs);
-    let waf_count = waf_state.increase_counter(
+    let exact_count =
+        L4_EXACT_COUNTERS.increase_by(cluster_id, ip, kind, config.period_secs, amount);
+    let waf_count = waf_state.increase_counter_by(
         format!("L4:{}:cluster:{}:{}", kind.as_str(), cluster_id, ip),
         config.period_secs,
+        amount,
     );
     let count = match exact_count {
         L4ExactCounterIncrement::Count(count) => count.max(waf_count),
@@ -1057,6 +1282,7 @@ pub fn record_l4_event_scored(
         false,
         config.use_local_firewall,
     );
+    drain_l4_connections_for_ip(ip, kind, "blocked");
 
     let detail = context.detail;
     crate::rpc::ip_report::report_item(IpReportMessage {
@@ -1127,6 +1353,24 @@ pub fn record_l4_event_scored(
     }
     L4_METRICS.record(kind, L4DefenseVerdict::Blocked);
     L4DefenseVerdict::Blocked
+}
+
+fn drain_l4_connections_for_ip(ip: IpAddr, kind: L4DefenseKind, reason: &'static str) {
+    let drained = crate::l4_connection_registry::drain_ip(ip);
+    if drained > 0 {
+        crate::logging::report_node_log(
+            "warn".to_string(),
+            "l4_recovery".to_string(),
+            format!(
+                "ip={} kind={} reason={} drained_connections={}",
+                ip,
+                kind.as_str(),
+                reason,
+                drained
+            ),
+            0,
+        );
+    }
 }
 
 fn warn_l4_counter_saturation(mode: &'static str) {
@@ -1227,7 +1471,21 @@ mod tests {
     #[test]
     fn confidence_multipliers_match_policy() {
         assert_eq!(L4DefenseKind::TcpAdmissionReject.threshold_multiplier(), 1);
+        assert_eq!(L4DefenseKind::TcpConnectionChurn.threshold_multiplier(), 1);
+        assert_eq!(L4DefenseKind::TcpAcceptedChurn.threshold_multiplier(), 4);
+        assert_eq!(
+            L4DefenseKind::TcpProxyEarlyCloseOrTinyPayload.threshold_multiplier(),
+            1
+        );
         assert_eq!(L4DefenseKind::TcpSlowFirstByte.threshold_multiplier(), 1);
+        assert_eq!(
+            L4DefenseKind::TlsHandshakeThenNoHttp.threshold_multiplier(),
+            1
+        );
+        assert_eq!(
+            L4DefenseKind::HttpEarlyCloseOrTinyRequest.threshold_multiplier(),
+            1
+        );
         assert_eq!(L4DefenseKind::TlsSlowClientHello.threshold_multiplier(), 2);
         assert_eq!(L4DefenseKind::HttpSlowHeader.threshold_multiplier(), 2);
         assert_eq!(L4DefenseKind::UdpQueueFull.threshold_multiplier(), 2);
@@ -1383,15 +1641,15 @@ mod tests {
         let second_ip: IpAddr = "198.51.100.11".parse().unwrap();
 
         assert_eq!(
-            counters.increase(1, first_ip, L4DefenseKind::TcpAdmissionReject, 60),
+            counters.increase_by(1, first_ip, L4DefenseKind::TcpAdmissionReject, 60, 1),
             L4ExactCounterIncrement::Count(1)
         );
         assert_eq!(
-            counters.increase(1, second_ip, L4DefenseKind::TcpAdmissionReject, 60),
+            counters.increase_by(1, second_ip, L4DefenseKind::TcpAdmissionReject, 60, 1),
             L4ExactCounterIncrement::CapacitySaturatedFailClosed
         );
         assert_eq!(
-            counters.increase(1, second_ip, L4DefenseKind::QuicNoRoute, 60),
+            counters.increase_by(1, second_ip, L4DefenseKind::QuicNoRoute, 60, 1),
             L4ExactCounterIncrement::CapacitySaturatedAllowed
         );
     }
@@ -1530,6 +1788,26 @@ mod tests {
         )
     }
 
+    fn record_test_l4_event_weighted(
+        store: &ConfigStore,
+        waf_state: &Arc<WafStateManager>,
+        ip: IpAddr,
+        kind: L4DefenseKind,
+        amount: u64,
+        detail: impl Into<String>,
+    ) -> L4DefenseVerdict {
+        record_l4_event_weighted_with_pressure(
+            store,
+            waf_state,
+            7,
+            ip,
+            kind,
+            amount,
+            detail,
+            L4PressureLevel::Normal,
+        )
+    }
+
     #[tokio::test]
     async fn l4_defense_disabled_when_empty_connection_flood_is_off() {
         let store = store_with_empty_connection_flood(false, 1).await;
@@ -1547,6 +1825,87 @@ mod tests {
             L4DefenseVerdict::Disabled
         );
         assert!(!waf_state.is_blocked(ip, crate::special_defense::cluster_block_scope_id(12)));
+    }
+
+    #[tokio::test]
+    async fn completed_handshake_events_are_disabled_without_empty_connection_flood() {
+        let store = store_with_empty_connection_flood(false, 1).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let ip: IpAddr = "203.0.113.66".parse().unwrap();
+
+        assert_eq!(
+            record_completed_handshake_event(
+                &store,
+                &waf_state,
+                7,
+                ip,
+                L4DefenseKind::HttpEarlyCloseOrTinyRequest,
+                2,
+                || "disabled-completed".to_string(),
+            ),
+            None
+        );
+        assert!(!waf_state.is_blocked(ip, crate::special_defense::cluster_block_scope_id(12)));
+    }
+
+    #[tokio::test]
+    async fn tcp_accepted_churn_counts_at_normal_pressure_with_conservative_threshold() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 8, 1205).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(1205);
+        let ip: IpAddr = "203.0.113.67".parse().unwrap();
+
+        let mut saw_allowed = false;
+        for idx in 0..40 {
+            let verdict =
+                record_tcp_accepted_churn(&store, &waf_state, 7, ip, || format!("accepted-{idx}"));
+            assert_ne!(verdict, None);
+            if verdict == Some(L4DefenseVerdict::Allowed) {
+                saw_allowed = true;
+            }
+            if matches!(
+                verdict,
+                Some(L4DefenseVerdict::Blocked | L4DefenseVerdict::AlreadyBlocked)
+            ) {
+                break;
+            }
+        }
+        assert!(saw_allowed);
+        assert!(waf_state.is_blocked(ip, cluster_scope));
+    }
+
+    #[tokio::test]
+    async fn completed_handshake_weighted_event_blocks_quickly() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 3, 1206).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(1206);
+        let ip: IpAddr = "203.0.113.68".parse().unwrap();
+
+        assert_eq!(
+            record_completed_handshake_event(
+                &store,
+                &waf_state,
+                7,
+                ip,
+                L4DefenseKind::TlsHandshakeThenNoHttp,
+                2,
+                || "tls-no-http-1".to_string(),
+            ),
+            Some(L4DefenseVerdict::Allowed)
+        );
+        assert_eq!(
+            record_completed_handshake_event(
+                &store,
+                &waf_state,
+                7,
+                ip,
+                L4DefenseKind::TlsHandshakeThenNoHttp,
+                2,
+                || "tls-no-http-2".to_string(),
+            ),
+            Some(L4DefenseVerdict::Blocked)
+        );
+        assert!(waf_state.is_blocked(ip, cluster_scope));
     }
 
     #[tokio::test]
@@ -1638,11 +1997,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn l4_defense_pressure_tightens_reporting_threshold() {
-        let store = store_with_empty_connection_flood(true, 8).await;
+    async fn l4_defense_weighted_events_count_toward_threshold() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 2, 1204).await;
         let waf_state = Arc::new(WafStateManager::new());
-        let ip: IpAddr = "203.0.113.15".parse().unwrap();
-        let cluster_scope = crate::special_defense::cluster_block_scope_id(12);
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(1204);
+        let ip: IpAddr = "203.0.113.44".parse().unwrap();
+
+        assert_eq!(
+            record_test_l4_event_weighted(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::H2RequestChurn,
+                3,
+                "weighted-h2-churn"
+            ),
+            L4DefenseVerdict::Blocked
+        );
+        assert!(waf_state.is_blocked(ip, cluster_scope));
+    }
+
+    #[tokio::test]
+    async fn l4_defense_pressure_tightens_reporting_threshold() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 8, 1207).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let ip: IpAddr = "192.0.2.15".parse().unwrap();
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(1207);
 
         for idx in 0..2 {
             assert_eq!(
@@ -1674,10 +2054,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn high_confidence_prefix_events_can_apply_local_cluster_prefix_block() {
-        let store = store_with_empty_connection_flood(true, 10).await;
+    async fn tcp_connection_churn_is_high_confidence_under_pressure() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 8, 1208).await;
         let waf_state = Arc::new(WafStateManager::new());
-        let cluster_scope = crate::special_defense::cluster_block_scope_id(12);
+        let ip: IpAddr = "192.0.2.45".parse().unwrap();
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(1208);
+
+        for idx in 0..2 {
+            assert_eq!(
+                record_l4_event_with_pressure(
+                    &store,
+                    &waf_state,
+                    7,
+                    ip,
+                    L4DefenseKind::TcpConnectionChurn,
+                    format!("churn-{idx}"),
+                    L4PressureLevel::Critical,
+                ),
+                L4DefenseVerdict::Allowed
+            );
+        }
+        assert_eq!(
+            record_l4_event_with_pressure(
+                &store,
+                &waf_state,
+                7,
+                ip,
+                L4DefenseKind::TcpConnectionChurn,
+                "churn-block",
+                L4PressureLevel::Critical,
+            ),
+            L4DefenseVerdict::Blocked
+        );
+        assert!(waf_state.is_blocked(ip, cluster_scope));
+    }
+
+    #[tokio::test]
+    async fn high_confidence_prefix_events_can_apply_local_cluster_prefix_block() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 10, 1209).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(1209);
 
         for host in 1..=20 {
             let ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, host));
@@ -1699,9 +2115,9 @@ mod tests {
 
     #[tokio::test]
     async fn low_confidence_prefix_events_do_not_apply_prefix_block() {
-        let store = store_with_empty_connection_flood(true, 10).await;
+        let store = store_with_empty_connection_flood_for_cluster(true, 10, 1210).await;
         let waf_state = Arc::new(WafStateManager::new());
-        let cluster_scope = crate::special_defense::cluster_block_scope_id(12);
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(1210);
 
         for host in 1..=20 {
             let ip = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, host));
@@ -1723,7 +2139,7 @@ mod tests {
 
     #[tokio::test]
     async fn l4_defense_does_not_count_already_blocked_ip_again() {
-        let store = store_with_empty_connection_flood(true, 1).await;
+        let store = store_with_empty_connection_flood_for_cluster(true, 1, 1211).await;
         let waf_state = Arc::new(WafStateManager::new());
         let ip: IpAddr = "203.0.113.14".parse().unwrap();
 

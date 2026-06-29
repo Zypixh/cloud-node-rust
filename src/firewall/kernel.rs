@@ -1,9 +1,35 @@
 use ipnet::IpNet;
 use std::net::IpAddr;
 
+#[derive(Clone, Debug, Default)]
+pub struct KernelFilterRange {
+    pub from: u128,
+    pub to: u128,
+    pub v6: bool,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct KernelFilterSnapshot {
+    pub blocked_ips: Vec<(IpAddr, i64)>,
+    pub allowed_ips: Vec<(IpAddr, i64)>,
+    pub blocked_networks: Vec<(IpNet, i64)>,
+    pub allowed_networks: Vec<(IpNet, i64)>,
+    pub blocked_ranges: Vec<KernelFilterRange>,
+    pub allowed_ranges: Vec<KernelFilterRange>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct KernelFilterStatus {
+    pub name: &'static str,
+    pub available: bool,
+    pub detail: String,
+}
+
 pub trait KernelFilter: Send + Sync {
     fn block(&self, ip: IpAddr, ttl_secs: i64);
     fn unblock(&self, ip: IpAddr);
+    fn block_network(&self, _net: IpNet, _ttl_secs: i64) {}
     fn block_many(&self, entries: &[(IpAddr, i64)]) {
         for (ip, ttl_secs) in entries {
             self.block(*ip, *ttl_secs);
@@ -15,9 +41,18 @@ pub trait KernelFilter: Send + Sync {
         }
     }
     fn unblock_network(&self, net: IpNet);
+    fn block_range(&self, _from: u128, _to: u128, _v6: bool, _ttl_secs: i64) {}
     fn unblock_range(&self, from: u128, to: u128, v6: bool);
+    fn sync_snapshot(&self, _snapshot: &KernelFilterSnapshot) {}
     fn available(&self) -> bool;
     fn name(&self) -> &'static str;
+    fn status(&self) -> KernelFilterStatus {
+        KernelFilterStatus {
+            name: self.name(),
+            available: self.available(),
+            detail: String::new(),
+        }
+    }
 }
 
 pub struct NoopFilter;
@@ -500,6 +535,11 @@ mod linux {
 pub async fn build_filter(mode: Option<&str>) -> Box<dyn KernelFilter> {
     match mode {
         #[cfg(target_os = "linux")]
+        Some("xdp") => match crate::xdp::build_kernel_filter().await {
+            Some(filter) => filter,
+            None => Box::new(NoopFilter),
+        },
+        #[cfg(target_os = "linux")]
         Some("nftables") => {
             if linux::NftablesFilter::probe().await {
                 match linux::NftablesFilter::ensure_ready().await {
@@ -518,6 +558,9 @@ pub async fn build_filter(mode: Option<&str>) -> Box<dyn KernelFilter> {
         }
         #[cfg(target_os = "linux")]
         Some("auto") | None => {
+            if let Some(filter) = crate::xdp::build_kernel_filter().await {
+                return filter;
+            }
             if linux::NftablesFilter::probe().await {
                 match linux::NftablesFilter::ensure_ready().await {
                     Ok(()) => return Box::new(linux::NftablesFilter),
