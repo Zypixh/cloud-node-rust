@@ -94,32 +94,33 @@ jobs:
 
       - name: Install dependencies & Cross-Linkers
         timeout-minutes: 25
+        shell: bash
         run: |
-          packages=(cmake build-essential golang-go protobuf-compiler pkg-config libelf-dev zlib1g-dev)
+          set -euo pipefail
+
+          packages=(cmake build-essential golang-go protobuf-compiler pkg-config libelf-dev zlib1g-dev libpcap0.8-dev)
           if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
             sudo dpkg --add-architecture arm64
-            if [ -f /etc/apt/sources.list ]; then
-              sudo sed -i -E '/^deb / s#^deb (https?://)#deb [arch=amd64] \1#' /etc/apt/sources.list
-            fi
-            for source in /etc/apt/sources.list.d/*.list; do
+            sudo mkdir -p /etc/apt/sources.list.d.disabled
+            sudo mv /etc/apt/sources.list /etc/apt/sources.list.d.disabled/sources.list 2>/dev/null || true
+            for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
               [ -e "$source" ] || continue
-              sudo sed -i -E '/^deb / s#^deb (https?://)#deb [arch=amd64] \1#' "$source"
+              sudo mv "$source" /etc/apt/sources.list.d.disabled/
             done
-            for source in /etc/apt/sources.list.d/*.sources; do
-              [ -e "$source" ] || continue
-              if grep -q '^Architectures:' "$source"; then
-                sudo sed -i -E 's/^Architectures:.*/Architectures: amd64/' "$source"
-              else
-                sudo sed -i '/^Components:/a Architectures: amd64' "$source"
-              fi
-            done
+            sudo tee /etc/apt/sources.list.d/ubuntu-amd64.list >/dev/null <<'EOF'
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+          EOF
             sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.list >/dev/null <<'EOF'
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse
           deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
           EOF
-            packages+=(gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libelf-dev:arm64 zlib1g-dev:arm64)
+            sudo rm -rf /var/lib/apt/lists/*
+            packages+=(gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libelf-dev:arm64 zlib1g-dev:arm64 libpcap0.8-dev:arm64)
           fi
           for attempt in 1 2 3; do
             if sudo apt-get update && sudo apt-get install -y --no-install-recommends "${packages[@]}"; then
