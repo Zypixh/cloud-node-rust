@@ -1522,6 +1522,8 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "topPrefix": l4_metrics.top_prefix,
             "topPrefixEvents": l4_metrics.top_prefix_events,
         });
+        let xdp_status = serde_json::to_value(crate::xdp::status_snapshot())
+            .unwrap_or_else(|_| serde_json::json!({"available": false}));
 
         let status = serde_json::json!({
             "buildVersion": env!("CARGO_PKG_VERSION"),
@@ -1553,6 +1555,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "cacheTotalMemorySize": cache_stats.memory_bytes,
             "resourceGovernor": resource_governor,
             "l4Defense": l4_defense,
+            "xdp": xdp_status,
             "updatedAt": now,
             "timestamp": now,
             "isActive": true,
@@ -1638,6 +1641,8 @@ pub async fn report_node_online_once(
         .map(|ip| ip.to_string())
         .unwrap_or_default();
     let now = crate::utils::time::now_timestamp();
+    let xdp_status = serde_json::to_value(crate::xdp::status_snapshot())
+        .unwrap_or_else(|_| serde_json::json!({"available": false}));
     let status = serde_json::json!({
         "buildVersion": env!("CARGO_PKG_VERSION"),
         "buildVersionCode": build_version_code(),
@@ -1661,6 +1666,7 @@ pub async fn report_node_online_once(
         "apiAvgCostSeconds": api_avg_cost_seconds,
         "cacheTotalDiskSize": cache_stats.disk_bytes,
         "cacheTotalMemorySize": cache_stats.memory_bytes,
+        "xdp": xdp_status,
         "updatedAt": now,
         "timestamp": now,
         "isActive": true,

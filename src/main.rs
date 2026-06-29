@@ -20,6 +20,8 @@ use cloud_node_rust::api_config::ApiConfig;
 use cloud_node_rust::config::ConfigStore;
 use cloud_node_rust::firewall::state::WafStateManager;
 use cloud_node_rust::health_manager::GlobalHealthManager;
+use cloud_node_rust::kernel_syn_defense;
+use cloud_node_rust::l4_connection_registry;
 use cloud_node_rust::proxy::EdgeProxy;
 use cloud_node_rust::runtime_mode::RuntimeConfig;
 use cloud_node_rust::ssl::DynamicCertSelector;
@@ -220,6 +222,16 @@ enum Commands {
         #[command(subcommand)]
         command: FirewallCommands,
     },
+    /// Inspect runtime L4/TCP defense state
+    Defense {
+        #[command(subcommand)]
+        command: DefenseCommands,
+    },
+    /// Manage XDP/AF_XDP dataplane state
+    Xdp {
+        #[command(subcommand)]
+        command: XdpCommands,
+    },
     /// Test the configuration
     Test,
     /// Internal use only
@@ -242,6 +254,74 @@ enum FirewallCommands {
         /// Always print exact IP rows instead of /24 and /48 aggregation
         #[arg(long)]
         no_aggregate: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DefenseCommands {
+    /// Print current L4 defense, SYN pressure and active connection state
+    Status,
+    /// Inspect or request SYNPROXY mode
+    Synproxy {
+        #[command(subcommand)]
+        mode: SynproxyCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SynproxyCommands {
+    /// Show SYNPROXY runtime status
+    Status,
+    /// Request SYNPROXY enable
+    Enable,
+    /// Request SYNPROXY disable
+    Disable,
+}
+
+#[derive(Subcommand)]
+enum XdpCommands {
+    /// Print current or last persisted XDP state
+    Status,
+    /// Validate local XDP runtime configuration and object availability
+    Doctor,
+    /// Attach XDP programs using configs/runtime.yaml
+    Attach,
+    /// Detach XDP programs managed by this process
+    Detach,
+    /// Dump XDP shadow maps known to this process
+    #[command(name = "dump-maps")]
+    DumpMaps,
+    /// Detach and attach again using configs/runtime.yaml
+    Reload,
+    /// Attach and poll raw AF_XDP frames for a short Linux dataplane smoke test
+    #[command(name = "raw-smoke")]
+    RawSmoke {
+        /// Poll duration in milliseconds
+        #[arg(long, default_value_t = 3000)]
+        duration_ms: u64,
+        /// Write this file after AF_XDP attach and XSK setup are ready
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
+    },
+    /// Attach AF_XDP and verify HTTP/TCP/UDP proxy paths with local backends
+    #[command(name = "proxy-smoke")]
+    ProxySmoke {
+        /// Poll duration in milliseconds
+        #[arg(long, default_value_t = 8000)]
+        duration_ms: u64,
+        /// Write this file after AF_XDP proxy redirect is ready
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
+    },
+    /// Verify an in-process XDP reload while AF_XDP proxy bridge is active
+    #[command(name = "proxy-reload-smoke")]
+    ProxyReloadSmoke {
+        /// Poll duration in milliseconds after the replacement bridge is ready
+        #[arg(long, default_value_t = 3000)]
+        duration_ms: u64,
+        /// Write this file after AF_XDP proxy redirect is ready after reload
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
     },
 }
 
@@ -463,6 +543,304 @@ fn run_firewall_command(command: FirewallCommands) -> anyhow::Result<()> {
         } => run_firewall_list(aggregate_threshold, no_aggregate)?,
     }
     Ok(())
+}
+
+fn run_defense_command(command: DefenseCommands) -> anyhow::Result<()> {
+    match command {
+        DefenseCommands::Status => {
+            print_defense_status();
+        }
+        DefenseCommands::Synproxy { mode } => {
+            let mode = match mode {
+                SynproxyCommands::Status => kernel_syn_defense::SynproxyMode::Status,
+                SynproxyCommands::Enable => kernel_syn_defense::SynproxyMode::Enable,
+                SynproxyCommands::Disable => kernel_syn_defense::SynproxyMode::Disable,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            println!(
+                "{}",
+                rt.block_on(kernel_syn_defense::synproxy_command(mode))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
+    match command {
+        XdpCommands::Status => {
+            print_xdp_status();
+        }
+        XdpCommands::Doctor => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config);
+            println!("{}", cloud_node_rust::xdp::doctor_report());
+        }
+        XdpCommands::Attach => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cloud_node_rust::xdp::attach_from_runtime())?;
+            print_xdp_status();
+        }
+        XdpCommands::Detach => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cloud_node_rust::xdp::detach())?;
+            print_xdp_status();
+        }
+        XdpCommands::DumpMaps => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&cloud_node_rust::xdp::dump_maps())?
+            );
+        }
+        XdpCommands::Reload => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(cloud_node_rust::xdp::reload_from_runtime())?;
+            print_xdp_status();
+        }
+        XdpCommands::RawSmoke {
+            duration_ms,
+            ready_file,
+        } => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let duration = Duration::from_millis(duration_ms.max(1));
+            let report = rt.block_on(cloud_node_rust::xdp::raw_smoke(duration, ready_file))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        XdpCommands::ProxySmoke {
+            duration_ms,
+            ready_file,
+        } => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let duration = Duration::from_millis(duration_ms.max(1));
+            let report = rt.block_on(cloud_node_rust::xdp::proxy_smoke(duration, ready_file))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        XdpCommands::ProxyReloadSmoke {
+            duration_ms,
+            ready_file,
+        } => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let duration = Duration::from_millis(duration_ms.max(1));
+            let report = rt.block_on(cloud_node_rust::xdp::proxy_reload_smoke(
+                duration, ready_file,
+            ))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+    }
+    Ok(())
+}
+
+fn print_xdp_status() {
+    let status = if RuntimeConfig::current().is_some() {
+        cloud_node_rust::xdp::status_snapshot()
+    } else {
+        cloud_node_rust::xdp::persisted_status_snapshot()
+            .unwrap_or_else(cloud_node_rust::xdp::status_snapshot)
+    };
+    println!("CloudNode XDP status");
+    println!("  enabled:       {}", xdp_yes_no(status.enabled));
+    println!("  available:     {}", xdp_yes_no(status.available));
+    println!("  attached:      {}", xdp_yes_no(status.attached));
+    println!("  attach mode:   {}", status.attach_mode);
+    println!("  fallback:      {}", status.fallback);
+    println!(
+        "  fallback why:  {}",
+        if status.fallback_reason.is_empty() {
+            "-"
+        } else {
+            &status.fallback_reason
+        }
+    );
+    println!(
+        "  proxy ports:   {} supported={} unsupported={}",
+        status.proxy_ports, status.proxy_supported_ports, status.proxy_unsupported_ports
+    );
+    println!("  proxy ready:   {}", xdp_yes_no(status.proxy_ready));
+    println!(
+        "  redirect:      {}",
+        xdp_yes_no(status.proxy_redirect_enabled)
+    );
+    println!(
+        "  tcp dataplane: {}",
+        xdp_yes_no(status.tcp_dataplane_ready)
+    );
+    println!(
+        "  tcp why:       {}",
+        if status.tcp_dataplane_detail.is_empty() {
+            "-"
+        } else {
+            &status.tcp_dataplane_detail
+        }
+    );
+    println!(
+        "  proxy why:     {}",
+        if status.proxy_fallback_reason.is_empty() {
+            "-"
+        } else {
+            &status.proxy_fallback_reason
+        }
+    );
+    println!(
+        "  xsk queues:    configured={} ready={}",
+        status.xsk_configured_queues, status.xsk_ready_queues
+    );
+    println!("  eBPF object:   {}", status.ebpf_object);
+    println!(
+        "  maps:          block_v4={} block_v6={} allow_v4={} allow_v6={} block_nets={} allow_nets={} block_ranges={} allow_ranges={}",
+        status.exact_blocked_v4,
+        status.exact_blocked_v6,
+        status.exact_allowed_v4,
+        status.exact_allowed_v6,
+        status.blocked_networks,
+        status.allowed_networks,
+        status.blocked_ranges,
+        status.allowed_ranges
+    );
+    println!(
+        "  counters:      packets={} pass={} drop={} redirect={} parse_errors={} map_miss={} xsk_drops={}",
+        status.packets,
+        status.pass,
+        status.drop,
+        status.redirect,
+        status.parse_errors,
+        status.map_miss,
+        status.xsk_drops
+    );
+    if status.interfaces.is_empty() {
+        println!("  interfaces:    -");
+    } else {
+        for interface in status.interfaces {
+            println!(
+                "  interface:     {} mode={} queues={:?} attached={} xsk_ready={} frameSize={} detail={}",
+                interface.name,
+                interface.mode,
+                interface.queues,
+                xdp_yes_no(interface.attached),
+                xdp_yes_no(interface.xsk_ready),
+                interface.frame_size,
+                interface.detail
+            );
+            for queue in interface.xsk_queues {
+                println!(
+                    "    xsk queue:   {}:{} configured={} socket={} registered={} ready={} detail={}",
+                    queue.interface,
+                    queue.queue,
+                    xdp_yes_no(queue.configured),
+                    xdp_yes_no(queue.socket_created),
+                    xdp_yes_no(queue.registered),
+                    xdp_yes_no(queue.ready),
+                    queue.detail
+                );
+            }
+        }
+    }
+}
+
+fn xdp_yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn print_defense_status() {
+    let syn = kernel_syn_defense::snapshot();
+    let active = l4_connection_registry::snapshot();
+    let metrics = cloud_node_rust::l4_defense::metrics_snapshot();
+    let pressure = cloud_node_rust::l4_defense::current_pressure_level();
+
+    println!("CloudNode L4 defense status");
+    println!("  runtime scope:      current process snapshot");
+    println!("  effective pressure: {}", pressure.as_str());
+    println!(
+        "  syn pressure:       level={} listen_overflows={} listen_drops={} syncookies={} req_q_full_do_cookies={} req_q_full_drop={}",
+        syn.pressure_level.as_str(),
+        syn.listen_overflows_delta,
+        syn.listen_drops_delta,
+        syn.syncookies_sent_delta,
+        syn.req_q_full_do_cookies_delta,
+        syn.req_q_full_drop_delta
+    );
+    if let Ok(counters) = kernel_syn_defense::read_tcp_ext_counters() {
+        println!(
+            "  syn counters:       listen_overflows={} listen_drops={} syncookies={} req_q_full_do_cookies={} req_q_full_drop={}",
+            counters.listen_overflows,
+            counters.listen_drops,
+            counters.syncookies_sent,
+            counters.req_q_full_do_cookies,
+            counters.req_q_full_drop
+        );
+    }
+    println!(
+        "  active connections: total={} http1={} http2={} sni_tcp={}",
+        active.total, active.http1, active.http2, active.sni_tcp
+    );
+    println!(
+        "  events:             total={} allowed={} blocked={} already_blocked={} disabled={}",
+        metrics.events_total,
+        metrics.allowed_total,
+        metrics.blocked_total,
+        metrics.already_blocked_total,
+        metrics.disabled_total
+    );
+    println!(
+        "  categories:         active_limit={} admission_reject={} slow_close={} completed_handshake={} tls_probe={} h2={} syn={} quic={}",
+        metrics.active_limit_total,
+        metrics.admission_reject_total,
+        metrics.slow_close_total,
+        metrics.completed_handshake_total,
+        metrics.tls_probe_total,
+        metrics.h2_defense_total,
+        metrics.syn_pressure_total,
+        metrics.quic_pressure_total
+    );
+    println!(
+        "  aggregate:          distinct_ips_recent={} prefix_pressure={} top_prefix={} top_prefix_events={} prefix_blocked={} aggregate_drop={} exact_counter_saturated={}",
+        metrics.distinct_ips_recent,
+        metrics.prefix_pressure_level.as_str(),
+        if metrics.top_prefix.is_empty() {
+            "-"
+        } else {
+            &metrics.top_prefix
+        },
+        metrics.top_prefix_events,
+        metrics.prefix_blocked_total,
+        metrics.aggregate_drop_total,
+        metrics.exact_counter_saturated_total
+    );
+    println!(
+        "  top event kind:     {}",
+        if metrics.top_event_kind.is_empty() {
+            "-"
+        } else {
+            metrics.top_event_kind
+        }
+    );
 }
 
 fn run_firewall_list(aggregate_threshold: usize, no_aggregate: bool) -> anyhow::Result<()> {
@@ -699,6 +1077,7 @@ fn cmdline_contains_management_command(cmdline: &[u8]) -> bool {
                     | "zerocopy"
                     | "zero-copy"
                     | "firewall"
+                    | "defense"
             )
         })
 }
@@ -1549,6 +1928,12 @@ WantedBy=multi-user.target\n",
         Some(Commands::Firewall { command }) => {
             run_firewall_command(command)?;
         }
+        Some(Commands::Defense { command }) => {
+            run_defense_command(command)?;
+        }
+        Some(Commands::Xdp { command }) => {
+            run_xdp_command(command)?;
+        }
         Some(Commands::Test) => {
             println!("Testing configuration...");
             let api_config = ApiConfig::load_default()?;
@@ -1567,6 +1952,13 @@ WantedBy=multi-user.target\n",
                 cloud_node_rust::memory_governor::MEMORY_GOVERNOR.relay_copy_buffer_bytes()
             );
             println!("Runtime mode: {:?}", runtime_config.mode());
+            println!(
+                "XDP: enabled={} attachMode={} fallback={} interfaces={}",
+                yes_no(runtime_config.xdp.enabled),
+                runtime_config.xdp.attach_mode.as_str(),
+                runtime_config.xdp.fallback.as_str(),
+                runtime_config.xdp.interfaces.len()
+            );
             println!("Configuration is valid.");
         }
     }
@@ -1690,6 +2082,12 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         info!("Standalone runtime mode enabled.");
     }
     RuntimeConfig::set_current(runtime_config.clone());
+    if let Err(err) = rt.block_on(cloud_node_rust::xdp::initialize_from_runtime()) {
+        if runtime_config.xdp.fallback.fail_start() {
+            return Err(err.context("XDP initialization failed"));
+        }
+        warn!("XDP initialization skipped: {}", err);
+    }
     if runtime_config.is_rke2() {
         cloud_node_rust::cache_manager::CACHE
             .storage
@@ -1701,9 +2099,11 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     logging::set_numeric_node_id(numeric_node_id);
     cloud_node_rust::client_agent::load_client_agent_ip_index();
     cloud_node_rust::client_agent::start_client_agent_queue(api_config_arc.clone());
+    cloud_node_rust::kernel_syn_defense::start_monitor();
 
     // 2. Initialize Managers
     let config_store = Arc::new(ConfigStore::new());
+    cloud_node_rust::kernel_syn_defense::start_synproxy_reconciler(config_store.clone());
     let waf_state = Arc::new(WafStateManager::new());
     let initial_kernel_filter = rt.block_on(cloud_node_rust::firewall::kernel::build_filter(None));
     if initial_kernel_filter.available() {
@@ -1911,6 +2311,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         proxy_logic.clone(),
         my_server.configuration.clone(),
     );
+    let xdp_http_manager = http_manager.clone();
     cloud_node_rust::proxy::start_request_limit_cleanup_task();
     cloud_node_rust::origin_state::start_origin_state_cleanup_task();
     cloud_node_rust::metrics::storage::start_cache_access_flusher();
@@ -1941,18 +2342,27 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     let quic_udp_demux = cloud_node_rust::quic_udp_demux::QuicUdpDemuxManager::new(
         (*config_store).clone(),
         http3_manager,
-        udp_manager,
+        udp_manager.clone(),
     );
-    spawn_staggered(&rt, Duration::from_secs(2), async move {
-        quic_udp_demux.start_listeners().await;
-    });
-
+    let xdp_quic_udp_demux = quic_udp_demux.clone();
     let tcp_manager = tcp_proxy::TcpProxyManager::new(
         (*config_store).clone(),
         cert_selector.clone(),
         waf_state.clone(),
         numeric_node_id,
     );
+    let xdp_tcp_manager = tcp_manager.clone();
+    spawn_staggered(&rt, Duration::from_secs(2), async move {
+        quic_udp_demux.start_listeners().await;
+    });
+    spawn_staggered(&rt, Duration::from_secs(2), async move {
+        cloud_node_rust::xdp::af_xdp::start_proxy_bridge(
+            xdp_quic_udp_demux,
+            xdp_tcp_manager,
+            xdp_http_manager,
+        )
+        .await;
+    });
     spawn_staggered(&rt, Duration::from_secs(2), async move {
         tcp_manager.start_listeners().await;
     });
@@ -2075,6 +2485,9 @@ mod tests {
         ));
         assert!(cmdline_contains_management_command(
             b"/opt/cloud-node-rust/cloud-node-rust\0test\0"
+        ));
+        assert!(cmdline_contains_management_command(
+            b"/opt/cloud-node-rust/cloud-node-rust\0defense\0status\0"
         ));
         assert!(!cmdline_contains_management_command(
             b"/opt/cloud-node-rust/cloud-node-rust\0start\0"
