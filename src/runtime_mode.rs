@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock as OnceCell;
 
-static RUNTIME_CONFIG: OnceCell<RuntimeConfig> = OnceCell::new();
+static RUNTIME_CONFIG: OnceCell<parking_lot::RwLock<Option<RuntimeConfig>>> = OnceCell::new();
+#[cfg(test)]
+static RUNTIME_CONFIG_TEST_LOCK: OnceCell<parking_lot::Mutex<()>> = OnceCell::new();
 
 const DEFAULT_INTERNAL_TOKEN_ENV: &str = "CLOUD_NODE_CLUSTER_INTERNAL_TOKEN";
 const DEFAULT_POD_NAME_ENV: &str = "POD_NAME";
@@ -39,6 +41,194 @@ impl RuntimeMode {
 pub struct RuntimeSection {
     #[serde(default)]
     pub mode: RuntimeMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XdpAttachMode {
+    Auto,
+    Drv,
+    Skb,
+}
+
+impl Default for XdpAttachMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl XdpAttachMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Drv => "drv",
+            Self::Skb => "skb",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XdpFallbackMode {
+    Pass,
+    FailStart,
+}
+
+impl Default for XdpFallbackMode {
+    fn default() -> Self {
+        Self::Pass
+    }
+}
+
+impl XdpFallbackMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::FailStart => "fail-start",
+        }
+    }
+
+    pub fn fail_start(self) -> bool {
+        self == Self::FailStart
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XdpRuntimeMode {
+    Observe,
+    Protect,
+    Proxy,
+}
+
+impl Default for XdpRuntimeMode {
+    fn default() -> Self {
+        Self::Observe
+    }
+}
+
+impl XdpRuntimeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::Protect => "protect",
+            Self::Proxy => "proxy",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XdpProxyProtocol {
+    Http,
+    Https,
+    Tcp,
+    Udp,
+    H3,
+}
+
+impl Default for XdpProxyProtocol {
+    fn default() -> Self {
+        Self::Tcp
+    }
+}
+
+impl XdpProxyProtocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::H3 => "h3",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpProxyPortConfig {
+    #[serde(default)]
+    pub protocol: XdpProxyProtocol,
+    #[serde(default)]
+    pub port: u16,
+}
+
+impl Default for XdpProxyPortConfig {
+    fn default() -> Self {
+        Self {
+            protocol: XdpProxyProtocol::Tcp,
+            port: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpInterfaceConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub queues: Vec<u32>,
+    #[serde(default)]
+    pub mode: XdpRuntimeMode,
+    #[serde(rename = "localIps", default)]
+    pub local_ips: Vec<std::net::IpAddr>,
+    #[serde(rename = "frameSize", default = "default_xdp_frame_size")]
+    pub frame_size: u32,
+}
+
+impl Default for XdpInterfaceConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            queues: Vec::new(),
+            mode: XdpRuntimeMode::default(),
+            local_ips: Vec::new(),
+            frame_size: default_xdp_frame_size(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpProxyConfig {
+    #[serde(default = "default_xdp_proxy_protocols")]
+    pub protocols: Vec<XdpProxyProtocol>,
+    #[serde(default)]
+    pub ports: Vec<XdpProxyPortConfig>,
+}
+
+impl Default for XdpProxyConfig {
+    fn default() -> Self {
+        Self {
+            protocols: default_xdp_proxy_protocols(),
+            ports: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(rename = "attachMode", default)]
+    pub attach_mode: XdpAttachMode,
+    #[serde(default)]
+    pub fallback: XdpFallbackMode,
+    #[serde(default)]
+    pub interfaces: Vec<XdpInterfaceConfig>,
+    #[serde(default)]
+    pub proxy: XdpProxyConfig,
+}
+
+impl Default for XdpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            attach_mode: XdpAttachMode::default(),
+            fallback: XdpFallbackMode::default(),
+            interfaces: Vec::new(),
+            proxy: XdpProxyConfig::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -167,6 +357,8 @@ pub struct RuntimeConfig {
     pub runtime: RuntimeSection,
     #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default)]
+    pub xdp: XdpConfig,
 }
 
 impl RuntimeConfig {
@@ -201,15 +393,20 @@ impl RuntimeConfig {
     }
 
     pub fn set_current(config: RuntimeConfig) {
-        let _ = RUNTIME_CONFIG.set(config);
+        let current = RUNTIME_CONFIG.get_or_init(|| parking_lot::RwLock::new(None));
+        *current.write() = Some(config);
     }
 
-    pub fn current() -> Option<&'static RuntimeConfig> {
-        RUNTIME_CONFIG.get()
+    pub fn current() -> Option<RuntimeConfig> {
+        RUNTIME_CONFIG
+            .get()
+            .and_then(|config| config.read().clone())
     }
 
     pub fn current_mode() -> RuntimeMode {
-        Self::current().map(Self::mode).unwrap_or_default()
+        Self::current()
+            .map(|config| config.mode())
+            .unwrap_or_default()
     }
 
     pub fn current_is_rke2() -> bool {
@@ -225,6 +422,8 @@ impl RuntimeConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_xdp()?;
+
         if !self.is_rke2() {
             return Ok(());
         }
@@ -285,6 +484,51 @@ impl RuntimeConfig {
         Ok(())
     }
 
+    fn validate_xdp(&self) -> anyhow::Result<()> {
+        if !self.xdp.enabled {
+            return Ok(());
+        }
+        if self.xdp.interfaces.is_empty() {
+            anyhow::bail!("xdp.enabled=true requires at least one xdp.interfaces entry");
+        }
+        for interface in &self.xdp.interfaces {
+            if interface.name.trim().is_empty() {
+                anyhow::bail!("xdp.interfaces entries require name");
+            }
+            if interface.queues.is_empty() {
+                anyhow::bail!(
+                    "xdp interface {} requires at least one queue",
+                    interface.name
+                );
+            }
+            if interface.frame_size < 1024 || interface.frame_size > 4096 {
+                anyhow::bail!(
+                    "xdp interface {} frameSize must be between 1024 and 4096",
+                    interface.name
+                );
+            }
+            if interface.frame_size % 512 != 0 {
+                anyhow::bail!(
+                    "xdp interface {} frameSize must be a multiple of 512",
+                    interface.name
+                );
+            }
+        }
+        for port in &self.xdp.proxy.ports {
+            if port.port == 0 {
+                anyhow::bail!("xdp.proxy.ports entries require a non-zero port");
+            }
+            if !self.xdp.proxy.protocols.contains(&port.protocol) {
+                anyhow::bail!(
+                    "xdp.proxy.ports entry {}:{} is not enabled in xdp.proxy.protocols",
+                    port.protocol.as_str(),
+                    port.port
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn validate_cluster_cache_paths(&self) -> anyhow::Result<()> {
         let local_meta_dir = &self.cluster.cache.local_meta_dir;
         if local_meta_dir.as_os_str().is_empty() {
@@ -318,6 +562,20 @@ fn require_env(name: &str, label: &str) -> anyhow::Result<()> {
         anyhow::bail!("runtime.mode=rke2 requires non-empty {name} environment variable");
     }
     Ok(())
+}
+
+fn default_xdp_frame_size() -> u32 {
+    cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
+}
+
+fn default_xdp_proxy_protocols() -> Vec<XdpProxyProtocol> {
+    vec![
+        XdpProxyProtocol::Http,
+        XdpProxyProtocol::Https,
+        XdpProxyProtocol::Tcp,
+        XdpProxyProtocol::Udp,
+        XdpProxyProtocol::H3,
+    ]
 }
 
 fn default_cluster_type() -> String {
@@ -366,4 +624,100 @@ fn default_shard_weight() -> u32 {
 
 fn default_longhorn_replicas() -> u32 {
     2
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_config_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    RUNTIME_CONFIG_TEST_LOCK
+        .get_or_init(|| parking_lot::Mutex::new(()))
+        .lock()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xdp_runtime_current_replaces_previous_config() {
+        let _guard = runtime_config_test_guard();
+        RuntimeConfig::set_current(RuntimeConfig::default());
+        assert!(!RuntimeConfig::current().unwrap().xdp.enabled);
+
+        RuntimeConfig::set_current(RuntimeConfig {
+            xdp: XdpConfig {
+                enabled: true,
+                interfaces: vec![XdpInterfaceConfig {
+                    name: "eth0".to_string(),
+                    queues: vec![0],
+                    mode: XdpRuntimeMode::Proxy,
+                    ..Default::default()
+                }],
+                proxy: XdpProxyConfig {
+                    ports: vec![XdpProxyPortConfig {
+                        protocol: XdpProxyProtocol::Udp,
+                        port: 443,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let current = RuntimeConfig::current().unwrap();
+        assert!(current.xdp.enabled);
+        assert_eq!(current.xdp.interfaces[0].name, "eth0");
+        assert_eq!(current.xdp.proxy.ports[0].port, 443);
+    }
+
+    #[test]
+    fn xdp_runtime_config_deserializes_proxy_ports() {
+        let _guard = runtime_config_test_guard();
+        let config: RuntimeConfig = serde_yaml::from_str(
+            r#"
+xdp:
+  enabled: true
+  interfaces:
+    - name: eth0
+      queues: [0]
+      mode: proxy
+  proxy:
+    protocols: ["https", "h3"]
+    ports:
+      - protocol: https
+        port: 443
+      - protocol: h3
+        port: 443
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(config.xdp.proxy.ports.len(), 2);
+        assert_eq!(config.xdp.proxy.ports[0].protocol, XdpProxyProtocol::Https);
+        assert_eq!(config.xdp.proxy.ports[1].protocol, XdpProxyProtocol::H3);
+    }
+
+    #[test]
+    fn xdp_runtime_config_rejects_disabled_proxy_port_protocol() {
+        let _guard = runtime_config_test_guard();
+        let config: RuntimeConfig = serde_yaml::from_str(
+            r#"
+xdp:
+  enabled: true
+  interfaces:
+    - name: eth0
+      queues: [0]
+  proxy:
+    protocols: ["tcp"]
+    ports:
+      - protocol: udp
+        port: 53
+"#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("not enabled in xdp.proxy.protocols"));
+    }
 }

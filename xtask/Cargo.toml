@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.0"
+publish = false
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4", features = ["derive"] }

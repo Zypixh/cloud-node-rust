@@ -65,6 +65,10 @@ impl NodePaths {
         self.data_dir().join("metrics.db")
     }
 
+    pub fn xdp_state_file(&self) -> PathBuf {
+        self.data_dir().join("xdp-state.json")
+    }
+
     pub fn cache_dir(&self) -> PathBuf {
         self.data_dir().join("cache")
     }
