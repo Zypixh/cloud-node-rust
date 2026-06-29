@@ -48,6 +48,8 @@ gRPC 和 WebSocket 属于长连接协议，运行时会优先识别协议特征�
 
 四层代理不执行 HTTP header、WAF 规则和页面能力，但会参与节点级统计和连接状态记录。普通 L4 和 `@quic` 不生成访问日志；SNI 透传访问日志由对应 L7 服务配置控制。
 
+Linux 环境可通过本地 `configs/runtime.yaml` 显式启用 XDP/AF_XDP proxy。命中配置端口的 HTTP、HTTPS、TCP、UDP、SNI、QUIC 和 H3 流量可以从 XDP redirect 到用户态 AF_XDP 数据面，再复用现有协议路由和防护逻辑；未命中、未就绪或降级时继续走原 socket 监听器。
+
 ## SNI 透传
 
 共享 `443` 端口下，运行时会解析 TCP TLS ClientHello 并判断是否进入 SNI 透传逻辑。透传模式不会终止 TLS，而是直接将连接转发到目标上游。精确 L7 HTTPS 站点优先于通配 SNI 透传，精确 SNI 透传可优先于通配 L7 站点。
@@ -131,6 +133,8 @@ WAF 能力包括：
 - 本地封禁状态。
 
 WAF 状态管理会维护 IP 和网段封禁快照。请求热路径使用快照匹配，避免每次请求扫描所有规则。CC 和计数型规则使用固定窗口滚动桶统计，降低高 QPS 或攻击流量下的 CPU 和内存放大。
+
+启用 XDP protect/proxy 后，运行时封禁 IP、CIDR 和 range 会同步到 XDP maps；白名单优先于封禁。XDP map 同步失败时默认 fail-open 到现有 socket 路径，并在 XDP status 和节点上报中记录原因。
 
 ## 防盗链和访问限制
 

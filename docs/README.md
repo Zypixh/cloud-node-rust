@@ -8,6 +8,7 @@
 - [运行时说明](runtime.md)：说明进程启动、任务调度、配置热更新、证书、缓存后台任务和性能监控。
 - [功能说明](features.md)：逐项介绍协议代理、缓存、WAF、内容处理、日志统计、证书和多级分发能力。
 - [配置说明](configuration.md)：说明 `configs/api_node.yaml`、运行目录、数据文件、缓存目录和控制面配置兼容。
+- [XDP/AF_XDP 旁路数据面](xdp-af-xdp.md)：说明 Linux XDP protect/proxy 配置、CLI、回退、协议接入和集成测试。
 - [接收配置审计](config-receive-audit.md)：对照全局配置、网站配置、实际应用路径和优先级，并列出当前接收缺口。
 - [部署与运维](operations.md)：说明构建、安装、systemd、系统参数、监控、日志和排障建议。
 - [RKE2 部署文档](rke2-deployment.md)：说明 RKE2 多副本部署流程，以及复用/新建 Longhorn 的缓存存储配置。

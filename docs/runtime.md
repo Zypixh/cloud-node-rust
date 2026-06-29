@@ -13,8 +13,9 @@ CloudNode Rust 的运行时由一个主进程和多个异步后台任务组成�
 5. 初始化 `ConfigStore`、WAF 状态、证书选择器、健康检查管理器。
 6. 启动控制面同步任务。
 7. 启动 HTTP、HTTPS、HTTP/3、TCP、UDP 等监听器。
-8. 启动缓存、统计、日志上传和证书同步后台任务。
-9. 如指定 `--monitor-port`，启动本地性能监控页面。
+8. 如 `configs/runtime.yaml` 显式启用 XDP，则初始化 XDP/AF_XDP manager、maps、XSK queues 和 fallback 状态。
+9. 启动缓存、统计、日志上传和证书同步后台任务。
+10. 如指定 `--monitor-port`，启动本地性能监控页面。
 
 默认不带子命令时以前台方式运行。已注册 systemd unit 时，`start/restart` 会优先委托给 `systemctl`；未注册 systemd 时，`start` 子命令会以单 fork 方式进入后台。
 
@@ -30,6 +31,10 @@ cloud-node upgrade
 cloud-node ntp
 cloud-node firewall list
 cloud-node firewall init
+cloud-node xdp status
+cloud-node xdp doctor
+cloud-node xdp attach
+cloud-node xdp detach
 cloud-node test
 ```
 
@@ -52,6 +57,10 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `firewall init`：初始化本地 `nftables` table/set/chain/drop rule。
 - `firewall list`：合并展示本地 `nftables` 精确 IP 和 RocksDB 本地运行时黑名单；条目较多时按 IPv4 `/24`、IPv6 `/48` 聚合。
 - `firewall gc`：清理 RocksDB 中已过期的本地运行时封禁记录。
+- `xdp status`：查看当前或上次持久化的 XDP/AF_XDP attach、XSK、map 和 counter 状态。
+- `xdp doctor`：校验本地 runtime XDP 配置、eBPF 对象、权限和 proxy 能力。
+- `xdp attach` / `xdp detach` / `xdp reload`：按 `configs/runtime.yaml` 管理当前进程的 XDP attachment。
+- `xdp dump-maps`：输出当前进程维护的 XDP shadow maps 和 proxy 端口状态。
 - `test`：验证 `configs/api_node.yaml` 是否可解析。
 
 `upgrade` 默认使用交互式确认，并在成功替换后重启正在运行的 `cloud-node.service` 或内置后台进程：
@@ -89,6 +98,7 @@ cloud-node upgrade --version v1.1.7 --github-base-url https://github.example.com
 - `configs/api_node.yaml`：API 节点连接配置。
 - `data/cloud-node.pid`：后台进程 PID 文件。
 - `data/state.json`：部分运行状态持久化。
+- `data/cloud-node-xdp-ebpf.o`：`cargo xtask build-ebpf` 生成的 XDP eBPF 对象。
 - `data/blocked_ips.json`：旧版本地封禁快照，仅作为一次性迁移输入；迁移到 RocksDB 成功后会自动删除。
 - `data/metrics.db`：统计、缓存元数据和本地运行时防火墙封禁状态持久化。
 - `data/cache`：默认磁盘缓存目录。
@@ -129,6 +139,8 @@ L4 自动防御复用已有 `emptyConnectionFlood` 配置作为总开关。开�
 - TCP/TCP-TLS/SNI passthrough：连接 admission、单 IP 活跃连接、慢首包、慢 ClientHello、压力态 idle close 都进入 L4 事件；源站连接失败和源站超时不作为攻击。
 - UDP passthrough：新 session flood、admission reject 和 session queue full 计入事件；正常 idle cleanup 不计攻击。
 - QUIC passthrough/HY2/HTTP/3：QUIC incomplete ClientHello、pending/reassembly budget reject、new route flood、H3 admission reject 计入事件；有效 QUIC ClientHello 命中 `@quic` passthrough server 时不要求 ALPN 是 H3，也不计 H3 reject。
+
+XDP protect/proxy 启用时，WAF 封禁快照会同步到 XDP maps，白名单优先于封禁。proxy 命中端口的包进入 AF_XDP 后仍复用 L4 防御、QUIC demux、H3 manager、SNI 透传和 UDP session 防护；XSK 未就绪、attach 失败或 reload 降级时保持原 socket 路径可用。
 
 压力态分为 `Normal`、`Elevated`、`High`、`Critical`，由连接 admission、内存、FD-equivalent、UDP queued bytes、QUIC route/pending/reassembly 和前缀/集群 surge 综合计算。`memory_plan` 摘要会输出 `l4_pressure`、`prefix_pressure`、`tcp_like_per_ip_limit`、`fd_used_pct`、`zero_copy_active`、`udp_queued`、`l4_top_kind`、`l4_top_prefix`、`l4_counter_saturated` 等字段；节点状态上报包含 `resourceGovernor` 和 `l4Defense` JSON，便于压测期间观察防御收紧情况。
 

@@ -13,6 +13,7 @@ all_pb_rpcs.txt
 used_rust_rpcs.txt
 current_head.txt
 app-*.js
+*.pcap
 
 # Ignore local hidden tool/editor directories and their contents.
 .*/
