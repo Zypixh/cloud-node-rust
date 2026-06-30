@@ -54,35 +54,6 @@ impl XdpIpv6Key {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct XdpIpv4LpmKey {
-    pub prefix_len: u32,
-    pub addr_be: u32,
-}
-
-impl XdpIpv4LpmKey {
-    pub const fn new(prefix_len: u32, addr_be: u32) -> Self {
-        Self {
-            prefix_len,
-            addr_be,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct XdpIpv6LpmKey {
-    pub prefix_len: u32,
-    pub addr: [u8; 16],
-}
-
-impl XdpIpv6LpmKey {
-    pub const fn new(prefix_len: u32, addr: [u8; 16]) -> Self {
-        Self { prefix_len, addr }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct XdpRangeKey {
     pub from_hi: u64,
     pub from_lo: u64,
@@ -267,8 +238,6 @@ macro_rules! unsafe_impl_aya_pod {
 unsafe_impl_aya_pod!(
     XdpIpv4Key,
     XdpIpv6Key,
-    XdpIpv4LpmKey,
-    XdpIpv6LpmKey,
     XdpRangeKey,
     XdpPortProtoKey,
     XdpQueueKey,

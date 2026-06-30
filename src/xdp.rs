@@ -2865,7 +2865,7 @@ mod linux {
     use aya::programs::links::PinnedLink;
     use cloud_node_xdp_common::{
         XdpCounters, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key,
-        XdpPortProtoKey, XdpQueueKey, XdpRangeKey, XdpRuleValue,
+        XdpPortProtoKey, XdpQueueKey, XdpRuleValue,
     };
     use ipnet::IpNet;
     use std::collections::BTreeSet;
@@ -3481,18 +3481,6 @@ mod linux {
             false,
             true,
         )?;
-        sync_range_map(
-            ebpf,
-            "XDP_ALLOWED_RANGES",
-            state.allowed_ranges.iter(),
-            true,
-        )?;
-        sync_range_map(
-            ebpf,
-            "XDP_BLOCKED_RANGES",
-            state.blocked_ranges.iter(),
-            false,
-        )?;
         sync_range_lpm_maps(ebpf, state.allowed_ranges.iter(), true)?;
         sync_range_lpm_maps(ebpf, state.blocked_ranges.iter(), false)?;
         Ok(())
@@ -3787,32 +3775,6 @@ mod linux {
                     map.insert(&key, rule_value(*expiry, allow), 0)?;
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn sync_range_map<'a>(
-        ebpf: &mut aya::Ebpf,
-        name: &str,
-        entries: impl Iterator<Item = (&'a RangeKey, &'a i64)>,
-        allow: bool,
-    ) -> anyhow::Result<()> {
-        let map = ebpf
-            .map_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
-        let mut map = AyaHashMap::<_, XdpRangeKey, XdpRuleValue>::try_from(map)?;
-        clear_hash_map(&mut map)?;
-        for (range, expiry) in entries {
-            let family = if range.v6 {
-                XdpRangeKey::FAMILY_IPV6
-            } else {
-                XdpRangeKey::FAMILY_IPV4
-            };
-            map.insert(
-                XdpRangeKey::new(range.from, range.to, family),
-                rule_value(*expiry, allow),
-                0,
-            )?;
         }
         Ok(())
     }
