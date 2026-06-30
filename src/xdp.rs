@@ -755,25 +755,18 @@ impl XdpManager {
             return Ok(false);
         }
 
-        let result = self.flush_maps_full_blocking(true);
+        self.flush_maps_full_blocking(true);
 
-        match result {
-            Ok(()) => {
-                self.proxy_redirect_enabled.store(true, Ordering::Relaxed);
-                self.set_proxy_fallback_reason(xdp_proxy_partial_detail(&self.config));
-                self.set_tcp_dataplane_detail(xdp_tcp_dataplane_detail(&self.config));
-                self.persist_status();
-                Ok(true)
-            }
-            Err(err) => {
-                self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
-                self.set_proxy_fallback_reason(format!(
-                    "{source} failed to enable AF_XDP redirect: {err}; traffic will PASS"
-                ));
-                self.persist_status();
-                Err(err)
-            }
+        // Check if still attached after flush (detach_after_runtime_failure may have been called)
+        if self.attached.read().is_empty() {
+            return Err(anyhow::anyhow!("{source} failed to enable AF_XDP redirect: map sync failed"));
         }
+
+        self.proxy_redirect_enabled.store(true, Ordering::Relaxed);
+        self.set_proxy_fallback_reason(xdp_proxy_partial_detail(&self.config));
+        self.set_tcp_dataplane_detail(xdp_tcp_dataplane_detail(&self.config));
+        self.persist_status();
+        Ok(true)
     }
 
     fn queue_statuses_for_config(&self) -> Vec<XdpQueueStatus> {
@@ -4158,7 +4151,7 @@ mod linux {
         let now_mono_ns = monotonic_now_ns();
         if now_mono_ns == 0 {
             static LAST_WARN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let now_ms = crate::utils::time::now_timestamp_ms();
+            let now_ms = crate::utils::time::now_timestamp_millis() as u64;
             let last = LAST_WARN_MS.load(std::sync::atomic::Ordering::Relaxed);
             if now_ms.saturating_sub(last) > 60_000 {
                 LAST_WARN_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
