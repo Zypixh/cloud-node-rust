@@ -4157,6 +4157,15 @@ mod linux {
     fn monotonic_deadline_ns(expires_at: i64) -> u64 {
         let now_mono_ns = monotonic_now_ns();
         if now_mono_ns == 0 {
+            static LAST_WARN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now_ms = crate::utils::time::now_timestamp_ms();
+            let last = LAST_WARN_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if now_ms.saturating_sub(last) > 60_000 {
+                LAST_WARN_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    "XDP monotonic clock read failed; rules will rely on 5s shadow sweeper for expiry"
+                );
+            }
             return 0;
         }
         let ttl_secs = expires_at
