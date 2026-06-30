@@ -10,7 +10,7 @@ use aya_ebpf::{
 };
 use cloud_node_xdp_common::{
     XdpCounters, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key,
-    XdpPortProtoKey, XdpQueueKey, XdpRangeKey, XdpRuleValue,
+    XdpPortProtoKey, XdpQueueKey, XdpRuleValue,
 };
 use core::mem;
 use network_types::{
@@ -59,14 +59,6 @@ static XDP_ALLOWED_V4_LPM: LpmTrie<u32, XdpRuleValue> =
 #[map(name = "XDP_ALLOWED_V6_LPM")]
 static XDP_ALLOWED_V6_LPM: LpmTrie<[u8; 16], XdpRuleValue> =
     LpmTrie::<[u8; 16], XdpRuleValue>::with_max_entries(65_536, 0);
-
-#[map(name = "XDP_BLOCKED_RANGES")]
-static XDP_BLOCKED_RANGES: HashMap<XdpRangeKey, XdpRuleValue> =
-    HashMap::<XdpRangeKey, XdpRuleValue>::with_max_entries(65_536, 0);
-
-#[map(name = "XDP_ALLOWED_RANGES")]
-static XDP_ALLOWED_RANGES: HashMap<XdpRangeKey, XdpRuleValue> =
-    HashMap::<XdpRangeKey, XdpRuleValue>::with_max_entries(65_536, 0);
 
 #[map(name = "XDP_INTERFACE_POLICY")]
 static XDP_INTERFACE_POLICY: HashMap<u32, XdpInterfacePolicy> =

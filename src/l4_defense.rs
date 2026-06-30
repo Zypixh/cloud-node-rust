@@ -1076,6 +1076,11 @@ pub fn record_l4_event(
     )
 }
 
+/// Record TCP connection churn during elevated pressure (Moderate or High).
+///
+/// Returns None if pressure is Normal — pure open-close churn detection in
+/// Normal pressure relies on record_tcp_accepted_churn and
+/// record_completed_handshake_event, which bypass the pressure gate.
 pub fn record_tcp_connection_churn_under_pressure<F>(
     config_store: &ConfigStore,
     waf_state: &Arc<WafStateManager>,
@@ -1101,6 +1106,12 @@ where
     ))
 }
 
+/// Record TCP accepted-then-closed churn (socket accept followed by rapid close
+/// with minimal or no data transfer).
+///
+/// This path does NOT require elevated pressure — it detects pure open-close
+/// churn in Normal pressure. Returns None only if empty_connection_flood policy
+/// is not configured for the cluster.
 pub fn record_tcp_accepted_churn<F>(
     config_store: &ConfigStore,
     waf_state: &Arc<WafStateManager>,
@@ -1124,6 +1135,12 @@ where
     ))
 }
 
+/// Record completed-handshake events (early close with minimal data, connection
+/// lifetime churn).
+///
+/// This path does NOT require elevated pressure — it detects open-close churn
+/// patterns in Normal pressure. Returns None only if empty_connection_flood
+/// policy is not configured for the cluster.
 pub fn record_completed_handshake_event<F>(
     config_store: &ConfigStore,
     waf_state: &Arc<WafStateManager>,
@@ -1206,6 +1223,14 @@ pub fn record_l4_event_scored(
     let cluster_id = config_store.get_node_cluster_id_sync();
     let Some(config) = config_store.get_empty_connection_flood_config_for_cluster_sync(cluster_id)
     else {
+        if amount == 1 {
+            tracing::debug!(
+                "L4 defense {} event for {} skipped: empty_connection_flood policy not configured for cluster {}",
+                kind.as_str(),
+                ip,
+                cluster_id
+            );
+        }
         L4_METRICS.record(kind, L4DefenseVerdict::Disabled);
         return L4DefenseVerdict::Disabled;
     };
