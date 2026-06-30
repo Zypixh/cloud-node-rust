@@ -15,6 +15,10 @@ const XDP_EBPF_OBJECT_NAME: &str = "cloud-node-xdp-ebpf.o";
 const XDP_BPF_PIN_DIR: &str = "/sys/fs/bpf/cloud-node-xdp";
 const XDP_STATE_WRITE_INTERVAL_SECS: u64 = 10;
 const XDP_RULE_SWEEP_INTERVAL_SECS: u64 = 5;
+// Coalescing window for rule-map writes: bursts of block/unblock events under an
+// attack collapse into a single incremental eBPF map update. Off-round to avoid
+// whole-second resonance with the rule sweeper.
+const XDP_MAP_SYNC_DEBOUNCE_MS: u64 = 47;
 const XDP_PROXY_DATAPLANE_ACTIVE: bool = true;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -404,6 +408,12 @@ struct XdpManager {
     last_state_write_at: AtomicU64,
     rule_sweeper_started: AtomicBool,
     rule_sweeper_generation: AtomicU64,
+    /// Image of the rule state last successfully written to the eBPF maps. The
+    /// incremental sync diffs the live shadow `state` against this to compute the
+    /// minimal set of map inserts/removes.
+    synced: parking_lot::Mutex<RuleState>,
+    map_sync_started: AtomicBool,
+    map_sync_notify: tokio::sync::Notify,
 }
 
 impl XdpManager {
@@ -431,6 +441,9 @@ impl XdpManager {
             last_state_write_at: AtomicU64::new(0),
             rule_sweeper_started: AtomicBool::new(false),
             rule_sweeper_generation: AtomicU64::new(0),
+            synced: parking_lot::Mutex::new(RuleState::default()),
+            map_sync_started: AtomicBool::new(false),
+            map_sync_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -481,7 +494,7 @@ impl XdpManager {
                     let attached = attached_program.interfaces;
                     *self.attached.write() = attached;
                     self.set_fallback_reason(String::new());
-                    self.sync_maps_from_shadow();
+                    self.flush_maps_full_blocking(self.proxy_redirect_ready());
                     self.configure_af_xdp_runtime()?;
                 }
                 Err(err) => {
@@ -525,7 +538,6 @@ impl XdpManager {
         xdp_tcp_dataplane_detail(&self.config)
     }
 
-    #[cfg(any(test, target_os = "linux"))]
     fn proxy_xsk_ready(&self) -> bool {
         if !XDP_PROXY_DATAPLANE_ACTIVE
             || self.config.proxy.ports.is_empty()
@@ -550,7 +562,6 @@ impl XdpManager {
             })
     }
 
-    #[cfg(any(test, target_os = "linux"))]
     fn proxy_redirect_ready(&self) -> bool {
         self.proxy_redirect_enabled.load(Ordering::Relaxed) && self.proxy_xsk_ready()
     }
@@ -744,19 +755,7 @@ impl XdpManager {
             return Ok(false);
         }
 
-        let result = {
-            let state = self.state.read().clone();
-            let mut ebpf = self.ebpf.lock();
-            match ebpf.as_mut() {
-                Some(ebpf) => linux::sync_maps(ebpf, &self.config, &state, true),
-                None => {
-                    self.set_proxy_fallback_reason(format!(
-                        "{source} cannot enable AF_XDP redirect; eBPF program is not loaded"
-                    ));
-                    return Ok(false);
-                }
-            }
-        };
+        let result = self.flush_maps_full_blocking(true);
 
         match result {
             Ok(()) => {
@@ -992,13 +991,13 @@ impl XdpManager {
     fn update_block_ip(&self, ip: IpAddr, ttl_secs: i64) {
         let expiry = crate::utils::time::now_timestamp() + ttl_secs.max(1);
         self.state.write().blocked_ips.insert(ip, expiry);
-        self.sync_maps_from_shadow();
+        self.request_map_sync();
         self.persist_status();
     }
 
     fn remove_block_ip(&self, ip: IpAddr) {
         self.state.write().blocked_ips.remove(&ip);
-        self.sync_maps_from_shadow();
+        self.request_map_sync();
         self.persist_status();
     }
 
@@ -1008,13 +1007,13 @@ impl XdpManager {
             .write()
             .blocked_networks
             .insert(net.to_string(), (net, expiry));
-        self.sync_maps_from_shadow();
+        self.request_map_sync();
         self.persist_status();
     }
 
     fn remove_block_network(&self, net: IpNet) {
         self.state.write().blocked_networks.remove(&net.to_string());
-        self.sync_maps_from_shadow();
+        self.request_map_sync();
         self.persist_status();
     }
 
@@ -1027,7 +1026,7 @@ impl XdpManager {
             .write()
             .blocked_ranges
             .insert(RangeKey { from, to, v6 }, expiry);
-        self.sync_maps_from_shadow();
+        self.request_map_sync();
         self.persist_status();
     }
 
@@ -1036,7 +1035,7 @@ impl XdpManager {
             .write()
             .blocked_ranges
             .remove(&RangeKey { from, to, v6 });
-        self.sync_maps_from_shadow();
+        self.request_map_sync();
         self.persist_status();
     }
 
@@ -1045,7 +1044,7 @@ impl XdpManager {
         state.sync_from_snapshot(snapshot);
         state.retain_active(crate::utils::time::now_timestamp());
         drop(state);
-        self.sync_maps_from_shadow();
+        self.request_map_sync();
         self.persist_status();
     }
 
@@ -1055,7 +1054,7 @@ impl XdpManager {
             .write()
             .retain_active(crate::utils::time::now_timestamp());
         if changed {
-            self.sync_maps_from_shadow();
+            self.request_map_sync();
             self.persist_status();
         }
         changed
@@ -1068,30 +1067,72 @@ impl XdpManager {
             .ip_verdict(ip, crate::utils::time::now_timestamp())
     }
 
-    fn sync_maps_from_shadow(&self) {
-        #[cfg(target_os = "linux")]
-        {
-            if self.attached.read().is_empty() {
-                return;
+    /// Signal the background worker that the shadow rule state changed. Multiple
+    /// signals during a burst coalesce into one debounced incremental map write,
+    /// so a flood that blocks thousands of distinct IPs no longer triggers a full
+    /// map rebuild per block. The userspace `is_l4_blocked` check still applies
+    /// immediately; XDP enforcement follows within the debounce window.
+    fn request_map_sync(&self) {
+        self.map_sync_notify.notify_one();
+    }
+
+    /// Synchronous full reconciliation of every map (interface policy, local IPs,
+    /// proxy ports, XSK indices and all rule maps). Used on cold start / reload /
+    /// proxy-redirect enable where we want the maps populated before returning.
+    #[cfg(target_os = "linux")]
+    fn flush_maps_full_blocking(&self, proxy_dataplane_active: bool) {
+        if self.attached.read().is_empty() {
+            return;
+        }
+        let state = self.state.read().clone();
+        let result = {
+            let mut ebpf = self.ebpf.lock();
+            match ebpf.as_mut() {
+                Some(ebpf) => linux::sync_maps(ebpf, &self.config, &state, proxy_dataplane_active),
+                None => Ok(()),
             }
-            let state = self.state.read().clone();
-            let proxy_dataplane_active = self.proxy_redirect_ready();
-            let result = {
-                let mut ebpf = self.ebpf.lock();
-                match ebpf.as_mut() {
-                    Some(ebpf) => {
-                        linux::sync_maps(ebpf, &self.config, &state, proxy_dataplane_active)
-                    }
-                    None => Ok(()),
-                }
-            };
-            if let Err(err) = result {
+        };
+        match result {
+            Ok(()) => *self.synced.lock() = state,
+            Err(err) => {
                 let reason = format!("map sync failed: {err}");
-                self.detach_after_runtime_failure(reason.clone());
+                self.detach_after_runtime_failure(reason);
                 tracing::warn!("XDP map sync failed; detached and falling back: {}", err);
             }
         }
     }
+
+    /// Incremental reconciliation of just the rule maps, diffing the live shadow
+    /// state against the last-applied image. Run by the background worker.
+    #[cfg(target_os = "linux")]
+    fn flush_maps_diff(&self) {
+        if self.attached.read().is_empty() {
+            return;
+        }
+        let new_state = self.state.read().clone();
+        let old_state = self.synced.lock().clone();
+        let result = {
+            let mut ebpf = self.ebpf.lock();
+            match ebpf.as_mut() {
+                Some(ebpf) => linux::apply_rule_diff(ebpf, &old_state, &new_state),
+                None => Ok(()),
+            }
+        };
+        match result {
+            Ok(()) => *self.synced.lock() = new_state,
+            Err(err) => {
+                let reason = format!("map diff sync failed: {err}");
+                self.detach_after_runtime_failure(reason);
+                tracing::warn!("XDP map diff sync failed; detached and falling back: {}", err);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn flush_maps_diff(&self) {}
+
+    #[cfg(not(target_os = "linux"))]
+    fn flush_maps_full_blocking(&self, _proxy_dataplane_active: bool) {}
 
     #[cfg(target_os = "linux")]
     fn detach_after_runtime_failure(&self, reason: String) {
@@ -1267,7 +1308,6 @@ fn replace_manager_from_runtime() -> std::sync::Arc<XdpManager> {
     current.clone()
 }
 
-#[cfg(any(test, target_os = "linux"))]
 fn manager_is_current(candidate: &std::sync::Arc<XdpManager>) -> bool {
     let Some(manager) = XDP_MANAGER.get() else {
         return false;
@@ -1301,10 +1341,31 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
     });
 }
 
+fn start_map_sync_worker(manager: &std::sync::Arc<XdpManager>) {
+    if !manager.config.enabled {
+        return;
+    }
+    if manager.map_sync_started.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let manager = manager.clone();
+    tokio::spawn(async move {
+        loop {
+            manager.map_sync_notify.notified().await;
+            tokio::time::sleep(std::time::Duration::from_millis(XDP_MAP_SYNC_DEBOUNCE_MS)).await;
+            if !manager_is_current(&manager) {
+                break;
+            }
+            manager.flush_maps_diff();
+        }
+    });
+}
+
 pub async fn initialize_from_runtime() -> anyhow::Result<()> {
     let manager = manager_from_runtime();
     manager.initialize().await?;
     start_rule_sweeper(&manager);
+    start_map_sync_worker(&manager);
     Ok(())
 }
 
@@ -1358,7 +1419,7 @@ pub async fn reload_from_runtime() -> anyhow::Result<()> {
         .unwrap_or_default();
     let current = manager_from_runtime();
     if current.config == runtime_config && !current.attached.read().is_empty() {
-        current.sync_maps_from_shadow();
+        current.flush_maps_full_blocking(current.proxy_redirect_ready());
         current.persist_status_blocking();
         return Ok(());
     }
@@ -3826,6 +3887,256 @@ mod linux {
             }
         }
 
+        Ok(())
+    }
+
+    // Desired-contents "images" of the rule maps, keyed so that an unchanged
+    // entry (same expiry) is never rewritten. Keeping the diff keyed on the unix
+    // expiry preserves each entry's original monotonic deadline in the eBPF map.
+    type ExactV4Image = std::collections::BTreeMap<u32, i64>;
+    type ExactV6Image = std::collections::BTreeMap<[u8; 16], i64>;
+    type LpmV4Image = std::collections::BTreeMap<(u32, u32), i64>;
+    type LpmV6Image = std::collections::BTreeMap<(u32, [u8; 16]), i64>;
+
+    struct RuleMapImages {
+        allowed_v4: ExactV4Image,
+        allowed_v6: ExactV6Image,
+        blocked_v4: ExactV4Image,
+        blocked_v6: ExactV6Image,
+        allowed_v4_lpm: LpmV4Image,
+        allowed_v6_lpm: LpmV6Image,
+        blocked_v4_lpm: LpmV4Image,
+        blocked_v6_lpm: LpmV6Image,
+    }
+
+    fn exact_image(ips: &std::collections::BTreeMap<IpAddr, i64>) -> (ExactV4Image, ExactV6Image) {
+        let mut v4 = ExactV4Image::new();
+        let mut v6 = ExactV6Image::new();
+        for (ip, expiry) in ips {
+            match ip {
+                IpAddr::V4(addr) => {
+                    v4.insert(u32::from_be_bytes(addr.octets()), *expiry);
+                }
+                IpAddr::V6(addr) => {
+                    v6.insert(addr.octets(), *expiry);
+                }
+            }
+        }
+        (v4, v6)
+    }
+
+    fn lpm_image(
+        nets: &std::collections::BTreeMap<String, (IpNet, i64)>,
+        ranges: &std::collections::BTreeMap<RangeKey, i64>,
+    ) -> (LpmV4Image, LpmV6Image) {
+        let mut v4 = LpmV4Image::new();
+        let mut v6 = LpmV6Image::new();
+        // Networks first, then range decomposition, matching the full-sync order.
+        for (net, expiry) in nets.values() {
+            insert_net_image(&mut v4, &mut v6, net, *expiry);
+        }
+        for (range, expiry) in ranges {
+            for net in range_to_nets(range) {
+                insert_net_image(&mut v4, &mut v6, &net, *expiry);
+            }
+        }
+        (v4, v6)
+    }
+
+    fn insert_net_image(v4: &mut LpmV4Image, v6: &mut LpmV6Image, net: &IpNet, expiry: i64) {
+        match net {
+            IpNet::V4(net) => {
+                let key = (net.prefix_len() as u32, u32::from_be_bytes(net.network().octets()));
+                // Keep the latest-seen expiry deterministically (max wins).
+                let slot = v4.entry(key).or_insert(expiry);
+                if expiry > *slot {
+                    *slot = expiry;
+                }
+            }
+            IpNet::V6(net) => {
+                let key = (net.prefix_len() as u32, net.network().octets());
+                let slot = v6.entry(key).or_insert(expiry);
+                if expiry > *slot {
+                    *slot = expiry;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rule_map_images(state: &RuleState) -> RuleMapImages {
+        let (allowed_v4, allowed_v6) = exact_image(&state.allowed_ips);
+        let (blocked_v4, blocked_v6) = exact_image(&state.blocked_ips);
+        let (allowed_v4_lpm, allowed_v6_lpm) =
+            lpm_image(&state.allowed_networks, &state.allowed_ranges);
+        let (blocked_v4_lpm, blocked_v6_lpm) =
+            lpm_image(&state.blocked_networks, &state.blocked_ranges);
+        RuleMapImages {
+            allowed_v4,
+            allowed_v6,
+            blocked_v4,
+            blocked_v6,
+            allowed_v4_lpm,
+            allowed_v6_lpm,
+            blocked_v4_lpm,
+            blocked_v6_lpm,
+        }
+    }
+
+    /// Incrementally reconcile the six rule maps from `old` to `new` without ever
+    /// clearing a whole map. Only changed/added keys are inserted and only removed
+    /// keys are deleted, so the data plane never observes an empty-map window.
+    pub fn apply_rule_diff(
+        ebpf: &mut aya::Ebpf,
+        old: &RuleState,
+        new: &RuleState,
+    ) -> anyhow::Result<()> {
+        let old = rule_map_images(old);
+        let new = rule_map_images(new);
+        diff_exact_v4(ebpf, "XDP_ALLOWED_V4", &old.allowed_v4, &new.allowed_v4, true)?;
+        diff_exact_v6(ebpf, "XDP_ALLOWED_V6", &old.allowed_v6, &new.allowed_v6, true)?;
+        diff_exact_v4(ebpf, "XDP_BLOCKED_V4", &old.blocked_v4, &new.blocked_v4, false)?;
+        diff_exact_v6(ebpf, "XDP_BLOCKED_V6", &old.blocked_v6, &new.blocked_v6, false)?;
+        diff_lpm_v4(
+            ebpf,
+            "XDP_ALLOWED_V4_LPM",
+            &old.allowed_v4_lpm,
+            &new.allowed_v4_lpm,
+            true,
+        )?;
+        diff_lpm_v6(
+            ebpf,
+            "XDP_ALLOWED_V6_LPM",
+            &old.allowed_v6_lpm,
+            &new.allowed_v6_lpm,
+            true,
+        )?;
+        diff_lpm_v4(
+            ebpf,
+            "XDP_BLOCKED_V4_LPM",
+            &old.blocked_v4_lpm,
+            &new.blocked_v4_lpm,
+            false,
+        )?;
+        diff_lpm_v6(
+            ebpf,
+            "XDP_BLOCKED_V6_LPM",
+            &old.blocked_v6_lpm,
+            &new.blocked_v6_lpm,
+            false,
+        )?;
+        Ok(())
+    }
+
+    fn diff_exact_v4(
+        ebpf: &mut aya::Ebpf,
+        name: &str,
+        old: &ExactV4Image,
+        new: &ExactV4Image,
+        allow: bool,
+    ) -> anyhow::Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let map = ebpf
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
+        let mut map = AyaHashMap::<_, XdpIpv4Key, XdpRuleValue>::try_from(map)?;
+        for (addr_be, expiry) in new {
+            if old.get(addr_be) != Some(expiry) {
+                map.insert(XdpIpv4Key { addr_be: *addr_be }, rule_value(*expiry, allow), 0)?;
+            }
+        }
+        for addr_be in old.keys() {
+            if !new.contains_key(addr_be) {
+                let _ = map.remove(&XdpIpv4Key { addr_be: *addr_be });
+            }
+        }
+        Ok(())
+    }
+
+    fn diff_exact_v6(
+        ebpf: &mut aya::Ebpf,
+        name: &str,
+        old: &ExactV6Image,
+        new: &ExactV6Image,
+        allow: bool,
+    ) -> anyhow::Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let map = ebpf
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
+        let mut map = AyaHashMap::<_, XdpIpv6Key, XdpRuleValue>::try_from(map)?;
+        for (addr, expiry) in new {
+            if old.get(addr) != Some(expiry) {
+                map.insert(XdpIpv6Key { addr: *addr }, rule_value(*expiry, allow), 0)?;
+            }
+        }
+        for addr in old.keys() {
+            if !new.contains_key(addr) {
+                let _ = map.remove(&XdpIpv6Key { addr: *addr });
+            }
+        }
+        Ok(())
+    }
+
+    fn diff_lpm_v4(
+        ebpf: &mut aya::Ebpf,
+        name: &str,
+        old: &LpmV4Image,
+        new: &LpmV4Image,
+        allow: bool,
+    ) -> anyhow::Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let map = ebpf
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
+        let mut map = LpmTrie::<_, u32, XdpRuleValue>::try_from(map)?;
+        for ((prefix_len, addr_be), expiry) in new {
+            if old.get(&(*prefix_len, *addr_be)) != Some(expiry) {
+                let key = LpmKey::new(*prefix_len, *addr_be);
+                map.insert(&key, rule_value(*expiry, allow), 0)?;
+            }
+        }
+        for (prefix_len, addr_be) in old.keys() {
+            if !new.contains_key(&(*prefix_len, *addr_be)) {
+                let key = LpmKey::new(*prefix_len, *addr_be);
+                let _ = map.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
+    fn diff_lpm_v6(
+        ebpf: &mut aya::Ebpf,
+        name: &str,
+        old: &LpmV6Image,
+        new: &LpmV6Image,
+        allow: bool,
+    ) -> anyhow::Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let map = ebpf
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
+        let mut map = LpmTrie::<_, [u8; 16], XdpRuleValue>::try_from(map)?;
+        for ((prefix_len, addr), expiry) in new {
+            if old.get(&(*prefix_len, *addr)) != Some(expiry) {
+                let key = LpmKey::new(*prefix_len, *addr);
+                map.insert(&key, rule_value(*expiry, allow), 0)?;
+            }
+        }
+        for (prefix_len, addr) in old.keys() {
+            if !new.contains_key(&(*prefix_len, *addr)) {
+                let key = LpmKey::new(*prefix_len, *addr);
+                let _ = map.remove(&key);
+            }
+        }
         Ok(())
     }
 
@@ -6487,6 +6798,111 @@ mod tests {
         mark_test_proxy_bridge_ready(&new_manager);
 
         assert!(!af_xdp::proxy_bridge_should_continue(&old_manager));
+        assert!(af_xdp::proxy_bridge_should_continue(&new_manager));
+
+        new_manager
+            .mark_proxy_dataplane_degraded("test forced degraded");
+        assert!(!af_xdp::proxy_bridge_should_continue(&new_manager));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn apply_rule_diff_adds_removes_only_deltas() {
+        use std::net::IpAddr;
+
+        let old_state = RuleState {
+            blocked_ips: [
+                ("192.0.2.1".parse::<IpAddr>().unwrap(), 9999),
+                ("192.0.2.2".parse::<IpAddr>().unwrap(), 9999),
+            ]
+            .into_iter()
+            .collect(),
+            allowed_ips: [("198.51.100.1".parse::<IpAddr>().unwrap(), 9999)]
+                .into_iter()
+                .collect(),
+            blocked_networks: [
+                (
+                    "203.0.113.0/24".to_string(),
+                    (
+                        "203.0.113.0/24".parse::<IpNet>().unwrap(),
+                        9999,
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            allowed_networks: Default::default(),
+            blocked_ranges: Default::default(),
+            allowed_ranges: Default::default(),
+        };
+
+        let new_state = RuleState {
+            blocked_ips: [
+                ("192.0.2.2".parse::<IpAddr>().unwrap(), 9999), // kept
+                ("192.0.2.3".parse::<IpAddr>().unwrap(), 9999), // added
+            ]
+            .into_iter()
+            .collect(),
+            allowed_ips: [
+                ("198.51.100.1".parse::<IpAddr>().unwrap(), 9999), // kept
+                ("198.51.100.2".parse::<IpAddr>().unwrap(), 9999), // added
+            ]
+            .into_iter()
+            .collect(),
+            blocked_networks: Default::default(), // entire network removed
+            allowed_networks: [
+                (
+                    "2001:db8::/32".to_string(),
+                    (
+                        "2001:db8::/32".parse::<IpNet>().unwrap(),
+                        9999,
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            blocked_ranges: Default::default(),
+            allowed_ranges: Default::default(),
+        };
+
+        let old_img = rule_map_images(&old_state);
+        let new_img = rule_map_images(&new_state);
+
+        // Exact v4 blocked: 192.0.2.1 removed, 192.0.2.3 added, 192.0.2.2 kept (no-op)
+        assert!(old_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 1])));
+        assert!(old_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 2])));
+        assert!(!old_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 3])));
+
+        assert!(!new_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 1])));
+        assert!(new_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 2])));
+        assert!(new_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 3])));
+
+        // Exact v4 allowed: 198.51.100.2 added, 198.51.100.1 kept
+        assert!(old_img.allowed_v4.contains_key(&u32::from_be_bytes([198, 51, 100, 1])));
+        assert!(!old_img.allowed_v4.contains_key(&u32::from_be_bytes([198, 51, 100, 2])));
+
+        assert!(new_img.allowed_v4.contains_key(&u32::from_be_bytes([198, 51, 100, 1])));
+        assert!(new_img.allowed_v4.contains_key(&u32::from_be_bytes([198, 51, 100, 2])));
+
+        // LPM v4 blocked: 203.0.113.0/24 removed
+        assert!(!old_img.blocked_lpm_v4.is_empty());
+        assert!(new_img.blocked_lpm_v4.is_empty());
+
+        // LPM v6 allowed: 2001:db8::/32 added
+        assert!(old_img.allowed_lpm_v6.is_empty());
+        assert!(!new_img.allowed_lpm_v6.is_empty());
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    #[test]
+    fn xdp_proxy_bridge_lifecycle_continues_only_when_ready() {
+        let _guard = crate::runtime_mode::runtime_config_test_guard();
+        RuntimeConfig::set_current(RuntimeConfig {
+            xdp: test_proxy_config("eth-new"),
+            ..RuntimeConfig::default()
+        });
+        let new_manager = replace_manager_from_runtime();
+        mark_test_proxy_bridge_ready(&new_manager);
         assert!(af_xdp::proxy_bridge_should_continue(&new_manager));
 
         new_manager.attached.write().clear();
