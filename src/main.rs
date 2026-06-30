@@ -1,5 +1,7 @@
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
+use cloud_node_rust::i18n::{Language, t};
+use cloud_node_rust::xdp_config_wizard::XdpConfigWizard;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
 use std::fs;
@@ -106,7 +108,7 @@ impl<'a> MakeWriter<'a> for SharedLogWriter {
 #[derive(Parser)]
 #[command(name = "cloud-node-rust")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "CloudNode - High Performance Cloud Node written in Rust", long_about = None)]
+#[command(about = "CloudNode - High Performance Cloud Node written in Rust / Rust 编写的高性能云节点", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -114,16 +116,24 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Port to start the performance monitor web dashboard"
+        help = "Port to start the performance monitor web dashboard / 性能监控面板端口"
     )]
     monitor_port: Option<u16>,
 
     #[arg(
         long,
         global = true,
-        help = "Clear in-memory performance monitor samples on startup"
+        help = "Clear in-memory performance monitor samples on startup / 启动时清空内存性能采样"
     )]
     monitor_clear: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_parser = ["en", "zh"],
+        help = "CLI language: en or zh / CLI 语言：en 或 zh"
+    )]
+    lang: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -323,8 +333,15 @@ enum XdpCommands {
         #[arg(long)]
         ready_file: Option<PathBuf>,
     },
-}
 
+    /// Interactive XDP configuration wizard / XDP 交互式配置向导
+    #[command(name = "configure")]
+    Configure {
+        /// Force language: en or zh / 强制语言
+        #[arg(long, value_parser = ["en", "zh"])]
+        lang: Option<String>,
+    },
+}
 fn spawn_staggered<F>(rt: &tokio::runtime::Runtime, delay: Duration, task: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -399,10 +416,10 @@ fn prompt_ntp_timezone() -> anyhow::Result<Option<String>> {
 
     let current = cloud_node_rust::utils::ntp::detect_system_timezone()
         .unwrap_or_else(|| "Asia/Shanghai".to_string());
-    println!("CloudNode NTP");
-    println!("  current timezone: {}", current);
-    println!("  press Enter to keep current, or type a timezone such as Asia/Shanghai");
-    let timezone = prompt_text("Timezone", &current)?;
+    println!("{}", t("ntp.title"));
+    println!("  {}: {}", t("ntp.current_timezone"), current);
+    println!("  {}", t("ntp.keep_timezone"));
+    let timezone = prompt_text(t("ntp.timezone_prompt"), &current)?;
     if timezone == current {
         Ok(None)
     } else {
@@ -459,18 +476,24 @@ fn run_zerocopy_command(enable: bool, disable: bool, yes: bool) -> anyhow::Resul
     let path = api_config_existing_path()?;
     let config = ApiConfig::load(&path)?;
     let current = config.relay.normalized();
-    println!("CloudNode zero-copy relay");
-    println!("  config:            {}", path.display());
+    println!("{}", t("zerocopy.title"));
     println!(
-        "  current zero-copy: {}",
+        "  {:<18} {}",
+        format!("{}:", t("zerocopy.config")),
+        path.display()
+    );
+    println!(
+        "  {:<18} {}",
+        format!("{}:", t("zerocopy.current")),
         if current.zero_copy {
-            "enabled"
+            t("common.enabled")
         } else {
-            "disabled"
+            t("common.disabled")
         }
     );
     println!(
-        "  copy buffer:       auto (current {} bytes)",
+        "  {:<18} auto (current {} bytes)",
+        format!("{}:", t("zerocopy.copy_buffer")),
         cloud_node_rust::memory_governor::MEMORY_GOVERNOR.relay_copy_buffer_bytes()
     );
 
@@ -488,23 +511,28 @@ fn run_zerocopy_command(enable: bool, disable: bool, yes: bool) -> anyhow::Resul
     };
 
     let Some(zero_copy) = requested_zero_copy else {
-        println!("No change requested. Use --enable or --disable in non-interactive mode.");
+        println!("{}", t("zerocopy.no_change"));
         return Ok(());
     };
 
     println!(
-        "  new zero-copy:     {}",
-        if zero_copy { "enabled" } else { "disabled" }
+        "  {:<18} {}",
+        format!("{}:", t("zerocopy.new")),
+        if zero_copy {
+            t("common.enabled")
+        } else {
+            t("common.disabled")
+        }
     );
-    println!("  copy buffer:       auto");
+    println!("  {:<18} auto", format!("{}:", t("zerocopy.copy_buffer")));
 
-    if !yes && (enable || disable) && !prompt_yes_no("Write this relay configuration?", true)? {
+    if !yes && (enable || disable) && !prompt_yes_no(t("zerocopy.confirm_write"), true)? {
         anyhow::bail!("zero-copy configuration aborted");
     }
 
     write_relay_config(&path, zero_copy)?;
-    println!("Relay configuration updated.");
-    println!("Restart cloud-node for running listeners to use the new relay mode.");
+    println!("{}", t("zerocopy.updated"));
+    println!("{}", t("zerocopy.restart"));
     Ok(())
 }
 
@@ -529,13 +557,13 @@ fn run_firewall_command(command: FirewallCommands) -> anyhow::Result<()> {
                 .enable_all()
                 .build()?;
             rt.block_on(cloud_node_rust::firewall::kernel::ensure_nftables())?;
-            println!("nftables initialized: table=inet cloud_node sets=blocked_v4,blocked_v6");
+            println!("{}", t("firewall.initialized"));
         }
         FirewallCommands::Gc => {
             let now = cloud_node_rust::utils::time::now_timestamp();
             let removed = cloud_node_rust::firewall::persistence::cleanup_expired(now);
             let _ = cloud_node_rust::firewall::persistence::flush_pending();
-            println!("firewall gc removed {} expired RocksDB records", removed);
+            println!("{}: {}", t("firewall.gc_removed"), removed);
         }
         FirewallCommands::List {
             aggregate_threshold,
@@ -654,6 +682,12 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             ))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        XdpCommands::Configure { lang } => {
+            if let Some(lang) = lang.as_deref().and_then(Language::parse) {
+                Language::set_current(lang);
+            }
+            let _ = XdpConfigWizard::run_interactive()?;
+        }
     }
     Ok(())
 }
@@ -665,14 +699,35 @@ fn print_xdp_status() {
         cloud_node_rust::xdp::persisted_status_snapshot()
             .unwrap_or_else(cloud_node_rust::xdp::status_snapshot)
     };
-    println!("CloudNode XDP status");
-    println!("  enabled:       {}", xdp_yes_no(status.enabled));
-    println!("  available:     {}", xdp_yes_no(status.available));
-    println!("  attached:      {}", xdp_yes_no(status.attached));
-    println!("  attach mode:   {}", status.attach_mode);
-    println!("  fallback:      {}", status.fallback);
+    println!("{}", t("xdp.status.title"));
     println!(
-        "  fallback why:  {}",
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.enabled")),
+        xdp_yes_no(status.enabled)
+    );
+    println!(
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.available")),
+        xdp_yes_no(status.available)
+    );
+    println!(
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.attached")),
+        xdp_yes_no(status.attached)
+    );
+    println!(
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.attach_mode")),
+        status.attach_mode
+    );
+    println!(
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.fallback")),
+        status.fallback
+    );
+    println!(
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.fallback_why")),
         if status.fallback_reason.is_empty() {
             "-"
         } else {
@@ -680,20 +735,32 @@ fn print_xdp_status() {
         }
     );
     println!(
-        "  proxy ports:   {} supported={} unsupported={}",
-        status.proxy_ports, status.proxy_supported_ports, status.proxy_unsupported_ports
+        "  {:<14} {} {}={} {}={}",
+        format!("{}:", t("xdp.status.proxy_ports")),
+        status.proxy_ports,
+        t("xdp.status.supported"),
+        status.proxy_supported_ports,
+        t("xdp.status.unsupported"),
+        status.proxy_unsupported_ports
     );
-    println!("  proxy ready:   {}", xdp_yes_no(status.proxy_ready));
     println!(
-        "  redirect:      {}",
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.proxy_ready")),
+        xdp_yes_no(status.proxy_ready)
+    );
+    println!(
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.redirect")),
         xdp_yes_no(status.proxy_redirect_enabled)
     );
     println!(
-        "  tcp dataplane: {}",
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.tcp_dataplane")),
         xdp_yes_no(status.tcp_dataplane_ready)
     );
     println!(
-        "  tcp why:       {}",
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.tcp_why")),
         if status.tcp_dataplane_detail.is_empty() {
             "-"
         } else {
@@ -701,7 +768,8 @@ fn print_xdp_status() {
         }
     );
     println!(
-        "  proxy why:     {}",
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.proxy_why")),
         if status.proxy_fallback_reason.is_empty() {
             "-"
         } else {
@@ -709,12 +777,19 @@ fn print_xdp_status() {
         }
     );
     println!(
-        "  xsk queues:    configured={} ready={}",
-        status.xsk_configured_queues, status.xsk_ready_queues
+        "  {:<14} configured={} ready={}",
+        format!("{}:", t("xdp.status.xsk_queues")),
+        status.xsk_configured_queues,
+        status.xsk_ready_queues
     );
-    println!("  eBPF object:   {}", status.ebpf_object);
     println!(
-        "  maps:          block_v4={} block_v6={} allow_v4={} allow_v6={} block_nets={} allow_nets={} block_ranges={} allow_ranges={}",
+        "  {:<14} {}",
+        format!("{}:", t("xdp.status.ebpf_object")),
+        status.ebpf_object
+    );
+    println!(
+        "  {:<14} block_v4={} block_v6={} allow_v4={} allow_v6={} block_nets={} allow_nets={} block_ranges={} allow_ranges={}",
+        format!("{}:", t("xdp.status.maps")),
         status.exact_blocked_v4,
         status.exact_blocked_v6,
         status.exact_allowed_v4,
@@ -725,7 +800,8 @@ fn print_xdp_status() {
         status.allowed_ranges
     );
     println!(
-        "  counters:      packets={} pass={} drop={} redirect={} parse_errors={} map_miss={} xsk_drops={}",
+        "  {:<14} packets={} pass={} drop={} redirect={} parse_errors={} map_miss={} xsk_drops={}",
+        format!("{}:", t("xdp.status.counters")),
         status.packets,
         status.pass,
         status.drop,
@@ -735,11 +811,12 @@ fn print_xdp_status() {
         status.xsk_drops
     );
     if status.interfaces.is_empty() {
-        println!("  interfaces:    -");
+        println!("  {:<14} -", format!("{}:", t("xdp.status.interfaces")));
     } else {
         for interface in status.interfaces {
             println!(
-                "  interface:     {} mode={} queues={:?} attached={} xsk_ready={} frameSize={} detail={}",
+                "  {:<14} {} mode={} queues={:?} attached={} xsk_ready={} frameSize={} detail={}",
+                format!("{}:", t("xdp.status.interface")),
                 interface.name,
                 interface.mode,
                 interface.queues,
@@ -750,7 +827,8 @@ fn print_xdp_status() {
             );
             for queue in interface.xsk_queues {
                 println!(
-                    "    xsk queue:   {}:{} configured={} socket={} registered={} ready={} detail={}",
+                    "    {:<12} {}:{} configured={} socket={} registered={} ready={} detail={}",
+                    format!("{}:", t("xdp.status.xsk_queue")),
                     queue.interface,
                     queue.queue,
                     xdp_yes_no(queue.configured),
@@ -765,7 +843,11 @@ fn print_xdp_status() {
 }
 
 fn xdp_yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+    if value {
+        t("common.yes")
+    } else {
+        t("common.no")
+    }
 }
 
 fn print_defense_status() {
@@ -774,9 +856,17 @@ fn print_defense_status() {
     let metrics = cloud_node_rust::l4_defense::metrics_snapshot();
     let pressure = cloud_node_rust::l4_defense::current_pressure_level();
 
-    println!("CloudNode L4 defense status");
-    println!("  runtime scope:      current process snapshot");
-    println!("  effective pressure: {}", pressure.as_str());
+    println!("{}", t("defense.title"));
+    println!(
+        "  {:<20} {}",
+        format!("{}:", t("defense.runtime_scope")),
+        t("defense.current_snapshot")
+    );
+    println!(
+        "  {:<20} {}",
+        format!("{}:", t("defense.effective_pressure")),
+        pressure.as_str()
+    );
     println!(
         "  syn pressure:       level={} listen_overflows={} listen_drops={} syncookies={} req_q_full_do_cookies={} req_q_full_drop={}",
         syn.pressure_level.as_str(),
@@ -862,11 +952,15 @@ fn run_firewall_list(aggregate_threshold: usize, no_aggregate: bool) -> anyhow::
         exact.entry(*ip).or_default().blacklist = true;
     }
 
-    println!("CloudNode firewall blacklist");
-    println!("  nftables exact IPs: {}", nf_ips.len());
-    println!("  blacklist exact IPs: {}", black_ips.len());
-    println!("  blacklist CIDR/range targets: {}", black_targets.len());
-    println!("  expired RocksDB records cleaned: {}", expired_cleaned);
+    println!("{}", t("firewall.title"));
+    println!("  {}: {}", t("firewall.nft_exact"), nf_ips.len());
+    println!("  {}: {}", t("firewall.blacklist_exact"), black_ips.len());
+    println!(
+        "  {}: {}",
+        t("firewall.blacklist_targets"),
+        black_targets.len()
+    );
+    println!("  {}: {}", t("firewall.expired_cleaned"), expired_cleaned);
     println!();
 
     let aggregate = !no_aggregate && exact.len() > aggregate_threshold.max(1);
@@ -878,9 +972,9 @@ fn run_firewall_list(aggregate_threshold: usize, no_aggregate: bool) -> anyhow::
 
     if !black_targets.is_empty() {
         println!();
-        println!("Blacklist CIDR/range targets");
+        println!("{}", t("firewall.targets_header"));
         for target in black_targets {
-            println!("{}\tnf拉黑=-\t黑名单=是", target);
+            println!("{}\tnftables=-\tblacklist={}", target, yes_no(true));
         }
     }
 
@@ -913,7 +1007,7 @@ fn print_firewall_exact_rows(exact: &BTreeMap<IpAddr, FirewallListFlags>) {
         }
         printed = true;
         println!("{}", label);
-        println!("IP\tnf拉黑\t黑名单");
+        println!("{}", t("firewall.ip_header"));
         for (ip, flags) in rows {
             println!(
                 "{}\t{}\t{}",
@@ -925,7 +1019,7 @@ fn print_firewall_exact_rows(exact: &BTreeMap<IpAddr, FirewallListFlags>) {
         println!();
     }
     if !printed {
-        println!("No exact IP entries found.");
+        println!("{}", t("firewall.no_entries"));
     }
 }
 
@@ -941,8 +1035,8 @@ fn print_firewall_aggregates(exact: &BTreeMap<IpAddr, FirewallListFlags>) {
     }
 
     if !v4.is_empty() {
-        println!("IPv4 /24 aggregates");
-        println!("CIDR\t总数\tnf拉黑\t黑名单\t两者都有");
+        println!("{}", t("firewall.v4_aggregates"));
+        println!("{}", t("firewall.aggregate_header"));
         for (network, stats) in v4 {
             println!(
                 "{}/24\t{}\t{}\t{}\t{}",
@@ -953,8 +1047,8 @@ fn print_firewall_aggregates(exact: &BTreeMap<IpAddr, FirewallListFlags>) {
     }
 
     if !v6.is_empty() {
-        println!("IPv6 /48 aggregates");
-        println!("CIDR\t总数\tnf拉黑\t黑名单\t两者都有");
+        println!("{}", t("firewall.v6_aggregates"));
+        println!("{}", t("firewall.aggregate_header"));
         for (network, stats) in v6 {
             println!(
                 "{}/48\t{}\t{}\t{}\t{}",
@@ -990,7 +1084,11 @@ fn v6_48(ip: Ipv6Addr) -> Ipv6Addr {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value { "是" } else { "否" }
+    if value {
+        t("common.yes")
+    } else {
+        t("common.no")
+    }
 }
 
 fn run_ntp_command(
@@ -1012,7 +1110,7 @@ fn run_ntp_command(
 
     if let Some(timezone) = timezone {
         cloud_node_rust::utils::ntp::set_system_timezone(&timezone)?;
-        println!("System timezone set to {}", timezone);
+        println!("{} {}", t("ntp.timezone_set"), timezone);
     }
     cloud_node_rust::utils::time::init_local_timezone();
 
@@ -1078,6 +1176,7 @@ fn cmdline_contains_management_command(cmdline: &[u8]) -> bool {
                     | "zero-copy"
                     | "firewall"
                     | "defense"
+                    | "xdp"
             )
         })
 }
@@ -1214,14 +1313,11 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
 }
 
 fn stop_running_instance(instance: RunningInstance) -> anyhow::Result<()> {
-    println!("Stopping CloudNode (PID: {})...", instance.pid);
+    println!("{} (PID: {})...", t("stop.stopping"), instance.pid);
     send_signal(instance.pid, libc::SIGTERM)?;
 
     if !wait_for_exit(instance.pid, Duration::from_secs(20)) {
-        eprintln!(
-            "CloudNode did not stop within 20s, forcing shutdown (PID: {})...",
-            instance.pid
-        );
+        eprintln!("{} (PID: {})...", t("stop.force"), instance.pid);
         send_signal(instance.pid, libc::SIGKILL)?;
         if !wait_for_exit(instance.pid, Duration::from_secs(5)) {
             anyhow::bail!(
@@ -1234,7 +1330,7 @@ fn stop_running_instance(instance: RunningInstance) -> anyhow::Result<()> {
     if read_pid(&instance.pid_path) == Some(instance.pid) {
         let _ = fs::remove_file(&instance.pid_path);
     }
-    println!("CloudNode stopped.");
+    println!("{}", t("stop.stopped"));
     Ok(())
 }
 
@@ -1283,7 +1379,10 @@ fn run_systemctl(action: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
 
-    println!("CloudNode is managed by systemd, running: systemctl {action} cloud-node.service");
+    println!(
+        "{}: systemctl {action} cloud-node.service",
+        t("systemd.managed")
+    );
     let status = Command::new("systemctl")
         .arg(action)
         .arg("cloud-node.service")
@@ -1480,7 +1579,7 @@ fn extract_release_binary(archive_path: &Path, target_dir: &Path) -> anyhow::Res
 }
 
 fn prompt_upgrade_confirmation() -> anyhow::Result<bool> {
-    prompt_yes_no("Proceed with upgrade?", false)
+    prompt_yes_no(t("upgrade.proceed"), false)
 }
 
 fn backup_current_binary(
@@ -1524,19 +1623,19 @@ fn restart_after_upgrade(install_binary: &Path) -> anyhow::Result<()> {
         if systemd_service_is_active() {
             run_systemctl("restart")?;
         } else {
-            println!("cloud-node.service is installed but not active; leaving it stopped.");
+            println!("{}", t("upgrade.service_stopped"));
         }
         return Ok(());
     }
 
     if check_running().is_some() {
-        println!("Restarting CloudNode with upgraded binary...");
+        println!("{}", t("upgrade.restarting"));
         let status = Command::new(install_binary).arg("restart").status()?;
         if !status.success() {
             anyhow::bail!("{} restart failed with {status}", install_binary.display());
         }
     } else {
-        println!("CloudNode is not running; leaving it stopped.");
+        println!("{}", t("upgrade.node_stopped"));
     }
     Ok(())
 }
@@ -1557,21 +1656,48 @@ fn upgrade_binary(options: UpgradeOptions) -> anyhow::Result<()> {
         release_download_url(&options.github_base_url, &options.repo, &version, &asset);
     let download_url = apply_github_mirror(&original_url, options.github_mirror.as_deref());
 
-    println!("CloudNode upgrade summary:");
-    println!("  current version: {}", env!("CARGO_PKG_VERSION"));
-    println!("  target version:  {version}");
-    println!("  repository:      {}", options.repo);
-    println!("  asset:           {asset}");
-    println!("  download URL:    {download_url}");
-    println!("  install binary:  {}", install_binary.display());
-    println!("  backup dir:      {}", options.backup_dir.display());
+    println!("{}", t("upgrade.summary"));
     println!(
-        "  restart:         {}",
-        if options.no_restart { "no" } else { "yes" }
+        "  {:<17} {}",
+        format!("{}:", t("upgrade.current_version")),
+        env!("CARGO_PKG_VERSION")
+    );
+    println!(
+        "  {:<17} {version}",
+        format!("{}:", t("upgrade.target_version"))
+    );
+    println!(
+        "  {:<17} {}",
+        format!("{}:", t("upgrade.repository")),
+        options.repo
+    );
+    println!("  {:<17} {asset}", format!("{}:", t("upgrade.asset")));
+    println!(
+        "  {:<17} {download_url}",
+        format!("{}:", t("upgrade.download_url"))
+    );
+    println!(
+        "  {:<17} {}",
+        format!("{}:", t("upgrade.install_binary")),
+        install_binary.display()
+    );
+    println!(
+        "  {:<17} {}",
+        format!("{}:", t("upgrade.backup_dir")),
+        options.backup_dir.display()
+    );
+    println!(
+        "  {:<17} {}",
+        format!("{}:", t("upgrade.restart")),
+        if options.no_restart {
+            t("common.no")
+        } else {
+            t("common.yes")
+        }
     );
 
     if options.dry_run {
-        println!("Dry run only; no files will be changed.");
+        println!("{}", t("upgrade.dry_run"));
         return Ok(());
     }
 
@@ -1588,20 +1714,20 @@ fn upgrade_binary(options: UpgradeOptions) -> anyhow::Result<()> {
     let archive_path = tmp_dir.join(&asset);
 
     let result = (|| -> anyhow::Result<()> {
-        println!("Downloading release asset...");
+        println!("{}", t("upgrade.downloading"));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         rt.block_on(download_to_file(&download_url, &archive_path))?;
 
-        println!("Extracting release archive...");
+        println!("{}", t("upgrade.extracting"));
         let extracted_binary = extract_release_binary(&archive_path, &tmp_dir)?;
 
         let backup_path = backup_current_binary(&install_binary, &options.backup_dir, &version)?;
-        println!("Previous binary backup: {}", backup_path.display());
+        println!("{}: {}", t("upgrade.backup"), backup_path.display());
 
         replace_binary(&extracted_binary, &install_binary)?;
-        println!("Installed upgraded binary: {}", install_binary.display());
+        println!("{}: {}", t("upgrade.installed"), install_binary.display());
 
         if !options.no_restart {
             restart_after_upgrade(&install_binary)?;
@@ -1695,6 +1821,12 @@ mod upgrade_tests {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let language = cli
+        .lang
+        .as_deref()
+        .and_then(Language::parse)
+        .unwrap_or_else(Language::detect);
+    Language::set_current(language);
 
     match cli.command {
         None => {
@@ -1703,7 +1835,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Start) => {
             if let Some(instance) = check_running() {
-                println!("CloudNode is already running (PID: {})", instance.pid);
+                println!("{} (PID: {})", t("status.already_running"), instance.pid);
                 return Ok(());
             }
 
@@ -1723,7 +1855,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 if pid1 > 0 {
                     // Parent: report and exit
-                    println!("CloudNode started in background (PID: {})", pid1);
+                    println!("{} (PID: {})", t("start.started"), pid1);
                     return Ok(());
                 }
 
@@ -1771,17 +1903,17 @@ fn main() -> anyhow::Result<()> {
                 if let Some(instance) = check_running() {
                     stop_running_instance(instance)?;
                 } else {
-                    println!("CloudNode is not running.");
+                    println!("{}", t("stop.not_running"));
                 }
             }
         }
         Some(Commands::Status) => {
-            println!("CloudNode version: {}", env!("CARGO_PKG_VERSION"));
-            println!("Build time: {}", build_time_display());
+            println!("{}: {}", t("status.version"), env!("CARGO_PKG_VERSION"));
+            println!("{}: {}", t("status.build_time"), build_time_display());
             if let Some(instance) = check_running() {
-                println!("CloudNode is running (PID: {})", instance.pid);
+                println!("{} (PID: {})", t("status.running"), instance.pid);
             } else {
-                println!("CloudNode is stopped.");
+                println!("{}", t("status.stopped"));
             }
         }
         Some(Commands::Restart) => {
@@ -1836,7 +1968,7 @@ fn main() -> anyhow::Result<()> {
                     let _ = fs::set_permissions(bin_path, perms);
                 }
 
-                println!("Successfully registered global command: cloud-node");
+                println!("{}", t("install.global_ok"));
 
                 // 2. Create Systemd service
                 let service_path = "/etc/systemd/system/cloud-node.service";
@@ -1874,14 +2006,12 @@ WantedBy=multi-user.target\n",
                         .arg("enable")
                         .arg("cloud-node")
                         .status();
-                    println!(
-                        "Successfully registered systemd service. You can now use: systemctl start cloud-node"
-                    );
+                    println!("{}", t("install.service_ok"));
                 }
             }
             #[cfg(not(target_os = "linux"))]
             {
-                println!("Install command is currently only supported on Linux.");
+                println!("{}", t("install.linux_only"));
             }
         }
         Some(Commands::Upgrade {
@@ -1935,23 +2065,25 @@ WantedBy=multi-user.target\n",
             run_xdp_command(command)?;
         }
         Some(Commands::Test) => {
-            println!("Testing configuration...");
+            println!("{}", t("test.start"));
             let api_config = ApiConfig::load_default()?;
             let runtime_config = RuntimeConfig::load_default()?;
             let relay = api_config.relay.normalized();
             println!(
-                "Relay zero-copy: {}",
+                "{}: {}",
+                t("test.relay_zero_copy"),
                 if relay.zero_copy {
-                    "enabled"
+                    t("common.enabled")
                 } else {
-                    "disabled"
+                    t("common.disabled")
                 }
             );
             println!(
-                "Relay copy buffer: auto (current {} bytes)",
+                "{}: auto (current {} bytes)",
+                t("test.relay_copy_buffer"),
                 cloud_node_rust::memory_governor::MEMORY_GOVERNOR.relay_copy_buffer_bytes()
             );
-            println!("Runtime mode: {:?}", runtime_config.mode());
+            println!("{}: {:?}", t("test.runtime_mode"), runtime_config.mode());
             println!(
                 "XDP: enabled={} attachMode={} fallback={} interfaces={}",
                 yes_no(runtime_config.xdp.enabled),
@@ -1959,7 +2091,7 @@ WantedBy=multi-user.target\n",
                 runtime_config.xdp.fallback.as_str(),
                 runtime_config.xdp.interfaces.len()
             );
-            println!("Configuration is valid.");
+            println!("{}", t("test.valid"));
         }
     }
     Ok(())
