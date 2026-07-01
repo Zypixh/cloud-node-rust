@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use cloud_node_rust::i18n::{Language, t};
 use cloud_node_rust::xdp_config_wizard::XdpConfigWizard;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::fs;
 use std::future::Future;
 use std::io::{self, IsTerminal};
@@ -126,14 +126,6 @@ struct Cli {
         help = "Clear in-memory performance monitor samples on startup / 启动时清空内存性能采样"
     )]
     monitor_clear: bool,
-
-    #[arg(
-        long,
-        global = true,
-        value_parser = ["en", "zh"],
-        help = "CLI language: en or zh / CLI 语言：en 或 zh"
-    )]
-    lang: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -336,11 +328,7 @@ enum XdpCommands {
 
     /// Interactive XDP configuration wizard / XDP 交互式配置向导
     #[command(name = "configure")]
-    Configure {
-        /// Force language: en or zh / 强制语言
-        #[arg(long, value_parser = ["en", "zh"])]
-        lang: Option<String>,
-    },
+    Configure,
 }
 fn spawn_staggered<F>(rt: &tokio::runtime::Runtime, delay: Duration, task: F)
 where
@@ -682,10 +670,7 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             ))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        XdpCommands::Configure { lang } => {
-            if let Some(lang) = lang.as_deref().and_then(Language::parse) {
-                Language::set_current(lang);
-            }
+        XdpCommands::Configure => {
             let _ = XdpConfigWizard::run_interactive()?;
         }
     }
@@ -1412,6 +1397,14 @@ struct UpgradeOptions {
     no_restart: bool,
 }
 
+const XDP_EBPF_OBJECT_NAME: &str = "cloud-node-xdp-ebpf.o";
+
+#[derive(Debug)]
+struct ExtractedReleasePayload {
+    binary: PathBuf,
+    xdp_ebpf_object: Option<PathBuf>,
+}
+
 fn normalize_release_version(version: &str) -> String {
     let trimmed = version.trim();
     if trimmed.eq_ignore_ascii_case("latest") {
@@ -1557,25 +1550,54 @@ async fn download_to_file(url: &str, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn extract_release_binary(archive_path: &Path, target_dir: &Path) -> anyhow::Result<PathBuf> {
+fn archive_path_parts(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn extract_release_payload(
+    archive_path: &Path,
+    target_dir: &Path,
+) -> anyhow::Result<ExtractedReleasePayload> {
     let archive_file = fs::File::open(archive_path)?;
     let gz = flate2::read::GzDecoder::new(archive_file);
     let mut archive = tar::Archive::new(gz);
     let binary = target_dir.join("cloud-node");
+    let xdp_ebpf_object = target_dir.join(XDP_EBPF_OBJECT_NAME);
+    let mut found_binary = false;
+    let mut found_xdp_ebpf_object = false;
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?;
-        if path.file_name() == Some(OsStr::new("cloud-node")) {
+        let path = entry.path()?.into_owned();
+        let parts = archive_path_parts(&path);
+        if parts == ["cloud-node"] {
             entry.unpack(&binary)?;
             if !binary.is_file() {
                 anyhow::bail!("release archive cloud-node entry is not a regular file");
             }
-            return Ok(binary);
+            found_binary = true;
+        } else if parts == ["data", XDP_EBPF_OBJECT_NAME] {
+            entry.unpack(&xdp_ebpf_object)?;
+            if !xdp_ebpf_object.is_file() {
+                anyhow::bail!("release archive XDP eBPF object entry is not a regular file");
+            }
+            found_xdp_ebpf_object = true;
         }
     }
 
-    anyhow::bail!("release archive does not contain cloud-node");
+    if !found_binary {
+        anyhow::bail!("release archive does not contain cloud-node");
+    }
+
+    Ok(ExtractedReleasePayload {
+        binary,
+        xdp_ebpf_object: found_xdp_ebpf_object.then_some(xdp_ebpf_object),
+    })
 }
 
 fn prompt_upgrade_confirmation() -> anyhow::Result<bool> {
@@ -1615,6 +1637,41 @@ fn replace_binary(source: &Path, install_binary: &Path) -> anyhow::Result<()> {
 
     fs::rename(&new_path, install_binary)?;
     Ok(())
+}
+
+fn runtime_root_for_upgrade(install_binary: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(root) = std::env::var_os("CLOUD_NODE_HOME") {
+        return Ok(PathBuf::from(root));
+    }
+    install_binary
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("install binary has no parent directory"))
+}
+
+fn install_xdp_ebpf_object(
+    source: Option<&Path>,
+    install_binary: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let data_dir = runtime_root_for_upgrade(install_binary)?.join("data");
+    fs::create_dir_all(&data_dir)?;
+    let dest = data_dir.join(XDP_EBPF_OBJECT_NAME);
+    let new_path = data_dir.join(format!("{XDP_EBPF_OBJECT_NAME}.upgrade-new"));
+    fs::copy(source, &new_path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&new_path)?.permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&new_path, perms)?;
+    }
+
+    fs::rename(&new_path, &dest)?;
+    Ok(Some(dest))
 }
 
 fn restart_after_upgrade(install_binary: &Path) -> anyhow::Result<()> {
@@ -1721,13 +1778,17 @@ fn upgrade_binary(options: UpgradeOptions) -> anyhow::Result<()> {
         rt.block_on(download_to_file(&download_url, &archive_path))?;
 
         println!("{}", t("upgrade.extracting"));
-        let extracted_binary = extract_release_binary(&archive_path, &tmp_dir)?;
+        let payload = extract_release_payload(&archive_path, &tmp_dir)?;
 
         let backup_path = backup_current_binary(&install_binary, &options.backup_dir, &version)?;
         println!("{}: {}", t("upgrade.backup"), backup_path.display());
 
-        replace_binary(&extracted_binary, &install_binary)?;
+        replace_binary(&payload.binary, &install_binary)?;
         println!("{}: {}", t("upgrade.installed"), install_binary.display());
+        match install_xdp_ebpf_object(payload.xdp_ebpf_object.as_deref(), &install_binary)? {
+            Some(path) => println!("{}: {}", t("upgrade.xdp_object_installed"), path.display()),
+            None => println!("{}", t("upgrade.xdp_object_missing")),
+        }
 
         if !options.no_restart {
             restart_after_upgrade(&install_binary)?;
@@ -1743,6 +1804,9 @@ fn upgrade_binary(options: UpgradeOptions) -> anyhow::Result<()> {
 #[cfg(test)]
 mod upgrade_tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
 
     #[test]
     fn normalizes_release_versions() {
@@ -1817,16 +1881,60 @@ mod upgrade_tests {
             "cloud-node-rust-linux-arm64-generic.tar.gz"
         );
     }
+
+    #[test]
+    fn extracts_release_payload_with_xdp_object() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "cloud-node-release-payload-test-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        let archive_path = temp_root.join("release.tar.gz");
+        let extract_dir = temp_root.join("extract");
+        fs::create_dir_all(&temp_root).unwrap();
+        fs::create_dir_all(&extract_dir).unwrap();
+
+        let result = (|| -> anyhow::Result<()> {
+            let file = fs::File::create(&archive_path)?;
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+
+            append_test_tar_file(&mut archive, "cloud-node", b"binary")?;
+            append_test_tar_file(&mut archive, "data/cloud-node-xdp-ebpf.o", b"ebpf-object")?;
+            archive.finish()?;
+            let encoder = archive.into_inner()?;
+            encoder.finish()?;
+
+            let payload = extract_release_payload(&archive_path, &extract_dir)?;
+            assert_eq!(fs::read(payload.binary)?, b"binary");
+            let object = payload.xdp_ebpf_object.expect("missing xdp object");
+            assert_eq!(fs::read(object)?, b"ebpf-object");
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&temp_root);
+        result.unwrap();
+    }
+
+    fn append_test_tar_file(
+        archive: &mut tar::Builder<GzEncoder<fs::File>>,
+        path: &str,
+        body: &[u8],
+    ) -> anyhow::Result<()> {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path)?;
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append(&header, body)?;
+        archive.get_mut().flush()?;
+        Ok(())
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let language = cli
-        .lang
-        .as_deref()
-        .and_then(Language::parse)
-        .unwrap_or_else(Language::detect);
-    Language::set_current(language);
+    Language::set_current(Language::detect());
 
     match cli.command {
         None => {

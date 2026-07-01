@@ -58,7 +58,6 @@ Options:
   --install-dir DIR      Runtime working directory. Default: existing runtime dir, or /opt/cloud-node-rust
   --install-binary PATH  Installed Rust binary path. Default: INSTALL_DIR/cloud-node-rust
   --backup-root DIR      Backup root. Default: /var/backups/cloud-node-rust-migration
-  --lang zh|en           Interface language. Default: ask interactively.
   --geoip                Download GeoLite2 mmdb files from P3TERX/GeoLite.mmdb.
   --no-geoip             Do not download GeoLite2 mmdb files.
   --geoip-dir DIR        GeoIP target dir. Default: INSTALL_DIR/data.
@@ -520,6 +519,8 @@ while [ "$#" -gt 0 ]; do
             BACKUP_ROOT="${2:?missing backup root}"
             shift 2
             ;;
+        # Hidden compatibility for older one-line install commands. New usage should
+        # set LANGUAGE=zh or LANGUAGE=en instead of passing a language flag.
         --lang)
             LANGUAGE="${2:?missing language}"
             shift 2

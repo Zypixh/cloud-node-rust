@@ -52,7 +52,7 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `restart`：先停止再启动。
 - `status`：读取 PID 文件和文件锁判断节点状态。
 - `install`：注册 `/usr/bin/cloud-node` wrapper 和 systemd service。
-- `upgrade`：从 GitHub Release 下载匹配当前 CPU/架构的最新版或指定版本，确认后备份并替换当前二进制。
+- `upgrade`：从 GitHub Release 下载匹配当前 CPU/架构的最新版或指定版本，确认后备份并替换当前二进制，同时安装 release 包内的 `data/cloud-node-xdp-ebpf.o`。
 - `ntp`：交互式或非交互式设置系统时区，并按内置 NTP 源校准系统时钟；守护进程自动 NTP 只校准程序内部偏移。
 - `firewall init`：初始化本地 `nftables` table/set/chain/drop rule。
 - `firewall list`：合并展示本地 `nftables` 精确 IP 和 RocksDB 本地运行时黑名单；条目较多时按 IPv4 `/24`、IPv6 `/48` 聚合。

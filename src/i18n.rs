@@ -59,7 +59,6 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "CloudNode - High Performance Cloud Node written in Rust",
         "CloudNode - Rust 编写的高性能云节点",
     ),
-    ("arg.lang", "CLI language: en or zh", "CLI 语言：en 或 zh"),
     (
         "cmd.start",
         "Start the cloud node in background",
@@ -288,6 +287,16 @@ const STRINGS: &[(&str, &str, &str)] = &[
         "upgrade.installed",
         "Installed upgraded binary",
         "已安装升级后的二进制",
+    ),
+    (
+        "upgrade.xdp_object_installed",
+        "Installed XDP eBPF object",
+        "已安装 XDP eBPF 对象",
+    ),
+    (
+        "upgrade.xdp_object_missing",
+        "Release archive does not contain data/cloud-node-xdp-ebpf.o; XDP attach will remain unavailable until the object is installed.",
+        "发布包不包含 data/cloud-node-xdp-ebpf.o；安装该对象前 XDP attach 仍不可用。",
     ),
     // Firewall / defense
     (

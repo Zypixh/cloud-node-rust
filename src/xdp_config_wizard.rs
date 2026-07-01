@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::Path;
 
-use crate::i18n::t;
+use crate::i18n::{Language, t};
 use crate::runtime_mode::{
     RuntimeConfig, XdpAttachMode, XdpConfig, XdpFallbackMode, XdpInterfaceConfig, XdpProxyConfig,
     XdpProxyPortConfig, XdpProxyProtocol, XdpRuntimeMode,
@@ -16,6 +16,7 @@ pub struct XdpConfigWizard {
 
 impl XdpConfigWizard {
     pub fn run_interactive() -> Result<Option<Self>> {
+        prompt_menu_language()?;
         println!("\n{}\n", t("xdp.menu.title"));
 
         let enabled = prompt_yes_no(t("xdp.menu.enable"), true)?;
@@ -52,6 +53,32 @@ impl XdpConfigWizard {
 
     fn save_to_file(&self, path: &str) -> Result<()> {
         save_xdp_config(Path::new(path), &self.xdp)
+    }
+}
+
+fn prompt_menu_language() -> Result<()> {
+    println!("\n选择语言 / Select language");
+    println!("  1. 中文");
+    println!("  2. English");
+
+    let default = match Language::current() {
+        Language::Chinese => "1",
+        Language::English => "2",
+    };
+
+    loop {
+        let choice = prompt_input("请选择 / Select [1-2]", default)?;
+        match choice.trim() {
+            "1" | "zh" | "ZH" | "cn" | "CN" | "中文" => {
+                Language::set_current(Language::Chinese);
+                return Ok(());
+            }
+            "2" | "en" | "EN" | "English" | "english" => {
+                Language::set_current(Language::English);
+                return Ok(());
+            }
+            _ => println!("输入无效，请重试 / Invalid input, please try again"),
+        }
     }
 }
 
