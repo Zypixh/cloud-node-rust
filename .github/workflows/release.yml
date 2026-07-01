@@ -176,6 +176,8 @@ jobs:
           set -euo pipefail
           rustup toolchain install nightly --profile minimal -c rust-src
           rustup run nightly rustc --version
+          cargo +nightly install bpf-linker --version 0.10.3 --locked
+          bpf-linker --version
 
       - name: Build XDP eBPF Object
         shell: bash
