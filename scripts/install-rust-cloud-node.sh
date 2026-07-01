@@ -1412,6 +1412,9 @@ if [ "$DRY_RUN" -eq 0 ]; then
     curl -fL --retry 3 --connect-timeout 20 -o "$TMP_DIR/$ASSET_NAME" "$DOWNLOAD_URL"
     tar -xzf "$TMP_DIR/$ASSET_NAME" -C "$TMP_DIR"
     [ -f "$TMP_DIR/cloud-node" ] || die "release archive does not contain cloud-node"
+    if [ ! -f "$TMP_DIR/data/cloud-node-xdp-ebpf.o" ]; then
+        warn "release archive does not contain data/cloud-node-xdp-ebpf.o; XDP attach will be unavailable until the eBPF object is installed"
+    fi
 else
     log "+ curl -fL --retry 3 --connect-timeout 20 -o $TMP_DIR/$ASSET_NAME $DOWNLOAD_URL"
     log "+ tar -xzf $TMP_DIR/$ASSET_NAME -C $TMP_DIR"
@@ -1422,9 +1425,14 @@ migrate_runtime_layout
 if [ "$DRY_RUN" -eq 0 ]; then
     install -m 0755 "$TMP_DIR/cloud-node" "$INSTALL_BINARY.new"
     mv -f "$INSTALL_BINARY.new" "$INSTALL_BINARY"
+    if [ -f "$TMP_DIR/data/cloud-node-xdp-ebpf.o" ]; then
+        install -m 0644 "$TMP_DIR/data/cloud-node-xdp-ebpf.o" "$INSTALL_DIR/data/cloud-node-xdp-ebpf.o.new"
+        mv -f "$INSTALL_DIR/data/cloud-node-xdp-ebpf.o.new" "$INSTALL_DIR/data/cloud-node-xdp-ebpf.o"
+    fi
 else
     log "+ install -m 0755 $TMP_DIR/cloud-node $INSTALL_BINARY.new"
     log "+ mv -f $INSTALL_BINARY.new $INSTALL_BINARY"
+    log "+ install -m 0644 $TMP_DIR/data/cloud-node-xdp-ebpf.o $INSTALL_DIR/data/cloud-node-xdp-ebpf.o"
 fi
 
 write_api_node_config

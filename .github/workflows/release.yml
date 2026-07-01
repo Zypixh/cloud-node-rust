@@ -170,17 +170,33 @@ jobs:
           
           cargo build --release --target ${{ matrix.target }}
 
+      - name: Install eBPF Toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly --profile minimal -c rust-src
+          rustup run nightly rustc --version
+
+      - name: Build XDP eBPF Object
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo xtask build-ebpf
+          test -s data/cloud-node-xdp-ebpf.o
+
       - name: Package
         shell: bash
         run: |
+          set -euo pipefail
           ORIGINAL_BINARY="cloud-node-rust"
           TARGET_BINARY="cloud-node"
           PACKAGE_NAME="cloud-node-rust-${{ matrix.name }}"
           
-          mkdir -p dist
+          mkdir -p dist/data
           cp target/${{ matrix.target }}/release/$ORIGINAL_BINARY dist/$TARGET_BINARY
+          cp data/cloud-node-xdp-ebpf.o dist/data/cloud-node-xdp-ebpf.o
           cd dist
-          tar -czf ../$PACKAGE_NAME.tar.gz $TARGET_BINARY
+          tar -czf ../$PACKAGE_NAME.tar.gz $TARGET_BINARY data/cloud-node-xdp-ebpf.o
           cd ..
 
       - name: Upload Artifacts
