@@ -606,7 +606,7 @@ impl XdpManager {
             ));
             tracing::warn!("failed to disable AF_XDP proxy redirect maps: {}", err);
         }
-        self.persist_status();
+        self.persist_status_now();
     }
 
     #[cfg(target_os = "linux")]
@@ -772,7 +772,7 @@ impl XdpManager {
         self.proxy_redirect_enabled.store(true, Ordering::Relaxed);
         self.set_proxy_fallback_reason(xdp_proxy_partial_detail(&self.config));
         self.set_tcp_dataplane_detail(xdp_tcp_dataplane_detail(&self.config));
-        self.persist_status();
+        self.persist_status_now();
         Ok(true)
     }
 
@@ -946,17 +946,39 @@ impl XdpManager {
 
     fn persist_status(&self) {
         let now = crate::utils::time::now_timestamp() as u64;
-        let last = self.last_state_write_at.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < XDP_STATE_WRITE_INTERVAL_SECS {
+        if !self.claim_status_write_slot(now, false) {
             return;
+        }
+        self.write_status_snapshot();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persist_status_now(&self) {
+        let now = crate::utils::time::now_timestamp() as u64;
+        self.claim_status_write_slot(now, true);
+        self.write_status_snapshot();
+    }
+
+    fn claim_status_write_slot(&self, now: u64, force: bool) -> bool {
+        let last = self.last_state_write_at.load(Ordering::Relaxed);
+        if !force && now.saturating_sub(last) < XDP_STATE_WRITE_INTERVAL_SECS {
+            return false;
+        }
+        if force {
+            self.last_state_write_at.store(now, Ordering::Relaxed);
+            return true;
         }
         if self
             .last_state_write_at
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
-            return;
+            return false;
         }
+        true
+    }
+
+    fn write_status_snapshot(&self) {
         let paths = crate::paths::NodePaths::current();
         let path = paths.xdp_state_file();
         let status = self.status();
@@ -5699,7 +5721,7 @@ pub mod af_xdp {
                     0,
                 );
                 manager.set_proxy_fallback_reason(&message);
-                manager.persist_status();
+                manager.persist_status_now();
                 return;
             }
             Err(err) => {
@@ -7521,6 +7543,19 @@ mod tests {
         let status = manager.status();
         assert!(status.proxy_ready);
         assert!(status.proxy_redirect_enabled);
+    }
+
+    #[test]
+    fn xdp_status_force_write_bypasses_rate_limit() {
+        let manager = XdpManager::new(XdpConfig::default());
+
+        assert!(manager.claim_status_write_slot(100, false));
+        assert!(!manager.claim_status_write_slot(105, false));
+        assert_eq!(manager.last_state_write_at.load(Ordering::Relaxed), 100);
+
+        assert!(manager.claim_status_write_slot(105, true));
+        assert_eq!(manager.last_state_write_at.load(Ordering::Relaxed), 105);
+        assert!(!manager.claim_status_write_slot(106, false));
     }
 
     #[test]
