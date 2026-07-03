@@ -1428,11 +1428,22 @@ struct UpgradeOptions {
 }
 
 const XDP_EBPF_OBJECT_NAME: &str = "cloud-node-xdp-ebpf.o";
+#[cfg(target_os = "linux")]
+const CLOUD_NODE_SYSTEMD_SERVICE: &str = "cloud-node.service";
+#[cfg(target_os = "linux")]
+const CLOUD_NODE_SYSTEMD_SERVICE_PATH: &str = "/etc/systemd/system/cloud-node.service";
+const CLOUD_NODE_WRAPPER_PATH: &str = "/usr/bin/cloud-node";
 
 #[derive(Debug)]
 struct ExtractedReleasePayload {
     binary: PathBuf,
     xdp_ebpf_object: Option<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct XdpObjectRepair {
+    source: PathBuf,
+    dest: PathBuf,
 }
 
 fn normalize_release_version(version: &str) -> String {
@@ -1669,9 +1680,185 @@ fn replace_binary(source: &Path, install_binary: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn runtime_root_for_upgrade(install_binary: &Path) -> anyhow::Result<PathBuf> {
-    if let Some(root) = std::env::var_os("CLOUD_NODE_HOME") {
-        return Ok(PathBuf::from(root));
+fn runtime_dir_candidate(path: &Path) -> bool {
+    path != Path::new("/") && (path.join("configs").exists() || path.join("data").exists())
+}
+
+fn normalize_config_path(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unquoted = if trimmed.len() >= 2 {
+        let first = trimmed.as_bytes()[0] as char;
+        let last = trimmed.as_bytes()[trimmed.len() - 1] as char;
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            &trimmed[1..trimmed.len() - 1]
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+    let unquoted = unquoted.trim();
+    (!unquoted.is_empty()).then(|| PathBuf::from(unquoted))
+}
+
+fn split_config_words(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in value.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(quote_char) = quote {
+            if ch == quote_char {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words
+}
+
+fn service_env_cloud_node_home_from_text(service: &str) -> Option<PathBuf> {
+    for line in service.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("Environment=") else {
+            continue;
+        };
+        for word in split_config_words(rest) {
+            if let Some(value) = word.strip_prefix("CLOUD_NODE_HOME=") {
+                return normalize_config_path(value);
+            }
+        }
+    }
+    None
+}
+
+fn service_working_directory_from_text(service: &str) -> Option<PathBuf> {
+    for line in service.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("WorkingDirectory=") else {
+            continue;
+        };
+        if let Some(first_word) = split_config_words(rest).into_iter().next() {
+            return normalize_config_path(&first_word);
+        }
+        return normalize_config_path(rest);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn cloud_node_service_text() -> Option<String> {
+    if let Ok(output) = Command::new("systemctl")
+        .arg("cat")
+        .arg(CLOUD_NODE_SYSTEMD_SERVICE)
+        .output()
+        && output.status.success()
+        && !output.stdout.is_empty()
+    {
+        return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    fs::read_to_string(CLOUD_NODE_SYSTEMD_SERVICE_PATH).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cloud_node_service_text() -> Option<String> {
+    None
+}
+
+fn parse_script_cd_workdir(script: &str) -> Option<PathBuf> {
+    for line in script.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("cd") else {
+            continue;
+        };
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let mut value = rest.trim_start();
+        if let Some((before, _)) = value.split_once("&&") {
+            value = before;
+        }
+        if let Some((before, _)) = value.split_once(';') {
+            value = before;
+        }
+        return normalize_config_path(value);
+    }
+    None
+}
+
+fn script_cd_workdir(path: &Path) -> Option<PathBuf> {
+    let script = fs::read_to_string(path).ok()?;
+    let dir = parse_script_cd_workdir(&script)?;
+    if !dir.is_dir() {
+        return None;
+    }
+    fs::canonicalize(&dir).ok().or(Some(dir))
+}
+
+fn runtime_root_from_inputs(
+    cloud_node_home: Option<PathBuf>,
+    service_env_home: Option<PathBuf>,
+    service_workdir: Option<PathBuf>,
+    wrapper_workdir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    install_binary: &Path,
+) -> anyhow::Result<PathBuf> {
+    if let Some(root) = cloud_node_home {
+        return Ok(root);
+    }
+    if let Some(root) = service_env_home {
+        return Ok(root);
+    }
+    if let Some(root) = service_workdir {
+        return Ok(root);
+    }
+    if let Some(root) = wrapper_workdir {
+        return Ok(root);
+    }
+    if let Some(root) = cwd
+        && runtime_dir_candidate(&root)
+    {
+        return Ok(root);
     }
     install_binary
         .parent()
@@ -1679,14 +1866,27 @@ fn runtime_root_for_upgrade(install_binary: &Path) -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("install binary has no parent directory"))
 }
 
-fn install_xdp_ebpf_object(
-    source: Option<&Path>,
-    install_binary: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
-    let Some(source) = source else {
-        return Ok(None);
-    };
-    let data_dir = runtime_root_for_upgrade(install_binary)?.join("data");
+fn runtime_root_for_upgrade(install_binary: &Path) -> anyhow::Result<PathBuf> {
+    let service_text = cloud_node_service_text();
+    runtime_root_from_inputs(
+        std::env::var_os("CLOUD_NODE_HOME").map(PathBuf::from),
+        service_text
+            .as_deref()
+            .and_then(service_env_cloud_node_home_from_text),
+        service_text
+            .as_deref()
+            .and_then(service_working_directory_from_text),
+        script_cd_workdir(Path::new(CLOUD_NODE_WRAPPER_PATH)),
+        std::env::current_dir().ok(),
+        install_binary,
+    )
+}
+
+fn install_xdp_ebpf_object_to_runtime(
+    source: &Path,
+    runtime_root: &Path,
+) -> anyhow::Result<PathBuf> {
+    let data_dir = runtime_root.join("data");
     fs::create_dir_all(&data_dir)?;
     let dest = data_dir.join(XDP_EBPF_OBJECT_NAME);
     let new_path = data_dir.join(format!("{XDP_EBPF_OBJECT_NAME}.upgrade-new"));
@@ -1701,7 +1901,78 @@ fn install_xdp_ebpf_object(
     }
 
     fs::rename(&new_path, &dest)?;
-    Ok(Some(dest))
+    Ok(dest)
+}
+
+fn install_xdp_ebpf_object(
+    source: Option<&Path>,
+    install_binary: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let runtime_root = runtime_root_for_upgrade(install_binary)?;
+    install_xdp_ebpf_object_to_runtime(source, &runtime_root).map(Some)
+}
+
+fn repair_missing_xdp_ebpf_object(
+    runtime_root: &Path,
+    install_binary: &Path,
+    cwd: &Path,
+) -> anyhow::Result<Option<XdpObjectRepair>> {
+    let dest = runtime_root.join("data").join(XDP_EBPF_OBJECT_NAME);
+    if dest.is_file() {
+        return Ok(None);
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(binary_parent) = install_binary.parent() {
+        candidates.push(binary_parent.join("data").join(XDP_EBPF_OBJECT_NAME));
+    }
+    candidates.push(PathBuf::from("/usr/bin/data").join(XDP_EBPF_OBJECT_NAME));
+    candidates.push(cwd.join("data").join(XDP_EBPF_OBJECT_NAME));
+
+    for source in candidates {
+        if source == dest || !source.is_file() {
+            continue;
+        }
+        let repaired_dest = install_xdp_ebpf_object_to_runtime(&source, runtime_root)?;
+        return Ok(Some(XdpObjectRepair {
+            source,
+            dest: repaired_dest,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn repair_missing_xdp_ebpf_object_for_current_runtime(
+    node_paths: &cloud_node_rust::paths::NodePaths,
+) {
+    let dest = node_paths.data_dir().join(XDP_EBPF_OBJECT_NAME);
+    if dest.is_file() {
+        return;
+    }
+
+    let install_binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cloud-node"));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match repair_missing_xdp_ebpf_object(node_paths.runtime_root(), &install_binary, &cwd) {
+        Ok(Some(repair)) => warn!(
+            "XDP eBPF object was missing at {}; copied misplaced object from {}",
+            repair.dest.display(),
+            repair.source.display()
+        ),
+        Ok(None) => warn!(
+            "XDP eBPF object missing at {}; no misplaced copy found in binary data dir, /usr/bin/data, or current working directory data dir; install {} before enabling XDP",
+            dest.display(),
+            XDP_EBPF_OBJECT_NAME
+        ),
+        Err(err) => warn!(
+            "XDP eBPF object repair failed for {}: {}",
+            dest.display(),
+            err
+        ),
+    }
 }
 
 fn restart_after_upgrade(install_binary: &Path) -> anyhow::Result<()> {
@@ -1944,6 +2215,178 @@ mod upgrade_tests {
 
         let _ = fs::remove_dir_all(&temp_root);
         result.unwrap();
+    }
+
+    #[test]
+    fn parses_service_and_wrapper_runtime_paths() {
+        let service = r#"
+[Service]
+Environment="FOO=bar" "CLOUD_NODE_HOME=/srv/cloud node" BAZ=qux
+WorkingDirectory='/opt/cloud-node'
+"#;
+        assert_eq!(
+            service_env_cloud_node_home_from_text(service),
+            Some(PathBuf::from("/srv/cloud node"))
+        );
+        assert_eq!(
+            service_working_directory_from_text(service),
+            Some(PathBuf::from("/opt/cloud-node"))
+        );
+        assert_eq!(
+            parse_script_cd_workdir(
+                "#!/bin/bash\ncd \"/var/lib/cloud-node\" && exec /var/lib/cloud-node/cloud-node \"$@\"\n"
+            ),
+            Some(PathBuf::from("/var/lib/cloud-node"))
+        );
+    }
+
+    #[test]
+    fn runtime_root_priority_matches_upgrade_runtime() {
+        let temp_root = test_temp_root("runtime-root-priority");
+        let result = (|| -> anyhow::Result<()> {
+            let home = temp_root.join("home");
+            let service_env = temp_root.join("service-env");
+            let service_workdir = temp_root.join("service-workdir");
+            let wrapper_workdir = temp_root.join("wrapper-workdir");
+            let cwd = temp_root.join("cwd");
+            let empty_cwd = temp_root.join("empty-cwd");
+            let bin_dir = temp_root.join("bin");
+            let install_binary = bin_dir.join("cloud-node");
+            fs::create_dir_all(cwd.join("configs"))?;
+            fs::create_dir_all(&empty_cwd)?;
+            fs::create_dir_all(&bin_dir)?;
+
+            assert_eq!(
+                runtime_root_from_inputs(
+                    Some(home.clone()),
+                    Some(service_env.clone()),
+                    Some(service_workdir.clone()),
+                    Some(wrapper_workdir.clone()),
+                    Some(cwd.clone()),
+                    &install_binary
+                )?,
+                home
+            );
+            assert_eq!(
+                runtime_root_from_inputs(
+                    None,
+                    Some(service_env.clone()),
+                    Some(service_workdir.clone()),
+                    Some(wrapper_workdir.clone()),
+                    Some(cwd.clone()),
+                    &install_binary
+                )?,
+                service_env
+            );
+            assert_eq!(
+                runtime_root_from_inputs(
+                    None,
+                    None,
+                    Some(service_workdir.clone()),
+                    Some(wrapper_workdir.clone()),
+                    Some(cwd.clone()),
+                    &install_binary
+                )?,
+                service_workdir
+            );
+            assert_eq!(
+                runtime_root_from_inputs(
+                    None,
+                    None,
+                    None,
+                    Some(wrapper_workdir.clone()),
+                    Some(cwd.clone()),
+                    &install_binary
+                )?,
+                wrapper_workdir
+            );
+            assert_eq!(
+                runtime_root_from_inputs(None, None, None, None, Some(cwd), &install_binary)?,
+                temp_root.join("cwd")
+            );
+            assert_eq!(
+                runtime_root_from_inputs(None, None, None, None, Some(empty_cwd), &install_binary)?,
+                bin_dir
+            );
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&temp_root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn usr_bin_install_uses_discovered_runtime_root_for_xdp_object() {
+        let temp_root = test_temp_root("usr-bin-xdp-object");
+        let result = (|| -> anyhow::Result<()> {
+            let runtime_root = temp_root.join("runtime");
+            let cwd = temp_root.join("cwd");
+            fs::create_dir_all(runtime_root.join("data"))?;
+            fs::create_dir_all(&cwd)?;
+
+            let resolved = runtime_root_from_inputs(
+                None,
+                None,
+                None,
+                Some(runtime_root.clone()),
+                Some(cwd),
+                Path::new("/usr/bin/cloud-node"),
+            )?;
+            assert_eq!(resolved, runtime_root);
+            assert_ne!(resolved, PathBuf::from("/usr/bin"));
+
+            let source = temp_root.join(XDP_EBPF_OBJECT_NAME);
+            fs::write(&source, b"ebpf-object")?;
+            let dest = install_xdp_ebpf_object_to_runtime(&source, &resolved)?;
+            assert_eq!(
+                dest,
+                temp_root.join("runtime/data").join(XDP_EBPF_OBJECT_NAME)
+            );
+            assert_eq!(fs::read(dest)?, b"ebpf-object");
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&temp_root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn repairs_missing_xdp_object_from_misplaced_binary_data_dir() {
+        let temp_root = test_temp_root("repair-xdp-object");
+        let result = (|| -> anyhow::Result<()> {
+            let runtime_root = temp_root.join("runtime");
+            let bin_dir = temp_root.join("bin");
+            let cwd = temp_root.join("cwd");
+            let install_binary = bin_dir.join("cloud-node");
+            let misplaced = bin_dir.join("data").join(XDP_EBPF_OBJECT_NAME);
+            fs::create_dir_all(misplaced.parent().unwrap())?;
+            fs::create_dir_all(&cwd)?;
+            fs::write(&misplaced, b"misplaced-ebpf-object")?;
+
+            let repair = repair_missing_xdp_ebpf_object(&runtime_root, &install_binary, &cwd)?
+                .expect("expected repair from binary data dir");
+            assert_eq!(repair.source, misplaced);
+            assert_eq!(
+                repair.dest,
+                runtime_root.join("data").join(XDP_EBPF_OBJECT_NAME)
+            );
+            assert_eq!(fs::read(repair.dest)?, b"misplaced-ebpf-object");
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&temp_root);
+        result.unwrap();
+    }
+
+    fn test_temp_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("cloud-node-{name}-{}-{nanos}", std::process::id()))
     }
 
     fn append_test_tar_file(
@@ -2427,6 +2870,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         info!("Standalone runtime mode enabled.");
     }
     RuntimeConfig::set_current(runtime_config.clone());
+    repair_missing_xdp_ebpf_object_for_current_runtime(&node_paths);
     if let Err(err) = rt.block_on(cloud_node_rust::xdp::initialize_from_runtime()) {
         if runtime_config.xdp.fallback.fail_start() {
             return Err(err.context("XDP initialization failed"));
