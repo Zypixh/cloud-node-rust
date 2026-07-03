@@ -1586,6 +1586,7 @@ fn doctor_report_for_config(config: &XdpConfig) -> String {
             ));
         }
     }
+    lines.extend(crate::xdp_netdev_tuning::doctor_lines_for_config(config));
     #[cfg(not(target_os = "linux"))]
     lines.push("  issue:         XDP attach is supported on Linux only".to_string());
     lines.join("\n")
@@ -5673,26 +5674,61 @@ pub mod af_xdp {
         let mut frames = Vec::with_capacity(64);
 
         match manager.enable_proxy_redirect("AF_XDP proxy bridge") {
-            Ok(true) => {}
-            Ok(false) => {
-                manager.set_proxy_fallback_reason(
-                    "AF_XDP proxy bridge did not enable redirect; sockets are not ready or proxy ports are empty, traffic will PASS",
+            Ok(true) => {
+                let message = format!(
+                    "AF_XDP proxy bridge enabled redirect for {} configured proxy ports",
+                    manager.config.proxy.ports.len()
                 );
+                tracing::info!("{message}");
+                crate::logging::report_node_log(
+                    "info".to_string(),
+                    "xdp_proxy".to_string(),
+                    message,
+                    0,
+                );
+            }
+            Ok(false) => {
+                let message =
+                    "AF_XDP proxy bridge did not enable redirect; sockets are not ready or proxy ports are empty, traffic will PASS"
+                        .to_string();
+                tracing::warn!("{message}");
+                crate::logging::report_node_log(
+                    "warn".to_string(),
+                    "xdp_proxy".to_string(),
+                    message.clone(),
+                    0,
+                );
+                manager.set_proxy_fallback_reason(&message);
                 manager.persist_status();
                 return;
             }
             Err(err) => {
-                manager.disable_proxy_redirect_for_fallback(format!(
+                let message = format!(
                     "AF_XDP proxy bridge failed to enable AF_XDP redirect: {err}; traffic will PASS"
-                ));
+                );
+                tracing::warn!("{message}");
+                crate::logging::report_node_log(
+                    "warn".to_string(),
+                    "xdp_proxy".to_string(),
+                    message.clone(),
+                    0,
+                );
+                manager.disable_proxy_redirect_for_fallback(message);
                 return;
             }
         }
 
         loop {
             if !proxy_bridge_should_continue(&manager) {
-                tracing::debug!(
+                let message =
                     "AF_XDP proxy bridge exiting because XDP manager is stale or redirect is disabled"
+                        .to_string();
+                tracing::warn!("{message}");
+                crate::logging::report_node_log(
+                    "warn".to_string(),
+                    "xdp_proxy".to_string(),
+                    message,
+                    0,
                 );
                 return;
             }

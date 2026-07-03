@@ -7,12 +7,29 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::config_models::{NetworkAddressConfig, ServerConfig};
-#[cfg(target_os = "linux")]
-use crate::runtime_mode::XdpRuntimeMode;
 use crate::runtime_mode::{
     RuntimeConfig, XdpAttachMode, XdpConfig, XdpFallbackMode, XdpInterfaceConfig, XdpProxyConfig,
-    XdpProxyPortConfig, XdpProxyProtocol,
+    XdpProxyPortConfig, XdpProxyProtocol, XdpRuntimeMode,
 };
+
+#[derive(Clone, Debug)]
+pub struct XdpAutoConfigOptions {
+    pub interfaces: Vec<String>,
+    pub mode: XdpRuntimeMode,
+    pub attach_mode: XdpAttachMode,
+    pub fallback: XdpFallbackMode,
+}
+
+impl Default for XdpAutoConfigOptions {
+    fn default() -> Self {
+        Self {
+            interfaces: Vec::new(),
+            mode: XdpRuntimeMode::Proxy,
+            attach_mode: XdpAttachMode::Auto,
+            fallback: XdpFallbackMode::FailStart,
+        }
+    }
+}
 
 pub fn derive_xdp_config(runtime: &RuntimeConfig) -> anyhow::Result<XdpConfig> {
     if runtime.xdp.proxy.ports.is_empty() {
@@ -29,17 +46,25 @@ pub fn derive_xdp_config(runtime: &RuntimeConfig) -> anyhow::Result<XdpConfig> {
 pub async fn derive_xdp_config_from_live_node(
     runtime: &RuntimeConfig,
 ) -> anyhow::Result<XdpConfig> {
+    derive_xdp_config_from_live_node_with_options(runtime, XdpAutoConfigOptions::default()).await
+}
+
+pub async fn derive_xdp_config_from_live_node_with_options(
+    runtime: &RuntimeConfig,
+    options: XdpAutoConfigOptions,
+) -> anyhow::Result<XdpConfig> {
     #[cfg(target_os = "linux")]
     {
         let payload = crate::kernel_syn_defense::fetch_live_node_config_payload()
             .await
             .context("failed to fetch live node config for XDP auto ports")?;
-        derive_xdp_config_for_servers(runtime, &payload.servers)
+        derive_xdp_config_for_servers_with_options(runtime, &payload.servers, options)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = runtime;
+        let _ = options;
         anyhow::bail!("XDP automatic takeover is supported on Linux only")
     }
 }
@@ -48,11 +73,19 @@ pub fn derive_xdp_config_for_servers(
     runtime: &RuntimeConfig,
     servers: &[ServerConfig],
 ) -> anyhow::Result<XdpConfig> {
+    derive_xdp_config_for_servers_with_options(runtime, servers, XdpAutoConfigOptions::default())
+}
+
+pub fn derive_xdp_config_for_servers_with_options(
+    runtime: &RuntimeConfig,
+    servers: &[ServerConfig],
+    options: XdpAutoConfigOptions,
+) -> anyhow::Result<XdpConfig> {
     let ports = xdp_proxy_ports_from_servers(servers);
     if ports.is_empty() {
         anyhow::bail!("live node config has no enabled business listen ports for XDP proxy");
     }
-    derive_xdp_config_with_ports(runtime, ports)
+    derive_xdp_config_with_ports_and_options(runtime, ports, options)
 }
 
 pub fn xdp_proxy_ports_from_servers(servers: &[ServerConfig]) -> Vec<XdpProxyPortConfig> {
@@ -90,18 +123,39 @@ pub fn xdp_proxy_ports_from_servers(servers: &[ServerConfig]) -> Vec<XdpProxyPor
     ports.into_values().collect()
 }
 
+pub fn refresh_xdp_interface_queues(config: &mut XdpConfig) {
+    #[cfg(target_os = "linux")]
+    {
+        for interface in &mut config.interfaces {
+            interface.queues = rx_queues_for_interface(&interface.name);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config;
+    }
+}
+
 fn derive_xdp_config_with_ports(
     _runtime: &RuntimeConfig,
     ports: Vec<XdpProxyPortConfig>,
 ) -> anyhow::Result<XdpConfig> {
-    let interfaces = detect_xdp_interfaces()?;
+    derive_xdp_config_with_ports_and_options(_runtime, ports, XdpAutoConfigOptions::default())
+}
+
+fn derive_xdp_config_with_ports_and_options(
+    _runtime: &RuntimeConfig,
+    ports: Vec<XdpProxyPortConfig>,
+    options: XdpAutoConfigOptions,
+) -> anyhow::Result<XdpConfig> {
+    let interfaces = detect_xdp_interfaces_with_options(&options)?;
     if interfaces.is_empty() {
         anyhow::bail!("no Linux network interfaces are eligible for XDP automatic takeover");
     }
     Ok(XdpConfig {
         enabled: true,
-        attach_mode: XdpAttachMode::Auto,
-        fallback: XdpFallbackMode::FailStart,
+        attach_mode: options.attach_mode,
+        fallback: options.fallback,
         interfaces,
         proxy: XdpProxyConfig {
             protocols: default_xdp_proxy_protocols(),
@@ -166,11 +220,25 @@ fn xdp_proxy_protocol_order(protocol: &XdpProxyProtocol) -> u8 {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn detect_xdp_interfaces() -> anyhow::Result<Vec<XdpInterfaceConfig>> {
+    detect_xdp_interfaces_with_options(&XdpAutoConfigOptions::default())
+}
+
+#[cfg(target_os = "linux")]
+fn detect_xdp_interfaces_with_options(
+    options: &XdpAutoConfigOptions,
+) -> anyhow::Result<Vec<XdpInterfaceConfig>> {
     let mut candidates = BTreeSet::new();
-    candidates.extend(default_route_interfaces()?);
-    for iface in active_interfaces()? {
-        candidates.insert(iface);
+    if options.interfaces.is_empty() {
+        candidates.extend(default_route_interfaces()?);
+        for iface in active_interfaces()? {
+            candidates.insert(iface);
+        }
+    } else {
+        for iface in &options.interfaces {
+            candidates.insert(iface.clone());
+        }
     }
 
     let mut interfaces = Vec::new();
@@ -179,12 +247,15 @@ fn detect_xdp_interfaces() -> anyhow::Result<Vec<XdpInterfaceConfig>> {
             break;
         }
         if !eligible_interface(&name) {
+            if !options.interfaces.is_empty() {
+                anyhow::bail!("specified XDP interface {name} is not eligible or not up");
+            }
             continue;
         }
         interfaces.push(XdpInterfaceConfig {
             name: name.clone(),
             queues: rx_queues_for_interface(&name),
-            mode: XdpRuntimeMode::Proxy,
+            mode: options.mode,
             local_ips: Vec::new(),
             frame_size: cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE,
         });
@@ -197,7 +268,15 @@ fn detect_xdp_interfaces() -> anyhow::Result<Vec<XdpInterfaceConfig>> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 fn detect_xdp_interfaces() -> anyhow::Result<Vec<XdpInterfaceConfig>> {
+    anyhow::bail!("XDP automatic takeover is supported on Linux only")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_xdp_interfaces_with_options(
+    _options: &XdpAutoConfigOptions,
+) -> anyhow::Result<Vec<XdpInterfaceConfig>> {
     anyhow::bail!("XDP automatic takeover is supported on Linux only")
 }
 

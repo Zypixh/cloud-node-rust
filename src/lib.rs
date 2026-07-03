@@ -59,3 +59,4 @@ pub mod utils;
 pub mod xdp;
 pub mod xdp_auto_config;
 pub mod xdp_config_wizard;
+pub mod xdp_netdev_tuning;

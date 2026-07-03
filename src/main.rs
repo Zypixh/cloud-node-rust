@@ -1,5 +1,7 @@
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use chrono::{Local, TimeZone};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use cloud_node_rust::i18n::{Language, t};
 use cloud_node_rust::xdp_config_wizard::{XdpConfigWizard, save_xdp_config};
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,7 +27,9 @@ use cloud_node_rust::health_manager::GlobalHealthManager;
 use cloud_node_rust::kernel_syn_defense;
 use cloud_node_rust::l4_connection_registry;
 use cloud_node_rust::proxy::EdgeProxy;
-use cloud_node_rust::runtime_mode::RuntimeConfig;
+use cloud_node_rust::runtime_mode::{
+    RuntimeConfig, XdpAttachMode, XdpFallbackMode, XdpRuntimeMode,
+};
 use cloud_node_rust::ssl::DynamicCertSelector;
 use cloud_node_rust::{firewall, log_uploader, logging, rpc, tcp_proxy, udp_proxy};
 
@@ -288,10 +292,44 @@ enum XdpCommands {
     Doctor,
     /// Start automatic XDP proxy takeover
     #[command(alias = "attach")]
-    Start,
+    Start {
+        /// Restrict automatic XDP configuration to this interface. Repeat for multiple interfaces.
+        #[arg(long = "interface", action = clap::ArgAction::Append)]
+        interfaces: Vec<String>,
+        /// Runtime mode for selected interfaces.
+        #[arg(long, value_enum)]
+        mode: Option<XdpCliRuntimeMode>,
+        /// XDP attach mode.
+        #[arg(long = "attach-mode", value_enum)]
+        attach_mode: Option<XdpCliAttachMode>,
+        /// XDP fallback mode.
+        #[arg(long, value_enum)]
+        fallback: Option<XdpCliFallbackMode>,
+        /// Show generated config and tuning plan without writing config or attaching.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip automatic netdev tuning.
+        #[arg(long)]
+        no_tune: bool,
+        /// Do not install missing helper tools such as ethtool.
+        #[arg(long)]
+        no_install_tools: bool,
+    },
     /// Stop XDP automatic takeover
     #[command(alias = "detach")]
     Stop,
+    /// Inspect or apply XDP netdev tuning
+    Tune {
+        /// Restrict tuning to this interface. Repeat for multiple interfaces.
+        #[arg(long = "interface", action = clap::ArgAction::Append)]
+        interfaces: Vec<String>,
+        /// Apply tuning instead of only showing the plan.
+        #[arg(long)]
+        apply: bool,
+        /// Do not install missing helper tools such as ethtool.
+        #[arg(long)]
+        no_install_tools: bool,
+    },
     /// Dump XDP shadow maps known to this process
     #[command(name = "dump-maps")]
     DumpMaps,
@@ -332,6 +370,55 @@ enum XdpCommands {
     #[command(name = "configure")]
     Configure,
 }
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum XdpCliRuntimeMode {
+    Observe,
+    Protect,
+    Proxy,
+}
+
+impl From<XdpCliRuntimeMode> for XdpRuntimeMode {
+    fn from(value: XdpCliRuntimeMode) -> Self {
+        match value {
+            XdpCliRuntimeMode::Observe => Self::Observe,
+            XdpCliRuntimeMode::Protect => Self::Protect,
+            XdpCliRuntimeMode::Proxy => Self::Proxy,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum XdpCliAttachMode {
+    Auto,
+    Drv,
+    Skb,
+}
+
+impl From<XdpCliAttachMode> for XdpAttachMode {
+    fn from(value: XdpCliAttachMode) -> Self {
+        match value {
+            XdpCliAttachMode::Auto => Self::Auto,
+            XdpCliAttachMode::Drv => Self::Drv,
+            XdpCliAttachMode::Skb => Self::Skb,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum XdpCliFallbackMode {
+    Pass,
+    FailStart,
+}
+
+impl From<XdpCliFallbackMode> for XdpFallbackMode {
+    fn from(value: XdpCliFallbackMode) -> Self {
+        match value {
+            XdpCliFallbackMode::Pass => Self::Pass,
+            XdpCliFallbackMode::FailStart => Self::FailStart,
+        }
+    }
+}
 fn spawn_staggered<F>(rt: &tokio::runtime::Runtime, delay: Duration, task: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -342,6 +429,91 @@ where
         }
         task.await;
     });
+}
+
+fn spawn_xdp_port_sync_task(rt: &tokio::runtime::Runtime, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    spawn_staggered(rt, Duration::from_secs(30), async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut consecutive_errors = 0u64;
+        loop {
+            interval.tick().await;
+            match sync_xdp_proxy_ports_once().await {
+                Ok(Some((old_count, new_count))) => {
+                    consecutive_errors = 0;
+                    let message = format!(
+                        "xdp.proxy.ports synchronized from live node config old_count={old_count} new_count={new_count}"
+                    );
+                    info!("{message}");
+                    logging::report_node_log(
+                        "info".to_string(),
+                        "xdp_ports".to_string(),
+                        message,
+                        0,
+                    );
+                }
+                Ok(None) => {
+                    consecutive_errors = 0;
+                }
+                Err(err) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let message = format!(
+                        "xdp.proxy.ports sync failed consecutive={} reason={}",
+                        consecutive_errors, err
+                    );
+                    warn!("{message}");
+                    if consecutive_errors == 1 || consecutive_errors % 10 == 0 {
+                        logging::report_node_log(
+                            "warn".to_string(),
+                            "xdp_ports".to_string(),
+                            message,
+                            0,
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = rt;
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn sync_xdp_proxy_ports_once() -> anyhow::Result<Option<(usize, usize)>> {
+    let Some(mut runtime_config) = RuntimeConfig::current() else {
+        return Ok(None);
+    };
+    if !runtime_config.xdp.enabled {
+        return Ok(None);
+    }
+
+    let payload = kernel_syn_defense::fetch_live_node_config_payload()
+        .await
+        .context("failed to fetch live node config for XDP proxy port sync")?;
+    let ports = cloud_node_rust::xdp_auto_config::xdp_proxy_ports_from_servers(&payload.servers);
+    if ports == runtime_config.xdp.proxy.ports {
+        return Ok(None);
+    }
+
+    let old_count = runtime_config.xdp.proxy.ports.len();
+    let new_count = ports.len();
+    runtime_config.xdp.proxy.ports = ports;
+    runtime_config.validate()?;
+    let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
+    save_xdp_config(&runtime_path, &runtime_config.xdp)
+        .with_context(|| format!("failed to save {}", runtime_path.display()))?;
+    RuntimeConfig::set_current(runtime_config);
+    cloud_node_rust::xdp::reload_from_runtime()
+        .await
+        .context("failed to reload XDP after proxy port sync")?;
+    Ok(Some((old_count, new_count)))
 }
 
 fn build_time_display() -> String {
@@ -613,16 +785,60 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
                 println!("  auto derive:   failed: {err}");
             }
         }
-        XdpCommands::Start => {
+        XdpCommands::Start {
+            interfaces,
+            mode,
+            attach_mode,
+            fallback,
+            dry_run,
+            no_tune,
+            no_install_tools,
+        } => {
             let mut runtime_config = RuntimeConfig::load_default()?;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
             let effective_xdp = rt.block_on(
-                cloud_node_rust::xdp_auto_config::derive_xdp_config_from_live_node(&runtime_config),
+                cloud_node_rust::xdp_auto_config::derive_xdp_config_from_live_node_with_options(
+                    &runtime_config,
+                    cloud_node_rust::xdp_auto_config::XdpAutoConfigOptions {
+                        interfaces,
+                        mode: mode.map(Into::into).unwrap_or(XdpRuntimeMode::Proxy),
+                        attach_mode: attach_mode.map(Into::into).unwrap_or(XdpAttachMode::Auto),
+                        fallback: fallback
+                            .map(Into::into)
+                            .unwrap_or(XdpFallbackMode::FailStart),
+                    },
+                ),
             )?;
             runtime_config.xdp = effective_xdp;
             runtime_config.validate()?;
+            if !no_tune {
+                let report = cloud_node_rust::xdp_netdev_tuning::apply_for_xdp_config(
+                    &runtime_config.xdp,
+                    cloud_node_rust::xdp_netdev_tuning::XdpNetdevTuneOptions {
+                        dry_run,
+                        install_tools: !no_install_tools,
+                        report_node_log: true,
+                        persist_report: !dry_run,
+                    },
+                )?;
+                cloud_node_rust::xdp_netdev_tuning::print_report(&report);
+            }
+            if !dry_run {
+                cloud_node_rust::xdp_auto_config::refresh_xdp_interface_queues(
+                    &mut runtime_config.xdp,
+                );
+                runtime_config.validate()?;
+            }
+            if dry_run {
+                println!(
+                    "{}",
+                    serde_yaml::to_string(&runtime_config.xdp)
+                        .unwrap_or_else(|err| format!("failed to render XDP config: {err}"))
+                );
+                return Ok(());
+            }
             let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
             save_xdp_config(&runtime_path, &runtime_config.xdp)?;
             RuntimeConfig::set_current(runtime_config);
@@ -641,6 +857,49 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             save_xdp_config(&runtime_path, &runtime_config.xdp)?;
             RuntimeConfig::set_current(runtime_config);
             print_xdp_status();
+        }
+        XdpCommands::Tune {
+            interfaces,
+            apply,
+            no_install_tools,
+        } => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            let interface_names = if interfaces.is_empty() {
+                if runtime_config.xdp.interfaces.is_empty() {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    rt.block_on(
+                        cloud_node_rust::xdp_auto_config::derive_xdp_config_from_live_node(
+                            &runtime_config,
+                        ),
+                    )?
+                    .interfaces
+                    .into_iter()
+                    .map(|interface| interface.name)
+                    .collect::<Vec<_>>()
+                } else {
+                    runtime_config
+                        .xdp
+                        .interfaces
+                        .iter()
+                        .map(|interface| interface.name.clone())
+                        .collect::<Vec<_>>()
+                }
+            } else {
+                interfaces
+            };
+            let report = cloud_node_rust::xdp_netdev_tuning::apply_for_interfaces(
+                &interface_names,
+                runtime_config.xdp.fallback,
+                cloud_node_rust::xdp_netdev_tuning::XdpNetdevTuneOptions {
+                    dry_run: !apply,
+                    install_tools: apply && !no_install_tools,
+                    report_node_log: true,
+                    persist_report: apply,
+                },
+            )?;
+            cloud_node_rust::xdp_netdev_tuning::print_report(&report);
         }
         XdpCommands::DumpMaps => {
             let runtime_config = RuntimeConfig::load_default()?;
@@ -854,6 +1113,9 @@ fn print_xdp_status() {
                 );
             }
         }
+    }
+    for line in cloud_node_rust::xdp_netdev_tuning::status_lines() {
+        println!("{line}");
     }
 }
 
@@ -2859,7 +3121,20 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     // 1. Load API Config
     let api_config = ApiConfig::load_default().expect("Failed to load configs/api_node.yaml");
     cloud_node_rust::tcp_proxy::configure_relay_from_api(&api_config);
-    let runtime_config =
+    let numeric_node_id = api_config.node_id.parse::<i64>().unwrap_or(0);
+    logging::set_numeric_node_id(numeric_node_id);
+    let access_log_pipeline = api_config.access_log_pipeline.normalized();
+    let (log_tx, log_rx) = tokio::sync::mpsc::channel(access_log_pipeline.queue_capacity);
+    let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(
+        cloud_node_rust::memory_governor::MEMORY_GOVERNOR.node_log_queue_capacity(),
+    );
+    logging::init_global_log_bus(
+        log_tx,
+        node_log_tx,
+        access_log_pipeline.queue_capacity,
+        Duration::from_millis(access_log_pipeline.warning_interval_ms),
+    );
+    let mut runtime_config =
         RuntimeConfig::load_default().expect("Failed to load configs/runtime.yaml");
     if runtime_config.is_rke2() {
         info!(
@@ -2871,12 +3146,73 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     }
     RuntimeConfig::set_current(runtime_config.clone());
     repair_missing_xdp_ebpf_object_for_current_runtime(&node_paths);
+    if runtime_config.xdp.enabled {
+        match cloud_node_rust::xdp_netdev_tuning::apply_for_xdp_config(
+            &runtime_config.xdp,
+            cloud_node_rust::xdp_netdev_tuning::XdpNetdevTuneOptions {
+                dry_run: false,
+                install_tools: false,
+                report_node_log: true,
+                persist_report: true,
+            },
+        ) {
+            Ok(report) => {
+                info!("XDP netdev tuning completed: {}", report.summary());
+                let before_interfaces = runtime_config.xdp.interfaces.clone();
+                cloud_node_rust::xdp_auto_config::refresh_xdp_interface_queues(
+                    &mut runtime_config.xdp,
+                );
+                runtime_config.validate()?;
+                RuntimeConfig::set_current(runtime_config.clone());
+                if before_interfaces != runtime_config.xdp.interfaces {
+                    let runtime_path = node_paths.runtime_config_file();
+                    match save_xdp_config(&runtime_path, &runtime_config.xdp) {
+                        Ok(()) => {
+                            info!(
+                                "XDP interface queues refreshed after netdev tuning and saved to {}",
+                                runtime_path.display()
+                            );
+                            logging::report_node_log(
+                                "info".to_string(),
+                                "xdp_tuning".to_string(),
+                                "key=\"xdp.interfaces.queues\" old=\"runtime\" target=\"current-rx-queues\" final=\"saved\" status=\"applied\" reason=\"refreshed after netdev tuning\"".to_string(),
+                                0,
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Failed to save refreshed XDP interface queues to {}: {}",
+                                runtime_path.display(),
+                                err
+                            );
+                            logging::report_node_log(
+                                "warn".to_string(),
+                                "xdp_tuning".to_string(),
+                                format!(
+                                    "key=\"xdp.interfaces.queues\" old=\"runtime\" target=\"current-rx-queues\" final=\"memory-only\" status=\"failed\" reason=\"{}\"",
+                                    err.to_string().replace('"', "\\\"")
+                                ),
+                                0,
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                if runtime_config.xdp.fallback.fail_start() {
+                    return Err(err.context("XDP netdev tuning failed"));
+                }
+                warn!("XDP netdev tuning skipped: {}", err);
+            }
+        }
+    }
     if let Err(err) = rt.block_on(cloud_node_rust::xdp::initialize_from_runtime()) {
         if runtime_config.xdp.fallback.fail_start() {
             return Err(err.context("XDP initialization failed"));
         }
         warn!("XDP initialization skipped: {}", err);
     }
+    spawn_xdp_port_sync_task(&rt, runtime_config.xdp.enabled);
     if runtime_config.is_rke2() {
         cloud_node_rust::cache_manager::CACHE
             .storage
@@ -2884,8 +3220,6 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     }
     cloud_node_rust::cluster::runtime::start(&runtime_config);
     let api_config_arc = Arc::new(api_config.clone());
-    let numeric_node_id = api_config_arc.node_id.parse::<i64>().unwrap_or(0);
-    logging::set_numeric_node_id(numeric_node_id);
     cloud_node_rust::client_agent::load_client_agent_ip_index();
     cloud_node_rust::client_agent::start_client_agent_queue(api_config_arc.clone());
     cloud_node_rust::kernel_syn_defense::start_monitor();
@@ -3022,18 +3356,6 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     });
 
     // Log Uploader
-    let access_log_pipeline = api_config.access_log_pipeline.normalized();
-    let (log_tx, log_rx) = tokio::sync::mpsc::channel(access_log_pipeline.queue_capacity);
-    let (node_log_tx, node_log_rx) = tokio::sync::mpsc::channel(
-        cloud_node_rust::memory_governor::MEMORY_GOVERNOR.node_log_queue_capacity(),
-    );
-    logging::init_global_log_bus(
-        log_tx,
-        node_log_tx,
-        access_log_pipeline.queue_capacity,
-        Duration::from_millis(access_log_pipeline.warning_interval_ms),
-    );
-
     if api_config.kernel_tuning.normalized().enabled {
         cloud_node_rust::kernel_tuning::apply_runtime_tuning_and_report();
     } else {

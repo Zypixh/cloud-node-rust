@@ -69,6 +69,10 @@ impl NodePaths {
         self.data_dir().join("xdp-state.json")
     }
 
+    pub fn xdp_tuning_file(&self) -> PathBuf {
+        self.data_dir().join("xdp-netdev-tuning.json")
+    }
+
     pub fn cache_dir(&self) -> PathBuf {
         self.data_dir().join("cache")
     }
