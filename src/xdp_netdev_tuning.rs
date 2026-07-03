@@ -876,7 +876,7 @@ fn tune_link(interface: &str, options: &XdpNetdevTuneOptions, report: &mut XdpNe
     apply_ip_link_action(
         interface,
         "ip.link.txqueuelen",
-        qlen.map(|value| value.to_string()),
+        qlen.clone(),
         TARGET_TX_QUEUE_LEN,
         options,
         report,
