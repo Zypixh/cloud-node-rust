@@ -841,6 +841,17 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             }
             let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
             save_xdp_config(&runtime_path, &runtime_config.xdp)?;
+            #[cfg(target_os = "linux")]
+            if !is_systemd_invocation() && systemd_service_is_active() {
+                run_systemctl("restart")?;
+                std::thread::sleep(Duration::from_secs(3));
+                if let Some(status) = cloud_node_rust::xdp::persisted_status_snapshot() {
+                    print_xdp_status_snapshot(status);
+                } else {
+                    println!("XDP config saved; cloud-node.service restarted.");
+                }
+                return Ok(());
+            }
             RuntimeConfig::set_current(runtime_config);
             rt.block_on(cloud_node_rust::xdp::attach_from_runtime())?;
             print_xdp_status();
@@ -973,6 +984,10 @@ fn print_xdp_status() {
         cloud_node_rust::xdp::persisted_status_snapshot()
             .unwrap_or_else(cloud_node_rust::xdp::status_snapshot)
     };
+    print_xdp_status_snapshot(status);
+}
+
+fn print_xdp_status_snapshot(status: cloud_node_rust::xdp::XdpStatusSnapshot) {
     println!("{}", t("xdp.status.title"));
     println!(
         "  {:<14} {}",

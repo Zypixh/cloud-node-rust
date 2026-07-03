@@ -1148,7 +1148,10 @@ fn apply_sysfs_write(
     let old = fs::read_to_string(path)
         .ok()
         .map(|value| value.trim().to_string());
-    if old.as_deref() == Some(target) {
+    if old
+        .as_deref()
+        .is_some_and(|value| setting_value_matches(value, target))
+    {
         report.actions.push(XdpTuneAction::new(
             interface,
             key,
@@ -1191,7 +1194,10 @@ fn apply_sysfs_write(
     let final_value = fs::read_to_string(path)
         .ok()
         .map(|value| value.trim().to_string());
-    let success = write.is_ok() && final_value.as_deref() == Some(target);
+    let success = write.is_ok()
+        && final_value
+            .as_deref()
+            .is_some_and(|value| setting_value_matches(value, target));
     report.actions.push(XdpTuneAction::new(
         interface,
         key,
@@ -1594,6 +1600,16 @@ fn quote_field(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn setting_value_matches(value: &str, target: &str) -> bool {
+    value == target || normalize_whitespace(value) == normalize_whitespace(target)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn normalize_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -1717,5 +1733,17 @@ tx-usecs: 12
         assert_eq!(parsed["adaptive-tx"], 1);
         assert_eq!(parsed["rx-usecs"], 0);
         assert_eq!(parsed["tx-usecs"], 12);
+    }
+
+    #[test]
+    fn setting_values_match_with_kernel_whitespace() {
+        assert!(setting_value_matches(
+            "4096\t87380\t134217728",
+            "4096 87380 134217728"
+        ));
+        assert!(!setting_value_matches(
+            "4096\t87380\t134217728",
+            "4096 65536 134217728"
+        ));
     }
 }
