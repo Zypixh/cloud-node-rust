@@ -43,7 +43,27 @@ pub trait KernelFilter: Send + Sync {
     fn unblock_network(&self, net: IpNet);
     fn block_range(&self, _from: u128, _to: u128, _v6: bool, _ttl_secs: i64) {}
     fn unblock_range(&self, from: u128, to: u128, v6: bool);
-    fn sync_snapshot(&self, _snapshot: &KernelFilterSnapshot) {}
+    fn sync_snapshot(&self, snapshot: &KernelFilterSnapshot) {
+        let now = crate::utils::time::now_timestamp();
+        for (ip, expires_at) in &snapshot.blocked_ips {
+            let ttl_secs = expires_at.saturating_sub(now);
+            if ttl_secs > 0 {
+                self.block(*ip, ttl_secs);
+            }
+        }
+        for (net, expires_at) in &snapshot.blocked_networks {
+            let ttl_secs = expires_at.saturating_sub(now);
+            if ttl_secs > 0 {
+                self.block_network(*net, ttl_secs);
+            }
+        }
+        for range in &snapshot.blocked_ranges {
+            let ttl_secs = range.expires_at.saturating_sub(now);
+            if ttl_secs > 0 {
+                self.block_range(range.from, range.to, range.v6, ttl_secs);
+            }
+        }
+    }
     fn available(&self) -> bool;
     fn name(&self) -> &'static str;
     fn status(&self) -> KernelFilterStatus {
@@ -574,6 +594,22 @@ pub async fn build_filter(mode: Option<&str>) -> Box<dyn KernelFilter> {
         }
         _ => Box::new(NoopFilter),
     }
+}
+
+pub async fn build_non_xdp_fallback_filter() -> Box<dyn KernelFilter> {
+    #[cfg(target_os = "linux")]
+    {
+        if linux::NftablesFilter::probe().await {
+            match linux::NftablesFilter::ensure_ready().await {
+                Ok(()) => return Box::new(linux::NftablesFilter),
+                Err(err) => tracing::warn!("nftables fallback firewall unavailable: {}", err),
+            }
+        }
+        if linux::IptablesFilter::probe().await {
+            return Box::new(linux::IptablesFilter);
+        }
+    }
+    Box::new(NoopFilter)
 }
 
 pub async fn ensure_nftables() -> anyhow::Result<()> {

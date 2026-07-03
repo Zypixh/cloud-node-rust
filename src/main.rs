@@ -1,7 +1,7 @@
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
 use cloud_node_rust::i18n::{Language, t};
-use cloud_node_rust::xdp_config_wizard::XdpConfigWizard;
+use cloud_node_rust::xdp_config_wizard::{XdpConfigWizard, save_xdp_config};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs;
@@ -286,10 +286,12 @@ enum XdpCommands {
     Status,
     /// Validate local XDP runtime configuration and object availability
     Doctor,
-    /// Attach XDP programs using configs/runtime.yaml
-    Attach,
-    /// Detach XDP programs managed by this process
-    Detach,
+    /// Start automatic XDP proxy takeover
+    #[command(alias = "attach")]
+    Start,
+    /// Stop XDP automatic takeover
+    #[command(alias = "detach")]
+    Stop,
     /// Dump XDP shadow maps known to this process
     #[command(name = "dump-maps")]
     DumpMaps,
@@ -590,26 +592,54 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             print_xdp_status();
         }
         XdpCommands::Doctor => {
-            let runtime_config = RuntimeConfig::load_default()?;
+            let mut runtime_config = RuntimeConfig::load_default()?;
+            let mut auto_error = None;
+            if runtime_config.xdp.enabled && runtime_config.xdp.interfaces.is_empty() {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                match rt.block_on(
+                    cloud_node_rust::xdp_auto_config::derive_xdp_config_from_live_node(
+                        &runtime_config,
+                    ),
+                ) {
+                    Ok(xdp) => runtime_config.xdp = xdp,
+                    Err(err) => auto_error = Some(err.to_string()),
+                }
+            }
             RuntimeConfig::set_current(runtime_config);
             println!("{}", cloud_node_rust::xdp::doctor_report());
+            if let Some(err) = auto_error {
+                println!("  auto derive:   failed: {err}");
+            }
         }
-        XdpCommands::Attach => {
-            let runtime_config = RuntimeConfig::load_default()?;
-            RuntimeConfig::set_current(runtime_config);
+        XdpCommands::Start => {
+            let mut runtime_config = RuntimeConfig::load_default()?;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
+            let effective_xdp = rt.block_on(
+                cloud_node_rust::xdp_auto_config::derive_xdp_config_from_live_node(&runtime_config),
+            )?;
+            runtime_config.xdp = effective_xdp;
+            runtime_config.validate()?;
+            let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
+            save_xdp_config(&runtime_path, &runtime_config.xdp)?;
+            RuntimeConfig::set_current(runtime_config);
             rt.block_on(cloud_node_rust::xdp::attach_from_runtime())?;
             print_xdp_status();
         }
-        XdpCommands::Detach => {
-            let runtime_config = RuntimeConfig::load_default()?;
-            RuntimeConfig::set_current(runtime_config);
+        XdpCommands::Stop => {
+            let mut runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config.clone());
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
             rt.block_on(cloud_node_rust::xdp::detach())?;
+            runtime_config.xdp.enabled = false;
+            let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
+            save_xdp_config(&runtime_path, &runtime_config.xdp)?;
+            RuntimeConfig::set_current(runtime_config);
             print_xdp_status();
         }
         XdpCommands::DumpMaps => {
@@ -2205,6 +2235,81 @@ WantedBy=multi-user.target\n",
     Ok(())
 }
 
+fn spawn_xdp_health_fallback_task(rt: &tokio::runtime::Runtime, waf_state: Arc<WafStateManager>) {
+    spawn_staggered(rt, Duration::from_secs(10), async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut consecutive_failures = 0u8;
+        loop {
+            interval.tick().await;
+            let current = waf_state.kernel_filter_status();
+            if current.name != "xdp" {
+                consecutive_failures = 0;
+                continue;
+            }
+
+            let status = cloud_node_rust::xdp::status_snapshot();
+            let Some(reason) = xdp_health_fallback_reason(&status) else {
+                consecutive_failures = 0;
+                continue;
+            };
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            if consecutive_failures < 3 {
+                continue;
+            }
+
+            warn!(
+                "XDP health check failed repeatedly; switching L4 kernel enforcement to non-XDP fallback: {}",
+                reason
+            );
+            let fallback = cloud_node_rust::firewall::kernel::build_non_xdp_fallback_filter().await;
+            let fallback_status = fallback.status();
+            waf_state.set_kernel_filter(fallback);
+            warn!(
+                "L4 kernel enforcement backend is now {} available={} detail={}",
+                fallback_status.name, fallback_status.available, fallback_status.detail
+            );
+            consecutive_failures = 0;
+        }
+    });
+}
+
+fn xdp_health_fallback_reason(status: &cloud_node_rust::xdp::XdpStatusSnapshot) -> Option<String> {
+    if !status.enabled {
+        return None;
+    }
+    if !status.available {
+        return Some(if status.fallback_reason.is_empty() {
+            "XDP is unavailable".to_string()
+        } else {
+            status.fallback_reason.clone()
+        });
+    }
+    if !status.fallback_reason.is_empty() {
+        return Some(status.fallback_reason.clone());
+    }
+    if status.proxy_ports == 0 {
+        return None;
+    }
+    if status.xsk_configured_queues == 0 {
+        return Some("XDP proxy has no configured AF_XDP queues".to_string());
+    }
+    if status.xsk_ready_queues < status.xsk_configured_queues {
+        return Some(format!(
+            "AF_XDP queues not ready: ready={} configured={}",
+            status.xsk_ready_queues, status.xsk_configured_queues
+        ));
+    }
+    if !status.proxy_redirect_enabled || !status.proxy_ready {
+        return Some(if status.proxy_fallback_reason.is_empty() {
+            "AF_XDP proxy redirect is not ready".to_string()
+        } else {
+            status.proxy_fallback_reason.clone()
+        });
+    }
+    None
+}
+
 fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()> {
     let node_paths = cloud_node_rust::paths::NodePaths::current();
     node_paths.ensure_runtime_dirs().ok();
@@ -2349,6 +2454,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     if initial_kernel_filter.available() {
         waf_state.set_kernel_filter(initial_kernel_filter);
     }
+    spawn_xdp_health_fallback_task(&rt, waf_state.clone());
     let migrated_blocks = cloud_node_rust::firewall::persistence::migrate_legacy_blocked_ips_once();
     let restored_blocks = waf_state.restore_runtime_blocks_from_disk();
     if migrated_blocks > 0 || restored_blocks > 0 {

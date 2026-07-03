@@ -411,6 +411,7 @@ struct XdpManager {
     /// Image of the rule state last successfully written to the eBPF maps. The
     /// incremental sync diffs the live shadow `state` against this to compute the
     /// minimal set of map inserts/removes.
+    #[cfg(target_os = "linux")]
     synced: parking_lot::Mutex<RuleState>,
     map_sync_started: AtomicBool,
     map_sync_notify: tokio::sync::Notify,
@@ -441,6 +442,7 @@ impl XdpManager {
             last_state_write_at: AtomicU64::new(0),
             rule_sweeper_started: AtomicBool::new(false),
             rule_sweeper_generation: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
             synced: parking_lot::Mutex::new(RuleState::default()),
             map_sync_started: AtomicBool::new(false),
             map_sync_notify: tokio::sync::Notify::new(),
@@ -546,11 +548,14 @@ impl XdpManager {
             return false;
         }
         let statuses = self.xsk_status.read();
-        self.config
+        let proxy_interfaces = self
+            .config
             .interfaces
             .iter()
             .filter(|interface| interface.mode == XdpRuntimeMode::Proxy)
-            .any(|interface| {
+            .collect::<Vec<_>>();
+        !proxy_interfaces.is_empty()
+            && proxy_interfaces.iter().all(|interface| {
                 !interface.queues.is_empty()
                     && interface.queues.iter().all(|queue| {
                         statuses.iter().any(|status| {
@@ -759,7 +764,9 @@ impl XdpManager {
 
         // Check if still attached after flush (detach_after_runtime_failure may have been called)
         if self.attached.read().is_empty() {
-            return Err(anyhow::anyhow!("{source} failed to enable AF_XDP redirect: map sync failed"));
+            return Err(anyhow::anyhow!(
+                "{source} failed to enable AF_XDP redirect: map sync failed"
+            ));
         }
 
         self.proxy_redirect_enabled.store(true, Ordering::Relaxed);
@@ -878,10 +885,16 @@ impl XdpManager {
             .ports
             .len()
             .saturating_sub(proxy_supported_ports);
+        let proxy_interfaces = self
+            .config
+            .interfaces
+            .iter()
+            .filter(|interface| interface.mode == XdpRuntimeMode::Proxy)
+            .collect::<Vec<_>>();
         let proxy_ready = self.proxy_redirect_enabled.load(Ordering::Relaxed)
-            && self.config.interfaces.iter().any(|interface| {
-                interface.mode == XdpRuntimeMode::Proxy
-                    && !interface.queues.is_empty()
+            && !proxy_interfaces.is_empty()
+            && proxy_interfaces.iter().all(|interface| {
+                !interface.queues.is_empty()
                     && interface.queues.iter().all(|queue| {
                         queue_statuses.iter().any(|status| {
                             status.interface == interface.name
@@ -1116,7 +1129,10 @@ impl XdpManager {
             Err(err) => {
                 let reason = format!("map diff sync failed: {err}");
                 self.detach_after_runtime_failure(reason);
-                tracing::warn!("XDP map diff sync failed; detached and falling back: {}", err);
+                tracing::warn!(
+                    "XDP map diff sync failed; detached and falling back: {}",
+                    err
+                );
             }
         }
     }
@@ -1309,6 +1325,20 @@ fn manager_is_current(candidate: &std::sync::Arc<XdpManager>) -> bool {
     std::sync::Arc::ptr_eq(candidate, &*current)
 }
 
+async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
+    let Some(mut runtime) = RuntimeConfig::current() else {
+        return Ok(());
+    };
+    if !runtime.xdp.enabled || !runtime.xdp.interfaces.is_empty() {
+        return Ok(());
+    }
+
+    let derived = crate::xdp_auto_config::derive_xdp_config_from_live_node(&runtime).await?;
+    runtime.xdp = derived;
+    RuntimeConfig::set_current(runtime);
+    Ok(())
+}
+
 fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
     if !manager.config.enabled {
         return;
@@ -1355,6 +1385,7 @@ fn start_map_sync_worker(manager: &std::sync::Arc<XdpManager>) {
 }
 
 pub async fn initialize_from_runtime() -> anyhow::Result<()> {
+    ensure_current_xdp_auto_config().await?;
     let manager = manager_from_runtime();
     manager.initialize().await?;
     start_rule_sweeper(&manager);
@@ -1363,6 +1394,10 @@ pub async fn initialize_from_runtime() -> anyhow::Result<()> {
 }
 
 pub async fn build_kernel_filter() -> Option<Box<dyn KernelFilter>> {
+    if let Err(err) = ensure_current_xdp_auto_config().await {
+        tracing::warn!("XDP kernel filter auto configuration failed: {}", err);
+        return None;
+    }
     let manager = manager_from_runtime();
     if !manager.config.enabled {
         return None;
@@ -1394,6 +1429,7 @@ pub fn persisted_status_snapshot() -> Option<XdpStatusSnapshot> {
 }
 
 pub async fn attach_from_runtime() -> anyhow::Result<()> {
+    ensure_current_xdp_auto_config().await?;
     let manager = manager_from_runtime();
     manager.initialize().await?;
     start_rule_sweeper(&manager);
@@ -1407,6 +1443,7 @@ pub async fn detach() -> anyhow::Result<()> {
 }
 
 pub async fn reload_from_runtime() -> anyhow::Result<()> {
+    ensure_current_xdp_auto_config().await?;
     let runtime_config = RuntimeConfig::current()
         .map(|runtime| runtime.xdp)
         .unwrap_or_default();
@@ -1449,6 +1486,15 @@ fn doctor_report_for_config(config: &XdpConfig) -> String {
     lines.push(format!("  enabled:       {}", yes_no(config.enabled)));
     lines.push(format!("  attach mode:   {}", config.attach_mode.as_str()));
     lines.push(format!("  fallback:      {}", config.fallback.as_str()));
+    lines.push("  L4 engine:     active".to_string());
+    lines.push(format!(
+        "  kernel backend: {}",
+        if config.enabled {
+            "xdp (fallback: nftables/iptables/noop)"
+        } else {
+            "nftables/iptables/noop"
+        }
+    ));
     lines.push(format!(
         "  protocols:     {}",
         config
@@ -3939,7 +3985,10 @@ mod linux {
     fn insert_net_image(v4: &mut LpmV4Image, v6: &mut LpmV6Image, net: &IpNet, expiry: i64) {
         match net {
             IpNet::V4(net) => {
-                let key = (net.prefix_len() as u32, u32::from_be_bytes(net.network().octets()));
+                let key = (
+                    net.prefix_len() as u32,
+                    u32::from_be_bytes(net.network().octets()),
+                );
                 // Keep the latest-seen expiry deterministically (max wins).
                 let slot = v4.entry(key).or_insert(expiry);
                 if expiry > *slot {
@@ -3986,10 +4035,34 @@ mod linux {
     ) -> anyhow::Result<()> {
         let old = rule_map_images(old);
         let new = rule_map_images(new);
-        diff_exact_v4(ebpf, "XDP_ALLOWED_V4", &old.allowed_v4, &new.allowed_v4, true)?;
-        diff_exact_v6(ebpf, "XDP_ALLOWED_V6", &old.allowed_v6, &new.allowed_v6, true)?;
-        diff_exact_v4(ebpf, "XDP_BLOCKED_V4", &old.blocked_v4, &new.blocked_v4, false)?;
-        diff_exact_v6(ebpf, "XDP_BLOCKED_V6", &old.blocked_v6, &new.blocked_v6, false)?;
+        diff_exact_v4(
+            ebpf,
+            "XDP_ALLOWED_V4",
+            &old.allowed_v4,
+            &new.allowed_v4,
+            true,
+        )?;
+        diff_exact_v6(
+            ebpf,
+            "XDP_ALLOWED_V6",
+            &old.allowed_v6,
+            &new.allowed_v6,
+            true,
+        )?;
+        diff_exact_v4(
+            ebpf,
+            "XDP_BLOCKED_V4",
+            &old.blocked_v4,
+            &new.blocked_v4,
+            false,
+        )?;
+        diff_exact_v6(
+            ebpf,
+            "XDP_BLOCKED_V6",
+            &old.blocked_v6,
+            &new.blocked_v6,
+            false,
+        )?;
         diff_lpm_v4(
             ebpf,
             "XDP_ALLOWED_V4_LPM",
@@ -4037,7 +4110,11 @@ mod linux {
         let mut map = AyaHashMap::<_, XdpIpv4Key, XdpRuleValue>::try_from(map)?;
         for (addr_be, expiry) in new {
             if old.get(addr_be) != Some(expiry) {
-                map.insert(XdpIpv4Key { addr_be: *addr_be }, rule_value(*expiry, allow), 0)?;
+                map.insert(
+                    XdpIpv4Key { addr_be: *addr_be },
+                    rule_value(*expiry, allow),
+                    0,
+                )?;
             }
         }
         for addr_be in old.keys() {
@@ -4150,7 +4227,8 @@ mod linux {
     fn monotonic_deadline_ns(expires_at: i64) -> u64 {
         let now_mono_ns = monotonic_now_ns();
         if now_mono_ns == 0 {
-            static LAST_WARN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static LAST_WARN_MS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let now_ms = crate::utils::time::now_timestamp_millis() as u64;
             let last = LAST_WARN_MS.load(std::sync::atomic::Ordering::Relaxed);
             if now_ms.saturating_sub(last) > 60_000 {
@@ -6802,8 +6880,7 @@ mod tests {
         assert!(!af_xdp::proxy_bridge_should_continue(&old_manager));
         assert!(af_xdp::proxy_bridge_should_continue(&new_manager));
 
-        new_manager
-            .mark_proxy_dataplane_degraded("test forced degraded");
+        new_manager.mark_proxy_dataplane_degraded("test forced degraded");
         assert!(!af_xdp::proxy_bridge_should_continue(&new_manager));
     }
 
@@ -6822,15 +6899,10 @@ mod tests {
             allowed_ips: [("198.51.100.1".parse::<IpAddr>().unwrap(), 9999)]
                 .into_iter()
                 .collect(),
-            blocked_networks: [
-                (
-                    "203.0.113.0/24".to_string(),
-                    (
-                        "203.0.113.0/24".parse::<IpNet>().unwrap(),
-                        9999,
-                    ),
-                ),
-            ]
+            blocked_networks: [(
+                "203.0.113.0/24".to_string(),
+                ("203.0.113.0/24".parse::<IpNet>().unwrap(), 9999),
+            )]
             .into_iter()
             .collect(),
             allowed_networks: Default::default(),
@@ -6852,15 +6924,10 @@ mod tests {
             .into_iter()
             .collect(),
             blocked_networks: Default::default(), // entire network removed
-            allowed_networks: [
-                (
-                    "2001:db8::/32".to_string(),
-                    (
-                        "2001:db8::/32".parse::<IpNet>().unwrap(),
-                        9999,
-                    ),
-                ),
-            ]
+            allowed_networks: [(
+                "2001:db8::/32".to_string(),
+                ("2001:db8::/32".parse::<IpNet>().unwrap(), 9999),
+            )]
             .into_iter()
             .collect(),
             blocked_ranges: Default::default(),
@@ -6871,20 +6938,60 @@ mod tests {
         let new_img = rule_map_images(&new_state);
 
         // Exact v4 blocked: 192.0.2.1 removed, 192.0.2.3 added, 192.0.2.2 kept (no-op)
-        assert!(old_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 1])));
-        assert!(old_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 2])));
-        assert!(!old_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 3])));
+        assert!(
+            old_img
+                .blocked_v4
+                .contains_key(&u32::from_be_bytes([192, 0, 2, 1]))
+        );
+        assert!(
+            old_img
+                .blocked_v4
+                .contains_key(&u32::from_be_bytes([192, 0, 2, 2]))
+        );
+        assert!(
+            !old_img
+                .blocked_v4
+                .contains_key(&u32::from_be_bytes([192, 0, 2, 3]))
+        );
 
-        assert!(!new_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 1])));
-        assert!(new_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 2])));
-        assert!(new_img.blocked_v4.contains_key(&u32::from_be_bytes([192, 0, 2, 3])));
+        assert!(
+            !new_img
+                .blocked_v4
+                .contains_key(&u32::from_be_bytes([192, 0, 2, 1]))
+        );
+        assert!(
+            new_img
+                .blocked_v4
+                .contains_key(&u32::from_be_bytes([192, 0, 2, 2]))
+        );
+        assert!(
+            new_img
+                .blocked_v4
+                .contains_key(&u32::from_be_bytes([192, 0, 2, 3]))
+        );
 
         // Exact v4 allowed: 198.51.100.2 added, 198.51.100.1 kept
-        assert!(old_img.allowed_v4.contains_key(&u32::from_be_bytes([198, 51, 100, 1])));
-        assert!(!old_img.allowed_v4.contains_key(&u32::from_be_bytes([198, 51, 100, 2])));
+        assert!(
+            old_img
+                .allowed_v4
+                .contains_key(&u32::from_be_bytes([198, 51, 100, 1]))
+        );
+        assert!(
+            !old_img
+                .allowed_v4
+                .contains_key(&u32::from_be_bytes([198, 51, 100, 2]))
+        );
 
-        assert!(new_img.allowed_v4.contains_key(&u32::from_be_bytes([198, 51, 100, 1])));
-        assert!(new_img.allowed_v4.contains_key(&u32::from_be_bytes([198, 51, 100, 2])));
+        assert!(
+            new_img
+                .allowed_v4
+                .contains_key(&u32::from_be_bytes([198, 51, 100, 1]))
+        );
+        assert!(
+            new_img
+                .allowed_v4
+                .contains_key(&u32::from_be_bytes([198, 51, 100, 2]))
+        );
 
         // LPM v4 blocked: 203.0.113.0/24 removed
         assert!(!old_img.blocked_lpm_v4.is_empty());

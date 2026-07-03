@@ -467,7 +467,7 @@ impl WafStateManager {
 
     pub fn publish_kernel_filter_snapshot(&self) {
         let filter = self.kernel_filter();
-        if filter.name() != "xdp" || !filter.available() {
+        if !filter.available() {
             return;
         }
         let snapshot = self.kernel_filter_snapshot();

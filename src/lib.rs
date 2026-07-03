@@ -57,4 +57,5 @@ pub mod udp_proxy;
 pub mod unsupported;
 pub mod utils;
 pub mod xdp;
+pub mod xdp_auto_config;
 pub mod xdp_config_wizard;

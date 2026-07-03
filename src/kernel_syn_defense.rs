@@ -704,7 +704,7 @@ impl SynproxyNftStatus {
 }
 
 #[cfg(target_os = "linux")]
-async fn fetch_live_node_config_payload() -> anyhow::Result<NodeConfigPayload> {
+pub async fn fetch_live_node_config_payload() -> anyhow::Result<NodeConfigPayload> {
     use std::io::Read;
 
     let api_config = crate::api_config::ApiConfig::load_default()?;

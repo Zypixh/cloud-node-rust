@@ -488,9 +488,6 @@ impl RuntimeConfig {
         if !self.xdp.enabled {
             return Ok(());
         }
-        if self.xdp.interfaces.is_empty() {
-            anyhow::bail!("xdp.enabled=true requires at least one xdp.interfaces entry");
-        }
         for interface in &self.xdp.interfaces {
             if interface.name.trim().is_empty() {
                 anyhow::bail!("xdp.interfaces entries require name");
@@ -696,6 +693,20 @@ xdp:
         assert_eq!(config.xdp.proxy.ports.len(), 2);
         assert_eq!(config.xdp.proxy.ports[0].protocol, XdpProxyProtocol::Https);
         assert_eq!(config.xdp.proxy.ports[1].protocol, XdpProxyProtocol::H3);
+    }
+
+    #[test]
+    fn xdp_runtime_config_allows_empty_interfaces_for_auto_derivation() {
+        let config: RuntimeConfig = serde_yaml::from_str(
+            r#"
+xdp:
+  enabled: true
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert!(config.xdp.interfaces.is_empty());
     }
 
     #[test]

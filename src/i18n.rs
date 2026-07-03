@@ -393,13 +393,13 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "xdp.attach",
-        "Attach XDP programs using configs/runtime.yaml",
-        "使用 configs/runtime.yaml 附加 XDP 程序",
+        "Start automatic XDP proxy takeover",
+        "启动 XDP 自动代理接管",
     ),
     (
         "xdp.detach",
-        "Detach XDP programs managed by this process",
-        "分离由此进程管理的 XDP 程序",
+        "Stop XDP automatic takeover",
+        "停止 XDP 自动接管",
     ),
     (
         "xdp.dump_maps",
@@ -413,8 +413,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "xdp.configure",
-        "Interactive XDP configuration wizard",
-        "XDP 交互式配置向导",
+        "Preview and save automatic XDP configuration",
+        "预览并保存 XDP 自动配置",
     ),
     // XDP status
     (
@@ -446,10 +446,15 @@ const STRINGS: &[(&str, &str, &str)] = &[
     // XDP menu / wizard
     (
         "xdp.menu.title",
-        "=== XDP Configuration Wizard ===",
-        "=== XDP 配置向导 ===",
+        "=== XDP Automatic Takeover Configuration ===",
+        "=== XDP 自动接管配置 ===",
     ),
     ("xdp.menu.enable", "Enable XDP?", "启用 XDP？"),
+    (
+        "xdp.menu.auto_summary",
+        "Automatic XDP proxy takeover preview:",
+        "XDP 自动代理接管预览：",
+    ),
     (
         "xdp.menu.attach_mode",
         "Select attach mode:",
