@@ -20,6 +20,8 @@ const XDP_RULE_SWEEP_INTERVAL_SECS: u64 = 5;
 // whole-second resonance with the rule sweeper.
 const XDP_MAP_SYNC_DEBOUNCE_MS: u64 = 47;
 const XDP_PROXY_DATAPLANE_ACTIVE: bool = true;
+#[cfg(any(test, target_os = "linux"))]
+const XDP_XSK_STATUS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct XdpQueueStatus {
@@ -100,6 +102,23 @@ fn write_status_snapshot_blocking(
     let body = serde_json::to_vec_pretty(status)?;
     std::fs::write(path, body)?;
     Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn xsk_status_refresh_due(
+    last_refresh_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+    force: bool,
+) -> bool {
+    if force {
+        return true;
+    }
+    match last_refresh_at {
+        Some(last_refresh_at) => {
+            now.saturating_duration_since(last_refresh_at) >= XDP_XSK_STATUS_REFRESH_INTERVAL
+        }
+        None => true,
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -451,7 +470,7 @@ impl XdpManager {
 
     async fn initialize(&self) -> anyhow::Result<()> {
         if !self.config.enabled {
-            self.set_fallback_reason("runtime xdp.enabled=false");
+            self.ensure_detached_when_disabled().await;
             return Ok(());
         }
         if self.config.interfaces.is_empty() {
@@ -517,6 +536,39 @@ impl XdpManager {
 
         self.persist_status();
         Ok(())
+    }
+
+    async fn ensure_detached_when_disabled(&self) {
+        if self.config.enabled {
+            return;
+        }
+        self.stop_rule_sweeper();
+        self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        {
+            *self.af_xdp.lock() = None;
+            *self.ebpf.lock() = None;
+            if !self.config.interfaces.is_empty() {
+                if let Err(err) = linux::detach(&self.config).await {
+                    let detail = format!("runtime xdp.enabled=false; detach failed: {err}");
+                    self.set_fallback_reason(detail.clone());
+                    tracing::warn!("{detail}");
+                    crate::logging::report_node_log(
+                        "warn".to_string(),
+                        "xdp".to_string(),
+                        detail,
+                        0,
+                    );
+                    self.persist_status_blocking();
+                    return;
+                }
+            }
+        }
+        self.attached.write().clear();
+        self.xsk_status.write().clear();
+        self.set_fallback_reason(String::new());
+        self.set_proxy_fallback_reason(String::new());
+        self.persist_status_blocking();
     }
 
     fn set_fallback_reason(&self, reason: impl Into<String>) {
@@ -807,6 +859,8 @@ impl XdpManager {
     }
 
     fn status(&self) -> XdpStatusSnapshot {
+        #[cfg(target_os = "linux")]
+        self.refresh_af_xdp_statuses(true);
         self.refresh_counters();
         let state = self.state.read();
         let attached = self.attached.read();
@@ -1014,6 +1068,19 @@ impl XdpManager {
         if let Err(err) = write_status_snapshot_blocking(&path, &status) {
             tracing::warn!("failed to write XDP status: {}", err);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refresh_af_xdp_statuses(&self, force: bool) {
+        let statuses = {
+            let mut runtime = self.af_xdp.lock();
+            let Some(runtime) = runtime.as_mut() else {
+                return;
+            };
+            runtime.refresh_statuses(force);
+            runtime.statuses.clone()
+        };
+        *self.xsk_status.write() = statuses;
     }
 
     fn update_block_ip(&self, ip: IpAddr, ttl_secs: i64) {
@@ -1315,13 +1382,13 @@ fn manager_from_runtime() -> std::sync::Arc<XdpManager> {
 
     {
         let current = manager.read();
-        if current.config == config || !current.attached.read().is_empty() {
+        if current.config == config || (config.enabled && !current.attached.read().is_empty()) {
             return current.clone();
         }
     }
 
     let mut current = manager.write();
-    if current.config != config && current.attached.read().is_empty() {
+    if current.config != config && (!config.enabled || current.attached.read().is_empty()) {
         *current = std::sync::Arc::new(XdpManager::new(config));
     }
     current.clone()
@@ -1422,6 +1489,7 @@ pub async fn build_kernel_filter() -> Option<Box<dyn KernelFilter>> {
     }
     let manager = manager_from_runtime();
     if !manager.config.enabled {
+        manager.ensure_detached_when_disabled().await;
         return None;
     }
     if let Err(err) = manager.initialize().await {
@@ -1441,7 +1509,11 @@ pub async fn build_kernel_filter() -> Option<Box<dyn KernelFilter>> {
 }
 
 pub fn status_snapshot() -> XdpStatusSnapshot {
-    manager_from_runtime().status()
+    let manager = manager_from_runtime();
+    if !manager.config.enabled {
+        manager.persist_status_blocking();
+    }
+    manager.status()
 }
 
 pub fn persisted_status_snapshot() -> Option<XdpStatusSnapshot> {
@@ -3018,6 +3090,7 @@ mod linux {
     pub struct AfXdpRuntimeHandle {
         queues: Vec<AfXdpQueueHandle>,
         pub statuses: Vec<XdpQueueStatus>,
+        last_status_refresh_at: Option<std::time::Instant>,
     }
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -3041,7 +3114,7 @@ mod linux {
                 stats.parse_errors += queue_stats.parse_errors;
                 stats.refilled += queue_stats.refilled;
             }
-            self.refresh_statuses();
+            self.refresh_statuses(false);
             Ok(stats)
         }
 
@@ -3062,7 +3135,7 @@ mod linux {
                 return Ok(false);
             };
             let sent = queue.send_udp_datagram(link, listen_addr, peer_addr, payload)?;
-            self.refresh_statuses();
+            self.refresh_statuses(false);
             Ok(sent)
         }
 
@@ -3080,11 +3153,16 @@ mod linux {
                 return Ok(false);
             };
             let sent = queue.send_raw_frame(frame)?;
-            self.refresh_statuses();
+            self.refresh_statuses(false);
             Ok(sent)
         }
 
-        fn refresh_statuses(&mut self) {
+        pub fn refresh_statuses(&mut self, force: bool) {
+            let now = std::time::Instant::now();
+            if !super::xsk_status_refresh_due(self.last_status_refresh_at, now, force) {
+                return;
+            }
+            self.last_status_refresh_at = Some(now);
             for queue in &self.queues {
                 let Some(status) = self.statuses.iter_mut().find(|status| {
                     status.interface == queue.interface && status.queue == queue.queue
@@ -3301,7 +3379,11 @@ mod linux {
                 }
             }
         }
-        Ok(AfXdpRuntimeHandle { queues, statuses })
+        Ok(AfXdpRuntimeHandle {
+            queues,
+            statuses,
+            last_status_refresh_at: None,
+        })
     }
 
     fn create_af_xdp_queue_with_retry(
@@ -4394,7 +4476,16 @@ pub mod af_xdp {
     const AF_XDP_TCP_STREAM_CHANNEL_DEPTH: usize = 256;
     const AF_XDP_TCP_STREAM_WRITE_CHUNK: usize = 16 * 1024;
     #[cfg(any(test, target_os = "linux"))]
-    const AF_XDP_TCP_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
+    const AF_XDP_TCP_SOCKET_BUFFER_BYTES: usize = 16 * 1024;
+    #[cfg(any(test, target_os = "linux"))]
+    const AF_XDP_TCP_SESSION_ESTIMATED_BYTES: u64 =
+        (AF_XDP_TCP_SOCKET_BUFFER_BYTES as u64 * 2) + 16 * 1024;
+    #[cfg(any(test, target_os = "linux"))]
+    const AF_XDP_TCP_MIN_SESSION_LIMIT: usize = 512;
+    #[cfg(any(test, target_os = "linux"))]
+    const AF_XDP_TCP_MAX_SESSION_LIMIT: usize = 16_384;
+    #[cfg(any(test, target_os = "linux"))]
+    const AF_XDP_TCP_IDLE_PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
     #[cfg(any(test, target_os = "linux"))]
     const AF_XDP_TCP_RECV_SCRATCH_BYTES: usize = 16 * 1024;
     #[cfg(any(test, target_os = "linux"))]
@@ -4404,6 +4495,10 @@ pub mod af_xdp {
     static AF_XDP_TCP_DIAG_ACCEPTED: AtomicU64 = AtomicU64::new(0);
     #[cfg(target_os = "linux")]
     static AF_XDP_TCP_DIAG_IGNORED_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+    #[cfg(target_os = "linux")]
+    static AF_XDP_TCP_DIAG_REFUSED_AT_CAPACITY: AtomicU64 = AtomicU64::new(0);
+    #[cfg(target_os = "linux")]
+    static AF_XDP_TCP_DIAG_PRE_PROXY_TIMEOUT: AtomicU64 = AtomicU64::new(0);
     #[cfg(target_os = "linux")]
     static AF_XDP_TCP_DIAG_PROXY_STARTED: AtomicU64 = AtomicU64::new(0);
     #[cfg(target_os = "linux")]
@@ -4419,6 +4514,8 @@ pub mod af_xdp {
     pub(super) fn reset_tcp_diag() {
         AF_XDP_TCP_DIAG_ACCEPTED.store(0, Ordering::Relaxed);
         AF_XDP_TCP_DIAG_IGNORED_UNKNOWN.store(0, Ordering::Relaxed);
+        AF_XDP_TCP_DIAG_REFUSED_AT_CAPACITY.store(0, Ordering::Relaxed);
+        AF_XDP_TCP_DIAG_PRE_PROXY_TIMEOUT.store(0, Ordering::Relaxed);
         AF_XDP_TCP_DIAG_PROXY_STARTED.store(0, Ordering::Relaxed);
         AF_XDP_TCP_DIAG_SOCKET_RECV_BYTES.store(0, Ordering::Relaxed);
         AF_XDP_TCP_DIAG_STREAM_INGRESS_BYTES.store(0, Ordering::Relaxed);
@@ -4431,6 +4528,8 @@ pub mod af_xdp {
         serde_json::json!({
             "accepted": AF_XDP_TCP_DIAG_ACCEPTED.load(Ordering::Relaxed),
             "ignoredUnknown": AF_XDP_TCP_DIAG_IGNORED_UNKNOWN.load(Ordering::Relaxed),
+            "refusedAtCapacity": AF_XDP_TCP_DIAG_REFUSED_AT_CAPACITY.load(Ordering::Relaxed),
+            "preProxyTimeout": AF_XDP_TCP_DIAG_PRE_PROXY_TIMEOUT.load(Ordering::Relaxed),
             "proxyStarted": AF_XDP_TCP_DIAG_PROXY_STARTED.load(Ordering::Relaxed),
             "socketRecvBytes": AF_XDP_TCP_DIAG_SOCKET_RECV_BYTES.load(Ordering::Relaxed),
             "streamIngressBytes": AF_XDP_TCP_DIAG_STREAM_INGRESS_BYTES.load(Ordering::Relaxed),
@@ -4705,11 +4804,13 @@ pub mod af_xdp {
     struct AfXdpTcpSession {
         flow: AfXdpTcpFlowKey,
         route: AfXdpRouteMeta,
+        proxy_class: AfXdpTcpProxyClass,
         socket: SocketHandle,
         ingress_tx: Option<mpsc::Sender<Bytes>>,
-        egress_rx: mpsc::Receiver<Bytes>,
+        egress_rx: Option<mpsc::Receiver<Bytes>>,
         pending_ingress: Bytes,
         pending_egress: Bytes,
+        created_at: SmoltcpInstant,
         last_activity: SmoltcpInstant,
         proxy_started: bool,
         closing: bool,
@@ -4718,9 +4819,44 @@ pub mod af_xdp {
 
     #[cfg(any(test, target_os = "linux"))]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum AfXdpTcpProxyClass {
+        TcpPlain,
+        TcpTls,
+        Http,
+        Https,
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    impl AfXdpTcpProxyClass {
+        fn label(self) -> &'static str {
+            match self {
+                Self::TcpPlain => "tcp",
+                Self::TcpTls => "tcp_tls",
+                Self::Http => "http",
+                Self::Https => "https",
+            }
+        }
+
+        fn requires_client_payload_before_proxy(self) -> bool {
+            matches!(self, Self::TcpTls | Self::Http | Self::Https)
+        }
+
+        fn slow_first_payload_kind(self) -> crate::l4_defense::L4DefenseKind {
+            match self {
+                Self::TcpPlain => crate::l4_defense::L4DefenseKind::TcpSlowFirstByte,
+                Self::TcpTls | Self::Https => crate::l4_defense::L4DefenseKind::TlsSlowClientHello,
+                Self::Http => crate::l4_defense::L4DefenseKind::HttpSlowHeader,
+            }
+        }
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(super) enum AfXdpTcpIngestStatus {
         Accepted,
+        BlockedByL4,
         IgnoredUnknownFlow,
+        NoHandler,
         RefusedAtCapacity,
     }
 
@@ -4743,6 +4879,10 @@ pub mod af_xdp {
         pub(super) fn record(&mut self, status: AfXdpTcpIngestStatus) -> bool {
             match status {
                 AfXdpTcpIngestStatus::Accepted => {
+                    self.consecutive_refusals = 0;
+                    false
+                }
+                AfXdpTcpIngestStatus::BlockedByL4 | AfXdpTcpIngestStatus::NoHandler => {
                     self.consecutive_refusals = 0;
                     false
                 }
@@ -4897,6 +5037,9 @@ pub mod af_xdp {
         rx_scratch: Vec<u8>,
         tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
+        cached_pressure_level: crate::l4_defense::L4PressureLevel,
+        cached_proxy_idle_timeout: Duration,
+        idle_profile_refreshed_at: SmoltcpInstant,
         #[cfg(test)]
         test_auto_start_proxy: bool,
     }
@@ -4907,9 +5050,7 @@ pub mod af_xdp {
             tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
             http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
         ) -> Self {
-            let session_limit = crate::memory_governor::MEMORY_GOVERNOR
-                .limit_for(crate::memory_governor::AdmissionClass::TcpConnection)
-                .max(1);
+            let session_limit = af_xdp_tcp_session_limit();
             Self::new_with_session_limit(tcp_manager, http_manager, session_limit)
         }
 
@@ -4946,9 +5087,87 @@ pub mod af_xdp {
                 rx_scratch: vec![0u8; AF_XDP_TCP_RECV_SCRATCH_BYTES],
                 tcp_manager,
                 http_manager,
+                cached_pressure_level: crate::l4_defense::L4PressureLevel::Normal,
+                cached_proxy_idle_timeout: AF_XDP_TCP_SESSION_IDLE_TIMEOUT,
+                idle_profile_refreshed_at: SmoltcpInstant::from_millis(0),
                 #[cfg(test)]
                 test_auto_start_proxy: false,
             }
+        }
+
+        fn proxy_class_for_port(&self, port: u16) -> Option<AfXdpTcpProxyClass> {
+            if let Some(tcp_manager) = self.tcp_manager.as_ref()
+                && let Some((_, is_tls)) = tcp_manager.find_tcp_server_by_port_sync(port)
+            {
+                return Some(if is_tls {
+                    AfXdpTcpProxyClass::TcpTls
+                } else {
+                    AfXdpTcpProxyClass::TcpPlain
+                });
+            }
+            if let Some(http_manager) = self.http_manager.as_ref()
+                && let Some(kind) = http_manager.af_xdp_http_port_kind_sync(port)
+            {
+                return Some(match kind {
+                    crate::http_proxy_manager::AfXdpHttpPortKind::Http => AfXdpTcpProxyClass::Http,
+                    crate::http_proxy_manager::AfXdpHttpPortKind::Https => {
+                        AfXdpTcpProxyClass::Https
+                    }
+                });
+            }
+            None
+        }
+
+        fn is_l4_blocked(&self, ip: IpAddr) -> bool {
+            self.tcp_manager
+                .as_ref()
+                .is_some_and(|manager| manager.af_xdp_is_l4_blocked(ip))
+                || self
+                    .http_manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.af_xdp_is_l4_blocked(ip))
+        }
+
+        fn record_l4_event_for_ip(
+            &self,
+            ip: IpAddr,
+            kind: crate::l4_defense::L4DefenseKind,
+            pressure_level: crate::l4_defense::L4PressureLevel,
+            detail: String,
+        ) {
+            if let Some(tcp_manager) = self.tcp_manager.as_ref() {
+                let _ = tcp_manager.record_af_xdp_l4_event_with_pressure(
+                    ip,
+                    kind,
+                    pressure_level,
+                    detail,
+                );
+                return;
+            }
+            if let Some(http_manager) = self.http_manager.as_ref() {
+                let _ = http_manager.record_af_xdp_l4_event_with_pressure(
+                    ip,
+                    kind,
+                    pressure_level,
+                    detail,
+                );
+            }
+        }
+
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        fn should_ignore_unknown_non_syn(&self, flow: &AfXdpTcpFlowKey, flags: u8) -> bool {
+            !self.sessions.contains_key(flow) && !tcp_flags_are_initial_syn(flags)
+        }
+
+        fn record_ignored_unknown_non_syn(&self, flow: AfXdpTcpFlowKey, bytes: usize) {
+            #[cfg(target_os = "linux")]
+            AF_XDP_TCP_DIAG_IGNORED_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+            tracing::trace!(
+                "AF_XDP TCP reactor dropped non-SYN packet for unknown flow local={} peer={} bytes={}",
+                flow.local_addr,
+                flow.peer_addr,
+                bytes
+            );
         }
 
         pub(super) fn ingest(
@@ -4957,18 +5176,75 @@ pub mod af_xdp {
             flow: AfXdpTcpFlowKey,
             ip_packet: Bytes,
         ) -> AfXdpTcpIngestStatus {
-            if !self.sessions.contains_key(&flow) && !tcp_packet_is_initial_syn(&ip_packet) {
-                #[cfg(target_os = "linux")]
-                AF_XDP_TCP_DIAG_IGNORED_UNKNOWN.fetch_add(1, Ordering::Relaxed);
-                tracing::trace!(
-                    "AF_XDP TCP reactor dropped non-SYN packet for unknown flow local={} peer={} bytes={}",
-                    flow.local_addr,
-                    flow.peer_addr,
-                    ip_packet.len()
-                );
+            let existing_session = self.sessions.contains_key(&flow);
+            let flags = tcp_flags_from_ip_packet(&ip_packet).unwrap_or(0);
+            if !existing_session && !tcp_flags_are_initial_syn(flags) {
+                self.record_ignored_unknown_non_syn(flow, ip_packet.len());
                 return AfXdpTcpIngestStatus::IgnoredUnknownFlow;
             }
-            if !self.ensure_session(route.clone(), flow) {
+
+            if self.is_l4_blocked(flow.peer_addr.ip()) {
+                if let Some(session) = self.sessions.get_mut(&flow) {
+                    let socket = self
+                        .sockets
+                        .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
+                    socket.abort();
+                    session.closing = true;
+                }
+                return AfXdpTcpIngestStatus::BlockedByL4;
+            }
+
+            let proxy_class = if existing_session {
+                None
+            } else {
+                match self.proxy_class_for_port(flow.local_addr.port()) {
+                    Some(proxy_class) => Some(proxy_class),
+                    None => {
+                        #[cfg(test)]
+                        if self.test_auto_start_proxy {
+                            return if !self.ensure_session(
+                                route.clone(),
+                                flow,
+                                AfXdpTcpProxyClass::TcpPlain,
+                            ) {
+                                AfXdpTcpIngestStatus::RefusedAtCapacity
+                            } else {
+                                #[cfg(target_os = "linux")]
+                                AF_XDP_TCP_DIAG_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+                                self.device.push_ingress(route, flow, ip_packet);
+                                AfXdpTcpIngestStatus::Accepted
+                            };
+                        }
+                        tracing::debug!(
+                            "AF_XDP TCP reactor has no handler for local={} peer={}",
+                            flow.local_addr,
+                            flow.peer_addr
+                        );
+                        return AfXdpTcpIngestStatus::NoHandler;
+                    }
+                }
+            };
+
+            if !self.ensure_session(
+                route.clone(),
+                flow,
+                proxy_class.unwrap_or(AfXdpTcpProxyClass::TcpPlain),
+            ) {
+                #[cfg(target_os = "linux")]
+                AF_XDP_TCP_DIAG_REFUSED_AT_CAPACITY.fetch_add(1, Ordering::Relaxed);
+                self.record_l4_event_for_ip(
+                    flow.peer_addr.ip(),
+                    crate::l4_defense::L4DefenseKind::SynBacklogPressure,
+                    crate::l4_defense::current_pressure_level()
+                        .max(crate::l4_defense::L4PressureLevel::High),
+                    format!(
+                        "peer={} local={} phase=af_xdp_tcp_reactor_capacity sessions={} limit={}",
+                        flow.peer_addr,
+                        flow.local_addr,
+                        self.sessions.len(),
+                        self.session_limit
+                    ),
+                );
                 tracing::debug!(
                     "AF_XDP TCP reactor refused new session at limit local={} peer={} limit={}",
                     flow.local_addr,
@@ -5067,16 +5343,22 @@ pub mod af_xdp {
             });
         }
 
-        fn ensure_session(&mut self, route: AfXdpRouteMeta, flow: AfXdpTcpFlowKey) -> bool {
+        fn ensure_session(
+            &mut self,
+            route: AfXdpRouteMeta,
+            flow: AfXdpTcpFlowKey,
+            proxy_class: AfXdpTcpProxyClass,
+        ) -> bool {
             let now =
                 SmoltcpInstant::from_millis(crate::utils::time::now_timestamp_millis() as i64);
-            self.ensure_session_at(route, flow, now)
+            self.ensure_session_at(route, flow, proxy_class, now)
         }
 
         fn ensure_session_at(
             &mut self,
             route: AfXdpRouteMeta,
             flow: AfXdpTcpFlowKey,
+            proxy_class: AfXdpTcpProxyClass,
             now: SmoltcpInstant,
         ) -> bool {
             if let Some(session) = self.sessions.get_mut(&flow) {
@@ -5106,25 +5388,21 @@ pub mod af_xdp {
             }
 
             let socket = self.sockets.add(socket);
-            let AfXdpTcpStreamParts {
-                stream,
-                ingress_tx,
-                egress_rx,
-            } = AfXdpTcpStream::default_channel_pair();
             let mut session = AfXdpTcpSession {
                 flow,
                 route,
+                proxy_class,
                 socket,
-                ingress_tx: Some(ingress_tx),
-                egress_rx,
+                ingress_tx: None,
+                egress_rx: None,
                 pending_ingress: Bytes::new(),
                 pending_egress: Bytes::new(),
+                created_at: now,
                 last_activity: now,
                 proxy_started: false,
                 closing: false,
                 egress_closed: false,
             };
-            self.spawn_proxy_task(&mut session, stream);
             #[cfg(test)]
             if self.test_auto_start_proxy && !session.proxy_started {
                 session.proxy_started = true;
@@ -5152,72 +5430,106 @@ pub mod af_xdp {
             }
         }
 
-        fn spawn_proxy_task(&self, session: &mut AfXdpTcpSession, stream: AfXdpTcpStream) {
+        fn spawn_proxy_task_with_managers(
+            tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
+            http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
+            session: &mut AfXdpTcpSession,
+        ) -> bool {
             let peer_addr = session.flow.peer_addr;
             let listen_port = session.flow.local_addr.port();
-            if let Some(tcp_manager) = self.tcp_manager.as_ref().cloned()
-                && let Some((server, is_tls)) =
-                    tcp_manager.find_tcp_server_by_port_sync(listen_port)
-            {
-                session.proxy_started = true;
-                #[cfg(target_os = "linux")]
-                AF_XDP_TCP_DIAG_PROXY_STARTED.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(async move {
-                    let result = if is_tls {
-                        tcp_manager
-                            .handle_af_xdp_tls_tcp_stream(stream, peer_addr, server)
-                            .await
-                    } else {
-                        tcp_manager
-                            .handle_af_xdp_tcp_stream(stream, peer_addr, server)
-                            .await
+            let AfXdpTcpStreamParts {
+                stream,
+                ingress_tx,
+                egress_rx,
+            } = AfXdpTcpStream::default_channel_pair();
+            match session.proxy_class {
+                AfXdpTcpProxyClass::TcpPlain | AfXdpTcpProxyClass::TcpTls => {
+                    let Some(tcp_manager) = tcp_manager else {
+                        return false;
                     };
-                    if let Err(err) = result {
-                        tracing::debug!(
-                            "AF_XDP TCP proxy stream failed peer={}: {}",
-                            peer_addr,
-                            err
-                        );
-                    }
-                });
-                return;
-            }
-
-            if let Some(http_manager) = self.http_manager.as_ref().cloned()
-                && let Some(kind) = http_manager.af_xdp_http_port_kind_sync(listen_port)
-            {
-                session.proxy_started = true;
-                #[cfg(target_os = "linux")]
-                AF_XDP_TCP_DIAG_PROXY_STARTED.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(async move {
-                    if let Err(err) = http_manager
-                        .handle_af_xdp_http_stream(stream, peer_addr, listen_port, kind)
-                        .await
-                    {
-                        tracing::debug!(
-                            "AF_XDP HTTP stream failed peer={} port={}: {}",
-                            peer_addr,
-                            listen_port,
-                            err
-                        );
-                    }
-                });
+                    let Some((server, is_tls)) =
+                        tcp_manager.find_tcp_server_by_port_sync(listen_port)
+                    else {
+                        return false;
+                    };
+                    session.ingress_tx = Some(ingress_tx);
+                    session.egress_rx = Some(egress_rx);
+                    session.proxy_started = true;
+                    #[cfg(target_os = "linux")]
+                    AF_XDP_TCP_DIAG_PROXY_STARTED.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        let result = if is_tls {
+                            tcp_manager
+                                .handle_af_xdp_tls_tcp_stream(stream, peer_addr, server)
+                                .await
+                        } else {
+                            tcp_manager
+                                .handle_af_xdp_tcp_stream(stream, peer_addr, server)
+                                .await
+                        };
+                        if let Err(err) = result {
+                            tracing::debug!(
+                                "AF_XDP TCP proxy stream failed peer={}: {}",
+                                peer_addr,
+                                err
+                            );
+                        }
+                    });
+                    true
+                }
+                AfXdpTcpProxyClass::Http | AfXdpTcpProxyClass::Https => {
+                    let Some(http_manager) = http_manager else {
+                        return false;
+                    };
+                    let Some(kind) = http_manager.af_xdp_http_port_kind_sync(listen_port) else {
+                        return false;
+                    };
+                    session.ingress_tx = Some(ingress_tx);
+                    session.egress_rx = Some(egress_rx);
+                    session.proxy_started = true;
+                    #[cfg(target_os = "linux")]
+                    AF_XDP_TCP_DIAG_PROXY_STARTED.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        if let Err(err) = http_manager
+                            .handle_af_xdp_http_stream(stream, peer_addr, listen_port, kind)
+                            .await
+                        {
+                            tracing::debug!(
+                                "AF_XDP HTTP stream failed peer={} port={}: {}",
+                                peer_addr,
+                                listen_port,
+                                err
+                            );
+                        }
+                    });
+                    true
+                }
             }
         }
 
         fn pump_sessions(&mut self, now: SmoltcpInstant) {
+            let tcp_manager = self.tcp_manager.clone();
+            let http_manager = self.http_manager.clone();
             for session in self.sessions.values_mut() {
-                if !session.proxy_started {
-                    let socket = self
-                        .sockets
-                        .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
-                    socket.abort();
-                    session.closing = true;
-                    continue;
-                }
                 let socket = self
                     .sockets
                     .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
+
+                if !session.proxy_started {
+                    if af_xdp_tcp_proxy_ready(session.proxy_class, socket) {
+                        if !Self::spawn_proxy_task_with_managers(
+                            tcp_manager.clone(),
+                            http_manager.clone(),
+                            session,
+                        ) {
+                            socket.abort();
+                            session.closing = true;
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
 
                 if let Some(ingress_tx) = session.ingress_tx.as_ref() {
                     match flush_pending_ingress(ingress_tx, &mut session.pending_ingress) {
@@ -5305,7 +5617,10 @@ pub mod af_xdp {
 
                 while socket.can_send() {
                     if session.pending_egress.is_empty() {
-                        match session.egress_rx.try_recv() {
+                        let Some(egress_rx) = session.egress_rx.as_mut() else {
+                            break;
+                        };
+                        match egress_rx.try_recv() {
                             Ok(bytes) if bytes.is_empty() => continue,
                             Ok(bytes) => {
                                 session.last_activity = now;
@@ -5364,25 +5679,67 @@ pub mod af_xdp {
         }
 
         fn retain_live_sessions(&mut self, now: SmoltcpInstant) {
+            if self.sessions.is_empty() {
+                return;
+            }
+            self.refresh_idle_profile_if_due(now);
+            let pressure_level = self.cached_pressure_level;
+            let proxy_idle_timeout = self.cached_proxy_idle_timeout;
             let mut finished = Vec::new();
+            let mut pre_proxy_timeouts = Vec::new();
             for (flow, session) in &self.sessions {
                 let socket = self
                     .sockets
                     .get::<SmoltcpTcp::Socket<'static>>(session.socket);
-                let idle_timeout = effective_af_xdp_tcp_idle_timeout();
-                if !session.closing && session_idle_for(now, session.last_activity) >= idle_timeout
-                {
+                let idle_timeout = if session.proxy_started {
+                    proxy_idle_timeout
+                } else {
+                    effective_af_xdp_tcp_pre_proxy_timeout(session.proxy_class, pressure_level)
+                };
+                let idle_since = if session.proxy_started {
+                    session.last_activity
+                } else {
+                    session.created_at
+                };
+                let idle_for = session_idle_for(now, idle_since);
+                if !session.closing && idle_for >= idle_timeout {
                     tracing::debug!(
-                        "AF_XDP TCP reactor closing idle session local={} peer={} idle_ms={} timeout_ms={}",
+                        "AF_XDP TCP reactor closing idle session local={} peer={} class={} proxy_started={} idle_ms={} timeout_ms={}",
                         session.flow.local_addr,
                         session.flow.peer_addr,
-                        session_idle_for(now, session.last_activity).as_millis(),
+                        session.proxy_class.label(),
+                        session.proxy_started,
+                        idle_for.as_millis(),
                         idle_timeout.as_millis()
                     );
+                    if !session.proxy_started {
+                        pre_proxy_timeouts.push((
+                            *flow,
+                            session.proxy_class.slow_first_payload_kind(),
+                            idle_for,
+                            idle_timeout,
+                        ));
+                    }
                     finished.push(*flow);
                 } else if af_xdp_tcp_session_reapable(session.closing, socket.state()) {
                     finished.push(*flow);
                 }
+            }
+            for (flow, kind, idle_for, idle_timeout) in pre_proxy_timeouts {
+                #[cfg(target_os = "linux")]
+                AF_XDP_TCP_DIAG_PRE_PROXY_TIMEOUT.fetch_add(1, Ordering::Relaxed);
+                self.record_l4_event_for_ip(
+                    flow.peer_addr.ip(),
+                    kind,
+                    pressure_level,
+                    format!(
+                        "peer={} local={} phase=af_xdp_pre_proxy_idle idle_ms={} timeout_ms={}",
+                        flow.peer_addr,
+                        flow.local_addr,
+                        idle_for.as_millis(),
+                        idle_timeout.as_millis()
+                    ),
+                );
             }
             for flow in finished {
                 if let Some(session) = self.sessions.remove(&flow) {
@@ -5393,6 +5750,17 @@ pub mod af_xdp {
                     let _ = self.sockets.remove(session.socket);
                 }
             }
+        }
+
+        fn refresh_idle_profile_if_due(&mut self, now: SmoltcpInstant) {
+            if session_idle_for(now, self.idle_profile_refreshed_at)
+                < AF_XDP_TCP_IDLE_PROFILE_REFRESH_INTERVAL
+            {
+                return;
+            }
+            self.cached_pressure_level = crate::l4_defense::current_pressure_level();
+            self.cached_proxy_idle_timeout = effective_af_xdp_tcp_idle_timeout();
+            self.idle_profile_refreshed_at = now;
         }
     }
 
@@ -5422,6 +5790,52 @@ pub mod af_xdp {
             .tcp_relay_pressure_idle_timeout()
             .unwrap_or(AF_XDP_TCP_SESSION_IDLE_TIMEOUT)
             .min(AF_XDP_TCP_SESSION_IDLE_TIMEOUT)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    fn effective_af_xdp_tcp_pre_proxy_timeout(
+        proxy_class: AfXdpTcpProxyClass,
+        level: crate::l4_defense::L4PressureLevel,
+    ) -> Duration {
+        if proxy_class.requires_client_payload_before_proxy() {
+            return crate::l4_defense::first_byte_timeout(level);
+        }
+        match level {
+            crate::l4_defense::L4PressureLevel::Normal => Duration::from_secs(3),
+            crate::l4_defense::L4PressureLevel::Elevated => Duration::from_secs(2),
+            crate::l4_defense::L4PressureLevel::High => Duration::from_secs(1),
+            crate::l4_defense::L4PressureLevel::Critical => Duration::from_millis(500),
+        }
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    fn af_xdp_tcp_proxy_ready(
+        proxy_class: AfXdpTcpProxyClass,
+        socket: &SmoltcpTcp::Socket<'static>,
+    ) -> bool {
+        if proxy_class.requires_client_payload_before_proxy() {
+            return socket.can_recv() || socket.recv_queue() > 0;
+        }
+        matches!(
+            socket.state(),
+            SmoltcpTcp::State::Established | SmoltcpTcp::State::CloseWait
+        ) || socket.can_recv()
+            || socket.recv_queue() > 0
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn af_xdp_tcp_session_limit() -> usize {
+        let snapshot = crate::memory_governor::MEMORY_GOVERNOR
+            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
+        af_xdp_tcp_session_limit_from_budget(snapshot.connection_budget_bytes)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn af_xdp_tcp_session_limit_from_budget(connection_budget_bytes: u64) -> usize {
+        let memory_limit = connection_budget_bytes
+            .saturating_div(AF_XDP_TCP_SESSION_ESTIMATED_BYTES.max(1))
+            .max(1) as usize;
+        memory_limit.clamp(AF_XDP_TCP_MIN_SESSION_LIMIT, AF_XDP_TCP_MAX_SESSION_LIMIT)
     }
 
     #[cfg(any(test, target_os = "linux"))]
@@ -5811,6 +6225,12 @@ pub mod af_xdp {
             }
 
             for (interface, queue, frame) in frames.drain(..) {
+                if let Some((flow, flags)) = parse_tcp_flow_flags_from_frame(&frame)
+                    && tcp_reactor.should_ignore_unknown_non_syn(&flow, flags)
+                {
+                    tcp_reactor.record_ignored_unknown_non_syn(flow, frame.len());
+                    continue;
+                }
                 match parse_proxy_frame(&interface, queue, &frame) {
                     Some(AfXdpProxyFrame::Udp { route, packet }) => {
                         let now_ms = crate::udp_proxy::udp_activity_now_ms();
@@ -6612,15 +7032,112 @@ pub mod af_xdp {
     }
 
     #[cfg(any(test, target_os = "linux"))]
-    fn tcp_packet_is_initial_syn(ip_packet: &[u8]) -> bool {
-        let Some((protocol, l4_offset, packet_end)) = ip_transport_bounds(ip_packet) else {
+    pub(super) fn tcp_packet_is_initial_syn(ip_packet: &[u8]) -> bool {
+        let Some(flags) = tcp_flags_from_ip_packet(ip_packet) else {
             return false;
         };
-        if protocol != IP_PROTO_TCP || l4_offset + TCP_MIN_HEADER_LEN > packet_end {
-            return false;
-        }
-        let flags = ip_packet[l4_offset + 13];
+        tcp_flags_are_initial_syn(flags)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    fn tcp_flags_are_initial_syn(flags: u8) -> bool {
         flags & 0x17 == 0x02
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn parse_tcp_flow_flags_from_frame(frame: &[u8]) -> Option<(AfXdpTcpFlowKey, u8)> {
+        let (link, ip_offset) = parse_link_meta(frame)?;
+        tcp_flow_flags_from_frame(frame, ip_offset, link.ethertype)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    fn tcp_flow_flags_from_frame(
+        frame: &[u8],
+        ip_offset: usize,
+        ethertype: u16,
+    ) -> Option<(AfXdpTcpFlowKey, u8)> {
+        match ethertype {
+            ETHERTYPE_IPV4 => {
+                let base = frame.get(ip_offset..ip_offset + IPV4_MIN_HEADER_LEN)?;
+                let version = base[0] >> 4;
+                let ihl = usize::from(base[0] & 0x0f) * 4;
+                if version != 4 || ihl < IPV4_MIN_HEADER_LEN {
+                    return None;
+                }
+                let packet_end = ipv4_packet_end(frame, ip_offset)?;
+                let fragment = u16::from_be_bytes([base[6], base[7]]);
+                if fragment & 0x3fff != 0 || base[9] != IP_PROTO_TCP {
+                    return None;
+                }
+                let tcp_offset = ip_offset.checked_add(ihl)?;
+                let header = frame.get(tcp_offset..tcp_offset + TCP_MIN_HEADER_LEN)?;
+                let tcp_header_len = usize::from(header[12] >> 4) * 4;
+                if tcp_header_len < TCP_MIN_HEADER_LEN || tcp_offset + tcp_header_len > packet_end {
+                    return None;
+                }
+                let source = IpAddr::V4(Ipv4Addr::new(base[12], base[13], base[14], base[15]));
+                let destination = IpAddr::V4(Ipv4Addr::new(base[16], base[17], base[18], base[19]));
+                Some((
+                    AfXdpTcpFlowKey {
+                        local_addr: SocketAddr::new(
+                            destination,
+                            u16::from_be_bytes([header[2], header[3]]),
+                        ),
+                        peer_addr: SocketAddr::new(
+                            source,
+                            u16::from_be_bytes([header[0], header[1]]),
+                        ),
+                    },
+                    header[13],
+                ))
+            }
+            ETHERTYPE_IPV6 => {
+                let base = frame.get(ip_offset..ip_offset + IPV6_HEADER_LEN)?;
+                if base[0] >> 4 != 6 {
+                    return None;
+                }
+                let packet_end = ipv6_packet_end(frame, ip_offset)?;
+                let (protocol, tcp_offset) =
+                    ipv6_transport_offset(frame, base[6], ip_offset + IPV6_HEADER_LEN, packet_end)?;
+                if protocol != IP_PROTO_TCP {
+                    return None;
+                }
+                let header = frame.get(tcp_offset..tcp_offset + TCP_MIN_HEADER_LEN)?;
+                let tcp_header_len = usize::from(header[12] >> 4) * 4;
+                if tcp_header_len < TCP_MIN_HEADER_LEN || tcp_offset + tcp_header_len > packet_end {
+                    return None;
+                }
+                let mut source_octets = [0u8; 16];
+                source_octets.copy_from_slice(&base[8..24]);
+                let mut destination_octets = [0u8; 16];
+                destination_octets.copy_from_slice(&base[24..40]);
+                Some((
+                    AfXdpTcpFlowKey {
+                        local_addr: SocketAddr::new(
+                            IpAddr::V6(Ipv6Addr::from(destination_octets)),
+                            u16::from_be_bytes([header[2], header[3]]),
+                        ),
+                        peer_addr: SocketAddr::new(
+                            IpAddr::V6(Ipv6Addr::from(source_octets)),
+                            u16::from_be_bytes([header[0], header[1]]),
+                        ),
+                    },
+                    header[13],
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(super) fn tcp_flags_from_ip_packet(ip_packet: &[u8]) -> Option<u8> {
+        let Some((protocol, l4_offset, packet_end)) = ip_transport_bounds(ip_packet) else {
+            return None;
+        };
+        if protocol != IP_PROTO_TCP || l4_offset + TCP_MIN_HEADER_LEN > packet_end {
+            return None;
+        }
+        Some(ip_packet[l4_offset + 13])
     }
 
     fn ip_transport_bounds(ip_packet: &[u8]) -> Option<(u8, usize, usize)> {
@@ -6914,6 +7431,34 @@ mod tests {
 
         assert!(!manager_is_current(&old_manager));
         assert!(manager_is_current(&new_manager));
+    }
+
+    #[test]
+    fn xdp_runtime_disabled_replaces_stale_attached_manager() {
+        let _guard = crate::runtime_mode::runtime_config_test_guard();
+        let enabled_config = test_proxy_config("eth-stale");
+        RuntimeConfig::set_current(RuntimeConfig {
+            xdp: enabled_config.clone(),
+            ..RuntimeConfig::default()
+        });
+        let old_manager = replace_manager_from_runtime();
+        mark_test_proxy_bridge_ready(&old_manager);
+        assert!(old_manager.status().attached);
+
+        let mut disabled_config = enabled_config;
+        disabled_config.enabled = false;
+        RuntimeConfig::set_current(RuntimeConfig {
+            xdp: disabled_config,
+            ..RuntimeConfig::default()
+        });
+
+        let disabled_manager = manager_from_runtime();
+        let status = disabled_manager.status();
+        assert!(!std::sync::Arc::ptr_eq(&old_manager, &disabled_manager));
+        assert!(!status.enabled);
+        assert!(!status.available);
+        assert!(!status.attached);
+        assert!(status.fallback_reason.is_empty());
     }
 
     #[cfg(any(test, target_os = "linux"))]
@@ -7839,11 +8384,35 @@ mod tests {
         else {
             panic!("expected TCP proxy frame");
         };
-        let mut reactor = af_xdp::AfXdpTcpReactor::new(None, None);
+        let mut reactor =
+            af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
 
         assert_eq!(
             reactor.ingest(route, flow, ip_packet),
             af_xdp::AfXdpTcpIngestStatus::IgnoredUnknownFlow
+        );
+
+        assert!(reactor.poll().is_empty());
+        assert_eq!(reactor.session_count(), 0);
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    #[test]
+    fn af_xdp_tcp_reactor_requires_handler_for_new_syn() {
+        let frame = ipv4_tcp_syn_frame(false);
+        let af_xdp::AfXdpProxyFrame::Tcp {
+            route,
+            flow,
+            ip_packet,
+        } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+        else {
+            panic!("expected TCP proxy frame");
+        };
+        let mut reactor = af_xdp::AfXdpTcpReactor::new(None, None);
+
+        assert_eq!(
+            reactor.ingest(route, flow, ip_packet),
+            af_xdp::AfXdpTcpIngestStatus::NoHandler
         );
 
         assert!(reactor.poll().is_empty());
@@ -7905,7 +8474,8 @@ mod tests {
         else {
             panic!("expected TCP proxy frame");
         };
-        let mut reactor = af_xdp::AfXdpTcpReactor::new(None, None);
+        let mut reactor =
+            af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
 
         assert_eq!(
             reactor.ingest(route, flow, ip_packet),
@@ -8002,6 +8572,10 @@ mod tests {
 
         assert!(!tracker.record(af_xdp::AfXdpTcpIngestStatus::IgnoredUnknownFlow));
         assert_eq!(tracker.consecutive_refusals(), 0);
+        assert!(!tracker.record(af_xdp::AfXdpTcpIngestStatus::NoHandler));
+        assert_eq!(tracker.consecutive_refusals(), 0);
+        assert!(!tracker.record(af_xdp::AfXdpTcpIngestStatus::BlockedByL4));
+        assert_eq!(tracker.consecutive_refusals(), 0);
         assert!(!tracker.record(af_xdp::AfXdpTcpIngestStatus::RefusedAtCapacity));
         assert_eq!(tracker.consecutive_refusals(), 1);
         assert!(!tracker.record(af_xdp::AfXdpTcpIngestStatus::Accepted));
@@ -8015,6 +8589,78 @@ mod tests {
 
     #[cfg(any(test, target_os = "linux"))]
     #[test]
+    fn af_xdp_tcp_session_limit_uses_actual_af_xdp_budget() {
+        assert_eq!(af_xdp::af_xdp_tcp_session_limit_from_budget(0), 512);
+        assert_eq!(
+            af_xdp::af_xdp_tcp_session_limit_from_budget(u64::MAX),
+            16_384
+        );
+        let modest = af_xdp::af_xdp_tcp_session_limit_from_budget(256 * 1024 * 1024);
+        assert!((512..=16_384).contains(&modest));
+        assert!(modest < 16_384);
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    #[test]
+    fn af_xdp_tcp_initial_syn_accepts_ecn_variants() {
+        let mut frame = ipv4_tcp_syn_frame(false);
+        let (_, ip_packet) = af_xdp::extract_ip_frame(&frame).expect("valid IP frame");
+        assert!(af_xdp::tcp_packet_is_initial_syn(&ip_packet));
+
+        let tcp_flags_offset = ethernet_header_len(false) + 20 + 13;
+        frame[tcp_flags_offset] = 0xc2;
+        let (_, ip_packet) = af_xdp::extract_ip_frame(&frame).expect("valid ECN SYN frame");
+        assert_eq!(af_xdp::tcp_flags_from_ip_packet(&ip_packet), Some(0xc2));
+        assert!(af_xdp::tcp_packet_is_initial_syn(&ip_packet));
+
+        frame[tcp_flags_offset] = 0x52;
+        let (_, ip_packet) = af_xdp::extract_ip_frame(&frame).expect("valid SYN ACK frame");
+        assert_eq!(af_xdp::tcp_flags_from_ip_packet(&ip_packet), Some(0x52));
+        assert!(!af_xdp::tcp_packet_is_initial_syn(&ip_packet));
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    #[test]
+    fn af_xdp_tcp_flow_flag_prefilter_parses_without_ip_packet_copy() {
+        let mut frame = ipv4_tcp_syn_frame_with_source_port(false, 53123);
+        let tcp_flags_offset = ethernet_header_len(false) + 20 + 13;
+        frame[tcp_flags_offset] = 0xc2;
+
+        let (flow, flags) = af_xdp::parse_tcp_flow_flags_from_frame(&frame)
+            .expect("TCP flow flags should parse from Ethernet frame");
+
+        assert_eq!(flow.peer_addr, "192.0.2.10:53123".parse().unwrap());
+        assert_eq!(flow.local_addr, "198.51.100.5:443".parse().unwrap());
+        assert_eq!(flags, 0xc2);
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    #[test]
+    fn af_xdp_attack_pcap_samples_parse_without_state_growth() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut captures_seen = 0;
+        for name in ["1.pcap", "2.pcap", "443.pcap"] {
+            let path = root.join(name);
+            if !path.exists() {
+                continue;
+            }
+            captures_seen += 1;
+            let stats = pcap_sample_stats(&path, 50_000).expect("pcap sample should parse");
+            assert!(stats.frames > 0, "{name} should contain frames");
+            assert!(stats.tcp > 0, "{name} should contain TCP frames");
+            assert!(stats.initial_syn > 0, "{name} should contain TCP SYNs");
+            assert_eq!(
+                stats.reactor_sessions, 0,
+                "{name} unknown non-SYNs must not create sessions"
+            );
+        }
+        if captures_seen == 0 {
+            eprintln!("attack pcap sample test skipped: no local 1.pcap/2.pcap/443.pcap files");
+        }
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    #[test]
     fn af_xdp_proxy_bridge_idles_only_when_no_work_remains() {
         assert!(af_xdp::proxy_bridge_should_idle(0, 0, 0, 0, false));
         assert!(!af_xdp::proxy_bridge_should_idle(1, 0, 0, 0, false));
@@ -8022,6 +8668,23 @@ mod tests {
         assert!(!af_xdp::proxy_bridge_should_idle(0, 0, 1, 0, false));
         assert!(!af_xdp::proxy_bridge_should_idle(0, 0, 0, 1, false));
         assert!(!af_xdp::proxy_bridge_should_idle(0, 0, 0, 0, true));
+    }
+
+    #[test]
+    fn xsk_status_refresh_throttles_idle_kernel_stats() {
+        let start = std::time::Instant::now();
+        assert!(xsk_status_refresh_due(None, start, false));
+        assert!(!xsk_status_refresh_due(
+            Some(start),
+            start + XDP_XSK_STATUS_REFRESH_INTERVAL / 2,
+            false
+        ));
+        assert!(xsk_status_refresh_due(
+            Some(start),
+            start + XDP_XSK_STATUS_REFRESH_INTERVAL,
+            false
+        ));
+        assert!(xsk_status_refresh_due(Some(start), start, true));
     }
 
     #[test]
@@ -8418,6 +9081,92 @@ mod tests {
         assert_eq!(packet.peer_addr, "[2001:db8::1]:53000".parse().unwrap());
         assert_eq!(packet.local_addr, "[2001:db8::2]:443".parse().unwrap());
         assert_eq!(&packet.payload[..], udp_payload);
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    #[derive(Default)]
+    struct PcapSampleStats {
+        frames: usize,
+        tcp: usize,
+        initial_syn: usize,
+        reactor_sessions: usize,
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    fn pcap_sample_stats(
+        path: &std::path::Path,
+        max_packets: usize,
+    ) -> std::io::Result<PcapSampleStats> {
+        let mut file = std::fs::File::open(path)?;
+        let mut global = [0u8; 24];
+        std::io::Read::read_exact(&mut file, &mut global)?;
+        let little_endian = match &global[0..4] {
+            [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1] => true,
+            [0xa1, 0xb2, 0xc3, 0xd4] | [0xa1, 0xb2, 0x3c, 0x4d] => false,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported pcap magic",
+                ));
+            }
+        };
+        let linktype = pcap_u32(&global[20..24], little_endian);
+        if linktype != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported pcap linktype {linktype}"),
+            ));
+        }
+
+        let mut stats = PcapSampleStats::default();
+        let mut reactor = af_xdp::AfXdpTcpReactor::new(None, None);
+        for _ in 0..max_packets {
+            let mut record = [0u8; 16];
+            match std::io::Read::read_exact(&mut file, &mut record) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err),
+            }
+            let incl_len = pcap_u32(&record[8..12], little_endian) as usize;
+            if incl_len > 256 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("pcap record too large: {incl_len}"),
+                ));
+            }
+            let mut frame = vec![0u8; incl_len];
+            std::io::Read::read_exact(&mut file, &mut frame)?;
+            stats.frames = stats.frames.saturating_add(1);
+
+            let Some(proxy_frame) = af_xdp::parse_proxy_frame("eth0", 0, &frame) else {
+                continue;
+            };
+            if let af_xdp::AfXdpProxyFrame::Tcp {
+                route,
+                flow,
+                ip_packet,
+            } = proxy_frame
+            {
+                stats.tcp = stats.tcp.saturating_add(1);
+                if af_xdp::tcp_packet_is_initial_syn(&ip_packet) {
+                    stats.initial_syn = stats.initial_syn.saturating_add(1);
+                }
+                let _ = reactor.ingest(route, flow, ip_packet);
+            }
+        }
+        stats.reactor_sessions = reactor.session_count();
+        Ok(stats)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    fn pcap_u32(bytes: &[u8], little_endian: bool) -> u32 {
+        let mut array = [0u8; 4];
+        array.copy_from_slice(bytes);
+        if little_endian {
+            u32::from_le_bytes(array)
+        } else {
+            u32::from_be_bytes(array)
+        }
     }
 
     fn ethernet_header(ethertype: u16, vlan: bool) -> Vec<u8> {

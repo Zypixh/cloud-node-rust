@@ -157,6 +157,7 @@ pub fn reported_memory_totals() -> (i64, i64) {
 }
 
 const SNAPSHOT_TTL_MS: i64 = 2_000;
+const FD_SNAPSHOT_TTL_MS: i64 = 250;
 const MIN_MEMORY_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const RESERVE_HEADROOM_PCT: u64 = 30;
 const CONNECTION_BUDGET_PCT: u64 = 45;
@@ -338,7 +339,13 @@ pub struct MemoryGovernor {
     cached_total_bytes: AtomicU64,
     cached_used_bytes: AtomicU64,
     cached_available_bytes: AtomicU64,
+    cached_fd_soft_limit: AtomicU64,
+    cached_cpu_parallelism: AtomicU64,
+    cached_fd_used: AtomicU64,
+    cached_fd_used_at_millis: AtomicU64,
     cached_at_millis: AtomicU64,
+    #[cfg(test)]
+    fd_count_reads: AtomicU64,
 }
 
 pub struct AdmissionPermit<'a> {
@@ -398,7 +405,13 @@ impl MemoryGovernor {
             cached_total_bytes: AtomicU64::new(0),
             cached_used_bytes: AtomicU64::new(0),
             cached_available_bytes: AtomicU64::new(0),
+            cached_fd_soft_limit: AtomicU64::new(0),
+            cached_cpu_parallelism: AtomicU64::new(0),
+            cached_fd_used: AtomicU64::new(0),
+            cached_fd_used_at_millis: AtomicU64::new(0),
             cached_at_millis: AtomicU64::new(0),
+            #[cfg(test)]
+            fd_count_reads: AtomicU64::new(0),
         }
     }
 
@@ -835,7 +848,7 @@ impl MemoryGovernor {
 
     pub fn fd_equivalent_snapshot(&self) -> FdEquivalentSnapshot {
         let snapshot = self.memory_snapshot();
-        let live_fd_count = read_current_fd_count().unwrap_or(0);
+        let live_fd_count = self.live_fd_count();
         let estimated_extra = self.origin_connects.load(Ordering::Relaxed).saturating_add(
             self.zero_copy_relays
                 .load(Ordering::Relaxed)
@@ -850,6 +863,26 @@ impl MemoryGovernor {
             used_pct,
             pressure_level: pressure_level_from_pct(used_pct),
         }
+    }
+
+    fn live_fd_count(&self) -> u64 {
+        let now = crate::utils::time::system_timestamp_millis();
+        let cached_at = self.cached_fd_used_at_millis.load(Ordering::Relaxed) as i64;
+        if cached_at > 0 && now.saturating_sub(cached_at) < FD_SNAPSHOT_TTL_MS {
+            return self.cached_fd_used.load(Ordering::Relaxed);
+        }
+        let fallback = self.cached_fd_used.load(Ordering::Relaxed);
+        let live_fd_count = self.read_current_fd_count().unwrap_or(fallback);
+        self.cached_fd_used.store(live_fd_count, Ordering::Relaxed);
+        self.cached_fd_used_at_millis
+            .store(now.max(0) as u64, Ordering::Relaxed);
+        live_fd_count
+    }
+
+    fn read_current_fd_count(&self) -> Option<u64> {
+        #[cfg(test)]
+        self.fd_count_reads.fetch_add(1, Ordering::Relaxed);
+        read_current_fd_count()
     }
 
     pub fn is_connection_admission_pressure_high(&self) -> bool {
@@ -1174,10 +1207,9 @@ impl MemoryGovernor {
                 total_bytes: self.cached_total_bytes.load(Ordering::Relaxed),
                 used_bytes: self.cached_used_bytes.load(Ordering::Relaxed),
                 available_bytes: self.cached_available_bytes.load(Ordering::Relaxed),
-                fd_soft_limit: read_fd_soft_limit(),
-                cpu_parallelism: std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(1),
+                fd_soft_limit: self.cached_fd_soft_limit.load(Ordering::Relaxed).max(1),
+                cpu_parallelism: self.cached_cpu_parallelism.load(Ordering::Relaxed).max(1)
+                    as usize,
                 connection_budget_bytes: budget_from_available(
                     self.cached_total_bytes.load(Ordering::Relaxed),
                     self.cached_available_bytes.load(Ordering::Relaxed),
@@ -1209,6 +1241,10 @@ impl MemoryGovernor {
             .store(snapshot.used_bytes, Ordering::Relaxed);
         self.cached_available_bytes
             .store(snapshot.available_bytes, Ordering::Relaxed);
+        self.cached_fd_soft_limit
+            .store(snapshot.fd_soft_limit, Ordering::Relaxed);
+        self.cached_cpu_parallelism
+            .store(snapshot.cpu_parallelism as u64, Ordering::Relaxed);
         self.cached_at_millis.store(now as u64, Ordering::Relaxed);
 
         BudgetedMemorySnapshot {
@@ -2141,6 +2177,28 @@ mod tests {
     }
 
     #[test]
+    fn fd_equivalent_snapshot_reuses_cached_fd_count() {
+        let governor = MemoryGovernor::new();
+        governor.cached_fd_used.store(0, Ordering::Relaxed);
+        governor
+            .cached_fd_used_at_millis
+            .store(0, Ordering::Relaxed);
+        governor.fd_count_reads.store(0, Ordering::Relaxed);
+
+        let _ = governor.fd_equivalent_snapshot();
+        let reads_after_first = governor.fd_count_reads.load(Ordering::Relaxed);
+        assert_eq!(reads_after_first, 1);
+
+        for _ in 0..32 {
+            let _ = governor.fd_equivalent_snapshot();
+        }
+        assert_eq!(
+            governor.fd_count_reads.load(Ordering::Relaxed),
+            reads_after_first
+        );
+    }
+
+    #[test]
     fn high_cost_admission_classes_have_limits_and_release() {
         let governor = MemoryGovernor::new();
         for class in [
@@ -2221,6 +2279,10 @@ mod tests {
         governor
             .cached_available_bytes
             .store(available, Ordering::Release);
+        governor
+            .cached_fd_soft_limit
+            .store(1_048_576, Ordering::Release);
+        governor.cached_cpu_parallelism.store(8, Ordering::Release);
         governor.cached_at_millis.store(
             crate::utils::time::system_timestamp_millis() as u64,
             Ordering::Release,

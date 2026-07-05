@@ -1049,6 +1049,36 @@ impl HttpProxyManager {
         matched
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn af_xdp_is_l4_blocked(&self, ip: IpAddr) -> bool {
+        crate::l4_defense::is_l4_blocked(&self.config_store, &self.proxy_logic.waf_state, ip)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn record_af_xdp_l4_event_with_pressure(
+        &self,
+        ip: IpAddr,
+        kind: L4DefenseKind,
+        pressure_level: crate::l4_defense::L4PressureLevel,
+        detail: impl Into<String>,
+    ) -> crate::l4_defense::L4DefenseVerdict {
+        let node_id = self
+            .proxy_logic
+            .api_config
+            .node_id
+            .parse::<i64>()
+            .unwrap_or(0);
+        crate::l4_defense::record_l4_event_with_pressure(
+            &self.config_store,
+            &self.proxy_logic.waf_state,
+            node_id,
+            ip,
+            kind,
+            detail,
+            pressure_level,
+        )
+    }
+
     fn tls_handshake_timeout(&self) -> Duration {
         crate::resource_budget::tls_handshake_timeout(
             &self.config_store.get_global_http_config_sync(),

@@ -19,7 +19,7 @@ use rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, Signatu
 use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::LazyLock as Lazy;
@@ -223,6 +223,30 @@ impl TcpProxyManager {
                 }
                 None
             })
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn af_xdp_is_l4_blocked(&self, ip: IpAddr) -> bool {
+        crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, ip)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn record_af_xdp_l4_event_with_pressure(
+        &self,
+        ip: IpAddr,
+        kind: L4DefenseKind,
+        pressure_level: crate::l4_defense::L4PressureLevel,
+        detail: impl Into<String>,
+    ) -> crate::l4_defense::L4DefenseVerdict {
+        crate::l4_defense::record_l4_event_with_pressure(
+            &self.config_store,
+            &self.waf_state,
+            self.node_id,
+            ip,
+            kind,
+            detail,
+            pressure_level,
+        )
     }
 
     #[allow(dead_code)]
