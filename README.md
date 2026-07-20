@@ -62,6 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 
 发布说明：
 
+- [1.1.9](release-notes/v1.1.9.md)
 - [1.1.8](release-notes/v1.1.8.md)
 - [1.1.7](release-notes/v1.1.7.md)
 - [1.1.6](release-notes/v1.1.6.md)

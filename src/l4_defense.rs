@@ -1466,25 +1466,21 @@ fn block_cluster_prefix(
     block_secs: i64,
     use_local_firewall: bool,
 ) {
-    let Some(net) = prefix.ip_net() else {
+    let Some(_net) = prefix.ip_net() else {
         return;
     };
-    let expiry = crate::utils::time::now_timestamp() + block_secs.max(1);
-    waf_state.apply_black_network_until(cluster_scope, net, expiry);
-    if use_local_firewall {
-        let representative = match prefix {
-            L4AggregateKey::V4([a, b, c]) => IpAddr::V4(Ipv4Addr::new(a, b, c, 1)),
-            L4AggregateKey::V6([a, b, c, d]) => IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 1)),
-        };
-        waf_state.block_ip(
-            representative,
-            cluster_scope,
-            block_secs,
-            Some("cluster"),
-            true,
-            true,
-        );
-    }
+    let representative = match prefix {
+        L4AggregateKey::V4([a, b, c]) => IpAddr::V4(Ipv4Addr::new(a, b, c, 1)),
+        L4AggregateKey::V6([a, b, c, d]) => IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 1)),
+    };
+    waf_state.block_ip(
+        representative,
+        cluster_scope,
+        block_secs,
+        Some("cluster"),
+        true,
+        use_local_firewall,
+    );
 }
 
 #[cfg(test)]

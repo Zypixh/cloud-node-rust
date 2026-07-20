@@ -94,11 +94,14 @@ impl KernelFilter for NoopFilter {
 mod linux {
     use super::*;
     use serde_json::Value;
-    use std::collections::{BTreeSet, HashMap};
-    use std::sync::OnceLock;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
-    use tokio::sync::mpsc;
+    use tokio::sync::Notify;
 
     const NFT_TABLE: &str = "cloud_node";
     const NFT_CHAIN: &str = "input";
@@ -107,6 +110,7 @@ mod linux {
     const NFT_QUEUE_CAPACITY: usize = 8192;
     const NFT_BATCH_LIMIT: usize = 1024;
     const NFT_BATCH_WINDOW: Duration = Duration::from_millis(50);
+    const NFT_QUEUE_WARNING_INTERVAL_SECS: i64 = 10;
 
     #[derive(Clone, Copy)]
     enum NftOp {
@@ -114,7 +118,33 @@ mod linux {
         Unblock { ip: IpAddr },
     }
 
-    static NFT_TX: OnceLock<mpsc::Sender<NftOp>> = OnceLock::new();
+    impl NftOp {
+        fn ip(self) -> IpAddr {
+            match self {
+                Self::Block { ip, .. } | Self::Unblock { ip } => ip,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct NftPending {
+        snapshot: Option<KernelFilterSnapshot>,
+        ops: HashMap<IpAddr, NftOp>,
+    }
+
+    struct NftSyncQueue {
+        pending: Mutex<NftPending>,
+        notify: Notify,
+    }
+
+    enum NftWork {
+        Snapshot(KernelFilterSnapshot),
+        Ops(HashMap<IpAddr, NftOp>),
+    }
+
+    static NFT_QUEUE: OnceLock<Arc<NftSyncQueue>> = OnceLock::new();
+    static NFT_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
+    static NFT_QUEUE_LAST_WARNING: AtomicI64 = AtomicI64::new(0);
 
     pub struct NftablesFilter;
     pub struct IptablesFilter;
@@ -288,6 +318,10 @@ mod linux {
             });
         }
 
+        fn sync_snapshot(&self, snapshot: &KernelFilterSnapshot) {
+            enqueue_nft_snapshot(snapshot.clone());
+        }
+
         fn available(&self) -> bool {
             true
         }
@@ -366,75 +400,212 @@ mod linux {
     }
 
     fn enqueue_nft_op(op: NftOp) {
-        let sender = NFT_TX.get_or_init(|| {
-            let (tx, rx) = mpsc::channel(NFT_QUEUE_CAPACITY);
+        let queue = nft_sync_queue();
+        let ip = op.ip();
+        let accepted = {
+            let mut pending = queue
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if pending.ops.len() >= NFT_QUEUE_CAPACITY && !pending.ops.contains_key(&ip) {
+                false
+            } else {
+                pending.ops.insert(ip, op);
+                true
+            }
+        };
+        if accepted {
+            queue.notify.notify_one();
+        } else {
+            warn_nft_queue_full();
+        }
+    }
+
+    fn enqueue_nft_snapshot(snapshot: KernelFilterSnapshot) {
+        let queue = nft_sync_queue();
+        {
+            let mut pending = queue
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.snapshot = Some(snapshot);
+            pending.ops.clear();
+        }
+        queue.notify.notify_one();
+    }
+
+    fn nft_sync_queue() -> &'static Arc<NftSyncQueue> {
+        NFT_QUEUE.get_or_init(|| {
+            let queue = Arc::new(NftSyncQueue {
+                pending: Mutex::new(NftPending::default()),
+                notify: Notify::new(),
+            });
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
-                    handle.spawn(nft_worker(rx));
+                    handle.spawn(nft_worker(Arc::clone(&queue)));
                 }
                 Err(err) => {
                     tracing::warn!("nftables worker not started: {}", err);
                 }
             }
-            tx
-        });
-        if sender.try_send(op).is_err() {
-            tracing::warn!("nftables sync queue full; kernel firewall update skipped");
-            crate::logging::report_node_log(
-                "warn".to_string(),
-                "firewall_kernel_sync".to_string(),
-                "status=\"queue_full\" reason=\"nftables bounded queue is full\"".to_string(),
-                0,
-            );
-        }
+            queue
+        })
     }
 
-    async fn nft_worker(mut rx: mpsc::Receiver<NftOp>) {
-        while let Some(first) = rx.recv().await {
-            let mut pending = HashMap::<IpAddr, NftOp>::new();
-            merge_nft_op(&mut pending, first);
-            let delay = tokio::time::sleep(NFT_BATCH_WINDOW);
-            tokio::pin!(delay);
-            loop {
-                tokio::select! {
-                    _ = &mut delay => break,
-                    op = rx.recv() => {
-                        match op {
-                            Some(op) => {
-                                merge_nft_op(&mut pending, op);
-                                if pending.len() >= NFT_BATCH_LIMIT {
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
+    fn warn_nft_queue_full() {
+        NFT_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        let now = crate::utils::time::now_timestamp();
+        let last = NFT_QUEUE_LAST_WARNING.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < NFT_QUEUE_WARNING_INTERVAL_SECS
+            || NFT_QUEUE_LAST_WARNING
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let dropped = NFT_QUEUE_DROPPED.swap(0, Ordering::AcqRel);
+        tracing::warn!(
+            dropped,
+            capacity = NFT_QUEUE_CAPACITY,
+            "nftables sync queue full; unique kernel firewall updates skipped"
+        );
+        crate::logging::report_node_log(
+            "warn".to_string(),
+            "firewall_kernel_sync".to_string(),
+            format!(
+                "status=\"queue_full\" dropped=\"{}\" capacity=\"{}\"",
+                dropped, NFT_QUEUE_CAPACITY
+            ),
+            0,
+        );
+    }
+
+    fn take_nft_work(queue: &NftSyncQueue) -> Option<NftWork> {
+        let mut pending = queue
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(snapshot) = pending.snapshot.take() {
+            return Some(NftWork::Snapshot(snapshot));
+        }
+        if pending.ops.is_empty() {
+            return None;
+        }
+        if pending.ops.len() <= NFT_BATCH_LIMIT {
+            return Some(NftWork::Ops(std::mem::take(&mut pending.ops)));
+        }
+        let ips = pending
+            .ops
+            .keys()
+            .copied()
+            .take(NFT_BATCH_LIMIT)
+            .collect::<Vec<_>>();
+        let mut batch = HashMap::with_capacity(ips.len());
+        for ip in ips {
+            if let Some(op) = pending.ops.remove(&ip) {
+                batch.insert(ip, op);
+            }
+        }
+        Some(NftWork::Ops(batch))
+    }
+
+    async fn nft_worker(queue: Arc<NftSyncQueue>) {
+        loop {
+            queue.notify.notified().await;
+            tokio::time::sleep(NFT_BATCH_WINDOW).await;
+            while let Some(work) = take_nft_work(&queue) {
+                let result = match work {
+                    NftWork::Snapshot(snapshot) => replace_nft_snapshot(&snapshot).await,
+                    NftWork::Ops(pending) => flush_nft_ops(pending).await,
+                };
+                if let Err(err) = result {
+                    tracing::warn!("nftables batch sync failed: {}", err);
+                    crate::logging::report_node_log(
+                        "warn".to_string(),
+                        "firewall_kernel_sync".to_string(),
+                        format!("status=\"failed\" reason=\"{}\"", err),
+                        0,
+                    );
                 }
             }
-            if let Err(err) = flush_nft_ops(pending).await {
-                tracing::warn!("nftables batch sync failed: {}", err);
-                crate::logging::report_node_log(
-                    "warn".to_string(),
-                    "firewall_kernel_sync".to_string(),
-                    format!("status=\"failed\" reason=\"{}\"", err),
-                    0,
-                );
-            }
         }
     }
 
-    fn merge_nft_op(pending: &mut HashMap<IpAddr, NftOp>, op: NftOp) {
-        let ip = match op {
-            NftOp::Block { ip, .. } | NftOp::Unblock { ip } => ip,
-        };
-        pending.insert(ip, op);
+    async fn replace_nft_snapshot(snapshot: &KernelFilterSnapshot) -> anyhow::Result<()> {
+        NftablesFilter::ensure_ready().await?;
+        let now = crate::utils::time::now_timestamp();
+        let allowed = snapshot
+            .allowed_ips
+            .iter()
+            .filter_map(|(ip, expires_at)| (*expires_at > now).then_some(*ip))
+            .collect::<BTreeSet<_>>();
+        let mut v4 = BTreeMap::<IpAddr, i64>::new();
+        let mut v6 = BTreeMap::<IpAddr, i64>::new();
+        for (ip, expires_at) in &snapshot.blocked_ips {
+            if *expires_at <= now || allowed.contains(ip) {
+                continue;
+            }
+            let entries = if ip.is_ipv4() { &mut v4 } else { &mut v6 };
+            entries
+                .entry(*ip)
+                .and_modify(|current| *current = (*current).max(*expires_at))
+                .or_insert(*expires_at);
+        }
+
+        let mut script = format!(
+            "flush set inet {NFT_TABLE} {NFT_BLOCKED_V4_SET}\n\
+             flush set inet {NFT_TABLE} {NFT_BLOCKED_V6_SET}\n"
+        );
+        append_nft_snapshot_set(&mut script, NFT_BLOCKED_V4_SET, &v4, now);
+        append_nft_snapshot_set(&mut script, NFT_BLOCKED_V6_SET, &v6, now);
+        run_nft_script(&script).await
+    }
+
+    fn append_nft_snapshot_set(
+        script: &mut String,
+        set_name: &str,
+        entries: &BTreeMap<IpAddr, i64>,
+        now: i64,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        script.push_str(&format!("add element inet {NFT_TABLE} {set_name} {{ "));
+        for (index, (ip, expires_at)) in entries.iter().enumerate() {
+            if index > 0 {
+                script.push_str(", ");
+            }
+            let ttl_secs = expires_at.saturating_sub(now).max(1);
+            script.push_str(&format!("{ip} timeout {ttl_secs}s"));
+        }
+        script.push_str(" }\n");
+    }
+
+    async fn run_nft_script(script: &str) -> anyhow::Result<()> {
+        let mut child = Command::new("nft")
+            .args(["-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("nft stdin unavailable"))?;
+        stdin.write_all(script.as_bytes()).await?;
+        drop(stdin);
+        let output = child.wait_with_output().await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim())
+        }
     }
 
     async fn flush_nft_ops(pending: HashMap<IpAddr, NftOp>) -> anyhow::Result<()> {
         if pending.is_empty() {
             return Ok(());
         }
-        NftablesFilter::ensure_ready().await?;
         for op in pending.into_values() {
             match op {
                 NftOp::Block { ip, ttl_secs } => {

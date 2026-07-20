@@ -370,7 +370,9 @@ impl RollingCounter {
 
 pub struct WafStateManager {
     pub blocks: DashMap<(i64, IpAddr), i64>,
+    kernel_blocks: DashMap<(i64, IpAddr), i64>,
     pub block_networks: DashMap<(i64, IpNet), i64>,
+    kernel_block_networks: DashMap<(i64, IpNet), i64>,
     block_network_snapshots: ArcSwap<NetworkSnapshot>,
     list_blocks: DashMap<(i64, IpAddr), i64>,
     list_block_networks: DashMap<(i64, IpNet), i64>,
@@ -413,7 +415,9 @@ impl WafStateManager {
     pub fn new() -> Self {
         Self {
             blocks: DashMap::new(),
+            kernel_blocks: DashMap::new(),
             block_networks: DashMap::new(),
+            kernel_block_networks: DashMap::new(),
             block_network_snapshots: ArcSwap::from_pointee(HashMap::new()),
             list_blocks: DashMap::new(),
             list_block_networks: DashMap::new(),
@@ -477,7 +481,7 @@ impl WafStateManager {
     fn kernel_filter_snapshot(&self) -> KernelFilterSnapshot {
         let now = crate::utils::time::now_timestamp();
         KernelFilterSnapshot {
-            blocked_ips: Self::snapshot_ips(&self.blocks, now)
+            blocked_ips: Self::snapshot_ips(&self.kernel_blocks, now)
                 .into_iter()
                 .chain(Self::snapshot_ips(&self.list_blocks, now))
                 .collect(),
@@ -485,7 +489,7 @@ impl WafStateManager {
                 .into_iter()
                 .chain(Self::snapshot_ips(&self.list_whitelists, now))
                 .collect(),
-            blocked_networks: Self::snapshot_networks(&self.block_networks, now)
+            blocked_networks: Self::snapshot_networks(&self.kernel_block_networks, now)
                 .into_iter()
                 .chain(Self::snapshot_networks(&self.list_block_networks, now))
                 .collect(),
@@ -529,6 +533,56 @@ impl WafStateManager {
                 })
             })
             .collect()
+    }
+
+    fn max_ip_expiry(map: &DashMap<(i64, IpAddr), i64>, ip: IpAddr, now: i64) -> Option<i64> {
+        map.iter()
+            .filter_map(|entry| {
+                let expiry = *entry.value();
+                (entry.key().1 == ip && expiry > now).then_some(expiry)
+            })
+            .max()
+    }
+
+    fn max_network_expiry(map: &DashMap<(i64, IpNet), i64>, net: IpNet, now: i64) -> Option<i64> {
+        map.iter()
+            .filter_map(|entry| {
+                let expiry = *entry.value();
+                (entry.key().1 == net && expiry > now).then_some(expiry)
+            })
+            .max()
+    }
+
+    fn reconcile_kernel_ip(&self, ip: IpAddr) {
+        let filter = self.kernel_filter();
+        if !filter.available() {
+            return;
+        }
+        if self.is_whitelisted_any_scope(ip) {
+            filter.unblock(ip);
+            return;
+        }
+        let now = crate::utils::time::now_timestamp();
+        let expiry = Self::max_ip_expiry(&self.kernel_blocks, ip, now)
+            .max(Self::max_ip_expiry(&self.list_blocks, ip, now));
+        match expiry {
+            Some(expiry) => filter.block(ip, expiry.saturating_sub(now)),
+            None => filter.unblock(ip),
+        }
+    }
+
+    fn reconcile_kernel_network(&self, net: IpNet) {
+        let filter = self.kernel_filter();
+        if !filter.available() {
+            return;
+        }
+        let now = crate::utils::time::now_timestamp();
+        let expiry = Self::max_network_expiry(&self.kernel_block_networks, net, now)
+            .max(Self::max_network_expiry(&self.list_block_networks, net, now));
+        match expiry {
+            Some(expiry) => filter.block_network(net, expiry.saturating_sub(now)),
+            None => filter.unblock_network(net),
+        }
     }
 
     pub fn has_rules(&self) -> bool {
@@ -603,7 +657,8 @@ impl WafStateManager {
 
     pub fn apply_black_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
         Self::apply_scoped_ip(&self.blocks, server_id, ip, expiry);
-        self.publish_kernel_filter_snapshot();
+        Self::apply_scoped_ip(&self.kernel_blocks, server_id, ip, expiry);
+        self.reconcile_kernel_ip(ip);
     }
 
     pub fn apply_black_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
@@ -614,20 +669,19 @@ impl WafStateManager {
             net,
             expiry,
         );
-        self.publish_kernel_filter_snapshot();
+        Self::apply_scoped_network_map(&self.kernel_block_networks, server_id, net, expiry);
+        self.reconcile_kernel_network(net);
     }
 
     pub fn remove_black_ip(&self, server_id: i64, ip: IpAddr) {
         Self::remove_scoped_ip(&self.blocks, server_id, ip);
+        Self::remove_scoped_ip(&self.kernel_blocks, server_id, ip);
         crate::firewall::persistence::enqueue_delete(
             scope_label(server_id),
             server_id,
             &ip.to_string(),
         );
-        if !self.is_blocked_any_scope(ip) || self.is_whitelisted_any_scope(ip) {
-            self.kernel_filter().unblock(ip);
-        }
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_ip(ip);
     }
 
     pub fn remove_black_network(&self, server_id: i64, net: IpNet) {
@@ -637,18 +691,18 @@ impl WafStateManager {
             server_id,
             net,
         );
+        Self::remove_scoped_network_map(&self.kernel_block_networks, server_id, net);
         crate::firewall::persistence::enqueue_delete(
             scope_label(server_id),
             server_id,
             &net.to_string(),
         );
-        self.kernel_filter().unblock_network(net);
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_network(net);
     }
 
     pub fn apply_list_black_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
         Self::apply_scoped_ip(&self.list_blocks, server_id, ip, expiry);
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_ip(ip);
     }
 
     pub fn apply_list_black_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
@@ -659,7 +713,7 @@ impl WafStateManager {
             net,
             expiry,
         );
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_network(net);
     }
 
     pub fn remove_list_black_ip(&self, server_id: i64, ip: IpAddr) {
@@ -670,6 +724,7 @@ impl WafStateManager {
             .filter_map(|entry| (entry.key().1 == ip).then_some(entry.key().0))
             .collect::<Vec<_>>();
         self.blocks.retain(|key, _| key.1 != ip);
+        self.kernel_blocks.retain(|key, _| key.1 != ip);
         for scope_server_id in removed_runtime {
             crate::firewall::persistence::enqueue_delete(
                 scope_label(scope_server_id),
@@ -677,8 +732,7 @@ impl WafStateManager {
                 &ip.to_string(),
             );
         }
-        self.kernel_filter().unblock(ip);
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_ip(ip);
     }
 
     pub fn remove_list_black_network(&self, server_id: i64, net: IpNet) {
@@ -694,6 +748,7 @@ impl WafStateManager {
             .filter_map(|entry| (entry.key().1 == net).then_some(entry.key().0))
             .collect::<Vec<_>>();
         self.block_networks.retain(|key, _| key.1 != net);
+        self.kernel_block_networks.retain(|key, _| key.1 != net);
         for scope_server_id in removed_runtime {
             crate::firewall::persistence::enqueue_delete(
                 scope_label(scope_server_id),
@@ -706,8 +761,7 @@ impl WafStateManager {
             &self.block_network_snapshots,
             crate::utils::time::now_timestamp(),
         );
-        self.kernel_filter().unblock_network(net);
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_network(net);
     }
 
     pub fn apply_white_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
@@ -858,14 +912,34 @@ impl WafStateManager {
 
         if block_c_class {
             if let Ok(net) = self.get_c_class_net(ip) {
-                self.apply_black_network_until(key_server_id, net, expiry);
+                Self::insert_scoped_network(
+                    &self.block_networks,
+                    &self.block_network_snapshots,
+                    key_server_id,
+                    net,
+                    expiry,
+                );
                 crate::firewall::persistence::enqueue_upsert(FirewallBlockRecord::runtime(
                     net.to_string(),
                     key_server_id,
                     scope_label(key_server_id).to_string(),
                     expiry,
-                    false,
+                    use_local_firewall,
                 ));
+                if use_local_firewall {
+                    Self::apply_scoped_network_map(
+                        &self.kernel_block_networks,
+                        key_server_id,
+                        net,
+                        expiry,
+                    );
+                } else {
+                    Self::remove_scoped_network_map(
+                        &self.kernel_block_networks,
+                        key_server_id,
+                        net,
+                    );
+                }
                 if use_local_firewall && !kernel_filter_available {
                     self.exec_local_firewall(net.to_string(), timeout_secs);
                 }
@@ -874,7 +948,7 @@ impl WafStateManager {
                 }
             }
         } else {
-            self.apply_black_ip_until(key_server_id, ip, expiry);
+            Self::apply_scoped_ip(&self.blocks, key_server_id, ip, expiry);
             crate::firewall::persistence::enqueue_upsert(FirewallBlockRecord::runtime(
                 ip.to_string(),
                 key_server_id,
@@ -887,14 +961,16 @@ impl WafStateManager {
             }
         }
 
-        if use_local_firewall
-            && kernel_filter_available
-            && !block_c_class
-            && !self.is_whitelisted_any_scope(ip)
-        {
-            kernel_filter.block(ip, timeout_secs);
+        if !block_c_class {
+            if use_local_firewall {
+                Self::apply_scoped_ip(&self.kernel_blocks, key_server_id, ip, expiry);
+                if kernel_filter_available && !self.is_whitelisted_any_scope(ip) {
+                    kernel_filter.block(ip, timeout_secs);
+                }
+            } else {
+                Self::remove_scoped_ip(&self.kernel_blocks, key_server_id, ip);
+            }
         }
-        self.publish_kernel_filter_snapshot();
     }
 
     fn exec_local_firewall(&self, target: String, timeout: i64) {
@@ -970,7 +1046,6 @@ impl WafStateManager {
 
         let expiry = crate::utils::time::now_timestamp() + ttl_secs.max(1);
         self.apply_white_ip_until(key_server_id, ip, expiry);
-        self.publish_kernel_filter_snapshot();
     }
 
     fn exec_local_unblock(&self, target: String) {
@@ -1031,7 +1106,6 @@ impl WafStateManager {
     pub fn restore_runtime_blocks_from_disk(&self) -> usize {
         let now = crate::utils::time::now_timestamp();
         let records = crate::firewall::persistence::load_active_runtime_blocks(now);
-        let kernel_filter = self.kernel_filter();
         let mut restored = 0usize;
         for record in records {
             if record.expires_at <= now {
@@ -1039,18 +1113,35 @@ impl WafStateManager {
             }
             if let Ok(ip) = record.target.parse::<IpAddr>() {
                 let ip = canonical_lookup_ip(ip);
-                self.apply_black_ip_until(record.server_id, ip, record.expires_at);
-                if record.kernel_wanted
-                    && kernel_filter.available()
-                    && !self.is_whitelisted_any_scope(ip)
-                {
-                    kernel_filter.block(ip, record.expires_at.saturating_sub(now));
+                Self::apply_scoped_ip(&self.blocks, record.server_id, ip, record.expires_at);
+                if record.kernel_wanted {
+                    Self::apply_scoped_ip(
+                        &self.kernel_blocks,
+                        record.server_id,
+                        ip,
+                        record.expires_at,
+                    );
                 }
                 restored += 1;
                 continue;
             }
             if let Ok(net) = record.target.parse::<IpNet>() {
-                self.apply_black_network_until(record.server_id, net.trunc(), record.expires_at);
+                let net = net.trunc();
+                Self::insert_scoped_network(
+                    &self.block_networks,
+                    &self.block_network_snapshots,
+                    record.server_id,
+                    net,
+                    record.expires_at,
+                );
+                if record.kernel_wanted {
+                    Self::apply_scoped_network_map(
+                        &self.kernel_block_networks,
+                        record.server_id,
+                        net,
+                        record.expires_at,
+                    );
+                }
                 restored += 1;
                 continue;
             }
@@ -1223,6 +1314,27 @@ impl WafStateManager {
 
     fn remove_scoped_ip(map: &DashMap<(i64, IpAddr), i64>, server_id: i64, ip: IpAddr) {
         map.remove(&(server_id, ip));
+    }
+
+    fn apply_scoped_network_map(
+        map: &DashMap<(i64, IpNet), i64>,
+        server_id: i64,
+        net: IpNet,
+        expiry: i64,
+    ) {
+        if crate::utils::time::now_timestamp() >= expiry {
+            map.remove(&(server_id, net));
+        } else {
+            map.insert((server_id, net), expiry);
+        }
+    }
+
+    fn remove_scoped_network_map(
+        map: &DashMap<(i64, IpNet), i64>,
+        server_id: i64,
+        net: IpNet,
+    ) {
+        map.remove(&(server_id, net));
     }
 
     fn contains_scoped_ip(
@@ -1402,12 +1514,15 @@ impl WafStateManager {
         }
 
         self.blocks.retain(|_, expiry| now < *expiry);
+        self.kernel_blocks.retain(|_, expiry| now < *expiry);
         self.list_blocks.retain(|_, expiry| now < *expiry);
         self.whitelists.retain(|_, expiry| now < *expiry);
         self.list_whitelists.retain(|_, expiry| now < *expiry);
         self.graylists.retain(|_, expiry| now < *expiry);
         self.list_graylists.retain(|_, expiry| now < *expiry);
         self.block_networks.retain(|_, expiry| now < *expiry);
+        self.kernel_block_networks
+            .retain(|_, expiry| now < *expiry);
         self.list_block_networks.retain(|_, expiry| now < *expiry);
         self.whitelist_networks.retain(|_, expiry| now < *expiry);
         self.list_whitelist_networks
@@ -1474,7 +1589,15 @@ impl WafStateManager {
             range,
             expiry,
         );
-        self.publish_kernel_filter_snapshot();
+        let now = crate::utils::time::now_timestamp();
+        if expiry > now {
+            self.kernel_filter().block_range(
+                range.from,
+                range.to,
+                range.v6,
+                expiry.saturating_sub(now),
+            );
+        }
     }
 
     pub fn remove_list_black_range(&self, server_id: i64, range: IpAddrRange) {
@@ -1486,7 +1609,6 @@ impl WafStateManager {
         );
         self.kernel_filter()
             .unblock_range(range.from, range.to, range.v6);
-        self.publish_kernel_filter_snapshot();
     }
 
     pub fn apply_list_white_range_until(&self, server_id: i64, range: IpAddrRange, expiry: i64) {
