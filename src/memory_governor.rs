@@ -18,9 +18,11 @@ pub enum AdmissionClass {
     CacheRevalidate,
     CacheWrite,
     CacheReadMemory,
+    ClusterInternalConnection,
+    RpcStreamCommand,
 }
 
-const ADMISSION_CLASS_COUNT: usize = 14;
+const ADMISSION_CLASS_COUNT: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AdmissionRejectSnapshot {
@@ -38,6 +40,8 @@ pub struct AdmissionRejectSnapshot {
     pub cache_revalidate: u64,
     pub cache_write: u64,
     pub cache_read_memory: u64,
+    pub cluster_internal_connection: u64,
+    pub rpc_stream_command: u64,
 }
 
 impl AdmissionRejectSnapshot {
@@ -56,6 +60,8 @@ impl AdmissionRejectSnapshot {
             .saturating_add(self.cache_revalidate)
             .saturating_add(self.cache_write)
             .saturating_add(self.cache_read_memory)
+            .saturating_add(self.cluster_internal_connection)
+            .saturating_add(self.rpc_stream_command)
     }
 }
 
@@ -116,6 +122,8 @@ pub struct GovernorSnapshot {
     pub cache_revalidate_limit: usize,
     pub cache_write_limit: usize,
     pub cache_read_memory_limit: usize,
+    pub cluster_internal_connection_limit: usize,
+    pub rpc_stream_command_limit: usize,
     pub cache_read_memory_used_bytes: u64,
     pub cache_read_memory_budget_bytes: u64,
     pub cache_read_memory_object_limit_bytes: u64,
@@ -135,6 +143,14 @@ pub struct GovernorSnapshot {
     pub firewall_rolling_counter_capacity: usize,
     pub firewall_ip_bw_counter_capacity: usize,
     pub firewall_candidate_stats_capacity: usize,
+    pub l4_aggregate_state_budget_bytes: u64,
+    pub kernel_sync_queue_budget_bytes: u64,
+    pub cardinality_state_budget_bytes: u64,
+    pub regex_cache_budget_bytes: u64,
+    pub logging_retry_budget_bytes: u64,
+    pub local_log_queue_budget_bytes: u64,
+    pub ip_report_queue_budget_bytes: u64,
+    pub af_xdp_budget_bytes: u64,
     pub pingora_keepalive_pool_size: usize,
 }
 
@@ -192,6 +208,8 @@ const RESPONSE_TRANSFORM_ESTIMATED_BYTES: u64 = 16 * 1024 * 1024;
 const CACHE_REVALIDATE_ESTIMATED_BYTES: u64 = 64 * 1024;
 const CACHE_WRITE_ESTIMATED_BYTES: u64 = 1 * 1024 * 1024;
 const CACHE_READ_MEMORY_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024;
+const CLUSTER_INTERNAL_CONNECTION_ESTIMATED_BYTES: u64 = 64 * 1024;
+const RPC_STREAM_COMMAND_ESTIMATED_BYTES: u64 = 256 * 1024;
 const KEEPALIVE_CONN_ESTIMATED_BYTES: u64 = 16 * 1024;
 const NEGATIVE_CACHE_ESTIMATED_BYTES: u64 = 160;
 const FIREWALL_IP_LIMITER_ESTIMATED_BYTES: u64 = 1024;
@@ -227,6 +245,8 @@ const MIN_RESPONSE_TRANSFORM_LIMIT: usize = 32;
 const MIN_CACHE_REVALIDATE_LIMIT: usize = 64;
 const MIN_CACHE_WRITE_LIMIT: usize = 128;
 const MIN_CACHE_READ_MEMORY_LIMIT: usize = 8;
+const MIN_CLUSTER_INTERNAL_CONNECTION_LIMIT: usize = 32;
+const MIN_RPC_STREAM_COMMAND_LIMIT: usize = 16;
 const MIN_CACHE_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 const MIN_BLOOM_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 const MIN_NEGATIVE_CACHE_ENTRIES: usize = 262_144;
@@ -256,6 +276,8 @@ const MAX_RESPONSE_TRANSFORM_LIMIT: usize = 1_000_000;
 const MAX_CACHE_REVALIDATE_LIMIT: usize = 100_000;
 const MAX_CACHE_WRITE_LIMIT: usize = 1_000_000;
 const MAX_CACHE_READ_MEMORY_LIMIT: usize = 1_000_000;
+const MAX_CLUSTER_INTERNAL_CONNECTION_LIMIT: usize = 65_536;
+const MAX_RPC_STREAM_COMMAND_LIMIT: usize = 65_536;
 const CACHE_READ_MEMORY_MAX_OBJECT_BYTES: u64 = 50 * 1024 * 1024;
 const CACHE_READ_MEMORY_MEDIUM_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 const CACHE_READ_MEMORY_SMALL_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
@@ -334,6 +356,8 @@ pub struct MemoryGovernor {
     cache_revalidate: AtomicU64,
     cache_write: AtomicU64,
     cache_read_memory: AtomicU64,
+    cluster_internal_connections: AtomicU64,
+    rpc_stream_commands: AtomicU64,
     cache_read_memory_bytes: AtomicU64,
     admission_rejects: [AtomicU64; ADMISSION_CLASS_COUNT],
     cached_total_bytes: AtomicU64,
@@ -400,6 +424,8 @@ impl MemoryGovernor {
             cache_revalidate: AtomicU64::new(0),
             cache_write: AtomicU64::new(0),
             cache_read_memory: AtomicU64::new(0),
+            cluster_internal_connections: AtomicU64::new(0),
+            rpc_stream_commands: AtomicU64::new(0),
             cache_read_memory_bytes: AtomicU64::new(0),
             admission_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             cached_total_bytes: AtomicU64::new(0),
@@ -637,6 +663,23 @@ impl MemoryGovernor {
                 CACHE_READ_MEMORY_ESTIMATED_BYTES,
                 pressure_adjusted_min_limit(&snapshot, MIN_CACHE_READ_MEMORY_LIMIT, 4, 1),
                 MAX_CACHE_READ_MEMORY_LIMIT,
+            ),
+            AdmissionClass::ClusterInternalConnection => connection_limit(
+                state_budget_bytes(&snapshot) / 64,
+                CLUSTER_INTERNAL_CONNECTION_ESTIMATED_BYTES,
+                pressure_adjusted_min_limit(
+                    &snapshot,
+                    MIN_CLUSTER_INTERNAL_CONNECTION_LIMIT,
+                    16,
+                    4,
+                ),
+                MAX_CLUSTER_INTERNAL_CONNECTION_LIMIT,
+            ),
+            AdmissionClass::RpcStreamCommand => connection_limit(
+                event_queue_budget_bytes(&snapshot) / 8,
+                RPC_STREAM_COMMAND_ESTIMATED_BYTES,
+                pressure_adjusted_min_limit(&snapshot, MIN_RPC_STREAM_COMMAND_LIMIT, 8, 2),
+                MAX_RPC_STREAM_COMMAND_LIMIT,
             ),
         }
     }
@@ -1102,6 +1145,9 @@ impl MemoryGovernor {
             cache_revalidate_limit: self.limit_for(AdmissionClass::CacheRevalidate),
             cache_write_limit: self.limit_for(AdmissionClass::CacheWrite),
             cache_read_memory_limit: self.limit_for(AdmissionClass::CacheReadMemory),
+            cluster_internal_connection_limit: self
+                .limit_for(AdmissionClass::ClusterInternalConnection),
+            rpc_stream_command_limit: self.limit_for(AdmissionClass::RpcStreamCommand),
             cache_read_memory_used_bytes: self.cache_read_memory_bytes.load(Ordering::Relaxed),
             cache_read_memory_budget_bytes: cache_read_memory_budget_bytes(&mem),
             cache_read_memory_object_limit_bytes: cache_read_memory_object_limit_bytes(&mem),
@@ -1121,6 +1167,14 @@ impl MemoryGovernor {
             firewall_rolling_counter_capacity: firewall_rolling_counter_capacity(&mem),
             firewall_ip_bw_counter_capacity: firewall_ip_bw_counter_capacity(&mem),
             firewall_candidate_stats_capacity: firewall_candidate_stats_capacity(&mem),
+            l4_aggregate_state_budget_bytes: state_budget_bytes(&mem) / 8,
+            kernel_sync_queue_budget_bytes: state_budget_bytes(&mem) / 16,
+            cardinality_state_budget_bytes: state_budget_bytes(&mem) / 8,
+            regex_cache_budget_bytes: state_budget_bytes(&mem) / 8,
+            logging_retry_budget_bytes: event_queue_budget_bytes(&mem) / 3,
+            local_log_queue_budget_bytes: event_queue_budget_bytes(&mem) / 8,
+            ip_report_queue_budget_bytes: event_queue_budget_bytes(&mem) / 8,
+            af_xdp_budget_bytes: state_budget_bytes(&mem) / 4,
             pingora_keepalive_pool_size: self.pingora_keepalive_pool_size(pingora_threads),
         }
     }
@@ -1141,6 +1195,8 @@ impl MemoryGovernor {
             AdmissionClass::CacheRevalidate => &self.cache_revalidate,
             AdmissionClass::CacheWrite => &self.cache_write,
             AdmissionClass::CacheReadMemory => &self.cache_read_memory,
+            AdmissionClass::ClusterInternalConnection => &self.cluster_internal_connections,
+            AdmissionClass::RpcStreamCommand => &self.rpc_stream_commands,
         }
     }
 
@@ -1195,6 +1251,12 @@ impl MemoryGovernor {
                 .load(Ordering::Relaxed),
             cache_read_memory: self
                 .reject_counter(AdmissionClass::CacheReadMemory)
+                .load(Ordering::Relaxed),
+            cluster_internal_connection: self
+                .reject_counter(AdmissionClass::ClusterInternalConnection)
+                .load(Ordering::Relaxed),
+            rpc_stream_command: self
+                .reject_counter(AdmissionClass::RpcStreamCommand)
                 .load(Ordering::Relaxed),
         }
     }
@@ -1930,7 +1992,9 @@ fn shared_connection_charge_bytes(class: AdmissionClass) -> u64 {
         | AdmissionClass::ResponseTransform
         | AdmissionClass::CacheRevalidate
         | AdmissionClass::CacheWrite
-        | AdmissionClass::CacheReadMemory => 0,
+        | AdmissionClass::CacheReadMemory
+        | AdmissionClass::ClusterInternalConnection
+        | AdmissionClass::RpcStreamCommand => 0,
     }
 }
 
@@ -1950,6 +2014,8 @@ fn class_index(class: AdmissionClass) -> usize {
         AdmissionClass::CacheRevalidate => 11,
         AdmissionClass::CacheWrite => 12,
         AdmissionClass::CacheReadMemory => 13,
+        AdmissionClass::ClusterInternalConnection => 14,
+        AdmissionClass::RpcStreamCommand => 15,
     }
 }
 
@@ -2008,7 +2074,9 @@ fn runtime_limit(
         | AdmissionClass::ResponseTransform
         | AdmissionClass::CacheRevalidate
         | AdmissionClass::CacheWrite
-        | AdmissionClass::CacheReadMemory => return min_limit,
+        | AdmissionClass::CacheReadMemory
+        | AdmissionClass::ClusterInternalConnection
+        | AdmissionClass::RpcStreamCommand => return min_limit,
     };
     let memory_target = connection_limit(memory_budget, estimated_bytes, 1, max_limit);
     let cpu_floor = snapshot

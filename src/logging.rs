@@ -37,6 +37,9 @@ impl AccessLogHandle {
 
     fn try_enqueue(&self, log: pb::HttpAccessLog, kind: &str) {
         if let Err(err) = self.sender.try_send(log) {
+            crate::pipeline_metrics::increment(
+                crate::pipeline_metrics::PipelineCounter::AccessLogIngressDropped,
+            );
             self.dropped_since_warning.fetch_add(1, Ordering::Relaxed);
             let now = unix_epoch_millis_now();
             let last = self.last_warning_at_ms.load(Ordering::Relaxed);
@@ -160,7 +163,11 @@ pub fn report_node_log(level: String, tag: String, message: String, server_id: i
             created_at: crate::utils::time::now_timestamp(),
             ..Default::default()
         };
-        let _ = sender.try_send(log);
+        if let Err(_err) = sender.try_send(log) {
+            crate::pipeline_metrics::increment(
+                crate::pipeline_metrics::PipelineCounter::NodeLogIngressDropped,
+            );
+        }
     }
 }
 

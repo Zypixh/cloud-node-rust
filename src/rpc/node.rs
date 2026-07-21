@@ -216,10 +216,10 @@ pub async fn start_config_syncer(
     cert_selector: Arc<crate::ssl::DynamicCertSelector>,
     waf_state: Arc<crate::firewall::state::WafStateManager>,
 ) {
-    let mut state = crate::utils::persistence::load_state();
-    let mut task_version = state.task_version;
-    let mut deleted_content_version = state.deleted_content_version;
-    let mut config_version = state.config_version;
+    let initial_state = crate::utils::persistence::load_state();
+    let mut task_version = initial_state.task_version;
+    let mut deleted_content_version = initial_state.deleted_content_version;
+    let mut config_version = initial_state.config_version;
 
     let api_endpoint = api_config
         .effective_rpc_endpoints()
@@ -273,10 +273,13 @@ pub async fn start_config_syncer(
 
         report_connected_api_nodes(&api_config).await;
 
+        let mut state = crate::utils::persistence::load_state();
         state.config_version = config_version;
         state.task_version = task_version;
         state.deleted_content_version = deleted_content_version;
-        crate::utils::persistence::save_state(&state);
+        if let Err(err) = crate::utils::persistence::save_state(&state) {
+            warn!("failed to persist node sync state: {}", err);
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(30)) => {
@@ -489,21 +492,13 @@ where
                             let payload_config_version = payload.version.unwrap_or(0);
                             // For the next FindCurrentNodeConfig request parameter, use
                             // rpc_cursor if available, otherwise the payload version.
-                            *config_version = if rpc_cursor > 0 {
+                            let next_config_cursor = if rpc_cursor > 0 {
                                 rpc_cursor
                             } else if payload_config_version > 0 {
                                 payload_config_version
                             } else {
                                 *config_version
                             };
-                            // Store the actual config version for status reporting.
-                            config_store
-                                .update_config_version(payload_config_version)
-                                .await;
-                            {
-                                let mut last_hash = LAST_CONFIG_HASH.write();
-                                *last_hash = current_hash;
-                            }
                             let numeric_id = payload.id.unwrap_or(0);
                             let mut payload_servers = payload.servers.clone();
 
@@ -519,11 +514,6 @@ where
                                 payload.kernel_firewall_mode.as_deref(),
                             )
                             .await;
-                            if kernel_filter.available() {
-                                waf_state.set_kernel_filter(kernel_filter);
-                            }
-                            config_store.update_id(numeric_id).await;
-                            crate::logging::set_numeric_node_id(numeric_id);
 
                             for cp in &payload.http_cache_policies {
                                 debug!(
@@ -633,7 +623,6 @@ where
                                         }
                                     );
                                 }
-                                crate::cache_manager::CACHE.storage.apply_policy(cp).await;
                             }
 
                             // WAF Configuration Hashing and Logging
@@ -1175,11 +1164,9 @@ where
                                 &payload_servers,
                             );
                             tracing::debug!(
-                                "Received {} active certificates from RPC, starting sync...",
+                                "Received {} active certificates from RPC",
                                 all_certs.len()
                             );
-                            crate::ssl::sync_certs(cert_selector, &all_certs).await;
-                            tracing::debug!("Certificate sync completed");
 
                             // 4. gRPC Policy
                             let node_cluster_id =
@@ -1274,6 +1261,22 @@ where
                                         .and_then(|g| g.http_access_log.clone()),
                                 )
                                 .await;
+                            *config_version = next_config_cursor;
+                            {
+                                let mut last_hash = LAST_CONFIG_HASH.write();
+                                *last_hash = current_hash;
+                            }
+                            if kernel_filter.available() {
+                                waf_state.set_kernel_filter(kernel_filter);
+                            }
+                            for cache_policy in &payload.http_cache_policies {
+                                crate::cache_manager::CACHE
+                                    .storage
+                                    .apply_policy(cache_policy)
+                                    .await;
+                            }
+                            crate::ssl::sync_certs(cert_selector, &all_certs).await;
+                            crate::logging::set_numeric_node_id(numeric_id);
                             config_store.set_global_stat_upload(
                                 payload
                                     .global_server_config
@@ -1524,6 +1527,26 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         });
         let xdp_status = serde_json::to_value(crate::xdp::status_snapshot())
             .unwrap_or_else(|_| serde_json::json!({"available": false}));
+        let pipeline_metrics = crate::pipeline_metrics::snapshot();
+        let pipelines = serde_json::json!({
+            "accessLogIngressDropped": pipeline_metrics.access_log_ingress_dropped,
+            "accessLogRetryEvicted": pipeline_metrics.access_log_retry_evicted,
+            "accessLogUploadFailed": pipeline_metrics.access_log_upload_failed,
+            "nodeLogIngressDropped": pipeline_metrics.node_log_ingress_dropped,
+            "nodeLogUploadFailed": pipeline_metrics.node_log_upload_failed,
+            "httpDimensionDropped": pipeline_metrics.http_dimension_dropped,
+            "ipReportDropped": pipeline_metrics.ip_report_dropped,
+            "localLogDropped": pipeline_metrics.local_log_dropped,
+            "localLogWriteFailed": pipeline_metrics.local_log_write_failed,
+            "localLogRotationFailed": pipeline_metrics.local_log_rotation_failed,
+            "kernelSyncCoalesced": pipeline_metrics.kernel_sync_coalesced,
+            "kernelSyncReconcileRequested": pipeline_metrics.kernel_sync_reconcile_requested,
+            "kernelSyncFailed": pipeline_metrics.kernel_sync_failed,
+            "xdpMapSyncFailed": pipeline_metrics.xdp_map_sync_failed,
+            "internalApiRejected": pipeline_metrics.internal_api_rejected,
+            "rpcStreamCommandRejected": pipeline_metrics.rpc_stream_command_rejected,
+            "rpcStreamReplyDropped": pipeline_metrics.rpc_stream_reply_dropped,
+        });
 
         let status = serde_json::json!({
             "buildVersion": env!("CARGO_PKG_VERSION"),
@@ -1554,6 +1577,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "cacheTotalDiskSize": cache_stats.disk_bytes,
             "cacheTotalMemorySize": cache_stats.memory_bytes,
             "resourceGovernor": resource_governor,
+            "pipelines": pipelines,
             "l4Defense": l4_defense,
             "xdp": xdp_status,
             "updatedAt": now,

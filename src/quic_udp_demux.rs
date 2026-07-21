@@ -787,6 +787,7 @@ impl QuicUdpDemuxManager {
     pub async fn start_listeners(self: Arc<Self>) {
         let mut reconcile_tick = interval(Duration::from_secs(5));
         reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut reload_generation = self.config_store.runtime_reload_generation();
         let mut last_port_summary = None;
         loop {
             let http3_ports = self.http3_manager.desired_ports().await;
@@ -835,7 +836,9 @@ impl QuicUdpDemuxManager {
                     .await;
             }
             tokio::select! {
-                _ = self.config_store.wait_for_runtime_reload() => {}
+                generation = self.config_store.wait_for_runtime_reload(reload_generation) => {
+                    reload_generation = generation;
+                }
                 _ = reconcile_tick.tick() => {}
             }
         }

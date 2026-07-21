@@ -1,5 +1,3 @@
-#[cfg(target_os = "linux")]
-use anyhow::Context;
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand, ValueEnum};
 use cloud_node_rust::i18n::{Language, t};
@@ -12,7 +10,8 @@ use std::io::{self, IsTerminal};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, mpsc as std_mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -47,19 +46,35 @@ impl FormatTime for LocalLogTimer {
 
 #[derive(Clone)]
 struct SharedLogWriter {
-    file: Arc<Mutex<fs::File>>,
+    sender: std_mpsc::SyncSender<Vec<u8>>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl SharedLogWriter {
-    fn new(file: fs::File) -> Self {
-        Self {
-            file: Arc::new(Mutex::new(file)),
-        }
+    fn new(file: fs::File, path: PathBuf) -> Self {
+        let snapshot = cloud_node_rust::memory_governor::MEMORY_GOVERNOR.snapshot(
+            cloud_node_rust::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads(),
+        );
+        let estimated_event_bytes = 1024u64;
+        let queue_capacity = usize::try_from(
+            snapshot.local_log_queue_budget_bytes / estimated_event_bytes,
+        )
+        .unwrap_or(usize::MAX)
+        .max(1);
+        let (sender, receiver) = std_mpsc::sync_channel(queue_capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let worker_dropped = Arc::clone(&dropped);
+        std::thread::Builder::new()
+            .name("run-log-writer".to_string())
+            .spawn(move || run_log_writer(file, path, receiver, worker_dropped))
+            .unwrap_or_else(|err| panic!("failed to start run log writer: {err}"));
+        Self { sender, dropped }
     }
 }
 
 struct SharedLogGuard {
-    file: Arc<Mutex<fs::File>>,
+    sender: std_mpsc::SyncSender<Vec<u8>>,
+    dropped: Arc<AtomicU64>,
     buffer: Vec<u8>,
 }
 
@@ -68,16 +83,17 @@ impl SharedLogGuard {
         if self.buffer.is_empty() {
             return Ok(());
         }
-
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "run log lock poisoned"))?;
-        use io::Write as _;
-        file.write_all(&self.buffer)?;
-        file.flush()?;
-        self.buffer.clear();
-        Ok(())
+        let buffer = std::mem::take(&mut self.buffer);
+        match self.sender.try_send(buffer) {
+            Ok(()) => Ok(()),
+            Err(std_mpsc::TrySendError::Full(_)) | Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                cloud_node_rust::pipeline_metrics::increment(
+                    cloud_node_rust::pipeline_metrics::PipelineCounter::LocalLogDropped,
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -103,10 +119,62 @@ impl<'a> MakeWriter<'a> for SharedLogWriter {
 
     fn make_writer(&'a self) -> Self::Writer {
         SharedLogGuard {
-            file: Arc::clone(&self.file),
+            sender: self.sender.clone(),
+            dropped: Arc::clone(&self.dropped),
             buffer: Vec::new(),
         }
     }
+}
+
+fn run_log_writer(
+    mut file: fs::File,
+    path: PathBuf,
+    receiver: std_mpsc::Receiver<Vec<u8>>,
+    _dropped: Arc<AtomicU64>,
+) {
+    use std::io::Write as _;
+    let rotate_bytes = cloud_node_rust::memory_governor::MEMORY_GOVERNOR
+        .snapshot(cloud_node_rust::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
+        .local_log_queue_budget_bytes
+        .max(1024 * 1024);
+    let mut written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let mut pending = Vec::new();
+    while let Ok(first) = receiver.recv() {
+        pending.extend_from_slice(&first);
+        while let Ok(next) = receiver.try_recv() {
+            pending.extend_from_slice(&next);
+            if pending.len() as u64 >= rotate_bytes {
+                break;
+            }
+        }
+        if written.saturating_add(pending.len() as u64) > rotate_bytes {
+            let rotated = path.with_extension("log.1");
+            let rotation = (|| -> io::Result<()> {
+                file.flush()?;
+                if rotated.exists() {
+                    fs::remove_file(&rotated)?;
+                }
+                fs::rename(&path, &rotated)?;
+                file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+                written = 0;
+                Ok(())
+            })();
+            if rotation.is_err() {
+                cloud_node_rust::pipeline_metrics::increment(
+                    cloud_node_rust::pipeline_metrics::PipelineCounter::LocalLogRotationFailed,
+                );
+            }
+        }
+        if file.write_all(&pending).and_then(|_| file.flush()).is_err() {
+            cloud_node_rust::pipeline_metrics::increment(
+                cloud_node_rust::pipeline_metrics::PipelineCounter::LocalLogWriteFailed,
+            );
+        } else {
+            written = written.saturating_add(pending.len() as u64);
+        }
+        pending.clear();
+    }
+    let _ = file.flush();
 }
 
 #[derive(Parser)]
@@ -3243,6 +3311,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     let config_store = Arc::new(ConfigStore::new());
     cloud_node_rust::kernel_syn_defense::start_synproxy_reconciler(config_store.clone());
     let waf_state = Arc::new(WafStateManager::new());
+    waf_state.install_kernel_snapshot_provider();
     let initial_kernel_filter = rt.block_on(cloud_node_rust::firewall::kernel::build_filter(None));
     if initial_kernel_filter.available() {
         waf_state.set_kernel_filter(initial_kernel_filter);
@@ -3289,6 +3358,13 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     let il_i = ip_list_manager.clone();
     spawn_staggered(&rt, Duration::from_secs(5), async move {
         rpc::start_ip_list_syncer(ac_i, cs_i, il_i).await;
+    });
+
+    cloud_node_rust::metrics::analyzer::initialize_geoip_readers();
+
+    let ac_geoip = api_config.clone();
+    spawn_staggered(&rt, Duration::from_secs(6), async move {
+        rpc::start_ip_library_syncer(ac_geoip).await;
     });
 
     let ac_a = api_config.clone();
@@ -3521,7 +3597,7 @@ fn init_logging(node_paths: &cloud_node_rust::paths::NodePaths) {
             tracing_subscriber::fmt::layer()
                 .with_timer(LocalLogTimer)
                 .with_ansi(false)
-                .with_writer(SharedLogWriter::new(file)),
+                .with_writer(SharedLogWriter::new(file, node_paths.run_log_file())),
         ),
         Err(err) => {
             eprintln!(

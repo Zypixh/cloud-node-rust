@@ -246,14 +246,17 @@ async fn run_tonic_stream(
 ) -> anyhow::Result<NodeStreamProbeResult> {
     let connected_endpoints = api_config.effective_rpc_endpoints();
     let initial_node_id = config_store.get_node_id().await;
-    let initial_ping = (initial_node_id > 0).then(|| pb::NodeStreamMessage {
+    if initial_node_id <= 0 {
+        anyhow::bail!("node identity is not initialized");
+    }
+    let initial_ping = Some(pb::NodeStreamMessage {
         node_id: initial_node_id,
         request_id: 0,
         code: "ping".to_string(),
         is_ok: true,
         ..Default::default()
     });
-    let initial_ping_sent = initial_ping.is_some();
+    let initial_ping_sent = true;
     let (tx, mut rx) = mpsc::channel(100);
     let rx_stream = async_stream::stream! {
         if let Some(ping) = initial_ping {
@@ -327,6 +330,19 @@ async fn run_tonic_stream(
             msg_res = inbound.message() => {
                 match msg_res {
                     Ok(Some(message)) => {
+                        if let Err(err) = validate_stream_message(&message) {
+                            crate::pipeline_metrics::increment(
+                                crate::pipeline_metrics::PipelineCounter::RpcStreamCommandRejected,
+                            );
+                            warn!(
+                                "Rejected node stream command code={} request_id={} payload_bytes={} reason={}",
+                                message.code,
+                                message.request_id,
+                                message.data_json.len(),
+                                err
+                            );
+                            continue;
+                        }
                         stats.inbound_messages += 1;
                         if message.code.eq_ignore_ascii_case("connectedAPINode") {
                            match serde_json::from_slice::<ConnectedAPINodeMessage>(&message.data_json) {
@@ -407,6 +423,53 @@ fn is_retryable_stream_transport_error(error: &tonic::Status) -> bool {
         || message.contains("goaway")
 }
 
+const MAX_STREAM_CODE_BYTES: usize = 64;
+const MAX_STREAM_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_STREAM_DATA_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAM_CACHE_VALUE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STREAM_CACHE_POLICY_BYTES: usize = 512 * 1024;
+const MAX_STREAM_CACHE_KEY_BYTES: usize = 16 * 1024;
+
+fn validate_stream_message(message: &pb::NodeStreamMessage) -> anyhow::Result<()> {
+    if message.code.len() > MAX_STREAM_CODE_BYTES {
+        anyhow::bail!("stream command code is too long");
+    }
+    if message.message.len() > MAX_STREAM_MESSAGE_BYTES {
+        anyhow::bail!("stream command message is too long");
+    }
+    if message.data_json.len() > MAX_STREAM_DATA_BYTES {
+        anyhow::bail!("stream command payload is too large");
+    }
+    if message.request_id < 0 {
+        anyhow::bail!("stream request id is invalid");
+    }
+    if message.code.eq_ignore_ascii_case("writeCache") {
+        let value = serde_json::from_slice::<WriteCacheMessage>(&message.data_json)
+            .map_err(|_| anyhow::anyhow!("invalid writeCache payload"))?;
+        if value.value.len() > MAX_STREAM_CACHE_VALUE_BYTES {
+            anyhow::bail!("cache value is too large");
+        }
+        if value.cache_policy_json.len() > MAX_STREAM_CACHE_POLICY_BYTES {
+            anyhow::bail!("cache policy is too large");
+        }
+        if value.key.len() > MAX_STREAM_CACHE_KEY_BYTES {
+            anyhow::bail!("cache key is too long");
+        }
+    }
+    Ok(())
+}
+
+fn try_send_stream_reply(
+    tx: &mpsc::Sender<pb::NodeStreamMessage>,
+    reply: pb::NodeStreamMessage,
+) {
+    if tx.try_send(reply).is_err() {
+        crate::pipeline_metrics::increment(
+            crate::pipeline_metrics::PipelineCounter::RpcStreamReplyDropped,
+        );
+    }
+}
+
 async fn handle_message(
     message: &pb::NodeStreamMessage,
     tx: &mpsc::Sender<pb::NodeStreamMessage>,
@@ -441,6 +504,14 @@ async fn handle_message(
             let msg_cloned = message.clone();
 
             tokio::spawn(async move {
+                let Some(_admission) = crate::memory_governor::MEMORY_GOVERNOR
+                    .try_admit(crate::memory_governor::AdmissionClass::RpcStreamCommand)
+                else {
+                    crate::pipeline_metrics::increment(
+                        crate::pipeline_metrics::PipelineCounter::RpcStreamCommandRejected,
+                    );
+                    return;
+                };
                 let mut is_ok = false;
                 let reply_text;
 
@@ -474,7 +545,9 @@ async fn handle_message(
                     is_ok,
                     ..Default::default()
                 };
-                let _ = tx_cloned.send(reply).await;
+                if msg_cloned.request_id > 0 {
+                    try_send_stream_reply(&tx_cloned, reply);
+                }
             });
             return Ok(());
         }
@@ -483,6 +556,14 @@ async fn handle_message(
             let msg_cloned = message.clone();
 
             tokio::spawn(async move {
+                let Some(_admission) = crate::memory_governor::MEMORY_GOVERNOR
+                    .try_admit(crate::memory_governor::AdmissionClass::RpcStreamCommand)
+                else {
+                    crate::pipeline_metrics::increment(
+                        crate::pipeline_metrics::PipelineCounter::RpcStreamCommandRejected,
+                    );
+                    return;
+                };
                 let mut is_ok = false;
                 let reply_text;
 
@@ -516,7 +597,9 @@ async fn handle_message(
                     is_ok,
                     ..Default::default()
                 };
-                let _ = tx_cloned.send(reply).await;
+                if msg_cloned.request_id > 0 {
+                    try_send_stream_reply(&tx_cloned, reply);
+                }
             });
             return Ok(());
         }
@@ -526,6 +609,14 @@ async fn handle_message(
             let _config_store_cloned = config_store.clone();
 
             tokio::spawn(async move {
+                let Some(_admission) = crate::memory_governor::MEMORY_GOVERNOR
+                    .try_admit(crate::memory_governor::AdmissionClass::RpcStreamCommand)
+                else {
+                    crate::pipeline_metrics::increment(
+                        crate::pipeline_metrics::PipelineCounter::RpcStreamCommandRejected,
+                    );
+                    return;
+                };
                 let mut is_ok = false;
                 let reply_text;
                 match serde_json::from_slice::<StatCacheMessage>(&msg_cloned.data_json) {
@@ -560,7 +651,9 @@ async fn handle_message(
                     is_ok,
                     ..Default::default()
                 };
-                let _ = tx_cloned.send(reply).await;
+                if msg_cloned.request_id > 0 {
+                    try_send_stream_reply(&tx_cloned, reply);
+                }
             });
             return Ok(());
         }
@@ -569,6 +662,14 @@ async fn handle_message(
             let msg_cloned = message.clone();
 
             tokio::spawn(async move {
+                let Some(_admission) = crate::memory_governor::MEMORY_GOVERNOR
+                    .try_admit(crate::memory_governor::AdmissionClass::RpcStreamCommand)
+                else {
+                    crate::pipeline_metrics::increment(
+                        crate::pipeline_metrics::PipelineCounter::RpcStreamCommandRejected,
+                    );
+                    return;
+                };
                 let mut is_ok = false;
                 let reply_text;
                 match serde_json::from_slice::<CleanCacheMessage>(&msg_cloned.data_json) {
@@ -599,7 +700,9 @@ async fn handle_message(
                     is_ok,
                     ..Default::default()
                 };
-                let _ = tx_cloned.send(reply).await;
+                if msg_cloned.request_id > 0 {
+                    try_send_stream_reply(&tx_cloned, reply);
+                }
             });
             return Ok(()); // Handled asynchronously
         }
@@ -608,6 +711,14 @@ async fn handle_message(
             let msg_cloned = message.clone();
 
             tokio::spawn(async move {
+                let Some(_admission) = crate::memory_governor::MEMORY_GOVERNOR
+                    .try_admit(crate::memory_governor::AdmissionClass::RpcStreamCommand)
+                else {
+                    crate::pipeline_metrics::increment(
+                        crate::pipeline_metrics::PipelineCounter::RpcStreamCommandRejected,
+                    );
+                    return;
+                };
                 let mut sys = sysinfo::System::new_all();
                 sys.refresh_cpu_all();
                 let load = sysinfo::System::load_average();
@@ -644,22 +755,54 @@ async fn handle_message(
                     message: "ok".to_string(),
                     ..Default::default()
                 };
-                let _ = tx_cloned.send(reply).await;
+                if msg_cloned.request_id > 0 {
+                    try_send_stream_reply(&tx_cloned, reply);
+                }
             });
             return Ok(()); // Handled asynchronously
         }
         "changeapinode" => {
-            if let Ok(msg) = serde_json::from_slice::<ChangeAPINodeMessage>(&message.data_json) {
-                info!(
-                    "Received request to change API node address to: {}",
-                    msg.addr
-                );
-                ApiConfig::set_runtime_rpc_endpoints(vec![msg.addr]);
-                if let Err(e) = crate::rpc::client::SharedRpcClient::refresh(&api_config) {
-                    warn!(
-                        "Failed to refresh shared RPC channel after endpoint change: {}",
-                        e
-                    );
+            if api_config.rpc_disable_update {
+                is_ok = false;
+                message_reply = "runtime API endpoint updates are disabled".to_string();
+            } else {
+                match serde_json::from_slice::<ChangeAPINodeMessage>(&message.data_json) {
+                    Ok(msg) => {
+                        let endpoint = match crate::api_config::validate_rpc_endpoint(&msg.addr) {
+                            Ok(endpoint) => endpoint,
+                            Err(err) => {
+                                is_ok = false;
+                                message_reply = format!("endpoint rejected: {}", err);
+                                String::new()
+                            }
+                        };
+                        if !endpoint.is_empty()
+                            && !RpcClient::ping_endpoint(api_config, &endpoint).await
+                        {
+                            is_ok = false;
+                            message_reply = "endpoint health check failed".to_string();
+                        }
+                        if is_ok {
+                            match ApiConfig::set_runtime_rpc_endpoints(vec![endpoint]) {
+                                Ok(()) => {
+                                    if let Err(e) =
+                                        crate::rpc::client::SharedRpcClient::refresh(api_config)
+                                    {
+                                        is_ok = false;
+                                        message_reply = format!("refresh failed: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    is_ok = false;
+                                    message_reply = format!("endpoint rejected: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        is_ok = false;
+                        message_reply = format!("decode failed: {}", e);
+                    }
                 }
             }
         }
@@ -705,7 +848,7 @@ async fn handle_message(
             message: message_reply,
             ..Default::default()
         };
-        let _ = tx.send(reply).await;
+        try_send_stream_reply(tx, reply);
     }
 
     Ok(())

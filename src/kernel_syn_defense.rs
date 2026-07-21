@@ -299,14 +299,18 @@ async fn synproxy_command_with(
 
 #[cfg(target_os = "linux")]
 async fn synproxy_reconcile_loop(config_store: Arc<ConfigStore>) {
+    let mut reload_generation = config_store.runtime_reload_generation();
     loop {
-        config_store.wait_for_runtime_reload().await;
+        reload_generation = config_store
+            .wait_for_runtime_reload(reload_generation)
+            .await;
         loop {
             if reconcile_synproxy_from_store(&config_store).await {
                 break;
             }
             tokio::select! {
-                _ = config_store.wait_for_runtime_reload() => {
+                generation = config_store.wait_for_runtime_reload(reload_generation) => {
+                    reload_generation = generation;
                     continue;
                 }
                 _ = tokio::time::sleep(SYNPROXY_RECONCILE_RETRY) => {}

@@ -50,13 +50,17 @@ impl Http3ProxyManager {
     }
 
     pub async fn start_listeners(self: Arc<Self>) {
+        let mut reload_generation = self.config_store.runtime_reload_generation();
         loop {
             let desired_ports = self.desired_ports().await;
             for port in &desired_ports {
                 self.spawn_listener(*port).await;
             }
             self.reconcile_listeners(&desired_ports);
-            self.config_store.wait_for_runtime_reload().await;
+            reload_generation = self
+                .config_store
+                .wait_for_runtime_reload(reload_generation)
+                .await;
         }
     }
 

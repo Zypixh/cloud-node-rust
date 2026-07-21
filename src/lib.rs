@@ -39,6 +39,7 @@ pub mod oss_origin;
 pub mod pages;
 pub mod paths;
 pub mod perf_monitor;
+pub mod pipeline_metrics;
 pub mod process_log_policy;
 pub mod proxy;
 pub mod proxy_protocol;

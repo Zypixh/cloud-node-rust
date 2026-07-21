@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -15,12 +15,13 @@ use crate::rpc::ip_report::{IpReportKind, IpReportMessage};
 
 const L4_BLOCK_WARN_INTERVAL_MS: i64 = 5_000;
 const L4_AGGREGATE_WINDOW: Duration = Duration::from_secs(10);
-const L4_AGGREGATE_IP_CAPACITY: usize = 8192;
 const L4_SURGE_DISTINCT_IP_ELEVATED: usize = 1_000;
 const L4_SURGE_DISTINCT_IP_HIGH: usize = 5_000;
 const L4_SURGE_DISTINCT_IP_CRITICAL: usize = 10_000;
 const L4_EXACT_COUNTER_CAPACITY: usize = 262_144;
 const L4_EXACT_COUNTER_SWEEP_INTERVAL_MS: i64 = 10_000;
+const L4_AGGREGATE_ESTIMATED_BYTES: u64 = 192;
+const L4_AGGREGATE_SWEEP_INTERVAL_MS: i64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum L4DefenseKind {
@@ -163,18 +164,24 @@ struct AggregateWindow {
     started_at: Instant,
     events: u64,
     high_confidence_events: u64,
-    ips: VecDeque<IpAddr>,
+    ips: HashSet<IpAddr>,
 }
 
 struct DistinctIpWindow {
     started_at: Instant,
-    ips: VecDeque<IpAddr>,
+    ips: HashSet<IpAddr>,
+}
+
+struct PrefixCountWindow {
+    last_seen: Instant,
+    count: AtomicU64,
 }
 
 struct L4AggregateState {
     prefixes: DashMap<(i64, L4AggregateKey), Mutex<AggregateWindow>>,
     distinct_ips: DashMap<i64, Mutex<DistinctIpWindow>>,
-    prefix_counts: DashMap<(i64, String), AtomicU64>,
+    prefix_counts: DashMap<(i64, L4AggregateKey), PrefixCountWindow>,
+    last_sweep_at_ms: AtomicI64,
 }
 
 struct ExactCounterWindow {
@@ -186,7 +193,7 @@ struct ExactCounterWindow {
 struct L4ExactCounterState {
     counters: DashMap<(i64, IpAddr, &'static str), Mutex<ExactCounterWindow>>,
     last_sweep_at_ms: AtomicI64,
-    capacity: usize,
+    capacity_override: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,12 +259,21 @@ static TCP_ACTIVE_IP_TRACKER: LazyLock<ActiveIpTracker> = LazyLock::new(ActiveIp
 static L4_METRICS: LazyLock<L4DefenseMetrics> = LazyLock::new(L4DefenseMetrics::new);
 static L4_AGGREGATES: LazyLock<L4AggregateState> = LazyLock::new(L4AggregateState::new);
 static L4_EXACT_COUNTERS: LazyLock<L4ExactCounterState> =
-    LazyLock::new(|| L4ExactCounterState::with_capacity(L4_EXACT_COUNTER_CAPACITY));
+    LazyLock::new(L4ExactCounterState::new);
 static LAST_BLOCK_WARN_AT_MS: AtomicI64 = AtomicI64::new(0);
 static LAST_COUNTER_SATURATION_WARN_AT_MS: AtomicI64 = AtomicI64::new(0);
 
+fn canonical_l4_ip(ip: IpAddr) -> IpAddr {
+    if let IpAddr::V6(ipv6) = ip
+        && let Some(ipv4) = ipv6.to_ipv4_mapped()
+    {
+        return IpAddr::V4(ipv4);
+    }
+    ip
+}
+
 pub fn try_acquire_tcp_active_ip(ip: IpAddr, limit: usize) -> Option<ActiveIpPermit> {
-    TCP_ACTIVE_IP_TRACKER.try_acquire(ip, limit)
+    TCP_ACTIVE_IP_TRACKER.try_acquire(canonical_l4_ip(ip), limit)
 }
 
 impl L4DefenseMetrics {
@@ -402,19 +418,61 @@ impl L4AggregateState {
             prefixes: DashMap::new(),
             distinct_ips: DashMap::new(),
             prefix_counts: DashMap::new(),
+            last_sweep_at_ms: AtomicI64::new(0),
         }
+    }
+
+    fn capacity(&self) -> usize {
+        let budget = MEMORY_GOVERNOR
+            .snapshot(MEMORY_GOVERNOR.pingora_worker_threads())
+            .l4_aggregate_state_budget_bytes;
+        (budget / L4_AGGREGATE_ESTIMATED_BYTES)
+            .max(L4_SURGE_DISTINCT_IP_CRITICAL as u64)
+            .min(usize::MAX as u64) as usize
+    }
+
+    fn per_window_capacity(&self, prefix_count: usize) -> usize {
+        let budget = MEMORY_GOVERNOR
+            .snapshot(MEMORY_GOVERNOR.pingora_worker_threads())
+            .l4_aggregate_state_budget_bytes;
+        (budget
+            / L4_AGGREGATE_ESTIMATED_BYTES
+            .saturating_mul(prefix_count.max(1) as u64))
+        .max(1)
+        .min(usize::MAX as u64) as usize
     }
 
     fn record(&self, cluster_id: i64, ip: IpAddr, kind: L4DefenseKind) -> AggregateRecord {
         let now = Instant::now();
+        self.sweep_if_needed(now);
+        let prefix_capacity = self
+            .capacity()
+            .max(L4_SURGE_DISTINCT_IP_CRITICAL)
+            .max(1);
         let key = L4AggregateKey::from_ip(ip);
-        let label = key.label();
-        let prefix_counter = self
-            .prefix_counts
-            .entry((cluster_id, label))
-            .or_insert_with(|| AtomicU64::new(0));
-        let top_prefix_events = prefix_counter.fetch_add(1, Ordering::Relaxed) + 1;
-
+        let mut prefix_counter = if self.prefix_counts.contains_key(&(cluster_id, key))
+            || self.prefix_counts.len() < prefix_capacity
+        {
+            Some(self.prefix_counts.entry((cluster_id, key)).or_insert_with(|| {
+                PrefixCountWindow {
+                    last_seen: now,
+                    count: AtomicU64::new(0),
+                }
+            }))
+        } else {
+            None
+        };
+        let top_prefix_events = prefix_counter
+            .as_mut()
+            .map(|counter| {
+                if now.duration_since(counter.last_seen) >= L4_AGGREGATE_WINDOW {
+                    counter.count.store(0, Ordering::Relaxed);
+                }
+                counter.last_seen = now;
+                counter.count.fetch_add(1, Ordering::Relaxed) + 1
+            })
+            .unwrap_or_default();
+        let capacity = self.per_window_capacity(self.prefixes.len().saturating_add(1));
         let distinct_mutex = self
             .distinct_ips
             .entry(cluster_id)
@@ -422,12 +480,8 @@ impl L4AggregateState {
         let mut distinct_guard = distinct_mutex
             .lock()
             .expect("l4 distinct-ip window mutex poisoned");
-        distinct_guard.reset_if_stale(now);
-        if !distinct_guard.ips.iter().any(|existing| *existing == ip) {
-            if distinct_guard.ips.len() >= L4_AGGREGATE_IP_CAPACITY {
-                distinct_guard.ips.pop_front();
-            }
-            distinct_guard.ips.push_back(ip);
+        if distinct_guard.ips.len() < capacity || distinct_guard.ips.contains(&ip) {
+            distinct_guard.ips.insert(ip);
         }
         let distinct_ips = distinct_guard.ips.len();
         drop(distinct_guard);
@@ -441,11 +495,8 @@ impl L4AggregateState {
             .expect("l4 aggregate prefix window mutex poisoned");
         window.reset_if_stale(now);
         window.events = window.events.saturating_add(1);
-        if !window.ips.iter().any(|existing| *existing == ip) {
-            if window.ips.len() >= L4_AGGREGATE_IP_CAPACITY {
-                window.ips.pop_front();
-            }
-            window.ips.push_back(ip);
+        if window.ips.len() < capacity || window.ips.contains(&ip) {
+            window.ips.insert(ip);
         }
         if kind.is_high_confidence() {
             window.high_confidence_events = window.high_confidence_events.saturating_add(1);
@@ -461,17 +512,24 @@ impl L4AggregateState {
     }
 
     fn snapshot(&self) -> AggregateSnapshot {
+        let now = Instant::now();
+        self.sweep_if_needed(now);
         let distinct_ips_recent = self
             .distinct_ips
             .iter()
-            .filter_map(|entry| entry.value().lock().ok().map(|window| window.ips.len()))
+            .filter_map(|entry| {
+                entry.value().lock().ok().and_then(|mut window| {
+                    window.reset_if_stale(now);
+                    Some(window.ips.len())
+                })
+            })
             .max()
             .unwrap_or_default();
         let pressure_level = surge_pressure_level(distinct_ips_recent);
         let (top_prefix, top_prefix_events) = self
             .prefix_counts
             .iter()
-            .map(|entry| (entry.key().1.clone(), entry.value().load(Ordering::Relaxed)))
+            .map(|entry| (entry.key().1.label(), entry.value().count.load(Ordering::Relaxed)))
             .max_by_key(|(_, count)| *count)
             .unwrap_or_default();
         AggregateSnapshot {
@@ -481,15 +539,63 @@ impl L4AggregateState {
             top_prefix_events,
         }
     }
+
+    fn sweep_if_needed(&self, now: Instant) {
+        let now_ms = crate::utils::time::now_timestamp_millis();
+        let last_ms = self.last_sweep_at_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_ms) < L4_AGGREGATE_SWEEP_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_sweep_at_ms
+            .compare_exchange(last_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.prefixes.retain(|_, window| {
+            window
+                .lock()
+                .map(|window| now.duration_since(window.started_at) < L4_AGGREGATE_WINDOW)
+                .unwrap_or(false)
+        });
+        self.distinct_ips.retain(|_, window| {
+            window
+                .lock()
+                .map(|window| now.duration_since(window.started_at) < L4_AGGREGATE_WINDOW)
+                .unwrap_or(false)
+        });
+        self.prefix_counts.retain(|_, window| {
+            now.duration_since(window.last_seen) < L4_AGGREGATE_WINDOW
+        });
+    }
 }
 
 impl L4ExactCounterState {
+    fn new() -> Self {
+        Self {
+            counters: DashMap::new(),
+            last_sweep_at_ms: AtomicI64::new(0),
+            capacity_override: None,
+        }
+    }
+
+    #[cfg(test)]
     fn with_capacity(capacity: usize) -> Self {
         Self {
             counters: DashMap::new(),
             last_sweep_at_ms: AtomicI64::new(0),
-            capacity: capacity.max(1),
+            capacity_override: Some(capacity.max(1)),
         }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity_override.unwrap_or_else(|| {
+            let budget = MEMORY_GOVERNOR
+                .snapshot(MEMORY_GOVERNOR.pingora_worker_threads())
+                .cardinality_state_budget_bytes;
+            (budget / 256).max(1).min(usize::MAX as u64) as usize
+        })
     }
 
     fn increase_by(
@@ -506,9 +612,9 @@ impl L4ExactCounterState {
         self.sweep_if_needed(now);
 
         let key = (cluster_id, ip, kind.as_str());
-        if !self.counters.contains_key(&key) && self.counters.len() >= self.capacity {
+        if !self.counters.contains_key(&key) && self.counters.len() >= self.capacity() {
             self.sweep_force(now);
-            if self.counters.len() >= self.capacity {
+            if self.counters.len() >= self.capacity() {
                 return if kind.is_high_confidence() {
                     L4ExactCounterIncrement::CapacitySaturatedFailClosed
                 } else {
@@ -569,7 +675,7 @@ impl AggregateWindow {
             started_at: now,
             events: 0,
             high_confidence_events: 0,
-            ips: VecDeque::new(),
+            ips: HashSet::new(),
         }
     }
 
@@ -587,7 +693,7 @@ impl DistinctIpWindow {
     fn new(now: Instant) -> Self {
         Self {
             started_at: now,
-            ips: VecDeque::new(),
+            ips: HashSet::new(),
         }
     }
 
@@ -1219,6 +1325,7 @@ pub fn record_l4_event_scored(
     amount: u64,
     context: L4EventContext,
 ) -> L4DefenseVerdict {
+    let ip = canonical_l4_ip(ip);
     let amount = amount.max(1);
     let cluster_id = config_store.get_node_cluster_id_sync();
     let Some(config) = config_store.get_empty_connection_flood_config_for_cluster_sync(cluster_id)
@@ -1236,6 +1343,10 @@ pub fn record_l4_event_scored(
     };
 
     let cluster_scope = crate::special_defense::cluster_block_scope_id(cluster_id);
+    if waf_state.is_whitelisted(ip, cluster_scope) {
+        L4_METRICS.record(kind, L4DefenseVerdict::Allowed);
+        return L4DefenseVerdict::Allowed;
+    }
     if cluster_scope != 0 && waf_state.is_blocked(ip, cluster_scope) {
         L4_METRICS.record(kind, L4DefenseVerdict::AlreadyBlocked);
         drain_l4_connections_for_ip(ip, kind, "already_blocked_cluster");
@@ -1447,16 +1558,10 @@ fn prefix_has_whitelisted_ip(
     prefix: L4AggregateKey,
     cluster_scope: i64,
 ) -> bool {
-    match prefix {
-        L4AggregateKey::V4([a, b, c]) => {
-            waf_state.is_whitelisted(IpAddr::V4(Ipv4Addr::new(a, b, c, 1)), 0)
-                || waf_state.is_whitelisted(IpAddr::V4(Ipv4Addr::new(a, b, c, 1)), cluster_scope)
-        }
-        L4AggregateKey::V6([a, b, c, d]) => {
-            let ip = IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 1));
-            waf_state.is_whitelisted(ip, 0) || waf_state.is_whitelisted(ip, cluster_scope)
-        }
-    }
+    let Some(net) = prefix.ip_net() else {
+        return false;
+    };
+    waf_state.has_whitelist_overlapping_network(net, cluster_scope)
 }
 
 fn block_cluster_prefix(
@@ -1466,19 +1571,14 @@ fn block_cluster_prefix(
     block_secs: i64,
     use_local_firewall: bool,
 ) {
-    let Some(_net) = prefix.ip_net() else {
+    let Some(net) = prefix.ip_net() else {
         return;
     };
-    let representative = match prefix {
-        L4AggregateKey::V4([a, b, c]) => IpAddr::V4(Ipv4Addr::new(a, b, c, 1)),
-        L4AggregateKey::V6([a, b, c, d]) => IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 1)),
-    };
-    waf_state.block_ip(
-        representative,
+    waf_state.block_network(
+        net,
         cluster_scope,
         block_secs,
         Some("cluster"),
-        true,
         use_local_firewall,
     );
 }

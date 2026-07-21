@@ -1,8 +1,9 @@
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use pingora_load_balancing::{LoadBalancer, selection::Consistent};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
 use tracing::warn;
 
@@ -280,7 +281,9 @@ impl Default for NodeConfig {
 #[derive(Clone)]
 pub struct ConfigStore {
     inner: Arc<RwLock<NodeConfig>>,
+    update_gate: Arc<Mutex<()>>,
     reload_notify: Arc<Notify>,
+    reload_generation: Arc<AtomicU64>,
     parent_pressure: Arc<DashMap<String, (f32, std::time::Instant)>>,
 }
 
@@ -382,16 +385,32 @@ impl ConfigStore {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(NodeConfig::default())),
+            update_gate: Arc::new(Mutex::new(())),
             reload_notify: Arc::new(Notify::new()),
+            reload_generation: Arc::new(AtomicU64::new(0)),
             parent_pressure: Arc::new(DashMap::new()),
         }
     }
 
-    pub async fn wait_for_runtime_reload(&self) {
-        self.reload_notify.notified().await;
+    pub fn runtime_reload_generation(&self) -> u64 {
+        self.reload_generation.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_for_runtime_reload(&self, seen_generation: u64) -> u64 {
+        loop {
+            let notified = self.reload_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let generation = self.reload_generation.load(Ordering::Acquire);
+            if generation != seen_generation {
+                return generation;
+            }
+            notified.await;
+        }
     }
 
     fn notify_runtime_reload(&self) {
+        self.reload_generation.fetch_add(1, Ordering::Release);
         self.reload_notify.notify_waiters();
     }
 
@@ -468,13 +487,18 @@ impl ConfigStore {
         if let Some(server) = lock.servers.get(normalized_host) {
             return Some(server.clone());
         }
-        if let Some(server) = lock.servers.get(&format!("*.{normalized_host}")) {
+        let mut wildcard = String::with_capacity(normalized_host.len() + 2);
+        wildcard.push_str("*.");
+        wildcard.push_str(normalized_host);
+        if let Some(server) = lock.servers.get(&wildcard) {
             return Some(server.clone());
         }
         let mut suffix = normalized_host;
         while let Some((_, rest)) = suffix.split_once('.') {
             suffix = rest;
-            if let Some(server) = lock.servers.get(&format!("*.{suffix}")) {
+            wildcard.truncate(2);
+            wildcard.push_str(suffix);
+            if let Some(server) = lock.servers.get(&wildcard) {
                 return Some(server.clone());
             }
         }
@@ -488,13 +512,18 @@ impl ConfigStore {
         if let Some(route) = lock.routes.get(normalized_host) {
             return Some(route.clone());
         }
-        if let Some(route) = lock.routes.get(&format!("*.{normalized_host}")) {
+        let mut wildcard = String::with_capacity(normalized_host.len() + 2);
+        wildcard.push_str("*.");
+        wildcard.push_str(normalized_host);
+        if let Some(route) = lock.routes.get(&wildcard) {
             return Some(route.clone());
         }
         let mut suffix = normalized_host;
         while let Some((_, rest)) = suffix.split_once('.') {
             suffix = rest;
-            if let Some(route) = lock.routes.get(&format!("*.{suffix}")) {
+            wildcard.truncate(2);
+            wildcard.push_str(suffix);
+            if let Some(route) = lock.routes.get(&wildcard) {
                 return Some(route.clone());
             }
         }
@@ -569,18 +598,19 @@ impl ConfigStore {
         if let Some(server) = lock.servers.get(normalized_host).filter(is_l7) {
             return Some(server.clone());
         }
-        if let Some(server) = lock
-            .servers
-            .get(&format!("*.{normalized_host}"))
-            .filter(is_l7)
-        {
+        let mut wildcard = String::with_capacity(normalized_host.len() + 2);
+        wildcard.push_str("*.");
+        wildcard.push_str(normalized_host);
+        if let Some(server) = lock.servers.get(&wildcard).filter(is_l7) {
             return Some(server.clone());
         }
 
         let mut suffix = normalized_host;
         while let Some((_, rest)) = suffix.split_once('.') {
             suffix = rest;
-            if let Some(server) = lock.servers.get(&format!("*.{suffix}")).filter(is_l7) {
+            wildcard.truncate(2);
+            wildcard.push_str(suffix);
+            if let Some(server) = lock.servers.get(&wildcard).filter(is_l7) {
                 return Some(server.clone());
             }
         }
@@ -977,6 +1007,7 @@ impl ConfigStore {
         has_schedule: bool,
         has_access_log: bool,
     ) {
+        let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
         lock.dns_info_enabled = has_dns;
         lock.cache_info_enabled = has_cache;
@@ -1024,6 +1055,7 @@ impl ConfigStore {
         &self,
         config: Option<crate::config_models::GlobalStatUploadConfig>,
     ) {
+        let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
         lock.global_stat_upload = Arc::new(config.unwrap_or_default());
     }
@@ -1131,6 +1163,7 @@ impl ConfigStore {
     }
 
     pub async fn set_updating_servers(&self, ids: Vec<i64>) {
+        let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
         lock.updating_server_ids = ids.into_iter().collect();
     }
@@ -1206,6 +1239,7 @@ impl ConfigStore {
     }
 
     pub async fn set_tiered_origin_bypass(&self, bypass: bool) {
+        let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
         lock.tiered_origin_bypass = bypass;
     }
@@ -1221,6 +1255,7 @@ impl ConfigStore {
     }
 
     pub async fn update_id(&self, id: i64) {
+        let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
         lock.id = id;
     }
@@ -1231,6 +1266,7 @@ impl ConfigStore {
     }
 
     pub async fn update_config_version(&self, version: i64) {
+        let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
         lock.version = version;
     }
@@ -1320,6 +1356,7 @@ impl ConfigStore {
         toa: Option<TOAConfig>,
         global_access_log: Option<crate::config_models::GlobalHTTPAccessLogConfig>,
     ) {
+        let _update = self.update_gate.lock();
         for server in &all_servers {
             server.compile_url_patterns();
         }
@@ -1421,45 +1458,48 @@ impl ConfigStore {
         servers: HashMap<String, Arc<ServerConfig>>,
         routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
+        let _update = self.update_gate.lock();
         for server in &all_servers {
             server.compile_url_patterns();
         }
         crate::routing::location::clear_compiled_locations();
-        let mut lock = self.inner.write();
-        lock.all_servers
+        let mut candidate = self.inner.read().clone();
+        candidate
+            .all_servers
             .retain(|server| server.numeric_id() != server_id);
-        let stale_hosts = lock
+        let stale_hosts = candidate
             .servers
             .iter()
             .filter_map(|(host, server)| (server.numeric_id() == server_id).then_some(host.clone()))
             .collect::<Vec<_>>();
 
         for host in &stale_hosts {
-            lock.servers.remove(host);
-            lock.routes.remove(host);
+            candidate.servers.remove(host);
+            candidate.routes.remove(host);
         }
         if server_id > 0 {
-            lock.id_to_lb.remove(&server_id);
+            candidate.id_to_lb.remove(&server_id);
         }
 
-        lock.all_servers.extend(all_servers);
+        candidate.all_servers.extend(all_servers);
         for (host, config) in servers {
-            lock.servers.insert(host, config);
+            candidate.servers.insert(host, config);
         }
         for (host, lb) in routes {
             if server_id > 0 {
-                lock.id_to_lb.insert(server_id, lb.clone());
+                candidate.id_to_lb.insert(server_id, lb.clone());
             }
-            lock.routes.insert(host, lb);
+            candidate.routes.insert(host, lb);
         }
-        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
-            lock.firewall_policies.as_ref().as_slice(),
-            lock.cache_policies.as_ref().as_slice(),
-            &lock.all_servers,
+        candidate.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            candidate.firewall_policies.as_ref().as_slice(),
+            candidate.cache_policies.as_ref().as_slice(),
+            &candidate.all_servers,
         ));
-        Self::refresh_passthrough_indexes(&mut lock);
-        Self::refresh_cluster_policy_indexes(&mut lock);
-        drop(lock);
+        Self::refresh_passthrough_indexes(&mut candidate);
+        Self::refresh_cluster_policy_indexes(&mut candidate);
+        *self.inner.write() = candidate;
+        drop(_update);
         self.notify_runtime_reload();
     }
 
@@ -1470,117 +1510,128 @@ impl ConfigStore {
         servers: HashMap<String, Arc<ServerConfig>>,
         routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
+        let _update = self.update_gate.lock();
         for server in &all_servers {
             server.compile_url_patterns();
         }
         crate::routing::location::clear_compiled_locations();
-        let mut lock = self.inner.write();
-        lock.all_servers.retain(|server| server.user_id != user_id);
-        let stale_hosts = lock
+        let mut candidate = self.inner.read().clone();
+        let stale_server_ids = candidate
+            .all_servers
+            .iter()
+            .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
+            .collect::<std::collections::HashSet<_>>();
+        candidate
+            .all_servers
+            .retain(|server| server.user_id != user_id);
+        let stale_hosts = candidate
             .servers
             .iter()
             .filter_map(|(host, server)| (server.user_id == user_id).then_some(host.clone()))
             .collect::<Vec<_>>();
-        let stale_server_ids = lock
-            .all_servers
-            .iter()
-            .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
-            .collect::<std::collections::HashSet<_>>();
 
         for host in &stale_hosts {
-            lock.servers.remove(host);
-            lock.routes.remove(host);
+            candidate.servers.remove(host);
+            candidate.routes.remove(host);
         }
         for server_id in stale_server_ids {
             if server_id > 0 {
-                lock.id_to_lb.remove(&server_id);
+                candidate.id_to_lb.remove(&server_id);
             }
         }
 
-        lock.all_servers.extend(all_servers);
+        candidate.all_servers.extend(all_servers);
         for (host, config) in servers {
-            if let Some(sid) = config.id {
-                if let Some(lb) = routes.get(&host) {
-                    lock.id_to_lb.insert(sid, lb.clone());
-                }
+            if let Some(sid) = config.id
+                && let Some(lb) = routes.get(&host)
+            {
+                candidate.id_to_lb.insert(sid, lb.clone());
             }
-            lock.servers.insert(host, config);
+            candidate.servers.insert(host, config);
         }
         for (host, lb) in routes {
-            lock.routes.insert(host, lb);
+            candidate.routes.insert(host, lb);
         }
-        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
-            lock.firewall_policies.as_ref().as_slice(),
-            lock.cache_policies.as_ref().as_slice(),
-            &lock.all_servers,
+        candidate.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            candidate.firewall_policies.as_ref().as_slice(),
+            candidate.cache_policies.as_ref().as_slice(),
+            &candidate.all_servers,
         ));
-        Self::refresh_passthrough_indexes(&mut lock);
-        Self::refresh_cluster_policy_indexes(&mut lock);
-        drop(lock);
+        Self::refresh_passthrough_indexes(&mut candidate);
+        Self::refresh_cluster_policy_indexes(&mut candidate);
+        *self.inner.write() = candidate;
+        drop(_update);
         self.notify_runtime_reload();
     }
 
     pub async fn remove_user_servers(&self, user_id: i64) {
+        let _update = self.update_gate.lock();
         crate::routing::location::clear_compiled_locations();
-        let mut lock = self.inner.write();
-        let stale_server_ids = lock
+        let mut candidate = self.inner.read().clone();
+        let stale_server_ids = candidate
             .all_servers
             .iter()
             .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
             .collect::<std::collections::HashSet<_>>();
-        lock.all_servers.retain(|server| server.user_id != user_id);
-        let stale_hosts = lock
+        candidate
+            .all_servers
+            .retain(|server| server.user_id != user_id);
+        let stale_hosts = candidate
             .servers
             .iter()
             .filter_map(|(host, server)| (server.user_id == user_id).then_some(host.clone()))
             .collect::<Vec<_>>();
 
         for host in stale_hosts {
-            lock.servers.remove(&host);
-            lock.routes.remove(&host);
+            candidate.servers.remove(&host);
+            candidate.routes.remove(&host);
         }
         for server_id in stale_server_ids {
             if server_id > 0 {
-                lock.id_to_lb.remove(&server_id);
+                candidate.id_to_lb.remove(&server_id);
             }
         }
-        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
-            lock.firewall_policies.as_ref().as_slice(),
-            lock.cache_policies.as_ref().as_slice(),
-            &lock.all_servers,
+        candidate.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            candidate.firewall_policies.as_ref().as_slice(),
+            candidate.cache_policies.as_ref().as_slice(),
+            &candidate.all_servers,
         ));
-        Self::refresh_passthrough_indexes(&mut lock);
-        Self::refresh_cluster_policy_indexes(&mut lock);
-        drop(lock);
+        Self::refresh_passthrough_indexes(&mut candidate);
+        Self::refresh_cluster_policy_indexes(&mut candidate);
+        *self.inner.write() = candidate;
+        drop(_update);
         self.notify_runtime_reload();
     }
 
     pub async fn remove_server(&self, server_id: i64) {
+        let _update = self.update_gate.lock();
         crate::routing::location::clear_compiled_locations();
-        let mut lock = self.inner.write();
-        lock.all_servers
+        let mut candidate = self.inner.read().clone();
+        candidate
+            .all_servers
             .retain(|server| server.numeric_id() != server_id);
-        let stale_hosts = lock
+        let stale_hosts = candidate
             .servers
             .iter()
             .filter_map(|(host, server)| (server.numeric_id() == server_id).then_some(host.clone()))
             .collect::<Vec<_>>();
 
         for host in stale_hosts {
-            lock.servers.remove(&host);
-            lock.routes.remove(&host);
+            candidate.servers.remove(&host);
+            candidate.routes.remove(&host);
         }
         if server_id > 0 {
-            lock.id_to_lb.remove(&server_id);
+            candidate.id_to_lb.remove(&server_id);
         }
-        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
-            lock.firewall_policies.as_ref().as_slice(),
-            lock.cache_policies.as_ref().as_slice(),
-            &lock.all_servers,
+        candidate.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            candidate.firewall_policies.as_ref().as_slice(),
+            candidate.cache_policies.as_ref().as_slice(),
+            &candidate.all_servers,
         ));
-        Self::refresh_passthrough_indexes(&mut lock);
-        Self::refresh_cluster_policy_indexes(&mut lock);
-        drop(lock);
+        Self::refresh_passthrough_indexes(&mut candidate);
+        Self::refresh_cluster_policy_indexes(&mut candidate);
+        *self.inner.write() = candidate;
+        drop(_update);
         self.notify_runtime_reload();
     }
 
@@ -1590,26 +1641,29 @@ impl ConfigStore {
         server: Arc<ServerConfig>,
         lb: Arc<crate::lb_factory::AnyLoadBalancer>,
     ) {
+        let _update = self.update_gate.lock();
         server.compile_url_patterns();
         crate::routing::location::clear_compiled_locations();
-        let mut lock = self.inner.write();
+        let mut candidate = self.inner.read().clone();
         let server_id = server.numeric_id();
         if server_id > 0 {
-            lock.id_to_lb.insert(server_id, lb.clone());
-            lock.all_servers
+            candidate.id_to_lb.insert(server_id, lb.clone());
+            candidate
+                .all_servers
                 .retain(|existing| existing.numeric_id() != server_id);
         }
-        lock.all_servers.push(server.clone());
-        lock.servers.insert(host.clone(), server);
-        lock.routes.insert(host, lb);
-        lock.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
-            lock.firewall_policies.as_ref().as_slice(),
-            lock.cache_policies.as_ref().as_slice(),
-            &lock.all_servers,
+        candidate.all_servers.push(server.clone());
+        candidate.servers.insert(host.clone(), server);
+        candidate.routes.insert(host, lb);
+        candidate.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::compile(
+            candidate.firewall_policies.as_ref().as_slice(),
+            candidate.cache_policies.as_ref().as_slice(),
+            &candidate.all_servers,
         ));
-        Self::refresh_passthrough_indexes(&mut lock);
-        Self::refresh_cluster_policy_indexes(&mut lock);
-        drop(lock);
+        Self::refresh_passthrough_indexes(&mut candidate);
+        Self::refresh_cluster_policy_indexes(&mut candidate);
+        *self.inner.write() = candidate;
+        drop(_update);
         self.notify_runtime_reload();
     }
 
@@ -1928,18 +1982,21 @@ impl ConfigStore {
     }
 
     pub async fn set_deleted_contents(&self, deleted_contents: Vec<String>) {
+        let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
         lock.deleted_content_urls = deleted_contents.iter().cloned().collect();
         lock.deleted_contents = deleted_contents;
     }
 
     pub async fn set_plans(&self, plans: HashMap<i64, crate::pb::Plan>) {
+        let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
         lock.plans = plans;
         Self::refresh_plan_derived(&mut lock);
     }
 
     pub async fn set_user_plans(&self, user_plans: HashMap<i64, crate::pb::UserPlan>) {
+        let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
         lock.user_plans = user_plans;
         Self::refresh_plan_derived(&mut lock);
@@ -1950,6 +2007,7 @@ impl ConfigStore {
         level: i32,
         parent_nodes: HashMap<i64, Vec<ParentNodeConfig>>,
     ) {
+        let _update = self.update_gate.lock();
         let allow_lan_ip = {
             let lock = self.inner.read();
             lock.allow_lan_ip

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock as Lazy;
 use std::sync::RwLock;
@@ -292,7 +293,8 @@ impl ApiConfig {
 
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let content = fs::read_to_string(&path)?;
-        let config: ApiConfig = serde_yaml::from_str(&content)?;
+        let mut config: ApiConfig = serde_yaml::from_str(&content)?;
+        config.rpc_endpoints = validate_rpc_endpoints(config.rpc_endpoints)?;
         if config.rpc_endpoints.is_empty() {
             anyhow::bail!("no valid 'rpc.endpoints' in {:?}", path.as_ref());
         }
@@ -302,7 +304,7 @@ impl ApiConfig {
         if config.secret.is_empty() {
             anyhow::bail!("'secret' required in {:?}", path.as_ref());
         }
-        Self::set_runtime_rpc_endpoints(config.rpc_endpoints.clone());
+        Self::set_runtime_rpc_endpoints(config.rpc_endpoints.clone())?;
         Ok(config)
     }
 
@@ -345,9 +347,65 @@ impl ApiConfig {
             .unwrap_or_else(|| self.rpc_endpoints.clone())
     }
 
-    pub fn set_runtime_rpc_endpoints(endpoints: Vec<String>) {
+    pub fn set_runtime_rpc_endpoints(endpoints: Vec<String>) -> anyhow::Result<()> {
+        let endpoints = validate_rpc_endpoints(endpoints)?;
+        if endpoints.is_empty() {
+            anyhow::bail!("no valid RPC endpoints supplied");
+        }
         if let Ok(mut guard) = RUNTIME_RPC_ENDPOINTS.write() {
             *guard = Some(endpoints);
         }
+        Ok(())
     }
+}
+
+pub fn validate_rpc_endpoint(endpoint: &str) -> anyhow::Result<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        anyhow::bail!("RPC endpoint is empty");
+    }
+    let uri: http::Uri = endpoint
+        .parse()
+        .map_err(|err| anyhow::anyhow!("invalid RPC endpoint {endpoint:?}: {err}"))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| anyhow::anyhow!("RPC endpoint {endpoint:?} has no scheme"))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| anyhow::anyhow!("RPC endpoint {endpoint:?} has no host"))?;
+    if uri.path_and_query().is_some_and(|value| value.as_str() != "/") {
+        anyhow::bail!("RPC endpoint {endpoint:?} must not contain a path or query");
+    }
+    if authority.as_str().contains('@') {
+        anyhow::bail!("RPC endpoint {endpoint:?} must not contain userinfo");
+    }
+    if !matches!(scheme, "http" | "https") {
+        anyhow::bail!("RPC endpoint {endpoint:?} uses unsupported scheme {scheme:?}");
+    }
+    if scheme == "http" && !is_loopback_rpc_host(authority.host()) {
+        anyhow::bail!("plaintext RPC endpoint {endpoint:?} is only allowed on loopback");
+    }
+    Ok(endpoint.trim_end_matches('/').to_string())
+}
+
+pub fn validate_rpc_endpoints(endpoints: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut normalized = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let endpoint = validate_rpc_endpoint(&endpoint)?;
+        if !normalized.contains(&endpoint) {
+            normalized.push(endpoint);
+        }
+    }
+    Ok(normalized)
+}
+
+fn is_loopback_rpc_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let host = host.trim_matches(['[', ']']);
+    host.parse::<IpAddr>().is_ok_and(|ip| match ip {
+        IpAddr::V4(ip) => ip == Ipv4Addr::LOCALHOST || ip.is_loopback(),
+        IpAddr::V6(ip) => ip == Ipv6Addr::LOCALHOST || ip.is_loopback(),
+    })
 }

@@ -2,7 +2,7 @@ use chrono::Timelike;
 use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::sync::OnceLock as OnceCell;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -32,20 +32,12 @@ pub fn normalize_metric_category(category: &str) -> String {
 pub fn start_pressure_updater() {
     tokio::spawn(async {
         let mut sys = sysinfo::System::new();
-        let mut tick: u64 = 0;
         loop {
             let pressure = compute_node_pressure(&mut sys);
             CACHED_PRESSURE.store(pressure.to_bits(), Ordering::Relaxed);
 
-            // Every 5 minutes, cap distinct_ips to prevent unbounded growth
-            tick += 1;
-            if tick % 150 == 0 {
-                for entry in METRICS.servers.iter() {
-                    if entry.value().distinct_ips.len() > 100_000 {
-                        entry.value().distinct_ips.clear();
-                    }
-                }
-            }
+            // Runtime distinct-IP cardinality is strictly bounded by its
+            // governor-derived tracker; daily exact tracking remains separate.
 
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
@@ -297,6 +289,9 @@ impl HttpDimensionHandle {
 
     fn record_drop(&self, reason: &str) {
         HTTP_DIMENSION_DROPPED.fetch_add(1, Ordering::Relaxed);
+        crate::pipeline_metrics::increment(
+            crate::pipeline_metrics::PipelineCounter::HttpDimensionDropped,
+        );
         self.dropped_since_warning.fetch_add(1, Ordering::Relaxed);
         let now = unix_epoch_millis_now();
         let last = self.last_warning_at_ms.load(Ordering::Relaxed);
@@ -351,6 +346,51 @@ pub fn init_http_dimension_worker(queue_capacity: usize) {
     });
 }
 
+pub struct RuntimeDistinctIpTracker {
+    ips: dashmap::DashSet<std::net::IpAddr>,
+    reserved: AtomicUsize,
+    capacity: usize,
+}
+
+impl RuntimeDistinctIpTracker {
+    fn new() -> Self {
+        let budget = crate::memory_governor::MEMORY_GOVERNOR
+            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
+            .cardinality_state_budget_bytes;
+        let max_servers = METRICS.servers.len().saturating_add(1) as u64;
+        let tracker_budget = budget / max_servers.max(1);
+        Self {
+            ips: dashmap::DashSet::new(),
+            reserved: AtomicUsize::new(0),
+            capacity: (tracker_budget / 64)
+                .max(1)
+                .min(usize::MAX as u64) as usize,
+        }
+    }
+
+    fn insert(&self, ip: std::net::IpAddr) {
+        if self.ips.contains(&ip) {
+            return;
+        }
+        if self
+            .reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                (reserved < self.capacity).then_some(reserved + 1)
+            })
+            .is_err()
+        {
+            return;
+        }
+        if !self.ips.insert(ip) {
+            self.reserved.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ips.len()
+    }
+}
+
 /// Metrics for a specific server (site)
 pub struct ServerMetrics {
     pub user_id: AtomicI64,
@@ -367,7 +407,7 @@ pub struct ServerMetrics {
     pub origin_bytes_received: AtomicU64,
     pub active_connections: AtomicI64,
     pub count_websocket_connections: AtomicU64,
-    pub distinct_ips: dashmap::DashSet<std::net::IpAddr>,
+    pub distinct_ips: RuntimeDistinctIpTracker,
 }
 
 impl ServerMetrics {
@@ -387,7 +427,7 @@ impl ServerMetrics {
             origin_bytes_received: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
             count_websocket_connections: AtomicU64::new(0),
-            distinct_ips: dashmap::DashSet::new(),
+            distinct_ips: RuntimeDistinctIpTracker::new(),
         }
     }
 

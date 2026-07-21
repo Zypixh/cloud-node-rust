@@ -1,7 +1,7 @@
 use crate::firewall::kernel::{KernelFilter, KernelFilterRange, KernelFilterSnapshot, NoopFilter};
 use crate::firewall::persistence::FirewallBlockRecord;
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -185,7 +185,13 @@ impl<K: std::hash::Hash + Eq + Clone + Send + Sync + 'static> TrackedLimiter<K> 
     }
 }
 
-fn warn_state_capacity_full(last_warn: &AtomicI64, area: &str, len: usize, capacity: usize) {
+fn warn_state_capacity_full(
+    last_warn: &AtomicI64,
+    area: &str,
+    len: usize,
+    capacity: usize,
+    behavior: &str,
+) {
     let now = crate::utils::time::now_timestamp();
     let last = last_warn.load(Ordering::Relaxed);
     if now.saturating_sub(last) < STATE_CAPACITY_WARN_INTERVAL_SECS {
@@ -196,10 +202,11 @@ fn warn_state_capacity_full(last_warn: &AtomicI64, area: &str, len: usize, capac
         .is_ok()
     {
         tracing::warn!(
-            "WAF state capacity full for {}; len={} capacity={}, fail-open for new keys",
+            "WAF state capacity full for {}; len={} capacity={}, {}",
             area,
             len,
-            capacity
+            capacity,
+            behavior
         );
     }
 }
@@ -242,15 +249,12 @@ impl NetworkScopeSnapshot {
         }
     }
 
-    fn items(&self) -> Vec<(IpNet, i64)> {
-        let mut items = self.all.clone();
-        for bucket in self.v4_by_octet.values() {
-            items.extend(bucket.iter().copied());
-        }
-        for bucket in self.v6_by_hextet.values() {
-            items.extend(bucket.iter().copied());
-        }
-        items
+    fn overlaps(&self, net: IpNet, now: i64) -> bool {
+        self.all
+            .iter()
+            .chain(self.v4_by_octet.values().flat_map(|items| items.iter()))
+            .chain(self.v6_by_hextet.values().flat_map(|items| items.iter()))
+            .any(|(candidate, expiry)| now < *expiry && networks_overlap(*candidate, net))
     }
 
     fn contains(&self, ip: IpAddr, now: i64) -> bool {
@@ -267,6 +271,31 @@ impl NetworkScopeSnapshot {
                 .get(&v6.segments()[0])
                 .is_some_and(|items| networks_contain(items, ip, now)),
         }
+    }
+}
+
+fn networks_overlap(a: IpNet, b: IpNet) -> bool {
+    match (a, b) {
+        (IpNet::V4(a), IpNet::V4(b)) => a.contains(&b.network()) || b.contains(&a.network()),
+        (IpNet::V6(a), IpNet::V6(b)) => a.contains(&b.network()) || b.contains(&a.network()),
+        _ => false,
+    }
+}
+
+fn range_overlaps_network(range: IpAddrRange, net: IpNet) -> bool {
+    let (from, to) = range.bounds();
+    match (from, to, net) {
+        (IpAddr::V4(from), IpAddr::V4(to), IpNet::V4(net)) => {
+            let net_from = u32::from_be_bytes(net.network().octets()) as u128;
+            let net_to = u32::from_be_bytes(net.broadcast().octets()) as u128;
+            net.contains(&from) || net.contains(&to) || (range.from <= net_to && range.to >= net_from)
+        }
+        (IpAddr::V6(from), IpAddr::V6(to), IpNet::V6(net)) => {
+            let net_from = u128::from_be_bytes(net.network().octets());
+            let net_to = u128::from_be_bytes(net.broadcast().octets());
+            net.contains(&from) || net.contains(&to) || (range.from <= net_to && range.to >= net_from)
+        }
+        _ => false,
     }
 }
 
@@ -392,7 +421,9 @@ pub struct WafStateManager {
     server_limiters: DashMap<i64, TrackedLimiter<i64>>,
     ip_limiters: DashMap<(i64, IpAddr), TrackedLimiter<IpAddr>>,
     limiter_last_sweep: AtomicI64,
+    ip_limiter_reservations: AtomicU64,
     counters: DashMap<String, RollingCounter>,
+    counter_reservations: AtomicU64,
     counter_last_sweep: AtomicI64,
     list_block_ranges: DashMap<(i64, IpAddrRange), i64>,
     list_block_range_snapshots: ArcSwap<RangeSnapshot>,
@@ -400,9 +431,11 @@ pub struct WafStateManager {
     list_white_range_snapshots: ArcSwap<RangeSnapshot>,
     list_gray_ranges: DashMap<(i64, IpAddrRange), i64>,
     list_gray_range_snapshots: ArcSwap<RangeSnapshot>,
-    ip_bw_counters: DashMap<(i64, IpAddr), Arc<(AtomicU64, AtomicU64)>>,
+    ip_bw_counters: DashMap<(i64, IpAddr), Arc<RwLock<(u64, u64)>>>,
+    ip_bw_counter_reservations: AtomicU64,
     kernel_filter: RwLock<Arc<dyn KernelFilter>>,
-    pub candidate_stats: DashMap<(i64, i64), Arc<CandidateRulesetStats>>,
+    candidate_stats: DashMap<(i64, i64), Arc<CandidateRulesetStats>>,
+    candidate_stats_reservations: AtomicU64,
 }
 
 impl Default for WafStateManager {
@@ -437,7 +470,9 @@ impl WafStateManager {
             server_limiters: DashMap::new(),
             ip_limiters: DashMap::new(),
             limiter_last_sweep: AtomicI64::new(0),
+            ip_limiter_reservations: AtomicU64::new(0),
             counters: DashMap::new(),
+            counter_reservations: AtomicU64::new(0),
             counter_last_sweep: AtomicI64::new(0),
             list_block_ranges: DashMap::new(),
             list_block_range_snapshots: ArcSwap::from_pointee(HashMap::new()),
@@ -446,8 +481,10 @@ impl WafStateManager {
             list_gray_ranges: DashMap::new(),
             list_gray_range_snapshots: ArcSwap::from_pointee(HashMap::new()),
             ip_bw_counters: DashMap::with_shard_amount(64),
+            ip_bw_counter_reservations: AtomicU64::new(0),
             kernel_filter: RwLock::new(Arc::new(NoopFilter)),
             candidate_stats: DashMap::new(),
+            candidate_stats_reservations: AtomicU64::new(0),
         }
     }
 
@@ -456,6 +493,13 @@ impl WafStateManager {
             *guard = Arc::from(filter);
         }
         self.publish_kernel_filter_snapshot();
+    }
+
+    pub fn install_kernel_snapshot_provider(self: &Arc<Self>) {
+        let owner = Arc::clone(self);
+        crate::firewall::kernel::set_kernel_snapshot_provider(Some(Arc::new(move || {
+            owner.kernel_filter_snapshot()
+        })));
     }
 
     fn kernel_filter(&self) -> Arc<dyn KernelFilter> {
@@ -481,51 +525,60 @@ impl WafStateManager {
     fn kernel_filter_snapshot(&self) -> KernelFilterSnapshot {
         let now = crate::utils::time::now_timestamp();
         KernelFilterSnapshot {
-            blocked_ips: Self::snapshot_ips(&self.kernel_blocks, now)
+            blocked_ips: Self::snapshot_global_ips(&self.kernel_blocks, now)
                 .into_iter()
-                .chain(Self::snapshot_ips(&self.list_blocks, now))
+                .chain(Self::snapshot_global_ips(&self.list_blocks, now))
                 .collect(),
-            allowed_ips: Self::snapshot_ips(&self.whitelists, now)
+            allowed_ips: Self::snapshot_global_ips(&self.whitelists, now)
                 .into_iter()
-                .chain(Self::snapshot_ips(&self.list_whitelists, now))
+                .chain(Self::snapshot_global_ips(&self.list_whitelists, now))
                 .collect(),
-            blocked_networks: Self::snapshot_networks(&self.kernel_block_networks, now)
+            blocked_networks: Self::snapshot_global_networks(&self.kernel_block_networks, now)
                 .into_iter()
-                .chain(Self::snapshot_networks(&self.list_block_networks, now))
+                .chain(Self::snapshot_global_networks(&self.list_block_networks, now))
                 .collect(),
-            allowed_networks: Self::snapshot_networks(&self.whitelist_networks, now)
+            allowed_networks: Self::snapshot_global_networks(&self.whitelist_networks, now)
                 .into_iter()
-                .chain(Self::snapshot_networks(&self.list_whitelist_networks, now))
+                .chain(Self::snapshot_global_networks(
+                    &self.list_whitelist_networks,
+                    now,
+                ))
                 .collect(),
-            blocked_ranges: Self::snapshot_ranges(&self.list_block_ranges, now),
-            allowed_ranges: Self::snapshot_ranges(&self.list_white_ranges, now),
+            blocked_ranges: Self::snapshot_global_ranges(&self.list_block_ranges, now),
+            allowed_ranges: Self::snapshot_global_ranges(&self.list_white_ranges, now),
         }
     }
 
-    fn snapshot_ips(map: &DashMap<(i64, IpAddr), i64>, now: i64) -> Vec<(IpAddr, i64)> {
+    fn snapshot_global_ips(map: &DashMap<(i64, IpAddr), i64>, now: i64) -> Vec<(IpAddr, i64)> {
         map.iter()
             .filter_map(|entry| {
                 let expiry = *entry.value();
-                (expiry > now).then_some((entry.key().1, expiry))
+                (entry.key().0 == 0 && expiry > now).then_some((entry.key().1, expiry))
             })
             .collect()
     }
 
-    fn snapshot_networks(map: &DashMap<(i64, IpNet), i64>, now: i64) -> Vec<(IpNet, i64)> {
+    fn snapshot_global_networks(
+        map: &DashMap<(i64, IpNet), i64>,
+        now: i64,
+    ) -> Vec<(IpNet, i64)> {
         map.iter()
             .filter_map(|entry| {
                 let expiry = *entry.value();
-                (expiry > now).then_some((entry.key().1, expiry))
+                (entry.key().0 == 0 && expiry > now).then_some((entry.key().1, expiry))
             })
             .collect()
     }
 
-    fn snapshot_ranges(map: &DashMap<(i64, IpAddrRange), i64>, now: i64) -> Vec<KernelFilterRange> {
+    fn snapshot_global_ranges(
+        map: &DashMap<(i64, IpAddrRange), i64>,
+        now: i64,
+    ) -> Vec<KernelFilterRange> {
         map.iter()
             .filter_map(|entry| {
                 let expiry = *entry.value();
                 let range = entry.key().1;
-                (expiry > now).then_some(KernelFilterRange {
+                (entry.key().0 == 0 && expiry > now).then_some(KernelFilterRange {
                     from: range.from,
                     to: range.to,
                     v6: range.v6,
@@ -535,20 +588,28 @@ impl WafStateManager {
             .collect()
     }
 
-    fn max_ip_expiry(map: &DashMap<(i64, IpAddr), i64>, ip: IpAddr, now: i64) -> Option<i64> {
+    fn max_global_ip_expiry(
+        map: &DashMap<(i64, IpAddr), i64>,
+        ip: IpAddr,
+        now: i64,
+    ) -> Option<i64> {
         map.iter()
             .filter_map(|entry| {
                 let expiry = *entry.value();
-                (entry.key().1 == ip && expiry > now).then_some(expiry)
+                (entry.key().0 == 0 && entry.key().1 == ip && expiry > now).then_some(expiry)
             })
             .max()
     }
 
-    fn max_network_expiry(map: &DashMap<(i64, IpNet), i64>, net: IpNet, now: i64) -> Option<i64> {
+    fn max_global_network_expiry(
+        map: &DashMap<(i64, IpNet), i64>,
+        net: IpNet,
+        now: i64,
+    ) -> Option<i64> {
         map.iter()
             .filter_map(|entry| {
                 let expiry = *entry.value();
-                (entry.key().1 == net && expiry > now).then_some(expiry)
+                (entry.key().0 == 0 && entry.key().1 == net && expiry > now).then_some(expiry)
             })
             .max()
     }
@@ -558,13 +619,16 @@ impl WafStateManager {
         if !filter.available() {
             return;
         }
-        if self.is_whitelisted_any_scope(ip) {
-            filter.unblock(ip);
+        let now = crate::utils::time::now_timestamp();
+        let whitelist_expiry = Self::max_global_ip_expiry(&self.whitelists, ip, now)
+            .max(Self::max_global_ip_expiry(&self.list_whitelists, ip, now));
+        if let Some(expiry) = whitelist_expiry {
+            filter.allow(ip, expiry.saturating_sub(now));
             return;
         }
-        let now = crate::utils::time::now_timestamp();
-        let expiry = Self::max_ip_expiry(&self.kernel_blocks, ip, now)
-            .max(Self::max_ip_expiry(&self.list_blocks, ip, now));
+        filter.unallow(ip);
+        let expiry = Self::max_global_ip_expiry(&self.kernel_blocks, ip, now)
+            .max(Self::max_global_ip_expiry(&self.list_blocks, ip, now));
         match expiry {
             Some(expiry) => filter.block(ip, expiry.saturating_sub(now)),
             None => filter.unblock(ip),
@@ -577,8 +641,23 @@ impl WafStateManager {
             return;
         }
         let now = crate::utils::time::now_timestamp();
-        let expiry = Self::max_network_expiry(&self.kernel_block_networks, net, now)
-            .max(Self::max_network_expiry(&self.list_block_networks, net, now));
+        let whitelist_expiry = Self::max_global_network_expiry(&self.whitelist_networks, net, now)
+            .max(Self::max_global_network_expiry(
+                &self.list_whitelist_networks,
+                net,
+                now,
+            ));
+        if let Some(expiry) = whitelist_expiry {
+            filter.allow_network(net, expiry.saturating_sub(now));
+            return;
+        }
+        filter.unallow_network(net);
+        let expiry = Self::max_global_network_expiry(&self.kernel_block_networks, net, now)
+            .max(Self::max_global_network_expiry(
+                &self.list_block_networks,
+                net,
+                now,
+            ));
         match expiry {
             Some(expiry) => filter.block_network(net, expiry.saturating_sub(now)),
             None => filter.unblock_network(net),
@@ -590,14 +669,17 @@ impl WafStateManager {
             || !self.block_networks.is_empty()
             || !self.list_blocks.is_empty()
             || !self.list_block_networks.is_empty()
+            || !self.list_block_ranges.is_empty()
             || !self.whitelists.is_empty()
             || !self.whitelist_networks.is_empty()
             || !self.list_whitelists.is_empty()
             || !self.list_whitelist_networks.is_empty()
+            || !self.list_white_ranges.is_empty()
             || !self.graylists.is_empty()
             || !self.gray_networks.is_empty()
             || !self.list_graylists.is_empty()
             || !self.list_gray_networks.is_empty()
+            || !self.list_gray_ranges.is_empty()
     }
 
     pub fn is_whitelisted(&self, ip: IpAddr, server_id: i64) -> bool {
@@ -623,6 +705,81 @@ impl WafStateManager {
             || Self::contains_any_scoped_network(&self.whitelist_network_snapshots, ip, now)
             || Self::contains_any_scoped_network(&self.list_whitelist_network_snapshots, ip, now)
             || Self::contains_any_scoped_range(&self.list_white_range_snapshots, ip, now)
+    }
+
+    pub fn has_whitelist_overlapping_network(&self, net: IpNet, server_id: i64) -> bool {
+        let now = crate::utils::time::now_timestamp();
+        Self::scoped_network_snapshot_overlaps(
+            &self.whitelist_network_snapshots,
+            net,
+            server_id,
+            now,
+        ) || Self::scoped_network_snapshot_overlaps(
+            &self.list_whitelist_network_snapshots,
+            net,
+            server_id,
+            now,
+        ) || Self::scoped_range_snapshot_overlaps(
+            &self.list_white_range_snapshots,
+            net,
+            server_id,
+            now,
+        ) || self.whitelist_ip_overlaps_network(&self.whitelists, net, server_id, now)
+            || self.whitelist_ip_overlaps_network(&self.list_whitelists, net, server_id, now)
+    }
+
+    fn whitelist_ip_overlaps_network(
+        &self,
+        map: &DashMap<(i64, IpAddr), i64>,
+        net: IpNet,
+        server_id: i64,
+        now: i64,
+    ) -> bool {
+        map.iter().any(|entry| {
+            let (scope, ip) = *entry.key();
+            now < *entry.value() && (scope == 0 || scope == server_id) && net.contains(&ip)
+        })
+    }
+
+    fn scoped_range_snapshot_overlaps(
+        snapshots: &ArcSwap<RangeSnapshot>,
+        net: IpNet,
+        server_id: i64,
+        now: i64,
+    ) -> bool {
+        let snapshot = snapshots.load();
+        Self::ranges_overlap_network(snapshot.get(&0), net, now)
+            || (server_id != 0
+                && Self::ranges_overlap_network(snapshot.get(&server_id), net, now))
+    }
+
+    fn ranges_overlap_network(
+        ranges: Option<&Arc<Vec<(IpAddrRange, i64)>>>,
+        net: IpNet,
+        now: i64,
+    ) -> bool {
+        ranges.is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|(range, expiry)| now < *expiry && range_overlaps_network(*range, net))
+        })
+    }
+
+    fn scoped_network_snapshot_overlaps(
+        snapshots: &ArcSwap<NetworkSnapshot>,
+        net: IpNet,
+        server_id: i64,
+        now: i64,
+    ) -> bool {
+        snapshots
+            .load()
+            .get(&0)
+            .is_some_and(|snapshot| snapshot.overlaps(net, now))
+            || (server_id != 0
+                && snapshots
+                    .load()
+                    .get(&server_id)
+                    .is_some_and(|snapshot| snapshot.overlaps(net, now)))
     }
 
     pub fn is_blocked(&self, ip: IpAddr, server_id: i64) -> bool {
@@ -656,6 +813,7 @@ impl WafStateManager {
     }
 
     pub fn apply_black_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
+        let ip = canonical_lookup_ip(ip);
         Self::apply_scoped_ip(&self.blocks, server_id, ip, expiry);
         Self::apply_scoped_ip(&self.kernel_blocks, server_id, ip, expiry);
         self.reconcile_kernel_ip(ip);
@@ -674,6 +832,7 @@ impl WafStateManager {
     }
 
     pub fn remove_black_ip(&self, server_id: i64, ip: IpAddr) {
+        let ip = canonical_lookup_ip(ip);
         Self::remove_scoped_ip(&self.blocks, server_id, ip);
         Self::remove_scoped_ip(&self.kernel_blocks, server_id, ip);
         crate::firewall::persistence::enqueue_delete(
@@ -701,6 +860,7 @@ impl WafStateManager {
     }
 
     pub fn apply_list_black_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
+        let ip = canonical_lookup_ip(ip);
         Self::apply_scoped_ip(&self.list_blocks, server_id, ip, expiry);
         self.reconcile_kernel_ip(ip);
     }
@@ -717,21 +877,8 @@ impl WafStateManager {
     }
 
     pub fn remove_list_black_ip(&self, server_id: i64, ip: IpAddr) {
+        let ip = canonical_lookup_ip(ip);
         Self::remove_scoped_ip(&self.list_blocks, server_id, ip);
-        let removed_runtime = self
-            .blocks
-            .iter()
-            .filter_map(|entry| (entry.key().1 == ip).then_some(entry.key().0))
-            .collect::<Vec<_>>();
-        self.blocks.retain(|key, _| key.1 != ip);
-        self.kernel_blocks.retain(|key, _| key.1 != ip);
-        for scope_server_id in removed_runtime {
-            crate::firewall::persistence::enqueue_delete(
-                scope_label(scope_server_id),
-                scope_server_id,
-                &ip.to_string(),
-            );
-        }
         self.reconcile_kernel_ip(ip);
     }
 
@@ -742,34 +889,13 @@ impl WafStateManager {
             server_id,
             net,
         );
-        let removed_runtime = self
-            .block_networks
-            .iter()
-            .filter_map(|entry| (entry.key().1 == net).then_some(entry.key().0))
-            .collect::<Vec<_>>();
-        self.block_networks.retain(|key, _| key.1 != net);
-        self.kernel_block_networks.retain(|key, _| key.1 != net);
-        for scope_server_id in removed_runtime {
-            crate::firewall::persistence::enqueue_delete(
-                scope_label(scope_server_id),
-                scope_server_id,
-                &net.to_string(),
-            );
-        }
-        Self::rebuild_network_snapshot(
-            &self.block_networks,
-            &self.block_network_snapshots,
-            crate::utils::time::now_timestamp(),
-        );
         self.reconcile_kernel_network(net);
     }
 
     pub fn apply_white_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
+        let ip = canonical_lookup_ip(ip);
         Self::apply_scoped_ip(&self.whitelists, server_id, ip, expiry);
-        if crate::utils::time::now_timestamp() < expiry {
-            self.kernel_filter().unblock(ip);
-        }
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_ip(ip);
     }
 
     pub fn apply_white_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
@@ -780,15 +906,13 @@ impl WafStateManager {
             net,
             expiry,
         );
-        if crate::utils::time::now_timestamp() < expiry {
-            self.kernel_filter().unblock_network(net);
-        }
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_network(net);
     }
 
     pub fn remove_white_ip(&self, server_id: i64, ip: IpAddr) {
+        let ip = canonical_lookup_ip(ip);
         Self::remove_scoped_ip(&self.whitelists, server_id, ip);
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_ip(ip);
     }
 
     pub fn remove_white_network(&self, server_id: i64, net: IpNet) {
@@ -798,15 +922,12 @@ impl WafStateManager {
             server_id,
             net,
         );
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_network(net);
     }
 
     pub fn apply_list_white_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
         Self::apply_scoped_ip(&self.list_whitelists, server_id, ip, expiry);
-        if crate::utils::time::now_timestamp() < expiry {
-            self.kernel_filter().unblock(ip);
-        }
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_ip(ip);
     }
 
     pub fn apply_list_white_network_until(&self, server_id: i64, net: IpNet, expiry: i64) {
@@ -817,15 +938,13 @@ impl WafStateManager {
             net,
             expiry,
         );
-        if crate::utils::time::now_timestamp() < expiry {
-            self.kernel_filter().unblock_network(net);
-        }
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_network(net);
     }
 
     pub fn remove_list_white_ip(&self, server_id: i64, ip: IpAddr) {
+        let ip = canonical_lookup_ip(ip);
         Self::remove_scoped_ip(&self.list_whitelists, server_id, ip);
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_ip(ip);
     }
 
     pub fn remove_list_white_network(&self, server_id: i64, net: IpNet) {
@@ -835,7 +954,7 @@ impl WafStateManager {
             server_id,
             net,
         );
-        self.publish_kernel_filter_snapshot();
+        self.reconcile_kernel_network(net);
     }
 
     pub fn apply_gray_ip_until(&self, server_id: i64, ip: IpAddr, expiry: i64) {
@@ -892,6 +1011,54 @@ impl WafStateManager {
         );
     }
 
+    pub fn block_network(
+        &self,
+        net: IpNet,
+        server_id: i64,
+        timeout_secs: i64,
+        scope: Option<&str>,
+        use_local_firewall: bool,
+    ) {
+        let expiry = crate::utils::time::now_timestamp() + timeout_secs;
+        let key_server_id = if matches!(scope, Some("global")) {
+            0
+        } else {
+            server_id
+        };
+        let kernel_filter = self.kernel_filter();
+        let kernel_filter_available = kernel_filter.available();
+        Self::insert_scoped_network(
+            &self.block_networks,
+            &self.block_network_snapshots,
+            key_server_id,
+            net,
+            expiry,
+        );
+        crate::firewall::persistence::enqueue_upsert(FirewallBlockRecord::runtime(
+            net.to_string(),
+            key_server_id,
+            scope_label(key_server_id).to_string(),
+            expiry,
+            use_local_firewall,
+        ));
+        if use_local_firewall {
+            Self::apply_scoped_network_map(
+                &self.kernel_block_networks,
+                key_server_id,
+                net,
+                expiry,
+            );
+        } else {
+            Self::remove_scoped_network_map(&self.kernel_block_networks, key_server_id, net);
+        }
+        if use_local_firewall && !kernel_filter_available {
+            self.exec_local_firewall(net.to_string(), timeout_secs);
+        }
+        if kernel_filter_available {
+            self.reconcile_kernel_network(net);
+        }
+    }
+
     pub fn block_ip(
         &self,
         ip: IpAddr,
@@ -901,6 +1068,7 @@ impl WafStateManager {
         block_c_class: bool,
         use_local_firewall: bool,
     ) {
+        let ip = canonical_lookup_ip(ip);
         let expiry = crate::utils::time::now_timestamp() + timeout_secs;
         let key_server_id = if matches!(scope, Some("global")) {
             0
@@ -943,8 +1111,8 @@ impl WafStateManager {
                 if use_local_firewall && !kernel_filter_available {
                     self.exec_local_firewall(net.to_string(), timeout_secs);
                 }
-                if use_local_firewall && kernel_filter_available {
-                    kernel_filter.block_network(net, timeout_secs);
+                if kernel_filter_available {
+                    self.reconcile_kernel_network(net);
                 }
             }
         } else {
@@ -964,12 +1132,12 @@ impl WafStateManager {
         if !block_c_class {
             if use_local_firewall {
                 Self::apply_scoped_ip(&self.kernel_blocks, key_server_id, ip, expiry);
-                if kernel_filter_available && !self.is_whitelisted_any_scope(ip) {
-                    kernel_filter.block(ip, timeout_secs);
-                }
             } else {
                 Self::remove_scoped_ip(&self.kernel_blocks, key_server_id, ip);
             }
+        }
+        if kernel_filter_available {
+            self.reconcile_kernel_ip(ip);
         }
     }
 
@@ -1179,39 +1347,100 @@ impl WafStateManager {
         entry.limiter.check_key(&server_id).is_ok()
     }
 
+    fn reserve_slot(counter: &AtomicU64, capacity: usize) -> bool {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < capacity as u64).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    fn release_slot(counter: &AtomicU64) {
+        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(1))
+        });
+    }
+
     pub fn check_ip_rate_limit(&self, server_id: i64, ip: IpAddr, max_qps: u32) -> bool {
         if max_qps == 0 {
             return true;
         }
         let ip = rate_limit_key_ip(ip);
         self.sweep_limiters_if_needed();
-        if !self.ip_limiters.contains_key(&(server_id, ip))
-            && self.ip_limiters.len() >= self.ip_limiter_capacity()
-        {
-            self.sweep_limiters(crate::utils::time::now_timestamp());
-            if self.ip_limiters.len() >= self.ip_limiter_capacity() {
-                warn_state_capacity_full(
-                    &IP_LIMITER_CAPACITY_WARN_AT,
-                    "per-IP rate limiters",
-                    self.ip_limiters.len(),
-                    self.ip_limiter_capacity(),
-                );
-                return true;
+        let key = (server_id, ip);
+        let mut entry = match self.ip_limiters.entry(key) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => {
+                if !Self::reserve_slot(&self.ip_limiter_reservations, self.ip_limiter_capacity()) {
+                    drop(entry);
+                    self.sweep_limiters(crate::utils::time::now_timestamp());
+                    let entry = match self.ip_limiters.entry(key) {
+                        Entry::Occupied(entry) => entry.into_ref(),
+                        Entry::Vacant(entry) => {
+                            if !Self::reserve_slot(
+                                &self.ip_limiter_reservations,
+                                self.ip_limiter_capacity(),
+                            ) {
+                                warn_state_capacity_full(
+                                    &IP_LIMITER_CAPACITY_WARN_AT,
+                                    "per-IP rate limiters",
+                                    self.ip_limiters.len(),
+                                    self.ip_limiter_capacity(),
+                                    "fail-closed for untracked rate-limit keys",
+                                );
+                                return false;
+                            }
+                            let quota =
+                                Quota::per_second(NonZeroU32::new(max_qps).unwrap());
+                            entry.insert(TrackedLimiter::new(
+                                Arc::new(RateLimiter::dashmap(quota)),
+                                max_qps,
+                            ))
+                        }
+                    };
+                    entry
+                } else {
+                    let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
+                    entry.insert(TrackedLimiter::new(
+                        Arc::new(RateLimiter::dashmap(quota)),
+                        max_qps,
+                    ))
+                }
             }
-        }
-        // Same quota hot-reload logic as check_rate_limit.
-        let entry = self.ip_limiters.entry((server_id, ip)).or_insert_with(|| {
-            let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
-            TrackedLimiter::new(Arc::new(RateLimiter::dashmap(quota)), max_qps)
-        });
+        };
         if entry.quota_value.load(Ordering::Relaxed) != max_qps {
             drop(entry);
-            self.ip_limiters.remove(&(server_id, ip));
-            let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
-            let fresh = TrackedLimiter::new(Arc::new(RateLimiter::dashmap(quota)), max_qps);
-            let entry = self.ip_limiters.entry((server_id, ip)).or_insert(fresh);
-            entry.touch();
-            return entry.limiter.check_key(&ip).is_ok();
+            loop {
+                match self.ip_limiters.entry(key) {
+                    Entry::Occupied(mut current) => {
+                        if current.get().quota_value.load(Ordering::Relaxed) != max_qps {
+                            let quota =
+                                Quota::per_second(NonZeroU32::new(max_qps).unwrap());
+                            let _ = current.insert(TrackedLimiter::new(
+                                Arc::new(RateLimiter::dashmap(quota)),
+                                max_qps,
+                            ));
+                        }
+                        entry = current.into_ref();
+                        break;
+                    }
+                    Entry::Vacant(current) => {
+                        if !Self::reserve_slot(
+                            &self.ip_limiter_reservations,
+                            self.ip_limiter_capacity(),
+                        ) {
+                            return false;
+                        }
+                        let quota =
+                            Quota::per_second(NonZeroU32::new(max_qps).unwrap());
+                        entry = current.insert(TrackedLimiter::new(
+                            Arc::new(RateLimiter::dashmap(quota)),
+                            max_qps,
+                        ));
+                        break;
+                    }
+                }
+            }
         }
         entry.touch();
         entry.limiter.check_key(&ip).is_ok()
@@ -1239,7 +1468,21 @@ impl WafStateManager {
     fn sweep_limiters(&self, now: i64) {
         self.server_limiters
             .retain(|_, tracked| !tracked.is_idle(now));
-        self.ip_limiters.retain(|_, tracked| !tracked.is_idle(now));
+        let mut removed = 0u64;
+        self.ip_limiters.retain(|_, tracked| {
+            let retain = !tracked.is_idle(now);
+            if !retain {
+                removed = removed.saturating_add(1);
+            }
+            retain
+        });
+        if removed > 0 {
+            let _ = self.ip_limiter_reservations.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| Some(current.saturating_sub(removed)),
+            );
+        }
     }
 
     pub fn record_failure(&self, key: String) -> u64 {
@@ -1261,26 +1504,59 @@ impl WafStateManager {
         let amount = amount.max(1);
         self.sweep_counters(now);
         let key = format!("{}:{}", period_secs, key);
-        if !self.counters.contains_key(&key) && self.counters.len() >= self.counter_capacity() {
-            self.sweep_counters_force(now);
-            if self.counters.len() >= self.counter_capacity() {
-                warn_state_capacity_full(
-                    &COUNTER_CAPACITY_WARN_AT,
-                    "rolling counters",
-                    self.counters.len(),
-                    self.counter_capacity(),
-                );
-                return 0;
+        let mut entry = match self.counters.entry(key.clone()) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => {
+                if !Self::reserve_slot(&self.counter_reservations, self.counter_capacity()) {
+                    drop(entry);
+                    self.sweep_counters_force(now);
+                    match self.counters.entry(key) {
+                        Entry::Occupied(entry) => entry.into_ref(),
+                        Entry::Vacant(entry) => {
+                            if !Self::reserve_slot(
+                                &self.counter_reservations,
+                                self.counter_capacity(),
+                            ) {
+                                warn_state_capacity_full(
+                                    &COUNTER_CAPACITY_WARN_AT,
+                                    "rolling counters",
+                                    self.counters.len(),
+                                    self.counter_capacity(),
+                                    "fail-open for untracked counters",
+                                );
+                                return 0;
+                            }
+                            entry.insert(RollingCounter::default())
+                        }
+                    }
+                } else {
+                    entry.insert(RollingCounter::default())
+                }
             }
-        }
-        self.counters
-            .entry(key)
-            .or_default()
-            .increment_by(now, period_secs, amount)
+        };
+        entry.increment_by(now, period_secs, amount)
     }
 
     fn counter_capacity(&self) -> usize {
         crate::memory_governor::MEMORY_GOVERNOR.firewall_rolling_counter_capacity()
+    }
+
+    fn retain_active_counters(&self, now: i64) {
+        let mut removed = 0u64;
+        self.counters.retain(|_, counter| {
+            let retain = !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS);
+            if !retain {
+                removed = removed.saturating_add(1);
+            }
+            retain
+        });
+        if removed > 0 {
+            let _ = self.counter_reservations.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| Some(current.saturating_sub(removed)),
+            );
+        }
     }
 
     fn sweep_counters(&self, now: i64) {
@@ -1295,13 +1571,11 @@ impl WafStateManager {
         {
             return;
         }
-        self.counters
-            .retain(|_, counter| !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS));
+        self.retain_active_counters(now);
     }
 
     fn sweep_counters_force(&self, now: i64) {
-        self.counters
-            .retain(|_, counter| !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS));
+        self.retain_active_counters(now);
     }
 
     fn apply_scoped_ip(map: &DashMap<(i64, IpAddr), i64>, server_id: i64, ip: IpAddr, expiry: i64) {
@@ -1376,26 +1650,7 @@ impl WafStateManager {
         }
 
         map.insert((server_id, net), expiry);
-        let current = snapshots.load();
-        let mut next = current.as_ref().clone();
-        let mut networks = next
-            .get(&server_id)
-            .map(|items| {
-                items
-                    .items()
-                    .iter()
-                    .copied()
-                    .filter(|(_, exp)| now < *exp)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        networks.retain(|(existing, _)| *existing != net);
-        networks.push((net, expiry));
-        next.insert(
-            server_id,
-            Arc::new(NetworkScopeSnapshot::from_items(networks)),
-        );
-        snapshots.store(Arc::new(next));
+        Self::rebuild_network_snapshot(map, snapshots, now);
     }
 
     fn remove_scoped_network(
@@ -1405,26 +1660,7 @@ impl WafStateManager {
         net: IpNet,
     ) {
         map.remove(&(server_id, net));
-        let current = snapshots.load();
-        let Some(items) = current.get(&server_id) else {
-            return;
-        };
-        let mut next = current.as_ref().clone();
-        let networks = items
-            .items()
-            .iter()
-            .copied()
-            .filter(|(existing, _)| *existing != net)
-            .collect::<Vec<_>>();
-        if networks.is_empty() {
-            next.remove(&server_id);
-        } else {
-            next.insert(
-                server_id,
-                Arc::new(NetworkScopeSnapshot::from_items(networks)),
-            );
-        }
-        snapshots.store(Arc::new(next));
+        Self::rebuild_network_snapshot(map, snapshots, crate::utils::time::now_timestamp());
     }
 
     fn contains_scoped_network(
@@ -1491,26 +1727,42 @@ impl WafStateManager {
         let expired_ips = self
             .blocks
             .iter()
-            .filter_map(|entry| (now >= *entry.value()).then_some((entry.key().0, entry.key().1)))
+            .filter_map(|entry| {
+                (now >= *entry.value()).then_some((entry.key().0, entry.key().1, *entry.value()))
+            })
             .collect::<Vec<_>>();
-        for (server_id, ip) in expired_ips {
-            crate::firewall::persistence::enqueue_delete(
-                scope_label(server_id),
-                server_id,
-                &ip.to_string(),
-            );
+        for (server_id, ip, observed_expiry) in expired_ips {
+            let removed = self
+                .blocks
+                .remove_if(&(server_id, ip), |_, expiry| *expiry == observed_expiry)
+                .is_some();
+            if removed {
+                crate::firewall::persistence::enqueue_delete(
+                    scope_label(server_id),
+                    server_id,
+                    &ip.to_string(),
+                );
+            }
         }
         let expired_networks = self
             .block_networks
             .iter()
-            .filter_map(|entry| (now >= *entry.value()).then_some((entry.key().0, entry.key().1)))
+            .filter_map(|entry| {
+                (now >= *entry.value()).then_some((entry.key().0, entry.key().1, *entry.value()))
+            })
             .collect::<Vec<_>>();
-        for (server_id, net) in expired_networks {
-            crate::firewall::persistence::enqueue_delete(
-                scope_label(server_id),
-                server_id,
-                &net.to_string(),
-            );
+        for (server_id, net, observed_expiry) in expired_networks {
+            let removed = self
+                .block_networks
+                .remove_if(&(server_id, net), |_, expiry| *expiry == observed_expiry)
+                .is_some();
+            if removed {
+                crate::firewall::persistence::enqueue_delete(
+                    scope_label(server_id),
+                    server_id,
+                    &net.to_string(),
+                );
+            }
         }
 
         self.blocks.retain(|_, expiry| now < *expiry);
@@ -1551,13 +1803,10 @@ impl WafStateManager {
             &self.list_gray_network_snapshots,
             now,
         );
-        self.counters
-            .retain(|_, counter| !counter.is_stale(now, COUNTER_MAX_PERIOD_SECS));
+        self.retain_active_counters(now);
         self.sweep_candidate_stats(now);
 
-        self.server_limiters
-            .retain(|_, tracked| !tracked.is_idle(now));
-        self.ip_limiters.retain(|_, tracked| !tracked.is_idle(now));
+        self.sweep_limiters(now);
         self.list_block_ranges.retain(|_, expiry| now < *expiry);
         self.list_white_ranges.retain(|_, expiry| now < *expiry);
         self.list_gray_ranges.retain(|_, expiry| now < *expiry);
@@ -1572,10 +1821,7 @@ impl WafStateManager {
             now,
         );
         Self::rebuild_range_snapshot(&self.list_gray_ranges, &self.list_gray_range_snapshots, now);
-        self.ip_bw_counters.retain(|_, entry| {
-            let win = entry.1.load(Ordering::Relaxed);
-            (now as u64).saturating_sub(win) < 120
-        });
+        self.sweep_ip_bw_counters(now as u64);
         let _ = crate::firewall::persistence::cleanup_expired(now);
         self.persist_blocked_snapshot();
         self.publish_kernel_filter_snapshot();
@@ -1589,15 +1835,7 @@ impl WafStateManager {
             range,
             expiry,
         );
-        let now = crate::utils::time::now_timestamp();
-        if expiry > now {
-            self.kernel_filter().block_range(
-                range.from,
-                range.to,
-                range.v6,
-                expiry.saturating_sub(now),
-            );
-        }
+        self.publish_kernel_filter_snapshot();
     }
 
     pub fn remove_list_black_range(&self, server_id: i64, range: IpAddrRange) {
@@ -1607,8 +1845,7 @@ impl WafStateManager {
             server_id,
             range,
         );
-        self.kernel_filter()
-            .unblock_range(range.from, range.to, range.v6);
+        self.publish_kernel_filter_snapshot();
     }
 
     pub fn apply_list_white_range_until(&self, server_id: i64, range: IpAddrRange, expiry: i64) {
@@ -1619,10 +1856,6 @@ impl WafStateManager {
             range,
             expiry,
         );
-        if crate::utils::time::now_timestamp() < expiry {
-            self.kernel_filter()
-                .unblock_range(range.from, range.to, range.v6);
-        }
         self.publish_kernel_filter_snapshot();
     }
 
@@ -1667,7 +1900,7 @@ impl WafStateManager {
             Self::remove_scoped_range(map, snapshots, server_id, range);
         } else {
             map.insert((server_id, range), expiry);
-            Self::insert_range_snapshot(snapshots, server_id, range, expiry, now);
+            Self::rebuild_range_snapshot(map, snapshots, now);
         }
     }
 
@@ -1678,41 +1911,7 @@ impl WafStateManager {
         range: IpAddrRange,
     ) {
         map.remove(&(server_id, range));
-        let now = crate::utils::time::now_timestamp();
-        let current = snapshots.load();
-        let mut next = current.as_ref().clone();
-        if let Some(ranges) = next.get_mut(&server_id) {
-            let retained = ranges
-                .iter()
-                .copied()
-                .filter(|(candidate, expiry)| *candidate != range && now < *expiry)
-                .collect::<Vec<_>>();
-            if retained.is_empty() {
-                next.remove(&server_id);
-            } else {
-                next.insert(server_id, Arc::new(retained));
-            }
-        }
-        snapshots.store(Arc::new(next));
-    }
-
-    fn insert_range_snapshot(
-        snapshots: &ArcSwap<RangeSnapshot>,
-        server_id: i64,
-        range: IpAddrRange,
-        expiry: i64,
-        now: i64,
-    ) {
-        let current = snapshots.load();
-        let mut next = current.as_ref().clone();
-        let mut ranges = next
-            .get(&server_id)
-            .map(|ranges| ranges.as_ref().clone())
-            .unwrap_or_default();
-        ranges.retain(|(candidate, existing_expiry)| *candidate != range && now < *existing_expiry);
-        ranges.push((range, expiry));
-        next.insert(server_id, Arc::new(ranges));
-        snapshots.store(Arc::new(next));
+        Self::rebuild_range_snapshot(map, snapshots, crate::utils::time::now_timestamp());
     }
 
     fn rebuild_range_snapshot(
@@ -1780,39 +1979,72 @@ impl WafStateManager {
         }
         let ip = rate_limit_key_ip(ip);
         let now_secs = crate::utils::time::now_timestamp() as u64;
-        if !self.ip_bw_counters.contains_key(&(server_id, ip))
-            && self.ip_bw_counters.len() >= self.ip_bw_counter_capacity()
-        {
-            self.ip_bw_counters.retain(|_, entry| {
-                let win = entry.1.load(Ordering::Relaxed);
-                (now_secs).saturating_sub(win) < 120
-            });
-            if self.ip_bw_counters.len() >= self.ip_bw_counter_capacity() {
-                warn_state_capacity_full(
-                    &IP_BW_CAPACITY_WARN_AT,
-                    "per-IP bandwidth counters",
-                    self.ip_bw_counters.len(),
+        let key = (server_id, ip);
+        let entry = match self.ip_bw_counters.entry(key) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => {
+                if !Self::reserve_slot(
+                    &self.ip_bw_counter_reservations,
                     self.ip_bw_counter_capacity(),
-                );
-                return false;
+                ) {
+                    drop(entry);
+                    self.sweep_ip_bw_counters(now_secs);
+                    match self.ip_bw_counters.entry(key) {
+                        Entry::Occupied(entry) => entry.into_ref(),
+                        Entry::Vacant(entry) => {
+                            if !Self::reserve_slot(
+                                &self.ip_bw_counter_reservations,
+                                self.ip_bw_counter_capacity(),
+                            ) {
+                                warn_state_capacity_full(
+                                    &IP_BW_CAPACITY_WARN_AT,
+                                    "per-IP bandwidth counters",
+                                    self.ip_bw_counters.len(),
+                                    self.ip_bw_counter_capacity(),
+                                    "fail-open for untracked bandwidth keys",
+                                );
+                                return false;
+                            }
+                            entry.insert(Arc::new(RwLock::new((0, now_secs))))
+                        }
+                    }
+                } else {
+                    entry.insert(Arc::new(RwLock::new((0, now_secs))))
+                }
             }
-        }
-        let entry = self
-            .ip_bw_counters
-            .entry((server_id, ip))
-            .or_insert_with(|| Arc::new((AtomicU64::new(0), AtomicU64::new(now_secs))));
-        let (byte_counter, window_start) = entry.as_ref();
-        let win = window_start.load(Ordering::Relaxed);
-        if now_secs > win
-            && window_start
-                .compare_exchange(win, now_secs, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            byte_counter.store(bytes, Ordering::Relaxed);
+        };
+        let mut state = entry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if now_secs > state.1 {
+            state.0 = bytes;
+            state.1 = now_secs;
             return bytes > limit_bytes;
         }
-        let total = byte_counter.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        total > limit_bytes
+        state.0 = state.0.saturating_add(bytes);
+        state.0 > limit_bytes
+    }
+
+    fn sweep_ip_bw_counters(&self, now_secs: u64) {
+        let mut removed = 0u64;
+        self.ip_bw_counters.retain(|_, entry| {
+            let win = entry
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .1;
+            let retain = now_secs.saturating_sub(win) < 120;
+            if !retain {
+                removed = removed.saturating_add(1);
+            }
+            retain
+        });
+        if removed > 0 {
+            let _ = self.ip_bw_counter_reservations.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| Some(current.saturating_sub(removed)),
+            );
+        }
     }
 
     fn ip_bw_counter_capacity(&self) -> usize {
@@ -1828,18 +2060,32 @@ impl WafStateManager {
     ) {
         let now = crate::utils::time::now_timestamp();
         let key = (policy_id, version);
-        if !self.candidate_stats.contains_key(&key)
-            && self.candidate_stats.len() >= self.candidate_stats_capacity()
-        {
-            self.sweep_candidate_stats(now);
-            if self.candidate_stats.len() >= self.candidate_stats_capacity() {
-                return;
+        let entry = match self.candidate_stats.entry(key) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => {
+                if !Self::reserve_slot(
+                    &self.candidate_stats_reservations,
+                    self.candidate_stats_capacity(),
+                ) {
+                    drop(entry);
+                    self.sweep_candidate_stats(now);
+                    match self.candidate_stats.entry(key) {
+                        Entry::Occupied(entry) => entry.into_ref(),
+                        Entry::Vacant(entry) => {
+                            if !Self::reserve_slot(
+                                &self.candidate_stats_reservations,
+                                self.candidate_stats_capacity(),
+                            ) {
+                                return;
+                            }
+                            entry.insert(Arc::new(CandidateRulesetStats::new()))
+                        }
+                    }
+                } else {
+                    entry.insert(Arc::new(CandidateRulesetStats::new()))
+                }
             }
-        }
-        let entry = self
-            .candidate_stats
-            .entry(key)
-            .or_insert_with(|| Arc::new(CandidateRulesetStats::new()));
+        };
         entry.touch(now);
         entry.hits.fetch_add(1, Ordering::Relaxed);
         if blocked {
@@ -1855,22 +2101,37 @@ impl WafStateManager {
     }
 
     fn sweep_candidate_stats(&self, now: i64) {
-        self.candidate_stats.retain(|_, stats| !stats.is_idle(now));
+        let mut removed = 0u64;
+        self.candidate_stats.retain(|_, stats| {
+            let retain = !stats.is_idle(now);
+            if !retain {
+                removed = removed.saturating_add(1);
+            }
+            retain
+        });
+        if removed > 0 {
+            let _ = self.candidate_stats_reservations.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| Some(current.saturating_sub(removed)),
+            );
+        }
     }
 
     pub fn take_candidate_stats(&self) -> Vec<CandidateStatsSnapshot> {
         let keys: Vec<(i64, i64)> = self.candidate_stats.iter().map(|e| *e.key()).collect();
         keys.into_iter()
             .filter_map(|key| {
-                self.candidate_stats
-                    .remove(&key)
-                    .map(|(k, arc)| CandidateStatsSnapshot {
+                self.candidate_stats.remove(&key).map(|(k, arc)| {
+                    Self::release_slot(&self.candidate_stats_reservations);
+                    CandidateStatsSnapshot {
                         policy_id: k.0,
                         version: k.1,
                         hits: arc.hits.load(Ordering::Relaxed),
                         blocks: arc.blocks.load(Ordering::Relaxed),
                         observed: arc.observed.load(Ordering::Relaxed),
-                    })
+                    }
+                })
             })
             .collect()
     }
@@ -1936,10 +2197,10 @@ mod tests {
             .ip_bw_counters
             .get(&key)
             .expect("bandwidth counter should exist");
-        entry.1.store(
-            crate::utils::time::now_timestamp() as u64 - 1,
-            Ordering::Relaxed,
-        );
+        entry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .1 = crate::utils::time::now_timestamp() as u64 - 1;
         drop(entry);
 
         assert!(state.check_ip_bandwidth(server_id, ip, 101, 100));

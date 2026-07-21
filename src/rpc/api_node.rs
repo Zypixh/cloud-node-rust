@@ -243,8 +243,9 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
             continue;
         }
         for addr in node.access_addrs {
-            if !addr.is_empty() {
-                endpoints.push(addr);
+            match crate::api_config::validate_rpc_endpoint(&addr) {
+                Ok(endpoint) => endpoints.push(endpoint),
+                Err(err) => warn!("Ignoring invalid discovered API endpoint {:?}: {}", addr, err),
             }
         }
     }
@@ -252,7 +253,7 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
     endpoints.dedup();
 
     let current_endpoints = api_config.effective_rpc_endpoints();
-    if endpoints.is_empty() || endpoints == current_endpoints {
+    if api_config.rpc_disable_update || endpoints.is_empty() || endpoints == current_endpoints {
         return;
     }
 
@@ -284,8 +285,23 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
         return;
     }
 
+    if let Err(e) = ApiConfig::set_runtime_rpc_endpoints(healthy_endpoints.clone()) {
+        warn!("Rejected discovered API node endpoints: {}", e);
+        report_node_log_with_context(
+            api_config,
+            "error",
+            "API_NODE",
+            &format!("rejected discovered API node endpoints: {}", e),
+            None,
+            Some("apiNodeEndpointRejected"),
+            None,
+        )
+        .await;
+        return;
+    }
+
     let mut new_config = api_config.clone();
-    new_config.rpc_endpoints = healthy_endpoints.clone();
+    new_config.rpc_endpoints = healthy_endpoints;
     if let Err(e) = new_config.write_default() {
         debug!("Failed to write updated api_node config: {}", e);
         report_node_log_with_context(
@@ -299,8 +315,7 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
         )
         .await;
     }
-    ApiConfig::set_runtime_rpc_endpoints(healthy_endpoints);
-    if let Err(e) = crate::rpc::client::SharedRpcClient::refresh(&api_config) {
+    if let Err(e) = crate::rpc::client::SharedRpcClient::refresh(api_config) {
         warn!(
             "Failed to refresh shared RPC channel after endpoint change: {}",
             e

@@ -343,6 +343,7 @@ impl HttpProxyManager {
 
     pub async fn start_listeners(self: Arc<Self>) {
         debug!("HTTP/HTTPS Proxy Manager: Monitoring configuration for port changes...");
+        let mut reload_generation = self.config_store.runtime_reload_generation();
         loop {
             let servers = self.config_store.get_all_servers().await;
             let mut desired_ports = HashMap::new();
@@ -453,7 +454,8 @@ impl HttpProxyManager {
             }
             self.reconcile_listeners(&desired_ports);
             tokio::select! {
-                _ = self.config_store.wait_for_runtime_reload() => {
+                generation = self.config_store.wait_for_runtime_reload(reload_generation) => {
+                    reload_generation = generation;
                     debug!("HTTP/HTTPS Proxy Manager: Runtime reload notification received");
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}

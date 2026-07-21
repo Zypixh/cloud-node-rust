@@ -14,7 +14,9 @@ use tokio::sync::mpsc::Sender;
 use tonic::transport::channel::Change;
 use tonic::transport::{Channel, Endpoint};
 
-pub const RPC_MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
+pub const RPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const RPC_TRANSFER_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
+pub const RPC_NODE_STREAM_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 const RPC_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -112,7 +114,14 @@ impl RpcClient {
         }
         let mut last_err = None;
         for api_endpoint in endpoints {
-            let endpoint = match Channel::from_shared(api_endpoint.clone()) {
+            let endpoint = match crate::api_config::validate_rpc_endpoint(api_endpoint) {
+                Ok(endpoint) => endpoint,
+                Err(err) => {
+                    last_err = Some(err);
+                    continue;
+                }
+            };
+            let endpoint = match Channel::from_shared(endpoint) {
                 Ok(endpoint) => match endpoint.user_agent("grpc-go/1.0") {
                     Ok(endpoint) => endpoint,
                     Err(e) => {
@@ -153,7 +162,11 @@ impl RpcClient {
     }
 
     pub async fn ping_endpoint(api_config: &ApiConfig, endpoint: &str) -> bool {
-        let endpoint = match Channel::from_shared(endpoint.to_string()) {
+        let endpoint = match crate::api_config::validate_rpc_endpoint(endpoint) {
+            Ok(endpoint) => endpoint,
+            Err(_) => return false,
+        };
+        let endpoint = match Channel::from_shared(endpoint) {
             Ok(endpoint) => match endpoint.user_agent("grpc-go/1.0") {
                 Ok(endpoint) => endpoint,
                 Err(_) => return false,
@@ -289,8 +302,8 @@ impl RpcClient {
             self.channel.clone(),
             Self::interceptor(&self.api_config, None),
         )
-        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_decoding_message_size(RPC_NODE_STREAM_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_NODE_STREAM_MESSAGE_BYTES)
     }
 
     pub fn server_service(
@@ -553,7 +566,14 @@ impl RpcClient {
             impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + Send + 'static,
         >,
     > {
-        pb::server_deleted_content_service_client::ServerDeletedContentServiceClient::with_interceptor(self.channel.clone(), Self::interceptor(&self.api_config, None))
+        pb::server_deleted_content_service_client::ServerDeletedContentServiceClient::with_interceptor(
+            self.channel.clone(),
+            Self::interceptor(&self.api_config, None),
+        )
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
     }
 
     pub fn api_node_service(
@@ -624,8 +644,8 @@ impl RpcClient {
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_decoding_message_size(RPC_TRANSFER_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_TRANSFER_MESSAGE_BYTES)
     }
 
     pub fn file_chunk_service(
@@ -642,8 +662,8 @@ impl RpcClient {
         )
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
-        .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES)
+        .max_decoding_message_size(RPC_TRANSFER_MESSAGE_BYTES)
+        .max_encoding_message_size(RPC_TRANSFER_MESSAGE_BYTES)
     }
 
     pub fn ssl_cert_service(
@@ -976,6 +996,7 @@ impl SharedRpcClient {
     }
 
     fn build_endpoint(uri: &str) -> anyhow::Result<Endpoint> {
+        let uri = crate::api_config::validate_rpc_endpoint(uri)?;
         let endpoint = Channel::from_shared(uri.to_string())
             .map_err(|e| anyhow::anyhow!("Invalid URI {}: {}", uri, e))?;
         let endpoint = endpoint

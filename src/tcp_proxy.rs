@@ -523,6 +523,7 @@ impl TcpProxyManager {
 
     pub async fn start_listeners(self: Arc<Self>) {
         debug!("Starting TCP/TLS Proxy Manager...");
+        let mut reload_generation = self.config_store.runtime_reload_generation();
         loop {
             let servers = self.config_store.get_all_servers().await;
             debug!(
@@ -604,7 +605,8 @@ impl TcpProxyManager {
             }
             self.reconcile_listeners(&desired_ports);
             tokio::select! {
-                _ = self.config_store.wait_for_runtime_reload() => {
+                generation = self.config_store.wait_for_runtime_reload(reload_generation) => {
+                    reload_generation = generation;
                     debug!("TCP Proxy Manager: Runtime reload notification received");
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}

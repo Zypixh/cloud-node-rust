@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
+use std::time::Duration;
 
 /// Limit regex memory usage to 1MB to prevent catastrophic backtracking from user-controlled WAF patterns
 const REGEX_SIZE_LIMIT: usize = 1_048_576;
@@ -24,6 +25,7 @@ const WAF_RE_CACHE_MAX_ENTRIES: u64 = 16_384;
 static WAF_RE_CACHE: Lazy<moka::sync::Cache<String, Arc<Regex>>> = Lazy::new(|| {
     moka::sync::Cache::builder()
         .max_capacity(WAF_RE_CACHE_MAX_ENTRIES)
+        .time_to_idle(Duration::from_secs(15 * 60))
         .build()
 });
 
@@ -31,6 +33,7 @@ static WAF_BYTES_RE_CACHE: Lazy<moka::sync::Cache<String, Arc<regex::bytes::Rege
     Lazy::new(|| {
         moka::sync::Cache::builder()
             .max_capacity(WAF_RE_CACHE_MAX_ENTRIES)
+            .time_to_idle(Duration::from_secs(15 * 60))
             .build()
     });
 

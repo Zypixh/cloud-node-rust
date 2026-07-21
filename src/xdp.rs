@@ -433,6 +433,7 @@ struct XdpManager {
     #[cfg(target_os = "linux")]
     synced: parking_lot::Mutex<RuleState>,
     map_sync_started: AtomicBool,
+    map_sync_generation: AtomicU64,
     map_sync_notify: tokio::sync::Notify,
 }
 
@@ -464,6 +465,7 @@ impl XdpManager {
             #[cfg(target_os = "linux")]
             synced: parking_lot::Mutex::new(RuleState::default()),
             map_sync_started: AtomicBool::new(false),
+            map_sync_generation: AtomicU64::new(0),
             map_sync_notify: tokio::sync::Notify::new(),
         }
     }
@@ -543,6 +545,7 @@ impl XdpManager {
             return;
         }
         self.stop_rule_sweeper();
+        self.stop_map_sync_worker();
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
@@ -728,7 +731,11 @@ impl XdpManager {
                         None
                     };
                     *self.xsk_status.write() = statuses;
-                    *self.af_xdp.lock() = Some(runtime);
+                    if failed || registration_failed {
+                        drop(runtime);
+                    } else {
+                        *self.af_xdp.lock() = Some(runtime);
+                    }
                     if failed {
                         let detail = failure_detail.unwrap_or_else(|| {
                             "one or more AF_XDP sockets failed to start".to_string()
@@ -1134,6 +1141,57 @@ impl XdpManager {
         self.persist_status();
     }
 
+    fn update_allowed_ip(&self, ip: IpAddr, ttl_secs: i64) {
+        let expiry = crate::utils::time::now_timestamp() + ttl_secs.max(1);
+        self.state.write().allowed_ips.insert(ip, expiry);
+        self.request_map_sync();
+        self.persist_status();
+    }
+
+    fn remove_allowed_ip(&self, ip: IpAddr) {
+        self.state.write().allowed_ips.remove(&ip);
+        self.request_map_sync();
+        self.persist_status();
+    }
+
+    fn update_allowed_network(&self, net: IpNet, ttl_secs: i64) {
+        let expiry = crate::utils::time::now_timestamp() + ttl_secs.max(1);
+        self.state
+            .write()
+            .allowed_networks
+            .insert(net.to_string(), (net, expiry));
+        self.request_map_sync();
+        self.persist_status();
+    }
+
+    fn remove_allowed_network(&self, net: IpNet) {
+        self.state.write().allowed_networks.remove(&net.to_string());
+        self.request_map_sync();
+        self.persist_status();
+    }
+
+    fn update_allowed_range(&self, from: u128, to: u128, v6: bool, ttl_secs: i64) {
+        if from > to {
+            return;
+        }
+        let expiry = crate::utils::time::now_timestamp() + ttl_secs.max(1);
+        self.state
+            .write()
+            .allowed_ranges
+            .insert(RangeKey { from, to, v6 }, expiry);
+        self.request_map_sync();
+        self.persist_status();
+    }
+
+    fn remove_allowed_range(&self, from: u128, to: u128, v6: bool) {
+        self.state
+            .write()
+            .allowed_ranges
+            .remove(&RangeKey { from, to, v6 });
+        self.request_map_sync();
+        self.persist_status();
+    }
+
     fn sync_snapshot(&self, snapshot: &KernelFilterSnapshot) {
         let mut state = self.state.write();
         state.sync_from_snapshot(snapshot);
@@ -1336,6 +1394,7 @@ impl XdpManager {
 
     async fn detach_runtime(&self, reason: &'static str) -> anyhow::Result<()> {
         self.stop_rule_sweeper();
+        self.stop_map_sync_worker();
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
@@ -1364,6 +1423,12 @@ impl XdpManager {
         Ok(())
     }
 
+    fn stop_map_sync_worker(&self) {
+        self.map_sync_generation.fetch_add(1, Ordering::Relaxed);
+        self.map_sync_started.store(false, Ordering::Relaxed);
+        self.map_sync_notify.notify_one();
+    }
+
     fn stop_rule_sweeper(&self) {
         self.rule_sweeper_generation.fetch_add(1, Ordering::Relaxed);
         self.rule_sweeper_started.store(false, Ordering::Relaxed);
@@ -1389,7 +1454,10 @@ fn manager_from_runtime() -> std::sync::Arc<XdpManager> {
 
     let mut current = manager.write();
     if current.config != config && (!config.enabled || current.attached.read().is_empty()) {
+        let previous = current.clone();
         *current = std::sync::Arc::new(XdpManager::new(config));
+        previous.stop_rule_sweeper();
+        previous.stop_map_sync_worker();
     }
     current.clone()
 }
@@ -1402,7 +1470,10 @@ fn replace_manager_from_runtime() -> std::sync::Arc<XdpManager> {
         parking_lot::RwLock::new(std::sync::Arc::new(XdpManager::new(config.clone())))
     });
     let mut current = manager.write();
+    let previous = current.clone();
     *current = std::sync::Arc::new(XdpManager::new(config));
+    previous.stop_rule_sweeper();
+    previous.stop_map_sync_worker();
     current.clone()
 }
 
@@ -1460,12 +1531,18 @@ fn start_map_sync_worker(manager: &std::sync::Arc<XdpManager>) {
     if manager.map_sync_started.swap(true, Ordering::Relaxed) {
         return;
     }
+    let generation = manager.map_sync_generation.load(Ordering::Relaxed);
     let manager = manager.clone();
     tokio::spawn(async move {
         loop {
             manager.map_sync_notify.notified().await;
+            if manager.map_sync_generation.load(Ordering::Relaxed) != generation {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(XDP_MAP_SYNC_DEBOUNCE_MS)).await;
-            if !manager_is_current(&manager) {
+            if manager.map_sync_generation.load(Ordering::Relaxed) != generation
+                || !manager_is_current(&manager)
+            {
                 break;
             }
             manager.flush_maps_diff();
@@ -1658,10 +1735,13 @@ fn doctor_report_for_config(config: &XdpConfig) -> String {
             interface.frame_size,
             interface.local_ips.len()
         ));
-        if interface.mode == XdpRuntimeMode::Proxy && interface.frame_size > 2048 {
+        if interface.mode == XdpRuntimeMode::Proxy
+            && interface.frame_size != cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
+        {
             lines.push(format!(
-                "  warning:       interface {} proxy mode currently targets standard MTU; jumbo/multi-buffer should stay off",
-                interface.name
+                "  warning:       interface {} proxy mode requires frameSize={} until jumbo/multi-buffer support is enabled",
+                interface.name,
+                cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
             ));
         }
         if interface.mode == XdpRuntimeMode::Proxy && config.proxy.ports.is_empty() {
@@ -2955,18 +3035,22 @@ fn xdp_proxy_partial_detail(config: &XdpConfig) -> String {
 }
 
 fn xdp_proxy_frame_size_detail(config: &XdpConfig) -> String {
-    let oversized = config
+    let invalid = config
         .interfaces
         .iter()
-        .filter(|interface| interface.mode == XdpRuntimeMode::Proxy && interface.frame_size > 2048)
+        .filter(|interface| {
+            interface.mode == XdpRuntimeMode::Proxy
+                && interface.frame_size != cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
+        })
         .map(|interface| format!("{} frameSize={}", interface.name, interface.frame_size))
         .collect::<Vec<_>>();
-    if oversized.is_empty() {
+    if invalid.is_empty() {
         String::new()
     } else {
         format!(
-            "XDP proxy mode requires standard-MTU frameSize<=2048 until jumbo/multi-buffer support is enabled: {}",
-            oversized.join(",")
+            "XDP proxy mode requires frameSize={} until jumbo/multi-buffer support is enabled: {}",
+            cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE,
+            invalid.join(",")
         )
     }
 }
@@ -3015,6 +3099,30 @@ impl KernelFilter for XdpKernelFilter {
 
     fn block_network(&self, net: IpNet, ttl_secs: i64) {
         self.manager.update_block_network(net, ttl_secs);
+    }
+
+    fn allow(&self, ip: IpAddr, ttl_secs: i64) {
+        self.manager.update_allowed_ip(ip, ttl_secs);
+    }
+
+    fn unallow(&self, ip: IpAddr) {
+        self.manager.remove_allowed_ip(ip);
+    }
+
+    fn allow_network(&self, net: IpNet, ttl_secs: i64) {
+        self.manager.update_allowed_network(net, ttl_secs);
+    }
+
+    fn unallow_network(&self, net: IpNet) {
+        self.manager.remove_allowed_network(net);
+    }
+
+    fn allow_range(&self, from: u128, to: u128, v6: bool, ttl_secs: i64) {
+        self.manager.update_allowed_range(from, to, v6, ttl_secs);
+    }
+
+    fn unallow_range(&self, from: u128, to: u128, v6: bool) {
+        self.manager.remove_allowed_range(from, to, v6);
     }
 
     fn unblock_network(&self, net: IpNet) {
@@ -3077,6 +3185,7 @@ mod linux {
     const AF_XDP_FRAME_COUNT: u32 = 4096;
     const AF_XDP_RING_SIZE: u32 = 2048;
     const AF_XDP_RX_BATCH: usize = 64;
+    const AF_XDP_MAX_SOCKETS: usize = 4096;
     const AF_XDP_SOCKET_CREATE_ATTEMPTS: usize = 80;
     const AF_XDP_SOCKET_CREATE_RETRY_DELAY: std::time::Duration =
         std::time::Duration::from_millis(250);
@@ -3354,8 +3463,58 @@ mod linux {
     }
 
     pub fn prepare_af_xdp_sockets(config: &XdpConfig) -> anyhow::Result<AfXdpRuntimeHandle> {
-        let mut queues = Vec::new();
-        let mut statuses = Vec::new();
+        let socket_count = config
+            .interfaces
+            .iter()
+            .filter(|interface| interface.mode == XdpRuntimeMode::Proxy)
+            .try_fold(0usize, |count, interface| {
+                count.checked_add(interface.queues.len())
+            })
+            .ok_or_else(|| anyhow::anyhow!("AF_XDP queue count overflow"))?;
+        if socket_count > AF_XDP_MAX_SOCKETS {
+            anyhow::bail!(
+                "AF_XDP proxy queue count {} exceeds XSK map capacity {}",
+                socket_count,
+                AF_XDP_MAX_SOCKETS
+            );
+        }
+        let mut seen = std::collections::HashSet::with_capacity(socket_count);
+        let mut projected_bytes = 0u64;
+        for interface in config
+            .interfaces
+            .iter()
+            .filter(|interface| interface.mode == XdpRuntimeMode::Proxy)
+        {
+            for queue in &interface.queues {
+                anyhow::ensure!(
+                    seen.insert((interface.name.as_str(), *queue)),
+                    "duplicate AF_XDP queue {}:{}",
+                    interface.name,
+                    queue
+                );
+                let frames = u64::from(AF_XDP_FRAME_COUNT)
+                    .checked_mul(u64::from(interface.frame_size))
+                    .ok_or_else(|| anyhow::anyhow!("AF_XDP UMEM byte count overflow"))?;
+                let rings = u64::from(AF_XDP_RING_SIZE)
+                    .checked_mul(std::mem::size_of::<FrameDesc>() as u64)
+                    .and_then(|bytes| bytes.checked_mul(4))
+                    .ok_or_else(|| anyhow::anyhow!("AF_XDP ring byte count overflow"))?;
+                projected_bytes = projected_bytes
+                    .checked_add(frames.saturating_add(rings))
+                    .ok_or_else(|| anyhow::anyhow!("AF_XDP total byte count overflow"))?;
+            }
+        }
+        let budget = crate::memory_governor::MEMORY_GOVERNOR
+            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
+            .af_xdp_budget_bytes;
+        anyhow::ensure!(
+            projected_bytes <= budget,
+            "AF_XDP projected memory {} exceeds node budget {}",
+            projected_bytes,
+            budget
+        );
+        let mut queues = Vec::with_capacity(socket_count);
+        let mut statuses = Vec::with_capacity(socket_count);
         for interface in config
             .interfaces
             .iter()
@@ -3636,58 +3795,41 @@ mod linux {
         sync_local_ip_maps(ebpf, config)?;
         sync_proxy_ports(ebpf, config, proxy_dataplane_active)?;
         sync_xsk_indices(ebpf, config, proxy_dataplane_active)?;
-        sync_exact_ip_map(
-            ebpf,
-            "XDP_ALLOWED_V4",
-            state.allowed_ips.iter(),
-            true,
-            false,
-        )?;
-        sync_exact_ip_map(ebpf, "XDP_ALLOWED_V6", state.allowed_ips.iter(), true, true)?;
-        sync_exact_ip_map(
-            ebpf,
-            "XDP_BLOCKED_V4",
-            state.blocked_ips.iter(),
-            false,
-            false,
-        )?;
-        sync_exact_ip_map(
-            ebpf,
-            "XDP_BLOCKED_V6",
-            state.blocked_ips.iter(),
-            false,
-            true,
-        )?;
-        sync_network_map(
-            ebpf,
-            "XDP_ALLOWED_V4_LPM",
-            state.allowed_networks.values(),
-            true,
-            false,
-        )?;
-        sync_network_map(
-            ebpf,
-            "XDP_ALLOWED_V6_LPM",
-            state.allowed_networks.values(),
-            true,
-            true,
-        )?;
-        sync_network_map(
-            ebpf,
-            "XDP_BLOCKED_V4_LPM",
-            state.blocked_networks.values(),
-            false,
-            false,
-        )?;
-        sync_network_map(
-            ebpf,
-            "XDP_BLOCKED_V6_LPM",
-            state.blocked_networks.values(),
-            false,
-            true,
-        )?;
-        sync_range_lpm_maps(ebpf, state.allowed_ranges.iter(), true)?;
-        sync_range_lpm_maps(ebpf, state.blocked_ranges.iter(), false)?;
+        clear_rule_maps(ebpf)?;
+        let empty = RuleState::default();
+        apply_rule_diff(ebpf, &empty, state)?;
+        Ok(())
+    }
+
+    fn clear_rule_maps(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+        for name in ["XDP_ALLOWED_V4", "XDP_BLOCKED_V4"] {
+            let map = ebpf
+                .map_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
+            let mut map = AyaHashMap::<_, XdpIpv4Key, XdpRuleValue>::try_from(map)?;
+            clear_hash_map(&mut map)?;
+        }
+        for name in ["XDP_ALLOWED_V6", "XDP_BLOCKED_V6"] {
+            let map = ebpf
+                .map_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
+            let mut map = AyaHashMap::<_, XdpIpv6Key, XdpRuleValue>::try_from(map)?;
+            clear_hash_map(&mut map)?;
+        }
+        for name in ["XDP_ALLOWED_V4_LPM", "XDP_BLOCKED_V4_LPM"] {
+            let map = ebpf
+                .map_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
+            let mut map = LpmTrie::<_, u32, XdpRuleValue>::try_from(map)?;
+            clear_lpm_map(&mut map)?;
+        }
+        for name in ["XDP_ALLOWED_V6_LPM", "XDP_BLOCKED_V6_LPM"] {
+            let map = ebpf
+                .map_mut(name)
+                .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
+            let mut map = LpmTrie::<_, [u8; 16], XdpRuleValue>::try_from(map)?;
+            clear_lpm_map(&mut map)?;
+        }
         Ok(())
     }
 
@@ -3868,8 +4010,11 @@ mod linux {
             for queue in &interface.queues {
                 let index = u32::try_from(entries.len())
                     .map_err(|_| anyhow::anyhow!("too many AF_XDP queues configured"))?;
-                if index >= 4096 {
-                    anyhow::bail!("too many AF_XDP queues configured; XDP_XSKS max is 4096");
+                if index >= AF_XDP_MAX_SOCKETS as u32 {
+                    anyhow::bail!(
+                        "too many AF_XDP queues configured; XDP_XSKS max is {}",
+                        AF_XDP_MAX_SOCKETS
+                    );
                 }
                 entries.push(XskMapEntry {
                     interface: interface.name.clone(),
@@ -4053,6 +4198,100 @@ mod linux {
         blocked_v6_lpm: LpmV6Image,
     }
 
+    // Must stay aligned with crates/cloud-node-xdp-ebpf map max_entries.
+    const XDP_BLOCKED_EXACT_MAP_MAX_ENTRIES: u64 = 262_144;
+    const XDP_ALLOWED_EXACT_MAP_MAX_ENTRIES: u64 = 65_536;
+    const XDP_RULE_LPM_MAP_MAX_ENTRIES: u64 = 65_536;
+    const XDP_RULE_MAP_ENTRY_ESTIMATED_BYTES: u64 = 64;
+    const XDP_RULE_MAP_BUDGET_DIVISOR: u64 = 512;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct RuleMapEntryCounts {
+        allowed_v4: u64,
+        allowed_v6: u64,
+        blocked_v4: u64,
+        blocked_v6: u64,
+        allowed_v4_lpm: u64,
+        allowed_v6_lpm: u64,
+        blocked_v4_lpm: u64,
+        blocked_v6_lpm: u64,
+    }
+
+    impl RuleMapImages {
+        fn projected_high_water(&self, next: &Self) -> RuleMapEntryCounts {
+            fn high_water<K: Ord, V>(
+                old: &std::collections::BTreeMap<K, V>,
+                new: &std::collections::BTreeMap<K, V>,
+            ) -> u64 {
+                let additions = new.keys().filter(|key| !old.contains_key(*key)).count() as u64;
+                (old.len() as u64).saturating_add(additions)
+            }
+
+            RuleMapEntryCounts {
+                allowed_v4: high_water(&self.allowed_v4, &next.allowed_v4),
+                allowed_v6: high_water(&self.allowed_v6, &next.allowed_v6),
+                blocked_v4: high_water(&self.blocked_v4, &next.blocked_v4),
+                blocked_v6: high_water(&self.blocked_v6, &next.blocked_v6),
+                allowed_v4_lpm: high_water(&self.allowed_v4_lpm, &next.allowed_v4_lpm),
+                allowed_v6_lpm: high_water(&self.allowed_v6_lpm, &next.allowed_v6_lpm),
+                blocked_v4_lpm: high_water(&self.blocked_v4_lpm, &next.blocked_v4_lpm),
+                blocked_v6_lpm: high_water(&self.blocked_v6_lpm, &next.blocked_v6_lpm),
+            }
+        }
+    }
+
+    fn rule_map_entry_budget() -> u64 {
+        let snapshot = crate::memory_governor::MEMORY_GOVERNOR
+            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
+        snapshot
+            .af_xdp_budget_bytes
+            .max(snapshot.connection_budget_bytes)
+            .saturating_div(XDP_RULE_MAP_BUDGET_DIVISOR)
+            .saturating_div(XDP_RULE_MAP_ENTRY_ESTIMATED_BYTES.max(1))
+            .max(1)
+    }
+
+    fn ensure_rule_map_capacity(old: &RuleMapImages, new: &RuleMapImages) -> anyhow::Result<()> {
+        let projected = old.projected_high_water(new);
+        anyhow::ensure!(
+            projected.allowed_v4 <= XDP_ALLOWED_EXACT_MAP_MAX_ENTRIES
+                && projected.allowed_v6 <= XDP_ALLOWED_EXACT_MAP_MAX_ENTRIES
+                && projected.blocked_v4 <= XDP_BLOCKED_EXACT_MAP_MAX_ENTRIES
+                && projected.blocked_v6 <= XDP_BLOCKED_EXACT_MAP_MAX_ENTRIES
+                && projected.allowed_v4_lpm <= XDP_RULE_LPM_MAP_MAX_ENTRIES
+                && projected.allowed_v6_lpm <= XDP_RULE_LPM_MAP_MAX_ENTRIES
+                && projected.blocked_v4_lpm <= XDP_RULE_LPM_MAP_MAX_ENTRIES
+                && projected.blocked_v6_lpm <= XDP_RULE_LPM_MAP_MAX_ENTRIES,
+            "XDP rule map projected high-water exceeds static eBPF map maxima"
+        );
+
+        let budget = rule_map_entry_budget();
+        let allow_total = projected
+            .allowed_v4
+            .saturating_add(projected.allowed_v6)
+            .saturating_add(projected.allowed_v4_lpm)
+            .saturating_add(projected.allowed_v6_lpm);
+        anyhow::ensure!(
+            allow_total <= budget,
+            "XDP allow-map projected entries {} exceed node budget {}",
+            allow_total,
+            budget
+        );
+        let block_budget = budget.saturating_sub(allow_total);
+        let block_total = projected
+            .blocked_v4
+            .saturating_add(projected.blocked_v6)
+            .saturating_add(projected.blocked_v4_lpm)
+            .saturating_add(projected.blocked_v6_lpm);
+        anyhow::ensure!(
+            block_total <= block_budget,
+            "XDP block-map projected entries {} exceed remaining node budget {}",
+            block_total,
+            block_budget
+        );
+        Ok(())
+    }
+
     fn exact_image(ips: &std::collections::BTreeMap<IpAddr, i64>) -> (ExactV4Image, ExactV6Image) {
         let mut v4 = ExactV4Image::new();
         let mut v6 = ExactV6Image::new();
@@ -4140,6 +4379,7 @@ mod linux {
     ) -> anyhow::Result<()> {
         let old = rule_map_images(old);
         let new = rule_map_images(new);
+        ensure_rule_map_capacity(&old, &new)?;
         diff_exact_v4(
             ebpf,
             "XDP_ALLOWED_V4",
@@ -7597,12 +7837,12 @@ mod tests {
         );
 
         // LPM v4 blocked: 203.0.113.0/24 removed
-        assert!(!old_img.blocked_lpm_v4.is_empty());
-        assert!(new_img.blocked_lpm_v4.is_empty());
+        assert!(!old_img.blocked_v4_lpm.is_empty());
+        assert!(new_img.blocked_v4_lpm.is_empty());
 
         // LPM v6 allowed: 2001:db8::/32 added
-        assert!(old_img.allowed_lpm_v6.is_empty());
-        assert!(!new_img.allowed_lpm_v6.is_empty());
+        assert!(old_img.allowed_v6_lpm.is_empty());
+        assert!(!new_img.allowed_v6_lpm.is_empty());
     }
 
     #[cfg(any(test, target_os = "linux"))]

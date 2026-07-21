@@ -159,6 +159,9 @@ pub fn report_item(item: IpReportMessage) {
         // Channel full / closed → keep the IP list in sync with reality is best-effort
         // but losing every block silently can mask DDoS storms. Surface a periodic warn.
         let dropped = DROPPED_REPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        crate::pipeline_metrics::increment(
+            crate::pipeline_metrics::PipelineCounter::IpReportDropped,
+        );
         if dropped.is_power_of_two() {
             warn!(
                 "IP report channel saturated; dropped {} report(s) so far ({})",

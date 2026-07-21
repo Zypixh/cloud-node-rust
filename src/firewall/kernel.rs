@@ -29,7 +29,17 @@ pub struct KernelFilterStatus {
 pub trait KernelFilter: Send + Sync {
     fn block(&self, ip: IpAddr, ttl_secs: i64);
     fn unblock(&self, ip: IpAddr);
+    fn allow(&self, ip: IpAddr, ttl_secs: i64) {
+        self.unblock(ip);
+        let _ = ttl_secs;
+    }
+    fn unallow(&self, _ip: IpAddr) {}
     fn block_network(&self, _net: IpNet, _ttl_secs: i64) {}
+    fn allow_network(&self, net: IpNet, ttl_secs: i64) {
+        self.unblock_network(net);
+        let _ = ttl_secs;
+    }
+    fn unallow_network(&self, _net: IpNet) {}
     fn block_many(&self, entries: &[(IpAddr, i64)]) {
         for (ip, ttl_secs) in entries {
             self.block(*ip, *ttl_secs);
@@ -42,6 +52,11 @@ pub trait KernelFilter: Send + Sync {
     }
     fn unblock_network(&self, net: IpNet);
     fn block_range(&self, _from: u128, _to: u128, _v6: bool, _ttl_secs: i64) {}
+    fn allow_range(&self, from: u128, to: u128, v6: bool, ttl_secs: i64) {
+        self.unblock_range(from, to, v6);
+        let _ = ttl_secs;
+    }
+    fn unallow_range(&self, _from: u128, _to: u128, _v6: bool) {}
     fn unblock_range(&self, from: u128, to: u128, v6: bool);
     fn sync_snapshot(&self, snapshot: &KernelFilterSnapshot) {
         let now = crate::utils::time::now_timestamp();
@@ -61,6 +76,24 @@ pub trait KernelFilter: Send + Sync {
             let ttl_secs = range.expires_at.saturating_sub(now);
             if ttl_secs > 0 {
                 self.block_range(range.from, range.to, range.v6, ttl_secs);
+            }
+        }
+        for (ip, expires_at) in &snapshot.allowed_ips {
+            let ttl_secs = expires_at.saturating_sub(now);
+            if ttl_secs > 0 {
+                self.allow(*ip, ttl_secs);
+            }
+        }
+        for (net, expires_at) in &snapshot.allowed_networks {
+            let ttl_secs = expires_at.saturating_sub(now);
+            if ttl_secs > 0 {
+                self.allow_network(*net, ttl_secs);
+            }
+        }
+        for range in &snapshot.allowed_ranges {
+            let ttl_secs = range.expires_at.saturating_sub(now);
+            if ttl_secs > 0 {
+                self.allow_range(range.from, range.to, range.v6, ttl_secs);
             }
         }
     }
@@ -114,12 +147,23 @@ mod linux {
     const NFT_ALLOWED_V4_INTERVAL_SET: &str = "allowed_v4_intervals";
     const NFT_ALLOWED_V6_INTERVAL_SET: &str = "allowed_v6_intervals";
     const IPTABLES_CHAIN: &str = "CLOUD_NODE";
-    const NFT_QUEUE_CAPACITY: usize = 8192;
     const NFT_BATCH_WINDOW: Duration = Duration::from_millis(50);
     const NFT_QUEUE_WARNING_INTERVAL_SECS: i64 = 10;
-    const IPTABLES_QUEUE_CAPACITY: usize = 8192;
     const IPTABLES_BATCH_WINDOW: Duration = Duration::from_millis(50);
     const IPTABLES_QUEUE_WARNING_INTERVAL_SECS: i64 = 10;
+    const KERNEL_SYNC_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+    fn kernel_queue_capacity() -> usize {
+        let snapshot = crate::memory_governor::MEMORY_GOVERNOR.snapshot(
+            crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads(),
+        );
+        let estimated_entry_bytes = std::mem::size_of::<(KernelTarget, KernelOp)>()
+            .saturating_mul(4)
+            .max(1) as u64;
+        usize::try_from(snapshot.kernel_sync_queue_budget_bytes / estimated_entry_bytes)
+            .unwrap_or(usize::MAX)
+            .max(1)
+    }
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     enum KernelTarget {
@@ -147,12 +191,22 @@ mod linux {
         Unblock {
             target: KernelTarget,
         },
+        Allow {
+            target: KernelTarget,
+            ttl_secs: i64,
+        },
+        Unallow {
+            target: KernelTarget,
+        },
     }
 
     impl KernelOp {
         fn target(self) -> KernelTarget {
             match self {
-                Self::Block { target, .. } | Self::Unblock { target } => target,
+                Self::Block { target, .. }
+                | Self::Unblock { target }
+                | Self::Allow { target, .. }
+                | Self::Unallow { target } => target,
             }
         }
     }
@@ -213,6 +267,12 @@ mod linux {
                     KernelOp::Unblock { target } => {
                         self.blocked.remove(&target);
                     }
+                    KernelOp::Allow { target, ttl_secs } => {
+                        self.allowed.insert(target, now.saturating_add(ttl_secs.max(1)));
+                    }
+                    KernelOp::Unallow { target } => {
+                        self.allowed.remove(&target);
+                    }
                 }
             }
         }
@@ -250,6 +310,7 @@ mod linux {
     struct NftPending {
         snapshot: Option<KernelFilterSnapshot>,
         ops: HashMap<KernelTarget, KernelOp>,
+        force_reconcile: bool,
     }
 
     struct NftSyncQueue {
@@ -260,12 +321,14 @@ mod linux {
     enum NftWork {
         Snapshot(KernelFilterSnapshot),
         Ops(HashMap<KernelTarget, KernelOp>),
+        Reconcile,
     }
 
     #[derive(Default)]
     struct IptablesPending {
         snapshot: Option<KernelFilterSnapshot>,
         ops: HashMap<KernelTarget, KernelOp>,
+        force_reconcile: bool,
     }
 
     struct IptablesSyncQueue {
@@ -276,6 +339,7 @@ mod linux {
     enum IptablesWork {
         Snapshot(KernelFilterSnapshot),
         Ops(HashMap<KernelTarget, KernelOp>),
+        Reconcile,
     }
 
     static NFT_QUEUE: OnceLock<Arc<NftSyncQueue>> = OnceLock::new();
@@ -285,6 +349,24 @@ mod linux {
     static IPTABLES_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
     static IPTABLES_QUEUE_LAST_WARNING: AtomicI64 = AtomicI64::new(0);
     static IP6TABLES_AVAILABLE: AtomicBool = AtomicBool::new(false);
+    static KERNEL_SNAPSHOT_PROVIDER: OnceLock<
+        std::sync::Mutex<Option<std::sync::Arc<dyn Fn() -> KernelFilterSnapshot + Send + Sync>>>,
+    > = OnceLock::new();
+
+    pub fn set_kernel_snapshot_provider(
+        provider: Option<std::sync::Arc<dyn Fn() -> KernelFilterSnapshot + Send + Sync>>,
+    ) {
+        let slot = KERNEL_SNAPSHOT_PROVIDER.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(mut guard) = slot.lock() {
+            *guard = provider;
+        }
+    }
+
+    fn load_owner_snapshot() -> Option<KernelFilterSnapshot> {
+        let slot = KERNEL_SNAPSHOT_PROVIDER.get_or_init(|| std::sync::Mutex::new(None));
+        let provider = slot.lock().ok()?.clone()?;
+        Some(provider())
+    }
 
     pub struct NftablesFilter;
     pub struct IptablesFilter;
@@ -424,6 +506,19 @@ mod linux {
             });
         }
 
+        fn allow(&self, ip: IpAddr, ttl_secs: i64) {
+            enqueue_nft_op(KernelOp::Allow {
+                target: KernelTarget::Ip(ip),
+                ttl_secs,
+            });
+        }
+
+        fn unallow(&self, ip: IpAddr) {
+            enqueue_nft_op(KernelOp::Unallow {
+                target: KernelTarget::Ip(ip),
+            });
+        }
+
         fn block_network(&self, net: IpNet, ttl_secs: i64) {
             enqueue_nft_op(KernelOp::Block {
                 target: KernelTarget::Network(net),
@@ -437,6 +532,19 @@ mod linux {
             });
         }
 
+        fn allow_network(&self, net: IpNet, ttl_secs: i64) {
+            enqueue_nft_op(KernelOp::Allow {
+                target: KernelTarget::Network(net),
+                ttl_secs,
+            });
+        }
+
+        fn unallow_network(&self, net: IpNet) {
+            enqueue_nft_op(KernelOp::Unallow {
+                target: KernelTarget::Network(net),
+            });
+        }
+
         fn block_range(&self, from: u128, to: u128, v6: bool, ttl_secs: i64) {
             enqueue_nft_op(KernelOp::Block {
                 target: KernelTarget::Range { from, to, v6 },
@@ -446,6 +554,19 @@ mod linux {
 
         fn unblock_range(&self, from: u128, to: u128, v6: bool) {
             enqueue_nft_op(KernelOp::Unblock {
+                target: KernelTarget::Range { from, to, v6 },
+            });
+        }
+
+        fn allow_range(&self, from: u128, to: u128, v6: bool, ttl_secs: i64) {
+            enqueue_nft_op(KernelOp::Allow {
+                target: KernelTarget::Range { from, to, v6 },
+                ttl_secs,
+            });
+        }
+
+        fn unallow_range(&self, from: u128, to: u128, v6: bool) {
+            enqueue_nft_op(KernelOp::Unallow {
                 target: KernelTarget::Range { from, to, v6 },
             });
         }
@@ -477,6 +598,19 @@ mod linux {
             });
         }
 
+        fn allow(&self, ip: IpAddr, ttl_secs: i64) {
+            enqueue_iptables_op(KernelOp::Allow {
+                target: KernelTarget::Ip(ip),
+                ttl_secs,
+            });
+        }
+
+        fn unallow(&self, ip: IpAddr) {
+            enqueue_iptables_op(KernelOp::Unallow {
+                target: KernelTarget::Ip(ip),
+            });
+        }
+
         fn block_network(&self, net: IpNet, ttl_secs: i64) {
             enqueue_iptables_op(KernelOp::Block {
                 target: KernelTarget::Network(net),
@@ -490,6 +624,19 @@ mod linux {
             });
         }
 
+        fn allow_network(&self, net: IpNet, ttl_secs: i64) {
+            enqueue_iptables_op(KernelOp::Allow {
+                target: KernelTarget::Network(net),
+                ttl_secs,
+            });
+        }
+
+        fn unallow_network(&self, net: IpNet) {
+            enqueue_iptables_op(KernelOp::Unallow {
+                target: KernelTarget::Network(net),
+            });
+        }
+
         fn block_range(&self, from: u128, to: u128, v6: bool, ttl_secs: i64) {
             enqueue_iptables_op(KernelOp::Block {
                 target: KernelTarget::Range { from, to, v6 },
@@ -499,6 +646,19 @@ mod linux {
 
         fn unblock_range(&self, from: u128, to: u128, v6: bool) {
             enqueue_iptables_op(KernelOp::Unblock {
+                target: KernelTarget::Range { from, to, v6 },
+            });
+        }
+
+        fn allow_range(&self, from: u128, to: u128, v6: bool, ttl_secs: i64) {
+            enqueue_iptables_op(KernelOp::Allow {
+                target: KernelTarget::Range { from, to, v6 },
+                ttl_secs,
+            });
+        }
+
+        fn unallow_range(&self, from: u128, to: u128, v6: bool) {
+            enqueue_iptables_op(KernelOp::Unallow {
                 target: KernelTarget::Range { from, to, v6 },
             });
         }
@@ -524,7 +684,11 @@ mod linux {
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if pending.ops.len() >= NFT_QUEUE_CAPACITY && !pending.ops.contains_key(&target) {
+            if pending.ops.len() >= kernel_queue_capacity() && !pending.ops.contains_key(&target) {
+                // Preserve the latest desired image via authoritative reconcile instead of
+                // silently dropping a unique target update under burst pressure.
+                pending.force_reconcile = true;
+                pending.ops.clear();
                 false
             } else {
                 pending.ops.insert(target, op);
@@ -534,6 +698,7 @@ mod linux {
         if accepted {
             queue.notify.notify_one();
         } else {
+            queue.notify.notify_one();
             warn_nft_queue_full();
         }
     }
@@ -570,6 +735,7 @@ mod linux {
     }
 
     fn warn_nft_queue_full() {
+        crate::pipeline_metrics::increment(crate::pipeline_metrics::PipelineCounter::KernelSyncCoalesced);
         NFT_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed);
         let now = crate::utils::time::now_timestamp();
         let last = NFT_QUEUE_LAST_WARNING.load(Ordering::Relaxed);
@@ -583,15 +749,15 @@ mod linux {
         let dropped = NFT_QUEUE_DROPPED.swap(0, Ordering::AcqRel);
         tracing::warn!(
             dropped,
-            capacity = NFT_QUEUE_CAPACITY,
-            "nftables sync queue full; unique kernel firewall updates skipped"
+            capacity = kernel_queue_capacity(),
+            "nftables sync queue full; converting unique updates into authoritative reconcile"
         );
         crate::logging::report_node_log(
             "warn".to_string(),
             "firewall_kernel_sync".to_string(),
             format!(
                 "status=\"queue_full\" dropped=\"{}\" capacity=\"{}\"",
-                dropped, NFT_QUEUE_CAPACITY
+                dropped, kernel_queue_capacity()
             ),
             0,
         );
@@ -603,7 +769,14 @@ mod linux {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(snapshot) = pending.snapshot.take() {
+            pending.force_reconcile = false;
+            pending.ops.clear();
             return Some(NftWork::Snapshot(snapshot));
+        }
+        if pending.force_reconcile {
+            pending.force_reconcile = false;
+            pending.ops.clear();
+            return Some(NftWork::Reconcile);
         }
         if pending.ops.is_empty() {
             return None;
@@ -613,18 +786,36 @@ mod linux {
 
     async fn nft_worker(queue: Arc<NftSyncQueue>) {
         let mut desired = DesiredRules::default();
+        let mut retry_pending = false;
         loop {
-            queue.notify.notified().await;
+            let expiry = tokio::time::sleep(next_expiry_delay(&desired));
+            tokio::pin!(expiry);
+            tokio::select! {
+                _ = queue.notify.notified() => {}
+                _ = &mut expiry => retry_pending = true,
+            }
             tokio::time::sleep(NFT_BATCH_WINDOW).await;
-            let mut changed = false;
+            let mut changed = retry_pending;
+            retry_pending = false;
             while let Some(work) = take_nft_work(&queue) {
                 match work {
                     NftWork::Snapshot(snapshot) => desired.replace_from_snapshot(snapshot),
                     NftWork::Ops(pending) => desired.apply_ops(pending),
+                    NftWork::Reconcile => {
+                        if let Some(snapshot) = load_owner_snapshot() {
+                            desired.replace_from_snapshot(snapshot);
+                        } else {
+                            // No owner provider yet; keep current desired image and
+                            // re-apply it so batch apply recovers after queue saturation.
+                        }
+                    }
                 }
                 changed = true;
             }
             if changed && let Err(err) = replace_nft_rules(&mut desired).await {
+                crate::pipeline_metrics::increment(
+                    crate::pipeline_metrics::PipelineCounter::KernelSyncFailed,
+                );
                 tracing::warn!("nftables batch sync failed: {}", err);
                 crate::logging::report_node_log(
                     "warn".to_string(),
@@ -632,6 +823,10 @@ mod linux {
                     format!("status=\"failed\" reason=\"{}\"", err),
                     0,
                 );
+                tokio::time::sleep(KERNEL_SYNC_RETRY_DELAY).await;
+                retry_pending = true;
+                queue.notify.notify_one();
+                continue;
             }
         }
     }
@@ -879,9 +1074,11 @@ mod linux {
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if pending.ops.len() >= IPTABLES_QUEUE_CAPACITY
+            if pending.ops.len() >= kernel_queue_capacity()
                 && !pending.ops.contains_key(&target)
             {
+                pending.force_reconcile = true;
+                pending.ops.clear();
                 false
             } else {
                 pending.ops.insert(target, op);
@@ -891,6 +1088,7 @@ mod linux {
         if accepted {
             queue.notify.notify_one();
         } else {
+            queue.notify.notify_one();
             warn_iptables_queue_full();
         }
     }
@@ -927,6 +1125,7 @@ mod linux {
     }
 
     fn warn_iptables_queue_full() {
+        crate::pipeline_metrics::increment(crate::pipeline_metrics::PipelineCounter::KernelSyncCoalesced);
         IPTABLES_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed);
         let now = crate::utils::time::now_timestamp();
         let last = IPTABLES_QUEUE_LAST_WARNING.load(Ordering::Relaxed);
@@ -940,15 +1139,16 @@ mod linux {
         let dropped = IPTABLES_QUEUE_DROPPED.swap(0, Ordering::AcqRel);
         tracing::warn!(
             dropped,
-            capacity = IPTABLES_QUEUE_CAPACITY,
-            "iptables sync queue full; unique kernel firewall updates skipped"
+            capacity = kernel_queue_capacity(),
+            "iptables sync queue full; converting unique updates into authoritative reconcile"
         );
         crate::logging::report_node_log(
             "warn".to_string(),
             "firewall_kernel_sync".to_string(),
             format!(
                 "backend=\"iptables\" status=\"queue_full\" dropped=\"{}\" capacity=\"{}\"",
-                dropped, IPTABLES_QUEUE_CAPACITY
+                dropped,
+                kernel_queue_capacity()
             ),
             0,
         );
@@ -960,7 +1160,14 @@ mod linux {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(snapshot) = pending.snapshot.take() {
+            pending.force_reconcile = false;
+            pending.ops.clear();
             return Some(IptablesWork::Snapshot(snapshot));
+        }
+        if pending.force_reconcile {
+            pending.force_reconcile = false;
+            pending.ops.clear();
+            return Some(IptablesWork::Reconcile);
         }
         if pending.ops.is_empty() {
             return None;
@@ -968,20 +1175,50 @@ mod linux {
         Some(IptablesWork::Ops(std::mem::take(&mut pending.ops)))
     }
 
+    fn next_expiry_delay(desired: &DesiredRules) -> Duration {
+        let now = crate::utils::time::now_timestamp();
+        let next = desired
+            .blocked
+            .values()
+            .chain(desired.allowed.values())
+            .filter(|expires_at| **expires_at > now)
+            .min()
+            .copied();
+        match next {
+            Some(expires_at) => Duration::from_secs(expires_at.saturating_sub(now).max(1) as u64),
+            None => Duration::from_secs(3600),
+        }
+    }
+
     async fn iptables_worker(queue: Arc<IptablesSyncQueue>) {
         let mut desired = DesiredRules::default();
+        let mut retry_pending = false;
         loop {
-            queue.notify.notified().await;
+            let expiry = tokio::time::sleep(next_expiry_delay(&desired));
+            tokio::pin!(expiry);
+            tokio::select! {
+                _ = queue.notify.notified() => {}
+                _ = &mut expiry => retry_pending = true,
+            }
             tokio::time::sleep(IPTABLES_BATCH_WINDOW).await;
-            let mut changed = false;
+            let mut changed = retry_pending;
+            retry_pending = false;
             while let Some(work) = take_iptables_work(&queue) {
                 match work {
                     IptablesWork::Snapshot(snapshot) => desired.replace_from_snapshot(snapshot),
                     IptablesWork::Ops(pending) => desired.apply_ops(pending),
+                    IptablesWork::Reconcile => {
+                        if let Some(snapshot) = load_owner_snapshot() {
+                            desired.replace_from_snapshot(snapshot);
+                        }
+                    }
                 }
                 changed = true;
             }
             if changed && let Err(err) = replace_iptables_rules(&mut desired).await {
+                crate::pipeline_metrics::increment(
+                    crate::pipeline_metrics::PipelineCounter::KernelSyncFailed,
+                );
                 tracing::warn!("iptables batch sync failed: {}", err);
                 crate::logging::report_node_log(
                     "warn".to_string(),
@@ -989,6 +1226,10 @@ mod linux {
                     format!("backend=\"iptables\" status=\"failed\" reason=\"{}\"", err),
                     0,
                 );
+                tokio::time::sleep(KERNEL_SYNC_RETRY_DELAY).await;
+                retry_pending = true;
+                queue.notify.notify_one();
+                continue;
             }
         }
     }
@@ -1210,6 +1451,19 @@ mod linux {
         }
     }
 
+}
+
+pub fn set_kernel_snapshot_provider(
+    provider: Option<std::sync::Arc<dyn Fn() -> KernelFilterSnapshot + Send + Sync>>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        linux::set_kernel_snapshot_provider(provider);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = provider;
+    }
 }
 
 pub async fn build_filter(mode: Option<&str>) -> Box<dyn KernelFilter> {

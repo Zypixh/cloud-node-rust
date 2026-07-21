@@ -1,3 +1,4 @@
+use arc_swap::ArcSwapOption;
 use lru::LruCache;
 use maxminddb::geoip2;
 use std::collections::hash_map::DefaultHasher;
@@ -57,33 +58,43 @@ impl Clone for RequestStats {
     }
 }
 
-static GEO_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static GEO_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-static GEO_CITY_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
-    let paths = crate::paths::NodePaths::current().geoip_city_candidates();
-    for path in &paths {
+static GEO_CITY_READER: Lazy<ArcSwapOption<maxminddb::Reader<Vec<u8>>>> =
+    Lazy::new(ArcSwapOption::empty);
+
+pub fn initialize_geoip_readers() {
+    for path in crate::paths::NodePaths::current().geoip_city_candidates() {
         if path.exists() {
-            return match maxminddb::Reader::open_readfile(path) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    warn!(
-                        "Failed to load GeoIP City database at {}: {}. Geo stats will be disabled.",
-                        path.display(),
-                        e
-                    );
-                    GEO_AVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-                    None
-                }
-            };
+            if let Err(err) = reload_city_reader(&path) {
+                warn!(
+                    "Failed to load GeoIP City database at {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+            return;
         }
     }
-    warn!(
-        "Failed to load GeoIP City database from {:?}. Geo stats will be disabled.",
-        paths
+}
+
+pub fn reload_city_reader(path: &std::path::Path) -> anyhow::Result<()> {
+    let reader = maxminddb::Reader::open_readfile(path)?;
+    reader.verify()?;
+    anyhow::ensure!(
+        reader
+            .metadata
+            .database_type
+            .to_ascii_lowercase()
+            .contains("city"),
+        "GeoIP database is not a City database: {}",
+        reader.metadata.database_type
     );
-    GEO_AVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-    None
-});
+    GEO_CITY_READER.store(Some(Arc::new(reader)));
+    GEO_AVAILABLE.store(true, std::sync::atomic::Ordering::Release);
+    GEO_CACHE.clear();
+    Ok(())
+}
 
 static GEO_ASN_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
     let paths = crate::paths::NodePaths::current().geoip_asn_candidates();
@@ -110,6 +121,18 @@ static GEO_ASN_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
 });
 
 const CACHE_SHARDS: usize = 64;
+const GEO_CACHE_ENTRY_ESTIMATED_BYTES: u64 = 384;
+const UA_CACHE_ENTRY_ESTIMATED_BYTES: u64 = 768;
+
+fn cache_capacity_per_shard(estimated_entry_bytes: u64, budget_share: u64) -> usize {
+    let budget = crate::memory_governor::MEMORY_GOVERNOR
+        .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
+        .cardinality_state_budget_bytes
+        / budget_share.max(1);
+    usize::try_from(budget / estimated_entry_bytes.max(1) / CACHE_SHARDS as u64)
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
 
 struct ShardedLru<K, V> {
     shards: Vec<Mutex<LruCache<K, V>>>,
@@ -124,6 +147,12 @@ impl<K: Hash + Eq, V: Clone> ShardedLru<K, V> {
             )));
         }
         Self { shards }
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            shard.lock().unwrap().clear();
+        }
     }
 
     fn get_shard(&self, key: &K) -> &Mutex<LruCache<K, V>> {
@@ -147,13 +176,19 @@ impl<K: Hash + Eq, V: Clone> ShardedLru<K, V> {
 
 // Cache for GeoIP results (IP -> GeoInfo)
 static GEO_CACHE: Lazy<ShardedLru<IpAddr, Option<GeoInfo>>> = Lazy::new(|| {
-    ShardedLru::new(200) // 64 * 200 = ~12.8k entries
+    ShardedLru::new(cache_capacity_per_shard(
+        GEO_CACHE_ENTRY_ESTIMATED_BYTES,
+        4,
+    ))
 });
 
 // Cache for User-Agent results (UA string -> (Arc<str>, Arc<str>))
 static UA_CACHE: Lazy<ShardedLru<String, (Arc<str>, Arc<str>, Arc<str>, Arc<str>)>> =
     Lazy::new(|| {
-        ShardedLru::new(100) // 64 * 100 = ~6.4k entries
+        ShardedLru::new(cache_capacity_per_shard(
+            UA_CACHE_ENTRY_ESTIMATED_BYTES,
+            4,
+        ))
     });
 
 static UA_PARSER: Lazy<Parser> = Lazy::new(Parser::new);
@@ -230,7 +265,7 @@ fn get_isp_name(ip: IpAddr) -> String {
 }
 
 fn lookup_geo_internal(ip: IpAddr) -> Option<GeoInfo> {
-    if let Some(reader) = &*GEO_CITY_READER {
+    if let Some(reader) = GEO_CITY_READER.load_full() {
         match reader
             .lookup(ip)
             .and_then(|result| result.decode::<geoip2::City>())

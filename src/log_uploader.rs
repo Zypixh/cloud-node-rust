@@ -97,6 +97,10 @@ impl LogUploader {
                                     "ACCESS_LOG: all upload workers closed, dropped {} logs",
                                     err.0.len()
                                 );
+                                crate::pipeline_metrics::add(
+                                    crate::pipeline_metrics::PipelineCounter::AccessLogIngressDropped,
+                                    err.0.len() as u64,
+                                );
                                 break;
                             }
                             batch = Some(err.0);
@@ -156,6 +160,10 @@ impl LogUploader {
     ) {
         let batch = std::mem::take(buffer);
         if let Err(err) = batch_tx.send(batch).await {
+            crate::pipeline_metrics::add(
+                crate::pipeline_metrics::PipelineCounter::AccessLogIngressDropped,
+                err.0.len() as u64,
+            );
             tracing::error!(
                 "ACCESS_LOG: upload worker queue closed, dropped {} buffered access logs",
                 err.0.len()
@@ -170,7 +178,9 @@ impl AccessLogUploadWorker {
         let target_chunk_bytes = if config.target_chunk_bytes == 0 {
             RPC_MAX_MESSAGE_BYTES.saturating_mul(3) / 4
         } else {
-            config.target_chunk_bytes.min(RPC_MAX_MESSAGE_BYTES)
+            config
+                .target_chunk_bytes
+                .min(RPC_MAX_MESSAGE_BYTES.saturating_sub(64 * 1024))
         };
         Self {
             api_config,
@@ -194,8 +204,16 @@ impl AccessLogUploadWorker {
         }
 
         for api_endpoint in self.api_config.effective_rpc_endpoints() {
+            let api_endpoint = match crate::api_config::validate_rpc_endpoint(&api_endpoint) {
+                Ok(endpoint) => endpoint,
+                Err(err) => {
+                    error!("Rejected invalid LogUploader RPC endpoint: {}", err);
+                    continue;
+                }
+            };
             let endpoint = match tonic::transport::Endpoint::from_shared(api_endpoint.clone()) {
                 Ok(ep) => ep
+                    .connect_timeout(self.request_timeout)
                     .keep_alive_timeout(Duration::from_secs(10))
                     .tcp_keepalive(Some(Duration::from_secs(30))),
                 Err(err) => {
@@ -232,6 +250,10 @@ impl AccessLogUploadWorker {
         debug!("Flushing batch of {} access logs to Master", count);
 
         let Some(channel) = self.get_or_connect_channel().await.cloned() else {
+            crate::pipeline_metrics::add(
+                crate::pipeline_metrics::PipelineCounter::AccessLogUploadFailed,
+                logs_to_send.len() as u64,
+            );
             self.requeue_front(logs_to_send);
             return;
         };
@@ -262,6 +284,10 @@ impl AccessLogUploadWorker {
         if logs.len() > available {
             let drop_count = logs.len() - available;
             logs.drain(..drop_count);
+            crate::pipeline_metrics::add(
+                crate::pipeline_metrics::PipelineCounter::AccessLogRetryEvicted,
+                drop_count as u64,
+            );
             tracing::warn!(
                 "ACCESS_LOG: retry queue full, dropped {} oldest pending access logs",
                 drop_count
@@ -281,6 +307,10 @@ impl AccessLogUploadWorker {
         if logs.len() > available {
             let drop_count = logs.len() - available;
             logs.drain(..drop_count);
+            crate::pipeline_metrics::add(
+                crate::pipeline_metrics::PipelineCounter::AccessLogRetryEvicted,
+                drop_count as u64,
+            );
             tracing::warn!(
                 "ACCESS_LOG: retry queue full, dropped {} oldest failed access logs",
                 drop_count
@@ -376,6 +406,10 @@ impl AccessLogUploadWorker {
                     return match self.send_access_log_chunk(channel, &logs).await {
                         Ok(_) => Ok(()),
                         Err(err) => {
+                            crate::pipeline_metrics::add(
+                                crate::pipeline_metrics::PipelineCounter::AccessLogUploadFailed,
+                                logs.len() as u64,
+                            );
                             warn!(
                                 "Failed to upload access logs after dropping request bodies: {}",
                                 err
@@ -388,6 +422,9 @@ impl AccessLogUploadWorker {
                     let right = logs.split_off(count / 2);
                     Err(AccessLogUploadError::Split { left: logs, right })
                 } else {
+                    crate::pipeline_metrics::increment(
+                        crate::pipeline_metrics::PipelineCounter::AccessLogUploadFailed,
+                    );
                     tracing::warn!(
                         "ACCESS_LOG: dropping single oversized access log ({} bytes)",
                         encoded_size
@@ -396,6 +433,10 @@ impl AccessLogUploadWorker {
                 }
             }
             Err(e) => {
+                crate::pipeline_metrics::add(
+                    crate::pipeline_metrics::PipelineCounter::AccessLogUploadFailed,
+                    logs.len() as u64,
+                );
                 warn!("Failed to upload access logs: {}", e);
                 Err(AccessLogUploadError::Retry(logs))
             }
@@ -541,6 +582,9 @@ pub struct NodeLogUploader {
     api_config: ApiConfig,
     batch_size: usize,
     flush_interval: Duration,
+    request_timeout: Duration,
+    retry_queue: VecDeque<pb::NodeLog>,
+    retry_queue_capacity: usize,
     channel: Option<Channel>,
 }
 
@@ -551,11 +595,22 @@ impl NodeLogUploader {
         batch_size: usize,
         flush_interval: Duration,
     ) -> Self {
+        let snapshot = crate::memory_governor::MEMORY_GOVERNOR.snapshot(
+            crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads(),
+        );
+        let retry_queue_capacity = usize::try_from(
+            snapshot.logging_retry_budget_bytes / 1024,
+        )
+        .unwrap_or(usize::MAX)
+        .max(batch_size.max(1));
         Self {
             rx,
             api_config,
             batch_size,
             flush_interval,
+            request_timeout: Duration::from_secs(10),
+            retry_queue: VecDeque::with_capacity(retry_queue_capacity.min(1024)),
+            retry_queue_capacity,
             channel: None,
         }
     }
@@ -572,9 +627,7 @@ impl NodeLogUploader {
             tokio::select! {
                 msg = self.rx.recv() => {
                     let Some(log) = msg else {
-                        // All senders dropped; flush remaining and exit so we
-                        // don't busy-loop on the timeout arm.
-                        if !buffer.is_empty() {
+                        if !buffer.is_empty() || !self.retry_queue.is_empty() {
                             self.flush_batch(&mut buffer).await;
                         }
                         return;
@@ -586,7 +639,7 @@ impl NodeLogUploader {
                     }
                 }
                 _ = timeout => {
-                    if !buffer.is_empty() {
+                    if !buffer.is_empty() || !self.retry_queue.is_empty() {
                         self.flush_batch(&mut buffer).await;
                     }
                     last_flush = Instant::now();
@@ -609,6 +662,7 @@ impl NodeLogUploader {
 
         let endpoint = match tonic::transport::Endpoint::from_shared(api_endpoint) {
             Ok(ep) => ep
+                .connect_timeout(self.request_timeout)
                 .keep_alive_timeout(Duration::from_secs(10))
                 .tcp_keepalive(Some(Duration::from_secs(30))),
             Err(err) => {
@@ -631,10 +685,21 @@ impl NodeLogUploader {
 
     #[allow(clippy::result_large_err)]
     async fn flush_batch(&mut self, buffer: &mut Vec<pb::NodeLog>) {
-        let count = buffer.len();
-        let logs_to_send = std::mem::replace(buffer, Vec::with_capacity(self.batch_size));
+        let fresh = std::mem::replace(buffer, Vec::with_capacity(self.batch_size));
+        self.push_node_logs(fresh);
+        if self.retry_queue.is_empty() {
+            return;
+        }
+        let logs_to_send = self.retry_queue.drain(..).collect::<Vec<_>>();
+        let retry_copy = logs_to_send.clone();
+        let count = logs_to_send.len();
 
         let Some(channel) = self.get_or_connect_channel().await.cloned() else {
+            crate::pipeline_metrics::add(
+                crate::pipeline_metrics::PipelineCounter::NodeLogUploadFailed,
+                count as u64,
+            );
+            self.requeue_node_logs(logs_to_send);
             return;
         };
 
@@ -666,17 +731,58 @@ impl NodeLogUploader {
         .max_decoding_message_size(RPC_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(RPC_MAX_MESSAGE_BYTES);
 
-        match client
-            .create_node_logs(pb::CreateNodeLogsRequest {
-                node_logs: logs_to_send,
-            })
-            .await
+        let request = pb::CreateNodeLogsRequest {
+            node_logs: logs_to_send,
+        };
+        match tokio::time::timeout(
+            self.request_timeout,
+            client.create_node_logs(request),
+        )
+        .await
         {
-            Ok(_) => info!("Successfully uploaded {} node logs", count),
-            Err(e) => {
+            Ok(Ok(_)) => info!("Successfully uploaded {} node logs", count),
+            Ok(Err(e)) => {
+                crate::pipeline_metrics::add(
+                    crate::pipeline_metrics::PipelineCounter::NodeLogUploadFailed,
+                    count as u64,
+                );
                 warn!("Failed to upload node logs: {}", e);
+                self.requeue_node_logs(retry_copy);
                 self.channel = None;
             }
+            Err(_) => {
+                crate::pipeline_metrics::add(
+                    crate::pipeline_metrics::PipelineCounter::NodeLogUploadFailed,
+                    count as u64,
+                );
+                warn!("Node log upload timed out after {:?}", self.request_timeout);
+                self.requeue_node_logs(retry_copy);
+                self.channel = None;
+            }
+        }
+    }
+
+    fn push_node_logs(&mut self, logs: Vec<pb::NodeLog>) {
+        for log in logs {
+            if self.retry_queue.len() >= self.retry_queue_capacity {
+                self.retry_queue.pop_front();
+                crate::pipeline_metrics::increment(
+                    crate::pipeline_metrics::PipelineCounter::NodeLogIngressDropped,
+                );
+            }
+            self.retry_queue.push_back(log);
+        }
+    }
+
+    fn requeue_node_logs(&mut self, logs: Vec<pb::NodeLog>) {
+        for log in logs.into_iter().rev() {
+            if self.retry_queue.len() >= self.retry_queue_capacity {
+                self.retry_queue.pop_back();
+                crate::pipeline_metrics::increment(
+                    crate::pipeline_metrics::PipelineCounter::NodeLogIngressDropped,
+                );
+            }
+            self.retry_queue.push_front(log);
         }
     }
 }
