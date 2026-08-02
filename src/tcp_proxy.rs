@@ -1716,11 +1716,23 @@ pub(crate) enum RelayIoPhase {
     Shutdown,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct RelayOptions {
     defer_client_to_backend_clean_shutdown: bool,
     defer_backend_to_client_clean_shutdown: bool,
+    enforce_pressure_idle_timeout: bool,
     cancel_rx: Option<watch::Receiver<bool>>,
+}
+
+impl Default for RelayOptions {
+    fn default() -> Self {
+        Self {
+            defer_client_to_backend_clean_shutdown: false,
+            defer_backend_to_client_clean_shutdown: false,
+            enforce_pressure_idle_timeout: true,
+            cancel_rx: None,
+        }
+    }
 }
 
 impl RelayOptions {
@@ -1728,6 +1740,8 @@ impl RelayOptions {
         Self {
             defer_client_to_backend_clean_shutdown: false,
             defer_backend_to_client_clean_shutdown: true,
+            // Opaque SNI relays can carry intentionally idle multiplexed sessions.
+            enforce_pressure_idle_timeout: false,
             cancel_rx: None,
         }
     }
@@ -1736,6 +1750,7 @@ impl RelayOptions {
         Self {
             defer_client_to_backend_clean_shutdown: true,
             defer_backend_to_client_clean_shutdown: false,
+            enforce_pressure_idle_timeout: true,
             cancel_rx: None,
         }
     }
@@ -2057,7 +2072,13 @@ where
     let mut unflushed = 0u64;
 
     loop {
-        let n = match read_with_pressure_idle_timeout(&mut reader, &mut buf).await {
+        let n = match read_with_pressure_idle_timeout(
+            &mut reader,
+            &mut buf,
+            options.enforce_pressure_idle_timeout,
+        )
+        .await
+        {
             Ok(n) => n,
             Err(err) => {
                 record_stream_metrics_delta(server_id, direction, unflushed);
@@ -2104,11 +2125,14 @@ where
 async fn read_with_pressure_idle_timeout<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut [u8],
+    enforce_pressure_idle_timeout: bool,
 ) -> io::Result<usize> {
     read_with_optional_pressure_idle_timeout(
         reader,
         buf,
-        MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout(),
+        enforce_pressure_idle_timeout
+            .then(|| MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout())
+            .flatten(),
     )
     .await
 }
@@ -3254,6 +3278,13 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn sni_passthrough_disables_only_pressure_idle_timeout() {
+        assert!(RelayOptions::default().enforce_pressure_idle_timeout);
+        assert!(RelayOptions::af_xdp_tcp().enforce_pressure_idle_timeout);
+        assert!(!RelayOptions::sni_passthrough().enforce_pressure_idle_timeout);
     }
 
     #[test]
