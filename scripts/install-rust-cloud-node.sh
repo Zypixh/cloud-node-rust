@@ -9,6 +9,7 @@ INSTALL_DIR="${INSTALL_DIR:-}"
 INSTALL_BINARY="${INSTALL_BINARY:-}"
 START_MODE="${START_MODE:-preserve}"
 LANGUAGE="${LANGUAGE:-}"
+CLOUD_NODE_LANG="${CLOUD_NODE_LANG:-}"
 DOWNLOAD_GEOIP="${DOWNLOAD_GEOIP:-ask}"
 GEOIP_DIR="${GEOIP_DIR:-}"
 MODE="${MODE:-ask}"
@@ -77,13 +78,64 @@ Options:
 
 Environment variables with the same names are also supported:
   REPO, VERSION, SERVICE_NAME, INSTALL_DIR, INSTALL_BINARY, BACKUP_ROOT,
-  START_MODE, LANGUAGE, DOWNLOAD_GEOIP, GEOIP_DIR, MODE, RESTORE_BACKUP,
+  START_MODE, LANGUAGE, CLOUD_NODE_LANG, DOWNLOAD_GEOIP, GEOIP_DIR, MODE, RESTORE_BACKUP,
   API_ENDPOINTS, NODE_ID, NODE_SECRET, TIMEZONE.
 USAGE
 }
 
 is_zh() {
     [ "$LANGUAGE" = "zh" ] || [ "$LANGUAGE" = "zh_CN" ] || [ "$LANGUAGE" = "cn" ]
+}
+
+# LANGUAGE is also a gettext environment variable. On many systems it is set
+# to a locale preference list such as "en_HK:en", so it cannot be treated as a
+# single installer language token. Keep installer output limited to the two
+# supported languages while accepting locale names, encodings, modifiers, and
+# colon-separated fallback lists.
+normalize_language() {
+    local raw="${1:-}"
+    local normalized=""
+
+    normalized="${raw%%.*}"
+    normalized="${normalized%%@*}"
+    normalized="${normalized//_/-}"
+    normalized="$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')"
+
+    case "$normalized" in
+        zh|zh-*|cn|chinese|中文|汉语)
+            printf 'zh\n'
+            return 0
+            ;;
+        en|en-*|eng|english|c|posix)
+            printf 'en\n'
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+language_from_list() {
+    local remaining="$1"
+    local candidate=""
+    local parsed=""
+
+    while [ -n "$remaining" ]; do
+        if [[ "$remaining" == *:* ]]; then
+            candidate="${remaining%%:*}"
+            remaining="${remaining#*:}"
+        else
+            candidate="$remaining"
+            remaining=""
+        fi
+        [ -n "$candidate" ] || continue
+        if parsed="$(normalize_language "$candidate")"; then
+            printf '%s\n' "$parsed"
+            return 0
+        fi
+    done
+    return 1
 }
 
 setup_colors() {
@@ -215,15 +267,26 @@ systemctl_available() {
 }
 
 prompt_language() {
+    # CLOUD_NODE_LANG is the unambiguous installer setting. LANGUAGE remains
+    # supported for compatibility, but is parsed as a gettext locale list.
+    if [ -n "$CLOUD_NODE_LANG" ]; then
+        if LANGUAGE="$(language_from_list "$CLOUD_NODE_LANG")"; then
+            return
+        fi
+        die "unsupported language: $CLOUD_NODE_LANG"
+    fi
+
     if [ -n "$LANGUAGE" ]; then
+        if LANGUAGE="$(language_from_list "$LANGUAGE")"; then
+            return
+        fi
+
+        # Ignore an ambient, unsupported gettext value (for example
+        # LANGUAGE=fr_FR:de) and continue with normal selection instead of
+        # making the installer unusable.
         case "$LANGUAGE" in
-            zh|zh_CN|cn)
-                LANGUAGE="zh"
-                return
-                ;;
-            en|en_US)
-                LANGUAGE="en"
-                return
+            *[_:.-]*|*'@'*)
+                LANGUAGE=""
                 ;;
             *)
                 die "unsupported language: $LANGUAGE"
@@ -520,7 +583,7 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         # Hidden compatibility for older one-line install commands. New usage should
-        # set LANGUAGE=zh or LANGUAGE=en instead of passing a language flag.
+        # set CLOUD_NODE_LANG=zh or CLOUD_NODE_LANG=en instead of passing a language flag.
         --lang)
             LANGUAGE="${2:?missing language}"
             shift 2

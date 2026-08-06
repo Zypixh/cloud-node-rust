@@ -168,7 +168,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 
 脚本会执行以下步骤：
 
-- 第一步询问界面语言，支持中文和英文；自动化场景可使用 `LANGUAGE=zh` 或 `LANGUAGE=en` 环境变量。
+- 第一步询问界面语言，支持中文和英文；自动化场景优先使用 `CLOUD_NODE_LANG=zh` 或 `CLOUD_NODE_LANG=en`。为兼容旧命令也接受 `LANGUAGE=zh`/`LANGUAGE=en`，并能识别系统常见的 gettext locale 列表（例如 `LANGUAGE=en_HK:en`）。
 - 默认交互式选择操作：覆盖/升级旧 Go 原版为 Rust 版、全新安装 Rust 版、从备份恢复 Go 原版。自动化场景必须显式传 `--install` 或 `--fresh`。
 - 查找当前 `cloud-node` 命令、`cloud-node.service` 的 `ExecStart` 和常见安装路径。
 - 将找到的旧二进制、`/usr/bin/cloud-node` 和 systemd unit 备份到 `/var/backups/cloud-node-rust-migration/<timestamp>/`。
@@ -234,7 +234,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 非交互下载 GeoIP 库：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo env LANGUAGE=zh bash -s -- --geoip --yes
+curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts/install-rust-cloud-node.sh | sudo env CLOUD_NODE_LANG=zh bash -s -- --geoip --yes
 ```
 
 GeoIP 文件默认写入节点 `data/` 目录，因为运行时会优先从 `data/GeoLite2-City.mmdb` 和 `data/GeoLite2-ASN.mmdb` 读取。旧版工作目录 GeoIP 文件仍作为迁移 fallback。 如需指定目录：
