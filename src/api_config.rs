@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock as Lazy;
 use std::sync::RwLock;
@@ -284,6 +283,13 @@ kernelTuning:
 
         assert!(!config.kernel_tuning.normalized().enabled);
     }
+
+    #[test]
+    fn remote_plaintext_rpc_endpoint_remains_supported() {
+        let endpoint = "http://36.134.185.75:8001";
+
+        assert_eq!(validate_rpc_endpoint(endpoint).unwrap(), endpoint);
+    }
 }
 
 impl ApiConfig {
@@ -382,9 +388,8 @@ pub fn validate_rpc_endpoint(endpoint: &str) -> anyhow::Result<String> {
     if !matches!(scheme, "http" | "https") {
         anyhow::bail!("RPC endpoint {endpoint:?} uses unsupported scheme {scheme:?}");
     }
-    if scheme == "http" && !is_loopback_rpc_host(authority.host()) {
-        anyhow::bail!("plaintext RPC endpoint {endpoint:?} is only allowed on loopback");
-    }
+    // Plain HTTP/2 gRPC remains supported for legacy control planes. Deployments
+    // should protect remote plaintext endpoints with a private network or tunnel.
     Ok(endpoint.trim_end_matches('/').to_string())
 }
 
@@ -397,15 +402,4 @@ pub fn validate_rpc_endpoints(endpoints: Vec<String>) -> anyhow::Result<Vec<Stri
         }
     }
     Ok(normalized)
-}
-
-fn is_loopback_rpc_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let host = host.trim_matches(['[', ']']);
-    host.parse::<IpAddr>().is_ok_and(|ip| match ip {
-        IpAddr::V4(ip) => ip == Ipv4Addr::LOCALHOST || ip.is_loopback(),
-        IpAddr::V6(ip) => ip == Ipv6Addr::LOCALHOST || ip.is_loopback(),
-    })
 }

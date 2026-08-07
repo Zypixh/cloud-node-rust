@@ -19,7 +19,7 @@ relay:
 
 字段说明：
 
-- `rpc.endpoints`：API 节点 RPC 地址列表。节点会连接其中可用 endpoint。
+- `rpc.endpoints`：API 节点 RPC 地址列表。节点会连接其中可用 endpoint，兼容 `http` 和 `https`；远程 `http` 明文地址应放在私网或隧道内，生产环境优先使用 `https`。
 - `nodeId`：节点身份标识。
 - `secret`：节点认证密钥。
 - `billing.countInboundTraffic`：是否把客户端上传到节点的上行流量也计入控制面带宽和日统计计费流量。默认 `false`，只按节点下行流量计费；设为 `true` 后当前节点按上下行合计计费。
