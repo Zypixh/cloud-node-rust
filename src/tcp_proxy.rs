@@ -1721,6 +1721,7 @@ struct RelayOptions {
     defer_client_to_backend_clean_shutdown: bool,
     defer_backend_to_client_clean_shutdown: bool,
     cancel_rx: Option<watch::Receiver<bool>>,
+    pressure_idle_timeout: Option<std::time::Duration>,
 }
 
 impl RelayOptions {
@@ -1729,6 +1730,7 @@ impl RelayOptions {
             defer_client_to_backend_clean_shutdown: false,
             defer_backend_to_client_clean_shutdown: true,
             cancel_rx: None,
+            pressure_idle_timeout: None,
         }
     }
 
@@ -1737,6 +1739,7 @@ impl RelayOptions {
             defer_client_to_backend_clean_shutdown: true,
             defer_backend_to_client_clean_shutdown: false,
             cancel_rx: None,
+            pressure_idle_timeout: None,
         }
     }
 
@@ -2057,7 +2060,13 @@ where
     let mut unflushed = 0u64;
 
     loop {
-        let n = match read_with_pressure_idle_timeout(&mut reader, &mut buf).await {
+        let n = match read_with_optional_pressure_idle_timeout(
+            &mut reader,
+            &mut buf,
+            options.pressure_idle_timeout,
+        )
+        .await
+        {
             Ok(n) => n,
             Err(err) => {
                 record_stream_metrics_delta(server_id, direction, unflushed);
@@ -2099,18 +2108,6 @@ where
             unflushed = 0;
         }
     }
-}
-
-async fn read_with_pressure_idle_timeout<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    buf: &mut [u8],
-) -> io::Result<usize> {
-    read_with_optional_pressure_idle_timeout(
-        reader,
-        buf,
-        MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout(),
-    )
-    .await
 }
 
 async fn read_with_optional_pressure_idle_timeout<R: AsyncRead + Unpin>(
@@ -2548,7 +2545,13 @@ mod zero_copy {
             }
 
             let moved_to_pipe =
-                match splice_socket_to_pipe(fds.read.fd(), fds.pipe_write.fd(), control, &mut idle)
+                match splice_socket_to_pipe(
+                    fds.read.fd(),
+                    fds.pipe_write.fd(),
+                    control,
+                    &mut idle,
+                    options.pressure_idle_timeout,
+                )
                 {
                     Ok(n) => n,
                     Err(err) => {
@@ -2622,11 +2625,18 @@ mod zero_copy {
         pipe_write_fd: RawFd,
         control: &RelayControl,
         idle: &mut std::time::Duration,
+        pressure_timeout: Option<std::time::Duration>,
     ) -> io::Result<usize> {
         loop {
             match splice_once(read_fd, pipe_write_fd, SPLICE_CHUNK_BYTES) {
                 Err(err) if is_would_block(&err) => {
-                    poll_fd(read_fd, libc::POLLIN, control, Some(idle))?
+                    poll_fd(
+                        read_fd,
+                        libc::POLLIN,
+                        control,
+                        Some(idle),
+                        pressure_timeout,
+                    )?
                 }
                 other => return other,
             }
@@ -2642,7 +2652,7 @@ mod zero_copy {
         loop {
             match splice_once(pipe_read_fd, write_fd, len) {
                 Err(err) if is_would_block(&err) => {
-                    poll_fd(write_fd, libc::POLLOUT, control, None)?
+                    poll_fd(write_fd, libc::POLLOUT, control, None, None)?
                 }
                 other => return other,
             }
@@ -2677,12 +2687,12 @@ mod zero_copy {
         events: libc::c_short,
         control: &RelayControl,
         mut idle: Option<&mut std::time::Duration>,
+        pressure_timeout: Option<std::time::Duration>,
     ) -> io::Result<()> {
         loop {
             if control.should_stop() {
                 return Err(stop_error());
             }
-            let pressure_timeout = MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout();
             let poll_timeout_ms = pressure_timeout
                 .map(|timeout| {
                     timeout.min(std::time::Duration::from_secs(1)).as_millis() as libc::c_int
@@ -2700,8 +2710,7 @@ mod zero_copy {
             if result == 0 {
                 if let Some(idle) = idle.as_deref_mut() {
                     *idle += std::time::Duration::from_millis(poll_timeout_ms.max(1) as u64);
-                    if let Some(timeout) = MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout()
-                        && *idle >= timeout
+                    if let Some(timeout) = pressure_timeout && *idle >= timeout
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
