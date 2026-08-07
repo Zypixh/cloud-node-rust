@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand, ValueEnum};
 use cloud_node_rust::i18n::{Language, t};
