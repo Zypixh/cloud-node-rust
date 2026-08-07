@@ -353,11 +353,10 @@ pub struct RuntimeDistinctIpTracker {
 }
 
 impl RuntimeDistinctIpTracker {
-    fn new() -> Self {
+    fn new(max_servers: u64) -> Self {
         let budget = crate::memory_governor::MEMORY_GOVERNOR
             .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
             .cardinality_state_budget_bytes;
-        let max_servers = METRICS.servers.len().saturating_add(1) as u64;
         let tracker_budget = budget / max_servers.max(1);
         Self {
             ips: dashmap::DashSet::new(),
@@ -412,6 +411,10 @@ pub struct ServerMetrics {
 
 impl ServerMetrics {
     pub fn new() -> Self {
+        Self::with_server_count(1)
+    }
+
+    fn with_server_count(max_servers: u64) -> Self {
         Self {
             user_id: AtomicI64::new(0),
             user_plan_id: AtomicI64::new(0),
@@ -427,7 +430,7 @@ impl ServerMetrics {
             origin_bytes_received: AtomicU64::new(0),
             active_connections: AtomicI64::new(0),
             count_websocket_connections: AtomicU64::new(0),
-            distinct_ips: RuntimeDistinctIpTracker::new(),
+            distinct_ips: RuntimeDistinctIpTracker::new(max_servers),
         }
     }
 
@@ -731,10 +734,11 @@ pub mod record {
     use std::net::IpAddr;
 
     pub fn get_or_create(server_id: i64) -> Arc<ServerMetrics> {
+        let max_servers = METRICS.servers.len().saturating_add(1) as u64;
         METRICS
             .servers
             .entry(server_id)
-            .or_insert_with(|| Arc::new(ServerMetrics::new()))
+            .or_insert_with(|| Arc::new(ServerMetrics::with_server_count(max_servers)))
             .clone()
     }
 
