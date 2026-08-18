@@ -5,7 +5,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -218,6 +218,8 @@ pub struct UdpSession {
     pub plan_id: i64,
     pub last_activity_ms: Arc<AtomicU64>,
     pub quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
+    // Learned from the backend's long-header SCID. A zero value means unknown.
+    pub quic_server_cid_len: Arc<AtomicU8>,
     pub quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
     pub tx: mpsc::Sender<QueuedUdpDatagram>,
     pub shutdown_tx: watch::Sender<bool>,
@@ -818,6 +820,7 @@ impl UdpProxyManager {
             plan_id,
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: quic_cid_tx.clone(),
             tx,
             shutdown_tx: session_shutdown_tx,
@@ -845,6 +848,7 @@ impl UdpProxyManager {
         let client_addr = session.client_addr.clone();
         let last_activity_ms = session.last_activity_ms.clone();
         let quic_cids = session.quic_cids.clone();
+        let quic_server_cid_len = session.quic_server_cid_len.clone();
         let session_quic_cid_tx = session.quic_cid_tx.clone();
         let sessions = self.sessions.clone();
         self.sessions.insert(key, session.clone());
@@ -863,6 +867,7 @@ impl UdpProxyManager {
                 domain,
                 last_activity_ms,
                 quic_cids,
+                quic_server_cid_len,
                 session_quic_cid_tx,
                 downstream_sender,
                 rx,
@@ -939,6 +944,30 @@ impl UdpProxyManager {
         }
     }
 
+    async fn record_client_short_header_cid(session: &UdpSession, packet: &[u8]) {
+        if session.quic_cid_tx.is_none()
+            || packet.first().is_none_or(|first| first & 0x80 != 0)
+        {
+            return;
+        }
+
+        let cid_len = session.quic_server_cid_len.load(Ordering::Acquire) as usize;
+        if !(1..=20).contains(&cid_len) {
+            return;
+        }
+
+        let Some(cids) = crate::quic_probe::quic_packet_cids(packet, cid_len) else {
+            return;
+        };
+        Self::record_session_quic_cid(
+            session.id,
+            &session.quic_cids,
+            session.quic_cid_tx.as_ref(),
+            cids.dcid,
+        )
+        .await;
+    }
+
     pub fn send_to_session(session: &UdpSession, data: Bytes) -> UdpSessionSendStatus {
         let Some(item) = QueuedUdpDatagram::new(data) else {
             return UdpSessionSendStatus::Full;
@@ -963,6 +992,7 @@ impl UdpProxyManager {
         };
         match session.tx.try_reserve() {
             Ok(permit) => {
+                Self::record_client_short_header_cid(session, item.data.as_ref()).await;
                 Self::update_session_client_addr(session, client_addr).await;
                 permit.send(item);
                 Self::update_session_activity(session);
@@ -1006,6 +1036,7 @@ impl UdpProxyManager {
         domain: String,
         last_activity_ms: Arc<AtomicU64>,
         quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
+        quic_server_cid_len: Arc<AtomicU8>,
         quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
         downstream_sender: UdpDownstreamSender,
         mut rx: mpsc::Receiver<QueuedUdpDatagram>,
@@ -1089,17 +1120,27 @@ impl UdpProxyManager {
                         }
                     };
                     let len_u64 = len as u64;
-                    for cid in crate::quic_probe::quic_packet_cids(&buf[..len], 0)
-                        .into_iter()
-                        .flat_map(|cids| [Some(cids.dcid), cids.scid].into_iter().flatten())
-                    {
-                        Self::record_session_quic_cid(
-                            session_id,
-                            &quic_cids,
-                            quic_cid_tx.as_ref(),
-                            cid,
-                        )
-                        .await;
+                    if let Some(cids) = crate::quic_probe::quic_packet_cids(&buf[..len], 0) {
+                        if let Some(scid) = cids.scid.as_ref()
+                            && let Ok(cid_len) = u8::try_from(scid.len())
+                            && (1..=20).contains(&cid_len)
+                        {
+                            let _ = quic_server_cid_len.compare_exchange(
+                                0,
+                                cid_len,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                        }
+                        for cid in [Some(cids.dcid), cids.scid].into_iter().flatten() {
+                            Self::record_session_quic_cid(
+                                session_id,
+                                &quic_cids,
+                                quic_cid_tx.as_ref(),
+                                cid,
+                            )
+                            .await;
+                        }
                     }
                     let current_client_addr = *client_addr.read().await;
                     match downstream_sender.send_to(&buf[..len], current_client_addr).await {
@@ -1328,6 +1369,7 @@ mod tests {
             plan_id: 0,
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
             tx,
             shutdown_tx,
@@ -1359,6 +1401,7 @@ mod tests {
             plan_id: 0,
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
             tx,
             shutdown_tx,
@@ -1375,6 +1418,92 @@ mod tests {
             UdpSessionSendStatus::Full
         );
         assert_eq!(*session.client_addr.read().await, first);
+    }
+
+    #[tokio::test]
+    async fn client_short_header_learns_rotated_server_cid_after_queue_reservation() {
+        let client_addr: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (cid_tx, mut cid_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let session = UdpSession {
+            id: 7,
+            client_addr: Arc::new(RwLock::new(client_addr)),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(4)),
+            quic_cid_tx: Some(cid_tx),
+            tx,
+            shutdown_tx,
+            shutdown,
+        };
+
+        assert_eq!(
+            UdpProxyManager::send_to_session_from_client(
+                &session,
+                client_addr,
+                Bytes::from_static(&[0x40, 5, 6, 7, 8, 0xaa]),
+            )
+            .await,
+            UdpSessionSendStatus::Sent
+        );
+        assert_eq!(
+            cid_rx.recv().await,
+            Some(UdpSessionQuicCid {
+                session_id: 7,
+                cid: vec![5, 6, 7, 8],
+                retired_cid: None,
+            })
+        );
+        assert_eq!(
+            UdpProxyManager::session_quic_cids(&session),
+            vec![vec![5, 6, 7, 8]]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_server_cid_length_does_not_learn_client_short_header() {
+        let client_addr: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (cid_tx, mut cid_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let session = UdpSession {
+            id: 8,
+            client_addr: Arc::new(RwLock::new(client_addr)),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
+            quic_cid_tx: Some(cid_tx),
+            tx,
+            shutdown_tx,
+            shutdown,
+        };
+
+        assert_eq!(
+            UdpProxyManager::send_to_session_from_client(
+                &session,
+                client_addr,
+                Bytes::from_static(&[0x40, 5, 6, 7, 8, 0xaa]),
+            )
+            .await,
+            UdpSessionSendStatus::Sent
+        );
+        assert!(cid_rx.try_recv().is_err());
+        assert!(UdpProxyManager::session_quic_cids(&session).is_empty());
     }
 
     #[tokio::test]
@@ -1396,6 +1525,7 @@ mod tests {
             plan_id: 0,
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
             tx,
             shutdown_tx,
@@ -1437,6 +1567,7 @@ mod tests {
             plan_id: 0,
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
             tx,
             shutdown_tx,
@@ -1472,6 +1603,7 @@ mod tests {
             "udp.example.com".to_string(),
             Arc::new(AtomicU64::new(udp_activity_now_ms())),
             Arc::new(RwLock::new(VecDeque::new())),
+            Arc::new(AtomicU8::new(0)),
             None,
             UdpDownstreamSender::socket(listen_socket),
             rx,
@@ -1526,6 +1658,7 @@ mod tests {
             "udp.example.com".to_string(),
             Arc::new(AtomicU64::new(udp_activity_now_ms())),
             Arc::new(RwLock::new(VecDeque::new())),
+            Arc::new(AtomicU8::new(0)),
             None,
             UdpDownstreamSender::channel(listen_addr, downstream_tx),
             rx,
@@ -1596,6 +1729,7 @@ mod tests {
             plan_id: 0,
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
             tx,
             shutdown_tx,
