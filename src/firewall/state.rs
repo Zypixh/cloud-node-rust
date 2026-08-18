@@ -2146,7 +2146,10 @@ pub fn start_gc_task(state: Arc<WafStateManager>) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            state.gc_once();
+            let state_for_gc = Arc::clone(&state);
+            if let Err(err) = tokio::task::spawn_blocking(move || state_for_gc.gc_once()).await {
+                tracing::error!(error = %err, "firewall GC worker failed");
+            }
         }
     });
 }

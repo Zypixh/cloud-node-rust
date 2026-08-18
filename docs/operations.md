@@ -9,18 +9,21 @@ GitHub Release workflow 会在 `v*` tag 上执行正式发布构建。`main` 分
 普通构建：
 
 ```bash
+cargo clean
 cargo build --release
 ```
 
 针对 x86_64 v3 优化：
 
 ```bash
+cargo clean
 RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat" cargo build --release
 ```
 
 针对 ARM64 Neoverse N1 优化：
 
 ```bash
+cargo clean
 RUSTFLAGS="-C target-cpu=neoverse-n1 -C opt-level=3 -C lto=fat" cargo build --release
 ```
 
@@ -29,6 +32,7 @@ RUSTFLAGS="-C target-cpu=neoverse-n1 -C opt-level=3 -C lto=fat" cargo build --re
 XDP/AF_XDP eBPF 对象需要额外构建：
 
 ```bash
+cargo clean
 cargo xtask build-ebpf
 ```
 
@@ -341,7 +345,7 @@ tail -n 200 logs/run.log
 - 监控磁盘剩余空间。
 - 避免多个节点共享同一个本地缓存目录。
 - 控制缓存对象数量，避免极端小文件造成元数据压力。
-- 定期检查 RocksDB 指标和缓存清理日志。
+- 定期检查 Mace 指标和缓存清理日志。
 - 开启 WebP 时确认站点 WebP 规则、缓存策略和响应状态码同时满足要求；否则节点会按普通响应处理，不会为了不可缓存响应重复转换。
 
 ## 常见问题

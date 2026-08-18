@@ -88,7 +88,7 @@ pub fn emit_upsert(event: CacheMetaUpsertEvent<'_>) {
     }
 }
 
-pub fn apply_remote_event(event: CacheMetaEvent) {
+pub async fn apply_remote_event(event: CacheMetaEvent) {
     match event.event_type {
         CacheMetaEventType::Upsert => {
             if let Some(existing) = crate::metrics::storage::STORAGE.get_cache_meta(&event.hash)
@@ -96,7 +96,7 @@ pub fn apply_remote_event(event: CacheMetaEvent) {
             {
                 return;
             }
-            crate::metrics::storage::STORAGE.upsert_cache_meta_absolute(
+            crate::metrics::storage::STORAGE.upsert_cache_meta_absolute_async(
                 crate::metrics::storage::CacheMetaUpsert {
                     hash: &event.hash,
                     cache_key: &event.cache_key,
@@ -114,10 +114,13 @@ pub fn apply_remote_event(event: CacheMetaEvent) {
                     stale_while_revalidate_secs: event.stale_while_revalidate_secs,
                     created_at: event.created_at,
                 },
-            );
+            )
+            .await;
         }
         CacheMetaEventType::Delete | CacheMetaEventType::Purge => {
-            crate::metrics::storage::STORAGE.delete_cache_meta(&event.hash);
+            crate::metrics::storage::STORAGE
+                .delete_cache_meta_async(&event.hash)
+                .await;
         }
     }
 }

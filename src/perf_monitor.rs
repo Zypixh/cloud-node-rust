@@ -379,7 +379,7 @@ fn build_advice(
         advice.push(Advice {
             level: "warning",
             title: "磁盘空间偏高",
-            detail: "建议清理缓存、日志和 RocksDB 数据，避免缓存写入失败影响回源。".to_string(),
+            detail: "建议清理缓存、日志和 Mace 数据，避免缓存写入失败影响回源。".to_string(),
         });
     }
     if active_connections >= 50_000 {

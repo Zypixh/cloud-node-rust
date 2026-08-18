@@ -9,7 +9,7 @@ CloudNode Rust 是一个基于 [Pingora](https://github.com/cloudflare/pingora) 
 - **多协议边缘代理**：HTTP/1.1、HTTP/2、HTTP/3、gRPC、WebSocket、TCP、TCP-TLS、UDP。
 - **共享端口接入**：支持共享 `443` 端口下的 TLS、HTTP/2、HTTP/3、`@sni_passthrough` 和 `@quic` 流量分流。
 - **XDP/AF_XDP 旁路**：Linux 上可显式启用 XDP protect/proxy 模式，支持 HTTP、HTTPS、TCP、UDP、SNI、QUIC 和 H3 命中端口旁路，并保留 socket fallback。
-- **混合缓存系统**：Memory + Disk 缓存，RocksDB 元数据索引，多缓存策略匹配，支持大文件和高并发切片分发。
+- **混合缓存系统**：Memory + Disk 缓存，Mace 元数据索引，多缓存策略匹配，支持大文件和高并发切片分发。
 - **站点安全能力**：WAF、UAM、CC、防盗链、访问限制、请求限制、带宽和流量限制、自定义拦截页面。
 - **L4 自适应强防**：复用 `emptyConnectionFlood` 开关覆盖 HTTP/HTTPS/TCP/SNI/UDP/QUIC/H3 的慢连接、队列和 admission 攻击防御，支持集群级 IP 上报拉黑。
 - **内容处理能力**：WebP 转换、HTML/CSS/JS 优化、HLS 播放列表和分片处理、自定义错误页和模板变量。
@@ -56,6 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/Zypixh/cloud-node-rust/main/scripts
 - [功能说明](docs/features.md)
 - [配置说明](docs/configuration.md)
 - [XDP/AF_XDP 旁路数据面](docs/xdp-af-xdp.md)
+- [RocksDB 到 Mace 元数据迁移](docs/mace-migration.md)
 - [部署与运维](docs/operations.md)
 - [RKE2 部署文档](docs/rke2-deployment.md)
 - [gRPC API 使用文档](docs/grpc-api.md)
@@ -96,6 +97,7 @@ Release workflow 面向不同 CPU 和系统环境提供多个 Linux 产物：
 高性能编译示例：
 
 ```bash
+cargo clean
 RUSTFLAGS="-C target-cpu=x86-64-v3 -C opt-level=3 -C lto=fat" cargo build --release
 ```
 

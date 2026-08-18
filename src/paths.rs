@@ -65,6 +65,11 @@ impl NodePaths {
         self.data_dir().join("metrics.db")
     }
 
+    /// Mace must never be opened on the legacy RocksDB directory.
+    pub fn mace_metrics_db_dir(&self) -> PathBuf {
+        self.data_dir().join("metrics.mace")
+    }
+
     pub fn xdp_state_file(&self) -> PathBuf {
         self.data_dir().join("xdp-state.json")
     }
@@ -103,6 +108,10 @@ impl NodePaths {
 
     pub fn legacy_metrics_db_dir(&self) -> PathBuf {
         self.root.join("../data/metrics.db")
+    }
+
+    pub fn legacy_mace_metrics_db_dir(&self) -> PathBuf {
+        self.root.join("../data/metrics.mace")
     }
 
     pub fn legacy_cache_dir(&self) -> PathBuf {
@@ -144,6 +153,13 @@ impl NodePaths {
 
     pub fn metrics_db_candidates(&self) -> Vec<PathBuf> {
         vec![self.metrics_db_dir(), self.legacy_metrics_db_dir()]
+    }
+
+    pub fn mace_metrics_db_candidates(&self) -> Vec<PathBuf> {
+        vec![
+            self.mace_metrics_db_dir(),
+            self.legacy_mace_metrics_db_dir(),
+        ]
     }
 
     pub fn geoip_city_candidates(&self) -> Vec<PathBuf> {

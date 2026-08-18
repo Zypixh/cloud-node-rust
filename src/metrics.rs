@@ -58,6 +58,7 @@ fn compute_node_pressure(sys: &mut sysinfo::System) -> f32 {
 pub mod aggregator;
 pub mod analyzer;
 pub mod daily;
+mod mace_backend;
 pub mod storage;
 pub mod top_ip;
 
@@ -1153,12 +1154,25 @@ pub async fn start_persistence_flusher() {
         last_node_sent = node_sent;
         last_node_recv = node_recv;
 
-        if !updates.is_empty() {
-            storage::STORAGE.record_server_batch(period, updates, node_sent_delta, node_recv_delta);
-        }
-
-        if now % 3600 < 30 {
-            storage::STORAGE.cleanup_old_stats(now - 86400);
+        let cleanup_before = (now % 3600 < 30).then_some(now - 86400);
+        if !updates.is_empty() || cleanup_before.is_some() {
+            let write_result = tokio::task::spawn_blocking(move || {
+                if !updates.is_empty() {
+                    storage::STORAGE.record_server_batch(
+                        period,
+                        updates,
+                        node_sent_delta,
+                        node_recv_delta,
+                    );
+                }
+                if let Some(older_than) = cleanup_before {
+                    storage::STORAGE.cleanup_old_stats(older_than);
+                }
+            })
+            .await;
+            if let Err(err) = write_result {
+                tracing::error!(error = %err, "metrics persistence worker failed");
+            }
         }
     }
 }

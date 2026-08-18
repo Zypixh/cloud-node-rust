@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __POD_NAME__
+  namespace: cloud-node-perf
+  labels:
+    app: cloud-node-perf-mace
+    profile: __PROFILE__
+spec:
+  nodeName: hz-rke2-01
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: mace
+      image: docker.io/library/debian:12-slim
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-lc"]
+      args:
+        - >-
+          exec /opt/perf/__BINARY__ --path /var/lib/cloud-node/data/metrics.mace
+          --mode __MODE__ --duration-secs __DURATION__ --workers __WORKERS__
+          --batch-size __BATCH_SIZE__
+      env:
+        - name: CLOUD_NODE_HOME
+          value: /var/lib/cloud-node
+        - name: RUST_LOG
+          value: error
+      resources:
+        requests:
+          cpu: "1"
+          memory: 512Mi
+        limits:
+          cpu: "4"
+          memory: 4Gi
+      volumeMounts:
+        - name: artifacts
+          mountPath: /opt/perf
+          readOnly: true
+        - name: node-data
+          mountPath: /var/lib/cloud-node
+  volumes:
+    - name: artifacts
+      hostPath:
+        path: /root/cloud-node-rust-test/perf-artifacts
+        type: Directory
+    - name: node-data
+      emptyDir: {}

@@ -55,8 +55,8 @@ cloud-node --monitor-port 8888 --monitor-clear
 - `upgrade`：从 GitHub Release 下载匹配当前 CPU/架构的最新版或指定版本，确认后备份并替换当前二进制，同时安装 release 包内的 `data/cloud-node-xdp-ebpf.o`。
 - `ntp`：交互式或非交互式设置系统时区，并按内置 NTP 源校准系统时钟；守护进程自动 NTP 只校准程序内部偏移。
 - `firewall init`：初始化本地 `nftables` table/set/chain/drop rule。
-- `firewall list`：合并展示本地 `nftables` 精确 IP 和 RocksDB 本地运行时黑名单；条目较多时按 IPv4 `/24`、IPv6 `/48` 聚合。
-- `firewall gc`：清理 RocksDB 中已过期的本地运行时封禁记录。
+- `firewall list`：合并展示本地 `nftables` 精确 IP 和 Mace 本地运行时黑名单；条目较多时按 IPv4 `/24`、IPv6 `/48` 聚合。
+- `firewall gc`：清理 Mace 中已过期的本地运行时封禁记录。
 - `xdp status`：查看当前或上次持久化的 XDP/AF_XDP attach、XSK、map 和 counter 状态。
 - `xdp doctor`：校验本地 runtime XDP 配置、eBPF 对象、权限和 proxy 能力。
 - `xdp attach` / `xdp detach` / `xdp reload`：按 `configs/runtime.yaml` 管理当前进程的 XDP attachment。
@@ -99,8 +99,9 @@ cloud-node upgrade --version v1.1.7 --github-base-url https://github.example.com
 - `data/cloud-node.pid`：后台进程 PID 文件。
 - `data/state.json`：部分运行状态持久化。
 - `data/cloud-node-xdp-ebpf.o`：`cargo xtask build-ebpf` 生成的 XDP eBPF 对象。
-- `data/blocked_ips.json`：旧版本地封禁快照，仅作为一次性迁移输入；迁移到 RocksDB 成功后会自动删除。
-- `data/metrics.db`：统计、缓存元数据和本地运行时防火墙封禁状态持久化。
+- `data/blocked_ips.json`：旧版本地封禁快照，仅作为一次性迁移输入；迁移到 Mace 成功后会自动删除。
+- `data/metrics.mace`：统计、缓存元数据和本地运行时防火墙封禁状态持久化。
+- `data/metrics.db`：旧版 RocksDB 数据库，仅在导入到 `metrics.mace` 时使用；参见 [存储迁移](mace-migration.md)。
 - `data/cache`：默认磁盘缓存目录。
 - `data/GeoLite2-City.mmdb`、`data/GeoLite2-ASN.mmdb`：GeoIP 数据库。
 - `logs/run.log`：节点运行日志；systemd 和内置后台模式都会追加写入。

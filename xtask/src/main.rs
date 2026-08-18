@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::Command;
 
+mod mace_migration;
+
 #[derive(Parser)]
 #[command(name = "xtask")]
 struct Cli {
@@ -18,12 +20,29 @@ enum Commands {
         #[arg(long, default_value = "release")]
         profile: String,
     },
+    /// Import a legacy RocksDB metrics database into a separate Mace directory.
+    MigrateMetricsToMace {
+        /// Existing RocksDB directory, typically data/metrics.db
+        #[arg(long)]
+        source: PathBuf,
+        /// New Mace directory, typically data/metrics.mace
+        #[arg(long)]
+        destination: PathBuf,
+        /// Maximum records committed per Mace transaction
+        #[arg(long, default_value_t = 512)]
+        batch_size: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::BuildEbpf { profile } => build_ebpf(&profile),
+        Commands::MigrateMetricsToMace {
+            source,
+            destination,
+            batch_size,
+        } => mace_migration::migrate_rocksdb_metrics(&source, &destination, batch_size),
     }
 }
 

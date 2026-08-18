@@ -319,7 +319,7 @@ enum Commands {
 enum FirewallCommands {
     /// Initialize nftables table, sets, chain and drop rules
     Init,
-    /// Clean expired local firewall block records from RocksDB
+    /// Clean expired local firewall block records from Mace
     Gc,
     /// List nftables and CloudNode blacklist entries
     List {

@@ -38,7 +38,7 @@ pub fn save_state(state: &PersistentState) -> std::io::Result<()> {
     atomic_write(&node_paths.state_file(), &content)
 }
 
-/// Legacy compatibility writer for pre-RocksDB firewall snapshots.
+/// Legacy compatibility writer for pre-Mace firewall snapshots.
 ///
 /// Runtime firewall state is persisted through `firewall::persistence`; new
 /// code should not call this as the source of truth.

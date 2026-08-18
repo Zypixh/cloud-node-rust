@@ -1028,6 +1028,9 @@ migrate_runtime_layout() {
         if [ -e "$source_dir/metrics.db" ] && [ ! -e "$INSTALL_DIR/data/metrics.db" ]; then
             run cp -a "$source_dir/metrics.db" "$INSTALL_DIR/data/metrics.db"
         fi
+        if [ -e "$source_dir/metrics.mace" ] && [ ! -e "$INSTALL_DIR/data/metrics.mace" ]; then
+            run cp -a "$source_dir/metrics.mace" "$INSTALL_DIR/data/metrics.mace"
+        fi
     done
 }
 

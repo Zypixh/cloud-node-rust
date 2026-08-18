@@ -143,6 +143,11 @@ jobs:
           shared-key: release-${{ matrix.name }}-${{ matrix.target }}-${{ matrix.cpu }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
           env-vars: "RUSTFLAGS CXXFLAGS CFLAGS"
+          cache-targets: false
+
+      - name: Clean target before build
+        shell: bash
+        run: cargo clean --target ${{ matrix.target }}
 
       - name: Build
         shell: bash
@@ -206,6 +211,13 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: cloud-node-rust-${{ matrix.name }}.tar.gz
+
+      - name: Clean build artifacts
+        if: always()
+        shell: bash
+        run: |
+          cargo clean --target ${{ matrix.target }} || true
+          cargo clean --manifest-path crates/cloud-node-xdp-ebpf/Cargo.toml --target bpfel-unknown-none || true
 
   release:
     name: Create Release

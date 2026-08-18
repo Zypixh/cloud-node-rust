@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __POD_NAME__
+  namespace: cloud-node-perf
+  labels:
+    app: cloud-node-perf-proxy
+    profile: __PROFILE__
+spec:
+  nodeName: hz-rke2-01
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: proxy
+      image: docker.io/library/debian:12-slim
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-lc"]
+      args: ["exec /opt/perf/__BINARY__"]
+      env:
+        - name: CLOUD_NODE_HOME
+          value: /var/lib/cloud-node
+        - name: RUST_LOG
+          value: error
+      ports:
+        - name: proxy
+          containerPort: 8080
+      resources:
+        requests:
+          cpu: "1"
+          memory: 512Mi
+        limits:
+          cpu: "4"
+          memory: 4Gi
+      volumeMounts:
+        - name: artifacts
+          mountPath: /opt/perf
+          readOnly: true
+        - name: node-data
+          mountPath: /var/lib/cloud-node
+    - name: origin
+      image: docker.io/library/busybox:1.36
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/sh", "-lc"]
+      args:
+        - >-
+          set -eu;
+          mkdir -p /srv;
+          dd if=/dev/zero of=/srv/1k.bin bs=1024 count=1 status=none;
+          dd if=/dev/zero of=/srv/64k.bin bs=1024 count=64 status=none;
+          dd if=/dev/zero of=/srv/1m.bin bs=1024 count=1024 status=none;
+          exec httpd -f -p 127.0.0.1:8081 -h /srv
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+  volumes:
+    - name: artifacts
+      hostPath:
+        path: /root/cloud-node-rust-test/perf-artifacts
+        type: Directory
+    - name: node-data
+      emptyDir: {}

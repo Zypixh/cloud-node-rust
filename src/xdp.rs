@@ -3048,7 +3048,8 @@ fn xdp_proxy_frame_size_detail(config: &XdpConfig) -> String {
         String::new()
     } else {
         format!(
-            "XDP proxy mode requires frameSize={} until jumbo/multi-buffer support is enabled: {}",
+            "XDP proxy mode requires standard-MTU frameSize<={}; currently only frameSize={} is supported until jumbo/multi-buffer support is enabled: {}",
+            cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE,
             cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE,
             invalid.join(",")
         )
@@ -4187,15 +4188,15 @@ mod linux {
     type LpmV4Image = std::collections::BTreeMap<(u32, u32), i64>;
     type LpmV6Image = std::collections::BTreeMap<(u32, [u8; 16]), i64>;
 
-    struct RuleMapImages {
-        allowed_v4: ExactV4Image,
-        allowed_v6: ExactV6Image,
-        blocked_v4: ExactV4Image,
-        blocked_v6: ExactV6Image,
-        allowed_v4_lpm: LpmV4Image,
-        allowed_v6_lpm: LpmV6Image,
-        blocked_v4_lpm: LpmV4Image,
-        blocked_v6_lpm: LpmV6Image,
+    pub(super) struct RuleMapImages {
+        pub(super) allowed_v4: ExactV4Image,
+        pub(super) allowed_v6: ExactV6Image,
+        pub(super) blocked_v4: ExactV4Image,
+        pub(super) blocked_v6: ExactV6Image,
+        pub(super) allowed_v4_lpm: LpmV4Image,
+        pub(super) allowed_v6_lpm: LpmV6Image,
+        pub(super) blocked_v4_lpm: LpmV4Image,
+        pub(super) blocked_v6_lpm: LpmV6Image,
     }
 
     // Must stay aligned with crates/cloud-node-xdp-ebpf map max_entries.
@@ -4350,7 +4351,7 @@ mod linux {
     }
 
     #[cfg(target_os = "linux")]
-    fn rule_map_images(state: &RuleState) -> RuleMapImages {
+    pub(super) fn rule_map_images(state: &RuleState) -> RuleMapImages {
         let (allowed_v4, allowed_v6) = exact_image(&state.allowed_ips);
         let (blocked_v4, blocked_v6) = exact_image(&state.blocked_ips);
         let (allowed_v4_lpm, allowed_v6_lpm) =
@@ -7777,8 +7778,8 @@ mod tests {
             allowed_ranges: Default::default(),
         };
 
-        let old_img = rule_map_images(&old_state);
-        let new_img = rule_map_images(&new_state);
+        let old_img = linux::rule_map_images(&old_state);
+        let new_img = linux::rule_map_images(&new_state);
 
         // Exact v4 blocked: 192.0.2.1 removed, 192.0.2.3 added, 192.0.2.2 kept (no-op)
         assert!(

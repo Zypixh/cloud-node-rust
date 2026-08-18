@@ -348,7 +348,7 @@
 - item 字段：`id`、`ip`、`ptr`、`clientAgent`
 - `clientAgent` 字段：`id`、`name`、`code`、`description`、`countIPs`
 - 实测样本：`clientAgent.code="sm"`，`ptr` 为 `shenmaspider-...crawl.sm.cn.` 形态
-- 应用：写入 RocksDB `CAIP_IP_{ip}` 与 `CAIP_META_last_id`，更新内存 verified-IP 索引。
+- 应用：写入 Mace `CAIP_IP_{ip}` 与 `CAIP_META_last_id`，更新内存 verified-IP 索引。
 
 ### ClientAgentIPService.CreateClientAgentIPs
 

@@ -426,14 +426,14 @@ impl Storage for FileStorage {
         };
 
         let Some(path) = self.find_existing_path_by_hash(&hash).await else {
-            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+            crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
             return Ok(None);
         };
 
         let file_size = match tokio::fs::metadata(&path).await {
             Ok(metadata) => metadata.len(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
                 return Ok(None);
             }
             Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -446,7 +446,7 @@ impl Storage for FileStorage {
                 file_size,
                 path.display()
             );
-            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+            crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
             return Ok(None);
         }
 
@@ -485,7 +485,7 @@ impl Storage for FileStorage {
                 let file_data = match tokio::fs::read(&path).await {
                     Ok(data) => data,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                        crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
                         return Ok(None);
                     }
                     Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -509,7 +509,7 @@ impl Storage for FileStorage {
             let file = match tokio::fs::File::open(&path).await {
                 Ok(file) => file,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                    crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
                     return Ok(None);
                 }
                 Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -539,7 +539,7 @@ impl Storage for FileStorage {
             let file_data = match tokio::fs::read(&path).await {
                 Ok(data) => data,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                        crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
                     return Ok(None);
                 }
                 Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -569,7 +569,7 @@ impl Storage for FileStorage {
         let file = match tokio::fs::File::open(&path).await {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
                 return Ok(None);
             }
             Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -730,7 +730,7 @@ impl Storage for FileStorage {
         let hash = format!("{:x}", md5_legacy::compute(key.user_tag.as_ref()));
         let inner = self.inner.load();
         remove_cache_file_from_roots(&inner, &hash).await;
-        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+        crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
         Ok(true)
     }
 
@@ -812,7 +812,7 @@ impl Storage for FileStorage {
                     .unwrap_or(0)
             });
         let created_at = existing.as_ref().map(|m| m.created_at).unwrap_or(now);
-        crate::metrics::storage::STORAGE.upsert_cache_meta_absolute(
+        crate::metrics::storage::STORAGE.upsert_cache_meta_absolute_async(
             crate::metrics::storage::CacheMetaUpsert {
                 hash: &hash,
                 cache_key: &k_str,
@@ -835,7 +835,8 @@ impl Storage for FileStorage {
                 stale_while_revalidate_secs: swr_secs,
                 created_at,
             },
-        );
+        )
+        .await;
 
         Ok(true)
     }
@@ -1104,7 +1105,7 @@ impl HandleMiss for FileMissHandler {
 
         let now = crate::utils::time::now_timestamp();
         let expires = now + self.ttl as i64;
-        crate::metrics::storage::STORAGE.upsert_cache_meta_absolute(
+        crate::metrics::storage::STORAGE.upsert_cache_meta_absolute_async(
             crate::metrics::storage::CacheMetaUpsert {
                 hash: &self.hash,
                 cache_key: &self.key_str,
@@ -1122,7 +1123,8 @@ impl HandleMiss for FileMissHandler {
                 stale_while_revalidate_secs: self.stale_while_revalidate_secs,
                 created_at: now,
             },
-        );
+        )
+        .await;
         negative_cache_remove(&self.key_str);
         index_surrogate_keys(&self.headers, &self.hash);
         crate::cluster::metadata::emit_upsert(crate::cluster::metadata::CacheMetaUpsertEvent {
@@ -1889,7 +1891,7 @@ impl HybridStorage {
         let hash = format!("{:x}", md5_legacy::compute(key));
         let inner = self.l2.inner.load();
         remove_cache_file_from_roots(&inner, &hash).await;
-        crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+        crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
         remove_hash_from_surrogate_index(&hash);
         self.l1.remove(key);
         bloom_remove(key);
@@ -2285,7 +2287,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, _disk_root: Pat
         // Execute: Delete expired files
         for hash in expired_hashes {
             remove_cache_file_from_roots(&inner, &hash).await;
-            crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+            crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
         }
 
         // Pass 2: Capacity eviction using Max-Heap if disk exceeds limits
@@ -2336,7 +2338,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, _disk_root: Pat
             for candidate in heap {
                 let hash = candidate.hash;
                 remove_cache_file_from_roots(&inner, &hash).await;
-                crate::metrics::storage::STORAGE.delete_cache_meta(&hash);
+                crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
             }
         }
     }

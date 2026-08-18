@@ -306,8 +306,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "firewall.gc_removed",
-        "firewall gc removed expired RocksDB records",
-        "防火墙 GC 已删除过期 RocksDB 记录",
+        "firewall gc removed expired Mace records",
+        "防火墙 GC 已删除过期 Mace 记录",
     ),
     (
         "firewall.title",
@@ -331,8 +331,8 @@ const STRINGS: &[(&str, &str, &str)] = &[
     ),
     (
         "firewall.expired_cleaned",
-        "expired RocksDB records cleaned",
-        "已清理过期 RocksDB 记录",
+        "expired Mace records cleaned",
+        "已清理过期 Mace 记录",
     ),
     (
         "firewall.no_entries",

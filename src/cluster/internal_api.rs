@@ -331,7 +331,7 @@ async fn handle_metadata_events(stream: &mut TcpStream, body: &[u8]) -> anyhow::
     }
     let count = events.len();
     for event in events {
-        crate::cluster::metadata::apply_remote_event(event);
+        crate::cluster::metadata::apply_remote_event(event).await;
     }
     write_response(stream, 200, json!({"ok":true,"count":count})).await
 }

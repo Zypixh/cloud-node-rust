@@ -71,7 +71,7 @@ zstd = "0.13.2"
 chrono = "0.4.39"
 hex = "0.4.3"
 woothee = "0.13.0"
-rust-rocksdb = { version = "0.50.0", features = ["lz4", "jemalloc"] }
+mace-kv = "=0.1.0"
 rand = "0.8"
 libinjectionrs = { path = "vendor/libinjectionrs" }
 libc = "0.2"

@@ -171,7 +171,7 @@ pub fn flush_pending() -> bool {
     }
     let ok = crate::metrics::storage::STORAGE.write_raw_batch(puts, delete_records.clone());
     if !ok {
-        warn!("failed to flush firewall block records to RocksDB");
+        warn!("failed to flush firewall block records to Mace");
         if let Ok(mut pending) = PENDING.lock() {
             for (key, record) in upsert_records {
                 if !pending.deletes.contains(&key) {
@@ -193,7 +193,9 @@ pub fn start_flush_task() {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let _ = flush_pending();
+            if let Err(err) = tokio::task::spawn_blocking(flush_pending).await {
+                warn!(error = %err, "firewall persistence worker failed");
+            }
         }
     });
 }
@@ -260,7 +262,7 @@ pub fn migrate_legacy_blocked_ips_once() -> usize {
     let migrated = puts.len().saturating_sub(1);
     if crate::metrics::storage::STORAGE.write_raw_batch(puts, Vec::new()) {
         if migrated > 0 {
-            debug!("migrated {} legacy blocked IP records to RocksDB", migrated);
+            debug!("migrated {} legacy blocked IP records to Mace", migrated);
         }
         let removed_files = remove_legacy_blocked_ips_files();
         if removed_files > 0 {
