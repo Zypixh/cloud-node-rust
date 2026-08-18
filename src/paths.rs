@@ -62,7 +62,7 @@ impl NodePaths {
     }
 
     pub fn metrics_db_dir(&self) -> PathBuf {
-        self.data_dir().join("metrics.db")
+        self.data_dir().join("metrics.mace")
     }
 
     pub fn xdp_state_file(&self) -> PathBuf {

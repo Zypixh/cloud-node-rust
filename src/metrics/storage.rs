@@ -1,6 +1,6 @@
 use dashmap::DashMap;
+use mace::{Bucket, BucketOptions, Mace, OpCode, Options};
 use maxminddb::{self, geoip2};
-use rust_rocksdb::{DB, IteratorMode, MergeOperands, Options, WriteBatch};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -10,68 +10,112 @@ use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tracing::error;
 
-/// A specialized storage engine for metrics based on RocksDB.
-pub struct MetricStorage {
-    db: Option<Arc<DB>>,
+const METRICS_BUCKET: &str = "metrics";
+
+struct StorageBackend {
+    _mace: Mace,
+    bucket: Bucket,
 }
 
-/// A simple sum operator for RocksDB merge
-fn sum_merge_operator(
-    _new_key: &[u8],
-    existing_value: Option<&[u8]>,
-    operands: &MergeOperands,
-) -> Option<Vec<u8>> {
-    let mut sum = existing_value
-        .and_then(|v| {
-            if v.len() == 8 {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(v);
-                Some(u64::from_be_bytes(buf))
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
+/// Embedded key-value storage for metrics and node metadata (Mace).
+pub struct MetricStorage {
+    backend: Option<Arc<StorageBackend>>,
+}
 
-    for op in operands {
-        if op.len() == 8 {
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(op);
-            sum = sum.saturating_add(u64::from_be_bytes(buf));
-        }
+fn parse_u64_be(bytes: &[u8]) -> u64 {
+    if bytes.len() == 8 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(bytes);
+        u64::from_be_bytes(buf)
+    } else {
+        0
     }
+}
 
-    Some(sum.to_be_bytes().to_vec())
+fn merge_u64_in_txn(txn: &mace::TxnKV<'_>, key: &[u8], delta: u64) -> Result<(), OpCode> {
+    let current = match txn.get(key) {
+        Ok(value) => parse_u64_be(value.slice()),
+        Err(OpCode::NotFound) => 0,
+        Err(err) => return Err(err),
+    };
+    txn.upsert(key, current.saturating_add(delta).to_be_bytes())
 }
 
 impl MetricStorage {
     pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_merge_operator_associative("sum", sum_merge_operator);
-        // Optimize for write-heavy metrics
-        opts.set_use_direct_io_for_flush_and_compaction(true);
-        opts.set_max_background_jobs(4);
-
-        match DB::open(&opts, path) {
-            Ok(db) => Ok(Self {
-                db: Some(Arc::new(db)),
-            }),
-            Err(e) => {
-                let err_msg = e.to_string();
-                if err_msg.contains("Resource temporarily unavailable") {
-                    error!(
-                        "RocksDB LOCK error: The database is already in use by another process."
-                    );
-                    error!("Please run 'pkill -9 cloud-node-rust' and then try again.");
-                }
-                Err(anyhow::anyhow!("Failed to open RocksDB: {}", e))
-            }
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+
+        let opts = Options::new(path).validate().map_err(mace_open_error)?;
+        let mace = Mace::new(opts).map_err(mace_open_error)?;
+        let bucket = mace
+            .new_bucket(METRICS_BUCKET, BucketOptions::default())
+            .or_else(|err| {
+                if err == OpCode::Exist {
+                    mace.get_bucket(METRICS_BUCKET)
+                } else {
+                    Err(err)
+                }
+            })
+            .map_err(mace_open_error)?;
+
+        Ok(Self {
+            backend: Some(Arc::new(StorageBackend {
+                _mace: mace,
+                bucket,
+            })),
+        })
     }
 
     pub fn unavailable() -> Self {
-        Self { db: None }
+        Self { backend: None }
+    }
+
+    fn bucket(&self) -> Option<&Bucket> {
+        self.backend.as_ref().map(|backend| &backend.bucket)
+    }
+
+    fn read<F, T>(&self, f: F) -> Option<T>
+    where
+        F: FnOnce(&mace::TxnView<'_>) -> Result<T, OpCode>,
+    {
+        let bucket = self.bucket()?;
+        let view = bucket.view().ok()?;
+        f(&view).ok()
+    }
+
+    fn write<F>(&self, f: F) -> bool
+    where
+        F: FnOnce(&mace::TxnKV<'_>) -> Result<(), OpCode>,
+    {
+        let Some(bucket) = self.bucket() else {
+            return false;
+        };
+        let Ok(txn) = bucket.begin() else {
+            return false;
+        };
+        if f(&txn).is_err() {
+            return false;
+        }
+        txn.commit().is_ok()
+    }
+
+    fn get_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.read(|view| view.get(key).map(|value| value.to_vec()))
+    }
+
+    fn put_raw(&self, key: &[u8], value: &[u8]) -> bool {
+        self.write(|txn| txn.upsert(key, value))
+    }
+
+    fn delete_raw(&self, key: &[u8]) -> bool {
+        self.write(|txn| match txn.del(key) {
+            Ok(()) => Ok(()),
+            Err(OpCode::NotFound) => Ok(()),
+            Err(err) => Err(err),
+        })
     }
 
     pub fn record_server_batch(
@@ -81,148 +125,163 @@ impl MetricStorage {
         node_sent: u64,
         node_received: u64,
     ) {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return;
         };
-        let mut batch = WriteBatch::default();
+        let Ok(txn) = bucket.begin() else {
+            return;
+        };
 
         for u in updates {
             let prefix = format!("S{}_T{}", u.server_id, period);
 
-            // Store delta-based counters using merge operator
-            batch.merge(
-                format!("{}_req", prefix).as_bytes(),
-                u.total_requests.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_sent", prefix).as_bytes(),
-                u.bytes_sent.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_recv", prefix).as_bytes(),
-                u.bytes_received.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_cached_sent", prefix).as_bytes(),
-                u.cached_bytes.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_cached_req", prefix).as_bytes(),
-                u.count_cached_requests.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_attack_req", prefix).as_bytes(),
-                u.count_attack_requests.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_attack_sent", prefix).as_bytes(),
-                u.attack_bytes.to_be_bytes(),
-            );
+            for (suffix, delta) in [
+                ("req", u.total_requests),
+                ("sent", u.bytes_sent),
+                ("recv", u.bytes_received),
+                ("cached_sent", u.cached_bytes),
+                ("cached_req", u.count_cached_requests),
+                ("attack_req", u.count_attack_requests),
+                ("attack_sent", u.attack_bytes),
+            ] {
+                let key = format!("{prefix}_{suffix}");
+                if merge_u64_in_txn(&txn, key.as_bytes(), delta).is_err() {
+                    return;
+                }
+            }
 
-            // Store gauge values using put
-            batch.put(
-                format!("{}_conns", prefix).as_bytes(),
-                u.active_connections.to_be_bytes(),
-            );
-            batch.put(
-                format!("{}_ips", prefix).as_bytes(),
-                u.count_ips.to_be_bytes(),
-            );
+            if txn
+                .upsert(
+                    format!("{prefix}_conns").as_bytes(),
+                    u.active_connections.to_be_bytes(),
+                )
+                .is_err()
+            {
+                return;
+            }
+            if txn
+                .upsert(
+                    format!("{prefix}_ips").as_bytes(),
+                    u.count_ips.to_be_bytes(),
+                )
+                .is_err()
+            {
+                return;
+            }
         }
 
-        let node_prefix = format!("NODE_T{}", period);
-        batch.merge(
-            format!("{}_sent", node_prefix).as_bytes(),
-            node_sent.to_be_bytes(),
-        );
-        batch.merge(
-            format!("{}_recv", node_prefix).as_bytes(),
-            node_received.to_be_bytes(),
-        );
+        let node_prefix = format!("NODE_T{period}");
+        if merge_u64_in_txn(&txn, format!("{node_prefix}_sent").as_bytes(), node_sent).is_err() {
+            return;
+        }
+        if merge_u64_in_txn(
+            &txn,
+            format!("{node_prefix}_recv").as_bytes(),
+            node_received,
+        )
+        .is_err()
+        {
+            return;
+        }
 
-        let _ = db.write(&batch);
+        let _ = txn.commit();
     }
 
     /// Increments multiple counters in a single atomic batch.
     pub fn increment_batch(&self, updates: Vec<(String, u64)>) {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return;
         };
-        let mut batch = WriteBatch::default();
+        let Ok(txn) = bucket.begin() else {
+            return;
+        };
         for (key, delta) in updates {
-            batch.merge(key.as_bytes(), delta.to_be_bytes());
+            if merge_u64_in_txn(&txn, key.as_bytes(), delta).is_err() {
+                return;
+            }
         }
-        let _ = db.write(&batch);
+        let _ = txn.commit();
     }
 
     /// Deletes all data older than a specific timestamp.
     pub fn cleanup_old_stats(&self, older_than_timestamp: i64) {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return;
         };
-        // RocksDB delete_range is often CF-specific or version-dependent in the Rust wrapper.
-        // For maximum compatibility across environments, we use a scan-and-delete approach for small ranges,
-        // or a WriteBatch with delete_range if available.
-        let mut batch = WriteBatch::default();
-        let end_prefix = format!("S0_T{}", older_than_timestamp);
-        // We use a manual scan and delete for now to ensure compatibility
-        let iter = db.iterator(IteratorMode::Start);
-        for (key, _) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
-            if (key_str.starts_with("S") && &*key_str < end_prefix.as_str())
-                || (key_str.starts_with("NODE_T")
-                    && &*key_str < format!("NODE_T{}", older_than_timestamp).as_str())
-            {
-                batch.delete(&key);
-            } else if &*key_str >= "Z" {
-                break;
+        let Ok(view) = bucket.view() else {
+            return;
+        };
+        let Ok(txn) = bucket.begin() else {
+            return;
+        };
+
+        let end_prefix = format!("S0_T{older_than_timestamp}");
+        let node_end_prefix = format!("NODE_T{older_than_timestamp}");
+
+        for prefix in ["S", "NODE_T"] {
+            let end = if prefix == "S" {
+                end_prefix.as_str()
+            } else {
+                node_end_prefix.as_str()
+            };
+            for item in view.seek(prefix) {
+                let key = item.key();
+                let key_str = match std::str::from_utf8(key) {
+                    Ok(key_str) => key_str,
+                    Err(_) => continue,
+                };
+                if !key_str.starts_with(prefix) {
+                    break;
+                }
+                if key_str >= end {
+                    break;
+                }
+                if txn.del(key).is_err() {
+                    return;
+                }
             }
         }
-        let _ = db.write(&batch);
+
+        let _ = txn.commit();
     }
 
     pub fn put_json<T: Serialize>(&self, key: &str, value: &T) -> bool {
-        let Some(db) = &self.db else {
-            return false;
-        };
         match serde_json::to_vec(value) {
-            Ok(bytes) => db.put(key.as_bytes(), bytes).is_ok(),
+            Ok(bytes) => self.put_raw(key.as_bytes(), &bytes),
             Err(_) => false,
         }
     }
 
     pub fn get_json<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
-        let Some(db) = &self.db else {
-            return None;
-        };
-        db.get(key.as_bytes())
-            .ok()
-            .flatten()
+        self.get_raw(key.as_bytes())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
     }
 
     pub fn record_unique_ip(&self, server_id: i64, day: &str, ip: IpAddr) {
-        let Some(db) = &self.db else {
-            return;
-        };
         if server_id <= 0 || day.is_empty() {
             return;
         }
-        let _ = db.put(unique_ip_key(server_id, day, ip).as_bytes(), []);
+        let _ = self.put_raw(unique_ip_key(server_id, day, ip).as_bytes(), &[]);
     }
 
     pub fn load_unique_ips(&self, min_day: &str) -> Vec<(i64, String, IpAddr)> {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return Vec::new();
         };
+        let Ok(view) = bucket.view() else {
+            return Vec::new();
+        };
+
         let mut rows = Vec::new();
-        let iter = db.prefix_iterator("UIP_".as_bytes());
-        for (key, _) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
+        for item in view.seek("UIP_") {
+            let key_str = match std::str::from_utf8(item.key()) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with("UIP_") {
                 break;
             }
-            if let Some((server_id, day, ip)) = parse_unique_ip_key(&key_str)
+            if let Some((server_id, day, ip)) = parse_unique_ip_key(key_str)
                 && day.as_str() >= min_day
             {
                 rows.push((server_id, day, ip));
@@ -232,23 +291,34 @@ impl MetricStorage {
     }
 
     pub fn cleanup_unique_ips_before(&self, min_day: &str) {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return;
         };
-        let mut batch = WriteBatch::default();
-        let iter = db.prefix_iterator("UIP_".as_bytes());
-        for (key, _) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
+        let Ok(view) = bucket.view() else {
+            return;
+        };
+        let Ok(txn) = bucket.begin() else {
+            return;
+        };
+
+        for item in view.seek("UIP_") {
+            let key = item.key();
+            let key_str = match std::str::from_utf8(key) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with("UIP_") {
                 break;
             }
-            if let Some((_, day, _)) = parse_unique_ip_key(&key_str)
+            if let Some((_, day, _)) = parse_unique_ip_key(key_str)
                 && day.as_str() < min_day
+                && txn.del(key).is_err()
             {
-                batch.delete(&key);
+                return;
             }
         }
-        let _ = db.write(&batch);
+
+        let _ = txn.commit();
     }
 
     /// Cache Metadata Management
@@ -304,53 +374,46 @@ impl MetricStorage {
         CACHE_META_INDEX.insert(upsert.hash.to_string(), meta.clone());
         crate::cache_hybrid::index_surrogate_keys(&meta.headers, upsert.hash);
         crate::cache_hybrid::on_cache_meta_upsert(&meta);
-        let Some(db) = &self.db else {
-            return;
-        };
-        let _ = db.put(
-            format!("CMETA_{}", upsert.hash).as_bytes(),
+        let db_key = format!("CMETA_{}", upsert.hash);
+        let _ = self.put_raw(
+            db_key.as_bytes(),
             cache_meta_json(&meta).to_string().as_bytes(),
         );
     }
 
-    /// Records a cache access in memory only — no RocksDB I/O on the hot path.
-    /// Access timestamps and counts are flushed to RocksDB periodically by the background task.
+    /// Records a cache access in memory only — no storage I/O on the hot path.
     pub fn record_cache_access(&self, hash: &str) {
         record_cache_access_memory(hash);
     }
 
-    /// Flush in-memory access logs to RocksDB. Called by background task every 30s.
+    /// Flush in-memory access logs to storage. Called by background task every 30s.
     pub fn flush_cache_accesses(&self) {
-        let Some(db) = &self.db else {
-            return;
-        };
-        if CACHE_ACCESS_LOG.is_empty() {
+        if self.bucket().is_none() || CACHE_ACCESS_LOG.is_empty() {
             return;
         }
-        let mut batch = WriteBatch::default();
-        for entry in CACHE_ACCESS_LOG.iter() {
-            let hash = entry.key();
-            let (access_ts, access_cnt) = entry.value();
-            let cnt = access_cnt.swap(0, Ordering::Relaxed);
-            let ts = access_ts.load(Ordering::Relaxed);
-            if cnt == 0 {
-                continue;
+
+        let _ = self.write(|txn| {
+            for entry in CACHE_ACCESS_LOG.iter() {
+                let hash = entry.key();
+                let (access_ts, access_cnt) = entry.value();
+                let cnt = access_cnt.swap(0, Ordering::Relaxed);
+                let ts = access_ts.load(Ordering::Relaxed);
+                if cnt == 0 {
+                    continue;
+                }
+                if let Some(mut meta) = CACHE_META_INDEX.get(hash).map(|v| v.clone()) {
+                    meta.access_time = ts;
+                    meta.access_count += cnt;
+                    CACHE_META_INDEX.insert(hash.clone(), meta.clone());
+                    let db_key = format!("CMETA_{hash}");
+                    txn.upsert(
+                        db_key.as_bytes(),
+                        cache_meta_json(&meta).to_string().as_bytes(),
+                    )?;
+                }
             }
-            // Read from in-memory index, update, write back to both memory and RocksDB
-            if let Some(mut meta) = CACHE_META_INDEX.get(hash).map(|v| v.clone()) {
-                meta.access_time = ts;
-                meta.access_count += cnt;
-                // Write back to in-memory index so eviction/stats see updated access time
-                CACHE_META_INDEX.insert(hash.clone(), meta.clone());
-                // Persist to RocksDB
-                let db_key = format!("CMETA_{}", hash);
-                batch.put(
-                    db_key.as_bytes(),
-                    cache_meta_json(&meta).to_string().as_bytes(),
-                );
-            }
-        }
-        let _ = db.write(&batch);
+            Ok(())
+        });
     }
 
     pub fn get_cache_meta(&self, hash: &str) -> Option<CacheMetaEntry> {
@@ -363,28 +426,29 @@ impl MetricStorage {
             crate::cache_hybrid::on_cache_meta_delete(&meta.cache_key);
         }
         crate::cache_hybrid::remove_hash_from_surrogate_index(hash);
-        // Also drop the access-log entry — otherwise CACHE_ACCESS_LOG keeps
-        // growing across the lifetime of the node every time a cache entry is
-        // purged or expired (DashMap shards never shrink on their own).
         CACHE_ACCESS_LOG.remove(hash);
-        let Some(db) = &self.db else {
-            return;
-        };
-        let _ = db.delete(format!("CMETA_{}", hash).as_bytes());
+        let db_key = format!("CMETA_{hash}");
+        let _ = self.delete_raw(db_key.as_bytes());
     }
 
     pub fn load_client_agent_ips(&self) -> Vec<crate::client_agent::ClientAgentIpRecord> {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return Vec::new();
         };
+        let Ok(view) = bucket.view() else {
+            return Vec::new();
+        };
+
         let mut records = Vec::new();
-        let iter = db.prefix_iterator("CAIP_IP_".as_bytes());
-        for (key, val) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
+        for item in view.seek("CAIP_IP_") {
+            let key_str = match std::str::from_utf8(item.key()) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with("CAIP_IP_") {
                 break;
             }
-            if let Some(record) = client_agent_ip_record_from_slice(&val) {
+            if let Some(record) = client_agent_ip_record_from_slice(item.val()) {
                 records.push(record);
             }
         }
@@ -392,33 +456,24 @@ impl MetricStorage {
     }
 
     pub fn get_client_agent_last_id(&self) -> i64 {
-        let Some(db) = &self.db else {
-            return 0;
-        };
-        db.get("CAIP_META_last_id".as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|v| {
-                if v.len() == 8 {
+        self.get_raw(b"CAIP_META_last_id")
+            .map(|value| {
+                if value.len() == 8 {
                     let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&v);
-                    Some(i64::from_be_bytes(buf))
+                    buf.copy_from_slice(&value);
+                    i64::from_be_bytes(buf)
                 } else {
-                    None
+                    0
                 }
             })
             .unwrap_or(0)
     }
 
     pub fn save_client_agent_ip(&self, record: &crate::client_agent::ClientAgentIpRecord) -> bool {
-        let Some(db) = &self.db else {
-            return true;
-        };
-        db.put(
+        self.put_raw(
             client_agent_ip_key(&record.ip).as_bytes(),
             client_agent_ip_json(record).to_string().as_bytes(),
         )
-        .is_ok()
     }
 
     pub fn save_client_agent_ip_batch(
@@ -426,49 +481,37 @@ impl MetricStorage {
         records: &[crate::client_agent::ClientAgentIpRecord],
         last_id: i64,
     ) -> bool {
-        let Some(db) = &self.db else {
-            return true;
-        };
-        let mut batch = WriteBatch::default();
-        for record in records {
-            batch.put(
-                client_agent_ip_key(&record.ip).as_bytes(),
-                client_agent_ip_json(record).to_string().as_bytes(),
-            );
-        }
-        batch.put("CAIP_META_last_id".as_bytes(), last_id.to_be_bytes());
-        db.write(&batch).is_ok()
+        self.write(|txn| {
+            for record in records {
+                txn.upsert(
+                    client_agent_ip_key(&record.ip).as_bytes(),
+                    client_agent_ip_json(record).to_string().as_bytes(),
+                )?;
+            }
+            txn.upsert(b"CAIP_META_last_id", last_id.to_be_bytes())
+        })
     }
 
     /// WAF Token Persistence
     pub fn save_waf_token(&self, token: &str, ip: &str, ua_hash: &str, expired_at: u64) {
-        let Some(db) = &self.db else {
-            return;
-        };
         let val = serde_json::json!({
             "ip": ip,
             "ua": ua_hash,
             "exp": expired_at
         });
-        let _ = db.put(
-            format!("WAFTOK_{}", token).as_bytes(),
+        let _ = self.put_raw(
+            format!("WAFTOK_{token}").as_bytes(),
             val.to_string().as_bytes(),
         );
     }
 
     pub fn get_waf_token(&self, token: &str) -> Option<serde_json::Value> {
-        let db = self.db.as_ref()?;
-        db.get(format!("WAFTOK_{}", token).as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_slice(&v).ok())
+        self.get_raw(format!("WAFTOK_{token}").as_bytes())
+            .and_then(|value| serde_json::from_slice(&value).ok())
     }
 
     pub fn delete_waf_token(&self, token: &str) {
-        let Some(db) = &self.db else {
-            return;
-        };
-        let _ = db.delete(format!("WAFTOK_{}", token).as_bytes());
+        let _ = self.delete_raw(format!("WAFTOK_{token}").as_bytes());
     }
 
     pub fn total_cache_size(&self) -> u64 {
@@ -489,67 +532,57 @@ impl MetricStorage {
     }
 
     pub fn get_value(&self, key: &str) -> u64 {
-        let Some(db) = &self.db else {
-            return 0;
-        };
-        db.get(key.as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|v| {
-                if v.len() == 8 {
-                    let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&v);
-                    Some(u64::from_be_bytes(buf))
-                } else {
-                    None
-                }
-            })
+        self.get_raw(key.as_bytes())
+            .map(|value| parse_u64_be(&value))
             .unwrap_or(0)
     }
 
     pub fn delete_key(&self, key: &str) {
-        let Some(db) = &self.db else {
-            return;
-        };
-        let _ = db.delete(key.as_bytes());
+        let _ = self.delete_raw(key.as_bytes());
     }
 
     pub fn write_raw_batch(&self, puts: Vec<(String, Vec<u8>)>, deletes: Vec<String>) -> bool {
-        let Some(db) = &self.db else {
-            return false;
-        };
         if puts.is_empty() && deletes.is_empty() {
-            return true;
+            return self.backend.is_some();
         }
-        let mut batch = WriteBatch::default();
-        for (key, value) in puts {
-            batch.put(key.as_bytes(), value);
-        }
-        for key in deletes {
-            batch.delete(key.as_bytes());
-        }
-        db.write(&batch).is_ok()
+        self.write(|txn| {
+            for (key, value) in puts {
+                txn.upsert(key.as_bytes(), value)?;
+            }
+            for key in deletes {
+                match txn.del(key.as_bytes()) {
+                    Ok(()) | Err(OpCode::NotFound) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(())
+        })
     }
 
     pub fn scan_json_prefix<T: DeserializeOwned>(&self, prefix: &str) -> Vec<(String, T)> {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return Vec::new();
         };
+        let Ok(view) = bucket.view() else {
+            return Vec::new();
+        };
+
         let mut results = Vec::new();
-        let iter = db.prefix_iterator(prefix.as_bytes());
-        for (key, val) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key).to_string();
+        for item in view.seek(prefix) {
+            let key_str = match std::str::from_utf8(item.key()) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with(prefix) {
                 break;
             }
-            if let Ok(value) = serde_json::from_slice::<T>(&val) {
-                results.push((key_str, value));
+            if let Ok(value) = serde_json::from_slice::<T>(item.val()) {
+                results.push((key_str.to_string(), value));
             }
         }
         results
     }
 
-    /// Iterates over all cache metadata efficiently using a closure.
     pub fn for_each_cache_meta<F>(&self, mut f: F)
     where
         F: FnMut(String, &CacheMetaEntry),
@@ -559,7 +592,6 @@ impl MetricStorage {
         }
     }
 
-    /// Scans all cache metadata, returning a vector of (hash, metadata)
     pub fn scan_all_cache_meta(&self) -> Vec<(String, CacheMetaEntry)> {
         CACHE_META_INDEX
             .iter()
@@ -567,26 +599,34 @@ impl MetricStorage {
             .collect()
     }
 
-    /// Scans keys with a prefix, useful for extracting metrics for a specific server or period.
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, u64)> {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return Vec::new();
         };
+        let Ok(view) = bucket.view() else {
+            return Vec::new();
+        };
+
         let mut results = Vec::new();
-        let iter = db.prefix_iterator(prefix.as_bytes());
-        for (key, val) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key).to_string();
+        for item in view.seek(prefix) {
+            let key_str = match std::str::from_utf8(item.key()) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with(prefix) {
                 break;
             }
+            let val = item.val();
             if val.len() == 8 {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&val);
-                results.push((key_str, u64::from_be_bytes(buf)));
+                results.push((key_str.to_string(), parse_u64_be(val)));
             }
         }
         results
     }
+}
+
+fn mace_open_error(err: OpCode) -> anyhow::Error {
+    anyhow::anyhow!("Failed to open Mace storage: {err:?}")
 }
 
 pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
@@ -594,41 +634,29 @@ pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
     let path = if let Some(config) = crate::runtime_mode::RuntimeConfig::current()
         && config.is_rke2()
     {
-        let path = config.cluster.cache.local_meta_dir.join("metrics.db");
+        let path = config.cluster.cache.local_meta_dir.join("metrics.mace");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         path
     } else {
-        let canonical = node_paths.metrics_db_dir();
-        if !canonical.exists() && node_paths.legacy_metrics_db_dir().exists() {
-            let legacy = node_paths.legacy_metrics_db_dir();
-            tracing::warn!(
-                "Using legacy metrics database path {}. New deployments should use {}.",
-                legacy.display(),
-                canonical.display()
-            );
-            legacy
-        } else {
-            let _ = std::fs::create_dir_all(node_paths.data_dir());
-            canonical
-        }
+        let _ = std::fs::create_dir_all(node_paths.data_dir());
+        node_paths.metrics_db_dir()
     };
     match MetricStorage::open(&path) {
         Ok(storage) => storage,
         Err(err) => {
             error!(
-                "Failed to open RocksDB for metrics at {}, metrics storage disabled: {}",
+                "Failed to open Mace storage at {}, metrics storage disabled: {}",
                 path.display(),
                 err
             );
+            error!("If another process holds the store, stop it before restarting.");
             MetricStorage::unavailable()
         }
     }
 });
 
-/// In-memory cache access tracker: hash → (last_access_timestamp, access_count)
-/// Eliminates synchronous RocksDB I/O from the cache HIT hot path.
 static CACHE_ACCESS_LOG: Lazy<DashMap<String, (AtomicI64, AtomicU64)>> = Lazy::new(DashMap::new);
 
 pub struct CacheMetaUpsert<'a> {
@@ -645,13 +673,10 @@ pub struct CacheMetaUpsert<'a> {
     pub relative_path: Option<&'a str>,
     pub event_version: Option<u64>,
     pub updated_at: Option<i64>,
-    /// Value parsed from `Cache-Control: stale-while-revalidate=N` (0 = not set).
     pub stale_while_revalidate_secs: u64,
-    /// Unix timestamp when this entry was first created.
     pub created_at: i64,
 }
 
-/// Typed cache metadata — avoids per-lookup JSON clone/parse overhead.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheMetaEntry {
     pub cache_key: String,
@@ -670,17 +695,12 @@ pub struct CacheMetaEntry {
     pub event_version: Option<u64>,
     #[serde(default)]
     pub updated_at: i64,
-    /// Seconds from `expires` during which the stale entry may be served while
-    /// a background revalidation is in flight (RFC 5861 stale-while-revalidate).
     #[serde(default)]
     pub stale_while_revalidate_secs: u64,
-    /// Unix timestamp when this entry was first created (used for weak ETag generation).
     #[serde(default)]
     pub created_at: i64,
 }
 
-/// In-memory cache metadata index: hash → typed metadata.
-/// All cache lookups read from here, eliminating synchronous RocksDB reads on the hot path.
 static CACHE_META_INDEX: Lazy<DashMap<String, CacheMetaEntry>> = Lazy::new(DashMap::new);
 
 pub(crate) fn normalize_cache_status(status: u16) -> u16 {
@@ -718,7 +738,7 @@ fn cache_meta_json(meta: &CacheMetaEntry) -> serde_json::Value {
 }
 
 fn client_agent_ip_key(ip: &str) -> String {
-    format!("CAIP_IP_{}", ip)
+    format!("CAIP_IP_{ip}")
 }
 
 fn client_agent_ip_json(record: &crate::client_agent::ClientAgentIpRecord) -> serde_json::Value {
@@ -747,7 +767,7 @@ fn client_agent_ip_record_from_slice(
 }
 
 fn unique_ip_key(server_id: i64, day: &str, ip: IpAddr) -> String {
-    format!("UIP_{}_{}_{}", day, server_id, ip)
+    format!("UIP_{day}_{server_id}_{ip}")
 }
 
 fn parse_unique_ip_key(key: &str) -> Option<(i64, String, IpAddr)> {
@@ -783,22 +803,27 @@ pub fn delete_cache_meta_for_test(hash: &str) {
     CACHE_ACCESS_LOG.remove(hash);
 }
 
-/// Load all existing cache metadata from RocksDB into the in-memory index at startup.
 pub fn load_cache_meta_index() {
-    let Some(db) = &STORAGE.db else {
+    let Some(bucket) = STORAGE.bucket() else {
         return;
     };
+    let Ok(view) = bucket.view() else {
+        return;
+    };
+
     let mut count = 0;
-    let iter = db.prefix_iterator("CMETA_".as_bytes());
-    for (key, val) in iter.flatten() {
-        let key_str = String::from_utf8_lossy(&key);
+    for item in view.seek("CMETA_") {
+        let key_str = match std::str::from_utf8(item.key()) {
+            Ok(key_str) => key_str,
+            Err(_) => continue,
+        };
         if !key_str.starts_with("CMETA_") {
             break;
         }
-        if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&val) {
+        if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(item.val()) {
             let hash = key_str
                 .strip_prefix("CMETA_")
-                .unwrap_or(&key_str)
+                .unwrap_or(key_str)
                 .to_string();
             let headers: Vec<(String, String)> = raw
                 .get("h")
@@ -833,12 +858,10 @@ pub fn load_cache_meta_index() {
             count += 1;
         }
     }
-    tracing::info!("Loaded {} cache metadata entries into memory", count);
+    tracing::info!("Loaded {count} cache metadata entries into memory");
 }
 
-/// Start a background task that flushes in-memory cache access logs to RocksDB every 30 seconds.
 pub fn start_cache_access_flusher() {
-    // Load existing metadata into memory first
     load_cache_meta_index();
     crate::cache_hybrid::warm_admission_filters_from_cache_meta();
     tokio::spawn(async {
@@ -892,6 +915,8 @@ pub fn lookup_region_provider_id(ip: IpAddr) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{normalize_cache_status, parse_cache_status, parse_unique_ip_key, unique_ip_key};
+    use super::{MetricStorage, CacheMetaUpsert};
+    use std::net::IpAddr;
 
     #[test]
     fn cache_status_normalization_rejects_invalid_http_codes() {
@@ -915,5 +940,57 @@ mod tests {
             assert_eq!(parsed.1, "20260621");
             assert_eq!(parsed.2.to_string(), ip);
         }
+    }
+
+    #[test]
+    fn mace_storage_round_trip_and_prefix_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "cloud-node-mace-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = MetricStorage::open(&dir).expect("open mace storage");
+
+        assert!(storage.put_json("FWBLK_META_test", &true));
+        assert_eq!(storage.get_json::<bool>("FWBLK_META_test"), Some(true));
+
+        storage.increment_batch(vec![("counter_a".to_string(), 10), ("counter_a".to_string(), 5)]);
+        assert_eq!(storage.get_value("counter_a"), 15);
+
+        storage.write_raw_batch(
+            vec![(
+                "FWBLK_V1_global_0_192.0.2.1".to_string(),
+                br#"{"target":"192.0.2.1"}"#.to_vec(),
+            )],
+            Vec::new(),
+        );
+        let scanned = storage.scan_json_prefix::<serde_json::Value>("FWBLK_V1_");
+        assert_eq!(scanned.len(), 1);
+
+        storage.upsert_cache_meta_absolute(CacheMetaUpsert {
+            hash: "abc123",
+            cache_key: "/index.html",
+            size: 1024,
+            expires: 999_999,
+            access_time: 1,
+            access_count: 1,
+            status: 200,
+            headers: &[],
+            compressed: false,
+            shard_id: None,
+            relative_path: None,
+            event_version: None,
+            updated_at: Some(1),
+            stale_while_revalidate_secs: 0,
+            created_at: 1,
+        });
+        assert!(storage.get_cache_meta("abc123").is_some());
+
+        storage.record_unique_ip(1, "20260818", "203.0.113.9".parse::<IpAddr>().unwrap());
+        let ips = storage.load_unique_ips("20260818");
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0].0, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
