@@ -1103,6 +1103,7 @@ mod tests {
         assert_eq!(ips.len(), 1);
         assert_eq!(ips[0].0, 1);
 
+        drop(storage);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
