@@ -160,6 +160,10 @@ harness = false
 name = "targeted_hotspots_bench"
 harness = false
 
+[[bench]]
+name = "storage_bench"
+harness = false
+
 [build-dependencies]
 tonic-prost-build = "0.14.6"
 
