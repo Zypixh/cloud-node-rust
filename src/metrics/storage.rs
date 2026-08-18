@@ -1,8 +1,10 @@
+use crate::rpc::metrics::ServerMetricUpdate;
 use dashmap::DashMap;
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options};
 use maxminddb::{self, geoip2};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -11,10 +13,99 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tracing::error;
 
 const METRICS_BUCKET: &str = "metrics";
+pub const SERVER_PERIOD_BYTES: usize = 72;
+pub const NODE_PERIOD_BYTES: usize = 16;
 
 struct StorageBackend {
     _mace: Mace,
     bucket: Bucket,
+    counters: DashMap<String, u64>,
+}
+
+/// Open options shared by production `MetricStorage` and comparison benches.
+pub fn mace_metrics_options(path: impl AsRef<Path>) -> Options {
+    let mut opts = Options::new(path);
+    // Match the previous RocksDB default (`WriteOptions.sync = false`).
+    opts.sync_on_write = false;
+    opts
+}
+
+/// Bucket policy for metrics/firewall/cache metadata.
+pub fn mace_metrics_bucket_options() -> BucketOptions {
+    let mut opts = BucketOptions::default();
+    // Metrics commits are small and already coalesced; foreground backpressure
+    // only adds latency on the flush path.
+    opts.enable_backpressure = false;
+    opts
+}
+
+pub fn server_period_key(server_id: i64, period: i64) -> String {
+    format!("S{server_id}_T{period}")
+}
+
+pub fn node_period_key(period: i64) -> String {
+    format!("NODE_T{period}")
+}
+
+pub fn fold_counter_deltas(updates: Vec<(String, u64)>) -> Vec<(String, u64)> {
+    let mut merged: HashMap<String, u64> = HashMap::with_capacity(updates.len());
+    for (key, delta) in updates {
+        if delta == 0 {
+            continue;
+        }
+        let entry = merged.entry(key).or_insert(0);
+        *entry = (*entry).saturating_add(delta);
+    }
+    merged.into_iter().collect()
+}
+
+fn add_u64_be(buf: &mut [u8], offset: usize, delta: u64) {
+    let current = parse_u64_be(&buf[offset..offset + 8]);
+    buf[offset..offset + 8].copy_from_slice(&current.saturating_add(delta).to_be_bytes());
+}
+
+/// Packs one server's 5-minute counters into a single value so Mace does one
+/// get+upsert per server instead of nine merge-style RMW operations.
+pub fn apply_server_period_update(
+    existing: Option<&[u8]>,
+    update: &ServerMetricUpdate,
+) -> [u8; SERVER_PERIOD_BYTES] {
+    let mut buf = [0u8; SERVER_PERIOD_BYTES];
+    if let Some(existing) = existing.filter(|value| value.len() == SERVER_PERIOD_BYTES) {
+        buf.copy_from_slice(existing);
+    }
+    add_u64_be(&mut buf, 0, update.total_requests);
+    add_u64_be(&mut buf, 8, update.bytes_sent);
+    add_u64_be(&mut buf, 16, update.bytes_received);
+    add_u64_be(&mut buf, 24, update.cached_bytes);
+    add_u64_be(&mut buf, 32, update.count_cached_requests);
+    add_u64_be(&mut buf, 40, update.count_attack_requests);
+    add_u64_be(&mut buf, 48, update.attack_bytes);
+    buf[56..64].copy_from_slice(&update.active_connections.to_be_bytes());
+    buf[64..72].copy_from_slice(&update.count_ips.to_be_bytes());
+    buf
+}
+
+pub fn apply_node_period_deltas(
+    existing: Option<&[u8]>,
+    sent: u64,
+    received: u64,
+) -> [u8; NODE_PERIOD_BYTES] {
+    let mut buf = [0u8; NODE_PERIOD_BYTES];
+    if let Some(existing) = existing.filter(|value| value.len() == NODE_PERIOD_BYTES) {
+        buf.copy_from_slice(existing);
+    }
+    add_u64_be(&mut buf, 0, sent);
+    add_u64_be(&mut buf, 8, received);
+    buf
+}
+
+fn txn_get_slice(txn: &mace::TxnKV<'_>, key: &[u8]) -> Result<Option<Vec<u8>>, OpCode> {
+    match txn.get(key) {
+        Ok(value) => Ok(Some(value.to_vec())),
+        Err(OpCode::NotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 /// Embedded key-value storage for metrics and node metadata (Mace).
@@ -32,15 +123,6 @@ fn parse_u64_be(bytes: &[u8]) -> u64 {
     }
 }
 
-fn merge_u64_in_txn(txn: &mace::TxnKV<'_>, key: &[u8], delta: u64) -> Result<(), OpCode> {
-    let current = match txn.get(key) {
-        Ok(value) => parse_u64_be(value.slice()),
-        Err(OpCode::NotFound) => 0,
-        Err(err) => return Err(err),
-    };
-    txn.upsert(key, current.saturating_add(delta).to_be_bytes())
-}
-
 impl MetricStorage {
     pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref();
@@ -48,16 +130,12 @@ impl MetricStorage {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Mace defaults to `sync_on_write = true` (fsync every WAL/data write).
-        // The previous RocksDB backend used the RocksDB default `WriteOptions.sync
-        // = false`. Keep that durability for metrics/firewall state, which can be
-        // rebuilt after a crash; fsync-per-commit dominated the comparison benches.
-        let mut opts = Options::new(path);
-        opts.sync_on_write = false;
-        let opts = opts.validate().map_err(mace_open_error)?;
+        let opts = mace_metrics_options(path)
+            .validate()
+            .map_err(mace_open_error)?;
         let mace = Mace::new(opts).map_err(mace_open_error)?;
         let bucket = mace
-            .new_bucket(METRICS_BUCKET, BucketOptions::default())
+            .new_bucket(METRICS_BUCKET, mace_metrics_bucket_options())
             .or_else(|err| {
                 if err == OpCode::Exist {
                     mace.get_bucket(METRICS_BUCKET)
@@ -71,6 +149,7 @@ impl MetricStorage {
             backend: Some(Arc::new(StorageBackend {
                 _mace: mace,
                 bucket,
+                counters: DashMap::new(),
             })),
         })
     }
@@ -131,63 +210,35 @@ impl MetricStorage {
         node_sent: u64,
         node_received: u64,
     ) {
-        let Some(bucket) = self.bucket() else {
+        let Some(backend) = self.backend.as_ref() else {
             return;
         };
-        let Ok(txn) = bucket.begin() else {
+        let Ok(txn) = backend.bucket.begin() else {
             return;
         };
 
         for u in updates {
-            let prefix = format!("S{}_T{}", u.server_id, period);
-
-            for (suffix, delta) in [
-                ("req", u.total_requests),
-                ("sent", u.bytes_sent),
-                ("recv", u.bytes_received),
-                ("cached_sent", u.cached_bytes),
-                ("cached_req", u.count_cached_requests),
-                ("attack_req", u.count_attack_requests),
-                ("attack_sent", u.attack_bytes),
-            ] {
-                let key = format!("{prefix}_{suffix}");
-                if merge_u64_in_txn(&txn, key.as_bytes(), delta).is_err() {
-                    return;
-                }
-            }
-
-            if txn
-                .upsert(
-                    format!("{prefix}_conns").as_bytes(),
-                    u.active_connections.to_be_bytes(),
-                )
-                .is_err()
-            {
-                return;
-            }
-            if txn
-                .upsert(
-                    format!("{prefix}_ips").as_bytes(),
-                    u.count_ips.to_be_bytes(),
-                )
-                .is_err()
-            {
+            let key = server_period_key(u.server_id, period);
+            let existing = match txn_get_slice(&txn, key.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            let packed = apply_server_period_update(existing.as_deref(), &u);
+            if txn.upsert(key.as_bytes(), packed).is_err() {
                 return;
             }
         }
 
-        let node_prefix = format!("NODE_T{period}");
-        if merge_u64_in_txn(&txn, format!("{node_prefix}_sent").as_bytes(), node_sent).is_err() {
-            return;
-        }
-        if merge_u64_in_txn(
-            &txn,
-            format!("{node_prefix}_recv").as_bytes(),
-            node_received,
-        )
-        .is_err()
-        {
-            return;
+        if node_sent != 0 || node_received != 0 {
+            let key = node_period_key(period);
+            let existing = match txn_get_slice(&txn, key.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            let packed = apply_node_period_deltas(existing.as_deref(), node_sent, node_received);
+            if txn.upsert(key.as_bytes(), packed).is_err() {
+                return;
+            }
         }
 
         let _ = txn.commit();
@@ -195,18 +246,38 @@ impl MetricStorage {
 
     /// Increments multiple counters in a single atomic batch.
     pub fn increment_batch(&self, updates: Vec<(String, u64)>) {
-        let Some(bucket) = self.bucket() else {
+        let Some(backend) = self.backend.as_ref() else {
             return;
         };
-        let Ok(txn) = bucket.begin() else {
+        let updates = fold_counter_deltas(updates);
+        if updates.is_empty() {
+            return;
+        }
+        let Ok(txn) = backend.bucket.begin() else {
             return;
         };
+        let mut committed = HashMap::with_capacity(updates.len());
         for (key, delta) in updates {
-            if merge_u64_in_txn(&txn, key.as_bytes(), delta).is_err() {
+            let current = if let Some(cached) = backend.counters.get(&key) {
+                *cached
+            } else {
+                match txn.get(key.as_bytes()) {
+                    Ok(value) => parse_u64_be(value.slice()),
+                    Err(OpCode::NotFound) => 0,
+                    Err(_) => return,
+                }
+            };
+            let next = current.saturating_add(delta);
+            if txn.upsert(key.as_bytes(), next.to_be_bytes()).is_err() {
                 return;
             }
+            committed.insert(key, next);
         }
-        let _ = txn.commit();
+        if txn.commit().is_ok() {
+            for (key, next) in committed {
+                backend.counters.insert(key, next);
+            }
+        }
     }
 
     /// Deletes all data older than a specific timestamp.
@@ -538,6 +609,11 @@ impl MetricStorage {
     }
 
     pub fn get_value(&self, key: &str) -> u64 {
+        if let Some(backend) = self.backend.as_ref()
+            && let Some(cached) = backend.counters.get(key)
+        {
+            return *cached;
+        }
         self.get_raw(key.as_bytes())
             .map(|value| parse_u64_be(&value))
             .unwrap_or(0)
@@ -962,6 +1038,36 @@ mod tests {
 
         storage.increment_batch(vec![("counter_a".to_string(), 10), ("counter_a".to_string(), 5)]);
         assert_eq!(storage.get_value("counter_a"), 15);
+
+        let update = crate::rpc::metrics::ServerMetricUpdate {
+            server_id: 7,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            total_requests: 10,
+            bytes_sent: 100,
+            bytes_received: 20,
+            cached_bytes: 4,
+            count_cached_requests: 1,
+            count_attack_requests: 0,
+            attack_bytes: 0,
+            active_connections: 3,
+            count_websocket_connections: 0,
+            count_ips: 2,
+        };
+        storage.record_server_batch(1_700_000_000, vec![update.clone()], 50, 25);
+        storage.record_server_batch(1_700_000_000, vec![update], 10, 5);
+        let packed = storage
+            .get_raw(super::server_period_key(7, 1_700_000_000).as_bytes())
+            .expect("packed server period");
+        assert_eq!(packed.len(), super::SERVER_PERIOD_BYTES);
+        assert_eq!(super::parse_u64_be(&packed[0..8]), 20);
+        assert_eq!(super::parse_u64_be(&packed[8..16]), 200);
+        let node = storage
+            .get_raw(super::node_period_key(1_700_000_000).as_bytes())
+            .expect("packed node period");
+        assert_eq!(super::parse_u64_be(&node[0..8]), 60);
+        assert_eq!(super::parse_u64_be(&node[8..16]), 30);
 
         storage.write_raw_batch(
             vec![(

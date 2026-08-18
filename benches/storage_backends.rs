@@ -1,8 +1,14 @@
+use cloud_node_rust::metrics::storage::{
+    apply_node_period_deltas, apply_server_period_update, fold_counter_deltas,
+    mace_metrics_bucket_options, mace_metrics_options, node_period_key, server_period_key,
+};
 use cloud_node_rust::rpc::metrics::ServerMetricUpdate;
-use mace::{Bucket, BucketOptions, Mace, OpCode, Options};
+use dashmap::DashMap;
+use mace::{Bucket, Mace, OpCode};
 use rust_rocksdb::{DB, MergeOperands, Options as RocksOptions, WriteBatch, WriteOptions};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -164,6 +170,7 @@ pub fn open_backend_with(kind: BackendKind, tag: &str, durability: Durability) -
 pub(crate) struct MaceBackend {
     _mace: Mace,
     bucket: Bucket,
+    counters: DashMap<String, u64>,
 }
 
 impl MaceBackend {
@@ -171,12 +178,12 @@ impl MaceBackend {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut opts = Options::new(&path);
+        let mut opts = mace_metrics_options(&path);
         opts.sync_on_write = durability.fsync();
         let opts = opts.validate().map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let mace = Mace::new(opts).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let bucket = mace
-            .new_bucket("metrics", BucketOptions::default())
+            .new_bucket("metrics", mace_metrics_bucket_options())
             .or_else(|err| {
                 if err == OpCode::Exist {
                     mace.get_bucket("metrics")
@@ -185,7 +192,11 @@ impl MaceBackend {
                 }
             })
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        Ok(Self { _mace: mace, bucket })
+        Ok(Self {
+            _mace: mace,
+            bucket,
+            counters: DashMap::new(),
+        })
     }
 
     fn write<F>(&self, f: F) -> bool
@@ -199,15 +210,6 @@ impl MaceBackend {
             return false;
         }
         txn.commit().is_ok()
-    }
-
-    fn merge_u64(txn: &mace::TxnKV<'_>, key: &[u8], delta: u64) -> Result<(), OpCode> {
-        let current = match txn.get(key) {
-            Ok(value) => parse_u64_be(value.slice()),
-            Err(OpCode::NotFound) => 0,
-            Err(err) => return Err(err),
-        };
-        txn.upsert(key, current.saturating_add(delta).to_be_bytes())
     }
 }
 
@@ -228,6 +230,9 @@ impl StorageBackend for MaceBackend {
     }
 
     fn get_value(&self, key: &str) -> u64 {
+        if let Some(cached) = self.counters.get(key) {
+            return *cached;
+        }
         let view = self.bucket.view().ok();
         view.and_then(|view| view.get(key.as_bytes()).ok())
             .map(|v| parse_u64_be(v.slice()))
@@ -235,15 +240,35 @@ impl StorageBackend for MaceBackend {
     }
 
     fn increment_batch(&self, updates: Vec<(String, u64)>) {
+        let updates = fold_counter_deltas(updates);
+        if updates.is_empty() {
+            return;
+        }
         let Ok(txn) = self.bucket.begin() else {
             return;
         };
+        let mut committed = HashMap::with_capacity(updates.len());
         for (key, delta) in updates {
-            if Self::merge_u64(&txn, key.as_bytes(), delta).is_err() {
+            let current = if let Some(cached) = self.counters.get(&key) {
+                *cached
+            } else {
+                match txn.get(key.as_bytes()) {
+                    Ok(value) => parse_u64_be(value.slice()),
+                    Err(OpCode::NotFound) => 0,
+                    Err(_) => return,
+                }
+            };
+            let next = current.saturating_add(delta);
+            if txn.upsert(key.as_bytes(), next.to_be_bytes()).is_err() {
                 return;
             }
+            committed.insert(key, next);
         }
-        let _ = txn.commit();
+        if txn.commit().is_ok() {
+            for (key, next) in committed {
+                self.counters.insert(key, next);
+            }
+        }
     }
 
     fn record_server_batch(
@@ -257,48 +282,28 @@ impl StorageBackend for MaceBackend {
             return;
         };
         for u in updates {
-            let prefix = format!("S{}_T{}", u.server_id, period);
-            for (suffix, delta) in [
-                ("req", u.total_requests),
-                ("sent", u.bytes_sent),
-                ("recv", u.bytes_received),
-                ("cached_sent", u.cached_bytes),
-                ("cached_req", u.count_cached_requests),
-                ("attack_req", u.count_attack_requests),
-                ("attack_sent", u.attack_bytes),
-            ] {
-                if Self::merge_u64(&txn, format!("{prefix}_{suffix}").as_bytes(), delta).is_err() {
-                    return;
-                }
-            }
-            if txn
-                .upsert(
-                    format!("{prefix}_conns").as_bytes(),
-                    u.active_connections.to_be_bytes(),
-                )
-                .is_err()
-            {
-                return;
-            }
-            if txn
-                .upsert(format!("{prefix}_ips").as_bytes(), u.count_ips.to_be_bytes())
-                .is_err()
-            {
+            let key = server_period_key(u.server_id, period);
+            let existing = match txn.get(key.as_bytes()) {
+                Ok(value) => Some(value.to_vec()),
+                Err(OpCode::NotFound) => None,
+                Err(_) => return,
+            };
+            let packed = apply_server_period_update(existing.as_deref(), &u);
+            if txn.upsert(key.as_bytes(), packed).is_err() {
                 return;
             }
         }
-        let node_prefix = format!("NODE_T{period}");
-        if Self::merge_u64(&txn, format!("{node_prefix}_sent").as_bytes(), node_sent).is_err() {
-            return;
-        }
-        if Self::merge_u64(
-            &txn,
-            format!("{node_prefix}_recv").as_bytes(),
-            node_received,
-        )
-        .is_err()
-        {
-            return;
+        if node_sent != 0 || node_received != 0 {
+            let key = node_period_key(period);
+            let existing = match txn.get(key.as_bytes()) {
+                Ok(value) => Some(value.to_vec()),
+                Err(OpCode::NotFound) => None,
+                Err(_) => return,
+            };
+            let packed = apply_node_period_deltas(existing.as_deref(), node_sent, node_received);
+            if txn.upsert(key.as_bytes(), packed).is_err() {
+                return;
+            }
         }
         let _ = txn.commit();
     }
