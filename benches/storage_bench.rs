@@ -2,7 +2,8 @@ mod storage_backends;
 
 use cloud_node_rust::metrics::storage::{CacheMetaUpsert, MetricStorage};
 use storage_backends::{
-    BackendKind, StorageBackend, open_backend, prefill_firewall_records, sample_metric_updates,
+    BackendKind, Durability, StorageBackend, open_backend, open_backend_with,
+    prefill_firewall_records, sample_metric_updates,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -301,6 +302,43 @@ fn bench_concurrent_stress(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_durability_gap(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compare_durability");
+    group.measurement_time(Duration::from_secs(5));
+
+    for kind in BackendKind::ALL {
+        for durability in Durability::ALL {
+            let label = format!("{}/{}", kind.name(), durability.name());
+            group.bench_with_input(
+                BenchmarkId::new("put_json", &label),
+                &(kind, durability),
+                |b, (kind, durability)| {
+                    let storage = open_backend_with(*kind, "dur_put", *durability);
+                    let mut n = 0u64;
+                    b.iter(|| {
+                        n += 1;
+                        black_box(storage.put_json(&format!("meta_{n}"), &n));
+                    });
+                },
+            );
+
+            group.throughput(Throughput::Elements(100));
+            group.bench_with_input(
+                BenchmarkId::new("increment_batch/100", &label),
+                &(kind, durability),
+                |b, (kind, durability)| {
+                    let storage = open_backend_with(*kind, "dur_incr", *durability);
+                    let updates: Vec<(String, u64)> =
+                        (0..100).map(|i| (format!("S1_T1000_req_{i}"), 1)).collect();
+                    b.iter(|| black_box(storage.increment_batch(updates.clone())));
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_kv_basic,
@@ -308,6 +346,7 @@ criterion_group!(
     bench_firewall_and_scan,
     bench_cache_disk_paths,
     bench_cache_hot_path,
-    bench_concurrent_stress
+    bench_concurrent_stress,
+    bench_durability_gap
 );
 criterion_main!(benches);

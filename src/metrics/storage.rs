@@ -48,7 +48,13 @@ impl MetricStorage {
             std::fs::create_dir_all(parent)?;
         }
 
-        let opts = Options::new(path).validate().map_err(mace_open_error)?;
+        // Mace defaults to `sync_on_write = true` (fsync every WAL/data write).
+        // The previous RocksDB backend used the RocksDB default `WriteOptions.sync
+        // = false`. Keep that durability for metrics/firewall state, which can be
+        // rebuilt after a crash; fsync-per-commit dominated the comparison benches.
+        let mut opts = Options::new(path);
+        opts.sync_on_write = false;
+        let opts = opts.validate().map_err(mace_open_error)?;
         let mace = Mace::new(opts).map_err(mace_open_error)?;
         let bucket = mace
             .new_bucket(METRICS_BUCKET, BucketOptions::default())

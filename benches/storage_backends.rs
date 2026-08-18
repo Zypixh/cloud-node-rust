@@ -1,6 +1,6 @@
 use cloud_node_rust::rpc::metrics::ServerMetricUpdate;
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options};
-use rust_rocksdb::{DB, MergeOperands, Options as RocksOptions, WriteBatch};
+use rust_rocksdb::{DB, MergeOperands, Options as RocksOptions, WriteBatch, WriteOptions};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -21,6 +21,31 @@ impl BackendKind {
     }
 
     pub const ALL: [Self; 2] = [Self::Mace, Self::RocksDb];
+}
+
+/// WAL durability used for a comparison run.
+///
+/// `Async` matches RocksDB's default (`WriteOptions.sync = false`) and production
+/// `MetricStorage`. `Sync` matches Mace's crate default (`sync_on_write = true`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Durability {
+    Async,
+    Sync,
+}
+
+impl Durability {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Async => "async",
+            Self::Sync => "sync",
+        }
+    }
+
+    pub fn fsync(self) -> bool {
+        matches!(self, Self::Sync)
+    }
+
+    pub const ALL: [Self; 2] = [Self::Async, Self::Sync];
 }
 
 pub fn temp_store(tag: &str, backend: BackendKind) -> PathBuf {
@@ -121,25 +146,34 @@ impl StorageBackend for Backend {
 }
 
 pub fn open_backend(kind: BackendKind, tag: &str) -> Backend {
+    open_backend_with(kind, tag, Durability::Async)
+}
+
+pub fn open_backend_with(kind: BackendKind, tag: &str, durability: Durability) -> Backend {
     let path = temp_store(tag, kind);
     match kind {
-        BackendKind::Mace => Backend::Mace(MaceBackend::open(path).expect("open mace backend")),
+        BackendKind::Mace => {
+            Backend::Mace(MaceBackend::open(path, durability).expect("open mace backend"))
+        }
         BackendKind::RocksDb => {
-            Backend::RocksDb(RocksDbBackend::open(path).expect("open rocksdb backend"))
+            Backend::RocksDb(RocksDbBackend::open(path, durability).expect("open rocksdb backend"))
         }
     }
 }
 
 pub(crate) struct MaceBackend {
+    _mace: Mace,
     bucket: Bucket,
 }
 
 impl MaceBackend {
-    fn open(path: PathBuf) -> anyhow::Result<Self> {
+    fn open(path: PathBuf, durability: Durability) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let opts = Options::new(&path).validate().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut opts = Options::new(&path);
+        opts.sync_on_write = durability.fsync();
+        let opts = opts.validate().map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let mace = Mace::new(opts).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let bucket = mace
             .new_bucket("metrics", BucketOptions::default())
@@ -151,7 +185,7 @@ impl MaceBackend {
                 }
             })
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        Ok(Self { bucket })
+        Ok(Self { _mace: mace, bucket })
     }
 
     fn write<F>(&self, f: F) -> bool
@@ -308,10 +342,11 @@ impl StorageBackend for MaceBackend {
 
 pub(crate) struct RocksDbBackend {
     db: Arc<DB>,
+    sync: bool,
 }
 
 impl RocksDbBackend {
-    fn open(path: PathBuf) -> anyhow::Result<Self> {
+    fn open(path: PathBuf, durability: Durability) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -321,7 +356,16 @@ impl RocksDbBackend {
         opts.set_use_direct_io_for_flush_and_compaction(true);
         opts.set_max_background_jobs(4);
         let db = DB::open(&opts, path)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            sync: durability.fsync(),
+        })
+    }
+
+    fn write_opts(&self) -> WriteOptions {
+        let mut opts = WriteOptions::default();
+        opts.set_sync(self.sync);
+        opts
     }
 }
 
@@ -354,7 +398,7 @@ fn sum_merge_operator(
 impl StorageBackend for RocksDbBackend {
     fn put_json<T: Serialize>(&self, key: &str, value: &T) -> bool {
         match serde_json::to_vec(value) {
-            Ok(bytes) => self.db.put(key.as_bytes(), bytes).is_ok(),
+            Ok(bytes) => self.db.put_opt(key.as_bytes(), bytes, &self.write_opts()).is_ok(),
             Err(_) => false,
         }
     }
@@ -381,7 +425,7 @@ impl StorageBackend for RocksDbBackend {
         for (key, delta) in updates {
             batch.merge(key.as_bytes(), delta.to_be_bytes());
         }
-        let _ = self.db.write(&batch);
+        let _ = self.db.write_opt(&batch, &self.write_opts());
     }
 
     fn record_server_batch(
@@ -420,7 +464,7 @@ impl StorageBackend for RocksDbBackend {
             format!("{node_prefix}_recv").as_bytes(),
             node_received.to_be_bytes(),
         );
-        let _ = self.db.write(&batch);
+        let _ = self.db.write_opt(&batch, &self.write_opts());
     }
 
     fn write_raw_batch(&self, puts: Vec<(String, Vec<u8>)>, deletes: Vec<String>) -> bool {
@@ -431,7 +475,7 @@ impl StorageBackend for RocksDbBackend {
         for key in deletes {
             batch.delete(key.as_bytes());
         }
-        self.db.write(&batch).is_ok()
+        self.db.write_opt(&batch, &self.write_opts()).is_ok()
     }
 
     fn scan_json_prefix_count(&self, prefix: &str) -> usize {
@@ -449,7 +493,7 @@ impl StorageBackend for RocksDbBackend {
     }
 
     fn put_raw(&self, key: &[u8], value: &[u8]) -> bool {
-        self.db.put(key, value).is_ok()
+        self.db.put_opt(key, value, &self.write_opts()).is_ok()
     }
 }
 
