@@ -83,12 +83,12 @@ pub fn reload_city_reader(path: &std::path::Path) -> anyhow::Result<()> {
     reader.verify()?;
     anyhow::ensure!(
         reader
-            .metadata
+            .metadata()
             .database_type
             .to_ascii_lowercase()
             .contains("city"),
         "GeoIP database is not a City database: {}",
-        reader.metadata.database_type
+        reader.metadata().database_type
     );
     GEO_CITY_READER.store(Some(Arc::new(reader)));
     GEO_AVAILABLE.store(true, std::sync::atomic::Ordering::Release);

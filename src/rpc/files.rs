@@ -311,12 +311,12 @@ fn validate_city_database(path: &Path) -> anyhow::Result<()> {
     reader.verify()?;
     anyhow::ensure!(
         reader
-            .metadata
+            .metadata()
             .database_type
             .to_ascii_lowercase()
             .contains("city"),
         "IP library is not a City MaxMind database: {}",
-        reader.metadata.database_type
+        reader.metadata().database_type
     );
     Ok(())
 }

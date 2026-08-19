@@ -41,14 +41,14 @@ name = "libinjectionrs"
 path = "src/lib.rs"
 
 [dependencies.bitflags]
-version = "2.6"
+version = "2.13.1"
 
 [dependencies.smallvec]
-version = "1.13"
+version = "1.15.2"
 optional = true
 
 [dev-dependencies.urlencoding]
-version = "2.0"
+version = "2.1.3"
 
 [lints.clippy]
 arithmetic_side_effects = "warn"

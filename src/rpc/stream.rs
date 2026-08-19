@@ -175,11 +175,11 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
 
 fn stream_backoff(fail_count: u32, max: Duration) -> Duration {
     // Exponential backoff with a cap and jitter to avoid thundering herd.
-    use rand::Rng;
+    use rand::RngExt;
     let base = Duration::from_secs(1).saturating_mul(1u32 << fail_count.saturating_sub(1).min(6));
     let capped = base.min(max);
     let jitter_ms = (capped.as_millis() as u64 / 4) as i64;
-    let offset = rand::thread_rng().gen_range(-jitter_ms..=jitter_ms);
+    let offset = rand::rng().random_range(-jitter_ms..=jitter_ms);
     if offset < 0 {
         capped.saturating_sub(Duration::from_millis((-offset) as u64))
     } else {

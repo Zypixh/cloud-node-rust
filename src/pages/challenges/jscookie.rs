@@ -3,7 +3,7 @@ use crate::pages::challenges::{
 };
 use crate::pages::lang::Lang;
 use base64::{Engine as _, engine::general_purpose};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -27,7 +27,7 @@ pub fn issue_html(
         &hex_digest(&format!("{waf_token}|{seed}"))[..14]
     );
     let issued_ms = now_millis();
-    let display_ms = rand::thread_rng().gen_range(3_000..=5_000);
+    let display_ms = rand::rng().random_range(3_000..=5_000);
     let token_hash = hex_digest(waf_token);
 
     let payload = json!({

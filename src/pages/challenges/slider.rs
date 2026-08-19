@@ -1,5 +1,5 @@
 use crate::pages::Lang;
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 pub fn issue_html(
     lang: Lang,
@@ -24,17 +24,17 @@ pub fn issue_html_with_target(
     target_y: f64,
 ) -> String {
     let sfx = random_js_id();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let target_x = target_x.clamp(0.0, 280.0);
     let target_y = target_y.clamp(0.0, 160.0);
 
-    let offset = rng.gen_range(60.0f64..150.0);
+    let offset = rng.random_range(60.0f64..150.0);
     let left_start = target_x - offset;
     let right_start = target_x + offset;
     let left_ok = (0.0..=280.0).contains(&left_start);
     let right_ok = (0.0..=280.0).contains(&right_start);
     let handle_start = match (left_ok, right_ok) {
-        (true, true) if rng.gen_bool(0.5) => left_start,
+        (true, true) if rng.random_bool(0.5) => left_start,
         (true, true) => right_start,
         (true, false) => left_start,
         (false, true) => right_start,
@@ -47,14 +47,14 @@ pub fn issue_html_with_target(
     let decoy_x: f64 = {
         let mut dx;
         loop {
-            dx = rng.gen_range(10.0f64..270.0);
+            dx = rng.random_range(10.0f64..270.0);
             if (dx - target_x).abs() > 55.0 {
                 break;
             }
         }
         dx
     };
-    let decoy_y = (target_y + rng.gen_range(-50.0f64..50.0)).clamp(0.0, 155.0);
+    let decoy_y = (target_y + rng.random_range(-50.0f64..50.0)).clamp(0.0, 155.0);
 
     let (prompt, near_text) = match lang {
         Lang::ZhCn => ("拖动下方滑块对齐缺口", "快到了！"),
@@ -214,17 +214,17 @@ pub fn verify_explicit(
 
 fn random_js_id() -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..8)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
         .collect()
 }
 
-fn generate_puzzle_polygon(rng: &mut impl Rng) -> String {
-    let tab_side: u8 = rng.gen_range(0..4u8);
+fn generate_puzzle_polygon(rng: &mut (impl Rng + RngExt)) -> String {
+    let tab_side: u8 = rng.random_range(0..4u8);
     let notch_side: u8 = (tab_side + 2) % 4;
-    let tab_pos: f64 = rng.gen_range(35.0f64..65.0);
-    let tab_r: f64 = rng.gen_range(20.0f64..28.0);
+    let tab_pos: f64 = rng.random_range(35.0f64..65.0);
+    let tab_r: f64 = rng.random_range(20.0f64..28.0);
 
     let edge_pt = |edge: u8, along: f64, perp: f64| -> (f64, f64) {
         match edge {

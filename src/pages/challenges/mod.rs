@@ -8,7 +8,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
 };
 use base64::Engine;
-use rand::RngCore;
+use rand::RngExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -55,12 +55,12 @@ pub(crate) fn encode_challenge_token(payload: &Value, secret: &[u8]) -> String {
     let cipher = Aes256Gcm::new_from_slice(&key).expect("valid AES-256 key");
 
     let mut aes_nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut aes_nonce);
-    let nonce = Nonce::from_slice(&aes_nonce);
+    rand::rng().fill(&mut aes_nonce);
+    let nonce = Nonce::from(aes_nonce);
 
     let plaintext = serde_json::to_string(payload).expect("payload serialization");
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .expect("AES-GCM encryption");
 
     let mut combined = Vec::with_capacity(12 + ciphertext.len());
@@ -85,9 +85,9 @@ pub(crate) fn decode_challenge_token(token: &str, secret: &[u8]) -> Option<Value
     }
 
     let (aes_nonce, ciphertext) = combined.split_at(12);
-    let nonce = Nonce::from_slice(aes_nonce);
+    let nonce = Nonce::from(<[u8; 12]>::try_from(aes_nonce).ok()?);
 
-    let plaintext = cipher.decrypt(nonce, ciphertext).ok()?;
+    let plaintext = cipher.decrypt(&nonce, ciphertext).ok()?;
     serde_json::from_slice(&plaintext).ok()
 }
 
@@ -105,12 +105,11 @@ pub(crate) fn is_token_expired(payload: &Value) -> bool {
 
 /// Generate an 8-character random alphanumeric suffix for JS obfuscation.
 pub(crate) fn random_suffix() -> String {
-    use rand::Rng;
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..8)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARS.len());
+            let idx = rng.random_range(0..CHARS.len());
             CHARS[idx] as char
         })
         .collect()
