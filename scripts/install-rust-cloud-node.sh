@@ -1022,9 +1022,6 @@ migrate_runtime_layout() {
         if [ -e "$source_dir/state.json" ] && [ ! -e "$INSTALL_DIR/data/state.json" ]; then
             run cp -a "$source_dir/state.json" "$INSTALL_DIR/data/state.json"
         fi
-        if [ -e "$source_dir/blocked_ips.json" ] && [ ! -e "$INSTALL_DIR/data/blocked_ips.json" ]; then
-            run cp -a "$source_dir/blocked_ips.json" "$INSTALL_DIR/data/blocked_ips.json"
-        fi
         if [ -e "$source_dir/metrics.db" ] && [ ! -e "$INSTALL_DIR/data/metrics.db" ]; then
             run cp -a "$source_dir/metrics.db" "$INSTALL_DIR/data/metrics.db"
         fi

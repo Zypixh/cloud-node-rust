@@ -99,8 +99,7 @@ cloud-node upgrade --version v1.1.7 --github-base-url https://github.example.com
 - `data/cloud-node.pid`：后台进程 PID 文件。
 - `data/state.json`：部分运行状态持久化。
 - `data/cloud-node-xdp-ebpf.o`：`cargo xtask build-ebpf` 生成的 XDP eBPF 对象。
-- `data/blocked_ips.json`：旧版本地封禁快照，仅作为一次性迁移输入；迁移到 RocksDB 成功后会自动删除。
-- `data/metrics.db`：统计、缓存元数据和本地运行时防火墙封禁状态持久化。
+- `data/metrics.mace`：统计、缓存元数据和本地运行时防火墙封禁状态持久化。
 - `data/cache`：默认磁盘缓存目录。
 - `data/GeoLite2-City.mmdb`、`data/GeoLite2-ASN.mmdb`：GeoIP 数据库。
 - `logs/run.log`：节点运行日志；systemd 和内置后台模式都会追加写入。

@@ -102,7 +102,7 @@ xdp:
 - `data/GeoLite2-ASN.mmdb`：ASN 数据库。
 - `data/GeoLite2-Country.mmdb`：国家数据库。
 - `data/cache`：默认磁盘缓存目录。
-- `data/state.json`、`data/blocked_ips.json`、`data/metrics.db`：运行状态、封禁和统计数据。
+- `data/state.json`、`data/metrics.mace`：运行状态、封禁和统计数据。
 - `logs/run.log`：节点运行日志；systemd 和内置后台模式都会追加写入。
 
 旧版根目录 `api_node.yaml`、`../data/*` 和工作目录下的 `GeoLite2-*.mmdb` 会作为迁移兼容读取，新写入统一使用 `configs/`、`data/`、`logs/`。GeoIP 文件缺失时，地区类 WAF、地区统计和 ASN 识别能力会受限。

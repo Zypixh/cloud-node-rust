@@ -1,12 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock as Lazy;
 use std::sync::Mutex;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::warn;
 
 const BLOCK_PREFIX: &str = "FWBLK_V1_";
-const MIGRATED_LEGACY_JSON_KEY: &str = "FWBLK_META_migrated_blocked_ips_json";
 const FLUSH_THRESHOLD: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -40,33 +39,6 @@ impl FirewallBlockRecord {
             scope,
             source: "runtime".to_string(),
             reason: "local runtime block".to_string(),
-            expires_at,
-            created_at: now,
-            updated_at: now,
-            kernel_wanted,
-            kernel_applied: false,
-            kernel_status: if kernel_wanted {
-                "pending".to_string()
-            } else {
-                "not_applicable".to_string()
-            },
-        }
-    }
-
-    fn legacy(target: String, server_id: i64, expires_at: i64) -> Self {
-        let now = crate::utils::time::now_timestamp();
-        let target = normalize_target(&target);
-        let kernel_wanted = target.parse::<std::net::IpAddr>().is_ok();
-        Self {
-            target,
-            server_id,
-            scope: if server_id == 0 {
-                "global".to_string()
-            } else {
-                "server".to_string()
-            },
-            source: "legacy_json".to_string(),
-            reason: "legacy blocked_ips.json migration".to_string(),
             expires_at,
             created_at: now,
             updated_at: now,
@@ -171,7 +143,7 @@ pub fn flush_pending() -> bool {
     }
     let ok = crate::metrics::storage::STORAGE.write_raw_batch(puts, delete_records.clone());
     if !ok {
-        warn!("failed to flush firewall block records to RocksDB");
+        warn!("failed to flush firewall block records to storage");
         if let Ok(mut pending) = PENDING.lock() {
             for (key, record) in upsert_records {
                 if !pending.deletes.contains(&key) {
@@ -229,87 +201,8 @@ pub fn cleanup_expired(now: i64) -> usize {
     count
 }
 
-pub fn migrate_legacy_blocked_ips_once() -> usize {
-    if crate::metrics::storage::STORAGE
-        .get_json::<bool>(MIGRATED_LEGACY_JSON_KEY)
-        .unwrap_or(false)
-    {
-        let _ = remove_legacy_blocked_ips_files();
-        return 0;
-    }
-
-    let now = crate::utils::time::now_timestamp();
-    let mut records = HashMap::<String, FirewallBlockRecord>::new();
-    for (target, server_id, expiry) in crate::utils::persistence::load_blocked_ips() {
-        if expiry <= now as u64 {
-            continue;
-        }
-        let record = FirewallBlockRecord::legacy(target, server_id, expiry as i64);
-        records.insert(record.key(), record);
-    }
-
-    let mut puts = Vec::with_capacity(records.len() + 1);
-    for (key, record) in records {
-        if let Ok(bytes) = serde_json::to_vec(&record) {
-            puts.push((key, bytes));
-        }
-    }
-    if let Ok(bytes) = serde_json::to_vec(&true) {
-        puts.push((MIGRATED_LEGACY_JSON_KEY.to_string(), bytes));
-    }
-    let migrated = puts.len().saturating_sub(1);
-    if crate::metrics::storage::STORAGE.write_raw_batch(puts, Vec::new()) {
-        if migrated > 0 {
-            debug!("migrated {} legacy blocked IP records to RocksDB", migrated);
-        }
-        let removed_files = remove_legacy_blocked_ips_files();
-        if removed_files > 0 {
-            debug!(
-                "removed {} legacy blocked_ips.json migration input files",
-                removed_files
-            );
-        }
-        migrated
-    } else {
-        warn!("failed to mark legacy blocked_ips.json migration");
-        0
-    }
-}
-
 fn is_runtime_source(source: &str) -> bool {
     matches!(source, "runtime" | "legacy_json")
-}
-
-fn normalize_target(target: &str) -> String {
-    let target = target.trim();
-    if let Ok(net) = target.parse::<ipnet::IpNet>() {
-        return net.trunc().to_string();
-    }
-    target.to_string()
-}
-
-fn remove_legacy_blocked_ips_files() -> usize {
-    let node_paths = crate::paths::NodePaths::current();
-    let mut removed = 0usize;
-    let mut seen = BTreeSet::new();
-    for path in node_paths.blocked_ips_file_candidates() {
-        if !seen.insert(path.clone()) || !path.exists() {
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                removed += 1;
-            }
-            Err(err) => {
-                warn!(
-                    "failed to remove legacy blocked IP snapshot {}: {}",
-                    path.display(),
-                    err
-                );
-            }
-        }
-    }
-    removed
 }
 
 #[cfg(test)]
