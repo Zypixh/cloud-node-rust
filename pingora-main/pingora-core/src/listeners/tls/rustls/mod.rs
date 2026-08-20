@@ -133,13 +133,31 @@ impl Acceptor {
         }
     }
 
-    pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<TlsStream<S>> {
+    pub async fn tls_handshake<S: IO + Send + 'static>(&self, stream: S) -> Result<TlsStream<S>> {
         debug!("new tls session");
-        // TODO: be able to offload this handshake in a thread pool
-        if let Some(cb) = self.callbacks.as_ref() {
-            handshake_with_callback(self, stream, cb).await
-        } else {
-            handshake(self, stream).await
+        if let Some(callbacks) = self.callbacks.as_ref() {
+            return handshake_with_callback(self, stream, callbacks).await;
         }
+
+        let acceptor = Acceptor {
+            acceptor: self.acceptor.clone(),
+            callbacks: None,
+        };
+
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    Error::explain(InternalError, format!("failed to build TLS offload runtime: {e}"))
+                })
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(handshake(&acceptor, stream))
+                        .explain_err(InternalError, |e| format!("TLS offload handshake failed: {e}"))
+                })
+        })
+        .await
+        .or_err(InternalError, "TLS offload task join failed")?
     }
 }

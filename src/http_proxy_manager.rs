@@ -194,6 +194,15 @@ struct PassthroughBackendTarget {
     proxy_protocol: ProxyProtocolConfig,
 }
 
+trait SniPassthroughStream: AsyncRead + AsyncWrite + Unpin {}
+
+impl<T> SniPassthroughStream for T where T: AsyncRead + AsyncWrite + Unpin {}
+
+enum SniPassthroughClient {
+    Tcp(TcpStream),
+    Stream(Box<dyn SniPassthroughStream + Send>),
+}
+
 fn af_xdp_virtual_stream<S>(stream: S, client_addr: SocketAddr) -> L4Stream
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1367,7 +1376,7 @@ impl HttpProxyManager {
                         L4ConnectionProtocol::SniTcp,
                     );
                     let sni_cancel_rx = sni_connection_guard.cancel_receiver();
-                    self.handle_sni_passthrough(
+                    self.handle_sni_passthrough_stream(
                         client_stream,
                         client_addr,
                         listen_port,
@@ -1583,7 +1592,27 @@ impl HttpProxyManager {
         Ok(())
     }
 
-    async fn handle_sni_passthrough<S>(
+    async fn handle_sni_passthrough(
+        &self,
+        client_stream: TcpStream,
+        client_addr: SocketAddr,
+        listen_port: u16,
+        sni_host: String,
+        server: Arc<ServerConfig>,
+        cancel_rx: Option<watch::Receiver<bool>>,
+    ) -> anyhow::Result<()> {
+        self.handle_sni_passthrough_inner(
+            SniPassthroughClient::Tcp(client_stream),
+            client_addr,
+            listen_port,
+            sni_host,
+            server,
+            cancel_rx,
+        )
+        .await
+    }
+
+    async fn handle_sni_passthrough_stream<S>(
         &self,
         client_stream: S,
         client_addr: SocketAddr,
@@ -1593,8 +1622,28 @@ impl HttpProxyManager {
         cancel_rx: Option<watch::Receiver<bool>>,
     ) -> anyhow::Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.handle_sni_passthrough_inner(
+            SniPassthroughClient::Stream(Box::new(client_stream)),
+            client_addr,
+            listen_port,
+            sni_host,
+            server,
+            cancel_rx,
+        )
+        .await
+    }
+
+    async fn handle_sni_passthrough_inner(
+        &self,
+        client_stream: SniPassthroughClient,
+        client_addr: SocketAddr,
+        listen_port: u16,
+        sni_host: String,
+        server: Arc<ServerConfig>,
+        cancel_rx: Option<watch::Receiver<bool>>,
+    ) -> anyhow::Result<()> {
         let started = Instant::now();
         let started_at_millis = crate::utils::time::now_timestamp_millis();
         let request_id = crate::logging::next_request_id();
@@ -1824,14 +1873,26 @@ impl HttpProxyManager {
         crate::rpc::stats::push_origin_health_event(origin_id, true, connect_latency_ms);
         drop(origin_connect_permit);
 
-        let result =
-            crate::tcp_proxy::stream_sni_passthrough_bidirectional_with_metrics_cancelable_stream(
-                server_id,
-                client_stream,
-                backend_stream,
-                cancel_rx,
-            )
-            .await;
+        let result = match client_stream {
+            SniPassthroughClient::Tcp(client_stream) => {
+                crate::tcp_proxy::stream_sni_passthrough_bidirectional_with_metrics_cancelable(
+                    server_id,
+                    client_stream,
+                    backend_stream,
+                    cancel_rx,
+                )
+                .await
+            }
+            SniPassthroughClient::Stream(client_stream) => {
+                crate::tcp_proxy::stream_sni_passthrough_bidirectional_with_metrics_cancelable_stream(
+                    server_id,
+                    client_stream,
+                    backend_stream,
+                    cancel_rx,
+                )
+                .await
+            }
+        };
         if let Some(local_port) = toa_local_port {
             if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
             {
