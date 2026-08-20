@@ -15,6 +15,9 @@ use tracing::error;
 const METRICS_BUCKET: &str = "metrics";
 pub const SERVER_PERIOD_BYTES: usize = 72;
 pub const NODE_PERIOD_BYTES: usize = 16;
+/// Mace treats empty values as tombstones, so unique-IP presence keys need a
+/// non-empty sentinel (RocksDB previously allowed empty values).
+const UNIQUE_IP_MARKER: &[u8] = b"1";
 
 struct StorageBackend {
     _mace: Mace,
@@ -338,7 +341,10 @@ impl MetricStorage {
         if server_id <= 0 || day.is_empty() {
             return;
         }
-        let _ = self.put_raw(unique_ip_key(server_id, day, ip).as_bytes(), &[]);
+        let _ = self.put_raw(
+            unique_ip_key(server_id, day, ip).as_bytes(),
+            UNIQUE_IP_MARKER,
+        );
     }
 
     pub fn load_unique_ips(&self, min_day: &str) -> Vec<(i64, String, IpAddr)> {

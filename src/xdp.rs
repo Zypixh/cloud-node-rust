@@ -7984,7 +7984,17 @@ mod tests {
             ..XdpConfig::default()
         });
 
-        assert!(report.contains("requires standard-MTU frameSize<=2048"));
+        assert!(
+            report.contains(&format!(
+                "requires frameSize={}",
+                cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
+            )),
+            "doctor report should reject jumbo proxy frames: {report}"
+        );
+        assert!(
+            report.contains("until jumbo/multi-buffer support is enabled"),
+            "doctor report should mention jumbo/multi-buffer gating: {report}"
+        );
     }
 
     #[tokio::test]
@@ -8008,7 +8018,14 @@ mod tests {
         let status = manager.status();
         assert!(!status.available);
         assert!(!status.attached);
-        assert!(status.fallback_reason.contains("frameSize<=2048"));
+        assert!(
+            status.fallback_reason.contains(&format!(
+                "frameSize={}",
+                cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
+            )),
+            "fallback reason should reject jumbo proxy frames: {}",
+            status.fallback_reason
+        );
     }
 
     #[tokio::test]
@@ -8030,7 +8047,14 @@ mod tests {
             .initialize()
             .await
             .expect_err("fail-start must reject");
-        assert!(err.to_string().contains("frameSize<=2048"));
+        let err = err.to_string();
+        assert!(
+            err.contains(&format!(
+                "frameSize={}",
+                cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
+            )),
+            "fail-start should reject jumbo proxy frames: {err}"
+        );
     }
 
     #[test]
