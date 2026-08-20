@@ -39,7 +39,7 @@ pub use rustls::{
 /// as the process-level default. Safe to call multiple times — subsequent
 /// calls are no-ops.
 pub fn install_default_crypto_provider() {
-    let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
 }
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
@@ -188,6 +188,6 @@ pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
 }
 
 pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {
-    let hash = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
-    hash.as_ref().to_vec()
+    use sha2::{Digest, Sha256};
+    Sha256::digest(cert.as_ref()).to_vec()
 }

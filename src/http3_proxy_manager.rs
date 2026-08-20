@@ -232,7 +232,7 @@ impl Http3ProxyManager {
             true,
         )
         .context("build HTTP/3 rustls server config")?;
-        rustls_config.max_early_data_size = u32::MAX;
+        rustls_config.max_early_data_size = 0;
 
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_config))?,

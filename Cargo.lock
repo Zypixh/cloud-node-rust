@@ -3191,11 +3191,11 @@ dependencies = [
  "log",
  "no_debug",
  "pingora-error",
- "ring",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
  "rustls-pki-types",
+ "sha2",
  "tokio-rustls",
 ]
 

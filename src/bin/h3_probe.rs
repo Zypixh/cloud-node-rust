@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_connection(config: ProbeConfig, next: Arc<AtomicUsize>) -> anyhow::Result<ProbeStats> {
     let mut tls = rustls::ClientConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
+        rustls::crypto::aws_lc_rs::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .dangerous()

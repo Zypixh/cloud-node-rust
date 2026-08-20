@@ -52,11 +52,34 @@ impl KernelTuningConfig {
 pub struct RelayConfig {
     #[serde(rename = "zeroCopy", default)]
     pub zero_copy: bool,
+    #[serde(rename = "tcpKeepaliveIdleSecs", default = "default_tcp_keepalive_idle_secs")]
+    pub tcp_keepalive_idle_secs: u32,
+    #[serde(rename = "tcpKeepaliveIntervalSecs", default = "default_tcp_keepalive_interval_secs")]
+    pub tcp_keepalive_interval_secs: u32,
+    #[serde(rename = "tcpKeepaliveProbes", default = "default_tcp_keepalive_probes")]
+    pub tcp_keepalive_probes: u32,
+}
+
+fn default_tcp_keepalive_idle_secs() -> u32 {
+    60
+}
+
+fn default_tcp_keepalive_interval_secs() -> u32 {
+    15
+}
+
+fn default_tcp_keepalive_probes() -> u32 {
+    4
 }
 
 impl Default for RelayConfig {
     fn default() -> Self {
-        Self { zero_copy: false }
+        Self {
+            zero_copy: false,
+            tcp_keepalive_idle_secs: default_tcp_keepalive_idle_secs(),
+            tcp_keepalive_interval_secs: default_tcp_keepalive_interval_secs(),
+            tcp_keepalive_probes: default_tcp_keepalive_probes(),
+        }
     }
 }
 
@@ -64,6 +87,9 @@ impl RelayConfig {
     pub fn normalized(&self) -> Self {
         Self {
             zero_copy: self.zero_copy,
+            tcp_keepalive_idle_secs: self.tcp_keepalive_idle_secs.max(1),
+            tcp_keepalive_interval_secs: self.tcp_keepalive_interval_secs.max(1),
+            tcp_keepalive_probes: self.tcp_keepalive_probes.max(1),
         }
     }
 }
@@ -250,6 +276,9 @@ mod tests {
         let config = RelayConfig::default().normalized();
 
         assert!(!config.zero_copy);
+        assert_eq!(config.tcp_keepalive_idle_secs, 60);
+        assert_eq!(config.tcp_keepalive_interval_secs, 15);
+        assert_eq!(config.tcp_keepalive_probes, 4);
     }
 
     #[test]

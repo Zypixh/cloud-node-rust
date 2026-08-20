@@ -1,6 +1,5 @@
 use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose};
-use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -11,6 +10,7 @@ use std::sync::{Arc, RwLock};
 use x509_parser::prelude::*;
 
 use crate::config_models::SSLCertConfig;
+use crate::tls_crypto::{default_crypto_provider, install_default_crypto_provider};
 
 #[derive(Clone)]
 pub struct DynamicCertSelector {
@@ -36,6 +36,7 @@ struct CertSnapshot {
 pub struct CertPair {
     pub id: i64,
     certified_key: Arc<CertifiedKey>,
+    resolved_key: Arc<ArcSwap<CertifiedKey>>,
     cert_bytes: Vec<u8>,
     key_bytes: Vec<u8>,
     ocsp: Arc<ArcSwap<Vec<u8>>>,
@@ -43,20 +44,19 @@ pub struct CertPair {
 
 impl DynamicCertSelector {
     pub fn new() -> Self {
-        let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+        install_default_crypto_provider();
         Self {
             snapshot: Arc::new(ArcSwap::from_pointee(CertSnapshot::default())),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    pub async fn update_config(&self, _servers: &[crate::config_models::ServerConfig]) {}
-
     pub async fn update_ocsp(&self, cert_id: i64, data: Vec<u8>) {
         let cache = self.cache.read().unwrap();
         for (_, pair) in cache.values() {
             if pair.id == cert_id {
                 pair.ocsp.store(Arc::new(data.clone()));
+                pair.refresh_resolved_key();
             }
         }
     }
@@ -102,7 +102,7 @@ impl DynamicCertSelector {
 
     pub fn resolve_certified_key_for_host(&self, host: &str) -> Option<Arc<CertifiedKey>> {
         self.find_pair_blocking(&host.to_ascii_lowercase())
-            .map(|pair| pair.certified_key_with_ocsp())
+            .map(|pair| pair.resolved_certified_key())
     }
 
     pub fn has_default_cert(&self) -> bool {
@@ -150,7 +150,7 @@ pub fn build_rustls_server_config(
         "no certificate snapshot available for TLS listener"
     );
 
-    let provider = rustls::crypto::ring::default_provider();
+    let provider = default_crypto_provider();
     let builder = rustls::ServerConfig::builder_with_provider(provider.into());
     let builder = if tls13_only {
         builder.with_protocol_versions(&[&rustls::version::TLS13])?
@@ -164,16 +164,26 @@ pub fn build_rustls_server_config(
 }
 
 impl CertPair {
-    fn certified_key_with_ocsp(&self) -> Arc<CertifiedKey> {
-        let ocsp = self.ocsp.load();
-        if ocsp.is_empty() {
-            return Arc::clone(&self.certified_key);
-        }
-
-        let mut certified_key = (*self.certified_key).clone();
-        certified_key.ocsp = Some(ocsp.as_ref().clone());
-        Arc::new(certified_key)
+    fn resolved_certified_key(&self) -> Arc<CertifiedKey> {
+        Arc::clone(&*self.resolved_key.load())
     }
+
+    fn refresh_resolved_key(&self) {
+        self.resolved_key
+            .store(Arc::new(build_resolved_certified_key(
+                &self.certified_key,
+                self.ocsp.load().as_ref(),
+            )));
+    }
+}
+
+fn build_resolved_certified_key(base: &CertifiedKey, ocsp: &[u8]) -> CertifiedKey {
+    if ocsp.is_empty() {
+        return (*base).clone();
+    }
+    let mut certified_key = (*base).clone();
+    certified_key.ocsp = Some(ocsp.to_vec());
+    certified_key
 }
 
 fn serialize_pair_pem(pair: &Arc<CertPair>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -187,13 +197,15 @@ fn serialize_pair_pem(pair: &Arc<CertPair>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertConfig]) {
     let mut new_exact = HashMap::new();
     let mut new_wildcard = HashMap::new();
-    let mut first_pair: Option<Arc<CertPair>> = None;
+    let mut default_pair: Option<Arc<CertPair>> = None;
+    let mut fallback_pair: Option<Arc<CertPair>> = None;
     let mut new_cache = HashMap::new();
 
-    let (stats_parsed, stats_reused) = {
+    let (stats_parsed, stats_reused, stats_parsed_fresh) = {
         let old_cache = cert_selector.cache.read().unwrap();
         let mut parsed = 0;
         let mut reused = 0;
+        let mut parsed_fresh = 0;
 
         for cert_cfg in certs {
             if !cert_cfg.is_on {
@@ -227,7 +239,10 @@ pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertCon
                 old_pair.clone()
             } else {
                 match parse_cert_pair(cert_id, cert_bytes.clone(), key_bytes.clone()) {
-                    Ok(pair) => Arc::new(pair),
+                    Ok(pair) => {
+                        parsed_fresh += 1;
+                        Arc::new(pair)
+                    }
                     Err(err) => {
                         tracing::error!(
                             "SSL Parse Error for ID {}: certificate/key data invalid (cert_type={}, key_type={}): {}",
@@ -244,8 +259,11 @@ pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertCon
             parsed += 1;
             new_cache.insert(cert_id, (current_fingerprint, pair.clone()));
 
-            if first_pair.is_none() {
-                first_pair = Some(pair.clone());
+            if cert_cfg.is_default {
+                default_pair = Some(pair.clone());
+            }
+            if fallback_pair.is_none() {
+                fallback_pair = Some(pair.clone());
             }
 
             let mut names = certificate_names_from_der(pair.certified_key.cert.first());
@@ -267,13 +285,13 @@ pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertCon
                 }
             }
         }
-        (parsed, reused)
+        (parsed, reused, parsed_fresh)
     };
 
     let new_snapshot = CertSnapshot {
         exact: new_exact,
         wildcard: new_wildcard,
-        default: first_pair,
+        default: default_pair.or(fallback_pair),
     };
     let default_present = new_snapshot.default.is_some();
     let mut cache_lock = cert_selector.cache.write().unwrap();
@@ -284,7 +302,7 @@ pub async fn sync_certs(cert_selector: &DynamicCertSelector, certs: &[SSLCertCon
         "SSL Sync Result: {} certs processed (Reused: {}, Parsed: {}). Default Cert present: {}",
         stats_parsed,
         stats_reused,
-        stats_parsed - stats_reused,
+        stats_parsed_fresh,
         default_present
     );
 }
@@ -296,12 +314,18 @@ fn parse_cert_pair(
 ) -> anyhow::Result<CertPair> {
     let cert_chain = parse_cert_chain(&cert_bytes)?;
     let key = parse_private_key(&key_bytes)?;
-    let provider = rustls::crypto::ring::default_provider();
+    let provider = default_crypto_provider();
     let certified_key = CertifiedKey::from_der(cert_chain, key, &provider)?;
+    let certified_key = Arc::new(certified_key);
+    let resolved_key = Arc::new(ArcSwap::from_pointee(build_resolved_certified_key(
+        certified_key.as_ref(),
+        &[],
+    )));
 
     Ok(CertPair {
         id: cert_id,
-        certified_key: Arc::new(certified_key),
+        certified_key,
+        resolved_key,
         cert_bytes,
         key_bytes,
         ocsp: Arc::new(ArcSwap::from_pointee(Vec::new())),
@@ -408,7 +432,7 @@ fn cert_string_to_bytes(raw: &str) -> Option<Vec<u8>> {
         return Some(normalized.into_bytes());
     }
 
-    decode_base64(trimmed).or_else(|| Some(normalized.into_bytes()))
+    decode_base64(trimmed).or_else(|| Some(normalized.as_bytes().to_vec()))
 }
 
 fn decode_base64(raw: &str) -> Option<Vec<u8>> {

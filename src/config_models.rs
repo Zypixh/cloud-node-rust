@@ -2954,6 +2954,8 @@ pub struct SSLCertConfig {
     pub id: i64,
     #[serde(rename = "isOn", default)]
     pub is_on: bool,
+    #[serde(rename = "isDefault", default)]
+    pub is_default: bool,
     #[serde(rename = "certData")]
     pub cert_data_json: Option<Value>,
     #[serde(rename = "keyData")]

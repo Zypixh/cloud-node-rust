@@ -2424,7 +2424,7 @@ async fn start_xdp_smoke_sni_backend(
     )?
     .ok_or_else(|| anyhow::anyhow!("xdp smoke SNI backend key is missing"))?;
     let mut tls_config = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
+        rustls::crypto::aws_lc_rs::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])?
     .with_no_client_auth()
@@ -2503,7 +2503,7 @@ async fn start_xdp_smoke_quic_backend(
     )?
     .ok_or_else(|| anyhow::anyhow!("xdp smoke QUIC backend key is missing"))?;
     let mut tls_config = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
+        rustls::crypto::aws_lc_rs::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_no_client_auth()
@@ -2933,6 +2933,7 @@ fn xdp_proxy_smoke_ssl_cert() -> crate::config_models::SSLCertConfig {
     crate::config_models::SSLCertConfig {
         id: 7104,
         is_on: true,
+        is_default: true,
         cert_data_json: Some(serde_json::json!(include_str!(
             "../pingora-main/pingora-core/examples/keys/server/cert.pem"
         ))),
