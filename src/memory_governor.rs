@@ -204,7 +204,7 @@ struct ResidentMemoryAccounting {
 }
 
 impl ResidentMemoryAccounting {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self { used: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)], total: AtomicU64::new(0), owners: Mutex::new(HashMap::new()), mutation: Mutex::new(()) }
     }
 }
