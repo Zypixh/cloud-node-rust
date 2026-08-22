@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 
 use crate::config::ConfigStore;
 use crate::firewall::state::WafStateManager;
+use crate::l4_connection_registry::{self, L4ConnectionProtocol};
 use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR, MemoryPressureLevel};
 use crate::rpc::ip_report::{IpReportKind, IpReportMessage};
 
@@ -820,6 +821,24 @@ impl L4DefenseKind {
         }
     }
 
+    /// Churn/probe events should not tear down established SNI passthrough tunnels.
+    fn preserves_sni_tcp_tunnels(self) -> bool {
+        matches!(
+            self,
+            Self::TcpConnectionChurn
+                | Self::TcpAcceptedChurn
+                | Self::TcpProxyEarlyCloseOrTinyPayload
+                | Self::TcpPressureIdleClose
+                | Self::TlsHandshakeThenNoHttp
+                | Self::HttpEarlyCloseOrTinyRequest
+                | Self::TlsPartialClientHello
+                | Self::TlsSlowClientHello
+                | Self::TlsInvalidProbe
+                | Self::TlsPlaintextConnectOnTls
+                | Self::SniProbeFail
+        )
+    }
+
     fn is_active_limit(self) -> bool {
         matches!(self, Self::TcpActiveLimit)
     }
@@ -1047,6 +1066,12 @@ pub fn current_tcp_active_limit_per_ip() -> usize {
     tcp_active_limit_per_ip_for_level(total_limit, current_pressure_level())
 }
 
+pub fn current_sni_tcp_active_limit_per_ip() -> usize {
+    current_tcp_active_limit_per_ip()
+        .saturating_mul(4)
+        .max(256)
+}
+
 pub fn first_byte_timeout(level: L4PressureLevel) -> Duration {
     match level {
         L4PressureLevel::Normal => Duration::from_secs(2),
@@ -1080,6 +1105,14 @@ pub fn client_hello_timeouts(level: L4PressureLevel) -> ClientHelloTimeouts {
             total: Duration::from_millis(500),
             idle: Duration::from_millis(100),
         },
+    }
+}
+
+pub fn client_hello_timeouts_for_sni_passthrough(level: L4PressureLevel) -> ClientHelloTimeouts {
+    let base = client_hello_timeouts(level);
+    ClientHelloTimeouts {
+        total: base.total.max(Duration::from_secs(1)),
+        idle: base.idle.max(Duration::from_millis(300)),
     }
 }
 
@@ -1492,7 +1525,13 @@ pub fn record_l4_event_scored(
 }
 
 fn drain_l4_connections_for_ip(ip: IpAddr, kind: L4DefenseKind, reason: &'static str) {
-    let drained = crate::l4_connection_registry::drain_ip(ip);
+    let drained = if kind.preserves_sni_tcp_tunnels() {
+        l4_connection_registry::L4_CONNECTION_REGISTRY.drain_matching(|conn| {
+            conn.ip == ip && conn.protocol != L4ConnectionProtocol::SniTcp
+        })
+    } else {
+        l4_connection_registry::drain_ip(ip)
+    };
     if drained > 0 {
         crate::logging::report_node_log(
             "warn".to_string(),

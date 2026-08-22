@@ -1,51 +1,216 @@
-use super::mace_backend::{DB, IteratorMode, WriteBatch};
+use crate::rpc::metrics::ServerMetricUpdate;
 use dashmap::DashMap;
+use mace::{Bucket, BucketOptions, Mace, OpCode, Options};
 use maxminddb::{self, geoip2};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
-use std::sync::{LazyLock as Lazy, OnceLock};
-use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
-const CACHE_META_QUEUE_CAPACITY: usize = 8192;
-const STATS_CLEANUP_BATCH_SIZE: usize = 512;
+const METRICS_BUCKET: &str = "metrics";
+pub const SERVER_PERIOD_BYTES: usize = 72;
+pub const NODE_PERIOD_BYTES: usize = 16;
+/// Mace treats empty values as tombstones, so unique-IP presence keys need a
+/// non-empty sentinel (RocksDB previously allowed empty values).
+const UNIQUE_IP_MARKER: &[u8] = b"1";
 const CACHE_META_MAX_ENTRIES: usize = 1_000_000;
 const CACHE_META_MAX_ENTRY_BYTES: u64 = 256 * 1024;
 const CACHE_ACCESS_LOG_MAX_ENTRIES: usize = 262_144;
-const CACHE_ACCESS_LOG_TTL_SECS: i64 = 300;
 const CORRUPT_CMETA_ISOLATION_MAX: usize = 4_096;
 
 static CORRUPT_CMETA_KEYS: Lazy<DashMap<String, ()>> = Lazy::new(DashMap::new);
 static CORRUPT_CMETA_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// A specialized storage engine for metrics backed by Mace.
+struct StorageBackend {
+    _mace: Mace,
+    bucket: Bucket,
+    counters: DashMap<String, u64>,
+}
+
+/// Open options shared by production `MetricStorage` and comparison benches.
+pub fn mace_metrics_options(path: impl AsRef<Path>) -> Options {
+    let mut opts = Options::new(path);
+    // Match the previous RocksDB default (`WriteOptions.sync = false`).
+    opts.sync_on_write = false;
+    opts
+}
+
+/// Bucket policy for metrics/firewall/cache metadata.
+pub fn mace_metrics_bucket_options() -> BucketOptions {
+    let mut opts = BucketOptions::default();
+    // Metrics commits are small and already coalesced; foreground backpressure
+    // only adds latency on the flush path.
+    opts.enable_backpressure = false;
+    opts
+}
+
+pub fn server_period_key(server_id: i64, period: i64) -> String {
+    format!("S{server_id}_T{period}")
+}
+
+pub fn node_period_key(period: i64) -> String {
+    format!("NODE_T{period}")
+}
+
+pub fn fold_counter_deltas(updates: Vec<(String, u64)>) -> Vec<(String, u64)> {
+    let mut merged: HashMap<String, u64> = HashMap::with_capacity(updates.len());
+    for (key, delta) in updates {
+        if delta == 0 {
+            continue;
+        }
+        let entry = merged.entry(key).or_insert(0);
+        *entry = (*entry).saturating_add(delta);
+    }
+    merged.into_iter().collect()
+}
+
+fn add_u64_be(buf: &mut [u8], offset: usize, delta: u64) {
+    let current = parse_u64_be(&buf[offset..offset + 8]);
+    buf[offset..offset + 8].copy_from_slice(&current.saturating_add(delta).to_be_bytes());
+}
+
+/// Packs one server's 5-minute counters into a single value so Mace does one
+/// get+upsert per server instead of nine merge-style RMW operations.
+pub fn apply_server_period_update(
+    existing: Option<&[u8]>,
+    update: &ServerMetricUpdate,
+) -> [u8; SERVER_PERIOD_BYTES] {
+    let mut buf = [0u8; SERVER_PERIOD_BYTES];
+    if let Some(existing) = existing.filter(|value| value.len() == SERVER_PERIOD_BYTES) {
+        buf.copy_from_slice(existing);
+    }
+    add_u64_be(&mut buf, 0, update.total_requests);
+    add_u64_be(&mut buf, 8, update.bytes_sent);
+    add_u64_be(&mut buf, 16, update.bytes_received);
+    add_u64_be(&mut buf, 24, update.cached_bytes);
+    add_u64_be(&mut buf, 32, update.count_cached_requests);
+    add_u64_be(&mut buf, 40, update.count_attack_requests);
+    add_u64_be(&mut buf, 48, update.attack_bytes);
+    buf[56..64].copy_from_slice(&update.active_connections.to_be_bytes());
+    buf[64..72].copy_from_slice(&update.count_ips.to_be_bytes());
+    buf
+}
+
+pub fn apply_node_period_deltas(
+    existing: Option<&[u8]>,
+    sent: u64,
+    received: u64,
+) -> [u8; NODE_PERIOD_BYTES] {
+    let mut buf = [0u8; NODE_PERIOD_BYTES];
+    if let Some(existing) = existing.filter(|value| value.len() == NODE_PERIOD_BYTES) {
+        buf.copy_from_slice(existing);
+    }
+    add_u64_be(&mut buf, 0, sent);
+    add_u64_be(&mut buf, 8, received);
+    buf
+}
+
+fn txn_get_slice(txn: &mace::TxnKV<'_>, key: &[u8]) -> Result<Option<Vec<u8>>, OpCode> {
+    match txn.get(key) {
+        Ok(value) => Ok(Some(value.to_vec())),
+        Err(OpCode::NotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Embedded key-value storage for metrics and node metadata (Mace).
 pub struct MetricStorage {
-    db: Option<Arc<DB>>,
+    backend: Option<Arc<StorageBackend>>,
+}
+
+fn parse_u64_be(bytes: &[u8]) -> u64 {
+    if bytes.len() == 8 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(bytes);
+        u64::from_be_bytes(buf)
+    } else {
+        0
+    }
 }
 
 impl MetricStorage {
     pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        match DB::open(path) {
-            Ok(db) => Ok(Self {
-                db: Some(Arc::new(db)),
-            }),
-            Err(e) => {
-                let err_msg = e.to_string();
-                if err_msg.contains("Resource temporarily unavailable") {
-                    error!("Mace storage is already in use by another process.");
-                }
-                Err(anyhow::anyhow!("Failed to open Mace storage: {}", e))
-            }
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+
+        let opts = mace_metrics_options(path)
+            .validate()
+            .map_err(mace_open_error)?;
+        let mace = Mace::new(opts).map_err(mace_open_error)?;
+        let bucket = mace
+            .new_bucket(METRICS_BUCKET, mace_metrics_bucket_options())
+            .or_else(|err| {
+                if err == OpCode::Exist {
+                    mace.get_bucket(METRICS_BUCKET)
+                } else {
+                    Err(err)
+                }
+            })
+            .map_err(mace_open_error)?;
+
+        Ok(Self {
+            backend: Some(Arc::new(StorageBackend {
+                _mace: mace,
+                bucket,
+                counters: DashMap::new(),
+            })),
+        })
     }
 
     pub fn unavailable() -> Self {
-        Self { db: None }
+        Self { backend: None }
+    }
+
+    fn bucket(&self) -> Option<&Bucket> {
+        self.backend.as_ref().map(|backend| &backend.bucket)
+    }
+
+    fn read<F, T>(&self, f: F) -> Option<T>
+    where
+        F: FnOnce(&mace::TxnView<'_>) -> Result<T, OpCode>,
+    {
+        let bucket = self.bucket()?;
+        let view = bucket.view().ok()?;
+        f(&view).ok()
+    }
+
+    fn write<F>(&self, f: F) -> bool
+    where
+        F: FnOnce(&mace::TxnKV<'_>) -> Result<(), OpCode>,
+    {
+        let Some(bucket) = self.bucket() else {
+            return false;
+        };
+        let Ok(txn) = bucket.begin() else {
+            return false;
+        };
+        if f(&txn).is_err() {
+            return false;
+        }
+        txn.commit().is_ok()
+    }
+
+    fn get_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.read(|view| view.get(key).map(|value| value.to_vec()))
+    }
+
+    fn put_raw(&self, key: &[u8], value: &[u8]) -> bool {
+        self.write(|txn| txn.upsert(key, value))
+    }
+
+    fn delete_raw(&self, key: &[u8]) -> bool {
+        self.write(|txn| match txn.del(key) {
+            Ok(()) => Ok(()),
+            Err(OpCode::NotFound) => Ok(()),
+            Err(err) => Err(err),
+        })
     }
 
     pub fn record_server_batch(
@@ -55,176 +220,158 @@ impl MetricStorage {
         node_sent: u64,
         node_received: u64,
     ) {
-        let Some(db) = &self.db else {
+        let Some(backend) = self.backend.as_ref() else {
             return;
         };
-        let mut batch = WriteBatch::default();
+        let Ok(txn) = backend.bucket.begin() else {
+            return;
+        };
 
         for u in updates {
-            let prefix = format!("S{}_T{}", u.server_id, period);
-
-            // Store delta-based counters using merge operator
-            batch.merge(
-                format!("{}_req", prefix).as_bytes(),
-                u.total_requests.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_sent", prefix).as_bytes(),
-                u.bytes_sent.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_recv", prefix).as_bytes(),
-                u.bytes_received.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_cached_sent", prefix).as_bytes(),
-                u.cached_bytes.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_cached_req", prefix).as_bytes(),
-                u.count_cached_requests.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_attack_req", prefix).as_bytes(),
-                u.count_attack_requests.to_be_bytes(),
-            );
-            batch.merge(
-                format!("{}_attack_sent", prefix).as_bytes(),
-                u.attack_bytes.to_be_bytes(),
-            );
-
-            // Store gauge values using put
-            batch.put(
-                format!("{}_conns", prefix).as_bytes(),
-                u.active_connections.to_be_bytes(),
-            );
-            batch.put(
-                format!("{}_ips", prefix).as_bytes(),
-                u.count_ips.to_be_bytes(),
-            );
+            let key = server_period_key(u.server_id, period);
+            let existing = match txn_get_slice(&txn, key.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            let packed = apply_server_period_update(existing.as_deref(), &u);
+            if txn.upsert(key.as_bytes(), packed).is_err() {
+                return;
+            }
         }
 
-        let node_prefix = format!("NODE_T{}", period);
-        batch.merge(
-            format!("{}_sent", node_prefix).as_bytes(),
-            node_sent.to_be_bytes(),
-        );
-        batch.merge(
-            format!("{}_recv", node_prefix).as_bytes(),
-            node_received.to_be_bytes(),
-        );
-
-        if let Err(err) = db.write(&batch) {
-            error!(error = %err, "Mace metrics batch write failed");
+        if node_sent != 0 || node_received != 0 {
+            let key = node_period_key(period);
+            let existing = match txn_get_slice(&txn, key.as_bytes()) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            let packed = apply_node_period_deltas(existing.as_deref(), node_sent, node_received);
+            if txn.upsert(key.as_bytes(), packed).is_err() {
+                return;
+            }
         }
+
+        let _ = txn.commit();
     }
 
     /// Increments multiple counters in a single atomic batch.
     pub fn increment_batch(&self, updates: Vec<(String, u64)>) {
-        let Some(db) = &self.db else {
+        let Some(backend) = self.backend.as_ref() else {
             return;
         };
-        let mut batch = WriteBatch::default();
-        for (key, delta) in updates {
-            batch.merge(key.as_bytes(), delta.to_be_bytes());
+        let updates = fold_counter_deltas(updates);
+        if updates.is_empty() {
+            return;
         }
-        if let Err(err) = db.write(&batch) {
-            error!(error = %err, "Mace counter batch write failed");
+        let Ok(txn) = backend.bucket.begin() else {
+            return;
+        };
+        let mut committed = HashMap::with_capacity(updates.len());
+        for (key, delta) in updates {
+            let current = if let Some(cached) = backend.counters.get(&key) {
+                *cached
+            } else {
+                match txn.get(key.as_bytes()) {
+                    Ok(value) => parse_u64_be(value.slice()),
+                    Err(OpCode::NotFound) => 0,
+                    Err(_) => return,
+                }
+            };
+            let next = current.saturating_add(delta);
+            if txn.upsert(key.as_bytes(), next.to_be_bytes()).is_err() {
+                return;
+            }
+            committed.insert(key, next);
+        }
+        if txn.commit().is_ok() {
+            for (key, next) in committed {
+                backend.counters.insert(key, next);
+            }
         }
     }
 
     /// Deletes all data older than a specific timestamp.
     pub fn cleanup_old_stats(&self, older_than_timestamp: i64) {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return;
         };
-        // Delete by scan to keep retention behavior independent of engine range-delete semantics.
-        // Compare the parsed period, not the complete key: lexical ordering by server id makes
-        // keys such as S7_T... invisible when the old S0_T... sentinel is used.
-        let mut batch = WriteBatch::default();
-        let mut deleted = 0usize;
-        let iter = db.iterator(IteratorMode::Start);
-        for (key, _) in iter.flatten() {
-            if stats_period_from_key(&key).is_some_and(|period| period < older_than_timestamp) {
-                batch.delete(&key);
-                deleted += 1;
-                if deleted >= STATS_CLEANUP_BATCH_SIZE {
-                    if let Err(err) = db.write(&batch) {
-                        error!(error = %err, deleted, "Mace stats cleanup batch write failed");
-                    }
-                    batch = WriteBatch::default();
-                    deleted = 0;
+        let Ok(view) = bucket.view() else {
+            return;
+        };
+        let Ok(txn) = bucket.begin() else {
+            return;
+        };
+
+        let end_prefix = format!("S0_T{older_than_timestamp}");
+        let node_end_prefix = format!("NODE_T{older_than_timestamp}");
+
+        for prefix in ["S", "NODE_T"] {
+            let end = if prefix == "S" {
+                end_prefix.as_str()
+            } else {
+                node_end_prefix.as_str()
+            };
+            for item in view.seek(prefix) {
+                let key = item.key();
+                let key_str = match std::str::from_utf8(key) {
+                    Ok(key_str) => key_str,
+                    Err(_) => continue,
+                };
+                if !key_str.starts_with(prefix) {
+                    break;
+                }
+                if key_str >= end {
+                    break;
+                }
+                if txn.del(key).is_err() {
+                    return;
                 }
             }
         }
-        if deleted > 0
-            && let Err(err) = db.write(&batch)
-        {
-            error!(error = %err, deleted, "Mace stats cleanup write failed");
-        }
+
+        let _ = txn.commit();
     }
 
     pub fn put_json<T: Serialize>(&self, key: &str, value: &T) -> bool {
-        let Some(db) = &self.db else {
-            return false;
-        };
         match serde_json::to_vec(value) {
-            Ok(bytes) => db.put(key.as_bytes(), bytes).is_ok(),
+            Ok(bytes) => self.put_raw(key.as_bytes(), &bytes),
             Err(_) => false,
         }
     }
 
     pub fn get_json<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
-        let Some(db) = &self.db else {
-            return None;
-        };
-        db.get(key.as_bytes())
-            .ok()
-            .flatten()
+        self.get_raw(key.as_bytes())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
     }
 
     pub fn record_unique_ip(&self, server_id: i64, day: &str, ip: IpAddr) {
-        let Some(db) = &self.db else {
-            return;
-        };
         if server_id <= 0 || day.is_empty() {
             return;
         }
-        let key = unique_ip_key(server_id, day, ip);
-        if let Some(tx) = UNIQUE_IP_WRITER_TX.get() {
-            match tx.try_send((key, Vec::new())) {
-                Ok(()) => return,
-                Err(TrySendError::Full(_)) => {
-                    let dropped = UNIQUE_IP_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
-                    if dropped.is_power_of_two() {
-                        warn!(dropped, "Mace unique-IP writer queue is full");
-                    }
-                    return;
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    error!(server_id, day, "Mace unique-IP writer queue is closed");
-                    return;
-                }
-            }
-        }
-        if let Err(err) = db.put(key.as_bytes(), []) {
-            error!(error = %err, server_id, day, "Mace unique-IP write failed");
-        }
+        let _ = self.put_raw(
+            unique_ip_key(server_id, day, ip).as_bytes(),
+            UNIQUE_IP_MARKER,
+        );
     }
 
     pub fn load_unique_ips(&self, min_day: &str) -> Vec<(i64, String, IpAddr)> {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return Vec::new();
         };
+        let Ok(view) = bucket.view() else {
+            return Vec::new();
+        };
+
         let mut rows = Vec::new();
-        let iter = db.prefix_iterator("UIP_".as_bytes());
-        for (key, _) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
+        for item in view.seek("UIP_") {
+            let key_str = match std::str::from_utf8(item.key()) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with("UIP_") {
                 break;
             }
-            if let Some((server_id, day, ip)) = parse_unique_ip_key(&key_str)
+            if let Some((server_id, day, ip)) = parse_unique_ip_key(key_str)
                 && day.as_str() >= min_day
             {
                 rows.push((server_id, day, ip));
@@ -234,25 +381,34 @@ impl MetricStorage {
     }
 
     pub fn cleanup_unique_ips_before(&self, min_day: &str) {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return;
         };
-        let mut batch = WriteBatch::default();
-        let iter = db.prefix_iterator("UIP_".as_bytes());
-        for (key, _) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
+        let Ok(view) = bucket.view() else {
+            return;
+        };
+        let Ok(txn) = bucket.begin() else {
+            return;
+        };
+
+        for item in view.seek("UIP_") {
+            let key = item.key();
+            let key_str = match std::str::from_utf8(key) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with("UIP_") {
                 break;
             }
-            if let Some((_, day, _)) = parse_unique_ip_key(&key_str)
+            if let Some((_, day, _)) = parse_unique_ip_key(key_str)
                 && day.as_str() < min_day
+                && txn.del(key).is_err()
             {
-                batch.delete(&key);
+                return;
             }
         }
-        if let Err(err) = db.write(&batch) {
-            error!(error = %err, "Mace unique-IP cleanup write failed");
-        }
+
+        let _ = txn.commit();
     }
 
     /// Cache Metadata Management
@@ -287,101 +443,64 @@ impl MetricStorage {
     }
 
     pub fn upsert_cache_meta_absolute(&self, upsert: CacheMetaUpsert<'_>) {
-        let meta = cache_meta_from_upsert(&upsert);
-        apply_cache_meta_memory(upsert.hash, meta.clone());
-        let Some(db) = &self.db else {
-            return;
+        let meta = CacheMetaEntry {
+            cache_key: upsert.cache_key.to_string(),
+            size: upsert.size,
+            expires: upsert.expires,
+            access_time: upsert.access_time,
+            access_count: upsert.access_count,
+            status: normalize_cache_status(upsert.status),
+            headers: upsert.headers.to_vec(),
+            compressed: upsert.compressed,
+            shard_id: upsert.shard_id.map(str::to_string),
+            relative_path: upsert.relative_path.map(str::to_string),
+            event_version: upsert.event_version,
+            updated_at: upsert
+                .updated_at
+                .unwrap_or_else(crate::utils::time::now_timestamp),
+            stale_while_revalidate_secs: upsert.stale_while_revalidate_secs,
+            created_at: upsert.created_at,
         };
-        if let Err(err) = db.put(
-            format!("CMETA_{}", upsert.hash).as_bytes(),
+        apply_cache_meta_memory(upsert.hash, meta.clone());
+        let db_key = format!("CMETA_{}", upsert.hash);
+        let _ = self.put_raw(
+            db_key.as_bytes(),
             cache_meta_json(&meta).to_string().as_bytes(),
-        ) {
-            error!(error = %err, hash = upsert.hash, "Mace cache metadata write failed");
-        }
+        );
     }
 
-    /// Applies metadata to the hot in-memory index, then waits for a bounded,
-    /// dedicated Mace writer. The Tokio reactor never performs the sync write.
-    pub async fn upsert_cache_meta_absolute_async(&self, upsert: CacheMetaUpsert<'_>) -> bool {
-        let meta = cache_meta_from_upsert(&upsert);
-        apply_cache_meta_memory(upsert.hash, meta.clone());
-
-        let Some(tx) = CACHE_META_WRITER_TX.get() else {
-            warn!(
-                hash = upsert.hash,
-                "Mace cache metadata writer is not started"
-            );
-            return false;
-        };
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if tx
-            .send(CacheMetaWrite::Upsert {
-                hash: upsert.hash.to_string(),
-                meta,
-                ack: ack_tx,
-            })
-            .await
-            .is_err()
-        {
-            error!(
-                hash = upsert.hash,
-                "Mace cache metadata writer queue is closed"
-            );
-            return false;
-        }
-        ack_rx.await.unwrap_or(false)
-    }
-
-    /// Records a cache access in memory only — no Mace I/O on the hot path.
-    /// Access timestamps and counts are flushed periodically by the background task.
+    /// Records a cache access in memory only — no storage I/O on the hot path.
     pub fn record_cache_access(&self, hash: &str) {
         record_cache_access_memory(hash);
     }
 
-    /// Flush in-memory access logs to Mace. Called by background task every 30s.
+    /// Flush in-memory access logs to storage. Called by background task every 30s.
     pub fn flush_cache_accesses(&self) {
-        let Some(db) = &self.db else {
-            return;
-        };
-        if CACHE_ACCESS_LOG.is_empty() {
+        if self.bucket().is_none() || CACHE_ACCESS_LOG.is_empty() {
             return;
         }
-        let mut batch = WriteBatch::default();
-        for entry in CACHE_ACCESS_LOG.iter() {
-            let hash = entry.key();
-            let (access_ts, access_cnt) = entry.value();
-            let cnt = access_cnt.swap(0, Ordering::Relaxed);
-            let ts = access_ts.load(Ordering::Relaxed);
-            if cnt == 0 {
-                continue;
+
+        let _ = self.write(|txn| {
+            for entry in CACHE_ACCESS_LOG.iter() {
+                let hash = entry.key();
+                let (access_ts, access_cnt) = entry.value();
+                let cnt = access_cnt.swap(0, Ordering::Relaxed);
+                let ts = access_ts.load(Ordering::Relaxed);
+                if cnt == 0 {
+                    continue;
+                }
+                if let Some(mut meta) = CACHE_META_INDEX.get(hash).map(|v| v.clone()) {
+                    meta.access_time = ts;
+                    meta.access_count += cnt;
+                    CACHE_META_INDEX.insert(hash.clone(), meta.clone());
+                    let db_key = format!("CMETA_{hash}");
+                    txn.upsert(
+                        db_key.as_bytes(),
+                        cache_meta_json(&meta).to_string().as_bytes(),
+                    )?;
+                }
             }
-            // Read from the in-memory index, then update both memory and Mace.
-            if let Some(mut meta) = CACHE_META_INDEX.get(hash).map(|v| v.clone()) {
-                meta.access_time = ts;
-                meta.access_count += cnt;
-                // Write back to in-memory index so eviction/stats see updated access time
-                CACHE_META_INDEX.insert(hash.clone(), meta.clone());
-                // Persist to Mace.
-                let db_key = format!("CMETA_{}", hash);
-                batch.put(
-                    db_key.as_bytes(),
-                    cache_meta_json(&meta).to_string().as_bytes(),
-                );
-            }
-        }
-        if let Err(err) = db.write(&batch) {
-            error!(error = %err, "Mace cache access flush failed");
-        }
-        let now = crate::utils::time::now_timestamp();
-        let mut cleaned = 0usize;
-        CACHE_ACCESS_LOG.retain(|hash, (access_ts, access_cnt)| {
-            if cleaned >= STATS_CLEANUP_BATCH_SIZE || access_ts.load(Ordering::Relaxed) + CACHE_ACCESS_LOG_TTL_SECS > now || access_cnt.load(Ordering::Relaxed) > 0 {
-                true
-            } else {
-                cleaned += 1;
-                let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheAccessLog, hash, 0);
-                false
-            }
+            Ok(())
         });
     }
 
@@ -391,48 +510,28 @@ impl MetricStorage {
 
     pub fn delete_cache_meta(&self, hash: &str) {
         remove_cache_meta_memory(hash);
-        let Some(db) = &self.db else {
-            return;
-        };
-        if let Err(err) = db.delete(format!("CMETA_{}", hash).as_bytes()) {
-            error!(error = %err, hash, "Mace cache metadata delete failed");
-        }
-    }
-
-    pub async fn delete_cache_meta_async(&self, hash: &str) -> bool {
-        remove_cache_meta_memory(hash);
-
-        let Some(tx) = CACHE_META_WRITER_TX.get() else {
-            warn!(hash, "Mace cache metadata writer is not started");
-            return false;
-        };
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if tx
-            .send(CacheMetaWrite::Delete {
-                hash: hash.to_string(),
-                ack: ack_tx,
-            })
-            .await
-            .is_err()
-        {
-            error!(hash, "Mace cache metadata writer queue is closed");
-            return false;
-        }
-        ack_rx.await.unwrap_or(false)
+        let db_key = format!("CMETA_{hash}");
+        let _ = self.delete_raw(db_key.as_bytes());
     }
 
     pub fn load_client_agent_ips(&self) -> Vec<crate::client_agent::ClientAgentIpRecord> {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return Vec::new();
         };
+        let Ok(view) = bucket.view() else {
+            return Vec::new();
+        };
+
         let mut records = Vec::new();
-        let iter = db.prefix_iterator("CAIP_IP_".as_bytes());
-        for (key, val) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key);
+        for item in view.seek("CAIP_IP_") {
+            let key_str = match std::str::from_utf8(item.key()) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with("CAIP_IP_") {
                 break;
             }
-            if let Some(record) = client_agent_ip_record_from_slice(&val) {
+            if let Some(record) = client_agent_ip_record_from_slice(item.val()) {
                 records.push(record);
             }
         }
@@ -440,33 +539,24 @@ impl MetricStorage {
     }
 
     pub fn get_client_agent_last_id(&self) -> i64 {
-        let Some(db) = &self.db else {
-            return 0;
-        };
-        db.get("CAIP_META_last_id".as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|v| {
-                if v.len() == 8 {
+        self.get_raw(b"CAIP_META_last_id")
+            .map(|value| {
+                if value.len() == 8 {
                     let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&v);
-                    Some(i64::from_be_bytes(buf))
+                    buf.copy_from_slice(&value);
+                    i64::from_be_bytes(buf)
                 } else {
-                    None
+                    0
                 }
             })
             .unwrap_or(0)
     }
 
     pub fn save_client_agent_ip(&self, record: &crate::client_agent::ClientAgentIpRecord) -> bool {
-        let Some(db) = &self.db else {
-            return true;
-        };
-        db.put(
+        self.put_raw(
             client_agent_ip_key(&record.ip).as_bytes(),
             client_agent_ip_json(record).to_string().as_bytes(),
         )
-        .is_ok()
     }
 
     pub fn save_client_agent_ip_batch(
@@ -474,53 +564,37 @@ impl MetricStorage {
         records: &[crate::client_agent::ClientAgentIpRecord],
         last_id: i64,
     ) -> bool {
-        let Some(db) = &self.db else {
-            return true;
-        };
-        let mut batch = WriteBatch::default();
-        for record in records {
-            batch.put(
-                client_agent_ip_key(&record.ip).as_bytes(),
-                client_agent_ip_json(record).to_string().as_bytes(),
-            );
-        }
-        batch.put("CAIP_META_last_id".as_bytes(), last_id.to_be_bytes());
-        db.write(&batch).is_ok()
+        self.write(|txn| {
+            for record in records {
+                txn.upsert(
+                    client_agent_ip_key(&record.ip).as_bytes(),
+                    client_agent_ip_json(record).to_string().as_bytes(),
+                )?;
+            }
+            txn.upsert(b"CAIP_META_last_id", last_id.to_be_bytes())
+        })
     }
 
     /// WAF Token Persistence
     pub fn save_waf_token(&self, token: &str, ip: &str, ua_hash: &str, expired_at: u64) {
-        let Some(db) = &self.db else {
-            return;
-        };
         let val = serde_json::json!({
             "ip": ip,
             "ua": ua_hash,
             "exp": expired_at
         });
-        if let Err(err) = db.put(
-            format!("WAFTOK_{}", token).as_bytes(),
+        let _ = self.put_raw(
+            format!("WAFTOK_{token}").as_bytes(),
             val.to_string().as_bytes(),
-        ) {
-            error!(error = %err, "Mace WAF token write failed");
-        }
+        );
     }
 
     pub fn get_waf_token(&self, token: &str) -> Option<serde_json::Value> {
-        let db = self.db.as_ref()?;
-        db.get(format!("WAFTOK_{}", token).as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_slice(&v).ok())
+        self.get_raw(format!("WAFTOK_{token}").as_bytes())
+            .and_then(|value| serde_json::from_slice(&value).ok())
     }
 
     pub fn delete_waf_token(&self, token: &str) {
-        let Some(db) = &self.db else {
-            return;
-        };
-        if let Err(err) = db.delete(format!("WAFTOK_{}", token).as_bytes()) {
-            error!(error = %err, "Mace WAF token delete failed");
-        }
+        let _ = self.delete_raw(format!("WAFTOK_{token}").as_bytes());
     }
 
     pub fn total_cache_size(&self) -> u64 {
@@ -541,69 +615,62 @@ impl MetricStorage {
     }
 
     pub fn get_value(&self, key: &str) -> u64 {
-        let Some(db) = &self.db else {
-            return 0;
-        };
-        db.get(key.as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|v| {
-                if v.len() == 8 {
-                    let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&v);
-                    Some(u64::from_be_bytes(buf))
-                } else {
-                    None
-                }
-            })
+        if let Some(backend) = self.backend.as_ref()
+            && let Some(cached) = backend.counters.get(key)
+        {
+            return *cached;
+        }
+        self.get_raw(key.as_bytes())
+            .map(|value| parse_u64_be(&value))
             .unwrap_or(0)
     }
 
     pub fn delete_key(&self, key: &str) {
-        let Some(db) = &self.db else {
-            return;
-        };
-        if let Err(err) = db.delete(key.as_bytes()) {
-            error!(error = %err, key, "Mace key delete failed");
-        }
+        let _ = self.delete_raw(key.as_bytes());
     }
 
     pub fn write_raw_batch(&self, puts: Vec<(String, Vec<u8>)>, deletes: Vec<String>) -> bool {
-        let Some(db) = &self.db else {
-            return false;
-        };
         if puts.is_empty() && deletes.is_empty() {
-            return true;
+            return self.backend.is_some();
         }
-        let mut batch = WriteBatch::default();
-        for (key, value) in puts {
-            batch.put(key.as_bytes(), value);
-        }
-        for key in deletes {
-            batch.delete(key.as_bytes());
-        }
-        db.write(&batch).is_ok()
+        self.write(|txn| {
+            for (key, value) in puts {
+                txn.upsert(key.as_bytes(), value)?;
+            }
+            for key in deletes {
+                match txn.del(key.as_bytes()) {
+                    Ok(()) | Err(OpCode::NotFound) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(())
+        })
     }
 
     pub fn scan_json_prefix<T: DeserializeOwned>(&self, prefix: &str) -> Vec<(String, T)> {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return Vec::new();
         };
+        let Ok(view) = bucket.view() else {
+            return Vec::new();
+        };
+
         let mut results = Vec::new();
-        let iter = db.prefix_iterator(prefix.as_bytes());
-        for (key, val) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key).to_string();
+        for item in view.seek(prefix) {
+            let key_str = match std::str::from_utf8(item.key()) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with(prefix) {
                 break;
             }
-            if let Ok(value) = serde_json::from_slice::<T>(&val) {
-                results.push((key_str, value));
+            if let Ok(value) = serde_json::from_slice::<T>(item.val()) {
+                results.push((key_str.to_string(), value));
             }
         }
         results
     }
 
-    /// Iterates over all cache metadata efficiently using a closure.
     pub fn for_each_cache_meta<F>(&self, mut f: F)
     where
         F: FnMut(String, &CacheMetaEntry),
@@ -619,7 +686,8 @@ impl MetricStorage {
             return keys;
         }
         for entry in CACHE_META_INDEX.iter() {
-            if crate::cache_hybrid::meta_headers_contain_surrogate_tag(&entry.value().headers, tag) {
+            if crate::cache_hybrid::meta_headers_contain_surrogate_tag(&entry.value().headers, tag)
+            {
                 keys.push(entry.value().cache_key.clone());
                 if keys.len() >= limit {
                     break;
@@ -629,7 +697,6 @@ impl MetricStorage {
         keys
     }
 
-    /// Scans all cache metadata, returning a vector of (hash, metadata)
     pub fn scan_all_cache_meta(&self) -> Vec<(String, CacheMetaEntry)> {
         CACHE_META_INDEX
             .iter()
@@ -637,26 +704,34 @@ impl MetricStorage {
             .collect()
     }
 
-    /// Scans keys with a prefix, useful for extracting metrics for a specific server or period.
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, u64)> {
-        let Some(db) = &self.db else {
+        let Some(bucket) = self.bucket() else {
             return Vec::new();
         };
+        let Ok(view) = bucket.view() else {
+            return Vec::new();
+        };
+
         let mut results = Vec::new();
-        let iter = db.prefix_iterator(prefix.as_bytes());
-        for (key, val) in iter.flatten() {
-            let key_str = String::from_utf8_lossy(&key).to_string();
+        for item in view.seek(prefix) {
+            let key_str = match std::str::from_utf8(item.key()) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
+            };
             if !key_str.starts_with(prefix) {
                 break;
             }
+            let val = item.val();
             if val.len() == 8 {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&val);
-                results.push((key_str, u64::from_be_bytes(buf)));
+                results.push((key_str.to_string(), parse_u64_be(val)));
             }
         }
         results
     }
+}
+
+fn mace_open_error(err: OpCode) -> anyhow::Error {
+    anyhow::anyhow!("Failed to open Mace storage: {err:?}")
 }
 
 pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
@@ -670,19 +745,8 @@ pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
         }
         path
     } else {
-        let canonical = node_paths.mace_metrics_db_dir();
-        if !canonical.exists() && node_paths.legacy_mace_metrics_db_dir().exists() {
-            let legacy = node_paths.legacy_mace_metrics_db_dir();
-            tracing::warn!(
-                "Using legacy Mace metrics path {}. New deployments should use {}.",
-                legacy.display(),
-                canonical.display()
-            );
-            legacy
-        } else {
-            let _ = std::fs::create_dir_all(node_paths.data_dir());
-            canonical
-        }
+        let _ = std::fs::create_dir_all(node_paths.data_dir());
+        node_paths.metrics_db_dir()
     };
     match MetricStorage::open(&path) {
         Ok(storage) => storage,
@@ -692,13 +756,12 @@ pub static STORAGE: Lazy<MetricStorage> = Lazy::new(|| {
                 path.display(),
                 err
             );
+            error!("If another process holds the store, stop it before restarting.");
             MetricStorage::unavailable()
         }
     }
 });
 
-/// In-memory cache access tracker: hash → (last_access_timestamp, access_count)
-/// Eliminates synchronous Mace I/O from the cache HIT hot path.
 static CACHE_ACCESS_LOG: Lazy<DashMap<String, (AtomicI64, AtomicU64)>> = Lazy::new(DashMap::new);
 
 pub struct CacheMetaUpsert<'a> {
@@ -715,13 +778,10 @@ pub struct CacheMetaUpsert<'a> {
     pub relative_path: Option<&'a str>,
     pub event_version: Option<u64>,
     pub updated_at: Option<i64>,
-    /// Value parsed from `Cache-Control: stale-while-revalidate=N` (0 = not set).
     pub stale_while_revalidate_secs: u64,
-    /// Unix timestamp when this entry was first created.
     pub created_at: i64,
 }
 
-/// Typed cache metadata — avoids per-lookup JSON clone/parse overhead.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheMetaEntry {
     pub cache_key: String,
@@ -740,67 +800,47 @@ pub struct CacheMetaEntry {
     pub event_version: Option<u64>,
     #[serde(default)]
     pub updated_at: i64,
-    /// Seconds from `expires` during which the stale entry may be served while
-    /// a background revalidation is in flight (RFC 5861 stale-while-revalidate).
     #[serde(default)]
     pub stale_while_revalidate_secs: u64,
-    /// Unix timestamp when this entry was first created (used for weak ETag generation).
     #[serde(default)]
     pub created_at: i64,
 }
 
-enum CacheMetaWrite {
-    Upsert {
-        hash: String,
-        meta: CacheMetaEntry,
-        ack: oneshot::Sender<bool>,
-    },
-    Delete {
-        hash: String,
-        ack: oneshot::Sender<bool>,
-    },
-}
-
-static CACHE_META_WRITER_TX: OnceLock<mpsc::Sender<CacheMetaWrite>> = OnceLock::new();
-static UNIQUE_IP_WRITER_TX: OnceLock<SyncSender<(String, Vec<u8>)>> = OnceLock::new();
-static UNIQUE_IP_DROPPED: AtomicU64 = AtomicU64::new(0);
-
-/// In-memory cache metadata index: hash → typed metadata.
-/// All cache lookups read from here, eliminating synchronous Mace reads on the hot path.
 static CACHE_META_INDEX: Lazy<DashMap<String, CacheMetaEntry>> = Lazy::new(DashMap::new);
 
-fn cache_meta_from_upsert(upsert: &CacheMetaUpsert<'_>) -> CacheMetaEntry {
-    CacheMetaEntry {
-        cache_key: upsert.cache_key.to_string(),
-        size: upsert.size,
-        expires: upsert.expires,
-        access_time: upsert.access_time,
-        access_count: upsert.access_count,
-        status: normalize_cache_status(upsert.status),
-        headers: upsert.headers.to_vec(),
-        compressed: upsert.compressed,
-        shard_id: upsert.shard_id.map(str::to_string),
-        relative_path: upsert.relative_path.map(str::to_string),
-        event_version: upsert.event_version,
-        updated_at: upsert
-            .updated_at
-            .unwrap_or_else(crate::utils::time::now_timestamp),
-        stale_while_revalidate_secs: upsert.stale_while_revalidate_secs,
-        created_at: upsert.created_at,
-    }
-}
-
 fn cache_meta_estimated_bytes(hash: &str, meta: &CacheMetaEntry) -> u64 {
-    let headers = meta.headers.iter().map(|(k, v)| 64u64.saturating_add(k.len() as u64).saturating_add(v.len() as u64)).sum::<u64>();
-    (128u64).saturating_add(hash.len() as u64).saturating_add(meta.cache_key.len() as u64).saturating_add(headers).saturating_add((meta.headers.len() as u64).saturating_mul(32)).min(CACHE_META_MAX_ENTRY_BYTES)
+    let headers = meta
+        .headers
+        .iter()
+        .map(|(k, v)| 64u64.saturating_add(k.len() as u64).saturating_add(v.len() as u64))
+        .sum::<u64>();
+    (128u64)
+        .saturating_add(hash.len() as u64)
+        .saturating_add(meta.cache_key.len() as u64)
+        .saturating_add(headers)
+        .saturating_add((meta.headers.len() as u64).saturating_mul(32))
+        .min(CACHE_META_MAX_ENTRY_BYTES)
 }
 
 fn apply_cache_meta_memory(hash: &str, meta: CacheMetaEntry) {
-    if meta.expires <= crate::utils::time::now_timestamp() { return; }
+    if meta.expires <= crate::utils::time::now_timestamp() {
+        return;
+    }
     let new_bytes = cache_meta_estimated_bytes(hash, &meta);
-    let old_bytes = CACHE_META_INDEX.get(hash).map(|v| cache_meta_estimated_bytes(hash, &v)).unwrap_or(0);
-    if CACHE_META_INDEX.len() >= CACHE_META_MAX_ENTRIES && old_bytes == 0 { return; }
-    if !crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheMetadata, hash, new_bytes) { return; }
+    let old_bytes = CACHE_META_INDEX
+        .get(hash)
+        .map(|v| cache_meta_estimated_bytes(hash, &v))
+        .unwrap_or(0);
+    if CACHE_META_INDEX.len() >= CACHE_META_MAX_ENTRIES && old_bytes == 0 {
+        return;
+    }
+    if !crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+        crate::memory_governor::ResidentCategory::CacheMetadata,
+        hash,
+        new_bytes,
+    ) {
+        return;
+    }
     CACHE_META_INDEX.insert(hash.to_string(), meta.clone());
     crate::cache_hybrid::index_surrogate_keys(&meta.headers, hash);
     crate::cache_hybrid::on_cache_meta_upsert(&meta);
@@ -812,87 +852,17 @@ fn remove_cache_meta_memory(hash: &str) {
         crate::cache_hybrid::on_cache_meta_delete(&meta.cache_key);
     }
     crate::cache_hybrid::remove_hash_from_surrogate_index(hash);
-    // Drop the access-log entry as well; otherwise it grows for every purged entry.
     CACHE_ACCESS_LOG.remove(hash);
-    crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheAccessLog, hash, 0);
-}
-
-fn start_cache_meta_writer() {
-    let (tx, mut rx) = mpsc::channel(CACHE_META_QUEUE_CAPACITY);
-    if CACHE_META_WRITER_TX.set(tx).is_err() {
-        return;
-    }
-
-    let spawn_result = std::thread::Builder::new()
-        .name("mace-cache-writer".to_string())
-        .spawn(move || {
-            while let Some(command) = rx.blocking_recv() {
-                let result = match command {
-                    CacheMetaWrite::Upsert { hash, meta, ack } => {
-                        let result = STORAGE
-                            .db
-                            .as_ref()
-                            .map(|db| {
-                                db.put(
-                                    format!("CMETA_{hash}").as_bytes(),
-                                    cache_meta_json(&meta).to_string().as_bytes(),
-                                )
-                                .map(|_| ())
-                            })
-                            .transpose();
-                        if let Err(err) = &result {
-                            error!(error = %err, hash, "Mace async cache metadata write failed");
-                        }
-                        let ok = result.is_ok_and(|value| value.is_some());
-                        let _ = ack.send(ok);
-                        ok
-                    }
-                    CacheMetaWrite::Delete { hash, ack } => {
-                        let result = STORAGE
-                            .db
-                            .as_ref()
-                            .map(|db| db.delete(format!("CMETA_{hash}").as_bytes()))
-                            .transpose();
-                        if let Err(err) = &result {
-                            error!(error = %err, hash, "Mace async cache metadata delete failed");
-                        }
-                        let ok = result.is_ok_and(|value| value.is_some());
-                        let _ = ack.send(ok);
-                        ok
-                    }
-                };
-                if !result {
-                    // The request receives the failure through its acknowledgement; this log
-                    // also keeps a dropped receiver from becoming a silent persistence loss.
-                    warn!("Mace cache metadata writer rejected a command");
-                }
-            }
-        });
-    if let Err(err) = spawn_result {
-        error!(error = %err, "failed to start Mace cache metadata writer");
-    }
-}
-
-fn start_unique_ip_writer() {
-    let (tx, rx) = std::sync::mpsc::sync_channel(8192);
-    if UNIQUE_IP_WRITER_TX.set(tx).is_err() {
-        return;
-    }
-    let spawn_result = std::thread::Builder::new()
-        .name("mace-unique-ip-writer".to_string())
-        .spawn(move || {
-            while let Ok((key, value)) = rx.recv() {
-                let Some(db) = STORAGE.db.as_ref() else {
-                    continue;
-                };
-                if let Err(err) = db.put(&key, value) {
-                    error!(error = %err, key, "Mace async unique-IP write failed");
-                }
-            }
-        });
-    if let Err(err) = spawn_result {
-        error!(error = %err, "failed to start Mace unique-IP writer");
-    }
+    crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+        crate::memory_governor::ResidentCategory::CacheAccessLog,
+        hash,
+        0,
+    );
+    crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+        crate::memory_governor::ResidentCategory::CacheMetadata,
+        hash,
+        0,
+    );
 }
 
 pub(crate) fn normalize_cache_status(status: u16) -> u16 {
@@ -930,7 +900,7 @@ fn cache_meta_json(meta: &CacheMetaEntry) -> serde_json::Value {
 }
 
 fn client_agent_ip_key(ip: &str) -> String {
-    format!("CAIP_IP_{}", ip)
+    format!("CAIP_IP_{ip}")
 }
 
 fn client_agent_ip_json(record: &crate::client_agent::ClientAgentIpRecord) -> serde_json::Value {
@@ -959,7 +929,7 @@ fn client_agent_ip_record_from_slice(
 }
 
 fn unique_ip_key(server_id: i64, day: &str, ip: IpAddr) -> String {
-    format!("UIP_{}_{}_{}", day, server_id, ip)
+    format!("UIP_{day}_{server_id}_{ip}")
 }
 
 fn parse_unique_ip_key(key: &str) -> Option<(i64, String, IpAddr)> {
@@ -971,33 +941,27 @@ fn parse_unique_ip_key(key: &str) -> Option<(i64, String, IpAddr)> {
     Some((server_id, day, ip))
 }
 
-fn stats_period_from_key(key: &[u8]) -> Option<i64> {
-    let key = std::str::from_utf8(key).ok()?;
-    let period = if let Some(rest) = key.strip_prefix("NODE_T") {
-        rest.split('_').next()?
-    } else if let Some(rest) = key.strip_prefix('S') {
-        let (_, rest) = rest.split_once("_T")?;
-        rest.split('_').next()?
-    } else {
-        return None;
-    };
-    period.parse().ok()
-}
-
 pub fn get_cache_meta_memory(hash: &str) -> Option<CacheMetaEntry> {
     CACHE_META_INDEX.get(hash).map(|v| v.clone())
 }
 
 pub fn record_cache_access_memory(hash: &str) {
-    if !CACHE_META_INDEX.contains_key(hash) { return; }
-    if CACHE_ACCESS_LOG.len() >= CACHE_ACCESS_LOG_MAX_ENTRIES && !CACHE_ACCESS_LOG.contains_key(hash) { return; }
+    if !CACHE_META_INDEX.contains_key(hash) {
+        return;
+    }
+    if CACHE_ACCESS_LOG.len() >= CACHE_ACCESS_LOG_MAX_ENTRIES && !CACHE_ACCESS_LOG.contains_key(hash)
+    {
+        return;
+    }
     let now = crate::utils::time::now_timestamp();
-    let entry = CACHE_ACCESS_LOG
-        .entry(hash.to_string())
-        .or_insert_with(|| {
-            let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheAccessLog, hash, 128 + hash.len() as u64);
-            (AtomicI64::new(now), AtomicU64::new(0))
-        });
+    let entry = CACHE_ACCESS_LOG.entry(hash.to_string()).or_insert_with(|| {
+        let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+            crate::memory_governor::ResidentCategory::CacheAccessLog,
+            hash,
+            128 + hash.len() as u64,
+        );
+        (AtomicI64::new(now), AtomicU64::new(0))
+    });
     entry.0.store(now, Ordering::Relaxed);
     entry.1.fetch_add(1, Ordering::Relaxed);
 }
@@ -1009,28 +973,30 @@ pub fn insert_cache_meta_for_test(hash: String, meta: CacheMetaEntry) {
 
 #[cfg(test)]
 pub fn delete_cache_meta_for_test(hash: &str) {
-    CACHE_META_INDEX.remove(hash);
-    crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheMetadata, hash, 0);
-    CACHE_ACCESS_LOG.remove(hash);
-    crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheAccessLog, hash, 0);
+    remove_cache_meta_memory(hash);
 }
 
-/// Load all existing cache metadata from Mace into the in-memory index at startup.
 pub fn load_cache_meta_index() {
-    let Some(db) = &STORAGE.db else {
+    let Some(bucket) = STORAGE.bucket() else {
         return;
     };
+    let Ok(view) = bucket.view() else {
+        return;
+    };
+
     let mut count = 0;
-    let iter = db.prefix_iterator("CMETA_".as_bytes());
-    for (key, val) in iter.flatten() {
-        let key_str = String::from_utf8_lossy(&key);
+    for item in view.seek("CMETA_") {
+        let key_str = match std::str::from_utf8(item.key()) {
+            Ok(key_str) => key_str,
+            Err(_) => continue,
+        };
         if !key_str.starts_with("CMETA_") {
             break;
         }
-        if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&val) {
+        if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(item.val()) {
             let hash = key_str
                 .strip_prefix("CMETA_")
-                .unwrap_or(&key_str)
+                .unwrap_or(key_str)
                 .to_string();
             let headers: Vec<(String, String)> = raw
                 .get("h")
@@ -1078,12 +1044,11 @@ pub fn load_cache_meta_index() {
             CACHE_META_INDEX.insert(hash, entry);
             count += 1;
         } else {
-            isolate_corrupt_cmeta(&key_str);
+            isolate_corrupt_cmeta(key_str);
         }
     }
     tracing::info!(
-        "Loaded {} cache metadata entries into memory (corrupt_isolated={})",
-        count,
+        "Loaded {count} cache metadata entries into memory (corrupt_isolated={})",
         CORRUPT_CMETA_COUNT.load(Ordering::Relaxed)
     );
 }
@@ -1096,20 +1061,14 @@ fn isolate_corrupt_cmeta(key: &str) {
     warn!(key, "skipping corrupt cache metadata record; disk value retained");
 }
 
-/// Start a background task that flushes in-memory cache access logs to Mace every 30 seconds.
 pub fn start_cache_access_flusher() {
-    // Load existing metadata into memory first
     load_cache_meta_index();
     crate::cache_hybrid::warm_admission_filters_from_cache_meta();
     crate::cache_hybrid::start_bloom_rotation_task();
-    start_cache_meta_writer();
-    start_unique_ip_writer();
     tokio::spawn(async {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            if let Err(err) = tokio::task::spawn_blocking(|| STORAGE.flush_cache_accesses()).await {
-                error!(error = %err, "Mace cache access flusher task failed");
-            }
+            STORAGE.flush_cache_accesses();
         }
     });
 }
@@ -1156,10 +1115,9 @@ pub fn lookup_region_provider_id(ip: IpAddr) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MetricStorage, normalize_cache_status, parse_cache_status, parse_unique_ip_key,
-        stats_period_from_key, unique_ip_key,
-    };
+    use super::{normalize_cache_status, parse_cache_status, parse_unique_ip_key, unique_ip_key};
+    use super::{MetricStorage, CacheMetaUpsert};
+    use std::net::IpAddr;
 
     #[test]
     fn cache_status_normalization_rejects_invalid_http_codes() {
@@ -1186,37 +1144,85 @@ mod tests {
     }
 
     #[test]
-    fn stats_period_parsing_is_independent_of_server_id_order() {
-        assert_eq!(stats_period_from_key(b"S0_T100_req"), Some(100));
-        assert_eq!(stats_period_from_key(b"S7_T100_req"), Some(100));
-        assert_eq!(stats_period_from_key(b"NODE_T100_sent"), Some(100));
-        assert_eq!(stats_period_from_key(b"S7_bad"), None);
-    }
-
-    #[test]
-    fn cleanup_old_stats_removes_old_periods_for_every_server() {
-        let path =
-            std::env::temp_dir().join(format!("cloud-node-mace-cleanup-{}", uuid::Uuid::new_v4()));
-        let storage = MetricStorage::open(&path).expect("open Mace storage");
-        let value = vec![0; 8];
-        assert!(storage.write_raw_batch(
-            vec![
-                ("S0_T100_req".to_string(), value.clone()),
-                ("S7_T100_req".to_string(), value.clone()),
-                ("NODE_T100_sent".to_string(), value.clone()),
-                ("S7_T200_req".to_string(), value),
-            ],
-            Vec::new(),
+    fn mace_storage_round_trip_and_prefix_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "cloud-node-mace-test-{}",
+            uuid::Uuid::new_v4()
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = MetricStorage::open(&dir).expect("open mace storage");
 
-        storage.cleanup_old_stats(200);
+        assert!(storage.put_json("FWBLK_META_test", &true));
+        assert_eq!(storage.get_json::<bool>("FWBLK_META_test"), Some(true));
 
-        assert!(storage.scan_prefix("S0_T100").is_empty());
-        assert!(storage.scan_prefix("S7_T100").is_empty());
-        assert!(storage.scan_prefix("NODE_T100").is_empty());
-        assert_eq!(storage.scan_prefix("S7_T200").len(), 1);
+        storage.increment_batch(vec![("counter_a".to_string(), 10), ("counter_a".to_string(), 5)]);
+        assert_eq!(storage.get_value("counter_a"), 15);
+
+        let update = crate::rpc::metrics::ServerMetricUpdate {
+            server_id: 7,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            total_requests: 10,
+            bytes_sent: 100,
+            bytes_received: 20,
+            cached_bytes: 4,
+            count_cached_requests: 1,
+            count_attack_requests: 0,
+            attack_bytes: 0,
+            active_connections: 3,
+            count_websocket_connections: 0,
+            count_ips: 2,
+        };
+        storage.record_server_batch(1_700_000_000, vec![update.clone()], 50, 25);
+        storage.record_server_batch(1_700_000_000, vec![update], 10, 5);
+        let packed = storage
+            .get_raw(super::server_period_key(7, 1_700_000_000).as_bytes())
+            .expect("packed server period");
+        assert_eq!(packed.len(), super::SERVER_PERIOD_BYTES);
+        assert_eq!(super::parse_u64_be(&packed[0..8]), 20);
+        assert_eq!(super::parse_u64_be(&packed[8..16]), 200);
+        let node = storage
+            .get_raw(super::node_period_key(1_700_000_000).as_bytes())
+            .expect("packed node period");
+        assert_eq!(super::parse_u64_be(&node[0..8]), 60);
+        assert_eq!(super::parse_u64_be(&node[8..16]), 30);
+
+        storage.write_raw_batch(
+            vec![(
+                "FWBLK_V1_global_0_192.0.2.1".to_string(),
+                br#"{"target":"192.0.2.1"}"#.to_vec(),
+            )],
+            Vec::new(),
+        );
+        let scanned = storage.scan_json_prefix::<serde_json::Value>("FWBLK_V1_");
+        assert_eq!(scanned.len(), 1);
+
+        storage.upsert_cache_meta_absolute(CacheMetaUpsert {
+            hash: "abc123",
+            cache_key: "/index.html",
+            size: 1024,
+            expires: 999_999,
+            access_time: 1,
+            access_count: 1,
+            status: 200,
+            headers: &[],
+            compressed: false,
+            shard_id: None,
+            relative_path: None,
+            event_version: None,
+            updated_at: Some(1),
+            stale_while_revalidate_secs: 0,
+            created_at: 1,
+        });
+        assert!(storage.get_cache_meta("abc123").is_some());
+
+        storage.record_unique_ip(1, "20260818", "203.0.113.9".parse::<IpAddr>().unwrap());
+        let ips = storage.load_unique_ips("20260818");
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0].0, 1);
 
         drop(storage);
-        std::fs::remove_dir_all(path).expect("remove Mace test database");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

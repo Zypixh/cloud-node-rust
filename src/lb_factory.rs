@@ -184,7 +184,7 @@ pub fn should_verify_origin_tls(
         OriginTlsSecurityVerifyMode::Auto => {
             let sni_host = strip_addr_port(sni_host).to_ascii_lowercase();
             if sni_host.is_empty() {
-                return false;
+                return true;
             }
             let origin_host = &ext.origin_host_normalized;
 

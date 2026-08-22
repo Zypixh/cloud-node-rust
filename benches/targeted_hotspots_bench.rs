@@ -161,6 +161,7 @@ fn ssl_cert_config() -> SSLCertConfig {
     SSLCertConfig {
         id: 1,
         is_on: true,
+        is_default: true,
         cert_data_json: Some(json!(cert)),
         key_data_json: Some(json!(key)),
         dns_names: Vec::new(),

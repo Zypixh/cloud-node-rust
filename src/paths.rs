@@ -57,12 +57,8 @@ impl NodePaths {
         self.data_dir().join("state.json")
     }
 
-    pub fn blocked_ips_file(&self) -> PathBuf {
-        self.data_dir().join("blocked_ips.json")
-    }
-
     pub fn metrics_db_dir(&self) -> PathBuf {
-        self.data_dir().join("metrics.db")
+        self.data_dir().join("metrics.mace")
     }
 
     /// Mace must never be opened on the legacy RocksDB directory.
@@ -100,10 +96,6 @@ impl NodePaths {
 
     pub fn legacy_state_file(&self) -> PathBuf {
         self.root.join("../data/state.json")
-    }
-
-    pub fn legacy_blocked_ips_file(&self) -> PathBuf {
-        self.root.join("../data/blocked_ips.json")
     }
 
     pub fn legacy_metrics_db_dir(&self) -> PathBuf {
@@ -145,10 +137,6 @@ impl NodePaths {
 
     pub fn state_file_candidates(&self) -> Vec<PathBuf> {
         vec![self.state_file(), self.legacy_state_file()]
-    }
-
-    pub fn blocked_ips_file_candidates(&self) -> Vec<PathBuf> {
-        vec![self.blocked_ips_file(), self.legacy_blocked_ips_file()]
     }
 
     pub fn metrics_db_candidates(&self) -> Vec<PathBuf> {

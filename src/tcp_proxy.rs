@@ -41,6 +41,8 @@ struct ListenerHandle {
 }
 
 static RELAY_ZERO_COPY_ENABLED: AtomicBool = AtomicBool::new(false);
+static RELAY_KEEPALIVE_CACHE: Lazy<std::sync::RwLock<(u32, u32, u32)>> =
+    Lazy::new(|| std::sync::RwLock::new((60, 15, 4)));
 
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_PROXY_DIAG_ENTERED: AtomicU64 = AtomicU64::new(0);
@@ -100,9 +102,13 @@ pub(crate) fn af_xdp_tcp_proxy_diag_snapshot() -> serde_json::Value {
 pub fn configure_relay_from_api(config: &crate::api_config::ApiConfig) {
     let relay = config.relay.normalized();
     RELAY_ZERO_COPY_ENABLED.store(relay.zero_copy, Ordering::Relaxed);
+    refresh_relay_keepalive_cache(&relay);
     info!(
-        "TCP/SNI relay configured: zero_copy={}, copy_buffer=auto(current={} bytes)",
+        "TCP/SNI relay configured: zero_copy={}, keepalive={}s/{}s/{} probes, copy_buffer=auto(current={} bytes)",
         relay.zero_copy,
+        relay.tcp_keepalive_idle_secs,
+        relay.tcp_keepalive_interval_secs,
+        relay.tcp_keepalive_probes,
         MEMORY_GOVERNOR.relay_copy_buffer_bytes()
     );
 }
@@ -152,6 +158,9 @@ struct TcpForwardContext {
 
 static CLIENT_CERT_CACHE: Lazy<Mutex<LruCache<String, ParsedClientCert>>> =
     Lazy::new(|| Mutex::new(LruCache::new(NonZeroUsize::MIN)));
+
+static UPSTREAM_TLS_CONNECTOR_CACHE: Lazy<DashMap<String, Arc<pingora_core::tls::TlsConnector>>> =
+    Lazy::new(DashMap::new);
 
 type TcpTlsAcceptor = pingora_core::listeners::tls::Acceptor;
 
@@ -1565,11 +1574,17 @@ impl TcpProxyManager {
 }
 
 fn configure_backend_tcp_socket(stream: &TcpStream) {
+    configure_relay_tcp_socket(stream);
+}
+
+/// Apply TCP relay socket tuning for passthrough and backend connections.
+pub fn configure_relay_tcp_socket(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
 
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
+
         let fd = stream.as_raw_fd();
         let on = 1i32;
         unsafe {
@@ -1581,11 +1596,15 @@ fn configure_backend_tcp_socket(stream: &TcpStream) {
                 std::mem::size_of::<i32>() as libc::socklen_t,
             );
         }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        apply_tcp_keepalive_timers(fd);
     }
 
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
+
         let fd = stream.as_raw_fd();
         unsafe {
             libc::setsockopt(
@@ -1597,6 +1616,61 @@ fn configure_backend_tcp_socket(stream: &TcpStream) {
             );
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn apply_tcp_keepalive_timers(fd: std::os::unix::io::RawFd) {
+    let (idle_secs, intvl_secs, probes) = *RELAY_KEEPALIVE_CACHE.read().unwrap();
+    let idle = idle_secs as libc::c_int;
+    let intvl = intvl_secs as libc::c_int;
+    let cnt = probes as libc::c_int;
+
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
+                &idle as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
+                &intvl as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPCNT,
+                &cnt as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPALIVE,
+                &idle as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+}
+
+/// Refresh cached relay keepalive timers after config reload.
+pub fn refresh_relay_keepalive_cache(config: &crate::api_config::RelayConfig) {
+    let relay = config.normalized();
+    *RELAY_KEEPALIVE_CACHE.write().unwrap() = (
+        relay.tcp_keepalive_idle_secs,
+        relay.tcp_keepalive_interval_secs,
+        relay.tcp_keepalive_probes,
+    );
 }
 
 async fn release_toa_port(
@@ -1716,21 +1790,33 @@ pub(crate) enum RelayIoPhase {
     Shutdown,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct RelayOptions {
     defer_client_to_backend_clean_shutdown: bool,
     defer_backend_to_client_clean_shutdown: bool,
+    enforce_pressure_idle_timeout: bool,
     cancel_rx: Option<watch::Receiver<bool>>,
-    pressure_idle_timeout: Option<std::time::Duration>,
+}
+
+impl Default for RelayOptions {
+    fn default() -> Self {
+        Self {
+            defer_client_to_backend_clean_shutdown: false,
+            defer_backend_to_client_clean_shutdown: false,
+            enforce_pressure_idle_timeout: true,
+            cancel_rx: None,
+        }
+    }
 }
 
 impl RelayOptions {
     fn sni_passthrough() -> Self {
         Self {
             defer_client_to_backend_clean_shutdown: false,
-            defer_backend_to_client_clean_shutdown: true,
+            defer_backend_to_client_clean_shutdown: false,
+            // Opaque SNI relays can carry intentionally idle multiplexed sessions.
+            enforce_pressure_idle_timeout: false,
             cancel_rx: None,
-            pressure_idle_timeout: None,
         }
     }
 
@@ -1738,8 +1824,8 @@ impl RelayOptions {
         Self {
             defer_client_to_backend_clean_shutdown: true,
             defer_backend_to_client_clean_shutdown: false,
+            enforce_pressure_idle_timeout: true,
             cancel_rx: None,
-            pressure_idle_timeout: None,
         }
     }
 
@@ -1871,7 +1957,22 @@ pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics(
         .await
 }
 
-pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics_cancelable<C, B>(
+pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics_cancelable(
+    server_id: i64,
+    client: TcpStream,
+    backend: TcpStream,
+    cancel_rx: Option<watch::Receiver<bool>>,
+) -> Result<RelayOutcome, BidirectionalStreamError> {
+    stream_tcp_bidirectional_with_metrics_options(
+        server_id,
+        client,
+        backend,
+        RelayOptions::sni_passthrough().with_cancel(cancel_rx),
+    )
+    .await
+}
+
+pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics_cancelable_stream<C, B>(
     server_id: i64,
     client: C,
     backend: B,
@@ -2060,10 +2161,10 @@ where
     let mut unflushed = 0u64;
 
     loop {
-        let n = match read_with_optional_pressure_idle_timeout(
+        let n = match read_with_pressure_idle_timeout(
             &mut reader,
             &mut buf,
-            options.pressure_idle_timeout,
+            options.enforce_pressure_idle_timeout,
         )
         .await
         {
@@ -2108,6 +2209,21 @@ where
             unflushed = 0;
         }
     }
+}
+
+async fn read_with_pressure_idle_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    enforce_pressure_idle_timeout: bool,
+) -> io::Result<usize> {
+    read_with_optional_pressure_idle_timeout(
+        reader,
+        buf,
+        enforce_pressure_idle_timeout
+            .then(|| MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout())
+            .flatten(),
+    )
+    .await
 }
 
 async fn read_with_optional_pressure_idle_timeout<R: AsyncRead + Unpin>(
@@ -2544,13 +2660,18 @@ mod zero_copy {
                 });
             }
 
+            let pressure_timeout = options
+                .enforce_pressure_idle_timeout
+                .then(|| MEMORY_GOVERNOR.tcp_relay_pressure_idle_timeout())
+                .flatten();
+
             let moved_to_pipe =
                 match splice_socket_to_pipe(
                     fds.read.fd(),
                     fds.pipe_write.fd(),
                     control,
                     &mut idle,
-                    options.pressure_idle_timeout,
+                    pressure_timeout,
                 )
                 {
                     Ok(n) => n,
@@ -2881,7 +3002,12 @@ fn build_upstream_tls_connector(
     verify_origin_tls: bool,
     client_cert: Option<&SSLCertConfig>,
 ) -> anyhow::Result<pingora_core::tls::TlsConnector> {
-    let provider = rustls::crypto::ring::default_provider();
+    let cache_key = upstream_tls_connector_cache_key(verify_origin_tls, client_cert);
+    if let Some(connector) = UPSTREAM_TLS_CONNECTOR_CACHE.get(&cache_key) {
+        return Ok(connector.value().as_ref().clone());
+    }
+
+    let provider = crate::tls_crypto::default_crypto_provider();
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone().into())
         .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])?;
 
@@ -2916,7 +3042,19 @@ fn build_upstream_tls_connector(
             .set_certificate_verifier(Arc::new(NoCertificateVerification::new(provider)));
     }
 
-    Ok(pingora_core::tls::TlsConnector::from(Arc::new(config)))
+    let connector = pingora_core::tls::TlsConnector::from(Arc::new(config));
+    UPSTREAM_TLS_CONNECTOR_CACHE.insert(cache_key, Arc::new(connector.clone()));
+    Ok(connector)
+}
+
+fn upstream_tls_connector_cache_key(
+    verify_origin_tls: bool,
+    client_cert: Option<&SSLCertConfig>,
+) -> String {
+    match client_cert.and_then(client_cert_key_for_cache) {
+        Some(cert_key) => format!("verify={verify_origin_tls}:cert={cert_key}"),
+        None => format!("verify={verify_origin_tls}:cert=none"),
+    }
 }
 
 fn parsed_client_cert(client_cert: &SSLCertConfig) -> anyhow::Result<ParsedClientCert> {
@@ -3263,6 +3401,13 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn sni_passthrough_disables_only_pressure_idle_timeout() {
+        assert!(RelayOptions::default().enforce_pressure_idle_timeout);
+        assert!(RelayOptions::af_xdp_tcp().enforce_pressure_idle_timeout);
+        assert!(!RelayOptions::sni_passthrough().enforce_pressure_idle_timeout);
     }
 
     #[test]
@@ -3814,7 +3959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sni_passthrough_defers_backend_eof_until_upload_finishes() {
+    async fn sni_passthrough_propagates_backend_eof_to_client() {
         let (proxy_client, proxy_backend, client, mut backend) = connected_proxy_streams().await;
         let relay = tokio::spawn(async move {
             stream_bidirectional_with_metrics_options(
@@ -3827,16 +3972,10 @@ mod tests {
             .unwrap()
         });
         let response = b"early-control-response";
-        let upload_len = 128 * 1024;
-        let backend_task = tokio::spawn(async move {
-            backend.write_all(response).await.unwrap();
-            backend.shutdown().await.unwrap();
-            let mut upload = vec![0u8; upload_len];
-            backend.read_exact(&mut upload).await.unwrap();
-            assert!(upload.iter().all(|byte| *byte == 5));
-        });
+        backend.write_all(response).await.unwrap();
+        backend.shutdown().await.unwrap();
 
-        let (mut client_reader, mut client_writer) = client.into_split();
+        let (mut client_reader, client_writer) = client.into_split();
         let mut received_response = vec![0u8; response.len()];
         client_reader
             .read_exact(&mut received_response)
@@ -3845,32 +3984,18 @@ mod tests {
         assert_eq!(received_response, response);
 
         let mut eof_probe = [0u8; 1];
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                client_reader.read(&mut eof_probe)
-            )
-            .await
-            .is_err(),
-            "SNI passthrough should not forward backend EOF while upload is still active"
+        assert_eq!(
+            client_reader.read(&mut eof_probe).await.unwrap(),
+            0,
+            "SNI passthrough should forward backend EOF to the client promptly"
         );
 
-        let upload = vec![5u8; upload_len];
-        client_writer.write_all(&upload).await.unwrap();
-        client_writer.shutdown().await.unwrap();
         drop(client_writer);
-
-        let mut tail = Vec::new();
-        client_reader.read_to_end(&mut tail).await.unwrap();
-        assert!(tail.is_empty());
-
-        backend_task.await.unwrap();
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(outcome.close_reason, RelayCloseReason::Clean);
-        assert_eq!(outcome.bytes_received, upload_len as u64);
         assert_eq!(outcome.bytes_sent, response.len() as u64);
     }
 

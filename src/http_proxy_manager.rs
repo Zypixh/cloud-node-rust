@@ -194,6 +194,15 @@ struct PassthroughBackendTarget {
     proxy_protocol: ProxyProtocolConfig,
 }
 
+trait SniPassthroughStream: AsyncRead + AsyncWrite + Unpin {}
+
+impl<T> SniPassthroughStream for T where T: AsyncRead + AsyncWrite + Unpin {}
+
+enum SniPassthroughClient {
+    Tcp(TcpStream),
+    Stream(Box<dyn SniPassthroughStream + Send>),
+}
+
 fn af_xdp_virtual_stream<S>(stream: S, client_addr: SocketAddr) -> L4Stream
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -702,7 +711,11 @@ impl HttpProxyManager {
             ) {
                 continue;
             }
-            let per_ip_limit = crate::l4_defense::current_tcp_active_limit_per_ip();
+            let per_ip_limit = if is_tls && self.config_store.has_any_sni_passthrough_sync() {
+                crate::l4_defense::current_sni_tcp_active_limit_per_ip()
+            } else {
+                crate::l4_defense::current_tcp_active_limit_per_ip()
+            };
             let Some(client_permit) =
                 crate::l4_defense::try_acquire_tcp_active_ip(client_addr.ip(), per_ip_limit)
             else {
@@ -1277,8 +1290,9 @@ impl HttpProxyManager {
             return Ok(TlsHostInspection::None);
         }
 
-        let timeouts =
-            crate::l4_defense::client_hello_timeouts(crate::l4_defense::current_pressure_level());
+        let timeouts = crate::l4_defense::client_hello_timeouts_for_sni_passthrough(
+            crate::l4_defense::current_pressure_level(),
+        );
         match peek_client_hello_sni(client_stream, timeouts).await? {
             ClientHelloPeek::Found(host) => Ok(self
                 .config_store
@@ -1362,7 +1376,7 @@ impl HttpProxyManager {
                         L4ConnectionProtocol::SniTcp,
                     );
                     let sni_cancel_rx = sni_connection_guard.cancel_receiver();
-                    self.handle_sni_passthrough(
+                    self.handle_sni_passthrough_stream(
                         client_stream,
                         client_addr,
                         listen_port,
@@ -1578,7 +1592,27 @@ impl HttpProxyManager {
         Ok(())
     }
 
-    async fn handle_sni_passthrough<S>(
+    async fn handle_sni_passthrough(
+        &self,
+        client_stream: TcpStream,
+        client_addr: SocketAddr,
+        listen_port: u16,
+        sni_host: String,
+        server: Arc<ServerConfig>,
+        cancel_rx: Option<watch::Receiver<bool>>,
+    ) -> anyhow::Result<()> {
+        self.handle_sni_passthrough_inner(
+            SniPassthroughClient::Tcp(client_stream),
+            client_addr,
+            listen_port,
+            sni_host,
+            server,
+            cancel_rx,
+        )
+        .await
+    }
+
+    async fn handle_sni_passthrough_stream<S>(
         &self,
         client_stream: S,
         client_addr: SocketAddr,
@@ -1588,8 +1622,28 @@ impl HttpProxyManager {
         cancel_rx: Option<watch::Receiver<bool>>,
     ) -> anyhow::Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.handle_sni_passthrough_inner(
+            SniPassthroughClient::Stream(Box::new(client_stream)),
+            client_addr,
+            listen_port,
+            sni_host,
+            server,
+            cancel_rx,
+        )
+        .await
+    }
+
+    async fn handle_sni_passthrough_inner(
+        &self,
+        client_stream: SniPassthroughClient,
+        client_addr: SocketAddr,
+        listen_port: u16,
+        sni_host: String,
+        server: Arc<ServerConfig>,
+        cancel_rx: Option<watch::Receiver<bool>>,
+    ) -> anyhow::Result<()> {
         let started = Instant::now();
         let started_at_millis = crate::utils::time::now_timestamp_millis();
         let request_id = crate::logging::next_request_id();
@@ -1647,11 +1701,10 @@ impl HttpProxyManager {
             .try_admit(AdmissionClass::OriginConnect)
             .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         let toa_config = self.config_store.get_toa_config_sync();
-        let mut backend_stream = match crate::toa::connect_with_toa(
+        let mut backend_stream = match connect_passthrough_backend_with_retry(
             &backend_addr,
             client_addr,
             toa_config.clone(),
-            Duration::from_secs(10),
         )
         .await
         {
@@ -1820,14 +1873,26 @@ impl HttpProxyManager {
         crate::rpc::stats::push_origin_health_event(origin_id, true, connect_latency_ms);
         drop(origin_connect_permit);
 
-        let result =
-            crate::tcp_proxy::stream_sni_passthrough_bidirectional_with_metrics_cancelable(
-                server_id,
-                client_stream,
-                backend_stream,
-                cancel_rx,
-            )
-            .await;
+        let result = match client_stream {
+            SniPassthroughClient::Tcp(client_stream) => {
+                crate::tcp_proxy::stream_sni_passthrough_bidirectional_with_metrics_cancelable(
+                    server_id,
+                    client_stream,
+                    backend_stream,
+                    cancel_rx,
+                )
+                .await
+            }
+            SniPassthroughClient::Stream(client_stream) => {
+                crate::tcp_proxy::stream_sni_passthrough_bidirectional_with_metrics_cancelable_stream(
+                    server_id,
+                    client_stream,
+                    backend_stream,
+                    cancel_rx,
+                )
+                .await
+            }
+        };
         if let Some(local_port) = toa_local_port {
             if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
             {
@@ -2303,6 +2368,42 @@ fn is_benign_h2_error(message: &str) -> bool {
         || lower.contains("unexpected frame type")
 }
 
+async fn connect_passthrough_backend_with_retry(
+    backend_addr: &str,
+    client_addr: SocketAddr,
+    toa_config: Option<crate::config_models::TOAConfig>,
+) -> anyhow::Result<TcpStream> {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+    match crate::toa::connect_with_toa(
+        backend_addr,
+        client_addr,
+        toa_config.clone(),
+        CONNECT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(stream) => Ok(stream),
+        Err(first_err) => {
+            tokio::time::sleep(RETRY_DELAY).await;
+            crate::toa::connect_with_toa(
+                backend_addr,
+                client_addr,
+                toa_config,
+                CONNECT_TIMEOUT,
+            )
+            .await
+            .map_err(|second_err| {
+                second_err.context(format!(
+                    "retry failed for upstream {} (first error: {})",
+                    backend_addr, first_err
+                ))
+            })
+        }
+    }
+}
+
 fn normalize_passthrough_target(raw: &str) -> String {
     raw.trim()
         .trim_start_matches("tls://")
@@ -2312,40 +2413,7 @@ fn normalize_passthrough_target(raw: &str) -> String {
 }
 
 fn configure_passthrough_socket(stream: &TcpStream) {
-    let _ = stream.set_nodelay(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-
-        let fd = stream.as_raw_fd();
-        let on = 1i32;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_KEEPALIVE,
-                &on as *const _ as *const libc::c_void,
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-
-        let fd = stream.as_raw_fd();
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_CONGESTION,
-                "bbr\0".as_ptr() as *const libc::c_void,
-                4,
-            );
-        }
-    }
+    crate::tcp_proxy::configure_relay_tcp_socket(stream);
 }
 
 /// If `enable_proxy_protocol` is true, peek the first bytes of `stream` and

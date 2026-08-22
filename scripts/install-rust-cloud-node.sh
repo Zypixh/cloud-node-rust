@@ -33,8 +33,9 @@ The script:
   2. Finds the current cloud-node systemd ExecStart binary or command.
   3. Backs it up under a timestamped directory.
   4. Downloads the requested Rust release from GitHub; latest is the default.
-  5. Optionally downloads GeoLite2 mmdb files from P3TERX/GeoLite.mmdb.
-  6. Installs the Rust binary and re-registers the cloud-node command/service.
+  5. Stops any running legacy cloud-node process and unregisters old systemd units.
+  6. Optionally downloads GeoLite2 mmdb files from P3TERX/GeoLite.mmdb.
+  7. Overwrites the binary, re-registers the cloud-node command/service, and verifies startup.
 
 Usage:
   sudo scripts/install-rust-cloud-node.sh
@@ -748,18 +749,469 @@ find_existing_cloud_node() {
     done
 }
 
+resolve_wrapper_binary() {
+    local path="$1"
+    local line=""
+    local token=""
+    local candidate=""
+    [ -r "$path" ] || return 0
+    if ! head -c 2 "$path" 2>/dev/null | grep -q '^#!'; then
+        return 0
+    fi
+    while IFS= read -r line; do
+        line="$(trim_spaces "$line")"
+        case "$line" in
+            ''|\#*)
+                continue
+                ;;
+            cd\ *|export\ *|set\ *|umask\ *|ulimit\ *)
+                continue
+                ;;
+        esac
+        line="${line%%&&*}"
+        line="${line%%;*}"
+        line="$(trim_spaces "$line")"
+        token="$(printf '%s\n' "$line" | awk '{print $1}')"
+        token="${token%\"}"
+        token="${token#\"}"
+        token="${token%\'}"
+        token="${token#\'}"
+        case "$token" in
+            ''|exec|sudo|env|nice|nohup|bash|sh|dash|zsh)
+                continue
+                ;;
+        esac
+        if [ -x "$token" ] || [ -f "$token" ]; then
+            candidate="$token"
+            break
+        fi
+        if command -v "$token" >/dev/null 2>&1; then
+            candidate="$(command -v "$token")"
+            break
+        fi
+    done < "$path"
+    [ -n "$candidate" ] || return 0
+    printf '%s\n' "$candidate"
+}
+
 detect_runtime() {
     local path="$1"
+    local probe_path="$path"
+    local wrapper_target=""
     if [ ! -f "$path" ]; then
         printf 'non-regular-file\n'
         return
     fi
-    if command -v strings >/dev/null 2>&1 && strings "$path" 2>/dev/null | grep -q 'Go buildinf:'; then
+    wrapper_target="$(resolve_wrapper_binary "$path" || true)"
+    if [ -n "$wrapper_target" ] && [ -f "$wrapper_target" ]; then
+        probe_path="$wrapper_target"
+    fi
+    if command -v strings >/dev/null 2>&1 && strings "$probe_path" 2>/dev/null | grep -q 'Go buildinf:'; then
         printf 'go\n'
-    elif command -v strings >/dev/null 2>&1 && strings "$path" 2>/dev/null | grep -q 'cloud-node-rust'; then
+    elif command -v strings >/dev/null 2>&1 && strings "$probe_path" 2>/dev/null | grep -q 'cloud-node-rust'; then
         printf 'rust\n'
     else
         printf 'unknown\n'
+    fi
+}
+
+is_cloud_node_path() {
+    local path="$1"
+    case "$path" in
+        */cloud-node|*/cloud-node-rust|/usr/bin/cloud-node|/usr/local/bin/cloud-node|/usr/sbin/cloud-node)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+unique_lines() {
+    awk 'NF && !seen[$0]++'
+}
+
+discover_legacy_units() {
+    local unit=""
+    local unit_file=""
+    local exec_line=""
+    local exec_path=""
+    local units=()
+
+    if ! systemctl_available; then
+        return 0
+    fi
+
+    units+=("${SERVICE_NAME}.service")
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        units+=("$unit")
+    done < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+        | awk '{print $1}' \
+        | grep -E '^(cloud-node|edge-node|flexcdn|goedge)(-rust)?\.service$' || true)
+
+    for unit_file in \
+        /etc/systemd/system/*.service \
+        /lib/systemd/system/*.service \
+        /usr/lib/systemd/system/*.service
+    do
+        [ -e "$unit_file" ] || continue
+        unit="$(basename "$unit_file")"
+        case "$unit" in
+            cloud-node*.service|edge-node*.service|flexcdn*.service|goedge*.service)
+                units+=("$unit")
+                ;;
+        esac
+    done
+
+    for unit in "${units[@]}"; do
+        unit="${unit%.service}.service"
+        exec_line="$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true)"
+        if [ -z "$exec_line" ]; then
+            if [ -f "/etc/systemd/system/$unit" ]; then
+                exec_line="$(sed -n 's/^[[:space:]]*ExecStart=//p' "/etc/systemd/system/$unit" | tail -n 1)"
+            elif [ -f "/lib/systemd/system/$unit" ]; then
+                exec_line="$(sed -n 's/^[[:space:]]*ExecStart=//p' "/lib/systemd/system/$unit" | tail -n 1)"
+            elif [ -f "/usr/lib/systemd/system/$unit" ]; then
+                exec_line="$(sed -n 's/^[[:space:]]*ExecStart=//p' "/usr/lib/systemd/system/$unit" | tail -n 1)"
+            fi
+        fi
+        exec_path="$(first_exec_token "$exec_line")"
+        if [ "$unit" = "${SERVICE_NAME}.service" ] \
+            || is_cloud_node_path "$exec_path" \
+            || { [ -n "$EXISTING_BINARY" ] && [ "$exec_path" = "$EXISTING_BINARY" ]; }; then
+            printf '%s\n' "$unit"
+        fi
+    done | unique_lines
+}
+
+discover_legacy_pids() {
+    local path=""
+    local workdir=""
+    local pid_file=""
+    local pid=""
+    local candidates=()
+
+    [ -n "${EXISTING_BINARY:-}" ] && candidates+=("$EXISTING_BINARY")
+    [ -n "${EXISTING_BINARY_WORKDIR:-}" ] && candidates+=("$EXISTING_BINARY_WORKDIR/cloud-node" "$EXISTING_BINARY_WORKDIR/cloud-node-rust")
+    [ -n "${EXISTING_RUNTIME_DIR:-}" ] && candidates+=("$EXISTING_RUNTIME_DIR/cloud-node" "$EXISTING_RUNTIME_DIR/cloud-node-rust")
+    candidates+=(
+        /usr/bin/cloud-node
+        /usr/local/bin/cloud-node
+        /usr/sbin/cloud-node
+        /root/cloud-node/cloud-node
+        /root/cloud-node/cloud-node-rust
+        /opt/cloud-node/cloud-node
+        /opt/cloud-node/bin/cloud-node
+        /opt/cloud-node-rust/cloud-node-rust
+    )
+
+    for path in "${candidates[@]}"; do
+        [ -n "$path" ] || continue
+        [ -e "$path" ] || continue
+        if command -v pgrep >/dev/null 2>&1; then
+            while IFS= read -r pid; do
+                [ -n "$pid" ] || continue
+                printf '%s\n' "$pid"
+            done < <(pgrep -f "(^|[ /])$(printf '%s' "$path" | sed 's/[.[\*^$()+?{|]/\\&/g')( |$)" 2>/dev/null || true)
+        fi
+    done
+
+    for workdir in "$EXISTING_RUNTIME_DIR" "$EXISTING_BINARY_WORKDIR" "$INSTALL_DIR" /root/cloud-node /opt/cloud-node /opt/cloud-node-rust; do
+        [ -n "$workdir" ] || continue
+        for pid_file in \
+            "$workdir/data/cloud-node.pid" \
+            "$workdir/data/node.pid" \
+            "$workdir/cloud-node.pid" \
+            "$workdir/bin/cloud-node.pid"
+        do
+            [ -f "$pid_file" ] || continue
+            pid="$(trim_spaces "$(head -n 1 "$pid_file" 2>/dev/null || true)")"
+            case "$pid" in
+                ''|*[!0-9]*)
+                    continue
+                    ;;
+            esac
+            if [ -d "/proc/$pid" ]; then
+                printf '%s\n' "$pid"
+            fi
+        done
+    done | unique_lines
+}
+
+wait_for_pids_exit() {
+    local timeout_secs="${1:-15}"
+    local pid=""
+    local remaining="$timeout_secs"
+    shift || true
+    [ "$#" -gt 0 ] || return 0
+    while [ "$remaining" -gt 0 ]; do
+        local alive=0
+        for pid in "$@"; do
+            [ -n "$pid" ] || continue
+            if [ -d "/proc/$pid" ]; then
+                alive=1
+                break
+            fi
+        done
+        [ "$alive" -eq 0 ] && return 0
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+    return 1
+}
+
+signal_pids() {
+    local signal="$1"
+    shift || true
+    local pid=""
+    for pid in "$@"; do
+        [ -n "$pid" ] || continue
+        if [ -d "/proc/$pid" ]; then
+            run kill "-$signal" "$pid" || true
+        fi
+    done
+}
+
+legacy_ports_still_held() {
+    local ports=("80" "443")
+    local port=""
+    local holders=""
+    if ! command -v ss >/dev/null 2>&1; then
+        return 1
+    fi
+    for port in "${ports[@]}"; do
+        holders="$(ss -ltnup "sport = :$port" 2>/dev/null | grep -E 'cloud-node|cloud_node' || true)"
+        if [ -n "$holders" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+wait_for_ports_release() {
+    local timeout_secs="${1:-15}"
+    local remaining="$timeout_secs"
+    while [ "$remaining" -gt 0 ]; do
+        if ! legacy_ports_still_held; then
+            return 0
+        fi
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+    return 1
+}
+
+stop_legacy_deployment() {
+    local units=()
+    local active_units=()
+    local pids=()
+    local unit=""
+    local binary_stop_ok=0
+
+    mapfile -t units < <(discover_legacy_units || true)
+    mapfile -t pids < <(discover_legacy_pids || true)
+
+    if systemctl_available; then
+        for unit in "${units[@]}"; do
+            [ -n "$unit" ] || continue
+            if systemctl is-active --quiet "$unit" 2>/dev/null; then
+                active_units+=("$unit")
+            fi
+        done
+    fi
+
+    if [ "${#active_units[@]}" -eq 0 ] && [ "${#pids[@]}" -eq 0 ]; then
+        log "no running legacy cloud-node process detected"
+        return 0
+    fi
+
+    LEGACY_WAS_RUNNING=1
+
+    section "$(is_zh && printf '停止旧节点' || printf 'Stop Legacy Node')"
+    if [ "${#active_units[@]}" -gt 0 ]; then
+        kv "legacy units" "${active_units[*]}"
+    fi
+    if [ "${#pids[@]}" -gt 0 ]; then
+        kv "legacy pids" "${pids[*]}"
+    fi
+
+    if [ -n "${EXISTING_BINARY:-}" ] && [ -x "$EXISTING_BINARY" ]; then
+        if [ "$DRY_RUN" -eq 0 ]; then
+            log "trying legacy stop command: $EXISTING_BINARY stop"
+            if command -v timeout >/dev/null 2>&1; then
+                if timeout 15s "$EXISTING_BINARY" stop >/dev/null 2>&1; then
+                    binary_stop_ok=1
+                    ok "legacy binary stop succeeded"
+                else
+                    warn "legacy binary stop failed or timed out; continuing with systemd/process stop"
+                fi
+            elif "$EXISTING_BINARY" stop >/dev/null 2>&1; then
+                binary_stop_ok=1
+                ok "legacy binary stop succeeded"
+            else
+                warn "legacy binary stop failed; continuing with systemd/process stop"
+            fi
+        else
+            log "+ $EXISTING_BINARY stop"
+        fi
+    fi
+
+    if systemctl_available; then
+        for unit in "${active_units[@]}"; do
+            [ -n "$unit" ] || continue
+            run systemctl stop "$unit" || warn "failed to stop $unit"
+        done
+    fi
+
+    mapfile -t pids < <(discover_legacy_pids || true)
+    if [ "${#pids[@]}" -gt 0 ]; then
+        signal_pids TERM "${pids[@]}"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            wait_for_pids_exit 10 "${pids[@]}" || true
+            mapfile -t pids < <(discover_legacy_pids || true)
+            if [ "${#pids[@]}" -gt 0 ]; then
+                warn "forcing kill of remaining legacy pids: ${pids[*]}"
+                signal_pids KILL "${pids[@]}"
+                wait_for_pids_exit 5 "${pids[@]}" || true
+            fi
+        fi
+    fi
+
+    if [ "$DRY_RUN" -eq 0 ]; then
+        if ! wait_for_ports_release 15; then
+            die "legacy cloud-node still holds ports 80/443 after stop; aborting before overwrite. Restore with: $0 --restore --restore-backup $BACKUP_DIR"
+        fi
+        ok "legacy cloud-node stopped"
+    fi
+}
+
+unregister_legacy_services() {
+    local units=()
+    local unit=""
+    local unit_file=""
+    local dropin_dir=""
+    local backed_up=0
+    local dest=""
+
+    mapfile -t units < <(discover_legacy_units || true)
+    [ "${#units[@]}" -gt 0 ] || return 0
+
+    section "$(is_zh && printf '注销旧服务' || printf 'Unregister Legacy Services')"
+    for unit in "${units[@]}"; do
+        [ -n "$unit" ] || continue
+        if systemctl_available; then
+            if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+                run systemctl disable "$unit" || warn "failed to disable $unit"
+            fi
+        fi
+
+        for unit_file in \
+            "/etc/systemd/system/$unit" \
+            "/lib/systemd/system/$unit" \
+            "/usr/lib/systemd/system/$unit"
+        do
+            [ -e "$unit_file" ] || continue
+            backed_up=1
+            dest="$BACKUP_DIR/legacy-units$unit_file"
+            run mkdir -p "$(dirname "$dest")"
+            run cp -a "$unit_file" "$dest"
+            # Only remove admin-managed units under /etc; leave vendor units in /lib.
+            case "$unit_file" in
+                /etc/systemd/system/*)
+                    run rm -f "$unit_file"
+                    ;;
+            esac
+        done
+
+        dropin_dir="/etc/systemd/system/${unit}.d"
+        if [ -d "$dropin_dir" ]; then
+            backed_up=1
+            dest="$BACKUP_DIR/legacy-units$dropin_dir"
+            run mkdir -p "$(dirname "$dest")"
+            run cp -a "$dropin_dir" "$dest"
+            run rm -rf "$dropin_dir"
+        fi
+    done
+
+    if systemctl_available; then
+        run systemctl daemon-reload || true
+        run systemctl reset-failed || true
+    fi
+    if [ "$backed_up" -eq 1 ]; then
+        ok "legacy service registration removed (backed up under $BACKUP_DIR/legacy-units)"
+    fi
+}
+
+validate_rust_service_registration() {
+    local exec_line=""
+    local exec_path=""
+    local wrapper=""
+
+    if [ ! -x "$INSTALL_BINARY" ]; then
+        die "installed binary is missing or not executable: $INSTALL_BINARY"
+    fi
+
+    wrapper="/usr/bin/cloud-node"
+    if [ ! -e "$wrapper" ]; then
+        die "global cloud-node command was not registered at $wrapper"
+    fi
+
+    if systemctl_available; then
+        if ! systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+            die "systemd service ${SERVICE_NAME}.service was not registered"
+        fi
+        exec_line="$(systemctl show -p ExecStart --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+        exec_path="$(first_exec_token "$exec_line")"
+        if [ -z "$exec_path" ]; then
+            die "systemd service ${SERVICE_NAME}.service has empty ExecStart"
+        fi
+        if [ "$exec_path" != "$INSTALL_BINARY" ] && [ "$exec_path" != "$wrapper" ]; then
+            # Accept either direct binary or wrapper that ultimately points at INSTALL_BINARY.
+            local resolved=""
+            resolved="$(resolve_wrapper_binary "$exec_path" || true)"
+            if [ "$resolved" != "$INSTALL_BINARY" ] && [ "$exec_path" != "$INSTALL_BINARY" ]; then
+                warn "ExecStart=$exec_path does not match $INSTALL_BINARY; continuing because install completed"
+            fi
+        fi
+    fi
+    ok "Rust service registration validated"
+}
+
+verify_service_started() {
+    local timeout_secs="${1:-20}"
+    local remaining="$timeout_secs"
+    local active=0
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "+ verify ${SERVICE_NAME} is active"
+        return 0
+    fi
+
+    if systemctl_available; then
+        while [ "$remaining" -gt 0 ]; do
+            if systemctl is-active --quiet "$SERVICE_NAME"; then
+                active=1
+                break
+            fi
+            sleep 1
+            remaining=$((remaining - 1))
+        done
+        if [ "$active" -ne 1 ]; then
+            warn "service ${SERVICE_NAME} did not become active within ${timeout_secs}s"
+            if command -v journalctl >/dev/null 2>&1; then
+                journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+            fi
+            die "start verification failed; restore with: $0 --restore --restore-backup $BACKUP_DIR"
+        fi
+        ok "service ${SERVICE_NAME} is active"
+        return 0
+    fi
+
+    if [ -x "$INSTALL_BINARY" ]; then
+        if (cd "$INSTALL_DIR" && "$INSTALL_BINARY" status >/dev/null 2>&1); then
+            ok "cloud-node status reports running"
+            return 0
+        fi
+        die "cloud-node status check failed; restore with: $0 --restore --restore-backup $BACKUP_DIR"
     fi
 }
 
@@ -1022,9 +1474,6 @@ migrate_runtime_layout() {
         if [ -e "$source_dir/state.json" ] && [ ! -e "$INSTALL_DIR/data/state.json" ]; then
             run cp -a "$source_dir/state.json" "$INSTALL_DIR/data/state.json"
         fi
-        if [ -e "$source_dir/blocked_ips.json" ] && [ ! -e "$INSTALL_DIR/data/blocked_ips.json" ]; then
-            run cp -a "$source_dir/blocked_ips.json" "$INSTALL_DIR/data/blocked_ips.json"
-        fi
         if [ -e "$source_dir/metrics.db" ] && [ ! -e "$INSTALL_DIR/data/metrics.db" ]; then
             run cp -a "$source_dir/metrics.db" "$INSTALL_DIR/data/metrics.db"
         fi
@@ -1244,6 +1693,22 @@ restore_go_original() {
     restore_file "$backup_dir/usr_bin_cloud-node.go-original" "/usr/bin/cloud-node" "/usr/bin/cloud-node"
     restore_file "$backup_dir/${SERVICE_NAME}.service.go-original" "$service_file" "systemd service"
 
+    # Restore any legacy unit files captured during migration unregister.
+    if [ -d "$backup_dir/legacy-units/etc/systemd/system" ]; then
+        local legacy_src=""
+        local legacy_dst=""
+        for legacy_src in "$backup_dir/legacy-units/etc/systemd/system"/*; do
+            [ -e "$legacy_src" ] || continue
+            legacy_dst="/etc/systemd/system/$(basename "$legacy_src")"
+            if [ -d "$legacy_src" ]; then
+                run mkdir -p "$legacy_dst"
+                run cp -a "$legacy_src/." "$legacy_dst/"
+            else
+                restore_file "$legacy_src" "$legacy_dst" "legacy unit $legacy_dst"
+            fi
+        done
+    fi
+
     if systemctl_available; then
         run systemctl daemon-reload
     fi
@@ -1365,6 +1830,25 @@ if [ -z "$EXISTING_BINARY" ] && [ "$ALLOW_FRESH" -eq 0 ]; then
     die "no existing cloud-node was found; pass --allow-fresh for a new install"
 fi
 
+SERVICE_WAS_ACTIVE=0
+LEGACY_WAS_RUNNING=0
+if systemctl_available && systemctl is-active --quiet "$SERVICE_NAME"; then
+    SERVICE_WAS_ACTIVE=1
+    LEGACY_WAS_RUNNING=1
+fi
+if [ "$LEGACY_WAS_RUNNING" -eq 0 ] && discover_legacy_pids | grep -q .; then
+    LEGACY_WAS_RUNNING=1
+fi
+if [ "$LEGACY_WAS_RUNNING" -eq 0 ] && systemctl_available; then
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            LEGACY_WAS_RUNNING=1
+            break
+        fi
+    done < <(discover_legacy_units || true)
+fi
+
 section "$(is_zh && printf '安装摘要' || printf 'Install Summary')"
 kv "mode" "$MODE"
 kv "repository" "$REPO"
@@ -1372,6 +1856,7 @@ kv "version" "$NORMALIZED_VERSION"
 kv "asset" "$ASSET_NAME"
 kv "existing cloud-node" "${EXISTING_BINARY:-not found}"
 kv "existing runtime" "$EXISTING_RUNTIME"
+kv "legacy running" "$LEGACY_WAS_RUNNING"
 kv "install dir" "$INSTALL_DIR"
 kv "install binary" "$INSTALL_BINARY"
 kv "config dir" "$INSTALL_DIR/configs"
@@ -1470,8 +1955,22 @@ else
 fi
 
 SERVICE_WAS_ACTIVE=0
+LEGACY_WAS_RUNNING=0
 if systemctl_available && systemctl is-active --quiet "$SERVICE_NAME"; then
     SERVICE_WAS_ACTIVE=1
+    LEGACY_WAS_RUNNING=1
+fi
+if [ "$LEGACY_WAS_RUNNING" -eq 0 ] && discover_legacy_pids | grep -q .; then
+    LEGACY_WAS_RUNNING=1
+fi
+if [ "$LEGACY_WAS_RUNNING" -eq 0 ] && systemctl_available; then
+    while IFS= read -r unit; do
+        [ -n "$unit" ] || continue
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            LEGACY_WAS_RUNNING=1
+            break
+        fi
+    done < <(discover_legacy_units || true)
 fi
 
 log "downloading: $DOWNLOAD_URL"
@@ -1486,6 +1985,11 @@ else
     log "+ curl -fL --retry 3 --connect-timeout 20 -o $TMP_DIR/$ASSET_NAME $DOWNLOAD_URL"
     log "+ tar -xzf $TMP_DIR/$ASSET_NAME -C $TMP_DIR"
 fi
+
+# Stop and unregister the old deployment BEFORE overwriting binaries/unit files.
+# This avoids restarting with a mixed Go process + Rust ExecStop/unit state.
+stop_legacy_deployment
+unregister_legacy_services
 
 run mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/configs" "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
 migrate_runtime_layout
@@ -1510,6 +2014,12 @@ else
     log "+ cd $INSTALL_DIR && $INSTALL_BINARY install"
 fi
 
+if [ "$DRY_RUN" -eq 0 ]; then
+    validate_rust_service_registration
+else
+    log "+ validate Rust service registration"
+fi
+
 if [ "$DOWNLOAD_GEOIP" = "yes" ]; then
     download_geoip_files
 fi
@@ -1525,7 +2035,7 @@ case "$START_MODE" in
         ;;
     preserve)
         if [ "$ASSUME_YES" -eq 0 ] && prompt_available; then
-            if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+            if [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
                 if ask_yes_no "安装/升级已完成，是否现在重启 ${SERVICE_NAME} 进程？" "Install/upgrade completed. Restart ${SERVICE_NAME} now?" "yes"; then
                     RESTART_SERVICE=1
                 fi
@@ -1534,7 +2044,9 @@ case "$START_MODE" in
                     RESTART_SERVICE=1
                 fi
             fi
-        elif [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+        elif [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+            # Migration from a previously running node must bring the Rust node up,
+            # even when the old process was not managed by systemd.
             RESTART_SERVICE=1
         fi
         ;;
@@ -1548,25 +2060,19 @@ esac
 if [ "$RESTART_SERVICE" -eq 1 ]; then
     if [ "$DRY_RUN" -eq 0 ]; then
         if systemctl_available; then
-            if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
-                run systemctl restart "$SERVICE_NAME"
-            else
-                run systemctl start "$SERVICE_NAME"
-            fi
-        elif [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+            run systemctl restart "$SERVICE_NAME" || run systemctl start "$SERVICE_NAME"
+        elif [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
             log "+ cd $INSTALL_DIR && $INSTALL_BINARY restart"
-            (cd "$INSTALL_DIR" && "$INSTALL_BINARY" restart)
+            (cd "$INSTALL_DIR" && "$INSTALL_BINARY" restart) || (cd "$INSTALL_DIR" && "$INSTALL_BINARY" start)
         else
             log "+ cd $INSTALL_DIR && $INSTALL_BINARY start"
             (cd "$INSTALL_DIR" && "$INSTALL_BINARY" start)
         fi
+        verify_service_started 20
     elif systemctl_available; then
-        if [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
-            log "+ systemctl restart $SERVICE_NAME"
-        else
-            log "+ systemctl start $SERVICE_NAME"
-        fi
-    elif [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
+        log "+ systemctl restart $SERVICE_NAME"
+        log "+ verify ${SERVICE_NAME} is active"
+    elif [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ "$SERVICE_WAS_ACTIVE" -eq 1 ]; then
         log "+ cd $INSTALL_DIR && $INSTALL_BINARY restart"
     else
         log "+ cd $INSTALL_DIR && $INSTALL_BINARY start"
@@ -1576,3 +2082,17 @@ fi
 log "done"
 log "previous binary backup: $BACKUP_DIR"
 log "Rust binary installed at: $INSTALL_BINARY"
+if [ "$RESTART_SERVICE" -eq 0 ]; then
+    if is_zh; then
+        log "服务未启动。需要时执行: systemctl start ${SERVICE_NAME} 或 cd ${INSTALL_DIR} && ${INSTALL_BINARY} start"
+    else
+        log "service was not started. To start later: systemctl start ${SERVICE_NAME} or cd ${INSTALL_DIR} && ${INSTALL_BINARY} start"
+    fi
+fi
+if [ "$LEGACY_WAS_RUNNING" -eq 1 ] || [ -n "${EXISTING_BINARY:-}" ]; then
+    if is_zh; then
+        log "如需回滚到迁移前备份: $0 --restore --restore-backup $BACKUP_DIR"
+    else
+        log "to roll back to the pre-migration backup: $0 --restore --restore-backup $BACKUP_DIR"
+    fi
+fi

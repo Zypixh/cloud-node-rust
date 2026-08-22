@@ -1,6 +1,7 @@
 use aes::Aes128;
 use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::AeadInOut;
+use aes_gcm::aead::inout::InOutBuf;
 use aes_gcm::{Aes128Gcm, Nonce, Tag};
 use core::range::Range;
 use hmac::digest::KeyInit as HmacKeyInit;
@@ -279,14 +280,17 @@ fn decrypt_and_parse(
         return DecryptResult::None;
     }
     let payload_len = payload.len();
-    let tag = Tag::clone_from_slice(&payload[payload_len - 16..]);
+    let Ok(tag_bytes) = <[u8; 16]>::try_from(&payload[payload_len - 16..]) else {
+        return DecryptResult::None;
+    };
+    let tag = Tag::from(tag_bytes);
     let ciphertext = &mut payload[..payload_len - 16];
-    let nonce = packet_nonce(&iv, packet_number);
+    let nonce = Nonce::from(packet_nonce(&iv, packet_number));
     let Ok(cipher) = <Aes128Gcm as aes_gcm::aead::KeyInit>::new_from_slice(&key) else {
         return DecryptResult::None;
     };
     if cipher
-        .decrypt_in_place_detached(Nonce::from_slice(&nonce), &header_bytes, ciphertext, &tag)
+        .decrypt_inout_detached(&nonce, &header_bytes, InOutBuf::from(&mut ciphertext[..]), &tag)
         .is_err()
     {
         return DecryptResult::None;

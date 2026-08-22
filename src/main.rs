@@ -3319,12 +3319,11 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         waf_state.set_kernel_filter(initial_kernel_filter);
     }
     spawn_xdp_health_fallback_task(&rt, waf_state.clone());
-    let migrated_blocks = cloud_node_rust::firewall::persistence::migrate_legacy_blocked_ips_once();
     let restored_blocks = waf_state.restore_runtime_blocks_from_disk();
-    if migrated_blocks > 0 || restored_blocks > 0 {
+    if restored_blocks > 0 {
         info!(
-            "Firewall runtime state initialized: migrated_legacy={} restored_active={}",
-            migrated_blocks, restored_blocks
+            "Firewall runtime state initialized: restored_active={}",
+            restored_blocks
         );
     }
     cloud_node_rust::firewall::persistence::start_flush_task();

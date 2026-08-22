@@ -17,8 +17,8 @@ path = "src/lib.rs"
 [dependencies]
 log = "0.4.21"
 pingora-error = { version = "0.8.1", path = "../pingora-error"}
-ring = "0.17.12"
-rustls = { version = "0.23.12", features = ["ring"] }
+rustls = { version = "0.23.12", default-features = false, features = ["aws-lc-rs", "std"] }
+sha2 = "0.11.0"
 rustls-native-certs = "0.8.3"
 rustls-pemfile = "2.1.2"
 rustls-pki-types = "1.7.0"

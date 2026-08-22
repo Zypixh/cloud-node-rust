@@ -52,18 +52,24 @@ impl CustomConnector for OriginH3Connector {
 
     async fn reused_http_session<P: Peer + Send + Sync + 'static>(
         &self,
-        _peer: &P,
+        peer: &P,
     ) -> Option<Self::Session> {
-        None
+        let key = origin_h3_key(peer);
+        let (endpoint, connection) = crate::origin_h3_pool::take(&key)?;
+        build_h3_session(peer, key, endpoint, connection).await.ok()
     }
 
     async fn release_http_session<P: Peer + Send + Sync + 'static>(
         &self,
         mut session: Self::Session,
-        _peer: &P,
+        peer: &P,
         _idle_timeout: Option<Duration>,
     ) {
         let _ = session.finish_custom().await;
+        if session.can_reuse_connection() {
+            let key = origin_h3_key(peer);
+            crate::origin_h3_pool::offer(key, session._endpoint, session._connection);
+        }
     }
 }
 
@@ -82,10 +88,22 @@ pub struct OriginH3ClientSession {
     _connection: quinn::Connection,
 }
 
+impl OriginH3ClientSession {
+    fn can_reuse_connection(&self) -> bool {
+        self._connection.close_reason().is_none()
+            && self.request_body_finished
+            && self.request_stream.is_none()
+    }
+}
+
 async fn connect_h3<P: Peer + Send + Sync + 'static>(
     peer: &P,
-    _key: OriginH3Key,
+    key: OriginH3Key,
 ) -> PingoraResult<OriginH3ClientSession> {
+    if let Some((endpoint, connection)) = crate::origin_h3_pool::take(&key) {
+        return build_h3_session(peer, key, endpoint, connection).await;
+    }
+
     let Some(server_addr) = peer.address().as_inet().copied() else {
         return Error::e_explain(
             ErrorType::ConnectError,
@@ -127,6 +145,21 @@ async fn connect_h3<P: Peer + Send + Sync + 'static>(
         )
     })?;
 
+    build_h3_session(peer, key, endpoint, connection).await
+}
+
+async fn build_h3_session<P: Peer + Send + Sync + 'static>(
+    peer: &P,
+    _key: OriginH3Key,
+    endpoint: Endpoint,
+    connection: quinn::Connection,
+) -> PingoraResult<OriginH3ClientSession> {
+    let Some(server_addr) = peer.address().as_inet().copied() else {
+        return Error::e_explain(
+            ErrorType::ConnectError,
+            "HTTP/3 origin requires an IP socket address",
+        );
+    };
     let local_addr = endpoint
         .local_addr()
         .unwrap_or_else(|_| StdSocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
@@ -188,7 +221,7 @@ struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
 impl SkipServerVerification {
     fn new() -> Arc<Self> {
-        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
+        Arc::new(Self(Arc::new(crate::tls_crypto::default_crypto_provider())))
     }
 }
 

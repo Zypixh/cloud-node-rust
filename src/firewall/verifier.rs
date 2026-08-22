@@ -82,7 +82,7 @@ impl WafVerifier {
     ) -> String {
         let cipher = Aes256Gcm::new(&self.key.into());
         let nonce_bytes = rand::random::<[u8; 12]>();
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
 
         let mut hasher = Sha256::new();
         hasher.update(ua.as_bytes());
@@ -104,7 +104,7 @@ impl WafVerifier {
         };
 
         let plaintext = serde_json::to_vec(&payload).unwrap();
-        if let Ok(ciphertext) = cipher.encrypt(nonce, plaintext.as_ref()) {
+        if let Ok(ciphertext) = cipher.encrypt(&nonce, plaintext.as_ref()) {
             let mut combined = nonce_bytes.to_vec();
             combined.extend_from_slice(&ciphertext);
             let token_str = general_purpose::URL_SAFE_NO_PAD.encode(combined);
@@ -141,11 +141,11 @@ impl WafVerifier {
             return self.token_seconds_remaining_from_storage(ip, &current_ua_hash, token);
         }
         let (nonce_bytes, ciphertext) = decoded.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::from(<[u8; 12]>::try_from(nonce_bytes).ok()?);
 
         let payload = self
-            .decrypt_payload(&self.key, nonce, ciphertext)
-            .or_else(|| self.decrypt_payload(&self.legacy_key, nonce, ciphertext))?;
+            .decrypt_payload(&self.key, &nonce, ciphertext)
+            .or_else(|| self.decrypt_payload(&self.legacy_key, &nonce, ciphertext))?;
 
         if payload.ip != ip || payload.ua_hash != current_ua_hash {
             return None;
@@ -174,10 +174,10 @@ impl WafVerifier {
             return None;
         }
         let (nonce_bytes, ciphertext) = decoded.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::from(<[u8; 12]>::try_from(nonce_bytes).ok()?);
         let payload = self
-            .decrypt_payload(&self.key, nonce, ciphertext)
-            .or_else(|| self.decrypt_payload(&self.legacy_key, nonce, ciphertext))?;
+            .decrypt_payload(&self.key, &nonce, ciphertext)
+            .or_else(|| self.decrypt_payload(&self.legacy_key, &nonce, ciphertext))?;
         if payload.ip != ip || payload.ua_hash != current_ua_hash {
             return None;
         }

@@ -15,8 +15,8 @@ use pingora_proxy::{
     DownstreamParseErrorAction, DownstreamParseErrorLogLevel, FailToProxy, ProxyHttp, PurgeStatus,
     Session,
 };
-use rand::Rng;
-use rand::seq::SliceRandom;
+use rand::RngExt;
+use rand::seq::IndexedRandom;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -2781,7 +2781,7 @@ impl EdgeProxy {
         }
 
         if max_timeout > final_timeout as i32 {
-            final_timeout = rand::thread_rng().gen_range(final_timeout..=max_timeout as i64);
+            final_timeout = rand::rng().random_range(final_timeout..=max_timeout as i64);
         }
         if fail_global {
             scope = "global".to_string();
@@ -6990,7 +6990,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 let raw_method = self.waf_expected_challenge_method(&matched);
                 let effective_method = if raw_method == "geetest" {
                     let modes = ["slider", "click", "captcha"];
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rng();
                     modes.choose(&mut rng).copied().unwrap_or("slider")
                 } else {
                     raw_method.as_str()

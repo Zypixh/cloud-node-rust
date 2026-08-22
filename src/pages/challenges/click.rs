@@ -1,6 +1,6 @@
 use crate::pages::challenges::{encode_challenge_token, is_token_expired, random_suffix};
 use crate::pages::lang::Lang;
-use rand::Rng;
+use rand::RngExt;
 
 pub fn issue_html(
     lang: Lang,
@@ -11,7 +11,7 @@ pub fn issue_html(
     expiry: u64,
 ) -> String {
     let sfx = random_suffix();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let pool: Vec<char> = match lang {
         Lang::ZhCn => {
@@ -25,7 +25,7 @@ pub fn issue_html(
     let mut chosen: Vec<char> = Vec::with_capacity(10);
     let mut used = std::collections::HashSet::new();
     while chosen.len() < 10 {
-        let c = pool[rng.gen_range(0..pool.len())];
+        let c = pool[rng.random_range(0..pool.len())];
         if used.insert(c) {
             chosen.push(c);
         }
@@ -35,7 +35,7 @@ pub fn issue_html(
 
     let mut target_order: Vec<usize> = (0..5).collect();
     for i in (1..5).rev() {
-        target_order.swap(i, rng.gen_range(0..=i));
+        target_order.swap(i, rng.random_range(0..=i));
     }
 
     // Positions — 10 slots, minimum spacing 57px
@@ -43,8 +43,8 @@ pub fn issue_html(
         let mut pos = Vec::with_capacity(10);
         for _ in 0..10 {
             loop {
-                let x = rng.gen_range(34u32..386u32);
-                let y = rng.gen_range(44u32..216u32);
+                let x = rng.random_range(34u32..386u32);
+                let y = rng.random_range(44u32..216u32);
                 if pos.iter().all(|(px, py): &(u32, u32)| {
                     let dx = *px as i32 - x as i32;
                     let dy = *py as i32 - y as i32;
@@ -68,24 +68,24 @@ pub fn issue_html(
     let red_variants = ["#dc2626", "#e11d48", "#c2410c", "#b91c1c", "#be123c"];
 
     let target_colors: Vec<&str> = (0..5)
-        .map(|_| red_variants[rng.gen_range(0..red_variants.len())])
+        .map(|_| red_variants[rng.random_range(0..red_variants.len())])
         .collect();
     let target_fonts: Vec<String> = (0..5)
         .map(|_| {
-            font_templates[rng.gen_range(0..font_templates.len())]
-                .replace("{s}", &rng.gen_range(32u32..44).to_string())
+            font_templates[rng.random_range(0..font_templates.len())]
+                .replace("{s}", &rng.random_range(32u32..44).to_string())
         })
         .collect();
     let decoy_fonts: Vec<String> = (0..5)
         .map(|_| {
-            font_templates[rng.gen_range(0..font_templates.len())]
-                .replace("{s}", &rng.gen_range(18u32..36).to_string())
+            font_templates[rng.random_range(0..font_templates.len())]
+                .replace("{s}", &rng.random_range(18u32..36).to_string())
         })
         .collect();
     let decoy_ops: Vec<f64> = (0..5)
-        .map(|_| rng.gen_range(28u32..60) as f64 / 100.0)
+        .map(|_| rng.random_range(28u32..60) as f64 / 100.0)
         .collect();
-    let decoy_flip: Vec<bool> = (0..5).map(|_| rng.gen_bool(0.3)).collect();
+    let decoy_flip: Vec<bool> = (0..5).map(|_| rng.random_bool(0.3)).collect();
 
     // Ghost chars — faint tiny misleading chars scattered across canvas
     let ghost_pool: Vec<char> = if matches!(lang, Lang::ZhCn) {
@@ -96,11 +96,11 @@ pub fn issue_html(
         "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".chars().collect()
     };
     let ghost_chars: Vec<char> = (0..7)
-        .map(|_| ghost_pool[rng.gen_range(0..ghost_pool.len())])
+        .map(|_| ghost_pool[rng.random_range(0..ghost_pool.len())])
         .collect();
-    let ghost_x: Vec<u32> = (0..7).map(|_| rng.gen_range(10u32..410)).collect();
-    let ghost_y: Vec<u32> = (0..7).map(|_| rng.gen_range(10u32..250)).collect();
-    let ghost_sz: Vec<u32> = (0..7).map(|_| rng.gen_range(9u32..20)).collect();
+    let ghost_x: Vec<u32> = (0..7).map(|_| rng.random_range(10u32..410)).collect();
+    let ghost_y: Vec<u32> = (0..7).map(|_| rng.random_range(10u32..250)).collect();
+    let ghost_sz: Vec<u32> = (0..7).map(|_| rng.random_range(9u32..20)).collect();
 
     // Serialise to JS literals
     let js_char_arr = |v: &[char]| {

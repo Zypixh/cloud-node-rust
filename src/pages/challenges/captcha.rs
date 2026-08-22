@@ -1,6 +1,6 @@
 use crate::pages::challenges::{encode_challenge_token, is_token_expired, random_suffix};
 use crate::pages::lang::Lang;
-use rand::Rng;
+use rand::RngExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -13,11 +13,11 @@ pub fn issue_html(
     expiry: u64,
 ) -> String {
     let sfx = random_suffix();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     const ALPHANUM: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let captcha_text: String = (0..6)
-        .map(|_| ALPHANUM[rng.gen_range(0..ALPHANUM.len())] as char)
+        .map(|_| ALPHANUM[rng.random_range(0..ALPHANUM.len())] as char)
         .collect();
     let answer_hash = hex::encode(Sha256::digest(captcha_text.as_bytes()));
 

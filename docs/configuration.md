@@ -15,6 +15,9 @@ billing.countInboundTraffic: false
 # 可选，默认 false。SNI/TCP relay 默认使用稳定 async copy 路径。
 relay:
   zeroCopy: false
+  tcpKeepaliveIdleSecs: 60
+  tcpKeepaliveIntervalSecs: 15
+  tcpKeepaliveProbes: 4
 ```
 
 字段说明：
@@ -24,6 +27,7 @@ relay:
 - `secret`：节点认证密钥。
 - `billing.countInboundTraffic`：是否把客户端上传到节点的上行流量也计入控制面带宽和日统计计费流量。默认 `false`，只按节点下行流量计费；设为 `true` 后当前节点按上下行合计计费。
 - `relay.zeroCopy`：是否启用 Linux `splice` 零拷贝 TCP/SNI relay。默认 `false`，优先稳定性；需要追求极限转发性能时可显式设为 `true`。
+- `relay.tcpKeepaliveIdleSecs` / `relay.tcpKeepaliveIntervalSecs` / `relay.tcpKeepaliveProbes`：SNI/TCP passthrough relay 的 TCP keepalive 参数（秒/秒/次数）。默认 `60` / `15` / `4`，用于避免长连接在 Linux 默认 7200s keepalive 下被误判为半死隧道。
 
 未启用零拷贝时，TCP/SNI relay 的用户态 copy buffer 由内存治理器自动计算。程序会按当前内存压力和活动 TCP 连接数在 `16KiB` 到 `256KiB` 之间为新连接选档；用户不需要也不能通过配置手动设置 buffer。
 
@@ -102,7 +106,7 @@ xdp:
 - `data/GeoLite2-ASN.mmdb`：ASN 数据库。
 - `data/GeoLite2-Country.mmdb`：国家数据库。
 - `data/cache`：默认磁盘缓存目录。
-- `data/state.json`、`data/blocked_ips.json`、`data/metrics.mace`：运行状态、封禁、统计和缓存元数据；旧版 `data/metrics.db` 仅作为迁移输入保留。
+- `data/state.json`、`data/metrics.mace`：运行状态、封禁和统计数据。
 - `logs/run.log`：节点运行日志；systemd 和内置后台模式都会追加写入。
 
 旧版根目录 `api_node.yaml`、`../data/*` 和工作目录下的 `GeoLite2-*.mmdb` 会作为迁移兼容读取，新写入统一使用 `configs/`、`data/`、`logs/`。GeoIP 文件缺失时，地区类 WAF、地区统计和 ASN 识别能力会受限。

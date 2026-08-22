@@ -2293,6 +2293,7 @@ mod tests {
             plan_id: 0,
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             quic_cid_tx: None,
             tx,
             shutdown_tx,
@@ -2319,6 +2320,49 @@ mod tests {
 
         assert!(lookup_cid_route(&cid_routes, &[0x40, 1, 2, 3, 4, 0xaa]).is_none());
         assert!(lookup_cid_route(&cid_routes, &[0x40, 5, 6, 7, 8, 0xaa]).is_some());
+    }
+
+    #[test]
+    fn learned_cid_can_replace_the_client_address_route() {
+        let routes = DashMap::new();
+        let cid_routes = CidRoutes::new();
+        let original_addr: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+        let rebound_addr: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let route = RouteKind::Passthrough(Arc::new(UdpSession {
+            id: 78,
+            client_addr: Arc::new(tokio::sync::RwLock::new(original_addr)),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(std::sync::atomic::AtomicU8::new(4)),
+            quic_cid_tx: None,
+            tx,
+            shutdown_tx,
+            shutdown,
+        }));
+        routes.insert(original_addr, route.clone());
+        insert_cid_route(
+            &cid_routes,
+            QuicConnectionId(vec![5, 6, 7, 8]),
+            route.clone(),
+        );
+
+        let matched = lookup_cid_route(&cid_routes, &[0x40, 5, 6, 7, 8, 0xaa])
+            .expect("learned CID must match the existing session");
+        remove_route_aliases(&routes, &matched);
+        routes.insert(rebound_addr, matched);
+
+        assert!(!routes.contains_key(&original_addr));
+        assert_eq!(routes.len(), 1);
+        assert!(routes.contains_key(&rebound_addr));
     }
 
     #[tokio::test]
@@ -2600,6 +2644,7 @@ mod tests {
             plan_id: 0,
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             quic_cid_tx: None,
             tx,
             shutdown_tx,

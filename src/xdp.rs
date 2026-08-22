@@ -2424,7 +2424,7 @@ async fn start_xdp_smoke_sni_backend(
     )?
     .ok_or_else(|| anyhow::anyhow!("xdp smoke SNI backend key is missing"))?;
     let mut tls_config = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
+        rustls::crypto::aws_lc_rs::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])?
     .with_no_client_auth()
@@ -2503,7 +2503,7 @@ async fn start_xdp_smoke_quic_backend(
     )?
     .ok_or_else(|| anyhow::anyhow!("xdp smoke QUIC backend key is missing"))?;
     let mut tls_config = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
+        rustls::crypto::aws_lc_rs::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_no_client_auth()
@@ -2933,6 +2933,7 @@ fn xdp_proxy_smoke_ssl_cert() -> crate::config_models::SSLCertConfig {
     crate::config_models::SSLCertConfig {
         id: 7104,
         is_on: true,
+        is_default: true,
         cert_data_json: Some(serde_json::json!(include_str!(
             "../pingora-main/pingora-core/examples/keys/server/cert.pem"
         ))),
@@ -3048,8 +3049,7 @@ fn xdp_proxy_frame_size_detail(config: &XdpConfig) -> String {
         String::new()
     } else {
         format!(
-            "XDP proxy mode requires standard-MTU frameSize<={}; currently only frameSize={} is supported until jumbo/multi-buffer support is enabled: {}",
-            cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE,
+            "XDP proxy mode requires frameSize={} until jumbo/multi-buffer support is enabled: {}",
             cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE,
             invalid.join(",")
         )
@@ -4188,15 +4188,15 @@ mod linux {
     type LpmV4Image = std::collections::BTreeMap<(u32, u32), i64>;
     type LpmV6Image = std::collections::BTreeMap<(u32, [u8; 16]), i64>;
 
-    pub(super) struct RuleMapImages {
-        pub(super) allowed_v4: ExactV4Image,
-        pub(super) allowed_v6: ExactV6Image,
-        pub(super) blocked_v4: ExactV4Image,
-        pub(super) blocked_v6: ExactV6Image,
-        pub(super) allowed_v4_lpm: LpmV4Image,
-        pub(super) allowed_v6_lpm: LpmV6Image,
-        pub(super) blocked_v4_lpm: LpmV4Image,
-        pub(super) blocked_v6_lpm: LpmV6Image,
+    pub(crate) struct RuleMapImages {
+        pub(crate) allowed_v4: ExactV4Image,
+        pub(crate) allowed_v6: ExactV6Image,
+        pub(crate) blocked_v4: ExactV4Image,
+        pub(crate) blocked_v6: ExactV6Image,
+        pub(crate) allowed_v4_lpm: LpmV4Image,
+        pub(crate) allowed_v6_lpm: LpmV6Image,
+        pub(crate) blocked_v4_lpm: LpmV4Image,
+        pub(crate) blocked_v6_lpm: LpmV6Image,
     }
 
     // Must stay aligned with crates/cloud-node-xdp-ebpf map max_entries.
@@ -4351,7 +4351,7 @@ mod linux {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn rule_map_images(state: &RuleState) -> RuleMapImages {
+    pub(crate) fn rule_map_images(state: &RuleState) -> RuleMapImages {
         let (allowed_v4, allowed_v6) = exact_image(&state.allowed_ips);
         let (blocked_v4, blocked_v6) = exact_image(&state.blocked_ips);
         let (allowed_v4_lpm, allowed_v6_lpm) =
@@ -7778,8 +7778,8 @@ mod tests {
             allowed_ranges: Default::default(),
         };
 
-        let old_img = linux::rule_map_images(&old_state);
-        let new_img = linux::rule_map_images(&new_state);
+        let old_img = super::linux::rule_map_images(&old_state);
+        let new_img = super::linux::rule_map_images(&new_state);
 
         // Exact v4 blocked: 192.0.2.1 removed, 192.0.2.3 added, 192.0.2.2 kept (no-op)
         assert!(
@@ -7984,7 +7984,17 @@ mod tests {
             ..XdpConfig::default()
         });
 
-        assert!(report.contains("requires standard-MTU frameSize<=2048"));
+        assert!(
+            report.contains(&format!(
+                "requires frameSize={}",
+                cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
+            )),
+            "doctor report should reject jumbo proxy frames: {report}"
+        );
+        assert!(
+            report.contains("until jumbo/multi-buffer support is enabled"),
+            "doctor report should mention jumbo/multi-buffer gating: {report}"
+        );
     }
 
     #[tokio::test]
@@ -8008,7 +8018,14 @@ mod tests {
         let status = manager.status();
         assert!(!status.available);
         assert!(!status.attached);
-        assert!(status.fallback_reason.contains("frameSize<=2048"));
+        assert!(
+            status.fallback_reason.contains(&format!(
+                "frameSize={}",
+                cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
+            )),
+            "fallback reason should reject jumbo proxy frames: {}",
+            status.fallback_reason
+        );
     }
 
     #[tokio::test]
@@ -8030,7 +8047,14 @@ mod tests {
             .initialize()
             .await
             .expect_err("fail-start must reject");
-        assert!(err.to_string().contains("frameSize<=2048"));
+        let err = err.to_string();
+        assert!(
+            err.contains(&format!(
+                "frameSize={}",
+                cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE
+            )),
+            "fail-start should reject jumbo proxy frames: {err}"
+        );
     }
 
     #[test]

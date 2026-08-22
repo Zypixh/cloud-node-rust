@@ -2,7 +2,7 @@
 name = "cloud-node-xdp-common"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.1"
 
 [features]
 default = ["std"]
