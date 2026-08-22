@@ -1198,11 +1198,13 @@ mod tests {
         let scanned = storage.scan_json_prefix::<serde_json::Value>("FWBLK_V1_");
         assert_eq!(scanned.len(), 1);
 
+        let future_expires = crate::utils::time::now_timestamp() + 86_400;
+
         storage.upsert_cache_meta_absolute(CacheMetaUpsert {
             hash: "abc123",
             cache_key: "/index.html",
             size: 1024,
-            expires: 999_999,
+            expires: future_expires,
             access_time: 1,
             access_count: 1,
             status: 200,
