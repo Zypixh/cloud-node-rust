@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(feature = "migrate-metrics")]
 mod mace_migration;
 
 #[derive(Parser)]
@@ -21,6 +22,7 @@ enum Commands {
         profile: String,
     },
     /// Import a legacy RocksDB metrics database into a separate Mace directory.
+    #[cfg(feature = "migrate-metrics")]
     MigrateMetricsToMace {
         /// Existing RocksDB directory, typically data/metrics.db
         #[arg(long)]
@@ -38,6 +40,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::BuildEbpf { profile } => build_ebpf(&profile),
+        #[cfg(feature = "migrate-metrics")]
         Commands::MigrateMetricsToMace {
             source,
             destination,

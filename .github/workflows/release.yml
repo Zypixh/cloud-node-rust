@@ -9,6 +9,12 @@ on:
     paths:
       - '.github/workflows/**'
       - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'release-notes/**'
+      - 'src/**'
+      - 'crates/**'
+      - 'xtask/**'
       - 'pingora-main/**'
       - 'toa-main/**'
       - 'toa-sender/**'
