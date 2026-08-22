@@ -1576,10 +1576,6 @@ fn get_local_port(session: &Session) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
-    crate::client_ip::resolve_for_session(session, None)
-}
-
 fn geo_info(session: &Session) -> Option<analyzer::GeoInfo> {
     analyzer::lookup_geo(crate::client_ip::resolve_for_session(session, None))
 }

@@ -58,6 +58,7 @@ fn compute_node_pressure(sys: &mut sysinfo::System) -> f32 {
 pub mod aggregator;
 pub mod analyzer;
 pub mod daily;
+#[cfg(test)]
 mod mace_backend;
 pub mod storage;
 pub mod top_ip;
