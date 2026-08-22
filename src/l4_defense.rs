@@ -2334,4 +2334,357 @@ mod tests {
             L4DefenseVerdict::AlreadyBlocked
         );
     }
+
+    #[test]
+    fn admission_reject_attack_kinds_are_high_confidence_and_metered() {
+        for kind in [
+            L4DefenseKind::TcpAdmissionReject,
+            L4DefenseKind::UdpAdmissionReject,
+            L4DefenseKind::H2StreamAdmissionReject,
+            L4DefenseKind::H3AdmissionReject,
+            L4DefenseKind::QuicPendingReject,
+        ] {
+            assert!(
+                kind.is_admission_reject(),
+                "{kind:?} should count as admission reject"
+            );
+            assert!(
+                kind.is_high_confidence(),
+                "{kind:?} should use conservative threshold multiplier"
+            );
+        }
+    }
+
+    #[test]
+    fn slow_and_probe_attack_kinds_use_conservative_multipliers() {
+        assert_eq!(L4DefenseKind::HttpSlowHeader.threshold_multiplier(), 2);
+        assert_eq!(L4DefenseKind::TlsSlowClientHello.threshold_multiplier(), 2);
+        assert_eq!(L4DefenseKind::QuicNoRoute.threshold_multiplier(), 4);
+        assert!(!L4DefenseKind::HttpSlowHeader.is_high_confidence());
+        assert!(L4DefenseKind::HttpSlowHeader.is_slow_close());
+        assert!(L4DefenseKind::TlsSlowClientHello.is_tls_probe());
+    }
+
+    #[test]
+    fn h2_and_quic_attack_kinds_are_bucketed_for_metrics() {
+        for kind in [
+            L4DefenseKind::H2RapidReset,
+            L4DefenseKind::H2StreamAdmissionReject,
+            L4DefenseKind::H2RequestChurn,
+        ] {
+            assert!(kind.is_h2_defense(), "{kind:?} should land in H2 defense metrics");
+        }
+        for kind in [
+            L4DefenseKind::QuicNewRouteFlood,
+            L4DefenseKind::QuicIncompleteClientHello,
+            L4DefenseKind::H3AdmissionReject,
+        ] {
+            assert!(
+                kind.is_quic_pressure(),
+                "{kind:?} should land in QUIC/H3 pressure metrics"
+            );
+        }
+    }
+
+    #[test]
+    fn churn_events_preserve_sni_tunnels_but_hard_rejects_do_not() {
+        for kind in [
+            L4DefenseKind::TcpConnectionChurn,
+            L4DefenseKind::TcpAcceptedChurn,
+            L4DefenseKind::TlsSlowClientHello,
+            L4DefenseKind::SniProbeFail,
+        ] {
+            assert!(
+                kind.preserves_sni_tcp_tunnels(),
+                "{kind:?} should not tear down established SNI passthrough"
+            );
+        }
+        assert!(!L4DefenseKind::TcpAdmissionReject.preserves_sni_tcp_tunnels());
+        assert!(!L4DefenseKind::TcpActiveLimit.preserves_sni_tcp_tunnels());
+    }
+
+    #[test]
+    fn attack_deadlines_tighten_monotonically_with_pressure() {
+        let normal = first_byte_timeout(L4PressureLevel::Normal);
+        let elevated = first_byte_timeout(L4PressureLevel::Elevated);
+        let high = first_byte_timeout(L4PressureLevel::High);
+        let critical = first_byte_timeout(L4PressureLevel::Critical);
+        assert!(elevated < normal);
+        assert!(high < elevated);
+        assert!(critical < high);
+
+        let normal_tls = client_hello_timeouts(L4PressureLevel::Normal);
+        let critical_tls = client_hello_timeouts(L4PressureLevel::Critical);
+        assert!(critical_tls.total < normal_tls.total);
+        assert!(critical_tls.idle < normal_tls.idle);
+
+        for level in [
+            L4PressureLevel::Normal,
+            L4PressureLevel::Elevated,
+            L4PressureLevel::High,
+            L4PressureLevel::Critical,
+        ] {
+            let sni = client_hello_timeouts_for_sni_passthrough(level);
+            assert!(sni.total >= Duration::from_secs(1));
+            assert!(sni.idle >= Duration::from_millis(300));
+        }
+    }
+
+    #[test]
+    fn aggregate_pressure_rises_with_memory_connection_fd_and_prefix_surge() {
+        assert_eq!(
+            aggregate_pressure_level(MemoryPressureLevel::Critical, 10, None, Some(10)),
+            L4PressureLevel::Critical
+        );
+        assert_eq!(
+            aggregate_pressure_level(MemoryPressureLevel::Normal, 96, None, None),
+            L4PressureLevel::Critical
+        );
+        assert_eq!(
+            aggregate_pressure_level(MemoryPressureLevel::Normal, 10, Some(90), Some(10)),
+            L4PressureLevel::High
+        );
+    }
+
+    #[test]
+    fn canonical_l4_ip_normalizes_ipv4_mapped_ipv6() {
+        let v4: IpAddr = "203.0.113.5".parse().unwrap();
+        let mapped = IpAddr::V6("::ffff:cb00:7105".parse().unwrap());
+        assert_eq!(canonical_l4_ip(mapped), v4);
+        assert_eq!(canonical_l4_ip(v4), v4);
+    }
+
+    #[test]
+    fn tcp_active_per_ip_limit_tightens_under_attack_pressure() {
+        let total = 1_048_576;
+        let normal = tcp_active_limit_per_ip_for_level(total, L4PressureLevel::Normal);
+        let elevated = tcp_active_limit_per_ip_for_level(total, L4PressureLevel::Elevated);
+        let high = tcp_active_limit_per_ip_for_level(total, L4PressureLevel::High);
+        let critical = tcp_active_limit_per_ip_for_level(total, L4PressureLevel::Critical);
+        assert!(elevated < normal);
+        assert!(high < elevated);
+        assert!(critical < high);
+        assert!(critical <= 512);
+    }
+
+    #[tokio::test]
+    async fn h2_stream_admission_reject_blocks_at_threshold() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 2, 99001).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(99001);
+        let ip: IpAddr = "203.0.113.201".parse().unwrap();
+
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::H2StreamAdmissionReject,
+                "h2-admission-1"
+            ),
+            L4DefenseVerdict::Allowed
+        );
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::H2StreamAdmissionReject,
+                "h2-admission-2"
+            ),
+            L4DefenseVerdict::Allowed
+        );
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::H2StreamAdmissionReject,
+                "h2-admission-3"
+            ),
+            L4DefenseVerdict::Blocked
+        );
+        assert!(waf_state.is_blocked(ip, cluster_scope));
+    }
+
+    #[tokio::test]
+    async fn udp_admission_reject_blocks_at_threshold() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 2, 99002).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(99002);
+        let ip: IpAddr = "203.0.113.202".parse().unwrap();
+
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::UdpAdmissionReject,
+                "udp-admission-1"
+            ),
+            L4DefenseVerdict::Allowed
+        );
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::UdpAdmissionReject,
+                "udp-admission-2"
+            ),
+            L4DefenseVerdict::Allowed
+        );
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::UdpAdmissionReject,
+                "udp-admission-3"
+            ),
+            L4DefenseVerdict::Blocked
+        );
+        assert!(waf_state.is_blocked(ip, cluster_scope));
+    }
+
+    #[tokio::test]
+    async fn slowloris_style_http_slow_header_uses_conservative_threshold() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 2, 99003).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(99003);
+        let ip: IpAddr = "203.0.113.203".parse().unwrap();
+
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::HttpSlowHeader,
+                "slow-header-1"
+            ),
+            L4DefenseVerdict::Allowed
+        );
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::HttpSlowHeader,
+                "slow-header-2"
+            ),
+            L4DefenseVerdict::Allowed
+        );
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::HttpSlowHeader,
+                "slow-header-3"
+            ),
+            L4DefenseVerdict::Allowed
+        );
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::HttpSlowHeader,
+                "slow-header-4"
+            ),
+            L4DefenseVerdict::Allowed
+        );
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::HttpSlowHeader,
+                "slow-header-5"
+            ),
+            L4DefenseVerdict::Blocked
+        );
+        assert!(waf_state.is_blocked(ip, cluster_scope));
+    }
+
+    #[tokio::test]
+    async fn distributed_prefix_attack_can_apply_aggregate_drop_before_block() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 8, 99004).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let mut saw_aggregate_drop = false;
+        for host in 1..=80u8 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, host));
+            let verdict = record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::TcpAdmissionReject,
+                format!("distributed-{host}"),
+            );
+            if verdict == L4DefenseVerdict::AggregateDropped {
+                saw_aggregate_drop = true;
+            }
+        }
+        assert!(
+            saw_aggregate_drop,
+            "distributed /24 attack should trigger aggregate emergency drop before exact IP blocks dominate"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_slow_client_hello_attack_blocks_under_elevated_pressure() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 2, 99005).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(99005);
+        let ip: IpAddr = "203.0.113.205".parse().unwrap();
+
+        for idx in 0..3 {
+            let verdict = record_l4_event_with_pressure(
+                &store,
+                &waf_state,
+                7,
+                ip,
+                L4DefenseKind::TlsSlowClientHello,
+                format!("slow-hello-{idx}"),
+                L4PressureLevel::High,
+            );
+            if verdict == L4DefenseVerdict::Blocked {
+                assert!(waf_state.is_blocked(ip, cluster_scope));
+                return;
+            }
+        }
+        panic!("TLS slow ClientHello attack should block under high pressure with threshold 2");
+    }
+
+    #[tokio::test]
+    async fn h2_rapid_reset_attack_is_tracked_as_h2_defense() {
+        let store = store_with_empty_connection_flood_for_cluster(true, 1, 99006).await;
+        let waf_state = Arc::new(WafStateManager::new());
+        let cluster_scope = crate::special_defense::cluster_block_scope_id(99006);
+        let ip: IpAddr = "203.0.113.206".parse().unwrap();
+        let before = metrics_snapshot().h2_defense_total;
+
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::H2RapidReset,
+                "rapid-reset-1"
+            ),
+            L4DefenseVerdict::Allowed
+        );
+        assert_eq!(
+            record_test_l4_event(
+                &store,
+                &waf_state,
+                ip,
+                L4DefenseKind::H2RapidReset,
+                "rapid-reset-2"
+            ),
+            L4DefenseVerdict::Blocked
+        );
+        assert!(waf_state.is_blocked(ip, cluster_scope));
+        assert!(metrics_snapshot().h2_defense_total > before);
+    }
 }
