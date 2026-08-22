@@ -1347,7 +1347,7 @@ impl WafStateManager {
         entry.limiter.check_key(&server_id).is_ok()
     }
 
-    fn reserve_slot(counter: &AtomicU64, capacity: usize) -> bool {
+    pub(crate) fn reserve_slot(counter: &AtomicU64, capacity: usize) -> bool {
         counter
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < capacity as u64).then_some(current + 1)
@@ -1355,7 +1355,7 @@ impl WafStateManager {
             .is_ok()
     }
 
-    fn release_slot(counter: &AtomicU64) {
+    pub(crate) fn release_slot(counter: &AtomicU64) {
         let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             Some(current.saturating_sub(1))
         });
@@ -2284,5 +2284,18 @@ mod tests {
         }
         state.gc_once();
         assert_eq!(state.candidate_stats.len(), 0);
+    }
+
+    #[test]
+    fn reserve_slot_fails_closed_at_capacity() {
+        let counter = AtomicU64::new(0);
+        let capacity = 8;
+        for _ in 0..capacity {
+            assert!(WafStateManager::reserve_slot(&counter, capacity));
+        }
+        assert!(!WafStateManager::reserve_slot(&counter, capacity));
+        WafStateManager::release_slot(&counter);
+        assert!(WafStateManager::reserve_slot(&counter, capacity));
+        assert_eq!(counter.load(Ordering::Acquire), capacity as u64);
     }
 }

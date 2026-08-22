@@ -2176,6 +2176,34 @@ fn read_current_fd_count() -> Option<u64> {
 mod tests {
     use super::*;
 
+    fn seed_governor_memory(
+        governor: &MemoryGovernor,
+        total_bytes: u64,
+        available_bytes: u64,
+        fd_soft_limit: u64,
+        fd_used: u64,
+    ) {
+        let now = crate::utils::time::system_timestamp_millis().max(0) as u64;
+        governor
+            .cached_total_bytes
+            .store(total_bytes, Ordering::Release);
+        governor.cached_used_bytes.store(
+            total_bytes.saturating_sub(available_bytes),
+            Ordering::Release,
+        );
+        governor
+            .cached_available_bytes
+            .store(available_bytes, Ordering::Release);
+        governor
+            .cached_fd_soft_limit
+            .store(fd_soft_limit, Ordering::Release);
+        governor.cached_fd_used.store(fd_used, Ordering::Release);
+        governor
+            .cached_fd_used_at_millis
+            .store(now, Ordering::Release);
+        governor.cached_at_millis.store(now, Ordering::Release);
+    }
+
     fn synthetic_snapshot(
         total_gib: u64,
         available_gib: u64,
@@ -2665,6 +2693,357 @@ mod tests {
         assert_eq!(
             pressure_adjusted_min_limit(&critical, MIN_CACHE_READ_MEMORY_LIMIT, 4, 1),
             1
+        );
+    }
+
+    #[test]
+    fn control_plane_admission_classes_roll_back_and_track_rejects() {
+        let governor = MemoryGovernor::new();
+        for class in [
+            AdmissionClass::ClusterInternalConnection,
+            AdmissionClass::RpcStreamCommand,
+        ] {
+            let limit = governor.limit_for(class);
+            assert!(limit >= 16, "class {class:?} should have a positive governor limit");
+            let mut permits = Vec::new();
+            for _ in 0..limit {
+                permits.push(governor.try_admit(class).expect("should admit under limit"));
+            }
+            assert!(
+                governor.try_admit(class).is_none(),
+                "class {class:?} should reject when limit is full"
+            );
+            assert_eq!(governor.counter(class).load(Ordering::Acquire), limit as u64);
+            drop(permits.pop());
+            assert!(governor.try_admit(class).is_some());
+            drop(permits);
+            assert_eq!(governor.counter(class).load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn zero_copy_relay_disabled_under_high_memory_pressure() {
+        let governor = MemoryGovernor::new();
+        let total = 16 * 1024 * 1024 * 1024_u64;
+        seed_governor_memory(
+            &governor,
+            total,
+            32 * 1024 * 1024,
+            1_048_576,
+            128,
+        );
+        assert!(governor.is_memory_pressure_high());
+        assert!(governor.try_admit_zero_copy_relay().is_none());
+        assert_eq!(governor.zero_copy_relay_active(), 0);
+        assert_eq!(governor.zero_copy_relay_used_bytes(), 0);
+    }
+
+    #[test]
+    fn zero_copy_relay_disabled_under_high_fd_pressure() {
+        let governor = MemoryGovernor::new();
+        let total = 16 * 1024 * 1024 * 1024_u64;
+        let available = 12 * 1024 * 1024 * 1024_u64;
+        seed_governor_memory(&governor, total, available, 1_024, 900);
+        assert!(
+            governor.fd_equivalent_snapshot().pressure_level >= MemoryPressureLevel::High
+        );
+        assert!(governor.try_admit_zero_copy_relay().is_none());
+    }
+
+    #[test]
+    fn zero_copy_relay_disabled_when_connection_admission_is_saturated() {
+        let governor = MemoryGovernor::new();
+        let total = 16 * 1024 * 1024 * 1024_u64;
+        let available = 12 * 1024 * 1024 * 1024_u64;
+        seed_governor_memory(&governor, total, available, 1_048_576, 128);
+        let budget = governor.connection_admission_budget_bytes();
+        governor
+            .shared_connection_bytes
+            .store(budget.saturating_mul(81) / 100, Ordering::Release);
+        assert!(governor.is_connection_admission_pressure_high());
+        assert!(governor.try_admit_zero_copy_relay().is_none());
+    }
+
+    #[test]
+    fn governor_snapshot_budget_fields_stay_within_available_memory() {
+        let governor = MemoryGovernor::new();
+        let scenarios = [
+            (512_u64, 64_u64, 65_535_u64),
+            (16_u64, 8_u64, 1_048_576_u64),
+            (1024_u64, 768_u64, 16_777_216_u64),
+        ];
+        for (total_gib, available_gib, fd_limit) in scenarios {
+            let total = total_gib * 1024 * 1024 * 1024;
+            let available = available_gib * 1024 * 1024 * 1024;
+            seed_governor_memory(&governor, total, available, fd_limit, 128);
+            let snapshot = governor.snapshot(pingora_worker_threads(&governor.memory_snapshot()));
+            assert!(
+                snapshot.connection_budget_bytes <= snapshot.memory_available_bytes,
+                "connection budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.cache_budget_bytes <= snapshot.memory_available_bytes,
+                "cache budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.bloom_budget_bytes <= snapshot.memory_available_bytes,
+                "bloom budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.cache_read_memory_budget_bytes <= snapshot.memory_available_bytes,
+                "cache read budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.udp_queued_bytes_budget <= snapshot.memory_available_bytes,
+                "udp queue budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.l4_aggregate_state_budget_bytes <= snapshot.memory_available_bytes,
+                "L4 state budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.kernel_sync_queue_budget_bytes <= snapshot.l4_aggregate_state_budget_bytes,
+                "kernel sync budget should stay within L4 aggregate budget"
+            );
+            assert!(
+                snapshot.regex_cache_budget_bytes <= snapshot.l4_aggregate_state_budget_bytes,
+                "regex cache budget should stay within L4 aggregate budget"
+            );
+            assert!(
+                snapshot.logging_retry_budget_bytes <= snapshot.memory_available_bytes,
+                "logging retry budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.local_log_queue_budget_bytes <= snapshot.memory_available_bytes,
+                "local log queue budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.ip_report_queue_budget_bytes <= snapshot.memory_available_bytes,
+                "ip report queue budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.af_xdp_budget_bytes <= snapshot.memory_available_bytes,
+                "AF_XDP budget should not exceed available memory"
+            );
+            assert!(
+                snapshot.cluster_internal_connection_limit > 0
+                    && snapshot.rpc_stream_command_limit > 0,
+                "control-plane admission limits should remain positive"
+            );
+        }
+    }
+
+    #[test]
+    fn firewall_state_capacities_are_bounded_by_hard_guardrails() {
+        let governor = MemoryGovernor::new();
+        for (total_gib, available_gib) in [(16_u64, 8_u64), (512_u64, 384_u64), (2_u64, 1_u64)] {
+            let total = total_gib * 1024 * 1024 * 1024;
+            let available = available_gib * 1024 * 1024 * 1024;
+            seed_governor_memory(&governor, total, available, 1_048_576, 256);
+            let snapshot = governor.snapshot(pingora_worker_threads(&governor.memory_snapshot()));
+            assert!(
+                snapshot.firewall_ip_limiter_capacity <= MAX_FIREWALL_IP_LIMITERS,
+                "ip limiter capacity must stay below the hard guardrail max"
+            );
+            assert!(
+                snapshot.firewall_rolling_counter_capacity <= MAX_FIREWALL_ROLLING_COUNTERS,
+                "rolling counter capacity must stay below the hard guardrail max"
+            );
+            assert!(
+                snapshot.firewall_ip_bw_counter_capacity <= MAX_FIREWALL_IP_BW_COUNTERS,
+                "bandwidth counter capacity must stay below the hard guardrail max"
+            );
+            assert!(
+                snapshot.firewall_candidate_stats_capacity <= MAX_FIREWALL_CANDIDATE_STATS,
+                "candidate stats capacity must stay below the hard guardrail max"
+            );
+        }
+
+        let normal = synthetic_snapshot(16, 12, 1_048_576, 8);
+        let critical = synthetic_snapshot(16, 1, 1_048_576, 8);
+        assert!(
+            firewall_ip_limiter_capacity(&critical) <= firewall_ip_limiter_capacity(&normal),
+            "ip limiter capacity should not grow under critical memory pressure"
+        );
+        assert!(
+            firewall_rolling_counter_capacity(&critical)
+                <= firewall_rolling_counter_capacity(&normal),
+            "rolling counter capacity should not grow under critical memory pressure"
+        );
+    }
+
+    #[test]
+    fn concurrent_http_admission_never_exceeds_limit_or_leaks_counters() {
+        use std::sync::Arc;
+        use std::thread;
+
+        struct ActiveGuard {
+            active: Arc<AtomicU64>,
+        }
+
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.active.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        let governor = Arc::new(MemoryGovernor::new());
+        let limit = governor.limit_for(AdmissionClass::HttpConnection);
+        let thread_count = 32;
+        let attempts_per_thread = limit / thread_count + 128;
+        let active = Arc::new(AtomicU64::new(0));
+        let peak_active = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..thread_count {
+            let governor = Arc::clone(&governor);
+            let active = Arc::clone(&active);
+            let peak_active = Arc::clone(&peak_active);
+            handles.push(thread::spawn(move || {
+                let mut permits = Vec::new();
+                for _ in 0..attempts_per_thread {
+                    if let Some(permit) = governor.try_admit(AdmissionClass::HttpConnection) {
+                        let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        peak_active.fetch_max(current, Ordering::AcqRel);
+                        assert!(
+                            governor
+                                .counter(AdmissionClass::HttpConnection)
+                                .load(Ordering::Acquire)
+                                <= limit as u64,
+                            "live HTTP admission counter must never exceed the hard limit"
+                        );
+                        permits.push((
+                            permit,
+                            ActiveGuard {
+                                active: Arc::clone(&active),
+                            },
+                        ));
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(
+            peak_active.load(Ordering::Acquire) <= limit as u64,
+            "peak concurrent HTTP admissions must never exceed the hard limit"
+        );
+        assert_eq!(
+            governor
+                .counter(AdmissionClass::HttpConnection)
+                .load(Ordering::Acquire),
+            0,
+            "all HTTP admission permits must be released after concurrent stress"
+        );
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn mixed_connection_admission_respects_shared_connection_budget() {
+        let governor = MemoryGovernor::new();
+        let budget = governor.connection_admission_budget_bytes();
+        let mut permits = Vec::new();
+        loop {
+            match governor.try_admit(AdmissionClass::HttpConnection) {
+                Some(permit) => permits.push(permit),
+                None => break,
+            }
+        }
+        assert!(
+            governor.connection_admission_used_bytes() <= budget,
+            "shared connection bytes must never exceed the elastic budget"
+        );
+        assert!(
+            governor.try_admit(AdmissionClass::TcpConnection).is_none(),
+            "TCP admission should also fail once the shared budget is exhausted"
+        );
+        drop(permits);
+        assert_eq!(governor.connection_admission_used_bytes(), 0);
+    }
+
+    #[test]
+    fn quic_and_udp_budgets_shrink_under_memory_pressure() {
+        let normal = synthetic_snapshot(16, 12, 1_048_576, 8);
+        let critical = synthetic_snapshot(16, 1, 1_048_576, 8);
+        assert!(
+            h3_datagram_queue_size(&critical) <= h3_datagram_queue_size(&normal),
+            "H3 datagram queue should shrink under pressure"
+        );
+        assert!(
+            h3_datagram_queue_budget_bytes(&critical) <= h3_datagram_queue_budget_bytes(&normal),
+            "H3 datagram byte budget should shrink under pressure"
+        );
+        assert!(
+            udp_queued_bytes_budget(&critical) <= udp_queued_bytes_budget(&normal),
+            "UDP queued byte budget should shrink under pressure"
+        );
+        assert!(
+            quic_pending_reassembly_budget_bytes(&critical)
+                <= quic_pending_reassembly_budget_bytes(&normal),
+            "QUIC reassembly budget should shrink under pressure"
+        );
+        assert!(
+            zero_copy_relay_budget_bytes(&critical) <= zero_copy_relay_budget_bytes(&normal),
+            "zero-copy relay budget should shrink under pressure"
+        );
+    }
+
+    #[test]
+    fn cache_read_object_limit_tightens_under_pressure() {
+        let governor = MemoryGovernor::new();
+        let total = 64 * 1024 * 1024 * 1024_u64;
+        seed_governor_memory(&governor, total, 32 * 1024 * 1024, 1_048_576, 128);
+        let pressure_limit = governor.cache_read_memory_object_limit_bytes();
+        assert_eq!(
+            pressure_limit,
+            CACHE_READ_MEMORY_PRESSURE_OBJECT_BYTES,
+            "cache read object limit should tighten under high memory pressure"
+        );
+        let oversize = pressure_limit.saturating_add(1);
+        assert!(governor.try_admit_cache_read(oversize).is_none());
+        assert_eq!(governor.admission_reject_snapshot().cache_read_memory, 1);
+    }
+
+    #[test]
+    fn admission_reject_total_counts_control_plane_rejects() {
+        let governor = MemoryGovernor::new();
+        let class = AdmissionClass::RpcStreamCommand;
+        let limit = governor.limit_for(class);
+        let mut permits = Vec::new();
+        for _ in 0..limit {
+            permits.push(governor.try_admit(class).unwrap());
+        }
+        assert!(governor.try_admit(class).is_none());
+        let rejects = governor.admission_reject_snapshot();
+        assert_eq!(rejects.rpc_stream_command, 1);
+        assert!(rejects.total() >= 1);
+        drop(permits);
+    }
+
+    #[test]
+    fn tcp_relay_idle_timeout_engages_under_pressure() {
+        let governor = MemoryGovernor::new();
+        let total = 16 * 1024 * 1024 * 1024_u64;
+        seed_governor_memory(&governor, total, 32 * 1024 * 1024, 1_048_576, 128);
+        assert!(
+            governor.tcp_relay_pressure_idle_timeout().is_some(),
+            "idle timeout should engage under high memory pressure"
+        );
+
+        seed_governor_memory(
+            &governor,
+            total,
+            12 * 1024 * 1024 * 1024,
+            1_048_576,
+            128,
+        );
+        let budget = governor.connection_admission_budget_bytes();
+        governor
+            .shared_connection_bytes
+            .store(budget.saturating_mul(91) / 100, Ordering::Release);
+        assert!(
+            governor.tcp_relay_pressure_idle_timeout().is_some(),
+            "idle timeout should engage when connection admission is saturated"
         );
     }
 }
