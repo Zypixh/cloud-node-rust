@@ -308,11 +308,6 @@ pub(crate) fn reset_node_log_throttle_for_test() {
     NODE_LOG_THROTTLE.clear();
 }
 
-#[cfg(test)]
-pub(crate) fn node_log_throttle_len_for_test() -> usize {
-    NODE_LOG_THROTTLE.len()
-}
-
 pub fn access_log_needs_attrs(ctx: &ProxyCTX) -> bool {
     if !ctx.access_log_module_enabled || ctx.no_log || !ctx.global_access_log_on {
         return false;
