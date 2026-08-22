@@ -254,6 +254,7 @@
 - 请求：`CreateNodeLogsRequest { node_logs[] }`
 - 响应：`CreateNodeLogsResponse {}` 空消息
 - `node_logs[]` 字段：`id`、`role`、`tag`、`description`、`level`、`nodeId`、`createdAt`、`count`、`serverId`、`isFixed`、`originId`、`isRead`、`paramsJSON`、`type`
+- 节点侧会对相同 `type`（无 type 时按 `tag`+`serverId`）做限流合并：窗口内重复事件只上报一条，并用 `count` 表示合并次数，避免 API 宕机期间连通性错误日志把控制面数据库打满。
 
 ### NodeValueService.CreateNodeValues
 
