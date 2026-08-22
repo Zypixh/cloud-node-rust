@@ -2140,7 +2140,20 @@ impl WafStateManager {
 }
 
 /// Spawn a background tokio task that runs GC on the WAF state every 60 seconds.
+static WAF_STATE_FOR_RECLAIM: std::sync::OnceLock<std::sync::Weak<WafStateManager>> =
+    std::sync::OnceLock::new();
+
+pub fn accelerate_block_map_gc() {
+    if let Some(state) = WAF_STATE_FOR_RECLAIM
+        .get()
+        .and_then(std::sync::Weak::upgrade)
+    {
+        state.gc_once();
+    }
+}
+
 pub fn start_gc_task(state: Arc<WafStateManager>) {
+    let _ = WAF_STATE_FOR_RECLAIM.set(Arc::downgrade(&state));
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(GC_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

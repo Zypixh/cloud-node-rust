@@ -564,6 +564,21 @@ pub(crate) fn evaluate_operator_bytes(
     }
 }
 
+pub fn reclaim_waf_regex_caches(clear_all: bool) -> u64 {
+    let before = WAF_RE_CACHE
+        .entry_count()
+        .saturating_add(WAF_BYTES_RE_CACHE.entry_count());
+    if clear_all {
+        WAF_RE_CACHE.invalidate_all();
+        WAF_BYTES_RE_CACHE.invalidate_all();
+    }
+    before.saturating_sub(
+        WAF_RE_CACHE
+            .entry_count()
+            .saturating_add(WAF_BYTES_RE_CACHE.entry_count()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

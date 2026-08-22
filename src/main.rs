@@ -3521,6 +3521,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     cloud_node_rust::metrics::storage::start_cache_access_flusher();
     // cloud_node_rust::cache_hybrid::start_cache_profiler();
     cloud_node_rust::metrics::start_pressure_updater();
+    cloud_node_rust::memory_reclaim::start_reclaim_monitor();
     cloud_node_rust::cache_hybrid::start_cache_janitor();
     tokio::spawn(cloud_node_rust::cache_hybrid::start_cache_purger(
         cloud_node_rust::cache_manager::CACHE.storage,

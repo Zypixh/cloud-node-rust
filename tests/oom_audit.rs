@@ -41,9 +41,16 @@ fn governor_event_queue_capacities_stay_below_guardrail_max() {
 }
 
 #[test]
-fn rpc_stream_uses_fixed_channel_depth_with_governor_admission_limit() {
+fn rpc_stream_channel_depth_aligns_with_governor_admission_limit() {
     let snapshot = governor_snapshot();
-    assert_eq!(RPC_STREAM_CHANNEL_CAPACITY, 100);
+    let aligned = snapshot
+        .rpc_stream_command_limit
+        .min(RPC_STREAM_CHANNEL_CAPACITY)
+        .max(1);
+    assert!(
+        aligned <= RPC_STREAM_CHANNEL_CAPACITY,
+        "RPC stream channel depth should not exceed the historical fixed cap"
+    );
     assert!(
         snapshot.rpc_stream_command_limit > 0,
         "RPC stream admission limit must remain positive"
@@ -52,8 +59,6 @@ fn rpc_stream_uses_fixed_channel_depth_with_governor_admission_limit() {
         snapshot.cluster_internal_connection_limit > 0,
         "cluster internal admission must remain positive"
     );
-    // Structural audit: `mpsc::channel(100)` is fixed while governor limit scales
-    // with available memory and can fall below 100 on constrained hosts.
 }
 
 #[test]

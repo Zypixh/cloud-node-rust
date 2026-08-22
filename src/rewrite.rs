@@ -28,7 +28,6 @@ pub enum RewriteResult {
 }
 
 /// Match and evaluate rewrite rules using the legacy configureWeb/doRewrite behavior.
-static REWRITE_RE_CACHE: Lazy<DashMap<String, std::sync::Arc<Regex>>> = Lazy::new(DashMap::new);
 
 #[derive(Clone, Debug, Default)]
 pub struct CompiledServerRewritePlan {
@@ -635,18 +634,10 @@ fn compile_rewrite_pattern(pattern: &str) -> Option<Arc<Regex>> {
 }
 
 fn rewrite_pattern_regex(pattern: &str) -> Option<Arc<Regex>> {
-    if let Some(cached) = REWRITE_RE_CACHE.get(pattern) {
-        return Some(cached.clone());
+    if pattern == "*" {
+        return crate::bounded_regex_cache::get_or_compile("^/(.*)$");
     }
-    let compiled = if pattern == "*" {
-        Regex::new("^/(.*)$")
-    } else {
-        Regex::new(pattern)
-    }
-    .ok()?;
-    let re = Arc::new(compiled);
-    REWRITE_RE_CACHE.insert(pattern.to_string(), Arc::clone(&re));
-    Some(re)
+    crate::bounded_regex_cache::get_or_compile(pattern)
 }
 
 fn expand_rewrite_replacement(
@@ -1271,8 +1262,6 @@ mod tests {
     }
 }
 
-static HOST_REDIRECT_RE_CACHE: Lazy<DashMap<String, Arc<Regex>>> = Lazy::new(DashMap::new);
-
 fn request_uri(path: &str, query: &str) -> String {
     let mut uri = if path.is_empty() {
         "/".to_string()
@@ -1356,13 +1345,7 @@ fn domain_pattern_matches(pattern: &str, domain: &str) -> bool {
 }
 
 fn cached_host_redirect_regex(pattern: &str) -> Option<Arc<Regex>> {
-    if let Some(cached) = HOST_REDIRECT_RE_CACHE.get(pattern) {
-        return Some(cached.clone());
-    }
-    let compiled = Regex::new(pattern).ok()?;
-    let regex = Arc::new(compiled);
-    HOST_REDIRECT_RE_CACHE.insert(pattern.to_string(), Arc::clone(&regex));
-    Some(regex)
+    crate::bounded_regex_cache::get_or_compile(pattern)
 }
 
 fn expand_go_regex_replacement(

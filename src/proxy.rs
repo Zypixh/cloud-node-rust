@@ -531,10 +531,6 @@ static REQUEST_LIMIT_SERVER_COUNTS: Lazy<DashMap<i64, Arc<AtomicI32>>> =
     Lazy::new(|| DashMap::with_shard_amount(64));
 static REQUEST_LIMIT_IP_COUNTS: Lazy<DashMap<std::net::IpAddr, Arc<AtomicI32>>> =
     Lazy::new(|| DashMap::with_shard_amount(64));
-static WILDCARD_DOMAIN_REGEX_CACHE: Lazy<DashMap<String, Arc<Regex>>> =
-    Lazy::new(|| DashMap::with_shard_amount(64));
-static UA_WILDCARD_REGEX_CACHE: Lazy<DashMap<String, Arc<Regex>>> =
-    Lazy::new(|| DashMap::with_shard_amount(64));
 static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
     hostname::get()
         .unwrap_or_default()
@@ -4611,33 +4607,17 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
     }
 
     fn cached_wildcard_domain_regex_matches(pattern: &str, domain: &str) -> bool {
-        if let Some(re) = WILDCARD_DOMAIN_REGEX_CACHE.get(pattern) {
-            return re.is_match(domain);
-        }
-
         let escaped = regex::escape(pattern).replace("\\*", ".*");
-        let Ok(re) = Regex::new(&format!("(?i)^{}$", escaped)) else {
-            return false;
-        };
-        let re = Arc::new(re);
-        let matched = re.is_match(domain);
-        WILDCARD_DOMAIN_REGEX_CACHE.insert(pattern.to_string(), re);
-        matched
+        let regex_pattern = format!("(?i)^{}$", escaped);
+        crate::bounded_regex_cache::get_or_compile(&regex_pattern)
+            .is_some_and(|re| re.is_match(domain))
     }
 
     fn cached_user_agent_wildcard_matches(keyword: &str, user_agent: &str) -> bool {
-        if let Some(re) = UA_WILDCARD_REGEX_CACHE.get(keyword) {
-            return re.is_match(user_agent);
-        }
-
         let pattern = regex::escape(keyword).replace("\\*", ".*");
-        let Ok(re) = Regex::new(&format!("(?i){}", pattern)) else {
-            return false;
-        };
-        let re = Arc::new(re);
-        let matched = re.is_match(user_agent);
-        UA_WILDCARD_REGEX_CACHE.insert(keyword.to_string(), re);
-        matched
+        let regex_pattern = format!("(?i){}", pattern);
+        crate::bounded_regex_cache::get_or_compile(&regex_pattern)
+            .is_some_and(|re| re.is_match(user_agent))
     }
 
     fn url_patterns_match(

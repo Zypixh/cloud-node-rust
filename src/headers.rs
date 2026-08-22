@@ -13,7 +13,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
 
-static HEADER_RE_CACHE: Lazy<DashMap<String, Arc<Regex>>> = Lazy::new(DashMap::new);
 static HEADER_NAME_CACHE: Lazy<DashMap<String, Option<HeaderName>>> = Lazy::new(DashMap::new);
 
 fn cached_header_name(name: &str) -> Option<HeaderName> {
@@ -548,14 +547,7 @@ pub fn response_policy_needs_port(policy: &HTTPHeaderPolicy) -> bool {
 }
 
 fn cached_header_regex(pattern: &str) -> Option<Arc<Regex>> {
-    if let Some(cached) = HEADER_RE_CACHE.get(pattern) {
-        return Some(Arc::clone(&*cached));
-    }
-    Regex::new(pattern).ok().map(|re| {
-        let re = Arc::new(re);
-        HEADER_RE_CACHE.insert(pattern.to_string(), Arc::clone(&re));
-        re
-    })
+    crate::bounded_regex_cache::get_or_compile(pattern)
 }
 
 /// Applies request header policies to the upstream request headers.

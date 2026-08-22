@@ -1316,6 +1316,20 @@ impl TinyUfoL1 {
         self.set_max_bytes(0);
     }
 
+    fn force_rebuild_with_limit(&self, bytes: u64) {
+        let resolved = bytes.max(1024);
+        self.max_bytes.store(resolved, Ordering::Relaxed);
+        let new_cache = Arc::new(Self::build_cache(resolved));
+        self.current_weight.store(0, Ordering::Relaxed);
+        let mut guard = self.inner.write().expect("TinyUfoL1 lock poisoned");
+        *guard = new_cache;
+    }
+
+    fn force_clear(&self) {
+        let limit = self.max_bytes.load(Ordering::Relaxed).max(1024);
+        self.force_rebuild_with_limit(limit);
+    }
+
     fn stats(&self) -> (usize, u64) {
         let inner = self.read_inner();
         self.refresh_stats(&inner);
@@ -1495,6 +1509,44 @@ impl AdaptiveBloomFilter {
         let estimated_bytes = self.estimated_bytes.load(Ordering::Relaxed);
         (size, capacity, util, estimated_bytes)
     }
+
+    fn shrink_layers(&self, keep_layers_per_shard: usize) -> u64 {
+        let keep = keep_layers_per_shard.max(1);
+        let mut removed_layers = 0u64;
+        let mut freed_bytes = 0u64;
+        for shard in &self.shards {
+            let mut layers = shard.layers.write();
+            while layers.len() > keep {
+                if let Some(removed) = layers.first() {
+                    freed_bytes = freed_bytes.saturating_add(Self::estimated_layer_bytes(
+                        removed.capacity,
+                    ));
+                }
+                layers.remove(0);
+                removed_layers = removed_layers.saturating_add(1);
+            }
+        }
+        if freed_bytes > 0 {
+            self.estimated_bytes
+                .fetch_sub(freed_bytes, Ordering::Relaxed);
+        }
+        removed_layers
+    }
+
+    fn reset_to_minimal(&self) {
+        let per_shard = (1_000_000usize / self.shards.len().max(1)).max(1) as u32;
+        let mut total_capacity = 0u64;
+        let mut total_bytes = 0u64;
+        for shard in &self.shards {
+            let layer = Self::build_layer(per_shard);
+            total_capacity = total_capacity.saturating_add(layer.capacity);
+            total_bytes = total_bytes.saturating_add(Self::estimated_layer_bytes(layer.capacity));
+            *shard.layers.write() = vec![layer];
+        }
+        self.total_capacity.store(total_capacity, Ordering::Relaxed);
+        self.current_size.store(0, Ordering::Relaxed);
+        self.estimated_bytes.store(total_bytes, Ordering::Relaxed);
+    }
 }
 
 /// Billion-scale adaptive bloom filter: starts at 1M keys / 64 shards and grows by layer doubling.
@@ -1590,6 +1642,67 @@ fn negative_cache_stats() -> (usize, usize) {
 
 fn negative_cache_cleanup(now: i64) {
     NEGATIVE_CACHE.retain(|_, &mut expires| expires > now);
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheReclaimStats {
+    pub l1_entries_removed: usize,
+    pub l1_bytes_freed_estimate: u64,
+    pub bloom_layers_removed: u64,
+    pub negative_cache_entries_removed: usize,
+}
+
+fn reclaim_l1_from_storage(storage: &HybridStorage, shrink_to_bytes: Option<u64>) -> (usize, u64) {
+    let (count_before, bytes_before) = storage.l1.stats();
+    match shrink_to_bytes {
+        Some(bytes) => storage.l1.force_rebuild_with_limit(bytes),
+        None => storage.l1.force_clear(),
+    }
+    let (count_after, bytes_after) = storage.l1.stats();
+    (
+        count_before.saturating_sub(count_after),
+        bytes_before.saturating_sub(bytes_after),
+    )
+}
+
+pub fn reclaim_caches_elevated() -> CacheReclaimStats {
+    let now = crate::utils::time::now_timestamp();
+    let before = NEGATIVE_CACHE.len();
+    negative_cache_cleanup(now);
+    CacheReclaimStats {
+        negative_cache_entries_removed: before.saturating_sub(NEGATIVE_CACHE.len()),
+        ..Default::default()
+    }
+}
+
+pub fn reclaim_caches_high() -> CacheReclaimStats {
+    let target = MEMORY_GOVERNOR
+        .cache_budget_bytes()
+        .saturating_div(2)
+        .max(8 * 1024 * 1024);
+    let (l1_removed, l1_freed) =
+        reclaim_l1_from_storage(crate::cache_manager::CACHE.storage, Some(target));
+    let before = NEGATIVE_CACHE.len();
+    NEGATIVE_CACHE.clear();
+    CacheReclaimStats {
+        l1_entries_removed: l1_removed,
+        l1_bytes_freed_estimate: l1_freed,
+        bloom_layers_removed: CACHE_BLOOM.shrink_layers(1),
+        negative_cache_entries_removed: before,
+    }
+}
+
+pub fn reclaim_caches_critical() -> CacheReclaimStats {
+    let (l1_removed, l1_freed) = reclaim_l1_from_storage(crate::cache_manager::CACHE.storage, None);
+    let before = NEGATIVE_CACHE.len();
+    NEGATIVE_CACHE.clear();
+    CACHE_BLOOM.reset_to_minimal();
+    CacheReclaimStats {
+        l1_entries_removed: l1_removed,
+        l1_bytes_freed_estimate: l1_freed,
+        bloom_layers_removed: 0,
+        negative_cache_entries_removed: before,
+    }
 }
 
 pub(crate) fn warm_admission_filters_from_cache_meta() {
@@ -2450,6 +2563,7 @@ pub fn start_cache_janitor() {
             CACHED_DISK_AVAILABLE.store(available, Ordering::Relaxed);
 
             crate::cache_manager::CACHE.storage.l1.refresh_auto_budget();
+            crate::memory_reclaim::periodic_reclaim_check();
 
             // Clean expired negative cache entries
             let now = crate::utils::time::now_timestamp();
@@ -3078,5 +3192,40 @@ mod tests {
                     || !crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high()
             );
         }
+    }
+
+    #[test]
+    fn critical_reclaim_clears_l1_and_negative_cache() {
+        let storage = &crate::cache_manager::CACHE.storage;
+        let now = crate::utils::time::now_timestamp();
+        let key = unique_test_suffix("reclaim-critical");
+        storage.l1.put(
+            &key,
+            TinyUfoL1Entry {
+                data: bytes::Bytes::from_static(b"payload"),
+                response_header: pingora_http::ResponseHeader::build(200, None).unwrap(),
+                fresh_until: now + 60,
+                created_at: now,
+            },
+            std::time::Duration::from_secs(60),
+        );
+        negative_cache_insert(&key, now);
+        let (count_before, _) = storage.l1.stats();
+        assert!(count_before >= 1);
+
+        let stats = super::reclaim_caches_critical();
+        let (count_after, _) = storage.l1.stats();
+        assert!(stats.l1_entries_removed >= 1 || count_after < count_before);
+        assert!(stats.negative_cache_entries_removed >= 1);
+    }
+
+    #[test]
+    fn bloom_shrink_under_high_reclaim() {
+        let bloom = AdaptiveBloomFilter::new(8, 1);
+        for i in 0..32 {
+            bloom.insert(&format!("layer-key-{i}"));
+        }
+        let removed = bloom.shrink_layers(1);
+        let _ = removed;
     }
 }

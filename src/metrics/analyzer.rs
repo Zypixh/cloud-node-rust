@@ -328,3 +328,11 @@ pub fn lookup_isp_name(ip: IpAddr) -> Arc<str> {
 pub fn lookup_geo(ip: IpAddr) -> Option<GeoInfo> {
     lookup_geo_internal(ip)
 }
+
+pub fn reclaim_geo_ua_caches(clear_all: bool) -> (usize, usize) {
+    GEO_CACHE.clear();
+    if clear_all {
+        UA_CACHE.clear();
+    }
+    (1, usize::from(clear_all))
+}

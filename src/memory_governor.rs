@@ -706,6 +706,10 @@ impl MemoryGovernor {
         memory_pressure_high(&snapshot)
     }
 
+    pub fn current_memory_pressure_level(&self) -> MemoryPressureLevel {
+        memory_pressure_level(&self.memory_snapshot())
+    }
+
     pub fn relay_copy_buffer_bytes(&self) -> usize {
         let snapshot = self.memory_snapshot();
         relay_copy_buffer_bytes(&snapshot, self.tcp_connections.load(Ordering::Relaxed))
@@ -1290,7 +1294,9 @@ impl MemoryGovernor {
                     self.cached_total_bytes.load(Ordering::Relaxed),
                     self.cached_available_bytes.load(Ordering::Relaxed),
                     BLOOM_BUDGET_PCT,
-                    MIN_BLOOM_BUDGET_BYTES,
+                    effective_min_bloom_budget_bytes(
+                        self.cached_total_bytes.load(Ordering::Relaxed),
+                    ),
                     MAX_BLOOM_BUDGET_BYTES,
                 ),
             };
@@ -1309,7 +1315,7 @@ impl MemoryGovernor {
             .store(snapshot.cpu_parallelism as u64, Ordering::Relaxed);
         self.cached_at_millis.store(now as u64, Ordering::Relaxed);
 
-        BudgetedMemorySnapshot {
+        let mem = BudgetedMemorySnapshot {
             total_bytes: snapshot.total_bytes,
             used_bytes: snapshot.used_bytes,
             available_bytes: snapshot.available_bytes,
@@ -1333,10 +1339,12 @@ impl MemoryGovernor {
                 snapshot.total_bytes,
                 snapshot.available_bytes,
                 BLOOM_BUDGET_PCT,
-                MIN_BLOOM_BUDGET_BYTES,
+                effective_min_bloom_budget_bytes(snapshot.total_bytes),
                 MAX_BLOOM_BUDGET_BYTES,
             ),
-        }
+        };
+        crate::memory_reclaim::on_memory_pressure_observed(memory_pressure_level(&mem));
+        mem
     }
 }
 
@@ -1584,9 +1592,29 @@ fn cache_budget_from_available(total_bytes: u64, available_bytes: u64) -> u64 {
         total_bytes,
         available_bytes,
         CACHE_BUDGET_PCT,
-        MIN_CACHE_BUDGET_BYTES,
+        effective_min_cache_budget_bytes(total_bytes),
         MAX_CACHE_BUDGET_BYTES,
     )
+}
+
+fn effective_min_cache_budget_bytes(total_bytes: u64) -> u64 {
+    if total_bytes <= 4 * 1024 * 1024 * 1024 {
+        32 * 1024 * 1024
+    } else if total_bytes <= 8 * 1024 * 1024 * 1024 {
+        64 * 1024 * 1024
+    } else {
+        MIN_CACHE_BUDGET_BYTES
+    }
+}
+
+fn effective_min_bloom_budget_bytes(total_bytes: u64) -> u64 {
+    if total_bytes <= 4 * 1024 * 1024 * 1024 {
+        8 * 1024 * 1024
+    } else if total_bytes <= 8 * 1024 * 1024 * 1024 {
+        16 * 1024 * 1024
+    } else {
+        MIN_BLOOM_BUDGET_BYTES
+    }
 }
 
 fn cache_read_memory_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
@@ -2620,6 +2648,22 @@ mod tests {
         assert!(access_log_queue_capacity(&large) > access_log_queue_capacity(&small));
         assert!(metrics_queue_capacity(&large) > metrics_queue_capacity(&small));
         assert!(access_log_batch_size(&small) <= access_log_batch_size(&large));
+    }
+
+    #[test]
+    fn small_machine_uses_reduced_cache_and_bloom_floors() {
+        let small = synthetic_snapshot(2, 1, 65_535, 2);
+        let large = synthetic_snapshot(32, 24, 1_048_576, 16);
+        assert!(
+            cache_budget_from_available(small.total_bytes, small.available_bytes)
+                <= cache_budget_from_available(large.total_bytes, large.available_bytes)
+        );
+        assert!(
+            effective_min_cache_budget_bytes(small.total_bytes) < MIN_CACHE_BUDGET_BYTES
+        );
+        assert!(
+            effective_min_bloom_budget_bytes(small.total_bytes) < MIN_BLOOM_BUDGET_BYTES
+        );
     }
 
     #[test]
