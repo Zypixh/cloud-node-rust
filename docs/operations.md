@@ -312,6 +312,13 @@ cloud-node --monitor-port 8888
 - 控制面节点日志：由 NodeLogUploader 上报。
 - 访问日志：由 LogUploader 批量上报。
 
+节点日志防刷：
+
+- 相同 `type`（或无 type 时的 `tag`+`serverId`）在限流窗口内只上报一次，并用 `count` 累计被合并次数。
+- API/连通性类失败（如 `apiNodeListFailed`、`ocspListFailed`、`updatingServerSyncFailed`）默认 10 分钟窗口；其它节点日志默认 5 分钟。
+- 上传失败时 NodeLogUploader 指数退避（上限 5 分钟），重试队列按 `type` 合并，避免 API 宕机恢复后对控制面数据库造成日志洪峰。
+- 状态里的 `pipelines.nodeLogThrottled` 可观察被抑制次数。
+
 排障时优先看：
 
 ```bash

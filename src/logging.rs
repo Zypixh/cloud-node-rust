@@ -3,6 +3,7 @@ use crate::pb;
 use crate::proxy::ProxyCTX;
 use base64::Engine as _;
 use base64::engine::general_purpose;
+use dashmap::DashMap;
 use pingora_proxy::Session;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -152,23 +153,164 @@ fn access_log_field_enabled(fields: Option<&AccessLogFieldMask>, field: i32) -> 
     fields.is_none_or(|fields| fields.enabled(field))
 }
 
-pub fn report_node_log(level: String, tag: String, message: String, server_id: i64) {
-    if let Some(sender) = NODE_LOG_SENDER.get() {
-        let log = pb::NodeLog {
-            level,
-            tag,
-            description: message,
-            server_id,
-            node_id: NUMERIC_NODE_ID.load(Ordering::Relaxed),
-            created_at: crate::utils::time::now_timestamp(),
-            ..Default::default()
-        };
-        if let Err(_err) = sender.try_send(log) {
-            crate::pipeline_metrics::increment(
-                crate::pipeline_metrics::PipelineCounter::NodeLogIngressDropped,
-            );
-        }
+/// Minimum interval between uploads of the same node-log key.
+/// Repeated API/connectivity failures otherwise flood the control-plane DB.
+const NODE_LOG_THROTTLE_INTERVAL_MS: i64 = 300_000;
+/// Connectivity / sync failure keys use a longer window while API is down.
+const NODE_LOG_CONNECTIVITY_THROTTLE_INTERVAL_MS: i64 = 600_000;
+const NODE_LOG_THROTTLE_MAX_KEYS: usize = 4_096;
+
+struct NodeLogThrottleEntry {
+    last_emit_ms: AtomicI64,
+    suppressed: AtomicU64,
+}
+
+static NODE_LOG_THROTTLE: Lazy<DashMap<String, NodeLogThrottleEntry>> =
+    Lazy::new(|| DashMap::with_capacity(256));
+
+#[derive(Clone, Debug, Default)]
+pub struct NodeLogReport {
+    pub level: String,
+    pub tag: String,
+    pub message: String,
+    pub server_id: i64,
+    pub log_type: Option<String>,
+    pub params_json: Option<Vec<u8>>,
+}
+
+fn node_log_throttle_key(log_type: Option<&str>, tag: &str, server_id: i64) -> String {
+    match log_type.filter(|value| !value.is_empty()) {
+        Some(log_type) => format!("{log_type}\0{server_id}"),
+        None => format!("tag:{tag}\0{server_id}"),
     }
+}
+
+fn is_connectivity_node_log_type(log_type: &str) -> bool {
+    log_type.ends_with("ConnectFailed")
+        || log_type.ends_with("ListFailed")
+        || log_type.ends_with("SyncFailed")
+        || log_type.ends_with("PingFailed")
+        || matches!(
+            log_type,
+            "ocspListFailed"
+                | "apiNodeListFailed"
+                | "updatingServerSyncFailed"
+                | "updatingServerSyncConnectFailed"
+                | "apiNodeSyncConnectFailed"
+                | "ocspSyncConnectFailed"
+                | "ipLibrarySyncConnectFailed"
+                | "ipLibraryArtifactCheckFailed"
+                | "serverConfigSyncFailed"
+                | "userServerStateSyncFailed"
+                | "userServerStateCheckFailed"
+        )
+}
+
+fn node_log_throttle_interval_ms(log_type: Option<&str>) -> i64 {
+    match log_type {
+        Some(log_type) if is_connectivity_node_log_type(log_type) => {
+            NODE_LOG_CONNECTIVITY_THROTTLE_INTERVAL_MS
+        }
+        _ => NODE_LOG_THROTTLE_INTERVAL_MS,
+    }
+}
+
+fn throttle_node_log(key: &str, interval_ms: i64, now_ms: i64) -> Option<i32> {
+    if NODE_LOG_THROTTLE.len() >= NODE_LOG_THROTTLE_MAX_KEYS
+        && !NODE_LOG_THROTTLE.contains_key(key)
+    {
+        // Under key-cardinality pressure, still emit but skip tracking.
+        return Some(1);
+    }
+
+    let entry = NODE_LOG_THROTTLE
+        .entry(key.to_string())
+        .or_insert_with(|| NodeLogThrottleEntry {
+            last_emit_ms: AtomicI64::new(0),
+            suppressed: AtomicU64::new(0),
+        });
+
+    let last = entry.last_emit_ms.load(Ordering::Relaxed);
+    if last > 0 && now_ms.saturating_sub(last) < interval_ms {
+        entry.suppressed.fetch_add(1, Ordering::Relaxed);
+        crate::pipeline_metrics::increment(
+            crate::pipeline_metrics::PipelineCounter::NodeLogThrottled,
+        );
+        return None;
+    }
+
+    if entry
+        .last_emit_ms
+        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        // Another emitter won the window; count this attempt as suppressed.
+        entry.suppressed.fetch_add(1, Ordering::Relaxed);
+        crate::pipeline_metrics::increment(
+            crate::pipeline_metrics::PipelineCounter::NodeLogThrottled,
+        );
+        return None;
+    }
+
+    let suppressed = entry.suppressed.swap(0, Ordering::Relaxed);
+    Some(i32::try_from(suppressed.saturating_add(1).min(i32::MAX as u64)).unwrap_or(i32::MAX))
+}
+
+pub fn report_node_log(level: String, tag: String, message: String, server_id: i64) {
+    report_node_log_detailed(NodeLogReport {
+        level,
+        tag,
+        message,
+        server_id,
+        log_type: None,
+        params_json: None,
+    });
+}
+
+pub fn report_node_log_detailed(report: NodeLogReport) {
+    let Some(sender) = NODE_LOG_SENDER.get() else {
+        return;
+    };
+
+    let log_type = report
+        .log_type
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let key = node_log_throttle_key(log_type.as_deref(), &report.tag, report.server_id);
+    let interval_ms = node_log_throttle_interval_ms(log_type.as_deref());
+    let now_ms = unix_epoch_millis_now();
+    let Some(count) = throttle_node_log(&key, interval_ms, now_ms) else {
+        return;
+    };
+
+    let log = pb::NodeLog {
+        level: report.level,
+        tag: report.tag,
+        description: report.message,
+        server_id: report.server_id,
+        node_id: NUMERIC_NODE_ID.load(Ordering::Relaxed),
+        created_at: crate::utils::time::now_timestamp(),
+        count,
+        r#type: log_type.unwrap_or_default(),
+        params_json: report.params_json.unwrap_or_default(),
+        ..Default::default()
+    };
+    if let Err(_err) = sender.try_send(log) {
+        crate::pipeline_metrics::increment(
+            crate::pipeline_metrics::PipelineCounter::NodeLogIngressDropped,
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_node_log_throttle_for_test() {
+    NODE_LOG_THROTTLE.clear();
+}
+
+#[cfg(test)]
+pub(crate) fn node_log_throttle_len_for_test() -> usize {
+    NODE_LOG_THROTTLE.len()
 }
 
 pub fn access_log_needs_attrs(ctx: &ProxyCTX) -> bool {
@@ -1018,5 +1160,42 @@ mod tests {
             assert!(is_common_request_header(name), "{name}");
         }
         assert!(!is_common_request_header("x-custom-header"));
+    }
+
+    #[test]
+    fn node_log_throttle_suppresses_duplicates_within_window() {
+        reset_node_log_throttle_for_test();
+        let key = node_log_throttle_key(Some("apiNodeListFailed"), "API_NODE", 0);
+        let interval = node_log_throttle_interval_ms(Some("apiNodeListFailed"));
+        let first = throttle_node_log(&key, interval, 1_000).expect("first emit");
+        assert_eq!(first, 1);
+        assert!(throttle_node_log(&key, interval, 1_000 + interval - 1).is_none());
+        assert!(throttle_node_log(&key, interval, 1_000 + interval - 1).is_none());
+        let second = throttle_node_log(&key, interval, 1_000 + interval).expect("second emit");
+        assert_eq!(second, 3);
+    }
+
+    #[test]
+    fn connectivity_node_log_types_use_longer_throttle() {
+        assert_eq!(
+            node_log_throttle_interval_ms(Some("apiNodeListFailed")),
+            NODE_LOG_CONNECTIVITY_THROTTLE_INTERVAL_MS
+        );
+        assert_eq!(
+            node_log_throttle_interval_ms(Some("updatingServerSyncFailed")),
+            NODE_LOG_CONNECTIVITY_THROTTLE_INTERVAL_MS
+        );
+        assert_eq!(
+            node_log_throttle_interval_ms(Some("ocspListFailed")),
+            NODE_LOG_CONNECTIVITY_THROTTLE_INTERVAL_MS
+        );
+        assert_eq!(
+            node_log_throttle_interval_ms(Some("kernelTuningApplied")),
+            NODE_LOG_THROTTLE_INTERVAL_MS
+        );
+        assert_eq!(
+            node_log_throttle_interval_ms(None),
+            NODE_LOG_THROTTLE_INTERVAL_MS
+        );
     }
 }

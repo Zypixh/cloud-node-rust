@@ -586,6 +586,8 @@ pub struct NodeLogUploader {
     retry_queue: VecDeque<pb::NodeLog>,
     retry_queue_capacity: usize,
     channel: Option<Channel>,
+    consecutive_failures: u32,
+    next_attempt_at: Instant,
 }
 
 impl NodeLogUploader {
@@ -612,6 +614,8 @@ impl NodeLogUploader {
             retry_queue: VecDeque::with_capacity(retry_queue_capacity.min(1024)),
             retry_queue_capacity,
             channel: None,
+            consecutive_failures: 0,
+            next_attempt_at: Instant::now(),
         }
     }
 
@@ -646,6 +650,12 @@ impl NodeLogUploader {
                 }
             }
         }
+    }
+
+    fn upload_backoff(&self) -> Duration {
+        // 5s, 10s, 20s ... capped at 5 minutes while the API stays down.
+        let shift = self.consecutive_failures.saturating_sub(1).min(6);
+        Duration::from_secs(5u64.saturating_mul(1u64 << shift).min(300))
     }
 
     async fn get_or_connect_channel(&mut self) -> Option<&Channel> {
@@ -690,6 +700,9 @@ impl NodeLogUploader {
         if self.retry_queue.is_empty() {
             return;
         }
+        if Instant::now() < self.next_attempt_at {
+            return;
+        }
         let logs_to_send = self.retry_queue.drain(..).collect::<Vec<_>>();
         let retry_copy = logs_to_send.clone();
         let count = logs_to_send.len();
@@ -699,6 +712,7 @@ impl NodeLogUploader {
                 crate::pipeline_metrics::PipelineCounter::NodeLogUploadFailed,
                 count as u64,
             );
+            self.note_upload_failure();
             self.requeue_node_logs(logs_to_send);
             return;
         };
@@ -740,13 +754,18 @@ impl NodeLogUploader {
         )
         .await
         {
-            Ok(Ok(_)) => info!("Successfully uploaded {} node logs", count),
+            Ok(Ok(_)) => {
+                info!("Successfully uploaded {} node logs", count);
+                self.consecutive_failures = 0;
+                self.next_attempt_at = Instant::now();
+            }
             Ok(Err(e)) => {
                 crate::pipeline_metrics::add(
                     crate::pipeline_metrics::PipelineCounter::NodeLogUploadFailed,
                     count as u64,
                 );
                 warn!("Failed to upload node logs: {}", e);
+                self.note_upload_failure();
                 self.requeue_node_logs(retry_copy);
                 self.channel = None;
             }
@@ -756,33 +775,128 @@ impl NodeLogUploader {
                     count as u64,
                 );
                 warn!("Node log upload timed out after {:?}", self.request_timeout);
+                self.note_upload_failure();
                 self.requeue_node_logs(retry_copy);
                 self.channel = None;
             }
         }
     }
 
+    fn note_upload_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.next_attempt_at = Instant::now() + self.upload_backoff();
+    }
+
     fn push_node_logs(&mut self, logs: Vec<pb::NodeLog>) {
         for log in logs {
-            if self.retry_queue.len() >= self.retry_queue_capacity {
-                self.retry_queue.pop_front();
-                crate::pipeline_metrics::increment(
-                    crate::pipeline_metrics::PipelineCounter::NodeLogIngressDropped,
-                );
-            }
-            self.retry_queue.push_back(log);
+            self.enqueue_node_log(log, false);
         }
     }
 
     fn requeue_node_logs(&mut self, logs: Vec<pb::NodeLog>) {
         for log in logs.into_iter().rev() {
-            if self.retry_queue.len() >= self.retry_queue_capacity {
-                self.retry_queue.pop_back();
-                crate::pipeline_metrics::increment(
-                    crate::pipeline_metrics::PipelineCounter::NodeLogIngressDropped,
-                );
-            }
-            self.retry_queue.push_front(log);
+            self.enqueue_node_log(log, true);
         }
+    }
+
+    fn enqueue_node_log(&mut self, mut log: pb::NodeLog, to_front: bool) {
+        if log.count <= 0 {
+            log.count = 1;
+        }
+        if !log.r#type.is_empty()
+            && let Some(existing) = self
+                .retry_queue
+                .iter_mut()
+                .find(|queued| queued.r#type == log.r#type && queued.server_id == log.server_id)
+        {
+            existing.count = existing.count.saturating_add(log.count);
+            existing.description = log.description;
+            existing.level = log.level;
+            existing.tag = log.tag;
+            existing.created_at = log.created_at;
+            existing.params_json = log.params_json;
+            return;
+        }
+
+        if self.retry_queue.len() >= self.retry_queue_capacity {
+            if to_front {
+                self.retry_queue.pop_back();
+            } else {
+                self.retry_queue.pop_front();
+            }
+            crate::pipeline_metrics::increment(
+                crate::pipeline_metrics::PipelineCounter::NodeLogIngressDropped,
+            );
+        }
+        if to_front {
+            self.retry_queue.push_front(log);
+        } else {
+            self.retry_queue.push_back(log);
+        }
+    }
+}
+
+#[cfg(test)]
+mod node_log_uploader_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn sample_api_config() -> ApiConfig {
+        ApiConfig {
+            rpc_endpoints: vec!["http://127.0.0.1:1".to_string()],
+            rpc_disable_update: false,
+            node_id: "1".to_string(),
+            secret: "secret".to_string(),
+            billing_count_inbound_traffic: false,
+            access_log_pipeline: Default::default(),
+            relay: Default::default(),
+            kernel_tuning: Default::default(),
+        }
+    }
+
+    fn sample_node_log(log_type: &str, description: &str, count: i32) -> pb::NodeLog {
+        pb::NodeLog {
+            level: "warn".to_string(),
+            tag: "API_NODE".to_string(),
+            description: description.to_string(),
+            r#type: log_type.to_string(),
+            count,
+            server_id: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enqueue_merges_same_type_into_count() {
+        let (_tx, rx) = mpsc::channel(8);
+        let mut uploader =
+            NodeLogUploader::new(rx, sample_api_config(), 8, Duration::from_secs(5));
+        uploader.retry_queue_capacity = 8;
+
+        uploader.enqueue_node_log(sample_node_log("apiNodeListFailed", "first", 1), false);
+        uploader.enqueue_node_log(sample_node_log("apiNodeListFailed", "second", 4), false);
+        uploader.enqueue_node_log(sample_node_log("ocspListFailed", "other", 1), false);
+
+        assert_eq!(uploader.retry_queue.len(), 2);
+        let first = uploader.retry_queue.front().unwrap();
+        assert_eq!(first.r#type, "apiNodeListFailed");
+        assert_eq!(first.count, 5);
+        assert_eq!(first.description, "second");
+        assert_eq!(uploader.retry_queue.back().unwrap().r#type, "ocspListFailed");
+    }
+
+    #[test]
+    fn upload_backoff_grows_and_caps() {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut uploader =
+            NodeLogUploader::new(rx, sample_api_config(), 1, Duration::from_secs(5));
+
+        uploader.consecutive_failures = 1;
+        assert_eq!(uploader.upload_backoff(), Duration::from_secs(5));
+        uploader.consecutive_failures = 2;
+        assert_eq!(uploader.upload_backoff(), Duration::from_secs(10));
+        uploader.consecutive_failures = 20;
+        assert_eq!(uploader.upload_backoff(), Duration::from_secs(300));
     }
 }

@@ -7,17 +7,28 @@ use crate::rpc::logs::report_node_log_with_context;
 use crate::rpc::utils::build_runtime_maps;
 use crate::ssl::DynamicCertSelector;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, warn};
+
+const API_NODE_SYNC_INTERVAL: Duration = Duration::from_secs(300);
+const API_NODE_SYNC_MAX_INTERVAL: Duration = Duration::from_secs(900);
+const UPDATING_SERVER_SYNC_BASE_INTERVAL: Duration = Duration::from_secs(60);
+const UPDATING_SERVER_SYNC_MAX_INTERVAL: Duration = Duration::from_secs(900);
 
 pub async fn start_api_node_syncer(api_config: ApiConfig) {
     if api_config.rpc_disable_update {
         return;
     }
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    let mut delay = API_NODE_SYNC_INTERVAL;
     loop {
-        interval.tick().await;
-        sync_api_nodes(&api_config).await;
+        let success = sync_api_nodes(&api_config).await;
+        if success {
+            delay = API_NODE_SYNC_INTERVAL;
+        } else {
+            delay = (delay.saturating_mul(2)).min(API_NODE_SYNC_MAX_INTERVAL);
+        }
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -27,19 +38,19 @@ pub async fn start_updating_server_list_syncer(
     health_manager: Arc<GlobalHealthManager>,
     cert_selector: Arc<DynamicCertSelector>,
 ) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut delay = UPDATING_SERVER_SYNC_BASE_INTERVAL;
     let mut last_id = 0i64;
 
     loop {
-        interval.tick().await;
         if config_store.get_node_id().await <= 0 {
+            tokio::time::sleep(UPDATING_SERVER_SYNC_BASE_INTERVAL).await;
             continue;
         }
         let baseline = config_store.get_updating_server_list_id().await;
         if last_id <= 0 || baseline > last_id {
             last_id = baseline;
         }
-        sync_updating_server_list_once(
+        let success = sync_updating_server_list_once(
             &api_config,
             config_store.as_ref(),
             health_manager.as_ref(),
@@ -47,6 +58,12 @@ pub async fn start_updating_server_list_syncer(
             &mut last_id,
         )
         .await;
+        if success {
+            delay = UPDATING_SERVER_SYNC_BASE_INTERVAL;
+        } else {
+            delay = (delay.saturating_mul(2)).min(UPDATING_SERVER_SYNC_MAX_INTERVAL);
+        }
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -195,7 +212,7 @@ async fn refresh_certificates(config_store: &ConfigStore, cert_selector: &Dynami
     crate::ssl::sync_certs(cert_selector, &certs).await;
 }
 
-pub async fn sync_api_nodes(api_config: &ApiConfig) {
+pub async fn sync_api_nodes(api_config: &ApiConfig) -> bool {
     let client = match SharedRpcClient::get(api_config).await {
         Ok(shared) => shared.as_rpc_client(),
         Err(e) => {
@@ -210,7 +227,7 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
                 None,
             )
             .await;
-            return;
+            return false;
         }
     };
     let mut api_node_service = client.api_node_service();
@@ -233,7 +250,7 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
                 None,
             )
             .await;
-            return;
+            return false;
         }
     };
 
@@ -254,7 +271,7 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
 
     let current_endpoints = api_config.effective_rpc_endpoints();
     if api_config.rpc_disable_update || endpoints.is_empty() || endpoints == current_endpoints {
-        return;
+        return true;
     }
 
     let mut healthy_endpoints = Vec::new();
@@ -278,11 +295,11 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
             Some(serde_json::json!({ "endpoints": endpoints })),
         )
         .await;
-        return;
+        return false;
     }
 
     if healthy_endpoints == current_endpoints {
-        return;
+        return true;
     }
 
     if let Err(e) = ApiConfig::set_runtime_rpc_endpoints(healthy_endpoints.clone()) {
@@ -297,7 +314,7 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
             None,
         )
         .await;
-        return;
+        return false;
     }
 
     let mut new_config = api_config.clone();
@@ -314,6 +331,7 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
             Some(serde_json::json!({ "endpoints": new_config.rpc_endpoints })),
         )
         .await;
+        return false;
     }
     if let Err(e) = crate::rpc::client::SharedRpcClient::refresh(api_config) {
         warn!(
@@ -321,4 +339,5 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) {
             e
         );
     }
+    true
 }
