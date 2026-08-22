@@ -612,13 +612,20 @@ impl<'a> RequestFacts<'a> {
 
     pub(crate) fn raw_remote_addr(&self) -> String {
         self.raw_remote_addr
-            .get_or_init(|| get_raw_remote_addr(self.session))
+            .get_or_init(|| crate::client_ip::raw_remote_addr(self.session))
             .clone()
     }
 
     pub(crate) fn remote_port(&self) -> String {
         self.remote_port
-            .get_or_init(|| get_remote_port(self.session))
+            .get_or_init(|| {
+                let port = crate::client_ip::peer_remote_port(self.session);
+                if port > 0 {
+                    port.to_string()
+                } else {
+                    String::new()
+                }
+            })
             .clone()
     }
 
@@ -1221,8 +1228,15 @@ pub(crate) fn get_response_variable_value_with_facts(
 fn resolve_variable(session: &Session, inner: &str, request_body: &[u8], scheme: &str) -> String {
     match inner {
         "remoteAddr" => get_remote_addr(session),
-        "rawRemoteAddr" => get_raw_remote_addr(session),
-        "remotePort" => get_remote_port(session),
+        "rawRemoteAddr" => crate::client_ip::raw_remote_addr(session),
+        "remotePort" => {
+            let port = crate::client_ip::peer_remote_port(session);
+            if port > 0 {
+                port.to_string()
+            } else {
+                String::new()
+            }
+        }
         "remoteUser" => session
             .get_header("authorization")
             .and_then(|v| v.to_str().ok())
@@ -1540,25 +1554,6 @@ fn get_remote_addr(session: &Session) -> String {
     crate::client_ip::resolve_for_session(session, None).to_string()
 }
 
-fn get_remote_port(session: &Session) -> String {
-    session
-        .downstream_session
-        .digest()
-        .and_then(|d| d.socket_digest.as_ref())
-        .and_then(|sd| sd.peer_addr())
-        .and_then(|addr| addr.as_inet())
-        .map(|inet| inet.port().to_string())
-        .or_else(|| {
-            session.client_addr().and_then(|addr| match addr {
-                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => {
-                    Some(addr.port().to_string())
-                }
-                _ => None,
-            })
-        })
-        .unwrap_or_default()
-}
-
 fn get_local_addr(session: &Session) -> String {
     session
         .downstream_session
@@ -1598,25 +1593,6 @@ fn get_request_uri(session: &Session) -> String {
         .map(|q| format!("?{}", q))
         .unwrap_or_default();
     format!("{}{}", path, query)
-}
-
-fn get_raw_remote_addr(session: &Session) -> String {
-    session
-        .downstream_session
-        .digest()
-        .and_then(|d| d.socket_digest.as_ref())
-        .and_then(|sd| sd.peer_addr())
-        .and_then(|addr| addr.as_inet())
-        .map(|inet| inet.ip().to_string())
-        .or_else(|| {
-            session.client_addr().and_then(|addr| match addr {
-                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => {
-                    Some(addr.ip().to_string())
-                }
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]).to_string())
 }
 
 fn header_value(session: &Session, name: &str) -> String {
@@ -2047,7 +2023,7 @@ pub fn format_variables(
             let mut parts = inner.split('|');
             let var_name = parts.next().unwrap_or("");
             let mut value = match var_name {
-                "rawRemoteAddr" => get_raw_remote_addr(session),
+                "rawRemoteAddr" => crate::client_ip::raw_remote_addr(session),
                 "requestPathExtension" => std::path::Path::new(session.req_header().uri.path())
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -2082,7 +2058,7 @@ pub fn format_response_variables(
             let mut parts = inner.split('|');
             let var_name = parts.next().unwrap_or("");
             let mut value = match var_name {
-                "rawRemoteAddr" => get_raw_remote_addr(session),
+                "rawRemoteAddr" => crate::client_ip::raw_remote_addr(session),
                 "requestPathExtension" => std::path::Path::new(session.req_header().uri.path())
                     .extension()
                     .and_then(|ext| ext.to_str())

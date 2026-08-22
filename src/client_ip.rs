@@ -1,8 +1,9 @@
 use crate::config_models::{HTTPRemoteAddrConfig, ServerConfig};
 use base64::{Engine as _, engine::general_purpose};
+use pingora_core::protocols::http::ServerSession;
 use pingora_proxy::Session;
 use regex::Regex;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock as Lazy;
 
 static RE_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
@@ -117,6 +118,37 @@ pub fn canonicalize_ip(ip: IpAddr) -> IpAddr {
         }
     }
     ip
+}
+
+pub fn peer_socket_endpoints(session: &Session) -> (IpAddr, u16, String) {
+    peer_socket_endpoints_from_http_session(&session.downstream_session)
+}
+
+pub fn peer_socket_endpoints_from_http_session(session: &ServerSession) -> (IpAddr, u16, String) {
+    let socket_addr = session
+        .digest()
+        .and_then(|d| d.socket_digest.as_ref())
+        .and_then(|sd| sd.peer_addr().cloned())
+        .or_else(|| session.client_addr().cloned());
+
+    match socket_addr {
+        Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => {
+            (addr.ip(), addr.port(), addr.to_string())
+        }
+        _ => (IpAddr::from([127, 0, 0, 1]), 0, String::new()),
+    }
+}
+
+pub fn format_raw_remote_addr(raw_remote_addr: &str, fallback: IpAddr) -> String {
+    if raw_remote_addr.is_empty() {
+        return fallback.to_string();
+    }
+
+    raw_remote_addr
+        .parse::<SocketAddr>()
+        .map(|addr| addr.ip().to_string())
+        .or_else(|_| raw_remote_addr.parse::<IpAddr>().map(|ip| ip.to_string()))
+        .unwrap_or_else(|_| fallback.to_string())
 }
 
 pub fn fallback_client_ip(session: &Session, raw_ip: IpAddr) -> IpAddr {
@@ -407,6 +439,20 @@ mod tests {
         .unwrap();
         let cfg = server.web.as_ref().unwrap().remote_addr.as_ref().unwrap();
         assert!(cfg.is_request_header_type());
+    }
+
+    #[test]
+    fn format_raw_remote_addr_parses_socket_and_ip_forms() {
+        let fallback = IpAddr::from([203, 0, 113, 1]);
+        assert_eq!(
+            format_raw_remote_addr("198.51.100.2:443", fallback),
+            "198.51.100.2"
+        );
+        assert_eq!(
+            format_raw_remote_addr("198.51.100.2", fallback),
+            "198.51.100.2"
+        );
+        assert_eq!(format_raw_remote_addr("", fallback), "203.0.113.1");
     }
 
     #[test]
