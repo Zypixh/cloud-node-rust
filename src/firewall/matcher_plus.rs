@@ -160,8 +160,8 @@ pub fn match_set(
         return false;
     }
 
-    // Bypass check
-    let ip = parse_remote_ip(session);
+    let facts = RequestFacts::new(session, request_body, scheme);
+    let ip = facts.remote_ip();
     if set.ignore_local && is_local_ip(&ip) {
         return false;
     }
@@ -174,7 +174,6 @@ pub fn match_set(
         return false;
     }
 
-    let facts = RequestFacts::new(session, request_body, scheme);
     match_set_with_facts(set, session, &facts)
 }
 
@@ -222,8 +221,8 @@ pub fn match_set_response(
         return false;
     }
 
-    // Bypass check
-    let ip = parse_remote_ip(session);
+    let facts = ResponseFacts::new(session, request_body, response, scheme);
+    let ip = facts.request().remote_ip();
     if set.ignore_local && is_local_ip(&ip) {
         return false;
     }
@@ -236,7 +235,6 @@ pub fn match_set_response(
         return false;
     }
 
-    let facts = ResponseFacts::new(session, request_body, response, scheme);
     match_set_response_with_facts(set, session, &facts)
 }
 
@@ -309,31 +307,7 @@ pub fn match_group_response_with_server<'a>(
 }
 
 pub(crate) fn is_local_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => {
-            // Canonicalize IPv4-mapped IPv6 (::ffff:a.b.c.d) before testing.
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_private() || v4.is_loopback() || v4.is_link_local();
-            }
-            if v6.is_loopback() {
-                return true;
-            }
-            let octets = v6.octets();
-            // ULA (fc00::/7): first byte high 7 bits == 0xfc (octet & 0xfe == 0xfc).
-            // Operator precedence requires explicit parens — the previous
-            // `octets[0] & 0xfe == 0xfc` parses as `octets[0] & (0xfe == 0xfc)`
-            // which is always 0.
-            if (octets[0] & 0xfe) == 0xfc {
-                return true;
-            }
-            // Link-local (fe80::/10): first 10 bits == 1111_1110_10
-            if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
-                return true;
-            }
-            false
-        }
-    }
+    crate::client_ip::is_local_ip(ip)
 }
 
 fn is_raw_body_param(param: &str) -> bool {
@@ -627,7 +601,9 @@ impl<'a> RequestFacts<'a> {
     }
 
     pub(crate) fn remote_ip(&self) -> std::net::IpAddr {
-        *self.remote_ip.get_or_init(|| parse_remote_ip(self.session))
+        *self.remote_ip.get_or_init(|| {
+            crate::client_ip::resolve_for_session(self.session, self.server)
+        })
     }
 
     pub(crate) fn remote_addr(&self) -> String {
@@ -636,13 +612,20 @@ impl<'a> RequestFacts<'a> {
 
     pub(crate) fn raw_remote_addr(&self) -> String {
         self.raw_remote_addr
-            .get_or_init(|| get_raw_remote_addr(self.session))
+            .get_or_init(|| crate::client_ip::raw_remote_addr(self.session))
             .clone()
     }
 
     pub(crate) fn remote_port(&self) -> String {
         self.remote_port
-            .get_or_init(|| get_remote_port(self.session))
+            .get_or_init(|| {
+                let port = crate::client_ip::peer_remote_port(self.session);
+                if port > 0 {
+                    port.to_string()
+                } else {
+                    String::new()
+                }
+            })
             .clone()
     }
 
@@ -914,6 +897,19 @@ impl<'a> RequestFacts<'a> {
                     .unwrap_or_else(|| analyzer::lookup_isp_name(self.remote_ip()).to_string())
             })
             .clone()
+    }
+
+    pub(crate) fn geo_asn(&self) -> String {
+        analyzer::lookup_asn_label(self.remote_ip()).to_string()
+    }
+
+    pub(crate) fn geo_asn_number(&self) -> String {
+        let number = analyzer::lookup_asn_number(self.remote_ip());
+        if number > 0 {
+            number.to_string()
+        } else {
+            String::new()
+        }
     }
 
     pub(crate) fn query_param(&self, name: &str) -> String {
@@ -1232,8 +1228,15 @@ pub(crate) fn get_response_variable_value_with_facts(
 fn resolve_variable(session: &Session, inner: &str, request_body: &[u8], scheme: &str) -> String {
     match inner {
         "remoteAddr" => get_remote_addr(session),
-        "rawRemoteAddr" => get_raw_remote_addr(session),
-        "remotePort" => get_remote_port(session),
+        "rawRemoteAddr" => crate::client_ip::raw_remote_addr(session),
+        "remotePort" => {
+            let port = crate::client_ip::peer_remote_port(session);
+            if port > 0 {
+                port.to_string()
+            } else {
+                String::new()
+            }
+        }
         "remoteUser" => session
             .get_header("authorization")
             .and_then(|v| v.to_str().ok())
@@ -1320,9 +1323,25 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8], scheme:
         "geoCityName" => geo_info(session)
             .map(|g| g.city.to_string())
             .unwrap_or_default(),
+        "geoAsn" | "asn" => {
+            let ip = crate::client_ip::resolve_for_session(session, None);
+            analyzer::lookup_asn_label(ip).to_string()
+        }
+        "geoAsnNumber" | "asnNumber" => {
+            let ip = crate::client_ip::resolve_for_session(session, None);
+            let number = analyzer::lookup_asn_number(ip);
+            if number > 0 {
+                number.to_string()
+            } else {
+                String::new()
+            }
+        }
         "ispName" => geo_info(session)
             .map(|g| g.provider.to_string())
-            .unwrap_or_else(|| analyzer::lookup_isp_name(parse_remote_ip(session)).to_string()),
+            .unwrap_or_else(|| {
+                analyzer::lookup_isp_name(crate::client_ip::resolve_for_session(session, None))
+                    .to_string()
+            }),
         "serverAddr" => get_local_addr(session),
         "serverPort" => get_local_port(session),
         "requestUpload" => upload_summary(&parse_multipart_uploads(session, request_body)),
@@ -1455,6 +1474,8 @@ pub(crate) fn resolve_variable_with_facts(inner: &str, facts: &RequestFacts<'_>)
         "geoCityName" => analyzer::lookup_geo(facts.remote_ip())
             .map(|g| g.city.to_string())
             .unwrap_or_default(),
+        "geoAsn" | "asn" => facts.geo_asn(),
+        "geoAsnNumber" | "asnNumber" => facts.geo_asn_number(),
         "ispName" => analyzer::lookup_geo(facts.remote_ip())
             .map(|g| g.provider.to_string())
             .unwrap_or_else(|| analyzer::lookup_isp_name(facts.remote_ip()).to_string()),
@@ -1530,26 +1551,7 @@ pub(crate) fn resolve_response_variable_with_facts(
 }
 
 fn get_remote_addr(session: &Session) -> String {
-    parse_remote_ip(session).to_string()
-}
-
-fn get_remote_port(session: &Session) -> String {
-    session
-        .downstream_session
-        .digest()
-        .and_then(|d| d.socket_digest.as_ref())
-        .and_then(|sd| sd.peer_addr())
-        .and_then(|addr| addr.as_inet())
-        .map(|inet| inet.port().to_string())
-        .or_else(|| {
-            session.client_addr().and_then(|addr| match addr {
-                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => {
-                    Some(addr.port().to_string())
-                }
-                _ => None,
-            })
-        })
-        .unwrap_or_default()
+    crate::client_ip::resolve_for_session(session, None).to_string()
 }
 
 fn get_local_addr(session: &Session) -> String {
@@ -1575,81 +1577,11 @@ fn get_local_port(session: &Session) -> String {
 }
 
 pub(crate) fn parse_remote_ip(session: &Session) -> std::net::IpAddr {
-    let peer_ip = peer_socket_ip(session);
-    let canonicalize = |ip: std::net::IpAddr| -> std::net::IpAddr {
-        if let std::net::IpAddr::V6(v6) = ip {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return std::net::IpAddr::V4(v4);
-            }
-        }
-        ip
-    };
-    // Only trust forwarded-for-style headers when the immediate peer is local
-    // (loopback / private). Public clients can forge these headers to bypass
-    // CC counters, IP blacklists, and rule matches. The trust boundary mirrors
-    // proxy::resolve_client_ip.
-    let trust_headers = peer_ip.map(|ip| is_local_ip(&ip)).unwrap_or(false);
-    if trust_headers {
-        for header in [
-            "x-cloud-real-ip",
-            "x-real-ip",
-            "cf-connecting-ip",
-            "true-client-ip",
-            "x-forwarded-for",
-            "x-client-ip",
-            "x-original-forwarded-for",
-            "x-cluster-client-ip",
-            "fastly-client-ip",
-            "ali-cdn-real-ip",
-            "cdn-src-ip",
-            "forwarded",
-        ] {
-            if let Some(value) = session
-                .get_header(header)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.trim().trim_matches('"').trim_matches('\''))
-            {
-                let mut candidate = value;
-                if let Some(v) = candidate
-                    .strip_prefix("for=")
-                    .or_else(|| candidate.strip_prefix("For="))
-                {
-                    candidate = v.trim();
-                }
-                if let Some((first, _)) = candidate.split_once(';') {
-                    candidate = first.trim();
-                }
-                if let Some((first, _)) = candidate.split_once(',') {
-                    candidate = first.trim();
-                }
-                let candidate = candidate.trim_matches(|c| c == '[' || c == ']');
-                if let Ok(ip) = candidate.parse::<std::net::IpAddr>() {
-                    return canonicalize(ip);
-                }
-            }
-        }
-    }
-    canonicalize(peer_ip.unwrap_or(std::net::IpAddr::from([127, 0, 0, 1])))
-}
-
-fn peer_socket_ip(session: &Session) -> Option<std::net::IpAddr> {
-    session
-        .downstream_session
-        .digest()
-        .and_then(|d| d.socket_digest.as_ref())
-        .and_then(|sd| sd.peer_addr())
-        .and_then(|addr| addr.as_inet())
-        .map(|inet| inet.ip())
-        .or_else(|| {
-            session.client_addr().and_then(|addr| match addr {
-                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => Some(addr.ip()),
-                _ => None,
-            })
-        })
+    crate::client_ip::resolve_for_session(session, None)
 }
 
 fn geo_info(session: &Session) -> Option<analyzer::GeoInfo> {
-    analyzer::lookup_geo(parse_remote_ip(session))
+    analyzer::lookup_geo(crate::client_ip::resolve_for_session(session, None))
 }
 
 fn get_request_uri(session: &Session) -> String {
@@ -1661,25 +1593,6 @@ fn get_request_uri(session: &Session) -> String {
         .map(|q| format!("?{}", q))
         .unwrap_or_default();
     format!("{}{}", path, query)
-}
-
-fn get_raw_remote_addr(session: &Session) -> String {
-    session
-        .downstream_session
-        .digest()
-        .and_then(|d| d.socket_digest.as_ref())
-        .and_then(|sd| sd.peer_addr())
-        .and_then(|addr| addr.as_inet())
-        .map(|inet| inet.ip().to_string())
-        .or_else(|| {
-            session.client_addr().and_then(|addr| match addr {
-                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => {
-                    Some(addr.ip().to_string())
-                }
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]).to_string())
 }
 
 fn header_value(session: &Session, name: &str) -> String {
@@ -2110,7 +2023,7 @@ pub fn format_variables(
             let mut parts = inner.split('|');
             let var_name = parts.next().unwrap_or("");
             let mut value = match var_name {
-                "rawRemoteAddr" => get_raw_remote_addr(session),
+                "rawRemoteAddr" => crate::client_ip::raw_remote_addr(session),
                 "requestPathExtension" => std::path::Path::new(session.req_header().uri.path())
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -2145,7 +2058,7 @@ pub fn format_response_variables(
             let mut parts = inner.split('|');
             let var_name = parts.next().unwrap_or("");
             let mut value = match var_name {
-                "rawRemoteAddr" => get_raw_remote_addr(session),
+                "rawRemoteAddr" => crate::client_ip::raw_remote_addr(session),
                 "requestPathExtension" => std::path::Path::new(session.req_header().uri.path())
                     .extension()
                     .and_then(|ext| ext.to_str())

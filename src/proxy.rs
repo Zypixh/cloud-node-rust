@@ -642,22 +642,6 @@ impl EdgeProxy {
             .unwrap_or(false)
     }
 
-    fn raw_remote_ip(raw_remote_addr: &str, fallback: std::net::IpAddr) -> String {
-        if raw_remote_addr.is_empty() {
-            return fallback.to_string();
-        }
-
-        raw_remote_addr
-            .parse::<std::net::SocketAddr>()
-            .map(|addr| addr.ip().to_string())
-            .or_else(|_| {
-                raw_remote_addr
-                    .parse::<std::net::IpAddr>()
-                    .map(|ip| ip.to_string())
-            })
-            .unwrap_or_else(|_| fallback.to_string())
-    }
-
     fn cache_fetch_action_requested(session: &Session, ctx: &ProxyCTX) -> bool {
         if !ctx.is_loopback {
             return false;
@@ -1391,7 +1375,7 @@ impl EdgeProxy {
             "product.name" => self.product_name(ctx),
             "status" => status.to_string(),
             "statusMessage" => Self::status_message(status),
-            "rawRemoteAddr" => Self::raw_remote_ip(&ctx.raw_remote_addr, ctx.client_ip),
+            "rawRemoteAddr" => crate::client_ip::format_raw_remote_addr(&ctx.raw_remote_addr, ctx.client_ip),
             "remoteAddr" => ctx.client_ip.to_string(),
             "remotePort" => ctx.client_port.to_string(),
             "serverAddr" => {
@@ -1573,7 +1557,7 @@ impl EdgeProxy {
         values.insert("remoteAddrValue".to_string(), ctx.client_ip_str.clone());
         values.insert(
             "rawRemoteAddr".to_string(),
-            Self::raw_remote_ip(&ctx.raw_remote_addr, ctx.client_ip),
+            crate::client_ip::format_raw_remote_addr(&ctx.raw_remote_addr, ctx.client_ip),
         );
         values.insert("remotePort".to_string(), ctx.client_port.to_string());
         values.insert("remoteUser".to_string(), remote_user);
@@ -2148,7 +2132,7 @@ impl EdgeProxy {
     }
 
     fn socket_client_ip(session: &Session) -> (std::net::IpAddr, u16, String) {
-        Self::http_session_socket_client_ip(&session.downstream_session)
+        crate::client_ip::peer_socket_endpoints(session)
     }
 
     fn downstream_client_socket_addr(session: &Session, ctx: &ProxyCTX) -> SocketAddr {
@@ -2185,18 +2169,7 @@ impl EdgeProxy {
     fn http_session_socket_client_ip(
         session: &pingora_core::protocols::http::ServerSession,
     ) -> (std::net::IpAddr, u16, String) {
-        let socket_addr = session
-            .digest()
-            .and_then(|d| d.socket_digest.as_ref())
-            .and_then(|sd| sd.peer_addr().cloned())
-            .or_else(|| session.client_addr().cloned());
-
-        match socket_addr {
-            Some(pingora_core::protocols::l4::socket::SocketAddr::Inet(addr)) => {
-                (addr.ip(), addr.port(), addr.to_string())
-            }
-            _ => ("127.0.0.1".parse().unwrap(), 0, String::new()),
-        }
+        crate::client_ip::peer_socket_endpoints_from_http_session(session)
     }
 
     fn classify_downstream_parse_error(error: &Error) -> (&'static str, &'static str) {
@@ -2270,280 +2243,6 @@ impl EdgeProxy {
             ip,
             config,
         );
-    }
-
-    fn parse_candidate_ip(raw: &str) -> Option<std::net::IpAddr> {
-        let mut candidate = raw.trim().trim_matches('"').trim_matches('\'');
-        if candidate.is_empty() {
-            return None;
-        }
-        if let Some(value) = candidate
-            .strip_prefix("for=")
-            .or_else(|| candidate.strip_prefix("For="))
-        {
-            candidate = value.trim();
-        }
-        if let Some((first, _)) = candidate.split_once(';') {
-            candidate = first.trim();
-        }
-        if let Some((first, _)) = candidate.split_once(',') {
-            candidate = first.trim();
-        }
-        let candidate = candidate.trim_matches(|c| c == '[' || c == ']');
-        candidate.parse().ok()
-    }
-
-    fn header_value_ci<'a>(session: &'a Session, name: &str) -> Option<&'a str> {
-        session
-            .get_header(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    }
-
-    fn fallback_client_ip(session: &Session, raw_ip: std::net::IpAddr) -> std::net::IpAddr {
-        // Only trust forwarded-for-style headers when the immediate peer is
-        // local (loopback / private / link-local). When the peer is on the
-        // public internet, X-Forwarded-For is attacker-controlled and trusting
-        // it would let the client spoof their IP for rate limiting / IP
-        // reporting / access logs. The same guard runs in
-        // firewall::matcher_plus::parse_remote_ip — keep them in sync.
-        if !crate::firewall::matcher_plus::is_local_ip(&raw_ip) {
-            return raw_ip;
-        }
-        for header in [
-            "x-cloud-real-ip",
-            "x-real-ip",
-            "cf-connecting-ip",
-            "true-client-ip",
-            "x-forwarded-for",
-            "x-client-ip",
-            "x-original-forwarded-for",
-            "x-cluster-client-ip",
-            "fastly-client-ip",
-            "ali-cdn-real-ip",
-            "cdn-src-ip",
-            "forwarded",
-        ] {
-            if let Some(value) = Self::header_value_ci(session, header)
-                && let Some(ip) = Self::parse_candidate_ip(value)
-            {
-                return ip;
-            }
-        }
-        raw_ip
-    }
-
-    fn resolve_remote_addr_template(
-        session: &Session,
-        template: &str,
-        raw_ip: std::net::IpAddr,
-        raw_remote_addr: &str,
-        remote_port: u16,
-    ) -> String {
-        static RE_VAR: std::sync::LazyLock<Regex> =
-            std::sync::LazyLock::new(|| Regex::new(r"\$\{[^}]+\}").expect("valid regex"));
-
-        RE_VAR
-            .replace_all(template, |caps: &regex::Captures| {
-                let full = caps[0]
-                    .strip_prefix("${")
-                    .and_then(|s| s.strip_suffix('}'))
-                    .unwrap_or("");
-
-                // Split modifier pipeline: ${varName|mod1|mod2}
-                let mut parts = full.splitn(2, '|');
-                let inner = parts.next().unwrap_or("").trim();
-                let modifiers_str = parts.next().unwrap_or("");
-
-                let value = Self::resolve_remote_addr_template_var(
-                    session,
-                    inner,
-                    raw_ip,
-                    raw_remote_addr,
-                    remote_port,
-                );
-
-                // Apply modifier pipeline (reuse existing apply_template_modifier).
-                modifiers_str
-                    .split('|')
-                    .filter(|m| !m.trim().is_empty())
-                    .fold(value, |v, m| Self::apply_template_modifier(v, m.trim()))
-            })
-            .to_string()
-    }
-
-    /// Resolve a single variable name (no modifiers) inside `${...}`.
-    fn resolve_remote_addr_template_var(
-        session: &Session,
-        inner: &str,
-        raw_ip: std::net::IpAddr,
-        raw_remote_addr: &str,
-        remote_port: u16,
-    ) -> String {
-        if inner.eq_ignore_ascii_case("rawRemoteAddr") {
-            return raw_ip.to_string();
-        }
-        if inner.eq_ignore_ascii_case("remoteAddr") || inner.eq_ignore_ascii_case("remoteAddrValue")
-        {
-            return Self::fallback_client_ip(session, raw_ip).to_string();
-        }
-        if inner.eq_ignore_ascii_case("remotePort") {
-            return remote_port.to_string();
-        }
-        if inner.eq_ignore_ascii_case("socketRemoteAddr") {
-            return raw_remote_addr.to_string();
-        }
-        if inner.eq_ignore_ascii_case("host") || inner.eq_ignore_ascii_case("requestHost") {
-            return session
-                .get_header("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.split(':').next().unwrap_or(v).to_string())
-                .unwrap_or_default();
-        }
-
-        // ${host.first} / ${host.last} — split Host header by '.' and take
-        // the first or last segment (useful for building custom identifiers).
-        if inner.eq_ignore_ascii_case("host.first") {
-            let host = session
-                .get_header("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.split(':').next().unwrap_or(v))
-                .unwrap_or("");
-            return host.split('.').next().unwrap_or("").to_string();
-        }
-        if inner.eq_ignore_ascii_case("host.last") {
-            let host = session
-                .get_header("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.split(':').next().unwrap_or(v))
-                .unwrap_or("");
-            return host.split('.').last().unwrap_or("").to_string();
-        }
-
-        // ${node.id} — numeric node identifier from the control-plane config.
-        if inner.eq_ignore_ascii_case("node.id") {
-            return crate::logging::get_numeric_node_id().to_string();
-        }
-        // ${node.name} — human-readable node name; falls back to hostname when
-        // no explicit name has been assigned.
-        if inner.eq_ignore_ascii_case("node.name") {
-            return HOSTNAME.clone();
-        }
-
-        // ${origin.addr} / ${origin.host} — the upstream backend address used
-        // for this request.  These are populated later in the request lifecycle
-        // (after upstream selection), so they return an empty string when
-        // called during the early IP-resolution phase.  Callers that need the
-        // upstream address should use template rendering after upstream
-        // selection instead.
-        if inner.eq_ignore_ascii_case("origin.addr") || inner.eq_ignore_ascii_case("origin.host") {
-            // Not available at IP-resolution time; return empty rather than panicking.
-            return String::new();
-        }
-
-        // ${geo.country} / ${geo.province} / ${geo.city} / ${geo.isp}
-        // — GeoIP lookup on the raw (socket-level) IP.
-        if inner.eq_ignore_ascii_case("geo.country") {
-            return crate::metrics::analyzer::lookup_geo(raw_ip)
-                .map(|g| g.country.to_string())
-                .unwrap_or_default();
-        }
-        if inner.eq_ignore_ascii_case("geo.province") {
-            return crate::metrics::analyzer::lookup_geo(raw_ip)
-                .map(|g| g.region.to_string())
-                .unwrap_or_default();
-        }
-        if inner.eq_ignore_ascii_case("geo.city") {
-            return crate::metrics::analyzer::lookup_geo(raw_ip)
-                .map(|g| g.city.to_string())
-                .unwrap_or_default();
-        }
-        if inner.eq_ignore_ascii_case("geo.isp") {
-            return crate::metrics::analyzer::lookup_geo(raw_ip)
-                .map(|g| g.provider.to_string())
-                .unwrap_or_default();
-        }
-
-        // ${header.X-Name} / ${requestHeader.X-Name}
-        if let Some(name) = inner
-            .strip_prefix("requestHeader.")
-            .or_else(|| inner.strip_prefix("header."))
-            .or_else(|| inner.strip_prefix("requestHeader:"))
-            .or_else(|| inner.strip_prefix("header:"))
-        {
-            // Multi-header syntax: ${header.Name1,Name2} — return the first
-            // header that has a non-empty value.
-            for part in name.split(',') {
-                let part = part.trim();
-                if let Some(value) = Self::header_value_ci(session, part) {
-                    return value.to_string();
-                }
-            }
-            return String::new();
-        }
-
-        String::new()
-    }
-
-    fn resolve_client_ip(
-        &self,
-        session: &Session,
-        server: Option<&ServerConfig>,
-        raw_ip: std::net::IpAddr,
-        raw_remote_addr: &str,
-        remote_port: u16,
-    ) -> std::net::IpAddr {
-        if let Some(remote_addr_cfg) = server
-            .and_then(|server| server.web.as_ref())
-            .and_then(|web| web.remote_addr.as_ref())
-            .filter(|cfg| cfg.is_on && !cfg.is_empty())
-        {
-            // When `is_prior` is true this config should override any enclosing
-            // location-block's remote-addr rule.  Location blocks are not yet
-            // implemented; once they are, callers should consult `is_prior`
-            // before falling back to an outer scope's config.
-
-            if remote_addr_cfg.is_direct_type() {
-                return raw_ip;
-            }
-
-            if remote_addr_cfg.is_request_header_type() {
-                // If `request_header_name` is set it becomes the sole
-                // lookup target (already reflected by configured_values() /
-                // expanded_header_names()).  Otherwise expand multi-header
-                // expressions from value/values.
-                //
-                // Use expanded_header_names() so comma-separated
-                // multi-header syntax like `${header.X-Forwarded-For,CF-Connecting-IP}`
-                // is flattened and each name is tried in order.
-                for header_name in remote_addr_cfg.expanded_header_names() {
-                    if let Some(value) = Self::header_value_ci(session, &header_name)
-                        && let Some(ip) = Self::parse_candidate_ip(value)
-                    {
-                        return ip;
-                    }
-                }
-                // No header yielded a valid IP — return raw socket IP rather
-                // than falling through to the generic fallback heuristic.
-                return raw_ip;
-            }
-
-            for configured in remote_addr_cfg.configured_values() {
-                let value = Self::resolve_remote_addr_template(
-                    session,
-                    &configured,
-                    raw_ip,
-                    raw_remote_addr,
-                    remote_port,
-                );
-                if let Some(ip) = Self::parse_candidate_ip(&value) {
-                    return ip;
-                }
-            }
-        }
-
-        Self::fallback_client_ip(session, raw_ip)
     }
 
     fn should_redirect_to_https(
@@ -7790,7 +7489,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             ctx.client_ip = pp_ip;
         }
 
-        ctx.client_ip = self.resolve_client_ip(
+        ctx.client_ip = crate::client_ip::resolve_client_ip(
             session,
             ctx.server.as_ref().map(|v| &**v),
             detected_ip,

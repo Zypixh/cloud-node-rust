@@ -718,12 +718,15 @@ impl CacheVariable {
             Self::RemoteAddr => ctx
                 .client_ip
                 .map(|ip| ip.to_string())
-                .unwrap_or_else(|| socket_remote_ip(ctx.session)),
+                .unwrap_or_else(|| crate::client_ip::raw_remote_addr(ctx.session)),
             Self::RawRemoteAddr => raw_remote_ip(ctx),
             Self::RemotePort => ctx
                 .client_port
                 .map(|port| port.to_string())
-                .or_else(|| socket_remote_port(ctx.session).map(|port| port.to_string()))
+                .or_else(|| {
+                    let port = crate::client_ip::peer_remote_port(ctx.session);
+                    (port > 0).then(|| port.to_string())
+                })
                 .unwrap_or_default(),
             Self::RemoteUser => String::new(),
             Self::Referer => header_value(ctx.session, "referer"),
@@ -1301,58 +1304,14 @@ fn downstream_local_port(session: &Session) -> Option<u16> {
         .map(|inet| inet.port())
 }
 
-fn socket_remote_ip(session: &Session) -> String {
-    session
-        .downstream_session
-        .digest()
-        .and_then(|digest| digest.socket_digest.as_ref())
-        .and_then(|socket| socket.peer_addr())
-        .and_then(|addr| addr.as_inet())
-        .map(|inet| inet.ip().to_string())
-        .or_else(|| {
-            session.client_addr().and_then(|addr| match addr {
-                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => {
-                    Some(addr.ip().to_string())
-                }
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|| "127.0.0.1".to_string())
-}
-
-fn socket_remote_port(session: &Session) -> Option<u16> {
-    session
-        .downstream_session
-        .digest()
-        .and_then(|digest| digest.socket_digest.as_ref())
-        .and_then(|socket| socket.peer_addr())
-        .and_then(|addr| addr.as_inet())
-        .map(|inet| inet.port())
-        .or_else(|| {
-            session.client_addr().and_then(|addr| match addr {
-                pingora_core::protocols::l4::socket::SocketAddr::Inet(addr) => Some(addr.port()),
-                _ => None,
-            })
-        })
-}
-
 fn raw_remote_ip(ctx: &CacheEvalContext<'_>) -> String {
     let fallback = ctx.client_ip.unwrap_or_else(|| {
-        socket_remote_ip(ctx.session)
-            .parse()
-            .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]))
+        crate::client_ip::peer_socket_ip(ctx.session)
     });
-    let Some(raw) = ctx
-        .raw_remote_addr
+    ctx.raw_remote_addr
         .as_deref()
-        .filter(|value| !value.is_empty())
-    else {
-        return fallback.to_string();
-    };
-    raw.parse::<std::net::SocketAddr>()
-        .map(|addr| addr.ip().to_string())
-        .or_else(|_| raw.parse::<IpAddr>().map(|ip| ip.to_string()))
-        .unwrap_or_else(|_| fallback.to_string())
+        .map(|raw| crate::client_ip::format_raw_remote_addr(raw, fallback))
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn request_proto(session: &Session, is_http3_bridge: bool) -> String {
