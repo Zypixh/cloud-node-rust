@@ -231,14 +231,19 @@ pub async fn start_config_syncer(
         api_endpoint, api_config.node_id
     );
 
+    let mut connect_backoff = Duration::from_secs(5);
     loop {
         debug!("RPC_NODE: Starting periodic configuration sync check.");
 
         let client = match SharedRpcClient::get(&api_config).await {
-            Ok(shared) => shared.as_rpc_client(),
+            Ok(shared) => {
+                connect_backoff = Duration::from_secs(5);
+                shared.as_rpc_client()
+            }
             Err(e) => {
                 warn!("Failed to connect to API node: {}. Will retry...", e);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(connect_backoff).await;
+                connect_backoff = (connect_backoff.saturating_mul(2)).min(Duration::from_secs(300));
                 continue;
             }
         };
@@ -1542,6 +1547,7 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "accessLogRetryEvicted": pipeline_metrics.access_log_retry_evicted,
             "accessLogUploadFailed": pipeline_metrics.access_log_upload_failed,
             "nodeLogIngressDropped": pipeline_metrics.node_log_ingress_dropped,
+            "nodeLogThrottled": pipeline_metrics.node_log_throttled,
             "nodeLogUploadFailed": pipeline_metrics.node_log_upload_failed,
             "httpDimensionDropped": pipeline_metrics.http_dimension_dropped,
             "ipReportDropped": pipeline_metrics.ip_report_dropped,
