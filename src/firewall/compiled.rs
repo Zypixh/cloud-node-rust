@@ -1693,6 +1693,8 @@ enum CompiledVariable {
     GeoCountryName,
     GeoProvinceName,
     GeoCityName,
+    GeoAsn,
+    GeoAsnNumber,
     IspName,
     ServerAddr,
     ServerPort,
@@ -1762,6 +1764,8 @@ impl CompiledVariable {
             "geoCountryName" => Self::GeoCountryName,
             "geoProvinceName" => Self::GeoProvinceName,
             "geoCityName" => Self::GeoCityName,
+            "geoAsn" | "asn" => Self::GeoAsn,
+            "geoAsnNumber" | "asnNumber" => Self::GeoAsnNumber,
             "ispName" => Self::IspName,
             "serverAddr" => Self::ServerAddr,
             "serverPort" => Self::ServerPort,
@@ -1863,6 +1867,8 @@ impl CompiledVariable {
             Self::GeoCountryName => facts.geo_country_name(),
             Self::GeoProvinceName => facts.geo_province_name(),
             Self::GeoCityName => facts.geo_city_name(),
+            Self::GeoAsn => facts.geo_asn(),
+            Self::GeoAsnNumber => facts.geo_asn_number(),
             Self::IspName => facts.isp_name(),
             Self::ServerAddr => facts.local_addr(),
             Self::ServerPort => facts.local_port(),
@@ -2394,13 +2400,13 @@ fn match_group_response<'a>(
 
 fn match_set(
     set: &CompiledRuleSet,
-    session: &Session,
+    _session: &Session,
     facts: &crate::firewall::matcher_plus::RequestFacts<'_>,
 ) -> bool {
     if !set.is_on || set.rules.is_empty() {
         return false;
     }
-    if should_bypass_set(set, session) {
+    if should_bypass_set(set, facts) {
         return false;
     }
     if let Some(result) = set
@@ -2420,13 +2426,13 @@ fn match_set(
 
 fn match_set_response(
     set: &CompiledRuleSet,
-    session: &Session,
+    _session: &Session,
     facts: &crate::firewall::matcher_plus::ResponseFacts<'_, '_, '_>,
 ) -> bool {
     if !set.is_on || set.rules.is_empty() {
         return false;
     }
-    if should_bypass_set(set, session) {
+    if should_bypass_set(set, facts.request()) {
         return false;
     }
     match set.connector {
@@ -2435,15 +2441,15 @@ fn match_set_response(
     }
 }
 
-fn should_bypass_set(set: &CompiledRuleSet, session: &Session) -> bool {
-    let ip = crate::firewall::matcher_plus::parse_remote_ip(session);
-    let user_agent = session
-        .get_header("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+fn should_bypass_set(
+    set: &CompiledRuleSet,
+    facts: &crate::firewall::matcher_plus::RequestFacts<'_>,
+) -> bool {
+    let ip = facts.remote_ip();
+    let user_agent = facts.request_header("user-agent");
     (set.ignore_local && crate::firewall::matcher_plus::is_local_ip(&ip))
         || (set.ignore_search_engine
-            && crate::client_agent::is_verified_search_engine_ip(ip, user_agent))
+            && crate::client_agent::is_verified_search_engine_ip(ip, &user_agent))
 }
 
 fn fill_action_from_policy(
@@ -4139,6 +4145,15 @@ mod tests {
             CompiledVariable::compile("geoCityName"),
             CompiledVariable::GeoCityName
         );
+        std::assert_matches!(
+            CompiledVariable::compile("geoAsn"),
+            CompiledVariable::GeoAsn
+        );
+        std::assert_matches!(
+            CompiledVariable::compile("geoAsnNumber"),
+            CompiledVariable::GeoAsnNumber
+        );
+        std::assert_matches!(CompiledVariable::compile("asn"), CompiledVariable::GeoAsn);
         std::assert_matches!(
             CompiledVariable::compile("ispName"),
             CompiledVariable::IspName

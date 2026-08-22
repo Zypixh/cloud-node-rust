@@ -2307,7 +2307,7 @@ impl EdgeProxy {
         // public internet, X-Forwarded-For is attacker-controlled and trusting
         // it would let the client spoof their IP for rate limiting / IP
         // reporting / access logs. The same guard runs in
-        // firewall::matcher_plus::parse_remote_ip — keep them in sync.
+        // firewall::matcher_plus::parse_remote_ip — keep them in sync via client_ip.
         if !crate::firewall::matcher_plus::is_local_ip(&raw_ip) {
             return raw_ip;
         }
@@ -2494,56 +2494,13 @@ impl EdgeProxy {
         raw_remote_addr: &str,
         remote_port: u16,
     ) -> std::net::IpAddr {
-        if let Some(remote_addr_cfg) = server
-            .and_then(|server| server.web.as_ref())
-            .and_then(|web| web.remote_addr.as_ref())
-            .filter(|cfg| cfg.is_on && !cfg.is_empty())
-        {
-            // When `is_prior` is true this config should override any enclosing
-            // location-block's remote-addr rule.  Location blocks are not yet
-            // implemented; once they are, callers should consult `is_prior`
-            // before falling back to an outer scope's config.
-
-            if remote_addr_cfg.is_direct_type() {
-                return raw_ip;
-            }
-
-            if remote_addr_cfg.is_request_header_type() {
-                // If `request_header_name` is set it becomes the sole
-                // lookup target (already reflected by configured_values() /
-                // expanded_header_names()).  Otherwise expand multi-header
-                // expressions from value/values.
-                //
-                // Use expanded_header_names() so comma-separated
-                // multi-header syntax like `${header.X-Forwarded-For,CF-Connecting-IP}`
-                // is flattened and each name is tried in order.
-                for header_name in remote_addr_cfg.expanded_header_names() {
-                    if let Some(value) = Self::header_value_ci(session, &header_name)
-                        && let Some(ip) = Self::parse_candidate_ip(value)
-                    {
-                        return ip;
-                    }
-                }
-                // No header yielded a valid IP — return raw socket IP rather
-                // than falling through to the generic fallback heuristic.
-                return raw_ip;
-            }
-
-            for configured in remote_addr_cfg.configured_values() {
-                let value = Self::resolve_remote_addr_template(
-                    session,
-                    &configured,
-                    raw_ip,
-                    raw_remote_addr,
-                    remote_port,
-                );
-                if let Some(ip) = Self::parse_candidate_ip(&value) {
-                    return ip;
-                }
-            }
-        }
-
-        Self::fallback_client_ip(session, raw_ip)
+        crate::client_ip::resolve_client_ip(
+            session,
+            server,
+            raw_ip,
+            raw_remote_addr,
+            remote_port,
+        )
     }
 
     fn should_redirect_to_https(

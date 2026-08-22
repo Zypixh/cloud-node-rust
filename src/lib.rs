@@ -9,6 +9,7 @@ pub mod bounded_regex_cache;
 pub mod cache;
 pub mod cache_hybrid;
 pub mod cache_manager;
+pub mod client_ip;
 pub mod client_agent;
 pub mod cluster;
 pub mod compiled;

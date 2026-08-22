@@ -319,10 +319,43 @@ mod tests {
         assert_eq!(&*first.browser, &*second.browser);
         assert_eq!(&*first.os, &*second.os);
     }
+
+    #[test]
+    fn lookup_asn_label_formats_as_prefix_when_number_known() {
+        assert_eq!(lookup_asn_label("127.0.0.1".parse().unwrap()).as_ref(), "");
+        assert_eq!(lookup_asn_number("127.0.0.1".parse().unwrap()), 0);
+    }
 }
 
 pub fn lookup_isp_name(ip: IpAddr) -> Arc<str> {
     Arc::from(get_isp_name(ip))
+}
+
+pub fn lookup_asn_number(ip: IpAddr) -> i64 {
+    if let Some(reader) = &*GEO_ASN_READER {
+        match reader
+            .lookup(ip)
+            .and_then(|result| result.decode::<geoip2::Asn>())
+        {
+            Ok(Some(asn)) => asn.autonomous_system_number.map(i64::from).unwrap_or(0),
+            Ok(None) | Err(_) => 0,
+        }
+    } else {
+        0
+    }
+}
+
+pub fn lookup_asn_label(ip: IpAddr) -> Arc<str> {
+    let number = lookup_asn_number(ip);
+    if number > 0 {
+        Arc::from(format!("AS{number}"))
+    } else {
+        Arc::from("")
+    }
+}
+
+pub fn asn_database_available() -> bool {
+    GEO_ASN_READER.is_some()
 }
 
 pub fn lookup_geo(ip: IpAddr) -> Option<GeoInfo> {
