@@ -96,7 +96,7 @@ pub async fn apply_remote_event(event: CacheMetaEvent) {
             {
                 return;
             }
-            crate::metrics::storage::STORAGE.upsert_cache_meta_absolute(
+            crate::metrics::storage::STORAGE.upsert_cache_meta_absolute_async(
                 crate::metrics::storage::CacheMetaUpsert {
                     hash: &event.hash,
                     cache_key: &event.cache_key,
@@ -114,11 +114,13 @@ pub async fn apply_remote_event(event: CacheMetaEvent) {
                     stale_while_revalidate_secs: event.stale_while_revalidate_secs,
                     created_at: event.created_at,
                 },
-            );
+            )
+            .await;
         }
         CacheMetaEventType::Delete | CacheMetaEventType::Purge => {
             crate::metrics::storage::STORAGE
-                .delete_cache_meta(&event.hash);
+                .delete_cache_meta_async(&event.hash)
+                .await;
         }
     }
 }

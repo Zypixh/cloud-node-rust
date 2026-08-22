@@ -9,7 +9,9 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
 const METRICS_BUCKET: &str = "metrics";
@@ -21,6 +23,7 @@ const UNIQUE_IP_MARKER: &[u8] = b"1";
 const CACHE_META_MAX_ENTRIES: usize = 1_000_000;
 const CACHE_META_MAX_ENTRY_BYTES: u64 = 256 * 1024;
 const CACHE_ACCESS_LOG_MAX_ENTRIES: usize = 262_144;
+const CACHE_META_QUEUE_CAPACITY: usize = 8192;
 const CORRUPT_CMETA_ISOLATION_MAX: usize = 4_096;
 
 static CORRUPT_CMETA_KEYS: Lazy<DashMap<String, ()>> = Lazy::new(DashMap::new);
@@ -443,30 +446,45 @@ impl MetricStorage {
     }
 
     pub fn upsert_cache_meta_absolute(&self, upsert: CacheMetaUpsert<'_>) {
-        let meta = CacheMetaEntry {
-            cache_key: upsert.cache_key.to_string(),
-            size: upsert.size,
-            expires: upsert.expires,
-            access_time: upsert.access_time,
-            access_count: upsert.access_count,
-            status: normalize_cache_status(upsert.status),
-            headers: upsert.headers.to_vec(),
-            compressed: upsert.compressed,
-            shard_id: upsert.shard_id.map(str::to_string),
-            relative_path: upsert.relative_path.map(str::to_string),
-            event_version: upsert.event_version,
-            updated_at: upsert
-                .updated_at
-                .unwrap_or_else(crate::utils::time::now_timestamp),
-            stale_while_revalidate_secs: upsert.stale_while_revalidate_secs,
-            created_at: upsert.created_at,
-        };
+        let meta = cache_meta_from_upsert(&upsert);
         apply_cache_meta_memory(upsert.hash, meta.clone());
         let db_key = format!("CMETA_{}", upsert.hash);
         let _ = self.put_raw(
             db_key.as_bytes(),
             cache_meta_json(&meta).to_string().as_bytes(),
         );
+    }
+
+    /// Applies metadata to the hot in-memory index, then waits for a bounded,
+    /// dedicated Mace writer. The Tokio reactor never performs the sync write.
+    pub async fn upsert_cache_meta_absolute_async(&self, upsert: CacheMetaUpsert<'_>) -> bool {
+        let meta = cache_meta_from_upsert(&upsert);
+        apply_cache_meta_memory(upsert.hash, meta.clone());
+
+        let Some(tx) = CACHE_META_WRITER_TX.get() else {
+            warn!(
+                hash = upsert.hash,
+                "Mace cache metadata writer is not started"
+            );
+            return false;
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if tx
+            .send(CacheMetaWrite::Upsert {
+                hash: upsert.hash.to_string(),
+                meta,
+                ack: ack_tx,
+            })
+            .await
+            .is_err()
+        {
+            error!(
+                hash = upsert.hash,
+                "Mace cache metadata writer queue is closed"
+            );
+            return false;
+        }
+        ack_rx.await.unwrap_or(false)
     }
 
     /// Records a cache access in memory only — no storage I/O on the hot path.
@@ -512,6 +530,28 @@ impl MetricStorage {
         remove_cache_meta_memory(hash);
         let db_key = format!("CMETA_{hash}");
         let _ = self.delete_raw(db_key.as_bytes());
+    }
+
+    pub async fn delete_cache_meta_async(&self, hash: &str) -> bool {
+        remove_cache_meta_memory(hash);
+
+        let Some(tx) = CACHE_META_WRITER_TX.get() else {
+            warn!(hash, "Mace cache metadata writer is not started");
+            return false;
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if tx
+            .send(CacheMetaWrite::Delete {
+                hash: hash.to_string(),
+                ack: ack_tx,
+            })
+            .await
+            .is_err()
+        {
+            error!(hash, "Mace cache metadata writer queue is closed");
+            return false;
+        }
+        ack_rx.await.unwrap_or(false)
     }
 
     pub fn load_client_agent_ips(&self) -> Vec<crate::client_agent::ClientAgentIpRecord> {
@@ -808,6 +848,41 @@ pub struct CacheMetaEntry {
 
 static CACHE_META_INDEX: Lazy<DashMap<String, CacheMetaEntry>> = Lazy::new(DashMap::new);
 
+enum CacheMetaWrite {
+    Upsert {
+        hash: String,
+        meta: CacheMetaEntry,
+        ack: oneshot::Sender<bool>,
+    },
+    Delete {
+        hash: String,
+        ack: oneshot::Sender<bool>,
+    },
+}
+
+static CACHE_META_WRITER_TX: OnceLock<mpsc::Sender<CacheMetaWrite>> = OnceLock::new();
+
+fn cache_meta_from_upsert(upsert: &CacheMetaUpsert<'_>) -> CacheMetaEntry {
+    CacheMetaEntry {
+        cache_key: upsert.cache_key.to_string(),
+        size: upsert.size,
+        expires: upsert.expires,
+        access_time: upsert.access_time,
+        access_count: upsert.access_count,
+        status: normalize_cache_status(upsert.status),
+        headers: upsert.headers.to_vec(),
+        compressed: upsert.compressed,
+        shard_id: upsert.shard_id.map(str::to_string),
+        relative_path: upsert.relative_path.map(str::to_string),
+        event_version: upsert.event_version,
+        updated_at: upsert
+            .updated_at
+            .unwrap_or_else(crate::utils::time::now_timestamp),
+        stale_while_revalidate_secs: upsert.stale_while_revalidate_secs,
+        created_at: upsert.created_at,
+    }
+}
+
 fn cache_meta_estimated_bytes(hash: &str, meta: &CacheMetaEntry) -> u64 {
     let headers = meta
         .headers
@@ -1061,8 +1136,52 @@ fn isolate_corrupt_cmeta(key: &str) {
     warn!(key, "skipping corrupt cache metadata record; disk value retained");
 }
 
+fn start_cache_meta_writer() {
+    let (tx, mut rx) = mpsc::channel(CACHE_META_QUEUE_CAPACITY);
+    if CACHE_META_WRITER_TX.set(tx).is_err() {
+        return;
+    }
+
+    let spawn_result = std::thread::Builder::new()
+        .name("mace-cache-writer".to_string())
+        .spawn(move || {
+            while let Some(command) = rx.blocking_recv() {
+                let ok = match command {
+                    CacheMetaWrite::Upsert { hash, meta, ack } => {
+                        let db_key = format!("CMETA_{hash}");
+                        let ok = STORAGE.put_raw(
+                            db_key.as_bytes(),
+                            cache_meta_json(&meta).to_string().as_bytes(),
+                        );
+                        if !ok {
+                            error!(hash, "Mace async cache metadata write failed");
+                        }
+                        let _ = ack.send(ok);
+                        ok
+                    }
+                    CacheMetaWrite::Delete { hash, ack } => {
+                        let db_key = format!("CMETA_{hash}");
+                        let ok = STORAGE.delete_raw(db_key.as_bytes());
+                        if !ok {
+                            error!(hash, "Mace async cache metadata delete failed");
+                        }
+                        let _ = ack.send(ok);
+                        ok
+                    }
+                };
+                if !ok {
+                    warn!("Mace cache metadata writer rejected a command");
+                }
+            }
+        });
+    if let Err(err) = spawn_result {
+        error!(error = %err, "failed to start Mace cache metadata writer");
+    }
+}
+
 pub fn start_cache_access_flusher() {
     load_cache_meta_index();
+    start_cache_meta_writer();
     crate::cache_hybrid::warm_admission_filters_from_cache_meta();
     crate::cache_hybrid::start_bloom_rotation_task();
     tokio::spawn(async {
