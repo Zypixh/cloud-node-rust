@@ -1168,8 +1168,16 @@ impl Drop for FileMissHandler {
 /// a new tag is inserted; entries for evicted keys are pruned on purge.
 static SURROGATE_KEY_INDEX: Lazy<DashMap<String, dashmap::DashSet<String>>> =
     Lazy::new(DashMap::new);
+static SURROGATE_SATURATED_TAGS: Lazy<DashMap<String, ()>> = Lazy::new(DashMap::new);
+static SURROGATE_MEMBERSHIPS: AtomicU64 = AtomicU64::new(0);
+static SURROGATE_DEGRADED_PURGE: AtomicU64 = AtomicU64::new(0);
 const SURROGATE_INDEX_MAX_TAGS_NORMAL: usize = 1_000_000;
 const SURROGATE_INDEX_MAX_TAGS_PRESSURE: usize = 131_072;
+const SURROGATE_INDEX_MAX_MEMBERSHIPS: usize = 4_000_000;
+const SURROGATE_INDEX_MAX_MEMBERS_PER_TAG: usize = 16_384;
+const SURROGATE_TAG_MAX_BYTES: usize = 256;
+const SURROGATE_TAG_ENTRY_OVERHEAD: u64 = 96;
+
 
 fn surrogate_index_capacity() -> usize {
     if MEMORY_GOVERNOR.is_memory_pressure_high() {
@@ -1180,32 +1188,57 @@ fn surrogate_index_capacity() -> usize {
 }
 
 pub(crate) fn index_surrogate_keys(headers: &[(String, String)], hash: &str) {
-    let tags = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("surrogate-key"))
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
-    if tags.is_empty() {
-        return;
-    }
-    for tag in tags.split_whitespace() {
+    let tags = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("surrogate-key")).map(|(_, v)| v.as_str()).unwrap_or("");
+    for tag in tags.split_whitespace().take(64) {
+        if tag.is_empty() || tag.len() > SURROGATE_TAG_MAX_BYTES { continue; }
+        if SURROGATE_SATURATED_TAGS.contains_key(tag) { continue; }
         if !SURROGATE_KEY_INDEX.contains_key(tag)
-            && SURROGATE_KEY_INDEX.len() >= surrogate_index_capacity()
-        {
+            && SURROGATE_KEY_INDEX.len() >= surrogate_index_capacity() {
+            mark_surrogate_tag_saturated(tag);
             continue;
         }
-        SURROGATE_KEY_INDEX
-            .entry(tag.to_string())
-            .or_default()
-            .insert(hash.to_string());
+        let entry = SURROGATE_KEY_INDEX.entry(tag.to_string()).or_default();
+        if entry.len() >= SURROGATE_INDEX_MAX_MEMBERS_PER_TAG
+            || SURROGATE_MEMBERSHIPS.load(Ordering::Relaxed) as usize >= SURROGATE_INDEX_MAX_MEMBERSHIPS
+        {
+            mark_surrogate_tag_saturated(tag);
+            continue;
+        }
+        if entry.insert(hash.to_string()) {
+            SURROGATE_MEMBERSHIPS.fetch_add(1, Ordering::Relaxed);
+            let owner = format!("{tag}\0{hash}");
+            let bytes = SURROGATE_TAG_ENTRY_OVERHEAD + tag.len() as u64 + hash.len() as u64;
+            let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::SurrogateIndex, &owner, bytes);
+        }
     }
 }
 
+fn mark_surrogate_tag_saturated(tag: &str) {
+    SURROGATE_SATURATED_TAGS.insert(tag.to_string(), ());
+}
+
 pub(crate) fn remove_hash_from_surrogate_index(hash: &str) {
-    SURROGATE_KEY_INDEX.retain(|_, set| {
-        set.remove(hash);
+    SURROGATE_KEY_INDEX.retain(|tag, set| {
+        if set.remove(hash) {
+            SURROGATE_MEMBERSHIPS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            }).ok();
+            let owner = format!("{tag}\0{hash}");
+            let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::SurrogateIndex, &owner, 0);
+        }
         !set.is_empty()
     });
+}
+
+pub(crate) fn meta_headers_contain_surrogate_tag(headers: &[(String, String)], tag: &str) -> bool {
+    surrogate_headers_contain_tag(headers, tag)
+}
+
+fn surrogate_headers_contain_tag(headers: &[(String, String)], tag: &str) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("surrogate-key")
+            && value.split_whitespace().any(|candidate| candidate == tag)
+    })
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1434,11 +1467,11 @@ impl AdaptiveBloomFilter {
             .saturating_add(BLOOM_LAYER_OVERHEAD_BYTES)
     }
 
-    fn can_add_layer(&self, capacity: u64) -> bool {
+    fn can_add_layer(&self, capacity: u64, remaining_budget: u64) -> bool {
         self.estimated_bytes
             .load(Ordering::Relaxed)
             .saturating_add(Self::estimated_layer_bytes(capacity))
-            <= crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes()
+            <= remaining_budget
     }
 
     fn shard_index(&self, key: &str) -> usize {
@@ -1464,7 +1497,7 @@ impl AdaptiveBloomFilter {
             self.current_size.fetch_add(1, Ordering::Relaxed);
             if layer.count >= layer.capacity {
                 let candidate = self.next_layer_capacity(layer.capacity);
-                if self.can_add_layer(candidate as u64) {
+                if self.can_add_layer(candidate as u64, crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes()) {
                     next_capacity = Some(candidate);
                 }
             }
@@ -1499,10 +1532,106 @@ impl AdaptiveBloomFilter {
     }
 }
 
-/// Billion-scale adaptive bloom filter: starts at 1M keys / 64 shards and grows by layer doubling.
-/// The capacity expands with admitted cache keys instead of preallocating for the worst case.
-static CACHE_BLOOM: Lazy<AdaptiveBloomFilter> =
-    Lazy::new(|| AdaptiveBloomFilter::new(1_000_000, 64));
+/// Dual-generation Bloom: inserts go to the live generation; contains also
+/// checks a retiring generation until it is dropped after rotation.
+struct DualGenerationBloom {
+    live: ArcSwap<AdaptiveBloomFilter>,
+    stale: parking_lot::Mutex<Option<Arc<AdaptiveBloomFilter>>>,
+    generation: AtomicU64,
+}
+
+impl DualGenerationBloom {
+    fn new(initial_capacity: u32, shard_count: usize) -> Self {
+        let live = AdaptiveBloomFilter::new(initial_capacity, shard_count);
+        let estimated = live.estimated_bytes.load(Ordering::Relaxed);
+        let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+            crate::memory_governor::ResidentCategory::BloomFilter,
+            "cache-bloom",
+            estimated,
+        );
+        Self {
+            live: ArcSwap::from_pointee(live),
+            stale: parking_lot::Mutex::new(None),
+            generation: AtomicU64::new(1),
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        if self.live.load().contains(key) {
+            return true;
+        }
+        self.stale
+            .lock()
+            .as_ref()
+            .is_some_and(|stale| stale.contains(key))
+    }
+
+    fn insert(&self, key: &str) {
+        let live = self.live.load();
+        let before = live.estimated_bytes.load(Ordering::Relaxed);
+        live.insert(key);
+        if live.estimated_bytes.load(Ordering::Relaxed) != before {
+            self.sync_bloom_charge();
+        }
+    }
+
+    fn stats(&self) -> (u64, u64, f64, u64, u64) {
+        let live = self.live.load();
+        let (size, capacity, util, estimated_bytes) = live.stats();
+        let stale_bytes = self
+            .stale
+            .lock()
+            .as_ref()
+            .map(|stale| stale.estimated_bytes.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        (
+            size,
+            capacity,
+            util,
+            estimated_bytes.saturating_add(stale_bytes),
+            self.generation.load(Ordering::Relaxed),
+        )
+    }
+
+    fn sync_bloom_charge(&self) {
+        let (_, _, _, estimated, _) = self.stats();
+        let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+            crate::memory_governor::ResidentCategory::BloomFilter,
+            "cache-bloom",
+            estimated,
+        );
+    }
+
+    fn rotate_from_cache_meta(&self) {
+        let Some(_permit) = crate::memory_governor::MEMORY_GOVERNOR
+            .try_admit(crate::memory_governor::AdmissionClass::BackgroundWork)
+        else {
+            return;
+        };
+        let replacement = AdaptiveBloomFilter::new(1_000_000, 64);
+        let now = crate::utils::time::now_timestamp();
+        crate::metrics::storage::STORAGE.for_each_cache_meta(|_, meta| {
+            if meta.expires > now {
+                replacement.insert(&meta.cache_key);
+            }
+        });
+        let previous = self.live.swap(Arc::new(replacement));
+        {
+            let mut stale = self.stale.lock();
+            *stale = Some(previous);
+        }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.sync_bloom_charge();
+    }
+
+    fn drop_stale(&self) {
+        *self.stale.lock() = None;
+        self.sync_bloom_charge();
+    }
+}
+
+static CACHE_BLOOM: Lazy<DualGenerationBloom> =
+    Lazy::new(|| DualGenerationBloom::new(1_000_000, 64));
 
 fn bloom_may_exist(key: &str) -> bool {
     CACHE_BLOOM.contains(key)
@@ -1513,11 +1642,16 @@ fn bloom_insert(key: &str) {
 }
 
 fn bloom_remove(key: &str) {
-    CACHE_BLOOM.remove(key);
+    let _ = key;
 }
 
 fn bloom_stats() -> (u64, u64, f64, u64) {
-    CACHE_BLOOM.stats()
+    let (size, capacity, util, estimated, _) = CACHE_BLOOM.stats();
+    (size, capacity, util, estimated)
+}
+
+fn bloom_generation() -> u64 {
+    CACHE_BLOOM.generation.load(Ordering::Relaxed)
 }
 
 fn warm_bloom_from_cache_meta() {
@@ -1560,6 +1694,7 @@ fn negative_cache_check(key: &str, now: i64) -> bool {
         }
     }
     NEGATIVE_CACHE.remove(key);
+    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::NegativeCache, key, 0);
     false
 }
 
@@ -1580,10 +1715,12 @@ fn negative_cache_insert_with_capacity(key: &str, now: i64, capacity: usize) {
         }
     }
     NEGATIVE_CACHE.insert(key.to_string(), now + NEGATIVE_CACHE_TTL_SECS);
+    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::NegativeCache, key, 160 + key.len() as u64);
 }
 
 fn negative_cache_remove(key: &str) {
     NEGATIVE_CACHE.remove(key);
+    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::NegativeCache, key, 0);
 }
 
 fn negative_cache_stats() -> (usize, usize) {
@@ -1598,12 +1735,31 @@ pub(crate) fn warm_admission_filters_from_cache_meta() {
     warm_bloom_from_cache_meta();
     let (size, capacity, util, estimated_bytes) = bloom_stats();
     tracing::info!(
-        "CACHE_BLOOM: warmed size={} capacity={} utilization={:.3} estimated_bytes={}",
+        "CACHE_BLOOM: warmed size={} capacity={} utilization={:.3} estimated_bytes={} generation={}",
         size,
         capacity,
         util,
-        estimated_bytes
+        estimated_bytes,
+        bloom_generation()
     );
+}
+
+pub(crate) fn start_bloom_rotation_task() {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
+            let (_, _, util, estimated, _) = CACHE_BLOOM.stats();
+            let budget = crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes();
+            if util > 0.6 || estimated.saturating_mul(2) > budget.max(1) {
+                if let Err(err) = tokio::task::spawn_blocking(|| CACHE_BLOOM.rotate_from_cache_meta()).await {
+                    warn!(error = %err, "CACHE_BLOOM: rotation task failed");
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                CACHE_BLOOM.drop_stale();
+            }
+        }
+    });
 }
 
 pub(crate) fn on_cache_meta_upsert(meta: &crate::metrics::storage::CacheMetaEntry) {
@@ -1927,28 +2083,46 @@ impl HybridStorage {
         let partial_deleted = crate::cache::partial::purge_by_tag(tag, &location.roots).await;
         let hashes: Vec<String> = SURROGATE_KEY_INDEX
             .get(tag)
-            .map(|set| set.iter().map(|h| h.clone()).collect())
+            .map(|set| set.iter().take(SURROGATE_INDEX_MAX_MEMBERS_PER_TAG).map(|h| h.clone()).collect())
             .unwrap_or_default();
-        if hashes.is_empty() {
+        let mut keys_to_purge = Vec::new();
+        for hash in &hashes {
+            if let Some(meta) = crate::metrics::storage::get_cache_meta_memory(hash) {
+                keys_to_purge.push(meta.cache_key.clone());
+            }
+        }
+        let saturated = SURROGATE_SATURATED_TAGS.contains_key(tag);
+        if hashes.is_empty() || saturated {
+            let scanned = crate::metrics::storage::STORAGE.collect_cache_keys_by_surrogate_tag(tag, 512);
+            if !scanned.is_empty() {
+                SURROGATE_DEGRADED_PURGE.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    tag,
+                    scanned = scanned.len(),
+                    indexed = hashes.len(),
+                    "RPC_CACHE: surrogate index saturated or incomplete; using bounded metadata scan"
+                );
+            }
+            keys_to_purge.extend(scanned);
+        }
+        keys_to_purge.sort_unstable();
+        keys_to_purge.dedup();
+        if keys_to_purge.is_empty() {
             if partial_deleted > 0 {
                 info!(
                     "RPC_CACHE: Purged {} partial entries by surrogate tag: {}",
                     partial_deleted, tag
                 );
             }
+            SURROGATE_SATURATED_TAGS.remove(tag);
             return true;
-        }
-        let mut keys_to_purge = Vec::with_capacity(hashes.len());
-        for hash in &hashes {
-            if let Some(meta) = crate::metrics::storage::get_cache_meta_memory(hash) {
-                keys_to_purge.push(meta.cache_key.clone());
-            }
         }
         let deleted_count = keys_to_purge.len();
         for key in keys_to_purge {
             self.purge_exact_stored_key(&key).await;
         }
         SURROGATE_KEY_INDEX.remove(tag);
+        SURROGATE_SATURATED_TAGS.remove(tag);
         info!(
             "RPC_CACHE: Purged {} entries and {} partial entries by surrogate tag: {}",
             deleted_count, partial_deleted, tag
@@ -3057,6 +3231,15 @@ mod tests {
         let capacity = surrogate_index_capacity();
         assert!(capacity <= SURROGATE_INDEX_MAX_TAGS_NORMAL);
         assert!(capacity >= SURROGATE_INDEX_MAX_TAGS_PRESSURE);
+        assert!(meta_headers_contain_surrogate_tag(
+            &[("Surrogate-Key".to_string(), "alpha beta".to_string())],
+            "beta"
+        ));
+        assert!(!meta_headers_contain_surrogate_tag(
+            &[("Surrogate-Key".to_string(), "alpha".to_string())],
+            "beta"
+        ));
+        assert!(bloom_generation() >= 1);
     }
 
     #[test]

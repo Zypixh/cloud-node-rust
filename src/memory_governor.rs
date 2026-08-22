@@ -1,4 +1,6 @@
 use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -152,7 +154,61 @@ pub struct GovernorSnapshot {
     pub ip_report_queue_budget_bytes: u64,
     pub af_xdp_budget_bytes: u64,
     pub pingora_keepalive_pool_size: usize,
+    pub resident_memory: ResidentMemorySnapshot,
+    pub cgroup_managed: bool,
+    pub cgroup_memory_max_bytes: u64,
+    pub cgroup_memory_high_bytes: u64,
+    pub cgroup_swap_max_bytes: u64,
+    pub process_rss_bytes: u64,
+    pub process_pss_bytes: u64,
+    pub process_anon_rss_bytes: u64,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResidentMemorySnapshot {
+    pub total_used_bytes: u64,
+    pub total_budget_bytes: u64,
+    pub cache_metadata_used_bytes: u64,
+    pub cache_access_log_used_bytes: u64,
+    pub surrogate_index_used_bytes: u64,
+    pub bloom_filter_used_bytes: u64,
+    pub negative_cache_used_bytes: u64,
+    pub pressure_level: MemoryPressureLevel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ResidentCategory {
+    CacheMetadata,
+    CacheAccessLog,
+    SurrogateIndex,
+    BloomFilter,
+    NegativeCache,
+}
+
+impl ResidentCategory {
+    const COUNT: usize = 5;
+    const fn index(self) -> usize {
+        match self {
+            Self::CacheMetadata => 0, Self::CacheAccessLog => 1,
+            Self::SurrogateIndex => 2, Self::BloomFilter => 3, Self::NegativeCache => 4,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResidentMemoryAccounting {
+    used: [AtomicU64; ResidentCategory::COUNT],
+    total: AtomicU64,
+    owners: Mutex<HashMap<(ResidentCategory, String), u64>>,
+    mutation: Mutex<()>,
+}
+
+impl ResidentMemoryAccounting {
+    const fn new() -> Self {
+        Self { used: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)], total: AtomicU64::new(0), owners: Mutex::new(HashMap::new()), mutation: Mutex::new(()) }
+    }
+}
+
 
 struct MemorySnapshot {
     total_bytes: u64,
@@ -160,6 +216,13 @@ struct MemorySnapshot {
     available_bytes: u64,
     fd_soft_limit: u64,
     cpu_parallelism: usize,
+    cgroup_managed: bool,
+    cgroup_memory_max_bytes: u64,
+    cgroup_memory_high_bytes: u64,
+    cgroup_swap_max_bytes: u64,
+    process_rss_bytes: u64,
+    process_pss_bytes: u64,
+    process_anon_rss_bytes: u64,
 }
 
 pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(MemoryGovernor::new);
@@ -368,6 +431,14 @@ pub struct MemoryGovernor {
     cached_fd_used: AtomicU64,
     cached_fd_used_at_millis: AtomicU64,
     cached_at_millis: AtomicU64,
+    cached_cgroup_managed: AtomicU64,
+    cached_cgroup_memory_max_bytes: AtomicU64,
+    cached_cgroup_memory_high_bytes: AtomicU64,
+    cached_cgroup_swap_max_bytes: AtomicU64,
+    cached_process_rss_bytes: AtomicU64,
+    cached_process_pss_bytes: AtomicU64,
+    cached_process_anon_rss_bytes: AtomicU64,
+    resident: ResidentMemoryAccounting,
     #[cfg(test)]
     fd_count_reads: AtomicU64,
 }
@@ -436,6 +507,14 @@ impl MemoryGovernor {
             cached_fd_used: AtomicU64::new(0),
             cached_fd_used_at_millis: AtomicU64::new(0),
             cached_at_millis: AtomicU64::new(0),
+            cached_cgroup_managed: AtomicU64::new(0),
+            cached_cgroup_memory_max_bytes: AtomicU64::new(0),
+            cached_cgroup_memory_high_bytes: AtomicU64::new(0),
+            cached_cgroup_swap_max_bytes: AtomicU64::new(u64::MAX),
+            cached_process_rss_bytes: AtomicU64::new(0),
+            cached_process_pss_bytes: AtomicU64::new(0),
+            cached_process_anon_rss_bytes: AtomicU64::new(0),
+            resident: ResidentMemoryAccounting::new(),
             #[cfg(test)]
             fd_count_reads: AtomicU64::new(0),
         }
@@ -1083,6 +1162,67 @@ impl MemoryGovernor {
         firewall_candidate_stats_capacity(&self.memory_snapshot())
     }
 
+    pub fn resident_memory_snapshot(&self) -> ResidentMemorySnapshot {
+        let used = |category: ResidentCategory| self.resident.used[category.index()].load(Ordering::Acquire);
+        let total_used_bytes = self.resident.total.load(Ordering::Acquire);
+        let snapshot = self.memory_snapshot();
+        let total_budget_bytes = snapshot.cache_budget_bytes.saturating_add(snapshot.bloom_budget_bytes);
+        let pressure_level = if total_used_bytes >= total_budget_bytes.max(1) {
+            MemoryPressureLevel::Critical
+        } else if total_used_bytes.saturating_mul(100) >= total_budget_bytes.max(1).saturating_mul(90) {
+            MemoryPressureLevel::High
+        } else if total_used_bytes.saturating_mul(100) >= total_budget_bytes.max(1).saturating_mul(75) {
+            MemoryPressureLevel::Elevated
+        } else {
+            MemoryPressureLevel::Normal
+        };
+        ResidentMemorySnapshot {
+            total_used_bytes, total_budget_bytes,
+            cache_metadata_used_bytes: used(ResidentCategory::CacheMetadata),
+            cache_access_log_used_bytes: used(ResidentCategory::CacheAccessLog),
+            surrogate_index_used_bytes: used(ResidentCategory::SurrogateIndex),
+            bloom_filter_used_bytes: used(ResidentCategory::BloomFilter),
+            negative_cache_used_bytes: used(ResidentCategory::NegativeCache),
+            pressure_level,
+        }
+    }
+
+    pub fn resident_memory_replace(&self, category: ResidentCategory, old_bytes: u64, new_bytes: u64) -> bool {
+        let _mutation = self.resident.mutation.lock().expect("resident accounting lock poisoned");
+        let slot = &self.resident.used[category.index()];
+        let total = &self.resident.total;
+        if old_bytes == new_bytes { return true; }
+        if new_bytes > old_bytes {
+            let delta = new_bytes - old_bytes;
+            let budget = match category {
+                ResidentCategory::CacheMetadata | ResidentCategory::CacheAccessLog | ResidentCategory::SurrogateIndex => self.memory_snapshot().cache_budget_bytes,
+                ResidentCategory::BloomFilter | ResidentCategory::NegativeCache => self.memory_snapshot().bloom_budget_bytes,
+            };
+            let current = total.load(Ordering::Acquire);
+            if current.saturating_add(delta) > budget.max(1) { return false; }
+            total.fetch_add(delta, Ordering::AcqRel);
+            slot.fetch_add(delta, Ordering::AcqRel);
+        } else {
+            let delta = old_bytes - new_bytes;
+            slot.fetch_sub(delta.min(slot.load(Ordering::Acquire)), Ordering::AcqRel);
+            total.fetch_sub(delta.min(total.load(Ordering::Acquire)), Ordering::AcqRel);
+        }
+        true
+    }
+
+    pub fn resident_memory_replace_owned(&self, category: ResidentCategory, owner: &str, new_bytes: u64) -> bool {
+        let mut owners = self.resident.owners.lock().expect("resident accounting lock poisoned");
+        let key = (category, owner.to_string());
+        let old_bytes = owners.get(&key).copied().unwrap_or(0);
+        if !self.resident_memory_replace(category, old_bytes, new_bytes) { return false; }
+        if new_bytes == 0 { owners.remove(&key); } else { owners.insert(key, new_bytes); }
+        true
+    }
+
+    pub fn resident_memory_remove(&self, category: ResidentCategory, bytes: u64) {
+        let _ = self.resident_memory_replace(category, bytes, 0);
+    }
+
     pub fn snapshot(&self, pingora_threads: usize) -> GovernorSnapshot {
         let mem = self.memory_snapshot();
         let fd_snapshot = self.fd_equivalent_snapshot();
@@ -1176,6 +1316,14 @@ impl MemoryGovernor {
             ip_report_queue_budget_bytes: event_queue_budget_bytes(&mem) / 8,
             af_xdp_budget_bytes: state_budget_bytes(&mem) / 4,
             pingora_keepalive_pool_size: self.pingora_keepalive_pool_size(pingora_threads),
+            resident_memory: self.resident_memory_snapshot(),
+            cgroup_managed: mem.cgroup_managed,
+            cgroup_memory_max_bytes: mem.cgroup_memory_max_bytes,
+            cgroup_memory_high_bytes: mem.cgroup_memory_high_bytes,
+            cgroup_swap_max_bytes: mem.cgroup_swap_max_bytes,
+            process_rss_bytes: mem.process_rss_bytes,
+            process_pss_bytes: mem.process_pss_bytes,
+            process_anon_rss_bytes: mem.process_anon_rss_bytes,
         }
     }
 
@@ -1265,35 +1413,7 @@ impl MemoryGovernor {
         let now = crate::utils::time::system_timestamp_millis();
         let cached_at = self.cached_at_millis.load(Ordering::Relaxed) as i64;
         if cached_at > 0 && now.saturating_sub(cached_at) < SNAPSHOT_TTL_MS {
-            return BudgetedMemorySnapshot {
-                total_bytes: self.cached_total_bytes.load(Ordering::Relaxed),
-                used_bytes: self.cached_used_bytes.load(Ordering::Relaxed),
-                available_bytes: self.cached_available_bytes.load(Ordering::Relaxed),
-                fd_soft_limit: self.cached_fd_soft_limit.load(Ordering::Relaxed).max(1),
-                cpu_parallelism: self.cached_cpu_parallelism.load(Ordering::Relaxed).max(1)
-                    as usize,
-                connection_budget_bytes: budget_from_available(
-                    self.cached_total_bytes.load(Ordering::Relaxed),
-                    self.cached_available_bytes.load(Ordering::Relaxed),
-                    CONNECTION_BUDGET_PCT,
-                ),
-                keepalive_budget_bytes: budget_from_available(
-                    self.cached_total_bytes.load(Ordering::Relaxed),
-                    self.cached_available_bytes.load(Ordering::Relaxed),
-                    KEEPALIVE_BUDGET_PCT,
-                ),
-                cache_budget_bytes: cache_budget_from_available(
-                    self.cached_total_bytes.load(Ordering::Relaxed),
-                    self.cached_available_bytes.load(Ordering::Relaxed),
-                ),
-                bloom_budget_bytes: bounded_budget_from_available(
-                    self.cached_total_bytes.load(Ordering::Relaxed),
-                    self.cached_available_bytes.load(Ordering::Relaxed),
-                    BLOOM_BUDGET_PCT,
-                    MIN_BLOOM_BUDGET_BYTES,
-                    MAX_BLOOM_BUDGET_BYTES,
-                ),
-            };
+            return self.budgeted_from_cached();
         }
 
         let snapshot = read_memory_snapshot();
@@ -1307,35 +1427,59 @@ impl MemoryGovernor {
             .store(snapshot.fd_soft_limit, Ordering::Relaxed);
         self.cached_cpu_parallelism
             .store(snapshot.cpu_parallelism as u64, Ordering::Relaxed);
+        self.cached_cgroup_managed
+            .store(u64::from(snapshot.cgroup_managed), Ordering::Relaxed);
+        self.cached_cgroup_memory_max_bytes
+            .store(snapshot.cgroup_memory_max_bytes, Ordering::Relaxed);
+        self.cached_cgroup_memory_high_bytes
+            .store(snapshot.cgroup_memory_high_bytes, Ordering::Relaxed);
+        self.cached_cgroup_swap_max_bytes
+            .store(snapshot.cgroup_swap_max_bytes, Ordering::Relaxed);
+        self.cached_process_rss_bytes
+            .store(snapshot.process_rss_bytes, Ordering::Relaxed);
+        self.cached_process_pss_bytes
+            .store(snapshot.process_pss_bytes, Ordering::Relaxed);
+        self.cached_process_anon_rss_bytes
+            .store(snapshot.process_anon_rss_bytes, Ordering::Relaxed);
         self.cached_at_millis.store(now as u64, Ordering::Relaxed);
+        self.budgeted_from_cached()
+    }
 
+    fn budgeted_from_cached(&self) -> BudgetedMemorySnapshot {
+        let total_bytes = self.cached_total_bytes.load(Ordering::Relaxed);
+        let available_bytes = self.cached_available_bytes.load(Ordering::Relaxed);
         BudgetedMemorySnapshot {
-            total_bytes: snapshot.total_bytes,
-            used_bytes: snapshot.used_bytes,
-            available_bytes: snapshot.available_bytes,
-            fd_soft_limit: snapshot.fd_soft_limit,
-            cpu_parallelism: snapshot.cpu_parallelism,
+            total_bytes,
+            used_bytes: self.cached_used_bytes.load(Ordering::Relaxed),
+            available_bytes,
+            fd_soft_limit: self.cached_fd_soft_limit.load(Ordering::Relaxed).max(1),
+            cpu_parallelism: self.cached_cpu_parallelism.load(Ordering::Relaxed).max(1)
+                as usize,
             connection_budget_bytes: budget_from_available(
-                snapshot.total_bytes,
-                snapshot.available_bytes,
+                total_bytes,
+                available_bytes,
                 CONNECTION_BUDGET_PCT,
             ),
             keepalive_budget_bytes: budget_from_available(
-                snapshot.total_bytes,
-                snapshot.available_bytes,
+                total_bytes,
+                available_bytes,
                 KEEPALIVE_BUDGET_PCT,
             ),
-            cache_budget_bytes: cache_budget_from_available(
-                snapshot.total_bytes,
-                snapshot.available_bytes,
-            ),
+            cache_budget_bytes: cache_budget_from_available(total_bytes, available_bytes),
             bloom_budget_bytes: bounded_budget_from_available(
-                snapshot.total_bytes,
-                snapshot.available_bytes,
+                total_bytes,
+                available_bytes,
                 BLOOM_BUDGET_PCT,
                 MIN_BLOOM_BUDGET_BYTES,
                 MAX_BLOOM_BUDGET_BYTES,
             ),
+            cgroup_managed: self.cached_cgroup_managed.load(Ordering::Relaxed) != 0,
+            cgroup_memory_max_bytes: self.cached_cgroup_memory_max_bytes.load(Ordering::Relaxed),
+            cgroup_memory_high_bytes: self.cached_cgroup_memory_high_bytes.load(Ordering::Relaxed),
+            cgroup_swap_max_bytes: self.cached_cgroup_swap_max_bytes.load(Ordering::Relaxed),
+            process_rss_bytes: self.cached_process_rss_bytes.load(Ordering::Relaxed),
+            process_pss_bytes: self.cached_process_pss_bytes.load(Ordering::Relaxed),
+            process_anon_rss_bytes: self.cached_process_anon_rss_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -1387,6 +1531,36 @@ struct BudgetedMemorySnapshot {
     keepalive_budget_bytes: u64,
     cache_budget_bytes: u64,
     bloom_budget_bytes: u64,
+    cgroup_managed: bool,
+    cgroup_memory_max_bytes: u64,
+    cgroup_memory_high_bytes: u64,
+    cgroup_swap_max_bytes: u64,
+    process_rss_bytes: u64,
+    process_pss_bytes: u64,
+    process_anon_rss_bytes: u64,
+}
+
+impl Default for BudgetedMemorySnapshot {
+    fn default() -> Self {
+        Self {
+            total_bytes: 0,
+            used_bytes: 0,
+            available_bytes: 0,
+            fd_soft_limit: 1,
+            cpu_parallelism: 1,
+            connection_budget_bytes: 0,
+            keepalive_budget_bytes: 0,
+            cache_budget_bytes: 0,
+            bloom_budget_bytes: 0,
+            cgroup_managed: false,
+            cgroup_memory_max_bytes: 0,
+            cgroup_memory_high_bytes: 0,
+            cgroup_swap_max_bytes: u64::MAX,
+            process_rss_bytes: 0,
+            process_pss_bytes: 0,
+            process_anon_rss_bytes: 0,
+        }
+    }
 }
 
 fn read_memory_snapshot() -> MemorySnapshot {
@@ -1399,19 +1573,45 @@ fn read_memory_snapshot() -> MemorySnapshot {
     let mut used_bytes = sys.used_memory().min(total_bytes);
     #[allow(unused_mut)]
     let mut available_before_reserve = total_bytes.saturating_sub(used_bytes);
+    let mut cgroup_managed = false;
+    let mut cgroup_memory_max_bytes = 0;
+    let mut cgroup_memory_high_bytes = 0;
+    let mut cgroup_swap_max_bytes = u64::MAX;
 
     #[cfg(target_os = "linux")]
     {
-        if let Some((cgroup_total, cgroup_used)) = linux_cgroup_memory_limit() {
-            total_bytes = cgroup_total.max(1);
-            used_bytes = cgroup_used.min(total_bytes);
-            available_before_reserve = total_bytes.saturating_sub(used_bytes);
-        } else if let Some(mem_available) = linux_mem_available_bytes() {
-            available_before_reserve = mem_available.min(total_bytes);
-            used_bytes = total_bytes.saturating_sub(available_before_reserve);
+        match linux_cgroup_memory_effective() {
+            Some(cgroup) => {
+                cgroup_managed = true;
+                cgroup_memory_max_bytes = cgroup.max_bytes.unwrap_or(0);
+                cgroup_memory_high_bytes = cgroup.high_bytes.unwrap_or(0);
+                cgroup_swap_max_bytes = cgroup.swap_max_bytes.unwrap_or(u64::MAX);
+                if let Some(max) = cgroup.max_bytes {
+                    total_bytes = max.max(1);
+                    used_bytes = cgroup.current_bytes.min(total_bytes);
+                    available_before_reserve = total_bytes.saturating_sub(used_bytes);
+                } else if let Some(mem_available) = linux_mem_available_bytes() {
+                    available_before_reserve = mem_available.min(total_bytes);
+                    used_bytes = total_bytes.saturating_sub(available_before_reserve);
+                }
+                if let Some(high) = cgroup.high_bytes
+                    && high > 0
+                    && cgroup.current_bytes >= high
+                {
+                    available_before_reserve = available_before_reserve.min(total_bytes / 20);
+                    used_bytes = total_bytes.saturating_sub(available_before_reserve);
+                }
+            }
+            None => {
+                if let Some(mem_available) = linux_mem_available_bytes() {
+                    available_before_reserve = mem_available.min(total_bytes);
+                    used_bytes = total_bytes.saturating_sub(available_before_reserve);
+                }
+            }
         }
     }
 
+    let rss = read_process_rss_sample();
     let available_bytes = available_after_reserve(total_bytes, available_before_reserve);
 
     MemorySnapshot {
@@ -1422,45 +1622,205 @@ fn read_memory_snapshot() -> MemorySnapshot {
         cpu_parallelism: std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1),
+        cgroup_managed,
+        cgroup_memory_max_bytes,
+        cgroup_memory_high_bytes,
+        cgroup_swap_max_bytes,
+        process_rss_bytes: rss.rss_bytes,
+        process_pss_bytes: rss.pss_bytes,
+        process_anon_rss_bytes: rss.anon_bytes,
+    }
+}
+
+struct ProcessRssSample {
+    rss_bytes: u64,
+    pss_bytes: u64,
+    anon_bytes: u64,
+}
+
+fn read_process_rss_sample() -> ProcessRssSample {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(sample) = linux_process_rss_sample() {
+            return sample;
+        }
+    }
+    ProcessRssSample {
+        rss_bytes: 0,
+        pss_bytes: 0,
+        anon_bytes: 0,
     }
 }
 
 #[cfg(target_os = "linux")]
-fn linux_cgroup_memory_limit() -> Option<(u64, u64)> {
-    if let Some(limit_path) = linux_cgroup_v1_file("memory.limit_in_bytes")
-        && let Ok(limit_str) = std::fs::read_to_string(&limit_path)
-        && let Ok(limit) = limit_str.trim().parse::<u64>()
-        && limit > 0
-        && !linux_cgroup_limit_is_unlimited(limit)
+fn linux_process_rss_sample() -> Option<ProcessRssSample> {
+    let mut rss_bytes = 0;
+    let mut pss_bytes = 0;
+    let mut anon_bytes = 0;
+    if let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+        for line in rollup.lines() {
+            if let Some(value) = linux_smaps_kib(line, "Rss:") {
+                rss_bytes = value.saturating_mul(1024);
+            } else if let Some(value) = linux_smaps_kib(line, "Pss:") {
+                pss_bytes = value.saturating_mul(1024);
+            } else if let Some(value) = linux_smaps_kib(line, "Anonymous:") {
+                anon_bytes = value.saturating_mul(1024);
+            }
+        }
+    }
+    if rss_bytes == 0
+        && let Ok(status) = std::fs::read_to_string("/proc/self/status")
     {
-        let used_path = linux_cgroup_v1_file("memory.usage_in_bytes")?;
-        let stat_path = linux_cgroup_v1_file("memory.stat")?;
-        let used = std::fs::read_to_string(used_path)
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        let inactive_file =
-            linux_memory_stat_value(&stat_path, &["total_inactive_file", "inactive_file"]);
-        return Some((limit, used.saturating_sub(inactive_file)));
+        for line in status.lines() {
+            if let Some(value) = linux_smaps_kib(line, "VmRSS:") {
+                rss_bytes = value.saturating_mul(1024);
+            } else if let Some(value) = linux_smaps_kib(line, "RssAnon:") {
+                anon_bytes = value.saturating_mul(1024);
+            }
+        }
     }
+    (rss_bytes > 0).then_some(ProcessRssSample {
+        rss_bytes,
+        pss_bytes,
+        anon_bytes,
+    })
+}
 
-    let limit_path = linux_cgroup_v2_file("memory.max")?;
-    let limit_str = std::fs::read_to_string(limit_path).ok()?;
-    if limit_str.trim().eq_ignore_ascii_case("max") {
-        return None;
+#[cfg(target_os = "linux")]
+fn linux_smaps_kib(line: &str, prefix: &str) -> Option<u64> {
+    let rest = line.strip_prefix(prefix)?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+struct CgroupMemoryEffective {
+    max_bytes: Option<u64>,
+    high_bytes: Option<u64>,
+    swap_max_bytes: Option<u64>,
+    current_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_memory_effective() -> Option<CgroupMemoryEffective> {
+    if let Some(effective) = linux_cgroup_v2_effective() {
+        return Some(effective);
     }
-    let limit = limit_str.trim().parse::<u64>().ok()?;
-    if limit == 0 || linux_cgroup_limit_is_unlimited(limit) {
-        return None;
-    }
-    let current_path = linux_cgroup_v2_file("memory.current")?;
-    let stat_path = linux_cgroup_v2_file("memory.stat")?;
-    let used = std::fs::read_to_string(current_path)
+    linux_cgroup_v1_effective()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_v2_effective() -> Option<CgroupMemoryEffective> {
+    let leaf = linux_cgroup_v2_dir()?;
+    let root = std::path::Path::new("/sys/fs/cgroup");
+    let current = std::fs::read_to_string(leaf.join("memory.current"))
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    let inactive_file = linux_memory_stat_value(&stat_path, &["inactive_file"]);
-    Some((limit, used.saturating_sub(inactive_file)))
+    let inactive_file = linux_memory_stat_value(&leaf.join("memory.stat"), &["inactive_file"]);
+    let mut max_bytes = None;
+    let mut high_bytes = None;
+    let mut swap_max_bytes = None;
+    let mut dir = leaf;
+    loop {
+        max_bytes = min_cgroup_limit(max_bytes, linux_read_cgroup_limit(&dir.join("memory.max")));
+        high_bytes = min_cgroup_limit(high_bytes, linux_read_cgroup_limit(&dir.join("memory.high")));
+        swap_max_bytes = min_cgroup_swap(swap_max_bytes, linux_read_cgroup_swap(&dir.join("memory.swap.max")));
+        if dir == root {
+            break;
+        }
+        let Some(parent) = dir.parent() else {
+            break;
+        };
+        if !parent.starts_with(root) {
+            break;
+        }
+        dir = parent.to_path_buf();
+    }
+    Some(CgroupMemoryEffective {
+        max_bytes,
+        high_bytes,
+        swap_max_bytes,
+        current_bytes: current.saturating_sub(inactive_file),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_v1_effective() -> Option<CgroupMemoryEffective> {
+    let limit_path = linux_cgroup_v1_file("memory.limit_in_bytes")?;
+    let dir = limit_path.parent()?.to_path_buf();
+    let max_bytes = linux_read_cgroup_limit(&dir.join("memory.limit_in_bytes"));
+    let high_bytes = linux_read_cgroup_limit(&dir.join("memory.soft_limit_in_bytes"));
+    let used = std::fs::read_to_string(dir.join("memory.usage_in_bytes"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let inactive_file =
+        linux_memory_stat_value(&dir.join("memory.stat"), &["total_inactive_file", "inactive_file"]);
+    Some(CgroupMemoryEffective {
+        max_bytes,
+        high_bytes,
+        swap_max_bytes: linux_read_cgroup_limit(&dir.join("memory.memsw.limit_in_bytes")),
+        current_bytes: used.saturating_sub(inactive_file),
+    })
+    .filter(|effective| effective.max_bytes.is_some() || effective.high_bytes.is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_cgroup_limit(path: &std::path::Path) -> Option<u64> {
+    let value = std::fs::read_to_string(path).ok()?;
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("max") {
+        return None;
+    }
+    let parsed = trimmed.parse::<u64>().ok()?;
+    if parsed == 0 || linux_cgroup_limit_is_unlimited(parsed) {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_cgroup_swap(path: &std::path::Path) -> Option<u64> {
+    let value = std::fs::read_to_string(path).ok()?;
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("max") {
+        return None;
+    }
+    let parsed = trimmed.parse::<u64>().ok()?;
+    if linux_cgroup_limit_is_unlimited(parsed) {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn min_cgroup_limit(current: Option<u64>, next: Option<u64>) -> Option<u64> {
+    match (current, next) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, right) => right,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn min_cgroup_swap(current: Option<u64>, next: Option<u64>) -> Option<u64> {
+    min_cgroup_limit(current, next)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_v2_dir() -> Option<std::path::PathBuf> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        let hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        (hierarchy == "0" && controllers.is_empty()).then_some(path)
+    })?;
+    let relative = path.trim_start_matches('/');
+    Some(std::path::Path::new("/sys/fs/cgroup").join(relative))
 }
 
 #[cfg(target_os = "linux")]
@@ -1474,24 +1834,6 @@ fn linux_mem_available_bytes() -> Option<u64> {
         return Some(kib.saturating_mul(1024));
     }
     None
-}
-
-#[cfg(target_os = "linux")]
-fn linux_cgroup_v2_file(file: &str) -> Option<std::path::PathBuf> {
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let path = cgroup.lines().find_map(|line| {
-        let mut parts = line.splitn(3, ':');
-        let hierarchy = parts.next()?;
-        let controllers = parts.next()?;
-        let path = parts.next()?;
-        (hierarchy == "0" && controllers.is_empty()).then_some(path)
-    })?;
-    let relative = path.trim_start_matches('/');
-    Some(
-        std::path::Path::new("/sys/fs/cgroup")
-            .join(relative)
-            .join(file),
-    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1927,7 +2269,7 @@ fn memory_pressure_high(snapshot: &BudgetedMemorySnapshot) -> bool {
 }
 
 fn memory_pressure_level(snapshot: &BudgetedMemorySnapshot) -> MemoryPressureLevel {
-    if snapshot.available_bytes <= snapshot.total_bytes / 50
+    let mut level = if snapshot.available_bytes <= snapshot.total_bytes / 50
         || snapshot.available_bytes <= 64 * 1024 * 1024
     {
         MemoryPressureLevel::Critical
@@ -1937,7 +2279,28 @@ fn memory_pressure_level(snapshot: &BudgetedMemorySnapshot) -> MemoryPressureLev
         MemoryPressureLevel::Elevated
     } else {
         MemoryPressureLevel::Normal
+    };
+    if snapshot.cgroup_memory_high_bytes > 0
+        && snapshot.used_bytes >= snapshot.cgroup_memory_high_bytes
+    {
+        level = level.max(MemoryPressureLevel::High);
     }
+    if snapshot.process_rss_bytes > 0
+        && snapshot.cgroup_memory_max_bytes > 0
+        && snapshot
+            .process_rss_bytes
+            .saturating_mul(100)
+            >= snapshot.cgroup_memory_max_bytes.saturating_mul(90)
+    {
+        level = level.max(MemoryPressureLevel::High);
+    }
+    if snapshot.process_rss_bytes > 0
+        && snapshot.cgroup_memory_max_bytes > 0
+        && snapshot.process_rss_bytes >= snapshot.cgroup_memory_max_bytes
+    {
+        level = MemoryPressureLevel::Critical;
+    }
+    level
 }
 
 pub fn pressure_level_from_pct(pct: u64) -> MemoryPressureLevel {
@@ -2208,6 +2571,7 @@ mod tests {
                 MIN_BLOOM_BUDGET_BYTES,
                 MAX_BLOOM_BUDGET_BYTES,
             ),
+            ..Default::default()
         }
     }
 
@@ -2618,6 +2982,7 @@ mod tests {
                 MIN_BLOOM_BUDGET_BYTES,
                 MAX_BLOOM_BUDGET_BYTES,
             ),
+            ..Default::default()
         };
         assert!(cache_read_memory_budget_bytes(&critical) <= available);
         assert!(h3_datagram_queue_budget_bytes(&critical) <= available as usize);
@@ -2638,6 +3003,9 @@ mod tests {
     fn cgroup_unlimited_threshold_does_not_hide_large_real_limits() {
         assert!(!linux_cgroup_limit_is_unlimited(2 * 1024_u64.pow(4)));
         assert!(linux_cgroup_limit_is_unlimited(1_u64 << 60));
+        assert_eq!(linux_smaps_kib("Rss:     4096 kB", "Rss:"), Some(4096));
+        assert_eq!(min_cgroup_limit(Some(100), Some(50)), Some(50));
+        assert_eq!(min_cgroup_limit(None, Some(80)), Some(80));
     }
 
     #[test]
@@ -2652,6 +3020,7 @@ mod tests {
             keepalive_budget_bytes: 8 * 1024 * 1024,
             cache_budget_bytes: 16 * 1024 * 1024,
             bloom_budget_bytes: 8 * 1024 * 1024,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -2666,5 +3035,22 @@ mod tests {
             pressure_adjusted_min_limit(&critical, MIN_CACHE_READ_MEMORY_LIMIT, 4, 1),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod resident_memory_tests {
+    use super::{MemoryGovernor, ResidentCategory};
+
+    #[test]
+    fn resident_owner_replace_and_remove_are_idempotent() {
+        let governor = MemoryGovernor::new();
+        let category = ResidentCategory::CacheMetadata;
+        assert!(governor.resident_memory_replace_owned(category, "a", 128));
+        assert!(governor.resident_memory_replace_owned(category, "a", 256));
+        assert_eq!(governor.resident_memory_snapshot().cache_metadata_used_bytes, 256);
+        assert!(governor.resident_memory_replace_owned(category, "a", 0));
+        assert!(governor.resident_memory_replace_owned(category, "a", 0));
+        assert_eq!(governor.resident_memory_snapshot().total_used_bytes, 0);
     }
 }

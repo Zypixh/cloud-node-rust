@@ -1510,6 +1510,15 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "udpQueuedBytesBudget": governor_snapshot.udp_queued_bytes_budget,
             "httpAcceptWorkers": governor_snapshot.http_accept_workers,
             "listenerBacklog": governor_snapshot.listener_backlog,
+            "cgroupManaged": governor_snapshot.cgroup_managed,
+            "cgroupMemoryMaxBytes": governor_snapshot.cgroup_memory_max_bytes,
+            "cgroupMemoryHighBytes": governor_snapshot.cgroup_memory_high_bytes,
+            "cgroupSwapMaxBytes": governor_snapshot.cgroup_swap_max_bytes,
+            "processRssBytes": governor_snapshot.process_rss_bytes,
+            "processPssBytes": governor_snapshot.process_pss_bytes,
+            "processAnonRssBytes": governor_snapshot.process_anon_rss_bytes,
+            "residentUsedBytes": governor_snapshot.resident_memory.total_used_bytes,
+            "residentBudgetBytes": governor_snapshot.resident_memory.total_budget_bytes,
         });
         let l4_defense = serde_json::json!({
             "eventsTotal": l4_metrics.events_total,

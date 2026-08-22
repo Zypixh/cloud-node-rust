@@ -19,7 +19,7 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
     let l4_metrics = crate::l4_defense::metrics_snapshot();
     MemoryPlan {
         summary: format!(
-            "memory total={} used={} available={} pressure={} l4_pressure={} prefix_pressure={} tcp_like_per_ip_limit={} fd_used={} fd_soft_limit={} fd_used_pct={} fd_pressure={} cpu_parallelism={} pingora_threads={} http_accept_workers={} tcp_accept_workers={} udp_demux_workers={} conn_budget={} conn_admission_used={} zero_copy_active={} zero_copy_limit={} udp_queued={} udp_queue_budget={} admission_rejects_total={} l4_events={} l4_blocked={} l4_prefix_events={} l4_prefix_blocked={} l4_counter_saturated={} l4_top_kind={} l4_top_prefix={} l4_top_prefix_events={} l4_distinct_ips_recent={} keepalive_budget={} cache_budget={} bloom_budget={}",
+            "memory total={} used={} available={} pressure={} l4_pressure={} prefix_pressure={} tcp_like_per_ip_limit={} fd_used={} fd_soft_limit={} fd_used_pct={} fd_pressure={} cpu_parallelism={} pingora_threads={} http_accept_workers={} tcp_accept_workers={} udp_demux_workers={} conn_budget={} conn_admission_used={} zero_copy_active={} zero_copy_limit={} udp_queued={} udp_queue_budget={} admission_rejects_total={} l4_events={} l4_blocked={} l4_prefix_events={} l4_prefix_blocked={} l4_counter_saturated={} l4_top_kind={} l4_top_prefix={} l4_top_prefix_events={} l4_distinct_ips_recent={} keepalive_budget={} cache_budget={} bloom_budget={} cgroup_managed={} cgroup_max={} cgroup_high={} cgroup_swap_max={} rss={} pss={} anon_rss={} resident_est={}",
             snapshot.memory_total_bytes,
             snapshot.memory_used_bytes,
             snapshot.memory_available_bytes,
@@ -54,7 +54,15 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
             l4_metrics.distinct_ips_recent,
             snapshot.keepalive_budget_bytes,
             snapshot.cache_budget_bytes,
-            snapshot.bloom_budget_bytes
+            snapshot.bloom_budget_bytes,
+            snapshot.cgroup_managed,
+            snapshot.cgroup_memory_max_bytes,
+            snapshot.cgroup_memory_high_bytes,
+            snapshot.cgroup_swap_max_bytes,
+            snapshot.process_rss_bytes,
+            snapshot.process_pss_bytes,
+            snapshot.process_anon_rss_bytes,
+            snapshot.resident_memory.total_used_bytes
         ),
         items: vec![
             MemoryPlanItem {

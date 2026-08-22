@@ -14,6 +14,14 @@ use tracing::{error, warn};
 
 const CACHE_META_QUEUE_CAPACITY: usize = 8192;
 const STATS_CLEANUP_BATCH_SIZE: usize = 512;
+const CACHE_META_MAX_ENTRIES: usize = 1_000_000;
+const CACHE_META_MAX_ENTRY_BYTES: u64 = 256 * 1024;
+const CACHE_ACCESS_LOG_MAX_ENTRIES: usize = 262_144;
+const CACHE_ACCESS_LOG_TTL_SECS: i64 = 300;
+const CORRUPT_CMETA_ISOLATION_MAX: usize = 4_096;
+
+static CORRUPT_CMETA_KEYS: Lazy<DashMap<String, ()>> = Lazy::new(DashMap::new);
+static CORRUPT_CMETA_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// A specialized storage engine for metrics backed by Mace.
 pub struct MetricStorage {
@@ -364,6 +372,17 @@ impl MetricStorage {
         if let Err(err) = db.write(&batch) {
             error!(error = %err, "Mace cache access flush failed");
         }
+        let now = crate::utils::time::now_timestamp();
+        let mut cleaned = 0usize;
+        CACHE_ACCESS_LOG.retain(|hash, (access_ts, access_cnt)| {
+            if cleaned >= STATS_CLEANUP_BATCH_SIZE || access_ts.load(Ordering::Relaxed) + CACHE_ACCESS_LOG_TTL_SECS > now || access_cnt.load(Ordering::Relaxed) > 0 {
+                true
+            } else {
+                cleaned += 1;
+                let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheAccessLog, hash, 0);
+                false
+            }
+        });
     }
 
     pub fn get_cache_meta(&self, hash: &str) -> Option<CacheMetaEntry> {
@@ -594,6 +613,22 @@ impl MetricStorage {
         }
     }
 
+    pub fn collect_cache_keys_by_surrogate_tag(&self, tag: &str, limit: usize) -> Vec<String> {
+        let mut keys = Vec::new();
+        if tag.is_empty() || limit == 0 {
+            return keys;
+        }
+        for entry in CACHE_META_INDEX.iter() {
+            if crate::cache_hybrid::meta_headers_contain_surrogate_tag(&entry.value().headers, tag) {
+                keys.push(entry.value().cache_key.clone());
+                if keys.len() >= limit {
+                    break;
+                }
+            }
+        }
+        keys
+    }
+
     /// Scans all cache metadata, returning a vector of (hash, metadata)
     pub fn scan_all_cache_meta(&self) -> Vec<(String, CacheMetaEntry)> {
         CACHE_META_INDEX
@@ -755,7 +790,17 @@ fn cache_meta_from_upsert(upsert: &CacheMetaUpsert<'_>) -> CacheMetaEntry {
     }
 }
 
+fn cache_meta_estimated_bytes(hash: &str, meta: &CacheMetaEntry) -> u64 {
+    let headers = meta.headers.iter().map(|(k, v)| 64u64.saturating_add(k.len() as u64).saturating_add(v.len() as u64)).sum::<u64>();
+    (128u64).saturating_add(hash.len() as u64).saturating_add(meta.cache_key.len() as u64).saturating_add(headers).saturating_add((meta.headers.len() as u64).saturating_mul(32)).min(CACHE_META_MAX_ENTRY_BYTES)
+}
+
 fn apply_cache_meta_memory(hash: &str, meta: CacheMetaEntry) {
+    if meta.expires <= crate::utils::time::now_timestamp() { return; }
+    let new_bytes = cache_meta_estimated_bytes(hash, &meta);
+    let old_bytes = CACHE_META_INDEX.get(hash).map(|v| cache_meta_estimated_bytes(hash, &v)).unwrap_or(0);
+    if CACHE_META_INDEX.len() >= CACHE_META_MAX_ENTRIES && old_bytes == 0 { return; }
+    if !crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheMetadata, hash, new_bytes) { return; }
     CACHE_META_INDEX.insert(hash.to_string(), meta.clone());
     crate::cache_hybrid::index_surrogate_keys(&meta.headers, hash);
     crate::cache_hybrid::on_cache_meta_upsert(&meta);
@@ -769,6 +814,7 @@ fn remove_cache_meta_memory(hash: &str) {
     crate::cache_hybrid::remove_hash_from_surrogate_index(hash);
     // Drop the access-log entry as well; otherwise it grows for every purged entry.
     CACHE_ACCESS_LOG.remove(hash);
+    crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheAccessLog, hash, 0);
 }
 
 fn start_cache_meta_writer() {
@@ -943,10 +989,15 @@ pub fn get_cache_meta_memory(hash: &str) -> Option<CacheMetaEntry> {
 }
 
 pub fn record_cache_access_memory(hash: &str) {
+    if !CACHE_META_INDEX.contains_key(hash) { return; }
+    if CACHE_ACCESS_LOG.len() >= CACHE_ACCESS_LOG_MAX_ENTRIES && !CACHE_ACCESS_LOG.contains_key(hash) { return; }
     let now = crate::utils::time::now_timestamp();
     let entry = CACHE_ACCESS_LOG
         .entry(hash.to_string())
-        .or_insert_with(|| (AtomicI64::new(now), AtomicU64::new(0)));
+        .or_insert_with(|| {
+            let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheAccessLog, hash, 128 + hash.len() as u64);
+            (AtomicI64::new(now), AtomicU64::new(0))
+        });
     entry.0.store(now, Ordering::Relaxed);
     entry.1.fetch_add(1, Ordering::Relaxed);
 }
@@ -959,7 +1010,9 @@ pub fn insert_cache_meta_for_test(hash: String, meta: CacheMetaEntry) {
 #[cfg(test)]
 pub fn delete_cache_meta_for_test(hash: &str) {
     CACHE_META_INDEX.remove(hash);
+    crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheMetadata, hash, 0);
     CACHE_ACCESS_LOG.remove(hash);
+    crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::CacheAccessLog, hash, 0);
 }
 
 /// Load all existing cache metadata from Mace into the in-memory index at startup.
@@ -1008,11 +1061,39 @@ pub fn load_cache_meta_index() {
                 stale_while_revalidate_secs: raw.get("swr").and_then(|v| v.as_u64()).unwrap_or(0),
                 created_at: raw.get("ca").and_then(|v| v.as_i64()).unwrap_or(0),
             };
+            if entry.expires <= crate::utils::time::now_timestamp() {
+                continue;
+            }
+            let entry_bytes = cache_meta_estimated_bytes(&hash, &entry);
+            if CACHE_META_INDEX.len() >= CACHE_META_MAX_ENTRIES
+                || !crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+                    crate::memory_governor::ResidentCategory::CacheMetadata,
+                    &hash,
+                    entry_bytes,
+                )
+            {
+                continue;
+            }
+            crate::cache_hybrid::index_surrogate_keys(&entry.headers, &hash);
             CACHE_META_INDEX.insert(hash, entry);
             count += 1;
+        } else {
+            isolate_corrupt_cmeta(&key_str);
         }
     }
-    tracing::info!("Loaded {} cache metadata entries into memory", count);
+    tracing::info!(
+        "Loaded {} cache metadata entries into memory (corrupt_isolated={})",
+        count,
+        CORRUPT_CMETA_COUNT.load(Ordering::Relaxed)
+    );
+}
+
+fn isolate_corrupt_cmeta(key: &str) {
+    CORRUPT_CMETA_COUNT.fetch_add(1, Ordering::Relaxed);
+    if CORRUPT_CMETA_KEYS.len() < CORRUPT_CMETA_ISOLATION_MAX {
+        CORRUPT_CMETA_KEYS.insert(key.to_string(), ());
+    }
+    warn!(key, "skipping corrupt cache metadata record; disk value retained");
 }
 
 /// Start a background task that flushes in-memory cache access logs to Mace every 30 seconds.
@@ -1020,6 +1101,7 @@ pub fn start_cache_access_flusher() {
     // Load existing metadata into memory first
     load_cache_meta_index();
     crate::cache_hybrid::warm_admission_filters_from_cache_meta();
+    crate::cache_hybrid::start_bloom_rotation_task();
     start_cache_meta_writer();
     start_unique_ip_writer();
     tokio::spawn(async {
