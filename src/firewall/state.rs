@@ -1347,7 +1347,7 @@ impl WafStateManager {
         entry.limiter.check_key(&server_id).is_ok()
     }
 
-    fn reserve_slot(counter: &AtomicU64, capacity: usize) -> bool {
+    pub(crate) fn reserve_slot(counter: &AtomicU64, capacity: usize) -> bool {
         counter
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < capacity as u64).then_some(current + 1)
@@ -1355,7 +1355,7 @@ impl WafStateManager {
             .is_ok()
     }
 
-    fn release_slot(counter: &AtomicU64) {
+    pub(crate) fn release_slot(counter: &AtomicU64) {
         let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             Some(current.saturating_sub(1))
         });
@@ -2140,7 +2140,20 @@ impl WafStateManager {
 }
 
 /// Spawn a background tokio task that runs GC on the WAF state every 60 seconds.
+static WAF_STATE_FOR_RECLAIM: std::sync::OnceLock<std::sync::Weak<WafStateManager>> =
+    std::sync::OnceLock::new();
+
+pub fn accelerate_block_map_gc() {
+    if let Some(state) = WAF_STATE_FOR_RECLAIM
+        .get()
+        .and_then(std::sync::Weak::upgrade)
+    {
+        state.gc_once();
+    }
+}
+
 pub fn start_gc_task(state: Arc<WafStateManager>) {
+    let _ = WAF_STATE_FOR_RECLAIM.set(Arc::downgrade(&state));
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(GC_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2287,5 +2300,18 @@ mod tests {
         }
         state.gc_once();
         assert_eq!(state.candidate_stats.len(), 0);
+    }
+
+    #[test]
+    fn reserve_slot_fails_closed_at_capacity() {
+        let counter = AtomicU64::new(0);
+        let capacity = 8;
+        for _ in 0..capacity {
+            assert!(WafStateManager::reserve_slot(&counter, capacity));
+        }
+        assert!(!WafStateManager::reserve_slot(&counter, capacity));
+        WafStateManager::release_slot(&counter);
+        assert!(WafStateManager::reserve_slot(&counter, capacity));
+        assert_eq!(counter.load(Ordering::Acquire), capacity as u64);
     }
 }

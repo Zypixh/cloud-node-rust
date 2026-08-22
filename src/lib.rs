@@ -5,6 +5,7 @@ pub mod pb {
 pub mod adaptive_cpu;
 pub mod api_config;
 pub mod auth;
+pub mod bounded_regex_cache;
 pub mod cache;
 pub mod cache_hybrid;
 pub mod cache_manager;
@@ -30,6 +31,7 @@ pub mod log_uploader;
 pub mod logging;
 pub mod memory_governor;
 pub mod memory_plan;
+pub mod memory_reclaim;
 pub mod metrics;
 pub mod net_bind;
 pub mod origin_h3;

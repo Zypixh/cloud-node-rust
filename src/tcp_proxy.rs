@@ -162,6 +162,27 @@ static CLIENT_CERT_CACHE: Lazy<Mutex<LruCache<String, ParsedClientCert>>> =
 static UPSTREAM_TLS_CONNECTOR_CACHE: Lazy<DashMap<String, Arc<pingora_core::tls::TlsConnector>>> =
     Lazy::new(DashMap::new);
 
+const MAX_UPSTREAM_TLS_CONNECTOR_CACHE: usize = 512;
+
+pub fn reclaim_tls_connector_cache(keep_fraction: f64) -> usize {
+    let target = if keep_fraction <= 0.0 {
+        0
+    } else {
+        ((UPSTREAM_TLS_CONNECTOR_CACHE.len() as f64) * keep_fraction).ceil() as usize
+    };
+    let mut removed = 0usize;
+    while UPSTREAM_TLS_CONNECTOR_CACHE.len() > target {
+        let Some(entry) = UPSTREAM_TLS_CONNECTOR_CACHE.iter().next() else {
+            break;
+        };
+        let key = entry.key().clone();
+        drop(entry);
+        UPSTREAM_TLS_CONNECTOR_CACHE.remove(&key);
+        removed = removed.saturating_add(1);
+    }
+    removed
+}
+
 type TcpTlsAcceptor = pingora_core::listeners::tls::Acceptor;
 
 pub struct TcpProxyManager {
@@ -3043,6 +3064,9 @@ fn build_upstream_tls_connector(
     }
 
     let connector = pingora_core::tls::TlsConnector::from(Arc::new(config));
+    if UPSTREAM_TLS_CONNECTOR_CACHE.len() >= MAX_UPSTREAM_TLS_CONNECTOR_CACHE {
+        reclaim_tls_connector_cache(0.75);
+    }
     UPSTREAM_TLS_CONNECTOR_CACHE.insert(cache_key, Arc::new(connector.clone()));
     Ok(connector)
 }
