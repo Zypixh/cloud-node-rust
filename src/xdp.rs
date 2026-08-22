@@ -4047,139 +4047,6 @@ mod linux {
         }
     }
 
-    fn sync_exact_ip_map<'a>(
-        ebpf: &mut aya::Ebpf,
-        name: &str,
-        entries: impl Iterator<Item = (&'a IpAddr, &'a i64)>,
-        allow: bool,
-        v6: bool,
-    ) -> anyhow::Result<()> {
-        if v6 {
-            let map = ebpf
-                .map_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
-            let mut map = AyaHashMap::<_, XdpIpv6Key, XdpRuleValue>::try_from(map)?;
-            clear_hash_map(&mut map)?;
-            for (ip, expiry) in entries {
-                if let IpAddr::V6(addr) = ip {
-                    map.insert(
-                        XdpIpv6Key {
-                            addr: addr.octets(),
-                        },
-                        rule_value(*expiry, allow),
-                        0,
-                    )?;
-                }
-            }
-        } else {
-            let map = ebpf
-                .map_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
-            let mut map = AyaHashMap::<_, XdpIpv4Key, XdpRuleValue>::try_from(map)?;
-            clear_hash_map(&mut map)?;
-            for (ip, expiry) in entries {
-                if let IpAddr::V4(addr) = ip {
-                    map.insert(
-                        XdpIpv4Key {
-                            addr_be: u32::from_be_bytes(addr.octets()),
-                        },
-                        rule_value(*expiry, allow),
-                        0,
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn sync_network_map<'a>(
-        ebpf: &mut aya::Ebpf,
-        name: &str,
-        entries: impl Iterator<Item = &'a (IpNet, i64)>,
-        allow: bool,
-        v6: bool,
-    ) -> anyhow::Result<()> {
-        if v6 {
-            let map = ebpf
-                .map_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
-            let mut map = LpmTrie::<_, [u8; 16], XdpRuleValue>::try_from(map)?;
-            clear_lpm_map(&mut map)?;
-            for (net, expiry) in entries {
-                if let IpNet::V6(net) = net {
-                    let key = LpmKey::new(net.prefix_len() as u32, net.network().octets());
-                    map.insert(&key, rule_value(*expiry, allow), 0)?;
-                }
-            }
-        } else {
-            let map = ebpf
-                .map_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
-            let mut map = LpmTrie::<_, u32, XdpRuleValue>::try_from(map)?;
-            clear_lpm_map(&mut map)?;
-            for (net, expiry) in entries {
-                if let IpNet::V4(net) = net {
-                    let key = LpmKey::new(
-                        net.prefix_len() as u32,
-                        u32::from_be_bytes(net.network().octets()),
-                    );
-                    map.insert(&key, rule_value(*expiry, allow), 0)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn sync_range_lpm_maps<'a>(
-        ebpf: &mut aya::Ebpf,
-        entries: impl Iterator<Item = (&'a RangeKey, &'a i64)>,
-        allow: bool,
-    ) -> anyhow::Result<()> {
-        let ranges = entries
-            .map(|(range, expiry)| (range.clone(), *expiry))
-            .collect::<Vec<_>>();
-        let (v4_name, v6_name) = if allow {
-            ("XDP_ALLOWED_V4_LPM", "XDP_ALLOWED_V6_LPM")
-        } else {
-            ("XDP_BLOCKED_V4_LPM", "XDP_BLOCKED_V6_LPM")
-        };
-
-        {
-            let map = ebpf
-                .map_mut(v4_name)
-                .ok_or_else(|| anyhow::anyhow!("missing map {v4_name}"))?;
-            let mut map = LpmTrie::<_, u32, XdpRuleValue>::try_from(map)?;
-            for (range, expiry) in &ranges {
-                for net in range_to_nets(range) {
-                    if let IpNet::V4(net) = net {
-                        let key = LpmKey::new(
-                            net.prefix_len() as u32,
-                            u32::from_be_bytes(net.network().octets()),
-                        );
-                        map.insert(&key, rule_value(*expiry, allow), 0)?;
-                    }
-                }
-            }
-        }
-
-        {
-            let map = ebpf
-                .map_mut(v6_name)
-                .ok_or_else(|| anyhow::anyhow!("missing map {v6_name}"))?;
-            let mut map = LpmTrie::<_, [u8; 16], XdpRuleValue>::try_from(map)?;
-            for (range, expiry) in &ranges {
-                for net in range_to_nets(range) {
-                    if let IpNet::V6(net) = net {
-                        let key = LpmKey::new(net.prefix_len() as u32, net.network().octets());
-                        map.insert(&key, rule_value(*expiry, allow), 0)?;
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     // Desired-contents "images" of the rule maps, keyed so that an unchanged
     // entry (same expiry) is never rewritten. Keeping the diff keyed on the unix
     // expiry preserves each entry's original monotonic deadline in the eBPF map.
@@ -5629,7 +5496,7 @@ pub mod af_xdp {
             }
 
             let socket = self.sockets.add(socket);
-            let mut session = AfXdpTcpSession {
+            let session = AfXdpTcpSession {
                 flow,
                 route,
                 proxy_class,
@@ -5640,14 +5507,19 @@ pub mod af_xdp {
                 pending_egress: Bytes::new(),
                 created_at: now,
                 last_activity: now,
-                proxy_started: false,
+                proxy_started: {
+                    #[cfg(test)]
+                    {
+                        self.test_auto_start_proxy
+                    }
+                    #[cfg(not(test))]
+                    {
+                        false
+                    }
+                },
                 closing: false,
                 egress_closed: false,
             };
-            #[cfg(test)]
-            if self.test_auto_start_proxy && !session.proxy_started {
-                session.proxy_started = true;
-            }
             self.sessions.insert(flow, session);
             true
         }
@@ -7272,7 +7144,7 @@ pub mod af_xdp {
         })
     }
 
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(super) fn tcp_packet_is_initial_syn(ip_packet: &[u8]) -> bool {
         let Some(flags) = tcp_flags_from_ip_packet(ip_packet) else {
             return false;

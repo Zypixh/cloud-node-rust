@@ -1527,10 +1527,6 @@ impl AdaptiveBloomFilter {
         }
     }
 
-    fn remove(&self, key: &str) {
-        let _ = key;
-    }
-
     fn utilization(&self) -> f64 {
         let size = self.current_size.load(Ordering::Relaxed) as f64;
         let capacity = self.total_capacity.load(Ordering::Relaxed) as f64;

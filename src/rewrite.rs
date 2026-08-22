@@ -3,10 +3,8 @@ use crate::config_models::{
     HTTPHostRedirectConfig, HTTPRequestCond, HTTPRequestCondGroup, HTTPRequestCondsConfig,
     HTTPRewriteRef, HTTPRewriteRule, ServerConfig,
 };
-use dashmap::DashMap;
 use regex::Regex;
 use std::sync::Arc;
-use std::sync::LazyLock as Lazy;
 use tracing::debug;
 
 #[derive(Debug)]
