@@ -563,3 +563,52 @@ pub(crate) fn evaluate_operator_bytes(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waf_regex_cache_evicts_beyond_max_entries() {
+        for i in 0..(WAF_RE_CACHE_MAX_ENTRIES + 128) {
+            let pattern = format!("^waf-cache-evict-{i}$");
+            assert!(evaluate_operator(
+                &format!("waf-cache-evict-{i}"),
+                "regexp",
+                &pattern,
+                false
+            ));
+        }
+        assert!(
+            WAF_RE_CACHE.entry_count() <= WAF_RE_CACHE_MAX_ENTRIES,
+            "WAF regex cache must stay at or below {WAF_RE_CACHE_MAX_ENTRIES} entries, got {}",
+            WAF_RE_CACHE.entry_count()
+        );
+    }
+
+    #[test]
+    fn waf_bytes_regex_cache_evicts_beyond_max_entries() {
+        for i in 0..(WAF_RE_CACHE_MAX_ENTRIES + 64) {
+            let pattern = format!("^waf-bytes-evict-{i}$");
+            let value = format!("waf-bytes-evict-{i}");
+            assert!(evaluate_operator_bytes(
+                value.as_bytes(),
+                "regexp",
+                &pattern,
+                false,
+            ));
+        }
+        assert!(
+            WAF_BYTES_RE_CACHE.entry_count() <= WAF_RE_CACHE_MAX_ENTRIES,
+            "WAF bytes regex cache must stay bounded, got {}",
+            WAF_BYTES_RE_CACHE.entry_count()
+        );
+    }
+
+    #[test]
+    fn waf_regex_compile_failures_do_not_poison_cache() {
+        assert!(!evaluate_operator("value", "regexp", "(?", false));
+        assert!(!evaluate_operator("value", "regexp", "(?", false));
+        assert!(evaluate_operator("abc", "regexp", "^abc$", false));
+    }
+}

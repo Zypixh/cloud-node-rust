@@ -388,6 +388,11 @@ impl RuntimeDistinctIpTracker {
     fn len(&self) -> usize {
         self.ips.len()
     }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 
 /// Metrics for a specific server (site)
@@ -1166,6 +1171,7 @@ pub async fn start_persistence_flusher() {
 #[cfg(test)]
 mod tests {
     use super::MetricRequestContext;
+    use std::net::IpAddr;
 
     #[test]
     fn metric_request_context_resolves_go_style_keys() {
@@ -1231,5 +1237,22 @@ mod tests {
         assert_eq!(ctx.resolve_key("${remoteAddr}"), "203.0.113.9");
         assert_eq!(ctx.resolve_key("${bytesSent}"), "1234");
         assert_eq!(ctx.resolve_key("${requestLength}"), "56");
+    }
+
+    #[test]
+    fn runtime_distinct_ip_tracker_fail_closed_at_capacity() {
+        let tracker = super::RuntimeDistinctIpTracker::new(1);
+        let capacity = tracker.capacity();
+        assert!(capacity > 0, "distinct IP tracker must derive a positive capacity");
+
+        for i in 0..capacity.saturating_add(128) {
+            let ip = IpAddr::from([10, 0, (i / 256) as u8, (i % 256) as u8]);
+            tracker.insert(ip);
+        }
+        assert!(
+            tracker.len() <= capacity,
+            "distinct IP tracker must not grow beyond capacity ({capacity}), got {}",
+            tracker.len()
+        );
     }
 }
