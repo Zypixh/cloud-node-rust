@@ -1146,6 +1146,31 @@ impl ConfigStore {
         lock.servers.keys().cloned().collect()
     }
 
+    /// Drop host/LB maps and compiled server plans so a full snapshot can be
+    /// rebuilt without holding two generations in RSS. In-flight requests that
+    /// already cloned `Arc`s keep serving; new lookups miss until replace.
+    pub fn release_server_runtime_for_reload(&self) {
+        let dumped = {
+            let mut lock = self.inner.write();
+            let dumped = (
+                std::mem::take(&mut lock.all_servers),
+                std::mem::take(&mut lock.servers),
+                std::mem::take(&mut lock.routes),
+                std::mem::take(&mut lock.id_to_lb),
+                std::mem::replace(
+                    &mut lock.compiled_plans,
+                    Arc::new(crate::compiled::CompiledPlanSet::default()),
+                ),
+            );
+            Self::refresh_passthrough_indexes(&mut lock);
+            Self::refresh_cluster_policy_indexes(&mut lock);
+            dumped
+        };
+        drop(dumped);
+        crate::memory_reclaim::trim_released_heap();
+        self.notify_runtime_reload();
+    }
+
     pub async fn is_deleted_content(&self, url: &str) -> bool {
         let lock = self.inner.read();
         lock.deleted_contents
@@ -1525,50 +1550,47 @@ impl ConfigStore {
             server.compile_url_patterns();
         }
         crate::routing::location::clear_compiled_locations();
-        let mut candidate = self.inner.read().clone();
+        let removed: Vec<i64> = stale_ids.iter().copied().collect();
+        let compiled_plans = {
+            let lock = self.inner.read();
+            Arc::new(
+                lock.compiled_plans
+                    .recompile_servers(&added_servers, &removed),
+            )
+        };
+        let mut lock = self.inner.write();
         if !stale_ids.is_empty() {
-            candidate
-                .all_servers
+            lock.all_servers
                 .retain(|server| !stale_ids.contains(&server.numeric_id()));
-            let stale_hosts = candidate
+            let stale_hosts: Vec<String> = lock
                 .servers
                 .iter()
                 .filter_map(|(host, server)| {
                     stale_ids
                         .contains(&server.numeric_id())
-                        .then_some(host.clone())
+                        .then(|| host.clone())
                 })
-                .collect::<Vec<_>>();
+                .collect();
             for host in &stale_hosts {
-                candidate.servers.remove(host);
-                candidate.routes.remove(host);
+                lock.servers.remove(host);
+                lock.routes.remove(host);
             }
             for server_id in &stale_ids {
-                candidate.id_to_lb.remove(server_id);
+                lock.id_to_lb.remove(server_id);
             }
         }
-
-        let removed: Vec<i64> = stale_ids.into_iter().collect();
-        candidate.compiled_plans = Arc::new(
-            candidate
-                .compiled_plans
-                .recompile_servers(&added_servers, &removed),
-        );
-        candidate.all_servers.extend(added_servers);
-        for (host, config) in servers {
-            candidate.servers.insert(host, config);
-        }
-        for (host, lb) in routes {
-            candidate.routes.insert(host, lb);
-        }
+        lock.compiled_plans = compiled_plans;
+        lock.all_servers.extend(added_servers);
+        lock.servers.extend(servers);
+        lock.routes.extend(routes);
         for (server_id, lb) in id_to_lb {
             if server_id > 0 {
-                candidate.id_to_lb.insert(server_id, lb);
+                lock.id_to_lb.insert(server_id, lb);
             }
         }
-        Self::refresh_passthrough_indexes(&mut candidate);
-        Self::refresh_cluster_policy_indexes(&mut candidate);
-        *self.inner.write() = candidate;
+        Self::refresh_passthrough_indexes(&mut lock);
+        Self::refresh_cluster_policy_indexes(&mut lock);
+        drop(lock);
         drop(_update);
         self.notify_runtime_reload();
     }

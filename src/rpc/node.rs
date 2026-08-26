@@ -944,6 +944,12 @@ where
                     }
 
                     let apply_limits = crate::config_apply::ConfigApplyLimits::from_governor();
+                    if apply_limits.drop_previous_generation() {
+                        crate::config_apply::drop_previous_server_generation(
+                            config_store,
+                            health_manager,
+                        );
+                    }
                     let global_http_arc = global_http_config.clone().map(Arc::new);
                     let runtime_maps = crate::config_apply::materialize_runtime_servers(
                         payload_servers,

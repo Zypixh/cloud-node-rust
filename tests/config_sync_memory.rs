@@ -194,6 +194,7 @@ async fn large_site_config_sync_survives_low_memory_budgets() {
     assert!(!hash.is_empty());
     assert_eq!(decoded, json_bytes.len() as u64);
     assert_eq!(payload.servers.len(), MANY_SITES);
+    drop(payload);
 
     let low = budgets()
         .into_iter()
@@ -244,6 +245,17 @@ async fn large_site_config_sync_survives_low_memory_budgets() {
             elapsed < APPLY_TIMEOUT,
             "{name} apply took too long: {elapsed:?}"
         );
+        if name == "high" || name == "low" {
+            assert!(
+                maps.stats.released_previous_generation,
+                "{name} must drop the previous site generation before materializing a replacement"
+            );
+        } else {
+            assert!(
+                !maps.stats.released_previous_generation,
+                "{name} should keep serving the previous generation while applying"
+            );
+        }
         if name == "low" {
             assert!(
                 maps.stats.chunks >= MANY_SITES / limits.server_chunk_size(),

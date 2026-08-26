@@ -79,6 +79,12 @@ impl ConfigApplyLimits {
     pub fn should_reclaim(self) -> bool {
         self.pressure >= MemoryPressureLevel::Elevated
     }
+
+    /// High/Critical snapshots must not keep the previous site generation in
+    /// RSS while the next generation is materialized (2x servers + LBs + plans).
+    pub fn drop_previous_generation(self) -> bool {
+        self.pressure >= MemoryPressureLevel::High
+    }
 }
 
 pub fn pressure_from_budget(total_bytes: u64, available_bytes: u64) -> MemoryPressureLevel {
@@ -104,6 +110,7 @@ pub struct ConfigApplyStats {
     pub admitted: bool,
     pub elapsed: Duration,
     pub json_bytes: u64,
+    pub released_previous_generation: bool,
 }
 
 #[derive(Clone, Default)]
@@ -186,13 +193,24 @@ async fn admit_config_sync() -> (Option<crate::memory_governor::StaticAdmissionP
     (None, retries)
 }
 
-fn maybe_reclaim(limits: ConfigApplyLimits, stats: &mut ConfigApplyStats) {
+fn maybe_reclaim(
+    limits: ConfigApplyLimits,
+    stats: &mut ConfigApplyStats,
+    last_reclaimed: &mut MemoryPressureLevel,
+) {
     let live = MEMORY_GOVERNOR.current_memory_pressure_level();
     let pressure = limits.pressure.max(live);
-    if pressure >= MemoryPressureLevel::Elevated {
-        reclaim_for_level(pressure);
-        stats.reclaim_runs = stats.reclaim_runs.saturating_add(1);
+    if pressure < MemoryPressureLevel::Elevated {
+        return;
     }
+    // One cache/resident teardown per apply (or when live pressure rises).
+    // Rebuilding L1/Bloom on every chunk spikes RSS and stalls the snapshot.
+    if stats.reclaim_runs > 0 && pressure <= *last_reclaimed {
+        return;
+    }
+    reclaim_for_level(pressure);
+    stats.reclaim_runs = stats.reclaim_runs.saturating_add(1);
+    *last_reclaimed = pressure;
 }
 
 /// Build host/LB maps from an owned server list.
@@ -220,7 +238,8 @@ pub async fn materialize_runtime_servers(
         ..ConfigApplyStats::default()
     };
     let _permit = permit;
-    maybe_reclaim(limits, &mut stats);
+    let mut last_reclaimed = MemoryPressureLevel::Normal;
+    maybe_reclaim(limits, &mut stats, &mut last_reclaimed);
 
     let chunk = limits.server_chunk_size();
     let mut all_servers = Vec::with_capacity(servers.len());
@@ -231,7 +250,7 @@ pub async fn materialize_runtime_servers(
     for (index, server) in servers.into_iter().enumerate() {
         if index > 0 && index % chunk == 0 {
             stats.chunks = stats.chunks.saturating_add(1);
-            maybe_reclaim(limits, &mut stats);
+            maybe_reclaim(limits, &mut stats, &mut last_reclaimed);
             tokio::task::yield_now().await;
         }
 
@@ -262,11 +281,12 @@ pub async fn materialize_runtime_servers(
         if server_id > 0 {
             id_to_lb.insert(server_id, Arc::clone(&lb_arc));
             if has_hc {
-                health_manager.register(
-                    server_id,
-                    Arc::clone(&lb_arc),
-                    std::time::Duration::from_secs(30),
-                );
+                let frequency = std::time::Duration::from_secs(30);
+                if limits.drop_previous_generation() {
+                    health_manager.register_deferred(server_id, Arc::clone(&lb_arc), frequency);
+                } else {
+                    health_manager.register(server_id, Arc::clone(&lb_arc), frequency);
+                }
             }
         }
 
@@ -312,6 +332,14 @@ pub async fn materialize_runtime_servers(
     }
 }
 
+/// Drop the currently installed site generation (maps, compiled plans, LBs)
+/// before materializing a replacement snapshot. Callers must only do this
+/// under High/Critical pressure — it briefly makes new host lookups miss.
+pub fn drop_previous_server_generation(store: &ConfigStore, health_manager: &GlobalHealthManager) {
+    health_manager.unregister_all();
+    store.release_server_runtime_for_reload();
+}
+
 /// Apply a full site snapshot onto `store`, replacing previous servers while
 /// keeping unrelated global fields. Used by tests and by incremental RPC
 /// helpers that already parsed `Vec<ServerConfig>`.
@@ -321,10 +349,14 @@ pub async fn apply_server_snapshot(
     servers: Vec<ServerConfig>,
     limits: ConfigApplyLimits,
 ) -> RuntimeServerMaps {
+    let released = limits.drop_previous_generation();
+    if released {
+        drop_previous_server_generation(store, health_manager);
+    }
     let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
         store.get_origin_runtime_context().await;
     let global_http = Some(store.get_global_http_config_sync());
-    let maps = materialize_runtime_servers(
+    let mut maps = materialize_runtime_servers(
         servers,
         health_manager,
         node_level,
@@ -335,6 +367,7 @@ pub async fn apply_server_snapshot(
         limits,
     )
     .await;
+    maps.stats.released_previous_generation = released;
     store
         .replace_all_servers(
             maps.all_servers.clone(),
@@ -343,6 +376,9 @@ pub async fn apply_server_snapshot(
             maps.id_to_lb.clone(),
         )
         .await;
+    if released {
+        crate::memory_reclaim::trim_released_heap();
+    }
     maps
 }
 
@@ -423,10 +459,46 @@ mod tests {
         assert!(maps.stats.reclaim_runs >= 1);
     }
 
+    #[tokio::test]
+    async fn critical_reapply_drops_previous_store_generation() {
+        let health = GlobalHealthManager::new(1);
+        let store = ConfigStore::new();
+        let limits = ConfigApplyLimits::synthetic(512 * 1024 * 1024, 32 * 1024 * 1024);
+        let first = apply_server_snapshot(
+            &store,
+            &health,
+            vec![sample_server(1, &["a.example.com"])],
+            limits,
+        )
+        .await;
+        assert!(first.stats.released_previous_generation);
+        assert_eq!(store.get_all_servers_sync().len(), 1);
+        let second = apply_server_snapshot(
+            &store,
+            &health,
+            vec![sample_server(1, &["a.example.com"])],
+            limits,
+        )
+        .await;
+        assert!(second.stats.released_previous_generation);
+        assert_eq!(store.get_all_servers_sync().len(), 1);
+        assert!(store.get_server_sync("a.example.com").is_some());
+    }
+
     #[test]
     fn decode_budget_stays_within_available_memory() {
         let limits = ConfigApplyLimits::synthetic(512 * 1024 * 1024, 96 * 1024 * 1024);
         assert!(limits.decode_budget_bytes() <= 96 * 1024 * 1024);
         assert!(limits.decode_budget_bytes() >= MIN_DECODE_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn high_and_critical_drop_the_previous_generation() {
+        let high = ConfigApplyLimits::synthetic(2 * 1024 * 1024 * 1024, 150 * 1024 * 1024);
+        let low = ConfigApplyLimits::synthetic(512 * 1024 * 1024, 32 * 1024 * 1024);
+        let normal = ConfigApplyLimits::synthetic(8 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
+        assert!(high.drop_previous_generation());
+        assert!(low.drop_previous_generation());
+        assert!(!normal.drop_previous_generation());
     }
 }

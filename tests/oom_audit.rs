@@ -198,6 +198,21 @@ fn config_sync_decode_budget_is_bounded_by_governor_available_memory() {
         limits.server_chunk_size() <= 256,
         "config-sync chunk size must stay bounded"
     );
+    let high = cloud_node_rust::config_apply::ConfigApplyLimits::synthetic(
+        2 * 1024 * 1024 * 1024,
+        150 * 1024 * 1024,
+    );
+    let low = cloud_node_rust::config_apply::ConfigApplyLimits::synthetic(
+        512 * 1024 * 1024,
+        32 * 1024 * 1024,
+    );
+    assert!(high.drop_previous_generation());
+    assert!(low.drop_previous_generation());
+    assert!(
+        !limits.drop_previous_generation()
+            || snapshot.memory_pressure_level
+                >= cloud_node_rust::memory_governor::MemoryPressureLevel::High
+    );
 }
 
 #[test]
