@@ -9,7 +9,6 @@ use std::sync::LazyLock as Lazy;
 // parking_lot::RwLock does not poison on panic; the std variant would permanently
 // brick this config-sync path the moment any holder panics.
 use parking_lot::RwLock;
-use std::sync::Arc;
 use tracing::{debug, error};
 
 static LAST_SINGLE_SERVER_JSON_HASH: Lazy<RwLock<String>> =
@@ -84,12 +83,11 @@ pub async fn sync_single_server_config(
             match serde_json::from_slice::<ServerConfig>(&payload.server_config_json) {
                 Ok(server) => {
                     let user_id = server.user_id;
-                    let runtime_servers = vec![server];
                     let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
                         config_store.get_origin_runtime_context().await;
                     let global_http = Some((*config_store.get_global_http_config_sync()).clone());
-                    let (servers, routes) = build_runtime_maps(
-                        runtime_servers.clone(),
+                    let maps = build_runtime_maps(
+                        vec![server],
                         health_manager,
                         node_level,
                         parent_nodes,
@@ -102,19 +100,14 @@ pub async fn sync_single_server_config(
                         config_store
                             .replace_user_servers(
                                 user_id,
-                                runtime_servers.into_iter().map(Arc::new).collect(),
-                                servers,
-                                routes,
+                                maps.all_servers,
+                                maps.servers,
+                                maps.routes,
                             )
                             .await;
                     } else {
                         config_store
-                            .replace_server(
-                                server_id,
-                                runtime_servers.into_iter().map(Arc::new).collect(),
-                                servers,
-                                routes,
-                            )
+                            .replace_server(server_id, maps.all_servers, maps.servers, maps.routes)
                             .await;
                     }
                     let _ = sync_active_plans(api_config, config_store).await;
@@ -239,12 +232,11 @@ pub async fn sync_user_servers_state(
             }
             match serde_json::from_slice::<Vec<ServerConfig>>(&payload.servers_config_json) {
                 Ok(servers) => {
-                    let runtime_servers = servers;
                     let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
                         config_store.get_origin_runtime_context().await;
                     let global_http = Some((*config_store.get_global_http_config_sync()).clone());
-                    let (servers_map, routes_map) = build_runtime_maps(
-                        runtime_servers.clone(),
+                    let maps = build_runtime_maps(
+                        servers,
                         health_manager,
                         node_level,
                         parent_nodes,
@@ -254,12 +246,7 @@ pub async fn sync_user_servers_state(
                     )
                     .await;
                     config_store
-                        .replace_user_servers(
-                            user_id,
-                            runtime_servers.into_iter().map(Arc::new).collect(),
-                            servers_map,
-                            routes_map,
-                        )
+                        .replace_user_servers(user_id, maps.all_servers, maps.servers, maps.routes)
                         .await;
                     let _ = sync_active_plans(api_config, config_store).await;
                     true

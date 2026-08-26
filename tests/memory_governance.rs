@@ -1,3 +1,4 @@
+use cloud_node_rust::config_apply::ConfigApplyLimits;
 use cloud_node_rust::memory_governor::{
     AdmissionClass, MEMORY_GOVERNOR, MemoryPressureLevel, reported_memory_totals,
 };
@@ -16,7 +17,9 @@ impl Drop for ActiveGuard {
     }
 }
 
-fn assert_budget_fields_within_available(snapshot: &cloud_node_rust::memory_governor::GovernorSnapshot) {
+fn assert_budget_fields_within_available(
+    snapshot: &cloud_node_rust::memory_governor::GovernorSnapshot,
+) {
     let available = snapshot.memory_available_bytes.max(1);
     let budgets = [
         ("connection", snapshot.connection_budget_bytes),
@@ -52,13 +55,13 @@ fn memory_plan_snapshot_is_internally_consistent() {
         "memory plan summary should describe the active governor snapshot"
     );
     assert!(
-        plan.items.iter().any(|item| item.area == "cache_and_background"),
+        plan.items
+            .iter()
+            .any(|item| item.area == "cache_and_background"),
         "memory plan should expose cache/background budgets"
     );
     assert!(
-        plan.items
-            .iter()
-            .any(|item| item.area == "downstream_http"),
+        plan.items.iter().any(|item| item.area == "downstream_http"),
         "memory plan should expose downstream HTTP admission policy"
     );
 }
@@ -67,7 +70,10 @@ fn memory_plan_snapshot_is_internally_consistent() {
 fn reported_memory_totals_match_governor_snapshot() {
     let (total, used) = reported_memory_totals();
     let snapshot = MEMORY_GOVERNOR.snapshot(MEMORY_GOVERNOR.pingora_worker_threads());
-    assert_eq!(total, snapshot.memory_total_bytes.min(i64::MAX as u64) as i64);
+    assert_eq!(
+        total,
+        snapshot.memory_total_bytes.min(i64::MAX as u64) as i64
+    );
     assert_eq!(used, snapshot.memory_used_bytes.min(i64::MAX as u64) as i64);
     assert_budget_fields_within_available(&snapshot);
 }
@@ -244,4 +250,17 @@ fn firewall_and_event_queue_capacities_scale_without_fixed_explosion() {
         snapshot.node_log_queue_capacity <= 100_000,
         "node log queue must stay below guardrail max"
     );
+}
+
+#[test]
+fn config_sync_limits_derive_from_live_governor_snapshot() {
+    let snapshot = MEMORY_GOVERNOR.snapshot(MEMORY_GOVERNOR.pingora_worker_threads());
+    let limits = ConfigApplyLimits::from_governor();
+    assert_eq!(limits.total_bytes, snapshot.memory_total_bytes);
+    assert_eq!(limits.available_bytes, snapshot.memory_available_bytes);
+    assert_eq!(limits.pressure, snapshot.memory_pressure_level);
+    let low = ConfigApplyLimits::synthetic(512 * 1024 * 1024, 32 * 1024 * 1024);
+    assert_eq!(low.pressure, MemoryPressureLevel::Critical);
+    assert_eq!(low.server_chunk_size(), 4);
+    assert!(low.drop_previous_generation());
 }

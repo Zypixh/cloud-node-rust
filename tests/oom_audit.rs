@@ -102,7 +102,10 @@ fn metric_aggregator_flush_empties_in_memory_store() {
 
     let flushed = aggregator.flush();
     assert_eq!(flushed.len(), 1);
-    assert!(aggregator.data.is_empty(), "flush must drain aggregator keys");
+    assert!(
+        aggregator.data.is_empty(),
+        "flush must drain aggregator keys"
+    );
 }
 
 #[test]
@@ -172,8 +175,44 @@ fn waf_regex_evaluator_reuses_compiled_patterns_without_error() {
     for value in ["oom-audit-reuse-1", "oom-audit-reuse-2", "no-match"] {
         let _ = evaluate_operator(value, "regexp", pattern, false);
     }
-    assert!(evaluate_operator("oom-audit-reuse-99", "regexp", pattern, false));
+    assert!(evaluate_operator(
+        "oom-audit-reuse-99",
+        "regexp",
+        pattern,
+        false
+    ));
     assert!(!evaluate_operator("bad", "regexp", pattern, false));
+}
+
+#[test]
+fn config_sync_decode_budget_is_bounded_by_governor_available_memory() {
+    let snapshot = governor_snapshot();
+    let limits = cloud_node_rust::config_apply::ConfigApplyLimits::from_governor();
+    assert_eq!(limits.available_bytes, snapshot.memory_available_bytes);
+    assert!(limits.decode_budget_bytes() > 0);
+    assert!(
+        limits.decode_budget_bytes() <= snapshot.memory_available_bytes.max(16 * 1024 * 1024),
+        "config-sync decode budget must not exceed available memory"
+    );
+    assert!(
+        limits.server_chunk_size() <= 256,
+        "config-sync chunk size must stay bounded"
+    );
+    let high = cloud_node_rust::config_apply::ConfigApplyLimits::synthetic(
+        2 * 1024 * 1024 * 1024,
+        150 * 1024 * 1024,
+    );
+    let low = cloud_node_rust::config_apply::ConfigApplyLimits::synthetic(
+        512 * 1024 * 1024,
+        32 * 1024 * 1024,
+    );
+    assert!(high.drop_previous_generation());
+    assert!(low.drop_previous_generation());
+    assert!(
+        !limits.drop_previous_generation()
+            || snapshot.memory_pressure_level
+                >= cloud_node_rust::memory_governor::MemoryPressureLevel::High
+    );
 }
 
 #[test]

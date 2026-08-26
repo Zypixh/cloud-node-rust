@@ -1,5 +1,5 @@
-use crate::memory_governor::{MemoryPressureLevel, MEMORY_GOVERNOR};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use crate::memory_governor::{MEMORY_GOVERNOR, MemoryPressureLevel};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -73,7 +73,8 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
             stats.geo_cache_entries_removed = geo.0;
             stats.ua_cache_entries_removed = geo.1;
             stats.tls_connectors_removed = crate::tcp_proxy::reclaim_tls_connector_cache(0.5);
-            stats.waf_regex_entries_removed = crate::firewall::matcher::reclaim_waf_regex_caches(false);
+            stats.waf_regex_entries_removed =
+                crate::firewall::matcher::reclaim_waf_regex_caches(false);
             stats.metric_rows_flushed = flush_metric_aggregators();
             crate::firewall::state::accelerate_block_map_gc();
         }
@@ -87,7 +88,8 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
             stats.geo_cache_entries_removed = geo.0;
             stats.ua_cache_entries_removed = geo.1;
             stats.tls_connectors_removed = crate::tcp_proxy::reclaim_tls_connector_cache(0.0);
-            stats.waf_regex_entries_removed = crate::firewall::matcher::reclaim_waf_regex_caches(true);
+            stats.waf_regex_entries_removed =
+                crate::firewall::matcher::reclaim_waf_regex_caches(true);
             stats.metric_rows_flushed = flush_metric_aggregators();
             crate::firewall::state::accelerate_block_map_gc();
             crate::bounded_regex_cache::reclaim_all();
@@ -112,8 +114,12 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
 }
 
 fn flush_metric_aggregators() -> usize {
-    let stat_rows = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.flush().len();
-    let http_rows = crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.flush().len();
+    let stat_rows = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR
+        .flush()
+        .len();
+    let http_rows = crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR
+        .flush()
+        .len();
     stat_rows.saturating_add(http_rows)
 }
 
@@ -140,6 +146,15 @@ pub fn on_memory_pressure_observed(level: MemoryPressureLevel) {
 pub fn periodic_reclaim_check() {
     let level = MEMORY_GOVERNOR.current_memory_pressure_level();
     on_memory_pressure_observed(level);
+}
+
+/// Return freed pages to the OS after dropping a large config generation.
+/// No-op on non-Linux targets; glibc `malloc_trim` is what the node ships on.
+pub fn trim_released_heap() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 pub fn start_reclaim_monitor() {
