@@ -1681,10 +1681,16 @@ fn read_memory_snapshot() -> MemorySnapshot {
     let mut used_bytes = sys.used_memory().min(total_bytes);
     #[allow(unused_mut)]
     let mut available_before_reserve = total_bytes.saturating_sub(used_bytes);
-    let mut cgroup_managed = false;
-    let mut cgroup_memory_max_bytes = 0;
-    let mut cgroup_memory_high_bytes = 0;
-    let mut cgroup_swap_max_bytes = u64::MAX;
+    #[cfg(target_os = "linux")]
+    let (
+        mut cgroup_managed,
+        mut cgroup_memory_max_bytes,
+        mut cgroup_memory_high_bytes,
+        mut cgroup_swap_max_bytes,
+    ) = (false, 0, 0, u64::MAX);
+    #[cfg(not(target_os = "linux"))]
+    let (cgroup_managed, cgroup_memory_max_bytes, cgroup_memory_high_bytes, cgroup_swap_max_bytes) =
+        (false, 0, 0, u64::MAX);
 
     #[cfg(target_os = "linux")]
     {

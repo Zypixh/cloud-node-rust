@@ -1656,10 +1656,12 @@ pub fn configure_relay_tcp_socket(stream: &TcpStream) {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_tcp_keepalive_timers(fd: std::os::unix::io::RawFd) {
-    let (idle_secs, intvl_secs, probes) = *RELAY_KEEPALIVE_CACHE.read().unwrap();
-    let idle = idle_secs as libc::c_int;
-    let intvl = intvl_secs as libc::c_int;
-    let cnt = probes as libc::c_int;
+    let keepalive = *RELAY_KEEPALIVE_CACHE.read().unwrap();
+    let idle = keepalive.0 as libc::c_int;
+    #[cfg(target_os = "linux")]
+    let intvl = keepalive.1 as libc::c_int;
+    #[cfg(target_os = "linux")]
+    let cnt = keepalive.2 as libc::c_int;
 
     unsafe {
         #[cfg(target_os = "linux")]
@@ -1729,7 +1731,6 @@ pub(crate) enum RelayCloseReason {
     BenignIo,
     PressureIdleTimeout,
     L4Drain,
-    DrainTimeoutAfterBenign,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1738,7 +1739,6 @@ pub(crate) struct RelayOutcome {
     pub bytes_sent: u64,
     pub close_reason: RelayCloseReason,
     pub close_detail: Option<RelayIoDetail>,
-    pub drain_duration_millis: Option<u64>,
 }
 
 impl RelayOutcome {
@@ -1752,17 +1752,11 @@ impl RelayOutcome {
             bytes_sent: bytes_sent_counter.load(std::sync::atomic::Ordering::Relaxed),
             close_reason,
             close_detail: None,
-            drain_duration_millis: None,
         }
     }
 
     fn with_close_detail(mut self, close_detail: Option<RelayIoDetail>) -> Self {
         self.close_detail = close_detail;
-        self
-    }
-
-    fn with_drain_duration(mut self, drain_duration: std::time::Duration) -> Self {
-        self.drain_duration_millis = Some(drain_duration.as_millis().min(u64::MAX as u128) as u64);
         self
     }
 
@@ -1774,9 +1768,6 @@ impl RelayOutcome {
                 String::from("relay idle timeout under pressure")
             }
             RelayCloseReason::L4Drain => String::from("relay closed by L4 defense drain"),
-            RelayCloseReason::DrainTimeoutAfterBenign => {
-                String::from("relay drain timeout after benign close")
-            }
         };
         if let Some(detail) = self.close_detail {
             note.push_str(&format!(
@@ -1786,9 +1777,6 @@ impl RelayOutcome {
             if let Some(raw_os_error) = detail.raw_os_error {
                 note.push_str(&format!(" raw_os_error={}", raw_os_error));
             }
-        }
-        if let Some(drain_duration_millis) = self.drain_duration_millis {
-            note.push_str(&format!(" drain_ms={}", drain_duration_millis));
         }
         Some(note)
     }
@@ -1807,9 +1795,7 @@ fn should_record_tcp_proxy_early_close(
     }
     matches!(
         close_reason,
-        None | Some(RelayCloseReason::Clean)
-            | Some(RelayCloseReason::BenignIo)
-            | Some(RelayCloseReason::DrainTimeoutAfterBenign)
+        None | Some(RelayCloseReason::Clean) | Some(RelayCloseReason::BenignIo)
     )
 }
 
@@ -1823,7 +1809,6 @@ pub(crate) enum StreamDirection {
 pub(crate) enum RelayIoPhase {
     Read,
     Write,
-    Shutdown,
 }
 
 #[derive(Debug, Clone)]
@@ -2658,18 +2643,6 @@ mod zero_copy {
         io::Error::new(io::ErrorKind::Interrupted, "zero-copy relay stopped")
     }
 
-    fn shutdown_write(fd: RawFd) -> io::Result<()> {
-        if unsafe { libc::shutdown(fd, libc::SHUT_WR) } == 0 {
-            return Ok(());
-        }
-        let err = io::Error::last_os_error();
-        if is_benign_relay_io_error(&err) {
-            Ok(())
-        } else {
-            Err(err)
-        }
-    }
-
     #[derive(Default)]
     struct RelayControl {
         stop: AtomicBool,
@@ -3488,13 +3461,11 @@ mod tests {
             bytes_sent: 64,
             close_reason: RelayCloseReason::BenignIo,
             close_detail: success.close_detail,
-            drain_duration_millis: Some(12),
         };
         let note = outcome.close_note().unwrap();
         assert!(note.contains("benign relay close"));
         assert!(note.contains("direction=ClientToBackend"));
         assert!(note.contains("phase=Write"));
-        assert!(note.contains("drain_ms=12"));
     }
 
     #[tokio::test]
@@ -3674,9 +3645,7 @@ mod tests {
         assert!(
             matches!(
                 outcome.close_reason,
-                RelayCloseReason::Clean
-                    | RelayCloseReason::BenignIo
-                    | RelayCloseReason::DrainTimeoutAfterBenign
+                RelayCloseReason::Clean | RelayCloseReason::BenignIo
             ),
             "unexpected close reason: {:?}",
             outcome.close_reason
