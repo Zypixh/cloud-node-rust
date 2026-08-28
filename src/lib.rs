@@ -14,6 +14,7 @@ pub mod client_ip;
 pub mod cluster;
 pub mod compiled;
 pub mod config;
+pub mod config_apply;
 pub mod config_models;
 pub mod firewall;
 pub mod h3_downstream;

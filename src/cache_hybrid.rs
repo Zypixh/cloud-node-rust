@@ -1563,10 +1563,6 @@ impl AdaptiveBloomFilter {
         }
     }
 
-    fn remove(&self, key: &str) {
-        let _ = key;
-    }
-
     fn utilization(&self) -> f64 {
         let size = self.current_size.load(Ordering::Relaxed) as f64;
         let capacity = self.total_capacity.load(Ordering::Relaxed) as f64;
@@ -1585,16 +1581,12 @@ impl AdaptiveBloomFilter {
         let keep = keep_layers_per_shard.max(1);
         let mut removed_layers = 0u64;
         let mut freed_bytes = 0u64;
-        let mut removed_capacity = 0u64;
-        let mut removed_count = 0u64;
         for shard in &self.shards {
             let mut layers = shard.layers.write();
             while layers.len() > keep {
                 if let Some(removed) = layers.first() {
                     freed_bytes =
                         freed_bytes.saturating_add(Self::estimated_layer_bytes(removed.capacity));
-                    removed_capacity = removed_capacity.saturating_add(removed.capacity);
-                    removed_count = removed_count.saturating_add(removed.count);
                 }
                 layers.remove(0);
                 removed_layers = removed_layers.saturating_add(1);
@@ -1603,10 +1595,6 @@ impl AdaptiveBloomFilter {
         if freed_bytes > 0 {
             self.estimated_bytes
                 .fetch_sub(freed_bytes, Ordering::Relaxed);
-            self.total_capacity
-                .fetch_sub(removed_capacity, Ordering::Relaxed);
-            self.current_size
-                .fetch_sub(removed_count, Ordering::Relaxed);
         }
         removed_layers
     }
@@ -1725,19 +1713,19 @@ impl DualGenerationBloom {
     }
 
     fn shrink_layers(&self, keep_layers_per_shard: usize) -> u64 {
-        let live = self.live.load_full();
-        let mut removed = live.shrink_layers(keep_layers_per_shard);
+        let live = self.live.load();
+        let removed = live.shrink_layers(keep_layers_per_shard);
         if let Some(stale) = self.stale.lock().as_ref() {
-            removed = removed.saturating_add(stale.shrink_layers(keep_layers_per_shard));
+            let _ = stale.shrink_layers(keep_layers_per_shard);
         }
         self.sync_bloom_charge();
         removed
     }
 
     fn reset_to_minimal(&self) {
-        self.live.load().reset_to_minimal();
+        let live = self.live.load();
+        live.reset_to_minimal();
         *self.stale.lock() = None;
-        self.generation.fetch_add(1, Ordering::Relaxed);
         self.sync_bloom_charge();
     }
 }

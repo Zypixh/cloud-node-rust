@@ -151,6 +151,15 @@ pub fn periodic_reclaim_check() {
     on_memory_pressure_observed(level);
 }
 
+/// Return freed pages to the OS after dropping a large config generation.
+/// No-op on non-Linux targets; glibc `malloc_trim` is what the node ships on.
+pub fn trim_released_heap() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 pub fn start_reclaim_monitor() {
     std::thread::spawn(|| {
         loop {

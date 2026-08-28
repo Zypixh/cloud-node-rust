@@ -7,23 +7,6 @@ use tracing::debug;
 static PLAN_NODE_TYPE_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 pub async fn sync_active_plans(api_config: &ApiConfig, config_store: &ConfigStore) -> bool {
-    sync_active_plans_for_generation(
-        api_config,
-        config_store,
-        config_store.runtime_reload_generation(),
-    )
-    .await
-}
-
-pub async fn sync_active_plans_for_generation(
-    api_config: &ApiConfig,
-    config_store: &ConfigStore,
-    expected_generation: u64,
-) -> bool {
-    if config_store.runtime_reload_generation() != expected_generation {
-        return false;
-    }
-
     let server_ids = config_store
         .get_all_servers()
         .await
@@ -32,13 +15,13 @@ pub async fn sync_active_plans_for_generation(
         .collect::<Vec<_>>();
 
     if server_ids.is_empty() {
-        return config_store
-            .set_active_plans_if_generation(
-                expected_generation,
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-            )
+        config_store
+            .set_user_plans(std::collections::HashMap::new())
             .await;
+        config_store
+            .set_plans(std::collections::HashMap::new())
+            .await;
+        return true;
     }
 
     let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
@@ -113,9 +96,9 @@ pub async fn sync_active_plans_for_generation(
         }
     }
 
-    config_store
-        .set_active_plans_if_generation(expected_generation, user_plans, plans)
-        .await
+    config_store.set_user_plans(user_plans).await;
+    config_store.set_plans(plans).await;
+    true
 }
 
 fn is_unsupported_node_type_error(err: &tonic::Status) -> bool {

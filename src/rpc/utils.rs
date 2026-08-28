@@ -5,15 +5,7 @@ use futures_util::FutureExt;
 use pingora_load_balancing::{Backends, LoadBalancer, discovery::Static, selection::RoundRobin};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
-pub struct PreparedRuntimeMaps {
-    pub servers: HashMap<String, Arc<ServerConfig>>,
-    pub routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
-    pub health_checks: Vec<(i64, Arc<crate::lb_factory::AnyLoadBalancer>)>,
-}
-
-#[allow(clippy::type_complexity)]
 pub fn server_runtime_names(server: &ServerConfig) -> Vec<String> {
     let mut names = server.get_plain_server_names();
     if server_has_subdomain_oss_origin(server) {
@@ -54,93 +46,18 @@ pub async fn build_runtime_maps(
     tiered_origin_bypass: bool,
     allow_lan: bool,
     global_http: Option<crate::config_models::GlobalHTTPAllConfig>,
-) -> (
-    HashMap<String, Arc<ServerConfig>>,
-    HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
-) {
-    let prepared = build_runtime_maps_prepared(
+) -> crate::config_apply::RuntimeServerMaps {
+    crate::config_apply::materialize_runtime_servers(
         servers,
+        health_manager,
         node_level,
         parent_nodes,
         tiered_origin_bypass,
         allow_lan,
-        global_http,
+        global_http.map(Arc::new),
+        crate::config_apply::ConfigApplyLimits::from_governor(),
     )
-    .await;
-    for (server_id, lb) in prepared.health_checks {
-        health_manager.register(server_id, lb, Duration::from_secs(30));
-    }
-    (prepared.servers, prepared.routes)
-}
-
-pub async fn build_runtime_maps_prepared(
-    servers: Vec<ServerConfig>,
-    node_level: i32,
-    parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
-    tiered_origin_bypass: bool,
-    allow_lan: bool,
-    global_http: Option<crate::config_models::GlobalHTTPAllConfig>,
-) -> PreparedRuntimeMaps {
-    let mut new_servers = HashMap::new();
-    let mut new_routes = HashMap::new();
-    let mut health_checks = Vec::new();
-
-    for server in servers {
-        server.compile_url_patterns();
-        if !server.is_on {
-            continue;
-        }
-
-        let server_id = server.numeric_id();
-        let (lb_arc, has_hc) = if let Some(rp) = &server.reverse_proxy {
-            match crate::lb_factory::build_lb_blocking_with_global_http(
-                server_id,
-                rp.clone(),
-                node_level,
-                Arc::clone(&parent_nodes),
-                tiered_origin_bypass,
-                allow_lan,
-                global_http.clone(),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    tracing::warn!(
-                        "failed to build runtime LB for server {}: {}",
-                        server_id,
-                        err
-                    );
-                    fallback_runtime_lb()
-                }
-            }
-        } else {
-            fallback_runtime_lb()
-        };
-
-        if has_hc && let Some(id) = server.id {
-            health_checks.push((id, lb_arc.clone()));
-        }
-
-        let names = server_runtime_names(&server);
-        let server_arc = Arc::new(server);
-        if names.is_empty() {
-            let synthetic = format!("__id_{}", server_arc.numeric_id());
-            new_servers.insert(synthetic.clone(), server_arc.clone());
-            new_routes.insert(synthetic, lb_arc.clone());
-        } else {
-            for name in names {
-                new_servers.insert(name.clone(), server_arc.clone());
-                new_routes.insert(name.clone(), lb_arc.clone());
-            }
-        }
-    }
-
-    PreparedRuntimeMaps {
-        servers: new_servers,
-        routes: new_routes,
-        health_checks,
-    }
+    .await
 }
 
 pub(crate) fn fallback_runtime_lb() -> (Arc<crate::lb_factory::AnyLoadBalancer>, bool) {

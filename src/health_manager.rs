@@ -40,26 +40,60 @@ impl GlobalHealthManager {
         lb: Arc<crate::lb_factory::AnyLoadBalancer>,
         frequency: Duration,
     ) {
-        info!(
-            "Registering health check for upstream pool {} (Frequency: {:?})",
-            id, frequency
+        self.register_inner(id, lb, frequency, true);
+    }
+
+    /// Register without an immediate probe. Used under High/Critical memory so a
+    /// full snapshot cannot pin hundreds of load balancers in in-flight tasks.
+    pub fn register_deferred(
+        &self,
+        id: i64,
+        lb: Arc<crate::lb_factory::AnyLoadBalancer>,
+        frequency: Duration,
+    ) {
+        self.register_inner(id, lb, frequency, false);
+    }
+
+    fn register_inner(
+        &self,
+        id: i64,
+        lb: Arc<crate::lb_factory::AnyLoadBalancer>,
+        frequency: Duration,
+        immediate: bool,
+    ) {
+        debug!(
+            "Registering health check for upstream pool {} (Frequency: {:?}, immediate={})",
+            id, frequency, immediate
         );
         self.registry.insert(
             id,
             HealthCheckItem {
                 lb: Arc::downgrade(&lb),
                 frequency,
-                last_check: Instant::now(), // Set to now because we trigger it immediately below
+                last_check: Instant::now(),
             },
         );
 
-        // Trigger an immediate check in the background
-        let lb_clone = lb.clone();
-        tokio::spawn(async move {
-            debug!("Immediate health check for pool {}", id);
-            lb_clone.run_health_check(true).await;
+        if !immediate {
+            return;
+        }
 
-            for (backend, healthy) in lb_clone.backend_health() {
+        // Do not clone the Arc into the task. Wait on the limiter with a Weak
+        // so a replaced generation can drop while probes are queued.
+        let weak = Arc::downgrade(&lb);
+        let limiter = self.concurrency_limiter.clone();
+        tokio::spawn(async move {
+            let _permit = match limiter.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let Some(lb) = weak.upgrade() else {
+                return;
+            };
+            debug!("Immediate health check for pool {}", id);
+            lb.run_health_check(true).await;
+
+            for (backend, healthy) in lb.backend_health() {
                 if healthy {
                     debug!("Pool {}: Backend {} is HEALTHY (Initial)", id, backend.addr);
                 } else {
@@ -79,7 +113,7 @@ impl GlobalHealthManager {
         lb: Arc<LoadBalancer<Consistent>>,
         frequency: Duration,
     ) {
-        info!(
+        debug!(
             "Registering health check for L2 pool cluster {} (Frequency: {:?})",
             cluster_id, frequency
         );
@@ -92,10 +126,17 @@ impl GlobalHealthManager {
             },
         );
 
-        // Immediate check
-        let lb_clone = lb.clone();
+        let weak = Arc::downgrade(&lb);
+        let limiter = self.concurrency_limiter.clone();
         tokio::spawn(async move {
-            lb_clone.backends().run_health_check(true).await;
+            let _permit = match limiter.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let Some(lb) = weak.upgrade() else {
+                return;
+            };
+            lb.backends().run_health_check(true).await;
         });
     }
 
@@ -103,6 +144,33 @@ impl GlobalHealthManager {
     pub fn unregister(&self, id: i64) {
         self.registry.remove(&id);
         self.parent_registry.remove(&id);
+    }
+
+    /// Drop every registered probe. Used when a full snapshot replaces all sites
+    /// under memory pressure so old load balancers are not kept alive.
+    pub fn unregister_all(&self) {
+        self.registry.clear();
+        self.parent_registry.clear();
+    }
+
+    pub fn origin_check_count(&self) -> usize {
+        self.registry.len()
+    }
+
+    pub fn sweep_dropped_checks(&self) {
+        self.registry.retain(|id, item| {
+            if item.lb.strong_count() == 0 {
+                debug!(
+                    "Removing health check for pool {} (LoadBalancer dropped)",
+                    id
+                );
+                false
+            } else {
+                true
+            }
+        });
+        self.parent_registry
+            .retain(|_id, item| item.lb.strong_count() > 0);
     }
 
     /// Starts the main scheduling loop.
@@ -192,5 +260,37 @@ impl GlobalHealthManager {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn immediate_probe_does_not_pin_replaced_load_balancer() {
+        let health = GlobalHealthManager::new(0);
+        let (lb, _) = crate::rpc::utils::fallback_runtime_lb();
+        health.register(7, Arc::clone(&lb), Duration::from_secs(30));
+        assert_eq!(health.origin_check_count(), 1);
+        drop(lb);
+        tokio::task::yield_now().await;
+        health.sweep_dropped_checks();
+        assert_eq!(
+            health.origin_check_count(),
+            0,
+            "health checks must not keep a replaced load balancer alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_register_lets_replaced_lb_drop() {
+        let health = GlobalHealthManager::new(4);
+        let (lb, _) = crate::rpc::utils::fallback_runtime_lb();
+        health.register_deferred(9, Arc::clone(&lb), Duration::from_secs(30));
+        drop(lb);
+        health.sweep_dropped_checks();
+        assert_eq!(health.origin_check_count(), 0);
     }
 }

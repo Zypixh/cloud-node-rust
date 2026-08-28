@@ -118,16 +118,12 @@ pub async fn sync_updating_server_list_once(
                             .iter()
                             .filter_map(|server| server.id)
                             .collect::<std::collections::HashSet<_>>();
-                        let enabled = servers
-                            .into_iter()
-                            .filter(|server| server.is_on)
-                            .collect::<Vec<_>>();
                         let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
                             config_store.get_origin_runtime_context().await;
                         let global_http =
                             Some((*config_store.get_global_http_config_sync()).clone());
-                        let (server_map, route_map) = build_runtime_maps(
-                            enabled.clone(),
+                        let maps = build_runtime_maps(
+                            servers,
                             health_manager,
                             node_level,
                             parent_nodes,
@@ -136,40 +132,20 @@ pub async fn sync_updating_server_list_once(
                             global_http,
                         )
                         .await;
-                        for server_id in changed {
-                            if server_id > 0 {
-                                config_store.remove_server(server_id).await;
-                            }
-                        }
-                        for server in enabled {
-                            if let Some(server_id) = server.id
-                                && server_id > 0
-                            {
-                                let replacement = Arc::new(server);
-                                config_store
-                                    .replace_server(
-                                        server_id,
-                                        vec![replacement],
-                                        server_map
-                                            .iter()
-                                            .filter_map(|(host, cfg)| {
-                                                (cfg.id == Some(server_id))
-                                                    .then_some((host.clone(), cfg.clone()))
-                                            })
-                                            .collect(),
-                                        route_map
-                                            .iter()
-                                            .filter_map(|(host, lb)| {
-                                                server_map.get(host).and_then(|cfg| {
-                                                    (cfg.id == Some(server_id))
-                                                        .then_some((host.clone(), lb.clone()))
-                                                })
-                                            })
-                                            .collect(),
-                                    )
-                                    .await;
-                            }
-                        }
+                        let added = maps
+                            .all_servers
+                            .into_iter()
+                            .filter(|server| server.is_on)
+                            .collect::<Vec<_>>();
+                        config_store
+                            .replace_servers_snapshot(
+                                changed,
+                                added,
+                                maps.servers,
+                                maps.routes,
+                                maps.id_to_lb,
+                            )
+                            .await;
                         refresh_certificates(config_store, cert_selector).await;
                     }
                     Err(e) => {
