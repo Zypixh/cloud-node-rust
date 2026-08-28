@@ -20,6 +20,12 @@ pub struct PipelineMetricsSnapshot {
     pub internal_api_rejected: u64,
     pub rpc_stream_command_rejected: u64,
     pub rpc_stream_reply_dropped: u64,
+    pub config_task_batches_published: u64,
+    pub config_task_batches_deferred: u64,
+    pub config_task_prepare_failed: u64,
+    pub config_task_commit_rejected: u64,
+    pub config_task_ack_failed: u64,
+    pub config_task_deferred: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +48,12 @@ pub enum PipelineCounter {
     InternalApiRejected,
     RpcStreamCommandRejected,
     RpcStreamReplyDropped,
+    ConfigTaskBatchesPublished,
+    ConfigTaskBatchesDeferred,
+    ConfigTaskPrepareFailed,
+    ConfigTaskCommitRejected,
+    ConfigTaskAckFailed,
+    ConfigTaskDeferred,
 }
 
 struct PipelineMetrics {
@@ -63,6 +75,12 @@ struct PipelineMetrics {
     internal_api_rejected: AtomicU64,
     rpc_stream_command_rejected: AtomicU64,
     rpc_stream_reply_dropped: AtomicU64,
+    config_task_batches_published: AtomicU64,
+    config_task_batches_deferred: AtomicU64,
+    config_task_prepare_failed: AtomicU64,
+    config_task_commit_rejected: AtomicU64,
+    config_task_ack_failed: AtomicU64,
+    config_task_deferred: AtomicU64,
 }
 
 impl PipelineMetrics {
@@ -86,6 +104,12 @@ impl PipelineMetrics {
             internal_api_rejected: AtomicU64::new(0),
             rpc_stream_command_rejected: AtomicU64::new(0),
             rpc_stream_reply_dropped: AtomicU64::new(0),
+            config_task_batches_published: AtomicU64::new(0),
+            config_task_batches_deferred: AtomicU64::new(0),
+            config_task_prepare_failed: AtomicU64::new(0),
+            config_task_commit_rejected: AtomicU64::new(0),
+            config_task_ack_failed: AtomicU64::new(0),
+            config_task_deferred: AtomicU64::new(0),
         }
     }
 
@@ -103,14 +127,18 @@ impl PipelineMetrics {
             PipelineCounter::LocalLogWriteFailed => &self.local_log_write_failed,
             PipelineCounter::LocalLogRotationFailed => &self.local_log_rotation_failed,
             PipelineCounter::KernelSyncCoalesced => &self.kernel_sync_coalesced,
-            PipelineCounter::KernelSyncReconcileRequested => {
-                &self.kernel_sync_reconcile_requested
-            }
+            PipelineCounter::KernelSyncReconcileRequested => &self.kernel_sync_reconcile_requested,
             PipelineCounter::KernelSyncFailed => &self.kernel_sync_failed,
             PipelineCounter::XdpMapSyncFailed => &self.xdp_map_sync_failed,
             PipelineCounter::InternalApiRejected => &self.internal_api_rejected,
             PipelineCounter::RpcStreamCommandRejected => &self.rpc_stream_command_rejected,
             PipelineCounter::RpcStreamReplyDropped => &self.rpc_stream_reply_dropped,
+            PipelineCounter::ConfigTaskBatchesPublished => &self.config_task_batches_published,
+            PipelineCounter::ConfigTaskBatchesDeferred => &self.config_task_batches_deferred,
+            PipelineCounter::ConfigTaskPrepareFailed => &self.config_task_prepare_failed,
+            PipelineCounter::ConfigTaskCommitRejected => &self.config_task_commit_rejected,
+            PipelineCounter::ConfigTaskAckFailed => &self.config_task_ack_failed,
+            PipelineCounter::ConfigTaskDeferred => &self.config_task_deferred,
         }
     }
 
@@ -134,10 +162,16 @@ impl PipelineMetrics {
             kernel_sync_failed: self.kernel_sync_failed.load(Ordering::Relaxed),
             xdp_map_sync_failed: self.xdp_map_sync_failed.load(Ordering::Relaxed),
             internal_api_rejected: self.internal_api_rejected.load(Ordering::Relaxed),
-            rpc_stream_command_rejected: self
-                .rpc_stream_command_rejected
-                .load(Ordering::Relaxed),
+            rpc_stream_command_rejected: self.rpc_stream_command_rejected.load(Ordering::Relaxed),
             rpc_stream_reply_dropped: self.rpc_stream_reply_dropped.load(Ordering::Relaxed),
+            config_task_batches_published: self
+                .config_task_batches_published
+                .load(Ordering::Relaxed),
+            config_task_batches_deferred: self.config_task_batches_deferred.load(Ordering::Relaxed),
+            config_task_prepare_failed: self.config_task_prepare_failed.load(Ordering::Relaxed),
+            config_task_commit_rejected: self.config_task_commit_rejected.load(Ordering::Relaxed),
+            config_task_ack_failed: self.config_task_ack_failed.load(Ordering::Relaxed),
+            config_task_deferred: self.config_task_deferred.load(Ordering::Relaxed),
         }
     }
 }

@@ -597,14 +597,11 @@ impl NodeLogUploader {
         batch_size: usize,
         flush_interval: Duration,
     ) -> Self {
-        let snapshot = crate::memory_governor::MEMORY_GOVERNOR.snapshot(
-            crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads(),
-        );
-        let retry_queue_capacity = usize::try_from(
-            snapshot.logging_retry_budget_bytes / 1024,
-        )
-        .unwrap_or(usize::MAX)
-        .max(batch_size.max(1));
+        let snapshot = crate::memory_governor::MEMORY_GOVERNOR
+            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
+        let retry_queue_capacity = usize::try_from(snapshot.logging_retry_budget_bytes / 1024)
+            .unwrap_or(usize::MAX)
+            .max(batch_size.max(1));
         Self {
             rx,
             api_config,
@@ -748,12 +745,7 @@ impl NodeLogUploader {
         let request = pb::CreateNodeLogsRequest {
             node_logs: logs_to_send,
         };
-        match tokio::time::timeout(
-            self.request_timeout,
-            client.create_node_logs(request),
-        )
-        .await
-        {
+        match tokio::time::timeout(self.request_timeout, client.create_node_logs(request)).await {
             Ok(Ok(_)) => {
                 info!("Successfully uploaded {} node logs", count);
                 self.consecutive_failures = 0;
@@ -870,8 +862,7 @@ mod node_log_uploader_tests {
     #[test]
     fn enqueue_merges_same_type_into_count() {
         let (_tx, rx) = mpsc::channel(8);
-        let mut uploader =
-            NodeLogUploader::new(rx, sample_api_config(), 8, Duration::from_secs(5));
+        let mut uploader = NodeLogUploader::new(rx, sample_api_config(), 8, Duration::from_secs(5));
         uploader.retry_queue_capacity = 8;
 
         uploader.enqueue_node_log(sample_node_log("apiNodeListFailed", "first", 1), false);
@@ -883,14 +874,16 @@ mod node_log_uploader_tests {
         assert_eq!(first.r#type, "apiNodeListFailed");
         assert_eq!(first.count, 5);
         assert_eq!(first.description, "second");
-        assert_eq!(uploader.retry_queue.back().unwrap().r#type, "ocspListFailed");
+        assert_eq!(
+            uploader.retry_queue.back().unwrap().r#type,
+            "ocspListFailed"
+        );
     }
 
     #[test]
     fn upload_backoff_grows_and_caps() {
         let (_tx, rx) = mpsc::channel(1);
-        let mut uploader =
-            NodeLogUploader::new(rx, sample_api_config(), 1, Duration::from_secs(5));
+        let mut uploader = NodeLogUploader::new(rx, sample_api_config(), 1, Duration::from_secs(5));
 
         uploader.consecutive_failures = 1;
         assert_eq!(uploader.upload_backoff(), Duration::from_secs(5));

@@ -290,7 +290,12 @@ fn decrypt_and_parse(
         return DecryptResult::None;
     };
     if cipher
-        .decrypt_inout_detached(&nonce, &header_bytes, InOutBuf::from(&mut ciphertext[..]), &tag)
+        .decrypt_inout_detached(
+            &nonce,
+            &header_bytes,
+            InOutBuf::from(&mut ciphertext[..]),
+            &tag,
+        )
         .is_err()
     {
         return DecryptResult::None;

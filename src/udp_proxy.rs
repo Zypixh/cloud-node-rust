@@ -945,9 +945,7 @@ impl UdpProxyManager {
     }
 
     async fn record_client_short_header_cid(session: &UdpSession, packet: &[u8]) {
-        if session.quic_cid_tx.is_none()
-            || packet.first().is_none_or(|first| first & 0x80 != 0)
-        {
+        if session.quic_cid_tx.is_none() || packet.first().is_none_or(|first| first & 0x80 != 0) {
             return;
         }
 

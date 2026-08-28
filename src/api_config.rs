@@ -52,11 +52,20 @@ impl KernelTuningConfig {
 pub struct RelayConfig {
     #[serde(rename = "zeroCopy", default)]
     pub zero_copy: bool,
-    #[serde(rename = "tcpKeepaliveIdleSecs", default = "default_tcp_keepalive_idle_secs")]
+    #[serde(
+        rename = "tcpKeepaliveIdleSecs",
+        default = "default_tcp_keepalive_idle_secs"
+    )]
     pub tcp_keepalive_idle_secs: u32,
-    #[serde(rename = "tcpKeepaliveIntervalSecs", default = "default_tcp_keepalive_interval_secs")]
+    #[serde(
+        rename = "tcpKeepaliveIntervalSecs",
+        default = "default_tcp_keepalive_interval_secs"
+    )]
     pub tcp_keepalive_interval_secs: u32,
-    #[serde(rename = "tcpKeepaliveProbes", default = "default_tcp_keepalive_probes")]
+    #[serde(
+        rename = "tcpKeepaliveProbes",
+        default = "default_tcp_keepalive_probes"
+    )]
     pub tcp_keepalive_probes: u32,
 }
 
@@ -408,7 +417,10 @@ pub fn validate_rpc_endpoint(endpoint: &str) -> anyhow::Result<String> {
     let authority = uri
         .authority()
         .ok_or_else(|| anyhow::anyhow!("RPC endpoint {endpoint:?} has no host"))?;
-    if uri.path_and_query().is_some_and(|value| value.as_str() != "/") {
+    if uri
+        .path_and_query()
+        .is_some_and(|value| value.as_str() != "/")
+    {
         anyhow::bail!("RPC endpoint {endpoint:?} must not contain a path or query");
     }
     if authority.as_str().contains('@') {

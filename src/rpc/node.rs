@@ -1561,6 +1561,12 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "internalApiRejected": pipeline_metrics.internal_api_rejected,
             "rpcStreamCommandRejected": pipeline_metrics.rpc_stream_command_rejected,
             "rpcStreamReplyDropped": pipeline_metrics.rpc_stream_reply_dropped,
+            "configTaskBatchesPublished": pipeline_metrics.config_task_batches_published,
+            "configTaskBatchesDeferred": pipeline_metrics.config_task_batches_deferred,
+            "configTaskPrepareFailed": pipeline_metrics.config_task_prepare_failed,
+            "configTaskCommitRejected": pipeline_metrics.config_task_commit_rejected,
+            "configTaskAckFailed": pipeline_metrics.config_task_ack_failed,
+            "configTaskDeferred": pipeline_metrics.config_task_deferred,
         });
 
         let status = serde_json::json!({

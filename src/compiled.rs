@@ -1292,6 +1292,50 @@ impl CompiledPlanSet {
         }
     }
 
+    pub fn with_server_updates(
+        previous: &Self,
+        changed_server_ids: &std::collections::HashSet<i64>,
+        changed_servers: &[Arc<ServerConfig>],
+    ) -> Self {
+        let mut next = previous.clone();
+        for server_id in changed_server_ids {
+            next.server_firewall.remove(server_id);
+            next.server_cache.remove(server_id);
+            next.server_headers.remove(server_id);
+            next.server_rewrite.remove(server_id);
+            next.server_features.remove(server_id);
+        }
+
+        for server in changed_servers {
+            let server_id = server.numeric_id();
+            if let Some(policy) = server
+                .web
+                .as_ref()
+                .and_then(|web| web.firewall_policy.as_ref())
+            {
+                next.server_firewall.insert(
+                    server_id,
+                    Arc::new(crate::firewall::compiled::CompiledFirewallPolicy::compile(
+                        policy,
+                    )),
+                );
+            }
+            if let Some(plan) = CompiledWebCachePlan::compile(server) {
+                next.server_cache.insert(server_id, Arc::new(plan));
+            }
+            if let Some(plan) = crate::headers::CompiledServerHeaderPlan::compile(server) {
+                next.server_headers.insert(server_id, Arc::new(plan));
+            }
+            if let Some(plan) = crate::rewrite::CompiledServerRewritePlan::compile(server) {
+                next.server_rewrite.insert(server_id, Arc::new(plan));
+            }
+            if let Some(plan) = CompiledServerFeaturePlan::compile(server) {
+                next.server_features.insert(server_id, Arc::new(plan));
+            }
+        }
+        next
+    }
+
     pub fn compile_firewall(
         global_policies: &[HTTPFirewallPolicy],
         servers: &[Arc<ServerConfig>],

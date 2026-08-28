@@ -15,11 +15,12 @@ pub struct MemoryPlanItem {
 
 pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
     let snapshot = MEMORY_GOVERNOR.snapshot(pingora_threads);
+    let config_sync_budget = MEMORY_GOVERNOR.config_sync_budget();
     let l4_pressure = crate::l4_defense::current_pressure_level();
     let l4_metrics = crate::l4_defense::metrics_snapshot();
     MemoryPlan {
         summary: format!(
-            "memory total={} used={} available={} pressure={} l4_pressure={} prefix_pressure={} tcp_like_per_ip_limit={} fd_used={} fd_soft_limit={} fd_used_pct={} fd_pressure={} cpu_parallelism={} pingora_threads={} http_accept_workers={} tcp_accept_workers={} udp_demux_workers={} conn_budget={} conn_admission_used={} zero_copy_active={} zero_copy_limit={} udp_queued={} udp_queue_budget={} admission_rejects_total={} l4_events={} l4_blocked={} l4_prefix_events={} l4_prefix_blocked={} l4_counter_saturated={} l4_top_kind={} l4_top_prefix={} l4_top_prefix_events={} l4_distinct_ips_recent={} keepalive_budget={} cache_budget={} bloom_budget={} cgroup_managed={} cgroup_max={} cgroup_high={} cgroup_swap_max={} rss={} pss={} anon_rss={} resident_est={}",
+            "memory total={} used={} available={} pressure={} l4_pressure={} prefix_pressure={} tcp_like_per_ip_limit={} fd_used={} fd_soft_limit={} fd_used_pct={} fd_pressure={} cpu_parallelism={} pingora_threads={} http_accept_workers={} tcp_accept_workers={} udp_demux_workers={} conn_budget={} conn_admission_used={} zero_copy_active={} zero_copy_limit={} udp_queued={} udp_queue_budget={} admission_rejects_total={} l4_events={} l4_blocked={} l4_prefix_events={} l4_prefix_blocked={} l4_counter_saturated={} l4_top_kind={} l4_top_prefix={} l4_top_prefix_events={} l4_distinct_ips_recent={} keepalive_budget={} cache_budget={} bloom_budget={} config_sync_staging_budget={} config_sync_commit_reserve={} config_sync_prepare_allowed={} config_sync_commit_allowed={} cgroup_managed={} cgroup_max={} cgroup_high={} cgroup_swap_max={} rss={} pss={} anon_rss={} resident_est={}",
             snapshot.memory_total_bytes,
             snapshot.memory_used_bytes,
             snapshot.memory_available_bytes,
@@ -55,6 +56,10 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
             snapshot.keepalive_budget_bytes,
             snapshot.cache_budget_bytes,
             snapshot.bloom_budget_bytes,
+            config_sync_budget.staging_budget_bytes,
+            config_sync_budget.commit_reserve_bytes,
+            config_sync_budget.allow_new_prepare,
+            config_sync_budget.allow_commit,
             snapshot.cgroup_managed,
             snapshot.cgroup_memory_max_bytes,
             snapshot.cgroup_memory_high_bytes,
@@ -178,6 +183,19 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                     snapshot.admission_rejects.cache_revalidate,
                     snapshot.admission_rejects.cache_write,
                     snapshot.admission_rejects.cache_read_memory
+                ),
+            },
+            MemoryPlanItem {
+                area: "config_sync",
+                purpose: "stage configuration updates only when runtime publication reserve remains available",
+                policy: format!(
+                    "pressure={} available={} staging_budget={} commit_reserve={} allow_prepare={} allow_commit={}",
+                    config_sync_budget.pressure_level.as_str(),
+                    config_sync_budget.available_bytes,
+                    config_sync_budget.staging_budget_bytes,
+                    config_sync_budget.commit_reserve_bytes,
+                    config_sync_budget.allow_new_prepare,
+                    config_sync_budget.allow_commit
                 ),
             },
             MemoryPlanItem {

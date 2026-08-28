@@ -130,7 +130,8 @@ async fn download_file(
         .as_ref()
         .map(|file| file.size)
         .filter(|size| *size > 0)
-        .ok_or_else(|| anyhow::anyhow!("IP library artifact has no valid size"))? as u64;
+        .ok_or_else(|| anyhow::anyhow!("IP library artifact has no valid size"))?
+        as u64;
     let max_bytes = crate::memory_governor::MEMORY_GOVERNOR
         .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
         .cardinality_state_budget_bytes

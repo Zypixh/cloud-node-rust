@@ -7,6 +7,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub struct PreparedRuntimeMaps {
+    pub servers: HashMap<String, Arc<ServerConfig>>,
+    pub routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
+    pub health_checks: Vec<(i64, Arc<crate::lb_factory::AnyLoadBalancer>)>,
+}
+
 #[allow(clippy::type_complexity)]
 pub fn server_runtime_names(server: &ServerConfig) -> Vec<String> {
     let mut names = server.get_plain_server_names();
@@ -52,8 +58,32 @@ pub async fn build_runtime_maps(
     HashMap<String, Arc<ServerConfig>>,
     HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
 ) {
+    let prepared = build_runtime_maps_prepared(
+        servers,
+        node_level,
+        parent_nodes,
+        tiered_origin_bypass,
+        allow_lan,
+        global_http,
+    )
+    .await;
+    for (server_id, lb) in prepared.health_checks {
+        health_manager.register(server_id, lb, Duration::from_secs(30));
+    }
+    (prepared.servers, prepared.routes)
+}
+
+pub async fn build_runtime_maps_prepared(
+    servers: Vec<ServerConfig>,
+    node_level: i32,
+    parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
+    tiered_origin_bypass: bool,
+    allow_lan: bool,
+    global_http: Option<crate::config_models::GlobalHTTPAllConfig>,
+) -> PreparedRuntimeMaps {
     let mut new_servers = HashMap::new();
     let mut new_routes = HashMap::new();
+    let mut health_checks = Vec::new();
 
     for server in servers {
         server.compile_url_patterns();
@@ -88,10 +118,8 @@ pub async fn build_runtime_maps(
             fallback_runtime_lb()
         };
 
-        if let Some(id) = server.id {
-            if has_hc {
-                health_manager.register(id, lb_arc.clone(), Duration::from_secs(30));
-            }
+        if has_hc && let Some(id) = server.id {
+            health_checks.push((id, lb_arc.clone()));
         }
 
         let names = server_runtime_names(&server);
@@ -108,7 +136,11 @@ pub async fn build_runtime_maps(
         }
     }
 
-    (new_servers, new_routes)
+    PreparedRuntimeMaps {
+        servers: new_servers,
+        routes: new_routes,
+        health_checks,
+    }
 }
 
 pub(crate) fn fallback_runtime_lb() -> (Arc<crate::lb_factory::AnyLoadBalancer>, bool) {

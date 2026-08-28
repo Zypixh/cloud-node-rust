@@ -812,7 +812,7 @@ impl HttpProxyManager {
 
             tokio::spawn(async move {
                 let _client_permit = client_permit;
-                let _connection_permit = connection_permit;
+                let connection_permit = connection_permit;
                 let mut configured_tls_host = false;
                 let mut count_tls_handshake_failure = true;
 
@@ -844,6 +844,7 @@ impl HttpProxyManager {
                             configured_tls_host = route.has_l7_server;
                             if let Some(server) = route.sni_passthrough_server {
                                 drop(connection_guard);
+                                drop(connection_permit);
                                 let sni_connection_guard = l4_connection_registry::register(
                                     client_addr.ip(),
                                     L4ConnectionProtocol::SniTcp,
@@ -1697,6 +1698,9 @@ impl HttpProxyManager {
         let backend_addr = backend_target.addr;
         let origin_id = backend_target.origin_id;
         let proxy_protocol_to_origin = backend_target.proxy_protocol;
+        let sni_relay_permit = MEMORY_GOVERNOR
+            .try_admit_sni_relay()
+            .ok_or_else(|| anyhow::anyhow!("SNI relay memory admission rejected"))?;
         let origin_connect_permit = MEMORY_GOVERNOR
             .try_admit(AdmissionClass::OriginConnect)
             .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
@@ -1872,6 +1876,7 @@ impl HttpProxyManager {
         let connect_latency_ms = started.elapsed().as_millis() as i64;
         crate::rpc::stats::push_origin_health_event(origin_id, true, connect_latency_ms);
         drop(origin_connect_permit);
+        let _sni_relay_permit = sni_relay_permit;
 
         let result = match client_stream {
             SniPassthroughClient::Tcp(client_stream) => {
@@ -2387,19 +2392,14 @@ async fn connect_passthrough_backend_with_retry(
         Ok(stream) => Ok(stream),
         Err(first_err) => {
             tokio::time::sleep(RETRY_DELAY).await;
-            crate::toa::connect_with_toa(
-                backend_addr,
-                client_addr,
-                toa_config,
-                CONNECT_TIMEOUT,
-            )
-            .await
-            .map_err(|second_err| {
-                second_err.context(format!(
-                    "retry failed for upstream {} (first error: {})",
-                    backend_addr, first_err
-                ))
-            })
+            crate::toa::connect_with_toa(backend_addr, client_addr, toa_config, CONNECT_TIMEOUT)
+                .await
+                .map_err(|second_err| {
+                    second_err.context(format!(
+                        "retry failed for upstream {} (first error: {})",
+                        backend_addr, first_err
+                    ))
+                })
         }
     }
 }

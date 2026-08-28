@@ -259,8 +259,7 @@ impl Drop for ActiveIpPermit {
 static TCP_ACTIVE_IP_TRACKER: LazyLock<ActiveIpTracker> = LazyLock::new(ActiveIpTracker::new);
 static L4_METRICS: LazyLock<L4DefenseMetrics> = LazyLock::new(L4DefenseMetrics::new);
 static L4_AGGREGATES: LazyLock<L4AggregateState> = LazyLock::new(L4AggregateState::new);
-static L4_EXACT_COUNTERS: LazyLock<L4ExactCounterState> =
-    LazyLock::new(L4ExactCounterState::new);
+static L4_EXACT_COUNTERS: LazyLock<L4ExactCounterState> = LazyLock::new(L4ExactCounterState::new);
 static LAST_BLOCK_WARN_AT_MS: AtomicI64 = AtomicI64::new(0);
 static LAST_COUNTER_SATURATION_WARN_AT_MS: AtomicI64 = AtomicI64::new(0);
 
@@ -436,30 +435,27 @@ impl L4AggregateState {
         let budget = MEMORY_GOVERNOR
             .snapshot(MEMORY_GOVERNOR.pingora_worker_threads())
             .l4_aggregate_state_budget_bytes;
-        (budget
-            / L4_AGGREGATE_ESTIMATED_BYTES
-            .saturating_mul(prefix_count.max(1) as u64))
-        .max(1)
-        .min(usize::MAX as u64) as usize
+        (budget / L4_AGGREGATE_ESTIMATED_BYTES.saturating_mul(prefix_count.max(1) as u64))
+            .max(1)
+            .min(usize::MAX as u64) as usize
     }
 
     fn record(&self, cluster_id: i64, ip: IpAddr, kind: L4DefenseKind) -> AggregateRecord {
         let now = Instant::now();
         self.sweep_if_needed(now);
-        let prefix_capacity = self
-            .capacity()
-            .max(L4_SURGE_DISTINCT_IP_CRITICAL)
-            .max(1);
+        let prefix_capacity = self.capacity().max(L4_SURGE_DISTINCT_IP_CRITICAL).max(1);
         let key = L4AggregateKey::from_ip(ip);
         let mut prefix_counter = if self.prefix_counts.contains_key(&(cluster_id, key))
             || self.prefix_counts.len() < prefix_capacity
         {
-            Some(self.prefix_counts.entry((cluster_id, key)).or_insert_with(|| {
-                PrefixCountWindow {
-                    last_seen: now,
-                    count: AtomicU64::new(0),
-                }
-            }))
+            Some(
+                self.prefix_counts
+                    .entry((cluster_id, key))
+                    .or_insert_with(|| PrefixCountWindow {
+                        last_seen: now,
+                        count: AtomicU64::new(0),
+                    }),
+            )
         } else {
             None
         };
@@ -530,7 +526,12 @@ impl L4AggregateState {
         let (top_prefix, top_prefix_events) = self
             .prefix_counts
             .iter()
-            .map(|entry| (entry.key().1.label(), entry.value().count.load(Ordering::Relaxed)))
+            .map(|entry| {
+                (
+                    entry.key().1.label(),
+                    entry.value().count.load(Ordering::Relaxed),
+                )
+            })
             .max_by_key(|(_, count)| *count)
             .unwrap_or_default();
         AggregateSnapshot {
@@ -566,9 +567,8 @@ impl L4AggregateState {
                 .map(|window| now.duration_since(window.started_at) < L4_AGGREGATE_WINDOW)
                 .unwrap_or(false)
         });
-        self.prefix_counts.retain(|_, window| {
-            now.duration_since(window.last_seen) < L4_AGGREGATE_WINDOW
-        });
+        self.prefix_counts
+            .retain(|_, window| now.duration_since(window.last_seen) < L4_AGGREGATE_WINDOW);
     }
 }
 
@@ -1067,9 +1067,7 @@ pub fn current_tcp_active_limit_per_ip() -> usize {
 }
 
 pub fn current_sni_tcp_active_limit_per_ip() -> usize {
-    current_tcp_active_limit_per_ip()
-        .saturating_mul(4)
-        .max(256)
+    current_tcp_active_limit_per_ip().saturating_mul(4).max(256)
 }
 
 pub fn first_byte_timeout(level: L4PressureLevel) -> Duration {
@@ -1526,9 +1524,8 @@ pub fn record_l4_event_scored(
 
 fn drain_l4_connections_for_ip(ip: IpAddr, kind: L4DefenseKind, reason: &'static str) {
     let drained = if kind.preserves_sni_tcp_tunnels() {
-        l4_connection_registry::L4_CONNECTION_REGISTRY.drain_matching(|conn| {
-            conn.ip == ip && conn.protocol != L4ConnectionProtocol::SniTcp
-        })
+        l4_connection_registry::L4_CONNECTION_REGISTRY
+            .drain_matching(|conn| conn.ip == ip && conn.protocol != L4ConnectionProtocol::SniTcp)
     } else {
         l4_connection_registry::drain_ip(ip)
     };
@@ -2372,7 +2369,10 @@ mod tests {
             L4DefenseKind::H2StreamAdmissionReject,
             L4DefenseKind::H2RequestChurn,
         ] {
-            assert!(kind.is_h2_defense(), "{kind:?} should land in H2 defense metrics");
+            assert!(
+                kind.is_h2_defense(),
+                "{kind:?} should land in H2 defense metrics"
+            );
         }
         for kind in [
             L4DefenseKind::QuicNewRouteFlood,

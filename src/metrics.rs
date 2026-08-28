@@ -362,9 +362,7 @@ impl RuntimeDistinctIpTracker {
         Self {
             ips: dashmap::DashSet::new(),
             reserved: AtomicUsize::new(0),
-            capacity: (tracker_budget / 64)
-                .max(1)
-                .min(usize::MAX as u64) as usize,
+            capacity: (tracker_budget / 64).max(1).min(usize::MAX as u64) as usize,
         }
     }
 
@@ -1257,7 +1255,10 @@ mod tests {
     fn runtime_distinct_ip_tracker_fail_closed_at_capacity() {
         let tracker = super::RuntimeDistinctIpTracker::new(1);
         let capacity = tracker.capacity();
-        assert!(capacity > 0, "distinct IP tracker must derive a positive capacity");
+        assert!(
+            capacity > 0,
+            "distinct IP tracker must derive a positive capacity"
+        );
 
         for i in 0..capacity.saturating_add(128) {
             let ip = IpAddr::from([10, 0, (i / 256) as u8, (i % 256) as u8]);

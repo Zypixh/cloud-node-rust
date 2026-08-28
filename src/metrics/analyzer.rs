@@ -175,21 +175,12 @@ impl<K: Hash + Eq, V: Clone> ShardedLru<K, V> {
 }
 
 // Cache for GeoIP results (IP -> GeoInfo)
-static GEO_CACHE: Lazy<ShardedLru<IpAddr, Option<GeoInfo>>> = Lazy::new(|| {
-    ShardedLru::new(cache_capacity_per_shard(
-        GEO_CACHE_ENTRY_ESTIMATED_BYTES,
-        4,
-    ))
-});
+static GEO_CACHE: Lazy<ShardedLru<IpAddr, Option<GeoInfo>>> =
+    Lazy::new(|| ShardedLru::new(cache_capacity_per_shard(GEO_CACHE_ENTRY_ESTIMATED_BYTES, 4)));
 
 // Cache for User-Agent results (UA string -> (Arc<str>, Arc<str>))
 static UA_CACHE: Lazy<ShardedLru<String, (Arc<str>, Arc<str>, Arc<str>, Arc<str>)>> =
-    Lazy::new(|| {
-        ShardedLru::new(cache_capacity_per_shard(
-            UA_CACHE_ENTRY_ESTIMATED_BYTES,
-            4,
-        ))
-    });
+    Lazy::new(|| ShardedLru::new(cache_capacity_per_shard(UA_CACHE_ENTRY_ESTIMATED_BYTES, 4)));
 
 static UA_PARSER: Lazy<Parser> = Lazy::new(Parser::new);
 

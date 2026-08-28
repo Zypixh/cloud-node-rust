@@ -216,8 +216,7 @@ fn node_log_throttle_interval_ms(log_type: Option<&str>) -> i64 {
 }
 
 fn throttle_node_log(key: &str, interval_ms: i64, now_ms: i64) -> Option<i32> {
-    if NODE_LOG_THROTTLE.len() >= NODE_LOG_THROTTLE_MAX_KEYS
-        && !NODE_LOG_THROTTLE.contains_key(key)
+    if NODE_LOG_THROTTLE.len() >= NODE_LOG_THROTTLE_MAX_KEYS && !NODE_LOG_THROTTLE.contains_key(key)
     {
         // Under key-cardinality pressure, still emit but skip tracking.
         return Some(1);

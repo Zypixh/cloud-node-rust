@@ -48,9 +48,8 @@ fn sweep_idle() {
     let cutoff = Instant::now()
         .checked_sub(H3_POOL_IDLE)
         .unwrap_or_else(Instant::now);
-    H3_CONNECTION_POOL.retain(|_, entry| {
-        entry.last_used >= cutoff && entry.connection.close_reason().is_none()
-    });
+    H3_CONNECTION_POOL
+        .retain(|_, entry| entry.last_used >= cutoff && entry.connection.close_reason().is_none());
 }
 
 #[cfg(test)]

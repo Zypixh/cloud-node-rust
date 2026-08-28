@@ -313,6 +313,37 @@ pub struct HotPathSnapshot {
     pub enabled_features: EnabledNodeFeatures,
 }
 
+#[derive(Clone)]
+pub struct OriginBuildContext {
+    pub generation: u64,
+    pub node_level: i32,
+    pub parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
+    pub tiered_origin_bypass: bool,
+    pub allow_lan: bool,
+    pub global_http: Option<crate::config_models::GlobalHTTPAllConfig>,
+}
+
+pub enum ServerRuntimeMutation {
+    ReplaceServer {
+        server_id: i64,
+        all_servers: Vec<Arc<ServerConfig>>,
+        servers: HashMap<String, Arc<ServerConfig>>,
+        routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
+    },
+    ReplaceUserServers {
+        user_id: i64,
+        all_servers: Vec<Arc<ServerConfig>>,
+        servers: HashMap<String, Arc<ServerConfig>>,
+        routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
+    },
+    RemoveServer {
+        server_id: i64,
+    },
+    RemoveUserServers {
+        user_id: i64,
+    },
+}
+
 impl Default for ConfigStore {
     fn default() -> Self {
         Self::new()
@@ -981,6 +1012,26 @@ impl ConfigStore {
         )
     }
 
+    pub fn origin_build_context_snapshot(&self) -> OriginBuildContext {
+        loop {
+            let before = self.runtime_reload_generation();
+            let context = {
+                let lock = self.inner.read();
+                OriginBuildContext {
+                    generation: before,
+                    node_level: lock.level,
+                    parent_nodes: Arc::clone(&lock.parent_nodes),
+                    tiered_origin_bypass: lock.tiered_origin_bypass,
+                    allow_lan: lock.allow_lan_ip,
+                    global_http: Some((*lock.global_http_config).clone()),
+                }
+            };
+            if self.runtime_reload_generation() == before {
+                return context;
+            }
+        }
+    }
+
     pub fn get_upstream_peer_context_with_firewall_policies_sync(
         &self,
     ) -> (i32, bool, bool, bool, i64, Arc<Vec<HTTPFirewallPolicy>>) {
@@ -1241,7 +1292,12 @@ impl ConfigStore {
     pub async fn set_tiered_origin_bypass(&self, bypass: bool) {
         let _update = self.update_gate.lock();
         let mut lock = self.inner.write();
+        if lock.tiered_origin_bypass == bypass {
+            return;
+        }
         lock.tiered_origin_bypass = bypass;
+        drop(lock);
+        self.notify_runtime_reload();
     }
 
     pub async fn get_node_id(&self) -> i64 {
@@ -1499,8 +1555,8 @@ impl ConfigStore {
         Self::refresh_passthrough_indexes(&mut candidate);
         Self::refresh_cluster_policy_indexes(&mut candidate);
         *self.inner.write() = candidate;
-        drop(_update);
         self.notify_runtime_reload();
+        drop(_update);
     }
 
     pub async fn replace_user_servers(
@@ -1560,8 +1616,8 @@ impl ConfigStore {
         Self::refresh_passthrough_indexes(&mut candidate);
         Self::refresh_cluster_policy_indexes(&mut candidate);
         *self.inner.write() = candidate;
-        drop(_update);
         self.notify_runtime_reload();
+        drop(_update);
     }
 
     pub async fn remove_user_servers(&self, user_id: i64) {
@@ -1599,8 +1655,8 @@ impl ConfigStore {
         Self::refresh_passthrough_indexes(&mut candidate);
         Self::refresh_cluster_policy_indexes(&mut candidate);
         *self.inner.write() = candidate;
-        drop(_update);
         self.notify_runtime_reload();
+        drop(_update);
     }
 
     pub async fn remove_server(&self, server_id: i64) {
@@ -1631,8 +1687,8 @@ impl ConfigStore {
         Self::refresh_passthrough_indexes(&mut candidate);
         Self::refresh_cluster_policy_indexes(&mut candidate);
         *self.inner.write() = candidate;
-        drop(_update);
         self.notify_runtime_reload();
+        drop(_update);
     }
 
     pub async fn cache_server_route(
@@ -1663,8 +1719,170 @@ impl ConfigStore {
         Self::refresh_passthrough_indexes(&mut candidate);
         Self::refresh_cluster_policy_indexes(&mut candidate);
         *self.inner.write() = candidate;
-        drop(_update);
         self.notify_runtime_reload();
+        drop(_update);
+    }
+
+    pub async fn apply_server_runtime_mutations_batch(
+        &self,
+        expected_generation: u64,
+        mutations: Vec<ServerRuntimeMutation>,
+    ) -> bool {
+        if mutations.is_empty() {
+            return true;
+        }
+
+        let _update = self.update_gate.lock();
+        if self.runtime_reload_generation() != expected_generation {
+            return false;
+        }
+
+        crate::routing::location::clear_compiled_locations();
+
+        let mut candidate = self.inner.read().clone();
+        let mut changed_server_ids = HashSet::new();
+
+        for mutation in mutations {
+            match mutation {
+                ServerRuntimeMutation::ReplaceServer {
+                    server_id,
+                    all_servers,
+                    servers,
+                    routes,
+                } => {
+                    Self::remove_server_from_candidate(
+                        &mut candidate,
+                        server_id,
+                        &mut changed_server_ids,
+                    );
+                    for server in &all_servers {
+                        changed_server_ids.insert(server.numeric_id());
+                    }
+                    candidate.all_servers.extend(all_servers);
+                    for (host, config) in servers {
+                        candidate.servers.insert(host, config);
+                    }
+                    for (host, lb) in routes {
+                        if server_id > 0 {
+                            candidate.id_to_lb.insert(server_id, lb.clone());
+                        }
+                        candidate.routes.insert(host, lb);
+                    }
+                }
+                ServerRuntimeMutation::ReplaceUserServers {
+                    user_id,
+                    all_servers,
+                    servers,
+                    routes,
+                } => {
+                    Self::remove_user_servers_from_candidate(
+                        &mut candidate,
+                        user_id,
+                        &mut changed_server_ids,
+                    );
+                    for server in &all_servers {
+                        changed_server_ids.insert(server.numeric_id());
+                    }
+                    candidate.all_servers.extend(all_servers);
+                    for (host, config) in servers {
+                        if let Some(server_id) = config.id
+                            && let Some(lb) = routes.get(&host)
+                        {
+                            candidate.id_to_lb.insert(server_id, lb.clone());
+                        }
+                        candidate.servers.insert(host, config);
+                    }
+                    for (host, lb) in routes {
+                        candidate.routes.insert(host, lb);
+                    }
+                }
+                ServerRuntimeMutation::RemoveServer { server_id } => {
+                    Self::remove_server_from_candidate(
+                        &mut candidate,
+                        server_id,
+                        &mut changed_server_ids,
+                    );
+                }
+                ServerRuntimeMutation::RemoveUserServers { user_id } => {
+                    Self::remove_user_servers_from_candidate(
+                        &mut candidate,
+                        user_id,
+                        &mut changed_server_ids,
+                    );
+                }
+            }
+        }
+
+        let changed_servers = candidate
+            .all_servers
+            .iter()
+            .filter(|server| changed_server_ids.contains(&server.numeric_id()))
+            .cloned()
+            .collect::<Vec<_>>();
+        candidate.compiled_plans = Arc::new(crate::compiled::CompiledPlanSet::with_server_updates(
+            candidate.compiled_plans.as_ref(),
+            &changed_server_ids,
+            &changed_servers,
+        ));
+        Self::refresh_passthrough_indexes(&mut candidate);
+        Self::refresh_cluster_policy_indexes(&mut candidate);
+        *self.inner.write() = candidate;
+        self.notify_runtime_reload();
+        drop(_update);
+        true
+    }
+
+    fn remove_server_from_candidate(
+        candidate: &mut NodeConfig,
+        server_id: i64,
+        changed_server_ids: &mut HashSet<i64>,
+    ) {
+        changed_server_ids.insert(server_id);
+        candidate
+            .all_servers
+            .retain(|server| server.numeric_id() != server_id);
+        let stale_hosts = candidate
+            .servers
+            .iter()
+            .filter_map(|(host, server)| (server.numeric_id() == server_id).then_some(host.clone()))
+            .collect::<Vec<_>>();
+        for host in stale_hosts {
+            candidate.servers.remove(&host);
+            candidate.routes.remove(&host);
+        }
+        if server_id > 0 {
+            candidate.id_to_lb.remove(&server_id);
+        }
+    }
+
+    fn remove_user_servers_from_candidate(
+        candidate: &mut NodeConfig,
+        user_id: i64,
+        changed_server_ids: &mut HashSet<i64>,
+    ) {
+        let stale_server_ids = candidate
+            .all_servers
+            .iter()
+            .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
+            .collect::<HashSet<_>>();
+        changed_server_ids.extend(stale_server_ids.iter().copied());
+        candidate
+            .all_servers
+            .retain(|server| server.user_id != user_id);
+        let stale_hosts = candidate
+            .servers
+            .iter()
+            .filter_map(|(host, server)| (server.user_id == user_id).then_some(host.clone()))
+            .collect::<Vec<_>>();
+        for host in stale_hosts {
+            candidate.servers.remove(&host);
+            candidate.routes.remove(&host);
+        }
+        for server_id in stale_server_ids {
+            if server_id > 0 {
+                candidate.id_to_lb.remove(&server_id);
+            }
+        }
     }
 
     fn refresh_plan_derived(lock: &mut NodeConfig) {
@@ -2002,6 +2220,23 @@ impl ConfigStore {
         Self::refresh_plan_derived(&mut lock);
     }
 
+    pub async fn set_active_plans_if_generation(
+        &self,
+        expected_generation: u64,
+        user_plans: HashMap<i64, crate::pb::UserPlan>,
+        plans: HashMap<i64, crate::pb::Plan>,
+    ) -> bool {
+        let _update = self.update_gate.lock();
+        if self.runtime_reload_generation() != expected_generation {
+            return false;
+        }
+        let mut lock = self.inner.write();
+        lock.user_plans = user_plans;
+        lock.plans = plans;
+        Self::refresh_plan_derived(&mut lock);
+        true
+    }
+
     pub async fn update_node_level_info(
         &self,
         level: i32,
@@ -2129,6 +2364,54 @@ mod tests {
                 None,
             )
             .await;
+    }
+
+    #[tokio::test]
+    async fn batch_server_mutations_publish_once_and_reject_stale_generation() {
+        let store = ConfigStore::new();
+        let mutations = [101_i64, 102]
+            .into_iter()
+            .map(|server_id| ServerRuntimeMutation::ReplaceServer {
+                server_id,
+                all_servers: vec![Arc::new(ServerConfig {
+                    id: Some(server_id),
+                    ..Default::default()
+                })],
+                servers: HashMap::new(),
+                routes: HashMap::new(),
+            })
+            .collect();
+
+        assert!(
+            store
+                .apply_server_runtime_mutations_batch(0, mutations)
+                .await
+        );
+        assert_eq!(store.runtime_reload_generation(), 1);
+        let mut ids = store
+            .get_all_servers()
+            .await
+            .into_iter()
+            .map(|server| server.numeric_id())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![101, 102]);
+
+        assert!(
+            !store
+                .apply_server_runtime_mutations_batch(
+                    0,
+                    vec![ServerRuntimeMutation::RemoveServer { server_id: 101 }],
+                )
+                .await
+        );
+        assert_eq!(store.runtime_reload_generation(), 1);
+        assert_eq!(store.get_all_servers().await.len(), 2);
+        assert!(
+            !store
+                .set_active_plans_if_generation(0, HashMap::new(), HashMap::new())
+                .await
+        );
     }
 
     #[tokio::test]

@@ -186,6 +186,23 @@ pub fn drain_ip(ip: IpAddr) -> usize {
     L4_CONNECTION_REGISTRY.drain_ip(ip)
 }
 
+pub fn drain_sni_limited(max: usize) -> usize {
+    let mut selected = L4_CONNECTION_REGISTRY
+        .by_key
+        .iter()
+        .filter_map(|entry| {
+            (entry.key().1 == L4ConnectionProtocol::SniTcp).then(|| entry.value().clone())
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by_key(|conn| conn.started_at);
+    selected.truncate(max);
+    let count = selected.len();
+    for conn in selected {
+        conn.cancel();
+    }
+    count
+}
+
 pub fn snapshot() -> L4ConnectionRegistrySnapshot {
     L4_CONNECTION_REGISTRY.snapshot()
 }

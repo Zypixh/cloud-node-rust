@@ -12,8 +12,8 @@ use std::io::{self, IsTerminal};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, mpsc as std_mpsc};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -54,15 +54,13 @@ struct SharedLogWriter {
 
 impl SharedLogWriter {
     fn new(file: fs::File, path: PathBuf) -> Self {
-        let snapshot = cloud_node_rust::memory_governor::MEMORY_GOVERNOR.snapshot(
-            cloud_node_rust::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads(),
-        );
+        let snapshot = cloud_node_rust::memory_governor::MEMORY_GOVERNOR
+            .snapshot(cloud_node_rust::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
         let estimated_event_bytes = 1024u64;
-        let queue_capacity = usize::try_from(
-            snapshot.local_log_queue_budget_bytes / estimated_event_bytes,
-        )
-        .unwrap_or(usize::MAX)
-        .max(1);
+        let queue_capacity =
+            usize::try_from(snapshot.local_log_queue_budget_bytes / estimated_event_bytes)
+                .unwrap_or(usize::MAX)
+                .max(1);
         let (sender, receiver) = std_mpsc::sync_channel(queue_capacity);
         let dropped = Arc::new(AtomicU64::new(0));
         let worker_dropped = Arc::clone(&dropped);
@@ -157,7 +155,10 @@ fn run_log_writer(
                     fs::remove_file(&rotated)?;
                 }
                 fs::rename(&path, &rotated)?;
-                file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+                file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
                 written = 0;
                 Ok(())
             })();

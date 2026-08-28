@@ -116,7 +116,12 @@ async fn handle_connection(mut stream: TcpStream, state: InternalApiState) -> an
         }
         buffer.extend_from_slice(&temp[..read]);
         if find_header_end(&buffer).is_none() && buffer.len() > MAX_INTERNAL_HEADER_BYTES {
-            write_response(&mut stream, 431, json!({"error":"request headers too large"})).await?;
+            write_response(
+                &mut stream,
+                431,
+                json!({"error":"request headers too large"}),
+            )
+            .await?;
             return Ok(());
         }
         if buffer.len() > MAX_INTERNAL_BODY_BYTES + MAX_INTERNAL_HEADER_BYTES {
@@ -157,19 +162,30 @@ async fn handle_connection(mut stream: TcpStream, state: InternalApiState) -> an
         match name.as_str() {
             "content-length" => {
                 if content_length.is_some() {
-                    write_response(&mut stream, 400, json!({"error":"duplicate content-length"})).await?;
+                    write_response(
+                        &mut stream,
+                        400,
+                        json!({"error":"duplicate content-length"}),
+                    )
+                    .await?;
                     return Ok(());
                 }
                 content_length = match value.parse() {
                     Ok(value) => Some(value),
                     Err(_) => {
-                        write_response(&mut stream, 400, json!({"error":"invalid content-length"})).await?;
+                        write_response(&mut stream, 400, json!({"error":"invalid content-length"}))
+                            .await?;
                         return Ok(());
                     }
                 };
             }
             "transfer-encoding" => {
-                write_response(&mut stream, 400, json!({"error":"transfer-encoding unsupported"})).await?;
+                write_response(
+                    &mut stream,
+                    400,
+                    json!({"error":"transfer-encoding unsupported"}),
+                )
+                .await?;
                 return Ok(());
             }
             "content-type" => content_type = Some(value.to_ascii_lowercase()),
@@ -187,7 +203,12 @@ async fn handle_connection(mut stream: TcpStream, state: InternalApiState) -> an
     // metadata) still require the token.
     if method == "GET" && path == "/internal/v1/health" {
         if content_length != 0 || buffered_body_bytes != 0 {
-            write_response(&mut stream, 400, json!({"error":"health request must not contain a body"})).await?;
+            write_response(
+                &mut stream,
+                400,
+                json!({"error":"health request must not contain a body"}),
+            )
+            .await?;
             return Ok(());
         }
         write_response(&mut stream, 200, json!({"ok":true})).await?;
@@ -212,11 +233,21 @@ async fn handle_connection(mut stream: TcpStream, state: InternalApiState) -> an
             .as_deref()
             .is_none_or(|value| !is_json_content_type(value))
         {
-            write_response(&mut stream, 415, json!({"error":"application/json required"})).await?;
+            write_response(
+                &mut stream,
+                415,
+                json!({"error":"application/json required"}),
+            )
+            .await?;
             return Ok(());
         }
     } else if content_length != 0 || buffered_body_bytes != 0 {
-        write_response(&mut stream, 400, json!({"error":"request method must not contain a body"})).await?;
+        write_response(
+            &mut stream,
+            400,
+            json!({"error":"request method must not contain a body"}),
+        )
+        .await?;
         return Ok(());
     }
     if content_length > MAX_INTERNAL_BODY_BYTES {
@@ -224,7 +255,12 @@ async fn handle_connection(mut stream: TcpStream, state: InternalApiState) -> an
         return Ok(());
     }
     if buffered_body_bytes > content_length {
-        write_response(&mut stream, 400, json!({"error":"unexpected trailing request data"})).await?;
+        write_response(
+            &mut stream,
+            400,
+            json!({"error":"unexpected trailing request data"}),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -237,7 +273,12 @@ async fn handle_connection(mut stream: TcpStream, state: InternalApiState) -> an
         buffer.extend_from_slice(&temp[..read]);
     }
     if buffer.len() > body_start + content_length {
-        write_response(&mut stream, 400, json!({"error":"unexpected trailing request data"})).await?;
+        write_response(
+            &mut stream,
+            400,
+            json!({"error":"unexpected trailing request data"}),
+        )
+        .await?;
         return Ok(());
     }
     let body = &buffer[body_start..body_start + content_length];
@@ -270,7 +311,12 @@ async fn handle_purge(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()>
     let request: PurgeRequest = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
-            write_response(stream, 400, json!({"error":format!("invalid purge request: {err}")})).await?;
+            write_response(
+                stream,
+                400,
+                json!({"error":format!("invalid purge request: {err}")}),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -315,7 +361,12 @@ async fn handle_metadata_events(stream: &mut TcpStream, body: &[u8]) -> anyhow::
     let events: Vec<crate::cluster::metadata::CacheMetaEvent> = match serde_json::from_slice(body) {
         Ok(events) => events,
         Err(err) => {
-            write_response(stream, 400, json!({"error":format!("invalid metadata events: {err}")})).await?;
+            write_response(
+                stream,
+                400,
+                json!({"error":format!("invalid metadata events: {err}")}),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -325,7 +376,12 @@ async fn handle_metadata_events(stream: &mut TcpStream, body: &[u8]) -> anyhow::
     }
     for event in &events {
         if !valid_metadata_event(event) {
-            write_response(stream, 400, json!({"error":"metadata event exceeds field limits"})).await?;
+            write_response(
+                stream,
+                400,
+                json!({"error":"metadata event exceeds field limits"}),
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -341,10 +397,21 @@ fn valid_metadata_event(event: &crate::cluster::metadata::CacheMetaEvent) -> boo
         && event.pod_name.len() <= MAX_POD_NAME_BYTES
         && event.hash.len() <= MAX_METADATA_EVENT_STRING_BYTES
         && event.cache_key.len() <= MAX_METADATA_EVENT_STRING_BYTES
-        && event.shard_id.as_ref().is_none_or(|value| value.len() <= MAX_METADATA_EVENT_STRING_BYTES)
-        && event.relative_path.as_ref().is_none_or(|value| value.len() <= MAX_METADATA_EVENT_STRING_BYTES)
+        && event
+            .shard_id
+            .as_ref()
+            .is_none_or(|value| value.len() <= MAX_METADATA_EVENT_STRING_BYTES)
+        && event
+            .relative_path
+            .as_ref()
+            .is_none_or(|value| value.len() <= MAX_METADATA_EVENT_STRING_BYTES)
         && event.headers.len() <= MAX_METADATA_HEADERS
-        && event.headers.iter().map(|(name, value)| name.len() + value.len()).sum::<usize>() <= MAX_METADATA_HEADER_BYTES
+        && event
+            .headers
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum::<usize>()
+            <= MAX_METADATA_HEADER_BYTES
 }
 
 async fn handle_stats_snapshot(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()> {
@@ -355,12 +422,22 @@ async fn handle_stats_snapshot(stream: &mut TcpStream, body: &[u8]) -> anyhow::R
     let snapshot: crate::cluster::stats::ReplicaStatsSnapshot = match serde_json::from_slice(body) {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            write_response(stream, 400, json!({"error":format!("invalid stats snapshot: {err}")})).await?;
+            write_response(
+                stream,
+                400,
+                json!({"error":format!("invalid stats snapshot: {err}")}),
+            )
+            .await?;
             return Ok(());
         }
     };
     if !valid_stats_snapshot(&snapshot) {
-        write_response(stream, 400, json!({"error":"invalid stats snapshot fields"})).await?;
+        write_response(
+            stream,
+            400,
+            json!({"error":"invalid stats snapshot fields"}),
+        )
+        .await?;
         return Ok(());
     }
     crate::cluster::stats::insert_snapshot(snapshot);
@@ -385,7 +462,10 @@ fn valid_stats_snapshot(snapshot: &crate::cluster::stats::ReplicaStatsSnapshot) 
         && snapshot.active_connections >= 0
         && snapshot.cpu_usage.is_finite()
         && (0.0..=1.0).contains(&snapshot.cpu_usage)
-        && snapshot.created_at.abs_diff(crate::utils::time::now_timestamp()) <= 60
+        && snapshot
+            .created_at
+            .abs_diff(crate::utils::time::now_timestamp())
+            <= 60
 }
 
 fn is_json_content_type(value: &str) -> bool {

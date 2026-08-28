@@ -119,6 +119,7 @@ fn txn_get_slice(txn: &mace::TxnKV<'_>, key: &[u8]) -> Result<Option<Vec<u8>>, O
 }
 
 /// Embedded key-value storage for metrics and node metadata (Mace).
+#[derive(Clone)]
 pub struct MetricStorage {
     backend: Option<Arc<StorageBackend>>,
 }
@@ -469,6 +470,45 @@ impl MetricStorage {
         );
     }
 
+    pub async fn upsert_cache_meta_absolute_async(&self, upsert: CacheMetaUpsert<'_>) {
+        let storage = self.clone();
+        let hash = upsert.hash.to_string();
+        let cache_key = upsert.cache_key.to_string();
+        let headers = upsert.headers.to_vec();
+        let shard_id = upsert.shard_id.map(str::to_string);
+        let relative_path = upsert.relative_path.map(str::to_string);
+        let size = upsert.size;
+        let expires = upsert.expires;
+        let access_time = upsert.access_time;
+        let access_count = upsert.access_count;
+        let status = upsert.status;
+        let compressed = upsert.compressed;
+        let event_version = upsert.event_version;
+        let updated_at = upsert.updated_at;
+        let stale_while_revalidate_secs = upsert.stale_while_revalidate_secs;
+        let created_at = upsert.created_at;
+        let _ = tokio::task::spawn_blocking(move || {
+            storage.upsert_cache_meta_absolute(CacheMetaUpsert {
+                hash: &hash,
+                cache_key: &cache_key,
+                size,
+                expires,
+                access_time,
+                access_count,
+                status,
+                headers: &headers,
+                compressed,
+                shard_id: shard_id.as_deref(),
+                relative_path: relative_path.as_deref(),
+                event_version,
+                updated_at,
+                stale_while_revalidate_secs,
+                created_at,
+            });
+        })
+        .await;
+    }
+
     /// Records a cache access in memory only — no storage I/O on the hot path.
     pub fn record_cache_access(&self, hash: &str) {
         record_cache_access_memory(hash);
@@ -512,6 +552,12 @@ impl MetricStorage {
         remove_cache_meta_memory(hash);
         let db_key = format!("CMETA_{hash}");
         let _ = self.delete_raw(db_key.as_bytes());
+    }
+
+    pub async fn delete_cache_meta_async(&self, hash: &str) {
+        let storage = self.clone();
+        let hash = hash.to_string();
+        let _ = tokio::task::spawn_blocking(move || storage.delete_cache_meta(&hash)).await;
     }
 
     pub fn load_client_agent_ips(&self) -> Vec<crate::client_agent::ClientAgentIpRecord> {
@@ -812,7 +858,11 @@ fn cache_meta_estimated_bytes(hash: &str, meta: &CacheMetaEntry) -> u64 {
     let headers = meta
         .headers
         .iter()
-        .map(|(k, v)| 64u64.saturating_add(k.len() as u64).saturating_add(v.len() as u64))
+        .map(|(k, v)| {
+            64u64
+                .saturating_add(k.len() as u64)
+                .saturating_add(v.len() as u64)
+        })
         .sum::<u64>();
     (128u64)
         .saturating_add(hash.len() as u64)
@@ -949,7 +999,8 @@ pub fn record_cache_access_memory(hash: &str) {
     if !CACHE_META_INDEX.contains_key(hash) {
         return;
     }
-    if CACHE_ACCESS_LOG.len() >= CACHE_ACCESS_LOG_MAX_ENTRIES && !CACHE_ACCESS_LOG.contains_key(hash)
+    if CACHE_ACCESS_LOG.len() >= CACHE_ACCESS_LOG_MAX_ENTRIES
+        && !CACHE_ACCESS_LOG.contains_key(hash)
     {
         return;
     }
@@ -1058,7 +1109,10 @@ fn isolate_corrupt_cmeta(key: &str) {
     if CORRUPT_CMETA_KEYS.len() < CORRUPT_CMETA_ISOLATION_MAX {
         CORRUPT_CMETA_KEYS.insert(key.to_string(), ());
     }
-    warn!(key, "skipping corrupt cache metadata record; disk value retained");
+    warn!(
+        key,
+        "skipping corrupt cache metadata record; disk value retained"
+    );
 }
 
 pub fn start_cache_access_flusher() {
@@ -1115,8 +1169,8 @@ pub fn lookup_region_provider_id(ip: IpAddr) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::{CacheMetaUpsert, MetricStorage};
     use super::{normalize_cache_status, parse_cache_status, parse_unique_ip_key, unique_ip_key};
-    use super::{MetricStorage, CacheMetaUpsert};
     use std::net::IpAddr;
 
     #[test]
@@ -1145,17 +1199,18 @@ mod tests {
 
     #[test]
     fn mace_storage_round_trip_and_prefix_scan() {
-        let dir = std::env::temp_dir().join(format!(
-            "cloud-node-mace-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cloud-node-mace-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = MetricStorage::open(&dir).expect("open mace storage");
 
         assert!(storage.put_json("FWBLK_META_test", &true));
         assert_eq!(storage.get_json::<bool>("FWBLK_META_test"), Some(true));
 
-        storage.increment_batch(vec![("counter_a".to_string(), 10), ("counter_a".to_string(), 5)]);
+        storage.increment_batch(vec![
+            ("counter_a".to_string(), 10),
+            ("counter_a".to_string(), 5),
+        ]);
         assert_eq!(storage.get_value("counter_a"), 15);
 
         let update = crate::rpc::metrics::ServerMetricUpdate {

@@ -1,6 +1,6 @@
 use cloud_node_rust::metrics::storage::{
-    apply_node_period_deltas, apply_server_period_update, fold_counter_deltas, MetricStorage,
-    NODE_PERIOD_BYTES, SERVER_PERIOD_BYTES,
+    MetricStorage, NODE_PERIOD_BYTES, SERVER_PERIOD_BYTES, apply_node_period_deltas,
+    apply_server_period_update, fold_counter_deltas,
 };
 use cloud_node_rust::rpc::metrics::ServerMetricUpdate;
 
@@ -64,10 +64,7 @@ fn packed_period_records_merge_in_memory() {
 
 #[test]
 fn metric_storage_increment_and_server_batch_round_trip() {
-    let dir = std::env::temp_dir().join(format!(
-        "cloud-node-mace-opt-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let dir = std::env::temp_dir().join(format!("cloud-node-mace-opt-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::remove_dir_all(&dir);
     let storage = MetricStorage::open(&dir).expect("open mace storage");
 

@@ -463,10 +463,7 @@ fn validate_stream_message(message: &pb::NodeStreamMessage) -> anyhow::Result<()
     Ok(())
 }
 
-fn try_send_stream_reply(
-    tx: &mpsc::Sender<pb::NodeStreamMessage>,
-    reply: pb::NodeStreamMessage,
-) {
+fn try_send_stream_reply(tx: &mpsc::Sender<pb::NodeStreamMessage>, reply: pb::NodeStreamMessage) {
     if tx.try_send(reply).is_err() {
         crate::pipeline_metrics::increment(
             crate::pipeline_metrics::PipelineCounter::RpcStreamReplyDropped,

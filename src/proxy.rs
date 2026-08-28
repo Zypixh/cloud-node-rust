@@ -1375,7 +1375,9 @@ impl EdgeProxy {
             "product.name" => self.product_name(ctx),
             "status" => status.to_string(),
             "statusMessage" => Self::status_message(status),
-            "rawRemoteAddr" => crate::client_ip::format_raw_remote_addr(&ctx.raw_remote_addr, ctx.client_ip),
+            "rawRemoteAddr" => {
+                crate::client_ip::format_raw_remote_addr(&ctx.raw_remote_addr, ctx.client_ip)
+            }
             "remoteAddr" => ctx.client_ip.to_string(),
             "remotePort" => ctx.client_port.to_string(),
             "serverAddr" => {

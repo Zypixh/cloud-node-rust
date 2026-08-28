@@ -1305,9 +1305,9 @@ fn downstream_local_port(session: &Session) -> Option<u16> {
 }
 
 fn raw_remote_ip(ctx: &CacheEvalContext<'_>) -> String {
-    let fallback = ctx.client_ip.unwrap_or_else(|| {
-        crate::client_ip::peer_socket_ip(ctx.session)
-    });
+    let fallback = ctx
+        .client_ip
+        .unwrap_or_else(|| crate::client_ip::peer_socket_ip(ctx.session));
     ctx.raw_remote_addr
         .as_deref()
         .map(|raw| crate::client_ip::format_raw_remote_addr(raw, fallback))

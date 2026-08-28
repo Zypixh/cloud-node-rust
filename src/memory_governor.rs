@@ -1,5 +1,5 @@
-use std::sync::LazyLock;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -22,9 +22,10 @@ pub enum AdmissionClass {
     CacheReadMemory,
     ClusterInternalConnection,
     RpcStreamCommand,
+    SniRelay,
 }
 
-const ADMISSION_CLASS_COUNT: usize = 16;
+const ADMISSION_CLASS_COUNT: usize = 17;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AdmissionRejectSnapshot {
@@ -44,6 +45,7 @@ pub struct AdmissionRejectSnapshot {
     pub cache_read_memory: u64,
     pub cluster_internal_connection: u64,
     pub rpc_stream_command: u64,
+    pub sni_relay: u64,
 }
 
 impl AdmissionRejectSnapshot {
@@ -64,6 +66,7 @@ impl AdmissionRejectSnapshot {
             .saturating_add(self.cache_read_memory)
             .saturating_add(self.cluster_internal_connection)
             .saturating_add(self.rpc_stream_command)
+            .saturating_add(self.sni_relay)
     }
 }
 
@@ -189,8 +192,11 @@ impl ResidentCategory {
     const COUNT: usize = 5;
     const fn index(self) -> usize {
         match self {
-            Self::CacheMetadata => 0, Self::CacheAccessLog => 1,
-            Self::SurrogateIndex => 2, Self::BloomFilter => 3, Self::NegativeCache => 4,
+            Self::CacheMetadata => 0,
+            Self::CacheAccessLog => 1,
+            Self::SurrogateIndex => 2,
+            Self::BloomFilter => 3,
+            Self::NegativeCache => 4,
         }
     }
 }
@@ -204,11 +210,21 @@ struct ResidentMemoryAccounting {
 }
 
 impl ResidentMemoryAccounting {
-    const fn new() -> Self {
-        Self { used: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)], total: AtomicU64::new(0), owners: Mutex::new(HashMap::new()), mutation: Mutex::new(()) }
+    fn new() -> Self {
+        Self {
+            used: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            total: AtomicU64::new(0),
+            owners: Mutex::new(HashMap::new()),
+            mutation: Mutex::new(()),
+        }
     }
 }
-
 
 struct MemorySnapshot {
     total_bytes: u64,
@@ -255,6 +271,7 @@ const KEEPALIVE_FD_BUDGET_PCT: u64 = 10;
 
 const HTTP_CONN_ESTIMATED_BYTES: u64 = 32 * 1024;
 const TCP_CONN_ESTIMATED_BYTES: u64 = 24 * 1024;
+const SNI_RELAY_ESTIMATED_BYTES: u64 = 256 * 1024;
 const H3_CONN_ESTIMATED_BYTES: u64 = 48 * 1024;
 const UDP_SESSION_ESTIMATED_BYTES: u64 = 96 * 1024;
 const UDP_DATAGRAM_ESTIMATED_BYTES: u64 = 2 * 1024;
@@ -375,6 +392,16 @@ const MAX_FIREWALL_IP_BW_COUNTERS: usize = 16_000_000;
 const MIN_FIREWALL_CANDIDATE_STATS: usize = 4_096;
 const MAX_FIREWALL_CANDIDATE_STATS: usize = 2_000_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigSyncBudget {
+    pub available_bytes: u64,
+    pub pressure_level: MemoryPressureLevel,
+    pub staging_budget_bytes: u64,
+    pub commit_reserve_bytes: u64,
+    pub allow_new_prepare: bool,
+    pub allow_commit: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MemoryPressureLevel {
     Normal,
@@ -421,6 +448,7 @@ pub struct MemoryGovernor {
     cache_read_memory: AtomicU64,
     cluster_internal_connections: AtomicU64,
     rpc_stream_commands: AtomicU64,
+    sni_relays: AtomicU64,
     cache_read_memory_bytes: AtomicU64,
     admission_rejects: [AtomicU64; ADMISSION_CLASS_COUNT],
     cached_total_bytes: AtomicU64,
@@ -497,6 +525,7 @@ impl MemoryGovernor {
             cache_read_memory: AtomicU64::new(0),
             cluster_internal_connections: AtomicU64::new(0),
             rpc_stream_commands: AtomicU64::new(0),
+            sni_relays: AtomicU64::new(0),
             cache_read_memory_bytes: AtomicU64::new(0),
             admission_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             cached_total_bytes: AtomicU64::new(0),
@@ -517,6 +546,19 @@ impl MemoryGovernor {
             resident: ResidentMemoryAccounting::new(),
             #[cfg(test)]
             fd_count_reads: AtomicU64::new(0),
+        }
+    }
+
+    pub fn try_admit_sni_relay(&self) -> Option<AdmissionPermit<'_>> {
+        self.try_admit(AdmissionClass::SniRelay)
+    }
+
+    pub fn relay_socket_buffer_bytes(&self) -> usize {
+        match self.current_memory_pressure_level() {
+            MemoryPressureLevel::Critical => 256 * 1024,
+            MemoryPressureLevel::High => 512 * 1024,
+            MemoryPressureLevel::Elevated => 768 * 1024,
+            MemoryPressureLevel::Normal => 1024 * 1024,
         }
     }
 
@@ -760,6 +802,12 @@ impl MemoryGovernor {
                 pressure_adjusted_min_limit(&snapshot, MIN_RPC_STREAM_COMMAND_LIMIT, 8, 2),
                 MAX_RPC_STREAM_COMMAND_LIMIT,
             ),
+            AdmissionClass::SniRelay => runtime_limit(
+                &snapshot,
+                AdmissionClass::SniRelay,
+                MIN_TCP_CONNECTION_LIMIT,
+                MAX_TCP_CONNECTION_LIMIT,
+            ),
         }
     }
 
@@ -789,9 +837,17 @@ impl MemoryGovernor {
         memory_pressure_level(&self.memory_snapshot())
     }
 
+    pub fn config_sync_budget(&self) -> ConfigSyncBudget {
+        config_sync_budget_for_snapshot(&self.memory_snapshot())
+    }
+
     pub fn relay_copy_buffer_bytes(&self) -> usize {
         let snapshot = self.memory_snapshot();
-        relay_copy_buffer_bytes(&snapshot, self.tcp_connections.load(Ordering::Relaxed))
+        let active = self
+            .tcp_connections
+            .load(Ordering::Relaxed)
+            .saturating_add(self.sni_relays.load(Ordering::Relaxed));
+        relay_copy_buffer_bytes(&snapshot, active)
     }
 
     pub fn listener_backlog(&self) -> i32 {
@@ -1167,21 +1223,30 @@ impl MemoryGovernor {
     }
 
     pub fn resident_memory_snapshot(&self) -> ResidentMemorySnapshot {
-        let used = |category: ResidentCategory| self.resident.used[category.index()].load(Ordering::Acquire);
+        let used = |category: ResidentCategory| {
+            self.resident.used[category.index()].load(Ordering::Acquire)
+        };
         let total_used_bytes = self.resident.total.load(Ordering::Acquire);
         let snapshot = self.memory_snapshot();
-        let total_budget_bytes = snapshot.cache_budget_bytes.saturating_add(snapshot.bloom_budget_bytes);
+        let total_budget_bytes = snapshot
+            .cache_budget_bytes
+            .saturating_add(snapshot.bloom_budget_bytes);
         let pressure_level = if total_used_bytes >= total_budget_bytes.max(1) {
             MemoryPressureLevel::Critical
-        } else if total_used_bytes.saturating_mul(100) >= total_budget_bytes.max(1).saturating_mul(90) {
+        } else if total_used_bytes.saturating_mul(100)
+            >= total_budget_bytes.max(1).saturating_mul(90)
+        {
             MemoryPressureLevel::High
-        } else if total_used_bytes.saturating_mul(100) >= total_budget_bytes.max(1).saturating_mul(75) {
+        } else if total_used_bytes.saturating_mul(100)
+            >= total_budget_bytes.max(1).saturating_mul(75)
+        {
             MemoryPressureLevel::Elevated
         } else {
             MemoryPressureLevel::Normal
         };
         ResidentMemorySnapshot {
-            total_used_bytes, total_budget_bytes,
+            total_used_bytes,
+            total_budget_bytes,
             cache_metadata_used_bytes: used(ResidentCategory::CacheMetadata),
             cache_access_log_used_bytes: used(ResidentCategory::CacheAccessLog),
             surrogate_index_used_bytes: used(ResidentCategory::SurrogateIndex),
@@ -1191,19 +1256,36 @@ impl MemoryGovernor {
         }
     }
 
-    pub fn resident_memory_replace(&self, category: ResidentCategory, old_bytes: u64, new_bytes: u64) -> bool {
-        let _mutation = self.resident.mutation.lock().expect("resident accounting lock poisoned");
+    pub fn resident_memory_replace(
+        &self,
+        category: ResidentCategory,
+        old_bytes: u64,
+        new_bytes: u64,
+    ) -> bool {
+        let _mutation = self
+            .resident
+            .mutation
+            .lock()
+            .expect("resident accounting lock poisoned");
         let slot = &self.resident.used[category.index()];
         let total = &self.resident.total;
-        if old_bytes == new_bytes { return true; }
+        if old_bytes == new_bytes {
+            return true;
+        }
         if new_bytes > old_bytes {
             let delta = new_bytes - old_bytes;
             let budget = match category {
-                ResidentCategory::CacheMetadata | ResidentCategory::CacheAccessLog | ResidentCategory::SurrogateIndex => self.memory_snapshot().cache_budget_bytes,
-                ResidentCategory::BloomFilter | ResidentCategory::NegativeCache => self.memory_snapshot().bloom_budget_bytes,
+                ResidentCategory::CacheMetadata
+                | ResidentCategory::CacheAccessLog
+                | ResidentCategory::SurrogateIndex => self.memory_snapshot().cache_budget_bytes,
+                ResidentCategory::BloomFilter | ResidentCategory::NegativeCache => {
+                    self.memory_snapshot().bloom_budget_bytes
+                }
             };
             let current = total.load(Ordering::Acquire);
-            if current.saturating_add(delta) > budget.max(1) { return false; }
+            if current.saturating_add(delta) > budget.max(1) {
+                return false;
+            }
             total.fetch_add(delta, Ordering::AcqRel);
             slot.fetch_add(delta, Ordering::AcqRel);
         } else {
@@ -1214,12 +1296,27 @@ impl MemoryGovernor {
         true
     }
 
-    pub fn resident_memory_replace_owned(&self, category: ResidentCategory, owner: &str, new_bytes: u64) -> bool {
-        let mut owners = self.resident.owners.lock().expect("resident accounting lock poisoned");
+    pub fn resident_memory_replace_owned(
+        &self,
+        category: ResidentCategory,
+        owner: &str,
+        new_bytes: u64,
+    ) -> bool {
+        let mut owners = self
+            .resident
+            .owners
+            .lock()
+            .expect("resident accounting lock poisoned");
         let key = (category, owner.to_string());
         let old_bytes = owners.get(&key).copied().unwrap_or(0);
-        if !self.resident_memory_replace(category, old_bytes, new_bytes) { return false; }
-        if new_bytes == 0 { owners.remove(&key); } else { owners.insert(key, new_bytes); }
+        if !self.resident_memory_replace(category, old_bytes, new_bytes) {
+            return false;
+        }
+        if new_bytes == 0 {
+            owners.remove(&key);
+        } else {
+            owners.insert(key, new_bytes);
+        }
         true
     }
 
@@ -1349,6 +1446,7 @@ impl MemoryGovernor {
             AdmissionClass::CacheReadMemory => &self.cache_read_memory,
             AdmissionClass::ClusterInternalConnection => &self.cluster_internal_connections,
             AdmissionClass::RpcStreamCommand => &self.rpc_stream_commands,
+            AdmissionClass::SniRelay => &self.sni_relays,
         }
     }
 
@@ -1410,6 +1508,9 @@ impl MemoryGovernor {
             rpc_stream_command: self
                 .reject_counter(AdmissionClass::RpcStreamCommand)
                 .load(Ordering::Relaxed),
+            sni_relay: self
+                .reject_counter(AdmissionClass::SniRelay)
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1461,8 +1562,7 @@ impl MemoryGovernor {
             used_bytes: self.cached_used_bytes.load(Ordering::Relaxed),
             available_bytes,
             fd_soft_limit: self.cached_fd_soft_limit.load(Ordering::Relaxed).max(1),
-            cpu_parallelism: self.cached_cpu_parallelism.load(Ordering::Relaxed).max(1)
-                as usize,
+            cpu_parallelism: self.cached_cpu_parallelism.load(Ordering::Relaxed).max(1) as usize,
             connection_budget_bytes: budget_from_available(
                 total_bytes,
                 available_bytes,
@@ -1731,8 +1831,14 @@ fn linux_cgroup_v2_effective() -> Option<CgroupMemoryEffective> {
     let mut dir = leaf;
     loop {
         max_bytes = min_cgroup_limit(max_bytes, linux_read_cgroup_limit(&dir.join("memory.max")));
-        high_bytes = min_cgroup_limit(high_bytes, linux_read_cgroup_limit(&dir.join("memory.high")));
-        swap_max_bytes = min_cgroup_swap(swap_max_bytes, linux_read_cgroup_swap(&dir.join("memory.swap.max")));
+        high_bytes = min_cgroup_limit(
+            high_bytes,
+            linux_read_cgroup_limit(&dir.join("memory.high")),
+        );
+        swap_max_bytes = min_cgroup_swap(
+            swap_max_bytes,
+            linux_read_cgroup_swap(&dir.join("memory.swap.max")),
+        );
         if dir == root {
             break;
         }
@@ -1762,8 +1868,10 @@ fn linux_cgroup_v1_effective() -> Option<CgroupMemoryEffective> {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    let inactive_file =
-        linux_memory_stat_value(&dir.join("memory.stat"), &["total_inactive_file", "inactive_file"]);
+    let inactive_file = linux_memory_stat_value(
+        &dir.join("memory.stat"),
+        &["total_inactive_file", "inactive_file"],
+    );
     Some(CgroupMemoryEffective {
         max_bytes,
         high_bytes,
@@ -2296,6 +2404,51 @@ fn memory_pressure_high(snapshot: &BudgetedMemorySnapshot) -> bool {
     )
 }
 
+fn config_sync_budget_for_snapshot(snapshot: &BudgetedMemorySnapshot) -> ConfigSyncBudget {
+    let pressure_level = memory_pressure_level(snapshot);
+    let available_bytes = snapshot.available_bytes;
+    let (commit_reserve_bytes, staging_budget_bytes, allow_new_prepare, allow_commit) =
+        match pressure_level {
+            MemoryPressureLevel::Normal => {
+                let commit_reserve_bytes = available_bytes / 3;
+                (
+                    commit_reserve_bytes,
+                    available_bytes
+                        .saturating_sub(commit_reserve_bytes)
+                        .saturating_div(4),
+                    true,
+                    true,
+                )
+            }
+            MemoryPressureLevel::Elevated => {
+                let commit_reserve_bytes = available_bytes / 2;
+                (
+                    commit_reserve_bytes,
+                    available_bytes
+                        .saturating_sub(commit_reserve_bytes)
+                        .saturating_div(4),
+                    true,
+                    true,
+                )
+            }
+            MemoryPressureLevel::High => (
+                available_bytes.saturating_mul(2).saturating_div(3),
+                0,
+                false,
+                true,
+            ),
+            MemoryPressureLevel::Critical => (available_bytes, 0, false, false),
+        };
+    ConfigSyncBudget {
+        available_bytes,
+        pressure_level,
+        staging_budget_bytes,
+        commit_reserve_bytes,
+        allow_new_prepare,
+        allow_commit,
+    }
+}
+
 fn memory_pressure_level(snapshot: &BudgetedMemorySnapshot) -> MemoryPressureLevel {
     let mut level = if snapshot.available_bytes <= snapshot.total_bytes / 50
         || snapshot.available_bytes <= 64 * 1024 * 1024
@@ -2315,9 +2468,7 @@ fn memory_pressure_level(snapshot: &BudgetedMemorySnapshot) -> MemoryPressureLev
     }
     if snapshot.process_rss_bytes > 0
         && snapshot.cgroup_memory_max_bytes > 0
-        && snapshot
-            .process_rss_bytes
-            .saturating_mul(100)
+        && snapshot.process_rss_bytes.saturating_mul(100)
             >= snapshot.cgroup_memory_max_bytes.saturating_mul(90)
     {
         level = level.max(MemoryPressureLevel::High);
@@ -2386,6 +2537,7 @@ fn shared_connection_charge_bytes(class: AdmissionClass) -> u64 {
         | AdmissionClass::CacheReadMemory
         | AdmissionClass::ClusterInternalConnection
         | AdmissionClass::RpcStreamCommand => 0,
+        AdmissionClass::SniRelay => SNI_RELAY_ESTIMATED_BYTES,
     }
 }
 
@@ -2407,6 +2559,7 @@ fn class_index(class: AdmissionClass) -> usize {
         AdmissionClass::CacheReadMemory => 13,
         AdmissionClass::ClusterInternalConnection => 14,
         AdmissionClass::RpcStreamCommand => 15,
+        AdmissionClass::SniRelay => 16,
     }
 }
 
@@ -2428,6 +2581,12 @@ fn runtime_limit(
             TCP_CONN_ESTIMATED_BYTES,
             Some(TCP_FD_BUDGET_PCT),
             16_384,
+        ),
+        AdmissionClass::SniRelay => (
+            snapshot.connection_budget_bytes / 2,
+            SNI_RELAY_ESTIMATED_BYTES,
+            Some(TCP_FD_BUDGET_PCT),
+            8_192,
         ),
         AdmissionClass::Http3Connection => (
             snapshot.connection_budget_bytes / 2,
@@ -2628,6 +2787,30 @@ mod tests {
                 MAX_BLOOM_BUDGET_BYTES,
             ),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn config_sync_budget_tightens_and_defers_with_pressure() {
+        let normal = config_sync_budget_for_snapshot(&synthetic_snapshot(16, 12, 1_048_576, 8));
+        let elevated = config_sync_budget_for_snapshot(&synthetic_snapshot(16, 3, 1_048_576, 8));
+        let high = config_sync_budget_for_snapshot(&synthetic_snapshot(16, 1, 1_048_576, 8));
+        let critical = config_sync_budget_for_snapshot(&synthetic_snapshot(16, 0, 1_048_576, 8));
+
+        assert_eq!(normal.pressure_level, MemoryPressureLevel::Normal);
+        assert_eq!(elevated.pressure_level, MemoryPressureLevel::Elevated);
+        assert_eq!(high.pressure_level, MemoryPressureLevel::High);
+        assert_eq!(critical.pressure_level, MemoryPressureLevel::Critical);
+        assert!(normal.allow_new_prepare && normal.allow_commit);
+        assert!(elevated.allow_new_prepare && elevated.allow_commit);
+        assert!(elevated.staging_budget_bytes < normal.staging_budget_bytes);
+        assert!(!high.allow_new_prepare && high.allow_commit);
+        assert_eq!(high.staging_budget_bytes, 0);
+        assert!(!critical.allow_new_prepare && !critical.allow_commit);
+        assert_eq!(critical.staging_budget_bytes, 0);
+        for budget in [normal, elevated, high, critical] {
+            assert!(budget.commit_reserve_bytes <= budget.available_bytes);
+            assert!(budget.staging_budget_bytes <= budget.available_bytes);
         }
     }
 
@@ -3022,12 +3205,8 @@ mod tests {
             cache_budget_from_available(small.total_bytes, small.available_bytes)
                 <= cache_budget_from_available(large.total_bytes, large.available_bytes)
         );
-        assert!(
-            effective_min_cache_budget_bytes(small.total_bytes) < MIN_CACHE_BUDGET_BYTES
-        );
-        assert!(
-            effective_min_bloom_budget_bytes(small.total_bytes) < MIN_BLOOM_BUDGET_BYTES
-        );
+        assert!(effective_min_cache_budget_bytes(small.total_bytes) < MIN_CACHE_BUDGET_BYTES);
+        assert!(effective_min_bloom_budget_bytes(small.total_bytes) < MIN_BLOOM_BUDGET_BYTES);
     }
 
     #[test]
@@ -3117,7 +3296,10 @@ mod tests {
             AdmissionClass::RpcStreamCommand,
         ] {
             let limit = governor.limit_for(class);
-            assert!(limit >= 16, "class {class:?} should have a positive governor limit");
+            assert!(
+                limit >= 16,
+                "class {class:?} should have a positive governor limit"
+            );
             let mut permits = Vec::new();
             for _ in 0..limit {
                 permits.push(governor.try_admit(class).expect("should admit under limit"));
@@ -3126,7 +3308,10 @@ mod tests {
                 governor.try_admit(class).is_none(),
                 "class {class:?} should reject when limit is full"
             );
-            assert_eq!(governor.counter(class).load(Ordering::Acquire), limit as u64);
+            assert_eq!(
+                governor.counter(class).load(Ordering::Acquire),
+                limit as u64
+            );
             drop(permits.pop());
             assert!(governor.try_admit(class).is_some());
             drop(permits);
@@ -3138,13 +3323,7 @@ mod tests {
     fn zero_copy_relay_disabled_under_high_memory_pressure() {
         let governor = MemoryGovernor::new();
         let total = 16 * 1024 * 1024 * 1024_u64;
-        seed_governor_memory(
-            &governor,
-            total,
-            32 * 1024 * 1024,
-            1_048_576,
-            128,
-        );
+        seed_governor_memory(&governor, total, 32 * 1024 * 1024, 1_048_576, 128);
         assert!(governor.is_memory_pressure_high());
         assert!(governor.try_admit_zero_copy_relay().is_none());
         assert_eq!(governor.zero_copy_relay_active(), 0);
@@ -3157,9 +3336,7 @@ mod tests {
         let total = 16 * 1024 * 1024 * 1024_u64;
         let available = 12 * 1024 * 1024 * 1024_u64;
         seed_governor_memory(&governor, total, available, 1_024, 900);
-        assert!(
-            governor.fd_equivalent_snapshot().pressure_level >= MemoryPressureLevel::High
-        );
+        assert!(governor.fd_equivalent_snapshot().pressure_level >= MemoryPressureLevel::High);
         assert!(governor.try_admit_zero_copy_relay().is_none());
     }
 
@@ -3408,8 +3585,7 @@ mod tests {
         seed_governor_memory(&governor, total, 32 * 1024 * 1024, 1_048_576, 128);
         let pressure_limit = governor.cache_read_memory_object_limit_bytes();
         assert_eq!(
-            pressure_limit,
-            CACHE_READ_MEMORY_PRESSURE_OBJECT_BYTES,
+            pressure_limit, CACHE_READ_MEMORY_PRESSURE_OBJECT_BYTES,
             "cache read object limit should tighten under high memory pressure"
         );
         let oversize = pressure_limit.saturating_add(1);
@@ -3443,13 +3619,7 @@ mod tests {
             "idle timeout should engage under high memory pressure"
         );
 
-        seed_governor_memory(
-            &governor,
-            total,
-            12 * 1024 * 1024 * 1024,
-            1_048_576,
-            128,
-        );
+        seed_governor_memory(&governor, total, 12 * 1024 * 1024 * 1024, 1_048_576, 128);
         let budget = governor.connection_admission_budget_bytes();
         governor
             .shared_connection_bytes
@@ -3471,7 +3641,12 @@ mod resident_memory_tests {
         let category = ResidentCategory::CacheMetadata;
         assert!(governor.resident_memory_replace_owned(category, "a", 128));
         assert!(governor.resident_memory_replace_owned(category, "a", 256));
-        assert_eq!(governor.resident_memory_snapshot().cache_metadata_used_bytes, 256);
+        assert_eq!(
+            governor
+                .resident_memory_snapshot()
+                .cache_metadata_used_bytes,
+            256
+        );
         assert!(governor.resident_memory_replace_owned(category, "a", 0));
         assert!(governor.resident_memory_replace_owned(category, "a", 0));
         assert_eq!(governor.resident_memory_snapshot().total_used_bytes, 0);

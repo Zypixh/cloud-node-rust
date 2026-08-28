@@ -601,9 +601,9 @@ impl<'a> RequestFacts<'a> {
     }
 
     pub(crate) fn remote_ip(&self) -> std::net::IpAddr {
-        *self.remote_ip.get_or_init(|| {
-            crate::client_ip::resolve_for_session(self.session, self.server)
-        })
+        *self
+            .remote_ip
+            .get_or_init(|| crate::client_ip::resolve_for_session(self.session, self.server))
     }
 
     pub(crate) fn remote_addr(&self) -> String {

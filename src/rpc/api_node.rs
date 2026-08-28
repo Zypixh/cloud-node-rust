@@ -262,7 +262,10 @@ pub async fn sync_api_nodes(api_config: &ApiConfig) -> bool {
         for addr in node.access_addrs {
             match crate::api_config::validate_rpc_endpoint(&addr) {
                 Ok(endpoint) => endpoints.push(endpoint),
-                Err(err) => warn!("Ignoring invalid discovered API endpoint {:?}: {}", addr, err),
+                Err(err) => warn!(
+                    "Ignoring invalid discovered API endpoint {:?}: {}",
+                    addr, err
+                ),
             }
         }
     }

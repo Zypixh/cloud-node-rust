@@ -154,9 +154,8 @@ mod linux {
     const KERNEL_SYNC_RETRY_DELAY: Duration = Duration::from_secs(1);
 
     fn kernel_queue_capacity() -> usize {
-        let snapshot = crate::memory_governor::MEMORY_GOVERNOR.snapshot(
-            crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads(),
-        );
+        let snapshot = crate::memory_governor::MEMORY_GOVERNOR
+            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
         let estimated_entry_bytes = std::mem::size_of::<(KernelTarget, KernelOp)>()
             .saturating_mul(4)
             .max(1) as u64;
@@ -184,20 +183,10 @@ mod linux {
 
     #[derive(Clone, Copy)]
     enum KernelOp {
-        Block {
-            target: KernelTarget,
-            ttl_secs: i64,
-        },
-        Unblock {
-            target: KernelTarget,
-        },
-        Allow {
-            target: KernelTarget,
-            ttl_secs: i64,
-        },
-        Unallow {
-            target: KernelTarget,
-        },
+        Block { target: KernelTarget, ttl_secs: i64 },
+        Unblock { target: KernelTarget },
+        Allow { target: KernelTarget, ttl_secs: i64 },
+        Unallow { target: KernelTarget },
     }
 
     impl KernelOp {
@@ -262,13 +251,15 @@ mod linux {
             for op in ops.into_values() {
                 match op {
                     KernelOp::Block { target, ttl_secs } => {
-                        self.blocked.insert(target, now.saturating_add(ttl_secs.max(1)));
+                        self.blocked
+                            .insert(target, now.saturating_add(ttl_secs.max(1)));
                     }
                     KernelOp::Unblock { target } => {
                         self.blocked.remove(&target);
                     }
                     KernelOp::Allow { target, ttl_secs } => {
-                        self.allowed.insert(target, now.saturating_add(ttl_secs.max(1)));
+                        self.allowed
+                            .insert(target, now.saturating_add(ttl_secs.max(1)));
                     }
                     KernelOp::Unallow { target } => {
                         self.allowed.remove(&target);
@@ -395,7 +386,11 @@ mod linux {
                 (NFT_ALLOWED_V4_INTERVAL_SET, "ipv4_addr", true),
                 (NFT_ALLOWED_V6_INTERVAL_SET, "ipv6_addr", true),
             ] {
-                let flags = if interval { "interval,timeout" } else { "timeout" };
+                let flags = if interval {
+                    "interval,timeout"
+                } else {
+                    "timeout"
+                };
                 run_nft_allow_exists(&[
                     "add",
                     "set",
@@ -735,7 +730,9 @@ mod linux {
     }
 
     fn warn_nft_queue_full() {
-        crate::pipeline_metrics::increment(crate::pipeline_metrics::PipelineCounter::KernelSyncCoalesced);
+        crate::pipeline_metrics::increment(
+            crate::pipeline_metrics::PipelineCounter::KernelSyncCoalesced,
+        );
         NFT_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed);
         let now = crate::utils::time::now_timestamp();
         let last = NFT_QUEUE_LAST_WARNING.load(Ordering::Relaxed);
@@ -757,7 +754,8 @@ mod linux {
             "firewall_kernel_sync".to_string(),
             format!(
                 "status=\"queue_full\" dropped=\"{}\" capacity=\"{}\"",
-                dropped, kernel_queue_capacity()
+                dropped,
+                kernel_queue_capacity()
             ),
             0,
         );
@@ -900,10 +898,7 @@ mod linux {
         run_nft_script(&script).await
     }
 
-    fn exact_ip_entries(
-        rules: &HashMap<KernelTarget, i64>,
-        v6: bool,
-    ) -> BTreeMap<IpAddr, i64> {
+    fn exact_ip_entries(rules: &HashMap<KernelTarget, i64>, v6: bool) -> BTreeMap<IpAddr, i64> {
         rules
             .iter()
             .filter_map(|(target, expires_at)| match target {
@@ -956,10 +951,7 @@ mod linux {
             };
             events.entry(from).or_default().push((*expires_at, 1));
             if to < family_max {
-                events
-                    .entry(to + 1)
-                    .or_default()
-                    .push((*expires_at, -1));
+                events.entry(to + 1).or_default().push((*expires_at, -1));
             }
         }
 
@@ -993,8 +985,7 @@ mod linux {
             }
             segment_start = after.map(|_| position);
         }
-        if let (Some(from), Some(expires_at)) =
-            (segment_start, active.keys().next_back().copied())
+        if let (Some(from), Some(expires_at)) = (segment_start, active.keys().next_back().copied())
         {
             result.push(TimedInterval {
                 from,
@@ -1012,10 +1003,7 @@ mod linux {
             KernelTarget::Network(net) => {
                 let prefix_len = net.prefix_len() as u32;
                 let (network, bits) = match net {
-                    IpNet::V4(net) => (
-                        u32::from_be_bytes(net.network().octets()) as u128,
-                        32,
-                    ),
+                    IpNet::V4(net) => (u32::from_be_bytes(net.network().octets()) as u128, 32),
                     IpNet::V6(net) => (u128::from_be_bytes(net.network().octets()), 128),
                 };
                 let host_bits = bits - prefix_len;
@@ -1074,9 +1062,7 @@ mod linux {
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if pending.ops.len() >= kernel_queue_capacity()
-                && !pending.ops.contains_key(&target)
-            {
+            if pending.ops.len() >= kernel_queue_capacity() && !pending.ops.contains_key(&target) {
                 pending.force_reconcile = true;
                 pending.ops.clear();
                 false
@@ -1125,7 +1111,9 @@ mod linux {
     }
 
     fn warn_iptables_queue_full() {
-        crate::pipeline_metrics::increment(crate::pipeline_metrics::PipelineCounter::KernelSyncCoalesced);
+        crate::pipeline_metrics::increment(
+            crate::pipeline_metrics::PipelineCounter::KernelSyncCoalesced,
+        );
         IPTABLES_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed);
         let now = crate::utils::time::now_timestamp();
         let last = IPTABLES_QUEUE_LAST_WARNING.load(Ordering::Relaxed);
@@ -1311,7 +1299,10 @@ mod linux {
         } else {
             "iptables-restore"
         };
-        let output = Command::new(save_binary).args(["-t", "filter"]).output().await?;
+        let output = Command::new(save_binary)
+            .args(["-t", "filter"])
+            .output()
+            .await?;
         if !output.status.success() {
             anyhow::bail!(
                 "{}: {}",
@@ -1358,11 +1349,7 @@ mod linux {
         }
     }
 
-    async fn run_process_script(
-        binary: &str,
-        args: &[&str],
-        script: &str,
-    ) -> anyhow::Result<()> {
+    async fn run_process_script(binary: &str, args: &[&str], script: &str) -> anyhow::Result<()> {
         let mut child = Command::new(binary)
             .args(args)
             .stdin(Stdio::piped())
@@ -1450,7 +1437,6 @@ mod linux {
             _ => {}
         }
     }
-
 }
 
 pub fn set_kernel_snapshot_provider(

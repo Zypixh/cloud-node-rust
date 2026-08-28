@@ -1,6 +1,6 @@
 use cloud_node_rust::l4_defense::{
-    self, first_byte_timeout, metrics_snapshot, quic_new_route_limit, tcp_active_limit_per_ip_for_level,
-    try_acquire_tcp_active_ip, L4DefenseKind, L4PressureLevel,
+    self, L4DefenseKind, L4PressureLevel, first_byte_timeout, metrics_snapshot,
+    quic_new_route_limit, tcp_active_limit_per_ip_for_level, try_acquire_tcp_active_ip,
 };
 use cloud_node_rust::memory_governor::{AdmissionClass, MEMORY_GOVERNOR};
 use cloud_node_rust::memory_plan::current_memory_plan;
@@ -32,7 +32,9 @@ fn memory_plan_exposes_l4_and_l7_attack_budgets() {
         "memory plan should expose L7 WAF body admission limits"
     );
     assert!(
-        plan.items.iter().any(|item| item.area == "response_transform"),
+        plan.items
+            .iter()
+            .any(|item| item.area == "response_transform"),
         "memory plan should expose L7 response transform admission limits"
     );
     assert!(
@@ -68,7 +70,10 @@ fn l7_waf_and_transform_admission_stays_bounded_under_attack_load() {
         AdmissionClass::CacheRevalidate,
     ] {
         let limit = MEMORY_GOVERNOR.limit_for(class);
-        assert!(limit > 0, "L7 class {class:?} must keep positive admission during attacks");
+        assert!(
+            limit > 0,
+            "L7 class {class:?} must keep positive admission during attacks"
+        );
         assert!(
             limit <= 1_000_000,
             "L7 class {class:?} must stay below hard guardrail max during floods"
@@ -78,7 +83,9 @@ fn l7_waf_and_transform_admission_stays_bounded_under_attack_load() {
 
 #[test]
 fn l4_adaptive_limits_tighten_under_attack_pressure() {
-    let total = MEMORY_GOVERNOR.limit_for(AdmissionClass::TcpConnection).max(1);
+    let total = MEMORY_GOVERNOR
+        .limit_for(AdmissionClass::TcpConnection)
+        .max(1);
     let normal_per_ip = tcp_active_limit_per_ip_for_level(total, L4PressureLevel::Normal);
     let critical_per_ip = tcp_active_limit_per_ip_for_level(total, L4PressureLevel::Critical);
     assert!(
@@ -219,7 +226,10 @@ fn l4_defense_kinds_cover_common_attack_vectors() {
         (L4DefenseKind::SynBacklogPressure, "SYN backlog pressure"),
     ];
     for (kind, label) in vectors {
-        assert!(!kind.as_str().is_empty(), "{label} kind should have stable metric name");
+        assert!(
+            !kind.as_str().is_empty(),
+            "{label} kind should have stable metric name"
+        );
     }
 }
 
@@ -228,5 +238,8 @@ fn current_l4_pressure_integrates_live_governor_signals() {
     let level = l4_defense::current_pressure_level();
     let _ = level.as_str();
     let tcp_limit = l4_defense::current_tcp_active_limit_per_ip();
-    assert!(tcp_limit >= 16, "current TCP per-IP limit must remain usable under audit");
+    assert!(
+        tcp_limit >= 16,
+        "current TCP per-IP limit must remain usable under audit"
+    );
 }

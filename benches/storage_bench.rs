@@ -154,7 +154,13 @@ fn bench_firewall_and_scan(c: &mut Criterion) {
             |b, count| {
                 let storage = open_mace(&format!("scan_{count}"));
                 prefill_firewall_records(&storage, *count);
-                b.iter(|| black_box(storage.scan_json_prefix::<serde_json::Value>("FWBLK_V1_").len()));
+                b.iter(|| {
+                    black_box(
+                        storage
+                            .scan_json_prefix::<serde_json::Value>("FWBLK_V1_")
+                            .len(),
+                    )
+                });
             },
         );
     }

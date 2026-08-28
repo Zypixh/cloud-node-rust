@@ -1,4 +1,4 @@
-use cloud_node_rust::memory_governor::{MemoryPressureLevel, MEMORY_GOVERNOR};
+use cloud_node_rust::memory_governor::{MEMORY_GOVERNOR, MemoryPressureLevel};
 use cloud_node_rust::memory_reclaim::reclaim_for_level;
 
 #[test]

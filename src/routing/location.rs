@@ -3,6 +3,7 @@ use dashmap::DashMap;
 use regex::Regex;
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub enum PatternType {
@@ -84,20 +85,57 @@ pub fn match_location<'a>(
     None
 }
 
-static COMPILED_CACHE: Lazy<DashMap<i64, Arc<Vec<CompiledLocation>>>> = Lazy::new(DashMap::new);
+static COMPILED_CACHE: Lazy<DashMap<(u64, i64, usize), Arc<Vec<CompiledLocation>>>> =
+    Lazy::new(DashMap::new);
+static COMPILED_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub fn get_compiled_locations(
     server_id: i64,
     raw: &[LocationConfig],
 ) -> Arc<Vec<CompiledLocation>> {
-    if let Some(entry) = COMPILED_CACHE.get(&server_id) {
+    let cache_generation = COMPILED_CACHE_GENERATION.load(Ordering::Acquire);
+    let cache_key = (cache_generation, server_id, raw.as_ptr() as usize);
+    if let Some(entry) = COMPILED_CACHE.get(&cache_key) {
         return entry.clone();
     }
     let compiled = Arc::new(compile_locations(raw));
-    COMPILED_CACHE.insert(server_id, compiled.clone());
+    COMPILED_CACHE.insert(cache_key, compiled.clone());
     compiled
 }
 
 pub fn clear_compiled_locations() {
+    COMPILED_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
     COMPILED_CACHE.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn location(pattern: &str) -> LocationConfig {
+        LocationConfig {
+            is_on: true,
+            pattern: pattern.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cache_entries_do_not_cross_server_config_instances() {
+        clear_compiled_locations();
+        let old = vec![location("/old")];
+        let new = vec![location("/new")];
+
+        let old_compiled = get_compiled_locations(42, &old);
+        clear_compiled_locations();
+        let new_compiled = get_compiled_locations(42, &new);
+        let old_reinserted = get_compiled_locations(42, &old);
+        let new_after_old_reinsert = get_compiled_locations(42, &new);
+
+        assert_eq!(old_compiled[0].pattern, "/old");
+        assert_eq!(old_reinserted[0].pattern, "/old");
+        assert_eq!(new_compiled[0].pattern, "/new");
+        assert!(Arc::ptr_eq(&new_compiled, &new_after_old_reinsert));
+        clear_compiled_locations();
+    }
 }

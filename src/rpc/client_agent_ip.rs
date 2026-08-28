@@ -73,7 +73,8 @@ pub async fn sync_client_agent_ips_incremental(api_config: &Arc<ApiConfig>) -> b
 
         let records_for_storage = records.clone();
         let persisted = tokio::task::spawn_blocking(move || {
-            crate::metrics::storage::STORAGE.save_client_agent_ip_batch(&records_for_storage, max_id)
+            crate::metrics::storage::STORAGE
+                .save_client_agent_ip_batch(&records_for_storage, max_id)
         })
         .await
         .unwrap_or(false);

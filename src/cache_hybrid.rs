@@ -426,14 +426,18 @@ impl Storage for FileStorage {
         };
 
         let Some(path) = self.find_existing_path_by_hash(&hash).await else {
-            crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+            crate::metrics::storage::STORAGE
+                .delete_cache_meta_async(&hash)
+                .await;
             return Ok(None);
         };
 
         let file_size = match tokio::fs::metadata(&path).await {
             Ok(metadata) => metadata.len(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+                crate::metrics::storage::STORAGE
+                    .delete_cache_meta_async(&hash)
+                    .await;
                 return Ok(None);
             }
             Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -446,7 +450,9 @@ impl Storage for FileStorage {
                 file_size,
                 path.display()
             );
-            crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+            crate::metrics::storage::STORAGE
+                .delete_cache_meta_async(&hash)
+                .await;
             return Ok(None);
         }
 
@@ -485,7 +491,9 @@ impl Storage for FileStorage {
                 let file_data = match tokio::fs::read(&path).await {
                     Ok(data) => data,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+                        crate::metrics::storage::STORAGE
+                            .delete_cache_meta_async(&hash)
+                            .await;
                         return Ok(None);
                     }
                     Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -509,7 +517,9 @@ impl Storage for FileStorage {
             let file = match tokio::fs::File::open(&path).await {
                 Ok(file) => file,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+                    crate::metrics::storage::STORAGE
+                        .delete_cache_meta_async(&hash)
+                        .await;
                     return Ok(None);
                 }
                 Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -539,7 +549,9 @@ impl Storage for FileStorage {
             let file_data = match tokio::fs::read(&path).await {
                 Ok(data) => data,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+                    crate::metrics::storage::STORAGE
+                        .delete_cache_meta_async(&hash)
+                        .await;
                     return Ok(None);
                 }
                 Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -569,7 +581,9 @@ impl Storage for FileStorage {
         let file = match tokio::fs::File::open(&path).await {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+                crate::metrics::storage::STORAGE
+                    .delete_cache_meta_async(&hash)
+                    .await;
                 return Ok(None);
             }
             Err(_) => return Err(Error::new(ErrorType::InternalError)),
@@ -730,7 +744,9 @@ impl Storage for FileStorage {
         let hash = format!("{:x}", md5_legacy::compute(key.user_tag.as_ref()));
         let inner = self.inner.load();
         remove_cache_file_from_roots(&inner, &hash).await;
-        crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+        crate::metrics::storage::STORAGE
+            .delete_cache_meta_async(&hash)
+            .await;
         Ok(true)
     }
 
@@ -812,8 +828,8 @@ impl Storage for FileStorage {
                     .unwrap_or(0)
             });
         let created_at = existing.as_ref().map(|m| m.created_at).unwrap_or(now);
-        crate::metrics::storage::STORAGE.upsert_cache_meta_absolute_async(
-            crate::metrics::storage::CacheMetaUpsert {
+        crate::metrics::storage::STORAGE
+            .upsert_cache_meta_absolute_async(crate::metrics::storage::CacheMetaUpsert {
                 hash: &hash,
                 cache_key: &k_str,
                 size: existing.as_ref().map(|meta| meta.size).unwrap_or(0),
@@ -834,9 +850,8 @@ impl Storage for FileStorage {
                 updated_at: Some(now),
                 stale_while_revalidate_secs: swr_secs,
                 created_at,
-            },
-        )
-        .await;
+            })
+            .await;
 
         Ok(true)
     }
@@ -1105,8 +1120,8 @@ impl HandleMiss for FileMissHandler {
 
         let now = crate::utils::time::now_timestamp();
         let expires = now + self.ttl as i64;
-        crate::metrics::storage::STORAGE.upsert_cache_meta_absolute_async(
-            crate::metrics::storage::CacheMetaUpsert {
+        crate::metrics::storage::STORAGE
+            .upsert_cache_meta_absolute_async(crate::metrics::storage::CacheMetaUpsert {
                 hash: &self.hash,
                 cache_key: &self.key_str,
                 size: written as u64,
@@ -1122,9 +1137,8 @@ impl HandleMiss for FileMissHandler {
                 updated_at: Some(now),
                 stale_while_revalidate_secs: self.stale_while_revalidate_secs,
                 created_at: now,
-            },
-        )
-        .await;
+            })
+            .await;
         negative_cache_remove(&self.key_str);
         index_surrogate_keys(&self.headers, &self.hash);
         crate::cluster::metadata::emit_upsert(crate::cluster::metadata::CacheMetaUpsertEvent {
@@ -1178,7 +1192,6 @@ const SURROGATE_INDEX_MAX_MEMBERS_PER_TAG: usize = 16_384;
 const SURROGATE_TAG_MAX_BYTES: usize = 256;
 const SURROGATE_TAG_ENTRY_OVERHEAD: u64 = 96;
 
-
 fn surrogate_index_capacity() -> usize {
     if MEMORY_GOVERNOR.is_memory_pressure_high() {
         SURROGATE_INDEX_MAX_TAGS_PRESSURE
@@ -1188,18 +1201,28 @@ fn surrogate_index_capacity() -> usize {
 }
 
 pub(crate) fn index_surrogate_keys(headers: &[(String, String)], hash: &str) {
-    let tags = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("surrogate-key")).map(|(_, v)| v.as_str()).unwrap_or("");
+    let tags = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("surrogate-key"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
     for tag in tags.split_whitespace().take(64) {
-        if tag.is_empty() || tag.len() > SURROGATE_TAG_MAX_BYTES { continue; }
-        if SURROGATE_SATURATED_TAGS.contains_key(tag) { continue; }
+        if tag.is_empty() || tag.len() > SURROGATE_TAG_MAX_BYTES {
+            continue;
+        }
+        if SURROGATE_SATURATED_TAGS.contains_key(tag) {
+            continue;
+        }
         if !SURROGATE_KEY_INDEX.contains_key(tag)
-            && SURROGATE_KEY_INDEX.len() >= surrogate_index_capacity() {
+            && SURROGATE_KEY_INDEX.len() >= surrogate_index_capacity()
+        {
             mark_surrogate_tag_saturated(tag);
             continue;
         }
         let entry = SURROGATE_KEY_INDEX.entry(tag.to_string()).or_default();
         if entry.len() >= SURROGATE_INDEX_MAX_MEMBERS_PER_TAG
-            || SURROGATE_MEMBERSHIPS.load(Ordering::Relaxed) as usize >= SURROGATE_INDEX_MAX_MEMBERSHIPS
+            || SURROGATE_MEMBERSHIPS.load(Ordering::Relaxed) as usize
+                >= SURROGATE_INDEX_MAX_MEMBERSHIPS
         {
             mark_surrogate_tag_saturated(tag);
             continue;
@@ -1208,7 +1231,11 @@ pub(crate) fn index_surrogate_keys(headers: &[(String, String)], hash: &str) {
             SURROGATE_MEMBERSHIPS.fetch_add(1, Ordering::Relaxed);
             let owner = format!("{tag}\0{hash}");
             let bytes = SURROGATE_TAG_ENTRY_OVERHEAD + tag.len() as u64 + hash.len() as u64;
-            let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::SurrogateIndex, &owner, bytes);
+            let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(
+                crate::memory_governor::ResidentCategory::SurrogateIndex,
+                &owner,
+                bytes,
+            );
         }
     }
 }
@@ -1219,12 +1246,18 @@ fn mark_surrogate_tag_saturated(tag: &str) {
 
 pub(crate) fn remove_hash_from_surrogate_index(hash: &str) {
     SURROGATE_KEY_INDEX.retain(|tag, set| {
-        if set.remove(hash) {
-            SURROGATE_MEMBERSHIPS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_sub(1))
-            }).ok();
+        if set.remove(hash).is_some() {
+            SURROGATE_MEMBERSHIPS
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_sub(1))
+                })
+                .ok();
             let owner = format!("{tag}\0{hash}");
-            let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::SurrogateIndex, &owner, 0);
+            let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(
+                crate::memory_governor::ResidentCategory::SurrogateIndex,
+                &owner,
+                0,
+            );
         }
         !set.is_empty()
     });
@@ -1511,7 +1544,10 @@ impl AdaptiveBloomFilter {
             self.current_size.fetch_add(1, Ordering::Relaxed);
             if layer.count >= layer.capacity {
                 let candidate = self.next_layer_capacity(layer.capacity);
-                if self.can_add_layer(candidate as u64, crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes()) {
+                if self.can_add_layer(
+                    candidate as u64,
+                    crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes(),
+                ) {
                     next_capacity = Some(candidate);
                 }
             }
@@ -1549,13 +1585,16 @@ impl AdaptiveBloomFilter {
         let keep = keep_layers_per_shard.max(1);
         let mut removed_layers = 0u64;
         let mut freed_bytes = 0u64;
+        let mut removed_capacity = 0u64;
+        let mut removed_count = 0u64;
         for shard in &self.shards {
             let mut layers = shard.layers.write();
             while layers.len() > keep {
                 if let Some(removed) = layers.first() {
-                    freed_bytes = freed_bytes.saturating_add(Self::estimated_layer_bytes(
-                        removed.capacity,
-                    ));
+                    freed_bytes =
+                        freed_bytes.saturating_add(Self::estimated_layer_bytes(removed.capacity));
+                    removed_capacity = removed_capacity.saturating_add(removed.capacity);
+                    removed_count = removed_count.saturating_add(removed.count);
                 }
                 layers.remove(0);
                 removed_layers = removed_layers.saturating_add(1);
@@ -1564,6 +1603,10 @@ impl AdaptiveBloomFilter {
         if freed_bytes > 0 {
             self.estimated_bytes
                 .fetch_sub(freed_bytes, Ordering::Relaxed);
+            self.total_capacity
+                .fetch_sub(removed_capacity, Ordering::Relaxed);
+            self.current_size
+                .fetch_sub(removed_count, Ordering::Relaxed);
         }
         removed_layers
     }
@@ -1680,6 +1723,23 @@ impl DualGenerationBloom {
         *self.stale.lock() = None;
         self.sync_bloom_charge();
     }
+
+    fn shrink_layers(&self, keep_layers_per_shard: usize) -> u64 {
+        let live = self.live.load_full();
+        let mut removed = live.shrink_layers(keep_layers_per_shard);
+        if let Some(stale) = self.stale.lock().as_ref() {
+            removed = removed.saturating_add(stale.shrink_layers(keep_layers_per_shard));
+        }
+        self.sync_bloom_charge();
+        removed
+    }
+
+    fn reset_to_minimal(&self) {
+        self.live.load().reset_to_minimal();
+        *self.stale.lock() = None;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.sync_bloom_charge();
+    }
 }
 
 static CACHE_BLOOM: Lazy<DualGenerationBloom> =
@@ -1746,7 +1806,11 @@ fn negative_cache_check(key: &str, now: i64) -> bool {
         }
     }
     NEGATIVE_CACHE.remove(key);
-    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::NegativeCache, key, 0);
+    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+        crate::memory_governor::ResidentCategory::NegativeCache,
+        key,
+        0,
+    );
     false
 }
 
@@ -1767,12 +1831,20 @@ fn negative_cache_insert_with_capacity(key: &str, now: i64, capacity: usize) {
         }
     }
     NEGATIVE_CACHE.insert(key.to_string(), now + NEGATIVE_CACHE_TTL_SECS);
-    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::NegativeCache, key, 160 + key.len() as u64);
+    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+        crate::memory_governor::ResidentCategory::NegativeCache,
+        key,
+        160 + key.len() as u64,
+    );
 }
 
 fn negative_cache_remove(key: &str) {
     NEGATIVE_CACHE.remove(key);
-    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(crate::memory_governor::ResidentCategory::NegativeCache, key, 0);
+    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+        crate::memory_governor::ResidentCategory::NegativeCache,
+        key,
+        0,
+    );
 }
 
 fn negative_cache_stats() -> (usize, usize) {
@@ -1864,7 +1936,9 @@ pub(crate) fn start_bloom_rotation_task() {
             let (_, _, util, estimated, _) = CACHE_BLOOM.stats();
             let budget = crate::memory_governor::MEMORY_GOVERNOR.bloom_budget_bytes();
             if util > 0.6 || estimated.saturating_mul(2) > budget.max(1) {
-                if let Err(err) = tokio::task::spawn_blocking(|| CACHE_BLOOM.rotate_from_cache_meta()).await {
+                if let Err(err) =
+                    tokio::task::spawn_blocking(|| CACHE_BLOOM.rotate_from_cache_meta()).await
+                {
                     warn!(error = %err, "CACHE_BLOOM: rotation task failed");
                     continue;
                 }
@@ -2160,7 +2234,9 @@ impl HybridStorage {
         let hash = format!("{:x}", md5_legacy::compute(key));
         let inner = self.l2.inner.load();
         remove_cache_file_from_roots(&inner, &hash).await;
-        crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+        crate::metrics::storage::STORAGE
+            .delete_cache_meta_async(&hash)
+            .await;
         remove_hash_from_surrogate_index(&hash);
         self.l1.remove(key);
         bloom_remove(key);
@@ -2196,7 +2272,12 @@ impl HybridStorage {
         let partial_deleted = crate::cache::partial::purge_by_tag(tag, &location.roots).await;
         let hashes: Vec<String> = SURROGATE_KEY_INDEX
             .get(tag)
-            .map(|set| set.iter().take(SURROGATE_INDEX_MAX_MEMBERS_PER_TAG).map(|h| h.clone()).collect())
+            .map(|set| {
+                set.iter()
+                    .take(SURROGATE_INDEX_MAX_MEMBERS_PER_TAG)
+                    .map(|h| h.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         let mut keys_to_purge = Vec::new();
         for hash in &hashes {
@@ -2206,7 +2287,8 @@ impl HybridStorage {
         }
         let saturated = SURROGATE_SATURATED_TAGS.contains_key(tag);
         if hashes.is_empty() || saturated {
-            let scanned = crate::metrics::storage::STORAGE.collect_cache_keys_by_surrogate_tag(tag, 512);
+            let scanned =
+                crate::metrics::storage::STORAGE.collect_cache_keys_by_surrogate_tag(tag, 512);
             if !scanned.is_empty() {
                 SURROGATE_DEGRADED_PURGE.fetch_add(1, Ordering::Relaxed);
                 warn!(
@@ -2574,7 +2656,9 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, _disk_root: Pat
         // Execute: Delete expired files
         for hash in expired_hashes {
             remove_cache_file_from_roots(&inner, &hash).await;
-            crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+            crate::metrics::storage::STORAGE
+                .delete_cache_meta_async(&hash)
+                .await;
         }
 
         // Pass 2: Capacity eviction using Max-Heap if disk exceeds limits
@@ -2625,7 +2709,9 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, _disk_root: Pat
             for candidate in heap {
                 let hash = candidate.hash;
                 remove_cache_file_from_roots(&inner, &hash).await;
-                crate::metrics::storage::STORAGE.delete_cache_meta_async(&hash).await;
+                crate::metrics::storage::STORAGE
+                    .delete_cache_meta_async(&hash)
+                    .await;
             }
         }
     }

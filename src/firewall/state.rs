@@ -288,12 +288,16 @@ fn range_overlaps_network(range: IpAddrRange, net: IpNet) -> bool {
         (IpAddr::V4(from), IpAddr::V4(to), IpNet::V4(net)) => {
             let net_from = u32::from_be_bytes(net.network().octets()) as u128;
             let net_to = u32::from_be_bytes(net.broadcast().octets()) as u128;
-            net.contains(&from) || net.contains(&to) || (range.from <= net_to && range.to >= net_from)
+            net.contains(&from)
+                || net.contains(&to)
+                || (range.from <= net_to && range.to >= net_from)
         }
         (IpAddr::V6(from), IpAddr::V6(to), IpNet::V6(net)) => {
             let net_from = u128::from_be_bytes(net.network().octets());
             let net_to = u128::from_be_bytes(net.broadcast().octets());
-            net.contains(&from) || net.contains(&to) || (range.from <= net_to && range.to >= net_from)
+            net.contains(&from)
+                || net.contains(&to)
+                || (range.from <= net_to && range.to >= net_from)
         }
         _ => false,
     }
@@ -535,7 +539,10 @@ impl WafStateManager {
                 .collect(),
             blocked_networks: Self::snapshot_global_networks(&self.kernel_block_networks, now)
                 .into_iter()
-                .chain(Self::snapshot_global_networks(&self.list_block_networks, now))
+                .chain(Self::snapshot_global_networks(
+                    &self.list_block_networks,
+                    now,
+                ))
                 .collect(),
             allowed_networks: Self::snapshot_global_networks(&self.whitelist_networks, now)
                 .into_iter()
@@ -558,10 +565,7 @@ impl WafStateManager {
             .collect()
     }
 
-    fn snapshot_global_networks(
-        map: &DashMap<(i64, IpNet), i64>,
-        now: i64,
-    ) -> Vec<(IpNet, i64)> {
+    fn snapshot_global_networks(map: &DashMap<(i64, IpNet), i64>, now: i64) -> Vec<(IpNet, i64)> {
         map.iter()
             .filter_map(|entry| {
                 let expiry = *entry.value();
@@ -641,23 +645,18 @@ impl WafStateManager {
             return;
         }
         let now = crate::utils::time::now_timestamp();
-        let whitelist_expiry = Self::max_global_network_expiry(&self.whitelist_networks, net, now)
-            .max(Self::max_global_network_expiry(
-                &self.list_whitelist_networks,
-                net,
-                now,
-            ));
+        let whitelist_expiry =
+            Self::max_global_network_expiry(&self.whitelist_networks, net, now).max(
+                Self::max_global_network_expiry(&self.list_whitelist_networks, net, now),
+            );
         if let Some(expiry) = whitelist_expiry {
             filter.allow_network(net, expiry.saturating_sub(now));
             return;
         }
         filter.unallow_network(net);
-        let expiry = Self::max_global_network_expiry(&self.kernel_block_networks, net, now)
-            .max(Self::max_global_network_expiry(
-                &self.list_block_networks,
-                net,
-                now,
-            ));
+        let expiry = Self::max_global_network_expiry(&self.kernel_block_networks, net, now).max(
+            Self::max_global_network_expiry(&self.list_block_networks, net, now),
+        );
         match expiry {
             Some(expiry) => filter.block_network(net, expiry.saturating_sub(now)),
             None => filter.unblock_network(net),
@@ -749,8 +748,7 @@ impl WafStateManager {
     ) -> bool {
         let snapshot = snapshots.load();
         Self::ranges_overlap_network(snapshot.get(&0), net, now)
-            || (server_id != 0
-                && Self::ranges_overlap_network(snapshot.get(&server_id), net, now))
+            || (server_id != 0 && Self::ranges_overlap_network(snapshot.get(&server_id), net, now))
     }
 
     fn ranges_overlap_network(
@@ -1042,12 +1040,7 @@ impl WafStateManager {
             use_local_firewall,
         ));
         if use_local_firewall {
-            Self::apply_scoped_network_map(
-                &self.kernel_block_networks,
-                key_server_id,
-                net,
-                expiry,
-            );
+            Self::apply_scoped_network_map(&self.kernel_block_networks, key_server_id, net, expiry);
         } else {
             Self::remove_scoped_network_map(&self.kernel_block_networks, key_server_id, net);
         }
@@ -1390,8 +1383,7 @@ impl WafStateManager {
                                 );
                                 return false;
                             }
-                            let quota =
-                                Quota::per_second(NonZeroU32::new(max_qps).unwrap());
+                            let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
                             entry.insert(TrackedLimiter::new(
                                 Arc::new(RateLimiter::dashmap(quota)),
                                 max_qps,
@@ -1414,8 +1406,7 @@ impl WafStateManager {
                 match self.ip_limiters.entry(key) {
                     Entry::Occupied(mut current) => {
                         if current.get().quota_value.load(Ordering::Relaxed) != max_qps {
-                            let quota =
-                                Quota::per_second(NonZeroU32::new(max_qps).unwrap());
+                            let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
                             let _ = current.insert(TrackedLimiter::new(
                                 Arc::new(RateLimiter::dashmap(quota)),
                                 max_qps,
@@ -1431,8 +1422,7 @@ impl WafStateManager {
                         ) {
                             return false;
                         }
-                        let quota =
-                            Quota::per_second(NonZeroU32::new(max_qps).unwrap());
+                        let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
                         entry = current.insert(TrackedLimiter::new(
                             Arc::new(RateLimiter::dashmap(quota)),
                             max_qps,
@@ -1603,11 +1593,7 @@ impl WafStateManager {
         }
     }
 
-    fn remove_scoped_network_map(
-        map: &DashMap<(i64, IpNet), i64>,
-        server_id: i64,
-        net: IpNet,
-    ) {
+    fn remove_scoped_network_map(map: &DashMap<(i64, IpNet), i64>, server_id: i64, net: IpNet) {
         map.remove(&(server_id, net));
     }
 
@@ -1773,8 +1759,7 @@ impl WafStateManager {
         self.graylists.retain(|_, expiry| now < *expiry);
         self.list_graylists.retain(|_, expiry| now < *expiry);
         self.block_networks.retain(|_, expiry| now < *expiry);
-        self.kernel_block_networks
-            .retain(|_, expiry| now < *expiry);
+        self.kernel_block_networks.retain(|_, expiry| now < *expiry);
         self.list_block_networks.retain(|_, expiry| now < *expiry);
         self.whitelist_networks.retain(|_, expiry| now < *expiry);
         self.list_whitelist_networks
