@@ -29,7 +29,7 @@ fn format_token_for_c_compatibility(token: &Token) -> String {
             }
             result
         }
-        _ => token.value_as_str().to_string()
+        _ => token.value_as_str().to_string(),
     }
 }
 
@@ -61,21 +61,29 @@ fn test_folding_from_c_testdata() {
     for test_file in test_files {
         let content = fs::read_to_string(&test_file).unwrap();
         let test_case = parse_test_file(&content);
-        
+
         if let Some((test_name, input, expected)) = test_case {
             let result = run_folding_test(&input, &expected);
             if result {
                 passed += 1;
-                println!("PASS: {} - {}", test_file.file_name().unwrap().to_str().unwrap(), test_name);
+                println!(
+                    "PASS: {} - {}",
+                    test_file.file_name().unwrap().to_str().unwrap(),
+                    test_name
+                );
             } else {
                 failed += 1;
-                println!("FAIL: {} - {}", test_file.file_name().unwrap().to_str().unwrap(), test_name);
-                
+                println!(
+                    "FAIL: {} - {}",
+                    test_file.file_name().unwrap().to_str().unwrap(),
+                    test_name
+                );
+
                 // Show the actual vs expected for debugging
                 let mut state = SqliState::new(input.as_bytes(), SqliFlags::FLAG_NONE);
                 let token_count = state.fold_tokens();
                 let expected_lines: Vec<&str> = expected.lines().collect();
-                
+
                 println!("  Input: {}", input);
                 println!("  Expected tokens:");
                 for line in expected.lines() {
@@ -94,12 +102,25 @@ fn test_folding_from_c_testdata() {
                         if parts.len() >= 2 {
                             let expected_value = parts[1..].join(" ");
                             let actual_value = format_token_for_c_compatibility(token);
-                            println!("    {} {} (comparing with: {})", token.token_type.to_char(), actual_value, expected_value);
+                            println!(
+                                "    {} {} (comparing with: {})",
+                                token.token_type.to_char(),
+                                actual_value,
+                                expected_value
+                            );
                         } else {
-                            println!("    {} {}", token.token_type.to_char(), format_token_for_c_compatibility(token));
+                            println!(
+                                "    {} {}",
+                                token.token_type.to_char(),
+                                format_token_for_c_compatibility(token)
+                            );
                         }
                     } else {
-                        println!("    {} {}", token.token_type.to_char(), format_token_for_c_compatibility(token));
+                        println!(
+                            "    {} {}",
+                            token.token_type.to_char(),
+                            format_token_for_c_compatibility(token)
+                        );
                     }
                 }
                 println!();
@@ -115,13 +136,13 @@ fn test_folding_from_c_testdata() {
 
 fn parse_test_file(content: &str) -> Option<(String, String, String)> {
     let lines: Vec<&str> = content.lines().collect();
-    
+
     let mut test_name = None;
     let mut input = None;
     let mut expected = Vec::new();
-    
+
     let mut section = "";
-    
+
     for line in lines {
         let line = line.trim();
         if line == "--TEST--" {
@@ -136,7 +157,7 @@ fn parse_test_file(content: &str) -> Option<(String, String, String)> {
         } else if line.is_empty() {
             continue;
         }
-        
+
         match section {
             "test" => {
                 if test_name.is_none() {
@@ -156,7 +177,7 @@ fn parse_test_file(content: &str) -> Option<(String, String, String)> {
             _ => {}
         }
     }
-    
+
     if let (Some(name), Some(inp), _) = (test_name, input, &expected) {
         Some((name, inp, expected.join("\n")))
     } else {
@@ -167,40 +188,39 @@ fn parse_test_file(content: &str) -> Option<(String, String, String)> {
 fn run_folding_test(input: &str, expected: &str) -> bool {
     let mut state = SqliState::new(input.as_bytes(), SqliFlags::FLAG_NONE);
     let token_count = state.fold_tokens();
-    
+
     let expected_lines: Vec<&str> = expected.lines().collect();
-    
-    
+
     if token_count != expected_lines.len() {
         return false;
     }
-    
+
     for (i, expected_line) in expected_lines.iter().enumerate() {
         if i >= state.tokens.len() {
             return false;
         }
-        
+
         let token = &state.tokens[i];
         let parts: Vec<&str> = expected_line.split_whitespace().collect();
-        
+
         if parts.len() < 2 {
             continue;
         }
-        
+
         let expected_type_char = parts[0].chars().next().unwrap();
         let expected_value = parts[1..].join(" ");
-        
+
         // Don't strip quotes from expected value for string tokens
         // The format_token_for_c_compatibility function reconstructs the quotes
         // so we need to compare with quotes included
-        
+
         let actual_type_char = token.token_type.to_char();
         let actual_value = format_token_for_c_compatibility(token);
-        
+
         if actual_type_char != expected_type_char || actual_value != expected_value {
             return false;
         }
     }
-    
+
     true
 }
