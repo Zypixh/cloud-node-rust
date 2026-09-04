@@ -220,11 +220,14 @@ fn bench_cache_hot_path(c: &mut Criterion) {
             status: 200,
             headers: &[],
             compressed: false,
+            error_status_allowed: false,
             shard_id: None,
             relative_path: None,
+            root_path: None,
             event_version: None,
             updated_at: Some(1),
             stale_while_revalidate_secs: 0,
+            stale_if_error_secs: 0,
             created_at: 1,
         });
         b.iter(|| black_box(storage.record_cache_access("benchhash")));
@@ -242,11 +245,14 @@ fn bench_cache_hot_path(c: &mut Criterion) {
             status: 200,
             headers: &[],
             compressed: false,
+            error_status_allowed: false,
             shard_id: None,
             relative_path: None,
+            root_path: None,
             event_version: None,
             updated_at: Some(1),
             stale_while_revalidate_secs: 0,
+            stale_if_error_secs: 0,
             created_at: 1,
         });
         b.iter(|| black_box(storage.get_cache_meta("benchhash")));
