@@ -1,4 +1,5 @@
 use crate::memory_governor::{MEMORY_GOVERNOR, MemoryPressureLevel};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -34,6 +35,13 @@ impl ReclaimStats {
 static LAST_OBSERVED_PRESSURE: AtomicU8 = AtomicU8::new(MemoryPressureLevel::Normal as u8);
 static LAST_RECLAIM_AT_MS: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    // Reclaiming cache state can update resident-memory accounting, which in
+    // turn observes pressure again. Keep recursive notifications from
+    // re-entering the same reclaim path on the current thread.
+    static RECLAIM_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+}
+
 const RECLAIM_COOLDOWN_MS: u64 = 5_000;
 
 fn level_from_u8(value: u8) -> MemoryPressureLevel {
@@ -54,6 +62,10 @@ pub fn current_observed_pressure() -> MemoryPressureLevel {
 }
 
 pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
+    if RECLAIM_IN_PROGRESS.with(|in_progress| in_progress.replace(true)) {
+        return ReclaimStats::default();
+    }
+
     let mut stats = ReclaimStats::default();
     match level {
         MemoryPressureLevel::Normal => {}
@@ -113,6 +125,7 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
         metrics = stats.metric_rows_flushed,
         "memory reclaim completed"
     );
+    RECLAIM_IN_PROGRESS.with(|in_progress| in_progress.set(false));
     stats
 }
 

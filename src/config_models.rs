@@ -3335,11 +3335,14 @@ impl SizeCapacity {
 
     pub fn to_bytes(&self) -> i64 {
         if self.unit.eq_ignore_ascii_case("kb") || self.unit.eq_ignore_ascii_case("k") {
-            self.count * 1024
+            self.count.saturating_mul(1024)
         } else if self.unit.eq_ignore_ascii_case("mb") || self.unit.eq_ignore_ascii_case("m") {
-            self.count * 1024 * 1024
+            self.count.saturating_mul(1024).saturating_mul(1024)
         } else if self.unit.eq_ignore_ascii_case("gb") || self.unit.eq_ignore_ascii_case("g") {
-            self.count * 1024 * 1024 * 1024
+            self.count
+                .saturating_mul(1024)
+                .saturating_mul(1024)
+                .saturating_mul(1024)
         } else {
             self.count
         }
@@ -3691,6 +3694,12 @@ mod tests {
         assert_eq!(fallback.count, 0);
         assert_eq!(fallback.unit, "b");
         assert_eq!(fallback.to_bytes(), 0);
+
+        let huge = SizeCapacity {
+            count: i64::MAX,
+            unit: "GB".to_string(),
+        };
+        assert_eq!(huge.to_bytes(), i64::MAX);
     }
 
     #[test]
