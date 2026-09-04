@@ -299,15 +299,15 @@ pub fn apply_for_interfaces(
     {
         if interfaces.is_empty() {
             report.actions.push(XdpTuneAction {
-            interface: None,
-            key: ("interfaces").into(),
-            old: None,
-            target: ("non-empty").into(),
-            final_value: None,
-            status: XdpTuneStatus::SkippedMissing,
-            reason: ("no XDP interfaces configured").into(),
-            command: None,
-        });
+                interface: None,
+                key: ("interfaces").into(),
+                old: None,
+                target: ("non-empty").into(),
+                final_value: None,
+                status: XdpTuneStatus::SkippedMissing,
+                reason: ("no XDP interfaces configured").into(),
+                command: None,
+            });
             finish_report(&report, &options)?;
             return Ok(report);
         }
@@ -420,39 +420,40 @@ fn ensure_ethtool(report: &mut XdpNetdevTuneReport, options: &XdpNetdevTuneOptio
     }
 
     report.actions.push(XdpTuneAction {
-            interface: None,
-            key: ("tool.ethtool").into(),
-            old: Some("missing".to_string()),
-            target: ("present").into(),
-            final_value: Some("installing".to_string()),
-            status: XdpTuneStatus::Installing,
-            reason: (format!("installing with {}", manager.program())).into(),
-            command: Some(shell.to_string()),
-        });
+        interface: None,
+        key: ("tool.ethtool").into(),
+        old: Some("missing".to_string()),
+        target: ("present").into(),
+        final_value: Some("installing".to_string()),
+        status: XdpTuneStatus::Installing,
+        reason: (format!("installing with {}", manager.program())).into(),
+        command: Some(shell.to_string()),
+    });
     let status = Command::new("sh").arg("-c").arg(shell).status();
     report.ethtool_available = command_exists("ethtool");
     report.actions.push(XdpTuneAction {
-            interface: None,
-            key: ("tool.ethtool").into(),
-            old: Some("missing".to_string()),
-            target: ("present").into(),
-            final_value: Some(if report.ethtool_available {
+        interface: None,
+        key: ("tool.ethtool").into(),
+        old: Some("missing".to_string()),
+        target: ("present").into(),
+        final_value: Some(if report.ethtool_available {
             "present".to_string()
         } else {
             "missing".to_string()
         }),
-            status: if report.ethtool_available {
+        status: if report.ethtool_available {
             XdpTuneStatus::Installed
         } else {
             XdpTuneStatus::Failed
         },
-            reason: (match status {
+        reason: (match status {
             Ok(status) if status.success() => "package manager installed ethtool".to_string(),
             Ok(status) => format!("package manager exited with {status}"),
             Err(err) => err.to_string(),
-        }).into(),
-            command: Some(shell.to_string()),
-        });
+        })
+        .into(),
+        command: Some(shell.to_string()),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -507,15 +508,15 @@ fn tune_features(
         Ok(features) => features,
         Err(err) => {
             report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: ("features").into(),
-            old: None,
-            target: ("readable").into(),
-            final_value: None,
-            status: XdpTuneStatus::Failed,
-            reason: (err.to_string()).into(),
-            command: Some(format!("ethtool -k {interface}")),
-        });
+                interface: Some(interface.to_string()),
+                key: ("features").into(),
+                old: None,
+                target: ("readable").into(),
+                final_value: None,
+                status: XdpTuneStatus::Failed,
+                reason: (err.to_string()).into(),
+                command: Some(format!("ethtool -k {interface}")),
+            });
             return;
         }
     };
@@ -524,67 +525,68 @@ fn tune_features(
         let key = format!("feature.{}", tune.key);
         let Some(state) = features_before.get(tune.key) else {
             report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: (key).into(),
-            old: None,
-            target: (tune.target).into(),
-            final_value: None,
-            status: XdpTuneStatus::SkippedMissing,
-            reason: ("feature not reported by ethtool").into(),
-            command: Some(format!("ethtool -k {interface}")),
-        });
+                interface: Some(interface.to_string()),
+                key: (key).into(),
+                old: None,
+                target: (tune.target).into(),
+                final_value: None,
+                status: XdpTuneStatus::SkippedMissing,
+                reason: ("feature not reported by ethtool").into(),
+                command: Some(format!("ethtool -k {interface}")),
+            });
             continue;
         };
         if state.fixed {
             report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: (key).into(),
-            old: Some(state.value.clone()),
-            target: (tune.target).into(),
-            final_value: Some(state.value.clone()),
-            status: XdpTuneStatus::SkippedFixed,
-            reason: ("feature is fixed by the driver").into(),
-            command: Some(format!(
+                interface: Some(interface.to_string()),
+                key: (key).into(),
+                old: Some(state.value.clone()),
+                target: (tune.target).into(),
+                final_value: Some(state.value.clone()),
+                status: XdpTuneStatus::SkippedFixed,
+                reason: ("feature is fixed by the driver").into(),
+                command: Some(format!(
                     "ethtool -K {interface} {} {}",
                     tune.arg, tune.target
                 )),
-        });
+            });
             continue;
         }
         if state.value == tune.target {
             report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: (key).into(),
-            old: Some(state.value.clone()),
-            target: (tune.target).into(),
-            final_value: Some(state.value.clone()),
-            status: XdpTuneStatus::AlreadySet,
-            reason: ("already matches target").into(),
-            command: Some(format!(
+                interface: Some(interface.to_string()),
+                key: (key).into(),
+                old: Some(state.value.clone()),
+                target: (tune.target).into(),
+                final_value: Some(state.value.clone()),
+                status: XdpTuneStatus::AlreadySet,
+                reason: ("already matches target").into(),
+                command: Some(format!(
                     "ethtool -K {interface} {} {}",
                     tune.arg, tune.target
                 )),
-        });
+            });
             continue;
         }
         if options.dry_run {
             report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: (key).into(),
-            old: Some(state.value.clone()),
-            target: (tune.target).into(),
-            final_value: Some(state.value.clone()),
-            status: XdpTuneStatus::DryRun,
-            reason: (if tune.required {
+                interface: Some(interface.to_string()),
+                key: (key).into(),
+                old: Some(state.value.clone()),
+                target: (tune.target).into(),
+                final_value: Some(state.value.clone()),
+                status: XdpTuneStatus::DryRun,
+                reason: (if tune.required {
                     "would change required XDP feature"
                 } else {
                     "would change feature"
-                }).into(),
-            command: Some(format!(
+                })
+                .into(),
+                command: Some(format!(
                     "ethtool -K {interface} {} {}",
                     tune.arg, tune.target
                 )),
-        });
+            });
             continue;
         }
 
@@ -616,7 +618,8 @@ fn tune_features(
                 Ok(status) if status.success() => "feature updated".to_string(),
                 Ok(status) => format!("ethtool exited with {status}"),
                 Err(err) => err.to_string(),
-            }).into(),
+            })
+            .into(),
             command: Some(command),
         });
     }
@@ -632,15 +635,15 @@ fn tune_channels(
         Ok(output) => output,
         Err(err) => {
             report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: ("channels.combined").into(),
-            old: None,
-            target: ("max").into(),
-            final_value: None,
-            status: XdpTuneStatus::SkippedMissing,
-            reason: (err.to_string()).into(),
-            command: Some(format!("ethtool -l {interface}")),
-        });
+                interface: Some(interface.to_string()),
+                key: ("channels.combined").into(),
+                old: None,
+                target: ("max").into(),
+                final_value: None,
+                status: XdpTuneStatus::SkippedMissing,
+                reason: (err.to_string()).into(),
+                command: Some(format!("ethtool -l {interface}")),
+            });
             return;
         }
     };
@@ -686,15 +689,15 @@ fn tune_rings(interface: &str, options: &XdpNetdevTuneOptions, report: &mut XdpN
         Ok(output) => output,
         Err(err) => {
             report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: ("rings").into(),
-            old: None,
-            target: ("max").into(),
-            final_value: None,
-            status: XdpTuneStatus::SkippedMissing,
-            reason: (err.to_string()).into(),
-            command: Some(format!("ethtool -g {interface}")),
-        });
+                interface: Some(interface.to_string()),
+                key: ("rings").into(),
+                old: None,
+                target: ("max").into(),
+                final_value: None,
+                status: XdpTuneStatus::SkippedMissing,
+                reason: (err.to_string()).into(),
+                command: Some(format!("ethtool -g {interface}")),
+            });
             return;
         }
     };
@@ -733,15 +736,15 @@ fn tune_coalesce(
         Ok(output) => output,
         Err(err) => {
             report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: ("coalesce").into(),
-            old: None,
-            target: ("low-latency").into(),
-            final_value: None,
-            status: XdpTuneStatus::SkippedMissing,
-            reason: (err.to_string()).into(),
-            command: Some(format!("ethtool -c {interface}")),
-        });
+                interface: Some(interface.to_string()),
+                key: ("coalesce").into(),
+                old: None,
+                target: ("low-latency").into(),
+                final_value: None,
+                status: XdpTuneStatus::SkippedMissing,
+                reason: (err.to_string()).into(),
+                command: Some(format!("ethtool -c {interface}")),
+            });
             return;
         }
     };
@@ -798,27 +801,28 @@ fn tune_coalesce(
         ])
         .status();
     report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: ("coalesce").into(),
-            old: Some(old),
-            target: (target).into(),
-            final_value: if status.as_ref().is_ok_and(|status| status.success()) {
+        interface: Some(interface.to_string()),
+        key: ("coalesce").into(),
+        old: Some(old),
+        target: (target).into(),
+        final_value: if status.as_ref().is_ok_and(|status| status.success()) {
             Some(target.to_string())
         } else {
             None
         },
-            status: if status.as_ref().is_ok_and(|status| status.success()) {
+        status: if status.as_ref().is_ok_and(|status| status.success()) {
             XdpTuneStatus::Applied
         } else {
             XdpTuneStatus::Failed
         },
-            reason: (match status {
+        reason: (match status {
             Ok(status) if status.success() => "coalescing updated".to_string(),
             Ok(status) => format!("ethtool exited with {status}"),
             Err(err) => err.to_string(),
-        }).into(),
-            command: Some(command),
-        });
+        })
+        .into(),
+        command: Some(command),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -869,15 +873,15 @@ fn tune_link(interface: &str, options: &XdpNetdevTuneOptions, report: &mut XdpNe
         qlen.as_deref() == Some(TARGET_TX_QUEUE_LEN),
     );
     report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: ("ip.link.mtu").into(),
-            old: mtu.clone(),
-            target: ("detect-only").into(),
-            final_value: mtu,
-            status: XdpTuneStatus::Skipped,
-            reason: ("MTU is observed only and is not modified automatically").into(),
-            command: Some(format!("ip -details link show {interface}")),
-        });
+        interface: Some(interface.to_string()),
+        key: ("ip.link.mtu").into(),
+        old: mtu.clone(),
+        target: ("detect-only").into(),
+        final_value: mtu,
+        status: XdpTuneStatus::Skipped,
+        reason: ("MTU is observed only and is not modified automatically").into(),
+        command: Some(format!("ip -details link show {interface}")),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -891,15 +895,15 @@ fn tune_queue_cpu_masks(
         let queue_root = Path::new("/sys/class/net").join(interface).join("queues");
         let Ok(entries) = fs::read_dir(&queue_root) else {
             report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: (format!("queues.{queue_kind}.cpu_mask")).into(),
-            old: None,
-            target: (mask.clone()).into(),
-            final_value: None,
-            status: XdpTuneStatus::SkippedMissing,
-            reason: (format!("{} is missing", queue_root.display())).into(),
-            command: None,
-        });
+                interface: Some(interface.to_string()),
+                key: (format!("queues.{queue_kind}.cpu_mask")).into(),
+                old: None,
+                target: (mask.clone()).into(),
+                final_value: None,
+                status: XdpTuneStatus::SkippedMissing,
+                reason: (format!("{} is missing", queue_root.display())).into(),
+                command: None,
+            });
             return;
         };
         for entry in entries.flatten() {
@@ -1027,27 +1031,28 @@ fn apply_simple_ethtool_numeric(
     }
     let status = Command::new("ethtool").args(&args).status();
     report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: (key).into(),
-            old: Some(current.to_string()),
-            target: (target.to_string()).into(),
-            final_value: if status.as_ref().is_ok_and(|status| status.success()) {
+        interface: Some(interface.to_string()),
+        key: (key).into(),
+        old: Some(current.to_string()),
+        target: (target.to_string()).into(),
+        final_value: if status.as_ref().is_ok_and(|status| status.success()) {
             Some(target.to_string())
         } else {
             None
         },
-            status: if status.as_ref().is_ok_and(|status| status.success()) {
+        status: if status.as_ref().is_ok_and(|status| status.success()) {
             XdpTuneStatus::Applied
         } else {
             XdpTuneStatus::Failed
         },
-            reason: (match status {
+        reason: (match status {
             Ok(status) if status.success() => "setting updated".to_string(),
             Ok(status) => format!("ethtool exited with {status}"),
             Err(err) => err.to_string(),
-        }).into(),
-            command: Some(command),
-        });
+        })
+        .into(),
+        command: Some(command),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -1090,27 +1095,28 @@ fn apply_ip_link_action(
     }
     let status = Command::new("ip").args(args).status();
     report.actions.push(XdpTuneAction {
-            interface: Some(interface.to_string()),
-            key: (key).into(),
-            old: old,
-            target: (target).into(),
-            final_value: if status.as_ref().is_ok_and(|status| status.success()) {
+        interface: Some(interface.to_string()),
+        key: (key).into(),
+        old: old,
+        target: (target).into(),
+        final_value: if status.as_ref().is_ok_and(|status| status.success()) {
             Some(target.to_string())
         } else {
             None
         },
-            status: if status.as_ref().is_ok_and(|status| status.success()) {
+        status: if status.as_ref().is_ok_and(|status| status.success()) {
             XdpTuneStatus::Applied
         } else {
             XdpTuneStatus::Failed
         },
-            reason: (match status {
+        reason: (match status {
             Ok(status) if status.success() => "link setting updated".to_string(),
             Ok(status) => format!("ip exited with {status}"),
             Err(err) => err.to_string(),
-        }).into(),
-            command: Some(command),
-        });
+        })
+        .into(),
+        command: Some(command),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -1177,22 +1183,23 @@ fn apply_sysfs_write(
             .as_deref()
             .is_some_and(|value| setting_value_matches(value, target));
     report.actions.push(XdpTuneAction {
-            interface: interface,
-            key: (key).into(),
-            old: old,
-            target: (target).into(),
-            final_value: final_value,
-            status: if success {
+        interface: interface,
+        key: (key).into(),
+        old: old,
+        target: (target).into(),
+        final_value: final_value,
+        status: if success {
             XdpTuneStatus::Applied
         } else {
             XdpTuneStatus::Failed
         },
-            reason: (match write {
+        reason: (match write {
             Ok(()) => "setting updated".to_string(),
             Err(err) => err.to_string(),
-        }).into(),
-            command: Some(format!("write {} {}", path.display(), target)),
-        });
+        })
+        .into(),
+        command: Some(format!("write {} {}", path.display(), target)),
+    });
 }
 
 fn finish_report(

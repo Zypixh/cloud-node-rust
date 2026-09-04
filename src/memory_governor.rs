@@ -3331,6 +3331,13 @@ mod tests {
     #[test]
     fn control_plane_admission_classes_roll_back_and_track_rejects() {
         let governor = MemoryGovernor::new();
+        seed_governor_memory(
+            &governor,
+            16 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+            1_048_576,
+            8,
+        );
         for class in [
             AdmissionClass::ClusterInternalConnection,
             AdmissionClass::RpcStreamCommand,

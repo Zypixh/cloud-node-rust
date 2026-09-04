@@ -4975,11 +4975,13 @@ pub fn fast_l1_lookup(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock as TestLazyLock;
     use std::sync::atomic::{AtomicU64 as TestAtomicU64, Ordering as TestOrdering};
-    use std::sync::Mutex as TestMutex;
+    use tokio::sync::Mutex as TestMutex;
 
     static TEST_UNIQUE_COUNTER: TestAtomicU64 = TestAtomicU64::new(0);
-    static CACHE_GLOBAL_STATE_LOCK: TestMutex<()> = TestMutex::new(());
+    static CACHE_GLOBAL_STATE_LOCK: TestLazyLock<TestMutex<()>> =
+        TestLazyLock::new(|| TestMutex::new(()));
 
     fn unique_test_suffix(prefix: &str) -> String {
         let seq = TEST_UNIQUE_COUNTER.fetch_add(1, TestOrdering::Relaxed);
@@ -5331,6 +5333,7 @@ mod tests {
 
     #[tokio::test]
     async fn small_uncompressed_l2_hit_uses_memory_handler_for_fast_l1_promotion() {
+        let _state_guard = CACHE_GLOBAL_STATE_LOCK.lock().await;
         let unique = unique_test_suffix("small-l2-hit");
         let key_str = unique.clone();
         let root = std::env::temp_dir().join(format!("cloud-node-rust-cache-test-{unique}"));
@@ -6588,7 +6591,7 @@ mod tests {
 
     #[test]
     fn cache_meta_hooks_warm_bloom_and_clear_negative_cache() {
-        let _state_guard = CACHE_GLOBAL_STATE_LOCK.lock().expect("cache test lock");
+        let _state_guard = CACHE_GLOBAL_STATE_LOCK.blocking_lock();
         let key = unique_test_suffix("hook-key");
         let now = crate::utils::time::now_timestamp();
         negative_cache_insert(&key, now);
@@ -6612,6 +6615,7 @@ mod tests {
 
     #[test]
     fn critical_reclaim_clears_l1_and_negative_cache() {
+        let _state_guard = CACHE_GLOBAL_STATE_LOCK.blocking_lock();
         let storage = &crate::cache_manager::CACHE.storage;
         let now = crate::utils::time::now_timestamp();
         let key = unique_test_suffix("reclaim-critical");

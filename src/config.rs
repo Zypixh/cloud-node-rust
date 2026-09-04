@@ -1521,7 +1521,9 @@ impl ConfigStore {
         routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
         let mut id_to_lb = HashMap::new();
-        if server_id > 0 && let Some(lb) = routes.values().next() {
+        if server_id > 0
+            && let Some(lb) = routes.values().next()
+        {
             id_to_lb.insert(server_id, Arc::clone(lb));
         }
         self.replace_servers_snapshot(

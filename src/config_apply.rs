@@ -437,10 +437,7 @@ mod tests {
             tiered_origin_bypass: false,
             allow_lan: true,
             global_http: None,
-            limits: ConfigApplyLimits::synthetic(
-                8 * 1024 * 1024 * 1024,
-                4 * 1024 * 1024 * 1024,
-            ),
+            limits: ConfigApplyLimits::synthetic(8 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
         })
         .await;
         let a = maps.servers.get("a.example.com").expect("exact host");
@@ -461,15 +458,15 @@ mod tests {
         assert_eq!(limits.pressure, MemoryPressureLevel::Critical);
         assert_eq!(limits.server_chunk_size(), 4);
         let maps = materialize_runtime_servers(MaterializeRuntimeServersArgs {
-        servers,
-        health_manager: &health,
-        node_level: 1,
-        parent_nodes: Arc::new(HashMap::new()),
-        tiered_origin_bypass: false,
-        allow_lan: true,
-        global_http: None,
-        limits,
-    })
+            servers,
+            health_manager: &health,
+            node_level: 1,
+            parent_nodes: Arc::new(HashMap::new()),
+            tiered_origin_bypass: false,
+            allow_lan: true,
+            global_http: None,
+            limits,
+        })
         .await;
         assert_eq!(maps.all_servers.len(), 40);
         assert_eq!(maps.servers.len(), 40);

@@ -47,16 +47,18 @@ pub async fn build_runtime_maps(
     allow_lan: bool,
     global_http: Option<crate::config_models::GlobalHTTPAllConfig>,
 ) -> crate::config_apply::RuntimeServerMaps {
-    crate::config_apply::materialize_runtime_servers(crate::config_apply::MaterializeRuntimeServersArgs {
-        servers,
-        health_manager,
-        node_level,
-        parent_nodes,
-        tiered_origin_bypass,
-        allow_lan,
-        global_http: global_http.map(Arc::new),
-        limits: crate::config_apply::ConfigApplyLimits::from_governor(),
-    })
+    crate::config_apply::materialize_runtime_servers(
+        crate::config_apply::MaterializeRuntimeServersArgs {
+            servers,
+            health_manager,
+            node_level,
+            parent_nodes,
+            tiered_origin_bypass,
+            allow_lan,
+            global_http: global_http.map(Arc::new),
+            limits: crate::config_apply::ConfigApplyLimits::from_governor(),
+        },
+    )
     .await
 }
 
