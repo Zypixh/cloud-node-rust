@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -242,6 +243,19 @@ struct MemorySnapshot {
 }
 
 pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(MemoryGovernor::new);
+
+// Observing pressure can synchronously trigger cache reclamation. Cache
+// initialization itself asks the governor for a budget, so without a
+// per-thread guard that path recursively initializes CACHE and overflows the
+// stack when the first observation is already under pressure.
+thread_local! {
+    static PRESSURE_RECLAIM_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+    // resident_memory_replace_owned holds the owner map while calculating a
+    // budget. That calculation can synchronously reclaim the cache, whose
+    // Bloom accounting calls this method again. Reject the nested accounting
+    // attempt instead of recursively locking the owner map.
+    static RESIDENT_OWNER_UPDATE_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+}
 
 pub fn reported_memory_totals() -> (i64, i64) {
     let snapshot = MEMORY_GOVERNOR.snapshot(MEMORY_GOVERNOR.pingora_worker_threads());
@@ -1302,22 +1316,31 @@ impl MemoryGovernor {
         owner: &str,
         new_bytes: u64,
     ) -> bool {
-        let mut owners = self
-            .resident
-            .owners
-            .lock()
-            .expect("resident accounting lock poisoned");
-        let key = (category, owner.to_string());
-        let old_bytes = owners.get(&key).copied().unwrap_or(0);
-        if !self.resident_memory_replace(category, old_bytes, new_bytes) {
-            return false;
-        }
-        if new_bytes == 0 {
-            owners.remove(&key);
-        } else {
-            owners.insert(key, new_bytes);
-        }
-        true
+        RESIDENT_OWNER_UPDATE_IN_PROGRESS.with(|in_progress| {
+            if in_progress.replace(true) {
+                return false;
+            }
+            let result = (|| {
+                let mut owners = self
+                    .resident
+                    .owners
+                    .lock()
+                    .expect("resident accounting lock poisoned");
+                let key = (category, owner.to_string());
+                let old_bytes = owners.get(&key).copied().unwrap_or(0);
+                if !self.resident_memory_replace(category, old_bytes, new_bytes) {
+                    return false;
+                }
+                if new_bytes == 0 {
+                    owners.remove(&key);
+                } else {
+                    owners.insert(key, new_bytes);
+                }
+                true
+            })();
+            in_progress.set(false);
+            result
+        })
     }
 
     pub fn resident_memory_remove(&self, category: ResidentCategory, bytes: u64) {
@@ -1519,7 +1542,7 @@ impl MemoryGovernor {
         let cached_at = self.cached_at_millis.load(Ordering::Relaxed) as i64;
         if cached_at > 0 && now.saturating_sub(cached_at) < SNAPSHOT_TTL_MS {
             let mem = self.budgeted_from_cached();
-            crate::memory_reclaim::on_memory_pressure_observed(memory_pressure_level(&mem));
+            notify_pressure_reclaim(memory_pressure_level(&mem));
             return mem;
         }
 
@@ -1550,7 +1573,7 @@ impl MemoryGovernor {
             .store(snapshot.process_anon_rss_bytes, Ordering::Relaxed);
         self.cached_at_millis.store(now as u64, Ordering::Relaxed);
         let mem = self.budgeted_from_cached();
-        crate::memory_reclaim::on_memory_pressure_observed(memory_pressure_level(&mem));
+        notify_pressure_reclaim(memory_pressure_level(&mem));
         mem
     }
 
@@ -1590,6 +1613,16 @@ impl MemoryGovernor {
             process_anon_rss_bytes: self.cached_process_anon_rss_bytes.load(Ordering::Relaxed),
         }
     }
+}
+
+fn notify_pressure_reclaim(level: MemoryPressureLevel) {
+    PRESSURE_RECLAIM_IN_PROGRESS.with(|in_progress| {
+        if in_progress.replace(true) {
+            return;
+        }
+        crate::memory_reclaim::on_memory_pressure_observed(level);
+        in_progress.set(false);
+    });
 }
 
 impl Drop for AdmissionPermit<'_> {

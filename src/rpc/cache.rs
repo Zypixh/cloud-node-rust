@@ -541,9 +541,10 @@ pub async fn sync_cache_tasks(
 
                 if key_task.r#type == "purge" && is_tag_purge(&key_task.key_type) {
                     info!("Purging cache by surrogate tag: {}", key_task.key);
+                    let purge_version = crate::metrics::storage::next_cache_meta_event_version();
                     let purge_ok = crate::cache_manager::CACHE
                         .storage
-                        .purge_by_tag(key_task.key.trim())
+                        .purge_by_tag_at_version(key_task.key.trim(), Some(purge_version))
                         .await;
                     if purge_ok && crate::runtime_mode::RuntimeConfig::current_is_rke2() {
                         let purge_id = format!("{}:{}", key_task.id, uuid::Uuid::new_v4());
@@ -555,6 +556,7 @@ pub async fn sync_cache_tasks(
                                 key_type: key_task.key_type.clone(),
                                 prefix: String::new(),
                                 leader_epoch: crate::cluster::leader::ROLE_STATE.epoch(),
+                                version: purge_version,
                             },
                         )
                         .await
@@ -587,20 +589,29 @@ pub async fn sync_cache_tasks(
                         }
                     };
                     let mut purge_ok = !targets.is_empty();
+                    let mut purge_versions = Vec::with_capacity(targets.len());
                     for target in &targets {
+                        let purge_version =
+                            crate::metrics::storage::next_cache_meta_event_version();
+                        purge_versions.push(purge_version);
                         let target_ok = match target {
                             PurgeTarget::Key(key) => {
-                                crate::cache_manager::CACHE.purge_key(key).await.is_ok()
+                                crate::cache_manager::CACHE
+                                    .storage
+                                    .purge_by_key_at_version(key, Some(purge_version))
+                                    .await
                             }
-                            PurgeTarget::Prefix(prefix) => crate::cache_manager::CACHE
-                                .purge_prefix(prefix)
-                                .await
-                                .is_ok(),
+                            PurgeTarget::Prefix(prefix) => {
+                                crate::cache_manager::CACHE
+                                    .storage
+                                    .purge_by_prefix_at_version(prefix, Some(purge_version))
+                                    .await
+                            }
                         };
                         purge_ok &= target_ok;
                     }
                     if purge_ok && crate::runtime_mode::RuntimeConfig::current_is_rke2() {
-                        for target in &targets {
+                        for (target, version) in targets.iter().zip(purge_versions) {
                             let purge_id = format!("{}:{}", key_task.id, uuid::Uuid::new_v4());
                             let (key, key_type, prefix) = match target {
                                 PurgeTarget::Key(key) => {
@@ -618,6 +629,7 @@ pub async fn sync_cache_tasks(
                                     key_type,
                                     prefix,
                                     leader_epoch: crate::cluster::leader::ROLE_STATE.epoch(),
+                                    version,
                                 },
                             )
                             .await

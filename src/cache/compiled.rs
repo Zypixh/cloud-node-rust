@@ -811,7 +811,6 @@ pub struct CompiledCacheResponsePolicy {
     min_size_bytes: Option<i64>,
     max_size_bytes: Option<i64>,
     skip_cache_control_values: Vec<String>,
-    skip_set_cookie: bool,
     allow_chunked_encoding: bool,
     allow_partial_content: bool,
     force_partial_content: bool,
@@ -853,7 +852,6 @@ impl CompiledCacheResponsePolicy {
                 .filter(|value| !value.is_empty())
                 .map(|value| value.to_lowercase())
                 .collect(),
-            skip_set_cookie: cache_ref.skip_set_cookie,
             allow_chunked_encoding: cache_ref.allow_chunked_encoding,
             allow_partial_content: cache_ref.allow_partial_content,
             force_partial_content: cache_ref.force_partial_content,
@@ -899,16 +897,23 @@ impl CompiledCacheResponsePolicy {
         method: &str,
         _force_partial_content: bool,
     ) -> bool {
-        let method_allowed = if self.methods.is_empty() {
-            method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")
-        } else {
-            self.methods
-                .iter()
-                .any(|item| item.eq_ignore_ascii_case(method))
-        };
+        if !crate::cache::status_allows_shared_cache_with_error_policy(
+            status,
+            self.error_status_allowed(status),
+        ) {
+            return false;
+        }
+        let safe_method = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+        let method_allowed = safe_method
+            && (self.methods.is_empty()
+                || self
+                    .methods
+                    .iter()
+                    .any(|item| item.eq_ignore_ascii_case(method)));
         if !method_allowed {
             return false;
         }
+
         let partial_content_allowed = self.allow_partial_content || self.statuses.contains(&206);
         if status == 206 && !partial_content_allowed {
             return false;
@@ -949,52 +954,34 @@ impl CompiledCacheResponsePolicy {
         skip_size_checks: bool,
         req_headers: &HeaderMap,
     ) -> bool {
+        if !crate::cache::request_headers_allow_shared_cache(method, req_headers)
+            || !crate::cache::response_headers_allow_shared_cache(headers)
+        {
+            return false;
+        }
         if !self.allows_method_status(status, method, force_partial_content) {
             return false;
         }
         if !skip_size_checks {
             if self
                 .min_size_bytes
-                .is_some_and(|min_size| min_size > 0 && (body_size as i64) < min_size)
+                .is_some_and(|min_size| crate::cache::body_size_below_limit(body_size, min_size))
             {
                 return false;
             }
             if self
                 .max_size_bytes
-                .is_some_and(|max_size| max_size > 0 && (body_size as i64) > max_size)
+                .is_some_and(|max_size| crate::cache::body_size_exceeds_limit(body_size, max_size))
             {
                 return false;
             }
         }
-        if let Some(cc) = headers
-            .get("cache-control")
-            .and_then(|value| value.to_str().ok())
-        {
-            if crate::cache::cache_control_has_skipped_value(cc, &self.skip_cache_control_values) {
-                return false;
-            }
-        }
-        if self.skip_set_cookie && headers.contains_key("set-cookie") {
+        if crate::cache::cache_control_headers_have_skipped_value(
+            headers,
+            &self.skip_cache_control_values,
+        ) {
             return false;
         }
-
-        // Check Authorization: RFC 7234 §3.2
-        if req_headers.contains_key("authorization") {
-            let cc_allows = headers
-                .get("cache-control")
-                .and_then(|v| v.to_str().ok())
-                .map(|cc| {
-                    let lower = cc.to_ascii_lowercase();
-                    lower.contains("public")
-                        || lower.contains("must-revalidate")
-                        || lower.contains("s-maxage")
-                })
-                .unwrap_or(false);
-            if !cc_allows {
-                return false;
-            }
-        }
-
         true
     }
 
@@ -1022,6 +1009,10 @@ impl CompiledCacheResponsePolicy {
 
     pub fn allows_partial_content(&self) -> bool {
         self.allow_partial_content || self.statuses.contains(&206)
+    }
+
+    pub fn error_status_allowed(&self, status: u16) -> bool {
+        status >= 500 && self.statuses.contains(&(status as i32))
     }
 }
 

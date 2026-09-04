@@ -134,6 +134,27 @@ impl CompiledServerFeaturePlan {
             .and_then(|optimization| optimization.kind(content_type, request_url))
     }
 
+    /// Returns whether any response optimization rule can match this URL.
+    /// The response content type is not known during request cache admission,
+    /// so callers use this conservative predicate to avoid caching a body
+    /// before a later optimization filter can change it.
+    pub fn optimization_matches_url(&self, request_url: &str) -> bool {
+        self.optimization.as_ref().is_some_and(|optimization| {
+            optimization
+                .html
+                .as_ref()
+                .is_some_and(|patterns| patterns.matches_url(request_url))
+                || optimization
+                    .css
+                    .as_ref()
+                    .is_some_and(|patterns| patterns.matches_url(request_url))
+                || optimization
+                    .javascript
+                    .as_ref()
+                    .is_some_and(|patterns| patterns.matches_url(request_url))
+        })
+    }
+
     pub fn has_hls_encrypting(&self) -> bool {
         self.hls_encrypting.is_some()
     }
