@@ -389,7 +389,7 @@ impl CompiledAuthPlan {
         path: &str,
         authorization: Option<&str>,
     ) -> Option<CompiledAuthResult> {
-        for policy in &self.policies {
+        if let Some(policy) = self.policies.first() {
             let result = policy.result(host, path, authorization)?;
             return Some(result);
         }
@@ -1215,7 +1215,7 @@ fn canonical_url_pattern_type(type_name: &str) -> String {
 
 fn url_without_query_fragment(value: &str) -> &str {
     value
-        .find(|ch| ch == '?' || ch == '#')
+        .find(['?', '#'])
         .map(|idx| &value[..idx])
         .unwrap_or(value)
 }
@@ -1434,7 +1434,7 @@ mod tests {
             ..Default::default()
         });
         let next = plans.recompile_servers(&[replacement], &[11]);
-        assert!(next.server_features.get(&11).is_none());
+        assert!(!next.server_features.contains_key(&11));
         let _ = second;
         let _ = next;
     }

@@ -946,38 +946,30 @@ impl CompiledCacheResponsePolicy {
     fn should_cache_response(
         &self,
         _policy: Option<&CompiledCachePolicy>,
-        status: u16,
-        method: &str,
-        headers: &HeaderMap,
-        body_size: usize,
-        force_partial_content: bool,
-        skip_size_checks: bool,
-        req_headers: &HeaderMap,
+        input: crate::cache::CacheResponseDecisionInput<'_>,
     ) -> bool {
-        if !crate::cache::request_headers_allow_shared_cache(method, req_headers)
-            || !crate::cache::response_headers_allow_shared_cache(headers)
+        if !crate::cache::request_headers_allow_shared_cache(input.method, input.req_headers)
+            || !crate::cache::response_headers_allow_shared_cache(input.headers)
         {
             return false;
         }
-        if !self.allows_method_status(status, method, force_partial_content) {
+        if !self.allows_method_status(input.status, input.method, input.force_partial_content) {
             return false;
         }
-        if !skip_size_checks {
-            if self
-                .min_size_bytes
-                .is_some_and(|min_size| crate::cache::body_size_below_limit(body_size, min_size))
-            {
+        if !input.skip_size_checks {
+            if self.min_size_bytes.is_some_and(|min_size| {
+                crate::cache::body_size_below_limit(input.body_size, min_size)
+            }) {
                 return false;
             }
-            if self
-                .max_size_bytes
-                .is_some_and(|max_size| crate::cache::body_size_exceeds_limit(body_size, max_size))
-            {
+            if self.max_size_bytes.is_some_and(|max_size| {
+                crate::cache::body_size_exceeds_limit(input.body_size, max_size)
+            }) {
                 return false;
             }
         }
         if crate::cache::cache_control_headers_have_skipped_value(
-            headers,
+            input.headers,
             &self.skip_cache_control_values,
         ) {
             return false;
@@ -1165,24 +1157,11 @@ fn select_from_refs(
 pub fn should_cache_response_compiled(
     cache_ref: &CompiledCacheRef,
     policy: Option<&CompiledCachePolicy>,
-    status: u16,
-    method: &str,
-    headers: &HeaderMap,
-    body_size: usize,
-    force_partial_content: bool,
-    skip_size_checks: bool,
-    req_headers: &HeaderMap,
+    input: crate::cache::CacheResponseDecisionInput<'_>,
 ) -> bool {
-    cache_ref.response_policy.should_cache_response(
-        policy,
-        status,
-        method,
-        headers,
-        body_size,
-        force_partial_content,
-        skip_size_checks,
-        req_headers,
-    )
+    cache_ref
+        .response_policy
+        .should_cache_response(policy, input)
 }
 
 pub fn cache_ref_response_conditions_match(

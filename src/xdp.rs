@@ -5368,8 +5368,7 @@ pub mod af_xdp {
         }
 
         pub(super) fn poll(&mut self) -> Vec<(AfXdpRouteMeta, Vec<u8>)> {
-            let now =
-                SmoltcpInstant::from_millis(crate::utils::time::now_timestamp_millis() as i64);
+            let now = SmoltcpInstant::from_millis(crate::utils::time::now_timestamp_millis());
             self.poll_at(now)
         }
 
@@ -5457,8 +5456,7 @@ pub mod af_xdp {
             flow: AfXdpTcpFlowKey,
             proxy_class: AfXdpTcpProxyClass,
         ) -> bool {
-            let now =
-                SmoltcpInstant::from_millis(crate::utils::time::now_timestamp_millis() as i64);
+            let now = SmoltcpInstant::from_millis(crate::utils::time::now_timestamp_millis());
             self.ensure_session_at(route, flow, proxy_class, now)
         }
 
@@ -6824,11 +6822,11 @@ pub mod af_xdp {
     }
 
     fn checksum_sum(data: &[u8]) -> u32 {
-        let mut chunks = data.chunks_exact(2);
-        let mut sum = chunks.by_ref().fold(0u32, |sum, chunk| {
+        let (chunks, remainder) = data.as_chunks::<2>();
+        let mut sum = chunks.iter().fold(0u32, |sum, chunk| {
             sum + u16::from_be_bytes([chunk[0], chunk[1]]) as u32
         });
-        if let Some(byte) = chunks.remainder().first() {
+        if let Some(byte) = remainder.first() {
             sum += u16::from_be_bytes([*byte, 0]) as u32;
         }
         sum
@@ -7244,9 +7242,7 @@ pub mod af_xdp {
 
     #[cfg(any(test, target_os = "linux"))]
     pub(super) fn tcp_flags_from_ip_packet(ip_packet: &[u8]) -> Option<u8> {
-        let Some((protocol, l4_offset, packet_end)) = ip_transport_bounds(ip_packet) else {
-            return None;
-        };
+        let (protocol, l4_offset, packet_end) = ip_transport_bounds(ip_packet)?;
         if protocol != IP_PROTO_TCP || l4_offset + TCP_MIN_HEADER_LEN > packet_end {
             return None;
         }

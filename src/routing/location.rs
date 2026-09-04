@@ -85,7 +85,9 @@ pub fn match_location<'a>(
     None
 }
 
-static COMPILED_CACHE: Lazy<DashMap<(u64, i64, usize), Arc<Vec<CompiledLocation>>>> =
+type CompiledLocationCacheKey = (u64, i64, usize);
+type CompiledLocationCache = Lazy<DashMap<CompiledLocationCacheKey, Arc<Vec<CompiledLocation>>>>;
+static COMPILED_CACHE: CompiledLocationCache =
     Lazy::new(DashMap::new);
 static COMPILED_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 

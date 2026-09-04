@@ -77,11 +77,11 @@ impl Http3ProxyManager {
             return desired;
         }
 
-        if policy.port > 0 {
-            if let Ok(port) = u16::try_from(policy.port) {
-                desired.insert(port);
-                return desired;
-            }
+        if policy.port > 0
+            && let Ok(port) = u16::try_from(policy.port)
+        {
+            desired.insert(port);
+            return desired;
         }
 
         for server in self.config_store.get_all_servers_sync() {

@@ -42,11 +42,11 @@ pub async fn sync_active_plans(api_config: &ApiConfig, config_store: &ConfigStor
             .await
         {
             Ok(resp) => {
-                if let Some(user_plan) = resp.into_inner().user_plan {
-                    if user_plan.id > 0 {
-                        plan_ids.insert(user_plan.plan_id);
-                        user_plans.insert(user_plan.id, user_plan);
-                    }
+                if let Some(user_plan) = resp.into_inner().user_plan
+                    && user_plan.id > 0
+                {
+                    plan_ids.insert(user_plan.plan_id);
+                    user_plans.insert(user_plan.id, user_plan);
                 }
             }
             Err(err) => {

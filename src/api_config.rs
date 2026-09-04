@@ -233,103 +233,6 @@ fn default_kernel_tuning_enabled() -> bool {
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_access_log_pipeline_uses_auto_upload_concurrency() {
-        let normalized = AccessLogPipelineConfig::default().normalized();
-
-        assert!(normalized.upload_concurrency > 1);
-        assert!(normalized.upload_concurrency <= MAX_ACCESS_LOG_UPLOAD_CONCURRENCY);
-        assert_eq!(
-            normalized.queue_capacity,
-            crate::memory_governor::MEMORY_GOVERNOR
-                .access_log_queue_capacity()
-                .max(crate::memory_governor::MEMORY_GOVERNOR.access_log_batch_size())
-        );
-        assert_eq!(
-            normalized.batch_queue_capacity(),
-            ceil_div(normalized.queue_capacity, normalized.batch_size)
-                .max(normalized.upload_concurrency * 2)
-        );
-    }
-
-    #[test]
-    fn explicit_access_log_upload_concurrency_is_respected() {
-        let config = AccessLogPipelineConfig {
-            upload_concurrency: 3,
-            ..Default::default()
-        }
-        .normalized();
-
-        assert_eq!(config.upload_concurrency, 3);
-    }
-
-    #[test]
-    fn batch_queue_capacity_covers_main_queue_batches() {
-        let config = AccessLogPipelineConfig {
-            queue_capacity: 250_001,
-            batch_size: 10_000,
-            upload_concurrency: 2,
-            ..Default::default()
-        }
-        .normalized();
-
-        assert_eq!(config.batch_queue_capacity(), 26);
-    }
-
-    #[test]
-    fn relay_config_defaults_to_stable_copy_path() {
-        let config = RelayConfig::default().normalized();
-
-        assert!(!config.zero_copy);
-        assert_eq!(config.tcp_keepalive_idle_secs, 60);
-        assert_eq!(config.tcp_keepalive_interval_secs, 15);
-        assert_eq!(config.tcp_keepalive_probes, 4);
-    }
-
-    #[test]
-    fn kernel_tuning_defaults_to_enabled_for_legacy_config() {
-        let config: ApiConfig = serde_yaml::from_str(
-            r#"
-rpc.endpoints:
-  - https://api.example.com
-nodeId: "1"
-secret: "secret"
-"#,
-        )
-        .unwrap();
-
-        assert!(config.kernel_tuning.normalized().enabled);
-    }
-
-    #[test]
-    fn kernel_tuning_can_be_disabled() {
-        let config: ApiConfig = serde_yaml::from_str(
-            r#"
-rpc.endpoints:
-  - https://api.example.com
-nodeId: "1"
-secret: "secret"
-kernelTuning:
-  enabled: false
-"#,
-        )
-        .unwrap();
-
-        assert!(!config.kernel_tuning.normalized().enabled);
-    }
-
-    #[test]
-    fn remote_plaintext_rpc_endpoint_remains_supported() {
-        let endpoint = "http://36.134.185.75:8001";
-
-        assert_eq!(validate_rpc_endpoint(endpoint).unwrap(), endpoint);
-    }
-}
-
 impl ApiConfig {
     pub fn default_paths() -> Vec<PathBuf> {
         crate::paths::NodePaths::current().api_config_candidates()
@@ -443,4 +346,101 @@ pub fn validate_rpc_endpoints(endpoints: Vec<String>) -> anyhow::Result<Vec<Stri
         }
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_access_log_pipeline_uses_auto_upload_concurrency() {
+        let normalized = AccessLogPipelineConfig::default().normalized();
+
+        assert!(normalized.upload_concurrency > 1);
+        assert!(normalized.upload_concurrency <= MAX_ACCESS_LOG_UPLOAD_CONCURRENCY);
+        assert_eq!(
+            normalized.queue_capacity,
+            crate::memory_governor::MEMORY_GOVERNOR
+                .access_log_queue_capacity()
+                .max(crate::memory_governor::MEMORY_GOVERNOR.access_log_batch_size())
+        );
+        assert_eq!(
+            normalized.batch_queue_capacity(),
+            ceil_div(normalized.queue_capacity, normalized.batch_size)
+                .max(normalized.upload_concurrency * 2)
+        );
+    }
+
+    #[test]
+    fn explicit_access_log_upload_concurrency_is_respected() {
+        let config = AccessLogPipelineConfig {
+            upload_concurrency: 3,
+            ..Default::default()
+        }
+        .normalized();
+
+        assert_eq!(config.upload_concurrency, 3);
+    }
+
+    #[test]
+    fn batch_queue_capacity_covers_main_queue_batches() {
+        let config = AccessLogPipelineConfig {
+            queue_capacity: 250_001,
+            batch_size: 10_000,
+            upload_concurrency: 2,
+            ..Default::default()
+        }
+        .normalized();
+
+        assert_eq!(config.batch_queue_capacity(), 26);
+    }
+
+    #[test]
+    fn relay_config_defaults_to_stable_copy_path() {
+        let config = RelayConfig::default().normalized();
+
+        assert!(!config.zero_copy);
+        assert_eq!(config.tcp_keepalive_idle_secs, 60);
+        assert_eq!(config.tcp_keepalive_interval_secs, 15);
+        assert_eq!(config.tcp_keepalive_probes, 4);
+    }
+
+    #[test]
+    fn kernel_tuning_defaults_to_enabled_for_legacy_config() {
+        let config: ApiConfig = serde_yaml::from_str(
+            r#"
+rpc.endpoints:
+  - https://api.example.com
+nodeId: "1"
+secret: "secret"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.kernel_tuning.normalized().enabled);
+    }
+
+    #[test]
+    fn kernel_tuning_can_be_disabled() {
+        let config: ApiConfig = serde_yaml::from_str(
+            r#"
+rpc.endpoints:
+  - https://api.example.com
+nodeId: "1"
+secret: "secret"
+kernelTuning:
+  enabled: false
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.kernel_tuning.normalized().enabled);
+    }
+
+    #[test]
+    fn remote_plaintext_rpc_endpoint_remains_supported() {
+        let endpoint = "http://36.134.185.75:8001";
+
+        assert_eq!(validate_rpc_endpoint(endpoint).unwrap(), endpoint);
+    }
 }

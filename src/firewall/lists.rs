@@ -260,16 +260,17 @@ impl GlobalIpListManager {
 
         let ip_from = item.ip_from.trim();
         let ip_to = item.ip_to.trim();
-        if !ip_from.is_empty() && !ip_to.is_empty() {
-            if let (Ok(from), Ok(to)) = (ip_from.parse::<IpAddr>(), ip_to.parse::<IpAddr>()) {
-                let from = canonical_ip(from);
-                let to = canonical_ip(to);
-                if from == to {
-                    return Some(IpListTarget::Ip(from));
-                }
-                if let Some(range) = build_ip_addr_range(from, to) {
-                    return Some(IpListTarget::Range(range));
-                }
+        if !ip_from.is_empty()
+            && !ip_to.is_empty()
+            && let (Ok(from), Ok(to)) = (ip_from.parse::<IpAddr>(), ip_to.parse::<IpAddr>())
+        {
+            let from = canonical_ip(from);
+            let to = canonical_ip(to);
+            if from == to {
+                return Some(IpListTarget::Ip(from));
+            }
+            if let Some(range) = build_ip_addr_range(from, to) {
+                return Some(IpListTarget::Range(range));
             }
         }
         None

@@ -35,7 +35,7 @@ impl ProxyHttp for BenchProxy {
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         session
             .cache
-            .enable(&*CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
+            .enable(CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
         Ok(false)
     }
 

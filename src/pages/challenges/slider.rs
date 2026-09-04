@@ -1,5 +1,5 @@
 use crate::pages::Lang;
-use rand::{Rng, RngExt};
+use rand::RngExt;
 
 pub fn issue_html(
     lang: Lang,
@@ -220,7 +220,7 @@ fn random_js_id() -> String {
         .collect()
 }
 
-fn generate_puzzle_polygon(rng: &mut (impl Rng + RngExt)) -> String {
+fn generate_puzzle_polygon(rng: &mut impl RngExt) -> String {
     let tab_side: u8 = rng.random_range(0..4u8);
     let notch_side: u8 = (tab_side + 2) % 4;
     let tab_pos: f64 = rng.random_range(35.0f64..65.0);

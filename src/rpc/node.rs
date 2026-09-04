@@ -31,6 +31,22 @@ static LAST_GLOBAL_CONFIG_HASH: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(
 static CONNECTED_API_NODE_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
 static ENABLED_FEATURES_UNSUPPORTED_LOGGED: AtomicBool = AtomicBool::new(false);
 
+pub struct FetchConfigArgs<'a, F>
+where
+    F: FnMut(Request<()>) -> Result<Request<()>, Status> + Send + 'static,
+{
+    pub client: &'a mut pb::node_service_client::NodeServiceClient<
+        tonic::service::interceptor::InterceptedService<Channel, F>,
+    >,
+    pub config_store: &'a ConfigStore,
+    pub api_config: &'a ApiConfig,
+    pub health_manager: &'a crate::health_manager::GlobalHealthManager,
+    pub cert_selector: &'a crate::ssl::DynamicCertSelector,
+    pub waf_state: &'a crate::firewall::state::WafStateManager,
+    pub task_version: &'a mut i64,
+    pub config_version: &'a mut i64,
+}
+
 fn build_version_code() -> u32 {
     env!("CARGO_PKG_VERSION")
         .split('.')
@@ -85,9 +101,9 @@ fn dedup_ssl_certs(
             by_id.insert(key, cert);
             continue;
         }
-        if !by_id.contains_key(&cert.id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = by_id.entry(cert.id) {
             order.push(cert.id);
-            by_id.insert(cert.id, cert);
+            e.insert(cert);
             continue;
         }
         let replace = by_id
@@ -246,16 +262,16 @@ pub async fn start_config_syncer(
 
         let mut node_service = client.node_service();
 
-        let config_synced = fetch_and_apply_config(
-            &mut node_service,
-            &config_store,
-            &api_config,
-            &health_manager,
-            &cert_selector,
-            waf_state.as_ref(),
-            &mut task_version,
-            &mut config_version,
-        )
+        let config_synced = fetch_and_apply_config(FetchConfigArgs {
+            client: &mut node_service,
+            config_store: &config_store,
+            api_config: &api_config,
+            health_manager: &health_manager,
+            cert_selector: &cert_selector,
+            waf_state: waf_state.as_ref(),
+            task_version: &mut task_version,
+            config_version: &mut config_version,
+        })
         .await;
 
         if config_synced {
@@ -297,19 +313,34 @@ pub async fn start_config_syncer(
     }
 }
 
-fn log_global_settings(
-    payload: &crate::config_models::NodeConfigPayload,
-    server_name: &str,
+struct GlobalSettingsLogArgs<'a> {
+    payload: &'a crate::config_models::NodeConfigPayload,
+    server_name: &'a str,
     force_ln: bool,
-    ln_method: &str,
+    ln_method: &'a str,
     supports_low_version_http: bool,
     match_cert_from_all_servers: bool,
     enable_server_addr_variable: bool,
     request_origins_with_encodings: bool,
     xff_max_addresses: i32,
     allow_lan_ip: bool,
-    grpc_policy: &Option<crate::config_models::GRPCConfig>,
-) {
+    grpc_policy: &'a Option<crate::config_models::GRPCConfig>,
+}
+
+fn log_global_settings(args: GlobalSettingsLogArgs<'_>) {
+    let GlobalSettingsLogArgs {
+        payload,
+        server_name,
+        force_ln,
+        ln_method,
+        supports_low_version_http,
+        match_cert_from_all_servers,
+        enable_server_addr_variable,
+        request_origins_with_encodings,
+        xff_max_addresses,
+        allow_lan_ip,
+        grpc_policy,
+    } = args;
     let global_settings_hash_input = format!(
         "{:?}-{:?}-{:?}",
         payload.global_server_config, payload.is_on, payload.enable_ip_lists
@@ -356,42 +387,41 @@ fn log_global_settings(
         );
         debug!("  - XFF Max Addresses: {}", xff_max_addresses);
 
-        if let Some(gp) = grpc_policy {
-            if gp.is_on {
-                let r_size = gp
-                    .max_receive_message_size
-                    .as_ref()
-                    .map(|s| format!("{} {}", s.count, s.unit))
-                    .unwrap_or_else(|| "2 MiB".to_string());
-                let s_size = gp
-                    .max_send_message_size
-                    .as_ref()
-                    .map(|s| format!("{} {}", s.count, s.unit))
-                    .unwrap_or_else(|| "2 MiB".to_string());
-                debug!(
-                    "  - gRPC Proxy: ENABLED (Max Message: Recv={}, Send={})",
-                    r_size, s_size
-                );
-            }
+        if let Some(gp) = grpc_policy
+            && gp.is_on
+        {
+            let r_size = gp
+                .max_receive_message_size
+                .as_ref()
+                .map(|s| format!("{} {}", s.count, s.unit))
+                .unwrap_or_else(|| "2 MiB".to_string());
+            let s_size = gp
+                .max_send_message_size
+                .as_ref()
+                .map(|s| format!("{} {}", s.count, s.unit))
+                .unwrap_or_else(|| "2 MiB".to_string());
+            debug!(
+                "  - gRPC Proxy: ENABLED (Max Message: Recv={}, Send={})",
+                r_size, s_size
+            );
         }
     }
 }
 
-pub async fn fetch_and_apply_config<F>(
-    client: &mut pb::node_service_client::NodeServiceClient<
-        tonic::service::interceptor::InterceptedService<Channel, F>,
-    >,
-    config_store: &ConfigStore,
-    api_config: &ApiConfig,
-    health_manager: &crate::health_manager::GlobalHealthManager,
-    cert_selector: &crate::ssl::DynamicCertSelector,
-    waf_state: &crate::firewall::state::WafStateManager,
-    task_version: &mut i64,
-    config_version: &mut i64,
-) -> bool
+pub async fn fetch_and_apply_config<F>(args: FetchConfigArgs<'_, F>) -> bool
 where
     F: FnMut(Request<()>) -> Result<Request<()>, Status> + Send + 'static,
 {
+    let FetchConfigArgs {
+        client,
+        config_store,
+        api_config,
+        health_manager,
+        cert_selector,
+        waf_state,
+        task_version,
+        config_version,
+    } = args;
     let current_id = config_store.get_node_id().await;
     let fetch_version = if current_id == 0 { -1 } else { *config_version };
 
@@ -701,12 +731,11 @@ where
 
                                             // Handle variable parameters (e.g., ${header:User-Agent})
                                             let mut param = rule.param.clone();
-                                            if let Some(opts) = &rule.checkpoint_options {
-                                                if let Some(key) =
+                                            if let Some(opts) = &rule.checkpoint_options
+                                                && let Some(key) =
                                                     opts.get("name").and_then(|v| v.as_str())
-                                                {
-                                                    param = format!("{}:{}", param, key);
-                                                }
+                                            {
+                                                param = format!("{}:{}", param, key);
                                             }
 
                                             let val_display = if rule.value.is_empty() {
@@ -770,12 +799,11 @@ where
                                         {
                                             return Some(s.clone());
                                         }
-                                        if let Some(decoded) = decode_ref_candidate(s) {
-                                            if decoded.contains("GOEDGE_DATA_MAP:")
-                                                || decoded.contains("_DATA_MAP:")
-                                            {
-                                                return Some(decoded);
-                                            }
+                                        if let Some(decoded) = decode_ref_candidate(s)
+                                            && (decoded.contains("GOEDGE_DATA_MAP:")
+                                                || decoded.contains("_DATA_MAP:"))
+                                        {
+                                            return Some(decoded);
                                         }
                                         Some(s.clone())
                                     }
@@ -880,23 +908,22 @@ where
                     let mut node_ip_page_html = String::new();
                     let mut domain_mismatch_action = None;
 
-                    if let Some(gsc) = &payload.global_server_config {
-                        if let Some(http_all) = &gsc.http_all {
-                            allow_lan_ip = http_all.allow_lan_ip;
-                            force_ln = http_all.force_ln_request;
-                            ln_method = http_all.ln_request_scheduling_method.clone();
-                            supports_low_version_http = http_all.supports_low_version_http;
-                            match_cert_from_all_servers = http_all.match_cert_from_all_servers;
-                            server_name = http_all.server_name.clone();
-                            enable_server_addr_variable = http_all.enable_server_addr_variable;
-                            request_origins_with_encodings =
-                                http_all.request_origins_with_encodings;
-                            xff_max_addresses = http_all.xff_max_addresses;
-                            match_domain_strictly = http_all.match_domain_strictly;
-                            node_ip_show_page = http_all.node_ip_show_page;
-                            node_ip_page_html = http_all.node_ip_page_html.clone();
-                            domain_mismatch_action = http_all.domain_mismatch_action.clone();
-                        }
+                    if let Some(gsc) = &payload.global_server_config
+                        && let Some(http_all) = &gsc.http_all
+                    {
+                        allow_lan_ip = http_all.allow_lan_ip;
+                        force_ln = http_all.force_ln_request;
+                        ln_method = http_all.ln_request_scheduling_method.clone();
+                        supports_low_version_http = http_all.supports_low_version_http;
+                        match_cert_from_all_servers = http_all.match_cert_from_all_servers;
+                        server_name = http_all.server_name.clone();
+                        enable_server_addr_variable = http_all.enable_server_addr_variable;
+                        request_origins_with_encodings = http_all.request_origins_with_encodings;
+                        xff_max_addresses = http_all.xff_max_addresses;
+                        match_domain_strictly = http_all.match_domain_strictly;
+                        node_ip_show_page = http_all.node_ip_show_page;
+                        node_ip_page_html = http_all.node_ip_page_html.clone();
+                        domain_mismatch_action = http_all.domain_mismatch_action.clone();
                     }
                     let mut global_http_config = payload
                         .global_server_config
@@ -952,14 +979,16 @@ where
                     }
                     let global_http_arc = global_http_config.clone().map(Arc::new);
                     let runtime_maps = crate::config_apply::materialize_runtime_servers(
-                        payload_servers,
-                        health_manager,
-                        node_level,
-                        Arc::clone(&parent_nodes),
-                        tiered_origin_bypass,
-                        allow_lan_ip,
-                        global_http_arc,
-                        apply_limits,
+                        crate::config_apply::MaterializeRuntimeServersArgs {
+                            servers: payload_servers,
+                            health_manager,
+                            node_level,
+                            parent_nodes: Arc::clone(&parent_nodes),
+                            tiered_origin_bypass,
+                            allow_lan: allow_lan_ip,
+                            global_http: global_http_arc,
+                            limits: apply_limits,
+                        },
                     )
                     .await;
 
@@ -1030,19 +1059,19 @@ where
                         .or_else(|| payload.primary_grpc_policy.clone());
 
                     // --- GLOBAL SETTINGS LOGGING ---
-                    log_global_settings(
-                        &payload,
-                        &server_name,
+                    log_global_settings(GlobalSettingsLogArgs {
+                        payload: &payload,
+                        server_name: &server_name,
                         force_ln,
-                        &ln_method,
+                        ln_method: &ln_method,
                         supports_low_version_http,
                         match_cert_from_all_servers,
                         enable_server_addr_variable,
                         request_origins_with_encodings,
                         xff_max_addresses,
                         allow_lan_ip,
-                        &grpc_policy,
-                    );
+                        grpc_policy: &grpc_policy,
+                    });
 
                     let mut new_parent_routes = std::collections::HashMap::new();
                     for (cluster_id, nodes) in parent_nodes.iter() {
@@ -1168,53 +1197,53 @@ where
 
                     let _ = sync_active_plans(api_config, config_store).await;
                     // Fetch enabled features for management-plane reporting
-                    if numeric_id > 0 {
-                        if let Ok(shared) = SharedRpcClient::get(api_config).await {
-                            let client = shared.as_rpc_client();
-                            let mut service = client.node_service_with_type();
-                            match crate::rpc::track_rpc(service.find_enabled_node_config_info(
-                                pb::FindEnabledNodeConfigInfoRequest {
-                                    node_id: numeric_id,
-                                },
-                            ))
-                            .await
-                            {
-                                Ok(resp) => {
-                                    let info = resp.into_inner();
-                                    debug!(
-                                        "Node enabled features: DNS={} Cache={} Thresholds={} SSH={} Sys={} DDoS={} Sched={} AccessLog={}",
-                                        info.has_dns_info,
-                                        info.has_cache_info,
-                                        info.has_thresholds,
-                                        info.has_ssh,
-                                        info.has_system_settings,
-                                        info.has_d_do_s_protection,
-                                        info.has_schedule_settings,
-                                        info.has_access_log_settings
-                                    );
-                                    config_store.set_enabled_features(
-                                        info.has_dns_info,
-                                        info.has_cache_info,
-                                        info.has_thresholds,
-                                        info.has_ssh,
-                                        info.has_system_settings,
-                                        info.has_d_do_s_protection,
-                                        info.has_schedule_settings,
-                                        info.has_access_log_settings,
-                                    );
-                                }
-                                Err(e) if is_unsupported_node_type_error(&e) => {
-                                    if !ENABLED_FEATURES_UNSUPPORTED_LOGGED
-                                        .swap(true, Ordering::Relaxed)
-                                    {
-                                        debug!(
-                                            "Enabled feature sync is not supported by this API node for node credentials: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                                Err(e) => debug!("Failed to fetch enabled features: {}", e),
+                    if numeric_id > 0
+                        && let Ok(shared) = SharedRpcClient::get(api_config).await
+                    {
+                        let client = shared.as_rpc_client();
+                        let mut service = client.node_service_with_type();
+                        match crate::rpc::track_rpc(service.find_enabled_node_config_info(
+                            pb::FindEnabledNodeConfigInfoRequest {
+                                node_id: numeric_id,
+                            },
+                        ))
+                        .await
+                        {
+                            Ok(resp) => {
+                                let info = resp.into_inner();
+                                debug!(
+                                    "Node enabled features: DNS={} Cache={} Thresholds={} SSH={} Sys={} DDoS={} Sched={} AccessLog={}",
+                                    info.has_dns_info,
+                                    info.has_cache_info,
+                                    info.has_thresholds,
+                                    info.has_ssh,
+                                    info.has_system_settings,
+                                    info.has_d_do_s_protection,
+                                    info.has_schedule_settings,
+                                    info.has_access_log_settings
+                                );
+                                config_store.set_enabled_features(
+                                    info.has_dns_info,
+                                    info.has_cache_info,
+                                    info.has_thresholds,
+                                    info.has_ssh,
+                                    info.has_system_settings,
+                                    info.has_d_do_s_protection,
+                                    info.has_schedule_settings,
+                                    info.has_access_log_settings,
+                                );
                             }
+                            Err(e) if is_unsupported_node_type_error(&e) => {
+                                if !ENABLED_FEATURES_UNSUPPORTED_LOGGED
+                                    .swap(true, Ordering::Relaxed)
+                                {
+                                    debug!(
+                                        "Enabled feature sync is not supported by this API node for node credentials: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => debug!("Failed to fetch enabled features: {}", e),
                         }
                     }
                 }

@@ -301,7 +301,7 @@ fn persist_bandwidth_state(
     pending_stats: &[PendingBandwidthStat],
 ) {
     if current_window.is_empty() && window_stats.is_empty() && pending_stats.is_empty() {
-        let _ = crate::metrics::storage::STORAGE.delete_key(BANDWIDTH_STATE_STORAGE_KEY);
+        crate::metrics::storage::STORAGE.delete_key(BANDWIDTH_STATE_STORAGE_KEY);
         return;
     }
 
@@ -928,7 +928,7 @@ fn trim_http_request_stat_rows_with_limits(
     limits: HttpRequestStatUploadLimits,
 ) {
     req.region_cities
-        .sort_by(|a, b| b.count_requests.cmp(&a.count_requests));
+        .sort_by_key(|a| std::cmp::Reverse(a.count_requests));
     let mut server_counts = HashMap::<i64, usize>::new();
     req.region_cities.retain(|row| {
         let count = server_counts.entry(row.server_id).or_default();
@@ -936,7 +936,8 @@ fn trim_http_request_stat_rows_with_limits(
         *count <= limits.max_cities
     });
 
-    req.region_providers.sort_by(|a, b| b.count.cmp(&a.count));
+    req.region_providers
+        .sort_by_key(|a| std::cmp::Reverse(a.count));
     server_counts.clear();
     req.region_providers.retain(|row| {
         let count = server_counts.entry(row.server_id).or_default();
@@ -944,7 +945,7 @@ fn trim_http_request_stat_rows_with_limits(
         *count <= limits.max_providers
     });
 
-    req.systems.sort_by(|a, b| b.count.cmp(&a.count));
+    req.systems.sort_by_key(|a| std::cmp::Reverse(a.count));
     server_counts.clear();
     req.systems.retain(|row| {
         let count = server_counts.entry(row.server_id).or_default();
@@ -952,7 +953,7 @@ fn trim_http_request_stat_rows_with_limits(
         *count <= limits.max_systems
     });
 
-    req.browsers.sort_by(|a, b| b.count.cmp(&a.count));
+    req.browsers.sort_by_key(|a| std::cmp::Reverse(a.count));
     server_counts.clear();
     req.browsers.retain(|row| {
         let count = server_counts.entry(row.server_id).or_default();
@@ -1029,7 +1030,10 @@ pub async fn start_metrics_aggregator_reporter(config_store: ConfigStore, api_co
             http_firewall_rule_groups: vec![],
         };
 
-        let mut city_map: HashMap<(i64, i64, i64, i64), (i64, i64, i64, i64)> = HashMap::new();
+        type CityStatKey = (i64, i64, i64, i64);
+        type CityStatValue = (i64, i64, i64, i64);
+        type CityStatMap = HashMap<CityStatKey, CityStatValue>;
+        let mut city_map: CityStatMap = HashMap::new();
         let mut provider_map: HashMap<(i64, i64), i64> = HashMap::new();
         let mut system_map: HashMap<(i64, String, String), i64> = HashMap::new();
         let mut browser_map: HashMap<(i64, String, String), i64> = HashMap::new();
@@ -1471,7 +1475,7 @@ mod tests {
             )
         }
 
-        let samples = vec![
+        let samples = [
             sample(crate::metrics::METRIC_CATEGORY_HTTP),
             sample(crate::metrics::METRIC_CATEGORY_TCP),
         ];

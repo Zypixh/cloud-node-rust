@@ -300,7 +300,7 @@ const REQUEST_BODY_WAF_ESTIMATED_BYTES: u64 = 2 * 1024 * 1024;
 const RESPONSE_BODY_WAF_ESTIMATED_BYTES: u64 = 512 * 1024;
 const RESPONSE_TRANSFORM_ESTIMATED_BYTES: u64 = 16 * 1024 * 1024;
 const CACHE_REVALIDATE_ESTIMATED_BYTES: u64 = 64 * 1024;
-const CACHE_WRITE_ESTIMATED_BYTES: u64 = 1 * 1024 * 1024;
+const CACHE_WRITE_ESTIMATED_BYTES: u64 = 1024 * 1024;
 const CACHE_READ_MEMORY_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024;
 const CLUSTER_INTERNAL_CONNECTION_ESTIMATED_BYTES: u64 = 64 * 1024;
 const RPC_STREAM_COMMAND_ESTIMATED_BYTES: u64 = 256 * 1024;
@@ -416,8 +416,9 @@ pub struct ConfigSyncBudget {
     pub allow_commit: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Default)]
 pub enum MemoryPressureLevel {
+    #[default]
     Normal,
     Elevated,
     High,
@@ -432,12 +433,6 @@ impl MemoryPressureLevel {
             MemoryPressureLevel::High => "high",
             MemoryPressureLevel::Critical => "critical",
         }
-    }
-}
-
-impl Default for MemoryPressureLevel {
-    fn default() -> Self {
-        Self::Normal
     }
 }
 
@@ -514,6 +509,12 @@ pub struct FdEquivalentSnapshot {
     pub used: u64,
     pub used_pct: u64,
     pub pressure_level: MemoryPressureLevel,
+}
+
+impl Default for MemoryGovernor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryGovernor {
@@ -2723,7 +2724,7 @@ fn read_fd_soft_limit() -> u64 {
     };
     let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) == 0 };
     if ok {
-        (limits.rlim_cur as u64).max(MIN_FD_SOFT_LIMIT)
+        limits.rlim_cur.max(MIN_FD_SOFT_LIMIT)
     } else {
         MIN_FD_SOFT_LIMIT
     }
@@ -2744,7 +2745,7 @@ fn read_current_fd_count() -> Option<u64> {
 #[cfg(all(unix, not(target_os = "linux")))]
 fn read_current_fd_count() -> Option<u64> {
     let pid = std::process::id();
-    let path = format!("/dev/fd");
+    let path = "/dev/fd".to_string();
     std::fs::read_dir(path)
         .ok()
         .map(|entries| entries.count() as u64)
@@ -2941,7 +2942,7 @@ mod tests {
         assert_eq!(governor.admission_reject_snapshot().cache_read_memory, 1);
 
         let budget = cache_read_memory_budget_bytes(&governor.memory_snapshot());
-        let charge = object_limit.min(CACHE_READ_MEMORY_ESTIMATED_BYTES).max(1);
+        let charge = object_limit.clamp(1, CACHE_READ_MEMORY_ESTIMATED_BYTES);
         let baseline = budget.saturating_sub(charge / 2);
         governor
             .cache_read_memory_bytes
@@ -3253,7 +3254,7 @@ mod tests {
         let total = 512 * 1024 * 1024;
         let available = 16 * 1024 * 1024;
 
-        assert!(available_after_reserve(total, 1 * 1024 * 1024) <= 1024 * 1024);
+        assert!(available_after_reserve(total, 1024 * 1024) <= 1024 * 1024);
         assert!(budget_from_available(total, available, CONNECTION_BUDGET_PCT) <= available);
         assert!(cache_budget_from_available(total, available) <= available);
         let critical = BudgetedMemorySnapshot {
@@ -3572,11 +3573,8 @@ mod tests {
         let governor = MemoryGovernor::new();
         let budget = governor.connection_admission_budget_bytes();
         let mut permits = Vec::new();
-        loop {
-            match governor.try_admit(AdmissionClass::HttpConnection) {
-                Some(permit) => permits.push(permit),
-                None => break,
-            }
+        while let Some(permit) = governor.try_admit(AdmissionClass::HttpConnection) {
+            permits.push(permit);
         }
         assert!(
             governor.connection_admission_used_bytes() <= budget,

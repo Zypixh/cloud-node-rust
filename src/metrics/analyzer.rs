@@ -179,7 +179,8 @@ static GEO_CACHE: Lazy<ShardedLru<IpAddr, Option<GeoInfo>>> =
     Lazy::new(|| ShardedLru::new(cache_capacity_per_shard(GEO_CACHE_ENTRY_ESTIMATED_BYTES, 4)));
 
 // Cache for User-Agent results (UA string -> (Arc<str>, Arc<str>))
-static UA_CACHE: Lazy<ShardedLru<String, (Arc<str>, Arc<str>, Arc<str>, Arc<str>)>> =
+type UaCacheValue = (Arc<str>, Arc<str>, Arc<str>, Arc<str>);
+static UA_CACHE: Lazy<ShardedLru<String, UaCacheValue>> =
     Lazy::new(|| ShardedLru::new(cache_capacity_per_shard(UA_CACHE_ENTRY_ESTIMATED_BYTES, 4)));
 
 static UA_PARSER: Lazy<Parser> = Lazy::new(Parser::new);
@@ -295,29 +296,6 @@ fn lookup_geo_internal(ip: IpAddr) -> Option<GeoInfo> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn analyze_request_reuses_ua_cache_result_shape() {
-        let ip = "127.0.0.1".parse().expect("valid ip");
-        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
-
-        let first = analyze_request(ip, ua);
-        let second = analyze_request(ip, ua);
-
-        assert_eq!(&*first.browser, &*second.browser);
-        assert_eq!(&*first.os, &*second.os);
-    }
-
-    #[test]
-    fn lookup_asn_label_formats_as_prefix_when_number_known() {
-        assert_eq!(lookup_asn_label("127.0.0.1".parse().unwrap()).as_ref(), "");
-        assert_eq!(lookup_asn_number("127.0.0.1".parse().unwrap()), 0);
-    }
-}
-
 pub fn lookup_isp_name(ip: IpAddr) -> Arc<str> {
     Arc::from(get_isp_name(ip))
 }
@@ -359,4 +337,27 @@ pub fn reclaim_geo_ua_caches(clear_all: bool) -> (usize, usize) {
         UA_CACHE.clear();
     }
     (1, usize::from(clear_all))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyze_request_reuses_ua_cache_result_shape() {
+        let ip = "127.0.0.1".parse().expect("valid ip");
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
+
+        let first = analyze_request(ip, ua);
+        let second = analyze_request(ip, ua);
+
+        assert_eq!(&*first.browser, &*second.browser);
+        assert_eq!(&*first.os, &*second.os);
+    }
+
+    #[test]
+    fn lookup_asn_label_formats_as_prefix_when_number_known() {
+        assert_eq!(lookup_asn_label("127.0.0.1".parse().unwrap()).as_ref(), "");
+        assert_eq!(lookup_asn_number("127.0.0.1".parse().unwrap()), 0);
+    }
 }

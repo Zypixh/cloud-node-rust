@@ -308,7 +308,7 @@ fn top_servers(snapshots: &[crate::metrics::ServerStatusSnapshot]) -> Vec<TopSer
             attack_requests: snap.count_attack_requests,
         })
         .collect::<Vec<_>>();
-    servers.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+    servers.sort_by_key(|a| std::cmp::Reverse(a.total_bytes));
     servers.truncate(TOP_SERVER_LIMIT);
     servers
 }

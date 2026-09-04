@@ -440,6 +440,10 @@ impl DataMapConfig {
         self.r#map.len() + self.extra.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.r#map.is_empty() && self.extra.is_empty()
+    }
+
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.r#map.get(key).or_else(|| self.extra.get(key))
     }
@@ -1758,7 +1762,7 @@ impl URLPattern {
 
     fn path_without_query_fragment(value: &str) -> &str {
         value
-            .find(|ch| ch == '?' || ch == '#')
+            .find(['?', '#'])
             .map(|idx| &value[..idx])
             .unwrap_or(value)
     }
@@ -1833,7 +1837,7 @@ impl URLPattern {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct UAMConfig {
     #[serde(rename = "isPrior", default)]
     pub is_prior: bool,
@@ -1873,22 +1877,6 @@ pub struct UAMConfig {
         deserialize_with = "deserialize_flexible_u8_opt"
     )]
     pub pow_difficulty: Option<u8>,
-}
-
-impl Default for UAMConfig {
-    fn default() -> Self {
-        Self {
-            is_prior: false,
-            is_on: false,
-            only_url_patterns: Vec::new(),
-            except_url_patterns: Vec::new(),
-            min_qps_per_ip: 0,
-            conds: None,
-            key_life: 0,
-            mode: None,
-            pow_difficulty: None,
-        }
-    }
 }
 
 impl UAMConfig {
@@ -2726,7 +2714,7 @@ pub struct HTTPStatusConfig {
 
 impl HTTPStatusConfig {
     pub fn matches(&self, status: u16) -> bool {
-        self.always || self.codes.iter().any(|code| *code == status as i32)
+        self.always || self.codes.contains(&(status as i32))
     }
 }
 
@@ -3065,20 +3053,20 @@ struct NormalizedOriginAddr {
 fn normalize_origin_addr_string(raw: &str) -> NormalizedOriginAddr {
     let trimmed = raw.trim();
 
-    if has_uri_scheme(trimmed) {
-        if let Ok(uri) = trimmed.parse::<http::Uri>() {
-            let scheme = uri.scheme_str().unwrap_or("");
-            let host = uri.host().unwrap_or("").to_string();
-            let port = uri
-                .port_u16()
-                .unwrap_or_else(|| default_port_for_protocol(scheme));
-            let use_tls = corrected_origin_tls(scheme, Some(port));
-            return NormalizedOriginAddr {
-                address: format_host_port(&host, port),
-                host,
-                use_tls,
-            };
-        }
+    if has_uri_scheme(trimmed)
+        && let Ok(uri) = trimmed.parse::<http::Uri>()
+    {
+        let scheme = uri.scheme_str().unwrap_or("");
+        let host = uri.host().unwrap_or("").to_string();
+        let port = uri
+            .port_u16()
+            .unwrap_or_else(|| default_port_for_protocol(scheme));
+        let use_tls = corrected_origin_tls(scheme, Some(port));
+        return NormalizedOriginAddr {
+            address: format_host_port(&host, port),
+            host,
+            use_tls,
+        };
     }
 
     let (without_scheme, use_tls) = strip_known_scheme(trimmed);
@@ -3087,7 +3075,7 @@ fn normalize_origin_addr_string(raw: &str) -> NormalizedOriginAddr {
         .next()
         .unwrap_or(without_scheme);
     let (host, port) = split_host_port(without_path);
-    let port = port.unwrap_or_else(|| if use_tls { 443 } else { 80 });
+    let port = port.unwrap_or(if use_tls { 443 } else { 80 });
     let use_tls = corrected_origin_tls(if use_tls { "https" } else { "http" }, Some(port));
 
     NormalizedOriginAddr {
@@ -3119,20 +3107,20 @@ fn strip_known_scheme(value: &str) -> (&str, bool) {
 }
 
 fn split_host_port(value: &str) -> (String, Option<u16>) {
-    if let Some(rest) = value.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            let host = rest[..end].to_string();
-            let port = rest[end + 1..]
-                .strip_prefix(':')
-                .and_then(|p| p.parse::<u16>().ok());
-            return (host, port);
-        }
+    if let Some(rest) = value.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let host = rest[..end].to_string();
+        let port = rest[end + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok());
+        return (host, port);
     }
 
-    if value.matches(':').count() == 1 {
-        if let Some((host, port)) = value.rsplit_once(':') {
-            return (host.to_string(), port.parse::<u16>().ok());
-        }
+    if value.matches(':').count() == 1
+        && let Some((host, port)) = value.rsplit_once(':')
+    {
+        return (host.to_string(), port.parse::<u16>().ok());
     }
 
     (value.to_string(), None)

@@ -156,12 +156,11 @@ pub async fn apply_remote_event(event: CacheMetaEvent) {
             {
                 return;
             }
-            if let Some(existing) = crate::metrics::storage::STORAGE.get_cache_meta(&event.hash) {
-                if local_metadata_version(&existing) > event_version
-                    || (existing.event_version.is_none() && existing.updated_at > event.created_at)
-                {
-                    return;
-                }
+            if let Some(existing) = crate::metrics::storage::STORAGE.get_cache_meta(&event.hash)
+                && (local_metadata_version(&existing) > event_version
+                    || (existing.event_version.is_none() && existing.updated_at > event.created_at))
+            {
+                return;
             }
             let persisted = crate::metrics::storage::STORAGE
                 .upsert_cache_meta_absolute_async(crate::metrics::storage::CacheMetaUpsert {
@@ -199,12 +198,11 @@ pub async fn apply_remote_event(event: CacheMetaEvent) {
             {
                 return;
             }
-            if let Some(existing) = crate::metrics::storage::STORAGE.get_cache_meta(&event.hash) {
-                if local_metadata_version(&existing) > event_version
-                    || (existing.event_version.is_none() && existing.updated_at > event.created_at)
-                {
-                    return;
-                }
+            if let Some(existing) = crate::metrics::storage::STORAGE.get_cache_meta(&event.hash)
+                && (local_metadata_version(&existing) > event_version
+                    || (existing.event_version.is_none() && existing.updated_at > event.created_at))
+            {
+                return;
             }
             // The local metadata index may already be empty while a fallback
             // L1 entry (metadata_required=false) is still resident.  In that

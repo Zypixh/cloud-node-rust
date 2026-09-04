@@ -962,9 +962,9 @@ impl HttpProxyManager {
                         L4ConnectionProtocol::Http2,
                     );
                     let h2_cancel_rx = h2_connection_guard.cancel_receiver();
-                    process_h2_stream(
+                    process_h2_stream(ProcessH2StreamArgs {
                         stream,
-                        downstream_socket_digest,
+                        socket_digest: downstream_socket_digest,
                         proxy_inner,
                         shutdown_inner,
                         manager,
@@ -972,16 +972,16 @@ impl HttpProxyManager {
                         port,
                         http2_handshake_timeout,
                         h2_cancel_rx,
-                        h2_connection_guard,
+                        _h2_connection_guard: h2_connection_guard,
                         configured_tls_host,
-                    )
+                    })
                     .await
                 } else {
                     tokio::select! {
                         _ = connection_cancel_rx.changed() => {
                             debug!("HTTP/1 connection from {} cancelled by L4 registry", client_addr);
                         }
-                        _ = process_http1_stream(
+                        _ = process_http1_stream(ProcessHttp1StreamArgs {
                             stream,
                             proxy_inner,
                             shutdown_inner,
@@ -989,8 +989,8 @@ impl HttpProxyManager {
                             manager,
                             client_addr,
                             port,
-                            true,
-                        ) => {}
+                            is_tls: true,
+                        }) => {}
                     }
                 }
             });
@@ -1247,16 +1247,16 @@ impl HttpProxyManager {
             .node_id
             .parse::<i64>()
             .unwrap_or(0);
-        crate::l4_defense::record_l4_event_weighted_with_pressure(
-            &self.config_store,
-            &self.proxy_logic.waf_state,
+        crate::l4_defense::record_l4_event_weighted_with_pressure(crate::l4_defense::L4EventArgs {
+            config_store: &self.config_store,
+            waf_state: &self.proxy_logic.waf_state,
             node_id,
             ip,
             kind,
             amount,
-            detail,
-            crate::l4_defense::current_pressure_level(),
-        )
+            detail: detail.into(),
+            pressure_level: crate::l4_defense::current_pressure_level(),
+        })
     }
 
     fn record_special_defense_hit(
@@ -1532,19 +1532,19 @@ impl HttpProxyManager {
                         );
                         let h2_cancel_rx = h2_connection_guard.cancel_receiver();
                         let http2_handshake_timeout = self.http2_handshake_timeout();
-                        process_h2_stream(
-                            Box::new(tls_stream),
+                        process_h2_stream(ProcessH2StreamArgs {
+                            stream: Box::new(tls_stream),
                             socket_digest,
                             proxy_inner,
-                            shutdown_rx,
-                            self.clone(),
+                            shutdown_inner: shutdown_rx,
+                            manager: self.clone(),
                             client_addr,
-                            listen_port,
+                            port: listen_port,
                             http2_handshake_timeout,
                             h2_cancel_rx,
-                            h2_connection_guard,
-                            true,
-                        )
+                            _h2_connection_guard: h2_connection_guard,
+                            configured_tls_host: true,
+                        })
                         .await;
                         return Ok(());
                     }
@@ -1579,16 +1579,16 @@ impl HttpProxyManager {
             _ = connection_cancel_rx.changed() => {
                 debug!("AF_XDP HTTP/1 connection from {} cancelled by L4 registry", client_addr);
             }
-            _ = process_http1_stream(
+            _ = process_http1_stream(ProcessHttp1StreamArgs {
                 stream,
                 proxy_inner,
-                shutdown_rx,
+                shutdown_inner: shutdown_rx,
                 downstream_read_timeout,
-                self.clone(),
+                manager: self.clone(),
                 client_addr,
-                listen_port,
-                kind == AfXdpHttpPortKind::Https,
-            ) => {}
+                port: listen_port,
+                is_tls: kind == AfXdpHttpPortKind::Https,
+            }) => {}
         }
         Ok(())
     }
@@ -1732,14 +1732,16 @@ impl HttpProxyManager {
                     )),
                 );
                 crate::metrics::record::record_network_dimensions(
-                    crate::metrics::METRIC_CATEGORY_TCP,
-                    server_id,
-                    client_addr.ip(),
-                    &sni_host,
-                    "-",
-                    0,
-                    0,
-                    502,
+                    crate::metrics::NetworkDimensionsArgs {
+                        category: crate::metrics::METRIC_CATEGORY_TCP,
+                        server_id,
+                        client_ip: client_addr.ip(),
+                        domain: &sni_host,
+                        user_agent: "-",
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        status: 502,
+                    },
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
@@ -1767,68 +1769,66 @@ impl HttpProxyManager {
                 proxy_protocol_to_origin,
                 client_addr,
                 destination_addr,
-            ) {
-                if let Err(err) =
-                    tokio::io::AsyncWriteExt::write_all(&mut backend_stream, &header).await
+            ) && let Err(err) =
+                tokio::io::AsyncWriteExt::write_all(&mut backend_stream, &header).await
+            {
+                crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                if let Some(local_port) = toa_local_port
+                    && let Err(err) =
+                        crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
                 {
-                    crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
-                    if let Some(local_port) = toa_local_port {
-                        if let Err(err) =
-                            crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
-                        {
-                            debug!("failed to release TOA sender port {}: {}", local_port, err);
-                        }
-                    }
-                    crate::rpc::stats::push_origin_health_event(
-                        origin_id,
-                        false,
-                        started.elapsed().as_millis() as i64,
-                    );
-                    let reason = format!(
-                        "failed to write PROXY Protocol header to passthrough upstream {}: {}",
-                        backend_addr, err
-                    );
-                    crate::logging::log_sni_passthrough_access(
-                        request_id,
-                        &server,
-                        &sni_host,
-                        client_addr,
-                        listen_port,
-                        &backend_addr,
-                        started_at_millis,
-                        started.elapsed(),
-                        0,
-                        0,
-                        502,
-                        Some(&reason),
-                    );
-                    crate::metrics::record::record_network_dimensions(
-                        crate::metrics::METRIC_CATEGORY_TCP,
-                        server_id,
-                        client_addr.ip(),
-                        &sni_host,
-                        "-",
-                        0,
-                        0,
-                        502,
-                    );
-                    crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
-                    return Err(err).with_context(|| {
-                        format!(
-                            "failed to write PROXY Protocol header to passthrough upstream {}",
-                            backend_addr
-                        )
-                    });
+                    debug!("failed to release TOA sender port {}: {}", local_port, err);
                 }
+                crate::rpc::stats::push_origin_health_event(
+                    origin_id,
+                    false,
+                    started.elapsed().as_millis() as i64,
+                );
+                let reason = format!(
+                    "failed to write PROXY Protocol header to passthrough upstream {}: {}",
+                    backend_addr, err
+                );
+                crate::logging::log_sni_passthrough_access(
+                    request_id,
+                    &server,
+                    &sni_host,
+                    client_addr,
+                    listen_port,
+                    &backend_addr,
+                    started_at_millis,
+                    started.elapsed(),
+                    0,
+                    0,
+                    502,
+                    Some(&reason),
+                );
+                crate::metrics::record::record_network_dimensions(
+                    crate::metrics::NetworkDimensionsArgs {
+                        category: crate::metrics::METRIC_CATEGORY_TCP,
+                        server_id,
+                        client_ip: client_addr.ip(),
+                        domain: &sni_host,
+                        user_agent: "-",
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        status: 502,
+                    },
+                );
+                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to write PROXY Protocol header to passthrough upstream {}",
+                        backend_addr
+                    )
+                });
             }
             if let Err(err) = tokio::io::AsyncWriteExt::flush(&mut backend_stream).await {
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
-                if let Some(local_port) = toa_local_port {
-                    if let Err(err) =
+                if let Some(local_port) = toa_local_port
+                    && let Err(err) =
                         crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
-                    {
-                        debug!("failed to release TOA sender port {}: {}", local_port, err);
-                    }
+                {
+                    debug!("failed to release TOA sender port {}: {}", local_port, err);
                 }
                 crate::rpc::stats::push_origin_health_event(
                     origin_id,
@@ -1854,14 +1854,16 @@ impl HttpProxyManager {
                     Some(&reason),
                 );
                 crate::metrics::record::record_network_dimensions(
-                    crate::metrics::METRIC_CATEGORY_TCP,
-                    server_id,
-                    client_addr.ip(),
-                    &sni_host,
-                    "-",
-                    0,
-                    0,
-                    502,
+                    crate::metrics::NetworkDimensionsArgs {
+                        category: crate::metrics::METRIC_CATEGORY_TCP,
+                        server_id,
+                        client_ip: client_addr.ip(),
+                        domain: &sni_host,
+                        user_agent: "-",
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        status: 502,
+                    },
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 return Err(err).with_context(|| {
@@ -1898,11 +1900,10 @@ impl HttpProxyManager {
                 .await
             }
         };
-        if let Some(local_port) = toa_local_port {
-            if let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
-            {
-                debug!("failed to release TOA sender port {}: {}", local_port, err);
-            }
+        if let Some(local_port) = toa_local_port
+            && let Err(err) = crate::toa::unregister_toa_port(toa_config.clone(), local_port).await
+        {
+            debug!("failed to release TOA sender port {}: {}", local_port, err);
         }
         match result {
             Ok(outcome) => {
@@ -1920,14 +1921,16 @@ impl HttpProxyManager {
                     );
                 }
                 crate::metrics::record::record_network_dimensions(
-                    crate::metrics::METRIC_CATEGORY_TCP,
-                    server_id,
-                    client_addr.ip(),
-                    &sni_host,
-                    "-",
-                    bytes_sent as i64,
-                    bytes_received as i64,
-                    200,
+                    crate::metrics::NetworkDimensionsArgs {
+                        category: crate::metrics::METRIC_CATEGORY_TCP,
+                        server_id,
+                        client_ip: client_addr.ip(),
+                        domain: &sni_host,
+                        user_agent: "-",
+                        bytes_sent: bytes_sent as i64,
+                        bytes_received: bytes_received as i64,
+                        status: 200,
+                    },
                 );
                 crate::logging::log_sni_passthrough_access(
                     request_id,
@@ -1950,14 +1953,16 @@ impl HttpProxyManager {
                 let bytes_received = err.bytes_received;
                 let bytes_sent = err.bytes_sent;
                 crate::metrics::record::record_network_dimensions(
-                    crate::metrics::METRIC_CATEGORY_TCP,
-                    server_id,
-                    client_addr.ip(),
-                    &sni_host,
-                    "-",
-                    bytes_sent as i64,
-                    bytes_received as i64,
-                    502,
+                    crate::metrics::NetworkDimensionsArgs {
+                        category: crate::metrics::METRIC_CATEGORY_TCP,
+                        server_id,
+                        client_ip: client_addr.ip(),
+                        domain: &sni_host,
+                        user_agent: "-",
+                        bytes_sent: bytes_sent as i64,
+                        bytes_received: bytes_received as i64,
+                        status: 502,
+                    },
                 );
                 crate::logging::log_sni_passthrough_access(
                     request_id,
@@ -2053,20 +2058,20 @@ async fn process_plain_http_connection(
 ) {
     let _ = client_stream.set_nodelay(true);
     let l4_stream = stream_with_socket_digest(client_stream, client_addr);
-    process_http1_stream(
-        Box::new(l4_stream),
+    process_http1_stream(ProcessHttp1StreamArgs {
+        stream: Box::new(l4_stream),
         proxy_inner,
         shutdown_inner,
         downstream_read_timeout,
         manager,
         client_addr,
         port,
-        false,
-    )
+        is_tls: false,
+    })
     .await;
 }
 
-async fn process_h2_stream(
+struct ProcessH2StreamArgs {
     stream: pingora_core::protocols::Stream,
     socket_digest: Option<Arc<SocketDigest>>,
     proxy_inner: Arc<pingora_proxy::HttpProxy<EdgeProxy>>,
@@ -2075,10 +2080,25 @@ async fn process_h2_stream(
     client_addr: SocketAddr,
     port: u16,
     http2_handshake_timeout: Duration,
-    mut h2_cancel_rx: watch::Receiver<bool>,
+    h2_cancel_rx: watch::Receiver<bool>,
     _h2_connection_guard: crate::l4_connection_registry::L4ConnectionGuard,
     configured_tls_host: bool,
-) {
+}
+
+async fn process_h2_stream(args: ProcessH2StreamArgs) {
+    let ProcessH2StreamArgs {
+        stream,
+        socket_digest,
+        proxy_inner,
+        shutdown_inner,
+        manager,
+        client_addr,
+        port,
+        http2_handshake_timeout,
+        mut h2_cancel_rx,
+        _h2_connection_guard,
+        configured_tls_host,
+    } = args;
     let digest = Arc::new(pingora_core::protocols::Digest {
         socket_digest,
         ..Default::default()
@@ -2277,7 +2297,7 @@ async fn process_h2_stream(
     }
 }
 
-async fn process_http1_stream(
+struct ProcessHttp1StreamArgs {
     stream: pingora_core::protocols::Stream,
     proxy_inner: Arc<pingora_proxy::HttpProxy<EdgeProxy>>,
     shutdown_inner: watch::Receiver<bool>,
@@ -2286,7 +2306,19 @@ async fn process_http1_stream(
     client_addr: SocketAddr,
     port: u16,
     is_tls: bool,
-) {
+}
+
+async fn process_http1_stream(args: ProcessHttp1StreamArgs) {
+    let ProcessHttp1StreamArgs {
+        stream,
+        proxy_inner,
+        shutdown_inner,
+        downstream_read_timeout,
+        manager,
+        client_addr,
+        port,
+        is_tls,
+    } = args;
     let mut server_session = ServerSession::new_http1(stream);
     server_session.set_read_timeout(Some(downstream_read_timeout));
     if *shutdown_inner.borrow() {
@@ -2823,11 +2855,12 @@ mod tests {
     #[test]
     fn parses_fragmented_client_hello_sni() {
         let body = client_hello_body(Some("split.example.com"));
-        let mut handshake = Vec::new();
-        handshake.push(1);
-        handshake.push(((body.len() >> 16) & 0xff) as u8);
-        handshake.push(((body.len() >> 8) & 0xff) as u8);
-        handshake.push((body.len() & 0xff) as u8);
+        let mut handshake = vec![
+            1,
+            ((body.len() >> 16) & 0xff) as u8,
+            ((body.len() >> 8) & 0xff) as u8,
+            (body.len() & 0xff) as u8,
+        ];
         handshake.extend_from_slice(&body);
 
         let split_at = 12;

@@ -333,23 +333,22 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         debug!("ACCESS_LOG: blocked by no_log=true");
         return;
     }
-    if let Some(ref access_log) = ctx.access_log_ref {
-        if !access_log.is_on {
-            debug!("ACCESS_LOG: blocked by per-server access_log_ref.is_on=false");
-            return;
-        }
+    if let Some(ref access_log) = ctx.access_log_ref
+        && !access_log.is_on
+    {
+        debug!("ACCESS_LOG: blocked by per-server access_log_ref.is_on=false");
+        return;
     }
     if !ctx.global_access_log_on {
         debug!("ACCESS_LOG: blocked by global_access_log_on=false");
         return;
     }
-    if ctx.server.is_none() {
-        if let Some(ref cfg) = ctx.global_access_log_config {
-            if !cfg.enable_server_not_found {
-                debug!("ACCESS_LOG: blocked by enable_server_not_found=false (404)");
-                return;
-            }
-        }
+    if ctx.server.is_none()
+        && let Some(ref cfg) = ctx.global_access_log_config
+        && !cfg.enable_server_not_found
+    {
+        debug!("ACCESS_LOG: blocked by enable_server_not_found=false (404)");
+        return;
     }
     if let Some(ref cfg) = ctx.global_access_log_config {
         if cfg.firewall_only && !ctx.firewall_blocked {
@@ -429,7 +428,7 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         })
         .or_else(|| req.uri.authority().map(|value| value.as_str()))
         .or_else(|| req.uri.host())
-        .or_else(|| {
+        .or({
             if ctx.host.is_empty() {
                 None
             } else {
@@ -734,21 +733,19 @@ pub fn log_access(session: &Session, ctx: &ProxyCTX) {
         ..Default::default()
     };
 
-    if log_firewall_actions {
-        if let Some(waf) = &ctx.waf_action {
-            log.firewall_actions.push(waf.clone());
-        }
+    if log_firewall_actions && let Some(waf) = &ctx.waf_action {
+        log.firewall_actions.push(waf.clone());
     }
 
     if log_tags {
         if let Some(tags) = &ctx.tags {
             log.tags.extend(tags.iter().cloned());
         }
-    } else if fields.is_some() {
-        if let Some(tags) = &ctx.tags {
-            log.tags
-                .extend(tags.iter().filter(|tag| tag.as_str() == "rewrite").cloned());
-        }
+    } else if fields.is_some()
+        && let Some(tags) = &ctx.tags
+    {
+        log.tags
+            .extend(tags.iter().filter(|tag| tag.as_str() == "rewrite").cloned());
     }
 
     if log_attrs {

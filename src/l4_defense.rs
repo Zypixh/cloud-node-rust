@@ -59,18 +59,13 @@ pub enum L4DefenseKind {
     H3AdmissionReject,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Default)]
 pub enum L4PressureLevel {
+    #[default]
     Normal,
     Elevated,
     High,
     Critical,
-}
-
-impl Default for L4PressureLevel {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 impl L4PressureLevel {
@@ -515,9 +510,9 @@ impl L4AggregateState {
             .distinct_ips
             .iter()
             .filter_map(|entry| {
-                entry.value().lock().ok().and_then(|mut window| {
+                entry.value().lock().ok().map(|mut window| {
                     window.reset_if_stale(now);
-                    Some(window.ips.len())
+                    window.ips.len()
                 })
             })
             .max()
@@ -557,13 +552,13 @@ impl L4AggregateState {
         }
         self.prefixes.retain(|_, window| {
             window
-                .lock()
+                .get_mut()
                 .map(|window| now.duration_since(window.started_at) < L4_AGGREGATE_WINDOW)
                 .unwrap_or(false)
         });
         self.distinct_ips.retain(|_, window| {
             window
-                .lock()
+                .get_mut()
                 .map(|window| now.duration_since(window.started_at) < L4_AGGREGATE_WINDOW)
                 .unwrap_or(false)
         });
@@ -660,7 +655,7 @@ impl L4ExactCounterState {
 
     fn sweep_force(&self, now: Instant) {
         self.counters
-            .retain(|_, window| window.lock().map(|w| !w.is_stale(now)).unwrap_or(false));
+            .retain(|_, window| window.get_mut().map(|w| !w.is_stale(now)).unwrap_or(false));
     }
 }
 
@@ -1293,16 +1288,16 @@ where
     debug_assert!(kind.is_completed_handshake());
     let cluster_id = config_store.get_node_cluster_id_sync();
     config_store.get_empty_connection_flood_config_for_cluster_sync(cluster_id)?;
-    Some(record_l4_event_weighted_with_pressure(
+    Some(record_l4_event_weighted_with_pressure(L4EventArgs {
         config_store,
         waf_state,
         node_id,
         ip,
         kind,
         amount,
-        detail(),
-        current_pressure_level(),
-    ))
+        detail: detail(),
+        pressure_level: current_pressure_level(),
+    }))
 }
 
 pub fn record_l4_event_with_pressure(
@@ -1314,37 +1309,39 @@ pub fn record_l4_event_with_pressure(
     detail: impl Into<String>,
     pressure_level: L4PressureLevel,
 ) -> L4DefenseVerdict {
-    record_l4_event_weighted_with_pressure(
+    record_l4_event_weighted_with_pressure(L4EventArgs {
         config_store,
         waf_state,
         node_id,
         ip,
         kind,
-        1,
-        detail,
+        amount: 1,
+        detail: detail.into(),
         pressure_level,
+    })
+}
+
+pub fn record_l4_event_weighted_with_pressure(args: L4EventArgs) -> L4DefenseVerdict {
+    record_l4_event_scored(
+        args.config_store,
+        args.waf_state,
+        args.node_id,
+        args.ip,
+        args.kind,
+        args.amount,
+        L4EventContext::new(args.detail, args.pressure_level),
     )
 }
 
-pub fn record_l4_event_weighted_with_pressure(
-    config_store: &ConfigStore,
-    waf_state: &Arc<WafStateManager>,
-    node_id: i64,
-    ip: IpAddr,
-    kind: L4DefenseKind,
-    amount: u64,
-    detail: impl Into<String>,
-    pressure_level: L4PressureLevel,
-) -> L4DefenseVerdict {
-    record_l4_event_scored(
-        config_store,
-        waf_state,
-        node_id,
-        ip,
-        kind,
-        amount,
-        L4EventContext::new(detail, pressure_level),
-    )
+pub struct L4EventArgs<'a> {
+    pub config_store: &'a ConfigStore,
+    pub waf_state: &'a Arc<WafStateManager>,
+    pub node_id: i64,
+    pub ip: IpAddr,
+    pub kind: L4DefenseKind,
+    pub amount: u64,
+    pub detail: String,
+    pub pressure_level: L4PressureLevel,
 }
 
 pub fn record_l4_event_scored(
@@ -1392,19 +1389,18 @@ pub fn record_l4_event_scored(
     let aggregate = L4_AGGREGATES.record(cluster_id, ip, kind);
     L4_METRICS.record_prefix_event();
     let aggregate_drop = should_apply_aggregate_emergency_drop(&aggregate, kind, config.threshold);
-    if aggregate_drop {
-        if should_block_prefix(&aggregate, kind, config.threshold)
-            && !prefix_has_whitelisted_ip(waf_state, aggregate.prefix, cluster_scope)
-        {
-            block_cluster_prefix(
-                waf_state,
-                aggregate.prefix,
-                cluster_scope,
-                config.block_secs,
-                config.use_local_firewall,
-            );
-            L4_METRICS.record_prefix_blocked();
-        }
+    if aggregate_drop
+        && should_block_prefix(&aggregate, kind, config.threshold)
+        && !prefix_has_whitelisted_ip(waf_state, aggregate.prefix, cluster_scope)
+    {
+        block_cluster_prefix(
+            waf_state,
+            aggregate.prefix,
+            cluster_scope,
+            config.block_secs,
+            config.use_local_firewall,
+        );
+        L4_METRICS.record_prefix_blocked();
     }
 
     let pressure_level = context
@@ -1953,16 +1949,16 @@ mod tests {
         amount: u64,
         detail: impl Into<String>,
     ) -> L4DefenseVerdict {
-        record_l4_event_weighted_with_pressure(
-            store,
+        record_l4_event_weighted_with_pressure(L4EventArgs {
+            config_store: store,
             waf_state,
-            7,
+            node_id: 7,
             ip,
             kind,
             amount,
-            detail,
-            L4PressureLevel::Normal,
-        )
+            detail: detail.into(),
+            pressure_level: L4PressureLevel::Normal,
+        })
     }
 
     #[tokio::test]

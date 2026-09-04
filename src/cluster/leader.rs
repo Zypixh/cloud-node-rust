@@ -227,10 +227,10 @@ impl KubernetesLeaseClient {
         let port = std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".to_string());
         let token = tokio::fs::read_to_string(SERVICE_ACCOUNT_TOKEN).await?;
         let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
-        if let Ok(ca) = tokio::fs::read(SERVICE_ACCOUNT_CA).await {
-            if let Ok(cert) = reqwest::Certificate::from_pem(&ca) {
-                builder = builder.add_root_certificate(cert);
-            }
+        if let Ok(ca) = tokio::fs::read(SERVICE_ACCOUNT_CA).await
+            && let Ok(cert) = reqwest::Certificate::from_pem(&ca)
+        {
+            builder = builder.add_root_certificate(cert);
         }
         let client = builder.build()?;
         Ok(Self {

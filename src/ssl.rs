@@ -12,10 +12,12 @@ use x509_parser::prelude::*;
 use crate::config_models::SSLCertConfig;
 use crate::tls_crypto::{default_crypto_provider, install_default_crypto_provider};
 
+type CertCacheMap = Arc<RwLock<HashMap<i64, (String, Arc<CertPair>)>>>;
+
 #[derive(Clone)]
 pub struct DynamicCertSelector {
     snapshot: Arc<ArcSwap<CertSnapshot>>,
-    cache: Arc<RwLock<HashMap<i64, (String, Arc<CertPair>)>>>,
+    cache: CertCacheMap,
 }
 
 impl std::fmt::Debug for DynamicCertSelector {
@@ -40,6 +42,12 @@ pub struct CertPair {
     cert_bytes: Vec<u8>,
     key_bytes: Vec<u8>,
     ocsp: Arc<ArcSwap<Vec<u8>>>,
+}
+
+impl Default for DynamicCertSelector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DynamicCertSelector {

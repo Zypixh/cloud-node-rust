@@ -1232,7 +1232,7 @@ impl TcpProxyManager {
                 Ok(s) => s,
                 Err(e) => {
                     self.record_backend_connect_failure(client_addr, &server, &context);
-                    return Err(e.into());
+                    return Err(e);
                 }
             };
             let toa_local_port = backend_stream
@@ -1247,15 +1247,14 @@ impl TcpProxyManager {
                 .as_ref()
                 .map(|ext| ext.proxy_protocol)
                 .unwrap_or_default();
-            if proxy_protocol.enabled() {
-                if let Err(err) =
+            if proxy_protocol.enabled()
+                && let Err(err) =
                     write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol)
                         .await
-                {
-                    release_toa_port(toa_config, toa_local_port).await;
-                    self.record_backend_connect_failure(client_addr, &server, &context);
-                    return Err(err.into());
-                }
+            {
+                release_toa_port(toa_config, toa_local_port).await;
+                self.record_backend_connect_failure(client_addr, &server, &context);
+                return Err(err.into());
             }
             let backend_stream = pingora_core::protocols::l4::stream::Stream::from(backend_stream);
             let backend_stream = pingora_core::protocols::tls::client::handshake(
@@ -1330,7 +1329,7 @@ impl TcpProxyManager {
                 #[cfg(target_os = "linux")]
                 AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_FAIL.fetch_add(1, Ordering::Relaxed);
                 self.record_backend_connect_failure(client_addr, &server, &context);
-                return Err(e.into());
+                return Err(e);
             }
         };
         #[cfg(target_os = "linux")]
@@ -1347,14 +1346,13 @@ impl TcpProxyManager {
             .as_ref()
             .map(|ext| ext.proxy_protocol)
             .unwrap_or_default();
-        if proxy_protocol.enabled() {
-            if let Err(err) =
+        if proxy_protocol.enabled()
+            && let Err(err) =
                 write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol).await
-            {
-                release_toa_port(toa_config, toa_local_port).await;
-                self.record_backend_connect_failure(client_addr, &server, &context);
-                return Err(err.into());
-            }
+        {
+            release_toa_port(toa_config, toa_local_port).await;
+            self.record_backend_connect_failure(client_addr, &server, &context);
+            return Err(err.into());
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
         drop(origin_connect_permit);
@@ -1413,7 +1411,7 @@ impl TcpProxyManager {
             Ok(s) => s,
             Err(e) => {
                 self.record_backend_connect_failure(client_addr, &server, &context);
-                return Err(e.into());
+                return Err(e);
             }
         };
         let toa_local_port = backend_stream
@@ -1428,14 +1426,13 @@ impl TcpProxyManager {
             .as_ref()
             .map(|ext| ext.proxy_protocol)
             .unwrap_or_default();
-        if proxy_protocol.enabled() {
-            if let Err(err) =
+        if proxy_protocol.enabled()
+            && let Err(err) =
                 write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol).await
-            {
-                release_toa_port(toa_config, toa_local_port).await;
-                self.record_backend_connect_failure(client_addr, &server, &context);
-                return Err(err.into());
-            }
+        {
+            release_toa_port(toa_config, toa_local_port).await;
+            self.record_backend_connect_failure(client_addr, &server, &context);
+            return Err(err.into());
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
         drop(origin_connect_permit);
@@ -1479,16 +1476,16 @@ impl TcpProxyManager {
             .first()
             .cloned()
             .unwrap_or_default();
-        crate::metrics::record::record_network_dimensions(
-            crate::metrics::METRIC_CATEGORY_TCP,
-            context.sid,
-            client_addr.ip(),
-            &domain,
-            "-",
-            0,
-            0,
-            502,
-        );
+        crate::metrics::record::record_network_dimensions(crate::metrics::NetworkDimensionsArgs {
+            category: crate::metrics::METRIC_CATEGORY_TCP,
+            server_id: context.sid,
+            client_ip: client_addr.ip(),
+            domain: &domain,
+            user_agent: "-",
+            bytes_sent: 0,
+            bytes_received: 0,
+            status: 502,
+        });
         crate::metrics::record::request_end(context.sid, 0, 0, false, false, false, None);
         crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(context.origin_id);
     }
@@ -1563,16 +1560,16 @@ impl TcpProxyManager {
             .cloned()
             .unwrap_or_default();
         let status = if result.is_ok() { 200 } else { 502 };
-        crate::metrics::record::record_network_dimensions(
-            crate::metrics::METRIC_CATEGORY_TCP,
-            context.sid,
-            client_addr.ip(),
-            &domain,
-            "-",
-            bytes_sent as i64,
-            bytes_received as i64,
+        crate::metrics::record::record_network_dimensions(crate::metrics::NetworkDimensionsArgs {
+            category: crate::metrics::METRIC_CATEGORY_TCP,
+            server_id: context.sid,
+            client_ip: client_addr.ip(),
+            domain: &domain,
+            user_agent: "-",
+            bytes_sent: bytes_sent as i64,
+            bytes_received: bytes_received as i64,
             status,
-        );
+        });
         crate::metrics::record::request_end(context.sid, 0, 0, false, false, false, None);
     }
 
@@ -1715,13 +1712,13 @@ async fn release_toa_port(
     toa_config: Option<crate::config_models::TOAConfig>,
     local_port: Option<u16>,
 ) {
-    if let Some(local_port) = local_port {
-        if let Err(err) = crate::toa::unregister_toa_port(toa_config, local_port).await {
-            debug!(
-                "TCP Proxy: failed to release TOA sender port {}: {}",
-                local_port, err
-            );
-        }
+    if let Some(local_port) = local_port
+        && let Err(err) = crate::toa::unregister_toa_port(toa_config, local_port).await
+    {
+        debug!(
+            "TCP Proxy: failed to release TOA sender port {}: {}",
+            local_port, err
+        );
     }
 }
 

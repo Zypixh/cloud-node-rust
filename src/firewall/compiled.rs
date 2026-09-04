@@ -276,7 +276,7 @@ struct CompiledRegionDenyPlan {
 
 fn geo_region_matches_id(geo: &crate::metrics::analyzer::GeoInfo, id: i64) -> bool {
     geo.region_id == id
-        || legacy_province_id_to_name(id).map_or(false, |name| name == geo.region.as_ref())
+        || legacy_province_id_to_name(id).is_some_and(|name| name == geo.region.as_ref())
 }
 
 impl CompiledRegionDenyPlan {
@@ -2177,47 +2177,47 @@ fn evaluate_compiled_policy_inner(
 
         let start_set = next_start_set_id.take();
         if let Some(result) = match_group_from(group, session, request_body, &facts, start_set) {
-            if let Some(set) = result.set {
-                if let Some(mut matched) = perform_compiled_actions(set) {
-                    fill_action_from_policy(&mut matched, policy, group.id, set.id);
-                    crate::firewall::apply_observe_mode(&policy.raw, &mut matched);
+            if let Some(set) = result.set
+                && let Some(mut matched) = perform_compiled_actions(set)
+            {
+                fill_action_from_policy(&mut matched, policy, group.id, set.id);
+                crate::firewall::apply_observe_mode(&policy.raw, &mut matched);
 
-                    if matched.action_code == "allow" {
-                        match matched.allow_scope.as_deref() {
-                            Some("group") => {
-                                current_group_idx += 1;
-                                continue;
-                            }
-                            Some("server") | Some("policy") => return Some(matched),
-                            _ => {}
-                        }
-                    }
-
-                    if let Some(next_gid) = matched.next_group_id
-                        && let Some(idx) = inbound.groups.iter().position(|g| g.id == next_gid)
-                    {
-                        current_group_idx = idx;
-                        continue;
-                    }
-
-                    if let Some(next_sid) = matched.next_set_id {
-                        let target = inbound.groups.iter().enumerate().find_map(|(idx, g)| {
-                            g.sets.iter().any(|set| set.id == next_sid).then_some(idx)
-                        });
-                        if let Some(idx) = target {
-                            current_group_idx = idx;
-                            next_start_set_id = Some(next_sid);
+                if matched.action_code == "allow" {
+                    match matched.allow_scope.as_deref() {
+                        Some("group") => {
+                            current_group_idx += 1;
                             continue;
                         }
+                        Some("server") | Some("policy") => return Some(matched),
+                        _ => {}
                     }
+                }
 
-                    if matched.action_code == "log" {
-                        current_group_idx += 1;
+                if let Some(next_gid) = matched.next_group_id
+                    && let Some(idx) = inbound.groups.iter().position(|g| g.id == next_gid)
+                {
+                    current_group_idx = idx;
+                    continue;
+                }
+
+                if let Some(next_sid) = matched.next_set_id {
+                    let target = inbound.groups.iter().enumerate().find_map(|(idx, g)| {
+                        g.sets.iter().any(|set| set.id == next_sid).then_some(idx)
+                    });
+                    if let Some(idx) = target {
+                        current_group_idx = idx;
+                        next_start_set_id = Some(next_sid);
                         continue;
                     }
-
-                    return Some(matched);
                 }
+
+                if matched.action_code == "log" {
+                    current_group_idx += 1;
+                    continue;
+                }
+
+                return Some(matched);
             }
             if result.matched {
                 let mut action = crate::firewall::default_block_action(policy.id, group.id);
@@ -2298,12 +2298,12 @@ fn evaluate_compiled_outbound_policy_inner(
             continue;
         }
         if let Some(result) = match_group_response(group, session, &facts) {
-            if let Some(set) = result.set {
-                if let Some(mut matched) = perform_compiled_actions(set) {
-                    fill_action_from_policy(&mut matched, policy, group.id, set.id);
-                    crate::firewall::apply_observe_mode(&policy.raw, &mut matched);
-                    return Some(matched);
-                }
+            if let Some(set) = result.set
+                && let Some(mut matched) = perform_compiled_actions(set)
+            {
+                fill_action_from_policy(&mut matched, policy, group.id, set.id);
+                crate::firewall::apply_observe_mode(&policy.raw, &mut matched);
+                return Some(matched);
             }
             if result.matched {
                 let mut action = crate::firewall::default_block_action(policy.id, group.id);
@@ -4271,7 +4271,7 @@ mod tests {
 
     #[test]
     fn compiled_regex_prefilter_only_indexes_safe_same_value_or_sets() {
-        let rules = vec![
+        let rules = [
             custom_rule("${requestURI}", "regexp", "^/api/"),
             custom_rule("${requestURI}", "regexp", "^/static/"),
         ];
@@ -4284,7 +4284,7 @@ mod tests {
         );
         assert!(prefilter.is_some());
 
-        let mixed_values = vec![
+        let mixed_values = [
             custom_rule("${requestURI}", "regexp", "^/api/"),
             custom_rule("${host}", "regexp", "example\\.com$"),
         ];
@@ -4297,7 +4297,7 @@ mod tests {
         );
         assert!(prefilter.is_none());
 
-        let mixed_operator = vec![
+        let mixed_operator = [
             custom_rule("${requestURI}", "regexp", "^/api/"),
             custom_rule("${requestURI}", "contains", "/static/"),
         ];

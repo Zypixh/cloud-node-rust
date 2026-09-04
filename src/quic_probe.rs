@@ -485,8 +485,8 @@ fn merge_crypto_fragment(
         data.resize(fragment.data.len(), 0);
     }
     for range in fragment.ranges {
-        if let Some(fragment_data) = fragment.data.get(range.clone()) {
-            data[range.clone()].copy_from_slice(fragment_data);
+        if let Some(fragment_data) = fragment.data.get(range) {
+            data[range].copy_from_slice(fragment_data);
             ranges.push(range);
         }
     }

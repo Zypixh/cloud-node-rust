@@ -1,6 +1,7 @@
 use crate::memory_governor::MEMORY_GOVERNOR;
 use moka::sync::Cache;
 use regex::Regex;
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
 use std::time::Duration;
@@ -11,11 +12,21 @@ const REGEX_CACHE_ESTIMATED_BYTES: u64 = 64 * 1024;
 
 static SHARED_REGEX_CACHE: Lazy<Cache<String, Arc<Regex>>> = Lazy::new(build_regex_cache);
 
+thread_local! {
+    static CACHE_INITIALIZATION_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
+}
+
 fn build_regex_cache() -> Cache<String, Arc<Regex>> {
-    Cache::builder()
-        .max_capacity(regex_cache_max_entries())
-        .time_to_idle(Duration::from_secs(15 * 60))
-        .build()
+    CACHE_INITIALIZATION_IN_PROGRESS.with(|in_progress| {
+        let was_initializing = in_progress.replace(true);
+        debug_assert!(!was_initializing);
+        let cache = Cache::builder()
+            .max_capacity(regex_cache_max_entries())
+            .time_to_idle(Duration::from_secs(15 * 60))
+            .build();
+        in_progress.set(was_initializing);
+        cache
+    })
 }
 
 pub fn regex_cache_max_entries() -> u64 {
@@ -41,5 +52,8 @@ pub fn entry_count() -> u64 {
 }
 
 pub fn reclaim_all() {
+    if CACHE_INITIALIZATION_IN_PROGRESS.with(Cell::get) {
+        return;
+    }
     SHARED_REGEX_CACHE.invalidate_all();
 }

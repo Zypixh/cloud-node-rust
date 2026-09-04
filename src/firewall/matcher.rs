@@ -100,20 +100,20 @@ pub fn evaluate_operator(
         "eq string" => actual == expected,
         "neq string" => actual != expected,
         "match" | "matches" | "regexp" => {
-            get_or_compile_regex(&expected).map_or(false, |re| re.is_match(&actual))
+            get_or_compile_regex(&expected).is_some_and(|re| re.is_match(&actual))
         }
         "not match" | "notmatches" | "notregexp" => {
-            get_or_compile_regex(&expected).map_or(false, |re| !re.is_match(&actual))
+            get_or_compile_regex(&expected).is_some_and(|re| !re.is_match(&actual))
         }
         "wildcard match" => {
             let escaped = regex::escape(&expected).replace("\\*", ".*");
             let re_str = format!("^{}$", escaped);
-            get_or_compile_regex(&re_str).map_or(false, |re| re.is_match(&actual))
+            get_or_compile_regex(&re_str).is_some_and(|re| re.is_match(&actual))
         }
         "wildcard not match" => {
             let escaped = regex::escape(&expected).replace("\\*", ".*");
             let re_str = format!("^{}$", escaped);
-            get_or_compile_regex(&re_str).map_or(false, |re| !re.is_match(&actual))
+            get_or_compile_regex(&re_str).is_some_and(|re| !re.is_match(&actual))
         }
         "contains" | "containsstring" => actual.contains(expected.as_ref()),
         "not contains" | "notcontains" => !actual.contains(expected.as_ref()),
@@ -492,23 +492,23 @@ pub(crate) fn evaluate_operator_bytes(
     match operator_lower.as_ref() {
         "match" | "matches" | "regexp" => {
             get_or_compile_bytes_regex(expected_value, case_insensitive)
-                .map_or(false, |re| re.is_match(body))
+                .is_some_and(|re| re.is_match(body))
         }
         "not match" | "notmatches" | "notregexp" => {
             get_or_compile_bytes_regex(expected_value, case_insensitive)
-                .map_or(false, |re| !re.is_match(body))
+                .is_some_and(|re| !re.is_match(body))
         }
         "wildcard match" => {
             let escaped = regex::escape(expected_value).replace("\\*", ".*");
             let re_str = format!("^{}$", escaped);
             get_or_compile_bytes_regex(&re_str, case_insensitive)
-                .map_or(false, |re| re.is_match(body))
+                .is_some_and(|re| re.is_match(body))
         }
         "wildcard not match" => {
             let escaped = regex::escape(expected_value).replace("\\*", ".*");
             let re_str = format!("^{}$", escaped);
             get_or_compile_bytes_regex(&re_str, case_insensitive)
-                .map_or(false, |re| !re.is_match(body))
+                .is_some_and(|re| !re.is_match(body))
         }
         "contains" | "containsstring" => {
             if pattern_bytes.is_empty() {

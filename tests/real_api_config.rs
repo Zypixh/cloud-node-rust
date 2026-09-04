@@ -7,7 +7,9 @@ use cloud_node_rust::firewall::state::WafStateManager;
 use cloud_node_rust::health_manager::GlobalHealthManager;
 use cloud_node_rust::pb;
 use cloud_node_rust::rpc::client::RpcClient;
-use cloud_node_rust::rpc::node::{fetch_and_apply_config, report_node_online_once};
+use cloud_node_rust::rpc::node::{
+    FetchConfigArgs, fetch_and_apply_config, report_node_online_once,
+};
 use cloud_node_rust::ssl::DynamicCertSelector;
 use std::io::Read;
 
@@ -249,16 +251,16 @@ async fn real_api_consume_prefix_purge_cache_tasks_once() -> anyhow::Result<()> 
     let mut config_version = -1;
     tokio::time::timeout(
         Duration::from_secs(30),
-        fetch_and_apply_config(
-            &mut node_service,
-            &config_store,
-            &api_config,
-            &health_manager,
-            &cert_selector,
-            &waf_state,
-            &mut task_version,
-            &mut config_version,
-        ),
+        fetch_and_apply_config(FetchConfigArgs {
+            client: &mut node_service,
+            config_store: &config_store,
+            api_config: &api_config,
+            health_manager: &health_manager,
+            cert_selector: &cert_selector,
+            waf_state: &waf_state,
+            task_version: &mut task_version,
+            config_version: &mut config_version,
+        }),
     )
     .await
     .map_err(|_| anyhow::anyhow!("real API config fetch timed out before cache task consume"))?;
@@ -390,16 +392,16 @@ async fn real_api_config_can_be_fetched_parsed_and_applied() -> anyhow::Result<(
 
     tokio::time::timeout(
         Duration::from_secs(30),
-        fetch_and_apply_config(
-            &mut node_service,
-            &config_store,
-            &api_config,
-            &health_manager,
-            &cert_selector,
-            &waf_state,
-            &mut task_version,
-            &mut config_version,
-        ),
+        fetch_and_apply_config(FetchConfigArgs {
+            client: &mut node_service,
+            config_store: &config_store,
+            api_config: &api_config,
+            health_manager: &health_manager,
+            cert_selector: &cert_selector,
+            waf_state: &waf_state,
+            task_version: &mut task_version,
+            config_version: &mut config_version,
+        }),
     )
     .await
     .map_err(|_| anyhow::anyhow!("real API config fetch timed out"))?;

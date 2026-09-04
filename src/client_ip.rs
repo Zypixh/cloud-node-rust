@@ -112,10 +112,10 @@ pub fn peer_remote_port(session: &Session) -> u16 {
 }
 
 pub fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    if let IpAddr::V6(v6) = ip {
-        if let Some(v4) = v6.to_ipv4_mapped() {
-            return IpAddr::V4(v4);
-        }
+    if let IpAddr::V6(v6) = ip
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        return IpAddr::V4(v4);
     }
     ip
 }
@@ -323,7 +323,7 @@ fn resolve_remote_addr_template_var(
             .and_then(|v| v.to_str().ok())
             .map(|v| v.split(':').next().unwrap_or(v))
             .unwrap_or("");
-        return host.split('.').last().unwrap_or("").to_string();
+        return host.split('.').next_back().unwrap_or("").to_string();
     }
     if inner.eq_ignore_ascii_case("node.id") {
         return crate::logging::get_numeric_node_id().to_string();

@@ -192,11 +192,11 @@ impl GlobalHealthManager {
         for mut entry in self.registry.iter_mut() {
             let id = *entry.key();
             let item = entry.value_mut();
-            if now.duration_since(item.last_check) >= item.frequency {
-                if let Some(lb) = item.lb.upgrade() {
-                    targets.push((id, lb));
-                    item.last_check = now;
-                }
+            if now.duration_since(item.last_check) >= item.frequency
+                && let Some(lb) = item.lb.upgrade()
+            {
+                targets.push((id, lb));
+                item.last_check = now;
             }
         }
 
@@ -233,11 +233,11 @@ impl GlobalHealthManager {
         for mut entry in self.parent_registry.iter_mut() {
             let id = *entry.key();
             let item = entry.value_mut();
-            if now.duration_since(item.last_check) >= item.frequency {
-                if let Some(lb) = item.lb.upgrade() {
-                    parent_targets.push((id, lb));
-                    item.last_check = now;
-                }
+            if now.duration_since(item.last_check) >= item.frequency
+                && let Some(lb) = item.lb.upgrade()
+            {
+                parent_targets.push((id, lb));
+                item.last_check = now;
             }
         }
 

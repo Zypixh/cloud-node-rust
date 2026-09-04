@@ -10,7 +10,7 @@ pub enum UamMode {
 }
 
 impl UamMode {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         let normalized = s
             .trim()
             .to_ascii_lowercase()

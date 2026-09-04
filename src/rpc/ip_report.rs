@@ -48,10 +48,11 @@ struct ReportKey {
     source_category: String,
 }
 
-static REPORT_CHAN: Lazy<(
+type IpReportChannel = (
     mpsc::Sender<IpReportMessage>,
     Mutex<Option<mpsc::Receiver<IpReportMessage>>>,
-)> = Lazy::new(|| {
+);
+static REPORT_CHAN: Lazy<IpReportChannel> = Lazy::new(|| {
     let (tx, rx) = mpsc::channel(1000);
     (tx, Mutex::new(Some(rx)))
 });

@@ -10,6 +10,9 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+type IpBandwidthCounter = Arc<RwLock<(u64, u64)>>;
+type IpBandwidthCounters = DashMap<(i64, IpAddr), IpBandwidthCounter>;
+
 pub struct CandidateRulesetStats {
     pub hits: AtomicU64,
     pub blocks: AtomicU64,
@@ -435,7 +438,7 @@ pub struct WafStateManager {
     list_white_range_snapshots: ArcSwap<RangeSnapshot>,
     list_gray_ranges: DashMap<(i64, IpAddrRange), i64>,
     list_gray_range_snapshots: ArcSwap<RangeSnapshot>,
-    ip_bw_counters: DashMap<(i64, IpAddr), Arc<RwLock<(u64, u64)>>>,
+    ip_bw_counters: IpBandwidthCounters,
     ip_bw_counter_reservations: AtomicU64,
     kernel_filter: RwLock<Arc<dyn KernelFilter>>,
     candidate_stats: DashMap<(i64, i64), Arc<CandidateRulesetStats>>,
@@ -1367,7 +1370,8 @@ impl WafStateManager {
                 if !Self::reserve_slot(&self.ip_limiter_reservations, self.ip_limiter_capacity()) {
                     drop(entry);
                     self.sweep_limiters(crate::utils::time::now_timestamp());
-                    let entry = match self.ip_limiters.entry(key) {
+
+                    match self.ip_limiters.entry(key) {
                         Entry::Occupied(entry) => entry.into_ref(),
                         Entry::Vacant(entry) => {
                             if !Self::reserve_slot(
@@ -1389,8 +1393,7 @@ impl WafStateManager {
                                 max_qps,
                             ))
                         }
-                    };
-                    entry
+                    }
                 } else {
                     let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
                     entry.insert(TrackedLimiter::new(
@@ -1402,33 +1405,29 @@ impl WafStateManager {
         };
         if entry.quota_value.load(Ordering::Relaxed) != max_qps {
             drop(entry);
-            loop {
-                match self.ip_limiters.entry(key) {
-                    Entry::Occupied(mut current) => {
-                        if current.get().quota_value.load(Ordering::Relaxed) != max_qps {
-                            let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
-                            let _ = current.insert(TrackedLimiter::new(
-                                Arc::new(RateLimiter::dashmap(quota)),
-                                max_qps,
-                            ));
-                        }
-                        entry = current.into_ref();
-                        break;
-                    }
-                    Entry::Vacant(current) => {
-                        if !Self::reserve_slot(
-                            &self.ip_limiter_reservations,
-                            self.ip_limiter_capacity(),
-                        ) {
-                            return false;
-                        }
+            match self.ip_limiters.entry(key) {
+                Entry::Occupied(mut current) => {
+                    if current.get().quota_value.load(Ordering::Relaxed) != max_qps {
                         let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
-                        entry = current.insert(TrackedLimiter::new(
+                        let _ = current.insert(TrackedLimiter::new(
                             Arc::new(RateLimiter::dashmap(quota)),
                             max_qps,
                         ));
-                        break;
                     }
+                    entry = current.into_ref();
+                }
+                Entry::Vacant(current) => {
+                    if !Self::reserve_slot(
+                        &self.ip_limiter_reservations,
+                        self.ip_limiter_capacity(),
+                    ) {
+                        return false;
+                    }
+                    let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
+                    entry = current.insert(TrackedLimiter::new(
+                        Arc::new(RateLimiter::dashmap(quota)),
+                        max_qps,
+                    ));
                 }
             }
         }

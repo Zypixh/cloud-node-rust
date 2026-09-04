@@ -187,59 +187,58 @@ fn evaluate_policy_inner(
                 server,
                 start_set,
             ) {
-                if let Some(set) = result.set {
-                    if let Some(mut matched) = perform_actions(&set.actions) {
-                        fill_action_context(
-                            &mut matched,
-                            policy.id,
-                            group.id,
-                            set.id,
-                            policy.use_local_firewall,
-                        );
-                        fill_action_options(policy, &mut matched);
+                if let Some(set) = result.set
+                    && let Some(mut matched) = perform_actions(&set.actions)
+                {
+                    fill_action_context(
+                        &mut matched,
+                        policy.id,
+                        group.id,
+                        set.id,
+                        policy.use_local_firewall,
+                    );
+                    fill_action_options(policy, &mut matched);
 
-                        apply_observe_mode(policy, &mut matched);
+                    apply_observe_mode(policy, &mut matched);
 
-                        // Flow Control: ALLOW Scope
-                        if matched.action_code == "allow" {
-                            match matched.allow_scope.as_deref() {
-                                Some("group") => {
-                                    current_group_idx += 1;
-                                    continue;
-                                }
-                                Some("server") | Some("policy") => return Some(matched),
-                                _ => {}
-                            }
-                        }
-
-                        // Flow Control: GO_GROUP
-                        if let Some(next_gid) = matched.next_group_id {
-                            if let Some(idx) = inbound.groups.iter().position(|g| g.id == next_gid)
-                            {
-                                current_group_idx = idx;
+                    // Flow Control: ALLOW Scope
+                    if matched.action_code == "allow" {
+                        match matched.allow_scope.as_deref() {
+                            Some("group") => {
+                                current_group_idx += 1;
                                 continue;
                             }
+                            Some("server") | Some("policy") => return Some(matched),
+                            _ => {}
                         }
+                    }
 
-                        // Flow Control: GO_SET — precise jump to the named set
-                        if let Some(next_sid) = matched.next_set_id {
-                            let target = inbound.groups.iter().enumerate().find_map(|(idx, g)| {
-                                g.sets.iter().any(|s| s.id == next_sid).then_some(idx)
-                            });
-                            if let Some(idx) = target {
-                                current_group_idx = idx;
-                                next_start_set_id = Some(next_sid);
-                                continue;
-                            }
-                        }
+                    // Flow Control: GO_GROUP
+                    if let Some(next_gid) = matched.next_group_id
+                        && let Some(idx) = inbound.groups.iter().position(|g| g.id == next_gid)
+                    {
+                        current_group_idx = idx;
+                        continue;
+                    }
 
-                        if matched.action_code == "log" {
-                            current_group_idx += 1;
+                    // Flow Control: GO_SET — precise jump to the named set
+                    if let Some(next_sid) = matched.next_set_id {
+                        let target = inbound.groups.iter().enumerate().find_map(|(idx, g)| {
+                            g.sets.iter().any(|s| s.id == next_sid).then_some(idx)
+                        });
+                        if let Some(idx) = target {
+                            current_group_idx = idx;
+                            next_start_set_id = Some(next_sid);
                             continue;
                         }
-
-                        return Some(matched);
                     }
+
+                    if matched.action_code == "log" {
+                        current_group_idx += 1;
+                        continue;
+                    }
+
+                    return Some(matched);
                 }
                 if result.matched {
                     let mut action = default_block_action(policy.id, group.id);
@@ -363,21 +362,21 @@ fn evaluate_outbound_policy_inner(
                 scheme,
                 server,
             ) {
-                if let Some(set) = result.set {
-                    if let Some(mut matched) = perform_actions(&set.actions) {
-                        fill_action_context(
-                            &mut matched,
-                            policy.id,
-                            group.id,
-                            set.id,
-                            policy.use_local_firewall,
-                        );
-                        fill_action_options(policy, &mut matched);
+                if let Some(set) = result.set
+                    && let Some(mut matched) = perform_actions(&set.actions)
+                {
+                    fill_action_context(
+                        &mut matched,
+                        policy.id,
+                        group.id,
+                        set.id,
+                        policy.use_local_firewall,
+                    );
+                    fill_action_options(policy, &mut matched);
 
-                        apply_observe_mode(policy, &mut matched);
+                    apply_observe_mode(policy, &mut matched);
 
-                        return Some(matched);
-                    }
+                    return Some(matched);
                 }
                 if result.matched {
                     let mut action = default_block_action(policy.id, group.id);
@@ -1273,7 +1272,7 @@ fn legacy_country_id_to_iso(id: i64) -> Option<&'static str> {
 
 fn geo_region_matches_id(geo: &analyzer::GeoInfo, id: i64) -> bool {
     geo.region_id == id
-        || legacy_province_id_to_name(id).map_or(false, |name| name == geo.region.as_ref())
+        || legacy_province_id_to_name(id).is_some_and(|name| name == geo.region.as_ref())
 }
 
 fn legacy_province_id_to_name(id: i64) -> Option<&'static str> {
@@ -1345,12 +1344,12 @@ pub fn check_region_deny(
             !region
                 .allow_country_ids
                 .iter()
-                .any(|&id| legacy_country_id_to_iso(id).map_or(false, |iso| iso == country_iso))
+                .any(|&id| legacy_country_id_to_iso(id) == Some(country_iso))
         } else {
             region
                 .deny_country_ids
                 .iter()
-                .any(|&id| legacy_country_id_to_iso(id).map_or(false, |iso| iso == country_iso))
+                .any(|&id| legacy_country_id_to_iso(id) == Some(country_iso))
         };
         if country_blocked {
             let html = if !region.deny_country_html.is_empty() {

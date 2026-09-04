@@ -94,10 +94,10 @@ impl OriginStateManager {
         if let Some(state) = self.states.get(&origin_id) {
             return Arc::clone(&state);
         }
-        if self.states.len() >= MAX_ORIGIN_STATES {
-            if let Some(key) = self.states.iter().next().map(|entry| *entry.key()) {
-                self.states.remove(&key);
-            }
+        if self.states.len() >= MAX_ORIGIN_STATES
+            && let Some(key) = self.states.iter().next().map(|entry| *entry.key())
+        {
+            self.states.remove(&key);
         }
         Arc::clone(
             self.states

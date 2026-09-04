@@ -335,6 +335,34 @@ pub struct UdpProxyManager {
     next_session_id: AtomicU64,
 }
 
+pub(crate) struct UdpPassthroughSessionArgs {
+    pub client_addr: SocketAddr,
+    pub port: u16,
+    pub server: Arc<ServerConfig>,
+    pub probed_server_name: Option<String>,
+    pub downstream_sender: UdpDownstreamSender,
+    pub shutdown_rx: watch::Receiver<bool>,
+    pub quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
+}
+
+struct UdpHandleSessionArgs {
+    session_id: u64,
+    backend_addr: SocketAddr,
+    _listen_port: u16,
+    listener_shutdown_rx: watch::Receiver<bool>,
+    session_shutdown_rx: watch::Receiver<bool>,
+    server_id: i64,
+    origin_id: i64,
+    client_addr: Arc<RwLock<SocketAddr>>,
+    domain: String,
+    last_activity_ms: Arc<AtomicU64>,
+    quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
+    quic_server_cid_len: Arc<AtomicU8>,
+    quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
+    downstream_sender: UdpDownstreamSender,
+    rx: mpsc::Receiver<QueuedUdpDatagram>,
+}
+
 impl UdpProxyManager {
     pub fn new(
         config_store: ConfigStore,
@@ -415,18 +443,17 @@ impl UdpProxyManager {
                     server.numeric_id()
                 );
             }
-            if server.is_quic_passthrough() {
-                if let Some(https) = &server.https
-                    && https.is_on
-                {
-                    server_ports.extend(
-                        https
-                            .listen
-                            .iter()
-                            .filter_map(|addr| addr.port_range.as_deref())
-                            .flat_map(crate::config_models::ports_in_range),
-                    );
-                }
+            if server.is_quic_passthrough()
+                && let Some(https) = &server.https
+                && https.is_on
+            {
+                server_ports.extend(
+                    https
+                        .listen
+                        .iter()
+                        .filter_map(|addr| addr.port_range.as_deref())
+                        .flat_map(crate::config_models::ports_in_range),
+                );
             }
             desired_ports.extend(server_ports);
         }
@@ -659,49 +686,32 @@ impl UdpProxyManager {
         shutdown_rx: watch::Receiver<bool>,
     ) -> anyhow::Result<Option<Arc<UdpSession>>> {
         self.create_passthrough_session_for_server_with_cid_updates_and_downstream(
+            UdpPassthroughSessionArgs {
+                client_addr,
+                port,
+                server,
+                probed_server_name,
+                downstream_sender,
+                shutdown_rx,
+                quic_cid_tx: None,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn create_passthrough_session_for_server_with_cid_updates_and_downstream(
+        &self,
+        args: UdpPassthroughSessionArgs,
+    ) -> anyhow::Result<Option<Arc<UdpSession>>> {
+        let UdpPassthroughSessionArgs {
             client_addr,
             port,
             server,
             probed_server_name,
             downstream_sender,
             shutdown_rx,
-            None,
-        )
-        .await
-    }
-
-    pub async fn create_passthrough_session_for_server_with_cid_updates(
-        &self,
-        client_addr: SocketAddr,
-        port: u16,
-        server: Arc<ServerConfig>,
-        probed_server_name: Option<String>,
-        listen_socket: Arc<UdpSocket>,
-        shutdown_rx: watch::Receiver<bool>,
-        quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
-    ) -> anyhow::Result<Option<Arc<UdpSession>>> {
-        self.create_passthrough_session_for_server_with_cid_updates_and_downstream(
-            client_addr,
-            port,
-            server,
-            probed_server_name,
-            udp_socket_downstream(listen_socket),
-            shutdown_rx,
             quic_cid_tx,
-        )
-        .await
-    }
-
-    pub async fn create_passthrough_session_for_server_with_cid_updates_and_downstream(
-        &self,
-        client_addr: SocketAddr,
-        port: u16,
-        server: Arc<ServerConfig>,
-        probed_server_name: Option<String>,
-        downstream_sender: UdpDownstreamSender,
-        shutdown_rx: watch::Receiver<bool>,
-        quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
-    ) -> anyhow::Result<Option<Arc<UdpSession>>> {
+        } = args;
         let key = (client_addr, port);
         if let Some(session) = self.sessions.get(&key) {
             return Ok(Some(session.clone()));
@@ -855,23 +865,23 @@ impl UdpProxyManager {
 
         tokio::spawn(async move {
             let _session_permit = session_permit;
-            let result = Self::handle_session(
+            let result = Self::handle_session(UdpHandleSessionArgs {
                 session_id,
                 backend_addr,
-                listen_port,
+                _listen_port: listen_port,
                 listener_shutdown_rx,
                 session_shutdown_rx,
                 server_id,
                 origin_id,
-                client_addr.clone(),
+                client_addr: client_addr.clone(),
                 domain,
                 last_activity_ms,
                 quic_cids,
                 quic_server_cid_len,
-                session_quic_cid_tx,
+                quic_cid_tx: session_quic_cid_tx,
                 downstream_sender,
                 rx,
-            )
+            })
             .await;
             let last_client_addr = *client_addr.read().await;
             sessions.remove_if(&(initial_client_addr, listen_port), |_, session| {
@@ -1022,23 +1032,24 @@ impl UdpProxyManager {
         });
     }
 
-    async fn handle_session(
-        session_id: u64,
-        backend_addr: SocketAddr,
-        _listen_port: u16,
-        mut listener_shutdown_rx: watch::Receiver<bool>,
-        mut session_shutdown_rx: watch::Receiver<bool>,
-        server_id: i64,
-        origin_id: i64,
-        client_addr: Arc<RwLock<SocketAddr>>,
-        domain: String,
-        last_activity_ms: Arc<AtomicU64>,
-        quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
-        quic_server_cid_len: Arc<AtomicU8>,
-        quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
-        downstream_sender: UdpDownstreamSender,
-        mut rx: mpsc::Receiver<QueuedUdpDatagram>,
-    ) -> anyhow::Result<()> {
+    async fn handle_session(args: UdpHandleSessionArgs) -> anyhow::Result<()> {
+        let UdpHandleSessionArgs {
+            session_id,
+            backend_addr,
+            _listen_port,
+            mut listener_shutdown_rx,
+            mut session_shutdown_rx,
+            server_id,
+            origin_id,
+            client_addr,
+            domain,
+            last_activity_ms,
+            quic_cids,
+            quic_server_cid_len,
+            quic_cid_tx,
+            downstream_sender,
+            mut rx,
+        } = args;
         let backend_bind_addr = if backend_addr.is_ipv6() {
             "[::]:0"
         } else {
@@ -1050,14 +1061,16 @@ impl UdpProxyManager {
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                 let current_client_addr = *client_addr.read().await;
                 crate::metrics::record::record_network_dimensions(
-                    crate::metrics::METRIC_CATEGORY_UDP,
-                    server_id,
-                    current_client_addr.ip(),
-                    &domain,
-                    "-",
-                    0,
-                    0,
-                    502,
+                    crate::metrics::NetworkDimensionsArgs {
+                        category: crate::metrics::METRIC_CATEGORY_UDP,
+                        server_id,
+                        client_ip: current_client_addr.ip(),
+                        domain: &domain,
+                        user_agent: "-",
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        status: 502,
+                    },
                 );
                 crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
                 return Err(err.into());
@@ -1165,16 +1178,16 @@ impl UdpProxyManager {
         let (downstream_sent, upstream_sent) = transfer_metrics.totals();
         let current_client_addr = *client_addr.read().await;
         let status = if result.is_ok() { 200 } else { 502 };
-        crate::metrics::record::record_network_dimensions(
-            crate::metrics::METRIC_CATEGORY_UDP,
+        crate::metrics::record::record_network_dimensions(crate::metrics::NetworkDimensionsArgs {
+            category: crate::metrics::METRIC_CATEGORY_UDP,
             server_id,
-            current_client_addr.ip(),
-            &domain,
-            "-",
-            downstream_sent as i64,
-            upstream_sent as i64,
+            client_ip: current_client_addr.ip(),
+            domain: &domain,
+            user_agent: "-",
+            bytes_sent: downstream_sent as i64,
+            bytes_received: upstream_sent as i64,
             status,
-        );
+        });
         crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
         result
     }
@@ -1589,23 +1602,23 @@ mod tests {
         let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
 
-        let task = tokio::spawn(UdpProxyManager::handle_session(
-            1,
+        let task = tokio::spawn(UdpProxyManager::handle_session(UdpHandleSessionArgs {
+            session_id: 1,
             backend_addr,
-            443,
+            _listen_port: 443,
             listener_shutdown_rx,
             session_shutdown_rx,
-            1,
-            1,
-            Arc::new(RwLock::new(client_addr)),
-            "udp.example.com".to_string(),
-            Arc::new(AtomicU64::new(udp_activity_now_ms())),
-            Arc::new(RwLock::new(VecDeque::new())),
-            Arc::new(AtomicU8::new(0)),
-            None,
-            UdpDownstreamSender::socket(listen_socket),
+            server_id: 1,
+            origin_id: 1,
+            client_addr: Arc::new(RwLock::new(client_addr)),
+            domain: "udp.example.com".to_string(),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
+            quic_cid_tx: None,
+            downstream_sender: UdpDownstreamSender::socket(listen_socket),
             rx,
-        ));
+        }));
 
         tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping")).unwrap())
             .await
@@ -1644,23 +1657,23 @@ mod tests {
         let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
 
-        let task = tokio::spawn(UdpProxyManager::handle_session(
-            1,
+        let task = tokio::spawn(UdpProxyManager::handle_session(UdpHandleSessionArgs {
+            session_id: 1,
             backend_addr,
-            443,
+            _listen_port: 443,
             listener_shutdown_rx,
             session_shutdown_rx,
-            1,
-            1,
-            Arc::new(RwLock::new(client_addr)),
-            "udp.example.com".to_string(),
-            Arc::new(AtomicU64::new(udp_activity_now_ms())),
-            Arc::new(RwLock::new(VecDeque::new())),
-            Arc::new(AtomicU8::new(0)),
-            None,
-            UdpDownstreamSender::channel(listen_addr, downstream_tx),
+            server_id: 1,
+            origin_id: 1,
+            client_addr: Arc::new(RwLock::new(client_addr)),
+            domain: "udp.example.com".to_string(),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
+            quic_cid_tx: None,
+            downstream_sender: UdpDownstreamSender::channel(listen_addr, downstream_tx),
             rx,
-        ));
+        }));
 
         tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping")).unwrap())
             .await

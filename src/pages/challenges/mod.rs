@@ -100,7 +100,7 @@ pub(crate) fn is_token_expired(payload: &Value) -> bool {
     payload
         .get("e")
         .and_then(|v| v.as_u64())
-        .map_or(true, |exp| now > exp)
+        .is_none_or(|exp| now > exp)
 }
 
 /// Generate an 8-character random alphanumeric suffix for JS obfuscation.

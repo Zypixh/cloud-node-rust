@@ -184,7 +184,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     Mode::Get => db.get_json::<serde_json::Value>(&key).is_some(),
                     Mode::Mixed => {
-                        if sequence % 2 == 0 {
+                        if sequence.is_multiple_of(2) {
                             db.put_json(
                                 &format!("BENCH_MIXED_{worker}"),
                                 &serde_json::json!({

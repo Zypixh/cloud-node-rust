@@ -7,6 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
 use tracing::warn;
 
+type OriginBuildContext = (
+    i32,
+    Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
+    bool,
+    bool,
+    Option<crate::config_models::GlobalHTTPAllConfig>,
+);
+
 use crate::config_models::{
     HTTP3Policy, HTTPCCPolicy, HTTPCachePolicy, HTTPFirewallPolicy, HTTPPageConfig,
     HTTPPagesPolicy, MetricItemConfig, ParentNodeConfig, SSLCertConfig, SSLPolicyConfig,
@@ -360,9 +368,9 @@ fn dedup_ssl_certs(certs: Vec<SSLCertConfig>) -> Vec<SSLCertConfig> {
             by_id.insert(key, cert);
             continue;
         }
-        if !by_id.contains_key(&cert.id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = by_id.entry(cert.id) {
             order.push(cert.id);
-            by_id.insert(cert.id, cert);
+            e.insert(cert);
             continue;
         }
         let replace = by_id
@@ -962,15 +970,7 @@ impl ConfigStore {
         )
     }
 
-    pub fn get_origin_build_context_sync(
-        &self,
-    ) -> (
-        i32,
-        Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
-        bool,
-        bool,
-        Option<crate::config_models::GlobalHTTPAllConfig>,
-    ) {
+    pub fn get_origin_build_context_sync(&self) -> OriginBuildContext {
         let lock = self.inner.read();
         (
             lock.level,
@@ -1521,11 +1521,8 @@ impl ConfigStore {
         routes: HashMap<String, Arc<crate::lb_factory::AnyLoadBalancer>>,
     ) {
         let mut id_to_lb = HashMap::new();
-        if server_id > 0 {
-            for lb in routes.values() {
-                id_to_lb.insert(server_id, Arc::clone(lb));
-                break;
-            }
+        if server_id > 0 && let Some(lb) = routes.values().next() {
+            id_to_lb.insert(server_id, Arc::clone(lb));
         }
         self.replace_servers_snapshot(
             std::iter::once(server_id).filter(|id| *id > 0).collect(),
@@ -1565,11 +1562,8 @@ impl ConfigStore {
             let stale_hosts: Vec<String> = lock
                 .servers
                 .iter()
-                .filter_map(|(host, server)| {
-                    stale_ids
-                        .contains(&server.numeric_id())
-                        .then(|| host.clone())
-                })
+                .filter(|&(_host, server)| stale_ids.contains(&server.numeric_id()))
+                .map(|(host, _server)| host.clone())
                 .collect();
             for host in &stale_hosts {
                 lock.servers.remove(host);

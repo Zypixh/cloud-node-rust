@@ -121,12 +121,11 @@ pub fn current_memory_plan(pingora_threads: usize) -> MemoryPlan {
                     snapshot.udp_session_queue_size,
                     snapshot.udp_queued_bytes,
                     snapshot.udp_queued_bytes_budget,
-                    if snapshot.udp_queued_bytes_budget > 0 {
-                        snapshot.udp_queued_bytes.saturating_mul(100)
-                            / snapshot.udp_queued_bytes_budget
-                    } else {
-                        0
-                    },
+                    snapshot
+                        .udp_queued_bytes
+                        .saturating_mul(100)
+                        .checked_div(snapshot.udp_queued_bytes_budget)
+                        .unwrap_or(0),
                     snapshot.udp_socket_buffer_size,
                     snapshot.udp_fd_budget,
                     snapshot.admission_rejects.udp_session

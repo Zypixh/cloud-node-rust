@@ -99,7 +99,10 @@ fn bench_metrics_write_paths(c: &mut Criterion) {
                 let updates: Vec<(String, u64)> = (0..*count)
                     .map(|i| (format!("S1_T1000_req_{i}"), 1))
                     .collect();
-                b.iter(|| black_box(storage.increment_batch(updates.clone())));
+                b.iter(|| {
+                    storage.increment_batch(updates.clone());
+                    black_box(())
+                });
             },
         );
 
@@ -110,12 +113,8 @@ fn bench_metrics_write_paths(c: &mut Criterion) {
                 let storage = open_mace(&format!("server_batch_{count}"));
                 let updates = sample_metric_updates(*count);
                 b.iter(|| {
-                    black_box(storage.record_server_batch(
-                        1_700_000_000,
-                        updates.clone(),
-                        4096,
-                        2048,
-                    ))
+                    storage.record_server_batch(1_700_000_000, updates.clone(), 4096, 2048);
+                    black_box(())
                 });
             },
         );
@@ -230,7 +229,10 @@ fn bench_cache_hot_path(c: &mut Criterion) {
             stale_if_error_secs: 0,
             created_at: 1,
         });
-        b.iter(|| black_box(storage.record_cache_access("benchhash")));
+        b.iter(|| {
+            storage.record_cache_access("benchhash");
+            black_box(())
+        });
     });
 
     group.bench_function("get_cache_meta", |b| {

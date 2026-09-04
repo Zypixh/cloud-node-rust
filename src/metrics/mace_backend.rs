@@ -38,6 +38,8 @@ const ALL_BUCKETS: [BucketKind; 7] = [
     BucketKind::RuntimeState,
 ];
 
+type KvIterator = std::vec::IntoIter<Result<(Vec<u8>, Vec<u8>), Error>>;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Error(OpCode);
 
@@ -215,10 +217,7 @@ impl DB {
         Ok(())
     }
 
-    pub(crate) fn iterator(
-        &self,
-        _mode: IteratorMode,
-    ) -> std::vec::IntoIter<Result<(Vec<u8>, Vec<u8>), Error>> {
+    pub(crate) fn iterator(&self, _mode: IteratorMode) -> KvIterator {
         let _guard = self.operation_lock.lock();
         let mut records = Vec::new();
         for kind in ALL_BUCKETS {
@@ -228,10 +227,7 @@ impl DB {
         records.into_iter().map(Ok).collect::<Vec<_>>().into_iter()
     }
 
-    pub(crate) fn prefix_iterator<K: AsRef<[u8]>>(
-        &self,
-        prefix: K,
-    ) -> std::vec::IntoIter<Result<(Vec<u8>, Vec<u8>), Error>> {
+    pub(crate) fn prefix_iterator<K: AsRef<[u8]>>(&self, prefix: K) -> KvIterator {
         let _guard = self.operation_lock.lock();
         let prefix = prefix.as_ref();
         scan_bucket(self.bucket_for_key(prefix), prefix)

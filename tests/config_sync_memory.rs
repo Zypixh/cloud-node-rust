@@ -7,7 +7,8 @@
 
 use cloud_node_rust::config::ConfigStore;
 use cloud_node_rust::config_apply::{
-    ConfigApplyLimits, RuntimeServerMaps, apply_server_snapshot, parse_node_config_json,
+    ConfigApplyLimits, MaterializeRuntimeServersArgs, RuntimeServerMaps, apply_server_snapshot,
+    parse_node_config_json,
 };
 use cloud_node_rust::config_models::ServerConfig;
 use cloud_node_rust::health_manager::GlobalHealthManager;
@@ -324,14 +325,16 @@ async fn large_server_json_and_hot_reload_under_low_memory() {
     let maps = tokio::time::timeout(
         APPLY_TIMEOUT,
         cloud_node_rust::config_apply::materialize_runtime_servers(
-            vec![large],
-            &health,
-            1,
-            Arc::new(Default::default()),
-            false,
-            true,
-            None,
-            limits,
+            MaterializeRuntimeServersArgs {
+                servers: vec![large],
+                health_manager: &health,
+                node_level: 1,
+                parent_nodes: Arc::new(Default::default()),
+                tiered_origin_bypass: false,
+                allow_lan: true,
+                global_http: None,
+                limits,
+            },
         ),
     )
     .await

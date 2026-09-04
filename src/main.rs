@@ -2793,8 +2793,7 @@ fn main() -> anyhow::Result<()> {
 
                 // The tracing subscriber writes application logs to logs/run.log.
                 // Keep daemon stdout detached and reserve stderr for fatal errors.
-                let devnull =
-                    libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+                let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
                 if devnull >= 0 {
                     libc::dup2(devnull, libc::STDIN_FILENO);
                     libc::dup2(devnull, libc::STDOUT_FILENO);
@@ -3114,6 +3113,7 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&pid_path)?;
     let fd = pid_file.as_raw_fd();
 

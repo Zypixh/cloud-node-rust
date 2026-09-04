@@ -269,10 +269,12 @@ fn main() -> anyhow::Result<()> {
         tls_downstream: false,
     };
 
-    let mut server_conf = ServerConf::default();
-    server_conf.threads = 2;
-    server_conf.grace_period_seconds = Some(1);
-    server_conf.graceful_shutdown_timeout_seconds = Some(1);
+    let server_conf = ServerConf {
+        threads: 2,
+        grace_period_seconds: Some(1),
+        graceful_shutdown_timeout_seconds: Some(1),
+        ..Default::default()
+    };
     let mut pingora_server = Server::new_with_opt_and_conf(None, server_conf);
     pingora_server.bootstrap();
     let mut proxy_service =

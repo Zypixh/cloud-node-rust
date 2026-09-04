@@ -456,7 +456,6 @@ pub async fn open_writer_with_generation(
     open_writer_with_guards(
         cache_key,
         capture,
-        _roots,
         write_root,
         expected_generation,
         purge_guard,
@@ -473,7 +472,6 @@ pub async fn open_writer_with_generation(
 pub(crate) async fn open_writer_with_guards(
     cache_key: &str,
     capture: PartialCapture,
-    _roots: &[PathBuf],
     write_root: PathBuf,
     expected_generation: Option<u64>,
     purge_guard: tokio::sync::OwnedRwLockReadGuard<()>,
@@ -859,11 +857,11 @@ async fn commit_range_locked(
     }
 
     let meta_path = meta_path_in_root(root_key, &target_root);
-    if let Some(parent) = meta_path.parent() {
-        if let Err(err) = tokio::fs::create_dir_all(parent).await {
-            let _ = tokio::fs::remove_file(&new_body_path).await;
-            return Err(err);
-        }
+    if let Some(parent) = meta_path.parent()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        let _ = tokio::fs::remove_file(&new_body_path).await;
+        return Err(err);
     }
     let meta_json = match serde_json::to_vec(&meta) {
         Ok(meta_json) => meta_json,
@@ -1107,22 +1105,20 @@ async fn remove_files_at_root(cache_key: &str, root: &Path) -> bool {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name == format!("{hash}.json")
+        if (name == format!("{hash}.json")
             || name.starts_with(&format!("{hash}.body"))
             || name.starts_with(&format!("{hash}.range."))
-            || name.starts_with(&format!("{hash}.meta."))
+            || name.starts_with(&format!("{hash}.meta.")))
+            && let Err(err) = tokio::fs::remove_file(entry.path()).await
+            && err.kind() != std::io::ErrorKind::NotFound
         {
-            if let Err(err) = tokio::fs::remove_file(entry.path()).await
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(
-                    cache_key,
-                    root = %root.display(),
-                    error = %err,
-                    "failed to remove partial-cache file"
-                );
-                success = false;
-            }
+            tracing::warn!(
+                cache_key,
+                root = %root.display(),
+                error = %err,
+                "failed to remove partial-cache file"
+            );
+            success = false;
         }
     }
     success
@@ -1995,7 +1991,7 @@ mod tests {
         .expect("open writer")
         .expect("writer should be admitted");
         let temp_path = writer.temp_path.clone();
-        assert!(writer.write(b"too-long").await.expect("overflow write") == false);
+        assert!(!writer.write(b"too-long").await.expect("overflow write"));
         drop(writer);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!temp_path.exists());

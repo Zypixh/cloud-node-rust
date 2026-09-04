@@ -70,7 +70,7 @@ pub struct TcpExtCounters {
 }
 
 pub fn start_monitor() {
-    let _ = *STARTED;
+    *STARTED;
     static SPAWNED: AtomicU64 = AtomicU64::new(0);
     if SPAWNED
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -189,7 +189,7 @@ pub fn parse_tcp_ext_counters(input: &str) -> anyhow::Result<TcpExtCounters> {
             let values = fields;
             let map = header
                 .into_iter()
-                .zip(values.into_iter())
+                .zip(values)
                 .filter_map(|(key, value)| value.parse::<u64>().ok().map(|value| (key, value)))
                 .collect::<HashMap<_, _>>();
             return Ok(TcpExtCounters {
@@ -252,7 +252,7 @@ pub enum SynproxyMode {
 pub async fn synproxy_command(mode: SynproxyMode) -> anyhow::Result<String> {
     #[cfg(not(target_os = "linux"))]
     {
-        return match mode {
+        match mode {
             SynproxyMode::Status => Ok(format!(
                 "CloudNode SYNPROXY status\n  platform: unsupported (Linux only)\n  syn pressure: {}\n  l4 pressure: {}",
                 snapshot().pressure_level.as_str(),
@@ -261,7 +261,7 @@ pub async fn synproxy_command(mode: SynproxyMode) -> anyhow::Result<String> {
             SynproxyMode::Enable | SynproxyMode::Disable => {
                 anyhow::bail!("SYNPROXY management is only supported on Linux")
             }
-        };
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -685,7 +685,7 @@ impl<'a> RequestFacts<'a> {
                         .chain(server_name.sub_names.iter())
                         .find_map(|name| {
                             let normalized = ServerConfig::normalize_runtime_server_name(name);
-                            (normalized == host).then(|| normalized)
+                            (normalized == host).then_some(normalized)
                         })
                 })
             })
@@ -723,7 +723,7 @@ impl<'a> RequestFacts<'a> {
                     .uri
                     .path()
                     .split('.')
-                    .last()
+                    .next_back()
                     .filter(|ext| !ext.is_empty() && !ext.contains('/'))
                     .unwrap_or_default()
                     .to_string()
@@ -1262,7 +1262,7 @@ fn resolve_variable(session: &Session, inner: &str, request_body: &[u8], scheme:
             .uri
             .path()
             .split('.')
-            .last()
+            .next_back()
             .filter(|ext| !ext.is_empty() && !ext.contains('/'))
             .unwrap_or_default()
             .to_string(),
@@ -1410,7 +1410,7 @@ pub(crate) fn resolve_variable_with_facts(inner: &str, facts: &RequestFacts<'_>)
             .uri
             .path()
             .split('.')
-            .last()
+            .next_back()
             .filter(|ext| !ext.is_empty() && !ext.contains('/'))
             .unwrap_or_default()
             .to_string(),
@@ -1713,12 +1713,12 @@ fn query_param(session: &Session, name: &str) -> String {
                 let mut iter = part.splitn(2, '=');
                 let key = iter.next()?;
                 let decoded_key =
-                    urlencoding::decode(key).unwrap_or_else(|_| std::borrow::Cow::Borrowed(key));
+                    urlencoding::decode(key).unwrap_or(std::borrow::Cow::Borrowed(key));
                 if decoded_key == name {
                     let value = iter.next().unwrap_or("");
                     Some(
                         urlencoding::decode(value)
-                            .unwrap_or_else(|_| std::borrow::Cow::Borrowed(value))
+                            .unwrap_or(std::borrow::Cow::Borrowed(value))
                             .into_owned(),
                     )
                 } else {
@@ -1739,11 +1739,11 @@ fn parse_query_params(input: &str) -> Vec<(String, String)> {
             let mut iter = part.splitn(2, '=');
             let key = iter.next()?;
             let decoded_key = urlencoding::decode(key)
-                .unwrap_or_else(|_| std::borrow::Cow::Borrowed(key))
+                .unwrap_or(std::borrow::Cow::Borrowed(key))
                 .into_owned();
             let value = iter.next().unwrap_or("");
             let decoded_value = urlencoding::decode(value)
-                .unwrap_or_else(|_| std::borrow::Cow::Borrowed(value))
+                .unwrap_or(std::borrow::Cow::Borrowed(value))
                 .into_owned();
             Some((decoded_key, decoded_value))
         })

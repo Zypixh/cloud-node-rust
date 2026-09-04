@@ -80,6 +80,46 @@ pub struct HttpDimensionEvent {
     pub created_at: i64,
 }
 
+pub struct HttpDimensionsArgs<'a> {
+    pub server_id: i64,
+    pub client_ip: std::net::IpAddr,
+    pub domain: &'a str,
+    pub user_agent: &'a str,
+    pub bytes_sent: i64,
+    pub bytes_received: i64,
+    pub cached_bytes: i64,
+    pub waf_group_id: i64,
+    pub waf_action: Option<&'a str>,
+    pub cached_analyzed: Option<&'a crate::metrics::analyzer::RequestStats>,
+    pub request_context: Option<MetricRequestContext>,
+}
+
+pub struct NetworkDimensionsArgs<'a> {
+    pub category: &'a str,
+    pub server_id: i64,
+    pub client_ip: std::net::IpAddr,
+    pub domain: &'a str,
+    pub user_agent: &'a str,
+    pub bytes_sent: i64,
+    pub bytes_received: i64,
+    pub status: u16,
+}
+
+struct DimensionsArgs<'a> {
+    category: &'a str,
+    server_id: i64,
+    client_ip: std::net::IpAddr,
+    domain: &'a str,
+    user_agent: &'a str,
+    bytes_sent: i64,
+    bytes_received: i64,
+    cached_bytes: i64,
+    waf_group_id: i64,
+    waf_action: Option<&'a str>,
+    cached_analyzed: Option<&'a crate::metrics::analyzer::RequestStats>,
+    request_context: Option<MetricRequestContext>,
+}
+
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct MetricRequestContext {
     pub values: BTreeMap<String, String>,
@@ -412,6 +452,12 @@ pub struct ServerMetrics {
     pub active_connections: AtomicI64,
     pub count_websocket_connections: AtomicU64,
     pub distinct_ips: RuntimeDistinctIpTracker,
+}
+
+impl Default for ServerMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ServerMetrics {
@@ -877,21 +923,50 @@ pub mod record {
             .fetch_add(cost_ms, Ordering::Relaxed);
     }
 
-    pub fn record_http_dimensions(
-        server_id: i64,
-        client_ip: IpAddr,
-        domain: &str,
-        user_agent: &str,
-        bytes_sent: i64,
-        bytes_received: i64,
-        cached_bytes: i64,
-        waf_group_id: i64,
-        waf_action: Option<&str>,
-        cached_analyzed: Option<&crate::metrics::analyzer::RequestStats>,
-        request_context: Option<MetricRequestContext>,
-    ) {
-        record_dimensions(
-            crate::metrics::METRIC_CATEGORY_HTTP,
+    pub fn record_http_dimensions(args: HttpDimensionsArgs<'_>) {
+        record_dimensions(DimensionsArgs {
+            category: crate::metrics::METRIC_CATEGORY_HTTP,
+            server_id: args.server_id,
+            client_ip: args.client_ip,
+            domain: args.domain,
+            user_agent: args.user_agent,
+            bytes_sent: args.bytes_sent,
+            bytes_received: args.bytes_received,
+            cached_bytes: args.cached_bytes,
+            waf_group_id: args.waf_group_id,
+            waf_action: args.waf_action,
+            cached_analyzed: args.cached_analyzed,
+            request_context: args.request_context,
+        });
+    }
+
+    pub fn record_network_dimensions(args: NetworkDimensionsArgs<'_>) {
+        record_dimensions(DimensionsArgs {
+            category: args.category,
+            server_id: args.server_id,
+            client_ip: args.client_ip,
+            domain: args.domain,
+            user_agent: args.user_agent,
+            bytes_sent: args.bytes_sent,
+            bytes_received: args.bytes_received,
+            cached_bytes: 0,
+            waf_group_id: 0,
+            waf_action: None,
+            cached_analyzed: None,
+            request_context: Some(MetricRequestContext::network(
+                args.domain,
+                args.client_ip,
+                args.user_agent,
+                args.bytes_sent,
+                args.bytes_received,
+                args.status,
+            )),
+        });
+    }
+
+    fn record_dimensions(args: DimensionsArgs<'_>) {
+        let DimensionsArgs {
+            category,
             server_id,
             client_ip,
             domain,
@@ -903,56 +978,7 @@ pub mod record {
             waf_action,
             cached_analyzed,
             request_context,
-        );
-    }
-
-    pub fn record_network_dimensions(
-        category: &str,
-        server_id: i64,
-        client_ip: IpAddr,
-        domain: &str,
-        user_agent: &str,
-        bytes_sent: i64,
-        bytes_received: i64,
-        status: u16,
-    ) {
-        record_dimensions(
-            category,
-            server_id,
-            client_ip,
-            domain,
-            user_agent,
-            bytes_sent,
-            bytes_received,
-            0,
-            0,
-            None,
-            None,
-            Some(MetricRequestContext::network(
-                domain,
-                client_ip,
-                user_agent,
-                bytes_sent,
-                bytes_received,
-                status,
-            )),
-        );
-    }
-
-    fn record_dimensions(
-        category: &str,
-        server_id: i64,
-        client_ip: IpAddr,
-        domain: &str,
-        user_agent: &str,
-        bytes_sent: i64,
-        bytes_received: i64,
-        cached_bytes: i64,
-        waf_group_id: i64,
-        waf_action: Option<&str>,
-        cached_analyzed: Option<&crate::metrics::analyzer::RequestStats>,
-        request_context: Option<MetricRequestContext>,
-    ) {
+        } = args;
         if server_id <= 0 {
             return;
         }

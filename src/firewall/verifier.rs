@@ -266,7 +266,7 @@ impl WafVerifier {
         elapsed_ms: u64,
         trace: &str,
     ) -> bool {
-        if elapsed_ms < 650 || elapsed_ms > 120_000 {
+        if !(650..=120_000).contains(&elapsed_ms) {
             return false;
         }
         let target = self.slider_target(token) as i32;

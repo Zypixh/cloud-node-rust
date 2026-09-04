@@ -11,7 +11,7 @@ pub struct LocalFirewallStatus {
 pub async fn check_nftables() -> anyhow::Result<LocalFirewallStatus> {
     #[cfg(not(target_os = "linux"))]
     {
-        return Err(anyhow!("nftables check is only supported on Linux"));
+        Err(anyhow!("nftables check is only supported on Linux"))
     }
 
     #[cfg(target_os = "linux")]

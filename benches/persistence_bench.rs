@@ -1,5 +1,4 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use serde_json;
 use std::hint::black_box;
 
 fn bench_serialization_large_list(c: &mut Criterion) {

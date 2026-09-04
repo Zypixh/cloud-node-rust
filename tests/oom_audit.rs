@@ -45,8 +45,7 @@ fn rpc_stream_channel_depth_aligns_with_governor_admission_limit() {
     let snapshot = governor_snapshot();
     let aligned = snapshot
         .rpc_stream_command_limit
-        .min(RPC_STREAM_CHANNEL_CAPACITY)
-        .max(1);
+        .clamp(1, RPC_STREAM_CHANNEL_CAPACITY);
     assert!(
         aligned <= RPC_STREAM_CHANNEL_CAPACITY,
         "RPC stream channel depth should not exceed the historical fixed cap"

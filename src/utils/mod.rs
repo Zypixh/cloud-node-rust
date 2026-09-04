@@ -14,23 +14,22 @@ pub fn ensure_single_instance(pid_file: &str) -> anyhow::Result<()> {
         let _ = fs::create_dir_all(parent);
     }
 
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(old_pid_val) = content.trim().parse::<u32>() {
-                let mut sys = System::new();
-                let pid = Pid::from_u32(old_pid_val);
-                sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    if path.exists()
+        && let Ok(content) = fs::read_to_string(path)
+        && let Ok(old_pid_val) = content.trim().parse::<u32>()
+    {
+        let mut sys = System::new();
+        let pid = Pid::from_u32(old_pid_val);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
-                if let Some(process) = sys.process(pid) {
-                    let exe_name = process.name().to_string_lossy().to_lowercase();
-                    if exe_name.contains("cloud-node") || exe_name.contains("rust") {
-                        anyhow::bail!(
-                            "Instance already running. PID: {}, Name: {}. Please kill it first.",
-                            old_pid_val,
-                            exe_name
-                        );
-                    }
-                }
+        if let Some(process) = sys.process(pid) {
+            let exe_name = process.name().to_string_lossy().to_lowercase();
+            if exe_name.contains("cloud-node") || exe_name.contains("rust") {
+                anyhow::bail!(
+                    "Instance already running. PID: {}, Name: {}. Please kill it first.",
+                    old_pid_val,
+                    exe_name
+                );
             }
         }
     }

@@ -167,10 +167,9 @@ async fn acquire_cache_process_lock(
                 .create(true)
                 .read(true)
                 .write(true)
+                .truncate(false)
                 .open(&path)?;
-            if let Err(err) = lock_cache_process_file(&file, mode) {
-                return Err(err);
-            }
+            lock_cache_process_file(&file, mode)?;
             files.push(file);
         }
         if let Some(key_paths) = key_paths {
@@ -186,6 +185,7 @@ async fn acquire_cache_process_lock(
                     .create(true)
                     .read(true)
                     .write(true)
+                    .truncate(false)
                     .open(&path)?;
                 // The resource itself is always exclusive. This prevents a
                 // second process from publishing a competing body while a
@@ -1392,15 +1392,15 @@ impl Storage for FileStorage {
             .with_file_name(&versioned_name)
             .to_string_lossy()
             .into_owned();
-        if let Some(parent) = path.parent() {
-            if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                warn!(
-                    path = %parent.display(),
-                    error = %err,
-                    "CACHE_MISS: unable to create cache directory; bypassing fill"
-                );
-                return Ok(Box::new(NoopMissHandler));
-            }
+        if let Some(parent) = path.parent()
+            && let Err(err) = tokio::fs::create_dir_all(parent).await
+        {
+            warn!(
+                path = %parent.display(),
+                error = %err,
+                "CACHE_MISS: unable to create cache directory; bypassing fill"
+            );
+            return Ok(Box::new(NoopMissHandler));
         }
 
         let temp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), unique_id));
@@ -2255,7 +2255,6 @@ impl HandleMiss for PartialMissHandler {
             self.writer = match crate::cache::partial::open_writer_with_guards(
                 &self.cache_key,
                 self.capture.clone(),
-                &self.location.roots,
                 self.location.write_root.clone(),
                 Some(self.purge_generation),
                 purge_guard,
@@ -2354,11 +2353,12 @@ impl HandleMiss for FileMissHandler {
         }
 
         // Initialize encoder only if policy says so
-        if self.compressed && self.encoder.is_none() {
-            if let Some(f) = self.file.take() {
-                let enc = async_compression::tokio::write::ZstdEncoder::new(f);
-                self.encoder = Some(enc);
-            }
+        if self.compressed
+            && self.encoder.is_none()
+            && let Some(f) = self.file.take()
+        {
+            let enc = async_compression::tokio::write::ZstdEncoder::new(f);
+            self.encoder = Some(enc);
         }
 
         let write_result = if let Some(enc) = &mut self.encoder {
@@ -2430,16 +2430,16 @@ impl HandleMiss for FileMissHandler {
                 self.disabled = true;
                 return Ok(MissFinishType::Created(0));
             }
-        } else if let Some(mut f) = self.file.take() {
-            if let Err(err) = tokio::io::AsyncWriteExt::flush(&mut f).await {
-                tracing::warn!(
-                    key = %self.key_str,
-                    error = %err,
-                    "CACHE_MISS: cache flush failed; bypassing fill"
-                );
-                self.disabled = true;
-                return Ok(MissFinishType::Created(0));
-            }
+        } else if let Some(mut f) = self.file.take()
+            && let Err(err) = tokio::io::AsyncWriteExt::flush(&mut f).await
+        {
+            tracing::warn!(
+                key = %self.key_str,
+                error = %err,
+                "CACHE_MISS: cache flush failed; bypassing fill"
+            );
+            self.disabled = true;
+            return Ok(MissFinishType::Created(0));
         }
 
         if tokio::fs::rename(&self.temp_path, &self.final_path)
@@ -3300,10 +3300,10 @@ fn negative_cache_capacity_limit() -> usize {
 }
 
 fn negative_cache_check(key: &str, now: i64) -> bool {
-    if let Some(entry) = NEGATIVE_CACHE.get(key) {
-        if *entry > now {
-            return true;
-        }
+    if let Some(entry) = NEGATIVE_CACHE.get(key)
+        && *entry > now
+    {
+        return true;
     }
     NEGATIVE_CACHE.remove(key);
     let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
@@ -3809,9 +3809,7 @@ impl HybridStorage {
                     .map(|d| d.total_space())
                     .unwrap_or(100 * 1024 * 1024 * 1024);
 
-                let auto_min = (disk_size / 20)
-                    .max(1024 * 1024 * 1024)
-                    .min(10 * 1024 * 1024 * 1024);
+                let auto_min = (disk_size / 20).clamp(1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024);
 
                 info!(
                     "RPC_CACHE: Using auto-calculated min free space: {} bytes",
@@ -4978,8 +4976,10 @@ pub fn fast_l1_lookup(key: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64 as TestAtomicU64, Ordering as TestOrdering};
+    use std::sync::Mutex as TestMutex;
 
     static TEST_UNIQUE_COUNTER: TestAtomicU64 = TestAtomicU64::new(0);
+    static CACHE_GLOBAL_STATE_LOCK: TestMutex<()> = TestMutex::new(());
 
     fn unique_test_suffix(prefix: &str) -> String {
         let seq = TEST_UNIQUE_COUNTER.fetch_add(1, TestOrdering::Relaxed);
@@ -6588,6 +6588,7 @@ mod tests {
 
     #[test]
     fn cache_meta_hooks_warm_bloom_and_clear_negative_cache() {
+        let _state_guard = CACHE_GLOBAL_STATE_LOCK.lock().expect("cache test lock");
         let key = unique_test_suffix("hook-key");
         let now = crate::utils::time::now_timestamp();
         negative_cache_insert(&key, now);

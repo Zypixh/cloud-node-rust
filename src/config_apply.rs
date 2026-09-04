@@ -213,6 +213,18 @@ fn maybe_reclaim(
     *last_reclaimed = pressure;
 }
 
+/// Inputs required to turn a full website snapshot into runtime host/LB maps.
+pub struct MaterializeRuntimeServersArgs<'a> {
+    pub servers: Vec<ServerConfig>,
+    pub health_manager: &'a GlobalHealthManager,
+    pub node_level: i32,
+    pub parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
+    pub tiered_origin_bypass: bool,
+    pub allow_lan: bool,
+    pub global_http: Option<Arc<GlobalHTTPAllConfig>>,
+    pub limits: ConfigApplyLimits,
+}
+
 /// Build host/LB maps from an owned server list.
 ///
 /// Each `ServerConfig` is wrapped in `Arc` exactly once. Host indexes clone the
@@ -220,15 +232,18 @@ fn maybe_reclaim(
 /// collection and compiled plans still see them, matching historical snapshot
 /// semantics, but they are omitted from request routing maps.
 pub async fn materialize_runtime_servers(
-    servers: Vec<ServerConfig>,
-    health_manager: &GlobalHealthManager,
-    node_level: i32,
-    parent_nodes: Arc<HashMap<i64, Vec<ParentNodeConfig>>>,
-    tiered_origin_bypass: bool,
-    allow_lan: bool,
-    global_http: Option<Arc<GlobalHTTPAllConfig>>,
-    limits: ConfigApplyLimits,
+    args: MaterializeRuntimeServersArgs<'_>,
 ) -> RuntimeServerMaps {
+    let MaterializeRuntimeServersArgs {
+        servers,
+        health_manager,
+        node_level,
+        parent_nodes,
+        tiered_origin_bypass,
+        allow_lan,
+        global_http,
+        limits,
+    } = args;
     let started = Instant::now();
     let (permit, admission_retries) = admit_config_sync().await;
     let mut stats = ConfigApplyStats {
@@ -356,7 +371,7 @@ pub async fn apply_server_snapshot(
     let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
         store.get_origin_runtime_context().await;
     let global_http = Some(store.get_global_http_config_sync());
-    let mut maps = materialize_runtime_servers(
+    let mut maps = materialize_runtime_servers(MaterializeRuntimeServersArgs {
         servers,
         health_manager,
         node_level,
@@ -365,7 +380,7 @@ pub async fn apply_server_snapshot(
         allow_lan,
         global_http,
         limits,
-    )
+    })
     .await;
     maps.stats.released_previous_generation = released;
     store
@@ -414,16 +429,19 @@ mod tests {
     #[tokio::test]
     async fn host_indexes_share_one_server_arc() {
         let health = GlobalHealthManager::new(1);
-        let maps = materialize_runtime_servers(
-            vec![sample_server(7, &["a.example.com", "www.a.example.com"])],
-            &health,
-            1,
-            Arc::new(HashMap::new()),
-            false,
-            true,
-            None,
-            ConfigApplyLimits::synthetic(8 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
-        )
+        let maps = materialize_runtime_servers(MaterializeRuntimeServersArgs {
+            servers: vec![sample_server(7, &["a.example.com", "www.a.example.com"])],
+            health_manager: &health,
+            node_level: 1,
+            parent_nodes: Arc::new(HashMap::new()),
+            tiered_origin_bypass: false,
+            allow_lan: true,
+            global_http: None,
+            limits: ConfigApplyLimits::synthetic(
+                8 * 1024 * 1024 * 1024,
+                4 * 1024 * 1024 * 1024,
+            ),
+        })
         .await;
         let a = maps.servers.get("a.example.com").expect("exact host");
         let www = maps.servers.get("www.a.example.com").expect("alias host");
@@ -442,16 +460,16 @@ mod tests {
         let limits = ConfigApplyLimits::synthetic(512 * 1024 * 1024, 32 * 1024 * 1024);
         assert_eq!(limits.pressure, MemoryPressureLevel::Critical);
         assert_eq!(limits.server_chunk_size(), 4);
-        let maps = materialize_runtime_servers(
-            servers,
-            &health,
-            1,
-            Arc::new(HashMap::new()),
-            false,
-            true,
-            None,
-            limits,
-        )
+        let maps = materialize_runtime_servers(MaterializeRuntimeServersArgs {
+        servers,
+        health_manager: &health,
+        node_level: 1,
+        parent_nodes: Arc::new(HashMap::new()),
+        tiered_origin_bypass: false,
+        allow_lan: true,
+        global_http: None,
+        limits,
+    })
         .await;
         assert_eq!(maps.all_servers.len(), 40);
         assert_eq!(maps.servers.len(), 40);

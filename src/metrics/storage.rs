@@ -59,11 +59,12 @@ pub fn mace_metrics_options(path: impl AsRef<Path>) -> Options {
 
 /// Bucket policy for metrics/firewall/cache metadata.
 pub fn mace_metrics_bucket_options() -> BucketOptions {
-    let mut opts = BucketOptions::default();
     // Metrics commits are small and already coalesced; foreground backpressure
     // only adds latency on the flush path.
-    opts.enable_backpressure = false;
-    opts
+    BucketOptions {
+        enable_backpressure: false,
+        ..Default::default()
+    }
 }
 
 pub fn server_period_key(server_id: i64, period: i64) -> String {
@@ -148,6 +149,16 @@ fn parse_u64_be(bytes: &[u8]) -> u64 {
     } else {
         0
     }
+}
+
+pub struct UpdateCacheMetaArgs<'a> {
+    pub hash: &'a str,
+    pub key_str: &'a str,
+    pub size: u64,
+    pub ttl_secs: u64,
+    pub headers: &'a [(String, String)],
+    pub compressed: bool,
+    pub status: u16,
 }
 
 impl MetricStorage {
@@ -429,16 +440,16 @@ impl MetricStorage {
     }
 
     /// Cache Metadata Management
-    pub fn update_cache_meta(
-        &self,
-        hash: &str,
-        key_str: &str,
-        size: u64,
-        ttl_secs: u64,
-        headers: &[(String, String)],
-        compressed: bool,
-        status: u16,
-    ) {
+    pub fn update_cache_meta(&self, args: UpdateCacheMetaArgs<'_>) {
+        let UpdateCacheMetaArgs {
+            hash,
+            key_str,
+            size,
+            ttl_secs,
+            headers,
+            compressed,
+            status,
+        } = args;
         let now = crate::utils::time::now_timestamp();
         self.upsert_cache_meta_absolute(CacheMetaUpsert {
             hash,
@@ -1689,13 +1700,11 @@ fn cache_meta_headers_from_json(raw: &serde_json::Value) -> Option<Vec<(String, 
 
     // Backward compatibility with the old object format.  It cannot recover
     // duplicates already lost by the old serializer, but it remains readable.
-    Some(
-        headers
-            .as_object()?
-            .iter()
-            .map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
-            .collect::<Option<Vec<_>>>()?,
-    )
+    headers
+        .as_object()?
+        .iter()
+        .map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+        .collect::<Option<Vec<_>>>()
 }
 
 fn cache_meta_entry_from_json(raw: &serde_json::Value) -> Option<CacheMetaEntry> {

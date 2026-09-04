@@ -1,16 +1,28 @@
 use crate::api_config::ApiConfig;
 use crate::pb;
 
-pub async fn notify_firewall_event(
-    api_config: &ApiConfig,
-    server_id: i64,
-    policy_id: i64,
-    group_id: i64,
-    set_id: i64,
-    source_url: String,
-    source_ip: String,
-    source_user_agent: String,
-) {
+pub struct NotifyFirewallEventArgs<'a> {
+    pub api_config: &'a ApiConfig,
+    pub server_id: i64,
+    pub policy_id: i64,
+    pub group_id: i64,
+    pub set_id: i64,
+    pub source_url: String,
+    pub source_ip: String,
+    pub source_user_agent: String,
+}
+
+pub async fn notify_firewall_event(args: NotifyFirewallEventArgs<'_>) {
+    let NotifyFirewallEventArgs {
+        api_config,
+        server_id,
+        policy_id,
+        group_id,
+        set_id,
+        source_url,
+        source_ip,
+        source_user_agent,
+    } = args;
     let client = match crate::rpc::client::SharedRpcClient::get(api_config).await {
         Ok(s) => s.as_rpc_client(),
         Err(_) => return,

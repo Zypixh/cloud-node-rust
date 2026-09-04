@@ -510,38 +510,47 @@ pub(crate) fn cache_ref_explicitly_allows_error_status(
     status >= 500 && cache_ref.status.contains(&(status as i32))
 }
 
+#[derive(Clone, Copy)]
+pub struct CacheResponseDecisionInput<'a> {
+    pub status: u16,
+    pub method: &'a str,
+    pub headers: &'a http::HeaderMap,
+    pub body_size: usize,
+    pub force_partial_content: bool,
+    pub skip_size_checks: bool,
+    pub req_headers: &'a http::HeaderMap,
+}
+
 pub fn should_cache_response(
-    status: u16,
     cache_ref: &HTTPCacheRef,
-    method: &str,
-    headers: &http::HeaderMap,
-    _host: &str,
-    body_size: usize,
-    force_partial_content: bool,
-    skip_size_checks: bool,
-    req_headers: &http::HeaderMap,
+    input: CacheResponseDecisionInput<'_>,
 ) -> bool {
-    if !request_headers_allow_shared_cache(method, req_headers)
-        || !response_headers_allow_shared_cache(headers)
+    if !request_headers_allow_shared_cache(input.method, input.req_headers)
+        || !response_headers_allow_shared_cache(input.headers)
     {
         return false;
     }
 
-    if !cache_ref_allows_method_status(status, cache_ref, method, force_partial_content) {
+    if !cache_ref_allows_method_status(
+        input.status,
+        cache_ref,
+        input.method,
+        input.force_partial_content,
+    ) {
         return false;
     }
 
     // 3. Check Size (skip for chunked encoding when policy allows)
-    if !skip_size_checks {
+    if !input.skip_size_checks {
         if let Some(min_size_val) = &cache_ref.min_size {
             let min_bytes = crate::config_models::SizeCapacity::from_json(min_size_val).to_bytes();
-            if body_size_below_limit(body_size, min_bytes) {
+            if body_size_below_limit(input.body_size, min_bytes) {
                 return false;
             }
         }
         if let Some(max_size_val) = &cache_ref.max_size {
             let max_bytes = crate::config_models::SizeCapacity::from_json(max_size_val).to_bytes();
-            if body_size_exceeds_limit(body_size, max_bytes) {
+            if body_size_exceeds_limit(input.body_size, max_bytes) {
                 return false;
             }
         }
@@ -549,7 +558,8 @@ pub fn should_cache_response(
 
     // 4. Check every Cache-Control field. HTTP permits repeated fields and a
     // second field must not bypass a configured skip directive.
-    if cache_control_headers_have_skipped_value(headers, &cache_ref.skip_cache_control_values) {
+    if cache_control_headers_have_skipped_value(input.headers, &cache_ref.skip_cache_control_values)
+    {
         return false;
     }
 
@@ -563,7 +573,8 @@ pub fn parse_life_to_seconds(v: &serde_json::Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_ref_allows_method_status, should_cache_response, should_store_response_header,
+        CacheResponseDecisionInput, cache_ref_allows_method_status, should_cache_response,
+        should_store_response_header,
     };
     use crate::cache::compiled::{
         CompiledCacheRef, cache_ref_allows_method_status_compiled, should_cache_response_compiled,
@@ -665,51 +676,57 @@ mod tests {
         let compiled = CompiledCacheRef::compile_arc(&Arc::new(cache_ref.clone()));
 
         assert!(!should_cache_response(
-            500,
             &cache_ref,
-            "GET",
-            &headers,
-            "example.com",
-            0,
-            false,
-            false,
-            &request_headers,
+            crate::cache::CacheResponseDecisionInput {
+                status: 500,
+                method: "GET",
+                headers: &headers,
+                body_size: 0,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &request_headers,
+            },
         ));
         assert!(!should_cache_response_compiled(
             &compiled,
             None,
-            500,
-            "GET",
-            &headers,
-            0,
-            false,
-            false,
-            &request_headers,
+            crate::cache::CacheResponseDecisionInput {
+                status: 500,
+                method: "GET",
+                headers: &headers,
+                body_size: 0,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &request_headers,
+            },
         ));
 
         cache_ref.status = vec![500];
         let compiled = CompiledCacheRef::compile_arc(&Arc::new(cache_ref.clone()));
         assert!(should_cache_response(
-            500,
             &cache_ref,
-            "GET",
-            &headers,
-            "example.com",
-            0,
-            false,
-            false,
-            &request_headers,
+            crate::cache::CacheResponseDecisionInput {
+                status: 500,
+                method: "GET",
+                headers: &headers,
+                body_size: 0,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &request_headers,
+            },
         ));
         assert!(should_cache_response_compiled(
             &compiled,
             None,
-            500,
-            "GET",
-            &headers,
-            0,
-            false,
-            false,
-            &request_headers,
+            crate::cache::CacheResponseDecisionInput {
+                status: 500,
+                method: "GET",
+                headers: &headers,
+                body_size: 0,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &request_headers,
+            },
         ));
         assert!(compiled.response_policy.error_status_allowed(500));
         assert!(!compiled.response_policy.error_status_allowed(503));
@@ -1013,15 +1030,16 @@ mod tests {
             let req_headers = HeaderMap::new();
             assert_eq!(
                 should_cache_response(
-                    status,
                     &cache_ref,
-                    method,
-                    &headers,
-                    "example.com",
-                    size,
-                    force_partial,
-                    false,
-                    &req_headers
+                    CacheResponseDecisionInput {
+                        status,
+                        method,
+                        headers: &headers,
+                        body_size: size,
+                        force_partial_content: force_partial,
+                        skip_size_checks: false,
+                        req_headers: &req_headers,
+                    },
                 ),
                 expected
             );
@@ -1029,13 +1047,15 @@ mod tests {
                 should_cache_response_compiled(
                     &compiled,
                     None,
-                    status,
-                    method,
-                    &headers,
-                    size,
-                    force_partial,
-                    false,
-                    &req_headers
+                    CacheResponseDecisionInput {
+                        status,
+                        method,
+                        headers: &headers,
+                        body_size: size,
+                        force_partial_content: force_partial,
+                        skip_size_checks: false,
+                        req_headers: &req_headers,
+                    },
                 ),
                 expected
             );
@@ -1056,18 +1076,29 @@ mod tests {
             &compiled, 206, "GET", false
         ));
         assert!(should_cache_response(
-            206,
             &cache_ref,
-            "GET",
-            &headers,
-            "example.com",
-            10,
-            false,
-            false,
-            &headers
+            CacheResponseDecisionInput {
+                status: 206,
+                method: "GET",
+                headers: &headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &headers,
+            },
         ));
         assert!(should_cache_response_compiled(
-            &compiled, None, 206, "GET", &headers, 10, false, false, &headers
+            &compiled,
+            None,
+            CacheResponseDecisionInput {
+                status: 206,
+                method: "GET",
+                headers: &headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &headers,
+            },
         ));
 
         let mut private_headers = HeaderMap::new();
@@ -1076,76 +1107,85 @@ mod tests {
             HeaderValue::from_static("max-age=60, private"),
         );
         assert!(!should_cache_response(
-            200,
             &cache_ref,
-            "GET",
-            &private_headers,
-            "example.com",
-            10,
-            false,
-            false,
-            &headers
+            CacheResponseDecisionInput {
+                status: 200,
+                method: "GET",
+                headers: &private_headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &headers,
+            },
         ));
         assert!(!should_cache_response_compiled(
             &compiled,
             None,
-            200,
-            "GET",
-            &private_headers,
-            10,
-            false,
-            false,
-            &headers
+            CacheResponseDecisionInput {
+                status: 200,
+                method: "GET",
+                headers: &private_headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &headers,
+            },
         ));
 
         let mut cookie_headers = HeaderMap::new();
         cookie_headers.insert("set-cookie", HeaderValue::from_static("sid=1"));
         assert!(!should_cache_response(
-            200,
             &cache_ref,
-            "GET",
-            &cookie_headers,
-            "example.com",
-            10,
-            false,
-            false,
-            &headers
+            CacheResponseDecisionInput {
+                status: 200,
+                method: "GET",
+                headers: &cookie_headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &headers,
+            },
         ));
         assert!(!should_cache_response_compiled(
             &compiled,
             None,
-            200,
-            "GET",
-            &cookie_headers,
-            10,
-            false,
-            false,
-            &headers
+            CacheResponseDecisionInput {
+                status: 200,
+                method: "GET",
+                headers: &cookie_headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &headers,
+            },
         ));
 
         cache_ref.skip_set_cookie = false;
         let compiled = CompiledCacheRef::compile_arc(&Arc::new(cache_ref.clone()));
         assert!(!should_cache_response(
-            200,
             &cache_ref,
-            "GET",
-            &cookie_headers,
-            "example.com",
-            10,
-            false,
-            false,
-            &headers
+            CacheResponseDecisionInput {
+                status: 200,
+                method: "GET",
+                headers: &cookie_headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &headers,
+            },
         ));
         assert!(!should_cache_response_compiled(
             &compiled,
             None,
-            200,
-            "GET",
-            &cookie_headers,
-            10,
-            false,
-            false,
-            &headers
+            CacheResponseDecisionInput {
+                status: 200,
+                method: "GET",
+                headers: &cookie_headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &headers,
+            },
         ));
 
         assert_eq!(compiled.response_policy.ttl_seconds(), 3600);
@@ -1167,26 +1207,29 @@ mod tests {
         let request_headers = HeaderMap::new();
 
         assert!(!should_cache_response(
-            200,
             &cache_ref,
-            "GET",
-            &headers,
-            "example.com",
-            10,
-            false,
-            false,
-            &request_headers,
+            crate::cache::CacheResponseDecisionInput {
+                status: 200,
+                method: "GET",
+                headers: &headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &request_headers,
+            },
         ));
         assert!(!should_cache_response_compiled(
             &compiled,
             None,
-            200,
-            "GET",
-            &headers,
-            10,
-            false,
-            false,
-            &request_headers,
+            crate::cache::CacheResponseDecisionInput {
+                status: 200,
+                method: "GET",
+                headers: &headers,
+                body_size: 10,
+                force_partial_content: false,
+                skip_size_checks: false,
+                req_headers: &request_headers,
+            },
         ));
     }
 }

@@ -590,10 +590,7 @@ fn oss_origin_backend(
         }
     };
     let mut backend =
-        match backend_from_oss_target(&oss_backend.connect_addr, role, origin.id, allow_lan) {
-            Some(backend) => backend,
-            None => return None,
-        };
+        backend_from_oss_target(&oss_backend.connect_addr, role, origin.id, allow_lan)?;
     let legacy_tls_verify = parse_legacy_tls_verify(origin.tls_verify.as_ref());
     let mut ext = Extensions::new();
     ext.insert(BackendExtension {
@@ -830,10 +827,10 @@ pub fn build_parent_lb(
         }
     }
 
-    if endpoints.is_empty() {
-        if let Ok(b) = Backend::new("127.0.0.1:80") {
-            endpoints.push(b);
-        }
+    if endpoints.is_empty()
+        && let Ok(b) = Backend::new("127.0.0.1:80")
+    {
+        endpoints.push(b);
     }
 
     debug!(

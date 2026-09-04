@@ -259,8 +259,7 @@ async fn run_tonic_stream(
     let initial_ping_sent = true;
     let rpc_channel_capacity = crate::memory_governor::MEMORY_GOVERNOR
         .limit_for(crate::memory_governor::AdmissionClass::RpcStreamCommand)
-        .min(100)
-        .max(1);
+        .clamp(1, 100);
     let (tx, mut rx) = mpsc::channel(rpc_channel_capacity);
     let rx_stream = async_stream::stream! {
         if let Some(ping) = initial_ping {

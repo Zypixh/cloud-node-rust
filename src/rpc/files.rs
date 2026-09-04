@@ -135,8 +135,7 @@ async fn download_file(
     let max_bytes = crate::memory_governor::MEMORY_GOVERNOR
         .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
         .cardinality_state_budget_bytes
-        .min(512 * 1024 * 1024)
-        .max(16 * 1024 * 1024);
+        .clamp(16 * 1024 * 1024, 512 * 1024 * 1024);
     anyhow::ensure!(
         expected_size <= max_bytes,
         "IP library size {} exceeds node budget {}",

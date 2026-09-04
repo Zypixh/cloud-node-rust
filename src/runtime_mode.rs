@@ -12,15 +12,11 @@ const DEFAULT_POD_IP_ENV: &str = "POD_IP";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum RuntimeMode {
+    #[default]
     Standalone,
     Rke2,
-}
-
-impl Default for RuntimeMode {
-    fn default() -> Self {
-        Self::Standalone
-    }
 }
 
 impl RuntimeMode {
@@ -45,16 +41,12 @@ pub struct RuntimeSection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum XdpAttachMode {
+    #[default]
     Auto,
     Drv,
     Skb,
-}
-
-impl Default for XdpAttachMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl XdpAttachMode {
@@ -69,15 +61,11 @@ impl XdpAttachMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum XdpFallbackMode {
+    #[default]
     Pass,
     FailStart,
-}
-
-impl Default for XdpFallbackMode {
-    fn default() -> Self {
-        Self::Pass
-    }
 }
 
 impl XdpFallbackMode {
@@ -95,16 +83,12 @@ impl XdpFallbackMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum XdpRuntimeMode {
+    #[default]
     Observe,
     Protect,
     Proxy,
-}
-
-impl Default for XdpRuntimeMode {
-    fn default() -> Self {
-        Self::Observe
-    }
 }
 
 impl XdpRuntimeMode {
@@ -119,18 +103,14 @@ impl XdpRuntimeMode {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum XdpProxyProtocol {
     Http,
     Https,
+    #[default]
     Tcp,
     Udp,
     H3,
-}
-
-impl Default for XdpProxyProtocol {
-    fn default() -> Self {
-        Self::Tcp
-    }
 }
 
 impl XdpProxyProtocol {
@@ -205,7 +185,7 @@ impl Default for XdpProxyConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct XdpConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -217,18 +197,6 @@ pub struct XdpConfig {
     pub interfaces: Vec<XdpInterfaceConfig>,
     #[serde(default)]
     pub proxy: XdpProxyConfig,
-}
-
-impl Default for XdpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            attach_mode: XdpAttachMode::default(),
-            fallback: XdpFallbackMode::default(),
-            interfaces: Vec::new(),
-            proxy: XdpProxyConfig::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
