@@ -1832,7 +1832,7 @@ impl RelayOptions {
     fn sni_passthrough() -> Self {
         Self {
             strict_close_on_eof: true,
-            enforce_pressure_idle_timeout: true,
+            enforce_pressure_idle_timeout: false,
             cancel_rx: None,
         }
     }

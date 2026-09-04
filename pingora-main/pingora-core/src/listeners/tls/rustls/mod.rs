@@ -149,12 +149,17 @@ impl Acceptor {
                 .enable_all()
                 .build()
                 .map_err(|e| {
-                    Error::explain(InternalError, format!("failed to build TLS offload runtime: {e}"))
+                    Error::explain(
+                        InternalError,
+                        format!("failed to build TLS offload runtime: {e}"),
+                    )
                 })
                 .and_then(|runtime| {
                     runtime
                         .block_on(handshake(&acceptor, stream))
-                        .explain_err(InternalError, |e| format!("TLS offload handshake failed: {e}"))
+                        .explain_err(InternalError, |e| {
+                            format!("TLS offload handshake failed: {e}")
+                        })
                 })
         })
         .await

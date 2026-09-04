@@ -333,18 +333,11 @@ where
     }
 
     fn is_body_empty(&mut self) -> bool {
-        self.body_bytes_read == 0
-            && (self.body_done
-                || self
-                    .req_header
-                    .headers
-                    .get(http::header::CONTENT_LENGTH)
-                    .is_some_and(|value| value.as_bytes() == b"0")
-                || (self.req_header.method == http::Method::GET
-                    && !self
-                        .req_header
-                        .headers
-                        .contains_key(http::header::CONTENT_LENGTH)))
+        // HTTP/3 request headers do not carry an end-of-stream bit into this
+        // custom session.  Content-Length: 0 and a GET without Content-Length
+        // therefore do not prove that no DATA frame will follow.  Only the
+        // request stream's observed end marker is authoritative.
+        self.body_bytes_read == 0 && self.body_done
     }
 
     async fn read_body_or_idle(&mut self, no_body_expected: bool) -> PingoraResult<Option<Bytes>> {

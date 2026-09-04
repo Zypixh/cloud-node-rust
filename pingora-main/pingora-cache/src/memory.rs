@@ -20,7 +20,7 @@
 
 use super::*;
 use crate::key::CompactCacheKey;
-use crate::storage::{HandleHit, HandleMiss, streaming_write::U64WriteId};
+use crate::storage::{streaming_write::U64WriteId, HandleHit, HandleMiss};
 use crate::trace::SpanHandle;
 
 use async_trait::async_trait;
@@ -29,8 +29,8 @@ use parking_lot::RwLock;
 use pingora_error::*;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::watch;
 
 type BinaryMeta = (Vec<u8>, Vec<u8>);

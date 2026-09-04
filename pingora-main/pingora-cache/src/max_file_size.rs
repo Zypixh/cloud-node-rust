@@ -39,7 +39,7 @@ impl MaxFileSizeTracker {
     // Add bytes to the tracker.
     // If return value is true, the tracker bytes are under the max size allowed.
     pub fn add_body_bytes(&mut self, bytes: usize) -> bool {
-        self.body_bytes += bytes;
+        self.body_bytes = self.body_bytes.saturating_add(bytes);
         self.allow_caching()
     }
 
