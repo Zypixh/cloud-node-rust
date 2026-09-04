@@ -52,11 +52,8 @@ mod tests;
 #[cfg(test)]
 mod final_test;
 
-
-
-
 // Re-export types for advanced usage
-pub use sqli::{SqliState, SqliFlags, Fingerprint};
+pub use sqli::{Fingerprint, SqliFlags, SqliState};
 pub use xss::{XssDetector, XssResult};
 
 /// The type of injection detected by libinjection.
@@ -78,7 +75,7 @@ impl fmt::Display for InjectionType {
 }
 
 /// Result of an injection detection operation.
-/// 
+///
 /// This structure contains information about whether injection was detected,
 /// what type it was, and additional metadata like the fingerprint.
 #[derive(Debug, Clone, PartialEq)]
@@ -119,7 +116,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
-            Error::ParseError(pe) => write!(f, "Parse error at position {}: {}", pe.position, pe.message),
+            Error::ParseError(pe) => {
+                write!(f, "Parse error at position {}: {}", pe.position, pe.message)
+            }
             #[cfg(feature = "std")]
             Error::Io(msg) => write!(f, "I/O error: {}", msg),
         }
@@ -182,7 +181,7 @@ pub fn detect_sqli(input: &[u8]) -> DetectionResult {
 /// use libinjectionrs::{detect_sqli_with_flags, SqliFlags};
 ///
 /// let result = detect_sqli_with_flags(
-///     b"1' OR '1'='1", 
+///     b"1' OR '1'='1",
 ///     SqliFlags::FLAG_QUOTE_SINGLE | SqliFlags::FLAG_SQL_ANSI
 /// );
 /// assert!(result.is_injection());
@@ -236,7 +235,7 @@ pub fn detect_xss(input: &[u8]) -> XssResult {
 ///
 /// ```
 /// use libinjectionrs::version;
-/// 
+///
 /// println!("libinjection version: {}", version());
 /// ```
 pub fn version() -> &'static str {

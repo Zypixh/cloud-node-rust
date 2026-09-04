@@ -5,21 +5,28 @@ impl CharType {
     pub fn is_white(&self) -> bool {
         matches!(self, CharType::White)
     }
-    
+
     pub fn is_word(&self) -> bool {
         matches!(self, CharType::Word | CharType::BWord)
     }
-    
+
     pub fn is_string_start(&self) -> bool {
-        matches!(self, CharType::String | CharType::BString | CharType::EString | 
-                      CharType::NQString | CharType::QString | 
-                      CharType::UString | CharType::XString)
+        matches!(
+            self,
+            CharType::String
+                | CharType::BString
+                | CharType::EString
+                | CharType::NQString
+                | CharType::QString
+                | CharType::UString
+                | CharType::XString
+        )
     }
-    
+
     pub fn is_operator(&self) -> bool {
         matches!(self, CharType::Op1 | CharType::Op2 | CharType::Unary)
     }
-    
+
     pub fn is_number(&self) -> bool {
         matches!(self, CharType::Number)
     }

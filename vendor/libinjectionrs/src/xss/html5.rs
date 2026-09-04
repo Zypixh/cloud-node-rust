@@ -13,7 +13,7 @@ pub enum Html5Flags {
 pub enum TokenType {
     DataText,
     TagNameOpen,
-    TagNameClose, 
+    TagNameClose,
     TagNameSelfclose,
     TagData,
     TagClose,
@@ -27,7 +27,7 @@ impl fmt::Display for TokenType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             TokenType::DataText => "DATA_TEXT",
-            TokenType::TagNameOpen => "TAG_NAME_OPEN", 
+            TokenType::TagNameOpen => "TAG_NAME_OPEN",
             TokenType::TagNameClose => "TAG_NAME_CLOSE",
             TokenType::TagNameSelfclose => "TAG_NAME_SELFCLOSE",
             TokenType::TagData => "TAG_DATA",
@@ -77,16 +77,16 @@ impl<'a> Html5State<'a> {
     pub fn next(&mut self) -> bool {
         (self.state_fn)(self)
     }
-    
+
     pub fn position(&self) -> usize {
         self.pos
     }
-    
+
     #[cfg(test)]
     pub fn debug_is_close(&self) -> bool {
         self.is_close
     }
-    
+
     #[cfg(test)]
     pub fn debug_pos(&self) -> usize {
         self.pos
@@ -141,19 +141,21 @@ impl<'a> Html5State<'a> {
         }
         None
     }
-    
+
     // Match C h5_skip_white exactly: includes 0x00 for IE compatibility
     // CRITICAL: C uses signed char, so any byte >= 128 becomes negative and is returned as-is
     fn h5_skip_white(&mut self) -> Option<i8> {
         while self.pos < self.len {
             let ch_unsigned = self.s[self.pos];
-            let ch_signed = ch_unsigned as i8;  // Convert to signed like C does: char ch = hs->s[hs->pos]
-            
+            let ch_signed = ch_unsigned as i8; // Convert to signed like C does: char ch = hs->s[hs->pos]
+
             match ch_signed {
-                0x00 | 0x20 | 0x09 | 0x0A => {  // case 0x00, case 0x20, etc.
+                0x00 | 0x20 | 0x09 | 0x0A => {
+                    // case 0x00, case 0x20, etc.
                     self.pos += 1;
                 }
-                0x0B | 0x0C | 0x0D => {  // IE only cases
+                0x0B | 0x0C | 0x0D => {
+                    // IE only cases
                     self.pos += 1;
                 }
                 _ => {
@@ -164,14 +166,14 @@ impl<'a> Html5State<'a> {
                 }
             }
         }
-        Some(-1)  // CHAR_EOF
+        Some(-1) // CHAR_EOF
     }
 
     fn find_byte(&self, byte: u8, start: usize) -> Option<usize> {
         if start >= self.len {
             return None;
         }
-        
+
         for i in start..self.len {
             if self.s[i] == byte {
                 return Some(i);
@@ -184,39 +186,39 @@ impl<'a> Html5State<'a> {
         if start + 2 >= self.len {
             return None;
         }
-        
+
         let mut pos = start;
         while pos <= self.len - 3 {
             if let Some(dash_pos) = self.find_byte(b'-', pos) {
                 if dash_pos + 2 >= self.len {
                     break;
                 }
-                
+
                 let mut offset = 1;
                 // Skip nulls (IE-ism)
                 while dash_pos + offset < self.len && self.s[dash_pos + offset] == 0 {
                     offset += 1;
                 }
-                
+
                 if dash_pos + offset >= self.len {
                     break;
                 }
-                
+
                 let next_char = self.s[dash_pos + offset];
                 if next_char != b'-' && next_char != b'!' {
                     pos = dash_pos + 1;
                     continue;
                 }
-                
+
                 offset += 1;
                 if dash_pos + offset >= self.len {
                     break;
                 }
-                
+
                 if self.s[dash_pos + offset] == b'>' {
                     return Some((dash_pos, offset + 1));
                 }
-                
+
                 pos = dash_pos + 1;
             } else {
                 break;
@@ -229,7 +231,7 @@ impl<'a> Html5State<'a> {
         if start + 2 >= self.len {
             return None;
         }
-        
+
         for i in start..self.len - 2 {
             if self.s[i] == b']' && self.s[i + 1] == b']' && self.s[i + 2] == b'>' {
                 return Some(i);
@@ -241,7 +243,7 @@ impl<'a> Html5State<'a> {
     fn is_whitespace(ch: u8) -> bool {
         matches!(ch, 0x20 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D)
     }
-    
+
     // Match C h5_is_white function exactly: " \t\n\v\f\r"
     fn h5_is_white(ch: u8) -> bool {
         matches!(ch, 0x20 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D)
@@ -250,9 +252,9 @@ impl<'a> Html5State<'a> {
     // Match C alphabetic check exactly: (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
     // CRITICAL: C uses signed char, so bytes >= 128 become negative and fail the comparison
     fn is_alphabetic_c_style(ch: u8) -> bool {
-        let ch_signed = ch as i8;  // Convert to signed like C does
-        ((ch_signed >= b'a' as i8) && (ch_signed <= b'z' as i8)) ||
-        ((ch_signed >= b'A' as i8) && (ch_signed <= b'Z' as i8))
+        let ch_signed = ch as i8; // Convert to signed like C does
+        ((ch_signed >= b'a' as i8) && (ch_signed <= b'z' as i8))
+            || ((ch_signed >= b'A' as i8) && (ch_signed <= b'Z' as i8))
     }
 
     fn state_eof(&mut self) -> bool {
@@ -261,7 +263,7 @@ impl<'a> Html5State<'a> {
 
     fn state_data(&mut self) -> bool {
         let start = self.pos;
-        
+
         if let Some(lt_pos) = self.find_byte(b'<', self.pos) {
             if lt_pos > start {
                 self.set_token(TokenType::DataText, start, lt_pos - start);
@@ -404,20 +406,22 @@ impl<'a> Html5State<'a> {
 
     fn state_tag_name_close(&mut self) -> bool {
         // Match C implementation exactly: h5_state_tag_name_close (lines 234-248)
-        self.is_close = false;                                  // hs->is_close = 0;
-        self.set_token(TokenType::TagNameClose, self.pos, 1);   // token_start = hs->s + hs->pos; token_len = 1; token_type = TAG_NAME_CLOSE;
-        self.advance();                                         // hs->pos += 1;
-        if self.pos < self.len {                                // if (hs->pos < hs->len) {
-            self.state_fn = Self::state_data;                   //     hs->state = h5_state_data;
-        } else {                                                // } else {
-            self.state_fn = Self::state_eof;                    //     hs->state = h5_state_eof;
-        }                                                       // }
-        
-        true                                                    // return 1;
+        self.is_close = false; // hs->is_close = 0;
+        self.set_token(TokenType::TagNameClose, self.pos, 1); // token_start = hs->s + hs->pos; token_len = 1; token_type = TAG_NAME_CLOSE;
+        self.advance(); // hs->pos += 1;
+        if self.pos < self.len {
+            // if (hs->pos < hs->len) {
+            self.state_fn = Self::state_data; //     hs->state = h5_state_data;
+        } else {
+            // } else {
+            self.state_fn = Self::state_eof; //     hs->state = h5_state_eof;
+        } // }
+
+        true // return 1;
     }
 
     fn state_emit_tag_close_char(&mut self) -> bool {
-        self.is_close = false;  // Match C behavior - reset is_close when emitting TAG_NAME_CLOSE
+        self.is_close = false; // Match C behavior - reset is_close when emitting TAG_NAME_CLOSE
         self.set_token(TokenType::TagNameClose, self.pos, 1);
         self.advance();
         if self.pos < self.len {
@@ -432,7 +436,7 @@ impl<'a> Html5State<'a> {
         if self.is_eof() {
             return false;
         }
-        
+
         if self.current_char() == Some(b'>') {
             // Create the TAG_NAME_SELFCLOSE token pointing to the '/' character
             // with length 2 to include both '/' and '>'
@@ -452,7 +456,8 @@ impl<'a> Html5State<'a> {
         loop {
             match self.h5_skip_white() {
                 Some(-1) => return false, // CHAR_EOF
-                Some(0x2f) => { // CHAR_SLASH (47 as i8)
+                Some(0x2f) => {
+                    // CHAR_SLASH (47 as i8)
                     self.advance();
                     // Tail call optimization: if next char is not '>', loop instead of recursing
                     if self.pos < self.len && self.s[self.pos] != b'>' {
@@ -460,7 +465,8 @@ impl<'a> Html5State<'a> {
                     }
                     return self.state_self_closing_start_tag();
                 }
-                Some(0x3e) => { // CHAR_GT (62 as i8)
+                Some(0x3e) => {
+                    // CHAR_GT (62 as i8)
                     self.set_token(TokenType::TagNameClose, self.pos, 1);
                     self.advance();
                     self.state_fn = Self::state_data;
@@ -477,78 +483,90 @@ impl<'a> Html5State<'a> {
 
     fn state_attribute_name(&mut self) -> bool {
         // Match C implementation exactly line by line
-        let start_pos = self.pos;  // Store initial position
-        let mut scan_pos = self.pos + 1;  // pos = hs->pos + 1
-        
-        while scan_pos < self.len {  // while (pos < hs->len)
-            let ch = self.s[scan_pos];  // ch = hs->s[pos]
-            
-            if Self::h5_is_white(ch) {  // if (h5_is_white(ch))
+        let start_pos = self.pos; // Store initial position
+        let mut scan_pos = self.pos + 1; // pos = hs->pos + 1
+
+        while scan_pos < self.len {
+            // while (pos < hs->len)
+            let ch = self.s[scan_pos]; // ch = hs->s[pos]
+
+            if Self::h5_is_white(ch) {
+                // if (h5_is_white(ch))
                 self.set_token(TokenType::AttrName, start_pos, scan_pos - start_pos);
                 self.state_fn = Self::state_after_attribute_name;
-                self.pos = scan_pos + 1;  // hs->pos = pos + 1
+                self.pos = scan_pos + 1; // hs->pos = pos + 1
                 return true;
-            } else if ch == b'/' {  // ch == CHAR_SLASH
+            } else if ch == b'/' {
+                // ch == CHAR_SLASH
                 self.set_token(TokenType::AttrName, start_pos, scan_pos - start_pos);
                 self.state_fn = Self::state_self_closing_start_tag;
-                self.pos = scan_pos + 1;  // hs->pos = pos + 1
+                self.pos = scan_pos + 1; // hs->pos = pos + 1
                 return true;
-            } else if ch == b'=' {  // ch == CHAR_EQUALS
+            } else if ch == b'=' {
+                // ch == CHAR_EQUALS
                 self.set_token(TokenType::AttrName, start_pos, scan_pos - start_pos);
                 self.state_fn = Self::state_before_attribute_value;
-                self.pos = scan_pos + 1;  // hs->pos = pos + 1
+                self.pos = scan_pos + 1; // hs->pos = pos + 1
                 return true;
-            } else if ch == b'>' {  // ch == CHAR_GT
+            } else if ch == b'>' {
+                // ch == CHAR_GT
                 self.set_token(TokenType::AttrName, start_pos, scan_pos - start_pos);
-                self.state_fn = Self::state_tag_name_close;  // Match C: hs->state = h5_state_tag_name_close;
-                self.pos = scan_pos;  // hs->pos = pos (NOT pos + 1!)
+                self.state_fn = Self::state_tag_name_close; // Match C: hs->state = h5_state_tag_name_close;
+                self.pos = scan_pos; // hs->pos = pos (NOT pos + 1!)
                 return true;
             } else {
-                scan_pos += 1;  // pos += 1
+                scan_pos += 1; // pos += 1
             }
         }
-        
+
         // EOF - match C lines 393-398 exactly
         self.set_token(TokenType::AttrName, start_pos, self.len - start_pos);
         self.state_fn = Self::state_eof;
-        self.pos = self.len;  // hs->pos = hs->len
-        true  // return 1
+        self.pos = self.len; // hs->pos = hs->len
+        true // return 1
     }
 
     fn state_after_attribute_name(&mut self) -> bool {
         // Match C implementation exactly line by line
-        match self.h5_skip_white() {  // c = h5_skip_white(hs)
-            Some(-1) => false,  // case CHAR_EOF: return 0
-            Some(0x2f) => {  // case CHAR_SLASH (47 as i8)
-                self.pos += 1;  // hs->pos += 1
-                self.state_self_closing_start_tag()  // return h5_state_self_closing_start_tag(hs)
+        match self.h5_skip_white() {
+            // c = h5_skip_white(hs)
+            Some(-1) => false, // case CHAR_EOF: return 0
+            Some(0x2f) => {
+                // case CHAR_SLASH (47 as i8)
+                self.pos += 1; // hs->pos += 1
+                self.state_self_closing_start_tag() // return h5_state_self_closing_start_tag(hs)
             }
-            Some(0x3d) => {  // case CHAR_EQUALS (61 as i8)
-                self.pos += 1;  // hs->pos += 1
-                self.state_before_attribute_value()  // return h5_state_before_attribute_value(hs)
+            Some(0x3d) => {
+                // case CHAR_EQUALS (61 as i8)
+                self.pos += 1; // hs->pos += 1
+                self.state_before_attribute_value() // return h5_state_before_attribute_value(hs)
             }
-            Some(0x3e) => {  // case CHAR_GT (62 as i8)
-                self.state_tag_name_close()  // return h5_state_tag_name_close(hs)
+            Some(0x3e) => {
+                // case CHAR_GT (62 as i8)
+                self.state_tag_name_close() // return h5_state_tag_name_close(hs)
             }
-            Some(_) => {  // default
-                self.state_attribute_name()  // return h5_state_attribute_name(hs)
+            Some(_) => {
+                // default
+                self.state_attribute_name() // return h5_state_attribute_name(hs)
             }
-            None => false,  // Should not happen with new implementation
+            None => false, // Should not happen with new implementation
         }
     }
 
     fn state_before_attribute_value(&mut self) -> bool {
         // Match C implementation exactly: c = h5_skip_white(hs)
         match self.h5_skip_white() {
-            Some(-1) => {  // case CHAR_EOF
+            Some(-1) => {
+                // case CHAR_EOF
                 self.state_fn = Self::state_eof;
                 false
             }
-            Some(0x22) => self.state_attribute_value_double_quote(),  // CHAR_DOUBLE (34)
-            Some(0x27) => self.state_attribute_value_single_quote(),  // CHAR_SINGLE (39)
-            Some(0x60) => self.state_attribute_value_back_quote(),    // CHAR_TICK (96)
-            Some(_) => self.state_attribute_value_no_quote(),         // default
-            None => {  // Should not happen with new implementation
+            Some(0x22) => self.state_attribute_value_double_quote(), // CHAR_DOUBLE (34)
+            Some(0x27) => self.state_attribute_value_single_quote(), // CHAR_SINGLE (39)
+            Some(0x60) => self.state_attribute_value_back_quote(),   // CHAR_TICK (96)
+            Some(_) => self.state_attribute_value_no_quote(),        // default
+            None => {
+                // Should not happen with new implementation
                 self.state_fn = Self::state_eof;
                 false
             }
@@ -560,7 +578,7 @@ impl<'a> Html5State<'a> {
         if self.pos > 0 {
             self.advance();
         }
-        
+
         let start = self.pos;
         if let Some(quote_pos) = self.find_byte(b'"', self.pos) {
             self.set_token(TokenType::AttrValue, start, quote_pos - start);
@@ -579,7 +597,7 @@ impl<'a> Html5State<'a> {
         if self.pos > 0 {
             self.advance();
         }
-        
+
         let start = self.pos;
         if let Some(quote_pos) = self.find_byte(b'\'', self.pos) {
             self.set_token(TokenType::AttrValue, start, quote_pos - start);
@@ -598,7 +616,7 @@ impl<'a> Html5State<'a> {
         if self.pos > 0 {
             self.advance();
         }
-        
+
         let start = self.pos;
         if let Some(quote_pos) = self.find_byte(b'`', self.pos) {
             self.set_token(TokenType::AttrValue, start, quote_pos - start);
@@ -628,7 +646,7 @@ impl<'a> Html5State<'a> {
             }
             self.pos += 1;
         }
-        
+
         // EOF
         self.set_token(TokenType::AttrValue, start, self.len - start);
         self.state_fn = Self::state_eof;
@@ -639,7 +657,7 @@ impl<'a> Html5State<'a> {
         if self.is_eof() {
             return false;
         }
-        
+
         let ch = self.current_char().unwrap_or(0);
         if Self::is_whitespace(ch) {
             self.advance();
@@ -684,7 +702,7 @@ impl<'a> Html5State<'a> {
     fn state_doctype(&mut self) -> bool {
         // Set token start to include "DOCTYPE"
         let start = self.pos;
-        
+
         if let Some(gt_pos) = self.find_byte(b'>', self.pos) {
             self.set_token(TokenType::Doctype, start, gt_pos - start);
             self.pos = gt_pos + 1;
@@ -700,7 +718,7 @@ impl<'a> Html5State<'a> {
     fn state_bogus_comment2(&mut self) -> bool {
         let start = self.pos;
         let mut pos = self.pos;
-        
+
         loop {
             if let Some(percent_pos) = self.find_byte(b'%', pos) {
                 if percent_pos + 1 >= self.len {
@@ -710,7 +728,7 @@ impl<'a> Html5State<'a> {
                     self.state_fn = Self::state_eof;
                     return true;
                 }
-                
+
                 if self.s[percent_pos + 1] == b'>' {
                     // Found "%>"
                     self.set_token(TokenType::TagComment, start, percent_pos - start);
@@ -718,7 +736,7 @@ impl<'a> Html5State<'a> {
                     self.state_fn = Self::state_data;
                     return true;
                 }
-                
+
                 pos = percent_pos + 1;
             } else {
                 // No more '%' found, consume to EOF
@@ -732,7 +750,7 @@ impl<'a> Html5State<'a> {
 
     fn state_comment(&mut self) -> bool {
         let start = self.pos;
-        
+
         if let Some((end_pos, offset)) = self.find_comment_end(self.pos) {
             self.set_token(TokenType::TagComment, start, end_pos - start);
             self.pos = end_pos + offset;
@@ -747,7 +765,7 @@ impl<'a> Html5State<'a> {
 
     fn state_bogus_comment(&mut self) -> bool {
         let start = self.pos;
-        
+
         if let Some(gt_pos) = self.find_byte(b'>', self.pos) {
             self.set_token(TokenType::TagComment, start, gt_pos - start);
             self.pos = gt_pos + 1;
@@ -762,7 +780,7 @@ impl<'a> Html5State<'a> {
 
     fn state_cdata(&mut self) -> bool {
         let start = self.pos;
-        
+
         if let Some(end_pos) = self.find_cdata_end(self.pos) {
             self.set_token(TokenType::DataText, start, end_pos - start);
             self.pos = end_pos + 3; // Skip "]]>"

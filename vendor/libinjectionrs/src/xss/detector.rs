@@ -1,6 +1,6 @@
 use super::blacklists::{
-    AttributeType, BLACK_ATTR_EVENTS, BLACK_ATTRS, BLACK_TAGS, BLACK_URL_PROTOCOLS,
-    html_decode_char_at,
+    html_decode_char_at, AttributeType, BLACK_ATTRS, BLACK_ATTR_EVENTS, BLACK_TAGS,
+    BLACK_URL_PROTOCOLS,
 };
 use super::html5::{Html5Flags, Html5State, TokenType};
 
@@ -75,7 +75,7 @@ impl XssDetector {
             } else if html5.token_type == TokenType::AttrValue {
                 match attr {
                     AttributeType::None => {
-                        // break equivalent 
+                        // break equivalent
                     }
                     AttributeType::Black => {
                         return true;
@@ -90,7 +90,9 @@ impl XssDetector {
                     }
                     AttributeType::AttrIndirect => {
                         // an attribute name is specified in a _value_
-                        if Self::is_black_attr(&html5.token_start[..html5.token_len]) != AttributeType::None {
+                        if Self::is_black_attr(&html5.token_start[..html5.token_len])
+                            != AttributeType::None
+                        {
                             return true;
                         }
                     }
@@ -104,14 +106,16 @@ impl XssDetector {
 
                 // IE conditional comment
                 if html5.token_len > 3 {
-                    if html5.token_start[0] == b'[' &&
-                        (html5.token_start[1] == b'i' || html5.token_start[1] == b'I') &&
-                        (html5.token_start[2] == b'f' || html5.token_start[2] == b'F') {
+                    if html5.token_start[0] == b'['
+                        && (html5.token_start[1] == b'i' || html5.token_start[1] == b'I')
+                        && (html5.token_start[2] == b'f' || html5.token_start[2] == b'F')
+                    {
                         return true;
                     }
-                    if (html5.token_start[0] == b'x' || html5.token_start[0] == b'X') &&
-                        (html5.token_start[1] == b'm' || html5.token_start[1] == b'M') &&
-                        (html5.token_start[2] == b'l' || html5.token_start[2] == b'L') {
+                    if (html5.token_start[0] == b'x' || html5.token_start[0] == b'X')
+                        && (html5.token_start[1] == b'm' || html5.token_start[1] == b'M')
+                        && (html5.token_start[2] == b'l' || html5.token_start[2] == b'L')
+                    {
                         return true;
                     }
                 }
@@ -129,7 +133,7 @@ impl XssDetector {
                 }
             }
         }
-        
+
         false
     }
 
@@ -147,18 +151,20 @@ impl XssDetector {
 
         // Check SVG tags (case insensitive) - match C's manual case checking exactly
         if tag_name.len() >= 3 {
-            if (tag_name[0] == b's' || tag_name[0] == b'S') &&
-               (tag_name[1] == b'v' || tag_name[1] == b'V') &&
-               (tag_name[2] == b'g' || tag_name[2] == b'G') {
+            if (tag_name[0] == b's' || tag_name[0] == b'S')
+                && (tag_name[1] == b'v' || tag_name[1] == b'V')
+                && (tag_name[2] == b'g' || tag_name[2] == b'G')
+            {
                 return true;
             }
         }
 
         // Check XSL tags (case insensitive) - match C's manual case checking exactly
         if tag_name.len() >= 3 {
-            if (tag_name[0] == b'x' || tag_name[0] == b'X') &&
-               (tag_name[1] == b's' || tag_name[1] == b'S') &&
-               (tag_name[2] == b'l' || tag_name[2] == b'L') {
+            if (tag_name[0] == b'x' || tag_name[0] == b'X')
+                && (tag_name[1] == b's' || tag_name[1] == b'S')
+                && (tag_name[2] == b'l' || tag_name[2] == b'L')
+            {
                 return true;
             }
         }
@@ -173,8 +179,9 @@ impl XssDetector {
 
         // Check for event handlers (on* attributes) - match C's manual case checking exactly
         if attr_name.len() >= 5 {
-            if (attr_name[0] == b'o' || attr_name[0] == b'O') &&
-               (attr_name[1] == b'n' || attr_name[1] == b'N') {
+            if (attr_name[0] == b'o' || attr_name[0] == b'O')
+                && (attr_name[1] == b'n' || attr_name[1] == b'N')
+            {
                 let event_name = &attr_name[2..];
                 for event in BLACK_ATTR_EVENTS {
                     if Self::cstrcasecmp_with_null(event.name.as_bytes(), event_name) {
@@ -184,8 +191,9 @@ impl XssDetector {
             }
 
             // Check XMLNS and XLINK - use prefix matching like C (checks first 5 chars only)
-            if Self::cstrcasecmp_with_null_limited(b"XMLNS", attr_name, 5) 
-                || Self::cstrcasecmp_with_null_limited(b"XLINK", attr_name, 5) {
+            if Self::cstrcasecmp_with_null_limited(b"XMLNS", attr_name, 5)
+                || Self::cstrcasecmp_with_null_limited(b"XLINK", attr_name, 5)
+            {
                 return AttributeType::Black;
             }
         }
@@ -240,7 +248,7 @@ impl XssDetector {
         }
 
         if comment.len() > 3 {
-            // IE conditional comment: [if 
+            // IE conditional comment: [if
             if comment.len() >= 3
                 && comment[0] == b'['
                 && (comment[1] == b'i' || comment[1] == b'I')
@@ -280,36 +288,36 @@ impl XssDetector {
         let mut pattern_idx = 0;
         let mut input_idx = 0;
         let mut remaining = n;
-        
+
         while remaining > 0 && input_idx < input.len() {
             let input_char = input[input_idx];
             input_idx += 1;
             remaining -= 1;
-            
+
             // Skip null bytes in input (like C's cb == '\0')
             if input_char == 0 {
                 continue;
             }
-            
+
             // Always advance pattern pointer (like C's ca = a[ai++])
             if pattern_idx >= pattern.len() {
                 return false; // Pattern exhausted but input continues within n chars
             }
             let pattern_char = pattern[pattern_idx];
             pattern_idx += 1;
-            
+
             // Convert input character to uppercase (like C)
             let mut cb = input_char;
             if cb >= b'a' && cb <= b'z' {
                 cb -= 0x20;
             }
-            
+
             // Compare characters (like C's ca != cb)
             if pattern_char != cb {
                 return false;
             }
         }
-        
+
         // Check if pattern is fully consumed (like C's final ca = a[ai++]; ca == '\0')
         pattern_idx >= pattern.len()
     }
@@ -319,36 +327,36 @@ impl XssDetector {
     fn cstrcasecmp_with_null(pattern: &[u8], input: &[u8]) -> bool {
         let mut pattern_idx = 0;
         let mut input_idx = 0;
-        
+
         // Loop through input length (like C's n-- > 0)
         while input_idx < input.len() {
             let input_char = input[input_idx];
             input_idx += 1;
-            
+
             // Skip null bytes in input (like C's cb == '\0')
             if input_char == 0 {
                 continue;
             }
-            
+
             // Always advance pattern pointer (like C's ca = a[ai++])
             if pattern_idx >= pattern.len() {
                 return false; // Pattern exhausted but input continues
             }
             let pattern_char = pattern[pattern_idx];
             pattern_idx += 1;
-            
+
             // Convert input character to uppercase (like C)
             let mut cb = input_char;
             if cb >= b'a' && cb <= b'z' {
                 cb -= 0x20;
             }
-            
+
             // Compare characters (like C's ca != cb)
             if pattern_char != cb {
                 return false;
             }
         }
-        
+
         // Check if pattern is fully consumed (like C's final ca = a[ai++]; ca == '\0')
         // In C, this reads the next character and checks if it's null terminator
         if pattern_idx >= pattern.len() {
@@ -367,7 +375,7 @@ impl XssDetector {
         while input_pos < input.len() && pattern_idx < pattern.len() {
             let mut consumed = 0;
             let decoded_char = html_decode_char_at(&input[input_pos..], &mut consumed);
-            
+
             input_pos += consumed;
 
             // Skip leading whitespace and control characters
@@ -381,7 +389,7 @@ impl XssDetector {
                 continue;
             }
 
-            // Always ignore vertical tab characters  
+            // Always ignore vertical tab characters
             if decoded_char == 10 {
                 continue;
             }

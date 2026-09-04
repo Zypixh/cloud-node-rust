@@ -4,9 +4,9 @@
 #![allow(clippy::disallowed_methods)]
 #![allow(clippy::panic)]
 
+use crate::xss::{Html5Flags, Html5State};
 use std::fs;
 use std::path::Path;
-use crate::xss::{Html5State, Html5Flags};
 
 /// Right-trim whitespace from string, matching C testdriver behavior
 fn rtrim(s: &str) -> String {
@@ -109,7 +109,7 @@ fn run_single_html5_test(file_path: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("Failed to parse test file {:?}", file_path))?;
 
     let actual = run_html5_tokenization(&test_case.input);
-    
+
     // Apply rtrim to both expected and actual, matching C test framework behavior
     let expected_trimmed = rtrim(&test_case.expected);
     let actual_trimmed = rtrim(&actual);
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn test_all_html5_files() {
         let test_dir = "../libinjection-c/tests";
-        
+
         // Check if test directory exists
         if !Path::new(test_dir).exists() {
             panic!("Test directory {} does not exist. Make sure libinjection-c submodule is initialized.", test_dir);
@@ -145,7 +145,7 @@ mod tests {
         for entry in entries {
             let entry = entry.expect("Failed to read directory entry");
             let path = entry.path();
-            
+
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                 if filename.starts_with("test-html5-") && filename.ends_with(".txt") {
                     test_files.push(path);
@@ -154,7 +154,7 @@ mod tests {
         }
 
         test_files.sort();
-        
+
         println!("Found {} HTML5 test files", test_files.len());
 
         for test_file in &test_files {
@@ -186,7 +186,7 @@ mod tests {
         let input = "foo";
         let expected = "DATA_TEXT,3,foo";
         let actual = run_html5_tokenization(input);
-        
+
         assert_eq!(actual, expected, "Simple HTML5 tokenization test failed");
     }
 }

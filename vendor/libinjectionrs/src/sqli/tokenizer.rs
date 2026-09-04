@@ -1,6 +1,6 @@
 // SQL tokenizer implementation matching libinjection C version
 
-use crate::sqli::{SqliFlags, sqli_data};
+use crate::sqli::{sqli_data, SqliFlags};
 
 // Token type constants matching C version
 const TYPE_NONE: u8 = 0;
@@ -131,18 +131,18 @@ impl Token {
             count: 0,
         }
     }
-    
+
     pub fn value_as_str(&self) -> &str {
         let end = self.len.min(32);
         // For display purposes, show lossy conversion to handle 0xFF bytes
         // This won't affect tokenization logic, only debugging output
         std::str::from_utf8(&self.val[..end]).unwrap_or("<binary>")
     }
-    
+
     pub fn clear(&mut self) {
         *self = Self::new();
     }
-    
+
     pub fn assign_char(&mut self, token_type: u8, pos: usize, value: u8) {
         self.token_type = byte_to_token_type(token_type);
         self.pos = pos;
@@ -151,26 +151,26 @@ impl Token {
         self.val[1] = CHAR_NULL;
         // Note: str_open, str_close, and count are NOT reset to preserve variable info like C st_assign_char()
     }
-    
+
     pub fn assign(&mut self, token_type: u8, pos: usize, len: usize, value: &[u8]) {
         let copy_len = len.min(LIBINJECTION_SQLI_TOKEN_SIZE - 1);
         let actual_copy_len = copy_len.min(value.len());
         self.token_type = byte_to_token_type(token_type);
         self.pos = pos;
         self.len = actual_copy_len;
-        
+
         // Clear the value array first
         self.val = [0; 32];
-        
+
         // Copy the value
         for i in 0..actual_copy_len {
             self.val[i] = value[i];
         }
-        
+
         self.val[actual_copy_len] = CHAR_NULL;
         // Note: str_open, str_close, and count are NOT reset to preserve variable info like C st_assign()
     }
-    
+
     pub fn copy_from(&mut self, other: &Token) {
         *self = other.clone();
     }
@@ -271,12 +271,12 @@ impl<'a> SqliTokenizer<'a> {
             stats_comment_hash: 0,
         }
     }
-    
+
     pub fn with_lookup_fn(mut self, lookup_fn: &'a LookupFn) -> Self {
         self.lookup_fn = Some(lookup_fn);
         self
     }
-    
+
     fn lookup_word(&self, word: &str) -> TokenType {
         if let Some(lookup_fn) = self.lookup_fn {
             lookup_fn(word)
@@ -284,50 +284,50 @@ impl<'a> SqliTokenizer<'a> {
             sqli_data::lookup_word(word)
         }
     }
-    
+
     // Main tokenization function - matches libinjection_sqli_tokenize
     pub fn next_token(&mut self) -> Option<Token> {
         if self.input.is_empty() || self.pos >= self.input.len() {
             return None;
         }
-        
+
         self.current.clear();
-        
+
         // Handle quote context at start of string - matches C behavior
         let quote_context = self.flags.quote_context();
         if self.pos == 0 && quote_context != b'\0' {
             // FIXED: Parse only first token as string like C does with parse_string_core
             return self.parse_first_token_with_quote_context(quote_context);
         }
-        
+
         while self.pos < self.input.len() {
             let ch = self.input[self.pos];
             let new_pos = self.dispatch_char_parser(ch);
             self.pos = new_pos;
-            
+
             if self.current.token_type != TokenType::None {
                 return Some(self.current.clone());
             }
         }
-        
+
         None
     }
-    
+
     fn parse_first_token_with_quote_context(&mut self, quote_char: u8) -> Option<Token> {
         // FIXED: Implements exact C behavior from libinjection_sqli.c parse_string_core function
         // Called from libinjection_sqli.c:1216: parse_string_core(s, slen, 0, current, flag2delim(sf->flags), 0)
         // This handles FLAG_QUOTE_DOUBLE context where input is treated as if starting with a quote
-        
+
         let start_pos = self.pos; // Should be 0 for first token
         let len = self.input.len();
         let pos = start_pos; // 0 for first token
         let offset = 0; // simulated quote (libinjection_sqli.c:624 comment explains offset parameter)
-        
+
         // Step 1: Find first quote occurrence
         // From libinjection_sqli.c:627-628: memchr(cs + pos + offset, delim, len - pos - offset)
         let search_start = pos + offset;
         let search_len = len - pos - offset;
-        
+
         let mut qpos_idx = None;
         for i in search_start..(search_start + search_len) {
             if self.input[i] == quote_char {
@@ -335,11 +335,11 @@ impl<'a> SqliTokenizer<'a> {
                 break;
             }
         }
-        
+
         // From libinjection_sqli.c:638-643: Set str_open based on offset
         // offset = 0 means "simulated quote", so str_open = CHAR_NULL
         self.current.str_open = CHAR_NULL;
-        
+
         // Main parsing loop from libinjection_sqli.c:645-672
         while let Some(qpos) = qpos_idx {
             // Check backslash escape - libinjection_sqli.c:655
@@ -347,11 +347,11 @@ impl<'a> SqliTokenizer<'a> {
             if qpos > pos + offset {
                 let check_pos = qpos - 1;
                 let start_pos_for_escape = pos + offset;
-                
+
                 // Implement libinjection_sqli.c:586-606 is_backslash_escaped function exactly
                 let mut backslash_count = 0;
                 let mut ptr = check_pos;
-                
+
                 // libinjection_sqli.c:600-604: Count consecutive backslashes backwards
                 loop {
                     if ptr < start_pos_for_escape || self.input[ptr] != b'\\' {
@@ -363,7 +363,7 @@ impl<'a> SqliTokenizer<'a> {
                     }
                     ptr -= 1;
                 }
-                
+
                 // libinjection_sqli.c:605-606: If odd number of backslashes, it's escaped
                 if backslash_count & 1 == 1 {
                     // libinjection_sqli.c:656-659: Continue search from qpos + 1
@@ -377,7 +377,7 @@ impl<'a> SqliTokenizer<'a> {
                     continue;
                 }
             }
-            
+
             // Check double delimiter escape - libinjection_sqli.c:660
             // C: is_double_delim_escaped(qpos, cs + len)
             // Implements libinjection_sqli.c:610-612: ((cur + 1) < end) && *(cur + 1) == *cur
@@ -392,35 +392,41 @@ impl<'a> SqliTokenizer<'a> {
                 }
                 continue;
             }
-            
+
             // Found unescaped quote - libinjection_sqli.c:666-670
             // C: st_assign(st, TYPE_STRING, pos + offset, qpos - (cs + pos + offset), cs + pos + offset)
             let content_start = pos + offset;
             let content_len = qpos - content_start;
             let content = &self.input[content_start..(content_start + content_len)];
-            
-            self.current.assign(TYPE_STRING, content_start, content_len, content);
+
+            self.current
+                .assign(TYPE_STRING, content_start, content_len, content);
             self.current.str_close = quote_char; // libinjection_sqli.c:669
-            
+
             // libinjection_sqli.c:670: return (size_t)(qpos - cs + 1)
             self.pos = qpos + 1;
             return Some(self.current.clone());
         }
-        
+
         // No closing quote found - libinjection_sqli.c:646-654
         // C: st_assign(st, TYPE_STRING, pos + offset, len - pos - offset, cs + pos + offset)
         let content = &self.input[start_pos..];
-        self.current.assign(TYPE_STRING, start_pos, self.input.len() - start_pos, content);
+        self.current.assign(
+            TYPE_STRING,
+            start_pos,
+            self.input.len() - start_pos,
+            content,
+        );
         self.current.str_close = CHAR_NULL; // libinjection_sqli.c:653
         self.pos = self.input.len(); // libinjection_sqli.c:654: return len
-        
+
         Some(self.current.clone())
     }
-    
+
     // Character dispatch function - matches char_parse_map in C
     fn dispatch_char_parser(&mut self, ch: u8) -> usize {
         use crate::sqli::sqli_data::{get_char_type, CharType};
-        
+
         // Use the generated lookup table - same as C implementation
         match get_char_type(ch) {
             CharType::White => self.parse_white(),
@@ -430,13 +436,17 @@ impl<'a> SqliTokenizer<'a> {
             CharType::Money => self.parse_money(),
             CharType::Op1 | CharType::Unary => self.parse_operator1(),
             CharType::Op2 => self.parse_operator2(),
-            CharType::LeftParens | CharType::RightParens | CharType::Comma | 
-            CharType::Semicolon | CharType::LeftBrace | CharType::RightBrace => self.parse_char(),
+            CharType::LeftParens
+            | CharType::RightParens
+            | CharType::Comma
+            | CharType::Semicolon
+            | CharType::LeftBrace
+            | CharType::RightBrace => self.parse_char(),
             CharType::Dash => self.parse_dash(),
             CharType::Number => self.parse_number(),
             CharType::Slash => self.parse_slash(),
             CharType::Variable => self.parse_var(),
-            CharType::Word => self.parse_word(),     // This now handles UTF-8 bytes 128-255!
+            CharType::Word => self.parse_word(), // This now handles UTF-8 bytes 128-255!
             CharType::BString => self.parse_bstring(),
             CharType::EString => self.parse_estring(),
             CharType::NQString => self.parse_nqstring(),
@@ -449,36 +459,39 @@ impl<'a> SqliTokenizer<'a> {
             CharType::Other => self.parse_other(),
         }
     }
-    
+
     // Parser implementations matching C version exactly
-    
+
     fn parse_white(&mut self) -> usize {
         self.pos + 1
     }
-    
+
     fn parse_operator1(&mut self) -> usize {
         let ch = self.input[self.pos];
         self.current.assign_char(TYPE_OPERATOR, self.pos, ch);
         self.pos + 1
     }
-    
+
     fn parse_operator2(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         // Boundary check - if not enough characters for 2-char operator, fallback
         if pos + 1 >= slen {
             return self.parse_operator1();
         }
-        
+
         // First check for 3-character operator <=> (special case in C)
-        if pos + 2 < slen && 
-           self.input[pos] == b'<' && self.input[pos + 1] == b'=' && self.input[pos + 2] == b'>' {
+        if pos + 2 < slen
+            && self.input[pos] == b'<'
+            && self.input[pos + 1] == b'='
+            && self.input[pos + 2] == b'>'
+        {
             let op = [b'<', b'=', b'>'];
             self.current.assign(TYPE_OPERATOR, pos, 3, &op);
             return pos + 3;
         }
-        
+
         // Try 2-character operator lookup using the comprehensive table
         // Only attempt lookup if bytes form valid UTF-8, since operators are ASCII-only
         let two_char = &self.input[pos..pos + 2];
@@ -495,7 +508,7 @@ impl<'a> SqliTokenizer<'a> {
                 return pos + 2;
             }
         }
-        
+
         // No 2-character operator found, check for special single character cases
         let ch = self.input[pos];
         if ch == b':' {
@@ -507,19 +520,19 @@ impl<'a> SqliTokenizer<'a> {
             return self.parse_operator1();
         }
     }
-    
+
     fn parse_other(&mut self) -> usize {
         let ch = self.input[self.pos];
         self.current.assign_char(TYPE_UNKNOWN, self.pos, ch);
         self.pos + 1
     }
-    
+
     fn parse_char(&mut self) -> usize {
         let ch = self.input[self.pos];
         self.current.assign_char(ch, self.pos, ch);
         self.pos + 1
     }
-    
+
     fn parse_hash(&mut self) -> usize {
         self.stats_comment_hash += 1;
         if self.flags.is_mysql() {
@@ -532,11 +545,11 @@ impl<'a> SqliTokenizer<'a> {
             self.pos + 1
         }
     }
-    
+
     fn parse_dash(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         if pos + 1 < slen && self.input[pos + 1] == b'-' {
             if pos + 2 >= slen || self.is_white_char(self.input[pos + 2]) {
                 // "--" followed by whitespace or end: SQL comment
@@ -559,11 +572,11 @@ impl<'a> SqliTokenizer<'a> {
             pos + 1
         }
     }
-    
+
     fn parse_slash(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         // Match C logic exactly: if (pos1 == slen || cs[pos1] != '*')
         if pos + 1 == slen || self.input[pos + 1] != b'*' {
             // Regular operator
@@ -575,11 +588,11 @@ impl<'a> SqliTokenizer<'a> {
             self.parse_c_comment()
         }
     }
-    
+
     fn parse_backslash(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         // Weird MySQL alias for NULL, "\N" (capital N only)
         if pos + 1 < slen && self.input[pos + 1] == b'N' {
             let content = &self.input[pos..pos + 2];
@@ -591,33 +604,34 @@ impl<'a> SqliTokenizer<'a> {
             pos + 1
         }
     }
-    
+
     fn parse_eol_comment(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         // Find end of line or end of string
         let mut end_pos = pos;
         while end_pos < slen && self.input[end_pos] != b'\n' {
             end_pos += 1;
         }
-        
+
         let comment_slice = &self.input[pos..end_pos];
-        self.current.assign(TYPE_COMMENT, pos, end_pos - pos, comment_slice);
-        
+        self.current
+            .assign(TYPE_COMMENT, pos, end_pos - pos, comment_slice);
+
         if end_pos < slen {
             end_pos + 1 // Skip the newline
         } else {
             slen
         }
     }
-    
+
     // Helper function equivalent to C memchr2: finds two consecutive characters
     fn memchr2(&self, haystack: &[u8], c0: u8, c1: u8) -> Option<usize> {
         if haystack.len() < 2 {
             return None;
         }
-        
+
         for i in 0..haystack.len() - 1 {
             if haystack[i] == c0 && haystack[i + 1] == c1 {
                 return Some(i);
@@ -625,45 +639,43 @@ impl<'a> SqliTokenizer<'a> {
         }
         None
     }
-    
+
     // Helper function equivalent to C is_mysql_comment
     fn is_mysql_comment(&self, pos: usize) -> bool {
         let slen = self.input.len();
-        
+
         // Need at least 3 chars: /*!
         if pos + 2 >= slen {
             return false;
         }
-        
+
         // Check if it's /*!
-        self.input[pos] == b'/' && 
-        self.input[pos + 1] == b'*' && 
-        self.input[pos + 2] == b'!'
+        self.input[pos] == b'/' && self.input[pos + 1] == b'*' && self.input[pos + 2] == b'!'
     }
-    
+
     fn parse_c_comment(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         // This implements the exact same logic as C parse_slash function
-        
+
         // Search for */ in the part after /*
         let search_slice = if pos + 2 < slen {
             &self.input[pos + 2..]
         } else {
             &[]
         };
-        
+
         let clen = if let Some(close_pos) = self.memchr2(search_slice, b'*', b'/') {
             // Found */: include everything from /* to */
-            (pos + 2) + close_pos + 2 - pos  // +2 to include the */
+            (pos + 2) + close_pos + 2 - pos // +2 to include the */
         } else {
             // No */ found: include everything to end of string
             slen - pos
         };
-        
+
         let mut ctype = TYPE_COMMENT;
-        
+
         // Check for nested comments - matching C logic exactly, including the off-by-one bug
         // C code: memchr2(cur + 2, (size_t)(ptr - (cur + 1)), '/', '*')
         // where ptr points to the '*' in the closing '*/'
@@ -671,16 +683,16 @@ impl<'a> SqliTokenizer<'a> {
             // In C terms:
             // - cur = pos (start of /*)
             // - ptr = pos + 2 + close_pos (points to * in */)
-            // - Search start: cur + 2 = pos + 2 
+            // - Search start: cur + 2 = pos + 2
             // - Search length: ptr - (cur + 1) = (pos + 2 + close_pos) - (pos + 1) = close_pos + 1
             // The bug: should be ptr - (cur + 2) = close_pos, but it's close_pos + 1
-            
+
             // So we search 1 byte more than we should
             let buggy_search_length = close_pos + 1;
-            
+
             // Make sure we don't go out of bounds
             let actual_search_length = buggy_search_length.min(search_slice.len());
-            
+
             if actual_search_length > 0 {
                 let buggy_search_region = &search_slice[..actual_search_length];
                 if self.memchr2(buggy_search_region, b'/', b'*').is_some() {
@@ -688,33 +700,33 @@ impl<'a> SqliTokenizer<'a> {
                 }
             }
         }
-        
+
         // Check for MySQL conditional comments /*!
         if self.is_mysql_comment(pos) {
             ctype = TYPE_EVIL;
         }
-        
+
         let comment_slice = &self.input[pos..pos + clen];
         self.current.assign(ctype, pos, clen, comment_slice);
         pos + clen
     }
-    
+
     fn parse_string(&mut self) -> usize {
         let pos = self.pos;
         let delim = self.input[pos];
         self.parse_string_core(pos, delim, 1)
     }
-    
+
     fn parse_string_core(&mut self, pos: usize, delim: u8, offset: usize) -> usize {
         let slen = self.input.len();
         let start_pos = pos + offset;
         let mut end_pos = start_pos;
-        
+
         // Look for closing delimiter
         while end_pos < slen {
             if let Some(found_pos) = self.memchr(delim, &self.input[end_pos..]) {
                 let actual_pos = end_pos + found_pos;
-                
+
                 // Check for escape sequences
                 if actual_pos > 0 && self.is_backslash_escaped(actual_pos - 1) {
                     end_pos = actual_pos + 1;
@@ -725,7 +737,8 @@ impl<'a> SqliTokenizer<'a> {
                 } else {
                     // Found unescaped closing delimiter
                     let content = &self.input[start_pos..actual_pos];
-                    self.current.assign(TYPE_STRING, start_pos, actual_pos - start_pos, content);
+                    self.current
+                        .assign(TYPE_STRING, start_pos, actual_pos - start_pos, content);
                     self.current.str_open = delim;
                     self.current.str_close = delim;
                     return actual_pos + 1;
@@ -733,37 +746,39 @@ impl<'a> SqliTokenizer<'a> {
             } else {
                 // No closing delimiter found
                 let content = &self.input[start_pos..];
-                self.current.assign(TYPE_STRING, start_pos, slen - start_pos, content);
+                self.current
+                    .assign(TYPE_STRING, start_pos, slen - start_pos, content);
                 self.current.str_open = delim;
                 self.current.str_close = CHAR_NULL;
                 return slen;
             }
         }
-        
+
         // Handle unterminated string at end of input (like C does)
         let content = &self.input[start_pos..];
-        self.current.assign(TYPE_STRING, start_pos, slen - start_pos, content);
+        self.current
+            .assign(TYPE_STRING, start_pos, slen - start_pos, content);
         self.current.str_open = delim;
         self.current.str_close = CHAR_NULL;
-        
+
         slen
     }
-    
+
     fn parse_estring(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         if pos + 2 >= slen || self.input[pos + 1] != CHAR_SINGLE {
             return self.parse_word();
         }
-        
+
         self.parse_string_core(pos, CHAR_SINGLE, 2)
     }
-    
+
     fn parse_ustring(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         if pos + 2 < slen && self.input[pos + 1] == b'&' && self.input[pos + 2] == b'\'' {
             let _old_pos = self.pos;
             self.pos += 2;
@@ -777,32 +792,35 @@ impl<'a> SqliTokenizer<'a> {
             self.parse_word()
         }
     }
-    
+
     fn parse_qstring(&mut self) -> usize {
         self.parse_qstring_core(0)
     }
-    
+
     fn parse_nqstring(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         if pos + 2 < slen && self.input[pos + 1] == CHAR_SINGLE {
             return self.parse_estring();
         }
-        
+
         self.parse_qstring_core(1)
     }
-    
+
     fn parse_qstring_core(&mut self, offset: usize) -> usize {
         let pos = self.pos + offset;
         let slen = self.input.len();
-        
+
         // Oracle Q-string: Q'<delimiter>content<delimiter>'
-        if pos >= slen || (self.input[pos] != b'q' && self.input[pos] != b'Q') ||
-           pos + 2 >= slen || self.input[pos + 1] != b'\'' {
+        if pos >= slen
+            || (self.input[pos] != b'q' && self.input[pos] != b'Q')
+            || pos + 2 >= slen
+            || self.input[pos + 1] != b'\''
+        {
             return self.parse_word();
         }
-        
+
         let start_delim = self.input[pos + 2];
         // Match C logic exactly: libinjection_sqli.c:747-748
         // C uses signed char, so bytes 128-255 become negative values
@@ -811,7 +829,7 @@ impl<'a> SqliTokenizer<'a> {
         if start_delim_signed < 33 {
             return self.parse_word();
         }
-        
+
         // Map opening to closing delimiter
         let end_delim = match start_delim {
             b'(' => b')',
@@ -820,62 +838,67 @@ impl<'a> SqliTokenizer<'a> {
             b'<' => b'>',
             _ => start_delim,
         };
-        
+
         // Find ending pattern
         let content_start = pos + 3;
         if let Some(end_pos) = self.find_qstring_end(content_start, end_delim) {
             let content = &self.input[content_start..end_pos];
-            self.current.assign(TYPE_STRING, content_start, end_pos - content_start, content);
+            self.current
+                .assign(TYPE_STRING, content_start, end_pos - content_start, content);
             self.current.str_open = b'q';
             self.current.str_close = b'q';
             end_pos + 2
         } else {
             let content = &self.input[content_start..];
-            self.current.assign(TYPE_STRING, content_start, slen - content_start, content);
+            self.current
+                .assign(TYPE_STRING, content_start, slen - content_start, content);
             self.current.str_open = b'q';
             self.current.str_close = CHAR_NULL;
             slen
         }
     }
-    
+
     fn parse_bstring(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         // Binary string: B'01011'
         if pos + 2 >= slen || self.input[pos + 1] != b'\'' {
             return self.parse_word();
         }
-        
+
         let content_start = pos + 2;
         let mut content_end = content_start;
-        
+
         // Only allow 0 and 1
-        while content_end < slen && (self.input[content_end] == b'0' || self.input[content_end] == b'1') {
+        while content_end < slen
+            && (self.input[content_end] == b'0' || self.input[content_end] == b'1')
+        {
             content_end += 1;
         }
-        
+
         if content_end >= slen || self.input[content_end] != b'\'' {
             return self.parse_word();
         }
-        
+
         let full_token = &self.input[pos..content_end + 1];
-        self.current.assign(TYPE_NUMBER, pos, content_end + 1 - pos, full_token);
+        self.current
+            .assign(TYPE_NUMBER, pos, content_end + 1 - pos, full_token);
         content_end + 1
     }
-    
+
     fn parse_xstring(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         // Hex string: X'deadbeef'
         if pos + 2 >= slen || self.input[pos + 1] != b'\'' {
             return self.parse_word();
         }
-        
+
         let content_start = pos + 2;
         let mut content_end = content_start;
-        
+
         // Only allow hex digits
         while content_end < slen {
             match self.input[content_end] {
@@ -883,55 +906,59 @@ impl<'a> SqliTokenizer<'a> {
                 _ => break,
             }
         }
-        
+
         if content_end >= slen || self.input[content_end] != b'\'' {
             return self.parse_word();
         }
-        
+
         let full_token = &self.input[pos..content_end + 1];
-        self.current.assign(TYPE_NUMBER, pos, content_end + 1 - pos, full_token);
+        self.current
+            .assign(TYPE_NUMBER, pos, content_end + 1 - pos, full_token);
         content_end + 1
     }
-    
+
     fn parse_bword(&mut self) -> usize {
         let pos = self.pos;
-        
+
         // SQL Server bracket words: [column name]
         if let Some(end_pos) = self.memchr(b']', &self.input[pos..]) {
             let actual_end = pos + end_pos;
             let content = &self.input[pos..=actual_end];
-            self.current.assign(TYPE_BAREWORD, pos, content.len(), content);
+            self.current
+                .assign(TYPE_BAREWORD, pos, content.len(), content);
             actual_end + 1
         } else {
             let content = &self.input[pos..];
-            self.current.assign(TYPE_BAREWORD, pos, content.len(), content);
+            self.current
+                .assign(TYPE_BAREWORD, pos, content.len(), content);
             self.input.len()
         }
     }
-    
+
     fn parse_word(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         // Find word boundary - matches C version's strlencspn character set
         let word_chars = b" []{}<>:\\?=@!#~+-*/&|^%(),';	\n\x0B\x0C\r\"\xA0\x00";
         let mut end_pos = pos;
-        
+
         while end_pos < slen && !word_chars.contains(&self.input[end_pos]) {
             end_pos += 1;
         }
-        
+
         let word_len = end_pos - pos;
         let word_slice = &self.input[pos..end_pos];
-        
-        self.current.assign(TYPE_BAREWORD, pos, word_len, word_slice);
-        
+
+        self.current
+            .assign(TYPE_BAREWORD, pos, word_len, word_slice);
+
         // Check for special delimiters within word
         for (i, &byte) in word_slice.iter().enumerate() {
             if byte == b'.' || byte == b'`' {
                 // For delimiter detection, we only need to check if the first i bytes
                 // form a valid keyword. Since libinjection keywords are ASCII-only,
-                // if the slice contains any non-UTF8 bytes (like 0xFF), it can't be 
+                // if the slice contains any non-UTF8 bytes (like 0xFF), it can't be
                 // a keyword anyway, so we can safely skip the lookup.
                 if let Ok(partial_word) = std::str::from_utf8(&word_slice[..i]) {
                     let token_type = self.lookup_word(partial_word);
@@ -945,7 +972,7 @@ impl<'a> SqliTokenizer<'a> {
                 // If UTF-8 conversion fails, continue - can't be a keyword
             }
         }
-        
+
         // Do full word lookup - only for valid UTF-8 sequences since keywords are ASCII-only
         if word_len < LIBINJECTION_SQLI_TOKEN_SIZE {
             if let Ok(word_str) = std::str::from_utf8(word_slice) {
@@ -956,14 +983,14 @@ impl<'a> SqliTokenizer<'a> {
             }
             // If UTF-8 conversion fails, leave as BAREWORD - bytes with 0xFF can't be keywords
         }
-        
+
         end_pos
     }
-    
+
     fn parse_tick(&mut self) -> usize {
         // MySQL backticks
         let pos = self.parse_string_core(self.pos, CHAR_TICK, 1);
-        
+
         // Check if backtick content is a keyword/function - only for valid UTF-8
         if let Ok(word_str) = std::str::from_utf8(&self.current.val[..self.current.len]) {
             let token_type = self.lookup_word(word_str);
@@ -976,30 +1003,30 @@ impl<'a> SqliTokenizer<'a> {
             // If UTF-8 conversion fails, default to bareword - 0xFF bytes can't be keywords
             self.current.token_type = TokenType::Bareword;
         }
-        
+
         pos
     }
-    
+
     fn parse_var(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
         let mut new_pos = pos + 1;
-        
+
         // Count @ symbols
         let mut at_count = 1;
         if new_pos < slen && self.input[new_pos] == b'@' {
             new_pos += 1;
             at_count = 2;
         }
-        
+
         self.current.count = at_count;
-        
+
         // Handle special cases like @@`version`
         if new_pos < slen {
             if self.input[new_pos] == b'`' {
                 self.pos = new_pos;
                 let result = self.parse_tick();
-                
+
                 // Store only the backtick content (without @ symbols) like C
                 // The backtick content is already parsed correctly by parse_tick
                 self.current.token_type = TokenType::Variable;
@@ -1007,56 +1034,58 @@ impl<'a> SqliTokenizer<'a> {
             } else if self.input[new_pos] == CHAR_SINGLE || self.input[new_pos] == CHAR_DOUBLE {
                 self.pos = new_pos;
                 let result = self.parse_string();
-                
+
                 // Store only the string content (without @ symbols) like C
                 // The string content is already parsed correctly by parse_string
                 self.current.token_type = TokenType::Variable;
                 return result;
             }
         }
-        
+
         // Regular variable name - must exactly match C implementation
         // C: " <>:\\?=@!#~+-*/&|^%(),';\t\n\v\f\r'`\""
         let var_chars = b" <>:\\?=@!#~+-*/&|^%(),;'\t\n\x0B\x0C\r'`\"";
         let mut end_pos = new_pos;
-        
+
         while end_pos < slen && !var_chars.contains(&self.input[end_pos]) {
             end_pos += 1;
         }
-        
+
         if end_pos == new_pos {
             // Empty variable name (just @ or @@ symbols)
-            // Store the @ symbols like C implementation 
+            // Store the @ symbols like C implementation
             let var_slice = &self.input[self.pos..new_pos]; // Include @ symbols
-            self.current.assign(TYPE_VARIABLE, self.pos, new_pos - self.pos, var_slice);
+            self.current
+                .assign(TYPE_VARIABLE, self.pos, new_pos - self.pos, var_slice);
             new_pos
         } else {
             // Non-empty variable - store the @ symbols + name like C
             let var_slice = &self.input[self.pos..end_pos]; // Include @ symbols
-            self.current.assign(TYPE_VARIABLE, self.pos, end_pos - self.pos, var_slice);
+            self.current
+                .assign(TYPE_VARIABLE, self.pos, end_pos - self.pos, var_slice);
             end_pos
         }
     }
-    
+
     fn parse_money(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         if pos + 1 == slen {
             self.current.assign_char(TYPE_BAREWORD, pos, b'$');
             return slen;
         }
-        
+
         let next_char = self.input[pos + 1];
-        
+
         // Check for $1,000.00 format
         let money_chars = b"0123456789.,";
         let mut end_pos = pos + 1;
-        
+
         while end_pos < slen && money_chars.contains(&self.input[end_pos]) {
             end_pos += 1;
         }
-        
+
         if end_pos > pos + 1 {
             // Check for special case: $. should be parsed as word
             if end_pos == pos + 2 && self.input[pos + 1] == b'.' {
@@ -1064,23 +1093,24 @@ impl<'a> SqliTokenizer<'a> {
             }
             // Found numeric content
             let money_slice = &self.input[pos..end_pos];
-            self.current.assign(TYPE_NUMBER, pos, end_pos - pos, money_slice);
+            self.current
+                .assign(TYPE_NUMBER, pos, end_pos - pos, money_slice);
             return end_pos;
         }
-        
+
         // Check for PostgreSQL $$ strings
         if next_char == b'$' {
             return self.parse_dollar_string();
         }
-        
+
         // Check for PostgreSQL $tag$ strings
         let tag_chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let mut tag_end = pos + 1;
-        
+
         while tag_end < slen && tag_chars.contains(&self.input[tag_end]) {
             tag_end += 1;
         }
-        
+
         if tag_end == pos + 1 {
             // Just $ followed by non-alphanumeric
             self.current.assign_char(TYPE_BAREWORD, pos, b'$');
@@ -1094,14 +1124,14 @@ impl<'a> SqliTokenizer<'a> {
             pos + 1
         }
     }
-    
+
     fn parse_number(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
         let mut end_pos = pos;
         let mut have_e = false;
         let mut have_exp = false;
-        
+
         // Handle special prefixes 0x, 0X, 0b, 0B
         if end_pos < slen && self.input[end_pos] == b'0' && end_pos + 1 < slen {
             match self.input[end_pos + 1] {
@@ -1113,7 +1143,7 @@ impl<'a> SqliTokenizer<'a> {
                             _ => break,
                         }
                     }
-                    
+
                     if end_pos == pos + 2 {
                         // No hex digits after 0x
                         let token = &self.input[pos..pos + 2];
@@ -1127,10 +1157,12 @@ impl<'a> SqliTokenizer<'a> {
                 }
                 b'B' | b'b' => {
                     end_pos += 2;
-                    while end_pos < slen && (self.input[end_pos] == b'0' || self.input[end_pos] == b'1') {
+                    while end_pos < slen
+                        && (self.input[end_pos] == b'0' || self.input[end_pos] == b'1')
+                    {
                         end_pos += 1;
                     }
-                    
+
                     if end_pos == pos + 2 {
                         // No binary digits after 0b
                         let token = &self.input[pos..pos + 2];
@@ -1145,52 +1177,56 @@ impl<'a> SqliTokenizer<'a> {
                 _ => {} // Continue with normal number parsing
             }
         }
-        
+
         let start_pos = end_pos;
-        
+
         // Parse integer part
         while end_pos < slen && self.input[end_pos].is_ascii_digit() {
             end_pos += 1;
         }
-        
+
         // Parse decimal part
         if end_pos < slen && self.input[end_pos] == b'.' {
             end_pos += 1;
             while end_pos < slen && self.input[end_pos].is_ascii_digit() {
                 end_pos += 1;
             }
-            
+
             if end_pos - start_pos == 1 {
                 // Only read '.', this is a dot token
                 self.current.assign_char(TYPE_DOT, start_pos, b'.');
                 return end_pos;
             }
         }
-        
+
         // Parse exponent
         if end_pos < slen && (self.input[end_pos] == b'E' || self.input[end_pos] == b'e') {
             have_e = true;
             end_pos += 1;
-            
+
             if end_pos < slen && (self.input[end_pos] == b'+' || self.input[end_pos] == b'-') {
                 end_pos += 1;
             }
-            
+
             while end_pos < slen && self.input[end_pos].is_ascii_digit() {
                 have_exp = true;
                 end_pos += 1;
             }
         }
-        
+
         // Oracle float/double suffix
         if end_pos < slen {
             match self.input[end_pos] {
                 b'd' | b'D' | b'f' | b'F' => {
                     if end_pos + 1 == slen {
                         end_pos += 1;
-                    } else if self.is_white_char(self.input[end_pos + 1]) || self.input[end_pos + 1] == b';' {
+                    } else if self.is_white_char(self.input[end_pos + 1])
+                        || self.input[end_pos + 1] == b';'
+                    {
                         end_pos += 1;
-                    } else if end_pos + 1 < slen && (self.input[end_pos + 1] == b'u' || self.input[end_pos + 1] == b'U') {
+                    } else if end_pos + 1 < slen
+                        && (self.input[end_pos + 1] == b'u' || self.input[end_pos + 1] == b'U')
+                    {
                         // Handle "1fUNION" -> "1f" "UNION"
                         end_pos += 1;
                     }
@@ -1198,21 +1234,23 @@ impl<'a> SqliTokenizer<'a> {
                 _ => {}
             }
         }
-        
+
         // Check for invalid exponential format
         if have_e && !have_exp {
             let token = &self.input[start_pos..end_pos];
-            self.current.assign(TYPE_BAREWORD, start_pos, end_pos - start_pos, token);
+            self.current
+                .assign(TYPE_BAREWORD, start_pos, end_pos - start_pos, token);
         } else {
             let token = &self.input[start_pos..end_pos];
-            self.current.assign(TYPE_NUMBER, start_pos, end_pos - start_pos, token);
+            self.current
+                .assign(TYPE_NUMBER, start_pos, end_pos - start_pos, token);
         }
-        
+
         end_pos
     }
-    
+
     // Helper functions
-    
+
     fn is_white_char(&self, ch: u8) -> bool {
         // Match C implementation exactly - libinjection_sqli.c lines 194-205 (char_is_white function)
         // C code: return strchr(" \t\n\v\f\r\240\000", ch) != NULL;
@@ -1228,15 +1266,15 @@ impl<'a> SqliTokenizer<'a> {
         // */
         matches!(ch, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | 0xA0 | 0x00)
     }
-    
+
     fn memchr(&self, needle: u8, haystack: &[u8]) -> Option<usize> {
         haystack.iter().position(|&x| x == needle)
     }
-    
+
     fn is_backslash_escaped(&self, pos: usize) -> bool {
         let mut backslash_count = 0;
         let mut current_pos = pos;
-        
+
         // Count consecutive backslashes backwards from pos (including pos itself)
         while current_pos < self.input.len() && self.input[current_pos] == b'\\' {
             backslash_count += 1;
@@ -1245,78 +1283,86 @@ impl<'a> SqliTokenizer<'a> {
             }
             current_pos -= 1;
         }
-        
+
         // If odd number of backslashes, the character after them is escaped
         backslash_count & 1 == 1
     }
-    
+
     fn is_double_delim_escaped(&self, pos: usize) -> bool {
         pos + 1 < self.input.len() && self.input[pos] == self.input[pos + 1]
     }
-    
+
     fn find_qstring_end(&self, start: usize, end_delim: u8) -> Option<usize> {
         let mut pos = start;
-        
+
         while pos + 1 < self.input.len() {
             if self.input[pos] == end_delim && self.input[pos + 1] == b'\'' {
                 return Some(pos);
             }
             pos += 1;
         }
-        
+
         None
     }
-    
+
     fn parse_dollar_string(&mut self) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
-        
+
         // $$ string $$
         let content_start = pos + 2;
-        
+
         // Find ending $$
         let mut end_pos = content_start;
         while end_pos + 1 < slen {
             if self.input[end_pos] == b'$' && self.input[end_pos + 1] == b'$' {
                 let content = &self.input[content_start..end_pos];
-                self.current.assign(TYPE_STRING, content_start, end_pos - content_start, content);
+                self.current
+                    .assign(TYPE_STRING, content_start, end_pos - content_start, content);
                 self.current.str_open = b'$';
                 self.current.str_close = b'$';
                 return end_pos + 2;
             }
             end_pos += 1;
         }
-        
+
         // No closing $$ found
         let content = &self.input[content_start..];
-        self.current.assign(TYPE_STRING, content_start, slen - content_start, content);
+        self.current
+            .assign(TYPE_STRING, content_start, slen - content_start, content);
         self.current.str_open = b'$';
         self.current.str_close = CHAR_NULL;
         slen
     }
-    
+
     fn parse_tagged_dollar_string(&mut self, tag_end: usize) -> usize {
         let pos = self.pos;
         let slen = self.input.len();
         let tag = &self.input[pos..=tag_end];
         let content_start = tag_end + 1;
-        
+
         // Find matching end tag
         let mut search_pos = content_start;
         while search_pos + tag.len() <= slen {
             if &self.input[search_pos..search_pos + tag.len()] == tag {
                 let content = &self.input[content_start..search_pos];
-                self.current.assign(TYPE_STRING, content_start, search_pos - content_start, content);
+                self.current.assign(
+                    TYPE_STRING,
+                    content_start,
+                    search_pos - content_start,
+                    content,
+                );
                 self.current.str_open = b'$';
                 self.current.str_close = b'$';
                 return search_pos + tag.len();
             }
             search_pos += 1;
         }
-        
+
         // No matching end tag
         let content = &self.input[content_start..];
-        self.current.assign(TYPE_STRING, content_start, slen - content_start, content);
+        self.current
+            .assign(TYPE_STRING, content_start, slen - content_start, content);
         self.current.str_open = b'$';
         self.current.str_close = CHAR_NULL;
         slen

@@ -6,13 +6,13 @@ use super::sqli_data;
 /// This matches libinjection_sqli_blacklist from the C version
 pub fn is_blacklisted(fingerprint: &str) -> bool {
     // Match the C version: convert v0 fingerprint to v1 format
-    // v0: up to 5 chars, mixed case  
+    // v0: up to 5 chars, mixed case
     // v1: '0' prefix, up to 5 more chars, upper case
-    
+
     if fingerprint.is_empty() {
         return false;
     }
-    
+
     let mut fp2 = [0u8; 8];
     fp2[0] = b'0';
     let mut len = 1;
