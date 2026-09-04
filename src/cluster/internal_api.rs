@@ -1,5 +1,8 @@
+use http::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
+use std::path::{Component, Path};
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -12,18 +15,33 @@ const MAX_METADATA_EVENT_STRING_BYTES: usize = 16 * 1024;
 const MAX_METADATA_HEADERS: usize = 256;
 const MAX_METADATA_HEADER_BYTES: usize = 64 * 1024;
 const MAX_POD_NAME_BYTES: usize = 253;
+const MAX_METADATA_OBJECT_BYTES: u64 = 1 << 40;
 // Cap per-connection lifetime — a misbehaving / malicious peer that trickles
 // one byte at a time must not be able to permanently occupy a Tokio task.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PURGE_ID_BYTES: usize = 256;
+
+static APPLIED_PURGE_IDS: LazyLock<dashmap::DashMap<String, u64>> =
+    LazyLock::new(dashmap::DashMap::new);
+
+fn purge_request_is_duplicate(purge_id: &str) -> bool {
+    APPLIED_PURGE_IDS.contains_key(purge_id)
+}
 
 #[derive(Debug, Deserialize)]
 struct PurgeRequest {
+    #[serde(default)]
+    purge_id: String,
     #[serde(default)]
     key: String,
     #[serde(rename = "key_type", default)]
     key_type: String,
     #[serde(default)]
     prefix: String,
+    #[serde(default)]
+    version: u64,
+    #[serde(default)]
+    leader_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -320,6 +338,26 @@ async fn handle_purge(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()>
             return Ok(());
         }
     };
+    if request.purge_id.is_empty()
+        || request.purge_id.len() > MAX_PURGE_ID_BYTES
+        || request.leader_epoch == 0
+    {
+        write_response(
+            stream,
+            400,
+            json!({"error":"purge_id and positive leader_epoch required"}),
+        )
+        .await?;
+        return Ok(());
+    }
+    if request.leader_epoch < crate::cluster::leader::ROLE_STATE.epoch() {
+        write_response(stream, 409, json!({"error":"stale leader epoch"})).await?;
+        return Ok(());
+    }
+    if purge_request_is_duplicate(&request.purge_id) {
+        write_response(stream, 200, json!({"ok":true,"duplicate":true})).await?;
+        return Ok(());
+    }
     let key = request.key.trim();
     let prefix = request.prefix.trim();
 
@@ -328,7 +366,12 @@ async fn handle_purge(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()>
             write_response(stream, 400, json!({"error":"tag key required"})).await?;
             return Ok(());
         }
-        if !crate::cache_manager::CACHE.storage.purge_by_tag(key).await {
+        let version = (request.version > 0).then_some(request.version);
+        if !crate::cache_manager::CACHE
+            .storage
+            .purge_by_tag_at_version(key, version)
+            .await
+        {
             write_response(stream, 500, json!({"error":"tag purge failed"})).await?;
             return Ok(());
         }
@@ -337,7 +380,15 @@ async fn handle_purge(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()>
             write_response(stream, 400, json!({"error":"dangerous purge prefix"})).await?;
             return Ok(());
         }
-        crate::cache_manager::CACHE.purge_prefix(prefix).await?;
+        let version = (request.version > 0).then_some(request.version);
+        if !crate::cache_manager::CACHE
+            .storage
+            .purge_by_prefix_at_version(prefix, version)
+            .await
+        {
+            write_response(stream, 500, json!({"error":"prefix purge failed"})).await?;
+            return Ok(());
+        }
     } else if !key.is_empty() {
         if crate::rpc::cache::is_prefix_purge(&request.key_type, key) {
             let prefix = crate::rpc::cache::normalize_purge_prefix(key);
@@ -345,15 +396,32 @@ async fn handle_purge(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()>
                 write_response(stream, 400, json!({"error":"dangerous purge prefix"})).await?;
                 return Ok(());
             }
-            crate::cache_manager::CACHE.purge_prefix(&prefix).await?;
+            let version = (request.version > 0).then_some(request.version);
+            if !crate::cache_manager::CACHE
+                .storage
+                .purge_by_prefix_at_version(&prefix, version)
+                .await
+            {
+                write_response(stream, 500, json!({"error":"prefix purge failed"})).await?;
+                return Ok(());
+            }
         } else {
-            crate::cache_manager::CACHE.purge_key(key).await?;
+            let version = (request.version > 0).then_some(request.version);
+            if !crate::cache_manager::CACHE
+                .storage
+                .purge_by_key_at_version(key, version)
+                .await
+            {
+                write_response(stream, 500, json!({"error":"key purge failed"})).await?;
+                return Ok(());
+            }
         }
     } else {
         write_response(stream, 400, json!({"error":"key, tag or prefix required"})).await?;
         return Ok(());
     }
 
+    APPLIED_PURGE_IDS.insert(request.purge_id, request.leader_epoch);
     write_response(stream, 200, json!({"ok":true})).await
 }
 
@@ -393,25 +461,107 @@ async fn handle_metadata_events(stream: &mut TcpStream, body: &[u8]) -> anyhow::
 }
 
 fn valid_metadata_event(event: &crate::cluster::metadata::CacheMetaEvent) -> bool {
-    event.event_id.len() <= MAX_METADATA_EVENT_STRING_BYTES
-        && event.pod_name.len() <= MAX_POD_NAME_BYTES
-        && event.hash.len() <= MAX_METADATA_EVENT_STRING_BYTES
-        && event.cache_key.len() <= MAX_METADATA_EVENT_STRING_BYTES
-        && event
-            .shard_id
-            .as_ref()
-            .is_none_or(|value| value.len() <= MAX_METADATA_EVENT_STRING_BYTES)
-        && event
-            .relative_path
-            .as_ref()
-            .is_none_or(|value| value.len() <= MAX_METADATA_EVENT_STRING_BYTES)
-        && event.headers.len() <= MAX_METADATA_HEADERS
-        && event
-            .headers
-            .iter()
-            .map(|(name, value)| name.len() + value.len())
-            .sum::<usize>()
-            <= MAX_METADATA_HEADER_BYTES
+    if event.event_id.is_empty()
+        || event.event_id.len() > MAX_METADATA_EVENT_STRING_BYTES
+        || event.pod_name.is_empty()
+        || event.pod_name.len() > MAX_POD_NAME_BYTES
+        || event.cache_key.is_empty()
+        || event.cache_key.len() > MAX_METADATA_EVENT_STRING_BYTES
+        || event.cache_key.chars().any(char::is_control)
+        || event.hash.len() != 32
+        || !event.hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || event.hash != format!("{:x}", md5_legacy::compute(event.cache_key.as_bytes()))
+        || event.version == 0
+        || event.created_at <= 0
+        || event.size > MAX_METADATA_OBJECT_BYTES
+    {
+        return false;
+    }
+
+    if event.pod_name.chars().any(char::is_control)
+        || event.event_id.chars().any(char::is_control)
+        || event.shard_id.as_ref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > MAX_METADATA_EVENT_STRING_BYTES
+                || value.chars().any(char::is_control)
+        })
+        || event.relative_path.as_ref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > MAX_METADATA_EVENT_STRING_BYTES
+                || !is_clean_relative_path(value)
+        })
+        || event.root_path.as_ref().is_some_and(|value| {
+            value.is_empty()
+                || value.len() > MAX_METADATA_EVENT_STRING_BYTES
+                || !is_clean_absolute_path(value)
+        })
+    {
+        return false;
+    }
+
+    match &event.event_type {
+        crate::cluster::metadata::CacheMetaEventType::Upsert => {
+            if !crate::cache::status_allows_full_cache_with_error_policy(
+                event.status,
+                event.error_status_allowed,
+            ) || event.expires <= 0
+            {
+                return false;
+            }
+        }
+        crate::cluster::metadata::CacheMetaEventType::Delete
+        | crate::cluster::metadata::CacheMetaEventType::Purge => {}
+    }
+
+    valid_metadata_headers(&event.headers)
+}
+
+fn valid_metadata_headers(headers: &[(String, String)]) -> bool {
+    if headers.len() > MAX_METADATA_HEADERS {
+        return false;
+    }
+    let mut total_bytes = 0usize;
+    let mut restored = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            return false;
+        };
+        let Ok(value) = HeaderValue::from_str(value) else {
+            return false;
+        };
+        // Content-Length is intentionally omitted from most persisted full
+        // object metadata and reconstructed from the body size.  HEAD
+        // metadata is the exception: it has no body but must retain the
+        // representation length.  HeaderMap also permits repeated fields
+        // (including repeated Cache-Control); reject only fields that the
+        // shared-cache policy itself rejects, not every duplicate name.
+        let is_content_length = name.as_str().eq_ignore_ascii_case("content-length");
+        if !crate::cache::should_store_response_header(name.as_str()) && !is_content_length {
+            return false;
+        }
+        total_bytes = total_bytes
+            .checked_add(name.as_str().len())
+            .and_then(|total| total.checked_add(value.as_bytes().len()))
+            .unwrap_or(MAX_METADATA_HEADER_BYTES.saturating_add(1));
+        if total_bytes > MAX_METADATA_HEADER_BYTES {
+            return false;
+        }
+        restored.append(name, value);
+    }
+    crate::cache::stored_response_headers_allow_shared_cache(headers)
+}
+
+fn is_clean_relative_path(value: &str) -> bool {
+    Path::new(value).is_relative()
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn is_clean_absolute_path(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::RootDir))
+        && components.all(|component| matches!(component, Component::Normal(_)))
 }
 
 async fn handle_stats_snapshot(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()> {
@@ -518,4 +668,82 @@ async fn write_response(
     );
     stream.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_metadata_event;
+    use crate::cluster::metadata::{CacheMetaEvent, CacheMetaEventType};
+
+    fn event(event_type: CacheMetaEventType) -> CacheMetaEvent {
+        let cache_key = "https://cache.example.test/item".to_string();
+        let hash = format!("{:x}", md5_legacy::compute(cache_key.as_bytes()));
+        CacheMetaEvent {
+            event_id: "event-1".to_string(),
+            event_type,
+            pod_name: "cache-pod-1".to_string(),
+            hash,
+            cache_key,
+            shard_id: None,
+            relative_path: Some("ab/cdef".to_string()),
+            root_path: Some("/var/lib/cloud-node/cache".to_string()),
+            size: 42,
+            expires: 2_000_000_000,
+            status: 200,
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            compressed: false,
+            error_status_allowed: false,
+            created_at: 1_900_000_000,
+            version: 1,
+            stale_while_revalidate_secs: 0,
+            stale_if_error_secs: 0,
+        }
+    }
+
+    #[test]
+    fn metadata_event_validation_accepts_safe_upsert() {
+        assert!(valid_metadata_event(&event(CacheMetaEventType::Upsert)));
+    }
+
+    #[test]
+    fn metadata_event_validation_rejects_bad_identity_and_paths() {
+        let mut bad_hash = event(CacheMetaEventType::Upsert);
+        bad_hash.hash.replace_range(..1, "0");
+        assert!(!valid_metadata_event(&bad_hash));
+
+        let mut bad_path = event(CacheMetaEventType::Upsert);
+        bad_path.root_path = Some("/var/lib/../etc".to_string());
+        assert!(!valid_metadata_event(&bad_path));
+
+        let mut bad_relative = event(CacheMetaEventType::Upsert);
+        bad_relative.relative_path = Some("../outside".to_string());
+        assert!(!valid_metadata_event(&bad_relative));
+    }
+
+    #[test]
+    fn metadata_event_validation_rejects_unsafe_headers_and_conflicting_lengths() {
+        let mut unsafe_header = event(CacheMetaEventType::Upsert);
+        unsafe_header.headers = vec![("set-cookie".to_string(), "sid=1".to_string())];
+        assert!(!valid_metadata_event(&unsafe_header));
+
+        let mut conflicting_lengths = event(CacheMetaEventType::Upsert);
+        conflicting_lengths.headers = vec![
+            ("content-length".to_string(), "42".to_string()),
+            ("Content-Length".to_string(), "43".to_string()),
+        ];
+        assert!(!valid_metadata_event(&conflicting_lengths));
+    }
+
+    #[test]
+    fn metadata_event_validation_accepts_repeated_safe_headers_and_lengths() {
+        let mut repeated = event(CacheMetaEventType::Upsert);
+        repeated.headers = vec![
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("cache-control".to_string(), "public".to_string()),
+            ("Cache-Control".to_string(), "max-age=60".to_string()),
+            ("content-length".to_string(), "42".to_string()),
+            ("Content-Length".to_string(), "42".to_string()),
+        ];
+        assert!(valid_metadata_event(&repeated));
+    }
 }

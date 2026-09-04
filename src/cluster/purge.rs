@@ -9,6 +9,7 @@ pub struct PurgeFanoutRequest {
     pub key_type: String,
     pub prefix: String,
     pub leader_epoch: u64,
+    pub version: u64,
 }
 
 pub async fn fanout(request: PurgeFanoutRequest) -> anyhow::Result<()> {
@@ -29,6 +30,7 @@ pub async fn fanout(request: PurgeFanoutRequest) -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
     let body = serde_json::to_vec(&request)?;
+    let mut failures = Vec::new();
     for peer in peers {
         let url = format!("{}/internal/v1/purge", peer);
         match client
@@ -41,10 +43,24 @@ pub async fn fanout(request: PurgeFanoutRequest) -> anyhow::Result<()> {
             .await
         {
             Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => warn!("CLUSTER_PURGE: peer {} returned {}", url, resp.status()),
-            Err(err) => warn!("CLUSTER_PURGE: peer {} failed: {}", url, err),
+            Ok(resp) => {
+                warn!("CLUSTER_PURGE: peer {} returned {}", url, resp.status());
+                failures.push(format!("{} returned {}", url, resp.status()));
+            }
+            Err(err) => {
+                warn!("CLUSTER_PURGE: peer {} failed: {}", url, err);
+                failures.push(format!("{url} failed: {err}"));
+            }
         }
     }
 
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "purge fanout failed for {} peer(s): {}",
+            failures.len(),
+            failures.join("; ")
+        )
+    }
 }

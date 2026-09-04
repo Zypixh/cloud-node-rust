@@ -17,11 +17,17 @@ pub struct CacheMetaEvent {
     pub cache_key: String,
     pub shard_id: Option<String>,
     pub relative_path: Option<String>,
+    #[serde(default)]
+    pub root_path: Option<String>,
     pub size: u64,
     pub expires: i64,
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub compressed: bool,
+    /// Explicit opt-in for caching this exact 5xx response. Older events
+    /// default to false so they cannot resurrect an error object.
+    #[serde(default)]
+    pub error_status_allowed: bool,
     pub created_at: i64,
     pub version: u64,
     // SWR window propagated to other pods in cluster mode so they can keep
@@ -29,6 +35,10 @@ pub struct CacheMetaEvent {
     // Older event payloads (without this field) default to 0 via serde(default).
     #[serde(default)]
     pub stale_while_revalidate_secs: u64,
+    /// Stale-if-error window propagated with the metadata so a remote node
+    /// can make the same stale-serving decision as the writer.
+    #[serde(default)]
+    pub stale_if_error_secs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,12 +54,36 @@ pub struct CacheMetaUpsertEvent<'a> {
     pub cache_key: &'a str,
     pub shard_id: Option<&'a str>,
     pub relative_path: Option<&'a str>,
+    pub root_path: Option<&'a str>,
     pub size: u64,
     pub expires: i64,
     pub status: u16,
     pub headers: &'a [(String, String)],
     pub compressed: bool,
+    pub error_status_allowed: bool,
     pub stale_while_revalidate_secs: u64,
+    pub stale_if_error_secs: u64,
+}
+
+fn effective_event_version(event: &CacheMetaEvent) -> u64 {
+    if event.version > 0 {
+        return event.version;
+    }
+    event
+        .created_at
+        .saturating_mul(1_000)
+        .try_into()
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn local_metadata_version(meta: &crate::metrics::storage::CacheMetaEntry) -> u64 {
+    meta.event_version.unwrap_or_else(|| {
+        meta.updated_at
+            .saturating_mul(1_000)
+            .try_into()
+            .unwrap_or(0)
+    })
 }
 
 pub fn emit_upsert(event: CacheMetaUpsertEvent<'_>) {
@@ -58,7 +92,7 @@ pub fn emit_upsert(event: CacheMetaUpsertEvent<'_>) {
     }
 
     let now = crate::utils::time::now_timestamp();
-    let version = crate::utils::time::now_timestamp_millis() as u64;
+    let version = crate::metrics::storage::next_cache_meta_event_version();
     let pod_name = crate::runtime_mode::RuntimeConfig::current()
         .and_then(|config| std::env::var(&config.cluster.pod_name_env).ok())
         .unwrap_or_default();
@@ -70,14 +104,17 @@ pub fn emit_upsert(event: CacheMetaUpsertEvent<'_>) {
         cache_key: event.cache_key.to_string(),
         shard_id: event.shard_id.map(str::to_string),
         relative_path: event.relative_path.map(str::to_string),
+        root_path: event.root_path.map(str::to_string),
         size: event.size,
         expires: event.expires,
         status: event.status,
         headers: event.headers.to_vec(),
         compressed: event.compressed,
+        error_status_allowed: event.error_status_allowed,
         created_at: now,
         version,
         stale_while_revalidate_secs: event.stale_while_revalidate_secs,
+        stale_if_error_secs: event.stale_if_error_secs,
     };
 
     let Some(tx) = METADATA_EVENT_TX.get() else {
@@ -89,14 +126,44 @@ pub fn emit_upsert(event: CacheMetaUpsertEvent<'_>) {
 }
 
 pub async fn apply_remote_event(event: CacheMetaEvent) {
+    let expected_hash = format!("{:x}", md5_legacy::compute(event.cache_key.as_bytes()));
+    if expected_hash != event.hash {
+        warn!(
+            hash = %event.hash,
+            cache_key = %event.cache_key,
+            "CLUSTER_METADATA: ignoring event with mismatched cache key hash"
+        );
+        return;
+    }
+    // Broad prefix/tag purges use a barrier. Holding its read side for the
+    // whole remote event prevents an old event with no locally visible key
+    // from being admitted while the purge is scanning.
+    let _purge_guard = crate::cache_hybrid::acquire_cache_purge_read_guard().await;
+    let lock_key = if event.cache_key.is_empty() {
+        event.hash.as_str()
+    } else {
+        event.cache_key.as_str()
+    };
+    let write_lock = crate::cache_hybrid::cache_write_lock_for_key(lock_key);
+    let _write_guard = write_lock.lock().await;
+    let event_version = effective_event_version(&event);
+    crate::metrics::storage::observe_cache_meta_event_version(event_version);
+
     match event.event_type {
         CacheMetaEventType::Upsert => {
-            if let Some(existing) = crate::metrics::storage::STORAGE.get_cache_meta(&event.hash)
-                && existing.event_version.unwrap_or(0) > event.version
+            if crate::metrics::storage::cache_meta_tombstone_version(&event.hash)
+                .is_some_and(|version| event_version <= version)
             {
                 return;
             }
-            crate::metrics::storage::STORAGE
+            if let Some(existing) = crate::metrics::storage::STORAGE.get_cache_meta(&event.hash) {
+                if local_metadata_version(&existing) > event_version
+                    || (existing.event_version.is_none() && existing.updated_at > event.created_at)
+                {
+                    return;
+                }
+            }
+            let persisted = crate::metrics::storage::STORAGE
                 .upsert_cache_meta_absolute_async(crate::metrics::storage::CacheMetaUpsert {
                     hash: &event.hash,
                     cache_key: &event.cache_key,
@@ -107,18 +174,45 @@ pub async fn apply_remote_event(event: CacheMetaEvent) {
                     status: event.status,
                     headers: &event.headers,
                     compressed: event.compressed,
+                    error_status_allowed: event.error_status_allowed,
                     shard_id: event.shard_id.as_deref(),
                     relative_path: event.relative_path.as_deref(),
-                    event_version: Some(event.version),
+                    root_path: event.root_path.as_deref(),
+                    event_version: Some(event_version),
                     updated_at: Some(event.created_at),
                     stale_while_revalidate_secs: event.stale_while_revalidate_secs,
+                    stale_if_error_secs: event.stale_if_error_secs,
                     created_at: event.created_at,
                 })
                 .await;
+            if !persisted {
+                warn!(
+                    hash = %event.hash,
+                    version = event_version,
+                    "CLUSTER_METADATA: remote upsert was not admitted or persisted"
+                );
+            }
         }
         CacheMetaEventType::Delete | CacheMetaEventType::Purge => {
+            if crate::metrics::storage::cache_meta_tombstone_version(&event.hash)
+                .is_some_and(|version| event_version <= version)
+            {
+                return;
+            }
+            if let Some(existing) = crate::metrics::storage::STORAGE.get_cache_meta(&event.hash) {
+                if local_metadata_version(&existing) > event_version
+                    || (existing.event_version.is_none() && existing.updated_at > event.created_at)
+                {
+                    return;
+                }
+            }
+            // The local metadata index may already be empty while a fallback
+            // L1 entry (metadata_required=false) is still resident.  In that
+            // case delete_cache_meta_async cannot discover the cache key, so
+            // invalidate it from the event before removing the metadata.
+            crate::cache_hybrid::invalidate_l1_key(&event.cache_key);
             crate::metrics::storage::STORAGE
-                .delete_cache_meta_async(&event.hash)
+                .delete_cache_meta_async_at_version(&event.hash, event_version)
                 .await;
         }
     }
