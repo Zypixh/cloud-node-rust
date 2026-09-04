@@ -905,11 +905,10 @@ where
                         break;
                     }
                     // only log error that will be retried here, the final error will be logged below
-                    if !self.inner.suppress_error_log(
-                        &session,
-                        &ctx,
-                        proxy_error.as_ref().unwrap(),
-                    ) {
+                    if !self
+                        .inner
+                        .suppress_error_log(&session, &ctx, proxy_error.as_ref().unwrap())
+                    {
                         warn!(
                             "Fail to proxy: {}, tries: {}, retry: {}, {}",
                             proxy_error.as_ref().unwrap(),
@@ -1191,7 +1190,6 @@ where
             // stop downstream from reusing if this service is shutting down soon
             session.set_keepalive(None);
         }
-
 
         // Deliver user context from the previous request on this reused connection
         if let Some(prev_ctx) = prev_user_ctx {

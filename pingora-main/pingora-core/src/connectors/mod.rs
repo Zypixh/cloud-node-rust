@@ -226,31 +226,31 @@ impl TransportConnector {
                 };
 
                 if let Some(mut stream) = stream_opt {
-                        // test_reusable_stream: we assume server would never actively send data
-                        // first on an idle stream.
-                        #[cfg(unix)]
-                        if peer.matches_fd(stream.id()) && test_reusable_stream(&mut stream) {
+                    // test_reusable_stream: we assume server would never actively send data
+                    // first on an idle stream.
+                    #[cfg(unix)]
+                    if peer.matches_fd(stream.id()) && test_reusable_stream(&mut stream) {
+                        Some(stream)
+                    } else {
+                        None
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::io::{AsRawSocket, RawSocket};
+                        struct WrappedRawSocket(RawSocket);
+                        impl AsRawSocket for WrappedRawSocket {
+                            fn as_raw_socket(&self) -> RawSocket {
+                                self.0
+                            }
+                        }
+                        if peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
+                            && test_reusable_stream(&mut stream)
+                        {
                             Some(stream)
                         } else {
                             None
                         }
-                        #[cfg(windows)]
-                        {
-                            use std::os::windows::io::{AsRawSocket, RawSocket};
-                            struct WrappedRawSocket(RawSocket);
-                            impl AsRawSocket for WrappedRawSocket {
-                                fn as_raw_socket(&self) -> RawSocket {
-                                    self.0
-                                }
-                            }
-                            if peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
-                                && test_reusable_stream(&mut stream)
-                            {
-                                Some(stream)
-                            } else {
-                                None
-                            }
-                        }
+                    }
                 } else {
                     None
                 }
