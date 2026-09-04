@@ -414,7 +414,7 @@ fn apply_template_modifier(value: String, modifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_models::{ServerConfig, WebConfig};
+    use crate::config_models::ServerConfig;
 
     #[test]
     fn parse_candidate_ip_handles_forwarded_for_first_hop() {
