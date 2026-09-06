@@ -162,4 +162,17 @@ mod tests {
         let second = retry.await.unwrap().unwrap();
         assert_eq!(second.local_addr().unwrap(), addr);
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_udp_bind_allows_two_sockets_on_same_address() {
+        let first = bind_udp_socket("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = first.local_addr().unwrap();
+        let second = bind_udp_socket(addr).await.unwrap();
+
+        assert_eq!(first.local_addr().unwrap(), addr);
+        assert_eq!(second.local_addr().unwrap(), addr);
+    }
 }

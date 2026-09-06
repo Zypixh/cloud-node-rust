@@ -1043,6 +1043,10 @@ impl MemoryGovernor {
         udp_demux_worker_count(&self.memory_snapshot())
     }
 
+    pub fn udp_direct_worker_count(&self) -> usize {
+        udp_direct_worker_count(&self.memory_snapshot())
+    }
+
     pub fn connection_admission_used_bytes(&self) -> u64 {
         self.shared_connection_bytes.load(Ordering::Relaxed)
     }
@@ -2304,6 +2308,10 @@ fn udp_demux_worker_count(snapshot: &BudgetedMemorySnapshot) -> usize {
     base.max(1).min(memory_target).clamp(1, pressure_cap.max(1))
 }
 
+fn udp_direct_worker_count(snapshot: &BudgetedMemorySnapshot) -> usize {
+    udp_demux_worker_count(snapshot)
+}
+
 fn event_queue_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
     bounded_budget_from_available(
         snapshot.total_bytes,
@@ -3269,6 +3277,26 @@ mod tests {
         assert!(http_accept_worker_count(&large) > http_accept_worker_count(&small));
         assert_eq!(udp_demux_worker_count(&small), 1);
         assert!(udp_demux_worker_count(&large) > http_accept_worker_count(&large));
+    }
+
+    #[test]
+    fn udp_direct_workers_match_demux_snapshot_bounds() {
+        let small = synthetic_snapshot(2, 1, 65_535, 2);
+        let normal = synthetic_snapshot(16, 12, 1_048_576, 8);
+        let pressured = synthetic_snapshot(16, 1, 1_048_576, 8);
+        let large = synthetic_snapshot(256, 192, 16_777_216, 128);
+
+        for snapshot in [&small, &normal, &pressured, &large] {
+            let direct = udp_direct_worker_count(snapshot);
+            assert!((1..=MAX_UDP_DEMUX_WORKERS_PER_PORT).contains(&direct));
+            assert_eq!(direct, udp_demux_worker_count(snapshot));
+        }
+        assert_eq!(udp_direct_worker_count(&small), 1);
+        assert_eq!(
+            udp_direct_worker_count(&pressured),
+            MAX_UDP_DEMUX_WORKERS_PER_PORT / 4
+        );
+        assert!(udp_direct_worker_count(&large) > udp_direct_worker_count(&normal));
     }
 
     #[test]

@@ -323,6 +323,8 @@ impl QueuedUdpDatagram {
 
 struct ListenerHandle {
     shutdown_tx: watch::Sender<bool>,
+    listener_id: u64,
+    generation: u64,
 }
 
 pub struct UdpProxyManager {
@@ -332,6 +334,8 @@ pub struct UdpProxyManager {
     /// (ClientAddr, ListenPort) -> Session
     sessions: Arc<DashMap<(SocketAddr, u16), Arc<UdpSession>>>,
     handled_ports: DashMap<SocketAddr, ListenerHandle>,
+    next_listener_id: AtomicU64,
+    next_listener_generation: AtomicU64,
     next_session_id: AtomicU64,
 }
 
@@ -376,6 +380,8 @@ impl UdpProxyManager {
             node_id,
             sessions: Arc::new(DashMap::new()),
             handled_ports: DashMap::new(),
+            next_listener_id: AtomicU64::new(1),
+            next_listener_generation: AtomicU64::new(1),
             next_session_id: AtomicU64::new(1),
         })
     }
@@ -467,16 +473,39 @@ impl UdpProxyManager {
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        self.handled_ports
-            .insert(bind_addr, ListenerHandle { shutdown_tx });
+        let listener_id = self.next_listener_id.fetch_add(1, Ordering::Relaxed);
+        let generation = self
+            .next_listener_generation
+            .fetch_add(1, Ordering::Relaxed);
+        self.handled_ports.insert(
+            bind_addr,
+            ListenerHandle {
+                shutdown_tx,
+                listener_id,
+                generation,
+            },
+        );
 
-        let manager = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = manager.clone().run_listener(bind_addr, shutdown_rx).await {
-                error!("UDP listener on {} failed: {}", bind_addr, e);
-                manager.handled_ports.remove(&bind_addr);
-            }
-        });
+        let worker_count = MEMORY_GOVERNOR.udp_direct_worker_count();
+        for worker_id in 0..worker_count {
+            let manager = self.clone();
+            let worker_shutdown_rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = manager
+                    .clone()
+                    .run_listener(bind_addr, worker_shutdown_rx)
+                    .await
+                {
+                    error!(
+                        "UDP listener on {} worker {} failed: {}",
+                        bind_addr, worker_id, e
+                    );
+                    manager.handled_ports.remove_if(&bind_addr, |_, handle| {
+                        handle.listener_id == listener_id && handle.generation == generation
+                    });
+                }
+            });
+        }
     }
 
     fn reconcile_listeners(&self, desired_listeners: &std::collections::HashSet<SocketAddr>) {
@@ -504,7 +533,7 @@ impl UdpProxyManager {
         let port = bind_addr.port();
         let listen_socket = Arc::new(bind_udp_socket(bind_addr).await?);
         let downstream_sender = udp_socket_downstream(listen_socket.clone());
-        info!("UDP Proxy listening on {}", bind_addr);
+        info!("UDP Proxy worker listening on {}", bind_addr);
 
         let mut buf = vec![0u8; 65535];
         loop {
