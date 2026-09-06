@@ -3,13 +3,13 @@ use dashmap::DashMap;
 use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::LazyLock as Lazy;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{Notify, RwLock, mpsc, watch};
 use tokio::time::{Instant as TokioInstant, sleep_until};
 use tracing::{debug, error, info, warn};
 
@@ -333,10 +333,51 @@ pub struct UdpProxyManager {
     node_id: i64,
     /// (ClientAddr, ListenPort) -> Session
     sessions: Arc<DashMap<(SocketAddr, u16), Arc<UdpSession>>>,
+    inflight_sessions: Arc<DashMap<(SocketAddr, u16), Arc<InflightUdpSession>>>,
+    #[cfg(test)]
+    session_creation_attempts: AtomicU64,
     handled_ports: DashMap<SocketAddr, ListenerHandle>,
     next_listener_id: AtomicU64,
     next_listener_generation: AtomicU64,
     next_session_id: AtomicU64,
+}
+
+type SharedUdpCreationResult = Result<Option<Arc<UdpSession>>, Arc<anyhow::Error>>;
+
+struct InflightUdpSession {
+    result: Mutex<Option<SharedUdpCreationResult>>,
+    notify: Notify,
+}
+
+struct InflightUdpSessionGuard<'a> {
+    manager: &'a UdpProxyManager,
+    key: (SocketAddr, u16),
+    flight: Arc<InflightUdpSession>,
+}
+
+impl Drop for InflightUdpSessionGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut result) = self.flight.result.lock() {
+            if result.is_none() {
+                *result = Some(Err(Arc::new(anyhow::anyhow!(
+                    "UDP session creation cancelled"
+                ))));
+            }
+        }
+        self.manager
+            .inflight_sessions
+            .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.flight));
+        self.flight.notify.notify_waiters();
+    }
+}
+
+impl InflightUdpSession {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
 }
 
 pub(crate) struct UdpPassthroughSessionArgs {
@@ -379,6 +420,9 @@ impl UdpProxyManager {
             waf_state,
             node_id,
             sessions: Arc::new(DashMap::new()),
+            inflight_sessions: Arc::new(DashMap::new()),
+            #[cfg(test)]
+            session_creation_attempts: AtomicU64::new(0),
             handled_ports: DashMap::new(),
             next_listener_id: AtomicU64::new(1),
             next_listener_generation: AtomicU64::new(1),
@@ -746,6 +790,64 @@ impl UdpProxyManager {
         if let Some(session) = self.sessions.get(&key) {
             return Ok(Some(session.clone()));
         }
+        let (flight, is_creator) = match self.inflight_sessions.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => (entry.get().clone(), false),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let flight = Arc::new(InflightUdpSession::new());
+                entry.insert(flight.clone());
+                (flight, true)
+            }
+        };
+        if !is_creator {
+            loop {
+                let notified = flight.notify.notified();
+                if let Some(result) = flight.result.lock().unwrap().clone() {
+                    return result.map_err(|err| anyhow::anyhow!(err.to_string()));
+                }
+                notified.await;
+            }
+        }
+        let _flight_guard = InflightUdpSessionGuard {
+            manager: self,
+            key,
+            flight: flight.clone(),
+        };
+        #[cfg(test)]
+        self.session_creation_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        tokio::task::yield_now().await;
+        let result = self
+            .create_passthrough_session_for_server_impl(UdpPassthroughSessionArgs {
+                client_addr,
+                port,
+                server,
+                probed_server_name,
+                downstream_sender,
+                shutdown_rx,
+                quic_cid_tx,
+            })
+            .await
+            .map_err(Arc::new);
+        *flight.result.lock().unwrap() = Some(result.clone());
+        flight.notify.notify_waiters();
+        result.map_err(|err| anyhow::anyhow!(err.to_string()))
+    }
+
+    async fn create_passthrough_session_for_server_impl(
+        &self,
+        args: UdpPassthroughSessionArgs,
+    ) -> anyhow::Result<Option<Arc<UdpSession>>> {
+        let UdpPassthroughSessionArgs {
+            client_addr,
+            port,
+            server,
+            probed_server_name,
+            downstream_sender,
+            shutdown_rx,
+            quic_cid_tx,
+        } = args;
+        let key = (client_addr, port);
         if crate::l4_defense::is_l4_blocked(&self.config_store, &self.waf_state, client_addr.ip()) {
             return Ok(None);
         }
@@ -1953,5 +2055,49 @@ mod tests {
             .await
             .expect("normal UDP server should match first");
         assert_eq!(server.numeric_id(), 10);
+    }
+
+    #[tokio::test]
+    async fn concurrent_udp_session_creation_runs_route_chain_once_and_shares_failure() {
+        let store = ConfigStore::new();
+        let manager = UdpProxyManager::new(store, Arc::new(WafStateManager::new()), 1);
+        let server = Arc::new(ServerConfig {
+            id: Some(999),
+            is_on: true,
+            ..Default::default()
+        });
+        let client_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (downstream_tx, _downstream_rx) = mpsc::channel(4);
+        let args = || UdpPassthroughSessionArgs {
+            client_addr,
+            port: 443,
+            server: server.clone(),
+            probed_server_name: None,
+            downstream_sender: UdpDownstreamSender::channel(
+                "127.0.0.1:443".parse().unwrap(),
+                downstream_tx.clone(),
+            ),
+            shutdown_rx: shutdown_rx.clone(),
+            quic_cid_tx: None,
+        };
+
+        let (first, second) = tokio::join!(
+            manager.create_passthrough_session_for_server_with_cid_updates_and_downstream(args()),
+            manager.create_passthrough_session_for_server_with_cid_updates_and_downstream(args()),
+        );
+
+        let first = match first {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("first creation unexpectedly succeeded"),
+        };
+        let second = match second {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("second creation unexpectedly succeeded"),
+        };
+        assert_eq!(first, "No load balancer found for server id 999");
+        assert_eq!(second, first);
+        assert_eq!(manager.session_creation_attempts.load(Ordering::Relaxed), 1);
+        assert!(manager.inflight_sessions.is_empty());
     }
 }
