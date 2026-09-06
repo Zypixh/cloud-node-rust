@@ -155,6 +155,7 @@ impl UdpTransferAccumulator {
     }
 }
 
+#[cfg(test)]
 async fn resolve_udp_backend_addr(
     addr: String,
     origin_host: Option<&str>,
@@ -541,12 +542,12 @@ struct InflightUdpSessionGuard<'a> {
 
 impl Drop for InflightUdpSessionGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut result) = self.flight.result.lock() {
-            if result.is_none() {
-                *result = Some(Err(Arc::new(anyhow::anyhow!(
-                    "UDP session creation cancelled"
-                ))));
-            }
+        if let Ok(mut result) = self.flight.result.lock()
+            && result.is_none()
+        {
+            *result = Some(Err(Arc::new(anyhow::anyhow!(
+                "UDP session creation cancelled"
+            ))));
         }
         self.manager
             .inflight_sessions
