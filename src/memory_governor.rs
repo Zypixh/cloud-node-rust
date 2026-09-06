@@ -3294,7 +3294,7 @@ mod tests {
         assert_eq!(udp_direct_worker_count(&small), 1);
         assert_eq!(
             udp_direct_worker_count(&pressured),
-            MAX_UDP_DEMUX_WORKERS_PER_PORT / 4
+            udp_demux_worker_count(&pressured)
         );
         assert!(udp_direct_worker_count(&large) > udp_direct_worker_count(&normal));
     }
