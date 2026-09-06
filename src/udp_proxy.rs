@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use dashmap::DashMap;
+use moka::sync::Cache;
 use std::collections::{HashSet, VecDeque};
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::LazyLock as Lazy;
@@ -27,6 +29,8 @@ const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_MAX_QUIC_CIDS: usize = 8;
 const UDP_METRICS_FLUSH_BYTES: u64 = 1024 * 1024;
 const UDP_METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const UDP_DNS_CACHE_TTL: Duration = Duration::from_secs(30);
+const UDP_DNS_CACHE_CAPACITY: u64 = 4096;
 
 static UDP_ACTIVITY_EPOCH: Lazy<Instant> = Lazy::new(Instant::now);
 
@@ -182,6 +186,184 @@ async fn resolve_udp_backend_addr(
         .ok_or_else(|| anyhow::anyhow!("UDP backend address {} resolved no addresses", lookup_addr))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UdpDnsCacheKey {
+    origin_id: i64,
+    host: String,
+    port: u16,
+    prefer_ipv4: bool,
+    runtime_reload_generation: u64,
+}
+
+type SharedUdpDnsResult = Result<Arc<Vec<SocketAddr>>, Arc<anyhow::Error>>;
+
+struct InflightUdpDnsLookup {
+    result: Mutex<Option<SharedUdpDnsResult>>,
+    notify: Notify,
+}
+
+impl InflightUdpDnsLookup {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+}
+
+struct UdpDnsResolutionCache {
+    cache: Cache<UdpDnsCacheKey, Arc<Vec<SocketAddr>>>,
+    inflight: DashMap<UdpDnsCacheKey, Arc<InflightUdpDnsLookup>>,
+}
+
+impl UdpDnsResolutionCache {
+    fn new() -> Self {
+        Self {
+            cache: Cache::builder()
+                .max_capacity(UDP_DNS_CACHE_CAPACITY)
+                .time_to_live(UDP_DNS_CACHE_TTL)
+                .build(),
+            inflight: DashMap::new(),
+        }
+    }
+
+    async fn resolve<F, Fut>(
+        &self,
+        key: UdpDnsCacheKey,
+        lookup_addr: String,
+        client_ip: IpAddr,
+        lookup: F,
+    ) -> anyhow::Result<SocketAddr>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<SocketAddr>>>,
+    {
+        if let Some(addrs) = self.cache.get(&key) {
+            return select_udp_backend_addr(&addrs, &lookup_addr, client_ip);
+        }
+
+        let (flight, is_leader) = match self.inflight.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => (entry.get().clone(), false),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let flight = Arc::new(InflightUdpDnsLookup::new());
+                entry.insert(flight.clone());
+                (flight, true)
+            }
+        };
+
+        if is_leader {
+            let result = lookup(lookup_addr.clone())
+                .await
+                .and_then(|addrs| {
+                    if addrs.is_empty() {
+                        Err(anyhow::anyhow!(
+                            "UDP backend address {} resolved no addresses",
+                            lookup_addr
+                        ))
+                    } else {
+                        Ok(Arc::new(addrs))
+                    }
+                })
+                .map_err(Arc::new);
+            if let Ok(addrs) = &result {
+                self.cache.insert(key.clone(), addrs.clone());
+            }
+            *flight.result.lock().unwrap() = Some(result.clone());
+            self.inflight
+                .remove_if(&key, |_, current| Arc::ptr_eq(current, &flight));
+            flight.notify.notify_waiters();
+            match result {
+                Ok(addrs) => select_udp_backend_addr(&addrs, &lookup_addr, client_ip),
+                Err(err) => Err(anyhow::anyhow!(err.to_string())),
+            }
+        } else {
+            loop {
+                if let Some(result) = flight.result.lock().unwrap().clone() {
+                    return match result {
+                        Ok(addrs) => select_udp_backend_addr(&addrs, &lookup_addr, client_ip),
+                        Err(err) => Err(anyhow::anyhow!(err.to_string())),
+                    };
+                }
+                flight.notify.notified().await;
+            }
+        }
+    }
+}
+
+fn select_udp_backend_addr(
+    addrs: &[SocketAddr],
+    lookup_addr: &str,
+    client_ip: IpAddr,
+) -> anyhow::Result<SocketAddr> {
+    addrs
+        .iter()
+        .copied()
+        .find(|addr| addr.is_ipv4() == client_ip.is_ipv4())
+        .or_else(|| addrs.first().copied())
+        .ok_or_else(|| anyhow::anyhow!("UDP backend address {} resolved no addresses", lookup_addr))
+}
+
+async fn resolve_udp_backend_addr_cached(
+    cache: &UdpDnsResolutionCache,
+    origin_id: i64,
+    addr: String,
+    origin_host: Option<&str>,
+    client_ip: IpAddr,
+    runtime_reload_generation: u64,
+) -> anyhow::Result<SocketAddr> {
+    let lookup_host =
+        origin_host.filter(|host| !host.is_empty() && host.parse::<IpAddr>().is_err());
+    let lookup_addr = lookup_host.and_then(|host| {
+        addr.rsplit_once(':')
+            .map(|(_, port)| format!("{}:{}", host, port))
+    });
+
+    let Some(lookup_addr) = lookup_addr else {
+        if let Ok(addr) = addr.parse() {
+            return Ok(addr);
+        }
+        let lookup_addr = addr.clone();
+        let key = UdpDnsCacheKey {
+            origin_id,
+            host: lookup_addr
+                .rsplit_once(':')
+                .map(|(host, _)| host.trim_matches(['[', ']']).to_string())
+                .unwrap_or_else(|| lookup_addr.clone()),
+            port: lookup_addr
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse().ok())
+                .unwrap_or(0),
+            prefer_ipv4: client_ip.is_ipv4(),
+            runtime_reload_generation,
+        };
+        return cache
+            .resolve(key, lookup_addr.clone(), client_ip, |lookup_addr| async move {
+                Ok(tokio::net::lookup_host(&lookup_addr).await?.collect())
+            })
+            .await;
+    };
+
+    let port = addr
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid UDP backend address {}", addr))?;
+    let key = UdpDnsCacheKey {
+        origin_id,
+        host: lookup_host.unwrap_or_default().to_string(),
+        port,
+        prefer_ipv4: client_ip.is_ipv4(),
+        runtime_reload_generation,
+    };
+    cache
+        .resolve(
+            key,
+            lookup_addr.clone(),
+            client_ip,
+            |lookup_addr| async move { Ok(tokio::net::lookup_host(&lookup_addr).await?.collect()) },
+        )
+        .await
+}
+
 /// Session tracking for UDP sessions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpSessionSendStatus {
@@ -331,6 +513,7 @@ pub struct UdpProxyManager {
     config_store: ConfigStore,
     waf_state: Arc<WafStateManager>,
     node_id: i64,
+    dns_cache: Arc<UdpDnsResolutionCache>,
     /// (ClientAddr, ListenPort) -> Session
     sessions: Arc<DashMap<(SocketAddr, u16), Arc<UdpSession>>>,
     inflight_sessions: Arc<DashMap<(SocketAddr, u16), Arc<InflightUdpSession>>>,
@@ -419,6 +602,7 @@ impl UdpProxyManager {
             config_store,
             waf_state,
             node_id,
+            dns_cache: Arc::new(UdpDnsResolutionCache::new()),
             sessions: Arc::new(DashMap::new()),
             inflight_sessions: Arc::new(DashMap::new()),
             #[cfg(test)]
@@ -939,8 +1123,15 @@ impl UdpProxyManager {
             .ext
             .get::<BackendExtension>()
             .map(|ext| ext.origin_host.as_str());
-        let b_addr =
-            resolve_udp_backend_addr(peer.addr.to_string(), origin_host, client_addr.ip()).await?;
+        let b_addr = resolve_udp_backend_addr_cached(
+            &self.dns_cache,
+            origin_id,
+            peer.addr.to_string(),
+            origin_host,
+            client_addr.ip(),
+            self.config_store.runtime_reload_generation(),
+        )
+        .await?;
 
         debug!(
             "Created new UDP session: {} -> {} (Server {})",
@@ -1518,6 +1709,149 @@ mod tests {
         .unwrap();
 
         assert_eq!(addr, "127.0.0.1:18443".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn dns_cache_single_flight_shares_success_and_preserves_all_addresses() {
+        let cache = Arc::new(UdpDnsResolutionCache::new());
+        let key = UdpDnsCacheKey {
+            origin_id: 7,
+            host: "controlled.example".to_string(),
+            port: 18443,
+            prefer_ipv4: true,
+            runtime_reload_generation: 3,
+        };
+        let calls = Arc::new(AtomicU64::new(0));
+        let lookup = |_: String| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(vec![
+                    "[::1]:18443".parse().unwrap(),
+                    "127.0.0.1:18443".parse().unwrap(),
+                ])
+            }
+        };
+
+        let (first, second) = tokio::join!(
+            cache.resolve(
+                key.clone(),
+                "controlled.example:18443".to_string(),
+                "127.0.0.1".parse().unwrap(),
+                lookup
+            ),
+            cache.resolve(
+                key.clone(),
+                "controlled.example:18443".to_string(),
+                "127.0.0.1".parse().unwrap(),
+                |_| async { panic!("single-flight follower performed lookup") }
+            ),
+        );
+
+        assert_eq!(first.unwrap(), "127.0.0.1:18443".parse().unwrap());
+        assert_eq!(second.unwrap(), "127.0.0.1:18443".parse().unwrap());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.cache.get(&key).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dns_cache_shares_errors_without_caching_them_and_allows_retry() {
+        let cache = Arc::new(UdpDnsResolutionCache::new());
+        let key = UdpDnsCacheKey {
+            origin_id: 8,
+            host: "controlled.example".to_string(),
+            port: 18443,
+            prefer_ipv4: false,
+            runtime_reload_generation: 4,
+        };
+        let calls = Arc::new(AtomicU64::new(0));
+        let first_calls = calls.clone();
+        let (first, second) = tokio::join!(
+            cache.resolve(
+                key.clone(),
+                "controlled.example:18443".to_string(),
+                "::1".parse().unwrap(),
+                move |_| async move {
+                    first_calls.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Err(anyhow::anyhow!("controlled resolver failure"))
+                }
+            ),
+            cache.resolve(
+                key.clone(),
+                "controlled.example:18443".to_string(),
+                "::1".parse().unwrap(),
+                |_| async { panic!("single-flight follower performed lookup") }
+            ),
+        );
+        assert_eq!(
+            first.unwrap_err().to_string(),
+            "controlled resolver failure"
+        );
+        assert_eq!(
+            second.unwrap_err().to_string(),
+            "controlled resolver failure"
+        );
+        assert!(cache.cache.get(&key).is_none());
+
+        let retry_calls = calls.clone();
+        let retry = cache
+            .resolve(
+                key,
+                "controlled.example:18443".to_string(),
+                "::1".parse().unwrap(),
+                move |_| async move {
+                    retry_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(vec!["[::1]:18443".parse().unwrap()])
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry, "[::1]:18443".parse().unwrap());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn dns_cache_does_not_cache_empty_success_results() {
+        let cache = UdpDnsResolutionCache::new();
+        let key = UdpDnsCacheKey {
+            origin_id: 10,
+            host: "controlled.example".to_string(),
+            port: 18443,
+            prefer_ipv4: true,
+            runtime_reload_generation: 5,
+        };
+        let result = cache
+            .resolve(
+                key.clone(),
+                "controlled.example:18443".to_string(),
+                "127.0.0.1".parse().unwrap(),
+                |_| async { Ok(Vec::new()) },
+            )
+            .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "UDP backend address controlled.example:18443 resolved no addresses"
+        );
+        assert!(cache.cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn dns_cache_key_separates_generation_and_address_family_preference() {
+        let base = UdpDnsCacheKey {
+            origin_id: 9,
+            host: "controlled.example".to_string(),
+            port: 53,
+            prefer_ipv4: true,
+            runtime_reload_generation: 1,
+        };
+        let mut generation = base.clone();
+        generation.runtime_reload_generation = 2;
+        let mut family = base.clone();
+        family.prefer_ipv4 = false;
+        assert_ne!(base, generation);
+        assert_ne!(base, family);
     }
 
     #[tokio::test]
