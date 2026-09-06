@@ -2345,7 +2345,9 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: 77,
-            client_addr: Arc::new(tokio::sync::RwLock::new("127.0.0.1:10000".parse().unwrap())),
+            client_addr: Arc::new(arc_swap::ArcSwap::from_pointee(
+                "127.0.0.1:10000".parse().unwrap(),
+            )),
             listen_port: 443,
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,
@@ -2394,7 +2396,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let route = RouteKind::Passthrough(Arc::new(UdpSession {
             id: 78,
-            client_addr: Arc::new(tokio::sync::RwLock::new(original_addr)),
+            client_addr: Arc::new(arc_swap::ArcSwap::from_pointee(original_addr)),
             listen_port: 443,
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,
@@ -2697,7 +2699,9 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: 77,
-            client_addr: Arc::new(tokio::sync::RwLock::new("127.0.0.1:10000".parse().unwrap())),
+            client_addr: Arc::new(arc_swap::ArcSwap::from_pointee(
+                "127.0.0.1:10000".parse().unwrap(),
+            )),
             listen_port: 443,
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,

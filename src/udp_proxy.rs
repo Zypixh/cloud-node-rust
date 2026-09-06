@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
 use moka::sync::Cache;
@@ -390,7 +391,7 @@ pub struct UdpSessionQuicCid {
 
 pub struct UdpSession {
     pub id: u64,
-    pub client_addr: Arc<RwLock<SocketAddr>>,
+    pub client_addr: Arc<ArcSwap<SocketAddr>>,
     pub listen_port: u16,
     pub backend_addr: SocketAddr,
     pub origin_id: i64,
@@ -581,7 +582,7 @@ struct UdpHandleSessionArgs {
     session_shutdown_rx: watch::Receiver<bool>,
     server_id: i64,
     origin_id: i64,
-    client_addr: Arc<RwLock<SocketAddr>>,
+    client_addr: Arc<ArcSwap<SocketAddr>>,
     domain: String,
     last_activity_ms: Arc<AtomicU64>,
     quic_cids: Arc<RwLock<VecDeque<Vec<u8>>>>,
@@ -1143,7 +1144,7 @@ impl UdpProxyManager {
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: session_id,
-            client_addr: Arc::new(RwLock::new(client_addr)),
+            client_addr: Arc::new(ArcSwap::from_pointee(client_addr)),
             listen_port: port,
             backend_addr: b_addr,
             origin_id,
@@ -1213,7 +1214,7 @@ impl UdpProxyManager {
                 metrics_guard,
             })
             .await;
-            let last_client_addr = *client_addr.read().await;
+            let last_client_addr = **client_addr.load();
             sessions.remove_if(&(initial_client_addr, listen_port), |_, session| {
                 session.id == session_id
             });
@@ -1239,10 +1240,9 @@ impl UdpProxyManager {
             .store(udp_activity_now_ms(), Ordering::Relaxed);
     }
 
-    pub async fn update_session_client_addr(session: &UdpSession, client_addr: SocketAddr) {
-        let mut current = session.client_addr.write().await;
-        if *current != client_addr {
-            *current = client_addr;
+    pub fn update_session_client_addr(session: &UdpSession, client_addr: SocketAddr) {
+        if **session.client_addr.load() != client_addr {
+            session.client_addr.store(Arc::new(client_addr));
         }
     }
 
@@ -1331,7 +1331,7 @@ impl UdpProxyManager {
         match session.tx.try_reserve() {
             Ok(permit) => {
                 Self::record_client_short_header_cid(session, item.data.as_ref()).await;
-                Self::update_session_client_addr(session, client_addr).await;
+                Self::update_session_client_addr(session, client_addr);
                 permit.send(item);
                 Self::update_session_activity(session);
                 UdpSessionSendStatus::Sent
@@ -1390,7 +1390,7 @@ impl UdpProxyManager {
             Ok(socket) => socket,
             Err(err) => {
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
-                let current_client_addr = *client_addr.read().await;
+                let current_client_addr = **client_addr.load();
                 crate::metrics::record::record_network_dimensions(
                     crate::metrics::NetworkDimensionsArgs {
                         category: crate::metrics::METRIC_CATEGORY_UDP,
@@ -1493,7 +1493,7 @@ impl UdpProxyManager {
                             .await;
                         }
                     }
-                    let current_client_addr = *client_addr.read().await;
+                    let current_client_addr = **client_addr.load();
                     match downstream_sender.send_to(&buf[..len], current_client_addr).await {
                         Ok(_) => {}
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -1516,7 +1516,7 @@ impl UdpProxyManager {
         }
         transfer_metrics.flush_if_due(server_id, true);
         let (downstream_sent, upstream_sent) = transfer_metrics.totals();
-        let current_client_addr = *client_addr.read().await;
+        let current_client_addr = **client_addr.load();
         let status = if result.is_ok() { 200 } else { 502 };
         crate::metrics::record::record_network_dimensions(crate::metrics::NetworkDimensionsArgs {
             category: crate::metrics::METRIC_CATEGORY_UDP,
@@ -1626,6 +1626,7 @@ impl UdpProxyManager {
 mod tests {
     use super::*;
     use crate::config_models::{NetworkAddressConfig, ServerNameConfig, UDPConfig};
+    use arc_swap::ArcSwap;
     use std::collections::HashMap;
 
     #[test]
@@ -1857,12 +1858,12 @@ mod tests {
     #[tokio::test]
     async fn session_client_addr_updates_for_rebinding() {
         let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
-        let second: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let second: SocketAddr = "[2001:db8::2]:10001".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = UdpSession {
             id: 1,
-            client_addr: Arc::new(RwLock::new(first)),
+            client_addr: Arc::new(ArcSwap::from_pointee(first)),
             listen_port: 443,
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,
@@ -1879,22 +1880,23 @@ mod tests {
             shutdown,
         };
 
-        UdpProxyManager::update_session_client_addr(&session, second).await;
+        UdpProxyManager::update_session_client_addr(&session, second);
 
-        assert_eq!(*session.client_addr.read().await, second);
+        assert_eq!(**session.client_addr.load(), second);
     }
 
     #[tokio::test]
     async fn send_to_session_from_client_does_not_update_addr_when_full() {
         let first: SocketAddr = "127.0.0.1:10000".parse().unwrap();
-        let second: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let second: SocketAddr = "[2001:db8::2]:10001".parse().unwrap();
         let (tx, _rx) = mpsc::channel(1);
         tx.try_send(QueuedUdpDatagram::new(Bytes::from_static(b"queued")).unwrap())
             .unwrap();
         let (shutdown_tx, shutdown) = watch::channel(false);
+        let last_activity_ms = Arc::new(AtomicU64::new(1234));
         let session = UdpSession {
             id: 1,
-            client_addr: Arc::new(RwLock::new(first)),
+            client_addr: Arc::new(ArcSwap::from_pointee(first)),
             listen_port: 443,
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,
@@ -1902,7 +1904,7 @@ mod tests {
             user_id: 0,
             user_plan_id: 0,
             plan_id: 0,
-            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            last_activity_ms: last_activity_ms.clone(),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
@@ -1920,7 +1922,8 @@ mod tests {
             .await,
             UdpSessionSendStatus::Full
         );
-        assert_eq!(*session.client_addr.read().await, first);
+        assert_eq!(**session.client_addr.load(), first);
+        assert_eq!(last_activity_ms.load(Ordering::Relaxed), 1234);
     }
 
     #[tokio::test]
@@ -1931,7 +1934,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = UdpSession {
             id: 7,
-            client_addr: Arc::new(RwLock::new(client_addr)),
+            client_addr: Arc::new(ArcSwap::from_pointee(client_addr)),
             listen_port: 443,
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,
@@ -1979,7 +1982,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = UdpSession {
             id: 8,
-            client_addr: Arc::new(RwLock::new(client_addr)),
+            client_addr: Arc::new(ArcSwap::from_pointee(client_addr)),
             listen_port: 443,
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,
@@ -2018,7 +2021,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: 1,
-            client_addr: Arc::new(RwLock::new(first)),
+            client_addr: Arc::new(ArcSwap::from_pointee(first)),
             listen_port: 443,
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,
@@ -2060,7 +2063,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = UdpSession {
             id: 1,
-            client_addr: Arc::new(RwLock::new(first)),
+            client_addr: Arc::new(ArcSwap::from_pointee(first)),
             listen_port: 443,
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,
@@ -2102,7 +2105,7 @@ mod tests {
             session_shutdown_rx,
             server_id: 1,
             origin_id: 1,
-            client_addr: Arc::new(RwLock::new(client_addr)),
+            client_addr: Arc::new(ArcSwap::from_pointee(client_addr)),
             domain: "udp.example.com".to_string(),
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
@@ -2160,7 +2163,7 @@ mod tests {
             session_shutdown_rx,
             server_id: 1,
             origin_id: 1,
-            client_addr: Arc::new(RwLock::new(client_addr)),
+            client_addr: Arc::new(ArcSwap::from_pointee(client_addr)),
             domain: "udp.example.com".to_string(),
             last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
@@ -2228,7 +2231,7 @@ mod tests {
         let (shutdown_tx, shutdown) = watch::channel(false);
         let session = Arc::new(UdpSession {
             id: 77,
-            client_addr: Arc::new(RwLock::new(peer_addr)),
+            client_addr: Arc::new(ArcSwap::from_pointee(peer_addr)),
             listen_port: listen_addr.port(),
             backend_addr: "127.0.0.1:20000".parse().unwrap(),
             origin_id: 1,
