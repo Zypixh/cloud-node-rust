@@ -1,7 +1,6 @@
 use crate::rpc::metrics::ServerMetricUpdate;
 use dashmap::DashMap;
 use mace::{Bucket, BucketOptions, Mace, OpCode, Options};
-use maxminddb::{self, geoip2};
 use parking_lot::Mutex as ParkingMutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -33,6 +32,40 @@ const CACHE_ACCESS_LOG_MAX_ENTRIES: usize = 262_144;
 const CACHE_META_QUEUE_CAPACITY: usize = 8192;
 const CORRUPT_CMETA_ISOLATION_MAX: usize = 4_096;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaceMemoryTier {
+    MiB512,
+    GiB1,
+    GiB2,
+}
+
+impl MaceMemoryTier {
+    pub fn from_stable_capacity_bytes(bytes: u64) -> Self {
+        if bytes < 768 * 1024 * 1024 {
+            Self::MiB512
+        } else if bytes < 1536 * 1024 * 1024 {
+            Self::GiB1
+        } else {
+            Self::GiB2
+        }
+    }
+}
+
+fn stable_mace_capacity_bytes() -> u64 {
+    static STABLE_CAPACITY: OnceLock<u64> = OnceLock::new();
+    *STABLE_CAPACITY.get_or_init(|| {
+        let snapshot = crate::memory_governor::MEMORY_GOVERNOR
+            .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
+        snapshot
+            .cgroup_memory_max_bytes
+            .max(snapshot.memory_total_bytes)
+    })
+}
+
+pub fn mace_memory_tier_for_stable_capacity(bytes: u64) -> MaceMemoryTier {
+    MaceMemoryTier::from_stable_capacity_bytes(bytes)
+}
+
 static CORRUPT_CMETA_KEYS: Lazy<DashMap<String, ()>> = Lazy::new(DashMap::new);
 static CORRUPT_CMETA_COUNT: AtomicU64 = AtomicU64::new(0);
 static CACHE_META_VERSION: AtomicU64 = AtomicU64::new(0);
@@ -47,28 +80,114 @@ struct StorageBackend {
     _mace: Mace,
     bucket: Bucket,
     counters: DashMap<String, u64>,
+    server_cleanup_cursor: ParkingMutex<Option<Vec<u8>>>,
+    node_cleanup_cursor: ParkingMutex<Option<Vec<u8>>>,
 }
 
 /// Open options shared by production `MetricStorage` and comparison benches.
 pub fn mace_metrics_options(path: impl AsRef<Path>) -> Options {
     let mut opts = Options::new(path);
+    opts.concurrent_write = Options::CONCURRENT_WRITE;
+    let tier = MaceMemoryTier::from_stable_capacity_bytes(stable_mace_capacity_bytes());
+    let (wal_buffer_size, wal_file_size, lru_capacity, stat_mask_cache_count) = match tier {
+        MaceMemoryTier::MiB512 => (1 << 20, 4 << 20, 8 << 20, 128),
+        MaceMemoryTier::GiB1 => (2 << 20, 8 << 20, 16 << 20, 256),
+        MaceMemoryTier::GiB2 => (4 << 20, 16 << 20, 32 << 20, 512),
+    };
+    opts.wal_buffer_size = wal_buffer_size;
+    opts.wal_file_size = wal_file_size as u32;
+    opts.lru_capacity = lru_capacity;
+    opts.stat_mask_cache_count = stat_mask_cache_count;
+    opts.data_handle_cache_capacity = stat_mask_cache_count / 8;
+    opts.blob_handle_cache_capacity = stat_mask_cache_count / 16;
     // Match the previous RocksDB default (`WriteOptions.sync = false`).
     opts.sync_on_write = false;
+    tracing::debug!(
+        target: "metrics_storage",
+        ?tier,
+        concurrent_write = opts.concurrent_write,
+        sync_on_write = opts.sync_on_write,
+        wal_buffer_size = opts.wal_buffer_size,
+        wal_file_size = opts.wal_file_size,
+        lru_capacity = opts.lru_capacity,
+        "Mace options selected from stable capacity; WAL buffer is not total capacity"
+    );
     opts
 }
 
 /// Bucket policy for metrics/firewall/cache metadata.
 pub fn mace_metrics_bucket_options() -> BucketOptions {
-    // Metrics commits are small and already coalesced; foreground backpressure
-    // only adds latency on the flush path.
-    BucketOptions {
-        enable_backpressure: false,
+    let tier = MaceMemoryTier::from_stable_capacity_bytes(stable_mace_capacity_bytes());
+    let (cache_capacity, pool_capacity, checkpoint_size) = match tier {
+        MaceMemoryTier::MiB512 => (8 << 20, 8 << 20, 2 << 20),
+        MaceMemoryTier::GiB1 => (16 << 20, 16 << 20, 4 << 20),
+        MaceMemoryTier::GiB2 => (32 << 20, 32 << 20, 8 << 20),
+    };
+    let options = BucketOptions {
+        cache_capacity,
+        pool_capacity,
+        checkpoint_size,
+        inline_size: BucketOptions::MIN_INLINE_SIZE,
+        split_elems: BucketOptions::MAX_SPLIT_ELEMS,
+        // Foreground write backpressure must stay on: all Mace writers are
+        // either the dedicated blocking writer thread, spawn_blocking tasks,
+        // or bounded-queue consumers, so an admission wait slows producers
+        // down instead of stalling the Tokio reactor. With it disabled, a slow
+        // disk or blocked checkpoint lets foreground writes accumulate without
+        // bound and the memory governor never sees the pressure.
+        enable_backpressure: true,
         ..Default::default()
+    };
+    tracing::debug!(
+        target: "metrics_storage",
+        ?tier,
+        cache_capacity = options.cache_capacity,
+        pool_capacity = options.pool_capacity,
+        checkpoint_size = options.checkpoint_size,
+        inline_size = options.inline_size,
+        split_elems = options.split_elems,
+        "Mace bucket options selected; capacities are per-bucket controls"
+    );
+    options
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaceMemoryObservation {
+    pub tier: MaceMemoryTier,
+    pub concurrent_write: usize,
+    pub wal_buffer_bytes_per_group: u64,
+    pub wal_buffer_capacity_bytes: u64,
+    pub wal_file_size_bytes: u64,
+    pub bucket_cache_capacity_bytes: u64,
+    pub bucket_pool_capacity_bytes: u64,
+    pub bucket_checkpoint_size_bytes: u64,
+}
+
+pub fn mace_memory_observation() -> MaceMemoryObservation {
+    let options = mace_metrics_options(std::env::temp_dir());
+    let bucket = mace_metrics_bucket_options();
+    let concurrent_write = usize::from(options.concurrent_write);
+    MaceMemoryObservation {
+        tier: MaceMemoryTier::from_stable_capacity_bytes(stable_mace_capacity_bytes()),
+        concurrent_write,
+        wal_buffer_bytes_per_group: options.wal_buffer_size as u64,
+        wal_buffer_capacity_bytes: (options.wal_buffer_size as u64)
+            .saturating_mul(concurrent_write as u64),
+        wal_file_size_bytes: u64::from(options.wal_file_size),
+        bucket_cache_capacity_bytes: bucket.cache_capacity as u64,
+        bucket_pool_capacity_bytes: bucket.pool_capacity as u64,
+        bucket_checkpoint_size_bytes: bucket.checkpoint_size as u64,
     }
 }
 
 pub fn server_period_key(server_id: i64, period: i64) -> String {
     format!("S{server_id}_T{period}")
+}
+
+fn parse_server_period_key(key: &str) -> Option<(i64, i64)> {
+    let rest = key.strip_prefix('S')?;
+    let (server_id, period) = rest.split_once("_T")?;
+    Some((server_id.parse().ok()?, period.parse().ok()?))
 }
 
 pub fn node_period_key(period: i64) -> String {
@@ -172,22 +291,21 @@ impl MetricStorage {
             .validate()
             .map_err(mace_open_error)?;
         let mace = Mace::new(opts).map_err(mace_open_error)?;
-        let bucket = mace
-            .new_bucket(METRICS_BUCKET, mace_metrics_bucket_options())
-            .or_else(|err| {
-                if err == OpCode::Exist {
-                    mace.get_bucket(METRICS_BUCKET)
-                } else {
-                    Err(err)
-                }
-            })
-            .map_err(mace_open_error)?;
+        let bucket_options = mace_metrics_bucket_options();
+        let bucket = match mace.update_bucket_opt(METRICS_BUCKET, bucket_options) {
+            Ok(()) => mace.get_bucket(METRICS_BUCKET),
+            Err(OpCode::NotFound) => mace.new_bucket(METRICS_BUCKET, bucket_options),
+            Err(err) => Err(err),
+        }
+        .map_err(mace_open_error)?;
 
         Ok(Self {
             backend: Some(Arc::new(StorageBackend {
                 _mace: mace,
                 bucket,
                 counters: DashMap::new(),
+                server_cleanup_cursor: ParkingMutex::new(None),
+                node_cleanup_cursor: ParkingMutex::new(None),
             })),
         })
     }
@@ -247,53 +365,39 @@ impl MetricStorage {
         updates: Vec<crate::rpc::metrics::ServerMetricUpdate>,
         node_sent: u64,
         node_received: u64,
-    ) {
+    ) -> Result<(), OpCode> {
         let Some(backend) = self.backend.as_ref() else {
-            return;
+            return Err(OpCode::IoError);
         };
-        let Ok(txn) = backend.bucket.begin() else {
-            return;
-        };
+        let txn = backend.bucket.begin()?;
 
         for u in updates {
             let key = server_period_key(u.server_id, period);
-            let existing = match txn_get_slice(&txn, key.as_bytes()) {
-                Ok(value) => value,
-                Err(_) => return,
-            };
+            let existing = txn_get_slice(&txn, key.as_bytes())?;
             let packed = apply_server_period_update(existing.as_deref(), &u);
-            if txn.upsert(key.as_bytes(), packed).is_err() {
-                return;
-            }
+            txn.upsert(key.as_bytes(), packed)?;
         }
 
         if node_sent != 0 || node_received != 0 {
             let key = node_period_key(period);
-            let existing = match txn_get_slice(&txn, key.as_bytes()) {
-                Ok(value) => value,
-                Err(_) => return,
-            };
+            let existing = txn_get_slice(&txn, key.as_bytes())?;
             let packed = apply_node_period_deltas(existing.as_deref(), node_sent, node_received);
-            if txn.upsert(key.as_bytes(), packed).is_err() {
-                return;
-            }
+            txn.upsert(key.as_bytes(), packed)?;
         }
 
-        let _ = txn.commit();
+        txn.commit()
     }
 
     /// Increments multiple counters in a single atomic batch.
-    pub fn increment_batch(&self, updates: Vec<(String, u64)>) {
+    pub fn increment_batch(&self, updates: Vec<(String, u64)>) -> Result<(), OpCode> {
         let Some(backend) = self.backend.as_ref() else {
-            return;
+            return Err(OpCode::IoError);
         };
         let updates = fold_counter_deltas(updates);
         if updates.is_empty() {
-            return;
+            return Ok(());
         }
-        let Ok(txn) = backend.bucket.begin() else {
-            return;
-        };
+        let txn = backend.bucket.begin()?;
         let mut committed = HashMap::with_capacity(updates.len());
         for (key, delta) in updates {
             let current = if let Some(cached) = backend.counters.get(&key) {
@@ -302,62 +406,96 @@ impl MetricStorage {
                 match txn.get(key.as_bytes()) {
                     Ok(value) => parse_u64_be(value.slice()),
                     Err(OpCode::NotFound) => 0,
-                    Err(_) => return,
+                    Err(err) => return Err(err),
                 }
             };
             let next = current.saturating_add(delta);
-            if txn.upsert(key.as_bytes(), next.to_be_bytes()).is_err() {
-                return;
-            }
+            txn.upsert(key.as_bytes(), next.to_be_bytes())?;
             committed.insert(key, next);
         }
-        if txn.commit().is_ok() {
-            for (key, next) in committed {
-                backend.counters.insert(key, next);
-            }
+        txn.commit()?;
+        for (key, next) in committed {
+            backend.counters.insert(key, next);
         }
+        Ok(())
     }
 
     /// Deletes all data older than a specific timestamp.
-    pub fn cleanup_old_stats(&self, older_than_timestamp: i64) {
+    pub fn cleanup_old_stats(&self, older_than_timestamp: i64) -> Result<usize, OpCode> {
         let Some(bucket) = self.bucket() else {
-            return;
+            return Err(OpCode::IoError);
         };
-        let Ok(view) = bucket.view() else {
-            return;
+        let Some(backend) = self.backend.as_ref() else {
+            return Err(OpCode::IoError);
         };
-        let Ok(txn) = bucket.begin() else {
-            return;
-        };
+        let view = bucket.view()?;
+        let txn = bucket.begin()?;
 
-        let end_prefix = format!("S0_T{older_than_timestamp}");
-        let node_end_prefix = format!("NODE_T{older_than_timestamp}");
-
-        for prefix in ["S", "NODE_T"] {
-            let end = if prefix == "S" {
-                end_prefix.as_str()
-            } else {
-                node_end_prefix.as_str()
+        const MAX_CLEANUP_ROWS: usize = 1_024;
+        let mut removed = 0usize;
+        let server_cursor = backend.server_cleanup_cursor.lock().clone();
+        let mut last_key = None;
+        for item in view.seek("S") {
+            if removed >= MAX_CLEANUP_ROWS {
+                break;
+            }
+            let key = item.key();
+            if server_cursor.as_deref().is_some_and(|cursor| key <= cursor) {
+                continue;
+            }
+            let key_str = match std::str::from_utf8(key) {
+                Ok(key_str) => key_str,
+                Err(_) => continue,
             };
-            for item in view.seek(prefix) {
+            let Some((_, period)) = parse_server_period_key(key_str) else {
+                continue;
+            };
+            if period >= older_than_timestamp {
+                continue;
+            }
+            txn.del(key)?;
+            removed += 1;
+            last_key = Some(key.to_vec());
+        }
+        if removed < MAX_CLEANUP_ROWS {
+            let node_cursor = backend.node_cleanup_cursor.lock().clone();
+            for item in view.seek("NODE_T") {
+                if removed >= MAX_CLEANUP_ROWS {
+                    break;
+                }
                 let key = item.key();
+                if node_cursor.as_deref().is_some_and(|cursor| key <= cursor) {
+                    continue;
+                }
                 let key_str = match std::str::from_utf8(key) {
                     Ok(key_str) => key_str,
                     Err(_) => continue,
                 };
-                if !key_str.starts_with(prefix) {
-                    break;
+                let Some(period) = key_str
+                    .strip_prefix("NODE_T")
+                    .and_then(|v| v.parse::<i64>().ok())
+                else {
+                    continue;
+                };
+                if period >= older_than_timestamp {
+                    continue;
                 }
-                if key_str >= end {
-                    break;
-                }
-                if txn.del(key).is_err() {
-                    return;
-                }
+                txn.del(key)?;
+                removed += 1;
+                last_key = Some(key.to_vec());
             }
         }
 
-        let _ = txn.commit();
+        txn.commit()?;
+        if last_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with(b"NODE_T"))
+        {
+            *backend.node_cleanup_cursor.lock() = last_key;
+        } else {
+            *backend.server_cleanup_cursor.lock() = last_key;
+        }
+        Ok(removed)
     }
 
     pub fn put_json<T: Serialize>(&self, key: &str, value: &T) -> bool {
@@ -2140,28 +2278,13 @@ pub fn start_cache_access_flusher() {
     });
 }
 
-static ASN_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
-    let paths = crate::paths::NodePaths::current().geoip_asn_candidates();
-    for path in &paths {
-        if path.exists() {
-            return maxminddb::Reader::open_readfile(path).ok();
-        }
-    }
-    None
-});
-
 static ASN_NUMBER_CACHE: Lazy<DashMap<IpAddr, i64>> = Lazy::new(DashMap::new);
 
 pub fn lookup_asn_number(ip: IpAddr) -> i64 {
     if let Some(cached) = ASN_NUMBER_CACHE.get(&ip) {
         return *cached;
     }
-    let asn = ASN_READER
-        .as_ref()
-        .and_then(|reader| reader.lookup(ip).ok())
-        .and_then(|result| result.decode::<geoip2::Asn>().ok().flatten())
-        .and_then(|asn| asn.autonomous_system_number.map(i64::from))
-        .unwrap_or(0);
+    let asn = crate::metrics::analyzer::lookup_asn_number(ip);
     if ASN_NUMBER_CACHE.len() < 65536 {
         ASN_NUMBER_CACHE.insert(ip, asn);
     }
@@ -2186,6 +2309,16 @@ mod tests {
     use serde_json::json;
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicI64, AtomicU64};
+
+    #[test]
+    fn server_period_parser_uses_numeric_period_not_key_order() {
+        assert_eq!(
+            super::parse_server_period_key("S123_T1700000000"),
+            Some((123, 1_700_000_000))
+        );
+        assert_eq!(super::parse_server_period_key("STAT_S1_T2"), None);
+        assert_eq!(super::parse_server_period_key("S1_Tbad"), None);
+    }
 
     #[test]
     fn cache_status_parsing_preserves_missing_default_and_rejects_invalid_values() {
@@ -2246,10 +2379,12 @@ mod tests {
         assert!(storage.put_json("FWBLK_META_test", &true));
         assert_eq!(storage.get_json::<bool>("FWBLK_META_test"), Some(true));
 
-        storage.increment_batch(vec![
-            ("counter_a".to_string(), 10),
-            ("counter_a".to_string(), 5),
-        ]);
+        storage
+            .increment_batch(vec![
+                ("counter_a".to_string(), 10),
+                ("counter_a".to_string(), 5),
+            ])
+            .expect("persist counter batch");
         assert_eq!(storage.get_value("counter_a"), 15);
 
         let update = crate::rpc::metrics::ServerMetricUpdate {
@@ -2268,8 +2403,12 @@ mod tests {
             count_websocket_connections: 0,
             count_ips: 2,
         };
-        storage.record_server_batch(1_700_000_000, vec![update.clone()], 50, 25);
-        storage.record_server_batch(1_700_000_000, vec![update], 10, 5);
+        storage
+            .record_server_batch(1_700_000_000, vec![update.clone()], 50, 25)
+            .expect("persist first server batch");
+        storage
+            .record_server_batch(1_700_000_000, vec![update], 10, 5)
+            .expect("persist second server batch");
         let packed = storage
             .get_raw(super::server_period_key(7, 1_700_000_000).as_bytes())
             .expect("packed server period");
@@ -2324,6 +2463,93 @@ mod tests {
         let ips = storage.load_unique_ips("20260818");
         assert_eq!(ips.len(), 1);
         assert_eq!(ips[0].0, 1);
+
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unavailable_metric_storage_reports_persistence_failure() {
+        let storage = MetricStorage::unavailable();
+        assert!(
+            storage
+                .record_server_batch(1_700_000_000, Vec::new(), 0, 0)
+                .is_err()
+        );
+        assert!(storage.cleanup_old_stats(1_700_000_000).is_err());
+    }
+
+    #[test]
+    fn history_cleanup_removes_only_expired_metric_namespaces() {
+        let dir =
+            std::env::temp_dir().join(format!("cloud-node-mace-cleanup-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = MetricStorage::open(&dir).expect("open mace storage");
+
+        storage
+            .record_server_batch(
+                100,
+                vec![crate::rpc::metrics::ServerMetricUpdate {
+                    server_id: 9,
+                    user_id: 0,
+                    user_plan_id: 0,
+                    plan_id: 0,
+                    total_requests: 1,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    cached_bytes: 0,
+                    count_cached_requests: 0,
+                    count_attack_requests: 0,
+                    attack_bytes: 0,
+                    active_connections: 0,
+                    count_websocket_connections: 0,
+                    count_ips: 0,
+                }],
+                1,
+                1,
+            )
+            .expect("write expired server period");
+        storage
+            .record_server_batch(
+                200,
+                vec![crate::rpc::metrics::ServerMetricUpdate {
+                    server_id: 12345,
+                    user_id: 0,
+                    user_plan_id: 0,
+                    plan_id: 0,
+                    total_requests: 2,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    cached_bytes: 0,
+                    count_cached_requests: 0,
+                    count_attack_requests: 0,
+                    attack_bytes: 0,
+                    active_connections: 0,
+                    count_websocket_connections: 0,
+                    count_ips: 0,
+                }],
+                2,
+                2,
+            )
+            .expect("write current server period");
+        assert!(storage.put_json("STAT_KEEP", &true));
+
+        let removed = storage
+            .cleanup_old_stats(150)
+            .expect("cleanup expired history");
+        assert_eq!(removed, 2);
+        assert!(
+            storage
+                .get_raw(server_period_key(9, 100).as_bytes())
+                .is_none()
+        );
+        assert!(storage.get_raw(node_period_key(100).as_bytes()).is_none());
+        assert!(
+            storage
+                .get_raw(server_period_key(12345, 200).as_bytes())
+                .is_some()
+        );
+        assert!(storage.get_raw(b"STAT_KEEP").is_some());
 
         drop(storage);
         let _ = std::fs::remove_dir_all(&dir);

@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::LazyLock as Lazy;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 use woothee::parser::Parser;
@@ -59,8 +60,11 @@ impl Clone for RequestStats {
 }
 
 static GEO_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static GEO_CITY_BYTES: AtomicU64 = AtomicU64::new(0);
+static GEO_CITY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static GEO_ASN_BYTES: AtomicU64 = AtomicU64::new(0);
 
-static GEO_CITY_READER: Lazy<ArcSwapOption<maxminddb::Reader<Vec<u8>>>> =
+static GEO_CITY_READER: Lazy<ArcSwapOption<maxminddb::Reader<maxminddb::Mmap>>> =
     Lazy::new(ArcSwapOption::empty);
 
 pub fn initialize_geoip_readers() {
@@ -79,7 +83,10 @@ pub fn initialize_geoip_readers() {
 }
 
 pub fn reload_city_reader(path: &std::path::Path) -> anyhow::Result<()> {
-    let reader = maxminddb::Reader::open_readfile(path)?;
+    // SAFETY: the GeoIP database is only replaced via download-to-temp plus
+    // atomic rename (rpc/files.rs install_city_database), so the inode this
+    // reader mmaps is never modified or truncated in place.
+    let reader = unsafe { maxminddb::Reader::open_mmap(path)? };
     reader.verify()?;
     anyhow::ensure!(
         reader
@@ -91,17 +98,34 @@ pub fn reload_city_reader(path: &std::path::Path) -> anyhow::Result<()> {
         reader.metadata().database_type
     );
     GEO_CITY_READER.store(Some(Arc::new(reader)));
+    GEO_CITY_BYTES.store(
+        std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
+        Ordering::Release,
+    );
+    GEO_CITY_GENERATION.fetch_add(1, Ordering::AcqRel);
     GEO_AVAILABLE.store(true, std::sync::atomic::Ordering::Release);
     GEO_CACHE.clear();
     Ok(())
 }
 
-static GEO_ASN_READER: Lazy<Option<maxminddb::Reader<Vec<u8>>>> = Lazy::new(|| {
+static GEO_ASN_READER: Lazy<Option<maxminddb::Reader<maxminddb::Mmap>>> = Lazy::new(|| {
     let paths = crate::paths::NodePaths::current().geoip_asn_candidates();
     for path in &paths {
         if path.exists() {
-            return match maxminddb::Reader::open_readfile(path) {
-                Ok(r) => Some(r),
+            // SAFETY: GeoIP databases are only installed via atomic rename;
+            // see reload_city_reader.
+            return match unsafe { maxminddb::Reader::open_mmap(path) } {
+                Ok(r) => {
+                    GEO_ASN_BYTES.store(
+                        std::fs::metadata(path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0),
+                        Ordering::Release,
+                    );
+                    Some(r)
+                }
                 Err(e) => {
                     warn!(
                         "Failed to load GeoIP ASN database at {}: {}. ASN stats will be disabled.",
@@ -153,6 +177,18 @@ impl<K: Hash + Eq, V: Clone> ShardedLru<K, V> {
         for shard in &self.shards {
             shard.lock().unwrap().clear();
         }
+    }
+
+    fn clear_counted(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let mut cache = shard.lock().unwrap();
+                let removed = cache.len();
+                cache.clear();
+                removed
+            })
+            .sum()
     }
 
     fn get_shard(&self, key: &K) -> &Mutex<LruCache<K, V>> {
@@ -327,16 +363,37 @@ pub fn asn_database_available() -> bool {
     GEO_ASN_READER.is_some()
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GeoIpMemorySnapshot {
+    pub city_loaded: bool,
+    pub city_bytes: u64,
+    pub city_generation: u64,
+    pub asn_loaded: bool,
+    pub asn_bytes: u64,
+}
+
+pub fn geoip_memory_snapshot() -> GeoIpMemorySnapshot {
+    GeoIpMemorySnapshot {
+        city_loaded: GEO_AVAILABLE.load(Ordering::Acquire),
+        city_bytes: GEO_CITY_BYTES.load(Ordering::Acquire),
+        city_generation: GEO_CITY_GENERATION.load(Ordering::Acquire),
+        asn_loaded: asn_database_available(),
+        asn_bytes: GEO_ASN_BYTES.load(Ordering::Acquire),
+    }
+}
+
 pub fn lookup_geo(ip: IpAddr) -> Option<GeoInfo> {
     lookup_geo_internal(ip)
 }
 
 pub fn reclaim_geo_ua_caches(clear_all: bool) -> (usize, usize) {
-    GEO_CACHE.clear();
-    if clear_all {
-        UA_CACHE.clear();
-    }
-    (1, usize::from(clear_all))
+    let geo_removed = GEO_CACHE.clear_counted();
+    let ua_removed = if clear_all {
+        UA_CACHE.clear_counted()
+    } else {
+        0
+    };
+    (geo_removed, ua_removed)
 }
 
 #[cfg(test)]

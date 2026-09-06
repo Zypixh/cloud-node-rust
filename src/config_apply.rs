@@ -15,7 +15,7 @@ use crate::config::ConfigStore;
 use crate::config_models::{GlobalHTTPAllConfig, ParentNodeConfig, ServerConfig};
 use crate::health_manager::GlobalHealthManager;
 use crate::memory_governor::{AdmissionClass, MEMORY_GOVERNOR, MemoryPressureLevel};
-use crate::memory_reclaim::reclaim_for_level;
+use crate::memory_reclaim::request_reclaim;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
@@ -80,9 +80,10 @@ impl ConfigApplyLimits {
         self.pressure >= MemoryPressureLevel::Elevated
     }
 
-    /// High/Critical snapshots must not keep the previous site generation in
-    /// RSS while the next generation is materialized (2x servers + LBs + plans).
-    pub fn drop_previous_generation(self) -> bool {
+    /// High/Critical pressure defers immediate health probes for the new
+    /// generation so a full snapshot cannot pin hundreds of load balancers in
+    /// in-flight probe tasks at once.
+    pub fn defer_health_registration(self) -> bool {
         self.pressure >= MemoryPressureLevel::High
     }
 }
@@ -110,7 +111,6 @@ pub struct ConfigApplyStats {
     pub admitted: bool,
     pub elapsed: Duration,
     pub json_bytes: u64,
-    pub released_previous_generation: bool,
 }
 
 #[derive(Clone, Default)]
@@ -186,7 +186,7 @@ async fn admit_config_sync() -> (Option<crate::memory_governor::StaticAdmissionP
         retries = attempt + 1;
         let pressure = MEMORY_GOVERNOR.current_memory_pressure_level();
         if pressure >= MemoryPressureLevel::Elevated {
-            reclaim_for_level(pressure);
+            let _ = request_reclaim(pressure);
         }
         tokio::task::yield_now().await;
     }
@@ -208,7 +208,7 @@ fn maybe_reclaim(
     if stats.reclaim_runs > 0 && pressure <= *last_reclaimed {
         return;
     }
-    reclaim_for_level(pressure);
+    let _ = request_reclaim(pressure);
     stats.reclaim_runs = stats.reclaim_runs.saturating_add(1);
     *last_reclaimed = pressure;
 }
@@ -231,6 +231,11 @@ pub struct MaterializeRuntimeServersArgs<'a> {
 /// `Arc`, not the config body. Disabled servers stay in `all_servers` so SSL
 /// collection and compiled plans still see them, matching historical snapshot
 /// semantics, but they are omitted from request routing maps.
+///
+/// If the memory governor refuses admission after `CONFIG_SYNC_RETRY_LIMIT`
+/// attempts, nothing is built and the returned maps are empty with
+/// `stats.admitted == false`. Callers must not publish such a result; the
+/// installed generation keeps serving and the sync retries later.
 pub async fn materialize_runtime_servers(
     args: MaterializeRuntimeServersArgs<'_>,
 ) -> RuntimeServerMaps {
@@ -245,10 +250,34 @@ pub async fn materialize_runtime_servers(
         limits,
     } = args;
     let started = Instant::now();
+    let servers_in = servers.len();
     let (permit, admission_retries) = admit_config_sync().await;
+    if permit.is_none() {
+        // Never trade a memory-death build for a config refresh: keep the
+        // installed generation and let the next sync retry after reclaim.
+        tracing::warn!(
+            target: "config_apply",
+            servers_in,
+            admission_retries,
+            pressure = limits.pressure.as_str(),
+            available_bytes = limits.available_bytes,
+            "config apply not admitted after retries; keeping previous generation"
+        );
+        let _ = request_reclaim(MemoryPressureLevel::Critical);
+        return RuntimeServerMaps {
+            stats: ConfigApplyStats {
+                servers_in,
+                admitted: false,
+                admission_retries,
+                elapsed: started.elapsed(),
+                ..ConfigApplyStats::default()
+            },
+            ..RuntimeServerMaps::default()
+        };
+    }
     let mut stats = ConfigApplyStats {
-        servers_in: servers.len(),
-        admitted: permit.is_some(),
+        servers_in,
+        admitted: true,
         admission_retries,
         ..ConfigApplyStats::default()
     };
@@ -297,7 +326,7 @@ pub async fn materialize_runtime_servers(
             id_to_lb.insert(server_id, Arc::clone(&lb_arc));
             if has_hc {
                 let frequency = std::time::Duration::from_secs(30);
-                if limits.drop_previous_generation() {
+                if limits.defer_health_registration() {
                     health_manager.register_deferred(server_id, Arc::clone(&lb_arc), frequency);
                 } else {
                     health_manager.register(server_id, Arc::clone(&lb_arc), frequency);
@@ -350,28 +379,22 @@ pub async fn materialize_runtime_servers(
 /// Drop the currently installed site generation (maps, compiled plans, LBs)
 /// before materializing a replacement snapshot. Callers must only do this
 /// under High/Critical pressure — it briefly makes new host lookups miss.
-pub fn drop_previous_server_generation(store: &ConfigStore, health_manager: &GlobalHealthManager) {
-    health_manager.unregister_all();
-    store.release_server_runtime_for_reload();
-}
-
 /// Apply a full site snapshot onto `store`, replacing previous servers while
 /// keeping unrelated global fields. Used by tests and by incremental RPC
 /// helpers that already parsed `Vec<ServerConfig>`.
+///
+/// The replacement is materialized first and only published after it was built
+/// successfully, so the installed generation keeps serving until the swap.
 pub async fn apply_server_snapshot(
     store: &ConfigStore,
     health_manager: &GlobalHealthManager,
     servers: Vec<ServerConfig>,
     limits: ConfigApplyLimits,
 ) -> RuntimeServerMaps {
-    let released = limits.drop_previous_generation();
-    if released {
-        drop_previous_server_generation(store, health_manager);
-    }
     let (node_level, parent_nodes, tiered_origin_bypass, allow_lan) =
         store.get_origin_runtime_context().await;
     let global_http = Some(store.get_global_http_config_sync());
-    let mut maps = materialize_runtime_servers(MaterializeRuntimeServersArgs {
+    let maps = materialize_runtime_servers(MaterializeRuntimeServersArgs {
         servers,
         health_manager,
         node_level,
@@ -382,17 +405,15 @@ pub async fn apply_server_snapshot(
         limits,
     })
     .await;
-    maps.stats.released_previous_generation = released;
-    store
-        .replace_all_servers(
-            maps.all_servers.clone(),
-            maps.servers.clone(),
-            maps.routes.clone(),
-            maps.id_to_lb.clone(),
-        )
-        .await;
-    if released {
-        crate::memory_reclaim::trim_released_heap();
+    if maps.stats.admitted {
+        store
+            .replace_all_servers(
+                maps.all_servers.clone(),
+                maps.servers.clone(),
+                maps.routes.clone(),
+                maps.id_to_lb.clone(),
+            )
+            .await;
     }
     maps
 }
@@ -475,7 +496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn critical_reapply_drops_previous_store_generation() {
+    async fn critical_reapply_keeps_previous_generation_until_publish() {
         let health = GlobalHealthManager::new(1);
         let store = ConfigStore::new();
         let limits = ConfigApplyLimits::synthetic(512 * 1024 * 1024, 32 * 1024 * 1024);
@@ -486,7 +507,7 @@ mod tests {
             limits,
         )
         .await;
-        assert!(first.stats.released_previous_generation);
+        assert!(first.stats.admitted);
         assert_eq!(store.get_all_servers_sync().len(), 1);
         let second = apply_server_snapshot(
             &store,
@@ -495,7 +516,7 @@ mod tests {
             limits,
         )
         .await;
-        assert!(second.stats.released_previous_generation);
+        assert!(second.stats.admitted);
         assert_eq!(store.get_all_servers_sync().len(), 1);
         assert!(store.get_server_sync("a.example.com").is_some());
     }
@@ -508,12 +529,12 @@ mod tests {
     }
 
     #[test]
-    fn high_and_critical_drop_the_previous_generation() {
+    fn high_and_critical_defer_health_registration() {
         let high = ConfigApplyLimits::synthetic(2 * 1024 * 1024 * 1024, 150 * 1024 * 1024);
         let low = ConfigApplyLimits::synthetic(512 * 1024 * 1024, 32 * 1024 * 1024);
         let normal = ConfigApplyLimits::synthetic(8 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
-        assert!(high.drop_previous_generation());
-        assert!(low.drop_previous_generation());
-        assert!(!normal.drop_previous_generation());
+        assert!(high.defer_health_registration());
+        assert!(low.defer_health_registration());
+        assert!(!normal.defer_health_registration());
     }
 }

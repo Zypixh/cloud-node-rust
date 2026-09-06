@@ -288,6 +288,7 @@ pub(crate) fn current_cache_l1_invalidation_generation() -> u64 {
     CACHE_L1_INVALIDATION_GENERATION.load(Ordering::Acquire)
 }
 
+#[cfg(test)]
 pub(crate) fn advance_cache_purge_generation() -> u64 {
     CACHE_PURGE_GENERATION
         .fetch_add(1, Ordering::AcqRel)
@@ -1284,14 +1285,13 @@ impl Storage for FileStorage {
                     return Ok(Box::new(NoopMissHandler));
                 }
             };
-            let purge_generation = current_cache_purge_generation();
             return Ok(Box::new(PartialMissHandler {
                 cache_key: k_str.to_string(),
                 capture,
                 writer: None,
                 location,
                 disabled: false,
-                purge_generation,
+                purge_generation: current_cache_purge_generation(),
                 purge_guard: Some(purge_guard),
                 write_guard: Some(write_guard),
                 process_lock: Some(process_lock),
@@ -1510,7 +1510,6 @@ impl Storage for FileStorage {
 
         let key_str = key.user_tag.as_ref();
         let _purge_guard = acquire_cache_purge_write_guard().await;
-        advance_cache_purge_generation();
         let process_roots = self.inner.load().all_roots();
         let _process_lock = match acquire_cache_process_barrier_write_lock(&process_roots).await {
             Ok(lock) => lock,
@@ -2093,7 +2092,6 @@ struct MemoryMissHandler {
     stale_while_revalidate_secs: u64,
     stale_if_error_secs: u64,
     error_status_allowed: bool,
-    purge_generation: u64,
     l1_invalidation_generation: u64,
     metadata_required: bool,
     metadata_updated_at: i64,
@@ -2164,7 +2162,6 @@ impl HandleMiss for MemoryMissHandler {
             stale_while_revalidate_secs,
             stale_if_error_secs,
             error_status_allowed,
-            purge_generation,
             l1_invalidation_generation,
             metadata_required,
             metadata_updated_at,
@@ -2199,7 +2196,6 @@ impl HandleMiss for MemoryMissHandler {
             || !body_length_is_valid
             || !metadata_is_current
             || fresh_until <= now
-            || purge_generation != current_cache_purge_generation()
             || l1_invalidation_generation != current_cache_l1_invalidation_generation()
         {
             return Ok(MissFinishType::Created(0));
@@ -2220,7 +2216,7 @@ impl HandleMiss for MemoryMissHandler {
                 error_status_allowed,
                 metadata_updated_at,
                 cache_state_version,
-                purge_generation,
+                purge_generation: current_cache_purge_generation(),
                 metadata_required,
             },
             std::time::Duration::from_secs(ttl),
@@ -3655,7 +3651,6 @@ impl HybridStorage {
             stale_while_revalidate_secs: meta.stale_while_revalidate_sec() as u64,
             stale_if_error_secs: meta.stale_if_error_sec() as u64,
             error_status_allowed,
-            purge_generation: current_cache_purge_generation(),
             l1_invalidation_generation,
             metadata_required,
             metadata_updated_at,
@@ -3975,7 +3970,6 @@ impl HybridStorage {
         // key lock after this function has deleted the known variants and
         // publish the pre-purge response again.
         let _purge_guard = acquire_cache_purge_write_guard().await;
-        advance_cache_purge_generation();
         let process_roots = self.l2.inner.load().all_roots();
         let _process_lock = match acquire_cache_process_barrier_write_lock(&process_roots).await {
             Ok(lock) => lock,
@@ -4023,7 +4017,6 @@ impl HybridStorage {
         requested_version: Option<u64>,
     ) -> bool {
         let _purge_guard = acquire_cache_purge_write_guard().await;
-        advance_cache_purge_generation();
         let process_roots = self.l2.inner.load().all_roots();
         let _process_lock = match acquire_cache_process_barrier_write_lock(&process_roots).await {
             Ok(lock) => lock,
@@ -4127,7 +4120,6 @@ impl HybridStorage {
             return false;
         }
         let _purge_guard = acquire_cache_purge_write_guard().await;
-        advance_cache_purge_generation();
         let process_roots = self.l2.inner.load().all_roots();
         let _process_lock = match acquire_cache_process_barrier_write_lock(&process_roots).await {
             Ok(lock) => lock,
@@ -4541,7 +4533,6 @@ impl Storage for HybridStorage {
 
         let key_str = key.user_tag.as_ref();
         let _purge_guard = acquire_cache_purge_write_guard().await;
-        advance_cache_purge_generation();
         let process_roots = self.l2.inner.load().all_roots();
         let _process_lock = match acquire_cache_process_barrier_write_lock(&process_roots).await {
             Ok(lock) => lock,
@@ -5010,7 +5001,6 @@ mod tests {
             stale_while_revalidate_secs: 0,
             stale_if_error_secs: 0,
             error_status_allowed: false,
-            purge_generation: current_cache_purge_generation(),
             l1_invalidation_generation: current_cache_l1_invalidation_generation(),
             metadata_required: false,
             metadata_updated_at: 0,

@@ -26,19 +26,40 @@ impl L4ConnectionProtocol {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ConnectionCancelReason {
+    None,
+    DefenseBlocked,
+    ManagementShutdown,
+    ServiceExit,
+    ExplicitIdleReclaim,
+}
+
+impl ConnectionCancelReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::DefenseBlocked => "defense_blocked",
+            Self::ManagementShutdown => "management_shutdown",
+            Self::ServiceExit => "service_exit",
+            Self::ExplicitIdleReclaim => "explicit_idle_reclaim",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RegisteredConnection {
     pub id: u64,
     pub ip: IpAddr,
     pub protocol: L4ConnectionProtocol,
     pub started_at: Instant,
-    pub cancel_rx: watch::Receiver<bool>,
-    cancel_tx: watch::Sender<bool>,
+    pub cancel_rx: watch::Receiver<ConnectionCancelReason>,
+    cancel_tx: watch::Sender<ConnectionCancelReason>,
 }
 
 impl RegisteredConnection {
-    pub fn cancel(&self) {
-        let _ = self.cancel_tx.send(true);
+    pub fn cancel(&self, reason: ConnectionCancelReason) {
+        let _ = self.cancel_tx.send(reason);
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -54,14 +75,40 @@ pub struct L4ConnectionGuard {
 }
 
 impl L4ConnectionGuard {
-    pub fn cancel_receiver(&self) -> watch::Receiver<bool> {
+    pub fn cancel_receiver(&self) -> watch::Receiver<ConnectionCancelReason> {
         L4_CONNECTION_REGISTRY
             .get(self.ip, self.protocol, self.id)
             .map(|conn| conn.cancel_rx)
             .unwrap_or_else(|| {
-                let (_tx, rx) = watch::channel(false);
+                let (_tx, rx) = watch::channel(ConnectionCancelReason::None);
                 rx
             })
+    }
+
+    /// Re-register this connection under a different protocol (SNI takeover,
+    /// HTTP/1 → HTTP/2 upgrade) while preserving any cancel that raced in.
+    ///
+    /// The old entry is removed first so a defense drain can only ever reach
+    /// one entry: anything delivered before the swap is still readable from
+    /// the old watch channel and is replayed onto the new one. Unregistering
+    /// before re-registering is what closes the old-guard/new-guard race —
+    /// a cancel cannot land on an entry that no longer exists.
+    pub fn switch_protocol(
+        self,
+        new_protocol: L4ConnectionProtocol,
+    ) -> (L4ConnectionGuard, watch::Receiver<ConnectionCancelReason>) {
+        let old_rx = self.cancel_receiver();
+        let ip = self.ip;
+        drop(self);
+        let pending = *old_rx.borrow();
+        let new_guard = L4_CONNECTION_REGISTRY.register(ip, new_protocol);
+        let new_rx = new_guard.cancel_receiver();
+        if pending != ConnectionCancelReason::None
+            && let Some(conn) = L4_CONNECTION_REGISTRY.get(ip, new_protocol, new_guard.id)
+        {
+            conn.cancel(pending);
+        }
+        (new_guard, new_rx)
     }
 }
 
@@ -94,7 +141,7 @@ impl L4ConnectionRegistry {
 
     pub fn register(&self, ip: IpAddr, protocol: L4ConnectionProtocol) -> L4ConnectionGuard {
         let id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(ConnectionCancelReason::None);
         self.by_key.insert(
             (ip, protocol, id),
             RegisteredConnection {
@@ -130,6 +177,10 @@ impl L4ConnectionRegistry {
     }
 
     pub fn drain_ip(&self, ip: IpAddr) -> usize {
+        self.drain_ip_with_reason(ip, ConnectionCancelReason::DefenseBlocked)
+    }
+
+    pub fn drain_ip_with_reason(&self, ip: IpAddr, reason: ConnectionCancelReason) -> usize {
         let conns = self
             .by_key
             .iter()
@@ -138,12 +189,23 @@ impl L4ConnectionRegistry {
             .collect::<Vec<_>>();
         let count = conns.len();
         for conn in conns {
-            conn.cancel();
+            conn.cancel(reason);
         }
         count
     }
 
-    pub fn drain_matching<F>(&self, mut predicate: F) -> usize
+    pub fn drain_matching<F>(&self, predicate: F) -> usize
+    where
+        F: FnMut(&RegisteredConnection) -> bool,
+    {
+        self.drain_matching_with_reason(predicate, ConnectionCancelReason::DefenseBlocked)
+    }
+
+    pub fn drain_matching_with_reason<F>(
+        &self,
+        mut predicate: F,
+        reason: ConnectionCancelReason,
+    ) -> usize
     where
         F: FnMut(&RegisteredConnection) -> bool,
     {
@@ -157,7 +219,7 @@ impl L4ConnectionRegistry {
             .collect::<Vec<_>>();
         let count = conns.len();
         for conn in conns {
-            conn.cancel();
+            conn.cancel(reason);
         }
         count
     }
@@ -186,23 +248,6 @@ pub fn drain_ip(ip: IpAddr) -> usize {
     L4_CONNECTION_REGISTRY.drain_ip(ip)
 }
 
-pub fn drain_sni_limited(max: usize) -> usize {
-    let mut selected = L4_CONNECTION_REGISTRY
-        .by_key
-        .iter()
-        .filter_map(|entry| {
-            (entry.key().1 == L4ConnectionProtocol::SniTcp).then(|| entry.value().clone())
-        })
-        .collect::<Vec<_>>();
-    selected.sort_by_key(|conn| conn.started_at);
-    selected.truncate(max);
-    let count = selected.len();
-    for conn in selected {
-        conn.cancel();
-    }
-    count
-}
-
 pub fn snapshot() -> L4ConnectionRegistrySnapshot {
     L4_CONNECTION_REGISTRY.snapshot()
 }
@@ -218,11 +263,43 @@ mod tests {
         let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let guard = register(ip, L4ConnectionProtocol::Http2);
         let _other_guard = register(other, L4ConnectionProtocol::Http2);
-        let rx = guard.cancel_receiver();
+        let mut rx = guard.cancel_receiver();
 
         assert_eq!(drain_ip(ip), 1);
-        assert!(rx.has_changed().unwrap_or(false));
+        assert_eq!(
+            *rx.borrow_and_update(),
+            ConnectionCancelReason::DefenseBlocked
+        );
 
         drop(guard);
+    }
+
+    #[test]
+    fn switch_protocol_carries_cancel_that_raced_before_the_swap() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        let guard = register(ip, L4ConnectionProtocol::Http1);
+
+        assert_eq!(drain_ip(ip), 1);
+        let (_new_guard, mut new_rx) = guard.switch_protocol(L4ConnectionProtocol::Http2);
+        assert_eq!(
+            *new_rx.borrow_and_update(),
+            ConnectionCancelReason::DefenseBlocked
+        );
+    }
+
+    #[test]
+    fn switch_protocol_keeps_new_entry_cancellable_and_noop_without_cancel() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12));
+        let (guard, mut rx) = register(ip, L4ConnectionProtocol::Http1)
+            .switch_protocol(L4ConnectionProtocol::SniTcp);
+
+        assert_eq!(*rx.borrow(), ConnectionCancelReason::None);
+        assert_eq!(drain_ip(ip), 1);
+        assert_eq!(
+            *rx.borrow_and_update(),
+            ConnectionCancelReason::DefenseBlocked
+        );
+        drop(guard);
+        assert_eq!(drain_ip(ip), 0);
     }
 }

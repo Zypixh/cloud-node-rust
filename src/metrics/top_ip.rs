@@ -45,6 +45,45 @@ impl TopIpTracker {
         }
         rows
     }
+
+    /// Put flushed rows back so a failed upload does not lose the counts.
+    /// The tracker has no time dimension, so restored rows merge exactly into
+    /// the next upload window.
+    pub fn restore(&self, rows: &[(i64, String, u64)]) {
+        for (server_id, ip, count) in rows {
+            let Ok(ip) = ip.parse::<IpAddr>() else {
+                continue;
+            };
+            if *server_id <= 0 {
+                continue;
+            }
+            let mut entry = self.counts.entry((*server_id, ip)).or_insert(0);
+            *entry = entry.saturating_add(*count);
+        }
+    }
 }
 
 pub static TOP_IP_TRACKER: Lazy<Arc<TopIpTracker>> = Lazy::new(|| Arc::new(TopIpTracker::new()));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_returns_flushed_rows_for_retry_after_failed_upload() {
+        let tracker = TopIpTracker::new();
+        tracker.record_addr(7, "192.0.2.1".parse().unwrap());
+        tracker.record_addr(7, "192.0.2.1".parse().unwrap());
+
+        let rows = tracker.flush();
+        assert_eq!(rows.len(), 1);
+        assert!(tracker.flush().is_empty());
+
+        tracker.restore(&rows);
+        let restored = tracker.flush();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].0, 7);
+        assert_eq!(restored[0].1, "192.0.2.1");
+        assert_eq!(restored[0].2, 2);
+    }
+}

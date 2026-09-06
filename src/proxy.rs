@@ -296,6 +296,7 @@ pub struct ProxyCTX {
     pub is_tls_downstream: bool,
     pub is_loopback: bool,
     pub server_metrics: Option<Arc<crate::metrics::ServerMetrics>>,
+    pub active_request_metrics_guard: Option<crate::metrics::ActiveRequestMetricsGuard>,
     pub ip_recorded: bool,
     pub webp_convert_enabled: bool,
     pub webp_source_content_type: Option<String>,
@@ -446,6 +447,7 @@ impl Default for ProxyCTX {
             is_tls_downstream: false,
             is_loopback: false,
             server_metrics: None,
+            active_request_metrics_guard: None,
             ip_recorded: false,
             webp_convert_enabled: false,
             webp_source_content_type: None,
@@ -5650,7 +5652,13 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         } else {
             0
         };
-        ctx.ip_recorded = crate::metrics::record::request_start(
+        ctx.active_request_metrics_guard = Some(crate::metrics::ActiveRequestMetricsGuard::new(
+            ctx.server_metrics
+                .as_ref()
+                .expect("server metrics initialized")
+                .clone(),
+        ));
+        ctx.ip_recorded = crate::metrics::record::request_start_without_active(
             server_id,
             &ctx.client_ip_str,
             user_id,
@@ -9139,7 +9147,7 @@ impl ProxyHttp for EdgeProxy {
                 let bytes_sent = body_bytes_sent + ctx.response_headers_size as u64 + 20;
                 let is_cached = ctx.cache_hit.unwrap_or(false);
                 let is_attack = ctx.waf_action.is_some();
-                crate::metrics::record::request_end(
+                crate::metrics::record::request_end_without_active(
                     server_id,
                     bytes_sent,
                     bytes_received,
@@ -9148,6 +9156,9 @@ impl ProxyHttp for EdgeProxy {
                     ctx.is_websocket,
                     ctx.server_metrics.as_ref(),
                 );
+                if let Some(guard) = ctx.active_request_metrics_guard.as_mut() {
+                    guard.finish();
+                }
 
                 if !ctx.origin_address.is_empty() {
                     crate::metrics::record::record_origin_traffic(

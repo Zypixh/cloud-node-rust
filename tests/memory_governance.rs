@@ -262,5 +262,5 @@ fn config_sync_limits_derive_from_live_governor_snapshot() {
     let low = ConfigApplyLimits::synthetic(512 * 1024 * 1024, 32 * 1024 * 1024);
     assert_eq!(low.pressure, MemoryPressureLevel::Critical);
     assert_eq!(low.server_chunk_size(), 4);
-    assert!(low.drop_previous_generation());
+    assert!(low.defer_health_registration());
 }

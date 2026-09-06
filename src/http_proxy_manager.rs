@@ -780,6 +780,10 @@ impl HttpProxyManager {
                         effective_addr.ip(),
                         L4ConnectionProtocol::Http1,
                     );
+                    // Shadow counter for physical downstream transports.
+                    let _downstream_transport = crate::metrics::transport_metrics_guard(
+                        crate::metrics::ShadowTransportKind::DownstreamTcp,
+                    );
                     let mut connection_cancel_rx = connection_guard.cancel_receiver();
                     tokio::select! {
                         _ = connection_cancel_rx.changed() => {}
@@ -836,6 +840,11 @@ impl HttpProxyManager {
                 }
                 let connection_guard =
                     l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::Http1);
+                // Shadow counter for physical downstream transports; held for
+                // the whole connection, across protocol switches.
+                let _downstream_transport = crate::metrics::transport_metrics_guard(
+                    crate::metrics::ShadowTransportKind::DownstreamTcp,
+                );
                 let mut connection_cancel_rx = connection_guard.cancel_receiver();
 
                 if is_tls {
@@ -843,13 +852,13 @@ impl HttpProxyManager {
                         Ok(TlsHostInspection::Route(route)) => {
                             configured_tls_host = route.has_l7_server;
                             if let Some(server) = route.sni_passthrough_server {
-                                drop(connection_guard);
                                 drop(connection_permit);
-                                let sni_connection_guard = l4_connection_registry::register(
-                                    client_addr.ip(),
-                                    L4ConnectionProtocol::SniTcp,
-                                );
-                                let sni_cancel_rx = sni_connection_guard.cancel_receiver();
+                                // Re-register under SniTcp while carrying over
+                                // any cancel that raced in on the Http1 entry.
+                                let (_sni_connection_guard, sni_cancel_rx) =
+                                    connection_guard.switch_protocol(
+                                        L4ConnectionProtocol::SniTcp,
+                                    );
                                 configure_passthrough_socket(&client_stream);
                                 if let Err(err) = manager
                                     .handle_sni_passthrough(
@@ -956,12 +965,11 @@ impl HttpProxyManager {
                     };
 
                 if matches!(alpn, Some(ALPN::H2)) {
-                    drop(connection_guard);
-                    let h2_connection_guard = l4_connection_registry::register(
-                        client_addr.ip(),
-                        L4ConnectionProtocol::Http2,
-                    );
-                    let h2_cancel_rx = h2_connection_guard.cancel_receiver();
+                    // HTTP/1 → HTTP/2 upgrade: re-register under Http2 while
+                    // carrying over any cancel that raced in on the Http1
+                    // entry.
+                    let (h2_connection_guard, h2_cancel_rx) =
+                        connection_guard.switch_protocol(L4ConnectionProtocol::Http2);
                     process_h2_stream(ProcessH2StreamArgs {
                         stream,
                         socket_digest: downstream_socket_digest,
@@ -1512,6 +1520,9 @@ impl HttpProxyManager {
         );
         let connection_guard =
             l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::Http1);
+        let _downstream_transport = crate::metrics::transport_metrics_guard(
+            crate::metrics::ShadowTransportKind::DownstreamTcp,
+        );
         let mut connection_cancel_rx = connection_guard.cancel_receiver();
 
         let l4_stream = af_xdp_virtual_stream(client_stream, client_addr);
@@ -1525,12 +1536,10 @@ impl HttpProxyManager {
                 Ok(Ok(tls_stream)) => {
                     if matches!(tls_stream.selected_alpn_proto(), Some(ALPN::H2)) {
                         let socket_digest = tls_stream.get_socket_digest();
-                        drop(connection_guard);
-                        let h2_connection_guard = l4_connection_registry::register(
-                            client_addr.ip(),
-                            L4ConnectionProtocol::Http2,
-                        );
-                        let h2_cancel_rx = h2_connection_guard.cancel_receiver();
+                        // HTTP/1 → HTTP/2 upgrade over AF_XDP: carry any
+                        // pending Http1 cancel into the Http2 entry.
+                        let (h2_connection_guard, h2_cancel_rx) =
+                            connection_guard.switch_protocol(L4ConnectionProtocol::Http2);
                         let http2_handshake_timeout = self.http2_handshake_timeout();
                         process_h2_stream(ProcessH2StreamArgs {
                             stream: Box::new(tls_stream),
@@ -1600,7 +1609,7 @@ impl HttpProxyManager {
         listen_port: u16,
         sni_host: String,
         server: Arc<ServerConfig>,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
     ) -> anyhow::Result<()> {
         self.handle_sni_passthrough_inner(
             SniPassthroughClient::Tcp(client_stream),
@@ -1620,7 +1629,7 @@ impl HttpProxyManager {
         listen_port: u16,
         sni_host: String,
         server: Arc<ServerConfig>,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1643,7 +1652,7 @@ impl HttpProxyManager {
         listen_port: u16,
         sni_host: String,
         server: Arc<ServerConfig>,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
     ) -> anyhow::Result<()> {
         let started = Instant::now();
         let started_at_millis = crate::utils::time::now_timestamp_millis();
@@ -1684,7 +1693,9 @@ impl HttpProxyManager {
         };
 
         let client_ip = client_addr.ip().to_string();
-        crate::metrics::record::request_start(
+        let metrics = crate::metrics::record::get_or_create(server_id);
+        let mut metrics_guard = crate::metrics::ActiveRequestMetricsGuard::new(metrics.clone());
+        crate::metrics::record::request_start_without_active(
             server_id,
             &client_ip,
             server.user_id,
@@ -1743,7 +1754,16 @@ impl HttpProxyManager {
                         status: 502,
                     },
                 );
-                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                crate::metrics::record::request_end_without_active(
+                    server_id,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some(metrics_guard.metrics()),
+                );
+                metrics_guard.finish();
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
                 crate::rpc::stats::push_origin_health_event(
                     origin_id,
@@ -1814,7 +1834,16 @@ impl HttpProxyManager {
                         status: 502,
                     },
                 );
-                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                crate::metrics::record::request_end_without_active(
+                    server_id,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some(metrics_guard.metrics()),
+                );
+                metrics_guard.finish();
                 return Err(err).with_context(|| {
                     format!(
                         "failed to write PROXY Protocol header to passthrough upstream {}",
@@ -1865,7 +1894,16 @@ impl HttpProxyManager {
                         status: 502,
                     },
                 );
-                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                crate::metrics::record::request_end_without_active(
+                    server_id,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some(metrics_guard.metrics()),
+                );
+                metrics_guard.finish();
                 return Err(err).with_context(|| {
                     format!(
                         "failed to flush PROXY Protocol header to passthrough upstream {}",
@@ -1946,7 +1984,16 @@ impl HttpProxyManager {
                     200,
                     relay_note.as_deref(),
                 );
-                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                crate::metrics::record::request_end_without_active(
+                    server_id,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some(metrics_guard.metrics()),
+                );
+                metrics_guard.finish();
                 Ok(())
             }
             Err(err) => {
@@ -1978,7 +2025,16 @@ impl HttpProxyManager {
                     502,
                     Some(&err.to_string()),
                 );
-                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                crate::metrics::record::request_end_without_active(
+                    server_id,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some(metrics_guard.metrics()),
+                );
+                metrics_guard.finish();
                 Err(err.into())
             }
         }
@@ -2080,7 +2136,7 @@ struct ProcessH2StreamArgs {
     client_addr: SocketAddr,
     port: u16,
     http2_handshake_timeout: Duration,
-    h2_cancel_rx: watch::Receiver<bool>,
+    h2_cancel_rx: watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>,
     _h2_connection_guard: crate::l4_connection_registry::L4ConnectionGuard,
     configured_tls_host: bool,
 }

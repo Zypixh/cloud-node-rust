@@ -152,6 +152,11 @@ pub async fn start_node_stream(api_config: ApiConfig, config_store: Arc<ConfigSt
                     continue;
                 }
             };
+        // Shadow counter for the live node stream transport; dropped when the
+        // stream ends so reconnects are reflected.
+        let _rpc_transport = crate::metrics::transport_metrics_guard(
+            crate::metrics::ShadowTransportKind::RpcTransport,
+        );
         let stream_result = run_stream(client, &api_config, config_store.clone())
             .await
             .map(|_| NodeStreamProbeResult::default());

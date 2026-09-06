@@ -42,6 +42,7 @@ pub struct PartialWriter {
     written: u64,
     committed: bool,
     purge_generation: u64,
+    fence_purge_generation: bool,
     _purge_guard: tokio::sync::OwnedRwLockReadGuard<()>,
     _root_guard: OwnedMutexGuard<()>,
     _process_lock: Option<crate::cache_hybrid::CacheProcessLockGuard>,
@@ -509,6 +510,7 @@ pub(crate) async fn open_writer_with_guards(
         written: 0,
         committed: false,
         purge_generation,
+        fence_purge_generation: expected_generation.is_some(),
         _purge_guard: purge_guard,
         _root_guard: root_guard,
         _process_lock: process_lock,
@@ -535,7 +537,9 @@ impl PartialWriter {
     }
 
     pub async fn finish(mut self, roots: &[PathBuf], write_root: PathBuf) -> std::io::Result<bool> {
-        if self.purge_generation != crate::cache_hybrid::current_cache_purge_generation() {
+        if self.fence_purge_generation
+            && self.purge_generation != crate::cache_hybrid::current_cache_purge_generation()
+        {
             return Ok(false);
         }
         if let Some(file) = self.file.as_mut() {
@@ -545,7 +549,9 @@ impl PartialWriter {
         if capture_len(&self.capture).is_none_or(|expected| self.written != expected) {
             return Ok(false);
         }
-        if self.purge_generation != crate::cache_hybrid::current_cache_purge_generation() {
+        if self.fence_purge_generation
+            && self.purge_generation != crate::cache_hybrid::current_cache_purge_generation()
+        {
             return Ok(false);
         }
         // Close the range temp before the commit so Windows can rename/delete
@@ -1902,11 +1908,13 @@ mod tests {
         let root = test_root("stale-writer-generation").await;
         let roots = vec![root.clone()];
         let key = partial_cache_key(&base, Some("bytes=0-3")).expect("range key");
-        let mut writer = open_writer(
+        let expected_generation = crate::cache_hybrid::current_cache_purge_generation();
+        let mut writer = open_writer_with_generation(
             &key,
             test_capture(0, 3, MIN_FORCE_PARTIAL_HIT_BYTES, Some("v1"), None),
             &roots,
             root.clone(),
+            Some(expected_generation),
         )
         .await
         .expect("open writer")

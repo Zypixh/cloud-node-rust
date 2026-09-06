@@ -212,6 +212,10 @@ impl Http3ProxyManager {
             let shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 let _connection_permit = connection_permit;
+                // Shadow counter for live QUIC connections.
+                let _quic_transport = crate::metrics::transport_metrics_guard(
+                    crate::metrics::ShadowTransportKind::QuicConnection,
+                );
                 if let Err(err) = manager
                     .serve_connection(connecting, port, proxy, shutdown)
                     .await

@@ -1,6 +1,7 @@
 use cloud_node_rust::metrics::storage::{
-    MetricStorage, NODE_PERIOD_BYTES, SERVER_PERIOD_BYTES, apply_node_period_deltas,
-    apply_server_period_update, fold_counter_deltas,
+    MaceMemoryTier, MetricStorage, NODE_PERIOD_BYTES, SERVER_PERIOD_BYTES,
+    apply_node_period_deltas, apply_server_period_update, fold_counter_deltas,
+    mace_memory_observation, mace_memory_tier_for_stable_capacity,
 };
 use cloud_node_rust::rpc::metrics::ServerMetricUpdate;
 
@@ -68,16 +69,53 @@ fn metric_storage_increment_and_server_batch_round_trip() {
     let _ = std::fs::remove_dir_all(&dir);
     let storage = MetricStorage::open(&dir).expect("open mace storage");
 
-    storage.increment_batch(vec![
-        ("counter_a".to_string(), 10),
-        ("counter_a".to_string(), 5),
-        ("counter_b".to_string(), 0),
-    ]);
+    storage
+        .increment_batch(vec![
+            ("counter_a".to_string(), 10),
+            ("counter_a".to_string(), 5),
+            ("counter_b".to_string(), 0),
+        ])
+        .expect("persist counter batch");
     assert_eq!(storage.get_value("counter_a"), 15);
     assert_eq!(storage.get_value("counter_b"), 0);
 
-    storage.record_server_batch(1_700_000_000, vec![sample_update()], 50, 25);
-    storage.record_server_batch(1_700_000_000, vec![sample_update()], 10, 5);
+    storage
+        .record_server_batch(1_700_000_000, vec![sample_update()], 50, 25)
+        .expect("persist first server batch");
+    storage
+        .record_server_batch(1_700_000_000, vec![sample_update()], 10, 5)
+        .expect("persist second server batch");
     drop(storage);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mace_tier_uses_stable_capacity_boundaries() {
+    assert_eq!(
+        mace_memory_tier_for_stable_capacity(512 * 1024 * 1024),
+        MaceMemoryTier::MiB512
+    );
+    assert_eq!(
+        mace_memory_tier_for_stable_capacity(1024 * 1024 * 1024),
+        MaceMemoryTier::GiB1
+    );
+    assert_eq!(
+        mace_memory_tier_for_stable_capacity(2 * 1024 * 1024 * 1024),
+        MaceMemoryTier::GiB2
+    );
+}
+
+#[test]
+fn mace_memory_observation_labels_capacity_semantics() {
+    let observation = mace_memory_observation();
+    assert_eq!(
+        observation.wal_buffer_capacity_bytes,
+        observation
+            .wal_buffer_bytes_per_group
+            .saturating_mul(observation.concurrent_write as u64)
+    );
+    assert!(observation.wal_file_size_bytes >= observation.wal_buffer_bytes_per_group);
+    assert!(observation.bucket_cache_capacity_bytes > 0);
+    assert!(observation.bucket_pool_capacity_bytes > 0);
+    assert!(observation.bucket_checkpoint_size_bytes > 0);
 }

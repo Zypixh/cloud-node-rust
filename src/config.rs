@@ -293,6 +293,12 @@ pub struct ConfigStore {
     reload_notify: Arc<Notify>,
     reload_generation: Arc<AtomicU64>,
     parent_pressure: Arc<DashMap<String, (f32, std::time::Instant)>>,
+    published_fingerprints: Arc<DashMap<String, String>>,
+    /// Hash of the global runtime context (global HTTP settings, node level,
+    /// parent nodes, tiered bypass, LAN allow). Per-server/per-user published
+    /// fingerprints embed this salt, so a global-context change forces the
+    /// incremental syncs to rebuild instead of skipping on a matching JSON.
+    runtime_context_salt: Arc<Mutex<String>>,
 }
 
 #[derive(Clone, Default)]
@@ -397,11 +403,77 @@ impl ConfigStore {
             reload_notify: Arc::new(Notify::new()),
             reload_generation: Arc::new(AtomicU64::new(0)),
             parent_pressure: Arc::new(DashMap::new()),
+            published_fingerprints: Arc::new(DashMap::new()),
+            runtime_context_salt: Arc::new(Mutex::new(String::new())),
         }
     }
 
     pub fn runtime_reload_generation(&self) -> u64 {
         self.reload_generation.load(Ordering::Acquire)
+    }
+
+    pub fn published_fingerprint(&self, scope: &str) -> Option<String> {
+        self.published_fingerprints
+            .get(scope)
+            .map(|entry| entry.value().clone())
+    }
+
+    pub fn mark_published_fingerprint(
+        &self,
+        scope: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) {
+        self.published_fingerprints
+            .insert(scope.into(), fingerprint.into());
+    }
+
+    /// Drop a published fingerprint so a later sync with identical JSON still
+    /// rebuilds. Called when a server/user is removed or disabled — otherwise
+    /// re-enabling the same JSON would be misread as "already published" while
+    /// the actual routes are gone.
+    pub fn clear_published_fingerprint(&self, scope: &str) {
+        self.published_fingerprints.remove(scope);
+    }
+
+    /// Salt for published fingerprints derived from the global runtime
+    /// context. Fingerprints computed against an older salt (older global
+    /// settings or an older binary) no longer match, forcing a rebuild.
+    pub fn runtime_fingerprint_salt(&self) -> String {
+        self.runtime_context_salt.lock().clone()
+    }
+
+    fn refresh_runtime_context_salt_locked(
+        global_http: &crate::config_models::GlobalHTTPAllConfig,
+        level: i32,
+        parent_nodes: &HashMap<i64, Vec<ParentNodeConfig>>,
+        tiered_origin_bypass: bool,
+        allow_lan_ip: bool,
+    ) -> String {
+        let context_json = serde_json::to_vec(&(
+            global_http,
+            level,
+            parent_nodes,
+            tiered_origin_bypass,
+            allow_lan_ip,
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .unwrap_or_default();
+        format!("{:x}", md5_legacy::compute(context_json))
+    }
+
+    /// Forget fingerprints whose server/user no longer exists after a full
+    /// snapshot. Keeps the map bounded by the live site count.
+    fn prune_published_fingerprints(&self, live_servers: &HashSet<i64>, live_users: &HashSet<i64>) {
+        self.published_fingerprints.retain(|scope, _| {
+            if let Some(id) = scope.strip_prefix("server:").and_then(|v| v.parse::<i64>().ok()) {
+                live_servers.contains(&id)
+            } else if let Some(id) = scope.strip_prefix("user:").and_then(|v| v.parse::<i64>().ok())
+            {
+                live_users.contains(&id)
+            } else {
+                true
+            }
+        });
     }
 
     pub async fn wait_for_runtime_reload(&self, seen_generation: u64) -> u64 {
@@ -1146,31 +1218,6 @@ impl ConfigStore {
         lock.servers.keys().cloned().collect()
     }
 
-    /// Drop host/LB maps and compiled server plans so a full snapshot can be
-    /// rebuilt without holding two generations in RSS. In-flight requests that
-    /// already cloned `Arc`s keep serving; new lookups miss until replace.
-    pub fn release_server_runtime_for_reload(&self) {
-        let dumped = {
-            let mut lock = self.inner.write();
-            let dumped = (
-                std::mem::take(&mut lock.all_servers),
-                std::mem::take(&mut lock.servers),
-                std::mem::take(&mut lock.routes),
-                std::mem::take(&mut lock.id_to_lb),
-                std::mem::replace(
-                    &mut lock.compiled_plans,
-                    Arc::new(crate::compiled::CompiledPlanSet::default()),
-                ),
-            );
-            Self::refresh_passthrough_indexes(&mut lock);
-            Self::refresh_cluster_policy_indexes(&mut lock);
-            dumped
-        };
-        drop(dumped);
-        crate::memory_reclaim::trim_released_heap();
-        self.notify_runtime_reload();
-    }
-
     pub async fn is_deleted_content(&self, url: &str) -> bool {
         let lock = self.inner.read();
         lock.deleted_contents
@@ -1470,9 +1517,29 @@ impl ConfigStore {
                 .map(|cfg| cfg.is_on)
                 .unwrap_or(false),
         );
+        let live_server_ids: HashSet<i64> = lock
+            .all_servers
+            .iter()
+            .map(|server| server.numeric_id())
+            .collect();
+        let live_user_ids: HashSet<i64> = lock
+            .all_servers
+            .iter()
+            .map(|server| server.user_id)
+            .filter(|user_id| *user_id > 0)
+            .collect();
+        let new_salt = Self::refresh_runtime_context_salt_locked(
+            &lock.global_http_config,
+            lock.level,
+            &lock.parent_nodes,
+            lock.tiered_origin_bypass,
+            lock.allow_lan_ip,
+        );
         Self::refresh_passthrough_indexes(&mut lock);
         Self::refresh_cluster_policy_indexes(&mut lock);
         drop(lock);
+        *self.runtime_context_salt.lock() = new_salt;
+        self.prune_published_fingerprints(&live_server_ids, &live_user_ids);
         self.notify_runtime_reload();
     }
 
@@ -1625,6 +1692,7 @@ impl ConfigStore {
                 .filter_map(|server| (server.user_id == user_id).then_some(server.numeric_id()))
                 .collect::<std::collections::HashSet<_>>()
         };
+        self.clear_published_fingerprint(&format!("user:{user_id}"));
         self.replace_servers_snapshot(
             stale_ids,
             Vec::new(),
@@ -1636,6 +1704,7 @@ impl ConfigStore {
     }
 
     pub async fn remove_server(&self, server_id: i64) {
+        self.clear_published_fingerprint(&format!("server:{server_id}"));
         self.replace_servers_snapshot(
             std::iter::once(server_id).collect(),
             Vec::new(),
@@ -1837,6 +1906,9 @@ impl ConfigStore {
         lock.udp_server_by_port.clear();
 
         for server in &lock.all_servers {
+            if !server.is_on {
+                continue;
+            }
             if !server.is_quic_passthrough() {
                 for port in Self::server_udp_ports(server, false) {
                     if let Some(existing) = lock.udp_server_by_port.get(&port) {
@@ -1963,6 +2035,9 @@ impl ConfigStore {
         server: &Arc<ServerConfig>,
         ports: Vec<u16>,
     ) {
+        if !server.is_on {
+            return;
+        }
         for name in server.get_plain_server_names() {
             let name = Self::normalize_host(&name);
             if name.is_empty() {
@@ -2039,6 +2114,72 @@ mod tests {
         TLSExhaustionAttackConfig, UDPConfig,
     };
     use serde_json::json;
+
+    #[test]
+    fn published_fingerprint_is_scoped_and_only_changes_when_marked() {
+        let store = ConfigStore::new();
+        assert_eq!(store.published_fingerprint("server:7"), None);
+        store.mark_published_fingerprint("server:7", "v1");
+        assert_eq!(
+            store.published_fingerprint("server:7").as_deref(),
+            Some("v1")
+        );
+        assert_eq!(store.published_fingerprint("server:8"), None);
+        store.mark_published_fingerprint("server:7", "v2");
+        assert_eq!(
+            store.published_fingerprint("server:7").as_deref(),
+            Some("v2")
+        );
+    }
+
+    #[test]
+    fn published_fingerprints_clear_on_removal_and_prune_to_live_sites() {
+        let store = ConfigStore::new();
+        store.mark_published_fingerprint("server:7", "v1");
+        store.mark_published_fingerprint("user:9", "v1");
+        store.mark_published_fingerprint("user:10", "v1");
+
+        // Removing a server/user must drop its fingerprint so re-enabling the
+        // same JSON rebuilds instead of being skipped as "already published".
+        store.clear_published_fingerprint("server:7");
+        assert_eq!(store.published_fingerprint("server:7"), None);
+        assert_eq!(store.published_fingerprint("user:9").as_deref(), Some("v1"));
+
+        // A full snapshot prunes fingerprints whose site/user no longer exists.
+        store.prune_published_fingerprints(&HashSet::from([7]), &HashSet::from([9]));
+        assert_eq!(store.published_fingerprint("user:9").as_deref(), Some("v1"));
+        assert_eq!(store.published_fingerprint("user:10"), None);
+    }
+
+    #[test]
+    fn runtime_fingerprint_salt_tracks_global_context() {
+        let store = ConfigStore::new();
+        assert_eq!(store.runtime_fingerprint_salt(), "");
+        let salt_one = ConfigStore::refresh_runtime_context_salt_locked(
+            &crate::config_models::GlobalHTTPAllConfig::default(),
+            1,
+            &HashMap::new(),
+            false,
+            false,
+        );
+        assert!(!salt_one.is_empty());
+        let salt_two = ConfigStore::refresh_runtime_context_salt_locked(
+            &crate::config_models::GlobalHTTPAllConfig::default(),
+            1,
+            &HashMap::new(),
+            false,
+            false,
+        );
+        assert_eq!(salt_one, salt_two, "unchanged context must keep the salt");
+        let salt_three = ConfigStore::refresh_runtime_context_salt_locked(
+            &crate::config_models::GlobalHTTPAllConfig::default(),
+            2,
+            &HashMap::new(),
+            false,
+            false,
+        );
+        assert_ne!(salt_one, salt_three, "changed context must move the salt");
+    }
 
     fn test_firewall_policy(id: i64) -> HTTPFirewallPolicy {
         HTTPFirewallPolicy {

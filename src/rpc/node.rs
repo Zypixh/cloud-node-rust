@@ -971,13 +971,11 @@ where
                     }
 
                     let apply_limits = crate::config_apply::ConfigApplyLimits::from_governor();
-                    if apply_limits.drop_previous_generation() {
-                        crate::config_apply::drop_previous_server_generation(
-                            config_store,
-                            health_manager,
-                        );
-                    }
                     let global_http_arc = global_http_config.clone().map(Arc::new);
+                    // Materialize the new generation first and only publish it
+                    // once built. Releasing the installed generation up front
+                    // opens an empty-route window for every new request during
+                    // the whole materialization.
                     let runtime_maps = crate::config_apply::materialize_runtime_servers(
                         crate::config_apply::MaterializeRuntimeServersArgs {
                             servers: payload_servers,
@@ -991,6 +989,17 @@ where
                         },
                     )
                     .await;
+                    if !runtime_maps.stats.admitted {
+                        // Governor refused admission: keep the previous
+                        // generation serving and retry the sync later. The
+                        // config cursor is intentionally not advanced so the
+                        // next poll re-fetches this payload.
+                        warn!(
+                            "RPC_NODE: Config apply deferred by memory governor (retries={}); keeping previous generation",
+                            runtime_maps.stats.admission_retries
+                        );
+                        return false;
+                    }
 
                     let mut loaded_domain_names = std::collections::BTreeSet::new();
                     let mut port_only_server_count = 0usize;
@@ -1363,9 +1372,14 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
         let cache_stats = crate::cache_manager::CACHE.storage.runtime_stats().await;
         let governor_snapshot = crate::memory_governor::MEMORY_GOVERNOR
             .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
+        let mace_memory = crate::metrics::storage::mace_memory_observation();
+        let geoip_memory = crate::metrics::analyzer::geoip_memory_snapshot();
+        let shadow_connections = crate::metrics::shadow_connection_metrics();
         let l4_metrics = crate::l4_defense::metrics_snapshot();
         let resource_governor = serde_json::json!({
             "memoryPressure": governor_snapshot.memory_pressure_level.as_str(),
+            "memoryRawAvailableBytes": governor_snapshot.memory_raw_available_bytes,
+            "memoryAvailability": format!("{:?}", governor_snapshot.memory_availability),
             "fdUsed": governor_snapshot.fd_used,
             "fdSoftLimit": governor_snapshot.fd_soft_limit,
             "fdUsedPercent": governor_snapshot.fd_used_pct,
@@ -1389,6 +1403,23 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "processAnonRssBytes": governor_snapshot.process_anon_rss_bytes,
             "residentUsedBytes": governor_snapshot.resident_memory.total_used_bytes,
             "residentBudgetBytes": governor_snapshot.resident_memory.total_budget_bytes,
+            "mace": {
+                "tier": format!("{:?}", mace_memory.tier),
+                "concurrentWrite": mace_memory.concurrent_write,
+                "walBufferBytesPerGroup": mace_memory.wal_buffer_bytes_per_group,
+                "walBufferCapacityBytes": mace_memory.wal_buffer_capacity_bytes,
+                "walFileSizeBytes": mace_memory.wal_file_size_bytes,
+                "bucketCacheCapacityBytes": mace_memory.bucket_cache_capacity_bytes,
+                "bucketPoolCapacityBytes": mace_memory.bucket_pool_capacity_bytes,
+                "bucketCheckpointSizeBytes": mace_memory.bucket_checkpoint_size_bytes
+            },
+            "geoip": {
+                "cityLoaded": geoip_memory.city_loaded,
+                "cityBytes": geoip_memory.city_bytes,
+                "cityGeneration": geoip_memory.city_generation,
+                "asnLoaded": geoip_memory.asn_loaded,
+                "asnBytes": geoip_memory.asn_bytes
+            },
         });
         let l4_defense = serde_json::json!({
             "eventsTotal": l4_metrics.events_total,
@@ -1458,6 +1489,16 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "trafficInBytes": traffic_in,
             "trafficOutBytes": traffic_out,
             "connectionCount": connections,
+            "connectionShadow": {
+                "downstreamTransports": shadow_connections.downstream_transports,
+                "upstreamTransports": shadow_connections.upstream_transports,
+                "rpcTransports": shadow_connections.rpc_transports,
+                "udpSessions": shadow_connections.udp_sessions,
+                "quicConnections": shadow_connections.quic_connections,
+                "pendingRequests": shadow_connections.pending_requests,
+                "forwardingRequests": shadow_connections.forwarding_requests,
+                "activeRequests": shadow_connections.active_requests
+            },
             "apiSuccessPercent": api_success_percent,
             "apiAvgCostSeconds": api_avg_cost_seconds,
             "cacheTotalDiskSize": cache_stats.disk_bytes,
@@ -1553,6 +1594,7 @@ pub async fn report_node_online_once(
     let now = crate::utils::time::now_timestamp();
     let xdp_status = serde_json::to_value(crate::xdp::status_snapshot())
         .unwrap_or_else(|_| serde_json::json!({"available": false}));
+    let shadow_connections = crate::metrics::shadow_connection_metrics();
     let status = serde_json::json!({
         "buildVersion": env!("CARGO_PKG_VERSION"),
         "buildVersionCode": build_version_code(),
@@ -1572,6 +1614,16 @@ pub async fn report_node_online_once(
         "trafficInBytes": traffic_in,
         "trafficOutBytes": traffic_out,
         "connectionCount": connections,
+        "connectionShadow": {
+            "downstreamTransports": shadow_connections.downstream_transports,
+            "upstreamTransports": shadow_connections.upstream_transports,
+            "rpcTransports": shadow_connections.rpc_transports,
+            "udpSessions": shadow_connections.udp_sessions,
+            "quicConnections": shadow_connections.quic_connections,
+            "pendingRequests": shadow_connections.pending_requests,
+            "forwardingRequests": shadow_connections.forwarding_requests,
+            "activeRequests": shadow_connections.active_requests
+        },
         "apiSuccessPercent": api_success_percent,
         "apiAvgCostSeconds": api_avg_cost_seconds,
         "cacheTotalDiskSize": cache_stats.disk_bytes,

@@ -1,7 +1,9 @@
 use crate::memory_governor::{MEMORY_GOVERNOR, MemoryPressureLevel};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReclaimStats {
@@ -14,7 +16,6 @@ pub struct ReclaimStats {
     pub tls_connectors_removed: usize,
     pub waf_regex_entries_removed: u64,
     pub metric_rows_flushed: usize,
-    pub sni_relays_drained: usize,
 }
 
 impl ReclaimStats {
@@ -34,6 +35,13 @@ impl ReclaimStats {
 
 static LAST_OBSERVED_PRESSURE: AtomicU8 = AtomicU8::new(MemoryPressureLevel::Normal as u8);
 static LAST_RECLAIM_AT_MS: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static RECLAIM_CLOCK_START: OnceLock<Instant> = OnceLock::new();
+// Highest pressure level observed since the monitor last drained it. Hot-path
+// callers only bump this atomic and unpark the monitor; they never run reclaim
+// work themselves.
+static PENDING_RECLAIM_LEVEL: AtomicU8 = AtomicU8::new(MemoryPressureLevel::Normal as u8);
+static RECLAIM_MONITOR_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 
 thread_local! {
     // Reclaiming cache state can update resident-memory accounting, which in
@@ -43,6 +51,113 @@ thread_local! {
 }
 
 const RECLAIM_COOLDOWN_MS: u64 = 5_000;
+const ESCALATION_SAMPLES_REQUIRED: u8 = 2;
+const RECOVERY_STABILITY_MS: u64 = 30_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReclaimDecision {
+    Hold,
+    Trigger(MemoryPressureLevel),
+}
+
+/// Deterministic pressure hysteresis used by the runtime coordinator.
+///
+/// The clock is supplied by the caller so pressure transitions can be tested
+/// without wall-clock sleeps. Reclaim work itself remains bounded by the
+/// individual cache reclaimers.
+#[derive(Clone, Copy, Debug)]
+pub struct ReclaimCoordinator {
+    observed: MemoryPressureLevel,
+    escalation_level: MemoryPressureLevel,
+    escalation_samples: u8,
+    recovery_since_ms: Option<u64>,
+    next_allowed_ms: u64,
+    retry_backoff_ms: u64,
+}
+
+impl Default for ReclaimCoordinator {
+    fn default() -> Self {
+        Self {
+            observed: MemoryPressureLevel::Normal,
+            escalation_level: MemoryPressureLevel::Normal,
+            escalation_samples: 0,
+            recovery_since_ms: None,
+            next_allowed_ms: 0,
+            retry_backoff_ms: RECLAIM_COOLDOWN_MS,
+        }
+    }
+}
+
+impl ReclaimCoordinator {
+    pub fn observed_level(&self) -> MemoryPressureLevel {
+        self.observed
+    }
+
+    pub fn observe(&mut self, level: MemoryPressureLevel, now_ms: u64) -> ReclaimDecision {
+        if level > self.observed {
+            self.recovery_since_ms = None;
+            if self.escalation_level != level {
+                self.escalation_level = level;
+                self.escalation_samples = 0;
+            }
+            self.escalation_samples = self.escalation_samples.saturating_add(1);
+            if self.escalation_samples >= ESCALATION_SAMPLES_REQUIRED
+                && now_ms >= self.next_allowed_ms
+            {
+                self.observed = level;
+                self.escalation_samples = 0;
+                return ReclaimDecision::Trigger(level);
+            }
+            return ReclaimDecision::Hold;
+        }
+
+        if level == self.observed
+            && level >= MemoryPressureLevel::Elevated
+            && self.next_allowed_ms != 0
+            && now_ms >= self.next_allowed_ms
+        {
+            return ReclaimDecision::Trigger(level);
+        }
+
+        self.escalation_samples = 0;
+        if level < self.observed {
+            let since = *self.recovery_since_ms.get_or_insert(now_ms);
+            if now_ms.saturating_sub(since) >= RECOVERY_STABILITY_MS {
+                self.observed = level;
+                self.escalation_level = level;
+                self.recovery_since_ms = None;
+            }
+        } else {
+            self.recovery_since_ms = None;
+        }
+        ReclaimDecision::Hold
+    }
+
+    pub fn record_result(&mut self, now_ms: u64, stats: ReclaimStats) {
+        let made_progress = stats.total_entries_removed() > 0 || stats.freed_bytes_estimate() > 0;
+        if made_progress {
+            self.retry_backoff_ms = RECLAIM_COOLDOWN_MS;
+        } else {
+            self.retry_backoff_ms =
+                (self.retry_backoff_ms.saturating_mul(2)).clamp(RECLAIM_COOLDOWN_MS, 60_000);
+        }
+        self.next_allowed_ms = now_ms.saturating_add(self.retry_backoff_ms);
+    }
+}
+
+static RECLAIM_COORDINATOR: OnceLock<Mutex<ReclaimCoordinator>> = OnceLock::new();
+
+fn reclaim_coordinator() -> &'static Mutex<ReclaimCoordinator> {
+    RECLAIM_COORDINATOR.get_or_init(|| Mutex::new(ReclaimCoordinator::default()))
+}
+
+fn monotonic_elapsed_ms() -> u64 {
+    RECLAIM_CLOCK_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
 
 fn level_from_u8(value: u8) -> MemoryPressureLevel {
     match value {
@@ -74,10 +189,8 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
             stats.l1_entries_removed = cache_stats.l1_entries_removed;
             stats.l1_bytes_freed_estimate = cache_stats.l1_bytes_freed_estimate;
             stats.negative_cache_entries_removed = cache_stats.negative_cache_entries_removed;
-            stats.metric_rows_flushed = flush_metric_aggregators();
         }
         MemoryPressureLevel::High => {
-            stats.sni_relays_drained = crate::l4_connection_registry::drain_sni_limited(8);
             let cache_stats = crate::cache_hybrid::reclaim_caches_high();
             stats.l1_entries_removed = cache_stats.l1_entries_removed;
             stats.l1_bytes_freed_estimate = cache_stats.l1_bytes_freed_estimate;
@@ -89,11 +202,9 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
             stats.tls_connectors_removed = crate::tcp_proxy::reclaim_tls_connector_cache(0.5);
             stats.waf_regex_entries_removed =
                 crate::firewall::matcher::reclaim_waf_regex_caches(false);
-            stats.metric_rows_flushed = flush_metric_aggregators();
             crate::firewall::state::accelerate_block_map_gc();
         }
         MemoryPressureLevel::Critical => {
-            stats.sni_relays_drained = crate::l4_connection_registry::drain_sni_limited(32);
             let cache_stats = crate::cache_hybrid::reclaim_caches_critical();
             stats.l1_entries_removed = cache_stats.l1_entries_removed;
             stats.l1_bytes_freed_estimate = cache_stats.l1_bytes_freed_estimate;
@@ -105,7 +216,6 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
             stats.tls_connectors_removed = crate::tcp_proxy::reclaim_tls_connector_cache(0.0);
             stats.waf_regex_entries_removed =
                 crate::firewall::matcher::reclaim_waf_regex_caches(true);
-            stats.metric_rows_flushed = flush_metric_aggregators();
             crate::firewall::state::accelerate_block_map_gc();
             crate::bounded_regex_cache::reclaim_all();
         }
@@ -129,39 +239,79 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
     stats
 }
 
-fn flush_metric_aggregators() -> usize {
-    let stat_rows = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR
-        .flush()
-        .len();
-    let http_rows = crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR
-        .flush()
-        .len();
-    stat_rows.saturating_add(http_rows)
+pub fn request_reclaim(level: MemoryPressureLevel) -> Option<ReclaimStats> {
+    if level < MemoryPressureLevel::Elevated
+        || !RECLAIM_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        return None;
+    }
+    let now = monotonic_elapsed_ms();
+    let last = LAST_RECLAIM_AT_MS.load(Ordering::Acquire);
+    if now.saturating_sub(last) < RECLAIM_COOLDOWN_MS {
+        RECLAIM_IN_FLIGHT.store(false, Ordering::Release);
+        return None;
+    }
+    let result = reclaim_for_level(level);
+    LAST_RECLAIM_AT_MS.store(now, Ordering::Release);
+    RECLAIM_IN_FLIGHT.store(false, Ordering::Release);
+    Some(result)
 }
 
 pub fn on_memory_pressure_observed(level: MemoryPressureLevel) {
-    let previous = level_from_u8(LAST_OBSERVED_PRESSURE.load(Ordering::Relaxed));
-    LAST_OBSERVED_PRESSURE.store(level_to_u8(level), Ordering::Relaxed);
-
-    let now = crate::utils::time::system_timestamp_millis().max(0) as u64;
-    let last = LAST_RECLAIM_AT_MS.load(Ordering::Relaxed);
-    let cooled_down = now.saturating_sub(last) >= RECLAIM_COOLDOWN_MS;
-
-    let should_reclaim = level > previous
-        || (level >= MemoryPressureLevel::High && cooled_down)
-        || (level >= MemoryPressureLevel::Elevated
-            && previous >= MemoryPressureLevel::Elevated
-            && cooled_down);
-
-    if should_reclaim && level >= MemoryPressureLevel::Elevated {
-        reclaim_for_level(level);
-        LAST_RECLAIM_AT_MS.store(now, Ordering::Relaxed);
+    let now = monotonic_elapsed_ms();
+    let mut coordinator = reclaim_coordinator()
+        .lock()
+        .expect("reclaim coordinator lock poisoned");
+    // The coordinator is Copy: if the trigger cannot be executed (cooldown or a
+    // reclaim already in flight), roll the state machine back so the same
+    // pressure level is re-observed and re-triggered later instead of being
+    // consumed and lost.
+    let before = *coordinator;
+    let decision = coordinator.observe(level, now);
+    if let ReclaimDecision::Trigger(trigger_level) = decision {
+        match request_reclaim(trigger_level) {
+            Some(stats) => coordinator.record_result(now, stats),
+            None => {
+                *coordinator = before;
+            }
+        }
     }
+    drop(coordinator);
+    LAST_OBSERVED_PRESSURE.store(level_to_u8(level), Ordering::Relaxed);
 }
 
 pub fn periodic_reclaim_check() {
     let level = MEMORY_GOVERNOR.current_memory_pressure_level();
     on_memory_pressure_observed(level);
+}
+
+/// Record a hot-path pressure observation without doing reclaim work on the
+/// caller's thread. The pending level is coalesced (max) and the dedicated
+/// reclaim monitor is unparked once; repeated observations at the same or a
+/// lower level cost a couple of relaxed atomic stores.
+pub fn notify_pressure_async(level: MemoryPressureLevel) {
+    let level_u8 = level_to_u8(level);
+    loop {
+        let current = PENDING_RECLAIM_LEVEL.load(Ordering::Acquire);
+        if current >= level_u8 {
+            return;
+        }
+        if PENDING_RECLAIM_LEVEL
+            .compare_exchange(current, level_u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    if let Some(thread) = RECLAIM_MONITOR_THREAD.get() {
+        thread.unpark();
+    }
+}
+
+fn drain_pending_pressure() -> MemoryPressureLevel {
+    level_from_u8(PENDING_RECLAIM_LEVEL.swap(MemoryPressureLevel::Normal as u8, Ordering::AcqRel))
 }
 
 /// Return freed pages to the OS after dropping a large config generation.
@@ -174,12 +324,26 @@ pub fn trim_released_heap() {
 }
 
 pub fn start_reclaim_monitor() {
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(Duration::from_secs(5));
-            periodic_reclaim_check();
-        }
-    });
+    let spawn_result = std::thread::Builder::new()
+        .name("memory-reclaim".to_string())
+        .spawn(|| {
+            let _ = RECLAIM_MONITOR_THREAD.set(std::thread::current());
+            loop {
+                // Wake on an async pressure notification or every 5 seconds so
+                // sustained pressure still re-escalates through the
+                // coordinator's sample hysteresis and retry backoff.
+                std::thread::park_timeout(Duration::from_secs(5));
+                let pending = drain_pending_pressure();
+                if pending >= MemoryPressureLevel::Elevated {
+                    on_memory_pressure_observed(pending);
+                } else {
+                    periodic_reclaim_check();
+                }
+            }
+        });
+    if let Err(err) = spawn_result {
+        tracing::warn!("failed to spawn memory reclaim monitor: {err}");
+    }
 }
 
 #[cfg(test)]
@@ -203,5 +367,87 @@ mod tests {
         ] {
             assert_eq!(level_from_u8(level_to_u8(level)), level);
         }
+    }
+
+    #[test]
+    fn monotonic_elapsed_never_moves_backwards() {
+        let first = monotonic_elapsed_ms();
+        let second = monotonic_elapsed_ms();
+        assert!(
+            second >= first,
+            "reclaim clock must be monotonic: first={first}, second={second}"
+        );
+    }
+
+    #[test]
+    fn pressure_requires_two_escalation_samples() {
+        let mut coordinator = ReclaimCoordinator::default();
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::High, 1),
+            ReclaimDecision::Hold
+        );
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::High, 2),
+            ReclaimDecision::Trigger(MemoryPressureLevel::High)
+        );
+    }
+
+    #[test]
+    fn pressure_downgrade_requires_thirty_seconds_of_stability() {
+        let mut coordinator = ReclaimCoordinator::default();
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::High, 1),
+            ReclaimDecision::Hold
+        );
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::High, 2),
+            ReclaimDecision::Trigger(MemoryPressureLevel::High)
+        );
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::Elevated, 30_001),
+            ReclaimDecision::Hold
+        );
+        assert_eq!(coordinator.observed_level(), MemoryPressureLevel::High);
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::Elevated, 60_001),
+            ReclaimDecision::Hold
+        );
+        assert_eq!(coordinator.observed_level(), MemoryPressureLevel::Elevated);
+    }
+
+    #[test]
+    fn zero_progress_doubles_bounded_retry_backoff() {
+        let mut coordinator = ReclaimCoordinator::default();
+        coordinator.record_result(100, ReclaimStats::default());
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::High, 5_000),
+            ReclaimDecision::Hold
+        );
+        coordinator.record_result(100_000, ReclaimStats::default());
+        coordinator.record_result(200_000, ReclaimStats::default());
+        assert!(coordinator.next_allowed_ms <= 260_000);
+    }
+
+    #[test]
+    fn sustained_pressure_retries_after_backoff_expires() {
+        let mut coordinator = ReclaimCoordinator::default();
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::High, 1),
+            ReclaimDecision::Hold
+        );
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::High, 2),
+            ReclaimDecision::Trigger(MemoryPressureLevel::High)
+        );
+        coordinator.record_result(2, ReclaimStats::default());
+
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::High, 5_001),
+            ReclaimDecision::Hold
+        );
+        assert_eq!(
+            coordinator.observe(MemoryPressureLevel::High, 10_002),
+            ReclaimDecision::Trigger(MemoryPressureLevel::High)
+        );
     }
 }

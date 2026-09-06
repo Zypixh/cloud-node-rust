@@ -1,0 +1,31 @@
+FROM debian:bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        git \
+        libelf-dev \
+        libclang-dev \
+        libpcap-dev \
+        lld \
+        pkg-config \
+        protobuf-compiler \
+        llvm \
+        m4 \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.98.1
+
+WORKDIR /workspace
+COPY . .
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV CARGO_TERM_COLOR=never
+ENV CARGO_INCREMENTAL=0
+
+CMD ["cargo", "test", "--workspace", "--all-targets", "--no-fail-fast"]

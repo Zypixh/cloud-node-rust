@@ -361,6 +361,7 @@ struct UdpHandleSessionArgs {
     quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
     downstream_sender: UdpDownstreamSender,
     rx: mpsc::Receiver<QueuedUdpDatagram>,
+    metrics_guard: crate::metrics::ActiveRequestMetricsGuard,
 }
 
 impl UdpProxyManager {
@@ -838,7 +839,9 @@ impl UdpProxyManager {
         });
 
         let client_ip = client_addr.ip().to_string();
-        crate::metrics::record::request_start(
+        let metrics = crate::metrics::record::get_or_create(sid);
+        let metrics_guard = crate::metrics::ActiveRequestMetricsGuard::new(metrics.clone());
+        crate::metrics::record::request_start_without_active(
             sid,
             &client_ip,
             user_id,
@@ -865,6 +868,10 @@ impl UdpProxyManager {
 
         tokio::spawn(async move {
             let _session_permit = session_permit;
+            // Shadow counter for live UDP passthrough sessions.
+            let _udp_session_transport = crate::metrics::transport_metrics_guard(
+                crate::metrics::ShadowTransportKind::UdpSession,
+            );
             let result = Self::handle_session(UdpHandleSessionArgs {
                 session_id,
                 backend_addr,
@@ -881,6 +888,7 @@ impl UdpProxyManager {
                 quic_cid_tx: session_quic_cid_tx,
                 downstream_sender,
                 rx,
+                metrics_guard,
             })
             .await;
             let last_client_addr = *client_addr.read().await;
@@ -1049,6 +1057,7 @@ impl UdpProxyManager {
             quic_cid_tx,
             downstream_sender,
             mut rx,
+            mut metrics_guard,
         } = args;
         let backend_bind_addr = if backend_addr.is_ipv6() {
             "[::]:0"
@@ -1072,7 +1081,16 @@ impl UdpProxyManager {
                         status: 502,
                     },
                 );
-                crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+                crate::metrics::record::request_end_without_active(
+                    server_id,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some(metrics_guard.metrics()),
+                );
+                metrics_guard.finish();
                 return Err(err.into());
             }
         };
@@ -1188,7 +1206,16 @@ impl UdpProxyManager {
             bytes_received: upstream_sent as i64,
             status,
         });
-        crate::metrics::record::request_end(server_id, 0, 0, false, false, false, None);
+        crate::metrics::record::request_end_without_active(
+            server_id,
+            0,
+            0,
+            false,
+            false,
+            false,
+            Some(metrics_guard.metrics()),
+        );
+        metrics_guard.finish();
         result
     }
 
@@ -1618,6 +1645,9 @@ mod tests {
             quic_cid_tx: None,
             downstream_sender: UdpDownstreamSender::socket(listen_socket),
             rx,
+            metrics_guard: crate::metrics::ActiveRequestMetricsGuard::new(
+                crate::metrics::record::get_or_create(1),
+            ),
         }));
 
         tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping")).unwrap())
@@ -1673,6 +1703,9 @@ mod tests {
             quic_cid_tx: None,
             downstream_sender: UdpDownstreamSender::channel(listen_addr, downstream_tx),
             rx,
+            metrics_guard: crate::metrics::ActiveRequestMetricsGuard::new(
+                crate::metrics::record::get_or_create(1),
+            ),
         }));
 
         tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping")).unwrap())

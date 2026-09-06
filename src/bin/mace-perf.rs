@@ -201,8 +201,7 @@ fn main() -> anyhow::Result<()> {
                         for _ in 0..batch_size {
                             updates.push((merge_key.clone(), 1));
                         }
-                        db.increment_batch(updates);
-                        true
+                        db.increment_batch(updates).is_ok()
                     }
                     Mode::Reopen => unreachable!(),
                 };

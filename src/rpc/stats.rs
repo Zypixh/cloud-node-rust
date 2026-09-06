@@ -843,7 +843,6 @@ pub async fn start_metric_stat_reporter(
         }
         let metric_items = config_store.get_metric_items().await;
         if metric_items.is_empty() {
-            let _ = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.flush();
             continue;
         }
 
@@ -863,6 +862,7 @@ pub async fn start_metric_stat_reporter(
             continue;
         }
 
+        let mut upload_succeeded = true;
         for item in metric_items {
             if !item.is_on {
                 continue;
@@ -885,8 +885,12 @@ pub async fn start_metric_stat_reporter(
                         "Failed to upload metric stats for server {} item {}: {}",
                         server_id, item.id, e
                     );
+                    upload_succeeded = false;
                 }
             }
+        }
+        if !upload_succeeded {
+            crate::metrics::aggregator::METRIC_STAT_AGGREGATOR.restore(samples);
         }
     }
 }
@@ -1039,7 +1043,7 @@ pub async fn start_metrics_aggregator_reporter(config_store: ConfigStore, api_co
         let mut browser_map: HashMap<(i64, String, String), i64> = HashMap::new();
         let mut waf_map: HashMap<(i64, i64, String), i64> = HashMap::new();
 
-        for (key, val) in samples {
+        for (key, val) in &samples {
             if key.country_id > 0 {
                 let entry = city_map
                     .entry((key.server_id, key.country_id, key.province_id, key.city_id))
@@ -1142,10 +1146,11 @@ pub async fn start_metrics_aggregator_reporter(config_store: ConfigStore, api_co
             HttpRequestStatUploadLimits::from_config(&config_store.get_global_stat_upload_sync());
         trim_http_request_stat_rows_with_limits(&mut req, upload_limits);
 
-        if let Err(e) =
-            crate::rpc::track_rpc(server_service.upload_server_http_request_stat(req)).await
-        {
+        let upload_result =
+            crate::rpc::track_rpc(server_service.upload_server_http_request_stat(req)).await;
+        if let Err(e) = upload_result {
             warn!("Failed to upload HTTP request stats: {}", e);
+            crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.restore(samples);
         }
     }
 }
@@ -1167,6 +1172,9 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
             Ok(shared) => shared.as_rpc_client(),
             Err(e) => {
                 warn!("Top IP stat reporter failed to connect: {}", e);
+                // Upload never happened: give the counts back to the tracker
+                // so the next window re-attempts them.
+                crate::metrics::top_ip::TOP_IP_TRACKER.restore(&rows);
                 continue;
             }
         };
@@ -1178,16 +1186,18 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
         let time_at = format!("{:02}{:02}", now.hour(), minute_floor);
 
         let stats = rows
-            .into_iter()
+            .iter()
             .map(
-                |(server_id, ip, count_requests)| pb::upload_server_top_ip_stats_request::Stat {
-                    server_id: server_id as u64,
-                    ip,
-                    // u64 → u32 silent wraparound at 4.3B would mask runaway IPs;
-                    // saturate to u32::MAX so the upper bound stays visible.
-                    count_requests: u32::try_from(count_requests).unwrap_or(u32::MAX),
-                    day: day.clone(),
-                    time_at: time_at.clone(),
+                |(server_id, ip, count_requests)| {
+                    pb::upload_server_top_ip_stats_request::Stat {
+                        server_id: *server_id as u64,
+                        ip: ip.clone(),
+                        // u64 → u32 silent wraparound at 4.3B would mask runaway IPs;
+                        // saturate to u32::MAX so the upper bound stays visible.
+                        count_requests: u32::try_from(*count_requests).unwrap_or(u32::MAX),
+                        day: day.clone(),
+                        time_at: time_at.clone(),
+                    }
                 },
             )
             .collect();
@@ -1198,6 +1208,7 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
         .await
         {
             warn!("Failed to upload top IP stats: {}", e);
+            crate::metrics::top_ip::TOP_IP_TRACKER.restore(&rows);
         }
     }
 }

@@ -214,6 +214,44 @@ impl MetricAggregator {
         }
         samples
     }
+
+    pub fn restore(&self, samples: Vec<(AggregationKey, AggregatedValue)>) {
+        for (key, value) in samples {
+            let mut entry = self.data.entry(key).or_default();
+            entry.count += value.count;
+            entry.count_attack += value.count_attack;
+            entry.bytes_sent += value.bytes_sent;
+            entry.bytes_received += value.bytes_received;
+            entry.attack_bytes += value.attack_bytes;
+            for (attrs, request_value) in value.request_samples {
+                let target = entry.request_samples.entry(attrs).or_default();
+                target.count += request_value.count;
+                target.count_attack += request_value.count_attack;
+                target.bytes_sent += request_value.bytes_sent;
+                target.bytes_received += request_value.bytes_received;
+                target.attack_bytes += request_value.attack_bytes;
+            }
+        }
+    }
+
+    pub fn approximate_bytes(&self) -> u64 {
+        self.data
+            .iter()
+            .map(|entry| {
+                let key = entry.key();
+                let value = entry.value();
+                256u64
+                    .saturating_add(key.category.len() as u64)
+                    .saturating_add(key.country.len() as u64)
+                    .saturating_add(key.province.len() as u64)
+                    .saturating_add(key.city.len() as u64)
+                    .saturating_add(key.provider.len() as u64)
+                    .saturating_add(key.browser.len() as u64)
+                    .saturating_add(key.os.len() as u64)
+                    .saturating_add((value.request_samples.len() as u64).saturating_mul(128))
+            })
+            .sum()
+    }
 }
 
 pub static METRIC_STAT_AGGREGATOR: Lazy<Arc<MetricAggregator>> =
@@ -224,7 +262,7 @@ pub static HTTP_REQUEST_STAT_AGGREGATOR: Lazy<Arc<MetricAggregator>> =
 
 #[cfg(test)]
 mod tests {
-    use super::AggregationKey;
+    use super::{AggregationKey, MetricAggregator};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -370,5 +408,40 @@ mod tests {
         assert_eq!(rows[0].1.count, 2);
         assert_eq!(rows[0].1.bytes_sent, 30);
         assert_eq!(rows[0].1.request_samples.len(), 2);
+    }
+
+    #[test]
+    fn flushed_samples_can_be_restored_without_changing_totals() {
+        let aggregator = MetricAggregator::with_request_samples(true);
+        let key = AggregationKey {
+            category: Arc::from(crate::metrics::METRIC_CATEGORY_HTTP),
+            server_id: 1,
+            country: Arc::from(""),
+            country_id: 0,
+            province: Arc::from(""),
+            province_id: 0,
+            city: Arc::from(""),
+            city_id: 0,
+            provider: Arc::from("Unknown"),
+            browser: Arc::from(""),
+            os: Arc::from(""),
+            waf_group_id: 0,
+            waf_action: Arc::from(""),
+            provider_id: 0,
+            browser_version: Arc::from(""),
+            os_version: Arc::from(""),
+            request_attrs: Arc::new(BTreeMap::new()),
+        };
+        aggregator.record(key.clone(), 11, 7, true);
+        let samples = aggregator.flush();
+        assert_eq!(samples.len(), 1);
+        assert!(aggregator.data.is_empty());
+        aggregator.restore(samples);
+        let restored = aggregator.flush();
+        assert_eq!(restored[0].0, key);
+        assert_eq!(restored[0].1.count, 1);
+        assert_eq!(restored[0].1.bytes_sent, 11);
+        assert_eq!(restored[0].1.bytes_received, 7);
+        assert_eq!(restored[0].1.count_attack, 1);
     }
 }

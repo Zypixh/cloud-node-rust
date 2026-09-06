@@ -76,6 +76,8 @@ pub struct GovernorSnapshot {
     pub memory_total_bytes: u64,
     pub memory_used_bytes: u64,
     pub memory_available_bytes: u64,
+    pub memory_raw_available_bytes: Option<u64>,
+    pub memory_availability: MemoryAvailability,
     pub memory_pressure_level: MemoryPressureLevel,
     pub fd_soft_limit: u64,
     pub fd_used: u64,
@@ -169,6 +171,14 @@ pub struct GovernorSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MemoryAvailability {
+    #[default]
+    Unknown,
+    Known,
+    Degraded,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResidentMemorySnapshot {
     pub total_used_bytes: u64,
     pub total_budget_bytes: u64,
@@ -231,6 +241,8 @@ struct MemorySnapshot {
     total_bytes: u64,
     used_bytes: u64,
     available_bytes: u64,
+    raw_available_bytes: Option<u64>,
+    availability: MemoryAvailability,
     fd_soft_limit: u64,
     cpu_parallelism: usize,
     cgroup_managed: bool,
@@ -244,12 +256,12 @@ struct MemorySnapshot {
 
 pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(MemoryGovernor::new);
 
-// Observing pressure can synchronously trigger cache reclamation. Cache
-// initialization itself asks the governor for a budget, so without a
-// per-thread guard that path recursively initializes CACHE and overflows the
-// stack when the first observation is already under pressure.
+// Pressure observations are handed to the reclaim monitor asynchronously
+// (memory_reclaim::notify_pressure_async), so observing pressure can no longer
+// synchronously reclaim caches. That also removes the recursion where cache
+// initialization asked the governor for a budget and the first observation
+// under pressure swept the cache on the same stack.
 thread_local! {
-    static PRESSURE_RECLAIM_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
     // resident_memory_replace_owned holds the owner map while calculating a
     // budget. That calculation can synchronously reclaim the cache, whose
     // Bloom accounting calls this method again. Reject the nested accounting
@@ -268,7 +280,6 @@ pub fn reported_memory_totals() -> (i64, i64) {
 const SNAPSHOT_TTL_MS: i64 = 2_000;
 const FD_SNAPSHOT_TTL_MS: i64 = 250;
 const MIN_MEMORY_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
-const RESERVE_HEADROOM_PCT: u64 = 30;
 const CONNECTION_BUDGET_PCT: u64 = 45;
 const KEEPALIVE_BUDGET_PCT: u64 = 12;
 const CACHE_BUDGET_PCT: u64 = 25;
@@ -463,6 +474,8 @@ pub struct MemoryGovernor {
     cached_total_bytes: AtomicU64,
     cached_used_bytes: AtomicU64,
     cached_available_bytes: AtomicU64,
+    cached_raw_available_bytes: AtomicU64,
+    cached_memory_availability: AtomicU64,
     cached_fd_soft_limit: AtomicU64,
     cached_cpu_parallelism: AtomicU64,
     cached_fd_used: AtomicU64,
@@ -546,6 +559,8 @@ impl MemoryGovernor {
             cached_total_bytes: AtomicU64::new(0),
             cached_used_bytes: AtomicU64::new(0),
             cached_available_bytes: AtomicU64::new(0),
+            cached_raw_available_bytes: AtomicU64::new(0),
+            cached_memory_availability: AtomicU64::new(0),
             cached_fd_soft_limit: AtomicU64::new(0),
             cached_cpu_parallelism: AtomicU64::new(0),
             cached_fd_used: AtomicU64::new(0),
@@ -1355,6 +1370,8 @@ impl MemoryGovernor {
             memory_total_bytes: mem.total_bytes,
             memory_used_bytes: mem.used_bytes,
             memory_available_bytes: mem.available_bytes,
+            memory_raw_available_bytes: mem.raw_available_bytes,
+            memory_availability: mem.availability,
             memory_pressure_level: memory_pressure_level(&mem),
             fd_soft_limit: mem.fd_soft_limit,
             fd_used: fd_snapshot.used,
@@ -1554,6 +1571,16 @@ impl MemoryGovernor {
             .store(snapshot.used_bytes, Ordering::Relaxed);
         self.cached_available_bytes
             .store(snapshot.available_bytes, Ordering::Relaxed);
+        self.cached_raw_available_bytes
+            .store(snapshot.raw_available_bytes.unwrap_or(0), Ordering::Relaxed);
+        self.cached_memory_availability.store(
+            match snapshot.availability {
+                MemoryAvailability::Unknown => 0,
+                MemoryAvailability::Known => 1,
+                MemoryAvailability::Degraded => 2,
+            },
+            Ordering::Relaxed,
+        );
         self.cached_fd_soft_limit
             .store(snapshot.fd_soft_limit, Ordering::Relaxed);
         self.cached_cpu_parallelism
@@ -1581,10 +1608,20 @@ impl MemoryGovernor {
     fn budgeted_from_cached(&self) -> BudgetedMemorySnapshot {
         let total_bytes = self.cached_total_bytes.load(Ordering::Relaxed);
         let available_bytes = self.cached_available_bytes.load(Ordering::Relaxed);
+        let raw_available_bytes = match self.cached_memory_availability.load(Ordering::Relaxed) {
+            1 | 2 => Some(self.cached_raw_available_bytes.load(Ordering::Relaxed)),
+            _ => None,
+        };
         BudgetedMemorySnapshot {
             total_bytes,
             used_bytes: self.cached_used_bytes.load(Ordering::Relaxed),
             available_bytes,
+            raw_available_bytes,
+            availability: match self.cached_memory_availability.load(Ordering::Relaxed) {
+                1 => MemoryAvailability::Known,
+                2 => MemoryAvailability::Degraded,
+                _ => MemoryAvailability::Unknown,
+            },
             fd_soft_limit: self.cached_fd_soft_limit.load(Ordering::Relaxed).max(1),
             cpu_parallelism: self.cached_cpu_parallelism.load(Ordering::Relaxed).max(1) as usize,
             connection_budget_bytes: budget_from_available(
@@ -1617,13 +1654,12 @@ impl MemoryGovernor {
 }
 
 fn notify_pressure_reclaim(level: MemoryPressureLevel) {
-    PRESSURE_RECLAIM_IN_PROGRESS.with(|in_progress| {
-        if in_progress.replace(true) {
-            return;
-        }
-        crate::memory_reclaim::on_memory_pressure_observed(level);
-        in_progress.set(false);
-    });
+    // Hot-path safety valve: only record the observation and wake the reclaim
+    // monitor. Never sweep caches inline here — this runs inside admission
+    // checks on request worker threads.
+    if level >= MemoryPressureLevel::Elevated {
+        crate::memory_reclaim::notify_pressure_async(level);
+    }
 }
 
 impl Drop for AdmissionPermit<'_> {
@@ -1667,6 +1703,8 @@ struct BudgetedMemorySnapshot {
     total_bytes: u64,
     used_bytes: u64,
     available_bytes: u64,
+    raw_available_bytes: Option<u64>,
+    availability: MemoryAvailability,
     fd_soft_limit: u64,
     cpu_parallelism: usize,
     connection_budget_bytes: u64,
@@ -1688,6 +1726,8 @@ impl Default for BudgetedMemorySnapshot {
             total_bytes: 0,
             used_bytes: 0,
             available_bytes: 0,
+            raw_available_bytes: None,
+            availability: MemoryAvailability::Unknown,
             fd_soft_limit: 1,
             cpu_parallelism: 1,
             connection_budget_bytes: 0,
@@ -1709,12 +1749,23 @@ fn read_memory_snapshot() -> MemorySnapshot {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
 
-    #[allow(unused_mut)]
+    #[cfg(target_os = "linux")]
     let mut total_bytes = sys.total_memory().max(MIN_MEMORY_TOTAL_BYTES);
-    #[allow(unused_mut)]
+    #[cfg(not(target_os = "linux"))]
+    let total_bytes = sys.total_memory().max(MIN_MEMORY_TOTAL_BYTES);
+    #[cfg(target_os = "linux")]
     let mut used_bytes = sys.used_memory().min(total_bytes);
-    #[allow(unused_mut)]
+    #[cfg(not(target_os = "linux"))]
+    let used_bytes = sys.used_memory().min(total_bytes);
+    #[cfg(target_os = "linux")]
     let mut available_before_reserve = total_bytes.saturating_sub(used_bytes);
+    #[cfg(not(target_os = "linux"))]
+    let available_before_reserve = total_bytes.saturating_sub(used_bytes);
+    #[cfg(target_os = "linux")]
+    let mut raw_available_bytes = None;
+    #[cfg(not(target_os = "linux"))]
+    let raw_available_bytes = None;
+    let mut availability = MemoryAvailability::Unknown;
     #[cfg(target_os = "linux")]
     let (
         mut cgroup_managed,
@@ -1738,9 +1789,13 @@ fn read_memory_snapshot() -> MemorySnapshot {
                     total_bytes = max.max(1);
                     used_bytes = cgroup.current_bytes.min(total_bytes);
                     available_before_reserve = total_bytes.saturating_sub(used_bytes);
+                    raw_available_bytes = Some(available_before_reserve);
+                    availability = MemoryAvailability::Known;
                 } else if let Some(mem_available) = linux_mem_available_bytes() {
                     available_before_reserve = mem_available.min(total_bytes);
                     used_bytes = total_bytes.saturating_sub(available_before_reserve);
+                    raw_available_bytes = Some(available_before_reserve);
+                    availability = MemoryAvailability::Degraded;
                 }
                 if let Some(high) = cgroup.high_bytes
                     && high > 0
@@ -1754,18 +1809,25 @@ fn read_memory_snapshot() -> MemorySnapshot {
                 if let Some(mem_available) = linux_mem_available_bytes() {
                     available_before_reserve = mem_available.min(total_bytes);
                     used_bytes = total_bytes.saturating_sub(available_before_reserve);
+                    raw_available_bytes = Some(available_before_reserve);
+                    availability = MemoryAvailability::Known;
                 }
             }
         }
     }
 
     let rss = read_process_rss_sample();
-    let available_bytes = available_after_reserve(total_bytes, available_before_reserve);
+    let available_bytes = available_before_reserve;
+    if cgroup_managed && availability == MemoryAvailability::Known && cgroup_memory_max_bytes == 0 {
+        availability = MemoryAvailability::Degraded;
+    }
 
     MemorySnapshot {
         total_bytes,
         used_bytes,
         available_bytes,
+        raw_available_bytes,
+        availability,
         fd_soft_limit: read_fd_soft_limit(),
         cpu_parallelism: std::thread::available_parallelism()
             .map(usize::from)
@@ -2042,14 +2104,6 @@ fn linux_cgroup_limit_is_unlimited(limit: u64) -> bool {
 
 fn available_floor_bytes(total_bytes: u64) -> u64 {
     (total_bytes / 100).clamp(8 * 1024 * 1024, 256 * 1024 * 1024)
-}
-
-fn available_after_reserve(total_bytes: u64, available_before_reserve: u64) -> u64 {
-    let hard_reserve = total_bytes.saturating_mul(RESERVE_HEADROOM_PCT) / 100;
-    let floor = available_floor_bytes(total_bytes).min(available_before_reserve.max(1));
-    available_before_reserve
-        .saturating_sub(hard_reserve)
-        .max(floor)
 }
 
 fn budget_from_available(total_bytes: u64, available_bytes: u64, budget_pct: u64) -> u64 {
@@ -3254,7 +3308,6 @@ mod tests {
         let total = 512 * 1024 * 1024;
         let available = 16 * 1024 * 1024;
 
-        assert!(available_after_reserve(total, 1024 * 1024) <= 1024 * 1024);
         assert!(budget_from_available(total, available, CONNECTION_BUDGET_PCT) <= available);
         assert!(cache_budget_from_available(total, available) <= available);
         let critical = BudgetedMemorySnapshot {
@@ -3325,6 +3378,43 @@ mod tests {
         assert_eq!(
             pressure_adjusted_min_limit(&critical, MIN_CACHE_READ_MEMORY_LIMIT, 4, 1),
             1
+        );
+    }
+
+    #[test]
+    fn raw_availability_does_not_apply_reserve_twice() {
+        let total = 967 * 1024 * 1024;
+        let raw = 273 * 1024 * 1024;
+        let snapshot = BudgetedMemorySnapshot {
+            total_bytes: total,
+            used_bytes: total - raw,
+            available_bytes: raw,
+            raw_available_bytes: Some(raw),
+            availability: MemoryAvailability::Known,
+            ..Default::default()
+        };
+        assert_eq!(
+            memory_pressure_level(&snapshot),
+            MemoryPressureLevel::Normal
+        );
+    }
+
+    #[test]
+    fn very_low_raw_availability_limits_new_allocations() {
+        let total = 967 * 1024 * 1024;
+        let raw = 8 * 1024 * 1024;
+        let budget = budget_from_available(total, raw, CONNECTION_BUDGET_PCT);
+        assert!(budget <= raw);
+        assert_eq!(
+            memory_pressure_level(&BudgetedMemorySnapshot {
+                total_bytes: total,
+                used_bytes: total - raw,
+                available_bytes: raw,
+                raw_available_bytes: Some(raw),
+                availability: MemoryAvailability::Known,
+                ..Default::default()
+            }),
+            MemoryPressureLevel::Critical
         );
     }
 
@@ -3587,6 +3677,9 @@ mod tests {
             governor.connection_admission_used_bytes() <= budget,
             "shared connection bytes must never exceed the elastic budget"
         );
+        while let Some(permit) = governor.try_admit(AdmissionClass::TcpConnection) {
+            permits.push(permit);
+        }
         assert!(
             governor.try_admit(AdmissionClass::TcpConnection).is_none(),
             "TCP admission should also fail once the shared budget is exhausted"

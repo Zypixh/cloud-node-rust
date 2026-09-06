@@ -154,6 +154,7 @@ struct TcpForwardContext {
     backend_addr: String,
     backend_ext: Option<crate::lb_factory::BackendExtension>,
     use_tls_to_backend: bool,
+    metrics_guard: Option<crate::metrics::ActiveRequestMetricsGuard>,
 }
 
 static CLIENT_CERT_CACHE: Lazy<Mutex<LruCache<String, ParsedClientCert>>> =
@@ -298,6 +299,7 @@ impl TcpProxyManager {
             _connection_guard,
             _client_permit,
             _connection_permit,
+            _downstream_transport,
         )) = self
             .prepare_bypass_tcp_connection(
                 client_stream,
@@ -327,10 +329,11 @@ impl TcpProxyManager {
         Option<(
             SocketAddr,
             PrefixedStream<S>,
-            watch::Receiver<bool>,
+            watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>,
             crate::l4_connection_registry::L4ConnectionGuard,
             crate::l4_defense::ActiveIpPermit,
             crate::memory_governor::StaticAdmissionPermit,
+            crate::metrics::ShadowTransportMetricsGuard,
         )>,
     >
     where
@@ -421,6 +424,9 @@ impl TcpProxyManager {
 
         let connection_guard =
             l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::SniTcp);
+        let downstream_transport = crate::metrics::transport_metrics_guard(
+            crate::metrics::ShadowTransportKind::DownstreamTcp,
+        );
         let connection_cancel_rx = connection_guard.cancel_receiver();
         Ok(Some((
             client_addr,
@@ -429,6 +435,7 @@ impl TcpProxyManager {
             connection_guard,
             client_permit,
             connection_permit,
+            downstream_transport,
         )))
     }
 
@@ -449,6 +456,7 @@ impl TcpProxyManager {
             _connection_guard,
             _client_permit,
             _connection_permit,
+            _downstream_transport,
         )) = self
             .prepare_bypass_tcp_connection(
                 client_stream,
@@ -495,6 +503,7 @@ impl TcpProxyManager {
             _connection_guard,
             _client_permit,
             _connection_permit,
+            _downstream_transport,
         )) = self
             .prepare_bypass_tcp_connection(
                 client_stream,
@@ -950,6 +959,9 @@ impl TcpProxyManager {
         }
         let connection_guard =
             l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::SniTcp);
+        let _downstream_transport = crate::metrics::transport_metrics_guard(
+            crate::metrics::ShadowTransportKind::DownstreamTcp,
+        );
         let connection_cancel_rx = connection_guard.cancel_receiver();
 
         if !is_tls {
@@ -1123,6 +1135,7 @@ impl TcpProxyManager {
             backend_addr: peer.addr.to_string(),
             backend_ext,
             use_tls_to_backend,
+            metrics_guard: None,
         })
     }
 
@@ -1131,7 +1144,7 @@ impl TcpProxyManager {
         client_stream: S,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1146,7 +1159,7 @@ impl TcpProxyManager {
         client_stream: TcpStream,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
     ) -> anyhow::Result<()> {
         let context = self.tcp_forward_context(client_addr, &server).await?;
         if context.use_tls_to_backend {
@@ -1176,7 +1189,7 @@ impl TcpProxyManager {
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
         context: TcpForwardContext,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1197,8 +1210,8 @@ impl TcpProxyManager {
         client_stream: S,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
-        context: TcpForwardContext,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        mut context: TcpForwardContext,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
         relay_options: RelayOptions,
     ) -> anyhow::Result<()>
     where
@@ -1219,7 +1232,7 @@ impl TcpProxyManager {
             let tls_connector =
                 build_upstream_tls_connector(verify_origin_tls, ext.client_cert.as_ref())?;
 
-            self.record_request_start(client_addr, &context);
+            self.record_request_start(client_addr, &mut context);
             let toa_config = self.config_store.get_toa_config_sync();
             let mut backend_stream = match crate::toa::connect_with_toa(
                 &context.backend_addr,
@@ -1231,10 +1244,13 @@ impl TcpProxyManager {
             {
                 Ok(s) => s,
                 Err(e) => {
-                    self.record_backend_connect_failure(client_addr, &server, &context);
+                    self.record_backend_connect_failure(client_addr, &server, &mut context);
                     return Err(e);
                 }
             };
+            let _upstream_transport = crate::metrics::transport_metrics_guard(
+                crate::metrics::ShadowTransportKind::UpstreamTcp,
+            );
             let toa_local_port = backend_stream
                 .local_addr()
                 .ok()
@@ -1253,7 +1269,7 @@ impl TcpProxyManager {
                         .await
             {
                 release_toa_port(toa_config, toa_local_port).await;
-                self.record_backend_connect_failure(client_addr, &server, &context);
+                self.record_backend_connect_failure(client_addr, &server, &mut context);
                 return Err(err.into());
             }
             let backend_stream = pingora_core::protocols::l4::stream::Stream::from(backend_stream);
@@ -1268,7 +1284,7 @@ impl TcpProxyManager {
                     "TCP Proxy: TLS handshake with backend {} (SNI: {}) failed: {}",
                     context.backend_addr, host, e
                 );
-                self.record_backend_connect_failure(client_addr, &server, &context);
+                self.record_backend_connect_failure(client_addr, &server, &mut context);
                 e
             })?;
 
@@ -1282,7 +1298,7 @@ impl TcpProxyManager {
             )
             .await;
             release_toa_port(toa_config, toa_local_port).await;
-            self.finish_tcp_connection(client_addr, &server, &context, &res);
+            self.finish_tcp_connection(client_addr, &server, &mut context, &res);
             res.map(|_| ()).map_err(Into::into)
         } else {
             self.continue_handle_generic_plain_stream(
@@ -1302,8 +1318,8 @@ impl TcpProxyManager {
         client_stream: S,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
-        context: TcpForwardContext,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        mut context: TcpForwardContext,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
         relay_options: RelayOptions,
     ) -> anyhow::Result<()>
     where
@@ -1312,7 +1328,7 @@ impl TcpProxyManager {
         let origin_connect_permit = MEMORY_GOVERNOR
             .try_admit(AdmissionClass::OriginConnect)
             .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
-        self.record_request_start(client_addr, &context);
+        self.record_request_start(client_addr, &mut context);
         let toa_config = self.config_store.get_toa_config_sync();
         #[cfg(target_os = "linux")]
         AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_START.fetch_add(1, Ordering::Relaxed);
@@ -1328,12 +1344,15 @@ impl TcpProxyManager {
             Err(e) => {
                 #[cfg(target_os = "linux")]
                 AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_FAIL.fetch_add(1, Ordering::Relaxed);
-                self.record_backend_connect_failure(client_addr, &server, &context);
+                self.record_backend_connect_failure(client_addr, &server, &mut context);
                 return Err(e);
             }
         };
         #[cfg(target_os = "linux")]
         AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_OK.fetch_add(1, Ordering::Relaxed);
+        let _upstream_transport = crate::metrics::transport_metrics_guard(
+            crate::metrics::ShadowTransportKind::UpstreamTcp,
+        );
         let toa_local_port = backend_stream
             .local_addr()
             .ok()
@@ -1351,7 +1370,7 @@ impl TcpProxyManager {
                 write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol).await
         {
             release_toa_port(toa_config, toa_local_port).await;
-            self.record_backend_connect_failure(client_addr, &server, &context);
+            self.record_backend_connect_failure(client_addr, &server, &mut context);
             return Err(err.into());
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
@@ -1383,7 +1402,7 @@ impl TcpProxyManager {
             }
         }
         release_toa_port(toa_config, toa_local_port).await;
-        self.finish_tcp_connection(client_addr, &server, &context, &res);
+        self.finish_tcp_connection(client_addr, &server, &mut context, &res);
         res.map(|_| ()).map_err(Into::into)
     }
 
@@ -1392,13 +1411,13 @@ impl TcpProxyManager {
         client_stream: TcpStream,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
-        context: TcpForwardContext,
-        cancel_rx: Option<watch::Receiver<bool>>,
+        mut context: TcpForwardContext,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
     ) -> anyhow::Result<()> {
         let origin_connect_permit = MEMORY_GOVERNOR
             .try_admit(AdmissionClass::OriginConnect)
             .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
-        self.record_request_start(client_addr, &context);
+        self.record_request_start(client_addr, &mut context);
         let toa_config = self.config_store.get_toa_config_sync();
         let mut backend_stream = match crate::toa::connect_with_toa(
             &context.backend_addr,
@@ -1410,10 +1429,13 @@ impl TcpProxyManager {
         {
             Ok(s) => s,
             Err(e) => {
-                self.record_backend_connect_failure(client_addr, &server, &context);
+                self.record_backend_connect_failure(client_addr, &server, &mut context);
                 return Err(e);
             }
         };
+        let _upstream_transport = crate::metrics::transport_metrics_guard(
+            crate::metrics::ShadowTransportKind::UpstreamTcp,
+        );
         let toa_local_port = backend_stream
             .local_addr()
             .ok()
@@ -1431,7 +1453,7 @@ impl TcpProxyManager {
                 write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol).await
         {
             release_toa_port(toa_config, toa_local_port).await;
-            self.record_backend_connect_failure(client_addr, &server, &context);
+            self.record_backend_connect_failure(client_addr, &server, &mut context);
             return Err(err.into());
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
@@ -1444,13 +1466,17 @@ impl TcpProxyManager {
         )
         .await;
         release_toa_port(toa_config, toa_local_port).await;
-        self.finish_tcp_connection(client_addr, &server, &context, &res);
+        self.finish_tcp_connection(client_addr, &server, &mut context, &res);
         res.map(|_| ()).map_err(Into::into)
     }
 
-    fn record_request_start(&self, client_addr: SocketAddr, context: &TcpForwardContext) {
+    fn record_request_start(&self, client_addr: SocketAddr, context: &mut TcpForwardContext) {
         let client_ip = client_addr.ip().to_string();
-        crate::metrics::record::request_start(
+        let metrics = crate::metrics::record::get_or_create(context.sid);
+        context.metrics_guard = Some(crate::metrics::ActiveRequestMetricsGuard::new(
+            metrics.clone(),
+        ));
+        crate::metrics::record::request_start_without_active(
             context.sid,
             &client_ip,
             context.user_id,
@@ -1465,7 +1491,7 @@ impl TcpProxyManager {
         &self,
         client_addr: SocketAddr,
         server: &ServerConfig,
-        context: &TcpForwardContext,
+        context: &mut TcpForwardContext,
     ) {
         debug!(
             "TCP Proxy: Failed to connect to backend {}",
@@ -1486,7 +1512,18 @@ impl TcpProxyManager {
             bytes_received: 0,
             status: 502,
         });
-        crate::metrics::record::request_end(context.sid, 0, 0, false, false, false, None);
+        crate::metrics::record::request_end_without_active(
+            context.sid,
+            0,
+            0,
+            false,
+            false,
+            false,
+            context.metrics_guard.as_ref().map(|guard| guard.metrics()),
+        );
+        if let Some(mut guard) = context.metrics_guard.take() {
+            guard.finish();
+        }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(context.origin_id);
     }
 
@@ -1494,7 +1531,7 @@ impl TcpProxyManager {
         &self,
         client_addr: SocketAddr,
         server: &ServerConfig,
-        context: &TcpForwardContext,
+        context: &mut TcpForwardContext,
         result: &Result<RelayOutcome, BidirectionalStreamError>,
     ) {
         let (bytes_received, bytes_sent, close_reason) = match result {
@@ -1570,7 +1607,18 @@ impl TcpProxyManager {
             bytes_received: bytes_received as i64,
             status,
         });
-        crate::metrics::record::request_end(context.sid, 0, 0, false, false, false, None);
+        crate::metrics::record::request_end_without_active(
+            context.sid,
+            0,
+            0,
+            false,
+            false,
+            false,
+            context.metrics_guard.as_ref().map(|guard| guard.metrics()),
+        );
+        if let Some(mut guard) = context.metrics_guard.take() {
+            guard.finish();
+        }
     }
 
     fn record_tls_handshake_failure(&self, ip: std::net::IpAddr) {
@@ -1728,6 +1776,52 @@ pub(crate) enum RelayCloseReason {
     BenignIo,
     PressureIdleTimeout,
     L4Drain,
+    Cancelled(crate::l4_connection_registry::ConnectionCancelReason),
+}
+
+/// Wait for a connection-level cancel on the L4 registry watch channel.
+///
+/// Returns the typed reason once a real cancel is sent. A dropped sender (the
+/// registry entry went away, e.g. because its guard was replaced during an
+/// SNI/HTTP2 protocol switch) is NOT a cancel: the future keeps pending so the
+/// relay finishes naturally from its own IO instead of being torn down and
+/// misreported as an L4 drain.
+async fn wait_for_connection_cancel(
+    rx: Option<tokio::sync::watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
+) -> crate::l4_connection_registry::ConnectionCancelReason {
+    use crate::l4_connection_registry::ConnectionCancelReason;
+    let mut rx = match rx {
+        Some(rx) => rx,
+        None => return pending_no_cancel().await,
+    };
+    loop {
+        match rx.changed().await {
+            Ok(()) => {
+                let reason = *rx.borrow_and_update();
+                if reason != ConnectionCancelReason::None {
+                    return reason;
+                }
+            }
+            Err(_) => return pending_no_cancel().await,
+        }
+    }
+}
+
+async fn pending_no_cancel() -> crate::l4_connection_registry::ConnectionCancelReason {
+    loop {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn relay_close_reason_for_cancel(
+    reason: crate::l4_connection_registry::ConnectionCancelReason,
+) -> RelayCloseReason {
+    use crate::l4_connection_registry::ConnectionCancelReason;
+    match reason {
+        ConnectionCancelReason::None => RelayCloseReason::BenignIo,
+        ConnectionCancelReason::DefenseBlocked => RelayCloseReason::L4Drain,
+        other => RelayCloseReason::Cancelled(other),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1765,6 +1859,9 @@ impl RelayOutcome {
                 String::from("relay idle timeout under pressure")
             }
             RelayCloseReason::L4Drain => String::from("relay closed by L4 defense drain"),
+            RelayCloseReason::Cancelled(reason) => {
+                format!("relay cancelled ({})", reason.as_str())
+            }
         };
         if let Some(detail) = self.close_detail {
             note.push_str(&format!(
@@ -1812,7 +1909,7 @@ pub(crate) enum RelayIoPhase {
 struct RelayOptions {
     strict_close_on_eof: bool,
     enforce_pressure_idle_timeout: bool,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
 }
 
 impl Default for RelayOptions {
@@ -1842,7 +1939,10 @@ impl RelayOptions {
         }
     }
 
-    fn with_cancel(mut self, cancel_rx: Option<watch::Receiver<bool>>) -> Self {
+    fn with_cancel(
+        mut self,
+        cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
+    ) -> Self {
         self.cancel_rx = cancel_rx;
         self
     }
@@ -1964,7 +2064,7 @@ pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics_cancelable
     server_id: i64,
     client: TcpStream,
     backend: TcpStream,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
 ) -> Result<RelayOutcome, BidirectionalStreamError> {
     stream_tcp_bidirectional_with_metrics_options(
         server_id,
@@ -1979,7 +2079,7 @@ pub(crate) async fn stream_sni_passthrough_bidirectional_with_metrics_cancelable
     server_id: i64,
     client: C,
     backend: B,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
 ) -> Result<RelayOutcome, BidirectionalStreamError>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -2049,7 +2149,7 @@ where
     let bytes_received_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let bytes_sent_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let strict_close_on_eof = options.strict_close_on_eof;
-    let mut cancel_rx = options.cancel_rx.clone();
+    let cancel_rx = options.cancel_rx.clone();
     let client_to_backend = copy_stream_and_count(
         server_id,
         StreamDirection::ClientToBackend,
@@ -2070,22 +2170,49 @@ where
     tokio::pin!(client_to_backend);
     tokio::pin!(backend_to_client);
 
-    let first = tokio::select! {
-        result = &mut client_to_backend => result,
-        result = &mut backend_to_client => result,
-        _ = async {
-            if let Some(rx) = cancel_rx.as_mut() {
-                let _ = rx.changed().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        } => Ok(DirectionSuccess {
-                close_reason: RelayCloseReason::L4Drain,
+    let (first_direction, first) = tokio::select! {
+        result = &mut client_to_backend => (StreamDirection::ClientToBackend, result),
+        result = &mut backend_to_client => (StreamDirection::BackendToClient, result),
+        cancel_reason = wait_for_connection_cancel(cancel_rx.clone()) => (
+            StreamDirection::ClientToBackend,
+            Ok(DirectionSuccess {
+                close_reason: relay_close_reason_for_cancel(cancel_reason),
                 close_detail: None,
             }),
+        ),
     };
 
     if strict_close_on_eof {
+        if matches!(
+            first,
+            Ok(DirectionSuccess {
+                close_reason: RelayCloseReason::Clean,
+                ..
+            })
+        ) {
+            let second = if first_direction == StreamDirection::ClientToBackend {
+                tokio::select! {
+                    result = &mut backend_to_client => result,
+                    cancel_reason = wait_for_connection_cancel(cancel_rx.clone()) => {
+                        Ok(DirectionSuccess {
+                            close_reason: relay_close_reason_for_cancel(cancel_reason),
+                            close_detail: None,
+                        })
+                    }
+                }
+            } else {
+                tokio::select! {
+                    result = &mut client_to_backend => result,
+                    cancel_reason = wait_for_connection_cancel(cancel_rx.clone()) => {
+                        Ok(DirectionSuccess {
+                            close_reason: relay_close_reason_for_cancel(cancel_reason),
+                            close_detail: None,
+                        })
+                    }
+                }
+            };
+            return finish_relay_after_first(second, &bytes_received_counter, &bytes_sent_counter);
+        }
         return finish_relay_after_first(first, &bytes_received_counter, &bytes_sent_counter);
     }
 
@@ -2154,6 +2281,10 @@ where
         };
         if n == 0 {
             record_stream_metrics_delta(server_id, direction, unflushed);
+            writer
+                .shutdown()
+                .await
+                .map_err(|err| DirectionTaskError::new(direction, RelayIoPhase::Write, err))?;
             return Ok(DirectionSuccess {
                 close_reason: RelayCloseReason::Clean,
                 close_detail: None,
@@ -2317,7 +2448,7 @@ mod zero_copy {
         let bytes_sent_counter = Arc::new(AtomicU64::new(0));
         let control = Arc::new(RelayControl::default());
 
-        let mut cancel_rx = options.cancel_rx.clone();
+        let cancel_rx = options.cancel_rx.clone();
         let mut c2b = spawn_direction(
             server_id,
             StreamDirection::ClientToBackend,
@@ -2344,19 +2475,13 @@ mod zero_copy {
                 StreamDirection::BackendToClient,
                 flatten_join_result(StreamDirection::BackendToClient, result),
             ),
-            _ = async {
-                if let Some(rx) = cancel_rx.as_mut() {
-                    let _ = rx.changed().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
+            cancel_reason = wait_for_connection_cancel(cancel_rx) => {
                 control.stop();
                 shutdown_fds.shutdown_all();
                 (
                     StreamDirection::ClientToBackend,
                     Ok(DirectionSuccess {
-                        close_reason: RelayCloseReason::L4Drain,
+                        close_reason: relay_close_reason_for_cancel(cancel_reason),
                         close_detail: None,
                     }),
                 )
@@ -3469,7 +3594,8 @@ mod tests {
     async fn relay_cancel_returns_l4_drain_without_losing_counters() {
         let (proxy_client, proxy_backend, mut client, mut backend) =
             connected_proxy_streams().await;
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) =
+            watch::channel(crate::l4_connection_registry::ConnectionCancelReason::None);
         let relay = tokio::spawn(async move {
             stream_tcp_bidirectional_with_metrics_options(
                 91_008,
@@ -3491,7 +3617,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(&received, b"before-drain");
-        cancel_tx.send(true).unwrap();
+        cancel_tx
+            .send(crate::l4_connection_registry::ConnectionCancelReason::DefenseBlocked)
+            .unwrap();
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), relay)
             .await
@@ -3499,6 +3627,48 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.close_reason, RelayCloseReason::L4Drain);
         assert_eq!(outcome.bytes_received, received.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn relay_cancel_channel_close_is_not_misread_as_l4_drain() {
+        let (proxy_client, proxy_backend, mut client, mut backend) =
+            connected_proxy_streams().await;
+        let (cancel_tx, cancel_rx) =
+            watch::channel(crate::l4_connection_registry::ConnectionCancelReason::None);
+        // The registry entry disappeared without ever canceling (guard swap
+        // during a protocol switch): the relay must finish from its own IO,
+        // not be torn down as an L4 drain.
+        drop(cancel_tx);
+        let relay = tokio::spawn(async move {
+            stream_tcp_bidirectional_with_metrics_options(
+                91_009,
+                proxy_client,
+                proxy_backend,
+                RelayOptions::default().with_cancel(Some(cancel_rx)),
+            )
+            .await
+            .unwrap()
+        });
+
+        client.write_all(b"post-close").await.unwrap();
+        let mut received = [0u8; 10];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            backend.read_exact(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&received, b"post-close");
+
+        drop(client);
+        drop(backend);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(outcome.close_reason, RelayCloseReason::L4Drain);
+        assert_eq!(outcome.bytes_received, 10);
     }
 
     #[tokio::test]

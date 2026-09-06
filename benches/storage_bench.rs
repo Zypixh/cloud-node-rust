@@ -78,7 +78,9 @@ fn bench_kv_basic(c: &mut Criterion) {
 
     group.bench_function("get_value_counter", |b| {
         let storage = open_mace("get_value");
-        storage.increment_batch(vec![("counter".to_string(), 100)]);
+        storage
+            .increment_batch(vec![("counter".to_string(), 100)])
+            .expect("persist counter");
         b.iter(|| black_box(storage.get_value("counter")));
     });
 
@@ -100,7 +102,9 @@ fn bench_metrics_write_paths(c: &mut Criterion) {
                     .map(|i| (format!("S1_T1000_req_{i}"), 1))
                     .collect();
                 b.iter(|| {
-                    storage.increment_batch(updates.clone());
+                    storage
+                        .increment_batch(updates.clone())
+                        .expect("persist benchmark batch");
                     black_box(())
                 });
             },
@@ -113,7 +117,9 @@ fn bench_metrics_write_paths(c: &mut Criterion) {
                 let storage = open_mace(&format!("server_batch_{count}"));
                 let updates = sample_metric_updates(*count);
                 b.iter(|| {
-                    storage.record_server_batch(1_700_000_000, updates.clone(), 4096, 2048);
+                    storage
+                        .record_server_batch(1_700_000_000, updates.clone(), 4096, 2048)
+                        .expect("persist benchmark batch");
                     black_box(())
                 });
             },
@@ -276,7 +282,9 @@ fn bench_concurrent_stress(c: &mut Criterion) {
                     let storage = Arc::clone(&storage);
                     thread::spawn(move || {
                         for i in 0..500 {
-                            storage.increment_batch(vec![(format!("t{t}_k{i}"), 1)]);
+                            storage
+                                .increment_batch(vec![(format!("t{t}_k{i}"), 1)])
+                                .expect("persist concurrent benchmark batch");
                         }
                     })
                 })

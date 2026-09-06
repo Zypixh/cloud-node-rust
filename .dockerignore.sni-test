@@ -1,0 +1,11 @@
+target
+.git
+data
+runtime
+configs
+*.mmdb
+!pingora-main/pingora-core/examples/keys/server/cert.pem
+!pingora-main/pingora-core/examples/keys/server/key.pem
+*.pcap
+__pycache__
+*.pyc

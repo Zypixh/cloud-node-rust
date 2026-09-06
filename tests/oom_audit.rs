@@ -205,10 +205,10 @@ fn config_sync_decode_budget_is_bounded_by_governor_available_memory() {
         512 * 1024 * 1024,
         32 * 1024 * 1024,
     );
-    assert!(high.drop_previous_generation());
-    assert!(low.drop_previous_generation());
+    assert!(high.defer_health_registration());
+    assert!(low.defer_health_registration());
     assert!(
-        !limits.drop_previous_generation()
+        !limits.defer_health_registration()
             || snapshot.memory_pressure_level
                 >= cloud_node_rust::memory_governor::MemoryPressureLevel::High
     );

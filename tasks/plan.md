@@ -65,3 +65,7 @@ metadata.
 
 - None required for the correctness-first implementation; the safe defaults can
   be relaxed later with explicit representation-aware keys and tests.
+
+## Related Incident Plan
+
+- 2026-09-05: [SNI forwarding, connection counts, and memory repair](sni-memory-repair-plan-2026-09-05.md), based on production diagnosis of 64.204.49.107. This is a separate implementation plan; the cache correctness work above remains pending.
