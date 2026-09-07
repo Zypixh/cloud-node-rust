@@ -1023,9 +1023,7 @@ pub mod record {
             m.plan_id.store(plan_id, Ordering::Relaxed);
         }
         m.total_requests.fetch_add(1, Ordering::Relaxed);
-        if !ip_recorded
-            && let Ok(remote_ip) = remote_ip.parse::<IpAddr>()
-        {
+        if !ip_recorded && let Ok(remote_ip) = remote_ip.parse::<IpAddr>() {
             let day = get_current_day();
             crate::metrics::daily::UNIQUE_IP_TRACKER.record(server_id, &day, remote_ip);
             m.distinct_ips.insert(remote_ip);

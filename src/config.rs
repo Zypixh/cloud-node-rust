@@ -465,9 +465,14 @@ impl ConfigStore {
     /// snapshot. Keeps the map bounded by the live site count.
     fn prune_published_fingerprints(&self, live_servers: &HashSet<i64>, live_users: &HashSet<i64>) {
         self.published_fingerprints.retain(|scope, _| {
-            if let Some(id) = scope.strip_prefix("server:").and_then(|v| v.parse::<i64>().ok()) {
+            if let Some(id) = scope
+                .strip_prefix("server:")
+                .and_then(|v| v.parse::<i64>().ok())
+            {
                 live_servers.contains(&id)
-            } else if let Some(id) = scope.strip_prefix("user:").and_then(|v| v.parse::<i64>().ok())
+            } else if let Some(id) = scope
+                .strip_prefix("user:")
+                .and_then(|v| v.parse::<i64>().ok())
             {
                 live_users.contains(&id)
             } else {

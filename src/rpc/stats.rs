@@ -1187,19 +1187,17 @@ pub async fn start_top_ip_stat_reporter(api_config: ApiConfig) {
 
         let stats = rows
             .iter()
-            .map(
-                |(server_id, ip, count_requests)| {
-                    pb::upload_server_top_ip_stats_request::Stat {
-                        server_id: *server_id as u64,
-                        ip: ip.clone(),
-                        // u64 → u32 silent wraparound at 4.3B would mask runaway IPs;
-                        // saturate to u32::MAX so the upper bound stays visible.
-                        count_requests: u32::try_from(*count_requests).unwrap_or(u32::MAX),
-                        day: day.clone(),
-                        time_at: time_at.clone(),
-                    }
-                },
-            )
+            .map(|(server_id, ip, count_requests)| {
+                pb::upload_server_top_ip_stats_request::Stat {
+                    server_id: *server_id as u64,
+                    ip: ip.clone(),
+                    // u64 → u32 silent wraparound at 4.3B would mask runaway IPs;
+                    // saturate to u32::MAX so the upper bound stays visible.
+                    count_requests: u32::try_from(*count_requests).unwrap_or(u32::MAX),
+                    day: day.clone(),
+                    time_at: time_at.clone(),
+                }
+            })
             .collect();
 
         if let Err(e) = crate::rpc::track_rpc(

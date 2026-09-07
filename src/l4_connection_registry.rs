@@ -290,8 +290,8 @@ mod tests {
     #[test]
     fn switch_protocol_keeps_new_entry_cancellable_and_noop_without_cancel() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12));
-        let (guard, mut rx) = register(ip, L4ConnectionProtocol::Http1)
-            .switch_protocol(L4ConnectionProtocol::SniTcp);
+        let (guard, mut rx) =
+            register(ip, L4ConnectionProtocol::Http1).switch_protocol(L4ConnectionProtocol::SniTcp);
 
         assert_eq!(*rx.borrow(), ConnectionCancelReason::None);
         assert_eq!(drain_ip(ip), 1);

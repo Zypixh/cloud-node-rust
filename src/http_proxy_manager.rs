@@ -856,9 +856,7 @@ impl HttpProxyManager {
                                 // Re-register under SniTcp while carrying over
                                 // any cancel that raced in on the Http1 entry.
                                 let (_sni_connection_guard, sni_cancel_rx) =
-                                    connection_guard.switch_protocol(
-                                        L4ConnectionProtocol::SniTcp,
-                                    );
+                                    connection_guard.switch_protocol(L4ConnectionProtocol::SniTcp);
                                 configure_passthrough_socket(&client_stream);
                                 if let Err(err) = manager
                                     .handle_sni_passthrough(
