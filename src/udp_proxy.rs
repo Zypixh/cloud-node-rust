@@ -24,10 +24,11 @@ use crate::lb_factory::BackendExtension;
 use crate::memory_governor::{
     AdmissionClass, MEMORY_GOVERNOR, StaticAdmissionPermit, StaticUdpQueueBytePermit,
 };
-use crate::net_bind::{bind_udp_socket, dual_stack_bind_addrs};
+use crate::net_bind::{UdpBatchReceiver, bind_udp_socket, dual_stack_bind_addrs};
 
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_MAX_QUIC_CIDS: usize = 8;
+const UDP_UPSTREAM_DRAIN_BUDGET: usize = 32;
 const UDP_METRICS_FLUSH_BYTES: u64 = 1024 * 1024;
 const UDP_METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const UDP_DNS_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -763,44 +764,67 @@ impl UdpProxyManager {
         let port = bind_addr.port();
         let listen_socket = Arc::new(bind_udp_socket(bind_addr).await?);
         let downstream_sender = udp_socket_downstream(listen_socket.clone());
+        #[cfg(target_os = "linux")]
+        if let Err(err) = crate::net_bind::enable_udp_rxq_overflow(&listen_socket) {
+            warn!(
+                "UDP listener on {} could not enable kernel RX overflow accounting: {}",
+                bind_addr, err
+            );
+        }
+        let mut receiver = UdpBatchReceiver::new(listen_socket);
         info!("UDP Proxy worker listening on {}", bind_addr);
 
-        let mut buf = vec![0u8; 65535];
+        #[cfg(target_os = "linux")]
+        let mut last_rxq_overflow = 0u32;
         loop {
-            let recv_result = tokio::select! {
+            let datagrams = tokio::select! {
                 _ = shutdown_rx.changed() => {
                     info!("UDP listener on port {} shutting down", port);
                     return Ok(());
                 }
-                res = listen_socket.recv_from(&mut buf) => res,
+                res = receiver.recv_batch() => res?,
             };
-            let (len, client_addr) = recv_result?;
-            let data = Bytes::copy_from_slice(&buf[..len]);
 
-            match self
-                .receive_datagram_with_downstream(
-                    client_addr,
-                    port,
-                    data,
-                    downstream_sender.clone(),
-                    shutdown_rx.clone(),
-                )
-                .await
-            {
-                Ok(UdpIngressDatagramStatus::Sent)
-                | Ok(UdpIngressDatagramStatus::Blocked)
-                | Ok(UdpIngressDatagramStatus::NoRoute) => {}
-                Ok(UdpIngressDatagramStatus::Full) => {
-                    debug!("UDP session {} buffer full, dropping packet", client_addr);
-                }
-                Ok(UdpIngressDatagramStatus::Closed) => {
-                    debug!("UDP session {} closed, dropping packet", client_addr);
-                }
-                Err(err) => {
-                    debug!(
-                        "UDP session creation failed for {} on port {}: {}",
-                        client_addr, port, err
+            for datagram in datagrams {
+                #[cfg(target_os = "linux")]
+                if let Some(rxq_overflow) = datagram.rxq_overflow
+                    && rxq_overflow > last_rxq_overflow
+                {
+                    warn!(
+                        "UDP listener on {} observed {} kernel RX queue drops",
+                        bind_addr,
+                        rxq_overflow.saturating_sub(last_rxq_overflow)
                     );
+                    last_rxq_overflow = rxq_overflow;
+                }
+                match self
+                    .receive_datagram_with_downstream(
+                        datagram.peer_addr,
+                        port,
+                        datagram.payload,
+                        downstream_sender.clone(),
+                        shutdown_rx.clone(),
+                    )
+                    .await
+                {
+                    Ok(UdpIngressDatagramStatus::Sent)
+                    | Ok(UdpIngressDatagramStatus::Blocked)
+                    | Ok(UdpIngressDatagramStatus::NoRoute) => {}
+                    Ok(UdpIngressDatagramStatus::Full) => {
+                        debug!(
+                            "UDP session {} buffer full, dropping packet",
+                            datagram.peer_addr
+                        );
+                    }
+                    Ok(UdpIngressDatagramStatus::Closed) => {
+                        debug!("UDP session {} closed, dropping packet", datagram.peer_addr);
+                    }
+                    Err(err) => {
+                        debug!(
+                            "UDP session creation failed for {} on port {}: {}",
+                            datagram.peer_addr, port, err
+                        );
+                    }
                 }
             }
         }
@@ -1452,16 +1476,32 @@ impl UdpProxyManager {
                     let Some(item) = item else {
                         break;
                     };
-                    let data = item.data;
-                    let len = data.len() as u64;
-                    if let Err(err) = backend_socket.send(&data).await {
-                        crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
-                        result = Err(err.into());
+                    let mut drained = 0usize;
+                    let mut next_item = Some(item);
+                    while let Some(item) = next_item.take() {
+                        let data = item.data;
+                        let len = data.len() as u64;
+                        if let Err(err) = backend_socket.send(&data).await {
+                            crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
+                            result = Err(err.into());
+                            break;
+                        }
+                        last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
+                        transfer_metrics.record_upstream(len);
+                        transfer_metrics.flush_if_due(server_id, false);
+                        drained += 1;
+                        if drained >= UDP_UPSTREAM_DRAIN_BUDGET {
+                            break;
+                        }
+                        next_item = match rx.try_recv() {
+                            Ok(item) => Some(item),
+                            Err(mpsc::error::TryRecvError::Empty)
+                            | Err(mpsc::error::TryRecvError::Disconnected) => None,
+                        };
+                    }
+                    if result.is_err() {
                         break;
                     }
-                    last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
-                    transfer_metrics.record_upstream(len);
-                    transfer_metrics.flush_if_due(server_id, false);
                 }
                 recv = backend_socket.recv(&mut buf) => {
                     let len = match recv {
@@ -2201,6 +2241,213 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual high-burst UDP proxy A/B benchmark"]
+    async fn high_burst_udp_proxy_batch_baseline() {
+        let manager = UdpProxyManager::new(ConfigStore::new(), Arc::new(WafStateManager::new()), 1);
+        let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let backend_addr = backend.local_addr().unwrap();
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_addr = client.local_addr().unwrap();
+        let listen_socket = Arc::new(
+            bind_udp_socket("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let proxy_addr = listen_socket.local_addr().unwrap();
+        let downstream_sender = UdpDownstreamSender::socket(listen_socket.clone());
+        let queue_size = MEMORY_GOVERNOR.udp_session_queue_size();
+        let (tx, rx) = mpsc::channel(queue_size);
+        let (listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
+        let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+        let session = Arc::new(UdpSession {
+            id: 9001,
+            client_addr: Arc::new(ArcSwap::from_pointee(client_addr)),
+            listen_port: proxy_addr.port(),
+            backend_addr,
+            origin_id: 9001,
+            server_id: 9001,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
+            quic_cid_tx: None,
+            tx,
+            shutdown_tx: session_shutdown_tx.clone(),
+            shutdown: session_shutdown_rx.clone(),
+        });
+        manager
+            .sessions
+            .insert((client_addr, proxy_addr.port()), session.clone());
+
+        let backend_received = Arc::new(AtomicU64::new(0));
+        let backend_replies_sent = Arc::new(AtomicU64::new(0));
+        let client_received = Arc::new(AtomicU64::new(0));
+        let ingress_received = Arc::new(AtomicU64::new(0));
+        let ingress_sent = Arc::new(AtomicU64::new(0));
+        let ingress_full = Arc::new(AtomicU64::new(0));
+        let ingress_closed = Arc::new(AtomicU64::new(0));
+        let (backend_stop_tx, mut backend_stop_rx) = watch::channel(false);
+        let (client_stop_tx, mut client_stop_rx) = watch::channel(false);
+
+        let backend_task = {
+            let backend = backend.clone();
+            let backend_received = backend_received.clone();
+            let backend_replies_sent = backend_replies_sent.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65_535];
+                loop {
+                    tokio::select! {
+                        _ = backend_stop_rx.changed() => break,
+                        result = backend.recv_from(&mut buf) => {
+                            let Ok((len, peer)) = result else { break };
+                            backend_received.fetch_add(1, Ordering::Relaxed);
+                            if backend.send_to(&buf[..len], peer).await.is_ok() {
+                                backend_replies_sent.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        let client_task = {
+            let client = client.clone();
+            let client_received = client_received.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65_535];
+                loop {
+                    tokio::select! {
+                        _ = client_stop_rx.changed() => break,
+                        result = client.recv_from(&mut buf) => {
+                            if result.is_ok() {
+                                client_received.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        let listener_task = {
+            let manager = manager.clone();
+            let listen_socket = listen_socket.clone();
+            let downstream_sender = downstream_sender.clone();
+            let ingress_received = ingress_received.clone();
+            let ingress_sent = ingress_sent.clone();
+            let ingress_full = ingress_full.clone();
+            let ingress_closed = ingress_closed.clone();
+            let mut listener_shutdown_rx = listener_shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut receiver = crate::net_bind::UdpBatchReceiver::new(listen_socket);
+                loop {
+                    let datagrams = tokio::select! {
+                        _ = listener_shutdown_rx.changed() => break,
+                        result = receiver.recv_batch() => result?,
+                    };
+                    for datagram in datagrams {
+                        ingress_received.fetch_add(1, Ordering::Relaxed);
+                        match manager
+                            .receive_datagram_with_downstream(
+                                datagram.peer_addr,
+                                proxy_addr.port(),
+                                datagram.payload,
+                                downstream_sender.clone(),
+                                listener_shutdown_rx.clone(),
+                            )
+                            .await?
+                        {
+                            UdpIngressDatagramStatus::Sent => {
+                                ingress_sent.fetch_add(1, Ordering::Relaxed);
+                            }
+                            UdpIngressDatagramStatus::Full => {
+                                ingress_full.fetch_add(1, Ordering::Relaxed);
+                            }
+                            UdpIngressDatagramStatus::Closed => {
+                                ingress_closed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            UdpIngressDatagramStatus::NoRoute
+                            | UdpIngressDatagramStatus::Blocked => {}
+                        }
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+        };
+        let session_task = tokio::spawn(UdpProxyManager::handle_session(UdpHandleSessionArgs {
+            session_id: session.id,
+            backend_addr,
+            _listen_port: proxy_addr.port(),
+            listener_shutdown_rx: listener_shutdown_tx.subscribe(),
+            session_shutdown_rx,
+            server_id: session.server_id,
+            origin_id: session.origin_id,
+            client_addr: session.client_addr.clone(),
+            domain: "high-burst-udp.example".to_string(),
+            last_activity_ms: session.last_activity_ms.clone(),
+            quic_cids: session.quic_cids.clone(),
+            quic_server_cid_len: session.quic_server_cid_len.clone(),
+            quic_cid_tx: None,
+            downstream_sender,
+            rx,
+            metrics_guard: crate::metrics::ActiveRequestMetricsGuard::new(
+                crate::metrics::record::get_or_create(session.server_id),
+            ),
+        }));
+
+        const ATTEMPTED: u64 = 20_000;
+        let payload = vec![0xA5; 1_200];
+        let mut submitted = 0u64;
+        let mut send_errors = 0u64;
+        for _ in 0..ATTEMPTED {
+            match client.send_to(&payload, proxy_addr).await {
+                Ok(_) => submitted += 1,
+                Err(_) => send_errors += 1,
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        println!(
+            "udp proxy batch baseline: attempted={} submitted={} send_errors={} \
+             ingress_received={} sent={} full={} closed={} backend_received={} \
+             backend_replies_sent={} client_received={} queue_size={}",
+            ATTEMPTED,
+            submitted,
+            send_errors,
+            ingress_received.load(Ordering::Relaxed),
+            ingress_sent.load(Ordering::Relaxed),
+            ingress_full.load(Ordering::Relaxed),
+            ingress_closed.load(Ordering::Relaxed),
+            backend_received.load(Ordering::Relaxed),
+            backend_replies_sent.load(Ordering::Relaxed),
+            client_received.load(Ordering::Relaxed),
+            queue_size,
+        );
+
+        let _ = listener_shutdown_tx.send(true);
+        let _ = session_shutdown_tx.send(true);
+        let _ = backend_stop_tx.send(true);
+        let _ = client_stop_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), listener_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), backend_task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), client_task)
+            .await
             .unwrap()
             .unwrap();
     }

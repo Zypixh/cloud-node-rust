@@ -1,13 +1,220 @@
+use bytes::Bytes;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use anyhow::Context;
 use socket2::{Domain, Protocol, Socket, Type};
 #[cfg(target_os = "linux")]
+use socket2::{SockAddr, SockAddrStorage};
+#[cfg(target_os = "linux")]
+use std::mem::size_of;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use tokio::io::Interest;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
+
+#[cfg(target_os = "linux")]
+const UDP_RECEIVE_BATCH_SIZE: usize = 32;
+const UDP_MAX_DATAGRAM_SIZE: usize = 65_535;
+
+#[derive(Debug)]
+pub(crate) struct ReceivedUdpDatagram {
+    pub(crate) peer_addr: SocketAddr,
+    pub(crate) payload: Bytes,
+    #[cfg(target_os = "linux")]
+    pub(crate) rxq_overflow: Option<u32>,
+}
+
+pub(crate) struct UdpBatchReceiver {
+    socket: Arc<UdpSocket>,
+    #[cfg(target_os = "linux")]
+    buffers: Vec<[u8; UDP_MAX_DATAGRAM_SIZE]>,
+    #[cfg(target_os = "linux")]
+    addresses: Vec<libc::sockaddr_storage>,
+    #[cfg(target_os = "linux")]
+    iovecs: Vec<libc::iovec>,
+    #[cfg(target_os = "linux")]
+    messages: Vec<libc::mmsghdr>,
+    #[cfg(target_os = "linux")]
+    controls: Vec<[u64; 8]>,
+    #[cfg(not(target_os = "linux"))]
+    buffer: Vec<u8>,
+}
+
+impl UdpBatchReceiver {
+    pub(crate) fn new(socket: Arc<UdpSocket>) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut buffers = Vec::with_capacity(UDP_RECEIVE_BATCH_SIZE);
+            let mut addresses = Vec::with_capacity(UDP_RECEIVE_BATCH_SIZE);
+            let mut iovecs = Vec::with_capacity(UDP_RECEIVE_BATCH_SIZE);
+            let mut messages = Vec::with_capacity(UDP_RECEIVE_BATCH_SIZE);
+            let mut controls = Vec::with_capacity(UDP_RECEIVE_BATCH_SIZE);
+
+            for _ in 0..UDP_RECEIVE_BATCH_SIZE {
+                buffers.push([0u8; UDP_MAX_DATAGRAM_SIZE]);
+                addresses.push(unsafe { std::mem::zeroed() });
+                controls.push([0u64; 8]);
+            }
+            for index in 0..UDP_RECEIVE_BATCH_SIZE {
+                iovecs.push(libc::iovec {
+                    iov_base: buffers[index].as_mut_ptr().cast(),
+                    iov_len: UDP_MAX_DATAGRAM_SIZE,
+                });
+            }
+            for index in 0..UDP_RECEIVE_BATCH_SIZE {
+                messages.push(libc::mmsghdr {
+                    msg_hdr: libc::msghdr {
+                        msg_name: (&mut addresses[index] as *mut libc::sockaddr_storage).cast(),
+                        msg_namelen: size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                        msg_iov: &mut iovecs[index],
+                        msg_iovlen: 1,
+                        msg_control: controls[index].as_mut_ptr().cast(),
+                        msg_controllen: std::mem::size_of_val(&controls[index]),
+                        msg_flags: 0,
+                    },
+                    msg_len: 0,
+                });
+            }
+
+            return Self {
+                socket,
+                buffers,
+                addresses,
+                iovecs,
+                messages,
+                controls,
+            };
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        Self {
+            socket,
+            buffer: vec![0u8; UDP_MAX_DATAGRAM_SIZE],
+        }
+    }
+
+    pub(crate) async fn recv_batch(&mut self) -> io::Result<Vec<ReceivedUdpDatagram>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.recv_batch_linux().await
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (len, peer_addr) = self.socket.recv_from(&mut self.buffer).await?;
+            Ok(vec![ReceivedUdpDatagram {
+                peer_addr,
+                payload: Bytes::copy_from_slice(&self.buffer[..len]),
+            }])
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn recv_batch_linux(&mut self) -> io::Result<Vec<ReceivedUdpDatagram>> {
+        loop {
+            self.socket.readable().await?;
+            for message in &mut self.messages {
+                message.msg_hdr.msg_namelen =
+                    size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                message.msg_hdr.msg_controllen =
+                    std::mem::size_of_val(&self.controls[0]) as libc::socklen_t;
+                message.msg_len = 0;
+            }
+
+            let fd = self.socket.as_raw_fd();
+            let messages = &mut self.messages;
+            let received = self.socket.try_io(Interest::READABLE, || {
+                let result = unsafe {
+                    libc::recvmmsg(
+                        fd,
+                        messages.as_mut_ptr(),
+                        messages.len() as libc::c_uint,
+                        libc::MSG_DONTWAIT,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if result < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(result as usize)
+                }
+            });
+
+            let received = match received {
+                Ok(received) => received,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(err) => return Err(err),
+            };
+
+            let mut datagrams = Vec::with_capacity(received);
+            for index in 0..received {
+                let mut storage = SockAddrStorage::zeroed();
+                unsafe {
+                    *storage.view_as::<libc::sockaddr_storage>() = self.addresses[index];
+                }
+                let peer_addr =
+                    unsafe { SockAddr::new(storage, messages[index].msg_hdr.msg_namelen) }
+                        .as_socket()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "UDP recvmmsg returned a non-IP peer address",
+                            )
+                        })?;
+                let len = messages[index].msg_len as usize;
+                datagrams.push(ReceivedUdpDatagram {
+                    peer_addr,
+                    payload: Bytes::copy_from_slice(&self.buffers[index][..len]),
+                    rxq_overflow: parse_rxq_overflow(&messages[index].msg_hdr),
+                });
+            }
+            return Ok(datagrams);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_rxq_overflow(message: &libc::msghdr) -> Option<u32> {
+    let mut control = unsafe { libc::CMSG_FIRSTHDR(message) };
+    let minimum_len =
+        unsafe { libc::CMSG_LEN(std::mem::size_of::<u32>() as libc::c_uint) } as usize;
+    while !control.is_null() {
+        let header = unsafe { &*control };
+        if header.cmsg_level == libc::SOL_SOCKET
+            && header.cmsg_type == libc::SO_RXQ_OVFL
+            && (header.cmsg_len as usize) >= minimum_len
+        {
+            let data = unsafe { libc::CMSG_DATA(control) };
+            return Some(unsafe { std::ptr::read_unaligned(data.cast::<u32>()) });
+        }
+        control = unsafe { libc::CMSG_NXTHDR(message, control) };
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn enable_udp_rxq_overflow(socket: &UdpSocket) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            (&enabled as *const libc::c_int).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// Returns true if an accept error is normally recoverable under load and the
 /// listener should keep accepting instead of exiting.
@@ -174,5 +381,126 @@ mod tests {
 
         assert_eq!(first.local_addr().unwrap(), addr);
         assert_eq!(second.local_addr().unwrap(), addr);
+    }
+
+    #[tokio::test]
+    async fn udp_batch_receiver_preserves_order_and_short_datagrams() {
+        let receiver_socket = Arc::new(
+            bind_udp_socket("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let expected = [
+            b"a".as_slice(),
+            b"medium-payload".as_slice(),
+            b"".as_slice(),
+        ];
+
+        for payload in expected {
+            sender.send_to(payload, receiver_addr).await.unwrap();
+        }
+
+        let mut receiver = UdpBatchReceiver::new(receiver_socket);
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut received = Vec::new();
+            while received.len() < expected.len() {
+                received.extend(
+                    receiver
+                        .recv_batch()
+                        .await
+                        .expect("batch receive should succeed")
+                        .into_iter()
+                        .map(|datagram| datagram.payload),
+                );
+            }
+            received
+        })
+        .await
+        .expect("batch receiver should drain all test datagrams");
+
+        assert_eq!(
+            received,
+            expected
+                .into_iter()
+                .map(Bytes::copy_from_slice)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "manual high-burst UDP baseline"]
+    async fn udp_batch_receiver_high_burst_baseline() {
+        let receiver_socket = Arc::new(
+            bind_udp_socket("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        #[cfg(target_os = "linux")]
+        enable_udp_rxq_overflow(&receiver_socket).unwrap();
+        let receiver_addr = receiver_socket.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let attempted = 20_000u64;
+        let payload = vec![0xA5; 1_200];
+        let mut submitted = 0u64;
+        let mut send_errors = 0u64;
+
+        for _ in 0..attempted {
+            match sender.send_to(&payload, receiver_addr).await {
+                Ok(_) => submitted += 1,
+                Err(_) => send_errors += 1,
+            }
+        }
+
+        let mut receiver = UdpBatchReceiver::new(receiver_socket);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut received = 0u64;
+        #[cfg(target_os = "linux")]
+        let mut rxq_overflow = 0u32;
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let batch = match tokio::time::timeout(remaining, receiver.recv_batch()).await {
+                Ok(Ok(batch)) => batch,
+                Ok(Err(err)) => panic!("batch receive failed: {err}"),
+                Err(_) => break,
+            };
+            received += batch.len() as u64;
+            #[cfg(target_os = "linux")]
+            for datagram in &batch {
+                if let Some(value) = datagram.rxq_overflow {
+                    rxq_overflow = rxq_overflow.max(value);
+                }
+            }
+            if received >= submitted {
+                break;
+            }
+        }
+
+        println!(
+            "udp batch baseline: attempted={attempted} submitted={submitted} \
+             send_errors={send_errors} received={received}{}",
+            {
+                #[cfg(target_os = "linux")]
+                {
+                    format!(" rxq_overflow={rxq_overflow}")
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    String::new()
+                }
+            }
+        );
+        assert!(submitted > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_udp_batch_receiver_can_enable_rxq_overflow_accounting() {
+        let socket = bind_udp_socket("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+
+        enable_udp_rxq_overflow(&socket).unwrap();
     }
 }
