@@ -45,6 +45,14 @@ pub(crate) struct UdpBatchReceiver {
     buffer: Vec<u8>,
 }
 
+#[cfg(target_os = "linux")]
+// SAFETY: The recvmmsg descriptors contain pointers into allocations owned by
+// this receiver. Those allocations are fully initialized before the
+// descriptors are created and are never resized afterward. The receiver is
+// only accessed through &mut self, so the descriptors cannot be used
+// concurrently while the receiver is moved to the Tokio worker thread.
+unsafe impl Send for UdpBatchReceiver {}
+
 impl UdpBatchReceiver {
     pub(crate) fn new(socket: Arc<UdpSocket>) -> Self {
         #[cfg(target_os = "linux")]
@@ -121,8 +129,7 @@ impl UdpBatchReceiver {
             for message in &mut self.messages {
                 message.msg_hdr.msg_namelen =
                     size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                message.msg_hdr.msg_controllen =
-                    std::mem::size_of_val(&self.controls[0]) as libc::socklen_t;
+                message.msg_hdr.msg_controllen = std::mem::size_of_val(&self.controls[0]);
                 message.msg_len = 0;
             }
 
