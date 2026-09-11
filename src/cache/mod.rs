@@ -6,6 +6,7 @@ pub mod compiled;
 pub mod matching;
 pub mod partial;
 pub(crate) mod process_lock;
+pub(crate) mod purge_barrier;
 
 pub(crate) fn should_store_response_header(name: &str) -> bool {
     const SKIP: &[&str] = &[

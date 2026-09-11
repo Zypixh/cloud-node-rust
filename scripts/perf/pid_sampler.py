@@ -42,6 +42,9 @@ def total_cpu_jiffies():
     return sum(int(x) for x in fields)
 
 
+import signal
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pid", action="append", type=int, required=True)
@@ -50,6 +53,18 @@ def main():
     ap.add_argument("--interval", type=float, default=0.5)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+
+    # Request-count bounded runs (oha -n) may finish before --duration. The
+    # driver sends SIGTERM when the load ends; finalize and write what was
+    # sampled so the CPU average covers exactly the loaded interval.
+    stopped = False
+
+    def _stop(_sig, _frame):
+        nonlocal stopped
+        stopped = True
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
 
     names = args.name or [f"pid{p}" for p in args.pid]
     if len(names) != len(args.pid):
@@ -66,7 +81,7 @@ def main():
     series = {n: [] for n in groups}
     rss_peak = {n: 0 for n in groups}
     deadline = prev_t + args.duration
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline and not stopped:
         time.sleep(args.interval)
         now = time.monotonic()
         now_total = total_cpu_jiffies()

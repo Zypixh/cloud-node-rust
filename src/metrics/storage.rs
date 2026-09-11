@@ -827,7 +827,9 @@ impl MetricStorage {
                     continue;
                 }
 
-                let mut updated = memory_meta;
+                // Access-count merging needs an owned copy of the shared
+                // index entry; this runs once per flushed batch, not per hit.
+                let mut updated = memory_meta.as_ref().clone();
                 if let Some(durable) = durable_meta {
                     // Preserve access counts accumulated by another worker or
                     // by a previous flush, then add only this batch once.
@@ -861,6 +863,7 @@ impl MetricStorage {
                     && cache_meta_entry_version(&current) == version
                     && current.cache_key == updated.cache_key
                 {
+                    let current = Arc::make_mut(&mut *current);
                     current.access_time = current.access_time.max(updated.access_time);
                     current.access_count = current.access_count.max(updated.access_count);
                 }
@@ -873,7 +876,7 @@ impl MetricStorage {
         }
     }
 
-    pub fn get_cache_meta(&self, hash: &str) -> Option<CacheMetaEntry> {
+    pub fn get_cache_meta(&self, hash: &str) -> Option<Arc<CacheMetaEntry>> {
         get_cache_meta_memory(hash)
     }
 
@@ -1204,7 +1207,7 @@ impl MetricStorage {
     pub fn scan_all_cache_meta(&self) -> Vec<(String, CacheMetaEntry)> {
         CACHE_META_INDEX
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|entry| (entry.key().clone(), entry.value().as_ref().clone()))
             .collect()
     }
 
@@ -1331,7 +1334,9 @@ pub struct CacheMetaEntry {
     pub created_at: i64,
 }
 
-static CACHE_META_INDEX: Lazy<DashMap<String, CacheMetaEntry>> = Lazy::new(DashMap::new);
+// Entries are Arc-shared so read-mostly callers (the L1 hit validation path)
+// pay a refcount bump instead of cloning the headers vector on every lookup.
+static CACHE_META_INDEX: Lazy<DashMap<String, Arc<CacheMetaEntry>>> = Lazy::new(DashMap::new);
 
 enum CacheMetaWrite {
     Upsert {
@@ -1509,7 +1514,13 @@ fn cache_meta_tombstone_from_db(storage: &MetricStorage, hash: &str) -> Option<u
 }
 
 fn cache_meta_tombstone_version_for(storage: &MetricStorage, hash: &str) -> Option<u64> {
-    cache_meta_tombstone_memory(hash)
+    let memory = cache_meta_tombstone_memory(hash);
+    if !shared_cache_volume_declared() {
+        // Local tombstones are written to memory before durable storage, so
+        // in single-process mode memory is always at least as fresh.
+        return memory;
+    }
+    memory
         .into_iter()
         .chain(cache_meta_tombstone_from_db(storage, hash))
         .max()
@@ -1535,6 +1546,9 @@ fn newest_cache_meta_broad_purge_version(cached: u64, durable: u64) -> u64 {
 
 fn current_cache_meta_broad_purge_version_for(storage: &MetricStorage) -> u64 {
     let cached = CACHE_META_BROAD_PURGE_VERSION.load(Ordering::Acquire);
+    if !shared_cache_volume_declared() {
+        return cached;
+    }
     let durable = cache_meta_broad_purge_version_from_db(storage).unwrap_or(0);
     let newest = newest_cache_meta_broad_purge_version(cached, durable);
     if durable > cached {
@@ -1672,7 +1686,9 @@ fn cache_meta_upsert_is_valid(upsert: &CacheMetaUpsert<'_>, meta: &CacheMetaEntr
 
 fn remove_cache_meta_memory_if_current(hash: &str, expected: &CacheMetaEntry) {
     let _index_guard = CACHE_META_INDEX_LOCK.lock();
-    if let Some((_, meta)) = CACHE_META_INDEX.remove_if(hash, |_, current| current == expected) {
+    if let Some((_, meta)) =
+        CACHE_META_INDEX.remove_if(hash, |_, current| current.as_ref() == expected)
+    {
         remove_cache_meta_memory_entry(hash, &meta);
     }
 }
@@ -1740,7 +1756,7 @@ fn apply_cache_meta_memory(hash: &str, meta: CacheMetaEntry) -> bool {
     // Surrogate-Key set.  Remove the old reverse-index memberships before
     // adding the new set, otherwise purging an old tag deletes the refresh.
     crate::cache_hybrid::remove_hash_from_surrogate_index(hash);
-    CACHE_META_INDEX.insert(hash.to_string(), meta.clone());
+    CACHE_META_INDEX.insert(hash.to_string(), Arc::new(meta.clone()));
     crate::cache_hybrid::index_surrogate_keys(&meta.headers, hash);
     crate::cache_hybrid::on_cache_meta_upsert(&meta);
     true
@@ -1935,13 +1951,30 @@ fn parse_unique_ip_key(key: &str) -> Option<(i64, String, IpAddr)> {
     Some((server_id, day, ip))
 }
 
-pub fn get_cache_meta_memory(hash: &str) -> Option<CacheMetaEntry> {
+/// True only when the runtime explicitly declares a shared cache volume
+/// (RKE2 mode). Single-process deployments own the volume exclusively and
+/// every durable fence is written by this process after the in-memory fence
+/// is already updated, so the memory value is always authoritative.
+fn shared_cache_volume_declared() -> bool {
+    crate::runtime_mode::RuntimeConfig::current_is_rke2()
+}
+
+pub fn get_cache_meta_memory(hash: &str) -> Option<Arc<CacheMetaEntry>> {
+    get_cache_meta_memory_fenced(hash, cache_meta_broad_purge_version())
+}
+
+/// `broad_purge_version` is caller-supplied so the L1 validation path reads
+/// the fence once per request instead of once per metadata probe.
+pub(crate) fn get_cache_meta_memory_fenced(
+    hash: &str,
+    broad_purge_version: u64,
+) -> Option<Arc<CacheMetaEntry>> {
     let meta = CACHE_META_INDEX.get(hash).map(|v| v.clone())?;
-    // A broad purge can be committed by another process. Always compare the
-    // durable watermark with the local atomic instead of treating a non-zero
-    // local value as authoritative; the watermark is monotonic and the
-    // durable read failure path keeps the already observed local maximum.
-    let broad_purge_version = current_cache_meta_broad_purge_version_for(&STORAGE);
+    // A broad purge can be committed by another process. On a declared shared
+    // volume always compare the durable watermark with the local atomic
+    // instead of treating a non-zero local value as authoritative; the
+    // watermark is monotonic and the durable read failure path keeps the
+    // already observed local maximum.
     if broad_purge_version > 0 && cache_meta_entry_version(&meta) <= broad_purge_version {
         return None;
     }
@@ -2013,7 +2046,7 @@ fn restore_cache_access_memory(hash: &str, access_time: i64, access_count: u64) 
 
 #[cfg(test)]
 pub fn insert_cache_meta_for_test(hash: String, meta: CacheMetaEntry) {
-    CACHE_META_INDEX.insert(hash, meta);
+    CACHE_META_INDEX.insert(hash, Arc::new(meta));
 }
 
 #[cfg(test)]
@@ -2114,7 +2147,7 @@ pub fn load_cache_meta_index() {
                 continue;
             }
             crate::cache_hybrid::index_surrogate_keys(&entry.headers, &hash);
-            CACHE_META_INDEX.insert(hash, entry);
+            CACHE_META_INDEX.insert(hash, Arc::new(entry));
             count += 1;
         } else {
             isolate_corrupt_cmeta(key_str);
@@ -2137,6 +2170,98 @@ fn isolate_corrupt_cmeta(key: &str) {
     );
 }
 
+/// Max commands folded into one writer transaction. Bounds commit latency
+/// while still amortizing the per-transaction cost across many fills.
+const CACHE_META_BATCH_MAX: usize = 256;
+
+/// Evaluate one queued command inside an open transaction.
+/// Ok(true) = applied, Ok(false) = fenced/skipped (not an error),
+/// Err aborts the whole batch so no partial item state can commit.
+fn apply_cache_meta_write(txn: &mace::TxnKV<'_>, command: &CacheMetaWrite) -> Result<bool, OpCode> {
+    match command {
+        CacheMetaWrite::Upsert { hash, meta, .. } => {
+            let db_key = format!("CMETA_{hash}");
+            let tombstone_key = cache_meta_tombstone_key(hash);
+            let broad_purge_version = txn_get_slice(txn, CACHE_META_BROAD_PURGE_KEY.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|value| parse_cache_meta_tombstone(&value));
+            if cache_meta_version_is_fenced(broad_purge_version, meta.event_version) {
+                return Ok(false);
+            }
+            let tombstone = txn_get_slice(txn, tombstone_key.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|value| parse_cache_meta_tombstone(&value));
+            if cache_meta_version_is_fenced(tombstone, meta.event_version) {
+                return Ok(false);
+            }
+            let current = txn_get_slice(txn, db_key.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|value| cache_meta_entry_from_bytes(&value));
+            if cache_meta_update_is_stale(current.as_ref(), meta) {
+                return Ok(false);
+            }
+            if tombstone.is_some() {
+                match txn.del(tombstone_key.as_bytes()) {
+                    Ok(()) | Err(OpCode::NotFound) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            txn.upsert(
+                db_key.as_bytes(),
+                cache_meta_json(meta).to_string().as_bytes(),
+            )?;
+            Ok(true)
+        }
+        CacheMetaWrite::Delete {
+            hash,
+            tombstone_version,
+            ..
+        } => {
+            let db_key = format!("CMETA_{hash}");
+            let tombstone_key = cache_meta_tombstone_key(hash);
+            let current = txn_get_slice(txn, tombstone_key.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|value| parse_cache_meta_tombstone(&value))
+                .unwrap_or(0);
+            let version = current.max(*tombstone_version).max(1);
+            txn.upsert(tombstone_key.as_bytes(), version.to_string().as_bytes())?;
+            let current_meta = txn_get_slice(txn, db_key.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|value| cache_meta_entry_from_bytes(&value));
+            if current_meta
+                .as_ref()
+                .is_none_or(|meta| cache_meta_entry_version(meta) <= version)
+            {
+                match txn.del(db_key.as_bytes()) {
+                    Ok(()) | Err(OpCode::NotFound) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            // Do not let an older delayed purge delete a newer fill that was
+            // already persisted; the tombstone write above still stands.
+            Ok(true)
+        }
+        CacheMetaWrite::BroadPurge { version, .. } => {
+            let current = txn_get_slice(txn, CACHE_META_BROAD_PURGE_KEY.as_bytes())
+                .ok()
+                .flatten()
+                .and_then(|value| parse_cache_meta_tombstone(&value))
+                .unwrap_or(0);
+            let version = current.max(*version).max(1);
+            txn.upsert(
+                CACHE_META_BROAD_PURGE_KEY.as_bytes(),
+                version.to_string().as_bytes(),
+            )?;
+            Ok(true)
+        }
+    }
+}
+
 fn start_cache_meta_writer() {
     let (tx, mut rx) = mpsc::channel(CACHE_META_QUEUE_CAPACITY);
     if CACHE_META_WRITER_TX.set(tx).is_err() {
@@ -2146,117 +2271,70 @@ fn start_cache_meta_writer() {
     let spawn_result = std::thread::Builder::new()
         .name("mace-cache-writer".to_string())
         .spawn(move || {
-            while let Some(command) = rx.blocking_recv() {
-                let ok = match command {
-                    CacheMetaWrite::Upsert { hash, meta, ack } => {
-                        let db_key = format!("CMETA_{hash}");
-                        let tombstone_key = cache_meta_tombstone_key(&hash);
-                        let _db_guard = CACHE_META_DB_LOCK.lock();
-                        let ok = STORAGE.write(|txn| {
-                            let broad_purge_version =
-                                txn_get_slice(txn, CACHE_META_BROAD_PURGE_KEY.as_bytes())
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|value| parse_cache_meta_tombstone(&value));
-                            if cache_meta_version_is_fenced(broad_purge_version, meta.event_version)
-                            {
-                                return Err(OpCode::NotFound);
+            while let Some(first) = rx.blocking_recv() {
+                // Drain whatever is already queued and fold it into a single
+                // transaction: every sender still gets an explicit ack only
+                // after the batch commits, so durability semantics are
+                // unchanged — one commit is simply amortized across the batch.
+                let mut batch = Vec::with_capacity(64);
+                batch.push(first);
+                while batch.len() < CACHE_META_BATCH_MAX
+                    && let Ok(command) = rx.try_recv()
+                {
+                    batch.push(command);
+                }
+                let mut results = vec![false; batch.len()];
+                {
+                    let _db_guard = CACHE_META_DB_LOCK.lock();
+                    let committed = STORAGE.write(|txn| {
+                        for (index, command) in batch.iter().enumerate() {
+                            match apply_cache_meta_write(txn, command) {
+                                Ok(applied) => results[index] = applied,
+                                Err(err) => return Err(err),
                             }
-                            let tombstone = txn_get_slice(txn, tombstone_key.as_bytes())
-                                .ok()
-                                .flatten()
-                                .and_then(|value| parse_cache_meta_tombstone(&value));
-                            if cache_meta_version_is_fenced(tombstone, meta.event_version) {
-                                return Err(OpCode::NotFound);
-                            }
-                            let current = txn_get_slice(txn, db_key.as_bytes())
-                                .ok()
-                                .flatten()
-                                .and_then(|value| cache_meta_entry_from_bytes(&value));
-                            if cache_meta_update_is_stale(current.as_ref(), &meta) {
-                                return Err(OpCode::NotFound);
-                            }
-                            if tombstone.is_some() {
-                                match txn.del(tombstone_key.as_bytes()) {
-                                    Ok(()) | Err(OpCode::NotFound) => {}
-                                    Err(err) => return Err(err),
-                                }
-                            }
-                            txn.upsert(
-                                db_key.as_bytes(),
-                                cache_meta_json(&meta).to_string().as_bytes(),
-                            )
-                        });
-                        reconcile_cache_meta_upsert_result(&hash, &meta, ok);
-                        if !ok {
-                            error!(hash, "Mace async cache metadata write failed");
                         }
-                        let _ = ack.send(ok);
-                        ok
+                        Ok(())
+                    });
+                    if !committed {
+                        // The transaction rolled back: nothing in this batch is
+                        // durable. Per-item flags set before the failure must
+                        // not be acknowledged as committed.
+                        results.fill(false);
+                        warn!(
+                            batch = batch.len(),
+                            "Mace cache metadata writer aborted a batch"
+                        );
                     }
-                    CacheMetaWrite::Delete {
-                        hash,
-                        tombstone_version,
-                        ack,
-                    } => {
-                        let db_key = format!("CMETA_{hash}");
-                        let tombstone_key = cache_meta_tombstone_key(&hash);
-                        let _db_guard = CACHE_META_DB_LOCK.lock();
-                        let ok = STORAGE.write(|txn| {
-                            let current = txn_get_slice(txn, tombstone_key.as_bytes())
-                                .ok()
-                                .flatten()
-                                .and_then(|value| parse_cache_meta_tombstone(&value))
-                                .unwrap_or(0);
-                            let version = current.max(tombstone_version).max(1);
-                            txn.upsert(tombstone_key.as_bytes(), version.to_string().as_bytes())?;
-                            let current_meta = txn_get_slice(txn, db_key.as_bytes())
-                                .ok()
-                                .flatten()
-                                .and_then(|value| cache_meta_entry_from_bytes(&value));
-                            if current_meta
-                                .as_ref()
-                                .is_none_or(|meta| cache_meta_entry_version(meta) <= version)
-                            {
-                                match txn.del(db_key.as_bytes()) {
-                                    Ok(()) | Err(OpCode::NotFound) => Ok(()),
-                                    Err(err) => Err(err),
-                                }
-                            } else {
-                                // Do not let an older delayed purge delete a
-                                // newer fill that was already persisted.
-                                Ok(())
+                }
+                for (command, ok) in batch.into_iter().zip(results) {
+                    match command {
+                        CacheMetaWrite::Upsert { hash, meta, ack } => {
+                            reconcile_cache_meta_upsert_result(&hash, &meta, ok);
+                            if !ok {
+                                error!(hash, "Mace async cache metadata write failed");
                             }
-                        });
-                        if !ok {
-                            error!(hash, "Mace async cache metadata delete failed");
+                            let _ = ack.send(ok);
                         }
-                        let _ = ack.send(ok);
-                        ok
-                    }
-                    CacheMetaWrite::BroadPurge { version, ack } => {
-                        let _db_guard = CACHE_META_DB_LOCK.lock();
-                        let ok = STORAGE.write(|txn| {
-                            let current = txn_get_slice(txn, CACHE_META_BROAD_PURGE_KEY.as_bytes())
-                                .ok()
-                                .flatten()
-                                .and_then(|value| parse_cache_meta_tombstone(&value))
-                                .unwrap_or(0);
-                            let version = current.max(version).max(1);
-                            txn.upsert(
-                                CACHE_META_BROAD_PURGE_KEY.as_bytes(),
-                                version.to_string().as_bytes(),
-                            )
-                        });
-                        if !ok {
-                            error!(version, "Mace broad cache purge fence write failed");
+                        CacheMetaWrite::Delete {
+                            hash,
+                            tombstone_version: _,
+                            ack,
+                        } => {
+                            if !ok {
+                                error!(hash, "Mace async cache metadata delete failed");
+                            }
+                            let _ = ack.send(ok);
                         }
-                        let _ = ack.send(ok);
-                        ok
+                        CacheMetaWrite::BroadPurge { version, ack } => {
+                            if !ok {
+                                error!(version, "Mace broad cache purge fence write failed");
+                            }
+                            let _ = ack.send(ok);
+                        }
                     }
-                };
-                if !ok {
-                    warn!("Mace cache metadata writer rejected a command");
+                    if !ok {
+                        warn!("Mace cache metadata writer rejected a command");
+                    }
                 }
             }
         });
@@ -2684,7 +2762,7 @@ mod tests {
         storage.delete_cache_meta_at_version(&hash, 200);
         CACHE_META_INDEX.insert(
             hash.clone(),
-            CacheMetaEntry {
+            Arc::new(CacheMetaEntry {
                 cache_key,
                 size: 4,
                 expires: now + 86_400,
@@ -2696,7 +2774,7 @@ mod tests {
                 updated_at: now,
                 created_at: now,
                 ..Default::default()
-            },
+            }),
         );
         CACHE_ACCESS_LOG.insert(hash.clone(), (AtomicI64::new(now), AtomicU64::new(1)));
 
@@ -2750,7 +2828,7 @@ mod tests {
         });
         CACHE_META_INDEX.insert(
             hash.clone(),
-            CacheMetaEntry {
+            Arc::new(CacheMetaEntry {
                 cache_key: cache_key.clone(),
                 size: 4,
                 expires: now + 86_400,
@@ -2762,7 +2840,7 @@ mod tests {
                 updated_at: now,
                 created_at: now,
                 ..Default::default()
-            },
+            }),
         );
         CACHE_ACCESS_LOG.insert(hash.clone(), (AtomicI64::new(now), AtomicU64::new(1)));
 
@@ -2847,7 +2925,7 @@ mod tests {
         assert!(apply_cache_meta_memory(&hash, old.clone()));
         assert!(apply_cache_meta_memory(&hash, newer.clone()));
         reconcile_cache_meta_upsert_result(&hash, &old, false);
-        assert_eq!(get_cache_meta_memory(&hash), Some(newer));
+        assert_eq!(get_cache_meta_memory(&hash).as_deref(), Some(&newer));
 
         delete_cache_meta_for_test(&hash);
     }

@@ -18,6 +18,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use tracing_subscriber::fmt::MakeWriter;
+
+// Per-request cache hits do many small allocations (headers, metadata,
+// buffers); mimalloc cuts allocator contention across worker threads.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 

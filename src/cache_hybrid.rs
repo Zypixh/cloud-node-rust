@@ -16,9 +16,7 @@ use std::sync::LazyLock as Lazy;
 use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeek, BufReader};
-use tokio::sync::{
-    Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock,
-};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{info, warn};
 
 use arc_swap::ArcSwap;
@@ -47,10 +45,9 @@ static CACHE_L1_INVALIDATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 // must prevent new fills from starting while its disk/index scan is running.
 // Per-key locks cannot provide that guarantee because a broad purge does not
 // know all keys in advance (especially when metadata has not been published
-// yet). Keep the barrier separate from the per-key locks so ordinary fills do
-// not contend with one another.
-static CACHE_PURGE_BARRIER: Lazy<Arc<AsyncRwLock<()>>> =
-    Lazy::new(|| Arc::new(AsyncRwLock::new(())));
+// yet). The barrier lives in `crate::cache::purge_barrier`: reader counters
+// are sharded so the per-request read acquire never contends on one cache
+// line, while writers still drain every reader before proceeding.
 
 // A process-local Tokio lock is not sufficient when several node processes
 // share an RWX cache volume. The cross-process flock layer lives in
@@ -143,13 +140,10 @@ pub(crate) fn advance_cache_purge_generation() -> u64 {
         .saturating_add(1)
 }
 
-pub(crate) async fn acquire_cache_purge_read_guard() -> OwnedRwLockReadGuard<()> {
-    CACHE_PURGE_BARRIER.clone().read_owned().await
-}
-
-pub(crate) async fn acquire_cache_purge_write_guard() -> OwnedRwLockWriteGuard<()> {
-    CACHE_PURGE_BARRIER.clone().write_owned().await
-}
+pub(crate) use crate::cache::purge_barrier::{
+    PurgeReadGuard, acquire_cache_purge_read_guard, acquire_cache_purge_write_guard,
+    try_acquire_cache_purge_read_guard,
+};
 
 fn timestamp_from_system_time(time: std::time::SystemTime) -> i64 {
     time.duration_since(std::time::UNIX_EPOCH)
@@ -610,6 +604,24 @@ fn restore_content_length(header: &mut ResponseHeader, status: u16, size: u64) {
     }
 }
 
+/// Lowercase md5 hex on the stack — the lookup hot path pays no allocation.
+fn md5_hex(bytes: &[u8]) -> [u8; 32] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = md5_legacy::compute(bytes);
+    let mut out = [0u8; 32];
+    for (i, b) in digest.iter().enumerate() {
+        out[i * 2] = HEX[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    out
+}
+
+fn md5_hex_str<'a>(bytes: &[u8], buf: &'a mut [u8; 32]) -> &'a str {
+    *buf = md5_hex(bytes);
+    // Hex output is always ASCII.
+    std::str::from_utf8(buf).expect("md5 hex is ascii")
+}
+
 fn cache_key_is_head_variant(key: &str) -> bool {
     crate::cache::cache_key_is_head_variant(key)
 }
@@ -939,12 +951,40 @@ impl Storage for FileStorage {
                 }
                 Err(_) => return Err(Error::new(ErrorType::InternalError)),
             };
+            // Zero-copy delivery: when sendfile is enabled, serve the body
+            // straight out of a file mapping instead of read() chunks. The
+            // mapping is safe because cache files are immutable (temp file +
+            // rename publish) and remain valid after an unlink by purge.
+            // Objects above the in-memory serve limit keep streaming so a
+            // serving spike cannot fault arbitrarily large page sets into
+            // RSS. If the map fails the handler explicitly falls back to
+            // streaming reads — same bytes, same integrity checks.
+            let reader = if self.enable_sendfile() && meta.size > 0 && meta.size <= MEMORY_SERVE_MAX
+            {
+                let std_file = file.into_std().await;
+                match unsafe { memmap2::Mmap::map(&std_file) } {
+                    Ok(mmap) if !mmap.is_empty() => FileHitReader::Mapped(MappedFileReader {
+                        mmap: Arc::new(mmap),
+                        base: 0,
+                    }),
+                    _ => {
+                        warn!(
+                            key = %key_str,
+                            path = %path.display(),
+                            "CACHE_DISK_HIT: mmap failed; falling back to read() streaming"
+                        );
+                        FileHitReader::Plain(tokio::fs::File::from_std(std_file))
+                    }
+                }
+            } else {
+                FileHitReader::Plain(file)
+            };
             PROF_DISK_READ_US.fetch_add(io_start.elapsed().as_micros() as u64, Ordering::Relaxed);
             crate::metrics::storage::record_cache_access_memory(&hash);
             return Ok(Some((
                 cache_meta,
                 Box::new(FileHitHandler {
-                    reader: FileHitReader::Plain(file),
+                    reader,
                     buf_size: disk_hit_chunk_bytes,
                     expected_len: meta.size,
                     read_len: 0,
@@ -1689,8 +1729,33 @@ async fn discard_corrupt_cache_entry(entry: CorruptCacheEntry) {
     discard_corrupt_cache_entry_locked(entry).await;
 }
 
+/// A shared file mapping plus the absolute byte offset a seek placed the
+/// reader at. Cache files are immutable (written to a temp path, then
+/// renamed), so a mapping can never observe in-place mutation, and an unlink
+/// during purge leaves the mapping valid until it is dropped.
+struct MappedFileReader {
+    mmap: Arc<memmap2::Mmap>,
+    base: u64,
+}
+
+/// `AsRef<[u8]>` view over a mapped range; `Bytes::from_owner` turns it into
+/// a zero-copy body chunk — the kernel page cache pages flow straight to the
+/// socket write without a `read()` syscall or a user-buffer copy.
+struct MappedSlice {
+    mmap: Arc<memmap2::Mmap>,
+    start: usize,
+    len: usize,
+}
+
+impl AsRef<[u8]> for MappedSlice {
+    fn as_ref(&self) -> &[u8] {
+        &self.mmap[self.start..self.start + self.len]
+    }
+}
+
 enum FileHitReader {
     Plain(tokio::fs::File),
+    Mapped(MappedFileReader),
     Compressed(async_compression::tokio::bufread::ZstdDecoder<BufReader<tokio::fs::File>>),
 }
 
@@ -1733,6 +1798,8 @@ impl HandleHit for FileHitHandler {
                 FileHitReader::Compressed(_) => {
                     return Err(Error::new(ErrorType::InternalError));
                 }
+                // Mapped seeks complete inline; seek_pending is never set.
+                FileHitReader::Mapped(_) => unreachable!("mapped reader has no pending seek"),
             };
             // Tokio completes a failed seek by returning the file to Idle;
             // do not retry the operation on a later body read, because that
@@ -1753,10 +1820,45 @@ impl HandleHit for FileHitHandler {
         } else {
             remaining.min(self.buf_size as u64) as usize
         };
+        if let FileHitReader::Mapped(reader) = &self.reader {
+            // Zero-copy body slice over the file mapping. The same length and
+            // EOF checks as the read() path apply; a short/truncated mapping
+            // is treated exactly like a short read.
+            let abs = reader
+                .base
+                .checked_add(self.read_len)
+                .and_then(|pos| usize::try_from(pos).ok())
+                .unwrap_or(usize::MAX);
+            let avail = reader.mmap.len().saturating_sub(abs);
+            if avail == 0 {
+                if self.read_len != self.range_end {
+                    self.discard_corrupt_entry().await;
+                    return Err(Error::new(ErrorType::InternalError));
+                }
+                self.eof_verified = true;
+                return Ok(None);
+            }
+            let take = capacity.min(avail);
+            let next_len = self
+                .read_len
+                .checked_add(take as u64)
+                .ok_or_else(|| Error::new(ErrorType::InternalError))?;
+            if next_len > self.range_end || next_len > self.expected_len {
+                self.discard_corrupt_entry().await;
+                return Err(Error::new(ErrorType::InternalError));
+            }
+            self.read_len = next_len;
+            return Ok(Some(bytes::Bytes::from_owner(MappedSlice {
+                mmap: reader.mmap.clone(),
+                start: abs,
+                len: take,
+            })));
+        }
         let mut buf = bytes::BytesMut::with_capacity(capacity);
         let read_result = match &mut self.reader {
             FileHitReader::Plain(reader) => reader.read_buf(&mut buf).await,
             FileHitReader::Compressed(reader) => reader.read_buf(&mut buf).await,
+            FileHitReader::Mapped(_) => unreachable!("mapped reader handled above"),
         };
         let read = match read_result {
             Ok(read) => read,
@@ -1804,7 +1906,10 @@ impl HandleHit for FileHitHandler {
     }
 
     fn can_seek(&self) -> bool {
-        matches!(self.reader, FileHitReader::Plain(_))
+        matches!(
+            self.reader,
+            FileHitReader::Plain(_) | FileHitReader::Mapped(_)
+        )
     }
 
     fn seek(&mut self, start: usize, end: Option<usize>) -> Result<()> {
@@ -1820,17 +1925,25 @@ impl HandleHit for FileHitHandler {
         if start > end || end > self.expected_len {
             return Err(Error::new(ErrorType::InternalError));
         }
-        let FileHitReader::Plain(file) = &mut self.reader else {
-            unreachable!("can_seek checked above");
-        };
-        std::pin::Pin::new(file)
-            .start_seek(std::io::SeekFrom::Start(start))
-            .map_err(|_| Error::new(ErrorType::InternalError))?;
-        // `start_seek` only schedules the operation.  The first body read
-        // must wait for `poll_complete` before touching the file, otherwise a
-        // range response can read from the previous offset (or from an
-        // implementation-defined intermediate offset).
-        self.seek_pending = true;
+        match &mut self.reader {
+            FileHitReader::Mapped(reader) => {
+                // Seek is just a base-offset update; no syscall is needed and
+                // the first body read is safe immediately.
+                reader.base = start;
+            }
+            FileHitReader::Plain(file) => {
+                std::pin::Pin::new(file)
+                    .start_seek(std::io::SeekFrom::Start(start))
+                    .map_err(|_| Error::new(ErrorType::InternalError))?;
+                // `start_seek` only schedules the operation.  The first body
+                // read must wait for `poll_complete` before touching the
+                // file, otherwise a range response can read from the previous
+                // offset (or from an implementation-defined intermediate
+                // offset).
+                self.seek_pending = true;
+            }
+            FileHitReader::Compressed(_) => unreachable!("can_seek checked above"),
+        }
         self.read_len = 0;
         self.range_end = end.saturating_sub(start);
         self.range_limited = true;
@@ -1866,7 +1979,7 @@ struct FileMissHandler {
     disabled: bool,
     committed: bool,
     published: bool,
-    _purge_guard: OwnedRwLockReadGuard<()>,
+    _purge_guard: PurgeReadGuard,
     _write_guard: OwnedMutexGuard<()>,
     _process_lock: Option<CacheProcessLockGuard>,
     _cache_write_permit: StaticAdmissionPermit,
@@ -1920,7 +2033,7 @@ struct PartialMissHandler {
     location: PartialStorageLocation,
     disabled: bool,
     purge_generation: u64,
-    purge_guard: Option<OwnedRwLockReadGuard<()>>,
+    purge_guard: Option<PurgeReadGuard>,
     write_guard: Option<OwnedMutexGuard<()>>,
     process_lock: Option<CacheProcessLockGuard>,
     _cache_write_permit: StaticAdmissionPermit,
@@ -1949,7 +2062,7 @@ struct MemoryMissHandler {
     head_request: bool,
     l1: Arc<TinyUfoL1>,
     rejected: bool,
-    _purge_guard: OwnedRwLockReadGuard<()>,
+    _purge_guard: PurgeReadGuard,
     write_guard: OwnedMutexGuard<()>,
     _cache_write_permit: StaticAdmissionPermit,
 }
@@ -2052,12 +2165,17 @@ impl HandleMiss for MemoryMissHandler {
 
         let ttl = (fresh_until - now) as u64;
         let size = data.len();
+        // Store the header with Content-Length already restored so the hit
+        // path never rewrites it — the entry is immutable after this point.
+        let mut response_header = response_header;
+        let status = response_header.status.as_u16();
+        restore_content_length(&mut response_header, status, size as u64);
         l1.put(
             &key,
             TinyUfoL1Entry {
                 cache_key: key.clone(),
                 data: bytes::Bytes::from(data),
-                response_header,
+                response_header: Arc::new(response_header),
                 fresh_until,
                 created_at,
                 stale_while_revalidate_secs,
@@ -2538,7 +2656,7 @@ use pingora_memory_cache::{CacheStatus, MemoryCache, MemoryCacheStats};
 pub(crate) struct TinyUfoL1Entry {
     cache_key: String,
     data: bytes::Bytes,
-    response_header: ResponseHeader,
+    response_header: Arc<ResponseHeader>,
     fresh_until: i64,
     created_at: i64,
     stale_while_revalidate_secs: u64,
@@ -3147,17 +3265,28 @@ fn negative_cache_capacity_limit() -> usize {
 }
 
 fn negative_cache_check(key: &str, now: i64) -> bool {
-    if let Some(entry) = NEGATIVE_CACHE.get(key)
-        && *entry > now
-    {
+    // Fast path: absent keys (the overwhelming majority) need a single read
+    // and must not pay the shard write lock and governor accounting that a
+    // removal would cost on every request.
+    let Some(entry) = NEGATIVE_CACHE.get(key) else {
+        return false;
+    };
+    if *entry > now {
         return true;
     }
-    NEGATIVE_CACHE.remove(key);
-    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
-        crate::memory_governor::ResidentCategory::NegativeCache,
-        key,
-        0,
-    );
+    drop(entry);
+    // The entry exists but is expired: remove it (only if still expired) and
+    // refund its residency.
+    if NEGATIVE_CACHE
+        .remove_if(key, |_, expiry| *expiry <= now)
+        .is_some()
+    {
+        let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+            crate::memory_governor::ResidentCategory::NegativeCache,
+            key,
+            0,
+        );
+    }
     false
 }
 
@@ -3524,10 +3653,13 @@ impl HybridStorage {
         ttl_secs: u64,
     ) -> bool {
         let now = crate::utils::time::now_timestamp();
+        let mut response_header = meta.response_header().clone();
+        let status = response_header.status.as_u16();
+        restore_content_length(&mut response_header, status, body.len() as u64);
         let entry = TinyUfoL1Entry {
             cache_key: key.to_string(),
             data: body,
-            response_header: meta.response_header().clone(),
+            response_header: Arc::new(response_header),
             fresh_until: now + ttl_secs as i64,
             created_at: now,
             stale_while_revalidate_secs: meta.stale_while_revalidate_sec() as u64,
@@ -4126,7 +4258,10 @@ impl HybridStorage {
         ) {
             return false;
         }
-        let metadata = crate::metrics::storage::get_cache_meta_memory(hash);
+        // The broad-purge fence was already read above; reuse it so the probe
+        // does not pay a second durable read on shared volumes.
+        let metadata =
+            crate::metrics::storage::get_cache_meta_memory_fenced(hash, broad_purge_version);
         if !entry.metadata_required {
             return metadata.is_none_or(|meta| {
                 meta.cache_key == key
@@ -4179,20 +4314,24 @@ impl Storage for HybridStorage {
         }
 
         // md5(canonical key) is both the process-lock id and the metadata row
-        // id. Compute it once so a file-policy hit pays a single hash; the
-        // pure-memory policy never needs it.
-        let key_hash = (p_type != POLICY_MEMORY)
-            .then(|| format!("{:x}", md5_legacy::compute(k_str.as_bytes())));
-        let meta_hash = key_hash.as_deref().unwrap_or_default();
+        // id. Compute it once (on the stack, no allocation) so a file-policy
+        // hit pays a single hash; the pure-memory policy never needs it.
+        let mut key_hash_buf = [0u8; 32];
+        let key_hash =
+            (p_type != POLICY_MEMORY).then(|| md5_hex_str(k_str.as_bytes(), &mut key_hash_buf));
+        let meta_hash = key_hash.unwrap_or_default();
 
         {
-            // L1 validation and the Bytes clone must use the same ordering as
-            // broad purge: purge read barrier, then canonical key lock. This
-            // closes the window where purge advances the generation after the
-            // validation but before the old body is returned.
+            // L1 validation keeps the purge read barrier so a broad purge
+            // cannot advance the generation between validation and returning
+            // the handler. The per-key mutex is intentionally NOT taken on
+            // the hit path: the entry is an immutable Arc, so serving exactly
+            // the entry we validated is race-free — a concurrent fill that
+            // publishes a newer representation mid-lookup is the same
+            // ordering window a request sees after lookup returns anyway. The
+            // mutex is only needed to remove a stale entry without deleting
+            // a fill that landed in between, which the slow path below does.
             let _purge_guard = acquire_cache_purge_read_guard().await;
-            let write_lock = cache_write_lock_for_key(k_str);
-            let _write_guard = write_lock.lock().await;
             // File-policy L1 entries may be backed by a shared cache volume
             // whose purge is performed by another process.  Keep the same
             // cross-process read lock as the L2 hit path until the returned
@@ -4200,7 +4339,7 @@ impl Storage for HybridStorage {
             // between L1 validation and body delivery while this process has
             // no metadata callback yet. The lock is shared and refcounted, so
             // concurrent readers of one key no longer serialize on it.
-            let l1_process_lock = if let Some(key_hash) = key_hash.as_deref() {
+            let l1_process_lock = if let Some(key_hash) = key_hash {
                 let process_roots = self.l2.inner.load().all_roots();
                 match acquire_cache_process_read_lock_hashed(key_hash, &process_roots).await {
                     Ok(lock) => Some(lock),
@@ -4221,10 +4360,20 @@ impl Storage for HybridStorage {
                 && let Some((entry, _cache_status)) = self.l1.get_stale(k_str)
             {
                 if self.l1_entry_is_current(k_str, &entry, p_type, now, meta_hash) {
-                    let mut response_header = entry.response_header.clone();
-                    let status = response_header.status.as_u16();
-                    restore_content_length(&mut response_header, status, entry.data.len() as u64);
-                    let mut meta = CacheMeta::new(
+                    // Entries store the Content-Length-restored header, so the
+                    // hit path shares it with the returned meta via Arc. The
+                    // fallback copy only covers entries built before the
+                    // invariant existed (e.g. test fixtures).
+                    let response_header =
+                        if entry.response_header.headers.contains_key("content-length") {
+                            entry.response_header.clone()
+                        } else {
+                            let mut header = entry.response_header.as_ref().clone();
+                            let status = header.status.as_u16();
+                            restore_content_length(&mut header, status, entry.data.len() as u64);
+                            Arc::new(header)
+                        };
+                    let mut meta = CacheMeta::new_shared(
                         system_time_from_timestamp(entry.fresh_until),
                         system_time_from_timestamp(entry.created_at),
                         entry.stale_while_revalidate_secs.min(u32::MAX as u64) as u32,
@@ -4246,9 +4395,18 @@ impl Storage for HybridStorage {
                         }),
                     )));
                 }
-                // The key lock is still held, so a concurrent fill cannot
-                // replace this entry between validation and removal.
-                self.l1.remove(k_str);
+                // Stale entry: removal must not delete a fill that landed
+                // after the optimistic validation. Lock order requires the
+                // process lock to be dropped before taking the key mutex.
+                drop(l1_process_lock);
+                let write_lock = cache_write_lock_for_key(k_str);
+                let _write_guard = write_lock.lock().await;
+                let now = crate::utils::time::now_timestamp();
+                if let Some((current, _)) = self.l1.get_stale(k_str)
+                    && !self.l1_entry_is_current(k_str, &current, p_type, now, meta_hash)
+                {
+                    self.l1.remove(k_str);
+                }
             }
         }
 
@@ -4280,16 +4438,12 @@ impl Storage for HybridStorage {
                 // Promotion is opportunistic: take both guards without
                 // blocking and skip the promotion when either is contended.
                 let promotion_guards =
-                    CACHE_PURGE_BARRIER
-                        .clone()
-                        .try_read_owned()
-                        .ok()
-                        .and_then(|purge_guard| {
-                            cache_write_lock_for_key(k_str)
-                                .try_lock_owned()
-                                .ok()
-                                .map(|write_guard| (purge_guard, write_guard))
-                        });
+                    try_acquire_cache_purge_read_guard().and_then(|purge_guard| {
+                        cache_write_lock_for_key(k_str)
+                            .try_lock_owned()
+                            .ok()
+                            .map(|write_guard| (purge_guard, write_guard))
+                    });
                 let Some((_purge_guard, _write_guard)) = promotion_guards else {
                     prof_record_l2_promotion_skipped();
                     return Ok(Some((meta, handler)));
@@ -4330,7 +4484,7 @@ impl Storage for HybridStorage {
                     let entry = TinyUfoL1Entry {
                         cache_key: k_str.to_string(),
                         data: promotion_data,
-                        response_header,
+                        response_header: Arc::new(response_header),
                         fresh_until,
                         created_at,
                         stale_while_revalidate_secs: current_meta.stale_while_revalidate_secs,
@@ -4508,7 +4662,7 @@ impl Storage for HybridStorage {
                 TinyUfoL1Entry {
                     cache_key: key_str.to_string(),
                     data: existing.data.clone(),
-                    response_header,
+                    response_header: Arc::new(response_header),
                     fresh_until,
                     created_at,
                     stale_while_revalidate_secs: meta.stale_while_revalidate_sec() as u64,
@@ -5704,7 +5858,9 @@ mod tests {
             TinyUfoL1Entry {
                 cache_key: key.clone(),
                 data: bytes::Bytes::from_static(b"stale-body"),
-                response_header: ResponseHeader::build(200, None).expect("response header"),
+                response_header: Arc::new(
+                    ResponseHeader::build(200, None).expect("response header"),
+                ),
                 fresh_until: now + 60,
                 created_at: now,
                 stale_while_revalidate_secs: 0,
@@ -5847,7 +6003,7 @@ mod tests {
         let entry = || TinyUfoL1Entry {
             cache_key: unique.clone(),
             data: bytes::Bytes::from_static(b"stale-body"),
-            response_header: ResponseHeader::build(200, None).expect("response header"),
+            response_header: Arc::new(ResponseHeader::build(200, None).expect("response header")),
             fresh_until: now + 60,
             created_at: now,
             stale_while_revalidate_secs: 0,
@@ -5982,7 +6138,9 @@ mod tests {
             TinyUfoL1Entry {
                 cache_key: key.clone(),
                 data: bytes::Bytes::from_static(b"body"),
-                response_header: ResponseHeader::build(200, None).expect("response header"),
+                response_header: Arc::new(
+                    ResponseHeader::build(200, None).expect("response header"),
+                ),
                 fresh_until: crate::utils::time::now_timestamp() + 60,
                 created_at: crate::utils::time::now_timestamp(),
                 stale_while_revalidate_secs: 0,
@@ -6507,7 +6665,7 @@ mod tests {
             TinyUfoL1Entry {
                 cache_key: key.clone(),
                 data: bytes::Bytes::from_static(b"payload"),
-                response_header: pingora_http::ResponseHeader::build(200, None).unwrap(),
+                response_header: Arc::new(pingora_http::ResponseHeader::build(200, None).unwrap()),
                 fresh_until: now + 60,
                 created_at: now,
                 stale_while_revalidate_secs: 0,
