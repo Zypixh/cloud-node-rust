@@ -80,6 +80,9 @@ impl ProxyHttp for BenchProxy {
 }
 
 fn main() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     let mut conf = ServerConf::default();
     conf.threads = num_cpus::get();
     conf.upstream_keepalive_pool_size =
@@ -90,6 +93,17 @@ fn main() {
 
     // Force initialization of global cache
     Lazy::force(&CACHE);
+
+    // Cache metadata lives in the Mace-backed MetricStorage; without the writer
+    // thread every fill is discarded and all requests miss. Run the flusher on
+    // its own runtime so the tokio::spawn inside it has a reactor.
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().expect("flusher runtime");
+        rt.block_on(async {
+            cloud_node_rust::metrics::storage::start_cache_access_flusher();
+            std::future::pending::<()>().await;
+        });
+    });
 
     let mut proxy = pingora_proxy::http_proxy_service(&server.configuration, BenchProxy);
     proxy.add_tcp("0.0.0.0:8080");

@@ -52,171 +52,16 @@ static CACHE_L1_INVALIDATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CACHE_PURGE_BARRIER: Lazy<Arc<AsyncRwLock<()>>> =
     Lazy::new(|| Arc::new(AsyncRwLock::new(())));
 
-/// A process-local Tokio lock is not sufficient when several node processes
-/// share an RWX cache volume.  Keep a small set of persistent lock files on
-/// each configured cache root and use the kernel advisory lock attached to
-/// the open file descriptor.  The descriptor is retained by this guard for
-/// the whole operation, so a purge cannot race a fill in another process.
-pub(crate) struct CacheProcessLockGuard {
-    _files: Vec<std::fs::File>,
-}
-
-#[derive(Clone, Copy)]
-enum CacheProcessLockMode {
-    Shared,
-    Exclusive,
-}
-
-fn cache_process_lock_key(key: &str) -> String {
-    let canonical = crate::cache::partial::partial_base_key(key);
-    let canonical = canonical.as_deref().unwrap_or(key);
-    format!("{:x}", md5_legacy::compute(canonical.as_bytes()))
-}
-
-fn cache_process_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut roots = roots.to_vec();
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-fn cache_process_barrier_path(root: &Path) -> PathBuf {
-    root.join(".cloud-node-cache-locks").join("barrier.lock")
-}
-
-fn cache_process_key_path(root: &Path, key_hash: &str) -> PathBuf {
-    let first = key_hash.get(..2).unwrap_or("00");
-    root.join(".cloud-node-cache-locks")
-        .join("keys")
-        .join(first)
-        .join(format!("{key_hash}.lock"))
-}
-
-#[cfg(unix)]
-fn lock_cache_process_file(
-    file: &std::fs::File,
-    mode: CacheProcessLockMode,
-) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let operation = match mode {
-        CacheProcessLockMode::Shared => libc::LOCK_SH,
-        CacheProcessLockMode::Exclusive => libc::LOCK_EX,
-    };
-    // SAFETY: `file` owns a valid open descriptor for the duration of this
-    // call and the descriptor is retained in CacheProcessLockGuard until the
-    // operation completes. flock does not retain any Rust references.
-    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn lock_cache_process_file(
-    _file: &std::fs::File,
-    _mode: CacheProcessLockMode,
-) -> std::io::Result<()> {
-    // Production deployments use Linux.  Keep non-Unix builds functional;
-    // their existing process-local lock remains the only coordination layer.
-    Ok(())
-}
-
-async fn acquire_cache_process_lock(
-    key: Option<&str>,
-    roots: &[PathBuf],
-    mode: CacheProcessLockMode,
-) -> std::io::Result<CacheProcessLockGuard> {
-    let roots = cache_process_roots(roots);
-    if roots.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "cache process lock requires at least one root",
-        ));
-    }
-    let barrier_paths = roots
-        .iter()
-        .map(|root| cache_process_barrier_path(root))
-        .collect::<Vec<_>>();
-    let key_hash = key.map(cache_process_lock_key);
-    let key_paths = key_hash.as_deref().map(|key_hash| {
-        roots
-            .iter()
-            .map(|root| cache_process_key_path(root, key_hash))
-            .collect::<Vec<_>>()
-    });
-
-    tokio::task::spawn_blocking(move || {
-        let mut files =
-            Vec::with_capacity(barrier_paths.len() + key_paths.as_ref().map(Vec::len).unwrap_or(0));
-
-        // Every caller acquires all barrier files in sorted-root order before
-        // taking any key file. This fixed order prevents cross-root lock
-        // cycles when two processes have overlapping root configurations.
-        for path in barrier_paths {
-            let Some(parent) = path.parent() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "cache process lock path has no parent",
-                ));
-            };
-            std::fs::create_dir_all(parent)?;
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)?;
-            lock_cache_process_file(&file, mode)?;
-            files.push(file);
-        }
-        if let Some(key_paths) = key_paths {
-            for path in key_paths {
-                let Some(parent) = path.parent() else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "cache process lock path has no parent",
-                    ));
-                };
-                std::fs::create_dir_all(parent)?;
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .read(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&path)?;
-                // The resource itself is always exclusive. This prevents a
-                // second process from publishing a competing body while a
-                // first process is reading/filling the same key.
-                lock_cache_process_file(&file, CacheProcessLockMode::Exclusive)?;
-                files.push(file);
-            }
-        }
-        Ok(CacheProcessLockGuard { _files: files })
-    })
-    .await
-    .map_err(|err| std::io::Error::other(format!("cache process lock task failed: {err}")))?
-}
-
-/// Shared barrier plus exclusive resource lock for a cache read/fill. The
-/// shared barrier allows unrelated keys to proceed concurrently, while the
-/// key lock serializes all writers/readers for one representation family.
-pub(crate) async fn acquire_cache_process_read_lock(
-    key: &str,
-    roots: &[PathBuf],
-) -> std::io::Result<CacheProcessLockGuard> {
-    acquire_cache_process_lock(Some(key), roots, CacheProcessLockMode::Shared).await
-}
-
-/// Exclusive cross-process barrier for exact, prefix, tag and eviction
-/// purges. It blocks both cache reads and fills on every shared root.
-pub(crate) async fn acquire_cache_process_barrier_write_lock(
-    roots: &[PathBuf],
-) -> std::io::Result<CacheProcessLockGuard> {
-    acquire_cache_process_lock(None, roots, CacheProcessLockMode::Exclusive).await
-}
+// A process-local Tokio lock is not sufficient when several node processes
+// share an RWX cache volume. The cross-process flock layer lives in
+// `crate::cache::process_lock`: it caches open lock descriptors and refcounts
+// in-process shared holds, so a steady-state hit pays no filesystem syscalls
+// and readers of one key no longer serialize on an exclusive key lock.
+pub(crate) use crate::cache::process_lock::{
+    CacheProcessLockGuard, acquire_cache_process_barrier_write_lock,
+    acquire_cache_process_fill_lock, acquire_cache_process_read_lock,
+    acquire_cache_process_read_lock_hashed,
+};
 
 thread_local! {
     // Cache reclamation updates resident-memory accounting. That observation
@@ -250,6 +95,9 @@ pub(crate) fn cache_meta_allows_error_status(meta: &CacheMeta) -> bool {
 
 const DISK_HIT_CHUNK_BYTES: usize = 128 * 1024;
 const DISK_HIT_CHUNK_BYTES_SENDFILE_REQUESTED: usize = 256 * 1024;
+// Bytes slicing is refcount-only; a larger chunk cuts task wakeups and
+// downstream write calls on large memory hits without copying anything.
+const MEMORY_HIT_CHUNK_BYTES: usize = 256 * 1024;
 const MEMORY_SERVE_MAX: u64 = 50 * 1024 * 1024;
 const BLOOM_BITS_PER_ENTRY_ESTIMATE: u64 = 10;
 const BLOOM_LAYER_OVERHEAD_BYTES: u64 = 256;
@@ -874,8 +722,10 @@ impl Storage for FileStorage {
         let _purge_guard = acquire_cache_purge_read_guard().await;
         let write_lock = cache_write_lock_for_key(key_str);
         let _write_guard = write_lock.lock().await;
+        let hash = self.get_hash(key);
         let process_roots = self.inner.load().all_roots();
-        let process_lock = match acquire_cache_process_read_lock(key_str, &process_roots).await {
+        let process_lock = match acquire_cache_process_read_lock_hashed(&hash, &process_roots).await
+        {
             Ok(lock) => lock,
             Err(err) => {
                 warn!(
@@ -886,7 +736,6 @@ impl Storage for FileStorage {
                 return Ok(None);
             }
         };
-        let hash = self.get_hash(key);
 
         let meta = match crate::metrics::storage::get_cache_meta_memory(&hash) {
             Some(m) => m,
@@ -1274,7 +1123,7 @@ impl Storage for FileStorage {
             // after the purge.
             let purge_guard = acquire_cache_purge_read_guard().await;
             let write_guard = cache_write_lock_for_key(k_str).lock_owned().await;
-            let process_lock = match acquire_cache_process_read_lock(k_str, &location.roots).await {
+            let process_lock = match acquire_cache_process_fill_lock(k_str, &location.roots).await {
                 Ok(lock) => lock,
                 Err(err) => {
                     warn!(
@@ -1345,7 +1194,7 @@ impl Storage for FileStorage {
         let write_lock = cache_write_lock_for_key(&k_str);
         let write_guard = write_lock.lock_owned().await;
         let process_roots = self.inner.load().all_roots();
-        let process_lock = match acquire_cache_process_read_lock(&k_str, &process_roots).await {
+        let process_lock = match acquire_cache_process_fill_lock(&k_str, &process_roots).await {
             Ok(lock) => lock,
             Err(err) => {
                 warn!(
@@ -1554,7 +1403,7 @@ impl Storage for FileStorage {
         let write_lock = cache_write_lock_for_key(&k_str);
         let _write_guard = write_lock.lock().await;
         let process_roots = self.inner.load().all_roots();
-        let _process_lock = match acquire_cache_process_read_lock(&k_str, &process_roots).await {
+        let _process_lock = match acquire_cache_process_fill_lock(&k_str, &process_roots).await {
             Ok(lock) => lock,
             Err(err) => {
                 warn!(
@@ -1717,7 +1566,7 @@ impl HandleHit for MemoryHitHandler {
         if self.offset >= self.end {
             return Ok(None);
         }
-        let end = (self.offset + 32768).min(self.end);
+        let end = (self.offset + MEMORY_HIT_CHUNK_BYTES).min(self.end);
         let chunk = self.data.slice(self.offset..end);
         self.offset = end;
         Ok(Some(chunk))
@@ -2707,7 +2556,9 @@ pub(crate) struct TinyUfoL1Entry {
 /// Lock-free L1 cache backed by TinyUFO (S3-FIFO + TinyLFU admission).
 /// Replaces the old FAST_L1 (DashMap + BinaryHeap).
 pub(crate) struct TinyUfoL1 {
-    inner: StdRwLock<Arc<MemoryCache<String, TinyUfoL1Entry>>>,
+    // Entries are Arc-shared so a hit clones one refcount instead of the
+    // response HeaderMap, cache key, and body handle stored in the entry.
+    inner: StdRwLock<Arc<MemoryCache<String, Arc<TinyUfoL1Entry>>>>,
     // MemoryCache intentionally has no iterator. Keep a bounded best-effort
     // key index so prefix/tag purge can also invalidate memory-only entries.
     // Stale index members are pruned whenever the index grows past twice the
@@ -2736,7 +2587,7 @@ impl TinyUfoL1 {
         }
     }
 
-    fn build_cache(max_bytes: u64) -> MemoryCache<String, TinyUfoL1Entry> {
+    fn build_cache(max_bytes: u64) -> MemoryCache<String, Arc<TinyUfoL1Entry>> {
         let capacity = Self::weight_limit_for_bytes(max_bytes);
         MemoryCache::new(capacity)
     }
@@ -2745,11 +2596,11 @@ impl TinyUfoL1 {
         (max_bytes / 1024).max(1).min(usize::MAX as u64) as usize
     }
 
-    fn read_inner(&self) -> Arc<MemoryCache<String, TinyUfoL1Entry>> {
+    fn read_inner(&self) -> Arc<MemoryCache<String, Arc<TinyUfoL1Entry>>> {
         self.inner.read().expect("TinyUfoL1 lock poisoned").clone()
     }
 
-    fn get(&self, key: &str) -> Option<TinyUfoL1Entry> {
+    fn get(&self, key: &str) -> Option<Arc<TinyUfoL1Entry>> {
         let inner = self.read_inner();
         let (value, status) = inner.get(key);
         if status == CacheStatus::Hit {
@@ -2759,7 +2610,7 @@ impl TinyUfoL1 {
         }
     }
 
-    fn get_stale(&self, key: &str) -> Option<(TinyUfoL1Entry, CacheStatus)> {
+    fn get_stale(&self, key: &str) -> Option<(Arc<TinyUfoL1Entry>, CacheStatus)> {
         let inner = self.read_inner();
         let (value, status) = inner.get_stale(key);
         value
@@ -2774,7 +2625,7 @@ impl TinyUfoL1 {
         let retention = ttl.saturating_add(std::time::Duration::from_secs(stale_window));
         let weight = (entry.data.len().div_ceil(1024)).clamp(1, u16::MAX as usize) as u16;
         let inner = self.read_inner();
-        inner.put(key, entry, Some(retention), weight);
+        inner.put(key, Arc::new(entry), Some(retention), weight);
         if !retention.is_zero() {
             self.keys.insert(key.to_string());
             self.prune_key_index_if_needed();
@@ -2912,7 +2763,7 @@ impl TinyUfoL1 {
         self.max_bytes.load(Ordering::Relaxed)
     }
 
-    fn refresh_stats(&self, inner: &MemoryCache<String, TinyUfoL1Entry>) {
+    fn refresh_stats(&self, inner: &MemoryCache<String, Arc<TinyUfoL1Entry>>) {
         let MemoryCacheStats { current_weight, .. } = inner.stats();
         self.current_weight.store(
             current_weight.min(u64::MAX as usize) as u64,
@@ -3606,7 +3457,7 @@ impl HybridStorage {
         let policy_type = self.policy_type.load(Ordering::Acquire);
         let now = crate::utils::time::now_timestamp();
         if let Some((entry, _status)) = self.l1.get_stale(&key_str) {
-            if self.l1_entry_is_current(&key_str, &entry, policy_type, now) {
+            if self.l1_entry_is_current(&key_str, &entry, policy_type, now, &hash) {
                 return Ok(Box::new(NoopMissHandler));
             }
             // The key lock is still held, so no concurrent fill can replace
@@ -4227,6 +4078,9 @@ impl HybridStorage {
         entry: &TinyUfoL1Entry,
         policy_type: u8,
         now: i64,
+        // md5(key); only consulted for file policy — callers pass "" for
+        // memory-only entries which return before the metadata checks.
+        meta_hash: &str,
     ) -> bool {
         let stale_window = entry
             .stale_while_revalidate_secs
@@ -4261,18 +4115,18 @@ impl HybridStorage {
             return true;
         }
 
-        let hash = format!("{:x}", md5_legacy::compute(key.as_bytes()));
+        let hash = meta_hash;
         let state_version = entry.cache_state_version;
         let broad_purge_version = crate::metrics::storage::cache_meta_broad_purge_version();
         if broad_purge_version > 0 && (state_version == 0 || state_version <= broad_purge_version) {
             return false;
         }
-        if crate::metrics::storage::cache_meta_tombstone_version(&hash).is_some_and(
+        if crate::metrics::storage::cache_meta_tombstone_version(hash).is_some_and(
             |tombstone_version| state_version == 0 || state_version <= tombstone_version,
         ) {
             return false;
         }
-        let metadata = crate::metrics::storage::get_cache_meta_memory(&hash);
+        let metadata = crate::metrics::storage::get_cache_meta_memory(hash);
         if !entry.metadata_required {
             return metadata.is_none_or(|meta| {
                 meta.cache_key == key
@@ -4324,6 +4178,13 @@ impl Storage for HybridStorage {
             return Ok(None);
         }
 
+        // md5(canonical key) is both the process-lock id and the metadata row
+        // id. Compute it once so a file-policy hit pays a single hash; the
+        // pure-memory policy never needs it.
+        let key_hash = (p_type != POLICY_MEMORY)
+            .then(|| format!("{:x}", md5_legacy::compute(k_str.as_bytes())));
+        let meta_hash = key_hash.as_deref().unwrap_or_default();
+
         {
             // L1 validation and the Bytes clone must use the same ordering as
             // broad purge: purge read barrier, then canonical key lock. This
@@ -4337,12 +4198,11 @@ impl Storage for HybridStorage {
             // cross-process read lock as the L2 hit path until the returned
             // body handler is dropped; otherwise a remote purge can finish
             // between L1 validation and body delivery while this process has
-            // no metadata callback yet.
-            let l1_process_lock = if p_type == POLICY_MEMORY {
-                None
-            } else {
+            // no metadata callback yet. The lock is shared and refcounted, so
+            // concurrent readers of one key no longer serialize on it.
+            let l1_process_lock = if let Some(key_hash) = key_hash.as_deref() {
                 let process_roots = self.l2.inner.load().all_roots();
-                match acquire_cache_process_read_lock(k_str, &process_roots).await {
+                match acquire_cache_process_read_lock_hashed(key_hash, &process_roots).await {
                     Ok(lock) => Some(lock),
                     Err(err) => {
                         warn!(
@@ -4353,12 +4213,14 @@ impl Storage for HybridStorage {
                         None
                     }
                 }
+            } else {
+                None
             };
             // Check TinyUfoL1 (lock-free L1 cache with S3-FIFO + TinyLFU).
             if (p_type == POLICY_MEMORY || l1_process_lock.is_some())
                 && let Some((entry, _cache_status)) = self.l1.get_stale(k_str)
             {
-                if self.l1_entry_is_current(k_str, &entry, p_type, now) {
+                if self.l1_entry_is_current(k_str, &entry, p_type, now, meta_hash) {
                     let mut response_header = entry.response_header.clone();
                     let status = response_header.status.as_u16();
                     restore_content_length(&mut response_header, status, entry.data.len() as u64);
@@ -4410,14 +4272,30 @@ impl Storage for HybridStorage {
                         )
                     });
             if let Some((promotion_data, stamp)) = promotion {
-                let _purge_guard = acquire_cache_purge_read_guard().await;
-                let write_lock = cache_write_lock_for_key(k_str);
-                let _write_guard = write_lock.lock().await;
+                // The hit handler still holds the cross-process key lock as a
+                // delivery fence against remote purge completion. Every other
+                // path acquires purge-guard → key mutex → process lock, so
+                // blocking on either async lock here would invert that order
+                // and can deadlock concurrent same-key traffic (and did).
+                // Promotion is opportunistic: take both guards without
+                // blocking and skip the promotion when either is contended.
+                let promotion_guards =
+                    CACHE_PURGE_BARRIER
+                        .clone()
+                        .try_read_owned()
+                        .ok()
+                        .and_then(|purge_guard| {
+                            cache_write_lock_for_key(k_str)
+                                .try_lock_owned()
+                                .ok()
+                                .map(|write_guard| (purge_guard, write_guard))
+                        });
+                let Some((_purge_guard, _write_guard)) = promotion_guards else {
+                    prof_record_l2_promotion_skipped();
+                    return Ok(Some((meta, handler)));
+                };
                 let now = crate::utils::time::now_timestamp();
-                let current_meta = crate::metrics::storage::get_cache_meta_memory(&format!(
-                    "{:x}",
-                    md5_legacy::compute(k_str.as_bytes())
-                ));
+                let current_meta = crate::metrics::storage::get_cache_meta_memory(meta_hash);
                 let stamp_is_current = stamp.is_some_and(|stamp| {
                     stamp.purge_generation == current_cache_purge_generation()
                         && current_meta.as_ref().is_some_and(|current| {
@@ -4629,7 +4507,7 @@ impl Storage for HybridStorage {
                 key_str,
                 TinyUfoL1Entry {
                     cache_key: key_str.to_string(),
-                    data: existing.data,
+                    data: existing.data.clone(),
                     response_header,
                     fresh_until,
                     created_at,
@@ -4693,7 +4571,7 @@ async fn evict_full_cache_entry_if_current(
     let write_lock = cache_write_lock_for_key(cache_key);
     let _write_guard = write_lock.lock().await;
     let process_roots = storage.l2.inner.load().all_roots();
-    let _process_lock = match acquire_cache_process_read_lock(cache_key, &process_roots).await {
+    let _process_lock = match acquire_cache_process_fill_lock(cache_key, &process_roots).await {
         Ok(lock) => lock,
         Err(err) => {
             warn!(
@@ -4848,6 +4726,7 @@ pub async fn start_cache_purger(storage: &'static HybridStorage, _disk_root: Pat
 static PROF_L1_HITS: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_HITS: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_MEM_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
+static PROF_L2_PROMOTION_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static PROF_L2_ASYNC_PROMOTIONS: AtomicU64 = AtomicU64::new(0);
 static PROF_BLOOM_REJECTS: AtomicU64 = AtomicU64::new(0);
 /// Accumulated disk read time in microseconds for the current 10s window.
@@ -4867,6 +4746,9 @@ pub fn prof_record_l2_hit() {
 }
 pub fn prof_record_l2_mem_promotion() {
     PROF_L2_MEM_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
+}
+pub fn prof_record_l2_promotion_skipped() {
+    PROF_L2_PROMOTION_SKIPPED.fetch_add(1, Ordering::Relaxed);
 }
 pub fn prof_record_l2_async_promotion() {
     PROF_L2_ASYNC_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
@@ -4891,7 +4773,18 @@ pub fn start_cache_profiler() {
             let l1 = PROF_L1_HITS.swap(0, Ordering::Relaxed);
             let l2 = PROF_L2_HITS.swap(0, Ordering::Relaxed);
             let sync_prom = PROF_L2_MEM_PROMOTIONS.swap(0, Ordering::Relaxed);
+            let prom_skip = PROF_L2_PROMOTION_SKIPPED.swap(0, Ordering::Relaxed);
             let async_prom = PROF_L2_ASYNC_PROMOTIONS.swap(0, Ordering::Relaxed);
+            let lock_fast =
+                crate::cache::process_lock::PROCESS_LOCK_FASTPATH.swap(0, Ordering::Relaxed);
+            let lock_trans =
+                crate::cache::process_lock::PROCESS_LOCK_TRANSITION.swap(0, Ordering::Relaxed);
+            let lock_priv =
+                crate::cache::process_lock::PROCESS_LOCK_PRIVATE.swap(0, Ordering::Relaxed);
+            let lock_excl =
+                crate::cache::process_lock::PROCESS_LOCK_EXCLUSIVE.swap(0, Ordering::Relaxed);
+            let lock_off =
+                crate::cache::process_lock::PROCESS_LOCK_DISABLED.swap(0, Ordering::Relaxed);
             let bloom_rej = PROF_BLOOM_REJECTS.swap(0, Ordering::Relaxed);
             let disk_us = PROF_DISK_READ_US.swap(0, Ordering::Relaxed);
             let reqfil_us = PROF_REQFILT_US.swap(0, Ordering::Relaxed);
@@ -4917,7 +4810,7 @@ pub fn start_cache_profiler() {
                 0.0
             };
             tracing::info!(
-                "CACHE_PROFILE: L1={l1}/s L2={l2}/s L1%={l1_pct:.1} bloom_rej={bloom_rej}/s sync_prom={sync_prom}/s async_prom={async_prom}/s total={total}/s disk={avg_disk_ms:.1}ms rf={avg_reqfil_ms:.1}ms fp={fastpath}/s"
+                "CACHE_PROFILE: L1={l1}/s L2={l2}/s L1%={l1_pct:.1} bloom_rej={bloom_rej}/s sync_prom={sync_prom}/s prom_skip={prom_skip}/s async_prom={async_prom}/s total={total}/s disk={avg_disk_ms:.1}ms rf={avg_reqfil_ms:.1}ms fp={fastpath}/s plock(fast={lock_fast}/s trans={lock_trans}/s priv={lock_priv}/s excl={lock_excl}/s off={lock_off}/s)"
             );
         }
     });
