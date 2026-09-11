@@ -20,6 +20,127 @@ use std::time::Duration;
 use cloud_node_rust::cache_manager::CACHE;
 use pingora_cache::CacheKey;
 
+/// Minimal HTTP/3 (QUIC) listener mirroring the production `http3_proxy_manager`
+/// path: quinn Endpoint -> h3::server accept -> H3DownstreamSession ->
+/// ServerSession::new_custom -> HttpProxy::process_new_http. Upstream stays the
+/// default HTTP/1.1 TCP connector (unit custom connector).
+mod h3_listener {
+    use super::BenchProxy;
+    use bytes::Bytes;
+    use cloud_node_rust::h3_downstream::H3DownstreamSession;
+    use pingora_core::apps::HttpServerApp;
+    use pingora_core::protocols::http::server::Session as ServerSession;
+    use pingora_core::server::configuration::ServerConf;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    fn load_rustls_config(
+        cert_path: &str,
+        key_path: &str,
+    ) -> anyhow::Result<quinn::ServerConfig> {
+        let cert_pem = std::fs::read(cert_path)?;
+        let key_pem = std::fs::read(key_path)?;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_pem.as_slice()).collect::<Result<_, _>>()?;
+        let key = rustls_pemfile::private_key(&mut key_pem.as_slice())?
+            .ok_or_else(|| anyhow::anyhow!("no private key in {key_path}"))?;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        tls.max_early_data_size = 0;
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))?;
+        let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        let transport = Arc::get_mut(&mut cfg.transport).unwrap();
+        transport.max_concurrent_bidi_streams(256u32.into());
+        transport.max_concurrent_uni_streams(256u32.into());
+        Ok(cfg)
+    }
+
+    pub fn spawn(
+        addr: &str,
+        conf: Arc<ServerConf>,
+        cert_path: String,
+        key_path: String,
+    ) -> anyhow::Result<()> {
+        let server_config = load_rustls_config(&cert_path, &key_path)?;
+        let bind: SocketAddr = addr.parse()?;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("h3 runtime");
+            rt.block_on(async move {
+                if let Err(err) = run(bind, server_config, conf).await {
+                    eprintln!("h3 listener exited: {err}");
+                }
+            });
+        });
+        Ok(())
+    }
+
+    async fn run(
+        bind: SocketAddr,
+        server_config: quinn::ServerConfig,
+        conf: Arc<ServerConf>,
+    ) -> anyhow::Result<()> {
+        let endpoint = quinn::Endpoint::server(server_config, bind)?;
+        eprintln!("Bench proxy H3 ready: udp {}", bind);
+        let proxy = Arc::new(pingora_proxy::http_proxy_custom(&conf, BenchProxy, ()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let _keep_alive = shutdown_tx; // never signalled; keeps senders alive
+        loop {
+            let Some(connecting) = endpoint.accept().await else {
+                continue;
+            };
+            let remote_addr = connecting.remote_address();
+            let local_addr = bind;
+            let proxy = Arc::clone(&proxy);
+            let shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let Ok(conn) = connecting.await else { return };
+                let Ok(mut h3_conn) = h3::server::builder()
+                    .build(h3_quinn::Connection::new(conn))
+                    .await
+                else {
+                    return;
+                };
+                loop {
+                    match h3_conn.accept().await {
+                        Ok(Some(resolver)) => {
+                            let proxy = Arc::clone(&proxy);
+                            let shutdown = shutdown.clone();
+                            tokio::spawn(async move {
+                                let Ok((request, stream)) = resolver.resolve_request().await
+                                else {
+                                    return;
+                                };
+                                let Ok(h3_session) = H3DownstreamSession::new(
+                                    request,
+                                    stream,
+                                    remote_addr,
+                                    local_addr,
+                                ) else {
+                                    return;
+                                };
+                                let session =
+                                    ServerSession::new_custom(Box::new(h3_session));
+                                proxy.process_new_http(session, &shutdown).await;
+                            });
+                        }
+                        Ok(None) => return,
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
+    }
+
+    // Silence unused import lint when feature-gated pieces shift.
+    #[allow(dead_code)]
+    fn _t(_: Bytes) {}
+}
+
+use h3_listener as bench_h3;
+
 // Match the production binary's allocator so benchmarks measure the same
 // allocation behavior.
 #[global_allocator]
@@ -131,6 +252,36 @@ fn main() {
 
     let mut proxy = pingora_proxy::http_proxy_service(&server.configuration, BenchProxy);
     proxy.add_tcp("0.0.0.0:8080");
+
+    // Optional TLS + H3 endpoints for protocol-matrix runs. Enabled only when
+    // BENCH_TLS_CERT / BENCH_TLS_KEY point at PEM files: :8443/tcp serves
+    // h1+h2 via ALPN, :8443/udp serves h3. Without them the binary behaves
+    // exactly as before (h1 cleartext only).
+    match (
+        std::env::var("BENCH_TLS_CERT"),
+        std::env::var("BENCH_TLS_KEY"),
+    ) {
+        (Ok(cert), Ok(key)) => {
+            match pingora_core::listeners::tls::TlsSettings::intermediate(&cert, &key) {
+                Ok(mut tls) => {
+                    tls.enable_h2(); // ALPN: h2 preferred, http/1.1 allowed
+                    proxy.add_tls_with_settings("0.0.0.0:8443", None, tls);
+                    eprintln!("Bench proxy TLS ready: :8443 (ALPN h2,http/1.1)");
+                }
+                Err(err) => eprintln!("TLS listener disabled: {err}"),
+            }
+            if let Err(err) = bench_h3::spawn(
+                "0.0.0.0:8443",
+                server.configuration.clone(),
+                cert.clone(),
+                key.clone(),
+            ) {
+                eprintln!("H3 listener disabled: {err}");
+            }
+        }
+        _ => eprintln!("BENCH_TLS_CERT/BENCH_TLS_KEY unset: TLS/H3 listeners disabled"),
+    }
+
     server.add_service(proxy);
 
     eprintln!("Bench proxy ready: :8080 -> origin :8081");
