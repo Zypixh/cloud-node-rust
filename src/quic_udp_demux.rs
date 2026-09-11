@@ -765,6 +765,11 @@ pub struct QuicUdpDemuxManager {
     udp_manager: Arc<UdpProxyManager>,
     handled_ports: DashMap<SocketAddr, ListenerHandle>,
     af_xdp_ports: DashMap<SocketAddr, AfXdpDemuxHandle>,
+    /// Addresses whose listener/AF_XDP handle disappeared from the desired
+    /// set, first observed missing at this instant. A short grace period keeps
+    /// a transient config snapshot from killing every session on the port.
+    listener_undesired_since: DashMap<SocketAddr, Instant>,
+    af_xdp_undesired_since: DashMap<SocketAddr, Instant>,
     next_listener_id: AtomicU64,
 }
 
@@ -828,6 +833,8 @@ impl QuicUdpDemuxManager {
             udp_manager,
             handled_ports: DashMap::new(),
             af_xdp_ports: DashMap::new(),
+            listener_undesired_since: DashMap::new(),
+            af_xdp_undesired_since: DashMap::new(),
             next_listener_id: AtomicU64::new(1),
         })
     }
@@ -944,9 +951,24 @@ impl QuicUdpDemuxManager {
         for (bind_addr, http3_enabled) in active_listeners {
             let port = bind_addr.port();
             let desired_http3 = http3_ports.contains(&port);
-            let keep = desired_listeners.contains(&bind_addr) && http3_enabled == desired_http3;
-            if keep {
-                continue;
+            if desired_listeners.contains(&bind_addr) {
+                self.listener_undesired_since.remove(&bind_addr);
+                // A changed http3 flag is a deliberate config change; restart
+                // immediately so socket semantics stay correct.
+                if http3_enabled == desired_http3 {
+                    continue;
+                }
+            } else {
+                // Grace period: a transient config absence must not kill the
+                // listener and every UDP session on the port.
+                let first_missing = *self
+                    .listener_undesired_since
+                    .entry(bind_addr)
+                    .or_insert_with(Instant::now);
+                if first_missing.elapsed() < crate::udp_proxy::UDP_LISTENER_REMOVE_GRACE {
+                    continue;
+                }
+                self.listener_undesired_since.remove(&bind_addr);
             }
             if let Some((_, handle)) = self.handled_ports.remove(&bind_addr) {
                 info!("QUIC UDP demux: stopping listener on {}", bind_addr);
@@ -969,9 +991,20 @@ impl QuicUdpDemuxManager {
         for (listen_addr, http3_enabled) in active_handles {
             let port = listen_addr.port();
             let desired_http3 = http3_ports.contains(&port);
-            let keep = desired_demux_ports.contains(&port) && http3_enabled == desired_http3;
-            if keep {
-                continue;
+            if desired_demux_ports.contains(&port) {
+                self.af_xdp_undesired_since.remove(&listen_addr);
+                if http3_enabled == desired_http3 {
+                    continue;
+                }
+            } else {
+                let first_missing = *self
+                    .af_xdp_undesired_since
+                    .entry(listen_addr)
+                    .or_insert_with(Instant::now);
+                if first_missing.elapsed() < crate::udp_proxy::UDP_LISTENER_REMOVE_GRACE {
+                    continue;
+                }
+                self.af_xdp_undesired_since.remove(&listen_addr);
             }
             if let Some((_, handle)) = self.af_xdp_ports.remove(&listen_addr) {
                 info!(
@@ -2158,17 +2191,22 @@ impl QuicUdpDemuxManager {
                 {
                     UdpSessionSendStatus::Sent => DispatchStatus::Sent,
                     UdpSessionSendStatus::Full => {
-                        self.record_l4_event_with_pressure(
-                            client_addr,
-                            L4DefenseKind::UdpQueueFull,
-                            format!(
-                                "peer={} session={} pressure={}",
+                        // Throttle defense accounting so a busy but
+                        // legitimate session does not look like a per-packet
+                        // flood.
+                        if crate::udp_proxy::udp_session_queue_full_event_due(&session) {
+                            self.record_l4_event_with_pressure(
                                 client_addr,
-                                session.id,
-                                pressure_level.as_str()
-                            ),
-                            pressure_level,
-                        );
+                                L4DefenseKind::UdpQueueFull,
+                                format!(
+                                    "peer={} session={} pressure={}",
+                                    client_addr,
+                                    session.id,
+                                    pressure_level.as_str()
+                                ),
+                                pressure_level,
+                            );
+                        }
                         debug!(
                             "UDP passthrough session {} buffer full, dropping packet",
                             client_addr
@@ -2359,6 +2397,7 @@ mod tests {
             quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,
@@ -2408,6 +2447,7 @@ mod tests {
             quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(std::sync::atomic::AtomicU8::new(4)),
             quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,
@@ -2618,6 +2658,16 @@ mod tests {
 
         manager.reconcile_af_xdp_handles(&ports(&[8443, 9443]), &ports(&[9443]));
 
+        // A disappeared port stays within the grace period; a mode change is
+        // still applied immediately.
+        assert!(manager.af_xdp_ports.get(&stale_addr).is_some());
+        assert!(manager.af_xdp_ports.get(&changed_addr).is_none());
+        manager.af_xdp_undesired_since.insert(
+            stale_addr,
+            Instant::now() - crate::udp_proxy::UDP_LISTENER_REMOVE_GRACE - Duration::from_secs(1),
+        );
+        manager.reconcile_af_xdp_handles(&ports(&[8443, 9443]), &ports(&[9443]));
+
         assert!(manager.af_xdp_ports.get(&stale_addr).is_none());
         assert!(manager.af_xdp_ports.get(&changed_addr).is_none());
         assert!(manager.af_xdp_ports.get(&keep_addr).is_some());
@@ -2713,6 +2763,7 @@ mod tests {
             quic_cids: Arc::new(tokio::sync::RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,

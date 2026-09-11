@@ -29,6 +29,11 @@ use crate::net_bind::{UdpBatchReceiver, bind_udp_socket, dual_stack_bind_addrs};
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_SESSION_MAX_QUIC_CIDS: usize = 8;
 const UDP_UPSTREAM_DRAIN_BUDGET: usize = 32;
+const UDP_ERROR_BACKOFF: Duration = Duration::from_millis(1);
+const UDP_UPSTREAM_PORT_REUSE_TTL: Duration = Duration::from_secs(120);
+const UDP_UPSTREAM_PORT_REUSE_MAX: usize = 65_536;
+const UDP_QUEUE_FULL_EVENT_INTERVAL_MS: u64 = 1_000;
+pub(crate) const UDP_LISTENER_REMOVE_GRACE: Duration = Duration::from_secs(10);
 const UDP_METRICS_FLUSH_BYTES: u64 = 1024 * 1024;
 const UDP_METRICS_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const UDP_DNS_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -62,6 +67,68 @@ fn udp_session_idle_deadline(last_activity_ms: &AtomicU64, timeout: Duration) ->
         timeout,
     );
     TokioInstant::now() + remaining
+}
+
+/// Upstream socket address of a recently closed session, kept briefly so a
+/// session recreated for the same `(client_addr, listen_port)` can try to
+/// rebind the same upstream port. Protocols that pin server-side state to the
+/// upstream 4-tuple then survive session churn transparently.
+#[derive(Debug)]
+struct RecentUpstreamPort {
+    local_addr: SocketAddr,
+    recorded_at: Instant,
+}
+
+type RecentUpstreamPorts = Arc<DashMap<(SocketAddr, u16), RecentUpstreamPort>>;
+
+fn record_recent_upstream_port(
+    registry: &RecentUpstreamPorts,
+    client_addr: SocketAddr,
+    listen_port: u16,
+    local_addr: SocketAddr,
+) {
+    if local_addr.ip().is_unspecified() && local_addr.port() == 0 {
+        return;
+    }
+    if registry.len() >= UDP_UPSTREAM_PORT_REUSE_MAX {
+        return;
+    }
+    registry.insert(
+        (client_addr, listen_port),
+        RecentUpstreamPort {
+            local_addr,
+            recorded_at: Instant::now(),
+        },
+    );
+}
+
+async fn bind_backend_socket(
+    preferred: Option<SocketAddr>,
+    fallback_addr: &str,
+    session_id: u64,
+) -> io::Result<UdpSocket> {
+    // The preferred bind uses an exclusive bind (no SO_REUSEPORT): if the port
+    // was already claimed by another session's wildcard bind, we must fall
+    // back instead of silently sharing the port and splitting replies.
+    if let Some(addr) = preferred
+        && let Ok(socket) = UdpSocket::bind(addr).await
+    {
+        debug!("UDP session {} reused upstream address {}", session_id, addr);
+        return Ok(socket);
+    }
+    UdpSocket::bind(fallback_addr).await
+}
+
+pub(crate) fn udp_session_queue_full_event_due(session: &UdpSession) -> bool {
+    let now = udp_activity_now_ms();
+    let last = session.queue_full_event_at_ms.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < UDP_QUEUE_FULL_EVENT_INTERVAL_MS {
+        return false;
+    }
+    session
+        .queue_full_event_at_ms
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,6 +473,7 @@ pub struct UdpSession {
     // Learned from the backend's long-header SCID. A zero value means unknown.
     pub quic_server_cid_len: Arc<AtomicU8>,
     pub quic_cid_tx: Option<mpsc::Sender<UdpSessionQuicCid>>,
+    pub queue_full_event_at_ms: AtomicU64,
     pub tx: mpsc::Sender<QueuedUdpDatagram>,
     pub shutdown_tx: watch::Sender<bool>,
     pub shutdown: watch::Receiver<bool>,
@@ -520,6 +588,13 @@ pub struct UdpProxyManager {
     /// (ClientAddr, ListenPort) -> Session
     sessions: Arc<DashMap<(SocketAddr, u16), Arc<UdpSession>>>,
     inflight_sessions: Arc<DashMap<(SocketAddr, u16), Arc<InflightUdpSession>>>,
+    /// (ClientAddr, ListenPort) -> last upstream socket address, kept briefly
+    /// so a recreated session can try to keep the same upstream port.
+    recent_upstream_ports: RecentUpstreamPorts,
+    /// Bind addresses that disappeared from the desired listener set, first
+    /// observed missing at this instant. Listeners are only torn down after
+    /// the grace period so a transient config absence does not kill sessions.
+    undesired_since: DashMap<SocketAddr, Instant>,
     #[cfg(test)]
     session_creation_attempts: AtomicU64,
     handled_ports: DashMap<SocketAddr, ListenerHandle>,
@@ -593,6 +668,8 @@ struct UdpHandleSessionArgs {
     downstream_sender: UdpDownstreamSender,
     rx: mpsc::Receiver<QueuedUdpDatagram>,
     metrics_guard: crate::metrics::ActiveRequestMetricsGuard,
+    recent_upstream_ports: RecentUpstreamPorts,
+    preferred_backend_bind: Option<SocketAddr>,
 }
 
 impl UdpProxyManager {
@@ -608,6 +685,8 @@ impl UdpProxyManager {
             dns_cache: Arc::new(UdpDnsResolutionCache::new()),
             sessions: Arc::new(DashMap::new()),
             inflight_sessions: Arc::new(DashMap::new()),
+            recent_upstream_ports: Arc::new(DashMap::new()),
+            undesired_since: DashMap::new(),
             #[cfg(test)]
             session_creation_attempts: AtomicU64::new(0),
             handled_ports: DashMap::new(),
@@ -746,13 +825,26 @@ impl UdpProxyManager {
             .map(|entry| *entry.key())
             .collect();
         for bind_addr in active_listeners {
-            if !desired_listeners.contains(&bind_addr) {
-                if let Some((_, handle)) = self.handled_ports.remove(&bind_addr) {
-                    info!("UDP Proxy Manager: Stopping listener on {}", bind_addr);
-                    let _ = handle.shutdown_tx.send(true);
-                }
-                self.remove_sessions_for_port(bind_addr.port());
+            if desired_listeners.contains(&bind_addr) {
+                self.undesired_since.remove(&bind_addr);
+                continue;
             }
+            // Keep the listener alive for a grace period when the port
+            // disappears from the desired set: a transient config snapshot
+            // must not kill the listener and every session on it.
+            let first_missing = *self
+                .undesired_since
+                .entry(bind_addr)
+                .or_insert_with(Instant::now);
+            if first_missing.elapsed() < UDP_LISTENER_REMOVE_GRACE {
+                continue;
+            }
+            self.undesired_since.remove(&bind_addr);
+            if let Some((_, handle)) = self.handled_ports.remove(&bind_addr) {
+                info!("UDP Proxy Manager: Stopping listener on {}", bind_addr);
+                let _ = handle.shutdown_tx.send(true);
+            }
+            self.remove_sessions_for_port(bind_addr.port());
         }
     }
 
@@ -864,11 +956,16 @@ impl UdpProxyManager {
         match Self::send_to_session_from_client(&session, client_addr, data).await {
             UdpSessionSendStatus::Sent => Ok(UdpIngressDatagramStatus::Sent),
             UdpSessionSendStatus::Full => {
-                self.record_l4_event(
-                    client_addr.ip(),
-                    L4DefenseKind::UdpQueueFull,
-                    format!("port={} peer={} session={}", port, client_addr, session.id),
-                );
+                // Throttle defense accounting: a busy but legitimate session
+                // can drop many datagrams per second and must not look like a
+                // per-packet flood.
+                if udp_session_queue_full_event_due(&session) {
+                    self.record_l4_event(
+                        client_addr.ip(),
+                        L4DefenseKind::UdpQueueFull,
+                        format!("port={} peer={} session={}", port, client_addr, session.id),
+                    );
+                }
                 Ok(UdpIngressDatagramStatus::Full)
             }
             UdpSessionSendStatus::Closed => {
@@ -1181,6 +1278,7 @@ impl UdpProxyManager {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: quic_cid_tx.clone(),
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx: session_shutdown_tx,
             shutdown: session_shutdown_rx.clone(),
@@ -1212,6 +1310,16 @@ impl UdpProxyManager {
         let quic_server_cid_len = session.quic_server_cid_len.clone();
         let session_quic_cid_tx = session.quic_cid_tx.clone();
         let sessions = self.sessions.clone();
+        let recent_upstream_ports = self.recent_upstream_ports.clone();
+        // One-shot reuse: a session recreated for the same key after churn
+        // tries to keep the previous upstream port so tuple-pinned peers keep
+        // working. The entry is consumed whether the rebind succeeds or not.
+        let preferred_backend_bind = recent_upstream_ports
+            .remove(&key)
+            .and_then(|(_, entry)| {
+                (entry.recorded_at.elapsed() <= UDP_UPSTREAM_PORT_REUSE_TTL)
+                    .then_some(entry.local_addr)
+            });
         self.sessions.insert(key, session.clone());
 
         tokio::spawn(async move {
@@ -1237,6 +1345,8 @@ impl UdpProxyManager {
                 downstream_sender,
                 rx,
                 metrics_guard,
+                recent_upstream_ports,
+                preferred_backend_bind,
             })
             .await;
             let last_client_addr = **client_addr.load();
@@ -1299,13 +1409,14 @@ impl UdpProxyManager {
         }
         drop(cids);
         if let Some(tx) = quic_cid_tx {
-            let _ = tx
-                .send(UdpSessionQuicCid {
-                    session_id,
-                    cid,
-                    retired_cid,
-                })
-                .await;
+            // CID bookkeeping is opportunistic: the demux re-derives routes
+            // from `session_cids` on every dispatch, so a full update channel
+            // must never stall the packet path.
+            let _ = tx.try_send(UdpSessionQuicCid {
+                session_id,
+                cid,
+                retired_cid,
+            });
         }
     }
 
@@ -1355,9 +1466,13 @@ impl UdpProxyManager {
         };
         match session.tx.try_reserve() {
             Ok(permit) => {
-                Self::record_client_short_header_cid(session, item.data.as_ref()).await;
+                // Queue the datagram first; CID bookkeeping below may await a
+                // lock and must not hold a reserved slot while the packet is
+                // still undelivered.
+                let data = item.data.clone();
                 Self::update_session_client_addr(session, client_addr);
                 permit.send(item);
+                Self::record_client_short_header_cid(session, &data).await;
                 Self::update_session_activity(session);
                 UdpSessionSendStatus::Sent
             }
@@ -1385,6 +1500,8 @@ impl UdpProxyManager {
             }
             keep
         });
+        self.recent_upstream_ports
+            .retain(|_, entry| entry.recorded_at.elapsed() <= UDP_UPSTREAM_PORT_REUSE_TTL);
     }
 
     async fn handle_session(args: UdpHandleSessionArgs) -> anyhow::Result<()> {
@@ -1405,13 +1522,21 @@ impl UdpProxyManager {
             downstream_sender,
             mut rx,
             mut metrics_guard,
+            recent_upstream_ports,
+            preferred_backend_bind,
         } = args;
         let backend_bind_addr = if backend_addr.is_ipv6() {
             "[::]:0"
         } else {
             "0.0.0.0:0"
         };
-        let backend_socket = match UdpSocket::bind(backend_bind_addr).await {
+        let backend_socket = match bind_backend_socket(
+            preferred_backend_bind,
+            backend_bind_addr,
+            session_id,
+        )
+        .await
+        {
             Ok(socket) => socket,
             Err(err) => {
                 crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
@@ -1447,7 +1572,6 @@ impl UdpProxyManager {
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
         let mut transfer_metrics = UdpTransferAccumulator::new(Instant::now());
-        let mut result: anyhow::Result<()> = Ok(());
         let mut buf = vec![0u8; 65535];
         loop {
             let idle_deadline =
@@ -1482,8 +1606,15 @@ impl UdpProxyManager {
                         let data = item.data;
                         let len = data.len() as u64;
                         if let Err(err) = backend_socket.send(&data).await {
+                            // A UDP send error must not tear down the session:
+                            // connected sockets surface transient ICMP and
+                            // egress failures that would otherwise force a new
+                            // upstream port and break tuple-pinned protocols.
                             crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
-                            result = Err(err.into());
+                            debug!(
+                                "UDP session {} upstream send to {} failed, dropping datagram: {}",
+                                session_id, backend_addr, err
+                            );
                             break;
                         }
                         last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
@@ -1499,16 +1630,20 @@ impl UdpProxyManager {
                             | Err(mpsc::error::TryRecvError::Disconnected) => None,
                         };
                     }
-                    if result.is_err() {
-                        break;
-                    }
                 }
                 recv = backend_socket.recv(&mut buf) => {
                     let len = match recv {
                         Ok(packet) => packet,
                         Err(err) => {
-                            result = Err(err.into());
-                            break;
+                            // Connected UDP sockets report ICMP errors (port or
+                            // host unreachable) through recv; treat them as a
+                            // dropped reply and keep the session alive.
+                            debug!(
+                                "UDP session {} upstream recv from {} failed, continuing: {}",
+                                session_id, backend_addr, err
+                            );
+                            sleep_until(TokioInstant::now() + UDP_ERROR_BACKOFF).await;
+                            continue;
                         }
                     };
                     let len_u64 = len as u64;
@@ -1545,8 +1680,14 @@ impl UdpProxyManager {
                             continue;
                         }
                         Err(err) => {
-                            result = Err(err.into());
-                            break;
+                            // A transient downstream send error (for example an
+                            // ICMP error reported on the shared listen socket)
+                            // must not tear down the session.
+                            debug!(
+                                "UDP session {} downstream send to {} failed, dropping backend packet: {}",
+                                session_id, current_client_addr, err
+                            );
+                            continue;
                         }
                     }
                     last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
@@ -1556,9 +1697,17 @@ impl UdpProxyManager {
             }
         }
         transfer_metrics.flush_if_due(server_id, true);
+        if let Ok(local_addr) = backend_socket.local_addr() {
+            record_recent_upstream_port(
+                &recent_upstream_ports,
+                **client_addr.load(),
+                _listen_port,
+                local_addr,
+            );
+        }
         let (downstream_sent, upstream_sent) = transfer_metrics.totals();
         let current_client_addr = **client_addr.load();
-        let status = if result.is_ok() { 200 } else { 502 };
+        let status = 200;
         crate::metrics::record::record_network_dimensions(crate::metrics::NetworkDimensionsArgs {
             category: crate::metrics::METRIC_CATEGORY_UDP,
             server_id,
@@ -1579,7 +1728,7 @@ impl UdpProxyManager {
             Some(metrics_guard.metrics()),
         );
         metrics_guard.finish();
-        result
+        Ok(())
     }
 
     pub async fn find_server_for_packet(
@@ -1916,6 +2065,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,
@@ -1949,6 +2099,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,
@@ -1987,6 +2138,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(4)),
             quic_cid_tx: Some(cid_tx),
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,
@@ -2035,6 +2187,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: Some(cid_tx),
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,
@@ -2074,6 +2227,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,
@@ -2116,6 +2270,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,
@@ -2157,6 +2312,8 @@ mod tests {
             metrics_guard: crate::metrics::ActiveRequestMetricsGuard::new(
                 crate::metrics::record::get_or_create(1),
             ),
+            recent_upstream_ports: Arc::new(DashMap::new()),
+            preferred_backend_bind: None,
         }));
 
         tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping")).unwrap())
@@ -2215,6 +2372,8 @@ mod tests {
             metrics_guard: crate::metrics::ActiveRequestMetricsGuard::new(
                 crate::metrics::record::get_or_create(1),
             ),
+            recent_upstream_ports: Arc::new(DashMap::new()),
+            preferred_backend_bind: None,
         }));
 
         tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping")).unwrap())
@@ -2243,6 +2402,174 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_session_survives_downstream_send_error() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let listen_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+        let (downstream_tx, downstream_rx) = mpsc::channel(4);
+        // Dropping the receiver makes every downstream send fail with
+        // BrokenPipe. The session must stay alive and keep relaying upstream.
+        drop(downstream_rx);
+        let (tx, rx) = mpsc::channel(4);
+        let (_listener_shutdown_tx, listener_shutdown_rx) = watch::channel(false);
+        let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+        let recent_upstream_ports: RecentUpstreamPorts = Arc::new(DashMap::new());
+        let registry = recent_upstream_ports.clone();
+
+        let task = tokio::spawn(UdpProxyManager::handle_session(UdpHandleSessionArgs {
+            session_id: 1,
+            backend_addr,
+            _listen_port: 443,
+            listener_shutdown_rx,
+            session_shutdown_rx,
+            server_id: 1,
+            origin_id: 1,
+            client_addr: Arc::new(ArcSwap::from_pointee(client_addr)),
+            domain: "udp.example.com".to_string(),
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
+            quic_cid_tx: None,
+            downstream_sender: UdpDownstreamSender::channel(listen_addr, downstream_tx),
+            rx,
+            metrics_guard: crate::metrics::ActiveRequestMetricsGuard::new(
+                crate::metrics::record::get_or_create(1),
+            ),
+            recent_upstream_ports,
+            preferred_backend_bind: None,
+        }));
+
+        tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping")).unwrap())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let (len, backend_peer) =
+            tokio::time::timeout(Duration::from_secs(1), backend.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buf[..len], b"ping");
+
+        // This reply fails to enqueue downstream; the session must survive.
+        backend.send_to(b"pong", backend_peer).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+
+        tx.send(QueuedUdpDatagram::new(Bytes::from_static(b"ping2")).unwrap())
+            .await
+            .unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), backend.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..len], b"ping2");
+
+        session_shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        // The closed session recorded its upstream socket address so a
+        // recreated session for the same key can try to reuse the port.
+        let entry = registry
+            .get(&(client_addr, 443))
+            .expect("recent upstream port recorded");
+        assert_eq!(entry.local_addr, backend_peer);
+    }
+
+    #[tokio::test]
+    async fn backend_socket_reuses_freed_port_and_falls_back_when_busy() {
+        let previous = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let freed = previous.local_addr().unwrap();
+        drop(previous);
+        let reused = bind_backend_socket(Some(freed), "0.0.0.0:0", 1)
+            .await
+            .unwrap();
+        assert_eq!(reused.local_addr().unwrap(), freed);
+
+        let occupied = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let busy = occupied.local_addr().unwrap();
+        let fallback = bind_backend_socket(Some(busy), "0.0.0.0:0", 2)
+            .await
+            .unwrap();
+        assert_ne!(fallback.local_addr().unwrap().port(), busy.port());
+    }
+
+    #[tokio::test]
+    async fn queue_full_event_is_throttled_per_session() {
+        let (tx, _rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let session = UdpSession {
+            id: 1,
+            client_addr: Arc::new(ArcSwap::from_pointee(
+                "127.0.0.1:50000".parse().unwrap(),
+            )),
+            listen_port: 443,
+            backend_addr: "127.0.0.1:20000".parse().unwrap(),
+            origin_id: 1,
+            server_id: 1,
+            user_id: 0,
+            user_plan_id: 0,
+            plan_id: 0,
+            last_activity_ms: Arc::new(AtomicU64::new(udp_activity_now_ms())),
+            quic_cids: Arc::new(RwLock::new(VecDeque::new())),
+            quic_server_cid_len: Arc::new(AtomicU8::new(0)),
+            quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
+            tx,
+            shutdown_tx,
+            shutdown,
+        };
+        assert!(udp_session_queue_full_event_due(&session));
+        assert!(!udp_session_queue_full_event_due(&session));
+        session.queue_full_event_at_ms.store(
+            udp_activity_now_ms().saturating_sub(UDP_QUEUE_FULL_EVENT_INTERVAL_MS + 1),
+            Ordering::Relaxed,
+        );
+        assert!(udp_session_queue_full_event_due(&session));
+    }
+
+    #[test]
+    fn reconcile_keeps_missing_listener_during_grace_period() {
+        let manager = UdpProxyManager::new(ConfigStore::new(), Arc::new(WafStateManager::new()), 1);
+        let bind_addr: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+        let (shutdown_tx, _rx) = watch::channel(false);
+        manager.handled_ports.insert(
+            bind_addr,
+            ListenerHandle {
+                shutdown_tx,
+                listener_id: 1,
+                generation: 0,
+            },
+        );
+
+        // First miss starts the grace period; the listener must stay.
+        manager.reconcile_listeners(&std::collections::HashSet::new());
+        assert!(manager.handled_ports.contains_key(&bind_addr));
+
+        // Still within the grace period the listener survives.
+        manager.reconcile_listeners(&std::collections::HashSet::new());
+        assert!(manager.handled_ports.contains_key(&bind_addr));
+
+        // A port that returns to the desired set clears the miss marker.
+        let mut desired = std::collections::HashSet::new();
+        desired.insert(bind_addr);
+        manager.reconcile_listeners(&desired);
+        assert!(!manager.undesired_since.contains_key(&bind_addr));
+
+        // Once the grace period has elapsed the listener is removed.
+        manager.undesired_since.insert(
+            bind_addr,
+            Instant::now() - UDP_LISTENER_REMOVE_GRACE - Duration::from_secs(1),
+        );
+        manager.reconcile_listeners(&std::collections::HashSet::new());
+        assert!(!manager.handled_ports.contains_key(&bind_addr));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2278,6 +2605,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx: session_shutdown_tx.clone(),
             shutdown: session_shutdown_rx.clone(),
@@ -2397,6 +2725,8 @@ mod tests {
             metrics_guard: crate::metrics::ActiveRequestMetricsGuard::new(
                 crate::metrics::record::get_or_create(session.server_id),
             ),
+            recent_upstream_ports: Arc::new(DashMap::new()),
+            preferred_backend_bind: None,
         }));
 
         const ATTEMPTED: u64 = 20_000;
@@ -2491,6 +2821,7 @@ mod tests {
             quic_cids: Arc::new(RwLock::new(VecDeque::new())),
             quic_server_cid_len: Arc::new(AtomicU8::new(0)),
             quic_cid_tx: None,
+            queue_full_event_at_ms: AtomicU64::new(0),
             tx,
             shutdown_tx,
             shutdown,
