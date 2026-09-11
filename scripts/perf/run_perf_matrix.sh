@@ -19,9 +19,11 @@ ORIGIN="http://127.0.0.1:8081"
 PROXY="http://127.0.0.1:8080"
 DUR="${DUR:-15s}"
 DUR_S="${DUR%s}"
-# D-group request cap: unique miss keys at ~256KB each. Keep below both the
-# L2 disk budget and available scratch space (default 32768 * 256KB ~= 8GB).
-MISS_REQUESTS="${MISS_REQUESTS:-32768}"
+# D-group miss keyspace: fixed set of real 256KB origin files. The set must
+# exceed the memory-cache capacity so repeated passes keep missing through
+# LRU eviction (default 4096 * 256KB = 1.1GB > 512MB L1). Bounds total cache
+# writes to the keyspace size while keeping the run duration-bounded.
+MISS_KEYS="${MISS_KEYS:-4096}"
 
 mkdir -p "$RESULTS/urls"
 # Canonicalize before use so every output path is absolute.
@@ -37,6 +39,7 @@ for f in 1K 10K 100K 1M 10M; do
     echo "$PROXY/file-$f.bin" > "$RESULTS/urls/proxy-$f.txt"
 done
 seq 0 1999 | awk -v p="$PROXY" '{print p "/many/" $1 ".bin"}' > "$RESULTS/urls/proxy-many.txt"
+seq 0 $((MISS_KEYS - 1)) | awk -v p="$PROXY" '{print p "/miss/" $1 ".bin"}' > "$RESULTS/urls/proxy-miss.txt"
 echo "$ORIGIN/file-1K.bin" > "$RESULTS/urls/origin-1K.txt"
 
 # ---- start bench-proxy ------------------------------------------------------
@@ -103,13 +106,11 @@ for f in 10K 100K 1M 10M; do
 done
 
 # ---- D. cache-miss stream -----------------------------------------------------
-# Unique key per request (rand-regex path) so every request is a real miss:
-# the L1/L2 caches can never serve a key twice. The nginx /miss/ location maps
-# any sub-path to a fixed 256KB body, so this exercises the full
-# origin-fetch + disk-write + metadata-publish pipeline. -n bounds total
-# bytes written to the isolated cache volume.
-run D-miss-256k-c200 -c 200 -n "$MISS_REQUESTS" \
-    --rand-regex-url "$PROXY/miss/[a-z0-9]{16}"
+# Cycle a fixed keyspace of real 256KB origin files that exceeds the memory
+# cache capacity, so evictions keep nearly every request a genuine miss.
+# Exercises the full origin-fetch + cache-fill + metadata-publish pipeline
+# while bounding total cache writes to the keyspace size.
+run D-miss-256k-c200 -c 200 --urls-from-file "$RESULTS/urls/proxy-miss.txt"
 
 # ---- E. connection churn vs keep-alive ----------------------------------------
 run E-hit-1k-churn-c200 -c 200 --disable-keepalive "$PROXY/file-1K.bin" 2>/dev/null || true
