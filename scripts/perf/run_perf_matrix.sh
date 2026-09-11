@@ -88,29 +88,37 @@ echo "proxy pid=$PROXY_PID nginx workers=${NGINX_WORKERS[*]:-none}"
 
 run() { # name, extra oha args... — duration-bounded
     local name="$1"; shift
-    run_impl "$name" -z "$DUR" "$@"
+    run_impl "$name" "$DUR_S" -z "$DUR" "$@"
 }
 
 run_n() { # name, request-count bound, extra oha args...
     local name="$1"; shift
     local count="$1"; shift
-    run_impl "$name" -n "$count" "$@"
+    run_impl "$name" 0 -n "$count" "$@"
 }
 
-run_impl() { # name, oha bound args + extra args
-    local name="$1"; shift
+run_impl() { # name, sample_secs (0 = sample until oha exits), oha args...
+    local name="$1" sample_secs="$2"; shift 2
     echo "=== $name"
     local sampler_args=(--pid "$PROXY_PID" --name proxy)
     local w
     for w in "${NGINX_WORKERS[@]}"; do
         sampler_args+=(--pid "$w" --name nginx)
     done
+    # For request-count bounded runs the sampler watches a generous ceiling
+    # and is stopped with SIGTERM when the load exits, so the reported CPU
+    # average covers exactly the loaded interval.
+    local sampler_duration="$sample_secs"
+    [ "$sampler_duration" -eq 0 ] && sampler_duration=86400
     python3 "$SAMPLER" "${sampler_args[@]}" \
-        --duration "$DUR_S" --interval 0.5 --out "$RESULTS/$name.sys.json" &
+        --duration "$sampler_duration" --interval 0.5 --out "$RESULTS/$name.sys.json" &
     local spid=$!
     sleep 0.3
     oha "$@" --no-tui --output-format json > "$RESULTS/$name.oha.json" 2>"$RESULTS/$name.oha.err"
-    wait $spid
+    if [ "$sample_secs" -eq 0 ]; then
+        kill -TERM "$spid" 2>/dev/null || true
+    fi
+    wait $spid || true
     python3 - "$RESULTS/$name.oha.json" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
@@ -150,6 +158,9 @@ run_n D-miss-256k-c200 "$MISS_REQUESTS" -c 200 \
 # Same 256KB bodies but a fixed keyspace that fits in L2 (1.1GB < L2 budget)
 # while exceeding L1 (512MB). After the first pass these are L2 disk hits —
 # this group measures the disk-hit path, NOT misses. Do not relabel.
+# Warm every key sequentially first; a random oha warm would leave tail keys
+# uncached and contaminate the disk-hit measurement with fill misses.
+xargs -P 32 -n 1 -a "$RESULTS/urls/proxy-miss.txt" curl -sf -o /dev/null
 run D2-l2hit-256k-c200 -c 200 --urls-from-file "$RESULTS/urls/proxy-miss.txt"
 
 # ---- E. connection churn vs keep-alive ----------------------------------------

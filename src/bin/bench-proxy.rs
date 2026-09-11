@@ -118,6 +118,13 @@ fn main() {
         let rt = tokio::runtime::Runtime::new().expect("flusher runtime");
         rt.block_on(async {
             cloud_node_rust::metrics::storage::start_cache_access_flusher();
+            // The purger enforces BENCH_DISK_MAX_BYTES (and expiry) on the
+            // isolated cache volume; without it the miss-stream group could
+            // grow the disk cache without bound.
+            tokio::spawn(cloud_node_rust::cache_hybrid::start_cache_purger(
+                CACHE.storage,
+                cloud_node_rust::paths::NodePaths::current().cache_dir(),
+            ));
             std::future::pending::<()>().await;
         });
     });

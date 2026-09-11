@@ -954,10 +954,13 @@ impl Storage for FileStorage {
             // Zero-copy delivery: when sendfile is enabled, serve the body
             // straight out of a file mapping instead of read() chunks. The
             // mapping is safe because cache files are immutable (temp file +
-            // rename publish) and remain valid after an unlink by purge. If
-            // the map fails the handler explicitly falls back to streaming
-            // reads — same bytes, same integrity checks.
-            let reader = if self.enable_sendfile() && meta.size > 0 {
+            // rename publish) and remain valid after an unlink by purge.
+            // Objects above the in-memory serve limit keep streaming so a
+            // serving spike cannot fault arbitrarily large page sets into
+            // RSS. If the map fails the handler explicitly falls back to
+            // streaming reads — same bytes, same integrity checks.
+            let reader = if self.enable_sendfile() && meta.size > 0 && meta.size <= MEMORY_SERVE_MAX
+            {
                 let std_file = file.into_std().await;
                 match unsafe { memmap2::Mmap::map(&std_file) } {
                     Ok(mmap) if !mmap.is_empty() => FileHitReader::Mapped(MappedFileReader {

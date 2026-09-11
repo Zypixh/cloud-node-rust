@@ -2296,6 +2296,10 @@ fn start_cache_meta_writer() {
                         Ok(())
                     });
                     if !committed {
+                        // The transaction rolled back: nothing in this batch is
+                        // durable. Per-item flags set before the failure must
+                        // not be acknowledged as committed.
+                        results.fill(false);
                         warn!(
                             batch = batch.len(),
                             "Mace cache metadata writer aborted a batch"

@@ -120,23 +120,40 @@ impl PurgeBarrier {
 
     async fn write(&'static self) -> PurgeWriteGuard {
         let writers = self.writer_lock.lock().await;
+        // The guard is created before the flag is set so that cancelling this
+        // future while readers drain drops the guard, clears `writer_active`,
+        // and bumps the epoch — readers can never be parked forever by a
+        // cancelled purge.
+        let guard = PurgeWriteGuard {
+            barrier: self,
+            _writers: writers,
+        };
         self.writer_active.store(true, Ordering::SeqCst);
         // Reader critical sections are microseconds; yield to the scheduler
         // rather than block the worker thread while they drain.
-        for shard in &self.shards {
+        for (idx, shard) in self.shards.iter().enumerate() {
+            let mut spins = 0u64;
             while shard.0.load(Ordering::SeqCst) != 0 {
                 tokio::task::yield_now().await;
+                spins += 1;
+                #[cfg(test)]
+                if spins == 10_000_000 {
+                    eprintln!(
+                        "purge_barrier drain stuck: shard {idx} count {}",
+                        shard.0.load(Ordering::SeqCst)
+                    );
+                }
             }
         }
-        PurgeWriteGuard {
-            barrier: self,
-            _writers: writers,
-        }
+        guard
     }
 }
 
 static PURGE_BARRIER: LazyLock<PurgeBarrier> = LazyLock::new(PurgeBarrier::new);
 
+/// Acquire a purge read guard. A task must not hold one read guard while
+/// awaiting another: writers block new readers and wait for existing ones to
+/// drain, so hold-and-wait deadlocks — the same rule as `RwLock`.
 pub(crate) async fn acquire_cache_purge_read_guard() -> PurgeReadGuard {
     PURGE_BARRIER.read().await
 }
@@ -182,6 +199,25 @@ mod tests {
         assert!(!read_task.is_finished());
         drop(write_guard);
         let _read_guard = read_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_writer_releases_pending_readers() {
+        let read_guard = acquire_cache_purge_read_guard().await;
+        let write_task = tokio::spawn(acquire_cache_purge_write_guard());
+        // Let the writer set the flag and enter the drain loop.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Cancel the writer mid-drain: the flag must be cleared by the
+        // dropped guard so later readers/writers make progress.
+        write_task.abort();
+        let _ = write_task.await;
+        // Release the held reader BEFORE acquiring a new one: holding a read
+        // guard while awaiting another acquisition deadlocks against any
+        // pending writer (same hold-and-wait rule as RwLock).
+        drop(read_guard);
+        let new_reader = acquire_cache_purge_read_guard().await;
+        drop(new_reader);
+        let _write_guard = acquire_cache_purge_write_guard().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
