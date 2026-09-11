@@ -126,10 +126,14 @@ impl UdpBatchReceiver {
     async fn recv_batch_linux(&mut self) -> io::Result<Vec<ReceivedUdpDatagram>> {
         loop {
             self.socket.readable().await?;
-            for message in &mut self.messages {
+            for (message, iovec) in self.messages.iter_mut().zip(self.iovecs.iter_mut()) {
                 message.msg_hdr.msg_namelen =
                     size_of::<libc::sockaddr_storage>() as libc::socklen_t;
                 message.msg_hdr.msg_controllen = std::mem::size_of_val(&self.controls[0]);
+                // Re-derive the iovec pointer each call so the descriptor
+                // always points at the buffer this receiver owns.
+                message.msg_hdr.msg_iov = iovec;
+                message.msg_hdr.msg_iovlen = 1;
                 message.msg_len = 0;
             }
 
