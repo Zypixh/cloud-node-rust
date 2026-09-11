@@ -22,6 +22,7 @@ use pingora_header_serde::HeaderSerde;
 use pingora_http::{HMap, ResponseHeader};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::key::HashBinary;
@@ -412,7 +413,10 @@ mod internal_meta {
 pub(crate) struct CacheMetaInner {
     // http header and Internal meta have different ways of serialization, so keep them separated
     pub(crate) internal: InternalMeta,
-    pub(crate) header: ResponseHeader,
+    // Shared so a storage backend can hand out its immutable stored header
+    // without cloning the HeaderMap on every hit. Mutation goes through
+    // `Arc::make_mut` copy-on-write.
+    pub(crate) header: Arc<ResponseHeader>,
     /// An opaque type map to hold extra information for communication between cache backends
     /// and users. This field is **not** guaranteed be persistently stored in the cache backend.
     pub extensions: Extensions,
@@ -430,6 +434,25 @@ impl CacheMeta {
         stale_while_revalidate_sec: u32,
         stale_if_error_sec: u32,
         header: ResponseHeader,
+    ) -> CacheMeta {
+        Self::new_shared(
+            fresh_until,
+            created,
+            stale_while_revalidate_sec,
+            stale_if_error_sec,
+            Arc::new(header),
+        )
+    }
+
+    /// Create a [CacheMeta] sharing an already-immutable response header.
+    /// The header is copy-on-write if later mutated through
+    /// [Self::response_header_mut].
+    pub fn new_shared(
+        fresh_until: SystemTime,
+        created: SystemTime,
+        stale_while_revalidate_sec: u32,
+        stale_if_error_sec: u32,
+        header: Arc<ResponseHeader>,
     ) -> CacheMeta {
         CacheMeta(Box::new(CacheMetaInner {
             internal: InternalMeta {
@@ -579,8 +602,10 @@ impl CacheMeta {
     }
 
     /// Modify the header in this asset
+    ///
+    /// Copy-on-write when the header is shared with a cache backend.
     pub fn response_header_mut(&mut self) -> &mut ResponseHeader {
-        &mut self.0.header
+        Arc::make_mut(&mut self.0.header)
     }
 
     /// Expose the extensions to read
@@ -595,6 +620,11 @@ impl CacheMeta {
 
     /// Get a copy of the response header
     pub fn response_header_copy(&self) -> ResponseHeader {
+        self.0.header.as_ref().clone()
+    }
+
+    /// Share the immutable response header without copying it.
+    pub fn response_header_shared(&self) -> Arc<ResponseHeader> {
         self.0.header.clone()
     }
 
@@ -634,7 +664,7 @@ impl CacheMeta {
         let header = header_deserialize(header)?;
         Ok(CacheMeta(Box::new(CacheMetaInner {
             internal,
-            header,
+            header: Arc::new(header),
             extensions: Extensions::new(),
         })))
     }

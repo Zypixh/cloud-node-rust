@@ -20,6 +20,11 @@ use std::time::Duration;
 use cloud_node_rust::cache_manager::CACHE;
 use pingora_cache::CacheKey;
 
+// Match the production binary's allocator so benchmarks measure the same
+// allocation behavior.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 static CACHE_LOCK: Lazy<CacheLock> =
     Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(1)));
 
@@ -93,6 +98,18 @@ fn main() {
 
     // Force initialization of global cache
     Lazy::force(&CACHE);
+
+    // BENCH_DISK_MAX_BYTES caps the L2 budget for miss-stream workloads so
+    // the purger bounds total cache writes during a bounded run.
+    if let Ok(limit) = std::env::var("BENCH_DISK_MAX_BYTES")
+        && let Ok(bytes) = limit.parse::<u64>()
+    {
+        CACHE
+            .storage
+            .max_disk_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("L2 disk budget overridden: {bytes} bytes");
+    }
 
     // Cache metadata lives in the Mace-backed MetricStorage; without the writer
     // thread every fill is discarded and all requests miss. Run the flusher on

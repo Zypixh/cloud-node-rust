@@ -81,6 +81,8 @@ async-compression = { version = "0.4.43", features = ["tokio", "zstd"] }
 arc-swap = "1.9.2"
 ahash = "0.8.12"
 cloud-node-xdp-common = { path = "crates/cloud-node-xdp-common", features = ["aya"] }
+mimalloc = "0.1.52"
+memmap2 = "0.9.11"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = "0.14.0"

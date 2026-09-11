@@ -43,7 +43,7 @@ pub struct PartialWriter {
     committed: bool,
     purge_generation: u64,
     fence_purge_generation: bool,
-    _purge_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    _purge_guard: crate::cache::purge_barrier::PurgeReadGuard,
     _root_guard: OwnedMutexGuard<()>,
     _process_lock: Option<crate::cache_hybrid::CacheProcessLockGuard>,
 }
@@ -475,7 +475,7 @@ pub(crate) async fn open_writer_with_guards(
     capture: PartialCapture,
     write_root: PathBuf,
     expected_generation: Option<u64>,
-    purge_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    purge_guard: crate::cache::purge_barrier::PurgeReadGuard,
     root_guard: OwnedMutexGuard<()>,
     process_lock: Option<crate::cache_hybrid::CacheProcessLockGuard>,
 ) -> std::io::Result<Option<PartialWriter>> {
@@ -1320,7 +1320,7 @@ struct PartialFileHitHandler {
     cache_key: String,
     roots: Vec<PathBuf>,
     invalidated: bool,
-    _purge_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    _purge_guard: crate::cache::purge_barrier::PurgeReadGuard,
     _root_guard: OwnedMutexGuard<()>,
     _process_lock: Option<crate::cache_hybrid::CacheProcessLockGuard>,
 }

@@ -23,6 +23,7 @@ use log::warn;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use pingora_timeout::timeout;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use storage::MissFinishType;
 use strum::IntoStaticStr;
@@ -1092,7 +1093,15 @@ impl HttpCache {
                  * - Content-Location, Date, ETag, and Vary
                  * - Cache-Control and Expires...
                  */
-                let mut old_header = self.inner_enabled().meta.as_ref().unwrap().0.header.clone();
+                let mut old_header = self
+                    .inner_enabled()
+                    .meta
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .header
+                    .as_ref()
+                    .clone();
                 let mut clone_header = |header_name: &'static str| {
                     for (i, value) in resp.headers.get_all(header_name).iter().enumerate() {
                         if i == 0 {
@@ -1132,7 +1141,7 @@ impl HttpCache {
         match self.phase {
             CachePhase::Stale => {
                 // replace cache meta header
-                self.inner_enabled_mut().meta.as_mut().unwrap().0.header = header;
+                self.inner_enabled_mut().meta.as_mut().unwrap().0.header = Arc::new(header);
                 // upstream request done, release write lock
                 self.release_write_lock(reason);
             }
