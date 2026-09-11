@@ -176,6 +176,13 @@ impl HttpModuleCtx {
         }
     }
 
+    /// Whether any modules are attached. When false, the `*_filter` methods
+    /// are no-ops and callers may skip them (e.g. to serve a body without
+    /// materializing it as bytes).
+    pub fn is_empty(&self) -> bool {
+        self.module_ctx.is_empty()
+    }
+
     /// Get a ref to [HttpModule] if any.
     pub fn get<T: 'static>(&self) -> Option<&T> {
         let idx = self.module_index.get(&TypeId::of::<T>())?;

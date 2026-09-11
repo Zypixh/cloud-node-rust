@@ -71,8 +71,25 @@ struct Shared {
     ok: AtomicU64,
     err: AtomicU64,
     bytes: AtomicU64,
+    /// Total requests dispatched across all workers; `--requests` bounds it.
+    issued: AtomicU64,
+    /// Workers that finished their setup and are waiting for the start gun.
+    ready: AtomicU64,
     latencies_us: parking_lot::Mutex<Vec<u64>>,
     stop: AtomicBool,
+}
+
+impl Shared {
+    /// Reserve a request slot; returns false once `--requests` is exhausted.
+    fn issue(&self, bound: Option<u64>) -> bool {
+        if self.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        match bound {
+            Some(n) => self.issued.fetch_add(1, Ordering::Relaxed) < n,
+            None => true,
+        }
+    }
 }
 
 async fn run_stream(
@@ -109,18 +126,25 @@ async fn run_stream(
 
 /// Churn mode: every iteration opens a fresh QUIC connection for a single
 /// request, then drops it — measures handshake+first-request cost.
+#[allow(clippy::too_many_arguments)]
 async fn churn_worker(
     server: SocketAddr,
     endpoint: quinn::Endpoint,
     authority: String,
     path: String,
     shared: Arc<Shared>,
+    start: Arc<tokio::sync::Barrier>,
+    bound: Option<u64>,
     read_body: bool,
 ) {
-    while !shared.stop.load(Ordering::Relaxed) {
+    shared.ready.fetch_add(1, Ordering::Relaxed);
+    start.wait().await;
+    while shared.issue(bound) {
         let start = Instant::now();
         let res = async {
-            let connecting = endpoint.connect(server, "localhost").map_err(|e| e.to_string())?;
+            let connecting = endpoint
+                .connect(server, "localhost")
+                .map_err(|e| e.to_string())?;
             let conn = connecting.await.map_err(|e| e.to_string())?;
             let (mut driver, mut send_request) = h3::client::builder()
                 .build(h3_quinn::Connection::new(conn.clone()))
@@ -139,7 +163,10 @@ async fn churn_worker(
             Ok(n) => {
                 shared.ok.fetch_add(1, Ordering::Relaxed);
                 shared.bytes.fetch_add(n, Ordering::Relaxed);
-                shared.latencies_us.lock().push(start.elapsed().as_micros() as u64);
+                shared
+                    .latencies_us
+                    .lock()
+                    .push(start.elapsed().as_micros() as u64);
             }
             Err(_) => {
                 shared.err.fetch_add(1, Ordering::Relaxed);
@@ -148,48 +175,65 @@ async fn churn_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn conn_worker(
+    conn_index: usize,
     server: SocketAddr,
     endpoint: quinn::Endpoint,
     authority: String,
     paths: Arc<Vec<String>>,
     streams: usize,
+    total_lanes: usize,
     shared: Arc<Shared>,
+    start: Arc<tokio::sync::Barrier>,
+    bound: Option<u64>,
     read_body: bool,
 ) {
+    let fail = || {
+        // A failed handshake reduces the achieved concurrency — record it so
+        // the reported in-flight count stays honest.
+        shared.err.fetch_add(1, Ordering::Relaxed);
+        shared.ready.fetch_add(1, Ordering::Relaxed);
+    };
     let connecting = match endpoint.connect(server, "localhost") {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return fail(),
     };
     let conn = match connecting.await {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return fail(),
     };
-    let (mut driver, send_request) =
-        match h3::client::builder().build(h3_quinn::Connection::new(conn)).await {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+    let (mut driver, send_request) = match h3::client::builder()
+        .build(h3_quinn::Connection::new(conn))
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return fail(),
+    };
     tokio::spawn(async move {
         let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
-    let send = Arc::new(tokio::sync::Mutex::new(send_request));
 
+    shared.ready.fetch_add(1, Ordering::Relaxed);
+    start.wait().await;
+
+    // Each lane owns a `SendRequest` clone — `send_request` needs `&mut`
+    // only to pick a fresh stream, so no lock is required across lanes.
     let mut tasks = Vec::new();
     for lane in 0..streams {
-        let send = Arc::clone(&send);
+        let mut send = send_request.clone();
         let shared = Arc::clone(&shared);
         let authority = authority.clone();
         let paths = Arc::clone(&paths);
         tasks.push(tokio::spawn(async move {
-            let mut seq = lane;
-            while !shared.stop.load(Ordering::Relaxed) {
+            // Stride the URL file by total lanes so every connection covers
+            // a distinct slice of the keyspace instead of all starting at 0.
+            let mut seq = conn_index.wrapping_mul(streams).wrapping_add(lane);
+            while shared.issue(bound) {
                 let path = &paths[seq % paths.len()];
-                seq = seq.wrapping_add(streams);
+                seq = seq.wrapping_add(total_lanes);
                 let start = Instant::now();
-                let mut guard = send.lock().await;
-                let res = run_stream(&mut guard, path, &authority, read_body).await;
-                drop(guard);
+                let res = run_stream(&mut send, path, &authority, read_body).await;
                 match res {
                     Ok(n) => {
                         shared.ok.fetch_add(1, Ordering::Relaxed);
@@ -259,26 +303,42 @@ async fn main() -> anyhow::Result<()> {
     crypto.alpn_protocols = vec![b"h3".to_vec()];
     crypto.enable_early_data = false;
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?;
-    let client_cfg = quinn::ClientConfig::new(Arc::new(quic));
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic));
+    // Match the server-side transport tuning; BENCH_QUIC_MTU opts into
+    // loopback jumbo datagrams so the per-datagram cost amortizes.
+    let mtu = std::env::var("BENCH_QUIC_MTU")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok());
+    client_cfg.transport_config(Arc::new(
+        cloud_node_rust::quic_transport::tuned_transport_config(mtu),
+    ));
 
     let server = SocketAddr::new(host.parse::<IpAddr>()?, port);
-    let mut endpoint = quinn::Endpoint::client(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        0,
-    ))?;
+    let mut endpoint =
+        quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
     endpoint.set_default_client_config(client_cfg);
     let endpoint = Arc::new(endpoint);
+
+    let bound: Option<u64> = match arg_value(&args, "--requests", "") {
+        s if s.is_empty() => None,
+        s => Some(s.parse()?),
+    };
 
     let shared = Arc::new(Shared {
         ok: AtomicU64::new(0),
         err: AtomicU64::new(0),
         bytes: AtomicU64::new(0),
+        issued: AtomicU64::new(0),
+        ready: AtomicU64::new(0),
         latencies_us: parking_lot::Mutex::new(Vec::new()),
         stop: AtomicBool::new(false),
     });
+    // +1 for main, which releases the barrier and starts the clock.
+    let start = Arc::new(tokio::sync::Barrier::new(conns + 1));
+    let total_lanes = conns * streams;
 
     let mut workers = Vec::new();
-    for _ in 0..conns {
+    for i in 0..conns {
         if churn {
             workers.push(tokio::spawn(churn_worker(
                 server,
@@ -286,16 +346,22 @@ async fn main() -> anyhow::Result<()> {
                 authority.clone(),
                 single_path.clone(),
                 Arc::clone(&shared),
+                Arc::clone(&start),
+                bound,
                 read_body,
             )));
         } else {
             workers.push(tokio::spawn(conn_worker(
+                i,
                 server,
                 (*endpoint).clone(),
                 authority.clone(),
                 Arc::clone(&paths),
                 streams,
+                total_lanes,
                 Arc::clone(&shared),
+                Arc::clone(&start),
+                bound,
                 read_body,
             )));
         }
@@ -303,7 +369,32 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
-    tokio::time::sleep(dur).await;
+    // Wait until every worker finished connection setup so the measured
+    // window contains only steady-state traffic. The barrier releases all
+    // workers simultaneously and starts the clock.
+    tokio::select! {
+        _ = start.wait() => {},
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            eprintln!("warning: not all H3 connections established within 30s");
+        },
+    }
+    let t0 = Instant::now();
+
+    // Run until the duration elapses or the request bound is consumed.
+    loop {
+        let elapsed = t0.elapsed();
+        if elapsed >= dur {
+            break;
+        }
+        if let Some(n) = bound {
+            let done = shared.ok.load(Ordering::Relaxed) + shared.err.load(Ordering::Relaxed);
+            if done >= n {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let measured = t0.elapsed();
     shared.stop.store(true, Ordering::Relaxed);
     for w in workers {
         let _ = tokio::time::timeout(Duration::from_secs(10), w).await;
@@ -322,20 +413,20 @@ async fn main() -> anyhow::Result<()> {
         lats[i] as f64 / 1e6
     };
     let total = ok + err;
-    let rps = ok as f64 / dur.as_secs_f64();
+    let rps = ok as f64 / measured.as_secs_f64();
 
     // oha-compatible shape used by the matrix runner.
     let out_json = serde_json::json!({
         "summary": {
             "successRate": if total == 0 { 0.0 } else { ok as f64 / total as f64 },
-            "total": dur.as_secs_f64(),
+            "total": measured.as_secs_f64(),
             "slowest": lats.last().copied().unwrap_or(0) as f64 / 1e6,
             "fastest": lats.first().copied().unwrap_or(0) as f64 / 1e6,
             "average": if lats.is_empty() { 0.0 } else { lats.iter().sum::<u64>() as f64 / lats.len() as f64 / 1e6 },
             "requestsPerSec": rps,
             "totalData": bytes,
-            "sizePerRequest": if ok == 0 { 0 } else { bytes / ok },
-            "sizePerSec": (bytes as f64 / dur.as_secs_f64()) as u64
+            "sizePerRequest": bytes.checked_div(ok).unwrap_or(0),
+            "sizePerSec": (bytes as f64 / measured.as_secs_f64()) as u64
         },
         "latencyPercentiles": {
             "p10": pct(0.10), "p25": pct(0.25), "p50": pct(0.50),

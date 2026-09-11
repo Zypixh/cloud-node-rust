@@ -170,6 +170,19 @@ pub trait HandleHit {
         0
     }
 
+    /// Return a file-backed view of the remaining body, if this storage can
+    /// serve it without first materializing it in memory.
+    ///
+    /// When the proxy accepts the file body, the range described here is
+    /// written to the downstream transport directly; the bytes it covers no
+    /// longer flow through `read_body`.
+    ///
+    /// The default implementation returns `None`; callers fall back to
+    /// `read_body()`.
+    fn file_body(&self) -> Option<pingora_http::FileBody> {
+        None
+    }
+
     /// Helper function to cast the trait object to concrete types
     fn as_any(&self) -> &(dyn Any + Send + Sync);
 

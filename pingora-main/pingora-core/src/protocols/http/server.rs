@@ -25,7 +25,7 @@ use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::Bytes;
 use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
-use pingora_error::{Error, Result};
+use pingora_error::{Error, OrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::any::Any;
 use std::time::Duration;
@@ -214,6 +214,55 @@ impl Session {
                 Ok(())
             }
             Self::Custom(s) => s.write_body(data, end).await,
+        }
+    }
+
+    /// Write a file-backed response body to the client.
+    ///
+    /// HTTP/1.1 sessions may transfer the range with zero-copy syscalls such
+    /// as `sendfile(2)`; every other session type streams the range through
+    /// its normal `write_body` path so framing (chunked, DATA frames) and
+    /// encryption are preserved.
+    pub async fn write_response_body_file(
+        &mut self,
+        file_body: pingora_http::FileBody,
+        end: bool,
+    ) -> Result<()> {
+        if file_body.is_empty() {
+            return self.write_response_body(Bytes::new(), end).await;
+        }
+        match self {
+            Self::H1(s) => {
+                s.write_body_file(&file_body).await?;
+                if end {
+                    s.finish_body().await?;
+                }
+                Ok(())
+            }
+            _ => {
+                // Buffered-read fallback: keeps h2 framing, TLS and custom
+                // session semantics identical to the Bytes path.
+                const CHUNK: u64 = 256 * 1024;
+                let mut at = 0u64;
+                while at < file_body.len() {
+                    let want = (file_body.len() - at).min(CHUNK) as usize;
+                    let mut buf = vec![0u8; want];
+                    let n = file_body
+                        .read_at(&mut buf, at)
+                        .or_err(pingora_error::ErrorType::WriteError, "reading file body")?;
+                    if n == 0 {
+                        return Error::e_explain(
+                            pingora_error::ErrorType::WriteError,
+                            "file body shorter than declared range",
+                        );
+                    }
+                    buf.truncate(n);
+                    at += n as u64;
+                    let done = at >= file_body.len();
+                    self.write_response_body(Bytes::from(buf), end && done).await?;
+                }
+                Ok(())
+            }
         }
     }
 

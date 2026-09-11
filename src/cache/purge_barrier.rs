@@ -131,18 +131,9 @@ impl PurgeBarrier {
         self.writer_active.store(true, Ordering::SeqCst);
         // Reader critical sections are microseconds; yield to the scheduler
         // rather than block the worker thread while they drain.
-        for (idx, shard) in self.shards.iter().enumerate() {
-            let mut spins = 0u64;
+        for shard in self.shards.iter() {
             while shard.0.load(Ordering::SeqCst) != 0 {
                 tokio::task::yield_now().await;
-                spins += 1;
-                #[cfg(test)]
-                if spins == 10_000_000 {
-                    eprintln!(
-                        "purge_barrier drain stuck: shard {idx} count {}",
-                        shard.0.load(Ordering::SeqCst)
-                    );
-                }
             }
         }
         guard

@@ -34,10 +34,7 @@ mod h3_listener {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    fn load_rustls_config(
-        cert_path: &str,
-        key_path: &str,
-    ) -> anyhow::Result<quinn::ServerConfig> {
+    fn load_rustls_config(cert_path: &str, key_path: &str) -> anyhow::Result<quinn::ServerConfig> {
         let cert_pem = std::fs::read(cert_path)?;
         let key_pem = std::fs::read(key_path)?;
         let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
@@ -52,7 +49,14 @@ mod h3_listener {
         tls.max_early_data_size = 0;
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))?;
         let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        // BENCH_QUIC_MTU raises the initial/upper-bound QUIC datagram size —
+        // on loopback (mtu 65536) each datagram carries far more payload so
+        // the per-packet syscall+AEAD cost amortizes over more bytes.
+        let mtu = std::env::var("BENCH_QUIC_MTU")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok());
         let transport = Arc::get_mut(&mut cfg.transport).unwrap();
+        *transport = cloud_node_rust::quic_transport::tuned_transport_config(mtu);
         transport.max_concurrent_bidi_streams(256u32.into());
         transport.max_concurrent_uni_streams(256u32.into());
         Ok(cfg)
@@ -109,8 +113,7 @@ mod h3_listener {
                             let proxy = Arc::clone(&proxy);
                             let shutdown = shutdown.clone();
                             tokio::spawn(async move {
-                                let Ok((request, stream)) = resolver.resolve_request().await
-                                else {
+                                let Ok((request, stream)) = resolver.resolve_request().await else {
                                     return;
                                 };
                                 let Ok(h3_session) = H3DownstreamSession::new(
@@ -121,8 +124,7 @@ mod h3_listener {
                                 ) else {
                                     return;
                                 };
-                                let session =
-                                    ServerSession::new_custom(Box::new(h3_session));
+                                let session = ServerSession::new_custom(Box::new(h3_session));
                                 proxy.process_new_http(session, &shutdown).await;
                             });
                         }
@@ -159,9 +161,20 @@ impl ProxyHttp for BenchProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
-        session
-            .cache
-            .enable(CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
+        // A `dyn=` query marker models dynamic API traffic: cache stays
+        // disabled end-to-end so the run measures pure passthrough (no
+        // lookup, no fill, no metadata write) instead of a miss stream.
+        let dynamic = session
+            .req_header()
+            .uri
+            .query()
+            .map(|q| q.split('&').any(|p| p.starts_with("dyn=")))
+            .unwrap_or(false);
+        if !dynamic {
+            session
+                .cache
+                .enable(CACHE.storage, None, None, Some(&*CACHE_LOCK), None);
+        }
         Ok(false)
     }
 
@@ -192,6 +205,18 @@ impl ProxyHttp for BenchProxy {
         let now = std::time::SystemTime::now();
         let meta = CacheMeta::new(now + Duration::from_secs(3600), now, 0, 0, resp.clone());
         Ok(pingora_cache::RespCacheable::Cacheable(meta))
+    }
+
+    /// File-backed cache hits may bypass `response_body_filter` (sendfile).
+    /// The bench has no per-byte accounting or throttling, so allow it
+    /// unconditionally.
+    async fn cache_hit_file_body(
+        &self,
+        _session: &mut Session,
+        _body_len: u64,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        Ok(Some(Duration::ZERO))
     }
 
     async fn response_filter(

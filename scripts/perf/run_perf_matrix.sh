@@ -115,9 +115,17 @@ PROXY_PID=""
 READY=0
 for _ in $(seq 1 50); do
     PROXY_PID=$(pgrep -x bench-proxy | head -1 || true)
-    # -k: TLS rounds serve a self-signed cert; h1 ignores the flag anyway via
-    # https URL only — for h3 this still probes the TCP TLS listener on :8443.
-    if [ -n "$PROXY_PID" ] && curl -skf -o /dev/null "$PROXY/index.html"; then
+    if [ "$PROTO" = h3 ]; then
+        # Probe the UDP/QUIC endpoint itself — the TCP TLS listener answers
+        # curl even when the QUIC side failed to bind.
+        if [ -n "$PROXY_PID" ] && grep -q 'H3 ready' "$RESULTS/bench-proxy.log" \
+            && "$H3_BIN" --host 127.0.0.1 --port 8443 --conns 1 --streams 1 \
+                --duration 1s --path /index.html 2>/dev/null \
+                | grep -q '"successRate": 1'; then
+            READY=1
+            break
+        fi
+    elif [ -n "$PROXY_PID" ] && curl -skf -o /dev/null "$PROXY/index.html"; then
         READY=1
         break
     fi
@@ -191,9 +199,18 @@ run_impl() { # name, sample_secs (0 = sample until load exits), loadgen args...
     done
 
     if [ "$PROTO" = h3 ] && [ "$direct_origin" = 0 ]; then
-        local conns=$(( conc / STREAMS_PER_CONN )); [ "$conns" -lt 1 ] && conns=1
-        local h3_args=(--host 127.0.0.1 --port 8443 --conns "$conns"
-            --streams "$STREAMS_PER_CONN" --duration "${dur_arg}s")
+        # bench-h3-load parses the FIRST occurrence of each flag, so the
+        # churn override must replace the default values, not append.
+        local h3_conns h3_streams="$STREAMS_PER_CONN"
+        if [ "$churn" = 1 ]; then
+            h3_conns=$conc; h3_streams=1
+        else
+            h3_conns=$(( conc / STREAMS_PER_CONN )); [ "$h3_conns" -lt 1 ] && h3_conns=1
+        fi
+        local h3_args=(--host 127.0.0.1 --port 8443 --conns "$h3_conns"
+            --streams "$h3_streams" --duration "${dur_arg}s")
+        [ "$churn" = 1 ] && h3_args+=(--churn)
+        [ -n "$bounded_n" ] && h3_args+=(--requests "$bounded_n")
         local i path
         for i in "${!rest[@]}"; do
             case "${rest[$i]}" in
@@ -204,10 +221,15 @@ run_impl() { # name, sample_secs (0 = sample until load exits), loadgen args...
             esac
         done
         if [ "$rand_regex" = 1 ]; then
-            h3_args+=(--urls-file "$RESULTS/urls/proxy-miss-rand.txt")
-        fi
-        if [ "$churn" = 1 ]; then
-            h3_args+=(--churn --streams 1 --conns "$conc")
+            case "$rand_url" in
+                # Miss stream: the pregenerated 100k-unique-key file
+                # (bigger than L2 so repeats still miss).
+                */miss/*) h3_args+=(--urls-file "$RESULTS/urls/proxy-miss-rand.txt") ;;
+                # Dynamic group: a constant `dyn=` query — the marker itself
+                # disables the cache, uniqueness is not needed.
+                *) local u="${rand_url#*://}"
+                   h3_args+=(--path "/file-1K.bin?dyn=h3") ;;
+            esac
         fi
         "$H3_BIN" "${h3_args[@]}" > "$RESULTS/$name.oha.json" 2>"$RESULTS/$name.oha.err"
     elif [ "$PROTO" = h2 ] && [ "$churn" = 1 ]; then
@@ -226,6 +248,9 @@ run_impl() { # name, sample_secs (0 = sample until load exits), loadgen args...
         fi
         local oha_args=(-z "${dur_arg}s" -c "$conns")
         [ -n "$bounded_n" ] && oha_args=(-n "$bounded_n" -c "$conns")
+        # --disable-keepalive still applies to h1/h1s (conn-per-request);
+        # it was consumed as the churn marker and must be forwarded.
+        [ "$churn" = 1 ] && oha_args+=(--disable-keepalive)
         [ "$rand_regex" = 1 ] && rest+=(--rand-regex-url "$rand_url")
         oha "${oha_args[@]}" \
             "${proto_args[@]+"${proto_args[@]}"}" "${rest[@]}" \
@@ -300,6 +325,15 @@ fi
 # ---- F. mixed small files (warm, 2000 keys fits in cache) ---------------------
 oha -n 4000 -c 50 --no-tui --urls-from-file "$RESULTS/urls/proxy-many-warm.txt" >/dev/null 2>&1  # warm all (h1)
 run F-hit-many-c200 -c 200 --urls-from-file "$RESULTS/urls/proxy-many.txt"
+
+# ---- G. dynamic passthrough (cache disabled, pure proxy path) -----------------
+# The `dyn=` query marker makes bench-proxy skip cache entirely — this is the
+# dynamic-API workload: upstream keepalive reuse + body streaming with zero
+# cache involvement. A unique query value per request also defeats any
+# client-side reuse. For h3 the query is constant (rand-regex unsupported);
+# the cache is disabled by the marker regardless of the key.
+run G-dynamic-1k-c200 -c 200 \
+    --rand-regex-url "$PROXY/file-1K.bin?dyn=[a-z0-9]{12}"
 
 echo "results in $RESULTS"
 kill "$PROXY_PID" 2>/dev/null || true

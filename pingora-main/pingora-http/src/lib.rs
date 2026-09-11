@@ -46,6 +46,57 @@ pub mod prelude {
     pub use crate::ResponseHeader;
 }
 
+/// A body that is a range of a file on disk.
+///
+/// Used to express that a response body can be served directly from a file
+/// descriptor, so that downstream transports which support it (e.g. plain TCP
+/// HTTP/1.1 on Linux) may use zero-copy syscalls such as `sendfile(2)`.
+/// Transports which cannot serve a file descriptor must fall back to reading
+/// the range into memory and writing it as normal body bytes.
+#[derive(Clone)]
+pub struct FileBody {
+    /// The file to read from. Shared so the body can outlive the hit handler.
+    pub file: std::sync::Arc<std::fs::File>,
+    /// Absolute byte offset inside `file` where the body starts.
+    pub offset: u64,
+    /// Number of bytes to serve.
+    pub len: u64,
+}
+
+impl FileBody {
+    /// Total bytes this body will produce.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether this body is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Read `buf.len()` bytes at `at` bytes into this body range, never
+    /// reading past the declared `len` (the underlying file may be longer).
+    /// Returns how many bytes were read; a short read means the file is
+    /// truncated relative to the declared range.
+    pub fn read_at(&self, buf: &mut [u8], at: u64) -> std::io::Result<usize> {
+        if at >= self.len {
+            return Ok(0);
+        }
+        let max = (self.len - at).min(buf.len() as u64) as usize;
+        let file_offset = self.offset.saturating_add(at);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(&mut buf[..max], file_offset)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            self.file.seek_read(&mut buf[..max], file_offset)
+        }
+    }
+}
+
 /* an ordered header map to store the original case of each header name
 HMap({
     "foo": ["Foo", "foO", "FoO"]
@@ -969,6 +1020,31 @@ mod tests {
         req.set_send_end_stream(false);
         // Some(false)
         assert!(!req.send_end_stream().unwrap());
+    }
+
+    #[test]
+    fn file_body_read_at_subrange() {
+        let path = std::env::temp_dir().join(format!(
+            "pingora-http-filebody-{}-{}.bin",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, b"XXhelloYY").unwrap();
+        let fb = crate::FileBody {
+            file: std::sync::Arc::new(std::fs::File::open(&path).unwrap()),
+            offset: 2,
+            len: 5,
+        };
+        assert_eq!(fb.len(), 5);
+        assert!(!fb.is_empty());
+        let mut buf = [0u8; 8];
+        let n = fb.read_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        // mid-range read: absolute file offset = body offset + position,
+        // clamped to the declared range (never leaks trailing file bytes)
+        let n = fb.read_at(&mut buf, 3).unwrap();
+        assert_eq!(&buf[..n], b"lo");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
