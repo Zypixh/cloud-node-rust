@@ -443,7 +443,7 @@ pub async fn open_writer_with_generation(
     let purge_guard = crate::cache_hybrid::acquire_cache_purge_read_guard().await;
     let root_guard = lock_for(root_key).lock_owned().await;
     let process_lock =
-        match crate::cache_hybrid::acquire_cache_process_read_lock(root_key, _roots).await {
+        match crate::cache_hybrid::acquire_cache_process_fill_lock(root_key, _roots).await {
             Ok(lock) => lock,
             Err(err) => {
                 tracing::warn!(

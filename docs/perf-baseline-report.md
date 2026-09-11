@@ -53,6 +53,13 @@ handler body 已物化为内存 `Bytes`，流式输出期间不再访问磁盘�
 校验完成后提前释放 `l1_process_lock`（本次未改，需先验证跨进程 purge 时序语义）。
 更彻底的方案是把跨进程 key 锁降级为「仅填充/校验期持有」或用 try-lock+回退。
 
+> **后续已实现（本 PR 第二轮改动）**：未选择提前释放，而是把读路径的
+> key 锁由 `LOCK_EX` 改为 `LOCK_SH` 并对锁 fd 做按 (roots,key) 缓存 +
+> 进程内引用计数（见 `src/cache/process_lock.rs`）。热键并发读者共享同一把
+> `LOCK_SH`，流式输出期间仍持有交付栅栏（语义不变），稳态下每请求
+> 0 文件锁 syscall、无 spawn_blocking；写者经 `exclusive_pending` 门控保持
+> 内核 FIFO 公平，容量/fd 预算耗尽时回退到逐请求私有 fd（计数可观测）。
+
 ### 3. bench-proxy 缺少缓存元数据写入器初始化（已修复）
 
 `start_cache_access_flusher()`（加载 meta 索引 + 启动 Mace writer 线程 + bloom 预热）

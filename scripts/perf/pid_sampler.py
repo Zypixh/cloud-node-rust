@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Sample CPU% and RSS for a set of PIDs while a load run is in flight.
 
-Usage: pid_sampler.py --pid 1234 [--pid 5678] --duration 15 --interval 0.5 --out run.json
+Usage: pid_sampler.py --pid 1234 --name proxy [--pid 5678 --name nginx --pid 5679 --name nginx] \
+    --duration 15 --interval 0.5 --out run.json
+
+Multiple PIDs may share one --name; their CPU% and RSS are aggregated so a
+multi-worker process (e.g. nginx worker_processes auto) is reported as a
+single series instead of sampling only the first worker.
 """
 import argparse
 import json
@@ -47,12 +52,19 @@ def main():
     args = ap.parse_args()
 
     names = args.name or [f"pid{p}" for p in args.pid]
+    if len(names) != len(args.pid):
+        ap.error("--name must be given once per --pid")
+    # name -> [pids]; order preserved, duplicates merged.
+    groups = {}
+    for pid, name in zip(args.pid, names):
+        groups.setdefault(name, []).append(pid)
+
     prev_proc = {p: read_stat(p) for p in args.pid}
     prev_total = total_cpu_jiffies()
     prev_t = time.monotonic()
 
-    series = {n: [] for n in names}
-    rss_peak = {n: 0 for n in names}
+    series = {n: [] for n in groups}
+    rss_peak = {n: 0 for n in groups}
     deadline = prev_t + args.duration
     while time.monotonic() < deadline:
         time.sleep(args.interval)
@@ -60,20 +72,30 @@ def main():
         now_total = total_cpu_jiffies()
         dtotal = now_total - prev_total
         dt = now - prev_t
-        for name, pid in zip(names, args.pid):
-            cur = read_stat(pid)
-            if cur is None or prev_proc.get(pid) is None or dtotal <= 0:
+        for name, pids in groups.items():
+            cpu_jiffies = 0
+            rss_kb = 0
+            missing = False
+            for pid in pids:
+                cur = read_stat(pid)
+                if cur is None or prev_proc.get(pid) is None:
+                    missing = True
+                    continue
+                cpu_jiffies += cur - prev_proc[pid]
+                prev_proc[pid] = cur
+                rss_kb += read_rss_kb(pid)
+            if missing or dtotal <= 0:
                 continue
-            cpu_pct = (cur - prev_proc[pid]) / CLK / dt * 100.0
-            rss = read_rss_kb(pid)
-            rss_peak[name] = max(rss_peak[name], rss)
-            series[name].append({"t": round(now, 1), "cpu_pct": round(cpu_pct, 1), "rss_kb": rss})
-            prev_proc[pid] = cur
+            cpu_pct = cpu_jiffies / CLK / dt * 100.0
+            rss_peak[name] = max(rss_peak[name], rss_kb)
+            series[name].append(
+                {"t": round(now, 1), "cpu_pct": round(cpu_pct, 1), "rss_kb": rss_kb}
+            )
         prev_total = now_total
         prev_t = now
 
     summary = {}
-    for name in names:
+    for name in groups:
         cpus = [s["cpu_pct"] for s in series[name]]
         summary[name] = {
             "cpu_pct_avg": round(sum(cpus) / len(cpus), 1) if cpus else 0.0,
