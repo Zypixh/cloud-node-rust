@@ -4396,7 +4396,7 @@ impl Storage for HybridStorage {
         }
 
         // Check L2 (disk)
-        if let Some((meta, handler)) = self.l2.lookup(key, trace).await? {
+        if let Some((meta, mut handler)) = self.l2.lookup(key, trace).await? {
             prof_record_l2_hit();
             // Promote L2 disk hits to TinyUfoL1
             let promotion =
@@ -4410,6 +4410,14 @@ impl Storage for HybridStorage {
                         )
                     });
             if let Some((promotion_data, stamp)) = promotion {
+                // The handler body is already materialized in memory, so it
+                // does not need the cross-process key lock during streaming.
+                // Keeping it while re-acquiring the key write lock inverts
+                // the write-lock-then-flock order used by lookup/fill paths
+                // and can deadlock concurrent same-key traffic.
+                if let Some(mem_handler) = handler.as_any_mut().downcast_mut::<MemoryHitHandler>() {
+                    mem_handler._process_lock = None;
+                }
                 let _purge_guard = acquire_cache_purge_read_guard().await;
                 let write_lock = cache_write_lock_for_key(k_str);
                 let _write_guard = write_lock.lock().await;
