@@ -26,6 +26,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
@@ -558,6 +559,27 @@ impl HttpProxyManager {
             "HTTP/HTTPS Proxy Manager: starting {} accept worker(s) on {} (TLS={}, proxy_protocol={})",
             worker_count, bind_addr, is_tls, enable_proxy_protocol
         );
+        // Pressure-adaptive scaling: a scaler task spawns extra SO_REUSEPORT
+        // accept workers (each holding its own shutdown watch) when L4
+        // pressure rises; scaled-down workers self-terminate on their tick.
+        let desired_workers = Arc::new(AtomicUsize::new(worker_count));
+        {
+            let manager = self.clone();
+            let desired = desired_workers.clone();
+            let mut scaler_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                manager
+                    .run_accept_scaler(
+                        bind_addr,
+                        is_tls,
+                        enable_proxy_protocol,
+                        worker_count,
+                        desired,
+                        &mut scaler_shutdown,
+                    )
+                    .await;
+            });
+        }
         for worker_id in 1..worker_count {
             let manager = self.clone();
             let worker_shutdown = shutdown_rx.clone();
@@ -569,6 +591,7 @@ impl HttpProxyManager {
                         enable_proxy_protocol,
                         worker_id,
                         worker_shutdown,
+                        None,
                     )
                     .await
                 {
@@ -579,8 +602,84 @@ impl HttpProxyManager {
                 }
             });
         }
-        self.run_http_listener_worker(bind_addr, is_tls, enable_proxy_protocol, 0, shutdown_rx)
-            .await
+        self.run_http_listener_worker(
+            bind_addr,
+            is_tls,
+            enable_proxy_protocol,
+            0,
+            shutdown_rx,
+            None,
+        )
+        .await
+    }
+
+    /// Spawns/stops extra accept workers so the live count tracks
+    /// `l4_defense::pressure_accept_worker_target`. Scale-up is instant; extra
+    /// workers retire themselves once `desired` drops below their id, so
+    /// scale-down is graceful and never drops in-flight accepts.
+    async fn run_accept_scaler(
+        self: Arc<Self>,
+        bind_addr: SocketAddr,
+        is_tls: bool,
+        enable_proxy_protocol: bool,
+        base_workers: usize,
+        desired: Arc<AtomicUsize>,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut next_id = base_workers;
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = tick.tick() => {}
+            }
+            let target = crate::l4_defense::pressure_accept_worker_target(base_workers);
+            let previous = desired.swap(target, Ordering::Relaxed);
+            if target != previous {
+                info!(
+                    "L4 pressure {:?}: HTTP accept workers on {} {} -> {}",
+                    crate::l4_defense::current_pressure_level(),
+                    bind_addr,
+                    previous,
+                    target
+                );
+                crate::logging::report_node_log(
+                    "info".to_string(),
+                    "accept_scaling".to_string(),
+                    format!(
+                        "HTTP accept workers on {bind_addr} scaled {previous} -> {target} under {:?} pressure",
+                        crate::l4_defense::current_pressure_level()
+                    ),
+                    0,
+                );
+            }
+            while next_id < target {
+                let manager = self.clone();
+                let worker_shutdown = shutdown_rx.clone();
+                let desired = desired.clone();
+                let worker_id = next_id;
+                tokio::spawn(async move {
+                    if let Err(err) = manager
+                        .run_http_listener_worker(
+                            bind_addr,
+                            is_tls,
+                            enable_proxy_protocol,
+                            worker_id,
+                            worker_shutdown,
+                            Some(desired),
+                        )
+                        .await
+                    {
+                        error!(
+                            "HTTP/HTTPS accept worker {} on {} failed: {}",
+                            worker_id, bind_addr, err
+                        );
+                    }
+                });
+                next_id += 1;
+            }
+        }
     }
 
     async fn run_http_listener_worker(
@@ -590,6 +689,7 @@ impl HttpProxyManager {
         enable_proxy_protocol: bool,
         worker_id: usize,
         mut shutdown_rx: watch::Receiver<bool>,
+        scale_state: Option<Arc<AtomicUsize>>,
     ) -> anyhow::Result<()> {
         let port = bind_addr.port();
         let listener = bind_tcp_listener_with_retry(
@@ -628,11 +728,29 @@ impl HttpProxyManager {
             .parse::<i64>()
             .unwrap_or(0);
 
+        let mut scale_retire = std::pin::pin!(async {
+            match &scale_state {
+                Some(desired) => loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if worker_id >= desired.load(Ordering::Relaxed) {
+                        break;
+                    }
+                },
+                None => std::future::pending::<()>().await,
+            }
+        });
         loop {
             let accept_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
                     info!(
                         "HTTP/HTTPS accept worker {} on {} shutting down",
+                        worker_id, bind_addr
+                    );
+                    return Ok(());
+                }
+                _ = &mut scale_retire => {
+                    info!(
+                        "HTTP/HTTPS accept worker {} on {} retiring after pressure scale-down",
                         worker_id, bind_addr
                     );
                     return Ok(());

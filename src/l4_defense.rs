@@ -960,6 +960,34 @@ pub fn pressure_level_from_utilization_pct_ext(
         .max(crate::kernel_syn_defense::current_pressure_level())
 }
 
+/// Desired accept-worker count for the current pressure level: double at
+/// Elevated, quadruple at High, 8x at Critical, capped at 4x online CPUs so
+/// SO_REUSEPORT fan-out never exceeds what the machine can schedule. The cap
+/// can only tighten below `base_workers` when `base_workers` itself exceeds
+/// 4x CPUs (misconfiguration); it never shrinks below the base count.
+pub fn pressure_accept_worker_target(base_workers: usize) -> usize {
+    scale_accept_workers(
+        base_workers,
+        current_pressure_level(),
+        num_cpus::get(),
+    )
+}
+
+fn scale_accept_workers(
+    base_workers: usize,
+    level: L4PressureLevel,
+    online_cpus: usize,
+) -> usize {
+    let base = base_workers.max(1);
+    let scaled = match level {
+        L4PressureLevel::Normal => base,
+        L4PressureLevel::Elevated => base.saturating_mul(2),
+        L4PressureLevel::High => base.saturating_mul(4),
+        L4PressureLevel::Critical => base.saturating_mul(8),
+    };
+    scaled.min(online_cpus.saturating_mul(4)).max(base)
+}
+
 pub fn current_pressure_level() -> L4PressureLevel {
     let snapshot = MEMORY_GOVERNOR.snapshot(MEMORY_GOVERNOR.pingora_worker_threads());
     let connection_pct = snapshot
@@ -2706,5 +2734,28 @@ mod tests {
         );
         assert!(waf_state.is_blocked(ip, cluster_scope));
         assert!(metrics_snapshot().h2_defense_total > before);
+    }
+
+    #[test]
+    fn accept_worker_scaling_tracks_pressure_with_cpu_cap() {
+        assert_eq!(
+            scale_accept_workers(2, L4PressureLevel::Normal, 8),
+            2
+        );
+        assert_eq!(scale_accept_workers(2, L4PressureLevel::Elevated, 8), 4);
+        assert_eq!(scale_accept_workers(2, L4PressureLevel::High, 8), 8);
+        assert_eq!(
+            scale_accept_workers(2, L4PressureLevel::Critical, 8),
+            16
+        );
+        // CPU cap: 2 CPUs allow at most 8 workers even at Critical.
+        assert_eq!(
+            scale_accept_workers(4, L4PressureLevel::Critical, 2),
+            8
+        );
+        // Base never shrinks: a base larger than the cap keeps all workers.
+        assert_eq!(scale_accept_workers(64, L4PressureLevel::Normal, 2), 64);
+        // Zero base is clamped to one worker minimum.
+        assert_eq!(scale_accept_workers(0, L4PressureLevel::Normal, 8), 1);
     }
 }
