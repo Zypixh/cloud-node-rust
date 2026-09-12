@@ -164,6 +164,7 @@
 
 **X4. eBPF 快路径下沉（在 XDP 内完成的）**
 - per-IP pps 限速 map（原 A3）：SYN/UDP/QUIC-Initial 限速在驱动层完成，smoltcp 只见合法流量。
+  - 实现状态（已提交）：`XDP_RATE_CFG`（Array[1] 配置）+ `XDP_RATE_V4/V6`（262k per-IP 固定窗口 bucket，`bpf_ktime_get_ns` 判定）。UDP 全量计数，TCP 仅 SYN&&!ACK（连接建立尝试），已建立流不受限。map 满 fail-open + `ratelimit_map_full` 计数。userspace `sync_rate_limit_config` 挂 sweeper（5s 周期）按压力下发：Normal=关，Elevated=base，High=/2，Critical=/4；`XdpConfig.rateLimit`（`udpPps/tcpSynPps/windowMs`）为 None 时恒关。旧 .o 无 map → `rate_limit_detail` 显式报告 "missing map XDP_RATE_CFG"。计数 `rate_limited` 已入 `XdpStatusSnapshot` + bench L4METRICS。
 - **UDP 纯 L4 透传全 XDP 化**：转发 map（listen 4元组→后端）+ 反向 conntrack map + 校验和重写，`XDP_TX` 直发，用户态零参与。需要 userspace 填邻居 MAC 表（云环境=网关 MAC）。这是 Katran 标准做法，pps 上限≈线速。
 - **TCP 纯 L4 透传走 XDP 逐包 NAT**（性能优先，不用 sockmap）：per-flow map 记 seq/ack delta，逐包重写 4-tuple+seq/ack+校验和，`XDP_TX` 直发——不过内核 TCP 协议栈，线速。**正确性边界**：重传/SACK/时间戳/window probe/分片都要覆盖，必须配双路径 seq 流一致性差异测试；sockmap/sk_msg 保留为降级参考实现（内核 TCP 终结零拷贝，安全但慢一档）。
 - **QUIC DCID 路由**：透传 → DCID 查 map 直转后端；终结在本机的 H3 → **DCID→XSK queue 映射**把连接钉到固定队列/worker，解决 QUIC 多核扩展与连接迁移（X2 的 QUIC 半边靠这个）。

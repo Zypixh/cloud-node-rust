@@ -161,6 +161,7 @@ fn derive_xdp_config_with_ports_and_options(
             protocols: default_xdp_proxy_protocols(),
             ports,
         },
+        rate_limit: None,
     })
 }
 

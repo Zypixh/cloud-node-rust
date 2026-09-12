@@ -190,6 +190,34 @@ impl Default for XdpProxyConfig {
     }
 }
 
+fn default_xdp_rate_limit_window_ms() -> u64 {
+    1000
+}
+
+/// Base per-IP fixed-window limits for the eBPF limiter. Userspace scales
+/// these down under elevated pressure (Elevated: x1, High: /2, Critical: /4)
+/// and disables the limiter entirely at Normal pressure. `0` disables the
+/// limit for that protocol.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpRateLimitSettings {
+    #[serde(rename = "udpPps", default)]
+    pub udp_pps: u64,
+    #[serde(rename = "tcpSynPps", default)]
+    pub tcp_syn_pps: u64,
+    #[serde(rename = "windowMs", default = "default_xdp_rate_limit_window_ms")]
+    pub window_ms: u64,
+}
+
+impl Default for XdpRateLimitSettings {
+    fn default() -> Self {
+        Self {
+            udp_pps: 0,
+            tcp_syn_pps: 0,
+            window_ms: default_xdp_rate_limit_window_ms(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct XdpConfig {
     #[serde(default)]
@@ -202,6 +230,8 @@ pub struct XdpConfig {
     pub interfaces: Vec<XdpInterfaceConfig>,
     #[serde(default)]
     pub proxy: XdpProxyConfig,
+    #[serde(rename = "rateLimit", default)]
+    pub rate_limit: Option<XdpRateLimitSettings>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

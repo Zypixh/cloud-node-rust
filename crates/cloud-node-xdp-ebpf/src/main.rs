@@ -10,7 +10,7 @@ use aya_ebpf::{
 };
 use cloud_node_xdp_common::{
     XdpCounters, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key,
-    XdpPortProtoKey, XdpQueueKey, XdpRuleValue,
+    XdpPortProtoKey, XdpQueueKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue,
 };
 use core::mem;
 use network_types::{
@@ -85,6 +85,18 @@ static XDP_XSKS: XskMap = XskMap::with_max_entries(4096, 0);
 #[map(name = "XDP_XSK_INDEX")]
 static XDP_XSK_INDEX: HashMap<XdpQueueKey, u32> =
     HashMap::<XdpQueueKey, u32>::with_max_entries(4096, 0);
+
+#[map(name = "XDP_RATE_CFG")]
+static XDP_RATE_CFG: Array<XdpRateLimitConfig> =
+    Array::<XdpRateLimitConfig>::with_max_entries(1, 0);
+
+#[map(name = "XDP_RATE_V4")]
+static XDP_RATE_V4: HashMap<XdpIpv4Key, XdpRateBucket> =
+    HashMap::<XdpIpv4Key, XdpRateBucket>::with_max_entries(262_144, 0);
+
+#[map(name = "XDP_RATE_V6")]
+static XDP_RATE_V6: HashMap<XdpIpv6Key, XdpRateBucket> =
+    HashMap::<XdpIpv6Key, XdpRateBucket>::with_max_entries(262_144, 0);
 
 #[xdp]
 pub fn cloud_node_xdp(ctx: XdpContext) -> u32 {
@@ -173,13 +185,18 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
     let protocol = unsafe { (*ip).proto };
+    let l4_offset = ip_offset + ihl;
+    if rate_limited_v4(ctx, &key, protocol, l4_offset, now_mono_ns) {
+        counter_rate_limited();
+        return Ok(xdp_action::XDP_DROP);
+    }
     let destination_be = u32::from_be_bytes(unsafe { (*ip).dst_addr });
     if let Some(policy) = policy {
         if !local_ipv4_allowed(policy, ifindex, destination_be) {
             return Ok(xdp_action::XDP_PASS);
         }
     }
-    Ok(maybe_redirect(ctx, policy, protocol, ip_offset + ihl))
+    Ok(maybe_redirect(ctx, policy, protocol, l4_offset))
 }
 
 fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
@@ -226,6 +243,10 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         None => return Ok(xdp_action::XDP_PASS),
     };
     let destination = unsafe { (*ip).dst_addr };
+    if rate_limited_v6(ctx, &key, protocol, l4_offset, now_mono_ns) {
+        counter_rate_limited();
+        return Ok(xdp_action::XDP_DROP);
+    }
     if let Some(policy) = policy {
         if !local_ipv6_allowed(policy, ifindex, destination) {
             return Ok(xdp_action::XDP_PASS);
@@ -358,6 +379,131 @@ fn maybe_redirect(
     }
 }
 
+/// Per-IP fixed-window pps limiter. Only UDP datagrams and TCP SYN-without-ACK
+/// (connection attempts) are counted; established flows are never throttled.
+/// A full map fails open (pass + `ratelimit_map_full` counter) so the limiter
+/// can never blackhole traffic on map exhaustion.
+fn rate_limited_v4(
+    ctx: &XdpContext,
+    key: &XdpIpv4Key,
+    protocol: u8,
+    l4_offset: usize,
+    now_mono_ns: u64,
+) -> bool {
+    let Some(cfg) = XDP_RATE_CFG.get(0).copied() else {
+        return false;
+    };
+    let limit = match protocol {
+        value if value == IpProto::Udp as u8 => cfg.udp_pps,
+        value if value == IpProto::Tcp as u8 => {
+            if cfg.tcp_syn_pps == 0 || !is_tcp_syn_attempt(ctx, l4_offset) {
+                return false;
+            }
+            cfg.tcp_syn_pps
+        }
+        _ => return false,
+    };
+    if limit == 0 || cfg.window_ns == 0 {
+        return false;
+    }
+    rate_bucket_hit_v4(key, limit, cfg.window_ns, now_mono_ns)
+}
+
+fn rate_limited_v6(
+    ctx: &XdpContext,
+    key: &XdpIpv6Key,
+    protocol: u8,
+    l4_offset: usize,
+    now_mono_ns: u64,
+) -> bool {
+    let Some(cfg) = XDP_RATE_CFG.get(0).copied() else {
+        return false;
+    };
+    let limit = match protocol {
+        value if value == IpProto::Udp as u8 => cfg.udp_pps,
+        value if value == IpProto::Tcp as u8 => {
+            if cfg.tcp_syn_pps == 0 || !is_tcp_syn_attempt(ctx, l4_offset) {
+                return false;
+            }
+            cfg.tcp_syn_pps
+        }
+        _ => return false,
+    };
+    if limit == 0 || cfg.window_ns == 0 {
+        return false;
+    }
+    rate_bucket_hit_v6(key, limit, cfg.window_ns, now_mono_ns)
+}
+
+fn is_tcp_syn_attempt(ctx: &XdpContext, l4_offset: usize) -> bool {
+    match ptr_at::<TcpHdr>(ctx, l4_offset) {
+        Ok(tcp) => unsafe { (*tcp).syn() == 1 && (*tcp).ack() == 0 },
+        Err(_) => false,
+    }
+}
+
+fn rate_bucket_hit_v4(
+    key: &XdpIpv4Key,
+    limit: u64,
+    window_ns: u64,
+    now_mono_ns: u64,
+) -> bool {
+    if let Some(bucket) = XDP_RATE_V4.get_ptr_mut(key) {
+        // SAFETY: `bucket` points into the map value for `key`; the update races
+        // with other CPUs by design (fixed-window limiter tolerates slight
+        // overcount-adjacent drift).
+        let bucket = unsafe { &mut *bucket };
+        if now_mono_ns.saturating_sub(bucket.window_start_ns) >= window_ns {
+            bucket.window_start_ns = now_mono_ns;
+            bucket.count = 1;
+            return false;
+        }
+        bucket.count = bucket.count.saturating_add(1);
+        return bucket.count > limit;
+    }
+    let bucket = XdpRateBucket {
+        window_start_ns: now_mono_ns,
+        count: 1,
+    };
+    match XDP_RATE_V4.insert(key, &bucket, 0) {
+        Ok(()) => false,
+        Err(_) => {
+            counter_ratelimit_map_full();
+            false
+        }
+    }
+}
+
+fn rate_bucket_hit_v6(
+    key: &XdpIpv6Key,
+    limit: u64,
+    window_ns: u64,
+    now_mono_ns: u64,
+) -> bool {
+    if let Some(bucket) = XDP_RATE_V6.get_ptr_mut(key) {
+        // SAFETY: see rate_bucket_hit_v4.
+        let bucket = unsafe { &mut *bucket };
+        if now_mono_ns.saturating_sub(bucket.window_start_ns) >= window_ns {
+            bucket.window_start_ns = now_mono_ns;
+            bucket.count = 1;
+            return false;
+        }
+        bucket.count = bucket.count.saturating_add(1);
+        return bucket.count > limit;
+    }
+    let bucket = XdpRateBucket {
+        window_start_ns: now_mono_ns,
+        count: 1,
+    };
+    match XDP_RATE_V6.insert(key, &bucket, 0) {
+        Ok(()) => false,
+        Err(_) => {
+            counter_ratelimit_map_full();
+            false
+        }
+    }
+}
+
 fn local_ipv4_allowed(policy: &XdpInterfacePolicy, ifindex: u32, destination_be: u32) -> bool {
     if policy.local_ip_filter == 0 {
         return true;
@@ -483,6 +629,18 @@ fn counter_map_miss() {
 fn counter_xsk_drop() {
     if let Some(counters) = counters() {
         counters.xsk_drops = counters.xsk_drops.saturating_add(1);
+    }
+}
+
+fn counter_rate_limited() {
+    if let Some(counters) = counters() {
+        counters.rate_limited = counters.rate_limited.saturating_add(1);
+    }
+}
+
+fn counter_ratelimit_map_full() {
+    if let Some(counters) = counters() {
+        counters.ratelimit_map_full = counters.ratelimit_map_full.saturating_add(1);
     }
 }
 
