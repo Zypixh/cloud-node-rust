@@ -3900,11 +3900,55 @@ mod linux {
             XdpAttachMode::Drv => aya::programs::XdpMode::Driver,
             XdpAttachMode::Skb => aya::programs::XdpMode::Skb,
         };
+        {
+            let program: &mut aya::programs::Xdp = ebpf
+                .program_mut("cloud_node_xdp")
+                .ok_or_else(|| anyhow::anyhow!("missing eBPF program cloud_node_xdp"))?
+                .try_into()?;
+            program.load()?;
+        }
+        // Populate the tail-call dispatch table for the NAT subprogram. An
+        // older object without these symbols leaves the slot empty; the
+        // program then falls back to the inline redirect path explicitly.
+        let nat_dispatch_fd = match ebpf.program_mut("xdp_nat_dispatch") {
+            Some(sub_program) => {
+                let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
+                sub.load()?;
+                Some(
+                    sub.fd()?
+                        .try_clone()
+                        .map_err(|err| anyhow::anyhow!("clone xdp_nat_dispatch fd: {err}"))?,
+                )
+            }
+            None => None,
+        };
+        match (ebpf.map_mut("XDP_DISPATCH"), nat_dispatch_fd) {
+            (Some(map), Some(fd)) => {
+                let mut table = aya::maps::ProgramArray::try_from(map)?;
+                table.set(0, &fd, 0)?;
+            }
+            (Some(_), None) => {
+                tracing::warn!(
+                    "eBPF object lacks xdp_nat_dispatch; direct-forward NAT stays on the normal dataplane"
+                );
+            }
+            (None, _) => {
+                let configured: usize = config
+                    .interfaces
+                    .iter()
+                    .map(|iface| iface.udp_forwards.len() + iface.tcp_forwards.len())
+                    .sum();
+                if configured > 0 {
+                    tracing::warn!(
+                        "eBPF object lacks XDP_DISPATCH; {configured} configured forwards are not active (stale object, rebuild cloud-node-xdp-ebpf.o)"
+                    );
+                }
+            }
+        }
         let program: &mut aya::programs::Xdp = ebpf
             .program_mut("cloud_node_xdp")
             .ok_or_else(|| anyhow::anyhow!("missing eBPF program cloud_node_xdp"))?
             .try_into()?;
-        program.load()?;
         for interface in &config.interfaces {
             let link_id = program.attach(&interface.name, mode)?;
             let link = program.take_link(link_id)?;
