@@ -214,6 +214,8 @@ pub struct XdpCounters {
     pub xsk_drops: u64,
     pub rate_limited: u64,
     pub ratelimit_map_full: u64,
+    pub udp_fwd_tx: u64,
+    pub udp_fwd_map_full: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -262,6 +264,94 @@ impl XdpQuicDcidKey {
     }
 }
 
+/// UDP direct-forward rule key: a listen address+port that bypasses the
+/// userspace dataplane entirely. `addr` carries an IPv4 address in the first
+/// 4 bytes when `family == 4`, or a full IPv6 address when `family == 6`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct XdpUdpFwdKey {
+    pub addr: [u8; 16],
+    pub port_be: u16,
+    pub family: u8,
+    pub _pad: u8,
+}
+
+impl XdpUdpFwdKey {
+    pub fn new_v4(addr_be: u32, port_be: u16) -> Self {
+        let mut addr = [0u8; 16];
+        addr[..4].copy_from_slice(&addr_be.to_be_bytes());
+        Self {
+            addr,
+            port_be,
+            family: 4,
+            _pad: 0,
+        }
+    }
+
+    pub fn new_v6(addr: [u8; 16], port_be: u16) -> Self {
+        Self {
+            addr,
+            port_be,
+            family: 6,
+            _pad: 0,
+        }
+    }
+}
+
+/// NAT target for a direct-forwarded UDP listen tuple. `next_hop_mac` is the
+/// resolved gateway/neighbor MAC for the backend, populated by userspace;
+/// the egress source MAC is taken from the inbound frame's destination (this
+/// interface's own address), so it needs no config.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpUdpFwdRule {
+    pub backend_addr: [u8; 16],
+    pub next_hop_mac: [u8; 6],
+    pub backend_port_be: u16,
+    pub family: u8,
+    /// Billing dimension: forwarded bytes are attributed to this server id.
+    pub server_id: i64,
+}
+
+/// Conntrack entry: a client 4-tuple pinned to a backend so reply traffic can
+/// be rewritten back to the listen tuple. Written on the first forwarded
+/// datagram; `client_mac` is learned from the ingress Ethernet header.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct XdpUdpCtKey {
+    pub client_addr: [u8; 16],
+    pub backend_addr: [u8; 16],
+    pub client_port_be: u16,
+    pub backend_port_be: u16,
+    pub family: u8,
+    pub _pad: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpUdpCtValue {
+    pub listen_addr: [u8; 16],
+    pub client_mac: [u8; 6],
+    pub listen_port_be: u16,
+    pub family: u8,
+    /// Billing dimension mirrored from the forward rule.
+    pub server_id: i64,
+    pub last_seen_ns: u64,
+}
+
+/// Per-CPU traffic accounting for direct-forwarded flows, keyed by the
+/// conntrack key so both directions accumulate under the client flow.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpFlowAcct {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_pkts: u64,
+    pub tx_pkts: u64,
+    pub last_seen_ns: u64,
+    pub server_id: i64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct XdpInterfacePolicy {
@@ -297,6 +387,11 @@ unsafe_impl_aya_pod!(
     XdpRateLimitConfig,
     XdpRateBucket,
     XdpQuicDcidKey,
+    XdpUdpFwdKey,
+    XdpUdpFwdRule,
+    XdpUdpCtKey,
+    XdpUdpCtValue,
+    XdpFlowAcct,
 );
 
 #[cfg(feature = "std")]

@@ -444,6 +444,12 @@ struct XdpManager {
     /// minimal set of map inserts/removes.
     #[cfg(target_os = "linux")]
     synced: parking_lot::Mutex<RuleState>,
+    /// Last-aggregated per-flow totals for XDP UDP direct-forward accounting;
+    /// sweeps emit deltas against this image so nothing is double-counted.
+    #[cfg(target_os = "linux")]
+    udp_flow_shadow: parking_lot::Mutex<
+        std::collections::HashMap<cloud_node_xdp_common::XdpUdpCtKey, cloud_node_xdp_common::XdpFlowAcct>,
+    >,
     map_sync_started: AtomicBool,
     map_sync_generation: AtomicU64,
     map_sync_notify: tokio::sync::Notify,
@@ -480,6 +486,8 @@ impl XdpManager {
             rule_sweeper_generation: AtomicU64::new(0),
             #[cfg(target_os = "linux")]
             synced: parking_lot::Mutex::new(RuleState::default()),
+            #[cfg(target_os = "linux")]
+            udp_flow_shadow: parking_lot::Mutex::new(std::collections::HashMap::new()),
             map_sync_started: AtomicBool::new(false),
             map_sync_generation: AtomicU64::new(0),
             map_sync_notify: tokio::sync::Notify::new(),
@@ -1440,6 +1448,40 @@ impl XdpManager {
         let _ = map.remove(dcid_key);
     }
 
+    /// GC direct-forward conntrack entries and fold per-CPU flow accounting
+    /// into billing. No-op unless the dataplane is attached and forwards are
+    /// configured.
+    #[cfg(target_os = "linux")]
+    fn sweep_udp_nat_maps(&self) {
+        let configured = self
+            .config
+            .interfaces
+            .iter()
+            .any(|iface| !iface.udp_forwards.is_empty());
+        if !configured || self.attached.read().is_empty() {
+            return;
+        }
+        let result = {
+            let mut guard = self.ebpf.lock();
+            let mut shadow = self.udp_flow_shadow.lock();
+            match guard.as_mut() {
+                Some(ebpf) => linux::sweep_udp_nat_maps(
+                    ebpf,
+                    &mut shadow,
+                    std::time::Duration::from_secs(180),
+                ),
+                None => Ok(()),
+            }
+        };
+        if let Err(err) = result {
+            tracing::warn!("XDP UDP NAT map sweep failed: {err}");
+            crate::pipeline_metrics::add(
+                crate::pipeline_metrics::PipelineCounter::XdpMapSyncFailed,
+                1,
+            );
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn flush_maps_full_blocking(&self, _proxy_dataplane_active: bool) {}
 
@@ -1678,6 +1720,8 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
                 tracing::debug!("XDP rule sweeper removed expired shadow rules");
             }
             manager.sync_rate_limit_config();
+            #[cfg(target_os = "linux")]
+            manager.sweep_udp_nat_maps();
         }
     });
 }
@@ -3326,8 +3370,9 @@ mod linux {
     use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, XskMap};
     use aya::programs::links::PinnedLink;
     use cloud_node_xdp_common::{
-        XdpCounters, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key,
-        XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig, XdpRuleValue,
+        XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key,
+        XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig, XdpRuleValue,
+        XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
     };
     use ipnet::IpNet;
     use std::collections::BTreeSet;
@@ -3921,6 +3966,7 @@ mod linux {
         sync_local_ip_maps(ebpf, config)?;
         sync_proxy_ports(ebpf, config, proxy_dataplane_active)?;
         sync_xsk_indices(ebpf, config, proxy_dataplane_active)?;
+        sync_udp_forwards(ebpf, config, proxy_dataplane_active)?;
         clear_rule_maps(ebpf)?;
         let empty = RuleState::default();
         apply_rule_diff(ebpf, &empty, state)?;
@@ -4109,6 +4155,241 @@ mod linux {
         }
         for entry in xsk_map_entries(config)? {
             map.insert(XdpQueueKey::new(entry.ifindex, entry.queue), entry.index, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Program explicit UDP direct-forward rules. Each entry needs a resolved
+    /// backend address and a next-hop MAC (from config or the neighbor table).
+    /// Unresolvable entries are skipped with a warning so the listen tuple
+    /// keeps its normal XSK/kernel path instead of being silently forwarded
+    /// with a bogus route.
+    fn sync_udp_forwards(
+        ebpf: &mut aya::Ebpf,
+        config: &XdpConfig,
+        dataplane_active: bool,
+    ) -> anyhow::Result<()> {
+        let Some(map) = ebpf.map_mut("XDP_UDP_FWD") else {
+            let configured: usize = config
+                .interfaces
+                .iter()
+                .map(|iface| iface.udp_forwards.len())
+                .sum();
+            if configured > 0 {
+                tracing::warn!(
+                    "eBPF object lacks XDP_UDP_FWD; {configured} configured UDP forwards are not active (stale object, rebuild cloud-node-xdp-ebpf.o)"
+                );
+            }
+            return Ok(());
+        };
+        let mut map =
+            AyaHashMap::<_, XdpUdpFwdKey, XdpUdpFwdRule>::try_from(map)?;
+        clear_hash_map(&mut map)?;
+        if !dataplane_active {
+            return Ok(());
+        }
+        for iface in &config.interfaces {
+            for fwd in &iface.udp_forwards {
+                match udp_forward_entry(fwd) {
+                    Ok((key, rule)) => {
+                        if let Err(err) = map.insert(key, rule, 0) {
+                            tracing::warn!(
+                                "XDP UDP forward {} -> {} on {} failed to install: {err}",
+                                fwd.listen,
+                                fwd.backend,
+                                iface.name
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "XDP UDP forward {} -> {} on {} is not active: {err}; traffic keeps the normal dataplane",
+                            fwd.listen,
+                            fwd.backend,
+                            iface.name
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn udp_forward_entry(
+        fwd: &crate::runtime_mode::XdpUdpForwardConfig,
+    ) -> anyhow::Result<(XdpUdpFwdKey, XdpUdpFwdRule)> {
+        use std::net::ToSocketAddrs;
+        let backend = fwd
+            .backend
+            .to_socket_addrs()
+            .map_err(|err| anyhow::anyhow!("backend {} resolve failed: {err}", fwd.backend))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("backend {} resolved no addresses", fwd.backend))?;
+        if backend.is_ipv4() != fwd.listen.is_ipv4() {
+            anyhow::bail!(
+                "address family mismatch: listen {} vs backend {}",
+                fwd.listen,
+                backend
+            );
+        }
+        let next_hop_mac = if fwd.next_hop_mac.is_empty() {
+            resolve_next_hop_mac(backend.ip())
+                .map_err(|err| anyhow::anyhow!("next-hop MAC for {}: {err}", backend.ip()))?
+        } else {
+            parse_mac(&fwd.next_hop_mac)
+                .map_err(|err| anyhow::anyhow!("invalid nextHopMac {}: {err}", fwd.next_hop_mac))?
+        };
+        let (key, backend_addr) = match (fwd.listen.ip(), backend.ip()) {
+            (IpAddr::V4(listen), IpAddr::V4(backend)) => (
+                XdpUdpFwdKey::new_v4(u32::from_be_bytes(listen.octets()), fwd.listen.port().to_be()),
+                v4_embed(backend),
+            ),
+            (IpAddr::V6(listen), IpAddr::V6(backend)) => (
+                XdpUdpFwdKey::new_v6(listen.octets(), fwd.listen.port().to_be()),
+                backend.octets(),
+            ),
+            _ => unreachable!(),
+        };
+        Ok((
+            key,
+            XdpUdpFwdRule {
+                backend_addr,
+                next_hop_mac,
+                backend_port_be: backend.port().to_be(),
+                family: key.family,
+                server_id: fwd.server_id,
+            },
+        ))
+    }
+
+    fn v4_embed(addr: std::net::Ipv4Addr) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..4].copy_from_slice(&addr.octets());
+        out
+    }
+
+    pub(super) fn parse_mac(text: &str) -> anyhow::Result<[u8; 6]> {
+        let parts: Vec<&str> = text.split(':').collect();
+        if parts.len() != 6 {
+            anyhow::bail!("expected 6 octets");
+        }
+        let mut mac = [0u8; 6];
+        for (idx, part) in parts.iter().enumerate() {
+            mac[idx] = u8::from_str_radix(part, 16)?;
+        }
+        Ok(mac)
+    }
+
+    /// Resolve the neighbor MAC for a backend address: `ip -j route get`
+    /// yields the next hop (gateway, or the target itself when on-link), then
+    /// `ip -j neigh show` yields its link-layer address.
+    fn resolve_next_hop_mac(target: IpAddr) -> anyhow::Result<[u8; 6]> {
+        let route = run_ip_json(&["route", "get", &target.to_string()])?;
+        let entry = route
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no route to {target}"))?;
+        let next_hop = entry
+            .get("gateway")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| target.to_string());
+        let neigh = run_ip_json(&["neigh", "show", "to", &next_hop])?;
+        for entry in &neigh {
+            let Some(lladdr) = entry.get("lladdr").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let usable = entry
+                .get("state")
+                .and_then(|v| v.as_array())
+                .map(|states| {
+                    states.iter().any(|s| {
+                        matches!(
+                            s.as_str(),
+                            Some("REACHABLE") | Some("STALE") | Some("DELAY") | Some("PERMANENT")
+                        )
+                    })
+                })
+                .unwrap_or(true);
+            if usable {
+                return parse_mac(lladdr)
+                    .map_err(|err| anyhow::anyhow!("neighbor {next_hop} lladdr {lladdr}: {err}"));
+            }
+        }
+        anyhow::bail!("no usable neighbor entry for {next_hop} (route to {target})")
+    }
+
+    fn run_ip_json(args: &[&str]) -> anyhow::Result<Vec<serde_json::Value>> {
+        let mut argv = vec!["-j"];
+        argv.extend_from_slice(args);
+        let output = std::process::Command::new("ip")
+            .args(&argv)
+            .output()
+            .map_err(|err| anyhow::anyhow!("ip command failed to start: {err}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "ip {} exited {}: {}",
+                argv.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|err| anyhow::anyhow!("ip -j output parse failed: {err}"))
+    }
+
+    /// GC stale conntrack entries and fold per-CPU flow accounting into the
+    /// billing pipeline. Entries idle past `ct_idle` are removed; accounting
+    /// is emitted as deltas against the shadow totals so repeated sweeps never
+    /// double-count.
+    pub(super) fn sweep_udp_nat_maps(
+        ebpf: &mut aya::Ebpf,
+        shadow: &mut std::collections::HashMap<XdpUdpCtKey, XdpFlowAcct>,
+        ct_idle: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let now_ns = monotonic_now_ns();
+        let idle_ns = ct_idle.as_nanos().min(u64::MAX as u128) as u64;
+
+        if let Some(map) = ebpf.map_mut("XDP_UDP_CT") {
+            let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
+            let mut stale = Vec::new();
+            for item in map.iter() {
+                let (key, value) = item?;
+                if now_ns.saturating_sub(value.last_seen_ns) >= idle_ns {
+                    stale.push(key);
+                }
+            }
+            for key in stale {
+                let _ = map.remove(&key);
+                shadow.remove(&key);
+            }
+        }
+
+        if let Some(map) = ebpf.map("XDP_FLOW_ACCT") {
+            let map = aya::maps::PerCpuHashMap::<_, XdpUdpCtKey, XdpFlowAcct>::try_from(map)?;
+            for item in map.iter() {
+                let (key, per_cpu) = item?;
+                let mut total = XdpFlowAcct::default();
+                for value in per_cpu.iter() {
+                    total.rx_bytes = total.rx_bytes.saturating_add(value.rx_bytes);
+                    total.tx_bytes = total.tx_bytes.saturating_add(value.tx_bytes);
+                    total.rx_pkts = total.rx_pkts.saturating_add(value.rx_pkts);
+                    total.tx_pkts = total.tx_pkts.saturating_add(value.tx_pkts);
+                    total.last_seen_ns = total.last_seen_ns.max(value.last_seen_ns);
+                    total.server_id = value.server_id;
+                }
+                let previous = shadow.get(&key).copied().unwrap_or_default();
+                let delta_rx = total.rx_bytes.saturating_sub(previous.rx_bytes);
+                let delta_tx = total.tx_bytes.saturating_sub(previous.tx_bytes);
+                if delta_rx > 0 || delta_tx > 0 {
+                    crate::metrics::record::record_transfer(
+                        total.server_id,
+                        delta_tx,
+                        delta_rx,
+                        None,
+                    );
+                }
+                shadow.insert(key, total);
+            }
         }
         Ok(())
     }
@@ -9402,6 +9683,43 @@ mod tests {
         let remaining = routes.iter().next().unwrap();
         assert_eq!(remaining.key().1.port(), 53003);
         assert_eq!(remaining.value().route.queue, 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn udp_forward_parse_mac_and_entry_validation() {
+        use std::net::SocketAddr;
+
+        assert_eq!(
+            linux::parse_mac("aa:bb:cc:dd:ee:ff").unwrap(),
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        );
+        assert!(linux::parse_mac("aa:bb").is_err());
+        assert!(linux::parse_mac("gg:bb:cc:dd:ee:ff").is_err());
+
+        let fwd = crate::runtime_mode::XdpUdpForwardConfig {
+            listen: SocketAddr::from(([192, 0, 2, 10], 5353)),
+            backend: "10.0.0.5:53".to_string(),
+            next_hop_mac: "02:00:00:00:00:01".to_string(),
+            server_id: 42,
+        };
+        let (key, rule) = linux::udp_forward_entry(&fwd).unwrap();
+        assert_eq!(key.family, 4);
+        assert_eq!(&key.addr[..4], &[192, 0, 2, 10]);
+        assert_eq!(key.port_be, 5353u16.to_be());
+        assert_eq!(&rule.backend_addr[..4], &[10, 0, 0, 5]);
+        assert_eq!(rule.backend_port_be, 53u16.to_be());
+        assert_eq!(rule.server_id, 42);
+        assert_eq!(rule.next_hop_mac, [0x02, 0, 0, 0, 0, 1]);
+
+        // Family mismatch is rejected explicitly.
+        let bad = crate::runtime_mode::XdpUdpForwardConfig {
+            listen: SocketAddr::from(([192, 0, 2, 10], 5353)),
+            backend: "[2001:db8::5]:53".to_string(),
+            next_hop_mac: "02:00:00:00:00:01".to_string(),
+            server_id: 0,
+        };
+        assert!(linux::udp_forward_entry(&bad).is_err());
     }
 
     #[test]
