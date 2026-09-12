@@ -1165,7 +1165,8 @@ pub fn effective_l4_threshold(
         .max(1)
         .saturating_mul(kind.threshold_multiplier());
     match level {
-        L4PressureLevel::Normal | L4PressureLevel::Elevated => threshold.max(1),
+        L4PressureLevel::Normal => threshold.max(1),
+        L4PressureLevel::Elevated => threshold.saturating_mul(3).saturating_div(4).max(1),
         L4PressureLevel::High => (threshold / 2).max(2),
         L4PressureLevel::Critical => (threshold / 4).max(2),
     }
@@ -1674,6 +1675,29 @@ mod tests {
     }
 
     #[test]
+    fn effective_threshold_scales_down_with_pressure() {
+        // base=20, multiplier=1 (high-confidence kind)
+        let kind = L4DefenseKind::TcpSlowFirstByte;
+        assert_eq!(effective_l4_threshold(20, kind, L4PressureLevel::Normal), 20);
+        assert_eq!(effective_l4_threshold(20, kind, L4PressureLevel::Elevated), 15);
+        assert_eq!(effective_l4_threshold(20, kind, L4PressureLevel::High), 10);
+        assert_eq!(effective_l4_threshold(20, kind, L4PressureLevel::Critical), 5);
+    }
+
+    #[test]
+    fn effective_threshold_never_drops_below_floor() {
+        let kind = L4DefenseKind::TcpSlowFirstByte;
+        assert_eq!(effective_l4_threshold(1, kind, L4PressureLevel::Critical), 2);
+        assert_eq!(effective_l4_threshold(4, kind, L4PressureLevel::High), 2);
+        // multiplier=4 kind: churn
+        let churn = L4DefenseKind::TcpAcceptedChurn;
+        assert_eq!(effective_l4_threshold(10, churn, L4PressureLevel::Normal), 40);
+        assert_eq!(effective_l4_threshold(10, churn, L4PressureLevel::Elevated), 30);
+        assert_eq!(effective_l4_threshold(10, churn, L4PressureLevel::High), 20);
+        assert_eq!(effective_l4_threshold(10, churn, L4PressureLevel::Critical), 10);
+    }
+
+    #[test]
     fn tcp_active_limit_per_ip_tightens_by_pressure() {
         let total = 1_048_576;
         assert_eq!(
@@ -1710,7 +1734,7 @@ mod tests {
         );
         assert_eq!(
             effective_l4_threshold(100, L4DefenseKind::QuicNoRoute, L4PressureLevel::Elevated),
-            400
+            300
         );
         assert_eq!(
             effective_l4_threshold(100, L4DefenseKind::QuicNoRoute, L4PressureLevel::High),
