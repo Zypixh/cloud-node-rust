@@ -999,7 +999,7 @@ fn notrack_rule_args() -> [&'static str; 24] {
 }
 
 #[cfg(target_os = "linux")]
-fn synproxy_rule_args() -> [&'static str; 20] {
+fn synproxy_rule_args() -> [&'static str; 19] {
     [
         "add",
         "rule",
@@ -1020,7 +1020,6 @@ fn synproxy_rule_args() -> [&'static str; 20] {
         "timestamp",
         "sack-perm",
         "comment",
-        NFT_COMMENT_SYNPROXY,
     ]
 }
 
@@ -1079,7 +1078,7 @@ fn with_rule_comment(args: &[String]) -> Vec<String> {
         } else {
             NFT_COMMENT_SYNPROXY
         };
-        out.push(comment.to_string());
+        out.push(format!("\"{comment}\""));
     }
     out
 }
