@@ -58,6 +58,10 @@ xdp:
 - `interfaces[].frameSize`：UMEM frame size，默认 `2048`。
 - `proxy.protocols`：允许进入 AF_XDP proxy 数据面的协议族。
 - `proxy.ports`：显式发布到 eBPF map 的协议和端口。
+- `interfaces[].udpForwards[]` / `interfaces[].tcpForwards[]`：L4 直通转发（XDP_TX NAT）规则，字段 `listen`、`backend`、`nextHopMac`（可空，自动按邻居表解析）、`serverId`、`snat`。
+  - `snat: false`（默认）：纯 DNAT，保留客户端源 IP。要求网络不过滤源 IP——多数云厂商的 vSwitch 按端口绑定源 IP 做 anti-spoof，会把这种帧丢掉（已实测：帧计数发出但对端不可达）。
+  - `snat: true`：源改写为 `(listen IP, 节点分配端口 40000-60999)`，回包经 `XDP_SNAT_REV` 反向绑定还原客户端 tuple。可在 anti-spoof 云上工作；代价是 backend 看到的源是本节点而非真实客户端。端口分配失败会计 `snat_alloc_fail` 并回落用户态路径（不丢包）。
+  - SNAT 模式下 backend 拿不到真实客户端 IP；如需保留可叠加 PROXY 协议（未实现）。
 
 ## 模式
 
@@ -103,6 +107,7 @@ proxy 模式命中端口后内核 socket 不再收到该包；未命中、降级
 - map 更新失败不会立即中断 socket 路径，状态中会记录 fallback reason。
 - 配置 reload 时，如果接口、队列和 proxy 端口未变化，运行时保留现有 AF_XDP bridge，避免队列重复绑定。
 - `detach` 会撤销当前进程管理的 XDP attach，并将状态标记为 detached。
+
 
 ## 集成测试
 
