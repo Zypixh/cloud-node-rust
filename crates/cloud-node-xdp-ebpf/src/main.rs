@@ -5,7 +5,7 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::{bpf_csum_diff, bpf_ktime_get_ns},
     macros::{map, xdp},
-    maps::{Array, HashMap, LpmTrie, PerCpuHashMap, XskMap, lpm_trie::Key as LpmKey},
+    maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, ProgramArray, XskMap, lpm_trie::Key as LpmKey},
     programs::XdpContext,
 };
 use cloud_node_xdp_common::{
@@ -131,6 +131,35 @@ static XDP_TCP_FWD: HashMap<XdpUdpFwdKey, XdpUdpFwdRule> =
 static XDP_TCP_CT: HashMap<XdpUdpCtKey, XdpUdpCtValue> =
     HashMap::<XdpUdpCtKey, XdpUdpCtValue>::with_max_entries(262_144, 0);
 
+/// Per-CPU scratch space for NAT/DCID key construction. eBPF stack is capped
+/// at 512 bytes and the conntrack/forward keys plus values exceed it when
+/// inlined, so large temporaries are built in this map instead. Internal only;
+/// never read by userspace.
+#[repr(C)]
+struct NatScratch {
+    fwd_key: XdpUdpFwdKey,
+    ct_key: XdpUdpCtKey,
+    ct_value: XdpUdpCtValue,
+    dcid_key: XdpQuicDcidKey,
+}
+
+#[map(name = "XDP_NAT_SCRATCH")]
+static XDP_NAT_SCRATCH: PerCpuArray<NatScratch> =
+    PerCpuArray::<NatScratch>::with_max_entries(1, 0);
+
+/// Tail-call table into the NAT subprogram. The NAT handlers need their own
+/// 512-byte stack and instruction budget, so they run as a separate XDP
+/// program; slot 0 = `xdp_nat_dispatch`.
+#[map(name = "XDP_DISPATCH")]
+static XDP_DISPATCH: ProgramArray = ProgramArray::with_max_entries(4, 0);
+
+const XDP_DISPATCH_NAT: u32 = 0;
+
+#[inline(always)]
+fn nat_scratch() -> Result<*mut NatScratch, ()> {
+    XDP_NAT_SCRATCH.get_ptr_mut(0).ok_or(())
+}
+
 /// Per-CPU byte/packet accounting for direct-forwarded flows; userspace
 /// aggregates periodically into the billing pipeline so the fast path never
 /// bypasses traffic accounting.
@@ -147,6 +176,94 @@ pub fn cloud_node_xdp(ctx: XdpContext) -> u32 {
             xdp_action::XDP_PASS
         }
     }
+}
+
+/// NAT subprogram entered via tail call. Runs the configured direct-forward
+/// handlers for the packet whose context the parent parked in XDP_NAT_SCRATCH,
+/// then falls through to the same redirect/PASS decision the parent would make.
+#[xdp]
+pub fn xdp_nat_dispatch(ctx: XdpContext) -> u32 {
+    match try_nat_dispatch(&ctx) {
+        Ok(action) => action,
+        Err(_) => {
+            counter_parse_error();
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+fn try_nat_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
+    // The subprogram re-parses the packet: offsets handed over through the
+    // scratch map arrive as unbounded scalars and lose the verifier's packet
+    // range tracking, whereas parsing derives them with proper bounds.
+    let (eth_proto, ip_offset) = parse_eth_payload(ctx)?;
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    let ifindex = ctx.ingress_ifindex() as u32;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
+    let (family, proto, l4_offset, packet_len) = if eth_proto == EtherType::Ipv4 as u16 {
+        let ip = ptr_at::<Ipv4Hdr>(ctx, ip_offset)?;
+        let ihl = unsafe { (*ip).ihl() as usize };
+        let total_len = unsafe { (*ip).tot_len() as usize };
+        if unsafe { (*ip).version() } != 4
+            || ihl < mem::size_of::<Ipv4Hdr>()
+            || total_len < ihl
+        {
+            return Err(());
+        }
+        if unsafe { (*ip).frag_offset() } != 0 || unsafe { (*ip).frag_flags() & 1 } != 0 {
+            return Ok(xdp_action::XDP_PASS);
+        }
+        (
+            4u8,
+            unsafe { (*ip).proto },
+            ip_offset + ihl,
+            total_len as u64,
+        )
+    } else if eth_proto == EtherType::Ipv6 as u16 {
+        let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
+        if unsafe { (*ip).version() } != 6 {
+            return Err(());
+        }
+        let payload_len = unsafe { u16::from_be_bytes((*ip).payload_len) as usize };
+        let packet_end = ip_offset
+            .checked_add(mem::size_of::<Ipv6Hdr>())
+            .and_then(|offset| offset.checked_add(payload_len))
+            .ok_or(())?;
+        if packet_end > ctx.data_end().saturating_sub(ctx.data()) {
+            return Err(());
+        }
+        let next = unsafe { (*ip).next_hdr };
+        let Some((proto, l4_offset)) = ipv6_transport_offset(
+            ctx,
+            next,
+            ip_offset + mem::size_of::<Ipv6Hdr>(),
+            packet_end,
+        )? else {
+            return Ok(xdp_action::XDP_PASS);
+        };
+        (6u8, proto, l4_offset, payload_len as u64)
+    } else {
+        return Ok(xdp_action::XDP_PASS);
+    };
+    let action = match (family, proto) {
+        (4, value) if value == IpProto::Udp as u8 => {
+            try_udp_nat_v4(ctx, ip_offset, l4_offset, packet_len, now_ns)?
+        }
+        (4, value) if value == IpProto::Tcp as u8 => {
+            try_tcp_nat_v4(ctx, ip_offset, l4_offset, packet_len, now_ns)?
+        }
+        (6, value) if value == IpProto::Udp as u8 => {
+            try_udp_nat_v6(ctx, ip_offset, l4_offset, packet_len, now_ns)?
+        }
+        (6, value) if value == IpProto::Tcp as u8 => {
+            try_tcp_nat_v6(ctx, ip_offset, l4_offset, packet_len, now_ns)?
+        }
+        _ => None,
+    };
+    if let Some(action) = action {
+        return Ok(action);
+    }
+    Ok(maybe_redirect(ctx, policy, proto, l4_offset))
 }
 
 fn try_cloud_node_xdp(ctx: XdpContext) -> Result<u32, ()> {
@@ -235,27 +352,12 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         if !local_ipv4_allowed(policy, ifindex, destination_be) {
             return Ok(xdp_action::XDP_PASS);
         }
-        if protocol == IpProto::Udp as u8 && policy.mode == 2 {
-            if let Some(action) = try_udp_nat_v4(
-                ctx,
-                ip_offset,
-                l4_offset,
-                total_len as u64,
-                now_mono_ns,
-            )? {
-                return Ok(action);
-            }
-        }
-        if protocol == IpProto::Tcp as u8 && policy.mode == 2 {
-            if let Some(action) = try_tcp_nat_v4(
-                ctx,
-                ip_offset,
-                l4_offset,
-                total_len as u64,
-                now_mono_ns,
-            )? {
-                return Ok(action);
-            }
+        if policy.mode == 2
+            && (protocol == IpProto::Udp as u8 || protocol == IpProto::Tcp as u8)
+        {
+            // Returns only when the dispatch slot is empty: explicit fallback
+            // to the normal redirect/PASS path, never a drop.
+            unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT) };
         }
     }
     Ok(maybe_redirect(ctx, policy, protocol, l4_offset))
@@ -313,19 +415,10 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         if !local_ipv6_allowed(policy, ifindex, destination) {
             return Ok(xdp_action::XDP_PASS);
         }
-        if protocol == IpProto::Udp as u8 && policy.mode == 2 {
-            if let Some(action) =
-                try_udp_nat_v6(ctx, ip_offset, l4_offset, payload_len as u64, now_mono_ns)?
-            {
-                return Ok(action);
-            }
-        }
-        if protocol == IpProto::Tcp as u8 && policy.mode == 2 {
-            if let Some(action) =
-                try_tcp_nat_v6(ctx, ip_offset, l4_offset, payload_len as u64, now_mono_ns)?
-            {
-                return Ok(action);
-            }
+        if policy.mode == 2
+            && (protocol == IpProto::Udp as u8 || protocol == IpProto::Tcp as u8)
+        {
+            unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT) };
         }
     }
     Ok(maybe_redirect(ctx, policy, protocol, l4_offset))
@@ -467,6 +560,7 @@ fn maybe_redirect(
 /// so they keep RSS queue affinity (userspace resolves those flows through the
 /// shared demux route table). Returns the mapped XSK index, or None to use the
 /// receiving queue.
+#[inline(never)]
 fn quic_dcid_xsk_index(ctx: &XdpContext, payload_offset: usize) -> Option<u32> {
     let first = read_u8(ctx, payload_offset).ok()?;
     if first & 0x80 == 0 {
@@ -485,25 +579,25 @@ fn quic_dcid_xsk_index(ctx: &XdpContext, payload_offset: usize) -> Option<u32> {
     if dcid_len == 0 || dcid_len > 20 {
         return None;
     }
-    let mut bytes = [0u8; 20];
+    let scratch = nat_scratch().ok()?;
+    let key = unsafe { &mut (*scratch).dcid_key };
+    key.len = dcid_len as u8;
+    key._pad = [0; 3];
     for i in 0..20usize {
         if i >= dcid_len {
-            break;
+            key.bytes[i] = 0;
+        } else {
+            key.bytes[i] = read_u8(ctx, payload_offset + 6 + i).ok()?;
         }
-        bytes[i] = read_u8(ctx, payload_offset + 6 + i).ok()?;
     }
-    let key = XdpQuicDcidKey {
-        bytes,
-        len: dcid_len as u8,
-        _pad: [0; 3],
-    };
-    unsafe { XDP_QUIC_DCID.get(&key).copied() }
+    unsafe { XDP_QUIC_DCID.get(&(*scratch).dcid_key).copied() }
 }
 
 /// Per-IP fixed-window pps limiter. Only UDP datagrams and TCP SYN-without-ACK
 /// (connection attempts) are counted; established flows are never throttled.
 /// A full map fails open (pass + `ratelimit_map_full` counter) so the limiter
 /// can never blackhole traffic on map exhaustion.
+#[inline(never)]
 fn rate_limited_v4(
     ctx: &XdpContext,
     key: &XdpIpv4Key,
@@ -511,7 +605,7 @@ fn rate_limited_v4(
     l4_offset: usize,
     now_mono_ns: u64,
 ) -> bool {
-    let Some(cfg) = XDP_RATE_CFG.get(0).copied() else {
+    let Some(cfg) = XDP_RATE_CFG.get(0) else {
         return false;
     };
     let limit = match protocol {
@@ -530,6 +624,7 @@ fn rate_limited_v4(
     rate_bucket_hit_v4(key, limit, cfg.window_ns, now_mono_ns)
 }
 
+#[inline(never)]
 fn rate_limited_v6(
     ctx: &XdpContext,
     key: &XdpIpv6Key,
@@ -537,7 +632,7 @@ fn rate_limited_v6(
     l4_offset: usize,
     now_mono_ns: u64,
 ) -> bool {
-    let Some(cfg) = XDP_RATE_CFG.get(0).copied() else {
+    let Some(cfg) = XDP_RATE_CFG.get(0) else {
         return false;
     };
     let limit = match protocol {
@@ -795,6 +890,7 @@ fn rate_bucket_hit_v6(
 /// UDP direct forward / NAT, IPv4. Returns `Some(action)` when the packet was
 /// handled (XDP_TX); `None` falls through to the normal redirect/PASS path so
 /// a forward-map miss never drops traffic silently.
+#[inline(never)]
 fn try_udp_nat_v4(
     ctx: &XdpContext,
     ip_offset: usize,
@@ -810,22 +906,24 @@ fn try_udp_nat_v4(
     let dst_addr = unsafe { (*ip).dst_addr };
     let src_be = u32::from_be_bytes(src_addr);
     let dst_be = u32::from_be_bytes(dst_addr);
+    let scratch = nat_scratch()?;
 
     // Reply path: source is a backend serving a tracked client flow.
-    let ct_key = XdpUdpCtKey {
-        client_addr: v4_embed(dst_be),
-        backend_addr: v4_embed(src_be),
-        client_port_be: dst_port,
-        backend_port_be: src_port,
-        family: 4,
-        proto: 17,
-        _pad: [0; 2],
+    unsafe {
+        let k = &mut (*scratch).ct_key;
+        k.client_addr = v4_embed(dst_be);
+        k.backend_addr = v4_embed(src_be);
+        k.client_port_be = dst_port;
+        k.backend_port_be = src_port;
+        k.family = 4;
+        k.proto = 17;
     };
-    if let Some(ct) = XDP_UDP_CT.get_ptr_mut(&ct_key) {
+    if let Some(ct) = XDP_UDP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         ct.last_seen_ns = now_mono_ns;
         let listen_be = u32::from_be_bytes([ct.listen_addr[0], ct.listen_addr[1], ct.listen_addr[2], ct.listen_addr[3]]);
+        let listen_port = ct.listen_port_be;
         // Rewrite source -> listen tuple.
         let mut old_w = [u32::from_ne_bytes(src_addr), 0, 0, 0];
         let mut new_w = [u32::from_ne_bytes(listen_be.to_be_bytes()), 0, 0, 0];
@@ -833,17 +931,22 @@ fn try_udp_nat_v4(
         unsafe { (*ip_hdr).src_addr = listen_be.to_be_bytes() };
         ipv4_csum_update(ctx, ip_offset, u32::from_ne_bytes(src_addr), u32::from_ne_bytes(listen_be.to_be_bytes()))?;
         let udp_hdr = ptr_at_mut::<UdpHdr>(ctx, l4_offset)?;
-        unsafe { (*udp_hdr).src = ct.listen_port_be.to_ne_bytes() };
-        udp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 1, src_port, ct.listen_port_be)?;
+        unsafe { (*udp_hdr).src = listen_port.to_ne_bytes() };
+        udp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 1, src_port, listen_port)?;
         eth_rewrite(ctx, ct.client_mac)?;
-        acct_flow(&ct_key, 0, packet_len, ct.server_id, now_mono_ns);
+        acct_flow(unsafe { &(*scratch).ct_key }, 0, packet_len, ct.server_id, now_mono_ns);
         counter_udp_fwd_tx();
         return Ok(Some(xdp_action::XDP_TX));
     }
 
     // Forward path: destination is a configured direct-forward listen tuple.
-    let fwd_key = XdpUdpFwdKey::new_v4(dst_be, dst_port);
-    let Some(rule) = (unsafe { XDP_UDP_FWD.get(&fwd_key) }) else {
+    unsafe {
+        let k = &mut (*scratch).fwd_key;
+        k.addr = v4_embed(dst_be);
+        k.port_be = dst_port;
+        k.family = 4;
+    };
+    let Some(rule) = (unsafe { XDP_UDP_FWD.get(&(*scratch).fwd_key) }) else {
         return Ok(None);
     };
     let eth = ptr_at::<EthHdr>(ctx, 0)?;
@@ -854,30 +957,42 @@ fn try_udp_nat_v4(
         rule.backend_addr[2],
         rule.backend_addr[3],
     ]);
-    let ct_key = XdpUdpCtKey {
-        client_addr: v4_embed(src_be),
-        backend_addr: rule.backend_addr,
-        client_port_be: src_port,
-        backend_port_be: rule.backend_port_be,
-        family: 4,
-        proto: 17,
-        _pad: [0; 2],
-    };
-    let ct_value = XdpUdpCtValue {
-        listen_addr: v4_embed(dst_be),
-        client_mac,
-        listen_port_be: dst_port,
-        family: 4,
-        state: XDP_CT_STATE_OPEN,
-        _pad: [0; 6],
-        server_id: rule.server_id,
-        last_seen_ns: now_mono_ns,
-    };
-    if let Some(ct) = XDP_UDP_CT.get_ptr_mut(&ct_key) {
+    unsafe {
+        let k = &mut (*scratch).ct_key;
+        k.client_addr = v4_embed(src_be);
+        k.backend_addr = rule.backend_addr;
+        k.client_port_be = src_port;
+        k.backend_port_be = rule.backend_port_be;
+        k.family = 4;
+        k.proto = 17;
+        let v = &mut (*scratch).ct_value;
+        v.listen_addr = v4_embed(dst_be);
+        v.client_mac = client_mac;
+        v.listen_port_be = dst_port;
+        v.family = 4;
+        v.state = XDP_CT_STATE_OPEN;
+        v.server_id = rule.server_id;
+        v.last_seen_ns = now_mono_ns;
+    }
+    if let Some(ct) = XDP_UDP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
-        *ct = ct_value;
-    } else if XDP_UDP_CT.insert(&ct_key, &ct_value, 0).is_err() {
+        let v = unsafe { &(*scratch).ct_value };
+        ct.listen_addr = v.listen_addr;
+        ct.client_mac = v.client_mac;
+        ct.listen_port_be = v.listen_port_be;
+        ct.family = v.family;
+        ct.state = v.state;
+        ct.server_id = v.server_id;
+        ct.last_seen_ns = v.last_seen_ns;
+    } else if XDP_UDP_CT
+        .insert(
+            unsafe { &(*scratch).ct_key },
+            unsafe { &(*scratch).ct_value },
+            0,
+        )
+        .is_err()
+    {
         // Fail explicit: report and leave the packet to the normal path so a
         // full conntrack table degrades to userspace handling, not drops.
         counter_udp_fwd_map_full();
@@ -893,7 +1008,13 @@ fn try_udp_nat_v4(
     unsafe { (*udp_hdr).dst = rule.backend_port_be.to_ne_bytes() };
     udp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 1, dst_port, rule.backend_port_be)?;
     eth_rewrite(ctx, rule.next_hop_mac)?;
-    acct_flow(&ct_key, packet_len, 0, rule.server_id, now_mono_ns);
+    acct_flow(
+        unsafe { &(*scratch).ct_key },
+        packet_len,
+        0,
+        rule.server_id,
+        now_mono_ns,
+    );
     counter_udp_fwd_tx();
     Ok(Some(xdp_action::XDP_TX))
 }
@@ -902,6 +1023,7 @@ fn try_udp_nat_v4(
 /// IPv6 header has no checksum, but the UDP checksum covers the pseudo-header
 /// addresses and is mandatory, so it is always updated when non-zero (a zero
 /// checksum is preserved rather than fabricated over unseen payload).
+#[inline(never)]
 fn try_udp_nat_v6(
     ctx: &XdpContext,
     ip_offset: usize,
@@ -915,63 +1037,82 @@ fn try_udp_nat_v6(
     let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
     let src_addr = unsafe { (*ip).src_addr };
     let dst_addr = unsafe { (*ip).dst_addr };
+    let scratch = nat_scratch()?;
 
-    let ct_key = XdpUdpCtKey {
-        client_addr: dst_addr,
-        backend_addr: src_addr,
-        client_port_be: dst_port,
-        backend_port_be: src_port,
-        family: 6,
-        proto: 17,
-        _pad: [0; 2],
+    unsafe {
+        let k = &mut (*scratch).ct_key;
+        k.client_addr = dst_addr;
+        k.backend_addr = src_addr;
+        k.client_port_be = dst_port;
+        k.backend_port_be = src_port;
+        k.family = 6;
+        k.proto = 17;
     };
-    if let Some(ct) = XDP_UDP_CT.get_ptr_mut(&ct_key) {
+    if let Some(ct) = XDP_UDP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         ct.last_seen_ns = now_mono_ns;
+        let listen_port = ct.listen_port_be;
         let mut old_w = words16(src_addr);
         let mut new_w = words16(ct.listen_addr);
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
         unsafe { (*ip_hdr).src_addr = ct.listen_addr };
         let udp_hdr = ptr_at_mut::<UdpHdr>(ctx, l4_offset)?;
-        unsafe { (*udp_hdr).src = ct.listen_port_be.to_ne_bytes() };
-        udp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 4, src_port, ct.listen_port_be)?;
+        unsafe { (*udp_hdr).src = listen_port.to_ne_bytes() };
+        udp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 4, src_port, listen_port)?;
         eth_rewrite(ctx, ct.client_mac)?;
-        acct_flow(&ct_key, 0, packet_len, ct.server_id, now_mono_ns);
+        acct_flow(unsafe { &(*scratch).ct_key }, 0, packet_len, ct.server_id, now_mono_ns);
         counter_udp_fwd_tx();
         return Ok(Some(xdp_action::XDP_TX));
     }
 
-    let fwd_key = XdpUdpFwdKey::new_v6(dst_addr, dst_port);
-    let Some(rule) = (unsafe { XDP_UDP_FWD.get(&fwd_key) }) else {
+    unsafe {
+        let k = &mut (*scratch).fwd_key;
+        k.addr = dst_addr;
+        k.port_be = dst_port;
+        k.family = 6;
+    };
+    let Some(rule) = (unsafe { XDP_UDP_FWD.get(&(*scratch).fwd_key) }) else {
         return Ok(None);
     };
     let eth = ptr_at::<EthHdr>(ctx, 0)?;
     let client_mac = unsafe { (*eth).src_addr };
-    let ct_key = XdpUdpCtKey {
-        client_addr: src_addr,
-        backend_addr: rule.backend_addr,
-        client_port_be: src_port,
-        backend_port_be: rule.backend_port_be,
-        family: 6,
-        proto: 17,
-        _pad: [0; 2],
-    };
-    let ct_value = XdpUdpCtValue {
-        listen_addr: dst_addr,
-        client_mac,
-        listen_port_be: dst_port,
-        family: 6,
-        state: XDP_CT_STATE_OPEN,
-        _pad: [0; 6],
-        server_id: rule.server_id,
-        last_seen_ns: now_mono_ns,
-    };
-    if let Some(ct) = XDP_UDP_CT.get_ptr_mut(&ct_key) {
+    unsafe {
+        let k = &mut (*scratch).ct_key;
+        k.client_addr = src_addr;
+        k.backend_addr = rule.backend_addr;
+        k.client_port_be = src_port;
+        k.backend_port_be = rule.backend_port_be;
+        k.family = 6;
+        k.proto = 17;
+        let v = &mut (*scratch).ct_value;
+        v.listen_addr = dst_addr;
+        v.client_mac = client_mac;
+        v.listen_port_be = dst_port;
+        v.family = 6;
+        v.state = XDP_CT_STATE_OPEN;
+        v.server_id = rule.server_id;
+        v.last_seen_ns = now_mono_ns;
+    }
+    if let Some(ct) = XDP_UDP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
-        *ct = ct_value;
-    } else if XDP_UDP_CT.insert(&ct_key, &ct_value, 0).is_err() {
+        let v = unsafe { &(*scratch).ct_value };
+        ct.listen_addr = v.listen_addr;
+        ct.client_mac = v.client_mac;
+        ct.listen_port_be = v.listen_port_be;
+        ct.family = v.family;
+        ct.state = v.state;
+        ct.server_id = v.server_id;
+        ct.last_seen_ns = v.last_seen_ns;
+    } else if XDP_UDP_CT
+        .insert(
+            unsafe { &(*scratch).ct_key },
+            unsafe { &(*scratch).ct_value },
+            0,
+        )
+        .is_err()
+    {
         counter_udp_fwd_map_full();
         return Ok(None);
     }
@@ -983,7 +1124,13 @@ fn try_udp_nat_v6(
     unsafe { (*udp_hdr).dst = rule.backend_port_be.to_ne_bytes() };
     udp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 4, dst_port, rule.backend_port_be)?;
     eth_rewrite(ctx, rule.next_hop_mac)?;
-    acct_flow(&ct_key, packet_len, 0, rule.server_id, now_mono_ns);
+    acct_flow(
+        unsafe { &(*scratch).ct_key },
+        packet_len,
+        0,
+        rule.server_id,
+        now_mono_ns,
+    );
     counter_udp_fwd_tx();
     Ok(Some(xdp_action::XDP_TX))
 }
@@ -1032,6 +1179,7 @@ fn tcp_csum_update(
 /// mid-stream pickups never get silently fast-pathed: non-SYN packets without
 /// state fall through to `None` (PASS -> userspace/kernel dataplane). FIN/RST
 /// in either direction marks the entry CLOSING for early reaping by userspace.
+#[inline(never)]
 fn try_tcp_nat_v4(
     ctx: &XdpContext,
     ip_offset: usize,
@@ -1050,18 +1198,19 @@ fn try_tcp_nat_v4(
     let dst_addr = unsafe { (*ip).dst_addr };
     let src_be = u32::from_be_bytes(src_addr);
     let dst_be = u32::from_be_bytes(dst_addr);
+    let scratch = nat_scratch()?;
 
     // Reply path: source is a backend serving a tracked client flow.
-    let ct_key = XdpUdpCtKey {
-        client_addr: v4_embed(dst_be),
-        backend_addr: v4_embed(src_be),
-        client_port_be: dst_port,
-        backend_port_be: src_port,
-        family: 4,
-        proto: 6,
-        _pad: [0; 2],
+    unsafe {
+        let k = &mut (*scratch).ct_key;
+        k.client_addr = v4_embed(dst_be);
+        k.backend_addr = v4_embed(src_be);
+        k.client_port_be = dst_port;
+        k.backend_port_be = src_port;
+        k.family = 4;
+        k.proto = 6;
     };
-    if let Some(ct) = XDP_TCP_CT.get_ptr_mut(&ct_key) {
+    if let Some(ct) = XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         ct.last_seen_ns = now_mono_ns;
@@ -1074,6 +1223,7 @@ fn try_tcp_nat_v4(
             ct.listen_addr[2],
             ct.listen_addr[3],
         ]);
+        let listen_port = ct.listen_port_be;
         let mut old_w = [u32::from_ne_bytes(src_addr), 0, 0, 0];
         let mut new_w = [u32::from_ne_bytes(listen_be.to_be_bytes()), 0, 0, 0];
         let ip_hdr = ptr_at_mut::<Ipv4Hdr>(ctx, ip_offset)?;
@@ -1085,17 +1235,22 @@ fn try_tcp_nat_v4(
             u32::from_ne_bytes(listen_be.to_be_bytes()),
         )?;
         let tcp_hdr = ptr_at_mut::<TcpHdr>(ctx, l4_offset)?;
-        unsafe { (*tcp_hdr).source = ct.listen_port_be.to_ne_bytes() };
-        tcp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 1, src_port, ct.listen_port_be)?;
+        unsafe { (*tcp_hdr).source = listen_port.to_ne_bytes() };
+        tcp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 1, src_port, listen_port)?;
         eth_rewrite(ctx, ct.client_mac)?;
-        acct_flow(&ct_key, 0, packet_len, ct.server_id, now_mono_ns);
+        acct_flow(unsafe { &(*scratch).ct_key }, 0, packet_len, ct.server_id, now_mono_ns);
         counter_tcp_fwd_tx();
         return Ok(Some(xdp_action::XDP_TX));
     }
 
     // Forward path: destination is a configured direct-forward listen tuple.
-    let fwd_key = XdpUdpFwdKey::new_v4(dst_be, dst_port);
-    let Some(rule) = (unsafe { XDP_TCP_FWD.get(&fwd_key) }) else {
+    unsafe {
+        let k = &mut (*scratch).fwd_key;
+        k.addr = v4_embed(dst_be);
+        k.port_be = dst_port;
+        k.family = 4;
+    };
+    let Some(rule) = (unsafe { XDP_TCP_FWD.get(&(*scratch).fwd_key) }) else {
         return Ok(None);
     };
     let backend_be = u32::from_be_bytes([
@@ -1104,16 +1259,16 @@ fn try_tcp_nat_v4(
         rule.backend_addr[2],
         rule.backend_addr[3],
     ]);
-    let ct_key = XdpUdpCtKey {
-        client_addr: v4_embed(src_be),
-        backend_addr: rule.backend_addr,
-        client_port_be: src_port,
-        backend_port_be: rule.backend_port_be,
-        family: 4,
-        proto: 6,
-        _pad: [0; 2],
-    };
-    match XDP_TCP_CT.get_ptr_mut(&ct_key) {
+    unsafe {
+        let k = &mut (*scratch).ct_key;
+        k.client_addr = v4_embed(src_be);
+        k.backend_addr = rule.backend_addr;
+        k.client_port_be = src_port;
+        k.backend_port_be = rule.backend_port_be;
+        k.family = 4;
+        k.proto = 6;
+    }
+    match XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         Some(ct) => {
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
@@ -1129,17 +1284,24 @@ fn try_tcp_nat_v4(
                 return Ok(None);
             }
             let eth = ptr_at::<EthHdr>(ctx, 0)?;
-            let ct_value = XdpUdpCtValue {
-                listen_addr: v4_embed(dst_be),
-                client_mac: unsafe { (*eth).src_addr },
-                listen_port_be: dst_port,
-                family: 4,
-                state: XDP_CT_STATE_OPEN,
-                _pad: [0; 6],
-                server_id: rule.server_id,
-                last_seen_ns: now_mono_ns,
-            };
-            if XDP_TCP_CT.insert(&ct_key, &ct_value, 0).is_err() {
+            unsafe {
+                let v = &mut (*scratch).ct_value;
+                v.listen_addr = v4_embed(dst_be);
+                v.client_mac = (*eth).src_addr;
+                v.listen_port_be = dst_port;
+                v.family = 4;
+                v.state = XDP_CT_STATE_OPEN;
+                v.server_id = rule.server_id;
+                v.last_seen_ns = now_mono_ns;
+            }
+            if XDP_TCP_CT
+                .insert(
+                    unsafe { &(*scratch).ct_key },
+                    unsafe { &(*scratch).ct_value },
+                    0,
+                )
+                .is_err()
+            {
                 counter_tcp_fwd_map_full();
                 return Ok(None);
             }
@@ -1167,12 +1329,19 @@ fn try_tcp_nat_v4(
         rule.backend_port_be,
     )?;
     eth_rewrite(ctx, rule.next_hop_mac)?;
-    acct_flow(&ct_key, packet_len, 0, rule.server_id, now_mono_ns);
+    acct_flow(
+        unsafe { &(*scratch).ct_key },
+        packet_len,
+        0,
+        rule.server_id,
+        now_mono_ns,
+    );
     counter_tcp_fwd_tx();
     Ok(Some(xdp_action::XDP_TX))
 }
 
 /// TCP direct forward / NAT, IPv6. Same contract as `try_tcp_nat_v4`.
+#[inline(never)]
 fn try_tcp_nat_v6(
     ctx: &XdpContext,
     ip_offset: usize,
@@ -1189,50 +1358,57 @@ fn try_tcp_nat_v6(
     let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
     let src_addr = unsafe { (*ip).src_addr };
     let dst_addr = unsafe { (*ip).dst_addr };
+    let scratch = nat_scratch()?;
 
-    let ct_key = XdpUdpCtKey {
-        client_addr: dst_addr,
-        backend_addr: src_addr,
-        client_port_be: dst_port,
-        backend_port_be: src_port,
-        family: 6,
-        proto: 6,
-        _pad: [0; 2],
+    unsafe {
+        let k = &mut (*scratch).ct_key;
+        k.client_addr = dst_addr;
+        k.backend_addr = src_addr;
+        k.client_port_be = dst_port;
+        k.backend_port_be = src_port;
+        k.family = 6;
+        k.proto = 6;
     };
-    if let Some(ct) = XDP_TCP_CT.get_ptr_mut(&ct_key) {
+    if let Some(ct) = XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         ct.last_seen_ns = now_mono_ns;
         if closing {
             ct.state = XDP_CT_STATE_CLOSING;
         }
+        let listen_port = ct.listen_port_be;
         let mut old_w = words16(src_addr);
         let mut new_w = words16(ct.listen_addr);
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
         unsafe { (*ip_hdr).src_addr = ct.listen_addr };
         let tcp_hdr = ptr_at_mut::<TcpHdr>(ctx, l4_offset)?;
-        unsafe { (*tcp_hdr).source = ct.listen_port_be.to_ne_bytes() };
-        tcp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 4, src_port, ct.listen_port_be)?;
+        unsafe { (*tcp_hdr).source = listen_port.to_ne_bytes() };
+        tcp_csum_update(ctx, l4_offset, &mut old_w, &mut new_w, 4, src_port, listen_port)?;
         eth_rewrite(ctx, ct.client_mac)?;
-        acct_flow(&ct_key, 0, packet_len, ct.server_id, now_mono_ns);
+        acct_flow(unsafe { &(*scratch).ct_key }, 0, packet_len, ct.server_id, now_mono_ns);
         counter_tcp_fwd_tx();
         return Ok(Some(xdp_action::XDP_TX));
     }
 
-    let fwd_key = XdpUdpFwdKey::new_v6(dst_addr, dst_port);
-    let Some(rule) = (unsafe { XDP_TCP_FWD.get(&fwd_key) }) else {
+    unsafe {
+        let k = &mut (*scratch).fwd_key;
+        k.addr = dst_addr;
+        k.port_be = dst_port;
+        k.family = 6;
+    };
+    let Some(rule) = (unsafe { XDP_TCP_FWD.get(&(*scratch).fwd_key) }) else {
         return Ok(None);
     };
-    let ct_key = XdpUdpCtKey {
-        client_addr: src_addr,
-        backend_addr: rule.backend_addr,
-        client_port_be: src_port,
-        backend_port_be: rule.backend_port_be,
-        family: 6,
-        proto: 6,
-        _pad: [0; 2],
-    };
-    match XDP_TCP_CT.get_ptr_mut(&ct_key) {
+    unsafe {
+        let k = &mut (*scratch).ct_key;
+        k.client_addr = src_addr;
+        k.backend_addr = rule.backend_addr;
+        k.client_port_be = src_port;
+        k.backend_port_be = rule.backend_port_be;
+        k.family = 6;
+        k.proto = 6;
+    }
+    match XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         Some(ct) => {
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
@@ -1246,17 +1422,24 @@ fn try_tcp_nat_v6(
                 return Ok(None);
             }
             let eth = ptr_at::<EthHdr>(ctx, 0)?;
-            let ct_value = XdpUdpCtValue {
-                listen_addr: dst_addr,
-                client_mac: unsafe { (*eth).src_addr },
-                listen_port_be: dst_port,
-                family: 6,
-                state: XDP_CT_STATE_OPEN,
-                _pad: [0; 6],
-                server_id: rule.server_id,
-                last_seen_ns: now_mono_ns,
-            };
-            if XDP_TCP_CT.insert(&ct_key, &ct_value, 0).is_err() {
+            unsafe {
+                let v = &mut (*scratch).ct_value;
+                v.listen_addr = dst_addr;
+                v.client_mac = (*eth).src_addr;
+                v.listen_port_be = dst_port;
+                v.family = 6;
+                v.state = XDP_CT_STATE_OPEN;
+                v.server_id = rule.server_id;
+                v.last_seen_ns = now_mono_ns;
+            }
+            if XDP_TCP_CT
+                .insert(
+                    unsafe { &(*scratch).ct_key },
+                    unsafe { &(*scratch).ct_value },
+                    0,
+                )
+                .is_err()
+            {
                 counter_tcp_fwd_map_full();
                 return Ok(None);
             }
@@ -1278,7 +1461,13 @@ fn try_tcp_nat_v6(
         rule.backend_port_be,
     )?;
     eth_rewrite(ctx, rule.next_hop_mac)?;
-    acct_flow(&ct_key, packet_len, 0, rule.server_id, now_mono_ns);
+    acct_flow(
+        unsafe { &(*scratch).ct_key },
+        packet_len,
+        0,
+        rule.server_id,
+        now_mono_ns,
+    );
     counter_tcp_fwd_tx();
     Ok(Some(xdp_action::XDP_TX))
 }
