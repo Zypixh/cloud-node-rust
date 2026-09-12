@@ -89,6 +89,14 @@ pub struct XdpStatusSnapshot {
     pub parse_errors: u64,
     pub map_miss: u64,
     pub xsk_drops: u64,
+    #[serde(default)]
+    pub rate_limited: u64,
+    #[serde(default)]
+    pub ratelimit_map_full: u64,
+    #[serde(default)]
+    pub rate_limit_active: bool,
+    #[serde(default)]
+    pub rate_limit_detail: String,
     pub updated_at: i64,
 }
 
@@ -423,6 +431,10 @@ struct XdpManager {
     parse_errors: AtomicU64,
     map_miss: AtomicU64,
     xsk_drops: AtomicU64,
+    rate_limited: AtomicU64,
+    ratelimit_map_full: AtomicU64,
+    rate_limit_active: AtomicU64,
+    rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
     last_state_write_at: AtomicU64,
     rule_sweeper_started: AtomicBool,
@@ -458,6 +470,10 @@ impl XdpManager {
             parse_errors: AtomicU64::new(0),
             map_miss: AtomicU64::new(0),
             xsk_drops: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+            ratelimit_map_full: AtomicU64::new(0),
+            rate_limit_active: AtomicU64::new(0),
+            rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
             last_state_write_at: AtomicU64::new(0),
             rule_sweeper_started: AtomicBool::new(false),
@@ -1001,6 +1017,10 @@ impl XdpManager {
             parse_errors: self.parse_errors.load(Ordering::Relaxed),
             map_miss: self.map_miss.load(Ordering::Relaxed),
             xsk_drops: self.xsk_drops.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            ratelimit_map_full: self.ratelimit_map_full.load(Ordering::Relaxed),
+            rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
+            rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
         }
     }
@@ -1303,6 +1323,66 @@ impl XdpManager {
     #[cfg(not(target_os = "linux"))]
     fn flush_maps_diff(&self) {}
 
+    /// Effective per-IP rate limit for the current pressure level: base
+    /// settings apply at Elevated, halve at High, quarter at Critical, and the
+    /// limiter is fully disabled at Normal (zero pps = off in eBPF).
+    fn effective_rate_limit_config(&self) -> cloud_node_xdp_common::XdpRateLimitConfig {
+        let mut config = cloud_node_xdp_common::XdpRateLimitConfig::default();
+        let Some(base) = &self.config.rate_limit else {
+            return config;
+        };
+        let divisor: u64 = match crate::l4_defense::current_pressure_level() {
+            crate::l4_defense::L4PressureLevel::Normal => return config,
+            crate::l4_defense::L4PressureLevel::Elevated => 1,
+            crate::l4_defense::L4PressureLevel::High => 2,
+            crate::l4_defense::L4PressureLevel::Critical => 4,
+        };
+        config.udp_pps = base.udp_pps / divisor;
+        config.tcp_syn_pps = base.tcp_syn_pps / divisor;
+        config.window_ns = base.window_ms.saturating_mul(1_000_000);
+        config
+    }
+
+    /// Push the effective rate limit into the eBPF config map and record the
+    /// outcome in the status snapshot. An object without XDP_RATE_CFG (built
+    /// before the limiter existed) is reported, never silently ignored.
+    fn sync_rate_limit_config(&self) {
+        let config = self.effective_rate_limit_config();
+        let active = config.window_ns != 0 && (config.udp_pps != 0 || config.tcp_syn_pps != 0);
+        let detail = format!(
+            "udp_pps={} tcp_syn_pps={} window_ns={}",
+            config.udp_pps, config.tcp_syn_pps, config.window_ns
+        );
+        #[cfg(target_os = "linux")]
+        let result = {
+            let mut ebpf = self.ebpf.lock();
+            match ebpf.as_mut() {
+                Some(ebpf) => linux::sync_rate_limit(ebpf, &config),
+                None => return,
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let result: anyhow::Result<()> = Ok(());
+        match result {
+            Ok(()) => {
+                self.rate_limit_active.store(u64::from(active), Ordering::Relaxed);
+                *self.rate_limit_detail.lock() = detail;
+            }
+            Err(err) => {
+                let detail = format!("rate limit map sync unavailable: {err}");
+                if *self.rate_limit_detail.lock() != detail {
+                    tracing::warn!("{detail}");
+                    *self.rate_limit_detail.lock() = detail;
+                }
+                self.rate_limit_active.store(0, Ordering::Relaxed);
+                crate::pipeline_metrics::add(
+                    crate::pipeline_metrics::PipelineCounter::XdpMapSyncFailed,
+                    1,
+                );
+            }
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn flush_maps_full_blocking(&self, _proxy_dataplane_active: bool) {}
 
@@ -1341,6 +1421,10 @@ impl XdpManager {
                     .store(counters.parse_errors, Ordering::Relaxed);
                 self.map_miss.store(counters.map_miss, Ordering::Relaxed);
                 self.xsk_drops.store(counters.xsk_drops, Ordering::Relaxed);
+                self.rate_limited
+                    .store(counters.rate_limited, Ordering::Relaxed);
+                self.ratelimit_map_full
+                    .store(counters.ratelimit_map_full, Ordering::Relaxed);
             }
         }
     }
@@ -1536,6 +1620,7 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
             if manager.sweep_expired_rules() {
                 tracing::debug!("XDP rule sweeper removed expired shadow rules");
             }
+            manager.sync_rate_limit_config();
         }
     });
 }
@@ -3185,7 +3270,7 @@ mod linux {
     use aya::programs::links::PinnedLink;
     use cloud_node_xdp_common::{
         XdpCounters, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key,
-        XdpPortProtoKey, XdpQueueKey, XdpRuleValue,
+        XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig, XdpRuleValue,
     };
     use ipnet::IpNet;
     use std::collections::BTreeSet;
@@ -3830,6 +3915,23 @@ mod linux {
             .ok_or_else(|| anyhow::anyhow!("missing map XDP_COUNTERS"))?;
         let counters = Array::<_, XdpCounters>::try_from(map)?.get(&0, 0)?;
         Ok(counters)
+    }
+
+    /// Write the per-IP rate limiter config. Returns an explicit error when the
+    /// loaded eBPF object predates the limiter so callers can report the
+    /// unsupported feature instead of silently degrading.
+    pub fn sync_rate_limit(
+        ebpf: &mut aya::Ebpf,
+        config: &XdpRateLimitConfig,
+    ) -> anyhow::Result<()> {
+        let map = ebpf.map_mut("XDP_RATE_CFG").ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing map XDP_RATE_CFG; eBPF object predates rate limiter (rebuild cloud-node-xdp-ebpf.o)"
+            )
+        })?;
+        let mut array = Array::<_, XdpRateLimitConfig>::try_from(map)?;
+        array.set(0, *config, 0)?;
+        Ok(())
     }
 
     fn zero_counters(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
@@ -7470,7 +7572,8 @@ mod tests {
         let manager = XdpManager::new(XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
         let now = crate::utils::time::now_timestamp();
         manager.sync_snapshot(&KernelFilterSnapshot {
             blocked_ips: vec![("192.0.2.10".parse().unwrap(), now + 60)],
@@ -7488,7 +7591,8 @@ mod tests {
         let manager = XdpManager::new(XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
         let now = crate::utils::time::now_timestamp();
         manager.sync_snapshot(&KernelFilterSnapshot {
             blocked_networks: vec![("198.51.100.0/24".parse().unwrap(), now + 60)],
@@ -7519,7 +7623,8 @@ mod tests {
         let manager = XdpManager::new(XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
         let now = crate::utils::time::now_timestamp();
         let expired_ip: IpAddr = "192.0.2.1".parse().unwrap();
         let active_ip: IpAddr = "192.0.2.2".parse().unwrap();
@@ -7576,7 +7681,8 @@ mod tests {
         let manager = XdpManager::new(XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
 
         assert_eq!(manager.rule_sweeper_generation.load(Ordering::Relaxed), 0);
         assert!(!manager.rule_sweeper_started.swap(true, Ordering::Relaxed));
@@ -7922,7 +8028,8 @@ mod tests {
         let report = doctor_report_for_config(&XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
         assert!(report.contains("interfaces is empty"));
     }
 

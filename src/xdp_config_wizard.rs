@@ -215,7 +215,8 @@ mod tests {
                     port: 443,
                 }],
             },
-        };
+            rate_limit: None,
+    };
 
         let yaml = serde_yaml::to_string(&xdp).unwrap();
         let parsed: XdpConfig = serde_yaml::from_str(&yaml).unwrap();

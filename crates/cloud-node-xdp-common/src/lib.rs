@@ -212,6 +212,27 @@ pub struct XdpCounters {
     pub parse_errors: u64,
     pub map_miss: u64,
     pub xsk_drops: u64,
+    pub rate_limited: u64,
+    pub ratelimit_map_full: u64,
+}
+
+/// Per-IP fixed-window rate limit configuration written by userspace.
+/// A zero `*_pps` disables limiting for that protocol; a zero `window_ns`
+/// disables the limiter entirely.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpRateLimitConfig {
+    pub udp_pps: u64,
+    pub tcp_syn_pps: u64,
+    pub window_ns: u64,
+}
+
+/// Per-IP fixed-window bucket; one entry per source address.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpRateBucket {
+    pub window_start_ns: u64,
+    pub count: u64,
 }
 
 #[repr(C)]
@@ -246,6 +267,8 @@ unsafe_impl_aya_pod!(
     XdpRuleValue,
     XdpCounters,
     XdpInterfacePolicy,
+    XdpRateLimitConfig,
+    XdpRateBucket,
 );
 
 #[cfg(feature = "std")]
