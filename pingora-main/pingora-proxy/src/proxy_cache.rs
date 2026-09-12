@@ -397,6 +397,61 @@ where
                 RangeType::Invalid => unreachable!(),
                 RangeType::None => None,
             };
+            // Zero-copy fast path: when the hit handler can expose the
+            // remaining body as a file range and no range filter or
+            // downstream module needs to see the bytes, let the proxy decide
+            // whether the body may bypass `response_body_filter` (e.g. to be
+            // sent via sendfile on the downstream transport). The
+            // `cache_hit_file_body` hook performs any accounting or
+            // throttling the byte path would have done per chunk.
+            let file_body = if maybe_range_filter.is_none()
+                && session.downstream_modules_ctx.is_empty()
+                // Only H1 transports can serve an fd directly; other session
+                // types would just re-read the range into Bytes anyway,
+                // which the mmap read path already does with less work.
+                && matches!(
+                    session.as_downstream(),
+                    pingora_core::protocols::http::server::Session::H1(_)
+                )
+            {
+                session.cache.hit_handler().file_body()
+            } else {
+                None
+            };
+            if let Some(file_body) = file_body {
+                match self
+                    .inner
+                    .cache_hit_file_body(session, file_body.len(), ctx)
+                    .await
+                {
+                    Ok(Some(delay)) => {
+                        if !delay.is_zero() {
+                            trace!("delaying file body response for {delay:?}");
+                            time::sleep(delay).await;
+                        }
+                        if let Err(e) = session
+                            .as_mut()
+                            .write_response_body_file(file_body, true)
+                            .await
+                            .map_err(|e| e.into_down())
+                        {
+                            return (false, Some(e));
+                        }
+                        if let Err(e) = session.cache.finish_hit_handler().await {
+                            debug!("Error during finish_hit_handler: {}", e);
+                        }
+                        return match session.as_mut().finish_body().await {
+                            Ok(_) => {
+                                debug!("finished sending cached file body to downstream");
+                                (true, None)
+                            }
+                            Err(e) => (false, Some(e)),
+                        };
+                    }
+                    Ok(None) => { /* fall through to the byte-streamed path */ }
+                    Err(e) => return (false, Some(e)),
+                }
+            }
             loop {
                 match session.cache.hit_handler().read_body().await {
                     Ok(raw_body) => {

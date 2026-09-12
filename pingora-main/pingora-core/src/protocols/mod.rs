@@ -102,6 +102,8 @@ pub trait IO:
 {
     /// helper to cast as the reference of the concrete type
     fn as_any(&self) -> &dyn Any;
+    /// helper to cast as the mutable reference of the concrete type
+    fn as_any_mut(&mut self) -> &mut dyn Any;
     /// helper to cast back of the concrete type
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
 }
@@ -125,6 +127,9 @@ where
     T: 'static,
 {
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
     fn into_any(self: Box<Self>) -> Box<dyn Any> {

@@ -456,6 +456,36 @@ pub trait ProxyHttp {
         Ok(None)
     }
 
+    /// Called once when a cache hit can serve its remaining body from a file
+    /// without materializing it into memory (e.g. via `sendfile(2)`).
+    ///
+    /// Returning `Ok(Some(delay))` opts in: the file bytes bypass
+    /// `response_body_filter` (which cannot observe them), `delay` is awaited
+    /// before the transfer starts, and the body is written to the downstream
+    /// transport directly. Implementations that opt in should perform any
+    /// per-byte accounting or rate limiting here that they would otherwise
+    /// do inside `response_body_filter`.
+    ///
+    /// Returning `Ok(None)` (the default) keeps the byte-streamed path where
+    /// every chunk flows through `response_body_filter`. Errors abort the
+    /// response.
+    ///
+    /// Note: this hook only engages when no downstream modules are attached
+    /// and the cache hit handler exposes a file body; implementations never
+    /// need to support partial file bodies — the hook sees the full
+    /// remaining length before any of it is sent.
+    async fn cache_hit_file_body(
+        &self,
+        _session: &mut Session,
+        _body_len: u64,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(None)
+    }
+
     /// Similar to [Self::response_filter()] but for response trailers.
     /// Note, returning an Ok(Some(Bytes)) will result in the downstream response
     /// trailers being written to the response body.

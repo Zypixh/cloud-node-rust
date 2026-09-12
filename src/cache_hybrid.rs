@@ -965,6 +965,11 @@ impl Storage for FileStorage {
                 match unsafe { memmap2::Mmap::map(&std_file) } {
                     Ok(mmap) if !mmap.is_empty() => FileHitReader::Mapped(MappedFileReader {
                         mmap: Arc::new(mmap),
+                        // The descriptor is kept alongside the mapping so the
+                        // hit can also be served via a true `sendfile(2)`
+                        // (kernel page-cache -> socket, zero user copy) when
+                        // the downstream transport supports it.
+                        file: Arc::new(std_file),
                         base: 0,
                     }),
                     _ => {
@@ -1735,6 +1740,9 @@ async fn discard_corrupt_cache_entry(entry: CorruptCacheEntry) {
 /// during purge leaves the mapping valid until it is dropped.
 struct MappedFileReader {
     mmap: Arc<memmap2::Mmap>,
+    /// The mapped descriptor, kept open so the hit can be served through
+    /// `sendfile(2)` when the downstream transport allows it.
+    file: Arc<std::fs::File>,
     base: u64,
 }
 
@@ -1910,6 +1918,32 @@ impl HandleHit for FileHitHandler {
             self.reader,
             FileHitReader::Plain(_) | FileHitReader::Mapped(_)
         )
+    }
+
+    /// The remaining body as a file range for transports that can serve a
+    /// file descriptor directly (sendfile). A mapping shorter than the
+    /// declared range is declined here so the byte path still detects the
+    /// truncation and discards the corrupt entry.
+    fn file_body(&self) -> Option<pingora_http::FileBody> {
+        let FileHitReader::Mapped(reader) = &self.reader else {
+            return None;
+        };
+        if self.seek_pending || self.eof_verified {
+            return None;
+        }
+        let remaining = self.range_end.saturating_sub(self.read_len);
+        if remaining == 0 {
+            return None;
+        }
+        let offset = reader.base.checked_add(self.read_len)?;
+        if (reader.mmap.len() as u64).saturating_sub(offset) < remaining {
+            return None;
+        }
+        Some(pingora_http::FileBody {
+            file: reader.file.clone(),
+            offset,
+            len: remaining,
+        })
     }
 
     fn seek(&mut self, start: usize, end: Option<usize>) -> Result<()> {

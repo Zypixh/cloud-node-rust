@@ -29,7 +29,7 @@ use pingora_timeout::timeout;
 use regex::bytes::Regex;
 use std::any::Any;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
@@ -812,6 +812,142 @@ impl HttpSession {
             },
             None => self.do_write_body(buf).await,
         }
+    }
+
+    /// Write a file-backed response body to the client.
+    ///
+    /// When the body framing is `Content-Length` and the transport is a plain
+    /// TCP stream, the range is transferred via `sendfile(2)` — zero
+    /// userspace copies. All other combinations (chunked framing, TLS, pending
+    /// buffered body data, non-TCP transports, non-Linux platforms) fall back
+    /// to reading the range into memory and writing it through `write_body`,
+    /// which keeps framing and encryption semantics unchanged.
+    ///
+    /// Returns `Ok(None)` when there shouldn't be more body to be written.
+    pub async fn write_body_file(
+        &mut self,
+        file_body: &pingora_http::FileBody,
+    ) -> Result<Option<usize>> {
+        if file_body.is_empty() {
+            return Ok(None);
+        }
+        // Flush any buffered body bytes first so wire ordering is preserved.
+        if !self.body_write_buf.is_empty() {
+            self.write_body_buf().await?;
+        }
+        let can_sendfile = matches!(
+            self.body_writer.body_mode,
+            super::body::BodyMode::ContentLength(_, _)
+        ) && !self.upgraded;
+        if can_sendfile
+            && self
+                .underlying_stream
+                .as_any()
+                .is::<crate::protocols::l4::stream::Stream>()
+        {
+            let res = match self.write_timeout(file_body.len() as usize) {
+                Some(t) => match timeout(t, self.do_write_body_file(file_body)).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        return Error::e_explain(
+                            WriteTimedout,
+                            format!("writing file body, timeout: {t:?}"),
+                        )
+                    }
+                },
+                None => self.do_write_body_file(file_body).await,
+            };
+            match res {
+                // `Ok(None)`: transport declined before any byte was sent —
+                // safe to take the buffered-read path.
+                Ok(Some(sent)) => return Ok(Some(sent)),
+                Ok(None) => {}
+                // A sendfile error may follow partial kernel writes whose
+                // count is unknown, so retrying via the read path could
+                // duplicate bytes onto the wire. Propagate instead.
+                Err(e) => return Err(e),
+            }
+        }
+        // Fallback: stream the range through the normal body writer.
+        // `try_clone` gives an fd with its own offset; the tokio File drives
+        // reads on the blocking pool so no runtime worker blocks on disk IO.
+        let mut file = tokio::fs::File::from_std(
+            file_body
+                .file
+                .try_clone()
+                .or_err(WriteError, "cloning file body fd")?,
+        );
+        file.seek(std::io::SeekFrom::Start(file_body.offset))
+            .await
+            .or_err(WriteError, "seeking file body")?;
+        let mut remaining = file_body.len();
+        let mut sent: usize = 0;
+        let mut buf = BytesMut::with_capacity((128 * 1024).min(remaining as usize));
+        while remaining > 0 {
+            buf.clear();
+            let want = remaining.min(buf.capacity() as u64) as usize;
+            let n = (&mut file)
+                .take(want as u64)
+                .read_buf(&mut buf)
+                .await
+                .or_err(WriteError, "reading file body")?;
+            if n == 0 {
+                return Error::e_explain(
+                    WriteError,
+                    "file body shorter than declared range",
+                );
+            }
+            match self.write_body(&buf[..n]).await? {
+                Some(w) => sent += w,
+                None => break, // more body bytes than Content-Length allows
+            }
+            remaining -= n as u64;
+        }
+        Ok(Some(sent))
+    }
+
+    async fn do_write_body_file(
+        &mut self,
+        file_body: &pingora_http::FileBody,
+    ) -> Result<Option<usize>> {
+        use super::body::BodyMode as BM;
+        let BM::ContentLength(total, written) = self.body_writer.body_mode else {
+            return Ok(None);
+        };
+        let remaining = (total - written) as u64;
+        if remaining == 0 {
+            return Ok(None);
+        }
+        let Some(l4) = self
+            .underlying_stream
+            .as_any_mut()
+            .downcast_mut::<crate::protocols::l4::stream::Stream>()
+        else {
+            return Ok(None);
+        };
+        let to_send = remaining.min(file_body.len());
+        let Some(sent) = l4
+            .sendfile_from(&file_body.file, file_body.offset, to_send)
+            .await
+            .or_err(WriteError, "sendfile body")?
+        else {
+            return Ok(None);
+        };
+        self.body_bytes_sent += sent as usize;
+        self.body_writer.body_mode = BM::ContentLength(total, written + sent as usize);
+        if sent < to_send {
+            // The input file is shorter than the declared range — the
+            // equivalent of a short read on the byte path. The body on the
+            // wire is already incomplete, so this is a hard error.
+            return Error::e_explain(WriteError, "file body shorter than declared range");
+        }
+        if self.body_writer.finished() {
+            self.underlying_stream
+                .flush()
+                .await
+                .or_err(WriteError, "flushing body")?;
+        }
+        Ok(Some(sent as usize))
     }
 
     async fn do_write_body_buf(&mut self) -> Result<Option<usize>> {
@@ -2486,6 +2622,45 @@ mod tests_stream {
         let input =
             BytesMut::from(&b"GET  HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\n"[..]);
         assert!(escape_illegal_request_line(&input).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_body_file_read_fallback() {
+        // The mock stream is not an l4::Stream, so `write_body_file` must
+        // serve the range through the buffered-read path with identical
+        // wire bytes.
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let write_expected = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(write_expected)
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        new_response.append_header("Content-Length", "5").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&new_response)
+            .await
+            .unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "pingora-filebody-{}-{}.bin",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, b"XXhelloYY").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let fb = pingora_http::FileBody {
+            file: std::sync::Arc::new(file),
+            offset: 2,
+            len: 5,
+        };
+        let written = http_stream.write_body_file(&fb).await.unwrap();
+        assert_eq!(written, Some(5));
+        http_stream.finish_body().await.unwrap();
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]

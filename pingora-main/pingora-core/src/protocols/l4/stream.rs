@@ -465,6 +465,75 @@ impl Stream {
             stream.map(|s| BufStream::with_capacity(BUF_READ_SIZE, BUF_WRITE_SIZE, s.into_inner()));
         let _ = mem::replace(&mut self.stream, stream);
     }
+
+    /// Write `len` bytes from `file` starting at `offset` directly to the
+    /// socket via `sendfile(2)`, bypassing the userspace copy entirely.
+    ///
+    /// Returns `Ok(Some(written))` when the body was (fully) transferred,
+    /// `Ok(None)` when this transport cannot serve a file descriptor (non-TCP
+    /// raw stream), in which case the caller must fall back to buffered
+    /// reads. Pending buffered writes are flushed first so wire ordering is
+    /// preserved.
+    #[cfg(target_os = "linux")]
+    pub async fn sendfile_from(
+        &mut self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<Option<u64>> {
+        // Flush buffered output first: sendfile writes to the socket below
+        // the BufStream, so any pending bytes must go out before it.
+        self.stream_mut().flush().await?;
+        let tcp = match &mut self.stream_mut().get_mut().stream {
+            RawStream::Tcp(s) => s,
+            _ => return Ok(None),
+        };
+        let out_fd = tcp.as_raw_fd();
+        let in_fd = file.as_raw_fd();
+        let mut off = offset as libc::off_t;
+        let mut remaining = len;
+        let mut sent: u64 = 0;
+        while remaining > 0 {
+            match tcp
+                .try_io(Interest::WRITABLE, || {
+                    let n = unsafe {
+                        libc::sendfile(
+                            out_fd,
+                            in_fd,
+                            &mut off,
+                            remaining.min(usize::MAX as u64) as usize,
+                        )
+                    };
+                    if n < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(n as u64)
+                    }
+                })
+                .await
+            {
+                Ok(0) => break, // EOF on the input file
+                Ok(n) => {
+                    sent += n;
+                    remaining = remaining.saturating_sub(n);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(Some(sent))
+    }
+
+    /// Non-Linux transports cannot `sendfile`; always decline so callers
+    /// take the buffered-read fallback.
+    #[cfg(not(target_os = "linux"))]
+    pub async fn sendfile_from(
+        &mut self,
+        _file: &std::fs::File,
+        _offset: u64,
+        _len: u64,
+    ) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 impl From<TcpStream> for Stream {
