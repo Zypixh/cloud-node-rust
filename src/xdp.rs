@@ -1452,12 +1452,12 @@ impl XdpManager {
     /// into billing. No-op unless the dataplane is attached and forwards are
     /// configured.
     #[cfg(target_os = "linux")]
-    fn sweep_udp_nat_maps(&self) {
+    fn sweep_nat_maps(&self) {
         let configured = self
             .config
             .interfaces
             .iter()
-            .any(|iface| !iface.udp_forwards.is_empty());
+            .any(|iface| !iface.udp_forwards.is_empty() || !iface.tcp_forwards.is_empty());
         if !configured || self.attached.read().is_empty() {
             return;
         }
@@ -1465,16 +1465,18 @@ impl XdpManager {
             let mut guard = self.ebpf.lock();
             let mut shadow = self.udp_flow_shadow.lock();
             match guard.as_mut() {
-                Some(ebpf) => linux::sweep_udp_nat_maps(
+                Some(ebpf) => linux::sweep_nat_maps(
                     ebpf,
                     &mut shadow,
                     std::time::Duration::from_secs(180),
+                    std::time::Duration::from_secs(7200),
+                    std::time::Duration::from_secs(120),
                 ),
                 None => Ok(()),
             }
         };
         if let Err(err) = result {
-            tracing::warn!("XDP UDP NAT map sweep failed: {err}");
+            tracing::warn!("XDP NAT map sweep failed: {err}");
             crate::pipeline_metrics::add(
                 crate::pipeline_metrics::PipelineCounter::XdpMapSyncFailed,
                 1,
@@ -1721,7 +1723,7 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
             }
             manager.sync_rate_limit_config();
             #[cfg(target_os = "linux")]
-            manager.sweep_udp_nat_maps();
+            manager.sweep_nat_maps();
         }
     });
 }
@@ -3967,6 +3969,7 @@ mod linux {
         sync_proxy_ports(ebpf, config, proxy_dataplane_active)?;
         sync_xsk_indices(ebpf, config, proxy_dataplane_active)?;
         sync_udp_forwards(ebpf, config, proxy_dataplane_active)?;
+        sync_tcp_forwards(ebpf, config, proxy_dataplane_active)?;
         clear_rule_maps(ebpf)?;
         let empty = RuleState::default();
         apply_rule_diff(ebpf, &empty, state)?;
@@ -4169,15 +4172,46 @@ mod linux {
         config: &XdpConfig,
         dataplane_active: bool,
     ) -> anyhow::Result<()> {
-        let Some(map) = ebpf.map_mut("XDP_UDP_FWD") else {
-            let configured: usize = config
-                .interfaces
-                .iter()
-                .map(|iface| iface.udp_forwards.len())
-                .sum();
+        sync_forward_map(
+            ebpf,
+            "XDP_UDP_FWD",
+            "UDP",
+            config,
+            dataplane_active,
+            |iface| &iface.udp_forwards,
+        )
+    }
+
+    /// Program explicit TCP direct-forward rules; same contract as
+    /// `sync_udp_forwards`.
+    fn sync_tcp_forwards(
+        ebpf: &mut aya::Ebpf,
+        config: &XdpConfig,
+        dataplane_active: bool,
+    ) -> anyhow::Result<()> {
+        sync_forward_map(
+            ebpf,
+            "XDP_TCP_FWD",
+            "TCP",
+            config,
+            dataplane_active,
+            |iface| &iface.tcp_forwards,
+        )
+    }
+
+    fn sync_forward_map(
+        ebpf: &mut aya::Ebpf,
+        map_name: &str,
+        proto: &str,
+        config: &XdpConfig,
+        dataplane_active: bool,
+        forwards: impl Fn(&crate::runtime_mode::XdpInterfaceConfig) -> &Vec<crate::runtime_mode::XdpUdpForwardConfig>,
+    ) -> anyhow::Result<()> {
+        let Some(map) = ebpf.map_mut(map_name) else {
+            let configured: usize = config.interfaces.iter().map(|i| forwards(i).len()).sum();
             if configured > 0 {
                 tracing::warn!(
-                    "eBPF object lacks XDP_UDP_FWD; {configured} configured UDP forwards are not active (stale object, rebuild cloud-node-xdp-ebpf.o)"
+                    "eBPF object lacks {map_name}; {configured} configured {proto} forwards are not active (stale object, rebuild cloud-node-xdp-ebpf.o)"
                 );
             }
             return Ok(());
@@ -4189,12 +4223,12 @@ mod linux {
             return Ok(());
         }
         for iface in &config.interfaces {
-            for fwd in &iface.udp_forwards {
+            for fwd in forwards(iface) {
                 match udp_forward_entry(fwd) {
                     Ok((key, rule)) => {
                         if let Err(err) = map.insert(key, rule, 0) {
                             tracing::warn!(
-                                "XDP UDP forward {} -> {} on {} failed to install: {err}",
+                                "XDP {proto} forward {} -> {} on {} failed to install: {err}",
                                 fwd.listen,
                                 fwd.backend,
                                 iface.name
@@ -4203,7 +4237,7 @@ mod linux {
                     }
                     Err(err) => {
                         tracing::warn!(
-                            "XDP UDP forward {} -> {} on {} is not active: {err}; traffic keeps the normal dataplane",
+                            "XDP {proto} forward {} -> {} on {} is not active: {err}; traffic keeps the normal dataplane",
                             fwd.listen,
                             fwd.backend,
                             iface.name
@@ -4338,34 +4372,62 @@ mod linux {
     }
 
     /// GC stale conntrack entries and fold per-CPU flow accounting into the
-    /// billing pipeline. Entries idle past `ct_idle` are removed; accounting
-    /// is emitted as deltas against the shadow totals so repeated sweeps never
-    /// double-count.
-    pub(super) fn sweep_udp_nat_maps(
+    /// billing pipeline. Accounting is folded first (final deltas included)
+    /// and only then are stale conntrack/accounting/shadow entries removed, so
+    /// a reaped flow's last bytes are billed exactly once. TCP entries in
+    /// CLOSING state are reaped after `tcp_closing_grace`; all others use the
+    /// protocol's idle timeout.
+    pub(super) fn sweep_nat_maps(
         ebpf: &mut aya::Ebpf,
         shadow: &mut std::collections::HashMap<XdpUdpCtKey, XdpFlowAcct>,
-        ct_idle: std::time::Duration,
+        udp_idle: std::time::Duration,
+        tcp_idle: std::time::Duration,
+        tcp_closing_grace: std::time::Duration,
     ) -> anyhow::Result<()> {
+        use cloud_node_xdp_common::XDP_CT_STATE_CLOSING;
         let now_ns = monotonic_now_ns();
-        let idle_ns = ct_idle.as_nanos().min(u64::MAX as u128) as u64;
+        let udp_idle_ns = udp_idle.as_nanos().min(u64::MAX as u128) as u64;
+        let tcp_idle_ns = tcp_idle.as_nanos().min(u64::MAX as u128) as u64;
+        let closing_ns = tcp_closing_grace.as_nanos().min(u64::MAX as u128) as u64;
 
+        let mut stale: Vec<XdpUdpCtKey> = Vec::new();
         if let Some(map) = ebpf.map_mut("XDP_UDP_CT") {
             let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
-            let mut stale = Vec::new();
             for item in map.iter() {
                 let (key, value) = item?;
-                if now_ns.saturating_sub(value.last_seen_ns) >= idle_ns {
+                if now_ns.saturating_sub(value.last_seen_ns) >= udp_idle_ns {
                     stale.push(key);
                 }
             }
-            for key in stale {
-                let _ = map.remove(&key);
-                shadow.remove(&key);
+            for key in &stale {
+                let _ = map.remove(key);
             }
         }
+        if let Some(map) = ebpf.map_mut("XDP_TCP_CT") {
+            let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
+            let mut tcp_stale = Vec::new();
+            for item in map.iter() {
+                let (key, value) = item?;
+                let idle = now_ns.saturating_sub(value.last_seen_ns);
+                let limit = if value.state == XDP_CT_STATE_CLOSING {
+                    closing_ns
+                } else {
+                    tcp_idle_ns
+                };
+                if idle >= limit {
+                    tcp_stale.push(key);
+                }
+            }
+            for key in &tcp_stale {
+                let _ = map.remove(key);
+            }
+            stale.extend(tcp_stale);
+        }
 
-        if let Some(map) = ebpf.map("XDP_FLOW_ACCT") {
-            let map = aya::maps::PerCpuHashMap::<_, XdpUdpCtKey, XdpFlowAcct>::try_from(map)?;
+        if let Some(map) = ebpf.map_mut("XDP_FLOW_ACCT") {
+            let mut map =
+                aya::maps::PerCpuHashMap::<_, XdpUdpCtKey, XdpFlowAcct>::try_from(map)?;
+            let mut acct_remove = Vec::new();
             for item in map.iter() {
                 let (key, per_cpu) = item?;
                 let mut total = XdpFlowAcct::default();
@@ -4388,9 +4450,19 @@ mod linux {
                         None,
                     );
                 }
-                shadow.insert(key, total);
+                if stale.contains(&key) {
+                    acct_remove.push(key);
+                    shadow.remove(&key);
+                } else {
+                    shadow.insert(key, total);
+                }
+            }
+            for key in acct_remove {
+                let _ = map.remove(&key);
             }
         }
+        // Shadow entries whose flow was already reaped stay; they are dropped
+        // once their acct entry is observed above, so nothing accumulates.
         Ok(())
     }
 
