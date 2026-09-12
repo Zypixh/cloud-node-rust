@@ -12,7 +12,7 @@ use cloud_node_xdp_common::{
     XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key,
     XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpQuicDcidKey, XdpRateBucket,
     XdpRateLimitConfig, XdpRuleValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
-    XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN,
+    XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN, XDP_SNI_MAX_LEN,
 };
 use core::mem;
 use network_types::{
@@ -153,7 +153,14 @@ static XDP_NAT_SCRATCH: PerCpuArray<NatScratch> =
 #[map(name = "XDP_DISPATCH")]
 static XDP_DISPATCH: ProgramArray = ProgramArray::with_max_entries(4, 0);
 
+/// Lowercased-SNI FNV-1a hashes blocked at line rate. Only evaluated on TCP
+/// segments whose payload starts a TLS handshake record; anything that does
+/// not parse completely falls through to the userspace dataplane.
+#[map(name = "XDP_SNI_BLOCK")]
+static XDP_SNI_BLOCK: HashMap<u64, u32> = HashMap::<u64, u32>::with_max_entries(65_536, 0);
+
 const XDP_DISPATCH_NAT: u32 = 0;
+const XDP_DISPATCH_SNI: u32 = 1;
 
 #[inline(always)]
 fn nat_scratch() -> Result<*mut NatScratch, ()> {
@@ -192,12 +199,17 @@ pub fn xdp_nat_dispatch(ctx: XdpContext) -> u32 {
     }
 }
 
-fn try_nat_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
-    // The subprogram re-parses the packet: offsets handed over through the
-    // scratch map arrive as unbounded scalars and lose the verifier's packet
-    // range tracking, whereas parsing derives them with proper bounds.
+/// Shared frame parse for the tail-call subprograms. Each subprogram
+/// re-parses the packet: offsets handed over through the scratch map arrive
+/// as unbounded scalars and lose the verifier's packet range tracking,
+/// whereas parsing derives them with proper bounds. Returns Err for packets
+/// that should simply take the normal path.
+#[allow(clippy::type_complexity)]
+#[inline(always)]
+fn parse_frame(
+    ctx: &XdpContext,
+) -> Result<(u8, usize, u8, usize, u64, u32, Option<&'static XdpInterfacePolicy>), ()> {
     let (eth_proto, ip_offset) = parse_eth_payload(ctx)?;
-    let now_ns = unsafe { bpf_ktime_get_ns() };
     let ifindex = ctx.ingress_ifindex() as u32;
     let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
     let (family, proto, l4_offset, packet_len) = if eth_proto == EtherType::Ipv4 as u16 {
@@ -211,7 +223,7 @@ fn try_nat_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
             return Err(());
         }
         if unsafe { (*ip).frag_offset() } != 0 || unsafe { (*ip).frag_flags() & 1 } != 0 {
-            return Ok(xdp_action::XDP_PASS);
+            return Err(());
         }
         (
             4u8,
@@ -239,12 +251,18 @@ fn try_nat_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
             ip_offset + mem::size_of::<Ipv6Hdr>(),
             packet_end,
         )? else {
-            return Ok(xdp_action::XDP_PASS);
+            return Err(());
         };
         (6u8, proto, l4_offset, payload_len as u64)
     } else {
-        return Ok(xdp_action::XDP_PASS);
+        return Err(());
     };
+    Ok((family, ip_offset, proto, l4_offset, packet_len, ifindex, policy))
+}
+
+fn try_nat_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
+    let (family, ip_offset, proto, l4_offset, packet_len, _, policy) = parse_frame(ctx)?;
+    let now_ns = unsafe { bpf_ktime_get_ns() };
     let action = match (family, proto) {
         (4, value) if value == IpProto::Udp as u8 => {
             try_udp_nat_v4(ctx, ip_offset, l4_offset, packet_len, now_ns)?
@@ -263,6 +281,84 @@ fn try_nat_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
     if let Some(action) = action {
         return Ok(action);
     }
+    Ok(maybe_redirect(ctx, policy, proto, l4_offset))
+}
+
+/// SNI subprogram entered via tail call ahead of NAT. Runs the TLS
+/// ClientHello blocklist check on TCP segments; on pass it chains into the
+/// NAT dispatcher, and falls back to the same redirect/PASS decision when
+/// the NAT slot is empty.
+#[xdp]
+pub fn xdp_sni_dispatch(ctx: XdpContext) -> u32 {
+    match try_sni_dispatch(&ctx) {
+        Ok(action) => action,
+        Err(_) => {
+            counter_parse_error();
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+/// Minimal reparse for the SNI subprogram: the ClientHello check only needs
+/// the transport offset and protocol. The full `parse_frame` result (policy
+/// map value, packet_len, family) is unnecessary here, and every extra live
+/// value at the hash loop multiplies the verifier's explored-state count.
+/// Returns the L4 proto and offset, or Err for packets that take the normal
+/// path (non-IP, malformed, fragmented - identical to `parse_frame`).
+fn sni_frame_proto(ctx: &XdpContext) -> Result<(u8, usize), ()> {
+    let (eth_proto, ip_offset) = parse_eth_payload(ctx)?;
+    if eth_proto == EtherType::Ipv4 as u16 {
+        let ip = ptr_at::<Ipv4Hdr>(ctx, ip_offset)?;
+        let ihl = unsafe { (*ip).ihl() as usize };
+        if unsafe { (*ip).version() } != 4
+            || ihl < mem::size_of::<Ipv4Hdr>()
+            || unsafe { (*ip).tot_len() as usize } < ihl
+        {
+            return Err(());
+        }
+        if unsafe { (*ip).frag_offset() } != 0 || unsafe { (*ip).frag_flags() & 1 } != 0 {
+            return Err(());
+        }
+        Ok((unsafe { (*ip).proto }, ip_offset + ihl))
+    } else if eth_proto == EtherType::Ipv6 as u16 {
+        let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
+        if unsafe { (*ip).version() } != 6 {
+            return Err(());
+        }
+        let payload_len = unsafe { u16::from_be_bytes((*ip).payload_len) as usize };
+        let packet_end = ip_offset
+            .checked_add(mem::size_of::<Ipv6Hdr>())
+            .and_then(|offset| offset.checked_add(payload_len))
+            .ok_or(())?;
+        if packet_end > ctx.data_end().saturating_sub(ctx.data()) {
+            return Err(());
+        }
+        let next = unsafe { (*ip).next_hdr };
+        ipv6_transport_offset(ctx, next, ip_offset + mem::size_of::<Ipv6Hdr>(), packet_end)
+            .and_then(|v| v.ok_or(()))
+    } else {
+        Err(())
+    }
+}
+
+fn try_sni_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
+    let (proto, l4_offset) = sni_frame_proto(ctx)?;
+    if proto == IpProto::Tcp as u8 {
+        match try_sni_block(ctx, l4_offset)? {
+            SNI_BLOCK => {
+                counter_sni_blocked();
+                return Ok(xdp_action::XDP_DROP);
+            }
+            SNI_INCOMPLETE => counter_sni_incomplete(),
+            _ => {}
+        }
+    }
+    // Chain into NAT; the tail call only returns when the slot is empty, in
+    // which case this program must still make the redirect/PASS decision the
+    // parent would have made.
+    let ifindex = ctx.ingress_ifindex() as u32;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
+    unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT) };
     Ok(maybe_redirect(ctx, policy, proto, l4_offset))
 }
 
@@ -352,12 +448,15 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         if !local_ipv4_allowed(policy, ifindex, destination_be) {
             return Ok(xdp_action::XDP_PASS);
         }
-        if policy.mode == 2
-            && (protocol == IpProto::Udp as u8 || protocol == IpProto::Tcp as u8)
-        {
-            // Returns only when the dispatch slot is empty: explicit fallback
-            // to the normal redirect/PASS path, never a drop.
-            unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT) };
+        if policy.mode == 2 {
+            if protocol == IpProto::Tcp as u8 {
+                // TCP enters through the SNI dispatcher, which chains into
+                // NAT. A tail call only returns when the slot is empty:
+                // explicit fallback to the redirect/PASS path, never a drop.
+                unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_SNI) };
+            } else if protocol == IpProto::Udp as u8 {
+                unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT) };
+            }
         }
     }
     Ok(maybe_redirect(ctx, policy, protocol, l4_offset))
@@ -415,10 +514,12 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         if !local_ipv6_allowed(policy, ifindex, destination) {
             return Ok(xdp_action::XDP_PASS);
         }
-        if policy.mode == 2
-            && (protocol == IpProto::Udp as u8 || protocol == IpProto::Tcp as u8)
-        {
-            unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT) };
+        if policy.mode == 2 {
+            if protocol == IpProto::Tcp as u8 {
+                unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_SNI) };
+            } else if protocol == IpProto::Udp as u8 {
+                unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT) };
+            }
         }
     }
     Ok(maybe_redirect(ctx, policy, protocol, l4_offset))
@@ -694,6 +795,167 @@ fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
     Ok((start + offset) as *mut T)
 }
 
+
+
+/// Inspect a TCP segment for a TLS ClientHello and drop when its SNI hash is
+/// blocklisted. Returns Some(XDP_DROP) on a block, None to continue the
+/// normal path. Records that do not fully parse count as `sni_incomplete`
+/// and pass - userspace remains the authoritative SNI implementation.
+/// Inlined into the dispatcher: as a separate call LLVM specializes its
+/// context argument into raw packet pointers and emits prohibited shift
+/// arithmetic on them.
+/// 0 = pass, 1 = block/drop, 2 = parsed-incomplete (pass, counted once by
+/// the dispatcher).
+const SNI_PASS: u32 = 0;
+const SNI_BLOCK: u32 = 1;
+const SNI_INCOMPLETE: u32 = 2;
+
+#[inline(always)]
+fn try_sni_block(ctx: &XdpContext, l4_offset: usize) -> Result<u32, ()> {
+    let tcp = ptr_at::<TcpHdr>(ctx, l4_offset)?;
+    let data_off = unsafe { (*tcp).doff() } as usize * 4;
+    if data_off < 20 {
+        return Ok(SNI_PASS);
+    }
+    let payload = l4_offset + data_off;
+    // Cheap gate: TLS record content-type 0x16 (handshake) + major version 3.
+    if read_u8(ctx, payload).map(u64::from).unwrap_or(0) != 0x16
+        || read_u8(ctx, payload + 1).map(u64::from).unwrap_or(0) != 0x03
+    {
+        return Ok(SNI_PASS);
+    }
+    // Handshake type 0x01 (ClientHello) at payload+5.
+    if read_u8(ctx, payload + 5).map(u64::from).unwrap_or(0) != 0x01 {
+        return Ok(SNI_PASS);
+    }
+    // ClientHello body: version(2) random(32) at payload+9, then session id.
+    let mut off = payload + 43;
+    // Clamp every length field to a sane TLS bound: oversized values are
+    // treated as unparseable (counted + passed to userspace) and also keep the
+    // packet offset range tight enough for the verifier to track.
+    let sid_len = match read_u8(ctx, off) {
+        Ok(v) if v <= 32 => v as usize,
+        _ => {
+            return Ok(SNI_INCOMPLETE);
+        }
+    };
+    off += 1 + sid_len;
+    let cs_len = match (read_u8(ctx, off), read_u8(ctx, off + 1)) {
+        (Ok(hi), Ok(lo)) => ((hi as usize) << 8) | lo as usize,
+        _ => {
+            return Ok(SNI_INCOMPLETE);
+        }
+    };
+    if cs_len == 0 || cs_len > 512 {
+        return Ok(SNI_INCOMPLETE);
+    }
+    // .min() keeps the verifier's bound on the scalar that feeds the packet
+    // offset - a checked_add/mask round trip can lose it.
+    off += 2 + cs_len.min(512);
+    // LLVM emits redundant u16 truncation masks that wipe the verifier's
+    // bound on length-derived scalars; an explicit ceiling on the packet
+    // offset re-establishes it deterministically.
+    if off > 1024 {
+        return Ok(SNI_INCOMPLETE);
+    }
+    let comp_len = match read_u8(ctx, off).map(usize::from) {
+        Ok(v) if v <= 8 && v > 0 => v,
+        _ => {
+            return Ok(SNI_INCOMPLETE);
+        }
+    };
+    off += 1 + comp_len;
+    if off > 1024 {
+        return Ok(SNI_INCOMPLETE);
+    }
+    let ext_total = match (read_u8(ctx, off), read_u8(ctx, off + 1)) {
+        (Ok(hi), Ok(lo)) => ((hi as usize) << 8) | lo as usize,
+        _ => {
+            return Ok(SNI_INCOMPLETE);
+        }
+    };
+    if ext_total > 2048 {
+        return Ok(SNI_INCOMPLETE);
+    }
+    // Fast path only parses the first extension: server_name leads the
+    // extension list in the vast majority of ClientHellos; anything else is
+    // counted incomplete and stays on the userspace dataplane. This keeps
+    // the verifier's explored-state count far under the budget (no loop
+    // back-edges at all).
+    let ext_end = off + 2 + ext_total.min(2048);
+    off += 2;
+    if off + 4 > ext_end {
+        return Ok(SNI_INCOMPLETE);
+    }
+    let (Ok(t_hi), Ok(t_lo), Ok(l_hi), Ok(l_lo)) = (
+        read_u8(ctx, off).map(u64::from),
+        read_u8(ctx, off + 1).map(u64::from),
+        read_u8(ctx, off + 2).map(u64::from),
+        read_u8(ctx, off + 3).map(u64::from),
+    ) else {
+        return Ok(SNI_INCOMPLETE);
+    };
+    let ext_type = ((t_hi as usize) << 8) | t_lo as usize;
+    let ext_len = ((l_hi as usize) << 8) | l_lo as usize;
+    off += 4;
+    if ext_type != 0 {
+        return Ok(SNI_INCOMPLETE);
+    }
+    if ext_len < 5 || ext_len > 255 {
+        return Ok(SNI_INCOMPLETE);
+    }
+    // server_name ext: list_len(2) name_type(1) name_len(2) name.
+    let (Ok(nt), Ok(n_hi), Ok(n_lo)) = (
+        read_u8(ctx, off + 2).map(u64::from),
+        read_u8(ctx, off + 3).map(u64::from),
+        read_u8(ctx, off + 4).map(u64::from),
+    ) else {
+        return Ok(SNI_INCOMPLETE);
+    };
+    // black_box keeps LLVM from merging this test into a combined boolean
+    // that aliases a packet-pointer register at a join point (verifier:
+    // bitwise ops on pointers are prohibited).
+    if core::hint::black_box(nt) != 0 {
+        return Ok(SNI_PASS);
+    }
+    let name_len = ((n_hi as usize) << 8) | n_lo as usize;
+    if name_len == 0 || name_len > XDP_SNI_MAX_LEN {
+        return Ok(SNI_INCOMPLETE);
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // One base pointer + one window check: the verifier marks the packet
+    // range on this register and `base + j` loads stay on the same pointer
+    // chain, so the range survives (scalar-offset reassembly let LLVM split
+    // the check and the load onto different pointer chains). name_len <=
+    // XDP_SNI_MAX_LEN keeps the loop bounded and inside the marked window.
+    // black_box pins `off` to one opaque scalar: without it LLVM re-derives
+    // `data + off` twice (once for the window check, once reassembled from
+    // spilled length fields for the loads), and the range marked on the
+    // check chain does not transfer to the reassembled pointer.
+    let name_base =
+        unsafe { (ctx.data() as *const u8).add(core::hint::black_box(off) + 5) };
+    if unsafe { name_base.add(XDP_SNI_MAX_LEN) } > ctx.data_end() as *const u8 {
+        return Ok(SNI_INCOMPLETE);
+    }
+    let mut j = 0usize;
+    while j < name_len {
+        // All bytes inside the declared name_len are hashed, including NUL;
+        // userspace hashes the same raw name bytes.
+        let b = unsafe { *name_base.add(j) } as u64;
+        let lower = if b >= u64::from(b'A') && b <= u64::from(b'Z') {
+            b + 32
+        } else {
+            b
+        };
+        hash = (hash ^ lower).wrapping_mul(0x0000_0100_0000_01b3);
+        j += 1;
+    }
+    if unsafe { XDP_SNI_BLOCK.get(&hash) }.is_some() {
+        return Ok(SNI_BLOCK);
+    }
+    Ok(SNI_PASS)
+}
+
 fn v4_embed(addr_be: u32) -> [u8; 16] {
     let mut out = [0u8; 16];
     out[..4].copy_from_slice(&addr_be.to_be_bytes());
@@ -822,6 +1084,18 @@ fn counter_tcp_fwd_tx() {
 fn counter_tcp_fwd_map_full() {
     if let Some(counters) = counters() {
         counters.tcp_fwd_map_full = counters.tcp_fwd_map_full.saturating_add(1);
+    }
+}
+
+fn counter_sni_blocked() {
+    if let Some(counters) = counters() {
+        counters.sni_blocked = counters.sni_blocked.saturating_add(1);
+    }
+}
+
+fn counter_sni_incomplete() {
+    if let Some(counters) = counters() {
+        counters.sni_incomplete = counters.sni_incomplete.saturating_add(1);
     }
 }
 
@@ -1561,7 +1835,16 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 }
 
 fn read_u8(ctx: &XdpContext, offset: usize) -> Result<u8, ()> {
-    let byte: *const u8 = ptr_at(ctx, offset)?;
+    let start = ctx.data();
+    let end = ctx.data_end();
+    // `end < ptr + N` compiles to `ptr + N > end` - a bound the verifier
+    // can mark on variable-offset packet pointers; `ptr + 1 > end` folds
+    // into `ptr >= end`, which is not marked on this kernel. The margin also
+    // covers fixed offsets LLVM folds into the load instruction.
+    if end < start + offset + 16 {
+        return Err(());
+    }
+    let byte: *const u8 = (start + offset) as *const u8;
     Ok(unsafe { *byte })
 }
 

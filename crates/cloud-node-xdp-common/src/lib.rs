@@ -218,6 +218,8 @@ pub struct XdpCounters {
     pub udp_fwd_map_full: u64,
     pub tcp_fwd_tx: u64,
     pub tcp_fwd_map_full: u64,
+    pub sni_blocked: u64,
+    pub sni_incomplete: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -354,6 +356,21 @@ pub struct XdpUdpCtValue {
     pub last_seen_ns: u64,
 }
 
+/// FNV-1a 64 over lowercased SNI bytes. Shared between userspace (blocklist
+/// sync) and the eBPF program (packet-path hashing) so both sides produce the
+/// same key.
+pub fn sni_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h = (h ^ u64::from(b.to_ascii_lowercase())).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Maximum SNI hostname length handled by the eBPF fast path. Longer names
+/// are treated as unparseable and stay on the userspace dataplane.
+pub const XDP_SNI_MAX_LEN: usize = 16;
+
 /// Per-CPU traffic accounting for direct-forwarded flows, keyed by the
 /// conntrack key so both directions accumulate under the client flow.
 #[repr(C)]
@@ -488,6 +505,16 @@ pub mod host {
             let short = XdpQuicDcidKey::new(&[1, 2]).unwrap();
             let long = XdpQuicDcidKey::new(&[1, 2, 0]).unwrap();
             assert_ne!(short, long);
+        }
+
+        #[test]
+        fn sni_hash_is_lowercase_fnv1a() {
+            // The eBPF fast path computes the same value over the wire bytes;
+            // the constant pins the shared contract.
+            assert_eq!(sni_hash("example.com"), 0x576846634e2714c6);
+            assert_eq!(sni_hash("Example.COM"), sni_hash("example.com"));
+            assert_eq!(sni_hash(""), 0xcbf2_9ce4_8422_2325);
+            assert_ne!(sni_hash("a.example.com"), sni_hash("example.com"));
         }
 
         #[test]
