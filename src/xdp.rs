@@ -3961,6 +3961,7 @@ mod linux {
         std::fs::create_dir_all(XDP_BPF_PIN_DIR)
             .map_err(|err| anyhow::anyhow!("create bpffs pin dir {XDP_BPF_PIN_DIR}: {err}"))?;
         detach(config).await?;
+        drop_stale_pinned_maps();
         let mut attached = BTreeSet::new();
         let mut ebpf = aya::EbpfLoader::new()
             .default_map_pin_directory(XDP_BPF_PIN_DIR)
