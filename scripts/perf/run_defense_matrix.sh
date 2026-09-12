@@ -30,6 +30,8 @@ start_node() {
     sudo nohup env BENCH_CC_PER_IP_QPS="${BENCH_CC_PER_IP_QPS:-500}" \
         BENCH_CC_BLOCK_SECS="${BENCH_CC_BLOCK_SECS:-30}" \
         BENCH_L4_BLOCK_SECS="${BENCH_L4_BLOCK_SECS:-30}" \
+        BENCH_KERNEL_FILTER="${BENCH_KERNEL_FILTER:-auto}" \
+        BENCH_CC_TOTAL_QPS="${BENCH_CC_TOTAL_QPS:-0}" \
         "$NODE" >"$LOG" 2>&1 &
     for _ in $(seq 40); do
         curl -sf -o /dev/null -H 'Host: plain.bench' http://127.0.0.1:8080/index.html && break
@@ -62,8 +64,16 @@ l4_diff() {
 import json, sys
 b = json.loads(sys.argv[1]) if sys.argv[1].strip().startswith('{') else {}
 a = json.loads(sys.argv[2]) if sys.argv[2].strip().startswith('{') else {}
-d = {k: (a.get(k, 0) - b.get(k, 0)) for k in a if isinstance(a.get(k), (int, float))}
+def diff(bv, av):
+    if isinstance(av, dict) and isinstance(bv, dict):
+        return {k: diff(bv.get(k), v) for k, v in av.items()}
+    if isinstance(av, (int, float)) and not isinstance(av, bool):
+        return av - bv if isinstance(bv, (int, float)) and not isinstance(bv, bool) else av
+    return av
+d = diff(b, a)
 d['pressure_after'] = a.get('pressure'); d['syn_pressure_after'] = a.get('syn_pressure')
+if isinstance(a.get('kernel_filter'), dict):
+    d['kernel_filter_after'] = a['kernel_filter']
 with open(sys.argv[3], 'w') as f: json.dump({'before': b, 'after': a, 'delta': d}, f, indent=1)
 EOF
 }

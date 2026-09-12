@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::sync::LazyLock as Lazy;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -740,6 +740,29 @@ impl TcpProxyManager {
             "TCP Proxy (TLS={}) starting {} accept worker(s) on {}",
             is_tls, worker_count, bind_addr
         );
+        // Pressure-adaptive scaling: extra SO_REUSEPORT workers spawn under
+        // elevated L4 pressure and retire themselves when it subsides.
+        let desired_workers = Arc::new(AtomicUsize::new(worker_count));
+        {
+            let manager = self.clone();
+            let server = server.clone();
+            let acceptor = shared_ssl_acceptor.clone();
+            let desired = desired_workers.clone();
+            let mut scaler_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                manager
+                    .run_tcp_accept_scaler(
+                        bind_addr,
+                        server,
+                        is_tls,
+                        acceptor,
+                        worker_count,
+                        desired,
+                        &mut scaler_shutdown,
+                    )
+                    .await;
+            });
+        }
         for worker_id in 1..worker_count {
             let manager = self.clone();
             let server = server.clone();
@@ -754,6 +777,7 @@ impl TcpProxyManager {
                         acceptor,
                         worker_id,
                         worker_shutdown,
+                        None,
                     )
                     .await
                 {
@@ -772,8 +796,81 @@ impl TcpProxyManager {
             shared_ssl_acceptor,
             0,
             shutdown_rx,
+            None,
         )
         .await
+    }
+
+    /// Keeps the live accept-worker count tracking
+    /// `l4_defense::pressure_accept_worker_target`; extra workers retire
+    /// themselves via their scale watch once pressure subsides.
+    async fn run_tcp_accept_scaler(
+        self: Arc<Self>,
+        bind_addr: SocketAddr,
+        server: Arc<ServerConfig>,
+        is_tls: bool,
+        shared_ssl_acceptor: Option<Arc<pingora_core::listeners::tls::Acceptor>>,
+        base_workers: usize,
+        desired: Arc<AtomicUsize>,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut next_id = base_workers;
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                _ = tick.tick() => {}
+            }
+            let target = crate::l4_defense::pressure_accept_worker_target(base_workers);
+            let previous = desired.swap(target, Ordering::Relaxed);
+            if target != previous {
+                info!(
+                    "L4 pressure {:?}: TCP accept workers on {} {} -> {}",
+                    crate::l4_defense::current_pressure_level(),
+                    bind_addr,
+                    previous,
+                    target
+                );
+                crate::logging::report_node_log(
+                    "info".to_string(),
+                    "accept_scaling".to_string(),
+                    format!(
+                        "TCP accept workers on {bind_addr} scaled {previous} -> {target} under {:?} pressure",
+                        crate::l4_defense::current_pressure_level()
+                    ),
+                    0,
+                );
+            }
+            while next_id < target {
+                let manager = self.clone();
+                let server = server.clone();
+                let acceptor = shared_ssl_acceptor.clone();
+                let worker_shutdown = shutdown_rx.clone();
+                let desired = desired.clone();
+                let worker_id = next_id;
+                tokio::spawn(async move {
+                    if let Err(err) = manager
+                        .run_tcp_listener_worker(
+                            bind_addr,
+                            server,
+                            is_tls,
+                            acceptor,
+                            worker_id,
+                            worker_shutdown,
+                            Some(desired),
+                        )
+                        .await
+                    {
+                        error!(
+                            "TCP accept worker {} on {} failed: {}",
+                            worker_id, bind_addr, err
+                        );
+                    }
+                });
+                next_id += 1;
+            }
+        }
     }
 
     async fn run_tcp_listener_worker(
@@ -784,6 +881,7 @@ impl TcpProxyManager {
         shared_ssl_acceptor: Option<Arc<pingora_core::listeners::tls::Acceptor>>,
         worker_id: usize,
         mut shutdown_rx: watch::Receiver<bool>,
+        scale_state: Option<Arc<AtomicUsize>>,
     ) -> anyhow::Result<()> {
         let listener = bind_tcp_listener_with_retry(
             bind_addr,
@@ -796,11 +894,29 @@ impl TcpProxyManager {
             worker_id, is_tls, bind_addr
         );
 
+        let mut scale_retire = std::pin::pin!(async {
+            match &scale_state {
+                Some(desired) => loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    if worker_id >= desired.load(Ordering::Relaxed) {
+                        break;
+                    }
+                },
+                None => std::future::pending::<()>().await,
+            }
+        });
         loop {
             let accept_result = tokio::select! {
                 _ = shutdown_rx.changed() => {
                     info!(
                         "TCP accept worker {} on {} shutting down",
+                        worker_id, bind_addr
+                    );
+                    return Ok(());
+                }
+                _ = &mut scale_retire => {
+                    info!(
+                        "TCP accept worker {} on {} retiring after pressure scale-down",
                         worker_id, bind_addr
                     );
                     return Ok(());
@@ -2251,11 +2367,17 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; relay_copy_buffer_bytes()];
+    let full_buf_bytes = relay_copy_buffer_bytes();
+    let mut buf = vec![0u8; full_buf_bytes];
     let mut total = 0u64;
     let mut unflushed = 0u64;
 
     loop {
+        // Regrow a pressure-shrunk buffer once data flows again; the shrink is
+        // only an idle-time memory release, never a throughput cap.
+        if buf.len() < full_buf_bytes {
+            buf.resize(full_buf_bytes, 0);
+        }
         let n = match read_with_pressure_idle_timeout(
             &mut reader,
             &mut buf,
@@ -2307,7 +2429,7 @@ where
 
 async fn read_with_pressure_idle_timeout<R: AsyncRead + Unpin>(
     reader: &mut R,
-    buf: &mut [u8],
+    buf: &mut Vec<u8>,
     enforce_pressure_idle_timeout: bool,
 ) -> io::Result<usize> {
     read_with_optional_pressure_idle_timeout(
@@ -2320,22 +2442,45 @@ async fn read_with_pressure_idle_timeout<R: AsyncRead + Unpin>(
     .await
 }
 
+/// Minimum read buffer kept while a connection sits idle under memory
+/// pressure; the full relay buffer returns as soon as data flows again.
+const RELAY_IDLE_SHRINK_BYTES: usize = 4096;
+
 async fn read_with_optional_pressure_idle_timeout<R: AsyncRead + Unpin>(
     reader: &mut R,
-    buf: &mut [u8],
+    buf: &mut Vec<u8>,
     pressure_timeout: Option<std::time::Duration>,
 ) -> io::Result<usize> {
     let Some(timeout) = pressure_timeout else {
-        return reader.read(buf).await;
+        return reader.read(&mut buf[..]).await;
     };
 
     let mut idle = std::time::Duration::ZERO;
+    let mut shrunk = false;
     loop {
         let poll_interval = timeout.min(std::time::Duration::from_secs(1));
-        match tokio::time::timeout(poll_interval, reader.read(buf)).await {
+        match tokio::time::timeout(poll_interval, reader.read(&mut buf[..])).await {
             Ok(result) => return result,
             Err(_) => {
                 idle += poll_interval;
+                if !shrunk && buf.len() > RELAY_IDLE_SHRINK_BYTES {
+                    // The connection is idle under pressure; release the large
+                    // relay buffer's memory back to the allocator. It regrows
+                    // at the top of the copy loop when traffic resumes.
+                    let released = buf.len().saturating_sub(RELAY_IDLE_SHRINK_BYTES);
+                    // Replace, not truncate: a fresh small Vec drops the large
+                    // allocation outright; shrink_to_fit is not guaranteed to
+                    // release capacity.
+                    *buf = vec![0u8; RELAY_IDLE_SHRINK_BYTES];
+                    shrunk = true;
+                    crate::pipeline_metrics::increment(
+                        crate::pipeline_metrics::PipelineCounter::TcpRelayBufferShrunk,
+                    );
+                    debug!(
+                        "TCP relay idle buffer shrunk under pressure, released {} bytes",
+                        released
+                    );
+                }
                 if idle >= timeout {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -3138,14 +3283,14 @@ async fn maybe_consume_proxy_protocol_header(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-struct PrefixedStream<S> {
+pub(crate) struct PrefixedStream<S> {
     prefix: io::Cursor<Vec<u8>>,
     inner: S,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl<S> PrefixedStream<S> {
-    fn new(prefix: Vec<u8>, inner: S) -> Self {
+    pub(crate) fn new(prefix: Vec<u8>, inner: S) -> Self {
         Self {
             prefix: io::Cursor::new(prefix),
             inner,
@@ -3191,7 +3336,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-async fn maybe_consume_proxy_protocol_header_generic<S>(
+pub(crate) async fn maybe_consume_proxy_protocol_header_generic<S>(
     mut stream: S,
     client_addr: SocketAddr,
     enable_proxy_protocol: bool,
@@ -3277,7 +3422,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_pressure_idle_normal_path_does_not_timeout() {
         let mut reader = PendingReader;
-        let mut buf = [0u8; 8];
+        let mut buf = vec![0u8; 8];
         let read = read_with_optional_pressure_idle_timeout(&mut reader, &mut buf, None);
         tokio::pin!(read);
 
@@ -3290,7 +3435,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_pressure_idle_pressure_path_times_out() {
         let mut reader = PendingReader;
-        let mut buf = [0u8; 8];
+        let mut buf = vec![0u8; 8];
         let err = read_with_optional_pressure_idle_timeout(
             &mut reader,
             &mut buf,
@@ -3300,6 +3445,38 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn tcp_pressure_idle_shrinks_buffer_before_timeout() {
+        let mut reader = PendingReader;
+        let mut buf = vec![0u8; RELAY_IDLE_SHRINK_BYTES * 2];
+        let err = read_with_optional_pressure_idle_timeout(
+            &mut reader,
+            &mut buf,
+            Some(std::time::Duration::from_millis(1100)),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(buf.len(), RELAY_IDLE_SHRINK_BYTES);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn tcp_pressure_idle_keeps_small_buffer_intact() {
+        let mut reader = PendingReader;
+        let mut buf = vec![0u8; RELAY_IDLE_SHRINK_BYTES];
+        let err = read_with_optional_pressure_idle_timeout(
+            &mut reader,
+            &mut buf,
+            Some(std::time::Duration::from_millis(10)),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(buf.len(), RELAY_IDLE_SHRINK_BYTES);
     }
 
     #[test]

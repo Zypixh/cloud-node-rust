@@ -161,6 +161,8 @@ fn derive_xdp_config_with_ports_and_options(
             protocols: default_xdp_proxy_protocols(),
             ports,
         },
+        rate_limit: None,
+        sni_blocklist: Vec::new(),
     })
 }
 
@@ -255,9 +257,12 @@ fn detect_xdp_interfaces_with_options(
         interfaces.push(XdpInterfaceConfig {
             name: name.clone(),
             queues: rx_queues_for_interface(&name),
+            cpus: Vec::new(),
             mode: options.mode,
             local_ips: Vec::new(),
             frame_size: cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE,
+                udp_forwards: Vec::new(),
+                tcp_forwards: Vec::new(),
         });
     }
 

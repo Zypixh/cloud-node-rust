@@ -89,6 +89,26 @@ pub struct XdpStatusSnapshot {
     pub parse_errors: u64,
     pub map_miss: u64,
     pub xsk_drops: u64,
+    #[serde(default)]
+    pub rate_limited: u64,
+    #[serde(default)]
+    pub ratelimit_map_full: u64,
+    #[serde(default)]
+    pub udp_fwd_tx: u64,
+    #[serde(default)]
+    pub udp_fwd_map_full: u64,
+    #[serde(default)]
+    pub tcp_fwd_tx: u64,
+    #[serde(default)]
+    pub tcp_fwd_map_full: u64,
+    #[serde(default)]
+    pub sni_blocked: u64,
+    #[serde(default)]
+    pub sni_incomplete: u64,
+    #[serde(default)]
+    pub rate_limit_active: bool,
+    #[serde(default)]
+    pub rate_limit_detail: String,
     pub updated_at: i64,
 }
 
@@ -423,6 +443,16 @@ struct XdpManager {
     parse_errors: AtomicU64,
     map_miss: AtomicU64,
     xsk_drops: AtomicU64,
+    rate_limited: AtomicU64,
+    ratelimit_map_full: AtomicU64,
+    udp_fwd_tx: AtomicU64,
+    udp_fwd_map_full: AtomicU64,
+    tcp_fwd_tx: AtomicU64,
+    tcp_fwd_map_full: AtomicU64,
+    sni_blocked: AtomicU64,
+    sni_incomplete: AtomicU64,
+    rate_limit_active: AtomicU64,
+    rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
     last_state_write_at: AtomicU64,
     rule_sweeper_started: AtomicBool,
@@ -432,6 +462,12 @@ struct XdpManager {
     /// minimal set of map inserts/removes.
     #[cfg(target_os = "linux")]
     synced: parking_lot::Mutex<RuleState>,
+    /// Last-aggregated per-flow totals for XDP UDP direct-forward accounting;
+    /// sweeps emit deltas against this image so nothing is double-counted.
+    #[cfg(target_os = "linux")]
+    udp_flow_shadow: parking_lot::Mutex<
+        std::collections::HashMap<cloud_node_xdp_common::XdpUdpCtKey, cloud_node_xdp_common::XdpFlowAcct>,
+    >,
     map_sync_started: AtomicBool,
     map_sync_generation: AtomicU64,
     map_sync_notify: tokio::sync::Notify,
@@ -458,12 +494,24 @@ impl XdpManager {
             parse_errors: AtomicU64::new(0),
             map_miss: AtomicU64::new(0),
             xsk_drops: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+            ratelimit_map_full: AtomicU64::new(0),
+            udp_fwd_tx: AtomicU64::new(0),
+            udp_fwd_map_full: AtomicU64::new(0),
+            tcp_fwd_tx: AtomicU64::new(0),
+            tcp_fwd_map_full: AtomicU64::new(0),
+            sni_blocked: AtomicU64::new(0),
+            sni_incomplete: AtomicU64::new(0),
+            rate_limit_active: AtomicU64::new(0),
+            rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
             last_state_write_at: AtomicU64::new(0),
             rule_sweeper_started: AtomicBool::new(false),
             rule_sweeper_generation: AtomicU64::new(0),
             #[cfg(target_os = "linux")]
             synced: parking_lot::Mutex::new(RuleState::default()),
+            #[cfg(target_os = "linux")]
+            udp_flow_shadow: parking_lot::Mutex::new(std::collections::HashMap::new()),
             map_sync_started: AtomicBool::new(false),
             map_sync_generation: AtomicU64::new(0),
             map_sync_notify: tokio::sync::Notify::new(),
@@ -1001,6 +1049,16 @@ impl XdpManager {
             parse_errors: self.parse_errors.load(Ordering::Relaxed),
             map_miss: self.map_miss.load(Ordering::Relaxed),
             xsk_drops: self.xsk_drops.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            ratelimit_map_full: self.ratelimit_map_full.load(Ordering::Relaxed),
+            udp_fwd_tx: self.udp_fwd_tx.load(Ordering::Relaxed),
+            udp_fwd_map_full: self.udp_fwd_map_full.load(Ordering::Relaxed),
+            tcp_fwd_tx: self.tcp_fwd_tx.load(Ordering::Relaxed),
+            tcp_fwd_map_full: self.tcp_fwd_map_full.load(Ordering::Relaxed),
+            sni_blocked: self.sni_blocked.load(Ordering::Relaxed),
+            sni_incomplete: self.sni_incomplete.load(Ordering::Relaxed),
+            rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
+            rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
         }
     }
@@ -1074,6 +1132,22 @@ impl XdpManager {
         let status = self.status();
         if let Err(err) = write_status_snapshot_blocking(&path, &status) {
             tracing::warn!("failed to write XDP status: {}", err);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_xsk_queue_status(
+        &self,
+        interface: &str,
+        queue: u32,
+        update: impl FnOnce(&mut XdpQueueStatus),
+    ) {
+        let mut statuses = self.xsk_status.write();
+        if let Some(status) = statuses
+            .iter_mut()
+            .find(|status| status.interface == interface && status.queue == queue)
+        {
+            update(status);
         }
     }
 
@@ -1287,6 +1361,159 @@ impl XdpManager {
     #[cfg(not(target_os = "linux"))]
     fn flush_maps_diff(&self) {}
 
+    /// Effective per-IP rate limit for the current pressure level: base
+    /// settings apply at Elevated, halve at High, quarter at Critical, and the
+    /// limiter is fully disabled at Normal (zero pps = off in eBPF).
+    fn effective_rate_limit_config(&self) -> cloud_node_xdp_common::XdpRateLimitConfig {
+        let mut config = cloud_node_xdp_common::XdpRateLimitConfig::default();
+        let Some(base) = &self.config.rate_limit else {
+            return config;
+        };
+        let divisor: u64 = match crate::l4_defense::current_pressure_level() {
+            crate::l4_defense::L4PressureLevel::Normal => return config,
+            crate::l4_defense::L4PressureLevel::Elevated => 1,
+            crate::l4_defense::L4PressureLevel::High => 2,
+            crate::l4_defense::L4PressureLevel::Critical => 4,
+        };
+        config.udp_pps = base.udp_pps / divisor;
+        config.tcp_syn_pps = base.tcp_syn_pps / divisor;
+        config.window_ns = base.window_ms.saturating_mul(1_000_000);
+        config
+    }
+
+    /// Push the effective rate limit into the eBPF config map and record the
+    /// outcome in the status snapshot. An object without XDP_RATE_CFG (built
+    /// before the limiter existed) is reported, never silently ignored.
+    fn sync_rate_limit_config(&self) {
+        let config = self.effective_rate_limit_config();
+        let active = config.window_ns != 0 && (config.udp_pps != 0 || config.tcp_syn_pps != 0);
+        let detail = format!(
+            "udp_pps={} tcp_syn_pps={} window_ns={}",
+            config.udp_pps, config.tcp_syn_pps, config.window_ns
+        );
+        #[cfg(target_os = "linux")]
+        let result = {
+            let mut ebpf = self.ebpf.lock();
+            match ebpf.as_mut() {
+                Some(ebpf) => linux::sync_rate_limit(ebpf, &config),
+                None => return,
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let result: anyhow::Result<()> = Ok(());
+        match result {
+            Ok(()) => {
+                self.rate_limit_active.store(u64::from(active), Ordering::Relaxed);
+                *self.rate_limit_detail.lock() = detail;
+            }
+            Err(err) => {
+                let detail = format!("rate limit map sync unavailable: {err}");
+                if *self.rate_limit_detail.lock() != detail {
+                    tracing::warn!("{detail}");
+                    *self.rate_limit_detail.lock() = detail;
+                }
+                self.rate_limit_active.store(0, Ordering::Relaxed);
+                crate::pipeline_metrics::add(
+                    crate::pipeline_metrics::PipelineCounter::XdpMapSyncFailed,
+                    1,
+                );
+            }
+        }
+    }
+
+    /// Pin a QUIC long-header DCID to the XSK queue owning the session, so
+    /// retransmitted Initials and handshake datagrams keep landing on the
+    /// reactor that holds the connection state instead of following RSS.
+    /// Returns false when the eBPF object lacks the maps (stale object build);
+    /// callers log that once and keep RSS affinity as the explicit fallback.
+    #[cfg(target_os = "linux")]
+    fn upsert_quic_dcid(&self, dcid: &[u8], ifindex: u32, queue: u32) -> bool {
+        let Some(dcid_key) = cloud_node_xdp_common::XdpQuicDcidKey::new(dcid) else {
+            return false;
+        };
+        let mut guard = self.ebpf.lock();
+        let Some(ebpf) = guard.as_mut() else {
+            return false;
+        };
+        let xsk_index = {
+            let Some(map) = ebpf.map("XDP_XSK_INDEX") else {
+                return false;
+            };
+            let Ok(map) =
+                aya::maps::HashMap::<_, cloud_node_xdp_common::XdpQueueKey, u32>::try_from(map)
+            else {
+                return false;
+            };
+            map.get(&cloud_node_xdp_common::XdpQueueKey::new(ifindex, queue), 0)
+                .ok()
+        };
+        let Some(xsk_index) = xsk_index else {
+            return false;
+        };
+        let Some(map) = ebpf.map_mut("XDP_QUIC_DCID") else {
+            return false;
+        };
+        let Ok(mut map) =
+            aya::maps::HashMap::<_, cloud_node_xdp_common::XdpQuicDcidKey, u32>::try_from(map)
+        else {
+            return false;
+        };
+        map.insert(dcid_key, xsk_index, 0).is_ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_quic_dcid(&self, dcid_key: &cloud_node_xdp_common::XdpQuicDcidKey) {
+        let mut guard = self.ebpf.lock();
+        let Some(ebpf) = guard.as_mut() else {
+            return;
+        };
+        let Some(map) = ebpf.map_mut("XDP_QUIC_DCID") else {
+            return;
+        };
+        let Ok(mut map) =
+            aya::maps::HashMap::<_, cloud_node_xdp_common::XdpQuicDcidKey, u32>::try_from(map)
+        else {
+            return;
+        };
+        let _ = map.remove(dcid_key);
+    }
+
+    /// GC direct-forward conntrack entries and fold per-CPU flow accounting
+    /// into billing. No-op unless the dataplane is attached and forwards are
+    /// configured.
+    #[cfg(target_os = "linux")]
+    fn sweep_nat_maps(&self) {
+        let configured = self
+            .config
+            .interfaces
+            .iter()
+            .any(|iface| !iface.udp_forwards.is_empty() || !iface.tcp_forwards.is_empty());
+        if !configured || self.attached.read().is_empty() {
+            return;
+        }
+        let result = {
+            let mut guard = self.ebpf.lock();
+            let mut shadow = self.udp_flow_shadow.lock();
+            match guard.as_mut() {
+                Some(ebpf) => linux::sweep_nat_maps(
+                    ebpf,
+                    &mut shadow,
+                    std::time::Duration::from_secs(180),
+                    std::time::Duration::from_secs(7200),
+                    std::time::Duration::from_secs(120),
+                ),
+                None => Ok(()),
+            }
+        };
+        if let Err(err) = result {
+            tracing::warn!("XDP NAT map sweep failed: {err}");
+            crate::pipeline_metrics::add(
+                crate::pipeline_metrics::PipelineCounter::XdpMapSyncFailed,
+                1,
+            );
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn flush_maps_full_blocking(&self, _proxy_dataplane_active: bool) {}
 
@@ -1325,6 +1552,22 @@ impl XdpManager {
                     .store(counters.parse_errors, Ordering::Relaxed);
                 self.map_miss.store(counters.map_miss, Ordering::Relaxed);
                 self.xsk_drops.store(counters.xsk_drops, Ordering::Relaxed);
+                self.rate_limited
+                    .store(counters.rate_limited, Ordering::Relaxed);
+                self.ratelimit_map_full
+                    .store(counters.ratelimit_map_full, Ordering::Relaxed);
+                self.udp_fwd_tx
+                    .store(counters.udp_fwd_tx, Ordering::Relaxed);
+                self.udp_fwd_map_full
+                    .store(counters.udp_fwd_map_full, Ordering::Relaxed);
+                self.tcp_fwd_tx
+                    .store(counters.tcp_fwd_tx, Ordering::Relaxed);
+                self.tcp_fwd_map_full
+                    .store(counters.tcp_fwd_map_full, Ordering::Relaxed);
+                self.sni_blocked
+                    .store(counters.sni_blocked, Ordering::Relaxed);
+                self.sni_incomplete
+                    .store(counters.sni_incomplete, Ordering::Relaxed);
             }
         }
     }
@@ -1485,7 +1728,7 @@ fn manager_is_current(candidate: &std::sync::Arc<XdpManager>) -> bool {
     std::sync::Arc::ptr_eq(candidate, &*current)
 }
 
-async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
+pub async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
     let Some(mut runtime) = RuntimeConfig::current() else {
         return Ok(());
     };
@@ -1493,7 +1736,15 @@ async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let derived = crate::xdp_auto_config::derive_xdp_config_from_live_node(&runtime).await?;
+    let mut derived = crate::xdp_auto_config::derive_xdp_config_from_live_node(&runtime).await?;
+    // Explicit file-level knobs that auto derivation cannot infer stay
+    // authoritative; the derived part covers interfaces/queues/ports only.
+    derived.attach_mode = runtime.xdp.attach_mode;
+    derived.fallback = runtime.xdp.fallback;
+    derived.rate_limit = runtime.xdp.rate_limit.clone().or(derived.rate_limit);
+    if !runtime.xdp.sni_blocklist.is_empty() {
+        derived.sni_blocklist = runtime.xdp.sni_blocklist.clone();
+    }
     runtime.xdp = derived;
     RuntimeConfig::set_current(runtime);
     Ok(())
@@ -1520,6 +1771,9 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
             if manager.sweep_expired_rules() {
                 tracing::debug!("XDP rule sweeper removed expired shadow rules");
             }
+            manager.sync_rate_limit_config();
+            #[cfg(target_os = "linux")]
+            manager.sweep_nat_maps();
         }
     });
 }
@@ -3168,8 +3422,9 @@ mod linux {
     use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, XskMap};
     use aya::programs::links::PinnedLink;
     use cloud_node_xdp_common::{
-        XdpCounters, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key,
-        XdpPortProtoKey, XdpQueueKey, XdpRuleValue,
+        XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key,
+        XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig, XdpRuleValue,
+        XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
     };
     use ipnet::IpNet;
     use std::collections::BTreeSet;
@@ -3228,45 +3483,6 @@ mod linux {
             Ok(stats)
         }
 
-        pub fn send_udp_datagram(
-            &mut self,
-            interface: &str,
-            queue: u32,
-            link: &super::af_xdp::AfXdpLinkMeta,
-            listen_addr: std::net::SocketAddr,
-            peer_addr: std::net::SocketAddr,
-            payload: &[u8],
-        ) -> anyhow::Result<bool> {
-            let Some(queue) = self
-                .queues
-                .iter_mut()
-                .find(|handle| handle.interface == interface && handle.queue == queue)
-            else {
-                return Ok(false);
-            };
-            let sent = queue.send_udp_datagram(link, listen_addr, peer_addr, payload)?;
-            self.refresh_statuses(false);
-            Ok(sent)
-        }
-
-        pub fn send_raw_frame(
-            &mut self,
-            interface: &str,
-            queue: u32,
-            frame: &[u8],
-        ) -> anyhow::Result<bool> {
-            let Some(queue) = self
-                .queues
-                .iter_mut()
-                .find(|handle| handle.interface == interface && handle.queue == queue)
-            else {
-                return Ok(false);
-            };
-            let sent = queue.send_raw_frame(frame)?;
-            self.refresh_statuses(false);
-            Ok(sent)
-        }
-
         pub fn refresh_statuses(&mut self, force: bool) {
             let now = std::time::Instant::now();
             if !super::xsk_status_refresh_due(self.last_status_refresh_at, now, force) {
@@ -3287,14 +3503,20 @@ mod linux {
                 }
             }
         }
+
+        /// Move queue handles out so each can be owned by a dedicated pinned
+        /// reactor thread. After this call `poll_raw_once` is a no-op.
+        pub fn take_queues(&mut self) -> Vec<AfXdpQueueHandle> {
+            std::mem::take(&mut self.queues)
+        }
     }
 
     #[derive(Debug)]
-    struct AfXdpQueueHandle {
-        interface: String,
-        queue: u32,
+    pub(super) struct AfXdpQueueHandle {
+        pub(super) interface: String,
+        pub(super) queue: u32,
         tx: TxQueue,
-        rx: RxQueue,
+        pub(super) rx: RxQueue,
         fill: Option<FillQueue>,
         comp: Option<CompQueue>,
         umem: Umem,
@@ -3305,7 +3527,7 @@ mod linux {
     }
 
     impl AfXdpQueueHandle {
-        fn poll_raw_once<F>(&mut self, on_packet: &mut F) -> anyhow::Result<AfXdpPollStats>
+        pub(super) fn poll_raw_once<F>(&mut self, on_packet: &mut F) -> anyhow::Result<AfXdpPollStats>
         where
             F: FnMut(&str, u32, Vec<u8>),
         {
@@ -3387,7 +3609,7 @@ mod linux {
             completed
         }
 
-        fn send_udp_datagram(
+        pub(super) fn send_udp_datagram(
             &mut self,
             link: &super::af_xdp::AfXdpLinkMeta,
             listen_addr: std::net::SocketAddr,
@@ -3417,7 +3639,7 @@ mod linux {
             result
         }
 
-        fn send_raw_frame(&mut self, frame: &[u8]) -> anyhow::Result<bool> {
+        pub(super) fn send_raw_frame(&mut self, frame: &[u8]) -> anyhow::Result<bool> {
             self.reclaim_tx_completions();
             let Some(desc) = self.free_frames.pop() else {
                 return Ok(false);
@@ -3728,11 +3950,79 @@ mod linux {
             XdpAttachMode::Drv => aya::programs::XdpMode::Driver,
             XdpAttachMode::Skb => aya::programs::XdpMode::Skb,
         };
+        {
+            let program: &mut aya::programs::Xdp = ebpf
+                .program_mut("cloud_node_xdp")
+                .ok_or_else(|| anyhow::anyhow!("missing eBPF program cloud_node_xdp"))?
+                .try_into()?;
+            program.load()?;
+        }
+        // Populate the tail-call dispatch table: slot 0 is the NAT
+        // subprogram, slot 1 the SNI blocklist subprogram (which chains into
+        // NAT). An older object without these symbols leaves slots empty; the
+        // program then falls back to the inline redirect path explicitly.
+        let nat_dispatch_fd = match ebpf.program_mut("xdp_nat_dispatch") {
+            Some(sub_program) => {
+                let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
+                sub.load()?;
+                Some(
+                    sub.fd()?
+                        .try_clone()
+                        .map_err(|err| anyhow::anyhow!("clone xdp_nat_dispatch fd: {err}"))?,
+                )
+            }
+            None => None,
+        };
+        let sni_dispatch_fd = match ebpf.program_mut("xdp_sni_dispatch") {
+            Some(sub_program) => {
+                let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
+                sub.load()?;
+                Some(
+                    sub.fd()?
+                        .try_clone()
+                        .map_err(|err| anyhow::anyhow!("clone xdp_sni_dispatch fd: {err}"))?,
+                )
+            }
+            None => None,
+        };
+        match (ebpf.map_mut("XDP_DISPATCH"), nat_dispatch_fd, sni_dispatch_fd) {
+            (Some(map), nat_fd, sni_fd) => {
+                let mut table = aya::maps::ProgramArray::try_from(map)?;
+                if let Some(ref fd) = nat_fd {
+                    table.set(0, fd, 0)?;
+                }
+                if let Some(ref fd) = sni_fd {
+                    table.set(1, fd, 0)?;
+                }
+                if nat_fd.is_none() || sni_fd.is_none() {
+                    tracing::warn!(
+                        "eBPF object lacks a dispatch subprogram; affected direct-forward/SNI features stay on the normal dataplane"
+                    );
+                }
+            }
+            (None, _, _) => {
+                let configured: usize = config
+                    .interfaces
+                    .iter()
+                    .map(|iface| iface.udp_forwards.len() + iface.tcp_forwards.len())
+                    .sum();
+                if configured > 0 {
+                    tracing::warn!(
+                        "eBPF object lacks XDP_DISPATCH; {configured} configured forwards are not active (stale object, rebuild cloud-node-xdp-ebpf.o)"
+                    );
+                }
+                if !config.sni_blocklist.is_empty() {
+                    tracing::warn!(
+                        "eBPF object lacks XDP_DISPATCH; {} configured SNI blocklist entries are not enforced in kernel (stale object, rebuild cloud-node-xdp-ebpf.o)",
+                        config.sni_blocklist.len()
+                    );
+                }
+            }
+        }
         let program: &mut aya::programs::Xdp = ebpf
             .program_mut("cloud_node_xdp")
             .ok_or_else(|| anyhow::anyhow!("missing eBPF program cloud_node_xdp"))?
             .try_into()?;
-        program.load()?;
         for interface in &config.interfaces {
             let link_id = program.attach(&interface.name, mode)?;
             let link = program.take_link(link_id)?;
@@ -3796,6 +4086,9 @@ mod linux {
         sync_local_ip_maps(ebpf, config)?;
         sync_proxy_ports(ebpf, config, proxy_dataplane_active)?;
         sync_xsk_indices(ebpf, config, proxy_dataplane_active)?;
+        sync_udp_forwards(ebpf, config, proxy_dataplane_active)?;
+        sync_tcp_forwards(ebpf, config, proxy_dataplane_active)?;
+        sync_sni_blocklist(ebpf, config)?;
         clear_rule_maps(ebpf)?;
         let empty = RuleState::default();
         apply_rule_diff(ebpf, &empty, state)?;
@@ -3847,6 +4140,23 @@ mod linux {
             .ok_or_else(|| anyhow::anyhow!("missing map XDP_COUNTERS"))?;
         let counters = Array::<_, XdpCounters>::try_from(map)?.get(&0, 0)?;
         Ok(counters)
+    }
+
+    /// Write the per-IP rate limiter config. Returns an explicit error when the
+    /// loaded eBPF object predates the limiter so callers can report the
+    /// unsupported feature instead of silently degrading.
+    pub fn sync_rate_limit(
+        ebpf: &mut aya::Ebpf,
+        config: &XdpRateLimitConfig,
+    ) -> anyhow::Result<()> {
+        let map = ebpf.map_mut("XDP_RATE_CFG").ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing map XDP_RATE_CFG; eBPF object predates rate limiter (rebuild cloud-node-xdp-ebpf.o)"
+            )
+        })?;
+        let mut array = Array::<_, XdpRateLimitConfig>::try_from(map)?;
+        array.set(0, *config, 0)?;
+        Ok(())
     }
 
     fn zero_counters(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
@@ -3968,6 +4278,333 @@ mod linux {
         for entry in xsk_map_entries(config)? {
             map.insert(XdpQueueKey::new(entry.ifindex, entry.queue), entry.index, 0)?;
         }
+        Ok(())
+    }
+
+    /// Program explicit UDP direct-forward rules. Each entry needs a resolved
+    /// backend address and a next-hop MAC (from config or the neighbor table).
+    /// Unresolvable entries are skipped with a warning so the listen tuple
+    /// keeps its normal XSK/kernel path instead of being silently forwarded
+    /// with a bogus route.
+    fn sync_udp_forwards(
+        ebpf: &mut aya::Ebpf,
+        config: &XdpConfig,
+        dataplane_active: bool,
+    ) -> anyhow::Result<()> {
+        sync_forward_map(
+            ebpf,
+            "XDP_UDP_FWD",
+            "UDP",
+            config,
+            dataplane_active,
+            |iface| &iface.udp_forwards,
+        )
+    }
+
+    /// Program explicit TCP direct-forward rules; same contract as
+    /// `sync_udp_forwards`.
+    fn sync_tcp_forwards(
+        ebpf: &mut aya::Ebpf,
+        config: &XdpConfig,
+        dataplane_active: bool,
+    ) -> anyhow::Result<()> {
+        sync_forward_map(
+            ebpf,
+            "XDP_TCP_FWD",
+            "TCP",
+            config,
+            dataplane_active,
+            |iface| &iface.tcp_forwards,
+        )
+    }
+
+    fn sync_forward_map(
+        ebpf: &mut aya::Ebpf,
+        map_name: &str,
+        proto: &str,
+        config: &XdpConfig,
+        dataplane_active: bool,
+        forwards: impl Fn(&crate::runtime_mode::XdpInterfaceConfig) -> &Vec<crate::runtime_mode::XdpUdpForwardConfig>,
+    ) -> anyhow::Result<()> {
+        let Some(map) = ebpf.map_mut(map_name) else {
+            let configured: usize = config.interfaces.iter().map(|i| forwards(i).len()).sum();
+            if configured > 0 {
+                tracing::warn!(
+                    "eBPF object lacks {map_name}; {configured} configured {proto} forwards are not active (stale object, rebuild cloud-node-xdp-ebpf.o)"
+                );
+            }
+            return Ok(());
+        };
+        let mut map =
+            AyaHashMap::<_, XdpUdpFwdKey, XdpUdpFwdRule>::try_from(map)?;
+        clear_hash_map(&mut map)?;
+        if !dataplane_active {
+            return Ok(());
+        }
+        for iface in &config.interfaces {
+            for fwd in forwards(iface) {
+                match udp_forward_entry(fwd) {
+                    Ok((key, rule)) => {
+                        if let Err(err) = map.insert(key, rule, 0) {
+                            tracing::warn!(
+                                "XDP {proto} forward {} -> {} on {} failed to install: {err}",
+                                fwd.listen,
+                                fwd.backend,
+                                iface.name
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "XDP {proto} forward {} -> {} on {} is not active: {err}; traffic keeps the normal dataplane",
+                            fwd.listen,
+                            fwd.backend,
+                            iface.name
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Program the SNI blocklist: FNV-1a(lower(SNI)) -> 1. The map is only a
+    /// fast-path accelerator; userspace SNI handling stays authoritative, so
+    /// a missing map with a configured list is a warning, not a silent skip.
+    fn sync_sni_blocklist(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Result<()> {
+        let Some(map) = ebpf.map_mut("XDP_SNI_BLOCK") else {
+            if !config.sni_blocklist.is_empty() {
+                tracing::warn!(
+                    "eBPF object lacks XDP_SNI_BLOCK; {} configured SNI blocklist entries are not active in kernel (stale object, rebuild cloud-node-xdp-ebpf.o)",
+                    config.sni_blocklist.len()
+                );
+            }
+            return Ok(());
+        };
+        let mut map = AyaHashMap::<_, u64, u32>::try_from(map)?;
+        clear_hash_map(&mut map)?;
+        for name in &config.sni_blocklist {
+            let hash = cloud_node_xdp_common::sni_hash(name);
+            map.insert(hash, 1u32, 0)
+                .map_err(|err| anyhow::anyhow!("insert SNI block {name}: {err}"))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn udp_forward_entry(
+        fwd: &crate::runtime_mode::XdpUdpForwardConfig,
+    ) -> anyhow::Result<(XdpUdpFwdKey, XdpUdpFwdRule)> {
+        use std::net::ToSocketAddrs;
+        let backend = fwd
+            .backend
+            .to_socket_addrs()
+            .map_err(|err| anyhow::anyhow!("backend {} resolve failed: {err}", fwd.backend))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("backend {} resolved no addresses", fwd.backend))?;
+        if backend.is_ipv4() != fwd.listen.is_ipv4() {
+            anyhow::bail!(
+                "address family mismatch: listen {} vs backend {}",
+                fwd.listen,
+                backend
+            );
+        }
+        let next_hop_mac = if fwd.next_hop_mac.is_empty() {
+            resolve_next_hop_mac(backend.ip())
+                .map_err(|err| anyhow::anyhow!("next-hop MAC for {}: {err}", backend.ip()))?
+        } else {
+            parse_mac(&fwd.next_hop_mac)
+                .map_err(|err| anyhow::anyhow!("invalid nextHopMac {}: {err}", fwd.next_hop_mac))?
+        };
+        let (key, backend_addr) = match (fwd.listen.ip(), backend.ip()) {
+            (IpAddr::V4(listen), IpAddr::V4(backend)) => (
+                XdpUdpFwdKey::new_v4(u32::from_be_bytes(listen.octets()), fwd.listen.port().to_be()),
+                v4_embed(backend),
+            ),
+            (IpAddr::V6(listen), IpAddr::V6(backend)) => (
+                XdpUdpFwdKey::new_v6(listen.octets(), fwd.listen.port().to_be()),
+                backend.octets(),
+            ),
+            _ => unreachable!(),
+        };
+        Ok((
+            key,
+            XdpUdpFwdRule {
+                backend_addr,
+                next_hop_mac,
+                backend_port_be: backend.port().to_be(),
+                family: key.family,
+                server_id: fwd.server_id,
+            },
+        ))
+    }
+
+    fn v4_embed(addr: std::net::Ipv4Addr) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..4].copy_from_slice(&addr.octets());
+        out
+    }
+
+    pub(super) fn parse_mac(text: &str) -> anyhow::Result<[u8; 6]> {
+        let parts: Vec<&str> = text.split(':').collect();
+        if parts.len() != 6 {
+            anyhow::bail!("expected 6 octets");
+        }
+        let mut mac = [0u8; 6];
+        for (idx, part) in parts.iter().enumerate() {
+            mac[idx] = u8::from_str_radix(part, 16)?;
+        }
+        Ok(mac)
+    }
+
+    /// Resolve the neighbor MAC for a backend address: `ip -j route get`
+    /// yields the next hop (gateway, or the target itself when on-link), then
+    /// `ip -j neigh show` yields its link-layer address.
+    fn resolve_next_hop_mac(target: IpAddr) -> anyhow::Result<[u8; 6]> {
+        let route = run_ip_json(&["route", "get", &target.to_string()])?;
+        let entry = route
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no route to {target}"))?;
+        let next_hop = entry
+            .get("gateway")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| target.to_string());
+        let neigh = run_ip_json(&["neigh", "show", "to", &next_hop])?;
+        for entry in &neigh {
+            let Some(lladdr) = entry.get("lladdr").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let usable = entry
+                .get("state")
+                .and_then(|v| v.as_array())
+                .map(|states| {
+                    states.iter().any(|s| {
+                        matches!(
+                            s.as_str(),
+                            Some("REACHABLE") | Some("STALE") | Some("DELAY") | Some("PERMANENT")
+                        )
+                    })
+                })
+                .unwrap_or(true);
+            if usable {
+                return parse_mac(lladdr)
+                    .map_err(|err| anyhow::anyhow!("neighbor {next_hop} lladdr {lladdr}: {err}"));
+            }
+        }
+        anyhow::bail!("no usable neighbor entry for {next_hop} (route to {target})")
+    }
+
+    fn run_ip_json(args: &[&str]) -> anyhow::Result<Vec<serde_json::Value>> {
+        let mut argv = vec!["-j"];
+        argv.extend_from_slice(args);
+        let output = std::process::Command::new("ip")
+            .args(&argv)
+            .output()
+            .map_err(|err| anyhow::anyhow!("ip command failed to start: {err}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "ip {} exited {}: {}",
+                argv.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|err| anyhow::anyhow!("ip -j output parse failed: {err}"))
+    }
+
+    /// GC stale conntrack entries and fold per-CPU flow accounting into the
+    /// billing pipeline. Accounting is folded first (final deltas included)
+    /// and only then are stale conntrack/accounting/shadow entries removed, so
+    /// a reaped flow's last bytes are billed exactly once. TCP entries in
+    /// CLOSING state are reaped after `tcp_closing_grace`; all others use the
+    /// protocol's idle timeout.
+    pub(super) fn sweep_nat_maps(
+        ebpf: &mut aya::Ebpf,
+        shadow: &mut std::collections::HashMap<XdpUdpCtKey, XdpFlowAcct>,
+        udp_idle: std::time::Duration,
+        tcp_idle: std::time::Duration,
+        tcp_closing_grace: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        use cloud_node_xdp_common::XDP_CT_STATE_CLOSING;
+        let now_ns = monotonic_now_ns();
+        let udp_idle_ns = udp_idle.as_nanos().min(u64::MAX as u128) as u64;
+        let tcp_idle_ns = tcp_idle.as_nanos().min(u64::MAX as u128) as u64;
+        let closing_ns = tcp_closing_grace.as_nanos().min(u64::MAX as u128) as u64;
+
+        let mut stale: Vec<XdpUdpCtKey> = Vec::new();
+        if let Some(map) = ebpf.map_mut("XDP_UDP_CT") {
+            let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
+            for item in map.iter() {
+                let (key, value) = item?;
+                if now_ns.saturating_sub(value.last_seen_ns) >= udp_idle_ns {
+                    stale.push(key);
+                }
+            }
+            for key in &stale {
+                let _ = map.remove(key);
+            }
+        }
+        if let Some(map) = ebpf.map_mut("XDP_TCP_CT") {
+            let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
+            let mut tcp_stale = Vec::new();
+            for item in map.iter() {
+                let (key, value) = item?;
+                let idle = now_ns.saturating_sub(value.last_seen_ns);
+                let limit = if value.state == XDP_CT_STATE_CLOSING {
+                    closing_ns
+                } else {
+                    tcp_idle_ns
+                };
+                if idle >= limit {
+                    tcp_stale.push(key);
+                }
+            }
+            for key in &tcp_stale {
+                let _ = map.remove(key);
+            }
+            stale.extend(tcp_stale);
+        }
+
+        if let Some(map) = ebpf.map_mut("XDP_FLOW_ACCT") {
+            let mut map =
+                aya::maps::PerCpuHashMap::<_, XdpUdpCtKey, XdpFlowAcct>::try_from(map)?;
+            let mut acct_remove = Vec::new();
+            for item in map.iter() {
+                let (key, per_cpu) = item?;
+                let mut total = XdpFlowAcct::default();
+                for value in per_cpu.iter() {
+                    total.rx_bytes = total.rx_bytes.saturating_add(value.rx_bytes);
+                    total.tx_bytes = total.tx_bytes.saturating_add(value.tx_bytes);
+                    total.rx_pkts = total.rx_pkts.saturating_add(value.rx_pkts);
+                    total.tx_pkts = total.tx_pkts.saturating_add(value.tx_pkts);
+                    total.last_seen_ns = total.last_seen_ns.max(value.last_seen_ns);
+                    total.server_id = value.server_id;
+                }
+                let previous = shadow.get(&key).copied().unwrap_or_default();
+                let delta_rx = total.rx_bytes.saturating_sub(previous.rx_bytes);
+                let delta_tx = total.tx_bytes.saturating_sub(previous.tx_bytes);
+                if delta_rx > 0 || delta_tx > 0 {
+                    crate::metrics::record::record_transfer(
+                        total.server_id,
+                        delta_tx,
+                        delta_rx,
+                        None,
+                    );
+                }
+                if stale.contains(&key) {
+                    acct_remove.push(key);
+                    shadow.remove(&key);
+                } else {
+                    shadow.insert(key, total);
+                }
+            }
+            for key in acct_remove {
+                let _ = map.remove(&key);
+            }
+        }
+        // Shadow entries whose flow was already reaped stay; they are dropped
+        // once their acct entry is observed above, so nothing accumulates.
         Ok(())
     }
 
@@ -4500,7 +5137,7 @@ mod linux {
         Ok(())
     }
 
-    fn ifindex_from_name(name: &str) -> anyhow::Result<u32> {
+    pub(super) fn ifindex_from_name(name: &str) -> anyhow::Result<u32> {
         let c_name = CString::new(name)?;
         let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
         if ifindex == 0 {
@@ -4539,6 +5176,8 @@ pub mod af_xdp {
     #[cfg(any(test, target_os = "linux"))]
     use smoltcp::time::Instant as SmoltcpInstant;
     #[cfg(any(test, target_os = "linux"))]
+    use dashmap::DashMap;
+    #[cfg(any(test, target_os = "linux"))]
     use smoltcp::wire::{
         HardwareAddress, IpAddress as SmoltcpIpAddress, IpCidr as SmoltcpIpCidr, IpEndpoint,
         IpListenEndpoint,
@@ -4557,8 +5196,6 @@ pub mod af_xdp {
     use tokio::sync::mpsc;
     #[cfg(target_os = "linux")]
     use tokio::sync::watch;
-    #[cfg(target_os = "linux")]
-    use tokio::time::{MissedTickBehavior, interval};
 
     const ETH_HEADER_LEN: usize = 14;
     const VLAN_HEADER_LEN: usize = 4;
@@ -6133,6 +6770,34 @@ pub mod af_xdp {
         pub(super) last_seen_ms: u64,
     }
 
+    /// Cross-interface forwarding between per-queue reactor threads. TX on any
+    /// queue of the same interface delivers identically, so forwarding is only
+    /// needed when a flow's L2 route resolves to a different interface than the
+    /// draining thread owns.
+    #[cfg(target_os = "linux")]
+    enum AfXdpForward {
+        Udp(crate::udp_proxy::DownstreamUdpDatagram),
+        TcpFrame(Vec<u8>),
+    }
+
+    /// Per-queue reactor context shared at spawn time.
+    #[cfg(target_os = "linux")]
+    struct AfXdpQueueCtx {
+        downstream_tx: mpsc::Sender<crate::udp_proxy::DownstreamUdpDatagram>,
+        downstream_rx: mpsc::Receiver<crate::udp_proxy::DownstreamUdpDatagram>,
+        fwd_rx: mpsc::Receiver<AfXdpForward>,
+        /// Route cache shared by all queue threads: ingress on queue A may be
+        /// answered by the demux/H3 endpoint on queue B's channel, so lookups
+        /// must see every queue's learned L2 routes.
+        udp_routes: Arc<DashMap<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>>,
+        /// QUIC DCIDs this bridge has pinned to an XSK queue, mirrored from the
+        /// eBPF XDP_QUIC_DCID map for idle-expiry sweeping.
+        quic_dcid_steers:
+            Arc<DashMap<cloud_node_xdp_common::XdpQuicDcidKey, u64>>,
+        /// First channel per interface for cross-interface forwarding.
+        iface_fwd: Arc<HashMap<String, mpsc::Sender<AfXdpForward>>>,
+    }
+
     pub fn runtime() -> AfXdpRuntime {
         let status = status_snapshot();
         AfXdpRuntime {
@@ -6186,40 +6851,48 @@ pub mod af_xdp {
     }
 
     #[cfg(target_os = "linux")]
+    fn pin_current_thread_to_cpu(cpu: u32) -> bool {
+        // SAFETY: `set` is zeroed before CPU_SET marks exactly one bit; pid 0
+        // targets the calling thread. cpu_set_t is a plain bitmask with no
+        // pointers.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(cpu as usize, &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+        }
+    }
+
+    /// Resolve the CPU a queue reactor should pin to: explicit `cpus[]` entry
+    /// aligned with `queues[]`, else round-robin the global queue ordinal over
+    /// online CPUs.
+    #[cfg(target_os = "linux")]
+    fn af_xdp_queue_cpu(
+        config: &XdpConfig,
+        interface: &str,
+        queue: u32,
+        ordinal: usize,
+        online_cpus: usize,
+    ) -> u32 {
+        if let Some(cfg) = config
+            .interfaces
+            .iter()
+            .find(|interface_cfg| interface_cfg.name == interface)
+            && let Some(position) = cfg.queues.iter().position(|candidate| *candidate == queue)
+            && let Some(cpu) = cfg.cpus.get(position)
+        {
+            return *cpu;
+        }
+        (ordinal % online_cpus.max(1)) as u32
+    }
+
+    #[cfg(target_os = "linux")]
     async fn run_proxy_bridge(
         manager: Arc<XdpManager>,
         quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
         tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
     ) {
-        const AF_XDP_DOWNSTREAM_QUEUE: usize = 4096;
-        const AF_XDP_DOWNSTREAM_DRAIN_BUDGET: usize = 1024;
-        const AF_XDP_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
-        const AF_XDP_ROUTE_CACHE_MAX: usize = 65_536;
-        const AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
-        const AF_XDP_ROUTE_CACHE_EVICT_BATCH: usize = 1024;
-        const AF_XDP_ROUTE_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-        const AF_XDP_MAX_CONSECUTIVE_POLL_ERRORS: u32 = 3;
-        const AF_XDP_MAX_CONSECUTIVE_TX_FAILURES: u32 = 256;
-        const AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES: u32 = 1024;
-        const AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS: u32 = 1024;
-
-        let (downstream_tx, mut downstream_rx) =
-            mpsc::channel::<crate::udp_proxy::DownstreamUdpDatagram>(AF_XDP_DOWNSTREAM_QUEUE);
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut idle_tick = interval(AF_XDP_IDLE_POLL_INTERVAL);
-        idle_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut udp_routes = HashMap::<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>::new();
-        let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
-        let mut tcp_reactor = AfXdpTcpReactor::new(tcp_manager, http_manager);
-        let mut consecutive_poll_errors = 0u32;
-        let mut tx_failures = AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TX_FAILURES);
-        let mut udp_ingress_failures =
-            AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES);
-        let mut tcp_admission_failures =
-            AfXdpTcpAdmissionFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS);
-        let mut frames = Vec::with_capacity(64);
-
         match manager.enable_proxy_redirect("AF_XDP proxy bridge") {
             Ok(true) => {
                 let message = format!(
@@ -6265,6 +6938,197 @@ pub mod af_xdp {
             }
         }
 
+        // Per-queue reactor threads: each AF_XDP queue is owned by a dedicated
+        // CPU-pinned OS thread running an isolated smoltcp reactor. The shared
+        // af_xdp mutex and single poll loop are removed from the dataplane;
+        // RSS flow-to-queue affinity keeps flows on one reactor.
+        let queue_handles = {
+            let mut runtime = manager.af_xdp.lock();
+            match runtime.as_mut() {
+                Some(runtime) => runtime.take_queues(),
+                None => {
+                    manager.set_proxy_fallback_reason(
+                        "AF_XDP proxy bridge cannot start; AF_XDP runtime is not initialized",
+                    );
+                    return;
+                }
+            }
+        };
+        if queue_handles.is_empty() {
+            let message =
+                "AF_XDP proxy bridge has no AF_XDP queues; proxy redirect disabled, traffic will PASS"
+                    .to_string();
+            tracing::warn!("{message}");
+            manager.disable_proxy_redirect_for_fallback(message);
+            return;
+        }
+        spawn_queue_reactors(&manager, queue_handles, quic_demux, tcp_manager, http_manager).await;
+    }
+
+    /// Spawn one pinned OS thread per AF_XDP queue and watch them: any reactor
+    /// exiting while the bridge should still be alive disables proxy redirect
+    /// so traffic falls back to kernel listeners explicitly.
+    #[cfg(target_os = "linux")]
+    async fn spawn_queue_reactors(
+        manager: &Arc<XdpManager>,
+        queue_handles: Vec<linux::AfXdpQueueHandle>,
+        quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
+        tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
+        http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
+    ) {
+        const AF_XDP_DOWNSTREAM_QUEUE: usize = 4096;
+
+        let online_cpus = num_cpus::get().max(1);
+        let udp_routes = Arc::new(DashMap::new());
+        let quic_dcid_steers = Arc::new(DashMap::new());
+        // One forwarding channel per queue; the first sender per interface is
+        // the cross-interface forward target.
+        let mut iface_fwd: HashMap<String, mpsc::Sender<AfXdpForward>> = HashMap::new();
+        let mut contexts = Vec::with_capacity(queue_handles.len());
+        for queue_handle in &queue_handles {
+            let (downstream_tx, downstream_rx) =
+                mpsc::channel::<crate::udp_proxy::DownstreamUdpDatagram>(
+                    AF_XDP_DOWNSTREAM_QUEUE,
+                );
+            let (fwd_tx, fwd_rx) = mpsc::channel::<AfXdpForward>(AF_XDP_DOWNSTREAM_QUEUE);
+            iface_fwd
+                .entry(queue_handle.interface.clone())
+                .or_insert(fwd_tx);
+            contexts.push(AfXdpQueueCtx {
+                downstream_tx,
+                downstream_rx,
+                fwd_rx,
+                udp_routes: udp_routes.clone(),
+                quic_dcid_steers: quic_dcid_steers.clone(),
+                iface_fwd: Arc::new(HashMap::new()),
+            });
+        }
+        let iface_fwd = Arc::new(iface_fwd);
+        for ctx in &mut contexts {
+            ctx.iface_fwd = iface_fwd.clone();
+        }
+        let mut joins: Vec<std::thread::JoinHandle<()>> =
+            Vec::with_capacity(queue_handles.len());
+        for (ordinal, (queue_handle, ctx)) in queue_handles
+            .into_iter()
+            .zip(contexts.into_iter())
+            .enumerate()
+        {
+            let cpu = af_xdp_queue_cpu(
+                &manager.config,
+                &queue_handle.interface,
+                queue_handle.queue,
+                ordinal,
+                online_cpus,
+            );
+            let thread_name = format!("afxdp-{}-{}", queue_handle.interface, queue_handle.queue);
+            let reactor_manager = manager.clone();
+            let quic_demux = quic_demux.clone();
+            let tcp_manager = tcp_manager.clone();
+            let http_manager = http_manager.clone();
+            let name = thread_name.clone();
+            let join = match std::thread::Builder::new().name(thread_name).spawn(move || {
+                if !pin_current_thread_to_cpu(cpu) {
+                    tracing::warn!("{name}: failed to pin reactor thread to cpu {cpu}");
+                }
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(run_queue_bridge_loop(
+                        reactor_manager,
+                        queue_handle,
+                        ctx,
+                        quic_demux,
+                        tcp_manager,
+                        http_manager,
+                    )),
+                    Err(err) => {
+                        tracing::error!("{name}: failed to build reactor runtime: {err}")
+                    }
+                }
+            }) {
+                Ok(join) => join,
+                Err(err) => {
+                    manager.disable_proxy_redirect_for_fallback(format!(
+                        "AF_XDP proxy bridge failed to spawn reactor thread: {err}; proxy redirect disabled, traffic will PASS"
+                    ));
+                    for join in joins {
+                        let _ = join.join();
+                    }
+                    return;
+                }
+            };
+            joins.push(join);
+        }
+        tracing::info!(
+            "AF_XDP proxy bridge running {} per-queue reactor threads",
+            joins.len()
+        );
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if joins.iter().all(|join| join.is_finished()) {
+                return;
+            }
+            if joins.iter().any(|join| join.is_finished())
+                && proxy_bridge_should_continue(manager)
+            {
+                manager.disable_proxy_redirect_for_fallback(
+                    "AF_XDP queue reactor thread exited unexpectedly; proxy redirect disabled, traffic will PASS"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_queue_bridge_loop(
+        manager: Arc<XdpManager>,
+        mut queue_handle: linux::AfXdpQueueHandle,
+        ctx: AfXdpQueueCtx,
+        quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
+        tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
+        http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
+    ) {
+        const AF_XDP_DOWNSTREAM_DRAIN_BUDGET: usize = 1024;
+        const AF_XDP_ROUTE_CACHE_MAX: usize = 65_536;
+        const AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+        const AF_XDP_ROUTE_CACHE_EVICT_BATCH: usize = 1024;
+        const AF_XDP_ROUTE_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+        const AF_XDP_MAX_CONSECUTIVE_POLL_ERRORS: u32 = 3;
+        const AF_XDP_MAX_CONSECUTIVE_TX_FAILURES: u32 = 256;
+        const AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES: u32 = 1024;
+        const AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS: u32 = 1024;
+        // Idle backoff: busy-poll first, then exponentially back off to 1ms.
+        const AF_XDP_IDLE_BACKOFF_MIN: Duration = Duration::from_micros(10);
+        const AF_XDP_IDLE_BACKOFF_MAX: Duration = Duration::from_millis(1);
+        const AF_XDP_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+        let AfXdpQueueCtx {
+            downstream_tx,
+            mut downstream_rx,
+            mut fwd_rx,
+            udp_routes,
+            quic_dcid_steers,
+            iface_fwd,
+        } = ctx;
+        let own_interface = queue_handle.interface.clone();
+        let own_ifindex = linux::ifindex_from_name(&own_interface).unwrap_or(0);
+        let mut quic_dcid_map_unavailable = false;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
+        let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
+        let mut tcp_reactor = AfXdpTcpReactor::new(tcp_manager, http_manager);
+        let mut consecutive_poll_errors = 0u32;
+        let mut tx_failures = AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TX_FAILURES);
+        let mut udp_ingress_failures =
+            AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES);
+        let mut tcp_admission_failures =
+            AfXdpTcpAdmissionFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS);
+        let mut frames = Vec::with_capacity(64);
+        let mut last_status_refresh = std::time::Instant::now();
+
         loop {
             if !proxy_bridge_should_continue(&manager) {
                 let message =
@@ -6279,21 +7143,25 @@ pub mod af_xdp {
                 );
                 return;
             }
-            frames.clear();
-            let poll_result = {
-                let mut runtime = manager.af_xdp.lock();
-                match runtime.as_mut() {
-                    Some(runtime) => runtime.poll_raw_once(|interface, queue, frame| {
-                        frames.push((interface.to_string(), queue, frame));
-                    }),
-                    None => {
-                        manager.set_proxy_fallback_reason(
-                            "AF_XDP proxy bridge cannot start; AF_XDP runtime is not initialized",
-                        );
-                        return;
-                    }
+            if last_status_refresh.elapsed() >= AF_XDP_STATUS_REFRESH_INTERVAL {
+                last_status_refresh = std::time::Instant::now();
+                if let Ok(stats) = queue_handle.rx.fd().xdp_statistics() {
+                    manager.update_xsk_queue_status(
+                        &queue_handle.interface,
+                        queue_handle.queue,
+                        |status| {
+                            status.rx_dropped = stats.rx_dropped();
+                            status.rx_invalid_descs = stats.rx_invalid_descs();
+                            status.rx_ring_full = stats.rx_ring_full();
+                            status.tx_invalid_descs = stats.tx_invalid_descs();
+                        },
+                    );
                 }
-            };
+            }
+            frames.clear();
+            let poll_result = queue_handle.poll_raw_once(&mut |interface, queue, frame| {
+                frames.push((interface.to_string(), queue, frame));
+            });
 
             let polled_packets = match poll_result {
                 Ok(stats) => {
@@ -6314,7 +7182,7 @@ pub mod af_xdp {
                         ));
                         return;
                     }
-                    idle_tick.tick().await;
+                    std::thread::sleep(idle_backoff);
                     continue;
                 }
             };
@@ -6326,12 +7194,25 @@ pub mod af_xdp {
                 AF_XDP_ROUTE_CACHE_SWEEP_INTERVAL,
             ) {
                 compact_udp_route_cache(
-                    &mut udp_routes,
+                    &udp_routes,
                     now_ms,
                     AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT,
                     AF_XDP_ROUTE_CACHE_MAX,
                     AF_XDP_ROUTE_CACHE_EVICT_BATCH,
                 );
+                let mut expired_dcids = Vec::new();
+                quic_dcid_steers.retain(|key, last_seen_ms| {
+                    if now_ms.saturating_sub(*last_seen_ms)
+                        >= AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT.as_millis() as u64
+                    {
+                        expired_dcids.push(*key);
+                        return false;
+                    }
+                    true
+                });
+                for key in expired_dcids {
+                    manager.remove_quic_dcid(&key);
+                }
                 last_route_cache_sweep_ms = now_ms;
             }
 
@@ -6347,7 +7228,7 @@ pub mod af_xdp {
                         let now_ms = crate::udp_proxy::udp_activity_now_ms();
                         if udp_routes.len() >= AF_XDP_ROUTE_CACHE_MAX {
                             compact_udp_route_cache(
-                                &mut udp_routes,
+                                &udp_routes,
                                 now_ms,
                                 AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT,
                                 AF_XDP_ROUTE_CACHE_MAX,
@@ -6361,6 +7242,37 @@ pub mod af_xdp {
                                 last_seen_ms: now_ms,
                             },
                         );
+                        // Long-header QUIC packets encode their DCID length,
+                        // so the eBPF program can steer them. Pin this flow's
+                        // DCID to this queue's XSK so retransmissions and
+                        // handshake traffic stay on the owning reactor.
+                        if own_ifindex != 0
+                            && packet.payload.first().is_some_and(|b| b & 0x80 != 0)
+                            && let Some(cids) =
+                                crate::quic_probe::quic_packet_cids(&packet.payload, 0)
+                            && let Some(dkey) =
+                                cloud_node_xdp_common::XdpQuicDcidKey::new(&cids.dcid)
+                        {
+                            match quic_dcid_steers.get_mut(&dkey) {
+                                Some(mut seen) => *seen = now_ms,
+                                None => {
+                                    if manager.upsert_quic_dcid(
+                                        &cids.dcid,
+                                        own_ifindex,
+                                        queue_handle.queue,
+                                    ) {
+                                        quic_dcid_steers.insert(dkey, now_ms);
+                                    } else if !quic_dcid_map_unavailable {
+                                        quic_dcid_map_unavailable = true;
+                                        tracing::warn!(
+                                            "AF_XDP QUIC DCID steering unavailable (eBPF object lacks XDP_QUIC_DCID or XSK index for {} queue {}); RSS queue affinity remains the fallback",
+                                            own_interface,
+                                            queue_handle.queue
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         let Some(datagram) = packet.into_udp_datagram() else {
                             continue;
                         };
@@ -6443,32 +7355,61 @@ pub mod af_xdp {
                 };
                 downstream_datagrams = downstream_datagrams.saturating_add(1);
                 let now_ms = crate::udp_proxy::udp_activity_now_ms();
-                let Some(entry) = udp_routes.get_mut(&(datagram.listen_addr, datagram.peer_addr))
-                else {
-                    tracing::debug!(
-                        "AF_XDP proxy bridge has no L2 route for downstream datagram listen={} peer={} bytes={}",
-                        datagram.listen_addr,
-                        datagram.peer_addr,
-                        datagram.payload.len()
-                    );
-                    continue;
-                };
-                entry.last_seen_ms = now_ms;
-                let route = entry.route.clone();
-                let sent = {
-                    let mut runtime = manager.af_xdp.lock();
-                    match runtime.as_mut() {
-                        Some(runtime) => runtime.send_udp_datagram(
-                            &route.interface,
-                            route.queue,
-                            &route.link,
+                let route = {
+                    let Some(mut entry) =
+                        udp_routes.get_mut(&(datagram.listen_addr, datagram.peer_addr))
+                    else {
+                        tracing::debug!(
+                            "AF_XDP proxy bridge has no L2 route for downstream datagram listen={} peer={} bytes={}",
                             datagram.listen_addr,
                             datagram.peer_addr,
-                            datagram.payload.as_ref(),
-                        ),
-                        None => Ok(false),
-                    }
+                            datagram.payload.len()
+                        );
+                        continue;
+                    };
+                    entry.last_seen_ms = now_ms;
+                    entry.route.clone()
                 };
+                if route.interface != own_interface {
+                    match iface_fwd.get(&route.interface) {
+                        Some(tx) => match tx.try_send(AfXdpForward::Udp(datagram)) {
+                            Ok(()) => continue,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(
+                                    "AF_XDP proxy bridge forward channel to interface {} is full; dropping downstream datagram",
+                                    route.interface
+                                );
+                                if tx_failures.record(AfXdpTxStatus::Backpressured) {
+                                    manager.disable_proxy_redirect_for_fallback(format!(
+                                        "AF_XDP cross-interface forward channel stayed full for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} datagrams; proxy redirect disabled, traffic will PASS"
+                                    ));
+                                    return;
+                                }
+                                continue;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::warn!(
+                                    "AF_XDP proxy bridge forward channel to interface {} is closed",
+                                    route.interface
+                                );
+                                continue;
+                            }
+                        },
+                        None => {
+                            tracing::warn!(
+                                "AF_XDP proxy bridge has no reactor channel for route interface {}; dropping downstream datagram",
+                                route.interface
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let sent = queue_handle.send_udp_datagram(
+                    &route.link,
+                    datagram.listen_addr,
+                    datagram.peer_addr,
+                    datagram.payload.as_ref(),
+                );
                 match sent {
                     Ok(true) => {
                         tx_failures.record(AfXdpTxStatus::Sent);
@@ -6508,6 +7449,61 @@ pub mod af_xdp {
                 downstream_budget_exhausted = true;
             }
 
+            // Forwarded traffic: datagrams/frames whose L2 route resolves to
+            // this thread's interface but were drained by a reactor on another
+            // interface.
+            for _ in 0..AF_XDP_DOWNSTREAM_DRAIN_BUDGET {
+                let fwd = match fwd_rx.try_recv() {
+                    Ok(fwd) => fwd,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                };
+                let sent = match fwd {
+                    AfXdpForward::Udp(datagram) => {
+                        let route = {
+                            let Some(entry) = udp_routes
+                                .get_mut(&(datagram.listen_addr, datagram.peer_addr))
+                            else {
+                                continue;
+                            };
+                            entry.route.clone()
+                        };
+                        if route.interface != own_interface {
+                            continue;
+                        }
+                        queue_handle.send_udp_datagram(
+                            &route.link,
+                            datagram.listen_addr,
+                            datagram.peer_addr,
+                            datagram.payload.as_ref(),
+                        )
+                    }
+                    AfXdpForward::TcpFrame(frame) => queue_handle.send_raw_frame(&frame),
+                };
+                match sent {
+                    Ok(true) => {
+                        tx_failures.record(AfXdpTxStatus::Sent);
+                    }
+                    Ok(false) => {
+                        if tx_failures.record(AfXdpTxStatus::Backpressured) {
+                            manager.disable_proxy_redirect_for_fallback(format!(
+                                "AF_XDP forwarded TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times; proxy redirect disabled, traffic will PASS"
+                            ));
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!("AF_XDP forwarded TX failed: {err}");
+                        if tx_failures.record(AfXdpTxStatus::Failed) {
+                            manager.disable_proxy_redirect_for_fallback(format!(
+                                "AF_XDP forwarded TX failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} attempts: {err}; proxy redirect disabled, traffic will PASS"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+
             let tcp_egress = tcp_reactor.poll();
             let tcp_egress_frames = tcp_egress.len();
             #[cfg(target_os = "linux")]
@@ -6522,15 +7518,13 @@ pub mod af_xdp {
                     );
                     continue;
                 };
-                let sent = {
-                    let mut runtime = manager.af_xdp.lock();
-                    match runtime.as_mut() {
-                        Some(runtime) => {
-                            runtime.send_raw_frame(&route.interface, route.queue, &frame)
-                        }
-                        None => Ok(false),
+                if route.interface != own_interface {
+                    if let Some(tx) = iface_fwd.get(&route.interface) {
+                        let _ = tx.try_send(AfXdpForward::TcpFrame(frame));
                     }
-                };
+                    continue;
+                }
+                let sent = queue_handle.send_raw_frame(&frame);
                 match sent {
                     Ok(true) => {
                         tx_failures.record(AfXdpTxStatus::Sent);
@@ -6574,7 +7568,11 @@ pub mod af_xdp {
                 tcp_egress_frames,
                 downstream_budget_exhausted,
             ) {
-                idle_tick.tick().await;
+                std::hint::spin_loop();
+                std::thread::sleep(idle_backoff);
+                idle_backoff = (idle_backoff.saturating_mul(2)).min(AF_XDP_IDLE_BACKOFF_MAX);
+            } else {
+                idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
             }
         }
     }
@@ -6591,7 +7589,7 @@ pub mod af_xdp {
 
     #[cfg(any(test, target_os = "linux"))]
     pub(super) fn compact_udp_route_cache(
-        routes: &mut HashMap<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>,
+        routes: &DashMap<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>,
         now_ms: u64,
         idle_timeout: Duration,
         max_entries: usize,
@@ -6611,7 +7609,10 @@ pub mod af_xdp {
             .max(evict_batch.min(routes.len()));
         let mut oldest = routes
             .iter()
-            .map(|(key, entry)| (*key, entry.last_seen_ms))
+            .map(|entry| {
+                let (key, value) = entry.pair();
+                (*key, value.last_seen_ms)
+            })
             .collect::<Vec<_>>();
         oldest.select_nth_unstable_by(evict_count.saturating_sub(1), |left, right| {
             left.1.cmp(&right.1)
@@ -7301,6 +8302,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: interface.to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
@@ -7339,7 +8341,8 @@ mod tests {
         let manager = XdpManager::new(XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
         let now = crate::utils::time::now_timestamp();
         manager.sync_snapshot(&KernelFilterSnapshot {
             blocked_ips: vec![("192.0.2.10".parse().unwrap(), now + 60)],
@@ -7357,7 +8360,8 @@ mod tests {
         let manager = XdpManager::new(XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
         let now = crate::utils::time::now_timestamp();
         manager.sync_snapshot(&KernelFilterSnapshot {
             blocked_networks: vec![("198.51.100.0/24".parse().unwrap(), now + 60)],
@@ -7388,7 +8392,8 @@ mod tests {
         let manager = XdpManager::new(XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
         let now = crate::utils::time::now_timestamp();
         let expired_ip: IpAddr = "192.0.2.1".parse().unwrap();
         let active_ip: IpAddr = "192.0.2.2".parse().unwrap();
@@ -7445,7 +8450,8 @@ mod tests {
         let manager = XdpManager::new(XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
 
         assert_eq!(manager.rule_sweeper_generation.load(Ordering::Relaxed), 0);
         assert!(!manager.rule_sweeper_started.swap(true, Ordering::Relaxed));
@@ -7465,6 +8471,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth-old".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Protect,
                 ..Default::default()
             }],
@@ -7496,6 +8503,7 @@ mod tests {
                 interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                     name: "eth-new".to_string(),
                     queues: vec![1],
+                    cpus: Vec::new(),
                     mode: XdpRuntimeMode::Proxy,
                     ..Default::default()
                 }],
@@ -7789,7 +8797,8 @@ mod tests {
         let report = doctor_report_for_config(&XdpConfig {
             enabled: true,
             ..XdpConfig::default()
-        });
+        
+            });
         assert!(report.contains("interfaces is empty"));
     }
 
@@ -7815,6 +8824,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
@@ -7838,6 +8848,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 frame_size: 4096,
                 ..Default::default()
@@ -7872,6 +8883,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 frame_size: 4096,
                 ..Default::default()
@@ -7904,6 +8916,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 frame_size: 4096,
                 ..Default::default()
@@ -7961,6 +8974,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 local_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
                 ..Default::default()
@@ -7990,6 +9004,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 local_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
                 ..Default::default()
@@ -8037,6 +9052,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 local_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
                 ..Default::default()
@@ -8181,6 +9197,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
@@ -8243,6 +9260,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
@@ -8312,6 +9330,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
@@ -8843,11 +9862,11 @@ mod tests {
 
     #[test]
     fn af_xdp_udp_route_cache_expires_and_evicts_oldest_without_clearing_all() {
-        use std::collections::HashMap;
+        use dashmap::DashMap;
         use std::net::SocketAddr;
         use std::time::Duration;
 
-        let mut routes = HashMap::new();
+        let routes = DashMap::new();
         for idx in 0..4u16 {
             let local = SocketAddr::from(([198, 51, 100, 5], 443));
             let peer = SocketAddr::from(([192, 0, 2, 10], 53000 + idx));
@@ -8864,16 +9883,56 @@ mod tests {
             );
         }
 
-        af_xdp::compact_udp_route_cache(&mut routes, 115, Duration::from_millis(100), 8, 2);
+        af_xdp::compact_udp_route_cache(&routes, 115, Duration::from_millis(100), 8, 2);
 
         assert_eq!(routes.len(), 2);
-        assert!(routes.keys().all(|(_, peer)| peer.port() >= 53002));
+        assert!(routes
+            .iter()
+            .all(|entry| entry.key().1.port() >= 53002));
 
-        af_xdp::compact_udp_route_cache(&mut routes, 116, Duration::from_millis(1_000), 2, 1);
+        af_xdp::compact_udp_route_cache(&routes, 116, Duration::from_millis(1_000), 2, 1);
 
         assert_eq!(routes.len(), 1);
-        assert!(routes.keys().all(|(_, peer)| peer.port() == 53003));
-        assert_eq!(routes.values().next().unwrap().route.queue, 3);
+        let remaining = routes.iter().next().unwrap();
+        assert_eq!(remaining.key().1.port(), 53003);
+        assert_eq!(remaining.value().route.queue, 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn udp_forward_parse_mac_and_entry_validation() {
+        use std::net::SocketAddr;
+
+        assert_eq!(
+            linux::parse_mac("aa:bb:cc:dd:ee:ff").unwrap(),
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        );
+        assert!(linux::parse_mac("aa:bb").is_err());
+        assert!(linux::parse_mac("gg:bb:cc:dd:ee:ff").is_err());
+
+        let fwd = crate::runtime_mode::XdpUdpForwardConfig {
+            listen: SocketAddr::from(([192, 0, 2, 10], 5353)),
+            backend: "10.0.0.5:53".to_string(),
+            next_hop_mac: "02:00:00:00:00:01".to_string(),
+            server_id: 42,
+        };
+        let (key, rule) = linux::udp_forward_entry(&fwd).unwrap();
+        assert_eq!(key.family, 4);
+        assert_eq!(&key.addr[..4], &[192, 0, 2, 10]);
+        assert_eq!(key.port_be, 5353u16.to_be());
+        assert_eq!(&rule.backend_addr[..4], &[10, 0, 0, 5]);
+        assert_eq!(rule.backend_port_be, 53u16.to_be());
+        assert_eq!(rule.server_id, 42);
+        assert_eq!(rule.next_hop_mac, [0x02, 0, 0, 0, 0, 1]);
+
+        // Family mismatch is rejected explicitly.
+        let bad = crate::runtime_mode::XdpUdpForwardConfig {
+            listen: SocketAddr::from(([192, 0, 2, 10], 5353)),
+            backend: "[2001:db8::5]:53".to_string(),
+            next_hop_mac: "02:00:00:00:00:01".to_string(),
+            server_id: 0,
+        };
+        assert!(linux::udp_forward_entry(&bad).is_err());
     }
 
     #[test]

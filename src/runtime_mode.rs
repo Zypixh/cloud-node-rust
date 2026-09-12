@@ -148,12 +148,43 @@ pub struct XdpInterfaceConfig {
     pub name: String,
     #[serde(default)]
     pub queues: Vec<u32>,
+    /// Optional CPU ids aligned index-wise with `queues`; pins each per-queue
+    /// AF_XDP reactor thread. Empty = auto round-robin across online CPUs.
+    #[serde(default)]
+    pub cpus: Vec<u32>,
     #[serde(default)]
     pub mode: XdpRuntimeMode,
     #[serde(rename = "localIps", default)]
     pub local_ips: Vec<std::net::IpAddr>,
     #[serde(rename = "frameSize", default = "default_xdp_frame_size")]
     pub frame_size: u32,
+    /// Explicitly configured UDP direct-forward rules. Each entry DNATs a
+    /// listen tuple to a backend at the XDP layer (XDP_TX, no userspace
+    /// pass). The backend must route replies back through this node.
+    #[serde(rename = "udpForwards", default)]
+    pub udp_forwards: Vec<XdpUdpForwardConfig>,
+    /// Explicitly configured TCP direct-forward rules: stateful L4 NAT at the
+    /// XDP layer (conntrack on bare SYN; mid-stream packets without state fall
+    /// back to the normal dataplane). The backend must route replies back
+    /// through this node.
+    #[serde(rename = "tcpForwards", default)]
+    pub tcp_forwards: Vec<XdpUdpForwardConfig>,
+}
+
+/// A single UDP direct-forward rule applied at the XDP layer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpUdpForwardConfig {
+    /// Local listen address, e.g. "192.0.2.10:5353" or "0.0.0.0:5353".
+    pub listen: std::net::SocketAddr,
+    /// Backend target, e.g. "10.0.0.5:5353" (hostnames resolve at sync time).
+    pub backend: String,
+    /// Optional explicit next-hop MAC for the backend; when empty it is
+    /// resolved from the neighbor table at sync time.
+    #[serde(rename = "nextHopMac", default)]
+    pub next_hop_mac: String,
+    /// Billing dimension for flow accounting.
+    #[serde(rename = "serverId", default)]
+    pub server_id: i64,
 }
 
 impl Default for XdpInterfaceConfig {
@@ -161,9 +192,12 @@ impl Default for XdpInterfaceConfig {
         Self {
             name: String::new(),
             queues: Vec::new(),
+            cpus: Vec::new(),
             mode: XdpRuntimeMode::default(),
             local_ips: Vec::new(),
             frame_size: default_xdp_frame_size(),
+            udp_forwards: Vec::new(),
+            tcp_forwards: Vec::new(),
         }
     }
 }
@@ -185,6 +219,34 @@ impl Default for XdpProxyConfig {
     }
 }
 
+fn default_xdp_rate_limit_window_ms() -> u64 {
+    1000
+}
+
+/// Base per-IP fixed-window limits for the eBPF limiter. Userspace scales
+/// these down under elevated pressure (Elevated: x1, High: /2, Critical: /4)
+/// and disables the limiter entirely at Normal pressure. `0` disables the
+/// limit for that protocol.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpRateLimitSettings {
+    #[serde(rename = "udpPps", default)]
+    pub udp_pps: u64,
+    #[serde(rename = "tcpSynPps", default)]
+    pub tcp_syn_pps: u64,
+    #[serde(rename = "windowMs", default = "default_xdp_rate_limit_window_ms")]
+    pub window_ms: u64,
+}
+
+impl Default for XdpRateLimitSettings {
+    fn default() -> Self {
+        Self {
+            udp_pps: 0,
+            tcp_syn_pps: 0,
+            window_ms: default_xdp_rate_limit_window_ms(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct XdpConfig {
     #[serde(default)]
@@ -197,6 +259,14 @@ pub struct XdpConfig {
     pub interfaces: Vec<XdpInterfaceConfig>,
     #[serde(default)]
     pub proxy: XdpProxyConfig,
+    #[serde(rename = "rateLimit", default)]
+    pub rate_limit: Option<XdpRateLimitSettings>,
+    /// SNI blocklist enforced at the XDP layer on the first data segment of
+    /// TCP flows (TLS ClientHello server_name). Parsed ClientHellos that match
+    /// are dropped in the driver; incomplete or split ClientHellos always pass
+    /// to userspace, which remains the authoritative SNI path.
+    #[serde(rename = "sniBlocklist", default)]
+    pub sni_blocklist: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -333,9 +403,21 @@ impl RuntimeConfig {
     pub fn load_default() -> anyhow::Result<Self> {
         let node_paths = crate::paths::NodePaths::current();
         let config_path = node_paths.runtime_config_file();
+        // Read the file twice: once as a raw value to learn whether the
+        // operator explicitly set `xdp.enabled` (an absent key must not
+        // override the environment), and once into the typed config.
+        let mut file_xdp_enabled = None;
         let mut config = if config_path.exists() {
             tracing::info!("Loading runtime config from: {}", config_path.display());
-            Self::load(&config_path)?
+            let content = std::fs::read_to_string(&config_path)?;
+            file_xdp_enabled = serde_yaml::from_str::<serde_yaml::Value>(&content)
+                .ok()
+                .and_then(|root| {
+                    root.get("xdp")
+                        .and_then(|xdp| xdp.get("enabled"))
+                        .and_then(|enabled| enabled.as_bool())
+                });
+            serde_yaml::from_str(&content)?
         } else {
             Self::default()
         };
@@ -350,6 +432,22 @@ impl RuntimeConfig {
             }
         }
 
+        // XDP is enabled unless told otherwise. Precedence, weakest first:
+        // built-in default (on) < CLOUD_NODE_XDP env var < explicit
+        // `xdp.enabled` in the config file. Everything else about the
+        // dataplane is auto-derived at attach time, so a missing file never
+        // needs to be generated.
+        let xdp_enabled = match file_xdp_enabled {
+            Some(value) => Some(value),
+            None => Self::xdp_enabled_from_env()?,
+        };
+        config.xdp.enabled = xdp_enabled.unwrap_or(true);
+        if config.is_rke2() {
+            // Cluster mode never runs the XDP dataplane: AF_XDP owns the NIC
+            // queues and would starve Kubernetes networking on the node.
+            config.xdp.enabled = false;
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -358,6 +456,17 @@ impl RuntimeConfig {
         let content = std::fs::read_to_string(path.as_ref())?;
         let config: Self = serde_yaml::from_str(&content)?;
         Ok(config)
+    }
+
+    fn xdp_enabled_from_env() -> anyhow::Result<Option<bool>> {
+        let Ok(value) = std::env::var("CLOUD_NODE_XDP") else {
+            return Ok(None);
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "1" | "true" | "on" | "yes" | "enable" | "enabled" => Ok(Some(true)),
+            "0" | "false" | "off" | "no" | "disable" | "disabled" => Ok(Some(false)),
+            other => anyhow::bail!("unsupported CLOUD_NODE_XDP value: {other}"),
+        }
     }
 
     pub fn set_current(config: RuntimeConfig) {
@@ -614,6 +723,7 @@ mod tests {
                 interfaces: vec![XdpInterfaceConfig {
                     name: "eth0".to_string(),
                     queues: vec![0],
+                    cpus: Vec::new(),
                     mode: XdpRuntimeMode::Proxy,
                     ..Default::default()
                 }],
@@ -698,5 +808,151 @@ xdp:
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("not enabled in xdp.proxy.protocols"));
+    }
+
+    struct XdpEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl XdpEnvGuard {
+        fn apply(home: &std::path::Path, vars: &[(&'static str, Option<&str>)]) -> Self {
+            let mut saved = vec![("CLOUD_NODE_HOME", std::env::var_os("CLOUD_NODE_HOME"))];
+            unsafe {
+                std::env::set_var("CLOUD_NODE_HOME", home);
+            }
+            for (key, value) in vars {
+                saved.push((key, std::env::var_os(key)));
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for XdpEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn xdp_home(contents: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cloud-node-xdp-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        if let Some(contents) = contents {
+            std::fs::create_dir_all(dir.join("configs")).unwrap();
+            std::fs::write(dir.join("configs").join("runtime.yaml"), contents).unwrap();
+        } else {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        dir
+    }
+
+    fn load_xdp_enabled(
+        file: Option<&str>,
+        vars: &[(&'static str, Option<&str>)],
+    ) -> anyhow::Result<bool> {
+        let home = xdp_home(file);
+        let _env = XdpEnvGuard::apply(&home, vars);
+        let enabled = RuntimeConfig::load_default().map(|config| config.xdp.enabled);
+        std::fs::remove_dir_all(&home).ok();
+        enabled
+    }
+
+    fn xdp_var(value: &str) -> (&'static str, Option<&str>) {
+        ("CLOUD_NODE_XDP", Some(value))
+    }
+
+    const NO_XDP_ENV: (&'static str, Option<&'static str>) = ("CLOUD_NODE_XDP", None);
+    const NO_MODE_ENV: (&'static str, Option<&'static str>) = ("CLOUD_NODE_MODE", None);
+
+    #[test]
+    fn xdp_enabled_precedence_default_env_file() {
+        let _guard = runtime_config_test_guard();
+        let clear = &[NO_XDP_ENV, NO_MODE_ENV];
+
+        // No file, no env: default enabled.
+        assert!(load_xdp_enabled(None, clear).unwrap());
+        // No file: env toggles.
+        assert!(!load_xdp_enabled(None, &[xdp_var("0"), NO_MODE_ENV]).unwrap());
+        assert!(load_xdp_enabled(None, &[xdp_var("true"), NO_MODE_ENV]).unwrap());
+        // File without xdp.enabled: env still applies.
+        assert!(
+            !load_xdp_enabled(Some("cluster: {}\n"), &[xdp_var("off"), NO_MODE_ENV]).unwrap()
+        );
+        assert!(load_xdp_enabled(Some("xdp: {}\n"), clear).unwrap());
+        // File is the final authority in both directions.
+        assert!(
+            load_xdp_enabled(Some("xdp:\n  enabled: true\n"), &[xdp_var("0"), NO_MODE_ENV])
+                .unwrap()
+        );
+        assert!(
+            !load_xdp_enabled(Some("xdp:\n  enabled: false\n"), &[xdp_var("1"), NO_MODE_ENV])
+                .unwrap()
+        );
+        assert!(!load_xdp_enabled(Some("xdp:\n  enabled: false\n"), clear).unwrap());
+        // Garbage env values are an explicit error, not a silent default.
+        assert!(load_xdp_enabled(None, &[xdp_var("maybe"), NO_MODE_ENV]).is_err());
+    }
+
+    #[test]
+    fn xdp_enabled_forced_off_in_rke2_mode() {
+        let _guard = runtime_config_test_guard();
+        let file = r#"
+cluster:
+  enabled: true
+  type: rke2
+  name: prod
+  namespace: cloud-node
+  serviceName: cloud-node
+  cache:
+    localMetaDir: /tmp/meta
+    shards:
+      - id: s0
+        path: /tmp/shard0
+        weight: 1
+        replicas: 1
+"#;
+        let vars = &[
+            xdp_var("1"),
+            ("CLOUD_NODE_MODE", Some("rke2")),
+            ("CLOUD_NODE_CLUSTER_INTERNAL_TOKEN", Some("token")),
+            ("POD_NAME", Some("pod-0")),
+            ("POD_IP", Some("10.0.0.1")),
+        ];
+        assert!(!load_xdp_enabled(Some(file), vars).unwrap());
+    }
+
+    #[test]
+    fn xdp_save_xdp_enabled_preserves_other_keys() {
+        let _guard = runtime_config_test_guard();
+        let home = xdp_home(Some(
+            "runtime:\n  mode: standalone\ncluster:\n  name: prod\nxdp:\n  enabled: false\n  attachMode: drv\n",
+        ));
+        let path = home.join("configs").join("runtime.yaml");
+        crate::xdp_config_wizard::save_xdp_enabled(&path, true).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        assert_eq!(value["xdp"]["enabled"].as_bool(), Some(true));
+        assert!(value["xdp"]["attachMode"].is_null());
+        assert_eq!(value["cluster"]["name"].as_str(), Some("prod"));
+        std::fs::remove_dir_all(&home).ok();
     }
 }

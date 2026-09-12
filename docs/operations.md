@@ -66,15 +66,14 @@ cloud-node xdp doctor
 
 systemd unit 会以 `Type=simple` 托管前台节点进程，用于开机自启、日志和状态排障。已注册 systemd unit 时，`cloud-node start/restart` 会优先委托给 `systemctl`；未注册 systemd 时才使用内置后台进程管理。节点自身会同时把运行日志追加到 `logs/run.log`。
 
-启用 XDP/AF_XDP 前，确认服务具备 root 或 `CAP_BPF`、`CAP_NET_ADMIN`、`CAP_NET_RAW`，并在 `configs/runtime.yaml` 中显式配置接口和队列。建议先执行：
+XDP/AF_XDP 默认启用，接口和队列由代码自动推导。部署前确认服务具备 root 或 `CAP_BPF`、`CAP_NET_ADMIN`、`CAP_NET_RAW`，建议先执行：
 
 ```bash
 cloud-node xdp doctor
-cloud-node xdp attach
 cloud-node xdp status
 ```
 
-如果生产环境要求 XDP 不可用时拒绝启动，把 `xdp.fallback` 设置为 `fail-start`；默认 `pass` 会回退到原监听器。
+如需关闭，设置 `CLOUD_NODE_XDP=0` 或在 `configs/runtime.yaml` 中写 `xdp.enabled: false`（文件为最终裁决）。如果生产环境要求 XDP 不可用时拒绝启动，把 `xdp.fallback` 设置为 `fail-start`；默认 `pass` 会回退到原监听器并记录原因。
 
 ## 内置 NTP 命令
 
