@@ -108,6 +108,25 @@ proxy 模式命中端口后内核 socket 不再收到该包；未命中、降级
 - 配置 reload 时，如果接口、队列和 proxy 端口未变化，运行时保留现有 AF_XDP bridge，避免队列重复绑定。
 - `detach` 会撤销当前进程管理的 XDP attach，并将状态标记为 detached。
 
+## 内核程序布局（tail-call）
+
+主程序 `cloud_node_xdp` 按 family/proto 经 `XDP_DISPATCH`（prog array，8 槽位）尾调用到各 NAT 子程序——每个 SNAT-capable handler 约 10KiB BPF 指令，拆分后单个程序才能通过旧内核（6.1 已实测）的 verifier 状态预算：
+
+| 槽位 | 程序 | 覆盖 |
+|---|---|---|
+| 0 | `xdp_nat_dispatch` | UDP/IPv4 forward + reply |
+| 1 | `xdp_sni_dispatch` | SNI blocklist，未命中链入槽位 2 |
+| 2 | `xdp_nat_tcp_dispatch` | TCP/IPv4 forward + reply |
+| 3 | `xdp_nat_udp6_dispatch` | UDP/IPv6 reply，forward 尾调用槽位 5 |
+| 4 | `xdp_nat_tcp6_dispatch` | TCP/IPv6 reply，forward 尾调用槽位 6 |
+| 5 | `xdp_nat_udp6_fwd` | UDP/IPv6 forward |
+| 6 | `xdp_nat_tcp6_fwd` | TCP/IPv6 forward |
+
+槽位为空（旧 .o 缺符号）时 tail-call 落空返回，流量显式走 redirect/PASS 路径，attach 时会有 warning。
+
+## Pinned map 迁移
+
+`/sys/fs/bpf/cloud-node-xdp/` 下的 map pin 跨重启复用。attach 前会逐张比对内核报告的 spec（type/key size/value size/max_entries）与当前 .o 定义；不一致的 pin 会被删除并重建（有 warn 日志），其运行时内容——conntrack、计费快照——丢弃后由流量自然重建。正常升级无需手工清理；手工迁移时可整体删除该目录后重启。
 
 ## 集成测试
 

@@ -4695,6 +4695,183 @@ mod linux {
         Ok(())
     }
 
+    /// Removes pinned maps whose kernel-reported spec no longer matches the
+    /// eBPF object's definition. aya adopts an existing pin purely by name
+    /// (`bpf_get_object` succeeds => reuse), so a pin left over from an older
+    /// build — a 4-slot XDP_DISPATCH, a pre-SNAT XDP_COUNTERS value, etc. —
+    /// would otherwise be silently reused and then fail deep inside attach
+    /// with an opaque index/size error. Mismatched maps only lose runtime
+    /// state that is resynced right after load (CT/acct entries are rebuilt
+    /// by traffic); the removal is logged, never silent.
+    fn drop_stale_pinned_maps() {
+        use aya::maps::MapType;
+        use cloud_node_xdp_common::*;
+        use core::mem::size_of;
+
+        // (name, map type, key size, value size, max_entries). Must stay
+        // aligned with the #[map] definitions in
+        // crates/cloud-node-xdp-ebpf/src/main.rs. LPM trie keys carry a
+        // 4-byte prefix length in front of the address.
+        let u = size_of::<u32>() as u32;
+        let v4 = size_of::<XdpIpv4Key>() as u32;
+        let v6 = size_of::<XdpIpv6Key>() as u32;
+        let rule = size_of::<XdpRuleValue>() as u32;
+        let fwd_key = size_of::<XdpUdpFwdKey>() as u32;
+        let fwd_rule = size_of::<XdpUdpFwdRule>() as u32;
+        let ct_key = size_of::<XdpUdpCtKey>() as u32;
+        let ct_value = size_of::<XdpUdpCtValue>() as u32;
+        let specs: [(&str, MapType, u32, u32, u32); 28] = [
+            ("XDP_BLOCKED_V4", MapType::Hash, v4, rule, 262_144),
+            ("XDP_BLOCKED_V6", MapType::Hash, v6, rule, 262_144),
+            ("XDP_ALLOWED_V4", MapType::Hash, v4, rule, 65_536),
+            ("XDP_ALLOWED_V6", MapType::Hash, v6, rule, 65_536),
+            ("XDP_BLOCKED_V4_LPM", MapType::LpmTrie, u + 4, rule, 65_536),
+            ("XDP_BLOCKED_V6_LPM", MapType::LpmTrie, u + 16, rule, 65_536),
+            ("XDP_ALLOWED_V4_LPM", MapType::LpmTrie, u + 4, rule, 65_536),
+            ("XDP_ALLOWED_V6_LPM", MapType::LpmTrie, u + 16, rule, 65_536),
+            (
+                "XDP_INTERFACE_POLICY",
+                MapType::Hash,
+                u,
+                size_of::<XdpInterfacePolicy>() as u32,
+                64,
+            ),
+            (
+                "XDP_LOCAL_V4",
+                MapType::Hash,
+                size_of::<XdpLocalIpv4Key>() as u32,
+                u,
+                4_096,
+            ),
+            (
+                "XDP_LOCAL_V6",
+                MapType::Hash,
+                size_of::<XdpLocalIpv6Key>() as u32,
+                u,
+                4_096,
+            ),
+            (
+                "XDP_PROXY_PORTS",
+                MapType::Hash,
+                size_of::<XdpPortProtoKey>() as u32,
+                u,
+                4_096,
+            ),
+            (
+                "XDP_COUNTERS",
+                MapType::Array,
+                u,
+                size_of::<XdpCounters>() as u32,
+                1,
+            ),
+            ("XDP_XSKS", MapType::XskMap, u, u, 4_096),
+            (
+                "XDP_XSK_INDEX",
+                MapType::Hash,
+                size_of::<XdpQueueKey>() as u32,
+                u,
+                4_096,
+            ),
+            (
+                "XDP_RATE_CFG",
+                MapType::Array,
+                u,
+                size_of::<XdpRateLimitConfig>() as u32,
+                1,
+            ),
+            (
+                "XDP_RATE_V4",
+                MapType::Hash,
+                v4,
+                size_of::<XdpRateBucket>() as u32,
+                262_144,
+            ),
+            (
+                "XDP_RATE_V6",
+                MapType::Hash,
+                v6,
+                size_of::<XdpRateBucket>() as u32,
+                262_144,
+            ),
+            (
+                "XDP_QUIC_DCID",
+                MapType::Hash,
+                size_of::<XdpQuicDcidKey>() as u32,
+                u,
+                131_072,
+            ),
+            ("XDP_UDP_FWD", MapType::Hash, fwd_key, fwd_rule, 4_096),
+            ("XDP_TCP_FWD", MapType::Hash, fwd_key, fwd_rule, 4_096),
+            ("XDP_UDP_CT", MapType::Hash, ct_key, ct_value, 262_144),
+            ("XDP_TCP_CT", MapType::Hash, ct_key, ct_value, 262_144),
+            (
+                "XDP_SNAT_REV",
+                MapType::Hash,
+                size_of::<XdpSnatRevKey>() as u32,
+                size_of::<XdpSnatRevValue>() as u32,
+                65_536,
+            ),
+            (
+                "XDP_NAT_SCRATCH",
+                MapType::PerCpuArray,
+                u,
+                size_of::<NatScratch>() as u32,
+                1,
+            ),
+            ("XDP_DISPATCH", MapType::ProgramArray, u, u, 8),
+            (
+                "XDP_SNI_BLOCK",
+                MapType::Hash,
+                size_of::<u64>() as u32,
+                u,
+                65_536,
+            ),
+            (
+                "XDP_FLOW_ACCT",
+                MapType::PerCpuHash,
+                ct_key,
+                size_of::<XdpFlowAcct>() as u32,
+                262_144,
+            ),
+        ];
+
+        let Ok(dir) = std::fs::read_dir(XDP_BPF_PIN_DIR) else {
+            return;
+        };
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(spec) = specs.iter().find(|(n, ..)| *n == name) else {
+                continue;
+            };
+            let Ok(info) = aya::maps::MapInfo::from_pin(entry.path()) else {
+                continue;
+            };
+            let matches = info.map_type().ok() == Some(spec.1)
+                && info.key_size() == spec.2
+                && info.value_size() == spec.3
+                && info.max_entries() == spec.4;
+            if matches {
+                continue;
+            }
+            tracing::warn!(
+                "removing stale pinned eBPF map {name}: kernel spec (type {:?}, key {}B, value {}B, max {}) != object spec (type {:?}, key {}B, value {}B, max {}); it is recreated on load and its previous contents are lost",
+                info.map_type().ok(),
+                info.key_size(),
+                info.value_size(),
+                info.max_entries(),
+                spec.1,
+                spec.2,
+                spec.3,
+                spec.4,
+            );
+            if let Err(err) = std::fs::remove_file(entry.path()) {
+                tracing::warn!(
+                    "failed to remove stale pinned eBPF map {name}: {err}; attach may fail on the stale definition"
+                );
+            }
+        }
+    }
+
     fn clear_xsk_map_entries<T>(map: &mut XskMap<T>)
     where
         T: std::borrow::BorrowMut<aya::maps::MapData>,
