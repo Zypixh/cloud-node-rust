@@ -189,26 +189,32 @@ async fn conn_worker(
     bound: Option<u64>,
     read_body: bool,
 ) {
-    let fail = || {
-        // A failed handshake reduces the achieved concurrency — record it so
-        // the reported in-flight count stays honest.
-        shared.err.fetch_add(1, Ordering::Relaxed);
-        shared.ready.fetch_add(1, Ordering::Relaxed);
-    };
+    // A failed handshake reduces the achieved concurrency — record it so
+    // the reported in-flight count stays honest. The worker must still
+    // arrive at the start barrier, otherwise the remaining workers wait on
+    // it forever.
+    macro_rules! setup_failed {
+        () => {{
+            shared.err.fetch_add(1, Ordering::Relaxed);
+            shared.ready.fetch_add(1, Ordering::Relaxed);
+            start.wait().await;
+            return;
+        }};
+    }
     let connecting = match endpoint.connect(server, "localhost") {
         Ok(c) => c,
-        Err(_) => return fail(),
+        Err(_) => setup_failed!(),
     };
     let conn = match connecting.await {
         Ok(c) => c,
-        Err(_) => return fail(),
+        Err(_) => setup_failed!(),
     };
     let (mut driver, send_request) = match h3::client::builder()
         .build(h3_quinn::Connection::new(conn))
         .await
     {
         Ok(v) => v,
-        Err(_) => return fail(),
+        Err(_) => setup_failed!(),
     };
     tokio::spawn(async move {
         let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;

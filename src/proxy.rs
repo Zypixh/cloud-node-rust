@@ -10657,8 +10657,9 @@ impl ProxyHttp for EdgeProxy {
 
     /// Cache hits backed by a file may bypass `response_body_filter`
     /// entirely (sendfile). Perform the same accounting and bandwidth
-    /// limiting the byte path applies to every chunk — once, for the whole
-    /// remaining body — and allow the zero-copy transfer.
+    /// limiting the byte path applies — charged in virtual chunks so the
+    /// 1-second window limiter sees the same shape it would have seen from
+    /// the streamed path — then always opt in.
     async fn cache_hit_file_body(
         &self,
         _session: &mut Session,
@@ -10666,7 +10667,20 @@ impl ProxyHttp for EdgeProxy {
         ctx: &mut Self::CTX,
     ) -> Result<Option<std::time::Duration>> {
         ctx.response_body_len += body_len as usize;
-        Ok(self.response_bandwidth_delay(body_len as usize, ctx))
+        // Match the streamed path's chunk cadence: the limiter resets per
+        // 1s window, so charging the full body once would under-throttle
+        // bodies larger than the per-connection limit.
+        const CHUNK: u64 = 256 * 1024;
+        let mut delay = std::time::Duration::ZERO;
+        let mut remaining = body_len;
+        while remaining > 0 {
+            let n = remaining.min(CHUNK) as usize;
+            if let Some(d) = self.response_bandwidth_delay(n, ctx) {
+                delay += d;
+            }
+            remaining -= n as u64;
+        }
+        Ok(Some(delay))
     }
 
     fn response_body_filter(

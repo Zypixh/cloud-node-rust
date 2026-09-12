@@ -29,7 +29,7 @@ use pingora_timeout::timeout;
 use regex::bytes::Regex;
 use std::any::Any;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
@@ -869,22 +869,39 @@ impl HttpSession {
             }
         }
         // Fallback: stream the range through the normal body writer.
-        let mut read_off = 0u64;
+        // `try_clone` gives an fd with its own offset; the tokio File drives
+        // reads on the blocking pool so no runtime worker blocks on disk IO.
+        let mut file = tokio::fs::File::from_std(
+            file_body
+                .file
+                .try_clone()
+                .or_err(WriteError, "cloning file body fd")?,
+        );
+        file.seek(std::io::SeekFrom::Start(file_body.offset))
+            .await
+            .or_err(WriteError, "seeking file body")?;
+        let mut remaining = file_body.len();
         let mut sent: usize = 0;
-        let mut buf = vec![0u8; 128 * 1024];
-        while read_off < file_body.len() {
-            let want = (file_body.len() - read_off).min(buf.len() as u64) as usize;
-            let n = file_body
-                .read_at(&mut buf[..want], read_off)
+        let mut buf = BytesMut::with_capacity((128 * 1024).min(remaining as usize));
+        while remaining > 0 {
+            buf.clear();
+            let want = remaining.min(buf.capacity() as u64) as usize;
+            let n = (&mut file)
+                .take(want as u64)
+                .read_buf(&mut buf)
+                .await
                 .or_err(WriteError, "reading file body")?;
             if n == 0 {
-                break;
+                return Error::e_explain(
+                    WriteError,
+                    "file body shorter than declared range",
+                );
             }
             match self.write_body(&buf[..n]).await? {
                 Some(w) => sent += w,
                 None => break, // more body bytes than Content-Length allows
             }
-            read_off += n as u64;
+            remaining -= n as u64;
         }
         Ok(Some(sent))
     }

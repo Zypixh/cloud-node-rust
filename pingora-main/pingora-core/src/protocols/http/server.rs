@@ -241,14 +241,28 @@ impl Session {
             }
             _ => {
                 // Buffered-read fallback: keeps h2 framing, TLS and custom
-                // session semantics identical to the Bytes path.
-                const CHUNK: u64 = 256 * 1024;
-                let mut at = 0u64;
-                while at < file_body.len() {
-                    let want = (file_body.len() - at).min(CHUNK) as usize;
-                    let mut buf = vec![0u8; want];
-                    let n = file_body
-                        .read_at(&mut buf, at)
+                // session semantics identical to the Bytes path. The reads
+                // go through a tokio File so no runtime worker blocks on
+                // disk IO.
+                let mut file = tokio::fs::File::from_std(
+                    file_body
+                        .file
+                        .try_clone()
+                        .or_err(pingora_error::ErrorType::WriteError, "cloning file body fd")?,
+                );
+                tokio::io::AsyncSeekExt::seek(
+                    &mut file,
+                    std::io::SeekFrom::Start(file_body.offset),
+                )
+                .await
+                .or_err(pingora_error::ErrorType::WriteError, "seeking file body")?;
+                let mut remaining = file_body.len();
+                while remaining > 0 {
+                    let want = remaining.min(256 * 1024) as usize;
+                    let mut buf = bytes::BytesMut::with_capacity(want);
+                    let mut take = tokio::io::AsyncReadExt::take(&mut file, want as u64);
+                    let n = tokio::io::AsyncReadExt::read_buf(&mut take, &mut buf)
+                        .await
                         .or_err(pingora_error::ErrorType::WriteError, "reading file body")?;
                     if n == 0 {
                         return Error::e_explain(
@@ -256,10 +270,9 @@ impl Session {
                             "file body shorter than declared range",
                         );
                     }
-                    buf.truncate(n);
-                    at += n as u64;
-                    let done = at >= file_body.len();
-                    self.write_response_body(Bytes::from(buf), end && done).await?;
+                    remaining -= n as u64;
+                    let done = remaining == 0;
+                    self.write_response_body(buf.freeze(), end && done).await?;
                 }
                 Ok(())
             }
