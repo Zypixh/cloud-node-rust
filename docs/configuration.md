@@ -45,29 +45,16 @@ cloud-node zerocopy --disable --yes
 
 ## configs/runtime.yaml
 
-`configs/runtime.yaml` 用于本机运行时开关，不从控制面自动推断网卡。XDP/AF_XDP 默认关闭，需要在该文件中显式启用：
+`configs/runtime.yaml` 是本机运行时开关文件（RKE2 模式、集群缓存等）。XDP/AF_XDP **默认启用**，网卡、队列、端口等全部由代码自动推导；文件只需要在显式关闭（或显式覆盖默认值）时出现：
 
 ```yaml
 xdp:
   enabled: false
-  attachMode: auto
-  fallback: pass
-  interfaces:
-    - name: eth0
-      queues: [0, 1]
-      mode: proxy
-      localIps: []
-      frameSize: 2048
-  proxy:
-    protocols: ["http", "https", "tcp", "udp", "h3"]
-    ports:
-      - protocol: https
-        port: 443
-      - protocol: h3
-        port: 443
 ```
 
-`fallback: pass` 表示 attach、XSK 或 map 同步失败时回退到现有 socket 路径；`fallback: fail-start` 表示启动条件不满足时返回错误。完整说明见 [XDP/AF_XDP 旁路数据面](xdp-af-xdp.md)。
+开关解析顺序：默认启用 < `CLOUD_NODE_XDP` 环境变量 < 文件中的 `xdp.enabled` 显式值（最终裁决）。文件不存在时不会自动生成。RKE2 模式下 XDP 强制关闭。
+
+`fallback: pass`（默认）表示 attach、XSK 或 map 同步失败时回退到现有 socket 路径并记录 fallback 原因；`fallback: fail-start` 表示启动条件不满足时返回错误。完整说明见 [XDP/AF_XDP 旁路数据面](xdp-af-xdp.md)。
 
 ## 控制面配置
 
@@ -101,7 +88,7 @@ xdp:
 常见目录和文件：
 
 - `configs/api_node.yaml`：API 节点连接配置。
-- `configs/runtime.yaml`：本机运行时配置，例如 RKE2 模式和 XDP/AF_XDP 显式网卡配置。
+- `configs/runtime.yaml`：本机运行时配置，例如 RKE2 模式和 `xdp.enabled` 显式开关。
 - `data/GeoLite2-City.mmdb`：GeoIP 城市库。
 - `data/GeoLite2-ASN.mmdb`：ASN 数据库。
 - `data/GeoLite2-Country.mmdb`：国家数据库。

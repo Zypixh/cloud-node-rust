@@ -1728,7 +1728,7 @@ fn manager_is_current(candidate: &std::sync::Arc<XdpManager>) -> bool {
     std::sync::Arc::ptr_eq(candidate, &*current)
 }
 
-async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
+pub async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
     let Some(mut runtime) = RuntimeConfig::current() else {
         return Ok(());
     };
@@ -1736,7 +1736,15 @@ async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let derived = crate::xdp_auto_config::derive_xdp_config_from_live_node(&runtime).await?;
+    let mut derived = crate::xdp_auto_config::derive_xdp_config_from_live_node(&runtime).await?;
+    // Explicit file-level knobs that auto derivation cannot infer stay
+    // authoritative; the derived part covers interfaces/queues/ports only.
+    derived.attach_mode = runtime.xdp.attach_mode;
+    derived.fallback = runtime.xdp.fallback;
+    derived.rate_limit = runtime.xdp.rate_limit.clone().or(derived.rate_limit);
+    if !runtime.xdp.sni_blocklist.is_empty() {
+        derived.sni_blocklist = runtime.xdp.sni_blocklist.clone();
+    }
     runtime.xdp = derived;
     RuntimeConfig::set_current(runtime);
     Ok(())
@@ -5188,7 +5196,6 @@ pub mod af_xdp {
     use tokio::sync::mpsc;
     #[cfg(target_os = "linux")]
     use tokio::sync::watch;
-    #[cfg(target_os = "linux")]
 
     const ETH_HEADER_LEN: usize = 14;
     const VLAN_HEADER_LEN: usize = 4;
