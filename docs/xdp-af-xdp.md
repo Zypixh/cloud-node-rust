@@ -128,6 +128,22 @@ proxy 模式命中端口后内核 socket 不再收到该包；未命中、降级
 
 `/sys/fs/bpf/cloud-node-xdp/` 下的 map pin 跨重启复用。attach 前会逐张比对内核报告的 spec（type/key size/value size/max_entries）与当前 .o 定义；不一致的 pin 会被删除并重建（有 warn 日志），其运行时内容——conntrack、计费快照——丢弃后由流量自然重建。正常升级无需手工清理；手工迁移时可整体删除该目录后重启。
 
+## 性能基线
+
+veth + kernel 6.1 + SKB 模式下 AF_PACKET 注入实测（32B payload，注入器单核上限约 250k pps，数字反映相对差异而非驱动模式上限）：
+
+| 场景 | `snat: false` | `snat: true` | SNAT 开销 |
+|---|---|---|---|
+| 固定五元组（conntrack-hit 稳态转发） | ~175k pps | ~152-183k pps（4 次中位 ~164k） | ≈5-13% |
+| 3 万源端口轮换（每包新流建 CT） | ~121k pps | ~119k pps | ≈2% |
+| echo 往返（forward + reverse 全路径） | ~194k pps | ~176k pps | ≈9% |
+
+要点：
+
+- SNAT 稳态每包多一次源地址/源端口重写和 checksum 增量更新，开销个位数到 10% 出头；默认关闭、按 forward 逐条开启。
+- 新流建立（CT insert + SNAT 时一次 `NOEXIST` 端口认领）比稳态慢约 30%，SNAT 分配相对 CT insert 开销很小。
+- 端口分配失败计数 `snat_alloc_fail` 并显式回落（该包走原路径），不丢包不静默。
+
 ## 集成测试
 
 Linux root 环境可运行：

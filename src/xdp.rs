@@ -2172,6 +2172,17 @@ async fn raw_smoke_inner(
         "parseErrors": status.parse_errors,
         "mapMiss": status.map_miss,
         "xskDrops": status.xsk_drops,
+        "rateLimited": status.rate_limited,
+        "ratelimitMapFull": status.ratelimit_map_full,
+        "udpFwdTx": status.udp_fwd_tx,
+        "udpFwdMapFull": status.udp_fwd_map_full,
+        "tcpFwdTx": status.tcp_fwd_tx,
+        "tcpFwdMapFull": status.tcp_fwd_map_full,
+        "sniBlocked": status.sni_blocked,
+        "sniIncomplete": status.sni_incomplete,
+        "snatBound": status.snat_bound,
+        "snatAllocFail": status.snat_alloc_fail,
+        "snatReplyTx": status.snat_reply_tx,
         "samples": samples,
     });
     Ok(report)
