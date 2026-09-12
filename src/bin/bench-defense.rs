@@ -9,6 +9,11 @@
 ///
 /// Cluster policy (node cluster 1): empty_connection_flood +
 /// tls_exhaustion_attack + syn_flood — see env knobs below.
+///
+/// Kernel offload validation: BENCH_KERNEL_FILTER=auto|xdp|nftables|iptables|off
+/// selects the kernel filter backend (auto = production behavior). Every
+/// L4METRICS dump includes kernel_filter/xdp/kernel_sync sections so the
+/// matrix can attribute blocks to userspace vs kernel dataplanes.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,6 +81,9 @@ fn main() -> anyhow::Result<()> {
     let l4_block_secs = env_i32("BENCH_L4_BLOCK_SECS", 30);
     let tls_fail_threshold = env_u32("BENCH_TLS_FAIL_THRESHOLD", 32);
     let syn_min_attempts = env_u32("BENCH_SYN_MIN_ATTEMPTS", 100);
+    // Kernel offload dataplane selection: auto (production behavior),
+    // xdp / nftables / iptables to force a specific backend, off to disable.
+    let kernel_filter_mode = env_str("BENCH_KERNEL_FILTER", "auto");
 
     cloud_node_rust::utils::time::init_local_timezone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -92,6 +100,28 @@ fn main() -> anyhow::Result<()> {
     cloud_node_rust::kernel_syn_defense::start_synproxy_reconciler(config_store.clone());
     let waf_state = Arc::new(WafStateManager::new());
     waf_state.install_kernel_snapshot_provider();
+    let kernel_filter_status = if kernel_filter_mode == "off" {
+        cloud_node_rust::firewall::kernel::KernelFilterStatus {
+            name: "disabled",
+            available: false,
+            detail: "BENCH_KERNEL_FILTER=off".to_string(),
+        }
+    } else {
+        let filter =
+            runtime.block_on(cloud_node_rust::firewall::kernel::build_filter(Some(
+                &kernel_filter_mode,
+            )));
+        let status = filter.status();
+        waf_state.set_kernel_filter(filter);
+        status
+    };
+    info!(
+        "kernel offload filter: mode={} name={} available={} detail={}",
+        kernel_filter_mode,
+        kernel_filter_status.name,
+        kernel_filter_status.available,
+        kernel_filter_status.detail,
+    );
     cloud_node_rust::firewall::state::start_gc_task(waf_state.clone());
     cloud_node_rust::metrics::storage::start_cache_access_flusher();
     cloud_node_rust::metrics::start_pressure_updater();
@@ -308,6 +338,9 @@ fn main() -> anyhow::Result<()> {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let l4 = cloud_node_rust::l4_defense::metrics_snapshot();
             let syn = cloud_node_rust::kernel_syn_defense::snapshot();
+            let kernel = waf_state.kernel_filter_status();
+            let xdp = cloud_node_rust::xdp::status_snapshot();
+            let pipeline = cloud_node_rust::pipeline_metrics::snapshot();
             eprintln!(
                 "L4METRICS {}",
                 json!({
@@ -323,6 +356,33 @@ fn main() -> anyhow::Result<()> {
                     "syn_drops": syn.listen_drops_delta,
                     "syncookies_sent": syn.syncookies_sent_delta,
                     "syn_pressure": syn.pressure_level.as_str(),
+                    "kernel_filter": {
+                        "name": kernel.name,
+                        "available": kernel.available,
+                        "detail": kernel.detail,
+                    },
+                    "xdp": {
+                        "enabled": xdp.enabled,
+                        "attached": xdp.attached,
+                        "attach_mode": xdp.attach_mode,
+                        "fallback": xdp.fallback,
+                        "fallback_reason": xdp.fallback_reason,
+                        "packets": xdp.packets,
+                        "pass": xdp.pass,
+                        "drop": xdp.drop,
+                        "redirect": xdp.redirect,
+                        "parse_errors": xdp.parse_errors,
+                        "map_miss": xdp.map_miss,
+                        "xsk_drops": xdp.xsk_drops,
+                        "blocked_v4": xdp.exact_blocked_v4,
+                        "blocked_v6": xdp.exact_blocked_v6,
+                    },
+                    "kernel_sync": {
+                        "coalesced": pipeline.kernel_sync_coalesced,
+                        "reconcile_requested": pipeline.kernel_sync_reconcile_requested,
+                        "failed": pipeline.kernel_sync_failed,
+                        "xdp_map_sync_failed": pipeline.xdp_map_sync_failed,
+                    },
                 })
             );
         }

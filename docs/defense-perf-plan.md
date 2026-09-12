@@ -49,6 +49,11 @@
 - 代码：`src/bin/bench-defense.rs`、`scripts/perf/run_defense_matrix.sh`、`src/xdp.rs:1093`、`src/firewall/kernel.rs`。
 - 验证：复测 churn 阶段，封禁后攻击源 conn/s 应 →0（内核 drop），合法 goodput 在封禁后立即回到满速而非"缓解"。
 - 回退：bench env 不开启时行为与现状完全一致。
+- 实现状态（已提交）：
+  - `BENCH_KERNEL_FILTER=auto|xdp|nftables|iptables|off`（默认 auto=生产行为）在 `bench-defense` 启动时显式选择后端；启动日志打印 `name/available/detail`，不可用后端显式报告而非静默降级。
+  - `L4METRICS` 每 1s 快照新增三段：`kernel_filter`（名称/可用性/详情）、`xdp`（attach 模式 + `packets/pass/drop/redirect/parse_errors/map_miss/xsk_drops` + `blocked_v4/v6` map 条目数）、`kernel_sync`（`coalesced/reconcile_requested/failed/xdp_map_sync_failed`）。
+  - `run_defense_matrix.sh` 透传 `BENCH_KERNEL_FILTER`；`l4_diff` 改为递归 diff，嵌套 kernel/xdp/kernel_sync 计数逐阶段差分。
+  - 封禁→内核写入延迟确认：`reconcile_kernel_ip` 对 XDP filter 是**同调用栈同步 map 写入**（µs 级）；nftables 走 `kernel_sync` 批处理队列（coalesced），下沉延迟 = 队列批窗口。矩阵中对比 `xdp.drop` 增量 vs `blocked_total` 即可量化"封禁后内核丢包占比"。
 
 **A2. 检测延迟压缩**
 
