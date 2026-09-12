@@ -494,31 +494,28 @@ impl Stream {
         let mut remaining = len;
         let mut sent: u64 = 0;
         while remaining > 0 {
-            match tcp
-                .try_io(Interest::WRITABLE, || {
-                    let n = unsafe {
-                        libc::sendfile(
-                            out_fd,
-                            in_fd,
-                            &mut off,
-                            remaining.min(usize::MAX as u64) as usize,
-                        )
-                    };
-                    if n < 0 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(n as u64)
-                    }
-                })
-                .await
-            {
-                Ok(0) => break, // EOF on the input file
-                Ok(n) => {
-                    sent += n;
-                    remaining = remaining.saturating_sub(n);
-                }
-                Err(err) => return Err(err),
+            let n = unsafe {
+                libc::sendfile(
+                    out_fd,
+                    in_fd,
+                    &mut off,
+                    remaining.min(usize::MAX as u64) as usize,
+                )
+            };
+            if n > 0 {
+                sent += n as u64;
+                remaining = remaining.saturating_sub(n as u64);
+                continue;
             }
+            if n == 0 {
+                break; // EOF on the input file
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                tcp.writable().await?;
+                continue;
+            }
+            return Err(err);
         }
         Ok(Some(sent))
     }
