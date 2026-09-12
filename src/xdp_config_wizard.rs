@@ -218,7 +218,8 @@ mod tests {
                 }],
             },
             rate_limit: None,
-    };
+            sni_blocklist: Vec::new(),
+        };
 
         let yaml = serde_yaml::to_string(&xdp).unwrap();
         let parsed: XdpConfig = serde_yaml::from_str(&yaml).unwrap();

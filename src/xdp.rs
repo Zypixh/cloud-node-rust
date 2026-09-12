@@ -94,6 +94,18 @@ pub struct XdpStatusSnapshot {
     #[serde(default)]
     pub ratelimit_map_full: u64,
     #[serde(default)]
+    pub udp_fwd_tx: u64,
+    #[serde(default)]
+    pub udp_fwd_map_full: u64,
+    #[serde(default)]
+    pub tcp_fwd_tx: u64,
+    #[serde(default)]
+    pub tcp_fwd_map_full: u64,
+    #[serde(default)]
+    pub sni_blocked: u64,
+    #[serde(default)]
+    pub sni_incomplete: u64,
+    #[serde(default)]
     pub rate_limit_active: bool,
     #[serde(default)]
     pub rate_limit_detail: String,
@@ -433,6 +445,12 @@ struct XdpManager {
     xsk_drops: AtomicU64,
     rate_limited: AtomicU64,
     ratelimit_map_full: AtomicU64,
+    udp_fwd_tx: AtomicU64,
+    udp_fwd_map_full: AtomicU64,
+    tcp_fwd_tx: AtomicU64,
+    tcp_fwd_map_full: AtomicU64,
+    sni_blocked: AtomicU64,
+    sni_incomplete: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
@@ -478,6 +496,12 @@ impl XdpManager {
             xsk_drops: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             ratelimit_map_full: AtomicU64::new(0),
+            udp_fwd_tx: AtomicU64::new(0),
+            udp_fwd_map_full: AtomicU64::new(0),
+            tcp_fwd_tx: AtomicU64::new(0),
+            tcp_fwd_map_full: AtomicU64::new(0),
+            sni_blocked: AtomicU64::new(0),
+            sni_incomplete: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
@@ -1027,6 +1051,12 @@ impl XdpManager {
             xsk_drops: self.xsk_drops.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             ratelimit_map_full: self.ratelimit_map_full.load(Ordering::Relaxed),
+            udp_fwd_tx: self.udp_fwd_tx.load(Ordering::Relaxed),
+            udp_fwd_map_full: self.udp_fwd_map_full.load(Ordering::Relaxed),
+            tcp_fwd_tx: self.tcp_fwd_tx.load(Ordering::Relaxed),
+            tcp_fwd_map_full: self.tcp_fwd_map_full.load(Ordering::Relaxed),
+            sni_blocked: self.sni_blocked.load(Ordering::Relaxed),
+            sni_incomplete: self.sni_incomplete.load(Ordering::Relaxed),
             rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
             rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
@@ -1526,6 +1556,18 @@ impl XdpManager {
                     .store(counters.rate_limited, Ordering::Relaxed);
                 self.ratelimit_map_full
                     .store(counters.ratelimit_map_full, Ordering::Relaxed);
+                self.udp_fwd_tx
+                    .store(counters.udp_fwd_tx, Ordering::Relaxed);
+                self.udp_fwd_map_full
+                    .store(counters.udp_fwd_map_full, Ordering::Relaxed);
+                self.tcp_fwd_tx
+                    .store(counters.tcp_fwd_tx, Ordering::Relaxed);
+                self.tcp_fwd_map_full
+                    .store(counters.tcp_fwd_map_full, Ordering::Relaxed);
+                self.sni_blocked
+                    .store(counters.sni_blocked, Ordering::Relaxed);
+                self.sni_incomplete
+                    .store(counters.sni_incomplete, Ordering::Relaxed);
             }
         }
     }
@@ -3907,8 +3949,9 @@ mod linux {
                 .try_into()?;
             program.load()?;
         }
-        // Populate the tail-call dispatch table for the NAT subprogram. An
-        // older object without these symbols leaves the slot empty; the
+        // Populate the tail-call dispatch table: slot 0 is the NAT
+        // subprogram, slot 1 the SNI blocklist subprogram (which chains into
+        // NAT). An older object without these symbols leaves slots empty; the
         // program then falls back to the inline redirect path explicitly.
         let nat_dispatch_fd = match ebpf.program_mut("xdp_nat_dispatch") {
             Some(sub_program) => {
@@ -3922,17 +3965,34 @@ mod linux {
             }
             None => None,
         };
-        match (ebpf.map_mut("XDP_DISPATCH"), nat_dispatch_fd) {
-            (Some(map), Some(fd)) => {
+        let sni_dispatch_fd = match ebpf.program_mut("xdp_sni_dispatch") {
+            Some(sub_program) => {
+                let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
+                sub.load()?;
+                Some(
+                    sub.fd()?
+                        .try_clone()
+                        .map_err(|err| anyhow::anyhow!("clone xdp_sni_dispatch fd: {err}"))?,
+                )
+            }
+            None => None,
+        };
+        match (ebpf.map_mut("XDP_DISPATCH"), nat_dispatch_fd, sni_dispatch_fd) {
+            (Some(map), nat_fd, sni_fd) => {
                 let mut table = aya::maps::ProgramArray::try_from(map)?;
-                table.set(0, &fd, 0)?;
+                if let Some(ref fd) = nat_fd {
+                    table.set(0, fd, 0)?;
+                }
+                if let Some(ref fd) = sni_fd {
+                    table.set(1, fd, 0)?;
+                }
+                if nat_fd.is_none() || sni_fd.is_none() {
+                    tracing::warn!(
+                        "eBPF object lacks a dispatch subprogram; affected direct-forward/SNI features stay on the normal dataplane"
+                    );
+                }
             }
-            (Some(_), None) => {
-                tracing::warn!(
-                    "eBPF object lacks xdp_nat_dispatch; direct-forward NAT stays on the normal dataplane"
-                );
-            }
-            (None, _) => {
+            (None, _, _) => {
                 let configured: usize = config
                     .interfaces
                     .iter()
@@ -3941,6 +4001,12 @@ mod linux {
                 if configured > 0 {
                     tracing::warn!(
                         "eBPF object lacks XDP_DISPATCH; {configured} configured forwards are not active (stale object, rebuild cloud-node-xdp-ebpf.o)"
+                    );
+                }
+                if !config.sni_blocklist.is_empty() {
+                    tracing::warn!(
+                        "eBPF object lacks XDP_DISPATCH; {} configured SNI blocklist entries are not enforced in kernel (stale object, rebuild cloud-node-xdp-ebpf.o)",
+                        config.sni_blocklist.len()
                     );
                 }
             }
@@ -4014,6 +4080,7 @@ mod linux {
         sync_xsk_indices(ebpf, config, proxy_dataplane_active)?;
         sync_udp_forwards(ebpf, config, proxy_dataplane_active)?;
         sync_tcp_forwards(ebpf, config, proxy_dataplane_active)?;
+        sync_sni_blocklist(ebpf, config)?;
         clear_rule_maps(ebpf)?;
         let empty = RuleState::default();
         apply_rule_diff(ebpf, &empty, state)?;
@@ -4289,6 +4356,29 @@ mod linux {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Program the SNI blocklist: FNV-1a(lower(SNI)) -> 1. The map is only a
+    /// fast-path accelerator; userspace SNI handling stays authoritative, so
+    /// a missing map with a configured list is a warning, not a silent skip.
+    fn sync_sni_blocklist(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Result<()> {
+        let Some(map) = ebpf.map_mut("XDP_SNI_BLOCK") else {
+            if !config.sni_blocklist.is_empty() {
+                tracing::warn!(
+                    "eBPF object lacks XDP_SNI_BLOCK; {} configured SNI blocklist entries are not active in kernel (stale object, rebuild cloud-node-xdp-ebpf.o)",
+                    config.sni_blocklist.len()
+                );
+            }
+            return Ok(());
+        };
+        let mut map = AyaHashMap::<_, u64, u32>::try_from(map)?;
+        clear_hash_map(&mut map)?;
+        for name in &config.sni_blocklist {
+            let hash = cloud_node_xdp_common::sni_hash(name);
+            map.insert(hash, 1u32, 0)
+                .map_err(|err| anyhow::anyhow!("insert SNI block {name}: {err}"))?;
         }
         Ok(())
     }

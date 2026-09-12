@@ -261,6 +261,12 @@ pub struct XdpConfig {
     pub proxy: XdpProxyConfig,
     #[serde(rename = "rateLimit", default)]
     pub rate_limit: Option<XdpRateLimitSettings>,
+    /// SNI blocklist enforced at the XDP layer on the first data segment of
+    /// TCP flows (TLS ClientHello server_name). Parsed ClientHellos that match
+    /// are dropped in the driver; incomplete or split ClientHellos always pass
+    /// to userspace, which remains the authoritative SNI path.
+    #[serde(rename = "sniBlocklist", default)]
+    pub sni_blocklist: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
