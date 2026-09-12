@@ -132,18 +132,24 @@
 - 性能优先强化：reactor 线程 **busy-poll 不睡眠**（去掉 5ms idle tick，或忙轮询+自适应退避二选一并可配置）、绑核、对应队列 IRQ 亲和绑定到同核、irqbalance 排除这些 CPU。
 - 验证：8 队列下吞吐随队列数近线性。
 
-**X3. 全兼容 parity 矩阵（逐项审计，缺则补）**
+**X3. 全兼容 parity 矩阵（审计结论，2026-09-12）**
 
 | 能力 | AF_XDP 路径现状 | 处理 |
 |---|---|---|
-| TCP→h1/h1s/h2 + TLS + ALPN | 骨架已在（`handle_af_xdp_*_stream` → http_manager） | 对照测试 |
-| UDP→QUIC demux / UDP 透传 | 已在 bridge | 对照测试 |
-| L4 防御事件 | `af_xdp_is_l4_blocked`、`record_af_xdp_l4_event` 已接 | 补全所有 L4DefenseKind |
-| sendfile | virtual stream 无真实 fd，**不可用** | 显式回退 mmap→Bytes 路径（已有设计），日志标 `sendfile_unavailable_af_xdp` |
-| PROXY protocol v1/v2 | 待审计 | 补解析或显式不支持 |
-| 连接准入/计费/idle timeout | 已有压力感知 | 与 socket 路径语义对齐 |
+| HTTP/1 + HTTPS + ALPN→h2 | 已 parity：`handle_af_xdp_l7_http_stream` → 共享 acceptor/`process_h2_stream`/`process_new_http`，含 admission/registry/shadow-transport guard | ✅ 已验证 |
+| HTTP/3 + QUIC demux | 已 parity：`quic_udp_demux` AF_XDP handle + `receive_af_xdp_datagram` | ✅ 已验证 |
+| TCP/UDP 透传 | 已 parity：`prepare_bypass_tcp_connection` 共享 L4 封禁/churn/active-limit/admission | ✅ 已验证 |
+| SNI sniff + SNI 透传 | 已 parity：`handle_af_xdp_http_stream` 内置 ClientHello peek + `handle_sni_passthrough_stream` | ✅ 已验证 |
+| PROXY protocol v1/v2 | **缺口（已修）**：`af_xdp_http_port_kind_sync` 不感知 `enableProxyProtocol`，L7 流不消费 PROXY 头 → PROXY 客户端会解析失败 | ✅ 已修：`af_xdp_port_requires_proxy_protocol_sync` + 入口先走 `maybe_consume_proxy_protocol_header_generic`（TCP 透传路径本就已消费） |
+| IPv6 TCP/UDP | 已 parity：v6 包解析 + smoltcp 会话 + v6 block map | ✅ 已验证 |
+| sendfile | virtual stream 无真实 fd，`sendfile_from` 对非 `RawStream::Tcp` 显式 `Ok(None)` → buffered-read 回退 | ✅ 显式回退已正确 |
+| splice() 零拷贝 relay | 仅 socket 路径（`stream_tcp_bidirectional_with_metrics_options` 要 `TcpStream`）；AF_XDP 走 generic copy | 已知性能差异（虚拟流无法 splice），explicit-by-design |
+| L4 防御事件 | 已 parity：churn-under-pressure/active-limit/admission-reject/handshake-timeout 全接 | ✅ 已验证 |
+| 计费/带宽 | 已 parity：`copy_stream_and_count` + `ShadowTransportMetricsGuard` 两路径共享 | ✅ 已验证 |
+| TLS session 复用 | 已 parity：共享 acceptor | ✅ 已验证 |
+| idle/超时 | 已 parity：smoltcp session reaping + pressure-clamped read/handshake 超时 | ✅ 已验证 |
 | loopback/UDS/管理面 | XDP 不经过 lo | **永远走内核 listener，文档注明** |
-| IPv6 | 待审计 | 补 |
+| 残余缺口 | 单 reactor 串行化（X2）、eBPF 快路径限速/NAT（X4） | 见对应条目 |
 
 **X4. eBPF 快路径下沉（在 XDP 内完成的）**
 - per-IP pps 限速 map（原 A3）：SYN/UDP/QUIC-Initial 限速在驱动层完成，smoltcp 只见合法流量。
