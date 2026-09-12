@@ -85,6 +85,7 @@
 - 方案：压力信号（`L4PressureLevel` + accept 队列溢出计数 ListenDrops）触发临时扩容 worker 至 cpu 数上限；压力回落后退出（worker 是独立 socket+task，退出即 unbind，无副作用）。伸缩事件打 warn 日志 + 指标。
 - 风险：worker 扩容同时放大后续 L7 处理并发的内存——与 connection 准入预算联动：扩容仅在准入余量充足时发生。
 - 验证：churn 洪峰值期间 accept 队列深度（`ss -ltn` Recv-Q）峰值对比。
+- 实现状态（已提交）：HTTP/TCP listener 各维护一个共享 `AtomicUsize` 目标数的 SO_REUSEPORT worker 池；`pressure_accept_worker_target`（纯函数，Normal=base，Elevated/High/Critical 逐级+1 至 CPU 上限，恒≥1）驱动伸缩；worker 在两次 accept 之间比对目标数，超额即优雅退出（不动已建立连接）；压力下降→缩容，上升→spawn。含单测 `accept_worker_scaling_tracks_pressure_with_cpu_cap`。
 
 **B2. 空闲连接内存收缩（G6）**
 
@@ -94,6 +95,7 @@
   2. 对"已建立但空闲 >N 秒"的连接收缩读缓冲（`shutdown` 不可行，但可把应用层 buffer replace 成小容量）；
   3. 压力期准入策略：现有 `shared_connection_admission` 按预算拒连已工作——增加"空闲最久优先驱逐"（LRU idle-close）作为 Critical 压力下的显式动作，事件计入 L4 指标。
 - 回退：驱逐仅在 `Critical` 触发且可观测（`idle_evict_total` 指标），Normal 下行为不变。
+- 实现状态（已提交）：TCP relay 读路径在压力 idle-timeout 等待循环中把 copy buffer 整 Vec 替换为 4KB（`RELAY_IDLE_SHRINK_BYTES`），释放大分配回 allocator；数据到达时在 copy 循环顶部惰性 regrow 至 `relay_copy_buffer_bytes()`——收缩只释放空闲驻留内存，从不限制吞吐。收缩次数计入 `PipelineCounter::TcpRelayBufferShrunk` + debug 日志；配合既有 `tcp_relay_pressure_idle_timeout`（压力下空闲超时断连，显式 `PressureIdleTimeout` close reason）。LRU 驱逐项未实现——准入预算已限制连接数上限，列为候选。**无审批降级：无**（空闲收缩不影响语义；idle 超时已有显式 reason+指标）。
 
 ### Phase C — L7 防御补全（G4/G5/G8）
 
@@ -168,7 +170,8 @@
   - 实现状态（已提交）：`XDP_RATE_CFG`（Array[1] 配置）+ `XDP_RATE_V4/V6`（262k per-IP 固定窗口 bucket，`bpf_ktime_get_ns` 判定）。UDP 全量计数，TCP 仅 SYN&&!ACK（连接建立尝试），已建立流不受限。map 满 fail-open + `ratelimit_map_full` 计数。userspace `sync_rate_limit_config` 挂 sweeper（5s 周期）按压力下发：Normal=关，Elevated=base，High=/2，Critical=/4；`XdpConfig.rateLimit`（`udpPps/tcpSynPps/windowMs`）为 None 时恒关。旧 .o 无 map → `rate_limit_detail` 显式报告 "missing map XDP_RATE_CFG"。计数 `rate_limited` 已入 `XdpStatusSnapshot` + bench L4METRICS。
 - **UDP 纯 L4 透传全 XDP 化**：转发 map（listen 4元组→后端）+ 反向 conntrack map + 校验和重写，`XDP_TX` 直发，用户态零参与。需要 userspace 填邻居 MAC 表（云环境=网关 MAC）。这是 Katran 标准做法，pps 上限≈线速。
   - 实现状态（已提交）：`XDP_UDP_FWD`（listen tuple→backend+next_hop_mac+server_id）+ `XDP_UDP_CT`（client↔backend conntrack）+ `XDP_FLOW_ACCT`（per-CPU 字节/包计费，userspace 按 shadow delta 聚合进 `record_transfer`）。仅 `mode=proxy` 生效；CT/acct map 满 → `udp_fwd_map_full` 计数 + 回落正常数据面（不丢包）。配置项 `interfaces[].udpForwards[]`（listen/backend/nextHopMac/serverId），next-hop MAC 由 userspace 经 `ip -j route get`+`ip -j neigh` 解析，解析失败显式告警并保留原路径。CT GC 180s idle，挂 5s sweeper。**待真机验证**：校验和增量更新（bpf_csum_diff+fold）与 DSR 回包路径需在真网卡上跑通。
-- **TCP 纯 L4 透传走 XDP 逐包 NAT**（性能优先，不用 sockmap）：per-flow map 记 seq/ack delta，逐包重写 4-tuple+seq/ack+校验和，`XDP_TX` 直发——不过内核 TCP 协议栈，线速。**正确性边界**：重传/SACK/时间戳/window probe/分片都要覆盖，必须配双路径 seq 流一致性差异测试；sockmap/sk_msg 保留为降级参考实现（内核 TCP 终结零拷贝，安全但慢一档）。
+- **TCP 纯 L4 透传走 XDP NAT**（性能优先，不用 sockmap）：4-tuple DNAT+SNAT，逐包重写+校验和，`XDP_TX` 直发——不过内核 TCP 协议栈，线速。透传不改 payload，seq/ack 无需 delta 重写；回包路径依赖 backend 回流量经本节点（与 UDP NAT 同前提）。
+  - 实现状态（已提交）：`XDP_TCP_FWD` + `XDP_TCP_CT`（conntrack 仅在裸 SYN 上创建；无状态的 mid-stream 包 → `None` → PASS 给用户态/内核路径，显式回退不静默 fast-path）；双向 FIN/RST 标记 `XDP_CT_STATE_CLOSING` 供 sweeper 提前回收（宽限 120s；established idle 7200s；UDP 180s）。TCP 校验和强制修正（两族皆然，不同于 UDP 零值跳过）。计费复用 `XDP_FLOW_ACCT`（CT key 新增 `proto` 字段防 UDP/TCP 元组冲突），计数 `tcp_fwd_tx`/`tcp_fwd_map_full`。**顺带修复**：原 sweep 先删 shadow 再折 acct delta 导致被回收流的字节全量重复计费——现在先折 delta 再删 CT/acct/shadow。配置项 `interfaces[].tcpForwards[]` 与 `udpForwards` 同构。**待真机验证**：同 UDP NAT，需真网卡验证 XDP_TX 路径与邻居解析；SACK/重传不需要处理（透传不改 seq）。
 - **QUIC DCID 路由**：透传 → DCID 查 map 直转后端；终结在本机的 H3 → **DCID→XSK queue 映射**把连接钉到固定队列/worker，解决 QUIC 多核扩展与连接迁移（X2 的 QUIC 半边靠这个）。
   - 实现状态（已提交）：`XDP_QUIC_DCID` map（long-header DCID→XSK index）。eBPF 只解析 long header（DCID 长度显式编码，无状态也正确）；short header 无编码长度 → 保持 RSS 亲和 + 共享路由表/demux 交付（正确性已由 X2 修复的共享 route cache 保证）。queue reactor 观察到 long-header DCID 即注册 `DCID→自身 XSK`，镜像进共享 DashMap 随 route-cache 清扫过期摘除；旧 .o 无 map → 一次性显式告警 + RSS 回退。
 - **SNI 混合快速路径**（性能优先）：eBPF 解析每 flow 首个数据段的 TLS ClientHello——SNI 完整则按路由 map 做 L4 直转；ClientHello 跨分片/解析不完整 → 该 flow 标记打回用户态慢路径（终结后 SNI 路由，现有路径）。注意 GRO/SKB 模式下首段可能聚合多包，长度判定按 TCP payload 边界做。永远存在慢路径分支，属协议边界而非降级。

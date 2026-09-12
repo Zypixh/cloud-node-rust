@@ -261,6 +261,7 @@ fn detect_xdp_interfaces_with_options(
             local_ips: Vec::new(),
             frame_size: cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE,
                 udp_forwards: Vec::new(),
+                tcp_forwards: Vec::new(),
         });
     }
 

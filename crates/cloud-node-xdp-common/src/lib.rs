@@ -216,6 +216,8 @@ pub struct XdpCounters {
     pub ratelimit_map_full: u64,
     pub udp_fwd_tx: u64,
     pub udp_fwd_map_full: u64,
+    pub tcp_fwd_tx: u64,
+    pub tcp_fwd_map_full: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -315,7 +317,9 @@ pub struct XdpUdpFwdRule {
 
 /// Conntrack entry: a client 4-tuple pinned to a backend so reply traffic can
 /// be rewritten back to the listen tuple. Written on the first forwarded
-/// datagram; `client_mac` is learned from the ingress Ethernet header.
+/// datagram (UDP) or SYN (TCP); `client_mac` is learned from the ingress
+/// Ethernet header. `proto` distinguishes UDP/TCP tuples that otherwise share
+/// the same addresses and ports.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct XdpUdpCtKey {
@@ -324,8 +328,16 @@ pub struct XdpUdpCtKey {
     pub client_port_be: u16,
     pub backend_port_be: u16,
     pub family: u8,
-    pub _pad: [u8; 3],
+    /// IP protocol number (6 = TCP, 17 = UDP).
+    pub proto: u8,
+    pub _pad: [u8; 2],
 }
+
+/// Conntrack state: a fresh/established flow.
+pub const XDP_CT_STATE_OPEN: u8 = 0;
+/// Conntrack state: a FIN or RST was observed; the entry is reaped after a
+/// short grace window instead of the full idle timeout.
+pub const XDP_CT_STATE_CLOSING: u8 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -334,6 +346,9 @@ pub struct XdpUdpCtValue {
     pub client_mac: [u8; 6],
     pub listen_port_be: u16,
     pub family: u8,
+    /// TCP lifecycle marker (XDP_CT_STATE_*); always OPEN for UDP.
+    pub state: u8,
+    pub _pad: [u8; 6],
     /// Billing dimension mirrored from the forward rule.
     pub server_id: i64,
     pub last_seen_ns: u64,

@@ -163,6 +163,12 @@ pub struct XdpInterfaceConfig {
     /// pass). The backend must route replies back through this node.
     #[serde(rename = "udpForwards", default)]
     pub udp_forwards: Vec<XdpUdpForwardConfig>,
+    /// Explicitly configured TCP direct-forward rules: stateful L4 NAT at the
+    /// XDP layer (conntrack on bare SYN; mid-stream packets without state fall
+    /// back to the normal dataplane). The backend must route replies back
+    /// through this node.
+    #[serde(rename = "tcpForwards", default)]
+    pub tcp_forwards: Vec<XdpUdpForwardConfig>,
 }
 
 /// A single UDP direct-forward rule applied at the XDP layer.
@@ -191,6 +197,7 @@ impl Default for XdpInterfaceConfig {
             local_ips: Vec::new(),
             frame_size: default_xdp_frame_size(),
             udp_forwards: Vec::new(),
+            tcp_forwards: Vec::new(),
         }
     }
 }
