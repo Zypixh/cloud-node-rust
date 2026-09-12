@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check / Clippy - linux-x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          packages=(cmake build-essential clang pkg-config perl protobuf-compiler libclang-dev libelf-dev zlib1g-dev libzstd-dev libpcap0.8-dev m4 llvm)
+
+          # GitHub ubuntu-22.04 runners pin apt to azure.archive.ubuntu.com via
+          # Mirrorlist. When that host stalls, apt-get update hangs until the
+          # job timeout. Pin archive.ubuntu.com instead.
+          sudo tee /etc/apt/apt.conf.d/99ci-timeouts >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          Acquire::ftp::Timeout "20";
+          EOF
+          sudo mkdir -p /etc/apt/sources.list.d.disabled
+          sudo mv /etc/apt/sources.list /etc/apt/sources.list.d.disabled/sources.list 2>/dev/null || true
+          sudo mv /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d.disabled/apt-mirrors.txt 2>/dev/null || true
+          for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -e "$source" ] || continue
+            sudo mv "$source" /etc/apt/sources.list.d.disabled/
+          done
+          sudo tee /etc/apt/sources.list.d/ubuntu-amd64.list >/dev/null <<'EOF'
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+          EOF
+          sudo rm -rf /var/lib/apt/lists/*
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends "${packages[@]}"; then
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            pingora-main -> pingora-main/target
+
+      - name: cargo check (all targets)
+        run: cargo check --all-targets
+
+      - name: cargo check (vendored pingora crates)
+        run: cargo check --manifest-path pingora-main/Cargo.toml -p pingora-core -p pingora-http -p pingora-cache -p pingora-proxy --all-targets
+
+      - name: cargo clippy
+        # Deny high-signal lint groups; pre-existing style warnings stay advisory.
+        run: cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious
+
+  test:
+    name: Test - linux-x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          packages=(cmake build-essential clang pkg-config perl protobuf-compiler libclang-dev libelf-dev zlib1g-dev libzstd-dev libpcap0.8-dev m4 llvm)
+
+          sudo tee /etc/apt/apt.conf.d/99ci-timeouts >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          Acquire::ftp::Timeout "20";
+          EOF
+          sudo mkdir -p /etc/apt/sources.list.d.disabled
+          sudo mv /etc/apt/sources.list /etc/apt/sources.list.d.disabled/sources.list 2>/dev/null || true
+          sudo mv /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d.disabled/apt-mirrors.txt 2>/dev/null || true
+          for source in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -e "$source" ] || continue
+            sudo mv "$source" /etc/apt/sources.list.d.disabled/
+          done
+          sudo tee /etc/apt/sources.list.d/ubuntu-amd64.list >/dev/null <<'EOF'
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+          EOF
+          sudo rm -rf /var/lib/apt/lists/*
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends "${packages[@]}"; then
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            pingora-main -> pingora-main/target
+
+      - name: cargo test
+        run: cargo test --lib --bins
+
+      - name: cargo test (vendored pingora)
+        run: cargo test --manifest-path pingora-main/Cargo.toml -p pingora-core -p pingora-http -p pingora-cache --lib

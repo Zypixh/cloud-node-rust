@@ -2331,6 +2331,65 @@ mod tests_stream {
     }
 
     #[tokio::test]
+    async fn write_response_header_emits_connection_close_when_keepalive_off() {
+        init_log();
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let write_expected = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nDate: {}\r\nConnection: close\r\n\r\n",
+            date::get_cached_date().to_str().unwrap()
+        );
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(write_expected.as_bytes())
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.set_keepalive(Some(60));
+        http_stream.set_keepalive(None);
+
+        let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None).unwrap();
+        response.set_content_length(0).unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+
+        assert!(!http_stream.will_keepalive());
+        http_stream.finish_body().await.unwrap();
+        let reused = http_stream.reuse().await.unwrap();
+        assert!(reused.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_response_header_emits_keep_alive_when_keepalive_on() {
+        init_log();
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let write_expected = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nDate: {}\r\nConnection: keep-alive\r\n\r\n",
+            date::get_cached_date().to_str().unwrap()
+        );
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(write_expected.as_bytes())
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.set_keepalive(Some(60));
+
+        let mut response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response.set_content_length(0).unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+
+        assert!(http_stream.will_keepalive());
+        http_stream.finish_body().await.unwrap();
+        let reused = http_stream.reuse().await.unwrap();
+        assert!(reused.is_some());
+    }
+
+    #[tokio::test]
     async fn write() {
         let read_wire = b"GET / HTTP/1.1\r\n\r\n";
         let write_expected = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
