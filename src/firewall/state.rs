@@ -2,7 +2,7 @@ use crate::firewall::kernel::{KernelFilter, KernelFilterRange, KernelFilterSnaps
 use crate::firewall::persistence::FirewallBlockRecord;
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, mapref::entry::Entry};
-use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
+use governor::{Quota, RateLimiter, clock::DefaultClock, state::{InMemoryState, NotKeyed}};
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -159,16 +159,18 @@ static IP_BW_CAPACITY_WARN_AT: AtomicI64 = AtomicI64::new(0);
 
 /// Wraps a RateLimiter with a last-seen timestamp for GC and the QPS value the
 /// quota was built from, so hot-reload can detect and replace stale limiters.
-pub(crate) struct TrackedLimiter<K: std::hash::Hash + Eq + Clone + Send + Sync + 'static> {
-    pub limiter: Arc<RateLimiter<K, DashMapStateStore<K>, DefaultClock>>,
+/// The limiter is NotKeyed: the outer DashMap already keys per server/(server,ip),
+/// so a keyed inner store would just hold a single entry per limiter.
+pub(crate) struct TrackedLimiter {
+    pub limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     pub last_seen: AtomicI64,
     /// The QPS value baked into `limiter`'s Quota at construction time.
     pub quota_value: AtomicU32,
 }
 
-impl<K: std::hash::Hash + Eq + Clone + Send + Sync + 'static> TrackedLimiter<K> {
+impl TrackedLimiter {
     fn new(
-        limiter: Arc<RateLimiter<K, DashMapStateStore<K>, DefaultClock>>,
+        limiter: Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
         quota_value: u32,
     ) -> Self {
         Self {
@@ -425,8 +427,8 @@ pub struct WafStateManager {
     list_graylists: DashMap<(i64, IpAddr), i64>,
     list_gray_networks: DashMap<(i64, IpNet), i64>,
     list_gray_network_snapshots: ArcSwap<NetworkSnapshot>,
-    server_limiters: DashMap<i64, TrackedLimiter<i64>>,
-    ip_limiters: DashMap<(i64, IpAddr), TrackedLimiter<IpAddr>>,
+    server_limiters: DashMap<i64, TrackedLimiter>,
+    ip_limiters: DashMap<(i64, IpAddr), TrackedLimiter>,
     limiter_last_sweep: AtomicI64,
     ip_limiter_reservations: AtomicU64,
     counters: DashMap<String, RollingCounter>,
@@ -1328,19 +1330,19 @@ impl WafStateManager {
         // insert a fresh one so the new quota takes effect immediately.
         let entry = self.server_limiters.entry(server_id).or_insert_with(|| {
             let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
-            TrackedLimiter::new(Arc::new(RateLimiter::dashmap(quota)), max_qps)
+            TrackedLimiter::new(Arc::new(RateLimiter::direct(quota)), max_qps)
         });
         if entry.quota_value.load(Ordering::Relaxed) != max_qps {
             drop(entry);
             self.server_limiters.remove(&server_id);
             let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
-            let fresh = TrackedLimiter::new(Arc::new(RateLimiter::dashmap(quota)), max_qps);
+            let fresh = TrackedLimiter::new(Arc::new(RateLimiter::direct(quota)), max_qps);
             let entry = self.server_limiters.entry(server_id).or_insert(fresh);
             entry.touch();
-            return entry.limiter.check_key(&server_id).is_ok();
+            return entry.limiter.check().is_ok();
         }
         entry.touch();
-        entry.limiter.check_key(&server_id).is_ok()
+        entry.limiter.check().is_ok()
     }
 
     pub(crate) fn reserve_slot(counter: &AtomicU64, capacity: usize) -> bool {
@@ -1389,7 +1391,7 @@ impl WafStateManager {
                             }
                             let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
                             entry.insert(TrackedLimiter::new(
-                                Arc::new(RateLimiter::dashmap(quota)),
+                                Arc::new(RateLimiter::direct(quota)),
                                 max_qps,
                             ))
                         }
@@ -1397,7 +1399,7 @@ impl WafStateManager {
                 } else {
                     let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
                     entry.insert(TrackedLimiter::new(
-                        Arc::new(RateLimiter::dashmap(quota)),
+                        Arc::new(RateLimiter::direct(quota)),
                         max_qps,
                     ))
                 }
@@ -1410,7 +1412,7 @@ impl WafStateManager {
                     if current.get().quota_value.load(Ordering::Relaxed) != max_qps {
                         let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
                         let _ = current.insert(TrackedLimiter::new(
-                            Arc::new(RateLimiter::dashmap(quota)),
+                            Arc::new(RateLimiter::direct(quota)),
                             max_qps,
                         ));
                     }
@@ -1425,14 +1427,14 @@ impl WafStateManager {
                     }
                     let quota = Quota::per_second(NonZeroU32::new(max_qps).unwrap());
                     entry = current.insert(TrackedLimiter::new(
-                        Arc::new(RateLimiter::dashmap(quota)),
+                        Arc::new(RateLimiter::direct(quota)),
                         max_qps,
                     ));
                 }
             }
         }
         entry.touch();
-        entry.limiter.check_key(&ip).is_ok()
+        entry.limiter.check().is_ok()
     }
 
     fn ip_limiter_capacity(&self) -> usize {

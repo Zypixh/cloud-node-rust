@@ -102,6 +102,7 @@
 - 机制已在（`apply_cc_policy` 同时查 `max_qps` 与 `per_ip_max_qps`），bench 未配置。
 - 方案：① bench-defense 加全局 `BENCH_CC_MAX_QPS` 配置跑一轮验证纵深；② 审查 `check_rate_limit` 在 300k+ req/s 下 `check_key(&server_id)` 的争用——`RateLimiter::dashmap` 内部 per-key 锁，同 server_id 下是全局限额的单 key 热点，高并发下需确认 governor 实现是否为无锁 GCRA（若是有锁，换分片计数+惰性汇总或 `cell` 原子钟方案）。
 - 验证：h1 hit 满速回归（全局限额开启时吞吐下降 <1%）。
+- 实现状态（已提交）：`BENCH_CC_TOTAL_QPS` env 接 `cc.bench` 的 `max_qps`（全局限额）；`TrackedLimiter` 内层从 `RateLimiter::dashmap`（每个 limiter 一张 DashMap 只放一个 key，check_key 有哈希+分片锁）改为 `RateLimiter::direct`（NotKeyed/InMemoryState，单原子槽 GCRA 无锁），外层 DashMap key 不变、quota 变更即重建、容量 fail-closed 语义全保留——`check()` 每请求省一次 key 哈希+内层 DashMap 查找。
 
 **C2. 拦截响应语义修正（G5）**
 
