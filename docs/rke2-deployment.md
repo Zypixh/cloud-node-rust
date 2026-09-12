@@ -114,6 +114,8 @@ stringData:
 
 ## 5. 配置 runtime.yaml
 
+`runtime.mode=rke2` 会强制关闭 XDP/AF_XDP 数据面（AF_XDP 独占网卡队列，会抢占 Kubernetes 网络），`xdp.enabled` 与 `CLOUD_NODE_XDP` 在此模式下不生效。
+
 `deploy/rke2/configmap-runtime.yaml` 默认内容如下：
 
 ```yaml

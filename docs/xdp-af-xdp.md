@@ -1,16 +1,16 @@
 # XDP/AF_XDP 旁路数据面
 
-本功能提供 Linux-only、默认关闭、可回退的 XDP/AF_XDP 数据面。XDP 程序负责在网卡入口提前执行 allow/block/proxy 决策；AF_XDP 负责把命中代理端口的队列包送到用户态；用户态继续复用现有 HTTP、HTTPS、TCP、UDP、SNI、QUIC 和 HTTP/3 路由与防护逻辑。
+本功能提供 Linux-only、默认启用、可回退的 XDP/AF_XDP 数据面。XDP 程序负责在网卡入口提前执行 allow/block/proxy 决策；AF_XDP 负责把命中代理端口的队列包送到用户态；用户态继续复用现有 HTTP、HTTPS、TCP、UDP、SNI、QUIC 和 HTTP/3 路由与防护逻辑。
 
-XDP 不从控制面自动猜网卡，必须由本机 `configs/runtime.yaml` 显式开启和指定接口。未开启、attach 失败、XSK 未就绪或协议/端口未命中时，节点保持原 socket/Pingora/Tokio 路径。
+网卡、队列、attach mode、proxy 端口等全部由代码在本机自动推导：接口取自默认路由与活跃物理网卡，proxy 端口取自当前生效的监听配置。attach 失败、XSK 未就绪或协议/端口未命中时，节点保持原 socket/Pingora/Tokio 路径，并在 `xdp status`/doctor 中给出明确的 fallback 原因。
 
 ## 适用范围
 
 - 仅 Linux 生产环境启用。
 - 需要 root，或至少具备 `CAP_BPF`、`CAP_NET_ADMIN`、`CAP_NET_RAW`。
-- 默认 `xdp.enabled=false`，不会改变现有部署行为。
+- XDP 默认启用；RKE2 集群模式下强制关闭（AF_XDP 会独占网卡队列，影响 Kubernetes 网络）。
 - 标准 MTU 是当前主要验收目标；proxy 模式遇到 jumbo/multi-buffer 风险时会在 doctor 或启动阶段拒绝或回退。
-- `fallback: pass` 会 fail-open 到原 socket 路径；`fallback: fail-start` 会在无法满足 XDP 启动条件时返回错误。
+- `fallback: pass`（默认）会 fail-open 到原 socket 路径并记录 fallback 原因；`fallback: fail-start` 会在无法满足 XDP 启动条件时返回错误。
 
 ## 构建
 
@@ -28,45 +28,29 @@ data/cloud-node-xdp-ebpf.o
 
 ## 本地配置
 
-配置文件位于运行目录：
+XDP 只需要一个开关，优先级为：默认值（启用）< `CLOUD_NODE_XDP` 环境变量 < 配置文件显式值。
 
 ```text
-configs/runtime.yaml
+configs/runtime.yaml   # 可选；不存在时不会自动生成
 ```
 
-示例：
+- 不配置任何文件也不设环境变量 → XDP 启用，其余全部自动推导。
+- `CLOUD_NODE_XDP=0` / `false` / `off` / `disabled` → 关闭（`1`/`true`/`on`/`enabled` 为开启）。
+- 文件中的 `xdp.enabled` 显式值是最终裁决，覆盖环境变量：
 
 ```yaml
 xdp:
-  enabled: false
-  attachMode: auto
-  fallback: pass
-  interfaces:
-    - name: eth0
-      queues: [0, 1]
-      mode: proxy
-      localIps: []
-      frameSize: 2048
-  proxy:
-    protocols: ["http", "https", "tcp", "udp", "h3"]
-    ports:
-      - protocol: http
-        port: 80
-      - protocol: https
-        port: 443
-      - protocol: h3
-        port: 443
-      - protocol: tcp
-        port: 9443
-      - protocol: udp
-        port: 53
+  enabled: false   # 显式关闭，即使 CLOUD_NODE_XDP=1 也保持关闭
 ```
 
-字段说明：
+`cloud-node xdp start` 写入 `xdp.enabled: true`，`cloud-node xdp stop` 写入 `xdp.enabled: false`；两者都保留文件中的其他内容，不会把推导出的运行时状态写回配置。
 
-- `enabled`：是否启用 XDP。默认 `false`。
+除 `enabled` 之外的字段（`attachMode`、`fallback`、`interfaces`、`proxy`、`rateLimit`、`sniBlocklist`）仍可在文件中显式提供以覆盖自动推导结果，但正常部署不需要；自动推导的状态只存在于内存，不会写回 `runtime.yaml`。
+
+字段说明（显式覆盖时）：
+
 - `attachMode`：`auto`、`drv`、`skb`。`auto` 优先尝试驱动模式，失败后按实现策略回退。
-- `fallback`：`pass` 或 `fail-start`。
+- `fallback`：`pass` 或 `fail-start`，默认 `pass`。
 - `interfaces[].name`：要 attach 的本机网卡名。
 - `interfaces[].queues`：要绑定 AF_XDP 的队列号。
 - `interfaces[].mode`：`observe`、`protect`、`proxy`。

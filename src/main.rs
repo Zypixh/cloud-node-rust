@@ -3,7 +3,7 @@ use anyhow::Context;
 use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand, ValueEnum};
 use cloud_node_rust::i18n::{Language, t};
-use cloud_node_rust::xdp_config_wizard::{XdpConfigWizard, save_xdp_config};
+use cloud_node_rust::xdp_config_wizard::{XdpConfigWizard, save_xdp_enabled};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs;
@@ -582,9 +582,8 @@ async fn sync_xdp_proxy_ports_once() -> anyhow::Result<Option<(usize, usize)>> {
     let new_count = ports.len();
     runtime_config.xdp.proxy.ports = ports;
     runtime_config.validate()?;
-    let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
-    save_xdp_config(&runtime_path, &runtime_config.xdp)
-        .with_context(|| format!("failed to save {}", runtime_path.display()))?;
+    // Derived state lives in memory only: the config file holds at most the
+    // explicit `xdp.enabled` override, and every attach re-derives the rest.
     RuntimeConfig::set_current(runtime_config);
     cloud_node_rust::xdp::reload_from_runtime()
         .await
@@ -887,6 +886,13 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
                     },
                 ),
             )?;
+            let mut effective_xdp = effective_xdp;
+            if runtime_config.xdp.rate_limit.is_some() {
+                effective_xdp.rate_limit = runtime_config.xdp.rate_limit.clone();
+            }
+            if !runtime_config.xdp.sni_blocklist.is_empty() {
+                effective_xdp.sni_blocklist = runtime_config.xdp.sni_blocklist.clone();
+            }
             runtime_config.xdp = effective_xdp;
             runtime_config.validate()?;
             if !no_tune {
@@ -916,7 +922,7 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
                 return Ok(());
             }
             let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
-            save_xdp_config(&runtime_path, &runtime_config.xdp)?;
+            save_xdp_enabled(&runtime_path, true)?;
             #[cfg(target_os = "linux")]
             if !is_systemd_invocation() && systemd_service_is_active() {
                 run_systemctl("restart")?;
@@ -941,7 +947,7 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             rt.block_on(cloud_node_rust::xdp::detach())?;
             runtime_config.xdp.enabled = false;
             let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
-            save_xdp_config(&runtime_path, &runtime_config.xdp)?;
+            save_xdp_enabled(&runtime_path, false)?;
             RuntimeConfig::set_current(runtime_config);
             print_xdp_status();
         }
@@ -3237,6 +3243,21 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
     }
     RuntimeConfig::set_current(runtime_config.clone());
     repair_missing_xdp_ebpf_object_for_current_runtime(&node_paths);
+    if runtime_config.xdp.enabled && runtime_config.xdp.interfaces.is_empty() {
+        match rt.block_on(cloud_node_rust::xdp::ensure_current_xdp_auto_config()) {
+            Ok(()) => {
+                if let Some(current) = RuntimeConfig::current() {
+                    runtime_config = current;
+                }
+            }
+            Err(err) => {
+                if runtime_config.xdp.fallback.fail_start() {
+                    return Err(err.context("XDP auto configuration failed"));
+                }
+                warn!("XDP auto configuration skipped: {}", err);
+            }
+        }
+    }
     if runtime_config.xdp.enabled {
         match cloud_node_rust::xdp_netdev_tuning::apply_for_xdp_config(
             &runtime_config.xdp,
@@ -3256,37 +3277,13 @@ fn run_node(monitor_port: Option<u16>, monitor_clear: bool) -> anyhow::Result<()
                 runtime_config.validate()?;
                 RuntimeConfig::set_current(runtime_config.clone());
                 if before_interfaces != runtime_config.xdp.interfaces {
-                    let runtime_path = node_paths.runtime_config_file();
-                    match save_xdp_config(&runtime_path, &runtime_config.xdp) {
-                        Ok(()) => {
-                            info!(
-                                "XDP interface queues refreshed after netdev tuning and saved to {}",
-                                runtime_path.display()
-                            );
-                            logging::report_node_log(
-                                "info".to_string(),
-                                "xdp_tuning".to_string(),
-                                "key=\"xdp.interfaces.queues\" old=\"runtime\" target=\"current-rx-queues\" final=\"saved\" status=\"applied\" reason=\"refreshed after netdev tuning\"".to_string(),
-                                0,
-                            );
-                        }
-                        Err(err) => {
-                            warn!(
-                                "Failed to save refreshed XDP interface queues to {}: {}",
-                                runtime_path.display(),
-                                err
-                            );
-                            logging::report_node_log(
-                                "warn".to_string(),
-                                "xdp_tuning".to_string(),
-                                format!(
-                                    "key=\"xdp.interfaces.queues\" old=\"runtime\" target=\"current-rx-queues\" final=\"memory-only\" status=\"failed\" reason=\"{}\"",
-                                    err.to_string().replace('"', "\\\"")
-                                ),
-                                0,
-                            );
-                        }
-                    }
+                    info!("XDP interface queues refreshed after netdev tuning");
+                    logging::report_node_log(
+                        "info".to_string(),
+                        "xdp_tuning".to_string(),
+                        "key=\"xdp.interfaces.queues\" old=\"runtime\" target=\"current-rx-queues\" final=\"memory-only\" status=\"applied\" reason=\"refreshed after netdev tuning; re-derived on next start\"".to_string(),
+                        0,
+                    );
                 }
             }
             Err(err) => {

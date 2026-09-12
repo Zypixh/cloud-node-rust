@@ -150,19 +150,7 @@ fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
 pub fn save_xdp_config(path: &Path, xdp: &XdpConfig) -> Result<()> {
     use std::fs;
 
-    let mut root = if path.exists() {
-        let existing = fs::read_to_string(path)?;
-        if existing.trim().is_empty() {
-            serde_yaml::Mapping::new()
-        } else {
-            match serde_yaml::from_str::<serde_yaml::Value>(&existing)? {
-                serde_yaml::Value::Mapping(mapping) => mapping,
-                _ => anyhow::bail!("{} is not a YAML mapping", path.display()),
-            }
-        }
-    } else {
-        serde_yaml::Mapping::new()
-    };
+    let mut root = read_yaml_mapping(path)?;
 
     root.insert(
         serde_yaml::Value::String("xdp".to_string()),
@@ -178,6 +166,57 @@ pub fn save_xdp_config(path: &Path, xdp: &XdpConfig) -> Result<()> {
         serde_yaml::to_string(&serde_yaml::Value::Mapping(root))?,
     )?;
     Ok(())
+}
+
+/// Persist only the `xdp.enabled` flag, preserving everything else already in
+/// the file. XDP is on by default; the file exists solely to record an
+/// explicit operator override and outranks the `CLOUD_NODE_XDP` env var.
+/// The `xdp` section is replaced rather than merged so stale operational
+/// fields cannot shadow the auto-derived configuration.
+pub fn save_xdp_enabled(path: &Path, enabled: bool) -> Result<()> {
+    use std::fs;
+
+    let mut root = read_yaml_mapping(path)?;
+    if let Some(value) = root.get_mut(serde_yaml::Value::String("xdp".to_string()))
+        && !matches!(value, serde_yaml::Value::Mapping(_) | serde_yaml::Value::Null)
+    {
+        anyhow::bail!("{}: `xdp` is not a YAML mapping", path.display());
+    }
+    let mut xdp = serde_yaml::Mapping::new();
+    xdp.insert(
+        serde_yaml::Value::String("enabled".to_string()),
+        serde_yaml::Value::Bool(enabled),
+    );
+    root.insert(
+        serde_yaml::Value::String("xdp".to_string()),
+        serde_yaml::Value::Mapping(xdp),
+    );
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(
+        path,
+        serde_yaml::to_string(&serde_yaml::Value::Mapping(root))?,
+    )?;
+    Ok(())
+}
+
+fn read_yaml_mapping(path: &Path) -> Result<serde_yaml::Mapping> {
+    use std::fs;
+
+    if !path.exists() {
+        return Ok(serde_yaml::Mapping::new());
+    }
+    let existing = fs::read_to_string(path)?;
+    if existing.trim().is_empty() {
+        return Ok(serde_yaml::Mapping::new());
+    }
+    match serde_yaml::from_str::<serde_yaml::Value>(&existing)? {
+        serde_yaml::Value::Mapping(mapping) => Ok(mapping),
+        _ => anyhow::bail!("{} is not a YAML mapping", path.display()),
+    }
 }
 
 #[cfg(test)]
