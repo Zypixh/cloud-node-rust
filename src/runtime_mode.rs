@@ -158,6 +158,27 @@ pub struct XdpInterfaceConfig {
     pub local_ips: Vec<std::net::IpAddr>,
     #[serde(rename = "frameSize", default = "default_xdp_frame_size")]
     pub frame_size: u32,
+    /// Explicitly configured UDP direct-forward rules. Each entry DNATs a
+    /// listen tuple to a backend at the XDP layer (XDP_TX, no userspace
+    /// pass). The backend must route replies back through this node.
+    #[serde(rename = "udpForwards", default)]
+    pub udp_forwards: Vec<XdpUdpForwardConfig>,
+}
+
+/// A single UDP direct-forward rule applied at the XDP layer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpUdpForwardConfig {
+    /// Local listen address, e.g. "192.0.2.10:5353" or "0.0.0.0:5353".
+    pub listen: std::net::SocketAddr,
+    /// Backend target, e.g. "10.0.0.5:5353" (hostnames resolve at sync time).
+    pub backend: String,
+    /// Optional explicit next-hop MAC for the backend; when empty it is
+    /// resolved from the neighbor table at sync time.
+    #[serde(rename = "nextHopMac", default)]
+    pub next_hop_mac: String,
+    /// Billing dimension for flow accounting.
+    #[serde(rename = "serverId", default)]
+    pub server_id: i64,
 }
 
 impl Default for XdpInterfaceConfig {
@@ -169,6 +190,7 @@ impl Default for XdpInterfaceConfig {
             mode: XdpRuntimeMode::default(),
             local_ips: Vec::new(),
             frame_size: default_xdp_frame_size(),
+            udp_forwards: Vec::new(),
         }
     }
 }

@@ -201,6 +201,7 @@ mod tests {
                 mode: XdpRuntimeMode::Proxy,
                 local_ips: vec!["192.0.2.10".parse().unwrap()],
                 frame_size: 2048,
+                udp_forwards: Vec::new(),
             }],
             proxy: XdpProxyConfig {
                 protocols: vec![
