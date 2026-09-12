@@ -3138,14 +3138,14 @@ async fn maybe_consume_proxy_protocol_header(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-struct PrefixedStream<S> {
+pub(crate) struct PrefixedStream<S> {
     prefix: io::Cursor<Vec<u8>>,
     inner: S,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl<S> PrefixedStream<S> {
-    fn new(prefix: Vec<u8>, inner: S) -> Self {
+    pub(crate) fn new(prefix: Vec<u8>, inner: S) -> Self {
         Self {
             prefix: io::Cursor::new(prefix),
             inner,
@@ -3191,7 +3191,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-async fn maybe_consume_proxy_protocol_header_generic<S>(
+pub(crate) async fn maybe_consume_proxy_protocol_header_generic<S>(
     mut stream: S,
     client_addr: SocketAddr,
     enable_proxy_protocol: bool,

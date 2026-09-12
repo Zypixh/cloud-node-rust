@@ -1324,7 +1324,72 @@ impl HttpProxyManager {
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// Whether any server bound to `port` requires an inbound PROXY
+    /// protocol v1/v2 header. Mirrors the socket listener's
+    /// `enable_proxy_protocol` flag so AF_XDP-steered streams honor the
+    /// same wire contract.
+    pub(crate) fn af_xdp_port_requires_proxy_protocol_sync(&self, port: u16) -> bool {
+        self.config_store
+            .get_all_servers_sync()
+            .iter()
+            .any(|server| {
+                server.enable_proxy_protocol
+                    && (server.http.as_ref().is_some_and(|http| {
+                        http.is_on
+                            && http.listen.iter().any(|addr| {
+                                addr.port_range.as_deref().is_some_and(|range| {
+                                    crate::config_models::port_range_contains(range, port)
+                                })
+                            })
+                    }) || server.https.as_ref().is_some_and(|https| {
+                        https.is_on
+                            && https.listen.iter().any(|addr| {
+                                addr.port_range.as_deref().is_some_and(|range| {
+                                    crate::config_models::port_range_contains(range, port)
+                                })
+                            })
+                    }))
+            })
+    }
+
     pub(crate) async fn handle_af_xdp_http_stream<S>(
+        self: Arc<Self>,
+        client_stream: S,
+        client_addr: SocketAddr,
+        listen_port: u16,
+        kind: AfXdpHttpPortKind,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        // The PROXY protocol header precedes everything else on the wire
+        // (including the TLS ClientHello), so it must be consumed before the
+        // SNI sniff / L7 dispatch below — same as the socket listener path.
+        if self.af_xdp_port_requires_proxy_protocol_sync(listen_port) {
+            let Some((client_addr, client_stream)) =
+                crate::tcp_proxy::maybe_consume_proxy_protocol_header_generic(
+                    client_stream,
+                    client_addr,
+                    true,
+                )
+                .await?
+            else {
+                return Ok(());
+            };
+            return self
+                .handle_af_xdp_http_stream_inner(
+                    client_stream,
+                    client_addr,
+                    listen_port,
+                    kind,
+                )
+                .await;
+        }
+        self.handle_af_xdp_http_stream_inner(client_stream, client_addr, listen_port, kind)
+            .await
+    }
+
+    async fn handle_af_xdp_http_stream_inner<S>(
         self: Arc<Self>,
         client_stream: S,
         client_addr: SocketAddr,
