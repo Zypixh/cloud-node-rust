@@ -31,6 +31,7 @@ start_node() {
         BENCH_CC_BLOCK_SECS="${BENCH_CC_BLOCK_SECS:-30}" \
         BENCH_L4_BLOCK_SECS="${BENCH_L4_BLOCK_SECS:-30}" \
         BENCH_KERNEL_FILTER="${BENCH_KERNEL_FILTER:-auto}" \
+        BENCH_CC_TOTAL_QPS="${BENCH_CC_TOTAL_QPS:-0}" \
         "$NODE" >"$LOG" 2>&1 &
     for _ in $(seq 40); do
         curl -sf -o /dev/null -H 'Host: plain.bench' http://127.0.0.1:8080/index.html && break

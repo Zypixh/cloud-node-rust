@@ -74,6 +74,7 @@ fn main() -> anyhow::Result<()> {
     let origin_udp = env_str("BENCH_ORIGIN_UDP", "127.0.0.1:8054");
 
     let cc_per_ip_qps = env_i32("BENCH_CC_PER_IP_QPS", 500);
+    let cc_total_qps = env_i32("BENCH_CC_TOTAL_QPS", 0);
     let cc_block_secs = env_i32("BENCH_CC_BLOCK_SECS", 30);
     let uam_mode = env_str("BENCH_UAM_MODE", "js_cookie");
     let l4_threshold = env_u32("BENCH_L4_EMPTY_THRESHOLD", 200);
@@ -171,6 +172,7 @@ fn main() -> anyhow::Result<()> {
         &origin_http,
         &origin_udp,
         cc_per_ip_qps,
+        cc_total_qps,
         cc_block_secs,
         &uam_mode,
     );
@@ -393,7 +395,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     info!(
-        "bench-defense ready: http :{http_port} tls :{tls_port} tcp :{tcp_port} udp :{udp_port} -> origin {origin_http} cc_per_ip_qps={cc_per_ip_qps} l4_empty_threshold={l4_threshold}/{l4_period}s block={l4_block_secs}s tls_fail={tls_fail_threshold} uam_mode={uam_mode}"
+        "bench-defense ready: http :{http_port} tls :{tls_port} tcp :{tcp_port} udp :{udp_port} -> origin {origin_http} cc_per_ip_qps={cc_per_ip_qps} cc_total_qps={cc_total_qps} l4_empty_threshold={l4_threshold}/{l4_period}s block={l4_block_secs}s tls_fail={tls_fail_threshold} uam_mode={uam_mode}"
     );
     runtime.block_on(std::future::pending::<()>());
     Ok(())
@@ -407,6 +409,7 @@ fn build_servers(
     origin_http: &str,
     origin_udp: &str,
     cc_per_ip_qps: i32,
+    cc_total_qps: i32,
     cc_block_secs: i32,
     uam_mode: &str,
 ) -> Vec<ServerConfig> {
@@ -443,7 +446,7 @@ fn build_servers(
     let mut cc_web = base_web();
     cc_web.cc_policy = Some(CCPolicy {
         is_on: true,
-        max_qps: 0,
+        max_qps: cc_total_qps,
         per_ip_max_qps: cc_per_ip_qps,
         max_bandwidth: 0.0,
         show_page: true,
