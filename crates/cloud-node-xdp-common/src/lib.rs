@@ -220,6 +220,13 @@ pub struct XdpCounters {
     pub tcp_fwd_map_full: u64,
     pub sni_blocked: u64,
     pub sni_incomplete: u64,
+    /// SNAT source-port bindings successfully claimed.
+    pub snat_bound: u64,
+    /// SNAT port allocation failures (port space probe exhausted); those
+    /// packets fall back to the userspace dataplane.
+    pub snat_alloc_fail: u64,
+    /// Backend replies restored to clients through a SNAT reverse binding.
+    pub snat_reply_tx: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -313,6 +320,11 @@ pub struct XdpUdpFwdRule {
     pub next_hop_mac: [u8; 6],
     pub backend_port_be: u16,
     pub family: u8,
+    /// SNAT mode: when non-zero the forwarded frame's source is rewritten to
+    /// the listen address plus a node-allocated port. Required on fabrics
+    /// that drop egress frames whose source IP is not bound to this port
+    /// (cloud vSwitch anti-spoof). 0 = plain DNAT preserving the client IP.
+    pub snat: u8,
     /// Billing dimension: forwarded bytes are attributed to this server id.
     pub server_id: i64,
 }
@@ -350,7 +362,10 @@ pub struct XdpUdpCtValue {
     pub family: u8,
     /// TCP lifecycle marker (XDP_CT_STATE_*); always OPEN for UDP.
     pub state: u8,
-    pub _pad: [u8; 6],
+    /// Node-allocated SNAT source port claimed for this flow
+    /// (XDP_SNAT_PORT_BASE..); 0 means the flow runs plain DNAT.
+    pub snat_port_be: u16,
+    pub _pad: [u8; 4],
     /// Billing dimension mirrored from the forward rule.
     pub server_id: i64,
     pub last_seen_ns: u64,
@@ -370,6 +385,47 @@ pub fn sni_hash(s: &str) -> u64 {
 /// Maximum SNI hostname length handled by the eBPF fast path. Longer names
 /// are treated as unparseable and stay on the userspace dataplane.
 pub const XDP_SNI_MAX_LEN: usize = 16;
+
+/// SNAT reverse-binding key: backend replies arrive addressed to
+/// (listen_addr, snat_port); the value restores the client tuple.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct XdpSnatRevKey {
+    pub listen_addr: [u8; 16],
+    pub snat_port_be: u16,
+    /// IP protocol number (17 = UDP, 6 = TCP).
+    pub proto: u8,
+    pub family: u8,
+    pub _pad: [u8; 3],
+}
+
+/// SNAT reverse-binding value: the full client flow tuple, needed both for
+/// the reply rewrite and to rebuild the conntrack key when sweeping orphan
+/// bindings.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpSnatRevValue {
+    pub client_addr: [u8; 16],
+    pub backend_addr: [u8; 16],
+    pub client_mac: [u8; 6],
+    pub client_port_be: u16,
+    pub backend_port_be: u16,
+    pub family: u8,
+    pub proto: u8,
+    /// Original listen port (network order): replies must masquerade as
+    /// (listen_addr, listen_port) - the tuple the client originally dialed.
+    /// Kept inside the former padding so earlier fields stay ABI-stable.
+    pub listen_port_be: u16,
+    pub _pad: [u8; 2],
+    /// Billing dimension copied from the forward rule so replies still
+    /// account correctly if the conntrack entry was already reaped.
+    pub server_id: i64,
+}
+
+/// First SNAT source port allocated by the eBPF dataplane.
+pub const XDP_SNAT_PORT_BASE: u16 = 40000;
+/// SNAT port space size: 40000..=60999.
+pub const XDP_SNAT_PORT_SPAN: u16 = 21000;
 
 /// Per-CPU traffic accounting for direct-forwarded flows, keyed by the
 /// conntrack key so both directions accumulate under the client flow.
@@ -392,6 +448,30 @@ pub struct XdpInterfacePolicy {
     pub local_ip_filter: u8,
     pub _pad: u8,
     pub frame_size: u32,
+}
+
+/// Per-CPU scratch space for NAT/DCID key construction in the eBPF dataplane.
+/// eBPF stack is capped at 512 bytes and the conntrack/forward keys plus
+/// values exceed it when inlined, so large temporaries are built in this map
+/// instead. The layout lives here (not in the eBPF crate) so userspace can
+/// verify the pinned XDP_NAT_SCRATCH map still matches the ABI before reuse.
+/// The map itself is internal only; contents are never read by userspace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NatScratch {
+    pub fwd_key: XdpUdpFwdKey,
+    pub ct_key: XdpUdpCtKey,
+    pub ct_value: XdpUdpCtValue,
+    pub dcid_key: XdpQuicDcidKey,
+    pub csum_old: [u32; 4],
+    pub csum_new: [u32; 4],
+    pub snat_rev_key: XdpSnatRevKey,
+    pub snat_rev_value: XdpSnatRevValue,
+    /// Packet header snapshots for the IPv6 handlers: keeping the two 16-byte
+    /// addresses in the per-CPU map instead of locals keeps those frames
+    /// under the 512-byte verifier stack limit.
+    pub pkt_src: [u8; 16],
+    pub pkt_dst: [u8; 16],
 }
 
 #[cfg(all(feature = "aya", target_os = "linux"))]
@@ -423,7 +503,10 @@ unsafe_impl_aya_pod!(
     XdpUdpFwdRule,
     XdpUdpCtKey,
     XdpUdpCtValue,
+    XdpSnatRevKey,
+    XdpSnatRevValue,
     XdpFlowAcct,
+    NatScratch,
 );
 
 #[cfg(feature = "std")]

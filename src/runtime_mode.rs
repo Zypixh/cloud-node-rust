@@ -185,6 +185,12 @@ pub struct XdpUdpForwardConfig {
     /// Billing dimension for flow accounting.
     #[serde(rename = "serverId", default)]
     pub server_id: i64,
+    /// Rewrite forwarded frames' source to the listen address plus a
+    /// node-allocated port. Required on fabrics that drop egress frames whose
+    /// source IP is not bound to this port (cloud vSwitch anti-spoof).
+    /// Default false = plain DNAT preserving the client IP.
+    #[serde(rename = "snat", default)]
+    pub snat: bool,
 }
 
 impl Default for XdpInterfaceConfig {

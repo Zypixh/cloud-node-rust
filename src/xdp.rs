@@ -105,6 +105,15 @@ pub struct XdpStatusSnapshot {
     pub sni_blocked: u64,
     #[serde(default)]
     pub sni_incomplete: u64,
+    /// SNAT source-port bindings successfully claimed.
+    #[serde(default)]
+    pub snat_bound: u64,
+    /// SNAT port allocation failures; those packets take the userspace path.
+    #[serde(default)]
+    pub snat_alloc_fail: u64,
+    /// Backend replies restored to clients via SNAT reverse bindings.
+    #[serde(default)]
+    pub snat_reply_tx: u64,
     #[serde(default)]
     pub rate_limit_active: bool,
     #[serde(default)]
@@ -451,6 +460,9 @@ struct XdpManager {
     tcp_fwd_map_full: AtomicU64,
     sni_blocked: AtomicU64,
     sni_incomplete: AtomicU64,
+    snat_bound: AtomicU64,
+    snat_alloc_fail: AtomicU64,
+    snat_reply_tx: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
@@ -502,6 +514,9 @@ impl XdpManager {
             tcp_fwd_map_full: AtomicU64::new(0),
             sni_blocked: AtomicU64::new(0),
             sni_incomplete: AtomicU64::new(0),
+            snat_bound: AtomicU64::new(0),
+            snat_alloc_fail: AtomicU64::new(0),
+            snat_reply_tx: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
@@ -1057,6 +1072,9 @@ impl XdpManager {
             tcp_fwd_map_full: self.tcp_fwd_map_full.load(Ordering::Relaxed),
             sni_blocked: self.sni_blocked.load(Ordering::Relaxed),
             sni_incomplete: self.sni_incomplete.load(Ordering::Relaxed),
+            snat_bound: self.snat_bound.load(Ordering::Relaxed),
+            snat_alloc_fail: self.snat_alloc_fail.load(Ordering::Relaxed),
+            snat_reply_tx: self.snat_reply_tx.load(Ordering::Relaxed),
             rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
             rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
@@ -1568,6 +1586,12 @@ impl XdpManager {
                     .store(counters.sni_blocked, Ordering::Relaxed);
                 self.sni_incomplete
                     .store(counters.sni_incomplete, Ordering::Relaxed);
+                self.snat_bound
+                    .store(counters.snat_bound, Ordering::Relaxed);
+                self.snat_alloc_fail
+                    .store(counters.snat_alloc_fail, Ordering::Relaxed);
+                self.snat_reply_tx
+                    .store(counters.snat_reply_tx, Ordering::Relaxed);
             }
         }
     }
@@ -3424,7 +3448,8 @@ mod linux {
     use cloud_node_xdp_common::{
         XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key,
         XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig, XdpRuleValue,
-        XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
+        XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey,
+        XdpUdpFwdRule,
     };
     use ipnet::IpNet;
     use std::collections::BTreeSet;
@@ -3957,50 +3982,56 @@ mod linux {
                 .try_into()?;
             program.load()?;
         }
-        // Populate the tail-call dispatch table: slot 0 is the NAT
-        // subprogram, slot 1 the SNI blocklist subprogram (which chains into
-        // NAT). An older object without these symbols leaves slots empty; the
-        // program then falls back to the inline redirect path explicitly.
-        let nat_dispatch_fd = match ebpf.program_mut("xdp_nat_dispatch") {
-            Some(sub_program) => {
-                let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
-                sub.load()?;
-                Some(
-                    sub.fd()?
-                        .try_clone()
-                        .map_err(|err| anyhow::anyhow!("clone xdp_nat_dispatch fd: {err}"))?,
-                )
-            }
-            None => None,
-        };
-        let sni_dispatch_fd = match ebpf.program_mut("xdp_sni_dispatch") {
-            Some(sub_program) => {
-                let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
-                sub.load()?;
-                Some(
-                    sub.fd()?
-                        .try_clone()
-                        .map_err(|err| anyhow::anyhow!("clone xdp_sni_dispatch fd: {err}"))?,
-                )
-            }
-            None => None,
-        };
-        match (ebpf.map_mut("XDP_DISPATCH"), nat_dispatch_fd, sni_dispatch_fd) {
-            (Some(map), nat_fd, sni_fd) => {
+        // Populate the tail-call dispatch table. Slots are per (family, proto)
+        // pairs because a single SNAT-capable NAT handler is already ~10KiB of
+        // BPF: slot 0 = UDP/IPv4, 1 = SNI blocklist (chains into TCP NAT),
+        // 2 = TCP/IPv4, 3 = UDP/IPv6 replies, 4 = TCP/IPv6 replies, and the
+        // IPv6 forward halves each get their own program (5 = UDPv6 fwd,
+        // 6 = TCPv6 fwd) to stay under older kernels' verifier state budget.
+        // An older object without a symbol leaves that slot empty; the tail
+        // call then returns and the dispatcher falls back to the
+        // redirect/PASS path explicitly.
+        let mut dispatch_fds: Vec<(u32, Option<aya::programs::ProgramFd>)> = Vec::new();
+        for (slot, name) in [
+            (0u32, "xdp_nat_dispatch"),
+            (1, "xdp_sni_dispatch"),
+            (2, "xdp_nat_tcp_dispatch"),
+            (3, "xdp_nat_udp6_dispatch"),
+            (4, "xdp_nat_tcp6_dispatch"),
+            (5, "xdp_nat_udp6_fwd"),
+            (6, "xdp_nat_tcp6_fwd"),
+        ] {
+            let fd = match ebpf.program_mut(name) {
+                Some(sub_program) => {
+                    let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
+                    sub.load()?;
+                    Some(
+                        sub.fd()?
+                            .try_clone()
+                            .map_err(|err| anyhow::anyhow!("clone {name} fd: {err}"))?,
+                    )
+                }
+                None => None,
+            };
+            dispatch_fds.push((slot, fd));
+        }
+        match ebpf.map_mut("XDP_DISPATCH") {
+            Some(map) => {
                 let mut table = aya::maps::ProgramArray::try_from(map)?;
-                if let Some(ref fd) = nat_fd {
-                    table.set(0, fd, 0)?;
+                let mut missing = false;
+                for (slot, fd) in &dispatch_fds {
+                    match fd {
+                        Some(fd) => table.set(*slot, fd, 0)?,
+                        None => missing = true,
+                    }
                 }
-                if let Some(ref fd) = sni_fd {
-                    table.set(1, fd, 0)?;
-                }
-                if nat_fd.is_none() || sni_fd.is_none() {
+                if missing {
                     tracing::warn!(
                         "eBPF object lacks a dispatch subprogram; affected direct-forward/SNI features stay on the normal dataplane"
                     );
                 }
             }
-            (None, _, _) => {
+            None => {
                 let configured: usize = config
                     .interfaces
                     .iter()
@@ -4433,6 +4464,7 @@ mod linux {
                 next_hop_mac,
                 backend_port_be: backend.port().to_be(),
                 family: key.family,
+                snat: u8::from(fwd.snat),
                 server_id: fwd.server_id,
             },
         ))
@@ -4533,12 +4565,16 @@ mod linux {
         let closing_ns = tcp_closing_grace.as_nanos().min(u64::MAX as u128) as u64;
 
         let mut stale: Vec<XdpUdpCtKey> = Vec::new();
+        let mut udp_live: std::collections::HashSet<XdpUdpCtKey> = Default::default();
+        let mut tcp_live: std::collections::HashSet<XdpUdpCtKey> = Default::default();
         if let Some(map) = ebpf.map_mut("XDP_UDP_CT") {
             let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
             for item in map.iter() {
                 let (key, value) = item?;
                 if now_ns.saturating_sub(value.last_seen_ns) >= udp_idle_ns {
                     stale.push(key);
+                } else {
+                    udp_live.insert(key);
                 }
             }
             for key in &stale {
@@ -4558,12 +4594,43 @@ mod linux {
                 };
                 if idle >= limit {
                     tcp_stale.push(key);
+                } else {
+                    tcp_live.insert(key);
                 }
             }
             for key in &tcp_stale {
                 let _ = map.remove(key);
             }
             stale.extend(tcp_stale);
+        }
+
+        // Reap SNAT reverse bindings whose owning conntrack entry is gone.
+        if let Some(map) = ebpf.map_mut("XDP_SNAT_REV") {
+            let mut map =
+                AyaHashMap::<_, XdpSnatRevKey, XdpSnatRevValue>::try_from(map)?;
+            let mut orphan = Vec::new();
+            for item in map.iter() {
+                let (key, value) = item?;
+                let ct_key = XdpUdpCtKey {
+                    client_addr: value.client_addr,
+                    backend_addr: value.backend_addr,
+                    client_port_be: value.client_port_be,
+                    backend_port_be: value.backend_port_be,
+                    family: value.family,
+                    proto: value.proto,
+                    ..Default::default()
+                };
+                let alive = match value.proto {
+                    6 => tcp_live.contains(&ct_key),
+                    _ => udp_live.contains(&ct_key),
+                };
+                if !alive {
+                    orphan.push(key);
+                }
+            }
+            for key in &orphan {
+                let _ = map.remove(key);
+            }
         }
 
         if let Some(map) = ebpf.map_mut("XDP_FLOW_ACCT") {
@@ -9915,6 +9982,7 @@ mod tests {
             backend: "10.0.0.5:53".to_string(),
             next_hop_mac: "02:00:00:00:00:01".to_string(),
             server_id: 42,
+            snat: false,
         };
         let (key, rule) = linux::udp_forward_entry(&fwd).unwrap();
         assert_eq!(key.family, 4);
@@ -9923,7 +9991,15 @@ mod tests {
         assert_eq!(&rule.backend_addr[..4], &[10, 0, 0, 5]);
         assert_eq!(rule.backend_port_be, 53u16.to_be());
         assert_eq!(rule.server_id, 42);
+        assert_eq!(rule.snat, 0);
         assert_eq!(rule.next_hop_mac, [0x02, 0, 0, 0, 0, 1]);
+
+        let fwd_snat = crate::runtime_mode::XdpUdpForwardConfig {
+            snat: true,
+            ..fwd
+        };
+        let (_, rule_snat) = linux::udp_forward_entry(&fwd_snat).unwrap();
+        assert_eq!(rule_snat.snat, 1);
 
         // Family mismatch is rejected explicitly.
         let bad = crate::runtime_mode::XdpUdpForwardConfig {
@@ -9931,6 +10007,7 @@ mod tests {
             backend: "[2001:db8::5]:53".to_string(),
             next_hop_mac: "02:00:00:00:00:01".to_string(),
             server_id: 0,
+            snat: false,
         };
         assert!(linux::udp_forward_entry(&bad).is_err());
     }
