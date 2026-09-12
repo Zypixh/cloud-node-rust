@@ -235,6 +235,33 @@ pub struct XdpRateBucket {
     pub count: u64,
 }
 
+/// QUIC long-header Destination Connection ID lookup key. `bytes` holds the
+/// DCID left-padded with trailing zeros; `len` is the encoded DCID length
+/// (1..=20). Only long headers carry an explicit DCID length, so short-header
+/// packets are never matched against this map — they use RSS queue affinity.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct XdpQuicDcidKey {
+    pub bytes: [u8; 20],
+    pub len: u8,
+    pub _pad: [u8; 3],
+}
+
+impl XdpQuicDcidKey {
+    pub fn new(dcid: &[u8]) -> Option<Self> {
+        if dcid.is_empty() || dcid.len() > 20 {
+            return None;
+        }
+        let mut bytes = [0u8; 20];
+        bytes[..dcid.len()].copy_from_slice(dcid);
+        Some(Self {
+            bytes,
+            len: dcid.len() as u8,
+            _pad: [0; 3],
+        })
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct XdpInterfacePolicy {
@@ -269,6 +296,7 @@ unsafe_impl_aya_pod!(
     XdpInterfacePolicy,
     XdpRateLimitConfig,
     XdpRateBucket,
+    XdpQuicDcidKey,
 );
 
 #[cfg(feature = "std")]
@@ -328,6 +356,28 @@ pub mod host {
             assert!(range_contains(range, "192.0.2.15".parse().unwrap()));
             assert!(!range_contains(range, "192.0.2.21".parse().unwrap()));
             assert!(!range_contains(range, "2001:db8::1".parse().unwrap()));
+        }
+
+        #[test]
+        fn quic_dcid_key_pads_and_bounds() {
+            let key = XdpQuicDcidKey::new(&[0xaa, 0xbb, 0xcc]).unwrap();
+            assert_eq!(key.len, 3);
+            assert_eq!(&key.bytes[..3], &[0xaa, 0xbb, 0xcc]);
+            assert!(key.bytes[3..].iter().all(|b| *b == 0));
+
+            let mut long = [0x11u8; 20];
+            long[19] = 0x22;
+            let key = XdpQuicDcidKey::new(&long).unwrap();
+            assert_eq!(key.len, 20);
+            assert_eq!(key.bytes, long);
+
+            assert!(XdpQuicDcidKey::new(&[]).is_none());
+            assert!(XdpQuicDcidKey::new(&[0u8; 21]).is_none());
+
+            // Same bytes with different lengths must not collide.
+            let short = XdpQuicDcidKey::new(&[1, 2]).unwrap();
+            let long = XdpQuicDcidKey::new(&[1, 2, 0]).unwrap();
+            assert_ne!(short, long);
         }
 
         #[test]
