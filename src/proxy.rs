@@ -2971,6 +2971,7 @@ impl EdgeProxy {
         ctx: &mut ProxyCTX,
         shutdown: &crate::compiled::CompiledShutdownPlan,
     ) -> Result<bool> {
+        session.as_downstream_mut().set_keepalive(None);
         if let Some((target, redirect_status)) = shutdown.redirect_target() {
             let mut resp = pingora_http::ResponseHeader::build(redirect_status, None).unwrap();
             Self::insert_location_header(&mut resp, target);
@@ -3017,6 +3018,7 @@ impl EdgeProxy {
         if !shutdown.is_on {
             return Ok(false);
         }
+        session.as_downstream_mut().set_keepalive(None);
 
         let status = Self::response_status_from_i64(i64::from(shutdown.status), 200);
         let body_type = shutdown.body_type.to_ascii_lowercase();
@@ -4191,6 +4193,13 @@ impl EdgeProxy {
         ctx: &mut ProxyCTX,
         status: u16,
     ) -> Result<bool> {
+        if status >= 400 {
+            // Terminal error responses intentionally end the downstream
+            // connection (each rejection costs the client a fresh accept
+            // cycle). Disabling keepalive before writing headers also makes
+            // the emitted `Connection: close` match the actual behavior.
+            session.as_downstream_mut().set_keepalive(None);
+        }
         if let Some(page) = self.find_custom_page(ctx, status) {
             if let Some(url) = page.url.as_ref().filter(|url| !url.is_empty()) {
                 let redirect_status = u16::try_from(page.new_status)
@@ -4537,6 +4546,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         };
         ctx.waf_action = Some(action_code.to_string());
         ctx.firewall_blocked = true;
+        session.as_downstream_mut().set_keepalive(None);
 
         let suffix = Self::waf_cookie_suffix(session, ctx, challenge_life_seconds);
         let mut resp = pingora_http::ResponseHeader::build(200u16, None).unwrap();
@@ -5070,6 +5080,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
 
         ctx.waf_action = Some("refererCheck".to_string());
         ctx.firewall_blocked = true;
+        session.as_downstream_mut().set_keepalive(None);
         let mut resp = pingora_http::ResponseHeader::build(403, None).unwrap();
         let _ = resp.insert_header("cache-control", "max-age=3600");
         session.write_response_header(Box::new(resp), false).await?;
@@ -5148,6 +5159,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
         if blocked {
             ctx.waf_action = Some("userAgentCheck".to_string());
             ctx.firewall_blocked = true;
+            session.as_downstream_mut().set_keepalive(None);
             let mut resp = pingora_http::ResponseHeader::build(403, None).unwrap();
             let _ = resp.insert_header("cache-control", "max-age=3600");
             session.write_response_header(Box::new(resp), false).await?;
@@ -6033,6 +6045,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 return Ok(true);
             }
 
+            session.as_downstream_mut().set_keepalive(None);
             let mut resp = pingora_http::ResponseHeader::build(403, None).unwrap();
             resp.insert_header("content-type", "text/html; charset=utf-8")
                 .unwrap();
@@ -6248,6 +6261,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
             }
         }
 
+        session.as_downstream_mut().set_keepalive(None);
         let mut resp = pingora_http::ResponseHeader::build(403, None).unwrap();
         resp.insert_header("content-type", "text/html; charset=utf-8")
             .unwrap();
@@ -6836,6 +6850,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
 
         if !matches!(action, crate::firewall::ActionResponse::Allow) {
             ctx.firewall_blocked = true;
+            session.as_downstream_mut().set_keepalive(None);
         }
 
         match action {
