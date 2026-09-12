@@ -131,11 +131,17 @@
 - 分工：OrbStack（编译 + Rust 测试，**内核共享 OrbStack 自带内核，无法验证 XDP/内核升级**）→ 真机 Debian13/Ubuntu24.04（XDP/eBPF/perf 矩阵验证）。现有 bench 机（Ubuntu 22.04/5.15）需重建或升 HWE 内核才能测 zc。
 - glibc 结论：2.35→2.41 对本项目无性能差异（热路径全在内核/Rust/静态 C），基线永远取矩阵最老版本。
 
-**X2. 单 reactor → per-queue pinned 线程（最大性能缺口）**
+**X2. 单 reactor → per-queue pinned 线程（已实现，待真机验证）**
 - 现状：`run_proxy_bridge` 单 async task 轮询全部 XSK 队列 = 单核天花板；SKB 模式每包成本更高，瓶颈更早到。
 - 方案：每队列一个 pinned OS 线程，独立 `smoltcp::Interface`+reactor 实例（smoltcp `!Sync` 天然适配 per-queue 分片）；RSS 已保证 flow→queue 亲和，无需跨队列会话迁移。session/连接上限按队列切分预算。
 - 性能优先强化：reactor 线程 **busy-poll 不睡眠**（去掉 5ms idle tick，或忙轮询+自适应退避二选一并可配置）、绑核、对应队列 IRQ 亲和绑定到同核、irqbalance 排除这些 CPU。
 - 验证：8 队列下吞吐随队列数近线性。
+- 实现状态（已提交）：
+  - `AfXdpRuntimeHandle::take_queues()` 把队列 handle 移出共享 runtime；每队列一个 `afxdp-<iface>-<q>` OS 线程，各跑 `current_thread` tokio runtime + 独立 `AfXdpTcpReactor`/`udp_routes`/downstream mpsc——`manager.af_xdp` 互斥锁完全移出数据面。
+  - CPU 绑核：`XdpInterfaceConfig.cpus[]` 与 `queues[]` 按索引对齐显式指定；缺省按全局队列序号 round-robin 到在线 CPU（`sched_setaffinity`，失败 warn 不降级）。
+  - 空闲路径：5ms 固定 idle tick → 自适应退避（spin → 10µs 起步指数退避至 1ms 封顶，有流量立即复位）。
+  - Watchdog：任一 reactor 线程在 bridge 应存活期间退出 → `disable_proxy_redirect_for_fallback`，全部队列显式回落内核 listener。
+  - 队列状态：reactor 线程每 1s 自更新 `xsk_status` 中本队列的 rx_dropped/ring_full 等统计。
 
 **X3. 全兼容 parity 矩阵（审计结论，2026-09-12）**
 

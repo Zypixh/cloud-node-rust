@@ -148,6 +148,10 @@ pub struct XdpInterfaceConfig {
     pub name: String,
     #[serde(default)]
     pub queues: Vec<u32>,
+    /// Optional CPU ids aligned index-wise with `queues`; pins each per-queue
+    /// AF_XDP reactor thread. Empty = auto round-robin across online CPUs.
+    #[serde(default)]
+    pub cpus: Vec<u32>,
     #[serde(default)]
     pub mode: XdpRuntimeMode,
     #[serde(rename = "localIps", default)]
@@ -161,6 +165,7 @@ impl Default for XdpInterfaceConfig {
         Self {
             name: String::new(),
             queues: Vec::new(),
+            cpus: Vec::new(),
             mode: XdpRuntimeMode::default(),
             local_ips: Vec::new(),
             frame_size: default_xdp_frame_size(),
@@ -614,6 +619,7 @@ mod tests {
                 interfaces: vec![XdpInterfaceConfig {
                     name: "eth0".to_string(),
                     queues: vec![0],
+                    cpus: Vec::new(),
                     mode: XdpRuntimeMode::Proxy,
                     ..Default::default()
                 }],
