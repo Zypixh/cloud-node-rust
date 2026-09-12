@@ -4624,6 +4624,8 @@ pub mod af_xdp {
     #[cfg(any(test, target_os = "linux"))]
     use smoltcp::time::Instant as SmoltcpInstant;
     #[cfg(any(test, target_os = "linux"))]
+    use dashmap::DashMap;
+    #[cfg(any(test, target_os = "linux"))]
     use smoltcp::wire::{
         HardwareAddress, IpAddress as SmoltcpIpAddress, IpCidr as SmoltcpIpCidr, IpEndpoint,
         IpListenEndpoint,
@@ -6217,6 +6219,30 @@ pub mod af_xdp {
         pub(super) last_seen_ms: u64,
     }
 
+    /// Cross-interface forwarding between per-queue reactor threads. TX on any
+    /// queue of the same interface delivers identically, so forwarding is only
+    /// needed when a flow's L2 route resolves to a different interface than the
+    /// draining thread owns.
+    #[cfg(target_os = "linux")]
+    enum AfXdpForward {
+        Udp(crate::udp_proxy::DownstreamUdpDatagram),
+        TcpFrame(Vec<u8>),
+    }
+
+    /// Per-queue reactor context shared at spawn time.
+    #[cfg(target_os = "linux")]
+    struct AfXdpQueueCtx {
+        downstream_tx: mpsc::Sender<crate::udp_proxy::DownstreamUdpDatagram>,
+        downstream_rx: mpsc::Receiver<crate::udp_proxy::DownstreamUdpDatagram>,
+        fwd_rx: mpsc::Receiver<AfXdpForward>,
+        /// Route cache shared by all queue threads: ingress on queue A may be
+        /// answered by the demux/H3 endpoint on queue B's channel, so lookups
+        /// must see every queue's learned L2 routes.
+        udp_routes: Arc<DashMap<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>>,
+        /// First channel per interface for cross-interface forwarding.
+        iface_fwd: Arc<HashMap<String, mpsc::Sender<AfXdpForward>>>,
+    }
+
     pub fn runtime() -> AfXdpRuntime {
         let status = status_snapshot();
         AfXdpRuntime {
@@ -6395,10 +6421,42 @@ pub mod af_xdp {
         tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
     ) {
+        const AF_XDP_DOWNSTREAM_QUEUE: usize = 4096;
+
         let online_cpus = num_cpus::get().max(1);
+        let udp_routes = Arc::new(DashMap::new());
+        // One forwarding channel per queue; the first sender per interface is
+        // the cross-interface forward target.
+        let mut iface_fwd: HashMap<String, mpsc::Sender<AfXdpForward>> = HashMap::new();
+        let mut contexts = Vec::with_capacity(queue_handles.len());
+        for queue_handle in &queue_handles {
+            let (downstream_tx, downstream_rx) =
+                mpsc::channel::<crate::udp_proxy::DownstreamUdpDatagram>(
+                    AF_XDP_DOWNSTREAM_QUEUE,
+                );
+            let (fwd_tx, fwd_rx) = mpsc::channel::<AfXdpForward>(AF_XDP_DOWNSTREAM_QUEUE);
+            iface_fwd
+                .entry(queue_handle.interface.clone())
+                .or_insert(fwd_tx);
+            contexts.push(AfXdpQueueCtx {
+                downstream_tx,
+                downstream_rx,
+                fwd_rx,
+                udp_routes: udp_routes.clone(),
+                iface_fwd: Arc::new(HashMap::new()),
+            });
+        }
+        let iface_fwd = Arc::new(iface_fwd);
+        for ctx in &mut contexts {
+            ctx.iface_fwd = iface_fwd.clone();
+        }
         let mut joins: Vec<std::thread::JoinHandle<()>> =
             Vec::with_capacity(queue_handles.len());
-        for (ordinal, queue_handle) in queue_handles.into_iter().enumerate() {
+        for (ordinal, (queue_handle, ctx)) in queue_handles
+            .into_iter()
+            .zip(contexts.into_iter())
+            .enumerate()
+        {
             let cpu = af_xdp_queue_cpu(
                 &manager.config,
                 &queue_handle.interface,
@@ -6423,6 +6481,7 @@ pub mod af_xdp {
                     Ok(rt) => rt.block_on(run_queue_bridge_loop(
                         reactor_manager,
                         queue_handle,
+                        ctx,
                         quic_demux,
                         tcp_manager,
                         http_manager,
@@ -6470,11 +6529,11 @@ pub mod af_xdp {
     async fn run_queue_bridge_loop(
         manager: Arc<XdpManager>,
         mut queue_handle: linux::AfXdpQueueHandle,
+        ctx: AfXdpQueueCtx,
         quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
         tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
     ) {
-        const AF_XDP_DOWNSTREAM_QUEUE: usize = 4096;
         const AF_XDP_DOWNSTREAM_DRAIN_BUDGET: usize = 1024;
         const AF_XDP_ROUTE_CACHE_MAX: usize = 65_536;
         const AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -6489,11 +6548,16 @@ pub mod af_xdp {
         const AF_XDP_IDLE_BACKOFF_MAX: Duration = Duration::from_millis(1);
         const AF_XDP_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-        let (downstream_tx, mut downstream_rx) =
-            mpsc::channel::<crate::udp_proxy::DownstreamUdpDatagram>(AF_XDP_DOWNSTREAM_QUEUE);
+        let AfXdpQueueCtx {
+            downstream_tx,
+            mut downstream_rx,
+            mut fwd_rx,
+            udp_routes,
+            iface_fwd,
+        } = ctx;
+        let own_interface = queue_handle.interface.clone();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
-        let mut udp_routes = HashMap::<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>::new();
         let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
         let mut tcp_reactor = AfXdpTcpReactor::new(tcp_manager, http_manager);
         let mut consecutive_poll_errors = 0u32;
@@ -6570,7 +6634,7 @@ pub mod af_xdp {
                 AF_XDP_ROUTE_CACHE_SWEEP_INTERVAL,
             ) {
                 compact_udp_route_cache(
-                    &mut udp_routes,
+                    &udp_routes,
                     now_ms,
                     AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT,
                     AF_XDP_ROUTE_CACHE_MAX,
@@ -6591,7 +6655,7 @@ pub mod af_xdp {
                         let now_ms = crate::udp_proxy::udp_activity_now_ms();
                         if udp_routes.len() >= AF_XDP_ROUTE_CACHE_MAX {
                             compact_udp_route_cache(
-                                &mut udp_routes,
+                                &udp_routes,
                                 now_ms,
                                 AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT,
                                 AF_XDP_ROUTE_CACHE_MAX,
@@ -6687,18 +6751,55 @@ pub mod af_xdp {
                 };
                 downstream_datagrams = downstream_datagrams.saturating_add(1);
                 let now_ms = crate::udp_proxy::udp_activity_now_ms();
-                let Some(entry) = udp_routes.get_mut(&(datagram.listen_addr, datagram.peer_addr))
-                else {
-                    tracing::debug!(
-                        "AF_XDP proxy bridge has no L2 route for downstream datagram listen={} peer={} bytes={}",
-                        datagram.listen_addr,
-                        datagram.peer_addr,
-                        datagram.payload.len()
-                    );
-                    continue;
+                let route = {
+                    let Some(entry) =
+                        udp_routes.get_mut(&(datagram.listen_addr, datagram.peer_addr))
+                    else {
+                        tracing::debug!(
+                            "AF_XDP proxy bridge has no L2 route for downstream datagram listen={} peer={} bytes={}",
+                            datagram.listen_addr,
+                            datagram.peer_addr,
+                            datagram.payload.len()
+                        );
+                        continue;
+                    };
+                    entry.last_seen_ms = now_ms;
+                    entry.route.clone()
                 };
-                entry.last_seen_ms = now_ms;
-                let route = entry.route.clone();
+                if route.interface != own_interface {
+                    match iface_fwd.get(&route.interface) {
+                        Some(tx) => match tx.try_send(AfXdpForward::Udp(datagram)) {
+                            Ok(()) => continue,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(
+                                    "AF_XDP proxy bridge forward channel to interface {} is full; dropping downstream datagram",
+                                    route.interface
+                                );
+                                if tx_failures.record(AfXdpTxStatus::Backpressured) {
+                                    manager.disable_proxy_redirect_for_fallback(format!(
+                                        "AF_XDP cross-interface forward channel stayed full for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} datagrams; proxy redirect disabled, traffic will PASS"
+                                    ));
+                                    return;
+                                }
+                                continue;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::warn!(
+                                    "AF_XDP proxy bridge forward channel to interface {} is closed",
+                                    route.interface
+                                );
+                                continue;
+                            }
+                        },
+                        None => {
+                            tracing::warn!(
+                                "AF_XDP proxy bridge has no reactor channel for route interface {}; dropping downstream datagram",
+                                route.interface
+                            );
+                            continue;
+                        }
+                    }
+                }
                 let sent = queue_handle.send_udp_datagram(
                     &route.link,
                     datagram.listen_addr,
@@ -6744,6 +6845,61 @@ pub mod af_xdp {
                 downstream_budget_exhausted = true;
             }
 
+            // Forwarded traffic: datagrams/frames whose L2 route resolves to
+            // this thread's interface but were drained by a reactor on another
+            // interface.
+            for _ in 0..AF_XDP_DOWNSTREAM_DRAIN_BUDGET {
+                let fwd = match fwd_rx.try_recv() {
+                    Ok(fwd) => fwd,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                };
+                let sent = match fwd {
+                    AfXdpForward::Udp(datagram) => {
+                        let route = {
+                            let Some(entry) = udp_routes
+                                .get_mut(&(datagram.listen_addr, datagram.peer_addr))
+                            else {
+                                continue;
+                            };
+                            entry.route.clone()
+                        };
+                        if route.interface != own_interface {
+                            continue;
+                        }
+                        queue_handle.send_udp_datagram(
+                            &route.link,
+                            datagram.listen_addr,
+                            datagram.peer_addr,
+                            datagram.payload.as_ref(),
+                        )
+                    }
+                    AfXdpForward::TcpFrame(frame) => queue_handle.send_raw_frame(&frame),
+                };
+                match sent {
+                    Ok(true) => {
+                        tx_failures.record(AfXdpTxStatus::Sent);
+                    }
+                    Ok(false) => {
+                        if tx_failures.record(AfXdpTxStatus::Backpressured) {
+                            manager.disable_proxy_redirect_for_fallback(format!(
+                                "AF_XDP forwarded TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times; proxy redirect disabled, traffic will PASS"
+                            ));
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!("AF_XDP forwarded TX failed: {err}");
+                        if tx_failures.record(AfXdpTxStatus::Failed) {
+                            manager.disable_proxy_redirect_for_fallback(format!(
+                                "AF_XDP forwarded TX failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} attempts: {err}; proxy redirect disabled, traffic will PASS"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+
             let tcp_egress = tcp_reactor.poll();
             let tcp_egress_frames = tcp_egress.len();
             #[cfg(target_os = "linux")]
@@ -6758,6 +6914,12 @@ pub mod af_xdp {
                     );
                     continue;
                 };
+                if route.interface != own_interface {
+                    if let Some(tx) = iface_fwd.get(&route.interface) {
+                        let _ = tx.try_send(AfXdpForward::TcpFrame(frame));
+                    }
+                    continue;
+                }
                 let sent = queue_handle.send_raw_frame(&frame);
                 match sent {
                     Ok(true) => {
@@ -6823,7 +6985,7 @@ pub mod af_xdp {
 
     #[cfg(any(test, target_os = "linux"))]
     pub(super) fn compact_udp_route_cache(
-        routes: &mut HashMap<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>,
+        routes: &DashMap<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>,
         now_ms: u64,
         idle_timeout: Duration,
         max_entries: usize,
@@ -9097,7 +9259,7 @@ mod tests {
         use std::net::SocketAddr;
         use std::time::Duration;
 
-        let mut routes = HashMap::new();
+        let routes = DashMap::new();
         for idx in 0..4u16 {
             let local = SocketAddr::from(([198, 51, 100, 5], 443));
             let peer = SocketAddr::from(([192, 0, 2, 10], 53000 + idx));
@@ -9114,12 +9276,12 @@ mod tests {
             );
         }
 
-        af_xdp::compact_udp_route_cache(&mut routes, 115, Duration::from_millis(100), 8, 2);
+        af_xdp::compact_udp_route_cache(&routes, 115, Duration::from_millis(100), 8, 2);
 
         assert_eq!(routes.len(), 2);
         assert!(routes.keys().all(|(_, peer)| peer.port() >= 53002));
 
-        af_xdp::compact_udp_route_cache(&mut routes, 116, Duration::from_millis(1_000), 2, 1);
+        af_xdp::compact_udp_route_cache(&routes, 116, Duration::from_millis(1_000), 2, 1);
 
         assert_eq!(routes.len(), 1);
         assert!(routes.keys().all(|(_, peer)| peer.port() == 53003));
