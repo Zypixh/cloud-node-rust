@@ -1383,6 +1383,63 @@ impl XdpManager {
         }
     }
 
+    /// Pin a QUIC long-header DCID to the XSK queue owning the session, so
+    /// retransmitted Initials and handshake datagrams keep landing on the
+    /// reactor that holds the connection state instead of following RSS.
+    /// Returns false when the eBPF object lacks the maps (stale object build);
+    /// callers log that once and keep RSS affinity as the explicit fallback.
+    #[cfg(target_os = "linux")]
+    fn upsert_quic_dcid(&self, dcid: &[u8], ifindex: u32, queue: u32) -> bool {
+        let Some(dcid_key) = cloud_node_xdp_common::XdpQuicDcidKey::new(dcid) else {
+            return false;
+        };
+        let mut guard = self.ebpf.lock();
+        let Some(ebpf) = guard.as_mut() else {
+            return false;
+        };
+        let xsk_index = {
+            let Some(map) = ebpf.map("XDP_XSK_INDEX") else {
+                return false;
+            };
+            let Ok(map) =
+                aya::maps::HashMap::<_, cloud_node_xdp_common::XdpQueueKey, u32>::try_from(map)
+            else {
+                return false;
+            };
+            map.get(&cloud_node_xdp_common::XdpQueueKey::new(ifindex, queue), 0)
+                .ok()
+        };
+        let Some(xsk_index) = xsk_index else {
+            return false;
+        };
+        let Some(map) = ebpf.map_mut("XDP_QUIC_DCID") else {
+            return false;
+        };
+        let Ok(mut map) =
+            aya::maps::HashMap::<_, cloud_node_xdp_common::XdpQuicDcidKey, u32>::try_from(map)
+        else {
+            return false;
+        };
+        map.insert(dcid_key, xsk_index, 0).is_ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_quic_dcid(&self, dcid_key: &cloud_node_xdp_common::XdpQuicDcidKey) {
+        let mut guard = self.ebpf.lock();
+        let Some(ebpf) = guard.as_mut() else {
+            return;
+        };
+        let Some(map) = ebpf.map_mut("XDP_QUIC_DCID") else {
+            return;
+        };
+        let Ok(mut map) =
+            aya::maps::HashMap::<_, cloud_node_xdp_common::XdpQuicDcidKey, u32>::try_from(map)
+        else {
+            return;
+        };
+        let _ = map.remove(dcid_key);
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn flush_maps_full_blocking(&self, _proxy_dataplane_active: bool) {}
 
@@ -4585,7 +4642,7 @@ mod linux {
         Ok(())
     }
 
-    fn ifindex_from_name(name: &str) -> anyhow::Result<u32> {
+    pub(super) fn ifindex_from_name(name: &str) -> anyhow::Result<u32> {
         let c_name = CString::new(name)?;
         let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
         if ifindex == 0 {
@@ -6239,6 +6296,10 @@ pub mod af_xdp {
         /// answered by the demux/H3 endpoint on queue B's channel, so lookups
         /// must see every queue's learned L2 routes.
         udp_routes: Arc<DashMap<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>>,
+        /// QUIC DCIDs this bridge has pinned to an XSK queue, mirrored from the
+        /// eBPF XDP_QUIC_DCID map for idle-expiry sweeping.
+        quic_dcid_steers:
+            Arc<DashMap<cloud_node_xdp_common::XdpQuicDcidKey, u64>>,
         /// First channel per interface for cross-interface forwarding.
         iface_fwd: Arc<HashMap<String, mpsc::Sender<AfXdpForward>>>,
     }
@@ -6425,6 +6486,7 @@ pub mod af_xdp {
 
         let online_cpus = num_cpus::get().max(1);
         let udp_routes = Arc::new(DashMap::new());
+        let quic_dcid_steers = Arc::new(DashMap::new());
         // One forwarding channel per queue; the first sender per interface is
         // the cross-interface forward target.
         let mut iface_fwd: HashMap<String, mpsc::Sender<AfXdpForward>> = HashMap::new();
@@ -6443,6 +6505,7 @@ pub mod af_xdp {
                 downstream_rx,
                 fwd_rx,
                 udp_routes: udp_routes.clone(),
+                quic_dcid_steers: quic_dcid_steers.clone(),
                 iface_fwd: Arc::new(HashMap::new()),
             });
         }
@@ -6553,9 +6616,12 @@ pub mod af_xdp {
             mut downstream_rx,
             mut fwd_rx,
             udp_routes,
+            quic_dcid_steers,
             iface_fwd,
         } = ctx;
         let own_interface = queue_handle.interface.clone();
+        let own_ifindex = linux::ifindex_from_name(&own_interface).unwrap_or(0);
+        let mut quic_dcid_map_unavailable = false;
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
         let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
@@ -6640,6 +6706,19 @@ pub mod af_xdp {
                     AF_XDP_ROUTE_CACHE_MAX,
                     AF_XDP_ROUTE_CACHE_EVICT_BATCH,
                 );
+                let mut expired_dcids = Vec::new();
+                quic_dcid_steers.retain(|key, last_seen_ms| {
+                    if now_ms.saturating_sub(*last_seen_ms)
+                        >= AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT.as_millis() as u64
+                    {
+                        expired_dcids.push(*key);
+                        return false;
+                    }
+                    true
+                });
+                for key in expired_dcids {
+                    manager.remove_quic_dcid(&key);
+                }
                 last_route_cache_sweep_ms = now_ms;
             }
 
@@ -6669,6 +6748,37 @@ pub mod af_xdp {
                                 last_seen_ms: now_ms,
                             },
                         );
+                        // Long-header QUIC packets encode their DCID length,
+                        // so the eBPF program can steer them. Pin this flow's
+                        // DCID to this queue's XSK so retransmissions and
+                        // handshake traffic stay on the owning reactor.
+                        if own_ifindex != 0
+                            && packet.payload.first().is_some_and(|b| b & 0x80 != 0)
+                            && let Some(cids) =
+                                crate::quic_probe::quic_packet_cids(&packet.payload, 0)
+                            && let Some(dkey) =
+                                cloud_node_xdp_common::XdpQuicDcidKey::new(&cids.dcid)
+                        {
+                            match quic_dcid_steers.get_mut(&dkey) {
+                                Some(mut seen) => *seen = now_ms,
+                                None => {
+                                    if manager.upsert_quic_dcid(
+                                        &cids.dcid,
+                                        own_ifindex,
+                                        queue_handle.queue,
+                                    ) {
+                                        quic_dcid_steers.insert(dkey, now_ms);
+                                    } else if !quic_dcid_map_unavailable {
+                                        quic_dcid_map_unavailable = true;
+                                        tracing::warn!(
+                                            "AF_XDP QUIC DCID steering unavailable (eBPF object lacks XDP_QUIC_DCID or XSK index for {} queue {}); RSS queue affinity remains the fallback",
+                                            own_interface,
+                                            queue_handle.queue
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         let Some(datagram) = packet.into_udp_datagram() else {
                             continue;
                         };
@@ -6752,7 +6862,7 @@ pub mod af_xdp {
                 downstream_datagrams = downstream_datagrams.saturating_add(1);
                 let now_ms = crate::udp_proxy::udp_activity_now_ms();
                 let route = {
-                    let Some(entry) =
+                    let Some(mut entry) =
                         udp_routes.get_mut(&(datagram.listen_addr, datagram.peer_addr))
                     else {
                         tracing::debug!(
@@ -7005,7 +7115,10 @@ pub mod af_xdp {
             .max(evict_batch.min(routes.len()));
         let mut oldest = routes
             .iter()
-            .map(|(key, entry)| (*key, entry.last_seen_ms))
+            .map(|entry| {
+                let (key, value) = entry.pair();
+                (*key, value.last_seen_ms)
+            })
             .collect::<Vec<_>>();
         oldest.select_nth_unstable_by(evict_count.saturating_sub(1), |left, right| {
             left.1.cmp(&right.1)
@@ -9255,7 +9368,7 @@ mod tests {
 
     #[test]
     fn af_xdp_udp_route_cache_expires_and_evicts_oldest_without_clearing_all() {
-        use std::collections::HashMap;
+        use dashmap::DashMap;
         use std::net::SocketAddr;
         use std::time::Duration;
 
@@ -9279,13 +9392,16 @@ mod tests {
         af_xdp::compact_udp_route_cache(&routes, 115, Duration::from_millis(100), 8, 2);
 
         assert_eq!(routes.len(), 2);
-        assert!(routes.keys().all(|(_, peer)| peer.port() >= 53002));
+        assert!(routes
+            .iter()
+            .all(|entry| entry.key().1.port() >= 53002));
 
         af_xdp::compact_udp_route_cache(&routes, 116, Duration::from_millis(1_000), 2, 1);
 
         assert_eq!(routes.len(), 1);
-        assert!(routes.keys().all(|(_, peer)| peer.port() == 53003));
-        assert_eq!(routes.values().next().unwrap().route.queue, 3);
+        let remaining = routes.iter().next().unwrap();
+        assert_eq!(remaining.key().1.port(), 53003);
+        assert_eq!(remaining.value().route.queue, 3);
     }
 
     #[test]

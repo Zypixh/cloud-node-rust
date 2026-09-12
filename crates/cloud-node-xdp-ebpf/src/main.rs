@@ -10,7 +10,7 @@ use aya_ebpf::{
 };
 use cloud_node_xdp_common::{
     XdpCounters, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key,
-    XdpPortProtoKey, XdpQueueKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue,
+    XdpPortProtoKey, XdpQueueKey, XdpQuicDcidKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue,
 };
 use core::mem;
 use network_types::{
@@ -97,6 +97,14 @@ static XDP_RATE_V4: HashMap<XdpIpv4Key, XdpRateBucket> =
 #[map(name = "XDP_RATE_V6")]
 static XDP_RATE_V6: HashMap<XdpIpv6Key, XdpRateBucket> =
     HashMap::<XdpIpv6Key, XdpRateBucket>::with_max_entries(262_144, 0);
+
+/// QUIC long-header DCID -> XSK map index. Keeps a connection's handshake and
+/// migrated long-header traffic on the queue that owns its userspace session
+/// instead of following RSS rehashes. Short-header DCIDs have no encoded
+/// length, so those packets always take the normal RSS queue path.
+#[map(name = "XDP_QUIC_DCID")]
+static XDP_QUIC_DCID: HashMap<XdpQuicDcidKey, u32> =
+    HashMap::<XdpQuicDcidKey, u32>::with_max_entries(131_072, 0);
 
 #[xdp]
 pub fn cloud_node_xdp(ctx: XdpContext) -> u32 {
@@ -330,6 +338,7 @@ fn maybe_redirect(
         return xdp_action::XDP_PASS;
     }
 
+    let mut steered_xsk: Option<u32> = None;
     match protocol {
         value if value == IpProto::Tcp as u8 => {
             let Ok(tcp) = ptr_at::<TcpHdr>(ctx, l4_offset) else {
@@ -350,6 +359,7 @@ fn maybe_redirect(
             if !proxy_port_enabled(dst_port_be, protocol) {
                 return xdp_action::XDP_PASS;
             }
+            steered_xsk = quic_dcid_xsk_index(ctx, l4_offset + mem::size_of::<UdpHdr>());
         }
         _ => return xdp_action::XDP_PASS,
     }
@@ -358,15 +368,19 @@ fn maybe_redirect(
         ifindex,
         queue_id: queue,
     };
-    let Some(xsk_index) = (unsafe { XDP_XSK_INDEX.get(&xsk_key) }) else {
-        counter_map_miss();
-        if policy.fallback_pass != 0 {
-            return xdp_action::XDP_PASS;
+    let default_xsk_index = unsafe { XDP_XSK_INDEX.get(&xsk_key) }.copied();
+    let xsk_index = match steered_xsk.or(default_xsk_index) {
+        Some(index) => index,
+        None => {
+            counter_map_miss();
+            if policy.fallback_pass != 0 {
+                return xdp_action::XDP_PASS;
+            }
+            return xdp_action::XDP_DROP;
         }
-        return xdp_action::XDP_DROP;
     };
 
-    match XDP_XSKS.redirect(*xsk_index, 0) {
+    match XDP_XSKS.redirect(xsk_index, 0) {
         Ok(_) => xdp_action::XDP_REDIRECT,
         Err(_) => {
             counter_xsk_drop();
@@ -377,6 +391,45 @@ fn maybe_redirect(
             }
         }
     }
+}
+
+/// Steer QUIC long-header packets to the XSK queue owning their connection.
+/// Parses the long-header form `flags | version | dcid_len | dcid | scid_len |
+/// scid`; short headers carry no DCID length and cannot be parsed statelessly,
+/// so they keep RSS queue affinity (userspace resolves those flows through the
+/// shared demux route table). Returns the mapped XSK index, or None to use the
+/// receiving queue.
+fn quic_dcid_xsk_index(ctx: &XdpContext, payload_offset: usize) -> Option<u32> {
+    let first = read_u8(ctx, payload_offset).ok()?;
+    if first & 0x80 == 0 {
+        return None;
+    }
+    let version = u32::from_be_bytes([
+        read_u8(ctx, payload_offset + 1).ok()?,
+        read_u8(ctx, payload_offset + 2).ok()?,
+        read_u8(ctx, payload_offset + 3).ok()?,
+        read_u8(ctx, payload_offset + 4).ok()?,
+    ]);
+    if version == 0 {
+        return None;
+    }
+    let dcid_len = read_u8(ctx, payload_offset + 5).ok()? as usize;
+    if dcid_len == 0 || dcid_len > 20 {
+        return None;
+    }
+    let mut bytes = [0u8; 20];
+    for i in 0..20usize {
+        if i >= dcid_len {
+            break;
+        }
+        bytes[i] = read_u8(ctx, payload_offset + 6 + i).ok()?;
+    }
+    let key = XdpQuicDcidKey {
+        bytes,
+        len: dcid_len as u8,
+        _pad: [0; 3],
+    };
+    unsafe { XDP_QUIC_DCID.get(&key).copied() }
 }
 
 /// Per-IP fixed-window pps limiter. Only UDP datagrams and TCP SYN-without-ACK
