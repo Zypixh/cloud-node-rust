@@ -197,6 +197,7 @@ mod tests {
             interfaces: vec![XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0, 1],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 local_ips: vec!["192.0.2.10".parse().unwrap()],
                 frame_size: 2048,

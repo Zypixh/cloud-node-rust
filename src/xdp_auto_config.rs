@@ -255,6 +255,7 @@ fn detect_xdp_interfaces_with_options(
         interfaces.push(XdpInterfaceConfig {
             name: name.clone(),
             queues: rx_queues_for_interface(&name),
+            cpus: Vec::new(),
             mode: options.mode,
             local_ips: Vec::new(),
             frame_size: cloud_node_xdp_common::XDP_DEFAULT_FRAME_SIZE,

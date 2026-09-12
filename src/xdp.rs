@@ -1078,6 +1078,22 @@ impl XdpManager {
     }
 
     #[cfg(target_os = "linux")]
+    fn update_xsk_queue_status(
+        &self,
+        interface: &str,
+        queue: u32,
+        update: impl FnOnce(&mut XdpQueueStatus),
+    ) {
+        let mut statuses = self.xsk_status.write();
+        if let Some(status) = statuses
+            .iter_mut()
+            .find(|status| status.interface == interface && status.queue == queue)
+        {
+            update(status);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn refresh_af_xdp_statuses(&self, force: bool) {
         let statuses = {
             let mut runtime = self.af_xdp.lock();
@@ -3228,45 +3244,6 @@ mod linux {
             Ok(stats)
         }
 
-        pub fn send_udp_datagram(
-            &mut self,
-            interface: &str,
-            queue: u32,
-            link: &super::af_xdp::AfXdpLinkMeta,
-            listen_addr: std::net::SocketAddr,
-            peer_addr: std::net::SocketAddr,
-            payload: &[u8],
-        ) -> anyhow::Result<bool> {
-            let Some(queue) = self
-                .queues
-                .iter_mut()
-                .find(|handle| handle.interface == interface && handle.queue == queue)
-            else {
-                return Ok(false);
-            };
-            let sent = queue.send_udp_datagram(link, listen_addr, peer_addr, payload)?;
-            self.refresh_statuses(false);
-            Ok(sent)
-        }
-
-        pub fn send_raw_frame(
-            &mut self,
-            interface: &str,
-            queue: u32,
-            frame: &[u8],
-        ) -> anyhow::Result<bool> {
-            let Some(queue) = self
-                .queues
-                .iter_mut()
-                .find(|handle| handle.interface == interface && handle.queue == queue)
-            else {
-                return Ok(false);
-            };
-            let sent = queue.send_raw_frame(frame)?;
-            self.refresh_statuses(false);
-            Ok(sent)
-        }
-
         pub fn refresh_statuses(&mut self, force: bool) {
             let now = std::time::Instant::now();
             if !super::xsk_status_refresh_due(self.last_status_refresh_at, now, force) {
@@ -3287,14 +3264,20 @@ mod linux {
                 }
             }
         }
+
+        /// Move queue handles out so each can be owned by a dedicated pinned
+        /// reactor thread. After this call `poll_raw_once` is a no-op.
+        pub fn take_queues(&mut self) -> Vec<AfXdpQueueHandle> {
+            std::mem::take(&mut self.queues)
+        }
     }
 
     #[derive(Debug)]
-    struct AfXdpQueueHandle {
-        interface: String,
-        queue: u32,
+    pub(super) struct AfXdpQueueHandle {
+        pub(super) interface: String,
+        pub(super) queue: u32,
         tx: TxQueue,
-        rx: RxQueue,
+        pub(super) rx: RxQueue,
         fill: Option<FillQueue>,
         comp: Option<CompQueue>,
         umem: Umem,
@@ -3305,7 +3288,7 @@ mod linux {
     }
 
     impl AfXdpQueueHandle {
-        fn poll_raw_once<F>(&mut self, on_packet: &mut F) -> anyhow::Result<AfXdpPollStats>
+        pub(super) fn poll_raw_once<F>(&mut self, on_packet: &mut F) -> anyhow::Result<AfXdpPollStats>
         where
             F: FnMut(&str, u32, Vec<u8>),
         {
@@ -3387,7 +3370,7 @@ mod linux {
             completed
         }
 
-        fn send_udp_datagram(
+        pub(super) fn send_udp_datagram(
             &mut self,
             link: &super::af_xdp::AfXdpLinkMeta,
             listen_addr: std::net::SocketAddr,
@@ -3417,7 +3400,7 @@ mod linux {
             result
         }
 
-        fn send_raw_frame(&mut self, frame: &[u8]) -> anyhow::Result<bool> {
+        pub(super) fn send_raw_frame(&mut self, frame: &[u8]) -> anyhow::Result<bool> {
             self.reclaim_tx_completions();
             let Some(desc) = self.free_frames.pop() else {
                 return Ok(false);
@@ -4558,7 +4541,6 @@ pub mod af_xdp {
     #[cfg(target_os = "linux")]
     use tokio::sync::watch;
     #[cfg(target_os = "linux")]
-    use tokio::time::{MissedTickBehavior, interval};
 
     const ETH_HEADER_LEN: usize = 14;
     const VLAN_HEADER_LEN: usize = 4;
@@ -6186,40 +6168,48 @@ pub mod af_xdp {
     }
 
     #[cfg(target_os = "linux")]
+    fn pin_current_thread_to_cpu(cpu: u32) -> bool {
+        // SAFETY: `set` is zeroed before CPU_SET marks exactly one bit; pid 0
+        // targets the calling thread. cpu_set_t is a plain bitmask with no
+        // pointers.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(cpu as usize, &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+        }
+    }
+
+    /// Resolve the CPU a queue reactor should pin to: explicit `cpus[]` entry
+    /// aligned with `queues[]`, else round-robin the global queue ordinal over
+    /// online CPUs.
+    #[cfg(target_os = "linux")]
+    fn af_xdp_queue_cpu(
+        config: &XdpConfig,
+        interface: &str,
+        queue: u32,
+        ordinal: usize,
+        online_cpus: usize,
+    ) -> u32 {
+        if let Some(cfg) = config
+            .interfaces
+            .iter()
+            .find(|interface_cfg| interface_cfg.name == interface)
+            && let Some(position) = cfg.queues.iter().position(|candidate| *candidate == queue)
+            && let Some(cpu) = cfg.cpus.get(position)
+        {
+            return *cpu;
+        }
+        (ordinal % online_cpus.max(1)) as u32
+    }
+
+    #[cfg(target_os = "linux")]
     async fn run_proxy_bridge(
         manager: Arc<XdpManager>,
         quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
         tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
     ) {
-        const AF_XDP_DOWNSTREAM_QUEUE: usize = 4096;
-        const AF_XDP_DOWNSTREAM_DRAIN_BUDGET: usize = 1024;
-        const AF_XDP_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
-        const AF_XDP_ROUTE_CACHE_MAX: usize = 65_536;
-        const AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
-        const AF_XDP_ROUTE_CACHE_EVICT_BATCH: usize = 1024;
-        const AF_XDP_ROUTE_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-        const AF_XDP_MAX_CONSECUTIVE_POLL_ERRORS: u32 = 3;
-        const AF_XDP_MAX_CONSECUTIVE_TX_FAILURES: u32 = 256;
-        const AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES: u32 = 1024;
-        const AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS: u32 = 1024;
-
-        let (downstream_tx, mut downstream_rx) =
-            mpsc::channel::<crate::udp_proxy::DownstreamUdpDatagram>(AF_XDP_DOWNSTREAM_QUEUE);
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut idle_tick = interval(AF_XDP_IDLE_POLL_INTERVAL);
-        idle_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut udp_routes = HashMap::<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>::new();
-        let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
-        let mut tcp_reactor = AfXdpTcpReactor::new(tcp_manager, http_manager);
-        let mut consecutive_poll_errors = 0u32;
-        let mut tx_failures = AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TX_FAILURES);
-        let mut udp_ingress_failures =
-            AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES);
-        let mut tcp_admission_failures =
-            AfXdpTcpAdmissionFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS);
-        let mut frames = Vec::with_capacity(64);
-
         match manager.enable_proxy_redirect("AF_XDP proxy bridge") {
             Ok(true) => {
                 let message = format!(
@@ -6265,6 +6255,154 @@ pub mod af_xdp {
             }
         }
 
+        // Per-queue reactor threads: each AF_XDP queue is owned by a dedicated
+        // CPU-pinned OS thread running an isolated smoltcp reactor. The shared
+        // af_xdp mutex and single poll loop are removed from the dataplane;
+        // RSS flow-to-queue affinity keeps flows on one reactor.
+        let queue_handles = {
+            let mut runtime = manager.af_xdp.lock();
+            match runtime.as_mut() {
+                Some(runtime) => runtime.take_queues(),
+                None => {
+                    manager.set_proxy_fallback_reason(
+                        "AF_XDP proxy bridge cannot start; AF_XDP runtime is not initialized",
+                    );
+                    return;
+                }
+            }
+        };
+        if queue_handles.is_empty() {
+            let message =
+                "AF_XDP proxy bridge has no AF_XDP queues; proxy redirect disabled, traffic will PASS"
+                    .to_string();
+            tracing::warn!("{message}");
+            manager.disable_proxy_redirect_for_fallback(message);
+            return;
+        }
+        spawn_queue_reactors(&manager, queue_handles, quic_demux, tcp_manager, http_manager).await;
+    }
+
+    /// Spawn one pinned OS thread per AF_XDP queue and watch them: any reactor
+    /// exiting while the bridge should still be alive disables proxy redirect
+    /// so traffic falls back to kernel listeners explicitly.
+    #[cfg(target_os = "linux")]
+    async fn spawn_queue_reactors(
+        manager: &Arc<XdpManager>,
+        queue_handles: Vec<linux::AfXdpQueueHandle>,
+        quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
+        tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
+        http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
+    ) {
+        let online_cpus = num_cpus::get().max(1);
+        let mut joins: Vec<std::thread::JoinHandle<()>> =
+            Vec::with_capacity(queue_handles.len());
+        for (ordinal, queue_handle) in queue_handles.into_iter().enumerate() {
+            let cpu = af_xdp_queue_cpu(
+                &manager.config,
+                &queue_handle.interface,
+                queue_handle.queue,
+                ordinal,
+                online_cpus,
+            );
+            let thread_name = format!("afxdp-{}-{}", queue_handle.interface, queue_handle.queue);
+            let reactor_manager = manager.clone();
+            let quic_demux = quic_demux.clone();
+            let tcp_manager = tcp_manager.clone();
+            let http_manager = http_manager.clone();
+            let name = thread_name.clone();
+            let join = match std::thread::Builder::new().name(thread_name).spawn(move || {
+                if !pin_current_thread_to_cpu(cpu) {
+                    tracing::warn!("{name}: failed to pin reactor thread to cpu {cpu}");
+                }
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(run_queue_bridge_loop(
+                        reactor_manager,
+                        queue_handle,
+                        quic_demux,
+                        tcp_manager,
+                        http_manager,
+                    )),
+                    Err(err) => {
+                        tracing::error!("{name}: failed to build reactor runtime: {err}")
+                    }
+                }
+            }) {
+                Ok(join) => join,
+                Err(err) => {
+                    manager.disable_proxy_redirect_for_fallback(format!(
+                        "AF_XDP proxy bridge failed to spawn reactor thread: {err}; proxy redirect disabled, traffic will PASS"
+                    ));
+                    for join in joins {
+                        let _ = join.join();
+                    }
+                    return;
+                }
+            };
+            joins.push(join);
+        }
+        tracing::info!(
+            "AF_XDP proxy bridge running {} per-queue reactor threads",
+            joins.len()
+        );
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if joins.iter().all(|join| join.is_finished()) {
+                return;
+            }
+            if joins.iter().any(|join| join.is_finished())
+                && proxy_bridge_should_continue(manager)
+            {
+                manager.disable_proxy_redirect_for_fallback(
+                    "AF_XDP queue reactor thread exited unexpectedly; proxy redirect disabled, traffic will PASS"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_queue_bridge_loop(
+        manager: Arc<XdpManager>,
+        mut queue_handle: linux::AfXdpQueueHandle,
+        quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
+        tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
+        http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
+    ) {
+        const AF_XDP_DOWNSTREAM_QUEUE: usize = 4096;
+        const AF_XDP_DOWNSTREAM_DRAIN_BUDGET: usize = 1024;
+        const AF_XDP_ROUTE_CACHE_MAX: usize = 65_536;
+        const AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+        const AF_XDP_ROUTE_CACHE_EVICT_BATCH: usize = 1024;
+        const AF_XDP_ROUTE_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+        const AF_XDP_MAX_CONSECUTIVE_POLL_ERRORS: u32 = 3;
+        const AF_XDP_MAX_CONSECUTIVE_TX_FAILURES: u32 = 256;
+        const AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES: u32 = 1024;
+        const AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS: u32 = 1024;
+        // Idle backoff: busy-poll first, then exponentially back off to 1ms.
+        const AF_XDP_IDLE_BACKOFF_MIN: Duration = Duration::from_micros(10);
+        const AF_XDP_IDLE_BACKOFF_MAX: Duration = Duration::from_millis(1);
+        const AF_XDP_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+        let (downstream_tx, mut downstream_rx) =
+            mpsc::channel::<crate::udp_proxy::DownstreamUdpDatagram>(AF_XDP_DOWNSTREAM_QUEUE);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
+        let mut udp_routes = HashMap::<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>::new();
+        let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
+        let mut tcp_reactor = AfXdpTcpReactor::new(tcp_manager, http_manager);
+        let mut consecutive_poll_errors = 0u32;
+        let mut tx_failures = AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TX_FAILURES);
+        let mut udp_ingress_failures =
+            AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES);
+        let mut tcp_admission_failures =
+            AfXdpTcpAdmissionFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS);
+        let mut frames = Vec::with_capacity(64);
+        let mut last_status_refresh = std::time::Instant::now();
+
         loop {
             if !proxy_bridge_should_continue(&manager) {
                 let message =
@@ -6279,21 +6417,25 @@ pub mod af_xdp {
                 );
                 return;
             }
-            frames.clear();
-            let poll_result = {
-                let mut runtime = manager.af_xdp.lock();
-                match runtime.as_mut() {
-                    Some(runtime) => runtime.poll_raw_once(|interface, queue, frame| {
-                        frames.push((interface.to_string(), queue, frame));
-                    }),
-                    None => {
-                        manager.set_proxy_fallback_reason(
-                            "AF_XDP proxy bridge cannot start; AF_XDP runtime is not initialized",
-                        );
-                        return;
-                    }
+            if last_status_refresh.elapsed() >= AF_XDP_STATUS_REFRESH_INTERVAL {
+                last_status_refresh = std::time::Instant::now();
+                if let Ok(stats) = queue_handle.rx.fd().xdp_statistics() {
+                    manager.update_xsk_queue_status(
+                        &queue_handle.interface,
+                        queue_handle.queue,
+                        |status| {
+                            status.rx_dropped = stats.rx_dropped();
+                            status.rx_invalid_descs = stats.rx_invalid_descs();
+                            status.rx_ring_full = stats.rx_ring_full();
+                            status.tx_invalid_descs = stats.tx_invalid_descs();
+                        },
+                    );
                 }
-            };
+            }
+            frames.clear();
+            let poll_result = queue_handle.poll_raw_once(&mut |interface, queue, frame| {
+                frames.push((interface.to_string(), queue, frame));
+            });
 
             let polled_packets = match poll_result {
                 Ok(stats) => {
@@ -6314,7 +6456,7 @@ pub mod af_xdp {
                         ));
                         return;
                     }
-                    idle_tick.tick().await;
+                    std::thread::sleep(idle_backoff);
                     continue;
                 }
             };
@@ -6455,20 +6597,12 @@ pub mod af_xdp {
                 };
                 entry.last_seen_ms = now_ms;
                 let route = entry.route.clone();
-                let sent = {
-                    let mut runtime = manager.af_xdp.lock();
-                    match runtime.as_mut() {
-                        Some(runtime) => runtime.send_udp_datagram(
-                            &route.interface,
-                            route.queue,
-                            &route.link,
-                            datagram.listen_addr,
-                            datagram.peer_addr,
-                            datagram.payload.as_ref(),
-                        ),
-                        None => Ok(false),
-                    }
-                };
+                let sent = queue_handle.send_udp_datagram(
+                    &route.link,
+                    datagram.listen_addr,
+                    datagram.peer_addr,
+                    datagram.payload.as_ref(),
+                );
                 match sent {
                     Ok(true) => {
                         tx_failures.record(AfXdpTxStatus::Sent);
@@ -6522,15 +6656,7 @@ pub mod af_xdp {
                     );
                     continue;
                 };
-                let sent = {
-                    let mut runtime = manager.af_xdp.lock();
-                    match runtime.as_mut() {
-                        Some(runtime) => {
-                            runtime.send_raw_frame(&route.interface, route.queue, &frame)
-                        }
-                        None => Ok(false),
-                    }
-                };
+                let sent = queue_handle.send_raw_frame(&frame);
                 match sent {
                     Ok(true) => {
                         tx_failures.record(AfXdpTxStatus::Sent);
@@ -6574,7 +6700,11 @@ pub mod af_xdp {
                 tcp_egress_frames,
                 downstream_budget_exhausted,
             ) {
-                idle_tick.tick().await;
+                std::hint::spin_loop();
+                std::thread::sleep(idle_backoff);
+                idle_backoff = (idle_backoff.saturating_mul(2)).min(AF_XDP_IDLE_BACKOFF_MAX);
+            } else {
+                idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
             }
         }
     }
@@ -7301,6 +7431,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: interface.to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
@@ -7465,6 +7596,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth-old".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Protect,
                 ..Default::default()
             }],
@@ -7496,6 +7628,7 @@ mod tests {
                 interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                     name: "eth-new".to_string(),
                     queues: vec![1],
+                    cpus: Vec::new(),
                     mode: XdpRuntimeMode::Proxy,
                     ..Default::default()
                 }],
@@ -7815,6 +7948,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
@@ -7838,6 +7972,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 frame_size: 4096,
                 ..Default::default()
@@ -7872,6 +8007,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 frame_size: 4096,
                 ..Default::default()
@@ -7904,6 +8040,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 frame_size: 4096,
                 ..Default::default()
@@ -7961,6 +8098,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 local_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
                 ..Default::default()
@@ -7990,6 +8128,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 local_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
                 ..Default::default()
@@ -8037,6 +8176,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 local_ips: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
                 ..Default::default()
@@ -8181,6 +8321,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
@@ -8243,6 +8384,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
@@ -8312,6 +8454,7 @@ mod tests {
             interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
                 name: "eth0".to_string(),
                 queues: vec![0],
+                cpus: Vec::new(),
                 mode: XdpRuntimeMode::Proxy,
                 ..Default::default()
             }],
