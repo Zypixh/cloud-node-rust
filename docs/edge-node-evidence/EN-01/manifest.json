@@ -1,0 +1,62 @@
+{
+  "task_id": "EN-01",
+  "status": "VERIFIED",
+  "start_commit": "8c6653704408764a229e3cb7e96f1fa6a1bfb527",
+  "end_commit": null,
+  "working_tree_dirty": false,
+  "contract_versions": {
+    "XDP_ABI_VERSION": 1,
+    "flow_abi": "XdpFlowKey/XdpFlowRecord/XdpFlowEvent v1",
+    "budget_abi": "XdpBudgetConfig/XdpPendingCap v1",
+    "userspace_contracts": "ServiceIdentity/PathProfile/NodeGeneration/BudgetSnapshot v1"
+  },
+  "changed_paths": [
+    "src/contracts.rs",
+    "src/lib.rs",
+    "crates/cloud-node-xdp-common/src/lib.rs",
+    "docs/edge-node-evidence/EN-01/report.md",
+    "docs/edge-node-evidence/EN-01/manifest.json"
+  ],
+  "implemented_behavior": [
+    "Fixed repr(C) ABI contracts: XdpFlowKey(48B)/XdpFlowRecord(64B)/XdpFlowEvent(88B)/XdpPathBinding(32B)/XdpBudgetConfig(48B)/XdpPendingCap(16B)",
+    "Admission state machine constants: ABSENT->PENDING->VALIDATED->CLOSING->EXPIRED; owner KERNEL/AFXDP/NAT; validation NONE/STATELESS/OWNER",
+    "DecisionReason and ParseClass append-only code tables",
+    "XDP_ABI_VERSION constant + 13 compile-time size assertions pinning existing and new layouts",
+    "Userspace ServiceIdentity/PathProfile/NodeGeneration/BudgetSnapshot/FullBehavior",
+    "compute_xdp_budget: map+UMEM+worker worst-case projection with per-resource BudgetSnapshot rows"
+  ],
+  "compatibility_and_migrations": "No existing map layout changed; all new contract types are unused by maps until EN-05..EN-10. Pinned-map reuse semantics unchanged. Serialization field names frozen by compat tests.",
+  "resource_bounds_and_full_behavior": "BudgetSnapshot requires (resource, unit, used, limit, fullBehavior, owner) per bounded resource. compute_xdp_budget emits rows for all 27 maps + UMEM + workers; rate-limit maps recorded as Fallback pending EN-07 aggregate caps.",
+  "failure_and_rollback_behavior": "flags=0 disables XdpBudgetConfig entirely; stale pinned-map rejection remains via spec table; no runtime behavior changed by this task.",
+  "invariants_covered": ["I01","I02","I03","I04","I05","I06","I09","I10","I11","I12","I14","I15"],
+  "tests_covered": [
+    "contracts::tests::generation_is_monotonic",
+    "contracts::tests::budget_scales_with_cpus_and_queues",
+    "contracts::tests::budget_umem_matches_attach_projection",
+    "contracts::tests::every_row_declares_full_behavior_and_owner",
+    "contracts::tests::path_profile_serializes_with_stable_field_names",
+    "contracts::tests::budget_snapshot_serializes_camel_case",
+    "xdp_common host::tests::flow_event_orders_by_incarnation_epoch_seq",
+    "xdp_common host::tests::pending_record_has_absolute_and_idle_deadlines",
+    "xdp_common host::tests::decision_reasons_are_stable",
+    "xdp_common host::tests::budget_config_zero_flags_is_disabled",
+    "13 compile-time size assertions in cloud-node-xdp-common"
+  ],
+  "commands_and_exit_codes": [
+    {"command": "cargo check (cloud-node-xdp-common, default+all-features)", "exit_code": 0},
+    {"command": "cargo check --lib", "exit_code": 0},
+    {"command": "cargo test --lib contracts::", "exit_code": 0, "passed": 6},
+    {"command": "cargo test --features aya (common)", "exit_code": 0, "passed": 7}
+  ],
+  "environment_and_path_profile": "macOS aarch64 dev host (Rust 1.98.1); contracts are compile-time, host-independent.",
+  "unrun_checks_and_reasons": [
+    "eBPF rebuild not needed: crates/cloud-node-xdp-ebpf untouched",
+    "netns smoke not needed: no runtime behavior change"
+  ],
+  "open_issues": [
+    "BPF map memory figures are conservative estimates (96B/entry overhead), not exact kernel accounting",
+    "Map capacity constants duplicated between xdp.rs spec table and compute_xdp_budget — consolidate in EN-04"
+  ],
+  "review_evidence": "docs/edge-node-evidence/EN-01/report.md",
+  "next_eligible_tasks": ["EN-02", "EN-16"]
+}

@@ -16,6 +16,7 @@ pub mod compiled;
 pub mod config;
 pub mod config_apply;
 pub mod config_models;
+pub mod contracts;
 pub mod firewall;
 pub mod h3_downstream;
 pub mod headers;
