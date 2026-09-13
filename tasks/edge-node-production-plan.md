@@ -50,7 +50,7 @@ commit 与 patch 摘要指被测代码状态；未提交代码也可以验证，
 | EN-01 | 共享合同与资源账本规范 | EN-00 | L | VERIFIED（证据 docs/edge-node-evidence/EN-01） |
 | EN-02 | 分层测试与证据工具 | EN-00 | L | VERIFIED（证据 docs/edge-node-evidence/EN-02；27 runnable case 实测通过） |
 | EN-03 | 正确低成本的基础观测 | EN-01、EN-02 | M | VERIFIED（证据 docs/edge-node-evidence/EN-03；PerCpuArray+真实eBPF流量核对一致） |
-| EN-04 | XDP 模块边界整理 | EN-01、EN-02 | M | TODO |
+| EN-04 | XDP 模块边界整理 | EN-01、EN-02 | M | VERIFIED（证据 docs/edge-node-evidence/EN-04；macOS+Linux 编译测试通过，真实 eBPF T01–T06 全过） |
 | EN-05 | 有界解析与分片策略 | EN-04 | L | TODO |
 | EN-06 | 独立受保护服务与路径策略 | EN-01、EN-04、EN-05 | L | TODO |
 | EN-07 | 聚合预算与每路径容量保护 | EN-03、EN-06 | L | TODO |
