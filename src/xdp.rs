@@ -10,7 +10,12 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-const XDP_EBPF_OBJECT_NAME: &str = "cloud-node-xdp-ebpf.o";
+/// eBPF program embedded at build time (see build.rs). The kernel only accepts
+/// verified eBPF bytecode at the XDP hook, so the program must ship as an ELF
+/// object — embedding it keeps binary and program versioned atomically.
+#[cfg(target_os = "linux")]
+const XDP_EBPF_EMBEDDED: &[u8] =
+    aya::include_bytes_aligned!(env!("CLOUD_NODE_XDP_EBPF_OBJECT"));
 #[cfg(target_os = "linux")]
 const XDP_BPF_PIN_DIR: &str = "/sys/fs/bpf/cloud-node-xdp";
 const XDP_STATE_WRITE_INTERVAL_SECS: u64 = 10;
@@ -559,22 +564,24 @@ impl XdpManager {
             return Ok(());
         }
 
-        let object_path = ebpf_object_path();
-        if !object_path.exists() {
-            self.set_fallback_reason(format!(
-                "eBPF object {} is missing; run cargo xtask build-ebpf",
-                object_path.display()
-            ));
-            if self.config.fallback.fail_start() {
-                anyhow::bail!("xdp eBPF object is missing: {}", object_path.display());
+        let object_override = ebpf_object_override(&self.config);
+        if let Some(path) = &object_override {
+            if !path.exists() {
+                self.set_fallback_reason(format!(
+                    "configured eBPF object {} is missing",
+                    path.display()
+                ));
+                if self.config.fallback.fail_start() {
+                    anyhow::bail!("xdp eBPF object is missing: {}", path.display());
+                }
+                self.persist_status();
+                return Ok(());
             }
-            self.persist_status();
-            return Ok(());
         }
 
         #[cfg(target_os = "linux")]
         {
-            match linux::attach(&self.config, &object_path).await {
+            match linux::attach(&self.config, object_override.as_deref()).await {
                 Ok(attached_program) => {
                     *self.ebpf.lock() = Some(attached_program.ebpf);
                     let attached = attached_program.interfaces;
@@ -1034,7 +1041,7 @@ impl XdpManager {
             attach_mode: self.config.attach_mode.as_str().to_string(),
             fallback: self.config.fallback.as_str().to_string(),
             fallback_reason,
-            ebpf_object: ebpf_object_path().display().to_string(),
+            ebpf_object: ebpf_object_source_label(&self.config),
             interfaces,
             exact_blocked_v4: state.blocked_ips.keys().filter(|ip| ip.is_ipv4()).count(),
             exact_blocked_v6: state.blocked_ips.keys().filter(|ip| ip.is_ipv6()).count(),
@@ -1929,7 +1936,6 @@ pub fn doctor_report() -> String {
 }
 
 fn doctor_report_for_config(config: &XdpConfig) -> String {
-    let object_path = ebpf_object_path();
     let mut lines = Vec::new();
     lines.push("CloudNode XDP doctor".to_string());
     lines.push(format!("  enabled:       {}", yes_no(config.enabled)));
@@ -1955,8 +1961,13 @@ fn doctor_report_for_config(config: &XdpConfig) -> String {
             .join(",")
     ));
     lines.push(format!("  proxy ports:   {}", config.proxy.ports.len()));
-    lines.push(format!("  eBPF object:   {}", object_path.display()));
-    lines.push(format!("  object exists: {}", yes_no(object_path.exists())));
+    lines.push(format!(
+        "  eBPF object:   {}",
+        ebpf_object_source_label(config)
+    ));
+    if let Some(path) = ebpf_object_override(config) {
+        lines.push(format!("  object exists: {}", yes_no(path.exists())));
+    }
     lines.push(format!("  platform:      {}", std::env::consts::OS));
     #[cfg(target_os = "linux")]
     {
@@ -3269,10 +3280,29 @@ fn range_bound_to_ip(value: u128, v6: bool) -> IpAddr {
     }
 }
 
-fn ebpf_object_path() -> PathBuf {
-    crate::paths::NodePaths::current()
-        .data_dir()
-        .join(XDP_EBPF_OBJECT_NAME)
+/// Explicit external eBPF object override. Precedence follows the project's
+/// config convention: file config (`xdp.ebpfObject`) wins over the
+/// `CLOUD_NODE_XDP_EBPF_OBJECT_PATH` environment variable; when neither is set
+/// the binary loads the object embedded at build time.
+fn ebpf_object_override(config: &XdpConfig) -> Option<PathBuf> {
+    if let Some(path) = config
+        .ebpf_object
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var_os("CLOUD_NODE_XDP_EBPF_OBJECT_PATH")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn ebpf_object_source_label(config: &XdpConfig) -> String {
+    match ebpf_object_override(config) {
+        Some(path) => format!("external: {}", path.display()),
+        None => "embedded".to_string(),
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -3968,15 +3998,21 @@ mod linux {
         ))
     }
 
-    pub async fn attach(config: &XdpConfig, object_path: &Path) -> anyhow::Result<AttachedProgram> {
+    pub async fn attach(
+        config: &XdpConfig,
+        object_path: Option<&Path>,
+    ) -> anyhow::Result<AttachedProgram> {
         std::fs::create_dir_all(XDP_BPF_PIN_DIR)
             .map_err(|err| anyhow::anyhow!("create bpffs pin dir {XDP_BPF_PIN_DIR}: {err}"))?;
         detach(config).await?;
         drop_stale_pinned_maps();
         let mut attached = BTreeSet::new();
-        let mut ebpf = aya::EbpfLoader::new()
-            .default_map_pin_directory(XDP_BPF_PIN_DIR)
-            .load_file(object_path)?;
+        let mut loader = aya::EbpfLoader::new();
+        loader.default_map_pin_directory(XDP_BPF_PIN_DIR);
+        let mut ebpf = match object_path {
+            Some(path) => loader.load_file(path)?,
+            None => loader.load(XDP_EBPF_EMBEDDED)?,
+        };
         sync_interface_policy(&mut ebpf, config)?;
         sync_local_ip_maps(&mut ebpf, config)?;
         sync_proxy_ports(&mut ebpf, config, false)?;

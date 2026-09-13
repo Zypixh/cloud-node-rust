@@ -14,17 +14,7 @@
 
 ## 构建
 
-普通节点构建仍使用原 Cargo 命令。XDP eBPF 对象需要额外构建：
-
-```bash
-cargo xtask build-ebpf
-```
-
-该命令会构建 `crates/cloud-node-xdp-ebpf`，并把对象复制到：
-
-```text
-data/cloud-node-xdp-ebpf.o
-```
+普通节点构建仍使用原 Cargo 命令。XDP eBPF 对象在 Linux 目标上由 `build.rs` 自动编译并内嵌进二进制；`cargo xtask build-ebpf` 仍可单独构建到 `data/cloud-node-xdp-ebpf.o`，用于调试或 `xdp.ebpfObject` 显式外部对象热替换。
 
 ## 本地配置
 

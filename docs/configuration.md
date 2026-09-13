@@ -56,6 +56,15 @@ xdp:
 
 `fallback: pass`（默认）表示 attach、XSK 或 map 同步失败时回退到现有 socket 路径并记录 fallback 原因；`fallback: fail-start` 表示启动条件不满足时返回错误。完整说明见 [XDP/AF_XDP 旁路数据面](xdp-af-xdp.md)。
 
+eBPF 程序默认使用**构建期内嵌进二进制**的对象（单文件部署，二进制与程序同版本）。需要调试或热替换 eBPF 时才显式指定外部对象：
+
+```yaml
+xdp:
+  ebpfObject: /path/to/cloud-node-xdp-ebpf.o   # 显式覆盖；文件缺失是显式错误
+```
+
+`xdp.ebpfObject`（最高优先级）> `CLOUD_NODE_XDP_EBPF_OBJECT_PATH` 环境变量 > 内嵌对象（默认）。
+
 ## 控制面配置
 
 大部分运行时配置由控制面下发，包括：

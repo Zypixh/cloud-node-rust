@@ -321,6 +321,7 @@ mod tests {
             },
             rate_limit: None,
             sni_blocklist: Vec::new(),
+            ebpf_object: None,
         };
 
         let yaml = serde_yaml::to_string(&xdp).unwrap();

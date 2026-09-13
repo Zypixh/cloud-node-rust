@@ -273,6 +273,11 @@ pub struct XdpConfig {
     /// to userspace, which remains the authoritative SNI path.
     #[serde(rename = "sniBlocklist", default)]
     pub sni_blocklist: Vec<String>,
+    /// Explicit path to an external eBPF object. When unset, the binary uses
+    /// the object embedded at build time (recommended: binary and program can
+    /// never drift apart). Set only for eBPF hotfix/debugging.
+    #[serde(rename = "ebpfObject", default)]
+    pub ebpf_object: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

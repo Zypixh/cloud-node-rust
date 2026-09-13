@@ -1979,7 +1979,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     tar -xzf "$TMP_DIR/$ASSET_NAME" -C "$TMP_DIR"
     [ -f "$TMP_DIR/cloud-node" ] || die "release archive does not contain cloud-node"
     if [ ! -f "$TMP_DIR/data/cloud-node-xdp-ebpf.o" ]; then
-        warn "release archive does not contain data/cloud-node-xdp-ebpf.o; XDP attach will be unavailable until the eBPF object is installed"
+        warn "release archive does not contain data/cloud-node-xdp-ebpf.o; the binary will use its embedded eBPF object (the file is only needed for explicit xdp.ebpfObject overrides)"
     fi
 else
     log "+ curl -fL --retry 3 --connect-timeout 20 -o $TMP_DIR/$ASSET_NAME $DOWNLOAD_URL"
