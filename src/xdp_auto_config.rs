@@ -264,7 +264,7 @@ fn detect_xdp_interfaces_with_options(
             udp_forwards: Vec::new(),
             tcp_forwards: Vec::new(),
             fragment_action: crate::runtime_mode::XdpFragmentAction::Pass,
-            fragment_overrides: Vec::new(),
+            protected_services: Vec::new(),
         });
     }
 

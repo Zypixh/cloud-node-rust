@@ -305,6 +305,8 @@ mod tests {
                 frame_size: 2048,
                 udp_forwards: Vec::new(),
                 tcp_forwards: Vec::new(),
+                fragment_action: crate::runtime_mode::XdpFragmentAction::default(),
+                protected_services: Vec::new(),
             }],
             proxy: XdpProxyConfig {
                 protocols: vec![

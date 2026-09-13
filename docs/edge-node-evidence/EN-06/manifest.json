@@ -1,0 +1,25 @@
+{
+  "task": "EN-06",
+  "title": "independent protected services and path policy",
+  "status": "verified-veth-netns",
+  "deliverables": [
+    "src/runtime_mode.rs: XdpProtectedService{ip,redirect,fragmentAction} + validation",
+    "crates/cloud-node-xdp-common: XdpLocalValue flags (bit0 redirect, bits[2:1] fragment override), aclWouldBlock/nonlocalPass counters, ABI v4",
+    "crates/cloud-node-xdp-ebpf/src/main.rs: classify->fragment->ACL->dispatch order; redirect gated by LOCAL_FLAG_REDIRECT; NAT dispatch->work->fwd tail-call split (11 programs)",
+    "src/xdp/linux.rs: local_ip_flags composition, status/dump-maps counters",
+    "src/xdp_auto_config.rs + src/xdp_config_wizard.rs: LOCAL map value sync"
+  ],
+  "verification": {
+    "verifier": "all 11 XDP programs accepted (kernel 7.0), zero r11 refs in disassembly",
+    "matrix": "T01 28/28; aggregate 38 cases, 0 failures",
+    "nat_udp": "snatBound=1 udpFwdTx snatReplyTx=1 tx — bidirectional DNAT+SNAT verified",
+    "nat_tcp": "tcpFwdTx=11 snatReplyTx=5 — full bidirectional",
+    "redirect_false": "proxy port UDP x3 -> redirect=0 pass, NAT fwd unaffected"
+  },
+  "known_gaps": [
+    "T08 partial: reload tested, crash injection pending EN-29/30",
+    "T14 pending: EN-25/26 generation harness",
+    "observe-mode aclWouldBlock e2e pending dynamic ACL injection harness (EN-09)",
+    "multi-VIP same-port isolation e2e pending multi-address topology"
+  ]
+}

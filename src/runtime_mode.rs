@@ -175,10 +175,10 @@ pub struct XdpInterfaceConfig {
     /// a trusted L4 flow under either setting.
     #[serde(rename = "fragmentAction", default)]
     pub fragment_action: XdpFragmentAction,
-    /// Per-VIP fragment overrides. Each `ip` must also be listed in
-    /// `localIps`; overrides are meaningless without local-IP filtering.
-    #[serde(rename = "fragmentOverrides", default)]
-    pub fragment_overrides: Vec<XdpFragmentOverride>,
+    /// Per-VIP service policy. Each `ip` must also be listed in `localIps`;
+    /// overrides are meaningless without local-IP filtering.
+    #[serde(rename = "protectedServices", default)]
+    pub protected_services: Vec<XdpProtectedService>,
 }
 
 /// Fragment disposition at the XDP layer (EN-05): fragments are classified
@@ -192,12 +192,27 @@ pub enum XdpFragmentAction {
     Drop,
 }
 
-/// Per-VIP fragment policy override (resolved via the XDP_LOCAL_* map value).
+/// Per-VIP protected-service policy (EN-06): protection scope and the AF_XDP
+/// redirect switch are independent. `redirect: false` keeps the VIP under
+/// XDP protection (classification, ACL, rate limits, fragment policy) while
+/// its ports are served by the kernel stack — two VIPs sharing a port do
+/// not cross-redirect.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct XdpFragmentOverride {
+#[serde(rename_all = "kebab-case")]
+pub struct XdpProtectedService {
     pub ip: std::net::IpAddr,
-    #[serde(default)]
-    pub action: XdpFragmentAction,
+    /// Whether proxy-port traffic for this VIP may redirect into AF_XDP.
+    /// Default true — preserving pre-EN-06 semantics for plain localIps.
+    #[serde(default = "default_true")]
+    pub redirect: bool,
+    /// Optional per-VIP fragment disposition override (resolved via the
+    /// XDP_LOCAL_* map value bits[2:1]).
+    #[serde(rename = "fragmentAction", default)]
+    pub fragment_action: Option<XdpFragmentAction>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A single UDP direct-forward rule applied at the XDP layer.
@@ -234,7 +249,7 @@ impl Default for XdpInterfaceConfig {
             udp_forwards: Vec::new(),
             tcp_forwards: Vec::new(),
             fragment_action: XdpFragmentAction::default(),
-            fragment_overrides: Vec::new(),
+            protected_services: Vec::new(),
         }
     }
 }
@@ -623,10 +638,18 @@ impl RuntimeConfig {
                     interface.name
                 );
             }
-            for entry in &interface.fragment_overrides {
+            let mut seen_vips = std::collections::HashSet::new();
+            for entry in &interface.protected_services {
                 if !interface.local_ips.contains(&entry.ip) {
                     anyhow::bail!(
-                        "xdp interface {} fragmentOverrides ip {} is not listed in localIps",
+                        "xdp interface {} protectedServices ip {} is not listed in localIps",
+                        interface.name,
+                        entry.ip
+                    );
+                }
+                if !seen_vips.insert(entry.ip) {
+                    anyhow::bail!(
+                        "xdp interface {} protectedServices has a duplicate entry for {}",
                         interface.name,
                         entry.ip
                     );
@@ -853,6 +876,68 @@ xdp:
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("not enabled in xdp.proxy.protocols"));
+    }
+
+    #[test]
+    fn xdp_protected_service_deserializes_and_validates() {
+        let _guard = runtime_config_test_guard();
+        let config: RuntimeConfig = serde_yaml::from_str(
+            r#"
+xdp:
+  enabled: true
+  interfaces:
+    - name: eth0
+      queues: [0]
+      localIps: ["10.0.0.5", "10.0.0.6"]
+      protectedServices:
+        - ip: "10.0.0.6"
+          redirect: false
+          fragmentAction: drop
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let svc = &config.xdp.interfaces[0].protected_services[0];
+        assert!(!svc.redirect);
+        assert_eq!(
+            svc.fragment_action,
+            Some(crate::runtime_mode::XdpFragmentAction::Drop)
+        );
+
+        // ip outside localIps is rejected
+        let bad: RuntimeConfig = serde_yaml::from_str(
+            r#"
+xdp:
+  enabled: true
+  interfaces:
+    - name: eth0
+      queues: [0]
+      localIps: ["10.0.0.5"]
+      protectedServices:
+        - ip: "10.0.0.9"
+"#,
+        )
+        .unwrap();
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("not listed in localIps"));
+
+        // duplicates are rejected
+        let dup: RuntimeConfig = serde_yaml::from_str(
+            r#"
+xdp:
+  enabled: true
+  interfaces:
+    - name: eth0
+      queues: [0]
+      localIps: ["10.0.0.5"]
+      protectedServices:
+        - ip: "10.0.0.5"
+        - ip: "10.0.0.5"
+"#,
+        )
+        .unwrap();
+        let err = dup.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate"));
     }
 
     struct XdpEnvGuard {
