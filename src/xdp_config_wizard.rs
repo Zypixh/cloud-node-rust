@@ -203,6 +203,44 @@ pub fn save_xdp_enabled(path: &Path, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Like `save_xdp_enabled` but merges into the existing `xdp` mapping instead
+/// of replacing it. Used when the file carries an explicit operational
+/// configuration (interfaces, ports): that file is the operator's
+/// authoritative document and only the `enabled` toggle may be touched.
+pub fn merge_xdp_enabled(path: &Path, enabled: bool) -> Result<()> {
+    use std::fs;
+
+    let mut root = read_yaml_mapping(path)?;
+    let key = serde_yaml::Value::String("xdp".to_string());
+    match root.get_mut(&key) {
+        Some(serde_yaml::Value::Mapping(xdp)) => {
+            xdp.insert(
+                serde_yaml::Value::String("enabled".to_string()),
+                serde_yaml::Value::Bool(enabled),
+            );
+        }
+        Some(serde_yaml::Value::Null) | None => {
+            let mut xdp = serde_yaml::Mapping::new();
+            xdp.insert(
+                serde_yaml::Value::String("enabled".to_string()),
+                serde_yaml::Value::Bool(enabled),
+            );
+            root.insert(key, serde_yaml::Value::Mapping(xdp));
+        }
+        Some(_) => anyhow::bail!("{}: `xdp` is not a YAML mapping", path.display()),
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(
+        path,
+        serde_yaml::to_string(&serde_yaml::Value::Mapping(root))?,
+    )?;
+    Ok(())
+}
+
 fn read_yaml_mapping(path: &Path) -> Result<serde_yaml::Mapping> {
     use std::fs;
 
@@ -226,6 +264,31 @@ mod tests {
         XdpAttachMode, XdpFallbackMode, XdpInterfaceConfig, XdpProxyConfig, XdpProxyPortConfig,
         XdpProxyProtocol, XdpRuntimeMode,
     };
+
+    #[test]
+    fn merge_xdp_enabled_preserves_operational_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "xdp-merge-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime.yaml");
+        std::fs::write(
+            &path,
+            "runtime:\n  mode: standalone\nxdp:\n  enabled: false\n  attachMode: skb\n  interfaces:\n    - name: eth0\n      mode: proxy\n",
+        )
+        .unwrap();
+        super::merge_xdp_enabled(&path, true).unwrap();
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["xdp"]["enabled"].as_bool(), Some(true));
+        assert_eq!(value["xdp"]["attachMode"].as_str(), Some("skb"));
+        assert_eq!(
+            value["xdp"]["interfaces"][0]["name"].as_str(),
+            Some("eth0")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn serializes_runtime_compatible_xdp_section() {
