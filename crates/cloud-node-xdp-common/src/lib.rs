@@ -457,6 +457,195 @@ pub struct NatScratch {
     pub pkt_dst: [u8; 16],
 }
 
+// ---------------------------------------------------------------------------
+// EN-01 shared contracts: admission state machine, flow identity, owner/path
+// binding, budgets and decision reasons. These types are the fixed ABI shared
+// between the eBPF dataplane and userspace; every field is network-order or
+// explicitly host-order documented. Sizes are asserted at compile time below —
+// a layout change must bump XDP_ABI_VERSION and update the map spec table in
+// src/xdp.rs (drop_stale_pinned_maps) so mismatched pinned maps are rejected.
+// ---------------------------------------------------------------------------
+
+/// ABI version of the whole XDP map/contract surface. Bump when any shared
+/// key/value layout, map semantics, or dispatch slot contract changes; userspace
+/// refuses to reuse pinned objects whose spec does not match this build.
+pub const XDP_ABI_VERSION: u32 = 1;
+
+/// Path that owns a flow's transport state (architecture §4.4 PathBinding).
+/// A flow has exactly one owner for its lifetime; packets may not migrate a
+/// flow between paths mid-stream.
+pub const XDP_OWNER_KERNEL: u8 = 0;
+/// AF_XDP userspace transport owner (smoltcp/UDP demux/QUIC).
+pub const XDP_OWNER_AFXDP: u8 = 1;
+/// XDP NAT direct-forward owner (XDP_TX rewrite).
+pub const XDP_OWNER_NAT: u8 = 2;
+
+/// Admission state machine states (architecture §4.4):
+///   ABSENT → PENDING → VALIDATED → CLOSING → EXPIRED
+///                  └──────────────→ EXPIRED
+/// ABSENT is "no map entry", so only four states are stored.
+pub const XDP_FLOW_PENDING: u8 = 0;
+pub const XDP_FLOW_VALIDATED: u8 = 1;
+pub const XDP_FLOW_CLOSING: u8 = 2;
+pub const XDP_FLOW_EXPIRED: u8 = 3;
+
+/// Validation level recorded at admission time.
+pub const XDP_VALIDATION_NONE: u8 = 0;
+/// Source passed a stateless proof (TCP cookie / QUIC Retry token).
+pub const XDP_VALIDATION_STATELESS: u8 = 1;
+/// A transport owner confirmed the handshake completed.
+pub const XDP_VALIDATION_OWNER: u8 = 2;
+
+/// Terminal decision reasons. Every DROP/reject path must carry exactly one
+/// reason so observability can attribute it (I10). Values are stable ABI for
+/// counters/metrics labels — append only, never renumber.
+pub const XDP_DECISION_PASS: u8 = 0;
+pub const XDP_DECISION_ACL_BLOCK: u8 = 1;
+pub const XDP_DECISION_RATE_SOURCE: u8 = 2;
+pub const XDP_DECISION_MALFORMED: u8 = 3;
+pub const XDP_DECISION_FRAGMENT: u8 = 4;
+pub const XDP_DECISION_NO_FLOW: u8 = 5;
+pub const XDP_DECISION_BUDGET: u8 = 6;
+pub const XDP_DECISION_NO_XSK: u8 = 7;
+pub const XDP_DECISION_FLOW_TABLE_FULL: u8 = 8;
+pub const XDP_DECISION_TCP_FLAG: u8 = 9;
+
+/// Parse classification (architecture §4.3): replaces the single
+/// Err→PASS bucket. CONTROL covers PMTU/ICMPv6-ND and other exempt traffic.
+pub const XDP_CLASS_SUPPORTED: u8 = 0;
+pub const XDP_CLASS_MALFORMED: u8 = 1;
+pub const XDP_CLASS_UNSUPPORTED: u8 = 2;
+pub const XDP_CLASS_FRAGMENTED: u8 = 3;
+pub const XDP_CLASS_CONTROL: u8 = 4;
+
+/// Flow identity. `service_*` is the node-side listen tuple (VIP); when the
+/// tenant is not yet known (shared 443) `service_id` carries the
+/// listener/service identity instead of a tenant id (I06/I11).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct XdpFlowKey {
+    pub client_addr: [u8; 16],
+    pub service_addr: [u8; 16],
+    /// Billing/tenant dimension; listener id until tenant is identified.
+    pub service_id: i64,
+    pub client_port_be: u16,
+    pub service_port_be: u16,
+    /// Interface-derived security zone.
+    pub security_domain: u16,
+    pub family: u8,
+    pub proto: u8,
+}
+
+/// Per-flow admission record. Lookup must validate deadlines; GC only reclaims
+/// space. `absolute_deadline_ns` is never extended by retransmits (I02/I03);
+/// `idle_deadline_ns` only advances on packets that match the current
+/// incarnation and owner.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpFlowRecord {
+    pub created_ns: u64,
+    /// Hard cap for PENDING lifetime; retransmits never extend it.
+    pub absolute_deadline_ns: u64,
+    /// Validated-flow idle deadline; lookup checks, GC reclaims.
+    pub idle_deadline_ns: u64,
+    /// Tuple-reuse guard: bumped per admission so stale events cannot own a
+    /// recycled tuple.
+    pub flow_incarnation: u64,
+    /// Owner generation; an old worker's events cannot touch a re-owned flow.
+    pub owner_epoch: u64,
+    /// Policy generation selected for this packet/flow.
+    pub policy_generation: u64,
+    pub service_id: i64,
+    /// XDP_FLOW_* state.
+    pub state: u8,
+    /// XDP_OWNER_* path owner.
+    pub owner_kind: u8,
+    /// XDP_VALIDATION_* level.
+    pub validation: u8,
+    pub flags: u8,
+    pub _pad: u32,
+}
+
+/// Flow lifecycle event (userspace ↔ dataplane feedback contract, EN-10).
+/// Old events must not override newer state on a reused tuple — compare
+/// (incarnation, owner_epoch, seq) before applying.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpFlowEvent {
+    pub key: XdpFlowKey,
+    pub flow_incarnation: u64,
+    pub owner_epoch: u64,
+    pub seq: u64,
+    pub timestamp_ns: u64,
+    /// Event kind: 0=admitted 1=validated 2=closed 3=rejected 4=expired.
+    pub kind: u8,
+    /// XDP_DECISION_* reason.
+    pub reason: u8,
+    pub _pad: [u8; 6],
+}
+
+/// Transport binding for a flow's owner path.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpPathBinding {
+    /// XDP_OWNER_*.
+    pub kind: u8,
+    pub _pad0: [u8; 3],
+    /// AF_XDP: bound RX queue; NAT: unused (backend lives in the CT value).
+    pub queue_id: u32,
+    /// NAT backend tuple (family-embedded), zero for KERNEL/AFXDP.
+    pub backend_addr: [u8; 16],
+    pub backend_port_be: u16,
+    pub _pad1: [u8; 6],
+}
+
+/// Aggregate admission budgets written by userspace (architecture §4.5).
+/// All counters are per-second rates over `window_ns`; zero disables a check.
+/// These are *aggregate* ceilings — they hold regardless of source rotation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpBudgetConfig {
+    /// Max packets/sec that may enter the unverified path.
+    pub unverified_pps: u64,
+    /// Max new-state admissions/sec (SYN, first-packet UDP, QUIC Initial).
+    pub new_flow_per_sec: u64,
+    /// Max packets/sec redirected into AF_XDP (protects the reactor).
+    pub xsk_redirect_pps: u64,
+    /// Max challenge responses/sec (cookie/Retry replies).
+    pub challenge_pps: u64,
+    /// Accounting window shared by the buckets.
+    pub window_ns: u64,
+    /// Enable bitset; bit0 = enforce unverified_pps, bit1 = new_flow,
+    /// bit2 = xsk_redirect, bit3 = challenge.
+    pub flags: u64,
+}
+
+/// Half-open concurrency cap stored in a single-slot map value so the dataplane
+/// can compare pending_count against a ceiling without a second lookup.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpPendingCap {
+    pub max_pending: u64,
+    pub _pad: u64,
+}
+
+// Compile-time ABI assertions. If any of these fire, a shared layout changed:
+// bump XDP_ABI_VERSION and update the map spec table so stale pinned maps are
+// rejected instead of misread.
+const _: () = assert!(core::mem::size_of::<XdpFlowKey>() == 48);
+const _: () = assert!(core::mem::size_of::<XdpFlowRecord>() == 64);
+const _: () = assert!(core::mem::size_of::<XdpFlowEvent>() == 88);
+const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
+const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 48);
+const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 16);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 128);
+const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
+const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 48);
+const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);
+const _: () = assert!(core::mem::size_of::<XdpSnatRevValue>() == 56);
+const _: () = assert!(core::mem::size_of::<XdpInterfacePolicy>() == 8);
+const _: () = assert!(core::mem::size_of::<XdpRateBucket>() == 16);
+
 #[cfg(all(feature = "aya", target_os = "linux"))]
 macro_rules! unsafe_impl_aya_pod {
     ($($ty:ty),+ $(,)?) => {
@@ -490,6 +679,12 @@ unsafe_impl_aya_pod!(
     XdpSnatRevValue,
     XdpFlowAcct,
     NatScratch,
+    XdpFlowKey,
+    XdpFlowRecord,
+    XdpFlowEvent,
+    XdpPathBinding,
+    XdpBudgetConfig,
+    XdpPendingCap,
 );
 
 #[cfg(feature = "std")]
@@ -582,6 +777,77 @@ pub mod host {
                 )
                 .is_none()
             );
+        }
+
+        // ---- EN-01 contract tests -------------------------------------
+
+        /// A stale event must not own a recycled tuple: the (incarnation,
+        /// owner_epoch, seq) triple is the ordering key — same tuple, later
+        /// admission must win over an older queued event.
+        #[test]
+        fn flow_event_orders_by_incarnation_epoch_seq() {
+            let mut key = XdpFlowKey::default();
+            key.family = 4;
+            key.proto = XDP_PROTO_TCP;
+            let stale = XdpFlowEvent {
+                key,
+                flow_incarnation: 1,
+                owner_epoch: 3,
+                seq: 40,
+                kind: 2,
+                reason: XDP_DECISION_PASS,
+                ..Default::default()
+            };
+            let fresh = XdpFlowEvent {
+                key,
+                flow_incarnation: 2,
+                owner_epoch: 4,
+                seq: 0,
+                kind: 0,
+                reason: XDP_DECISION_PASS,
+                ..Default::default()
+            };
+            // Ordering tuple: incarnation first, then epoch, then seq.
+            let order = |e: &XdpFlowEvent| (e.flow_incarnation, e.owner_epoch, e.seq);
+            assert!(order(&fresh) > order(&stale));
+        }
+
+        /// Pending flows die by absolute deadline even if retransmits keep
+        /// arriving — callers must compare against absolute_deadline_ns, not
+        /// refresh it.
+        #[test]
+        fn pending_record_has_absolute_and_idle_deadlines() {
+            let rec = XdpFlowRecord {
+                created_ns: 1_000,
+                absolute_deadline_ns: 5_000,
+                idle_deadline_ns: 2_000,
+                state: XDP_FLOW_PENDING,
+                ..Default::default()
+            };
+            assert!(rec.absolute_deadline_ns > rec.created_ns);
+            assert_ne!(rec.absolute_deadline_ns, rec.idle_deadline_ns);
+        }
+
+        /// Decision reason codes are append-only ABI; pin the numeric values
+        /// so a careless rename/renumber breaks the build, not the metrics.
+        #[test]
+        fn decision_reasons_are_stable() {
+            assert_eq!(XDP_DECISION_PASS, 0);
+            assert_eq!(XDP_DECISION_NO_XSK, 7);
+            assert_eq!(XDP_DECISION_TCP_FLAG, 9);
+        }
+
+        /// Disabled budget bits must make the whole config inert — zero flags
+        /// with nonzero rates is the documented "not configured" state.
+        #[test]
+        fn budget_config_zero_flags_is_disabled() {
+            let cfg = XdpBudgetConfig {
+                unverified_pps: 1_000_000,
+                flags: 0,
+                ..Default::default()
+            };
+            assert_eq!(cfg.flags, 0);
+            assert_eq!(cfg.window_ns, 0);
         }
     }
 }

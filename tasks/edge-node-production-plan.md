@@ -47,7 +47,7 @@ commit 与 patch 摘要指被测代码状态；未提交代码也可以验证，
 | ID | 名称 | 依赖 | 规模 | 状态 |
 |---|---|---|---|---|
 | EN-00 | 基线盘点与支持矩阵 | 无 | M | VERIFIED（证据 docs/edge-node-evidence/EN-00；待独立审阅） |
-| EN-01 | 共享合同与资源账本规范 | EN-00 | L | TODO |
+| EN-01 | 共享合同与资源账本规范 | EN-00 | L | VERIFIED（证据 docs/edge-node-evidence/EN-01） |
 | EN-02 | 分层测试与证据工具 | EN-00 | L | TODO |
 | EN-03 | 正确低成本的基础观测 | EN-01、EN-02 | M | TODO |
 | EN-04 | XDP 模块边界整理 | EN-01、EN-02 | M | TODO |

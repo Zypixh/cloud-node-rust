@@ -25,3 +25,4 @@ __pycache__/
 !.github/**
 !.cargo/
 !.cargo/**
+crates/cloud-node-xdp-common/target/
