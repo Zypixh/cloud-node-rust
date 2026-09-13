@@ -169,6 +169,35 @@ pub struct XdpInterfaceConfig {
     /// through this node.
     #[serde(rename = "tcpForwards", default)]
     pub tcp_forwards: Vec<XdpUdpForwardConfig>,
+    /// Fragment disposition for this interface's security domain: "pass"
+    /// (default) hands all IP fragments to the kernel stack — the legacy
+    /// behavior; "drop" rejects them at XDP. A first fragment never creates
+    /// a trusted L4 flow under either setting.
+    #[serde(rename = "fragmentAction", default)]
+    pub fragment_action: XdpFragmentAction,
+    /// Per-VIP fragment overrides. Each `ip` must also be listed in
+    /// `localIps`; overrides are meaningless without local-IP filtering.
+    #[serde(rename = "fragmentOverrides", default)]
+    pub fragment_overrides: Vec<XdpFragmentOverride>,
+}
+
+/// Fragment disposition at the XDP layer (EN-05): fragments are classified
+/// before any L4 handling, so neither setting lets a fragment create flow
+/// state — "pass" defers reassembly to the kernel, "drop" discards at RX.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum XdpFragmentAction {
+    #[default]
+    Pass,
+    Drop,
+}
+
+/// Per-VIP fragment policy override (resolved via the XDP_LOCAL_* map value).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpFragmentOverride {
+    pub ip: std::net::IpAddr,
+    #[serde(default)]
+    pub action: XdpFragmentAction,
 }
 
 /// A single UDP direct-forward rule applied at the XDP layer.
@@ -204,6 +233,8 @@ impl Default for XdpInterfaceConfig {
             frame_size: default_xdp_frame_size(),
             udp_forwards: Vec::new(),
             tcp_forwards: Vec::new(),
+            fragment_action: XdpFragmentAction::default(),
+            fragment_overrides: Vec::new(),
         }
     }
 }
@@ -592,6 +623,15 @@ impl RuntimeConfig {
                     interface.name
                 );
             }
+            for entry in &interface.fragment_overrides {
+                if !interface.local_ips.contains(&entry.ip) {
+                    anyhow::bail!(
+                        "xdp interface {} fragmentOverrides ip {} is not listed in localIps",
+                        interface.name,
+                        entry.ip
+                    );
+                }
+            }
         }
         for port in &self.xdp.proxy.ports {
             if port.port == 0 {
@@ -898,18 +938,22 @@ xdp:
         assert!(!load_xdp_enabled(None, &[xdp_var("0"), NO_MODE_ENV]).unwrap());
         assert!(load_xdp_enabled(None, &[xdp_var("true"), NO_MODE_ENV]).unwrap());
         // File without xdp.enabled: env still applies.
-        assert!(
-            !load_xdp_enabled(Some("cluster: {}\n"), &[xdp_var("off"), NO_MODE_ENV]).unwrap()
-        );
+        assert!(!load_xdp_enabled(Some("cluster: {}\n"), &[xdp_var("off"), NO_MODE_ENV]).unwrap());
         assert!(load_xdp_enabled(Some("xdp: {}\n"), clear).unwrap());
         // File is the final authority in both directions.
         assert!(
-            load_xdp_enabled(Some("xdp:\n  enabled: true\n"), &[xdp_var("0"), NO_MODE_ENV])
-                .unwrap()
+            load_xdp_enabled(
+                Some("xdp:\n  enabled: true\n"),
+                &[xdp_var("0"), NO_MODE_ENV]
+            )
+            .unwrap()
         );
         assert!(
-            !load_xdp_enabled(Some("xdp:\n  enabled: false\n"), &[xdp_var("1"), NO_MODE_ENV])
-                .unwrap()
+            !load_xdp_enabled(
+                Some("xdp:\n  enabled: false\n"),
+                &[xdp_var("1"), NO_MODE_ENV]
+            )
+            .unwrap()
         );
         assert!(!load_xdp_enabled(Some("xdp:\n  enabled: false\n"), clear).unwrap());
         // Garbage env values are an explicit error, not a silent default.

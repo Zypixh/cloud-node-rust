@@ -76,6 +76,12 @@ def setup_netns():
         "dev", PEER_IF])
     sh(["ip", "netns", "exec", NS, "ip", "link", "set", PEER_IF, "up"])
     sh(["ip", "netns", "exec", NS, "ip", "link", "set", "lo", "up"])
+    # Silence kernel-generated IPv6 noise (DAD/RS/NS) on both veth ends:
+    # it would pollute the per-case counter deltas. Raw injected frames are
+    # unaffected — XDP sees them regardless of the stack's IPv6 state.
+    for iface, ns in ((HOST_IF, None), (PEER_IF, NS)):
+        sh(["sysctl", "-qw", f"net.ipv6.conf.{iface}.disable_ipv6=1"],
+           check=False, netns=ns)
     if not subprocess.run(["which", "ethtool"],
                           capture_output=True).returncode:
         for iface, ns in ((HOST_IF, None), (PEER_IF, NS)):

@@ -46,8 +46,7 @@ fn xdp_shadow_rules_prefer_allow_over_block() {
     let manager = XdpManager::new(XdpConfig {
         enabled: true,
         ..XdpConfig::default()
-    
-        });
+    });
     let now = crate::utils::time::now_timestamp();
     manager.sync_snapshot(&KernelFilterSnapshot {
         blocked_ips: vec![("192.0.2.10".parse().unwrap(), now + 60)],
@@ -65,8 +64,7 @@ fn xdp_shadow_rules_match_network_and_range() {
     let manager = XdpManager::new(XdpConfig {
         enabled: true,
         ..XdpConfig::default()
-    
-        });
+    });
     let now = crate::utils::time::now_timestamp();
     manager.sync_snapshot(&KernelFilterSnapshot {
         blocked_networks: vec![("198.51.100.0/24".parse().unwrap(), now + 60)],
@@ -97,8 +95,7 @@ fn xdp_rule_sweeper_removes_expired_shadow_rules() {
     let manager = XdpManager::new(XdpConfig {
         enabled: true,
         ..XdpConfig::default()
-    
-        });
+    });
     let now = crate::utils::time::now_timestamp();
     let expired_ip: IpAddr = "192.0.2.1".parse().unwrap();
     let active_ip: IpAddr = "192.0.2.2".parse().unwrap();
@@ -155,8 +152,7 @@ fn xdp_rule_sweeper_stop_invalidates_running_generation() {
     let manager = XdpManager::new(XdpConfig {
         enabled: true,
         ..XdpConfig::default()
-    
-        });
+    });
 
     assert_eq!(manager.rule_sweeper_generation.load(Ordering::Relaxed), 0);
     assert!(!manager.rule_sweeper_started.swap(true, Ordering::Relaxed));
@@ -502,8 +498,7 @@ fn doctor_reports_missing_interface_when_enabled() {
     let report = doctor_report_for_config(&XdpConfig {
         enabled: true,
         ..XdpConfig::default()
-    
-        });
+    });
     assert!(report.contains("interfaces is empty"));
 }
 
@@ -1093,8 +1088,7 @@ fn af_xdp_parser_extracts_ipv4_udp_datagram() {
 #[test]
 fn af_xdp_proxy_frame_classifies_udp_with_route_meta() {
     let frame = ipv4_udp_frame(false, 0, b"hello");
-    let proxy_frame =
-        af_xdp::parse_proxy_frame("eth0", 3, &frame).expect("valid UDP proxy frame");
+    let proxy_frame = af_xdp::parse_proxy_frame("eth0", 3, &frame).expect("valid UDP proxy frame");
 
     let af_xdp::AfXdpProxyFrame::Udp { route, packet } = proxy_frame else {
         panic!("expected UDP proxy frame");
@@ -1110,8 +1104,7 @@ fn af_xdp_proxy_frame_classifies_udp_with_route_meta() {
 #[test]
 fn af_xdp_proxy_frame_classifies_tcp_and_preserves_ip_packet() {
     let frame = ipv4_tcp_frame(true, b"GET / HTTP/1.1\r\n\r\n");
-    let proxy_frame =
-        af_xdp::parse_proxy_frame("eth1", 7, &frame).expect("valid TCP proxy frame");
+    let proxy_frame = af_xdp::parse_proxy_frame("eth1", 7, &frame).expect("valid TCP proxy frame");
 
     let af_xdp::AfXdpProxyFrame::Tcp {
         route,
@@ -1200,8 +1193,7 @@ fn af_xdp_tcp_reactor_answers_syn_with_syn_ack() {
     else {
         panic!("expected TCP proxy frame");
     };
-    let mut reactor =
-        af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
 
     assert_eq!(
         reactor.ingest(route.clone(), flow, ip_packet),
@@ -1241,8 +1233,7 @@ fn af_xdp_tcp_reactor_ignores_unknown_non_syn_flow() {
     else {
         panic!("expected TCP proxy frame");
     };
-    let mut reactor =
-        af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
 
     assert_eq!(
         reactor.ingest(route, flow, ip_packet),
@@ -1293,8 +1284,7 @@ fn af_xdp_tcp_reactor_refuses_new_sessions_at_limit() {
         route: second_route,
         flow: second_flow,
         ip_packet: second_packet,
-    } = af_xdp::parse_proxy_frame("eth0", 0, &second_frame)
-        .expect("valid second TCP SYN frame")
+    } = af_xdp::parse_proxy_frame("eth0", 0, &second_frame).expect("valid second TCP SYN frame")
     else {
         panic!("expected second TCP proxy frame");
     };
@@ -1331,8 +1321,7 @@ fn af_xdp_tcp_reactor_reaps_idle_sessions() {
     else {
         panic!("expected TCP proxy frame");
     };
-    let mut reactor =
-        af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
 
     assert_eq!(
         reactor.ingest(route, flow, ip_packet),
@@ -1383,8 +1372,7 @@ fn af_xdp_tcp_reactor_resolves_egress_route_before_reaping_session() {
     else {
         panic!("expected TCP proxy frame");
     };
-    let mut reactor =
-        af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
     assert_eq!(
         reactor.ingest(route.clone(), flow, ip_packet),
         af_xdp::AfXdpTcpIngestStatus::Accepted
@@ -1399,8 +1387,7 @@ fn af_xdp_tcp_reactor_resolves_egress_route_before_reaping_session() {
     assert!(
         egress
             .iter()
-            .any(|(egress_route, ip_packet)| *egress_route == route
-                && *ip_packet == reply_packet)
+            .any(|(egress_route, ip_packet)| *egress_route == route && *ip_packet == reply_packet)
     );
     assert_eq!(reactor.session_count(), 0);
 }
@@ -1591,9 +1578,7 @@ fn af_xdp_udp_route_cache_expires_and_evicts_oldest_without_clearing_all() {
     af_xdp::compact_udp_route_cache(&routes, 115, Duration::from_millis(100), 8, 2);
 
     assert_eq!(routes.len(), 2);
-    assert!(routes
-        .iter()
-        .all(|entry| entry.key().1.port() >= 53002));
+    assert!(routes.iter().all(|entry| entry.key().1.port() >= 53002));
 
     af_xdp::compact_udp_route_cache(&routes, 116, Duration::from_millis(1_000), 2, 1);
 
@@ -1632,10 +1617,7 @@ fn udp_forward_parse_mac_and_entry_validation() {
     assert_eq!(rule.snat, 0);
     assert_eq!(rule.next_hop_mac, [0x02, 0, 0, 0, 0, 1]);
 
-    let fwd_snat = crate::runtime_mode::XdpUdpForwardConfig {
-        snat: true,
-        ..fwd
-    };
+    let fwd_snat = crate::runtime_mode::XdpUdpForwardConfig { snat: true, ..fwd };
     let (_, rule_snat) = linux::udp_forward_entry(&fwd_snat).unwrap();
     assert_eq!(rule_snat.snat, 1);
 
@@ -2350,4 +2332,270 @@ fn percpu_counter_aggregation_saturates_instead_of_wrapping() {
     let total = linux::sum_percpu_counters(slots.iter());
     assert_eq!(total.packets, u64::MAX);
     assert_eq!(total.tx, u64::MAX);
+}
+
+// ---- EN-05: parse classification mirror ----------------------------------
+
+fn ipv4_tcp_flags_frame(flags: u8, doff_words: u8) -> Vec<u8> {
+    let mut frame = ethernet_header(0x0800, false);
+    let tcp_len = usize::from(doff_words) * 4;
+    let total_len = 20 + tcp_len;
+    frame.extend_from_slice(&[
+        0x45,
+        0,
+        (total_len >> 8) as u8,
+        total_len as u8,
+        0,
+        1,
+        0,
+        0,
+        64,
+        6,
+        0,
+        0,
+        192,
+        0,
+        2,
+        10,
+        198,
+        51,
+        100,
+        5,
+    ]);
+    frame.extend_from_slice(&[0xcf, 0x08, 0x01, 0xbb]);
+    frame.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0]);
+    frame.push(doff_words << 4);
+    frame.push(flags);
+    frame.extend_from_slice(&[0xff, 0xff, 0, 0, 0, 0]);
+    for _ in 20..tcp_len {
+        frame.push(1); // option bytes (e.g. MSS/TFO cookie space)
+    }
+    frame
+}
+
+fn ipv4_proto_frame(proto: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = ethernet_header(0x0800, false);
+    let total_len = 20 + payload.len();
+    frame.extend_from_slice(&[
+        0x45,
+        0,
+        (total_len >> 8) as u8,
+        total_len as u8,
+        0,
+        1,
+        0,
+        0,
+        64,
+        proto,
+        0,
+        0,
+        192,
+        0,
+        2,
+        10,
+        198,
+        51,
+        100,
+        5,
+    ]);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn ipv6_ext_frame(next: u8, ext_chain: &[u8], l4: &[u8]) -> Vec<u8> {
+    let mut frame = ethernet_header(0x86dd, false);
+    let payload_len = ext_chain.len() + l4.len();
+    frame.extend_from_slice(&[
+        0x60,
+        0,
+        0,
+        0,
+        (payload_len >> 8) as u8,
+        payload_len as u8,
+        next,
+        64,
+    ]);
+    frame.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    frame.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    frame.extend_from_slice(ext_chain);
+    frame.extend_from_slice(l4);
+    frame
+}
+
+#[test]
+fn classify_supported_tcp_udp_and_atomic_fragments() {
+    use af_xdp::AfXdpFrameClass::*;
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_syn_frame(false)),
+        Supported
+    );
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_udp_frame(false, 0, b"hi")),
+        Supported
+    );
+    // Atomic fragment (offset 0, MF clear) parses through to L4.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_udp_frame(false, 0x4000, b"hi")),
+        Supported
+    );
+}
+
+#[test]
+fn classify_fragments_never_reach_l4() {
+    use af_xdp::AfXdpFrameClass::*;
+    // First fragment: offset 0 + MF set — must NOT be treated as a flow.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_udp_frame(false, 0x2000, b"hi")),
+        Fragmented
+    );
+    // Non-first fragment.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_udp_frame(false, 0x2001, b"hi")),
+        Fragmented
+    );
+    // IPv6 first fragment (M=1, offset 0).
+    let frag_first = [17, 0, 0, 1, 0, 0, 0, 1];
+    assert_eq!(
+        af_xdp::classify_frame(&ipv6_ext_frame(44, &frag_first, &[])),
+        Fragmented
+    );
+    // IPv6 atomic fragment header continues to L4.
+    let frag_atomic = [17, 0, 0, 0, 0, 0, 0, 1];
+    let udp = [0xcf, 0x08, 0x01, 0xbb, 0, 8, 0, 0];
+    assert_eq!(
+        af_xdp::classify_frame(&ipv6_ext_frame(44, &frag_atomic, &udp)),
+        Supported
+    );
+}
+
+#[test]
+fn classify_malformed_tcp_flag_combos() {
+    use af_xdp::AfXdpFrameClass::*;
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_flags_frame(0x00, 5)),
+        Malformed
+    ); // NULL scan
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_flags_frame(0x03, 5)),
+        Malformed
+    ); // SYN|FIN
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_flags_frame(0x06, 5)),
+        Malformed
+    ); // SYN|RST
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_flags_frame(0x02, 5)),
+        Supported
+    ); // SYN
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_flags_frame(0x10, 5)),
+        Supported
+    ); // ACK
+    // ECN flags are legal: SYN|ECE|CWR must not be hurt.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_flags_frame(0xc2, 5)),
+        Supported
+    );
+    // FIN|RST without SYN is unusual but not deterministic-illegal.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_flags_frame(0x05, 5)),
+        Supported
+    );
+}
+
+#[test]
+fn classify_malformed_lengths() {
+    use af_xdp::AfXdpFrameClass::*;
+    // TCP data offset below the 20-byte minimum.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_flags_frame(0x02, 4)),
+        Malformed
+    );
+    // TCP data offset beyond the declared datagram end.
+    let mut f = ipv4_tcp_flags_frame(0x02, 15);
+    f[16] = 0;
+    f[17] = 50; // tot_len = 50 < 20 + 15*4 = 80
+    assert_eq!(af_xdp::classify_frame(&f), Malformed);
+    // UDP length field below the header size.
+    let mut f = ipv4_udp_frame(false, 0, b"hello");
+    let udp_off = f.len() - 8 - 5;
+    f[udp_off + 4] = 0;
+    f[udp_off + 5] = 4;
+    assert_eq!(af_xdp::classify_frame(&f), Malformed);
+    // UDP length beyond the datagram.
+    let mut f = ipv4_udp_frame(false, 0, b"hello");
+    f[udp_off + 4] = 0;
+    f[udp_off + 5] = 60;
+    assert_eq!(af_xdp::classify_frame(&f), Malformed);
+    // IPv4 tot_len beyond what arrived (truncation).
+    let mut f = ipv4_udp_frame(false, 0, b"hello");
+    let ip_off = 14;
+    f[ip_off + 2] = 0xff;
+    f[ip_off + 3] = 0xff;
+    assert_eq!(af_xdp::classify_frame(&f), Malformed);
+}
+
+#[test]
+fn classify_tfo_and_options_unharmed() {
+    use af_xdp::AfXdpFrameClass::*;
+    // SYN with doff=8 (12 option bytes, e.g. MSS+TFO cookie) — legal.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_tcp_flags_frame(0x02, 8)),
+        Supported
+    );
+}
+
+#[test]
+fn classify_control_and_unsupported() {
+    use af_xdp::AfXdpFrameClass::*;
+    // ICMPv4 echo + PTB.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_proto_frame(1, &[8, 0, 0, 0, 0, 0, 0, 0])),
+        Control
+    );
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_proto_frame(1, &[3, 4, 0, 0, 0, 0, 0, 0])),
+        Control
+    );
+    // ICMPv6 NS.
+    let udp_len8 = [135u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
+        af_xdp::classify_frame(&ipv6_ext_frame(58, &[], &udp_len8)),
+        Control
+    );
+    // GRE/ESP etc: legal but unsupported by this dataplane.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv4_proto_frame(47, &[0; 20])),
+        Unsupported
+    );
+    // Non-IP ethertype (ARP).
+    assert_eq!(
+        af_xdp::classify_frame(&ethernet_header(0x0806, false)),
+        NonIp
+    );
+    // Triple VLAN tag exceeds the bounded walk.
+    let mut f = ethernet_header_with_vlan_tags(0x0800, &[(0x8100, 1), (0x8100, 2), (0x8100, 3)]);
+    // fix: the third tag's TPID is what classify sees after two tags
+    assert_eq!(af_xdp::classify_frame(&f), Unsupported);
+    f.clear();
+    // IPv6 unknown next-header and exhausted chain.
+    assert_eq!(
+        af_xdp::classify_frame(&ipv6_ext_frame(99, &[], &[0; 8])),
+        Unsupported
+    );
+    // 9 chained dest-opts headers exceed the 8-iteration bound.
+    let mut chain = Vec::new();
+    for _ in 0..9 {
+        chain.extend_from_slice(&[60, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    assert_eq!(
+        af_xdp::classify_frame(&ipv6_ext_frame(60, &chain, &[0; 8])),
+        Unsupported
+    );
+    // Extension header length beyond the datagram -> malformed.
+    let bad_ext = [17, 200, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
+        af_xdp::classify_frame(&ipv6_ext_frame(60, &bad_ext, &[0; 8])),
+        Malformed
+    );
 }

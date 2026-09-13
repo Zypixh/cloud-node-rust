@@ -12,8 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// verified eBPF bytecode at the XDP hook, so the program must ship as an ELF
 /// object — embedding it keeps binary and program versioned atomically.
 #[cfg(target_os = "linux")]
-const XDP_EBPF_EMBEDDED: &[u8] =
-    aya::include_bytes_aligned!(env!("CLOUD_NODE_XDP_EBPF_OBJECT"));
+const XDP_EBPF_EMBEDDED: &[u8] = aya::include_bytes_aligned!(env!("CLOUD_NODE_XDP_EBPF_OBJECT"));
 #[cfg(target_os = "linux")]
 const XDP_BPF_PIN_DIR: &str = "/sys/fs/bpf/cloud-node-xdp";
 const XDP_STATE_WRITE_INTERVAL_SECS: u64 = 10;
@@ -119,6 +118,19 @@ pub struct XdpStatusSnapshot {
     /// Terminal drops caused by ACL block rules.
     #[serde(default)]
     pub acl_blocked: u64,
+    /// Deterministic-illegal packets dropped at parse (XDP_CLASS_MALFORMED).
+    #[serde(default)]
+    pub malformed: u64,
+    /// Legal-but-unparseable traffic passed to the kernel (deep ext chains,
+    /// >2 VLAN tags, non-TCP/UDP/ICMP).
+    #[serde(default)]
+    pub unsupported: u64,
+    /// IP fragments classified before L4 handling.
+    #[serde(default)]
+    pub fragmented: u64,
+    /// ICMP/ICMPv6 control traffic handed to the kernel stack.
+    #[serde(default)]
+    pub control: u64,
     #[serde(default)]
     pub rate_limit_active: bool,
     #[serde(default)]
@@ -186,6 +198,10 @@ pub(crate) struct XdpManager {
     snat_reply_tx: AtomicU64,
     tx: AtomicU64,
     acl_blocked: AtomicU64,
+    malformed: AtomicU64,
+    unsupported: AtomicU64,
+    fragmented: AtomicU64,
+    control: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
@@ -201,7 +217,10 @@ pub(crate) struct XdpManager {
     /// sweeps emit deltas against this image so nothing is double-counted.
     #[cfg(target_os = "linux")]
     udp_flow_shadow: parking_lot::Mutex<
-        std::collections::HashMap<cloud_node_xdp_common::XdpUdpCtKey, cloud_node_xdp_common::XdpFlowAcct>,
+        std::collections::HashMap<
+            cloud_node_xdp_common::XdpUdpCtKey,
+            cloud_node_xdp_common::XdpFlowAcct,
+        >,
     >,
     map_sync_started: AtomicBool,
     map_sync_generation: AtomicU64,
@@ -240,6 +259,10 @@ impl XdpManager {
             snat_reply_tx: AtomicU64::new(0),
             tx: AtomicU64::new(0),
             acl_blocked: AtomicU64::new(0),
+            malformed: AtomicU64::new(0),
+            unsupported: AtomicU64::new(0),
+            fragmented: AtomicU64::new(0),
+            control: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
@@ -800,6 +823,10 @@ impl XdpManager {
             snat_reply_tx: self.snat_reply_tx.load(Ordering::Relaxed),
             tx: self.tx.load(Ordering::Relaxed),
             acl_blocked: self.acl_blocked.load(Ordering::Relaxed),
+            malformed: self.malformed.load(Ordering::Relaxed),
+            unsupported: self.unsupported.load(Ordering::Relaxed),
+            fragmented: self.fragmented.load(Ordering::Relaxed),
+            control: self.control.load(Ordering::Relaxed),
             rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
             rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
@@ -1146,7 +1173,8 @@ impl XdpManager {
         let result: anyhow::Result<()> = Ok(());
         match result {
             Ok(()) => {
-                self.rate_limit_active.store(u64::from(active), Ordering::Relaxed);
+                self.rate_limit_active
+                    .store(u64::from(active), Ordering::Relaxed);
                 *self.rate_limit_detail.lock() = detail;
             }
             Err(err) => {
@@ -1316,6 +1344,12 @@ impl XdpManager {
                 self.tx.store(counters.tx, Ordering::Relaxed);
                 self.acl_blocked
                     .store(counters.acl_blocked, Ordering::Relaxed);
+                self.malformed.store(counters.malformed, Ordering::Relaxed);
+                self.unsupported
+                    .store(counters.unsupported, Ordering::Relaxed);
+                self.fragmented
+                    .store(counters.fragmented, Ordering::Relaxed);
+                self.control.store(counters.control, Ordering::Relaxed);
             }
         }
     }
@@ -1376,6 +1410,10 @@ impl XdpManager {
                     "snatReplyTx": c.snat_reply_tx,
                     "tx": c.tx,
                     "aclBlocked": c.acl_blocked,
+                    "malformed": c.malformed,
+                    "unsupported": c.unsupported,
+                    "fragmented": c.fragmented,
+                    "control": c.control,
                 })
             })
             .ok();
@@ -1801,7 +1839,6 @@ pub fn dump_maps() -> serde_json::Value {
     manager_from_runtime().dump_maps()
 }
 
-
 fn range_bound_to_ip(value: u128, v6: bool) -> IpAddr {
     if v6 {
         IpAddr::V6(Ipv6Addr::from(value))
@@ -2017,6 +2054,6 @@ mod smoke;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use policy::*;
 pub use policy::XdpRuleVerdict;
+pub(crate) use policy::*;
 pub use smoke::*;

@@ -12,8 +12,9 @@ use cloud_node_xdp_common::{
     XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key,
     XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpQuicDcidKey, XdpRateBucket,
     XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey,
-    XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule, XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN,
-    XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN,
+    XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule, XDP_CLASS_MALFORMED, XDP_CLASS_UNSUPPORTED,
+    XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN, XDP_FRAGMENT_DROP, XDP_FRAGMENT_PASS,
+    XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS, XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN,
 };
 use core::mem;
 use network_types::{
@@ -25,11 +26,18 @@ use network_types::{
 };
 
 const IP_PROTO_HOP_BY_HOP: u8 = 0;
+const IP_PROTO_ICMP: u8 = 1;
 const IP_PROTO_ROUTING: u8 = 43;
 const IP_PROTO_FRAGMENT: u8 = 44;
 const IP_PROTO_AH: u8 = 51;
+const IP_PROTO_ICMPV6: u8 = 58;
 const IP_PROTO_NO_NEXT: u8 = 59;
 const IP_PROTO_DEST_OPTS: u8 = 60;
+
+/// TCP flag bits as stored in the flags byte (offset 13 of the header).
+const TCP_FLAG_FIN: u8 = 0x01;
+const TCP_FLAG_SYN: u8 = 0x02;
+const TCP_FLAG_RST: u8 = 0x04;
 
 #[map(name = "XDP_BLOCKED_V4")]
 static XDP_BLOCKED_V4: HashMap<XdpIpv4Key, XdpRuleValue> =
@@ -237,7 +245,7 @@ pub fn xdp_nat_dispatch(ctx: XdpContext) -> u32 {
 fn parse_frame<const F: u8>(
     ctx: &XdpContext,
 ) -> Result<(u8, usize, u8, usize, u64, u32, Option<&'static XdpInterfacePolicy>), ()> {
-    let (eth_proto, ip_offset) = parse_eth_payload(ctx)?;
+    let (eth_proto, ip_offset) = parse_eth_payload(ctx).map_err(|_| ())?;
     let ifindex = ctx.ingress_ifindex() as u32;
     let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
     let (family, proto, l4_offset, packet_len) = if F == 4 && eth_proto == EtherType::Ipv4 as u16 {
@@ -273,13 +281,14 @@ fn parse_frame<const F: u8>(
             return Err(());
         }
         let next = unsafe { (*ip).next_hdr };
-        let Some((proto, l4_offset)) = ipv6_transport_offset(
+        let (proto, l4_offset) = match unpack_v6_next(ipv6_transport_offset(
             ctx,
             next,
             ip_offset + mem::size_of::<Ipv6Hdr>(),
             packet_end,
-        )? else {
-            return Err(());
+        )?) {
+            Some(bounds) => bounds,
+            None => return Err(()),
         };
         (6u8, proto, l4_offset, payload_len as u64)
     } else {
@@ -447,7 +456,11 @@ pub fn xdp_nat_tcp6_dispatch(ctx: XdpContext) -> u32 {
 
 fn try_cloud_node_xdp(ctx: XdpContext) -> Result<u32, ()> {
     counter_packet();
-    let (eth_proto, ip_offset) = parse_eth_payload(&ctx)?;
+    let (eth_proto, ip_offset) = match parse_eth_payload(&ctx) {
+        Ok(bounds) => bounds,
+        Err(XDP_CLASS_MALFORMED) => return Ok(malformed_drop()),
+        Err(_) => return Ok(unsupported_pass()),
+    };
     let action = match eth_proto {
         value if value == EtherType::Ipv4 as u16 => handle_ipv4(&ctx, ip_offset)?,
         value if value == EtherType::Ipv6 as u16 => handle_ipv6(&ctx, ip_offset)?,
@@ -456,20 +469,27 @@ fn try_cloud_node_xdp(ctx: XdpContext) -> Result<u32, ()> {
     Ok(action)
 }
 
-fn parse_eth_payload(ctx: &XdpContext) -> Result<(u16, usize), ()> {
-    let eth: *const EthHdr = ptr_at(ctx, 0)?;
+/// Parse the Ethernet (+ up to two VLAN tags) boundary. `Err(class)` carries
+/// an XDP_CLASS_* parse verdict: MALFORMED for deterministic-illegal frames
+/// (truncated headers), UNSUPPORTED for legal-but-unparseable encapsulations
+/// (more than two stacked VLAN tags).
+fn parse_eth_payload(ctx: &XdpContext) -> Result<(u16, usize), u8> {
+    let eth: *const EthHdr = ptr_at(ctx, 0).map_err(|_| XDP_CLASS_MALFORMED)?;
     let mut eth_proto = unsafe { (*eth).ether_type };
     let mut offset = mem::size_of::<EthHdr>();
 
     if is_vlan_ethertype(eth_proto) {
-        let vlan: *const VlanHdr = ptr_at(ctx, offset)?;
+        let vlan: *const VlanHdr = ptr_at(ctx, offset).map_err(|_| XDP_CLASS_MALFORMED)?;
         eth_proto = unsafe { (*vlan).ether_type };
         offset += mem::size_of::<VlanHdr>();
     }
     if is_vlan_ethertype(eth_proto) {
-        let vlan: *const VlanHdr = ptr_at(ctx, offset)?;
+        let vlan: *const VlanHdr = ptr_at(ctx, offset).map_err(|_| XDP_CLASS_MALFORMED)?;
         eth_proto = unsafe { (*vlan).ether_type };
         offset += mem::size_of::<VlanHdr>();
+    }
+    if is_vlan_ethertype(eth_proto) {
+        return Err(XDP_CLASS_UNSUPPORTED);
     }
 
     Ok((eth_proto, offset))
@@ -484,17 +504,33 @@ fn is_vlan_ethertype(ethertype: u16) -> bool {
 }
 
 fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
-    let ip: *const Ipv4Hdr = ptr_at(ctx, ip_offset)?;
     let ifindex = ctx.ingress_ifindex() as u32;
     let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
     if policy.is_none() {
         counter_map_miss();
     }
+    let ip: *const Ipv4Hdr = match ptr_at(ctx, ip_offset) {
+        Ok(ip) => ip,
+        Err(_) => return Ok(malformed_drop()),
+    };
     let version = unsafe { (*ip).version() };
     let ihl = unsafe { (*ip).ihl() as usize };
     let total_len = unsafe { (*ip).tot_len() as usize };
-    if version != 4 || ihl < mem::size_of::<Ipv4Hdr>() || total_len < ihl {
-        return Err(());
+    let frame_len = ctx.data_end().saturating_sub(ctx.data());
+    let packet_end = match ip_offset.checked_add(total_len) {
+        Some(end) => end,
+        None => return Ok(malformed_drop()),
+    };
+    // Deterministic-illegal IPv4: wrong version, header shorter than the
+    // minimum, declared length shorter than the header, or a declared length
+    // beyond what actually arrived (truncation). Never legal — drop.
+    if version != 4
+        || ihl < mem::size_of::<Ipv4Hdr>()
+        || ihl > 15 * 4
+        || total_len < ihl
+        || packet_end > frame_len
+    {
+        return Ok(malformed_drop());
     }
     let source = unsafe { (*ip).src_addr };
     let source_be = u32::from_be_bytes(source);
@@ -512,16 +548,30 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     {
         return Ok(block_action(policy));
     }
+    let destination_be = u32::from_be_bytes(unsafe { (*ip).dst_addr });
+    // Any fragment — first included — is classified FRAGMENTED and leaves the
+    // pipeline here: a first fragment alone never creates a trusted L4 flow
+    // (no rate bucket, no redirect, no NAT conntrack). Disposition comes from
+    // the per-VIP override or the interface's security-domain policy.
     if unsafe { (*ip).frag_offset() != 0 || ((*ip).frag_flags() & 1) != 0 } {
-        return Ok(xdp_action::XDP_PASS);
+        return Ok(fragmented_action(fragment_policy_v4(
+            policy,
+            ifindex,
+            destination_be,
+        )));
     }
     let protocol = unsafe { (*ip).proto };
     let l4_offset = ip_offset + ihl;
+    match l4_sanity(ctx, protocol, l4_offset, packet_end) {
+        L4Class::Ok => {}
+        L4Class::Malformed => return Ok(malformed_drop()),
+        L4Class::Control => return Ok(control_pass()),
+        L4Class::Unsupported => return Ok(unsupported_pass()),
+    }
     if rate_limited_v4(ctx, &key, protocol, l4_offset, now_mono_ns) {
         counter_rate_limited();
         return Ok(xdp_action::XDP_DROP);
     }
-    let destination_be = u32::from_be_bytes(unsafe { (*ip).dst_addr });
     if let Some(policy) = policy {
         if !local_ipv4_allowed(policy, ifindex, destination_be) {
             return Ok(xdp_action::XDP_PASS);
@@ -540,14 +590,17 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
 }
 
 fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
-    let ip: *const Ipv6Hdr = ptr_at(ctx, ip_offset)?;
     let ifindex = ctx.ingress_ifindex() as u32;
     let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
     if policy.is_none() {
         counter_map_miss();
     }
+    let ip: *const Ipv6Hdr = match ptr_at(ctx, ip_offset) {
+        Ok(ip) => ip,
+        Err(_) => return Ok(malformed_drop()),
+    };
     if unsafe { (*ip).version() } != 6 {
-        return Err(());
+        return Ok(malformed_drop());
     }
     let source = unsafe { (*ip).src_addr };
     let key = XdpIpv6Key { addr: source };
@@ -564,13 +617,17 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     {
         return Ok(block_action(policy));
     }
+    let destination = unsafe { (*ip).dst_addr };
     let payload_len = unsafe { u16::from_be_bytes((*ip).payload_len) as usize };
-    let packet_end = ip_offset
+    let packet_end = match ip_offset
         .checked_add(mem::size_of::<Ipv6Hdr>())
         .and_then(|offset| offset.checked_add(payload_len))
-        .ok_or(())?;
+    {
+        Some(end) => end,
+        None => return Ok(malformed_drop()),
+    };
     if packet_end > ctx.data_end().saturating_sub(ctx.data()) {
-        return Err(());
+        return Ok(malformed_drop());
     }
     let protocol = unsafe { (*ip).next_hdr };
     let (protocol, l4_offset) = match ipv6_transport_offset(
@@ -578,11 +635,30 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         protocol,
         ip_offset + mem::size_of::<Ipv6Hdr>(),
         packet_end,
-    )? {
-        Some(bounds) => bounds,
-        None => return Ok(xdp_action::XDP_PASS),
+    ) {
+        Ok(packed) if packed & V6N_FLAG == 0 => (
+            (packed >> 32) as u8,
+            // black_box defeats store narrowing: without it LLVM can spill
+            // only the low 32 bits of the masked value, and the verifier then
+            // rejects the 64-bit reload as a partially-initialized read.
+            core::hint::black_box(packed & 0xffff_ffff) as usize,
+        ),
+        Ok(packed) if packed & 0xff == V6N_FRAGMENTED => {
+            return Ok(fragmented_action(fragment_policy_v6(
+                policy,
+                ifindex,
+                destination,
+            )));
+        }
+        Ok(_) => return Ok(unsupported_pass()),
+        Err(()) => return Ok(malformed_drop()),
     };
-    let destination = unsafe { (*ip).dst_addr };
+    match l4_sanity(ctx, protocol, l4_offset, packet_end) {
+        L4Class::Ok => {}
+        L4Class::Malformed => return Ok(malformed_drop()),
+        L4Class::Control => return Ok(control_pass()),
+        L4Class::Unsupported => return Ok(unsupported_pass()),
+    }
     if rate_limited_v6(ctx, &key, protocol, l4_offset, now_mono_ns) {
         counter_rate_limited();
         return Ok(xdp_action::XDP_DROP);
@@ -602,18 +678,41 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     Ok(maybe_redirect(ctx, policy, protocol, l4_offset))
 }
 
+/// IPv6 extension-chain walk, packed into a single u64 so the return value
+/// stays in registers (a fat enum spills partially-written stack slots that
+/// the verifier rejects). Non-fragment L4: `(proto << 32) | l4_offset`.
+/// With V6N_FLAG set the low byte is a V6N_* class instead.
+const V6N_FLAG: u64 = 1 << 63;
+const V6N_FRAGMENTED: u64 = 1;
+const V6N_UNSUPPORTED: u64 = 2;
+
+/// Decode for call sites that only care whether an L4 header was found.
+#[inline(always)]
+fn unpack_v6_next(packed: u64) -> Option<(u8, usize)> {
+    if packed & V6N_FLAG != 0 {
+        return None;
+    }
+    // See handle_ipv6: black_box keeps the masked low word a full-width store.
+    Some((
+        (packed >> 32) as u8,
+        core::hint::black_box(packed & 0xffff_ffff) as usize,
+    ))
+}
+
+#[inline(always)]
 fn ipv6_transport_offset(
     ctx: &XdpContext,
     mut next_header: u8,
     mut offset: usize,
     packet_end: usize,
-) -> Result<Option<(u8, usize)>, ()> {
+) -> Result<u64, ()> {
     for _ in 0..8 {
         match next_header {
             value if value == IpProto::Tcp as u8 || value == IpProto::Udp as u8 => {
-                return Ok(Some((next_header, offset)));
+                return Ok(((next_header as u64) << 32) | offset as u64);
             }
-            IP_PROTO_NO_NEXT => return Ok(None),
+            IP_PROTO_ICMPV6 => return Ok(((next_header as u64) << 32) | offset as u64),
+            IP_PROTO_NO_NEXT => return Ok(V6N_FLAG | V6N_UNSUPPORTED),
             IP_PROTO_HOP_BY_HOP | IP_PROTO_ROUTING | IP_PROTO_DEST_OPTS => {
                 if offset + 2 > packet_end {
                     return Err(());
@@ -640,19 +739,96 @@ fn ipv6_transport_offset(
                 let frag_hi = read_u8(ctx, offset + 2)?;
                 let frag_lo = read_u8(ctx, offset + 3)?;
                 let fragment = u16::from_be_bytes([frag_hi, frag_lo]);
+                // Non-atomic fragment (offset != 0 or M set): leave the chain
+                // — first fragments never reach the L4 path either.
                 if fragment & 0xfff9 != 0 {
-                    return Ok(None);
+                    return Ok(V6N_FLAG | V6N_FRAGMENTED);
                 }
                 next_header = current;
                 offset = offset.checked_add(8).ok_or(())?;
             }
-            _ => return Ok(None),
+            _ => return Ok(V6N_FLAG | V6N_UNSUPPORTED),
         }
         if offset > packet_end {
             return Err(());
         }
     }
-    Ok(None)
+    Ok(V6N_FLAG | V6N_UNSUPPORTED)
+}
+
+/// L4-level verdict after the transport header offset is known. Malformed is
+/// deterministic-illegal (bad data offset, impossible flag combo, UDP length
+/// outside the datagram); Control is ICMP/ICMPv6 handed to the kernel stack
+/// (ND, PMTU); Unsupported is a protocol the dataplane does not terminate.
+enum L4Class {
+    Ok,
+    Malformed,
+    Control,
+    Unsupported,
+}
+
+#[inline(always)]
+fn l4_sanity(ctx: &XdpContext, protocol: u8, l4_offset: usize, packet_end: usize) -> L4Class {
+    match protocol {
+        value if value == IpProto::Tcp as u8 => {
+            if tcp_sanity(ctx, l4_offset, packet_end).is_err() {
+                L4Class::Malformed
+            } else {
+                L4Class::Ok
+            }
+        }
+        value if value == IpProto::Udp as u8 => {
+            if udp_sanity(ctx, l4_offset, packet_end).is_err() {
+                L4Class::Malformed
+            } else {
+                L4Class::Ok
+            }
+        }
+        IP_PROTO_ICMP | IP_PROTO_ICMPV6 => L4Class::Control,
+        _ => L4Class::Unsupported,
+    }
+}
+
+/// Deterministic-illegal TCP: header outside the datagram, data offset below
+/// the 20-byte minimum or beyond the segment, or an impossible flag combo
+/// (no flags at all, SYN+FIN, SYN+RST). ECN (ECE/CWR) and options (TFO, MSS,
+/// SACK) are untouched — they never trip these checks.
+#[inline(always)]
+fn tcp_sanity(ctx: &XdpContext, l4_offset: usize, packet_end: usize) -> Result<(), ()> {
+    if l4_offset.checked_add(mem::size_of::<TcpHdr>()).ok_or(())? > packet_end {
+        return Err(());
+    }
+    // Single-byte reads keep the verifier's register tracking simple; the
+    // bitfield accessor chain spills into partially-untracked stack slots on
+    // older kernels.
+    let doff = (read_u8(ctx, l4_offset + 12)? >> 4) as usize * 4;
+    if doff < mem::size_of::<TcpHdr>()
+        || l4_offset.checked_add(doff).ok_or(())? > packet_end
+    {
+        return Err(());
+    }
+    let flags = read_u8(ctx, l4_offset + 13)? & 0x3f;
+    if flags == 0 || (flags & TCP_FLAG_SYN != 0 && flags & (TCP_FLAG_FIN | TCP_FLAG_RST) != 0) {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Deterministic-illegal UDP: header outside the datagram or a declared
+/// length shorter than the header / beyond the datagram end.
+#[inline(always)]
+fn udp_sanity(ctx: &XdpContext, l4_offset: usize, packet_end: usize) -> Result<(), ()> {
+    if l4_offset.checked_add(mem::size_of::<UdpHdr>()).ok_or(())? > packet_end {
+        return Err(());
+    }
+    let udp: *const UdpHdr = ptr_at(ctx, l4_offset)?;
+    let len = unsafe { (*udp).len() as usize };
+    if len < mem::size_of::<UdpHdr>()
+        || l4_offset.checked_add(len).ok_or(())? > packet_end
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn block_action(policy: Option<&XdpInterfacePolicy>) -> u32 {
@@ -663,6 +839,93 @@ fn block_action(policy: Option<&XdpInterfacePolicy>) -> u32 {
         }
         _ => xdp_action::XDP_PASS,
     }
+}
+
+/// Deterministic-illegal packet: always dropped, on every interface mode —
+/// there is no legal interpretation of a truncated header or an impossible
+/// flag combination.
+#[inline(always)]
+fn malformed_drop() -> u32 {
+    counter_malformed();
+    xdp_action::XDP_DROP
+}
+
+/// Legal traffic the bounded parser cannot fully classify. Passed to the
+/// kernel stack; counted so blind spots stay observable.
+#[inline(always)]
+fn unsupported_pass() -> u32 {
+    counter_unsupported();
+    xdp_action::XDP_PASS
+}
+
+/// ICMP/ICMPv6 control traffic (ND, PMTU): always handed to the kernel —
+/// dropping it would break neighbor discovery and path-MTU.
+#[inline(always)]
+fn control_pass() -> u32 {
+    counter_control();
+    xdp_action::XDP_PASS
+}
+
+/// Apply the resolved fragment disposition (XDP_FRAGMENT_*).
+#[inline(always)]
+fn fragmented_action(action: u8) -> u32 {
+    counter_fragmented();
+    if action == XDP_FRAGMENT_DROP {
+        xdp_action::XDP_DROP
+    } else {
+        xdp_action::XDP_PASS
+    }
+}
+
+/// Per-VIP override (XDP_LOCAL_* value bits[2:1]) wins over the interface
+/// fragment_action; interfaces without local-IP filtering use the interface
+/// default directly.
+#[inline(always)]
+fn fragment_policy_v4(
+    policy: Option<&XdpInterfacePolicy>,
+    ifindex: u32,
+    destination_be: u32,
+) -> u8 {
+    if let Some(policy) = policy {
+        if policy.local_ip_filter != 0 {
+            let key = XdpLocalIpv4Key::new(ifindex, destination_be);
+            if let Some(flags) = unsafe { XDP_LOCAL_V4.get(&key) } {
+                let code = *flags & (XDP_LOCAL_FRAG_PASS | XDP_LOCAL_FRAG_DROP);
+                if code == XDP_LOCAL_FRAG_PASS {
+                    return XDP_FRAGMENT_PASS;
+                }
+                if code == XDP_LOCAL_FRAG_DROP {
+                    return XDP_FRAGMENT_DROP;
+                }
+            }
+        }
+        return policy.fragment_action;
+    }
+    XDP_FRAGMENT_PASS
+}
+
+#[inline(always)]
+fn fragment_policy_v6(
+    policy: Option<&XdpInterfacePolicy>,
+    ifindex: u32,
+    destination: [u8; 16],
+) -> u8 {
+    if let Some(policy) = policy {
+        if policy.local_ip_filter != 0 {
+            let key = XdpLocalIpv6Key::new(ifindex, destination);
+            if let Some(flags) = unsafe { XDP_LOCAL_V6.get(&key) } {
+                let code = *flags & (XDP_LOCAL_FRAG_PASS | XDP_LOCAL_FRAG_DROP);
+                if code == XDP_LOCAL_FRAG_PASS {
+                    return XDP_FRAGMENT_PASS;
+                }
+                if code == XDP_LOCAL_FRAG_DROP {
+                    return XDP_FRAGMENT_DROP;
+                }
+            }
+        }
+        return policy.fragment_action;
+    }
+    XDP_FRAGMENT_PASS
 }
 
 fn maybe_redirect(
@@ -2407,16 +2670,9 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 }
 
 fn read_u8(ctx: &XdpContext, offset: usize) -> Result<u8, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
-    // `end < ptr + N` compiles to `ptr + N > end` - a bound the verifier
-    // can mark on variable-offset packet pointers; `ptr + 1 > end` folds
-    // into `ptr >= end`, which is not marked on this kernel. The margin also
-    // covers fixed offsets LLVM folds into the load instruction.
-    if end < start + offset + 16 {
-        return Err(());
-    }
-    let byte: *const u8 = (start + offset) as *const u8;
+    // `ptr + 1 > end` via ptr_at is the bound shape this kernel's verifier
+    // marks reliably on variable-offset packet pointers.
+    let byte: *const u8 = ptr_at(ctx, offset)?;
     Ok(unsafe { *byte })
 }
 
@@ -2479,6 +2735,30 @@ fn counter_redirect() {
 fn counter_parse_error() {
     if let Some(counters) = counters() {
         counters.parse_errors = counters.parse_errors.saturating_add(1);
+    }
+}
+
+fn counter_malformed() {
+    if let Some(counters) = counters() {
+        counters.malformed = counters.malformed.saturating_add(1);
+    }
+}
+
+fn counter_unsupported() {
+    if let Some(counters) = counters() {
+        counters.unsupported = counters.unsupported.saturating_add(1);
+    }
+}
+
+fn counter_fragmented() {
+    if let Some(counters) = counters() {
+        counters.fragmented = counters.fragmented.saturating_add(1);
+    }
+}
+
+fn counter_control() {
+    if let Some(counters) = counters() {
+        counters.control = counters.control.saturating_add(1);
     }
 }
 

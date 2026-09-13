@@ -1,0 +1,58 @@
+{
+  "task": "EN-05",
+  "title": "有界解析与分片策略",
+  "base_commit": "df7d125",
+  "status": "verified",
+  "environment": {
+    "host": "OrbStack x86_64 VM (x86-build@orb)",
+    "kernel": "7.0.14-orbstack-00380-ga7e0a2dc9535",
+    "topology": "netns + veth",
+    "attach_mode": "skb",
+    "ebpf_object_sha256": "3ecef86b7ef2140067266e70741d293e3a0449c686e4c885c4936f6adc54ae09"
+  },
+  "commands": [
+    "cargo xtask build-ebpf  # build-node (arm64), object is arch-independent",
+    "cargo build --bin cloud-node-rust  # x86-build, embeds eBPF object",
+    "sudo python3 scripts/edge/runner.py --node-bin ./target/debug/cloud-node-rust --mode proxy --only T01 --out /tmp/en05-t01.json",
+    "sudo python3 scripts/edge/runner.py --node-bin ./target/debug/cloud-node-rust --mode proxy --out /tmp/en05-all.json",
+    "cargo test --lib xdp  # macOS, 99 passed",
+    "cargo check --lib  # macOS, no new warnings"
+  ],
+  "results": {
+    "runner_matrix": {
+      "cases_total": 38,
+      "cases_passed": 38,
+      "cases_failed": 0,
+      "tests_runnable": ["T01", "T02", "T03", "T04", "T06"],
+      "tests_skipped_by_owner": ["T05", "T07", "T08", "T09", "T10", "T11", "T12", "T13", "T14", "T15", "T16", "T17", "T18"]
+    },
+    "verifier": "all programs loaded, no rejection, no out-of-bounds",
+    "counters_observed": ["malformed", "unsupported", "fragmented", "control", "pass", "drop", "redirect", "tx"]
+  },
+  "classification_contract": {
+    "MALFORMED": "deterministic-illegal; DROP; counters malformed+drop",
+    "UNSUPPORTED": "legal but unparseable; PASS; counters unsupported+pass",
+    "FRAGMENTED": "any IP fragment incl first/atomic; policy pass|drop; counters fragmented+pass/drop; no L4 state created",
+    "CONTROL": "ICMP/ICMPv6 (ND, PMTU/PTB); PASS; counters control+pass",
+    "SUPPORTED": "legal TCP/UDP; existing rate-limit/NAT/redirect path"
+  },
+  "files_changed": [
+    "crates/cloud-node-xdp-common/src/lib.rs",
+    "crates/cloud-node-xdp-ebpf/src/main.rs",
+    "src/runtime_mode.rs",
+    "src/xdp/linux.rs",
+    "src/xdp/mod.rs",
+    "src/xdp/af_xdp/mod.rs",
+    "src/xdp/af_xdp/parser.rs",
+    "src/xdp/tests.rs",
+    "src/xdp_auto_config.rs",
+    "scripts/edge/pktgen.py",
+    "scripts/edge/runner.py",
+    "scripts/edge/matrix.json"
+  ],
+  "known_limitations": [
+    "fragment_action defaults to pass; per-service drop policy is EN-06/07 scope",
+    "IPv6 ext-chain beyond depth limit classifies UNSUPPORTED (PASS), not DROP",
+    "kernel 6.1 native-attach verifier acceptance not exercised (env is 7.0.14 skb)"
+  ]
+}

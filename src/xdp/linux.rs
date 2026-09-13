@@ -1,13 +1,12 @@
 use super::*;
-use crate::runtime_mode::{XdpAttachMode, XdpRuntimeMode};
+use crate::runtime_mode::{XdpAttachMode, XdpInterfaceConfig, XdpRuntimeMode};
 use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, PerCpuArray, XskMap};
 use aya::programs::links::PinnedLink;
 use cloud_node_xdp_common::{
     XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key,
-    XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig, XdpRuleValue,
-    XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey,
-    XdpUdpFwdRule,
+    XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
+    XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
 };
 use ipnet::IpNet;
 use std::collections::BTreeSet;
@@ -26,8 +25,7 @@ const AF_XDP_RING_SIZE: u32 = 2048;
 const AF_XDP_RX_BATCH: usize = 64;
 const AF_XDP_MAX_SOCKETS: usize = 4096;
 const AF_XDP_SOCKET_CREATE_ATTEMPTS: usize = 80;
-const AF_XDP_SOCKET_CREATE_RETRY_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(250);
+const AF_XDP_SOCKET_CREATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 pub struct AttachedProgram {
     pub interfaces: BTreeSet<String>,
@@ -73,9 +71,11 @@ impl AfXdpRuntimeHandle {
         }
         self.last_status_refresh_at = Some(now);
         for queue in &self.queues {
-            let Some(status) = self.statuses.iter_mut().find(|status| {
-                status.interface == queue.interface && status.queue == queue.queue
-            }) else {
+            let Some(status) = self
+                .statuses
+                .iter_mut()
+                .find(|status| status.interface == queue.interface && status.queue == queue.queue)
+            else {
                 continue;
             };
             if let Ok(stats) = queue.rx.fd().xdp_statistics() {
@@ -592,8 +592,9 @@ pub async fn attach(
                 if pin_path.exists() {
                     std::fs::remove_file(&pin_path)?;
                 }
-                sub.pin(&pin_path)
-                    .map_err(|err| anyhow::anyhow!("pin {name} to {}: {err}", pin_path.display()))?;
+                sub.pin(&pin_path).map_err(|err| {
+                    anyhow::anyhow!("pin {name} to {}: {err}", pin_path.display())
+                })?;
                 Some(
                     sub.fd()?
                         .try_clone()
@@ -800,7 +801,11 @@ pub(crate) fn sum_percpu_counters<'a>(
             snat_alloc_fail,
             snat_reply_tx,
             tx,
-            acl_blocked
+            acl_blocked,
+            malformed,
+            unsupported,
+            fragmented,
+            control
         );
     }
     total
@@ -830,10 +835,7 @@ pub fn read_pinned_counters() -> anyhow::Result<XdpCounters> {
 /// Write the per-IP rate limiter config. Returns an explicit error when the
 /// loaded eBPF object predates the limiter so callers can report the
 /// unsupported feature instead of silently degrading.
-pub fn sync_rate_limit(
-    ebpf: &mut aya::Ebpf,
-    config: &XdpRateLimitConfig,
-) -> anyhow::Result<()> {
+pub fn sync_rate_limit(ebpf: &mut aya::Ebpf, config: &XdpRateLimitConfig) -> anyhow::Result<()> {
     let map = ebpf.map_mut("XDP_RATE_CFG").ok_or_else(|| {
         anyhow::anyhow!(
             "missing map XDP_RATE_CFG; eBPF object predates rate limiter (rebuild cloud-node-xdp-ebpf.o)"
@@ -872,12 +874,39 @@ fn sync_interface_policy(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Re
             },
             fallback_pass: u8::from(!config.fallback.fail_start()),
             local_ip_filter: u8::from(!interface.local_ips.is_empty()),
-            _pad: 0,
+            fragment_action: match interface.fragment_action {
+                crate::runtime_mode::XdpFragmentAction::Pass => {
+                    cloud_node_xdp_common::XDP_FRAGMENT_PASS
+                }
+                crate::runtime_mode::XdpFragmentAction::Drop => {
+                    cloud_node_xdp_common::XDP_FRAGMENT_DROP
+                }
+            },
             frame_size: interface.frame_size,
         };
         policies.insert(ifindex, policy, 0)?;
     }
     Ok(())
+}
+
+/// XDP_LOCAL_* value: bit0 marks presence; bits[2:1] carry the per-VIP
+/// fragment override resolved from `fragmentOverrides` (0 = inherit the
+/// interface policy).
+fn local_ip_flags(interface: &XdpInterfaceConfig, ip: &IpAddr) -> u32 {
+    let mut flags = cloud_node_xdp_common::XDP_LOCAL_PRESENT;
+    for entry in &interface.fragment_overrides {
+        if &entry.ip == ip {
+            flags |= match entry.action {
+                crate::runtime_mode::XdpFragmentAction::Pass => {
+                    cloud_node_xdp_common::XDP_LOCAL_FRAG_PASS
+                }
+                crate::runtime_mode::XdpFragmentAction::Drop => {
+                    cloud_node_xdp_common::XDP_LOCAL_FRAG_DROP
+                }
+            };
+        }
+    }
+    flags
 }
 
 fn sync_local_ip_maps(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Result<()> {
@@ -893,7 +922,7 @@ fn sync_local_ip_maps(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Resul
                 if let IpAddr::V4(addr) = ip {
                     map.insert(
                         XdpLocalIpv4Key::new(ifindex, u32::from_be_bytes(addr.octets())),
-                        1,
+                        local_ip_flags(interface, ip),
                         0,
                     )?;
                 }
@@ -911,7 +940,11 @@ fn sync_local_ip_maps(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Resul
             let ifindex = ifindex_from_name(&interface.name)?;
             for ip in &interface.local_ips {
                 if let IpAddr::V6(addr) = ip {
-                    map.insert(XdpLocalIpv6Key::new(ifindex, addr.octets()), 1, 0)?;
+                    map.insert(
+                        XdpLocalIpv6Key::new(ifindex, addr.octets()),
+                        local_ip_flags(interface, ip),
+                        0,
+                    )?;
                 }
             }
         }
@@ -1012,7 +1045,9 @@ fn sync_forward_map(
     proto: &str,
     config: &XdpConfig,
     dataplane_active: bool,
-    forwards: impl Fn(&crate::runtime_mode::XdpInterfaceConfig) -> &Vec<crate::runtime_mode::XdpUdpForwardConfig>,
+    forwards: impl Fn(
+        &crate::runtime_mode::XdpInterfaceConfig,
+    ) -> &Vec<crate::runtime_mode::XdpUdpForwardConfig>,
 ) -> anyhow::Result<()> {
     let Some(map) = ebpf.map_mut(map_name) else {
         let configured: usize = config.interfaces.iter().map(|i| forwards(i).len()).sum();
@@ -1023,8 +1058,7 @@ fn sync_forward_map(
         }
         return Ok(());
     };
-    let mut map =
-        AyaHashMap::<_, XdpUdpFwdKey, XdpUdpFwdRule>::try_from(map)?;
+    let mut map = AyaHashMap::<_, XdpUdpFwdKey, XdpUdpFwdRule>::try_from(map)?;
     clear_hash_map(&mut map)?;
     if !dataplane_active {
         return Ok(());
@@ -1082,7 +1116,10 @@ pub(super) fn udp_forward_entry(
     };
     let (key, backend_addr) = match (fwd.listen.ip(), backend.ip()) {
         (IpAddr::V4(listen), IpAddr::V4(backend)) => (
-            XdpUdpFwdKey::new_v4(u32::from_be_bytes(listen.octets()), fwd.listen.port().to_be()),
+            XdpUdpFwdKey::new_v4(
+                u32::from_be_bytes(listen.octets()),
+                fwd.listen.port().to_be(),
+            ),
             v4_embed(backend),
         ),
         (IpAddr::V6(listen), IpAddr::V6(backend)) => (
@@ -1240,8 +1277,7 @@ pub(super) fn sweep_nat_maps(
 
     // Reap SNAT reverse bindings whose owning conntrack entry is gone.
     if let Some(map) = ebpf.map_mut("XDP_SNAT_REV") {
-        let mut map =
-            AyaHashMap::<_, XdpSnatRevKey, XdpSnatRevValue>::try_from(map)?;
+        let mut map = AyaHashMap::<_, XdpSnatRevKey, XdpSnatRevValue>::try_from(map)?;
         let mut orphan = Vec::new();
         for item in map.iter() {
             let (key, value) = item?;
@@ -1268,8 +1304,7 @@ pub(super) fn sweep_nat_maps(
     }
 
     if let Some(map) = ebpf.map_mut("XDP_FLOW_ACCT") {
-        let mut map =
-            aya::maps::PerCpuHashMap::<_, XdpUdpCtKey, XdpFlowAcct>::try_from(map)?;
+        let mut map = aya::maps::PerCpuHashMap::<_, XdpUdpCtKey, XdpFlowAcct>::try_from(map)?;
         let mut acct_remove = Vec::new();
         for item in map.iter() {
             let (key, per_cpu) = item?;
@@ -1286,12 +1321,7 @@ pub(super) fn sweep_nat_maps(
             let delta_rx = total.rx_bytes.saturating_sub(previous.rx_bytes);
             let delta_tx = total.tx_bytes.saturating_sub(previous.tx_bytes);
             if delta_rx > 0 || delta_tx > 0 {
-                crate::metrics::record::record_transfer(
-                    total.server_id,
-                    delta_tx,
-                    delta_rx,
-                    None,
-                );
+                crate::metrics::record::record_transfer(total.server_id, delta_tx, delta_rx, None);
             }
             if stale.contains(&key) {
                 acct_remove.push(key);
@@ -1948,8 +1978,7 @@ fn rule_value(expires_at: i64, allow: bool) -> XdpRuleValue {
 fn monotonic_deadline_ns(expires_at: i64) -> u64 {
     let now_mono_ns = monotonic_now_ns();
     if now_mono_ns == 0 {
-        static LAST_WARN_MS: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static LAST_WARN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let now_ms = crate::utils::time::now_timestamp_millis() as u64;
         let last = LAST_WARN_MS.load(std::sync::atomic::Ordering::Relaxed);
         if now_ms.saturating_sub(last) > 60_000 {
@@ -1982,9 +2011,7 @@ fn monotonic_now_ns() -> u64 {
         .saturating_add(ts.tv_nsec as u64)
 }
 
-fn clear_hash_map<K, V>(
-    map: &mut AyaHashMap<&mut aya::maps::MapData, K, V>,
-) -> anyhow::Result<()>
+fn clear_hash_map<K, V>(map: &mut AyaHashMap<&mut aya::maps::MapData, K, V>) -> anyhow::Result<()>
 where
     K: aya::Pod,
     V: aya::Pod,
