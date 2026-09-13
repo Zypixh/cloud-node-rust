@@ -218,18 +218,25 @@ def recv_until(sock, needle):
 tcp_payload = b"cloud-node-xdp-tcp-proxy-smoke"
 expected_tcp = b"xdp-tcp-smoke:" + tcp_payload
 tcp_response = b""
+last_error = None
 for attempt in range(1, 6):
-    tcp = socket.create_connection((target, 9443), timeout=3)
-    tcp.settimeout(3)
-    tcp.sendall(tcp_payload)
-    tcp.shutdown(socket.SHUT_WR)
-    tcp_response = recv_all(tcp)
-    tcp.close()
+    try:
+        tcp = socket.create_connection((target, 9443), timeout=3)
+        tcp.settimeout(3)
+        tcp.sendall(tcp_payload)
+        tcp.shutdown(socket.SHUT_WR)
+        tcp_response = recv_all(tcp)
+        tcp.close()
+    except OSError as err:
+        last_error = err
+        tcp_response = b""
     if expected_tcp in tcp_response:
         break
     time.sleep(1.0)
 else:
-    raise SystemExit(f"TCP AF_XDP proxy response mismatch: {tcp_response!r}")
+    raise SystemExit(
+        f"TCP AF_XDP proxy response mismatch: {tcp_response!r} last_error={last_error!r}"
+    )
 time.sleep(2.0)
 
 tls_context = ssl.create_default_context()
