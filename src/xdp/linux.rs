@@ -5,9 +5,9 @@ use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, PerCpuArray, XskMap};
 use aya::programs::links::PinnedLink;
 use cloud_node_xdp_common::{
     XdpBudgetBucket, XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key,
-    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig,
-    XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey,
-    XdpUdpFwdRule,
+    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateBucket,
+    XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue,
+    XdpUdpFwdKey, XdpUdpFwdRule,
 };
 use ipnet::IpNet;
 use std::collections::BTreeSet;
@@ -764,6 +764,64 @@ fn clear_rule_maps(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("missing map {name}"))?;
         let mut map = LpmTrie::<_, [u8; 16], XdpRuleValue>::try_from(map)?;
         clear_lpm_map(&mut map)?;
+    }
+    Ok(())
+}
+
+/// EN-08 bounded GC for the per-source rate buckets: entries whose window
+/// has been idle for `gc_after_windows` windows are reaped so randomized
+/// source churn cannot permanently exhaust the table. Work is capped at
+/// `max_reap` removals per pass per map — the remainder is picked up by the
+/// next sweep tick, keeping a single GC run's latency bounded.
+pub(super) fn sweep_rate_maps(
+    ebpf: &mut aya::Ebpf,
+    window_ns: u64,
+    gc_after_windows: u64,
+    max_reap: usize,
+) -> anyhow::Result<()> {
+    if window_ns == 0 || gc_after_windows == 0 {
+        return Ok(());
+    }
+    let horizon = window_ns.saturating_mul(gc_after_windows);
+    let now_ns = monotonic_now_ns();
+    let mut reaped = 0usize;
+
+    if let Some(map) = ebpf.map_mut("XDP_RATE_V4") {
+        let mut map = AyaHashMap::<_, XdpIpv4Key, XdpRateBucket>::try_from(map)?;
+        let mut stale = Vec::new();
+        for item in map.iter() {
+            let (key, value) = item?;
+            if now_ns.saturating_sub(value.window_start_ns) >= horizon {
+                stale.push(key);
+                if stale.len() >= max_reap {
+                    break;
+                }
+            }
+        }
+        for key in &stale {
+            let _ = map.remove(key);
+        }
+        reaped += stale.len();
+    }
+    if let Some(map) = ebpf.map_mut("XDP_RATE_V6") {
+        let mut map = AyaHashMap::<_, XdpIpv6Key, XdpRateBucket>::try_from(map)?;
+        let mut stale = Vec::new();
+        for item in map.iter() {
+            let (key, value) = item?;
+            if now_ns.saturating_sub(value.window_start_ns) >= horizon {
+                stale.push(key);
+                if stale.len() >= max_reap {
+                    break;
+                }
+            }
+        }
+        for key in &stale {
+            let _ = map.remove(key);
+        }
+        reaped += stale.len();
+    }
+    if reaped > 0 {
+        tracing::debug!("XDP rate-map GC reaped {reaped} stale buckets");
     }
     Ok(())
 }

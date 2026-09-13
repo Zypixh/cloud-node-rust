@@ -80,6 +80,23 @@ xdp:
 - 基线保护在 Normal 压力下也存在；压力反馈只收窄弹性额度（High ÷2、Critical ÷4，份额下限 1），不存在"除到 0 变关闭"的路径。
 - 命中按 `unverifiedLimited` / `admissionLimited` 计数器上报；新状态拒绝发生在任何 CT/SNAT 写入之前，不产生残留状态。
 
+源地址限流（EN-08）——按源 IP（或源前缀）分桶的固定窗口限制器：
+
+```yaml
+xdp:
+  rateLimit:
+    udpPps: 0          # 每桶 UDP 包/窗口；0 = 关闭该维度
+    tcpSynPps: 0       # 每桶 TCP SYN 尝试/窗口；0 = 关闭该维度
+    windowMs: 1000     # 固定窗口长度
+    prefixV4Len: 0     # 0 = 每地址（/32）；1..=32 = 按前缀共享桶
+    prefixV6Len: 0     # 0 = 每地址（/128）；1..=128 = 按前缀共享桶
+    gcAfterWindows: 8  # 桶空闲超过该窗口数后由 sweeper 回收
+```
+
+- 该限制器是**压力门控**的：Normal 压力下整体关闭（聚合预算仍提供基线），Elevated 起按配置生效，High ÷2、Critical ÷4；非零基数除到下限 1，不会"除到 0 变关闭"。
+- `prefixV4Len`/`prefixV6Len` 是公平性粒度：同一前缀内的随机源共享一个桶，前缀洪泛无法耗尽其额度，良性前缀各自独立。语义是**近似**的 per-source/prefix 限制，不是精确配额；满表时新源回落到聚合预算并由 `ratelimitMapFull` 计数，不会静默放行也不会误杀。
+- GC 由 5s sweeper 执行，单次每表最多回收 8192 项——随机源 churn 不会永久占满表，也不会造成单 tick 无界扫描。
+
 ## 控制面配置
 
 大部分运行时配置由控制面下发，包括：

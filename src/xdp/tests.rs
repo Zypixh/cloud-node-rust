@@ -2648,3 +2648,36 @@ fn effective_budget_config_baseline_and_share_math() {
     assert_eq!(cfg.flags, 0);
     assert_eq!(cfg.unverified_pps, 0);
 }
+
+#[test]
+fn scaled_rate_limit_config_window_prefix_and_floor() {
+    use crate::runtime_mode::XdpRateLimitSettings;
+    let base = XdpRateLimitSettings {
+        udp_pps: 10_000,
+        tcp_syn_pps: 3,
+        window_ms: 250,
+        prefix_v4_len: 24,
+        prefix_v6_len: 200, // out of range: must clamp to 128
+        gc_after_windows: 8,
+    };
+    let cfg = scaled_rate_limit_config(&base, 4);
+    assert_eq!(cfg.udp_pps, 2_500);
+    // Nonzero base divided below 1 clamps to 1 — never silently off.
+    assert_eq!(cfg.tcp_syn_pps, 1);
+    assert_eq!(cfg.window_ns, 250_000_000);
+    assert_eq!(cfg.v4_prefix_len, 24);
+    assert_eq!(cfg.v6_prefix_len, 128);
+
+    // Zero base stays zero (explicit per-protocol off switch).
+    let cfg = scaled_rate_limit_config(
+        &XdpRateLimitSettings {
+            udp_pps: 0,
+            prefix_v4_len: 64, // clamps to 32
+            ..Default::default()
+        },
+        2,
+    );
+    assert_eq!(cfg.udp_pps, 0);
+    assert_eq!(cfg.v4_prefix_len, 32);
+    assert_eq!(cfg.v6_prefix_len, 0);
+}

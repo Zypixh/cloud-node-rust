@@ -1,0 +1,31 @@
+{
+  "task": "EN-08",
+  "status": "verified-veth-netns",
+  "abi": "v7",
+  "base_commit": "ca30b32",
+  "deliverables": [
+    "XdpRateLimitConfig +v4_prefix_len/+v6_prefix_len (32B, asserted)",
+    "prefix masking in rate_limited_v4/v6 (bounded shifts, 5-reg v6 signature, 0 r11)",
+    "map-full fallback: ratelimitMapFull + aggregate budget ceiling",
+    "xdp.rateLimit: prefixV4Len/prefixV6Len/gcAfterWindows",
+    "scaled_rate_limit_config: windowMs->ns, prefix clamp, nonzero floor",
+    "sweep_rate_buckets: bounded GC, <=8192 removals per pass per map",
+    "debug-only CLOUD_NODE_XDP_TEST_PRESSURE hook (release-unreachable)"
+  ],
+  "verification": {
+    "verifier": "11 programs accepted (kernel 7.0); 0 r11 in object",
+    "matrix": "T01 28/28, T02 4/4, T03 3/3, T04 2/2",
+    "unit": "77 xdp tests pass; scaled_rate_limit_config_window_prefix_and_floor",
+    "probe": "scripts/edge/en08_rate_probe.py",
+    "prefix_fairness": "3000pkts same-/24 -> 1 bucket, rateLimited=2787",
+    "perip": "5 srcs x600 -> 5 buckets, rateLimited=2000",
+    "bounded_gc": "12005 -> 3813 -> 0 (exactly 8192/pass)",
+    "map_full": "280k sources -> entries=262144, ratelimitMapFull=17856, pass=280000",
+    "post_full": "10pkts -> ratelimitMapFull=10, pass=10"
+  },
+  "limitations": [
+    "per-source limiter disabled at Normal pressure (aggregate budget baseline covers)",
+    "fixed-window limiter is approximate, not an exact quota",
+    "full drain of a saturated table takes multiple 5s sweep ticks (8192/pass bound)"
+  ]
+}
