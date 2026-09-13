@@ -14,7 +14,8 @@ use cloud_node_xdp_common::{
     XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey,
     XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule, XDP_CLASS_MALFORMED, XDP_CLASS_UNSUPPORTED,
     XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN, XDP_FRAGMENT_DROP, XDP_FRAGMENT_PASS,
-    XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS, XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN,
+    XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS, XDP_LOCAL_PRESENT, XDP_LOCAL_REDIRECT,
+    XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN,
 };
 use core::mem;
 use network_types::{
@@ -170,6 +171,19 @@ struct NatScratch {
     /// under the 512-byte verifier stack limit.
     pkt_src: [u8; 16],
     pkt_dst: [u8; 16],
+    /// Redirect context stashed before a NAT tail call: keeping these scalars
+    /// in the per-CPU map instead of the main frame stops LLVM from spilling
+    /// callee-saved registers through R11 (rejected by the verifier).
+    redir_flags: u32,
+    redir_proto: u8,
+    redir_l4off: u16,
+    redir_pad: u8,
+    /// Worker context stashed before the dispatch -> work tail call: offsets
+    /// are re-validated against packet bounds inside the worker program, so
+    /// only plain scalars need to cross the call.
+    work_ip_off: u32,
+    work_ifindex: u32,
+    work_pkt_len: u64,
 }
 
 #[map(name = "XDP_NAT_SCRATCH")]
@@ -180,7 +194,7 @@ static XDP_NAT_SCRATCH: PerCpuArray<NatScratch> =
 /// 512-byte stack and instruction budget, so they run as a separate XDP
 /// program; slot 0 = `xdp_nat_dispatch`.
 #[map(name = "XDP_DISPATCH")]
-static XDP_DISPATCH: ProgramArray = ProgramArray::with_max_entries(8, 0);
+static XDP_DISPATCH: ProgramArray = ProgramArray::with_max_entries(16, 0);
 
 const XDP_DISPATCH_NAT: u32 = 0;
 const XDP_DISPATCH_NAT_TCP: u32 = 2;
@@ -188,6 +202,14 @@ const XDP_DISPATCH_NAT_UDP6: u32 = 3;
 const XDP_DISPATCH_NAT_TCP6: u32 = 4;
 const XDP_DISPATCH_NAT_UDP6_FWD: u32 = 5;
 const XDP_DISPATCH_NAT_TCP6_FWD: u32 = 6;
+/// Worker programs run the heavyweight NAT handlers with a single verifier
+/// entry state: the dispatch programs above already parsed the frame, and
+/// keeping the ~1.5KiB handlers in the same program multiplied the parser's
+/// branch states past the pre-6.6 explored-state budget.
+const XDP_DISPATCH_NAT_UDP4_WORK: u32 = 7;
+const XDP_DISPATCH_NAT_TCP4_WORK: u32 = 8;
+const XDP_DISPATCH_NAT_UDP6_WORK: u32 = 9;
+const XDP_DISPATCH_NAT_TCP6_WORK: u32 = 10;
 
 #[inline(always)]
 fn nat_scratch() -> Result<*mut NatScratch, ()> {
@@ -244,11 +266,23 @@ pub fn xdp_nat_dispatch(ctx: XdpContext) -> u32 {
 /// which halves the verifier's explored-state space on older kernels.
 fn parse_frame<const F: u8>(
     ctx: &XdpContext,
-) -> Result<(u8, usize, u8, usize, u64, u32, Option<&'static XdpInterfacePolicy>), ()> {
+) -> Result<
+    (
+        u8,
+        usize,
+        u8,
+        usize,
+        u64,
+        u32,
+        Option<&'static XdpInterfacePolicy>,
+        u32,
+    ),
+    (),
+> {
     let (eth_proto, ip_offset) = parse_eth_payload(ctx).map_err(|_| ())?;
     let ifindex = ctx.ingress_ifindex() as u32;
     let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
-    let (family, proto, l4_offset, packet_len) = if F == 4 && eth_proto == EtherType::Ipv4 as u16 {
+    let tuple = if F == 4 && eth_proto == EtherType::Ipv4 as u16 {
         let ip = ptr_at::<Ipv4Hdr>(ctx, ip_offset)?;
         let ihl = unsafe { (*ip).ihl() as usize };
         let total_len = unsafe { (*ip).tot_len() as usize };
@@ -266,6 +300,12 @@ fn parse_frame<const F: u8>(
             unsafe { (*ip).proto },
             ip_offset + ihl,
             total_len as u64,
+            local_flags_v4(
+                policy,
+                ifindex,
+                u32::from_be_bytes(unsafe { (*ip).dst_addr }),
+            )
+            .unwrap_or(u32::MAX),
         )
     } else if F == 6 && eth_proto == EtherType::Ipv6 as u16 {
         let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
@@ -290,25 +330,50 @@ fn parse_frame<const F: u8>(
             Some(bounds) => bounds,
             None => return Err(()),
         };
-        (6u8, proto, l4_offset, payload_len as u64)
+        (
+            6u8,
+            proto,
+            l4_offset,
+            payload_len as u64,
+            local_flags_v6(policy, ifindex, unsafe { (*ip).dst_addr }).unwrap_or(u32::MAX),
+        )
     } else {
         return Err(());
     };
-    Ok((family, ip_offset, proto, l4_offset, packet_len, ifindex, policy))
+    let (family, proto, l4_offset, packet_len, local_flags) = tuple;
+    Ok((
+        family,
+        ip_offset,
+        proto,
+        l4_offset,
+        packet_len,
+        ifindex,
+        policy,
+        local_flags,
+    ))
 }
 
 fn try_nat_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
-    let (_, ip_offset, proto, l4_offset, packet_len, _, policy) = parse_frame::<4>(ctx)?;
+    let (_, ip_offset, proto, l4_offset, packet_len, ifindex, policy, local_flags) =
+        parse_frame::<4>(ctx)?;
+    if proto == IpProto::Udp as u8 {
+        stash_work_ctx(ifindex, local_flags, proto, ip_offset, l4_offset, packet_len);
+        unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_UDP4_WORK) };
+        return Ok(redirect_from_scratch(ctx, policy));
+    }
+    Ok(maybe_redirect_scratch(ctx, policy, local_flags, proto, l4_offset))
+}
+
+/// UDP/IPv4 NAT worker: runs with a single verifier entry state so the big
+/// handler is not re-explored under every parser branch state.
+fn try_nat_udp4_work(ctx: &XdpContext) -> Result<u32, ()> {
+    let (ip_offset, l4_offset, packet_len, local_flags, proto, ifindex) = work_ctx()?;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
     let now_ns = unsafe { bpf_ktime_get_ns() };
-    let action = if proto == IpProto::Udp as u8 {
-        try_udp_nat_v4(ctx, ip_offset, l4_offset, packet_len, now_ns)?
-    } else {
-        None
-    };
-    if let Some(action) = action {
+    if let Some(action) = try_udp_nat_v4(ctx, ip_offset, l4_offset, packet_len, now_ns)? {
         return Ok(action);
     }
-    Ok(maybe_redirect(ctx, policy, proto, l4_offset))
+    Ok(maybe_redirect_scratch(ctx, policy, local_flags, proto, l4_offset))
 }
 
 /// Per-family NAT dispatchers: one (family, proto) pair per tail-call target
@@ -316,22 +381,32 @@ fn try_nat_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
 /// SNAT/reverse-lookup branches in a single handler are already ~10KiB of
 /// BPF, and pairing families in one program multiplies states past 1M insns.
 fn try_nat_udp6_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
-    let (_, ip_offset, proto, l4_offset, packet_len, _, policy) = parse_frame::<6>(ctx)?;
-    let now_ns = unsafe { bpf_ktime_get_ns() };
+    let (_, ip_offset, proto, l4_offset, packet_len, ifindex, policy, local_flags) =
+        parse_frame::<6>(ctx)?;
     if proto == IpProto::Udp as u8 {
-        if let Some(action) = try_udp_nat_v6(ctx, ip_offset, l4_offset, packet_len, now_ns)? {
-            return Ok(action);
-        }
-        // The forward half lives in its own tail-call program: keeping the
-        // full handler here pushes the kernel 6.1 verifier past its explored-
-        // state budget. An empty slot returns immediately.
-        unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_UDP6_FWD) };
+        stash_work_ctx(ifindex, local_flags, proto, ip_offset, l4_offset, packet_len);
+        unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_UDP6_WORK) };
+        return Ok(redirect_from_scratch(ctx, policy));
     }
-    Ok(maybe_redirect(ctx, policy, proto, l4_offset))
+    Ok(maybe_redirect_scratch(ctx, policy, local_flags, proto, l4_offset))
+}
+
+fn try_nat_udp6_work(ctx: &XdpContext) -> Result<u32, ()> {
+    let (ip_offset, l4_offset, packet_len, _, _, ifindex) = work_ctx()?;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    if let Some(action) = try_udp_nat_v6(ctx, ip_offset, l4_offset, packet_len, now_ns)? {
+        return Ok(action);
+    }
+    // The forward half lives in its own tail-call program: the work context
+    // is already parked in scratch so no register must survive the call.
+    unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_UDP6_FWD) };
+    Ok(redirect_from_scratch(ctx, policy))
 }
 
 fn try_nat_udp6_fwd(ctx: &XdpContext) -> Result<u32, ()> {
-    let (_, ip_offset, proto, l4_offset, packet_len, _, policy) = parse_frame::<6>(ctx)?;
+    let (ip_offset, l4_offset, packet_len, local_flags, proto, ifindex) = work_ctx()?;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
     let now_ns = unsafe { bpf_ktime_get_ns() };
     let action = if proto == IpProto::Udp as u8 {
         try_udp_nat_v6_fwd(ctx, ip_offset, l4_offset, packet_len, now_ns)?
@@ -341,7 +416,7 @@ fn try_nat_udp6_fwd(ctx: &XdpContext) -> Result<u32, ()> {
     if let Some(action) = action {
         return Ok(action);
     }
-    Ok(maybe_redirect(ctx, policy, proto, l4_offset))
+    Ok(maybe_redirect_scratch(ctx, policy, local_flags, proto, l4_offset))
 }
 
 #[xdp]
@@ -359,33 +434,51 @@ pub fn xdp_nat_udp6_fwd(ctx: XdpContext) -> u32 {
 }
 
 fn try_nat_tcp_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
-    let (_, ip_offset, proto, l4_offset, packet_len, _, policy) = parse_frame::<4>(ctx)?;
+    let (_, ip_offset, proto, l4_offset, packet_len, ifindex, policy, local_flags) =
+        parse_frame::<4>(ctx)?;
+    if proto == IpProto::Tcp as u8 {
+        stash_work_ctx(ifindex, local_flags, proto, ip_offset, l4_offset, packet_len);
+        unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_TCP4_WORK) };
+        return Ok(redirect_from_scratch(ctx, policy));
+    }
+    Ok(maybe_redirect_scratch(ctx, policy, local_flags, proto, l4_offset))
+}
+
+fn try_nat_tcp4_work(ctx: &XdpContext) -> Result<u32, ()> {
+    let (ip_offset, l4_offset, packet_len, local_flags, proto, ifindex) = work_ctx()?;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
     let now_ns = unsafe { bpf_ktime_get_ns() };
-    let action = if proto == IpProto::Tcp as u8 {
-        try_tcp_nat_v4(ctx, ip_offset, l4_offset, packet_len, now_ns)?
-    } else {
-        None
-    };
-    if let Some(action) = action {
+    if let Some(action) = try_tcp_nat_v4(ctx, ip_offset, l4_offset, packet_len, now_ns)? {
         return Ok(action);
     }
-    Ok(maybe_redirect(ctx, policy, proto, l4_offset))
+    Ok(maybe_redirect_scratch(ctx, policy, local_flags, proto, l4_offset))
 }
 
 fn try_nat_tcp6_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
-    let (_, ip_offset, proto, l4_offset, packet_len, _, policy) = parse_frame::<6>(ctx)?;
-    let now_ns = unsafe { bpf_ktime_get_ns() };
+    let (_, ip_offset, proto, l4_offset, packet_len, ifindex, policy, local_flags) =
+        parse_frame::<6>(ctx)?;
     if proto == IpProto::Tcp as u8 {
-        if let Some(action) = try_tcp_nat_v6(ctx, ip_offset, l4_offset, packet_len, now_ns)? {
-            return Ok(action);
-        }
-        unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_TCP6_FWD) };
+        stash_work_ctx(ifindex, local_flags, proto, ip_offset, l4_offset, packet_len);
+        unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_TCP6_WORK) };
+        return Ok(redirect_from_scratch(ctx, policy));
     }
-    Ok(maybe_redirect(ctx, policy, proto, l4_offset))
+    Ok(maybe_redirect_scratch(ctx, policy, local_flags, proto, l4_offset))
+}
+
+fn try_nat_tcp6_work(ctx: &XdpContext) -> Result<u32, ()> {
+    let (ip_offset, l4_offset, packet_len, _, _, ifindex) = work_ctx()?;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
+    let now_ns = unsafe { bpf_ktime_get_ns() };
+    if let Some(action) = try_tcp_nat_v6(ctx, ip_offset, l4_offset, packet_len, now_ns)? {
+        return Ok(action);
+    }
+    unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_TCP6_FWD) };
+    Ok(redirect_from_scratch(ctx, policy))
 }
 
 fn try_nat_tcp6_fwd(ctx: &XdpContext) -> Result<u32, ()> {
-    let (_, ip_offset, proto, l4_offset, packet_len, _, policy) = parse_frame::<6>(ctx)?;
+    let (ip_offset, l4_offset, packet_len, local_flags, proto, ifindex) = work_ctx()?;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
     let now_ns = unsafe { bpf_ktime_get_ns() };
     let action = if proto == IpProto::Tcp as u8 {
         try_tcp_nat_v6_fwd(ctx, ip_offset, l4_offset, packet_len, now_ns)?
@@ -395,7 +488,7 @@ fn try_nat_tcp6_fwd(ctx: &XdpContext) -> Result<u32, ()> {
     if let Some(action) = action {
         return Ok(action);
     }
-    Ok(maybe_redirect(ctx, policy, proto, l4_offset))
+    Ok(maybe_redirect_scratch(ctx, policy, local_flags, proto, l4_offset))
 }
 
 #[xdp]
@@ -443,6 +536,62 @@ pub fn xdp_nat_udp6_dispatch(ctx: XdpContext) -> u32 {
 #[xdp]
 pub fn xdp_nat_tcp6_dispatch(ctx: XdpContext) -> u32 {
     match try_nat_tcp6_dispatch(&ctx) {
+        Ok(action) => {
+            count_action(action);
+            action
+        }
+        Err(_) => {
+            counter_parse_error();
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+#[xdp]
+pub fn xdp_nat_udp4_work(ctx: XdpContext) -> u32 {
+    match try_nat_udp4_work(&ctx) {
+        Ok(action) => {
+            count_action(action);
+            action
+        }
+        Err(_) => {
+            counter_parse_error();
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+#[xdp]
+pub fn xdp_nat_tcp4_work(ctx: XdpContext) -> u32 {
+    match try_nat_tcp4_work(&ctx) {
+        Ok(action) => {
+            count_action(action);
+            action
+        }
+        Err(_) => {
+            counter_parse_error();
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+#[xdp]
+pub fn xdp_nat_udp6_work(ctx: XdpContext) -> u32 {
+    match try_nat_udp6_work(&ctx) {
+        Ok(action) => {
+            count_action(action);
+            action
+        }
+        Err(_) => {
+            counter_parse_error();
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+#[xdp]
+pub fn xdp_nat_tcp6_work(ctx: XdpContext) -> u32 {
+    match try_nat_tcp6_work(&ctx) {
         Ok(action) => {
             count_action(action);
             action
@@ -534,31 +683,16 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     }
     let source = unsafe { (*ip).src_addr };
     let source_be = u32::from_be_bytes(source);
-    let key = XdpIpv4Key { addr_be: source_be };
-    // SAFETY: XDP programs may call the ktime helper; the returned monotonic
-    // timestamp is only used for read-only rule deadline comparisons.
-    let now_mono_ns = unsafe { bpf_ktime_get_ns() };
-    if active_exact_v4(&XDP_ALLOWED_V4, &key, now_mono_ns)
-        || active_lpm_v4(&XDP_ALLOWED_V4_LPM, source_be, now_mono_ns)
-    {
-        return Ok(xdp_action::XDP_PASS);
-    }
-    if active_exact_v4(&XDP_BLOCKED_V4, &key, now_mono_ns)
-        || active_lpm_v4(&XDP_BLOCKED_V4_LPM, source_be, now_mono_ns)
-    {
-        return Ok(block_action(policy));
-    }
     let destination_be = u32::from_be_bytes(unsafe { (*ip).dst_addr });
+    // Scope resolution happens once: local_flags is the VIP's XDP_LOCAL_*
+    // value, or None when the destination lies outside the protected set.
+    let local_flags = local_flags_v4(policy, ifindex, destination_be);
     // Any fragment — first included — is classified FRAGMENTED and leaves the
     // pipeline here: a first fragment alone never creates a trusted L4 flow
-    // (no rate bucket, no redirect, no NAT conntrack). Disposition comes from
-    // the per-VIP override or the interface's security-domain policy.
+    // (no rate bucket, no redirect, no NAT conntrack). The whitelist cannot
+    // bypass this: fragment bounds are a hard budget, checked before ACL.
     if unsafe { (*ip).frag_offset() != 0 || ((*ip).frag_flags() & 1) != 0 } {
-        return Ok(fragmented_action(fragment_policy_v4(
-            policy,
-            ifindex,
-            destination_be,
-        )));
+        return Ok(fragmented_action(fragment_policy(policy, local_flags)));
     }
     let protocol = unsafe { (*ip).proto };
     let l4_offset = ip_offset + ihl;
@@ -568,25 +702,144 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         L4Class::Control => return Ok(control_pass()),
         L4Class::Unsupported => return Ok(unsupported_pass()),
     }
-    if rate_limited_v4(ctx, &key, protocol, l4_offset, now_mono_ns) {
+    // SAFETY: XDP programs may call the ktime helper; the returned monotonic
+    // timestamp is only used for read-only rule deadline comparisons.
+    let now_mono_ns = unsafe { bpf_ktime_get_ns() };
+    // Whitelist priority is explicit: an allowed source skips ACL block rules
+    // and per-source rate limiting — but it already passed malformed,
+    // fragment and L4 sanity checks above, so hard bounds still apply.
+    match acl_verdict_v4(source_be, source_be, now_mono_ns) {
+        AclVerdict::Allow => return Ok(xdp_action::XDP_PASS),
+        AclVerdict::Block => return Ok(block_action(policy)),
+        AclVerdict::None => {}
+    }
+    if rate_limited_v4(ctx, source_be, protocol, l4_offset, now_mono_ns) {
         counter_rate_limited();
         return Ok(xdp_action::XDP_DROP);
     }
-    if let Some(policy) = policy {
-        if !local_ipv4_allowed(policy, ifindex, destination_be) {
-            return Ok(xdp_action::XDP_PASS);
-        }
-        if policy.mode == 2 {
-            if protocol == IpProto::Tcp as u8 {
-                // A tail call only returns when the slot is empty: explicit
-                // fallback to the redirect/PASS path, never a drop.
-                unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_TCP) };
-            } else if protocol == IpProto::Udp as u8 {
-                unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT) };
-            }
+    dispatch_local(ctx, policy, local_flags, protocol, l4_offset, XDP_DISPATCH_NAT_TCP, XDP_DISPATCH_NAT)
+}
+
+/// Shared tail for the IPv4/IPv6 inbound handlers: destinations outside the
+/// protected VIP set pass to the kernel (observable), non-TCP/UDP always
+/// passes — `maybe_redirect` is a no-op for them — and local TCP/UDP in
+/// proxy mode dispatches through the NAT tail call first. When the slot is
+/// empty the tail call returns and the redirect falls back to the inline
+/// path, which re-reads its arguments from the per-CPU scratch so the
+/// dispatch site carries no spillable registers across the call.
+#[inline(always)]
+fn dispatch_local(
+    ctx: &XdpContext,
+    policy: Option<&XdpInterfacePolicy>,
+    local_flags: Option<u32>,
+    protocol: u8,
+    l4_offset: usize,
+    tcp_slot: u32,
+    udp_slot: u32,
+) -> Result<u32, ()> {
+    let Some(policy) = policy else {
+        return Ok(xdp_action::XDP_PASS);
+    };
+    let Some(flags) = local_flags else {
+        // Inbound direction only: destinations outside the protected VIP set
+        // pass to the kernel untouched and stay observable.
+        counter_nonlocal_pass();
+        return Ok(xdp_action::XDP_PASS);
+    };
+    if policy.mode != 2 {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    let slot = match protocol {
+        value if value == IpProto::Tcp as u8 => tcp_slot,
+        value if value == IpProto::Udp as u8 => udp_slot,
+        _ => return Ok(xdp_action::XDP_PASS),
+    };
+    stash_redirect_ctx(flags, protocol, l4_offset);
+    // A tail call only returns when the slot is empty: explicit fallback to
+    // the redirect/PASS path, never a silent drop.
+    unsafe { XDP_DISPATCH.tail_call(ctx, slot) };
+    Ok(redirect_from_scratch(ctx, Some(policy)))
+}
+
+/// Stash the redirect context before a tail call so nothing must survive the
+/// call in registers — a missing scratch entry is recovered on read-back.
+#[inline(always)]
+fn stash_redirect_ctx(local_flags: u32, protocol: u8, l4_offset: usize) {
+    if let Ok(scratch) = nat_scratch() {
+        unsafe {
+            (*scratch).redir_flags = local_flags;
+            (*scratch).redir_proto = protocol;
+            (*scratch).redir_l4off = l4_offset as u16;
         }
     }
-    Ok(maybe_redirect(ctx, policy, protocol, l4_offset))
+}
+
+/// Park the full worker context before a dispatch -> work tail call: packet
+/// offsets are re-validated inside the worker (scalar provenance does not
+/// survive a tail call anyway), while flags/proto/offsets feed the redirect
+/// fallback when a later slot in the chain is empty.
+#[inline(always)]
+fn stash_work_ctx(
+    ifindex: u32,
+    local_flags: u32,
+    protocol: u8,
+    ip_offset: usize,
+    l4_offset: usize,
+    packet_len: u64,
+) {
+    if let Ok(scratch) = nat_scratch() {
+        unsafe {
+            (*scratch).redir_flags = local_flags;
+            (*scratch).redir_proto = protocol;
+            (*scratch).redir_l4off = l4_offset as u16;
+            (*scratch).work_ip_off = ip_offset as u32;
+            (*scratch).work_ifindex = ifindex;
+            (*scratch).work_pkt_len = packet_len;
+        }
+    }
+}
+
+/// Read back the worker context parked by `stash_work_ctx`. Offsets arrive as
+/// unbounded scalars; every packet access in the worker re-checks bounds via
+/// `ptr_at`/`ptr_at_mut`, so no verifier provenance is needed here.
+#[inline(always)]
+fn work_ctx() -> Result<(usize, usize, u64, u32, u8, u32), ()> {
+    let scratch = nat_scratch()?;
+    unsafe {
+        let ip_offset = (*scratch).work_ip_off as usize;
+        let l4_offset = (*scratch).redir_l4off as usize;
+        // Bound the scalars before they meet packet pointers: a full-width
+        // u32/u16 range defeats the verifier's variable-offset tracking, and
+        // every real offset is under a few hundred bytes anyway.
+        if ip_offset > 2048 || l4_offset > 2048 {
+            return Err(());
+        }
+        Ok((
+            ip_offset,
+            l4_offset,
+            (*scratch).work_pkt_len,
+            (*scratch).redir_flags,
+            (*scratch).redir_proto,
+            (*scratch).work_ifindex,
+        ))
+    }
+}
+
+/// Inline redirect fallback after an empty NAT slot: the context was written
+/// to the per-CPU scratch before the tail call, so nothing must survive the
+/// call in registers. Kept as a two-argument subprogram — all-argument
+/// registers, no stack slot — so the post-tail-call path in the main frame
+/// stays a single call instead of the full redirect body.
+#[inline(never)]
+fn redirect_from_scratch(ctx: &XdpContext, policy: Option<&XdpInterfacePolicy>) -> u32 {
+    let Ok(scratch) = nat_scratch() else {
+        counter_map_miss();
+        return match policy {
+            Some(p) if p.fallback_pass == 0 => xdp_action::XDP_DROP,
+            _ => xdp_action::XDP_PASS,
+        };
+    };
+    maybe_redirect(ctx, policy, scratch)
 }
 
 fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
@@ -603,20 +856,6 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         return Ok(malformed_drop());
     }
     let source = unsafe { (*ip).src_addr };
-    let key = XdpIpv6Key { addr: source };
-    // SAFETY: XDP programs may call the ktime helper; the returned monotonic
-    // timestamp is only used for read-only rule deadline comparisons.
-    let now_mono_ns = unsafe { bpf_ktime_get_ns() };
-    if active_exact_v6(&XDP_ALLOWED_V6, &key, now_mono_ns)
-        || active_lpm_v6(&XDP_ALLOWED_V6_LPM, source, now_mono_ns)
-    {
-        return Ok(xdp_action::XDP_PASS);
-    }
-    if active_exact_v6(&XDP_BLOCKED_V6, &key, now_mono_ns)
-        || active_lpm_v6(&XDP_BLOCKED_V6_LPM, source, now_mono_ns)
-    {
-        return Ok(block_action(policy));
-    }
     let destination = unsafe { (*ip).dst_addr };
     let payload_len = unsafe { u16::from_be_bytes((*ip).payload_len) as usize };
     let packet_end = match ip_offset
@@ -629,6 +868,8 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     if packet_end > ctx.data_end().saturating_sub(ctx.data()) {
         return Ok(malformed_drop());
     }
+    // Same ordering as handle_ipv4: fragment bounds precede the whitelist.
+    let local_flags = local_flags_v6(policy, ifindex, destination);
     let protocol = unsafe { (*ip).next_hdr };
     let (protocol, l4_offset) = match ipv6_transport_offset(
         ctx,
@@ -644,11 +885,7 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
             core::hint::black_box(packed & 0xffff_ffff) as usize,
         ),
         Ok(packed) if packed & 0xff == V6N_FRAGMENTED => {
-            return Ok(fragmented_action(fragment_policy_v6(
-                policy,
-                ifindex,
-                destination,
-            )));
+            return Ok(fragmented_action(fragment_policy(policy, local_flags)));
         }
         Ok(_) => return Ok(unsupported_pass()),
         Err(()) => return Ok(malformed_drop()),
@@ -659,23 +896,19 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         L4Class::Control => return Ok(control_pass()),
         L4Class::Unsupported => return Ok(unsupported_pass()),
     }
-    if rate_limited_v6(ctx, &key, protocol, l4_offset, now_mono_ns) {
+    // SAFETY: XDP programs may call the ktime helper; the returned monotonic
+    // timestamp is only used for read-only rule deadline comparisons.
+    let now_mono_ns = unsafe { bpf_ktime_get_ns() };
+    match acl_verdict_v6(source, now_mono_ns) {
+        AclVerdict::Allow => return Ok(xdp_action::XDP_PASS),
+        AclVerdict::Block => return Ok(block_action(policy)),
+        AclVerdict::None => {}
+    }
+    if rate_limited_v6(ctx, source, protocol, l4_offset, now_mono_ns) {
         counter_rate_limited();
         return Ok(xdp_action::XDP_DROP);
     }
-    if let Some(policy) = policy {
-        if !local_ipv6_allowed(policy, ifindex, destination) {
-            return Ok(xdp_action::XDP_PASS);
-        }
-        if policy.mode == 2 {
-            if protocol == IpProto::Tcp as u8 {
-                unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_TCP6) };
-            } else if protocol == IpProto::Udp as u8 {
-                unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_NAT_UDP6) };
-            }
-        }
-    }
-    Ok(maybe_redirect(ctx, policy, protocol, l4_offset))
+    dispatch_local(ctx, policy, local_flags, protocol, l4_offset, XDP_DISPATCH_NAT_TCP6, XDP_DISPATCH_NAT_UDP6)
 }
 
 /// IPv6 extension-chain walk, packed into a single u64 so the return value
@@ -767,7 +1000,7 @@ enum L4Class {
     Unsupported,
 }
 
-#[inline(always)]
+#[inline(never)]
 fn l4_sanity(ctx: &XdpContext, protocol: u8, l4_offset: usize, packet_end: usize) -> L4Class {
     match protocol {
         value if value == IpProto::Tcp as u8 => {
@@ -837,7 +1070,13 @@ fn block_action(policy: Option<&XdpInterfacePolicy>) -> u32 {
             counter_acl_blocked();
             xdp_action::XDP_DROP
         }
-        _ => xdp_action::XDP_PASS,
+        // Observe mode: the would-be drop stays visible instead of a silent
+        // pass — previewing enforcement is the point of observe.
+        Some(_) => {
+            counter_acl_would_block();
+            xdp_action::XDP_PASS
+        }
+        None => xdp_action::XDP_PASS,
     }
 }
 
@@ -878,62 +1117,88 @@ fn fragmented_action(action: u8) -> u32 {
 }
 
 /// Per-VIP override (XDP_LOCAL_* value bits[2:1]) wins over the interface
-/// fragment_action; interfaces without local-IP filtering use the interface
-/// default directly.
+/// fragment_action. `local_flags` is the already-resolved XDP_LOCAL_* value
+/// (None = destination outside the protected set -> interface default).
 #[inline(always)]
-fn fragment_policy_v4(
+fn fragment_policy(
     policy: Option<&XdpInterfacePolicy>,
-    ifindex: u32,
-    destination_be: u32,
+    local_flags: Option<u32>,
 ) -> u8 {
-    if let Some(policy) = policy {
-        if policy.local_ip_filter != 0 {
-            let key = XdpLocalIpv4Key::new(ifindex, destination_be);
-            if let Some(flags) = unsafe { XDP_LOCAL_V4.get(&key) } {
-                let code = *flags & (XDP_LOCAL_FRAG_PASS | XDP_LOCAL_FRAG_DROP);
-                if code == XDP_LOCAL_FRAG_PASS {
-                    return XDP_FRAGMENT_PASS;
-                }
-                if code == XDP_LOCAL_FRAG_DROP {
-                    return XDP_FRAGMENT_DROP;
-                }
-            }
+    if let Some(flags) = local_flags {
+        let code = flags & (XDP_LOCAL_FRAG_PASS | XDP_LOCAL_FRAG_DROP);
+        if code == XDP_LOCAL_FRAG_PASS {
+            return XDP_FRAGMENT_PASS;
         }
-        return policy.fragment_action;
+        if code == XDP_LOCAL_FRAG_DROP {
+            return XDP_FRAGMENT_DROP;
+        }
     }
-    XDP_FRAGMENT_PASS
+    match policy {
+        Some(policy) => policy.fragment_action,
+        None => XDP_FRAGMENT_PASS,
+    }
 }
 
-#[inline(always)]
-fn fragment_policy_v6(
-    policy: Option<&XdpInterfacePolicy>,
-    ifindex: u32,
-    destination: [u8; 16],
-) -> u8 {
-    if let Some(policy) = policy {
-        if policy.local_ip_filter != 0 {
-            let key = XdpLocalIpv6Key::new(ifindex, destination);
-            if let Some(flags) = unsafe { XDP_LOCAL_V6.get(&key) } {
-                let code = *flags & (XDP_LOCAL_FRAG_PASS | XDP_LOCAL_FRAG_DROP);
-                if code == XDP_LOCAL_FRAG_PASS {
-                    return XDP_FRAGMENT_PASS;
-                }
-                if code == XDP_LOCAL_FRAG_DROP {
-                    return XDP_FRAGMENT_DROP;
-                }
-            }
-        }
-        return policy.fragment_action;
-    }
-    XDP_FRAGMENT_PASS
-}
-
-fn maybe_redirect(
+/// `local_flags` is the destination VIP's resolved XDP_LOCAL_* value —
+/// None when the destination is outside the protected set. A VIP without
+/// XDP_LOCAL_REDIRECT is protected but never redirected: protection scope
+/// and the redirect switch are independent (EN-06), so a management VIP
+/// sharing a proxy port with a tenant VIP cannot be pulled into AF_XDP.
+#[inline(never)]
+/// Fills the per-CPU redirect context and enters `maybe_redirect`; a missing
+/// scratch entry falls back per interface policy — never silently. The raw
+/// flags stay a plain u32 (u32::MAX = nonlocal) so the whole signature fits
+/// in argument registers — an Option<u32> would take two and push the sixth
+/// argument onto the R11 caller-frame slot the verifier rejects.
+fn maybe_redirect_scratch(
     ctx: &XdpContext,
     policy: Option<&XdpInterfacePolicy>,
+    local_flags_raw: u32,
     protocol: u8,
     l4_offset: usize,
 ) -> u32 {
+    let Ok(scratch) = nat_scratch() else {
+        counter_map_miss();
+        return match policy {
+            Some(p) if p.fallback_pass == 0 => xdp_action::XDP_DROP,
+            _ => xdp_action::XDP_PASS,
+        };
+    };
+    unsafe {
+        (*scratch).redir_flags = local_flags_raw;
+        (*scratch).redir_proto = protocol;
+        (*scratch).redir_l4off = l4_offset as u16;
+    }
+    maybe_redirect(ctx, policy, scratch)
+}
+
+/// Three register-width arguments only: a wider signature makes LLVM place
+/// the spilled argument in the R11 frame that the verifier rejects in
+/// programs containing tail calls.
+fn maybe_redirect(
+    ctx: &XdpContext,
+    policy: Option<&XdpInterfacePolicy>,
+    scratch: *mut NatScratch,
+) -> u32 {
+    let (local_flags_raw, protocol, l4_offset) = unsafe {
+        (
+            (*scratch).redir_flags,
+            (*scratch).redir_proto,
+            (*scratch).redir_l4off as usize,
+        )
+    };
+    // A map-loaded scalar has no verifier range; bound it before it becomes a
+    // packet offset. L4 never starts past the bounded header walk (~512B), so
+    // a larger value only means a corrupt scratch — pass, never read blind.
+    if l4_offset > 512 {
+        counter_parse_error();
+        return xdp_action::XDP_PASS;
+    }
+    let local_flags = if local_flags_raw == u32::MAX {
+        None
+    } else {
+        Some(local_flags_raw)
+    };
     let Some(policy) = policy else {
         return xdp_action::XDP_PASS;
     };
@@ -941,6 +1206,10 @@ fn maybe_redirect(
     let ifindex = ctx.ingress_ifindex() as u32;
     if policy.mode != 2 {
         return xdp_action::XDP_PASS;
+    }
+    match local_flags {
+        Some(flags) if flags & XDP_LOCAL_REDIRECT != 0 => {}
+        _ => return xdp_action::XDP_PASS,
     }
 
     let mut steered_xsk: Option<u32> = None;
@@ -964,7 +1233,9 @@ fn maybe_redirect(
             if !proxy_port_enabled(dst_port_be, protocol) {
                 return xdp_action::XDP_PASS;
             }
-            steered_xsk = quic_dcid_xsk_index(ctx, l4_offset + mem::size_of::<UdpHdr>());
+            steered_xsk = ptr_at::<u8>(ctx, l4_offset + mem::size_of::<UdpHdr>())
+                .ok()
+                .and_then(|base| quic_dcid_xsk_index(ctx, base));
         }
         _ => return xdp_action::XDP_PASS,
     }
@@ -1004,22 +1275,31 @@ fn maybe_redirect(
 /// so they keep RSS queue affinity (userspace resolves those flows through the
 /// shared demux route table). Returns the mapped XSK index, or None to use the
 /// receiving queue.
+/// Takes a packet pointer (not a scalar offset): the pointer carries its
+/// bounds binding across the subprogram boundary, while a scalar argument
+/// arrives with no packet range and the verifier rejects `data + arg`.
 #[inline(never)]
-fn quic_dcid_xsk_index(ctx: &XdpContext, payload_offset: usize) -> Option<u32> {
-    let first = read_u8(ctx, payload_offset).ok()?;
+fn quic_dcid_xsk_index(ctx: &XdpContext, base: *const u8) -> Option<u32> {
+    // black_box keeps LLVM from hoisting the data_end load into the caller
+    // and handing it in as a pkt_end argument — truncating that pointer in
+    // here trips "pointer arithmetic on pkt_end prohibited".
+    let end = core::hint::black_box(ctx).data_end() as *const u8;
+    // One bound check covers the fixed long-header prefix: first byte,
+    // 4-byte version, DCID length.
+    if unsafe { base.add(6) } > end {
+        return None;
+    }
+    let first = unsafe { *base };
     if first & 0x80 == 0 {
         return None;
     }
-    let version = u32::from_be_bytes([
-        read_u8(ctx, payload_offset + 1).ok()?,
-        read_u8(ctx, payload_offset + 2).ok()?,
-        read_u8(ctx, payload_offset + 3).ok()?,
-        read_u8(ctx, payload_offset + 4).ok()?,
-    ]);
+    let version = u32::from_be_bytes(unsafe {
+        [*base.add(1), *base.add(2), *base.add(3), *base.add(4)]
+    });
     if version == 0 {
         return None;
     }
-    let dcid_len = read_u8(ctx, payload_offset + 5).ok()? as usize;
+    let dcid_len = unsafe { *base.add(5) } as usize;
     if dcid_len == 0 || dcid_len > 20 {
         return None;
     }
@@ -1031,7 +1311,12 @@ fn quic_dcid_xsk_index(ctx: &XdpContext, payload_offset: usize) -> Option<u32> {
         if i >= dcid_len {
             key.bytes[i] = 0;
         } else {
-            key.bytes[i] = read_u8(ctx, payload_offset + 6 + i).ok()?;
+            // Per-iteration bound: a variable-length check up front gives the
+            // verifier no constant range for the unrolled reads.
+            if unsafe { base.add(7 + i) } > end {
+                return None;
+            }
+            key.bytes[i] = unsafe { *base.add(6 + i) };
         }
     }
     unsafe { XDP_QUIC_DCID.get(&(*scratch).dcid_key).copied() }
@@ -1044,7 +1329,7 @@ fn quic_dcid_xsk_index(ctx: &XdpContext, payload_offset: usize) -> Option<u32> {
 #[inline(never)]
 fn rate_limited_v4(
     ctx: &XdpContext,
-    key: &XdpIpv4Key,
+    addr_be: u32,
     protocol: u8,
     l4_offset: usize,
     now_mono_ns: u64,
@@ -1065,13 +1350,14 @@ fn rate_limited_v4(
     if limit == 0 || cfg.window_ns == 0 {
         return false;
     }
-    rate_bucket_hit_v4(key, limit, cfg.window_ns, now_mono_ns)
+    let key = XdpIpv4Key::new(addr_be);
+    rate_bucket_hit_v4(&key, limit, cfg.window_ns, now_mono_ns)
 }
 
 #[inline(never)]
 fn rate_limited_v6(
     ctx: &XdpContext,
-    key: &XdpIpv6Key,
+    source: [u8; 16],
     protocol: u8,
     l4_offset: usize,
     now_mono_ns: u64,
@@ -1092,7 +1378,8 @@ fn rate_limited_v6(
     if limit == 0 || cfg.window_ns == 0 {
         return false;
     }
-    rate_bucket_hit_v6(key, limit, cfg.window_ns, now_mono_ns)
+    let key = XdpIpv6Key::new(source);
+    rate_bucket_hit_v6(&key, limit, cfg.window_ns, now_mono_ns)
 }
 
 fn is_tcp_syn_attempt(ctx: &XdpContext, l4_offset: usize) -> bool {
@@ -1178,19 +1465,46 @@ fn udp_csum_update(
     if old_check == 0 {
         return Ok(());
     }
-    let mut diff: i64 = 0;
-    let mut i = 0;
-    while i < addr_word_count {
+    // `addr_word_count` is 1 (IPv4) or 4 (IPv6) at the call sites; constant
+    // indices keep the verifier's stack-slot tracking straight-line instead
+    // of a variable-bound loop over `words[i]`.
+    let mut diff: i64 = unsafe {
+        bpf_csum_diff(
+            &mut old_addr_words[0] as *mut u32,
+            4,
+            &mut new_addr_words[0] as *mut u32,
+            4,
+            0,
+        )
+    } as i64;
+    if addr_word_count == 4 {
         diff = unsafe {
             bpf_csum_diff(
-                &mut old_addr_words[i] as *mut u32,
+                &mut old_addr_words[1] as *mut u32,
                 4,
-                &mut new_addr_words[i] as *mut u32,
+                &mut new_addr_words[1] as *mut u32,
                 4,
                 diff as u32,
             )
-        };
-        i += 1;
+        } as i64;
+        diff = unsafe {
+            bpf_csum_diff(
+                &mut old_addr_words[2] as *mut u32,
+                4,
+                &mut new_addr_words[2] as *mut u32,
+                4,
+                diff as u32,
+            )
+        } as i64;
+        diff = unsafe {
+            bpf_csum_diff(
+                &mut old_addr_words[3] as *mut u32,
+                4,
+                &mut new_addr_words[3] as *mut u32,
+                4,
+                diff as u32,
+            )
+        } as i64;
     }
     if old_port != new_port {
         // The port is a 16-bit word; place it in the low two bytes of the
@@ -1310,14 +1624,16 @@ fn snat_alloc(
     scratch: *mut NatScratch,
     fwd_map: &HashMap<XdpUdpFwdKey, XdpUdpFwdRule>,
 ) -> Option<u16> {
+    // Word-wise mixing keeps this straight-line for the verifier; the hash
+    // only feeds the SNAT probe start so any deterministic mix is valid.
     let mut h = 0x9e37_79b9u32;
-    let mut i = 0usize;
     unsafe {
         let v = &(*scratch).snat_rev_value;
-        while i < 16 {
-            h = h.wrapping_mul(31) ^ v.client_addr[i] as u32;
-            i += 1;
-        }
+        let a = (v.client_addr.as_ptr() as *const u64).read_unaligned();
+        let b = (v.client_addr.as_ptr() as *const u64).add(1).read_unaligned();
+        h ^= a as u32 ^ (a >> 32) as u32;
+        h = h.wrapping_mul(31);
+        h ^= b as u32 ^ (b >> 32) as u32;
         h ^= ((v.client_port_be as u32) << 8) | v.backend_port_be as u32;
     }
     h = h.wrapping_mul(0x85eb_ca6b);
@@ -1335,7 +1651,7 @@ fn snat_alloc(
         unsafe {
             let rk = &(*scratch).snat_rev_key;
             let k = &mut (*scratch).fwd_key;
-            k.addr = rk.listen_addr;
+            copy16(&mut k.addr, &rk.listen_addr);
             k.port_be = port_be;
             k.family = rk.family;
             k._pad = 0;
@@ -1372,8 +1688,8 @@ fn snat_prefill(scratch: *mut NatScratch, client_mac: [u8; 6], server_id: i64) {
         let ck = &(*scratch).ct_key;
         let rk = &(*scratch).snat_rev_key;
         let v = &mut (*scratch).snat_rev_value;
-        v.client_addr = ck.client_addr;
-        v.backend_addr = ck.backend_addr;
+        copy16(&mut v.client_addr, &ck.client_addr);
+        copy16(&mut v.backend_addr, &ck.backend_addr);
         v.client_mac = client_mac;
         v.client_port_be = ck.client_port_be;
         v.backend_port_be = ck.backend_port_be;
@@ -1392,7 +1708,16 @@ fn snat_prefill(scratch: *mut NatScratch, client_mac: [u8; 6], server_id: i64) {
 fn snat_rev_lookup(scratch: *mut NatScratch) -> bool {
     unsafe {
         if let Some(v) = XDP_SNAT_REV.get(&(*scratch).snat_rev_key) {
-            (*scratch).snat_rev_value = *v;
+            // Word-wise snapshot: a whole-struct assignment lowers to a
+            // variable-index byte loop that multiplies verifier states past
+            // the exploration limit on older kernels.
+            let src = v as *const XdpSnatRevValue as *const u64;
+            let dst = &mut (*scratch).snat_rev_value as *mut XdpSnatRevValue as *mut u64;
+            let mut i = 0usize;
+            while i < mem::size_of::<XdpSnatRevValue>() / mem::size_of::<u64>() {
+                core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+                i += 1;
+            }
             return true;
         }
     }
@@ -1549,8 +1874,8 @@ fn try_udp_nat_v4(
             // Rebuild the conntrack key for accounting and idle refresh.
             let k = &mut (*scratch).ct_key;
             let rv = &(*scratch).snat_rev_value;
-            k.client_addr = rv.client_addr;
-            k.backend_addr = rv.backend_addr;
+            copy16(&mut k.client_addr, &rv.client_addr);
+            copy16(&mut k.backend_addr, &rv.backend_addr);
             k.client_port_be = rv.client_port_be;
             k.backend_port_be = rv.backend_port_be;
             k.family = 4;
@@ -1622,7 +1947,7 @@ fn try_udp_nat_v4(
     unsafe {
         let k = &mut (*scratch).ct_key;
         k.client_addr = v4_embed(src_be);
-        k.backend_addr = rule.backend_addr;
+        copy16(&mut k.backend_addr, &rule.backend_addr);
         k.client_port_be = src_port;
         k.backend_port_be = rule.backend_port_be;
         k.family = 4;
@@ -1642,7 +1967,7 @@ fn try_udp_nat_v4(
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         let v = unsafe { &(*scratch).ct_value };
-        ct.listen_addr = v.listen_addr;
+        unsafe { copy16(&mut ct.listen_addr, &v.listen_addr) };
         ct.client_mac = v.client_mac;
         ct.listen_port_be = v.listen_port_be;
         ct.family = v.family;
@@ -1739,17 +2064,13 @@ fn try_udp_nat_v6(
     let udp = ptr_at::<UdpHdr>(ctx, l4_offset)?;
     let src_port = unsafe { u16::from_ne_bytes((*udp).src) };
     let dst_port = unsafe { u16::from_ne_bytes((*udp).dst) };
-    let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
     let scratch = nat_scratch()?;
-    unsafe {
-        (*scratch).pkt_src = (*ip).src_addr;
-        (*scratch).pkt_dst = (*ip).dst_addr;
-    }
+    copy_v6_addrs(ctx, ip_offset, scratch)?;
 
     unsafe {
         let k = &mut (*scratch).ct_key;
-        k.client_addr = (*scratch).pkt_dst;
-        k.backend_addr = (*scratch).pkt_src;
+        copy16(&mut k.client_addr, &(*scratch).pkt_dst);
+        copy16(&mut k.backend_addr, &(*scratch).pkt_src);
         k.client_port_be = dst_port;
         k.backend_port_be = src_port;
         k.family = 6;
@@ -1765,7 +2086,7 @@ fn try_udp_nat_v6(
             words16_into(&ct.listen_addr, &mut (*scratch).csum_new);
         }
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-        unsafe { (*ip_hdr).src_addr = ct.listen_addr };
+        unsafe { copy16(&mut (*ip_hdr).src_addr, &ct.listen_addr) };
         let udp_hdr = ptr_at_mut::<UdpHdr>(ctx, l4_offset)?;
         unsafe { (*udp_hdr).src = listen_port.to_ne_bytes() };
         udp_csum_update(ctx, l4_offset, unsafe { &mut (*scratch).csum_old }, unsafe { &mut (*scratch).csum_new }, 4, src_port, listen_port)?;
@@ -1779,7 +2100,7 @@ fn try_udp_nat_v6(
     // source must match the bound backend tuple.
     unsafe {
             let k = &mut (*scratch).snat_rev_key;
-            k.listen_addr = unsafe { (*scratch).pkt_dst };
+            copy16(&mut k.listen_addr, &(*scratch).pkt_dst);
             k.snat_port_be = dst_port;
             k.proto = 17;
             k.family = 6;
@@ -1797,8 +2118,8 @@ fn try_udp_nat_v6(
         unsafe {
             let k = &mut (*scratch).ct_key;
             let rv = &(*scratch).snat_rev_value;
-            k.client_addr = rv.client_addr;
-            k.backend_addr = rv.backend_addr;
+            copy16(&mut k.client_addr, &rv.client_addr);
+            copy16(&mut k.backend_addr, &rv.backend_addr);
             k.client_port_be = rv.client_port_be;
             k.backend_port_be = rv.backend_port_be;
             k.family = 6;
@@ -1810,7 +2131,7 @@ fn try_udp_nat_v6(
             words16_into(&(*scratch).pkt_dst, &mut (*scratch).csum_new);
         }
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-        unsafe { (*ip_hdr).src_addr = (*scratch).pkt_dst };
+        unsafe { copy16(&mut (*ip_hdr).src_addr, &(*scratch).pkt_dst) };
         let udp_hdr = ptr_at_mut::<UdpHdr>(ctx, l4_offset)?;
         unsafe { (*udp_hdr).src = listen_port.to_ne_bytes() };
         udp_csum_update(ctx, l4_offset, unsafe { &mut (*scratch).csum_old }, unsafe { &mut (*scratch).csum_new }, 4, src_port, listen_port)?;
@@ -1819,7 +2140,7 @@ fn try_udp_nat_v6(
             words16_into(&(*scratch).snat_rev_value.client_addr, &mut (*scratch).csum_new);
         }
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-        unsafe { (*ip_hdr).dst_addr = (*scratch).snat_rev_value.client_addr };
+        unsafe { copy16(&mut (*ip_hdr).dst_addr, &(*scratch).snat_rev_value.client_addr) };
         let udp_hdr = ptr_at_mut::<UdpHdr>(ctx, l4_offset)?;
         unsafe { (*udp_hdr).dst = client_port.to_ne_bytes() };
         udp_csum_update(ctx, l4_offset, unsafe { &mut (*scratch).csum_old }, unsafe { &mut (*scratch).csum_new }, 4, dst_port, client_port)?;
@@ -1861,15 +2182,11 @@ fn try_udp_nat_v6_fwd(
     let udp = ptr_at::<UdpHdr>(ctx, l4_offset)?;
     let src_port = unsafe { u16::from_ne_bytes((*udp).src) };
     let dst_port = unsafe { u16::from_ne_bytes((*udp).dst) };
-    let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
     let scratch = nat_scratch()?;
-    unsafe {
-        (*scratch).pkt_src = (*ip).src_addr;
-        (*scratch).pkt_dst = (*ip).dst_addr;
-    }
+    copy_v6_addrs(ctx, ip_offset, scratch)?;
     unsafe {
         let k = &mut (*scratch).fwd_key;
-        k.addr = (*scratch).pkt_dst;
+        copy16(&mut k.addr, &(*scratch).pkt_dst);
         k.port_be = dst_port;
         k.family = 6;
     };
@@ -1880,14 +2197,14 @@ fn try_udp_nat_v6_fwd(
     let client_mac = unsafe { (*eth).src_addr };
     unsafe {
         let k = &mut (*scratch).ct_key;
-        k.client_addr = (*scratch).pkt_src;
-        k.backend_addr = rule.backend_addr;
+        copy16(&mut k.client_addr, &(*scratch).pkt_src);
+        copy16(&mut k.backend_addr, &rule.backend_addr);
         k.client_port_be = src_port;
         k.backend_port_be = rule.backend_port_be;
         k.family = 6;
         k.proto = 17;
         let v = &mut (*scratch).ct_value;
-        v.listen_addr = (*scratch).pkt_dst;
+        copy16(&mut v.listen_addr, &(*scratch).pkt_dst);
         v.client_mac = client_mac;
         v.listen_port_be = dst_port;
         v.family = 6;
@@ -1901,7 +2218,7 @@ fn try_udp_nat_v6_fwd(
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         let v = unsafe { &(*scratch).ct_value };
-        ct.listen_addr = v.listen_addr;
+        unsafe { copy16(&mut ct.listen_addr, &v.listen_addr) };
         ct.client_mac = v.client_mac;
         ct.listen_port_be = v.listen_port_be;
         ct.family = v.family;
@@ -1913,7 +2230,7 @@ fn try_udp_nat_v6_fwd(
         if rule.snat != 0 {
             unsafe {
                 let k = &mut (*scratch).snat_rev_key;
-                k.listen_addr = unsafe { (*scratch).pkt_dst };
+                copy16(&mut k.listen_addr, &(*scratch).pkt_dst);
                 k.snat_port_be = 0;
                 k.proto = 17;
                 k.family = 6;
@@ -1945,7 +2262,7 @@ fn try_udp_nat_v6_fwd(
         words16_into(&rule.backend_addr, &mut (*scratch).csum_new);
     }
     let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-    unsafe { (*ip_hdr).dst_addr = rule.backend_addr };
+    unsafe { copy16(&mut (*ip_hdr).dst_addr, &rule.backend_addr) };
     let udp_hdr = ptr_at_mut::<UdpHdr>(ctx, l4_offset)?;
     unsafe { (*udp_hdr).dst = rule.backend_port_be.to_ne_bytes() };
     udp_csum_update(ctx, l4_offset, unsafe { &mut (*scratch).csum_old }, unsafe { &mut (*scratch).csum_new }, 4, dst_port, rule.backend_port_be)?;
@@ -1955,7 +2272,7 @@ fn try_udp_nat_v6_fwd(
             words16_into(&(*scratch).pkt_dst, &mut (*scratch).csum_new);
         }
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-        unsafe { (*ip_hdr).src_addr = (*scratch).pkt_dst };
+        unsafe { copy16(&mut (*ip_hdr).src_addr, &(*scratch).pkt_dst) };
         let udp_hdr = ptr_at_mut::<UdpHdr>(ctx, l4_offset)?;
         unsafe { (*udp_hdr).src = snat_port.to_ne_bytes() };
         udp_csum_update(ctx, l4_offset, unsafe { &mut (*scratch).csum_old }, unsafe { &mut (*scratch).csum_new }, 4, src_port, snat_port)?;
@@ -1987,19 +2304,46 @@ fn tcp_csum_update(
 ) -> Result<(), ()> {
     let tcp = ptr_at_mut::<TcpHdr>(ctx, l4_offset)?;
     let old_check = unsafe { u16::from_ne_bytes((*tcp).check) };
-    let mut diff: i64 = 0;
-    let mut i = 0;
-    while i < addr_word_count {
+    // `addr_word_count` is 1 (IPv4) or 4 (IPv6) at the call sites; constant
+    // indices keep the verifier's stack-slot tracking straight-line instead
+    // of a variable-bound loop over `words[i]`.
+    let mut diff: i64 = unsafe {
+        bpf_csum_diff(
+            &mut old_addr_words[0] as *mut u32,
+            4,
+            &mut new_addr_words[0] as *mut u32,
+            4,
+            0,
+        )
+    } as i64;
+    if addr_word_count == 4 {
         diff = unsafe {
             bpf_csum_diff(
-                &mut old_addr_words[i] as *mut u32,
+                &mut old_addr_words[1] as *mut u32,
                 4,
-                &mut new_addr_words[i] as *mut u32,
+                &mut new_addr_words[1] as *mut u32,
                 4,
                 diff as u32,
             )
-        };
-        i += 1;
+        } as i64;
+        diff = unsafe {
+            bpf_csum_diff(
+                &mut old_addr_words[2] as *mut u32,
+                4,
+                &mut new_addr_words[2] as *mut u32,
+                4,
+                diff as u32,
+            )
+        } as i64;
+        diff = unsafe {
+            bpf_csum_diff(
+                &mut old_addr_words[3] as *mut u32,
+                4,
+                &mut new_addr_words[3] as *mut u32,
+                4,
+                diff as u32,
+            )
+        } as i64;
     }
     if old_port != new_port {
         let mut old_p = old_port as u32;
@@ -2109,8 +2453,8 @@ fn try_tcp_nat_v4(
         unsafe {
             let k = &mut (*scratch).ct_key;
             let rv = &(*scratch).snat_rev_value;
-            k.client_addr = rv.client_addr;
-            k.backend_addr = rv.backend_addr;
+            copy16(&mut k.client_addr, &rv.client_addr);
+            copy16(&mut k.backend_addr, &rv.backend_addr);
             k.client_port_be = rv.client_port_be;
             k.backend_port_be = rv.backend_port_be;
             k.family = 4;
@@ -2181,7 +2525,7 @@ fn try_tcp_nat_v4(
     unsafe {
         let k = &mut (*scratch).ct_key;
         k.client_addr = v4_embed(src_be);
-        k.backend_addr = rule.backend_addr;
+        copy16(&mut k.backend_addr, &rule.backend_addr);
         k.client_port_be = src_port;
         k.backend_port_be = rule.backend_port_be;
         k.family = 4;
@@ -2324,17 +2668,13 @@ fn try_tcp_nat_v6(
     let syn = unsafe { (*tcp).syn() } == 1;
     let ack = unsafe { (*tcp).ack() } == 1;
     let closing = unsafe { (*tcp).fin() } == 1 || unsafe { (*tcp).rst() } == 1;
-    let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
     let scratch = nat_scratch()?;
-    unsafe {
-        (*scratch).pkt_src = (*ip).src_addr;
-        (*scratch).pkt_dst = (*ip).dst_addr;
-    }
+    copy_v6_addrs(ctx, ip_offset, scratch)?;
 
     unsafe {
         let k = &mut (*scratch).ct_key;
-        k.client_addr = (*scratch).pkt_dst;
-        k.backend_addr = (*scratch).pkt_src;
+        copy16(&mut k.client_addr, &(*scratch).pkt_dst);
+        copy16(&mut k.backend_addr, &(*scratch).pkt_src);
         k.client_port_be = dst_port;
         k.backend_port_be = src_port;
         k.family = 6;
@@ -2353,7 +2693,7 @@ fn try_tcp_nat_v6(
             words16_into(&ct.listen_addr, &mut (*scratch).csum_new);
         }
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-        unsafe { (*ip_hdr).src_addr = ct.listen_addr };
+        unsafe { copy16(&mut (*ip_hdr).src_addr, &ct.listen_addr) };
         let tcp_hdr = ptr_at_mut::<TcpHdr>(ctx, l4_offset)?;
         unsafe { (*tcp_hdr).source = listen_port.to_ne_bytes() };
         tcp_csum_update(ctx, l4_offset, unsafe { &mut (*scratch).csum_old }, unsafe { &mut (*scratch).csum_new }, 4, src_port, listen_port)?;
@@ -2367,7 +2707,7 @@ fn try_tcp_nat_v6(
     // source must match the bound backend tuple.
     unsafe {
             let k = &mut (*scratch).snat_rev_key;
-            k.listen_addr = unsafe { (*scratch).pkt_dst };
+            copy16(&mut k.listen_addr, &(*scratch).pkt_dst);
             k.snat_port_be = dst_port;
             k.proto = 6;
             k.family = 6;
@@ -2385,8 +2725,8 @@ fn try_tcp_nat_v6(
         unsafe {
             let k = &mut (*scratch).ct_key;
             let rv = &(*scratch).snat_rev_value;
-            k.client_addr = rv.client_addr;
-            k.backend_addr = rv.backend_addr;
+            copy16(&mut k.client_addr, &rv.client_addr);
+            copy16(&mut k.backend_addr, &rv.backend_addr);
             k.client_port_be = rv.client_port_be;
             k.backend_port_be = rv.backend_port_be;
             k.family = 6;
@@ -2398,7 +2738,7 @@ fn try_tcp_nat_v6(
             words16_into(&(*scratch).pkt_dst, &mut (*scratch).csum_new);
         }
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-        unsafe { (*ip_hdr).src_addr = (*scratch).pkt_dst };
+        unsafe { copy16(&mut (*ip_hdr).src_addr, &(*scratch).pkt_dst) };
         let tcp_hdr = ptr_at_mut::<TcpHdr>(ctx, l4_offset)?;
         unsafe { (*tcp_hdr).source = listen_port.to_ne_bytes() };
         tcp_csum_update(ctx, l4_offset, unsafe { &mut (*scratch).csum_old }, unsafe { &mut (*scratch).csum_new }, 4, src_port, listen_port)?;
@@ -2407,7 +2747,7 @@ fn try_tcp_nat_v6(
             words16_into(&(*scratch).snat_rev_value.client_addr, &mut (*scratch).csum_new);
         }
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-        unsafe { (*ip_hdr).dst_addr = (*scratch).snat_rev_value.client_addr };
+        unsafe { copy16(&mut (*ip_hdr).dst_addr, &(*scratch).snat_rev_value.client_addr) };
         let tcp_hdr = ptr_at_mut::<TcpHdr>(ctx, l4_offset)?;
         unsafe { (*tcp_hdr).dest = client_port.to_ne_bytes() };
         tcp_csum_update(ctx, l4_offset, unsafe { &mut (*scratch).csum_old }, unsafe { &mut (*scratch).csum_new }, 4, dst_port, client_port)?;
@@ -2452,15 +2792,11 @@ fn try_tcp_nat_v6_fwd(
     let syn = unsafe { (*tcp).syn() } == 1;
     let ack = unsafe { (*tcp).ack() } == 1;
     let closing = unsafe { (*tcp).fin() } == 1 || unsafe { (*tcp).rst() } == 1;
-    let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
     let scratch = nat_scratch()?;
-    unsafe {
-        (*scratch).pkt_src = (*ip).src_addr;
-        (*scratch).pkt_dst = (*ip).dst_addr;
-    }
+    copy_v6_addrs(ctx, ip_offset, scratch)?;
     unsafe {
         let k = &mut (*scratch).fwd_key;
-        k.addr = (*scratch).pkt_dst;
+        copy16(&mut k.addr, &(*scratch).pkt_dst);
         k.port_be = dst_port;
         k.family = 6;
     };
@@ -2469,8 +2805,8 @@ fn try_tcp_nat_v6_fwd(
     };
     unsafe {
         let k = &mut (*scratch).ct_key;
-        k.client_addr = (*scratch).pkt_src;
-        k.backend_addr = rule.backend_addr;
+        copy16(&mut k.client_addr, &(*scratch).pkt_src);
+        copy16(&mut k.backend_addr, &rule.backend_addr);
         k.client_port_be = src_port;
         k.backend_port_be = rule.backend_port_be;
         k.family = 6;
@@ -2495,7 +2831,7 @@ fn try_tcp_nat_v6_fwd(
             let client_mac = unsafe { (*eth).src_addr };
             unsafe {
                 let v = &mut (*scratch).ct_value;
-                v.listen_addr = (*scratch).pkt_dst;
+                copy16(&mut v.listen_addr, &(*scratch).pkt_dst);
                 v.client_mac = client_mac;
                 v.listen_port_be = dst_port;
                 v.family = 6;
@@ -2507,7 +2843,7 @@ fn try_tcp_nat_v6_fwd(
             if rule.snat != 0 {
                 unsafe {
                 let k = &mut (*scratch).snat_rev_key;
-                k.listen_addr = unsafe { (*scratch).pkt_dst };
+                copy16(&mut k.listen_addr, &(*scratch).pkt_dst);
                 k.snat_port_be = 0;
                 k.proto = 6;
                 k.family = 6;
@@ -2540,7 +2876,7 @@ fn try_tcp_nat_v6_fwd(
         words16_into(&rule.backend_addr, &mut (*scratch).csum_new);
     }
     let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-    unsafe { (*ip_hdr).dst_addr = rule.backend_addr };
+    unsafe { copy16(&mut (*ip_hdr).dst_addr, &rule.backend_addr) };
     let tcp_hdr = ptr_at_mut::<TcpHdr>(ctx, l4_offset)?;
     unsafe { (*tcp_hdr).dest = rule.backend_port_be.to_ne_bytes() };
     tcp_csum_update(
@@ -2558,7 +2894,7 @@ fn try_tcp_nat_v6_fwd(
             words16_into(&(*scratch).pkt_dst, &mut (*scratch).csum_new);
         }
         let ip_hdr = ptr_at_mut::<Ipv6Hdr>(ctx, ip_offset)?;
-        unsafe { (*ip_hdr).src_addr = (*scratch).pkt_dst };
+        unsafe { copy16(&mut (*ip_hdr).src_addr, &(*scratch).pkt_dst) };
         let tcp_hdr = ptr_at_mut::<TcpHdr>(ctx, l4_offset)?;
         unsafe { (*tcp_hdr).source = snat_port.to_ne_bytes() };
         tcp_csum_update(
@@ -2585,6 +2921,51 @@ fn try_tcp_nat_v6_fwd(
 
 /// Read a 16-byte IPv6 address as four memory-order 32-bit words for
 /// `bpf_csum_diff`.
+/// Copy the two 16-byte IPv6 addresses out of the packet into the scratch
+/// via four u32 accesses each: a `[u8; 16]` field copy lowers to a 16-round
+/// variable-offset byte loop whose state multiplies at every call site and
+/// pushes the verifier past its explored-state budget.
+#[inline(always)]
+/// Copy a 16-byte address between map values / packet memory. Volatile word
+/// copies keep this straight-line: a plain `[u8; 16]` assignment lowers to
+/// an inlined memmove whose pointer-difference overlap check multiplies
+/// verifier states on older kernels. u16 words only need 2-byte alignment,
+/// which every address field here satisfies.
+#[inline(always)]
+unsafe fn copy16(dst: *mut [u8; 16], src: *const [u8; 16]) {
+    unsafe {
+        let d = dst as *mut u16;
+        let s = src as *const u16;
+        let mut i = 0usize;
+        while i < 8 {
+            core::ptr::write_volatile(d.add(i), core::ptr::read_volatile(s.add(i)));
+            i += 1;
+        }
+    }
+}
+
+fn copy_v6_addrs(ctx: &XdpContext, ip_offset: usize, scratch: *mut NatScratch) -> Result<(), ()> {
+    let base = ctx.data() + ip_offset + 8; // Ipv6Hdr::src_addr
+    let end = ctx.data_end();
+    if base + 32 > end {
+        return Err(());
+    }
+    // Volatile word copies: a plain loop is recognized by LLVM's memcpy
+    // idiom pass and lowered to an inlined memmove whose pointer-difference
+    // overlap check multiplies verifier states on older kernels.
+    unsafe {
+        let src = base as *const u32;
+        let dst = (base + 16) as *const u32;
+        let ps = (*scratch).pkt_src.as_mut_ptr() as *mut u32;
+        let pd = (*scratch).pkt_dst.as_mut_ptr() as *mut u32;
+        for i in 0..4usize {
+            core::ptr::write_volatile(ps.add(i), core::ptr::read_volatile(src.add(i)));
+            core::ptr::write_volatile(pd.add(i), core::ptr::read_volatile(dst.add(i)));
+        }
+    }
+    Ok(())
+}
+
 fn words16_into(addr: &[u8; 16], out: &mut [u32; 4]) {
     out[0] = u32::from_ne_bytes([addr[0], addr[1], addr[2], addr[3]]);
     out[1] = u32::from_ne_bytes([addr[4], addr[5], addr[6], addr[7]]);
@@ -2592,20 +2973,84 @@ fn words16_into(addr: &[u8; 16], out: &mut [u32; 4]) {
     out[3] = u32::from_ne_bytes([addr[12], addr[13], addr[14], addr[15]]);
 }
 
-fn local_ipv4_allowed(policy: &XdpInterfacePolicy, ifindex: u32, destination_be: u32) -> bool {
-    if policy.local_ip_filter == 0 {
-        return true;
+/// Resolve the destination's VIP flags (XDP_LOCAL_* value). Returns
+/// Some(flags) when the VIP is known or when the interface has no local-IP
+/// filter (unfiltered interfaces treat every destination as local with
+/// redirect allowed); None only when the filter is on and the destination
+/// is outside the protected set.
+fn local_flags_v4(
+    policy: Option<&XdpInterfacePolicy>,
+    ifindex: u32,
+    destination_be: u32,
+) -> Option<u32> {
+    match policy {
+        Some(policy) if policy.local_ip_filter != 0 => unsafe {
+            XDP_LOCAL_V4
+                .get(&XdpLocalIpv4Key::new(ifindex, destination_be))
+                .copied()
+        },
+        _ => Some(XDP_LOCAL_PRESENT | XDP_LOCAL_REDIRECT),
     }
-    let key = XdpLocalIpv4Key::new(ifindex, destination_be);
-    unsafe { XDP_LOCAL_V4.get(&key).is_some() }
 }
 
-fn local_ipv6_allowed(policy: &XdpInterfacePolicy, ifindex: u32, destination: [u8; 16]) -> bool {
-    if policy.local_ip_filter == 0 {
-        return true;
+fn local_flags_v6(
+    policy: Option<&XdpInterfacePolicy>,
+    ifindex: u32,
+    destination: [u8; 16],
+) -> Option<u32> {
+    match policy {
+        Some(policy) if policy.local_ip_filter != 0 => unsafe {
+            XDP_LOCAL_V6
+                .get(&XdpLocalIpv6Key::new(ifindex, destination))
+                .copied()
+        },
+        _ => Some(XDP_LOCAL_PRESENT | XDP_LOCAL_REDIRECT),
     }
-    let key = XdpLocalIpv6Key::new(ifindex, destination);
-    unsafe { XDP_LOCAL_V6.get(&key).is_some() }
+}
+
+/// ACL outcome for a source: whitelist wins over blocklist — the caller has
+/// already applied malformed/fragment/sanity hard bounds (EN-06).
+enum AclVerdict {
+    None,
+    Allow,
+    Block,
+}
+
+/// Kept as a bpf-to-bpf subprogram: four map lookups plus deadline checks in
+/// the caller's frame pushed LLVM into R11-relative spills the verifier
+/// rejects.
+#[inline(never)]
+/// Addr is passed by value: taking a pointer into the main program's frame
+/// makes LLVM emit R11-relative accesses the verifier rejects.
+fn acl_verdict_v4(addr_be: u32, source_be: u32, now_mono_ns: u64) -> AclVerdict {
+    let key = XdpIpv4Key::new(addr_be);
+    if active_exact_v4(&XDP_ALLOWED_V4, &key, now_mono_ns)
+        || active_lpm_v4(&XDP_ALLOWED_V4_LPM, source_be, now_mono_ns)
+    {
+        return AclVerdict::Allow;
+    }
+    if active_exact_v4(&XDP_BLOCKED_V4, &key, now_mono_ns)
+        || active_lpm_v4(&XDP_BLOCKED_V4_LPM, source_be, now_mono_ns)
+    {
+        return AclVerdict::Block;
+    }
+    AclVerdict::None
+}
+
+#[inline(never)]
+fn acl_verdict_v6(source: [u8; 16], now_mono_ns: u64) -> AclVerdict {
+    let key = XdpIpv6Key::new(source);
+    if active_exact_v6(&XDP_ALLOWED_V6, &key, now_mono_ns)
+        || active_lpm_v6(&XDP_ALLOWED_V6_LPM, source, now_mono_ns)
+    {
+        return AclVerdict::Allow;
+    }
+    if active_exact_v6(&XDP_BLOCKED_V6, &key, now_mono_ns)
+        || active_lpm_v6(&XDP_BLOCKED_V6_LPM, source, now_mono_ns)
+    {
+        return AclVerdict::Block;
+    }
+    AclVerdict::None
 }
 
 fn active_exact_v4(
@@ -2759,6 +3204,18 @@ fn counter_fragmented() {
 fn counter_control() {
     if let Some(counters) = counters() {
         counters.control = counters.control.saturating_add(1);
+    }
+}
+
+fn counter_acl_would_block() {
+    if let Some(counters) = counters() {
+        counters.acl_would_block = counters.acl_would_block.saturating_add(1);
+    }
+}
+
+fn counter_nonlocal_pass() {
+    if let Some(counters) = counters() {
+        counters.nonlocal_pass = counters.nonlocal_pass.saturating_add(1);
     }
 }
 

@@ -583,6 +583,10 @@ pub async fn attach(
         (4, "xdp_nat_tcp6_dispatch"),
         (5, "xdp_nat_udp6_fwd"),
         (6, "xdp_nat_tcp6_fwd"),
+        (7, "xdp_nat_udp4_work"),
+        (8, "xdp_nat_tcp4_work"),
+        (9, "xdp_nat_udp6_work"),
+        (10, "xdp_nat_tcp6_work"),
     ] {
         let fd = match ebpf.program_mut(name) {
             Some(sub_program) => {
@@ -805,7 +809,9 @@ pub(crate) fn sum_percpu_counters<'a>(
             malformed,
             unsupported,
             fragmented,
-            control
+            control,
+            acl_would_block,
+            nonlocal_pass
         );
     }
     total
@@ -890,19 +896,26 @@ fn sync_interface_policy(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Re
 }
 
 /// XDP_LOCAL_* value: bit0 marks presence; bits[2:1] carry the per-VIP
-/// fragment override resolved from `fragmentOverrides` (0 = inherit the
-/// interface policy).
+/// fragment override resolved from `protectedServices[].fragmentAction`
+/// (0 = inherit the interface policy); bit3 marks the VIP redirect-eligible
+/// — `protectedServices[].redirect: false` clears it so protection stays on
+/// while the VIP's ports keep their kernel path.
 fn local_ip_flags(interface: &XdpInterfaceConfig, ip: &IpAddr) -> u32 {
-    let mut flags = cloud_node_xdp_common::XDP_LOCAL_PRESENT;
-    for entry in &interface.fragment_overrides {
+    let mut flags =
+        cloud_node_xdp_common::XDP_LOCAL_PRESENT | cloud_node_xdp_common::XDP_LOCAL_REDIRECT;
+    for entry in &interface.protected_services {
         if &entry.ip == ip {
-            flags |= match entry.action {
-                crate::runtime_mode::XdpFragmentAction::Pass => {
+            if !entry.redirect {
+                flags &= !cloud_node_xdp_common::XDP_LOCAL_REDIRECT;
+            }
+            flags |= match entry.fragment_action {
+                Some(crate::runtime_mode::XdpFragmentAction::Pass) => {
                     cloud_node_xdp_common::XDP_LOCAL_FRAG_PASS
                 }
-                crate::runtime_mode::XdpFragmentAction::Drop => {
+                Some(crate::runtime_mode::XdpFragmentAction::Drop) => {
                     cloud_node_xdp_common::XDP_LOCAL_FRAG_DROP
                 }
+                None => 0,
             };
         }
     }
@@ -1482,7 +1495,7 @@ fn drop_stale_pinned_maps() {
             size_of::<NatScratch>() as u32,
             1,
         ),
-        ("XDP_DISPATCH", MapType::ProgramArray, u, u, 8),
+        ("XDP_DISPATCH", MapType::ProgramArray, u, u, 16),
         (
             "XDP_FLOW_ACCT",
             MapType::PerCpuHash,

@@ -247,6 +247,14 @@ pub struct XdpCounters {
     /// XDP_CLASS_CONTROL: ICMP/ICMPv6 (ND, PMTU) handed to the kernel stack.
     /// Exempt from L4 handling but still subject to ACL block rules.
     pub control: u64,
+    /// Packets matching an ACL block rule on an observe-mode interface:
+    /// passed (observing, not enforcing) but counted so the would-be drop is
+    /// visible before protect/proxy is enabled.
+    pub acl_would_block: u64,
+    /// Packets whose destination is outside the interface's protected VIP
+    /// set (`local_ip_filter` on, no XDP_LOCAL_* hit): passed untouched —
+    /// management and transit traffic is not this layer's concern.
+    pub nonlocal_pass: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -469,6 +477,12 @@ pub const XDP_FRAGMENT_DROP: u8 = 1;
 pub const XDP_LOCAL_PRESENT: u32 = 1;
 pub const XDP_LOCAL_FRAG_PASS: u32 = 1 << 1;
 pub const XDP_LOCAL_FRAG_DROP: u32 = 2 << 1;
+/// EN-06: this VIP may redirect proxy-port traffic into AF_XDP. Cleared per
+/// VIP (`protectedServices[].redirect: false`) to keep a VIP protected —
+/// classification, ACL, rate limits, fragment policy — while its ports are
+/// served by the kernel stack. Two VIPs sharing a port therefore do not
+/// cross-redirect.
+pub const XDP_LOCAL_REDIRECT: u32 = 1 << 3;
 
 /// Per-CPU scratch space for NAT/DCID key construction in the eBPF dataplane.
 /// eBPF stack is capped at 512 bytes and the conntrack/forward keys plus
@@ -492,6 +506,17 @@ pub struct NatScratch {
     /// under the 512-byte verifier stack limit.
     pub pkt_src: [u8; 16],
     pub pkt_dst: [u8; 16],
+    /// Redirect context stashed before a NAT tail call so the dispatch site
+    /// keeps no spillable registers (see the eBPF-side mirror).
+    pub redir_flags: u32,
+    pub redir_proto: u8,
+    pub redir_l4off: u16,
+    pub redir_pad: u8,
+    /// Worker context stashed before the dispatch -> work tail call. Offsets
+    /// are re-validated against packet bounds inside the worker program.
+    pub work_ip_off: u32,
+    pub work_ifindex: u32,
+    pub work_pkt_len: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +535,11 @@ pub struct NatScratch {
 /// v3: EN-05 parse classification — XdpCounters +malformed/unsupported/
 /// fragmented/control; XdpInterfacePolicy +fragment_action; XDP_LOCAL_* values
 /// gain per-VIP fragment override bits.
-pub const XDP_ABI_VERSION: u32 = 3;
+/// v4: EN-06 protected-service policy — XdpCounters +acl_would_block/
+/// nonlocal_pass; XDP_LOCAL_* values gain the XDP_LOCAL_REDIRECT bit.
+/// v5: EN-06 verifier split — NatScratch +work_ip_off/work_ifindex/
+/// work_pkt_len; XDP_DISPATCH grows to 16 slots (7-10 = NAT work programs).
+pub const XDP_ABI_VERSION: u32 = 5;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -679,13 +708,14 @@ const _: () = assert!(core::mem::size_of::<XdpFlowEvent>() == 88);
 const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
 const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 16);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 176);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 192);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevValue>() == 56);
 const _: () = assert!(core::mem::size_of::<XdpInterfacePolicy>() == 8);
 const _: () = assert!(core::mem::size_of::<XdpRateBucket>() == 16);
+const _: () = assert!(core::mem::size_of::<NatScratch>() == 312);
 
 #[cfg(all(feature = "aya", target_os = "linux"))]
 macro_rules! unsafe_impl_aya_pod {

@@ -128,6 +128,13 @@ pub struct XdpStatusSnapshot {
     /// IP fragments classified before L4 handling.
     #[serde(default)]
     pub fragmented: u64,
+    /// Observe-mode ACL hits that would have dropped in enforce modes.
+    #[serde(default)]
+    pub acl_would_block: u64,
+    /// Packets passed because the destination is outside the protected
+    /// VIP set (direction gate).
+    #[serde(default)]
+    pub nonlocal_pass: u64,
     /// ICMP/ICMPv6 control traffic handed to the kernel stack.
     #[serde(default)]
     pub control: u64,
@@ -202,6 +209,8 @@ pub(crate) struct XdpManager {
     unsupported: AtomicU64,
     fragmented: AtomicU64,
     control: AtomicU64,
+    acl_would_block: AtomicU64,
+    nonlocal_pass: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
@@ -263,6 +272,8 @@ impl XdpManager {
             unsupported: AtomicU64::new(0),
             fragmented: AtomicU64::new(0),
             control: AtomicU64::new(0),
+            acl_would_block: AtomicU64::new(0),
+            nonlocal_pass: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
@@ -827,6 +838,8 @@ impl XdpManager {
             unsupported: self.unsupported.load(Ordering::Relaxed),
             fragmented: self.fragmented.load(Ordering::Relaxed),
             control: self.control.load(Ordering::Relaxed),
+            acl_would_block: self.acl_would_block.load(Ordering::Relaxed),
+            nonlocal_pass: self.nonlocal_pass.load(Ordering::Relaxed),
             rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
             rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
@@ -1350,6 +1363,10 @@ impl XdpManager {
                 self.fragmented
                     .store(counters.fragmented, Ordering::Relaxed);
                 self.control.store(counters.control, Ordering::Relaxed);
+                self.acl_would_block
+                    .store(counters.acl_would_block, Ordering::Relaxed);
+                self.nonlocal_pass
+                    .store(counters.nonlocal_pass, Ordering::Relaxed);
             }
         }
     }
@@ -1414,6 +1431,8 @@ impl XdpManager {
                     "unsupported": c.unsupported,
                     "fragmented": c.fragmented,
                     "control": c.control,
+                    "aclWouldBlock": c.acl_would_block,
+                    "nonlocalPass": c.nonlocal_pass,
                 })
             })
             .ok();
