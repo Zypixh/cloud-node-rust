@@ -35,7 +35,7 @@ xdp:
 
 `cloud-node xdp start` 写入 `xdp.enabled: true`，`cloud-node xdp stop` 写入 `xdp.enabled: false`；两者都保留文件中的其他内容，不会把推导出的运行时状态写回配置。
 
-除 `enabled` 之外的字段（`attachMode`、`fallback`、`interfaces`、`proxy`、`rateLimit`、`sniBlocklist`）仍可在文件中显式提供以覆盖自动推导结果，但正常部署不需要；自动推导的状态只存在于内存，不会写回 `runtime.yaml`。
+除 `enabled` 之外的字段（`attachMode`、`fallback`、`interfaces`、`proxy`、`rateLimit`）仍可在文件中显式提供以覆盖自动推导结果，但正常部署不需要；自动推导的状态只存在于内存，不会写回 `runtime.yaml`。
 
 字段说明（显式覆盖时）：
 
@@ -105,7 +105,7 @@ proxy 模式命中端口后内核 socket 不再收到该包；未命中、降级
 | 槽位 | 程序 | 覆盖 |
 |---|---|---|
 | 0 | `xdp_nat_dispatch` | UDP/IPv4 forward + reply |
-| 1 | `xdp_sni_dispatch` | SNI blocklist，未命中链入槽位 2 |
+| 1 | （保留空槽，原 SNI blocklist 已移除） | — |
 | 2 | `xdp_nat_tcp_dispatch` | TCP/IPv4 forward + reply |
 | 3 | `xdp_nat_udp6_dispatch` | UDP/IPv6 reply，forward 尾调用槽位 5 |
 | 4 | `xdp_nat_tcp6_dispatch` | TCP/IPv6 reply，forward 尾调用槽位 6 |

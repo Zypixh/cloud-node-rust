@@ -267,12 +267,6 @@ pub struct XdpConfig {
     pub proxy: XdpProxyConfig,
     #[serde(rename = "rateLimit", default)]
     pub rate_limit: Option<XdpRateLimitSettings>,
-    /// SNI blocklist enforced at the XDP layer on the first data segment of
-    /// TCP flows (TLS ClientHello server_name). Parsed ClientHellos that match
-    /// are dropped in the driver; incomplete or split ClientHellos always pass
-    /// to userspace, which remains the authoritative SNI path.
-    #[serde(rename = "sniBlocklist", default)]
-    pub sni_blocklist: Vec<String>,
     /// Explicit path to an external eBPF object. When unset, the binary uses
     /// the object embedded at build time (recommended: binary and program can
     /// never drift apart). Set only for eBPF hotfix/debugging.

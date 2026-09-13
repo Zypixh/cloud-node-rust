@@ -320,7 +320,6 @@ mod tests {
                 }],
             },
             rate_limit: None,
-            sni_blocklist: Vec::new(),
             ebpf_object: None,
         };
 
