@@ -65,6 +65,21 @@ xdp:
 
 `xdp.ebpfObject`（最高优先级）> `CLOUD_NODE_XDP_EBPF_OBJECT_PATH` 环境变量 > 内嵌对象（默认）。
 
+聚合预算（EN-07）——进入受保护 VIP 的未验证包总量与新状态准入速率上限：
+
+```yaml
+xdp:
+  budget:
+    enabled: true          # 默认 true；唯一关闭方式
+    unverifiedPps: 2000000 # 整机未验证包/秒（本地 TCP/UDP，ACL 之后）
+    newFlowPerSec: 100000  # 整机新建 CT/SNAT 准入/秒
+    windowMs: 1000         # 固定窗口
+```
+
+- 整机总额由用户态按 possible-CPU 数预分成每 CPU 份额（向上取整、下限 1），CPU/队列数变化不会倍增总配额。
+- 基线保护在 Normal 压力下也存在；压力反馈只收窄弹性额度（High ÷2、Critical ÷4，份额下限 1），不存在"除到 0 变关闭"的路径。
+- 命中按 `unverifiedLimited` / `admissionLimited` 计数器上报；新状态拒绝发生在任何 CT/SNAT 写入之前，不产生残留状态。
+
 ## 控制面配置
 
 大部分运行时配置由控制面下发，包括：

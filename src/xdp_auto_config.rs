@@ -162,6 +162,7 @@ fn derive_xdp_config_with_ports_and_options(
             ports,
         },
         rate_limit: None,
+        budget: None,
         ebpf_object: None,
     })
 }

@@ -53,7 +53,7 @@ commit 与 patch 摘要指被测代码状态；未提交代码也可以验证，
 | EN-04 | XDP 模块边界整理 | EN-01、EN-02 | M | VERIFIED（证据 docs/edge-node-evidence/EN-04；macOS+Linux 编译测试通过，真实 eBPF T01–T06 全过） |
 | EN-05 | 有界解析与分片策略 | EN-04 | L | VERIFIED（证据 docs/edge-node-evidence/EN-05；真实 eBPF 全矩阵 38/38，五分类+分片策略落地） |
 | EN-06 | 独立受保护服务与路径策略 | EN-01、EN-04、EN-05 | L | VERIFIED |
-| EN-07 | 聚合预算与每路径容量保护 | EN-03、EN-06 | L | TODO |
+| EN-07 | 聚合预算与每路径容量保护 | EN-03、EN-06 | L | VERIFIED |
 | EN-08 | 源地址公平性与有界状态维护 | EN-07 | M | TODO |
 | EN-09 | 准入状态机与 map 生命周期 | EN-06、EN-07 | L | TODO |
 | EN-10 | 连接所有者反馈与存量流 | EN-09、EN-12 | L | TODO |

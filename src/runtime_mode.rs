@@ -275,6 +275,50 @@ fn default_xdp_rate_limit_window_ms() -> u64 {
     1000
 }
 
+/// EN-07 aggregate budgets. Node-wide totals; the manager divides them by
+/// the possible-CPU count into per-CPU eBPF bucket shares (I09: quota does
+/// not multiply with CPU/queue count). Baseline protection is always on —
+/// including at Normal pressure — unless the operator explicitly sets
+/// `enabled: false`. Pressure scaling narrows the elastic allowance but
+/// clamps each per-CPU share at >=1 so "divide to zero" can never silently
+/// disable a dimension.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpBudgetSettings {
+    /// Master switch for the aggregate budget gates. Default true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Node-wide ceiling on packets/sec entering the unverified path
+    /// (local TCP/UDP post-ACL). Default 2M pps.
+    #[serde(rename = "unverifiedPps", default = "default_unverified_pps")]
+    pub unverified_pps: u64,
+    /// Node-wide ceiling on new conntrack/SNAT admissions per second.
+    /// Default 100k/s.
+    #[serde(rename = "newFlowPerSec", default = "default_new_flow_per_sec")]
+    pub new_flow_per_sec: u64,
+    /// Accounting window for the fixed-window buckets.
+    #[serde(rename = "windowMs", default = "default_xdp_rate_limit_window_ms")]
+    pub window_ms: u64,
+}
+
+fn default_unverified_pps() -> u64 {
+    2_000_000
+}
+
+fn default_new_flow_per_sec() -> u64 {
+    100_000
+}
+
+impl Default for XdpBudgetSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            unverified_pps: default_unverified_pps(),
+            new_flow_per_sec: default_new_flow_per_sec(),
+            window_ms: default_xdp_rate_limit_window_ms(),
+        }
+    }
+}
+
 /// Base per-IP fixed-window limits for the eBPF limiter. Userspace scales
 /// these down under elevated pressure (Elevated: x1, High: /2, Critical: /4)
 /// and disables the limiter entirely at Normal pressure. `0` disables the
@@ -313,6 +357,9 @@ pub struct XdpConfig {
     pub proxy: XdpProxyConfig,
     #[serde(rename = "rateLimit", default)]
     pub rate_limit: Option<XdpRateLimitSettings>,
+    /// Aggregate budget gate (EN-07). Absent = built-in baseline.
+    #[serde(rename = "budget", default)]
+    pub budget: Option<XdpBudgetSettings>,
     /// Explicit path to an external eBPF object. When unset, the binary uses
     /// the object embedded at build time (recommended: binary and program can
     /// never drift apart). Set only for eBPF hotfix/debugging.
