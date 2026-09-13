@@ -1,0 +1,59 @@
+{
+  "task_id": "EN-03",
+  "status": "VERIFIED",
+  "start_commit": "6e0116b",
+  "end_commit": null,
+  "working_tree_dirty": true,
+  "contract_versions": {
+    "xdp_abi_version": 2,
+    "xdp_counters_size_bytes": 144,
+    "xdp_counters_map_type": "PerCpuArray",
+    "ebpf_object_sha256": "1532610c4574abb9f66b553f7ddb9bbee53bfe6bdb3f40ee5d8c6fc6345bb20f"
+  },
+  "changed_paths": [
+    "crates/cloud-node-xdp-ebpf/src/main.rs",
+    "crates/cloud-node-xdp-common/src/lib.rs",
+    "src/xdp.rs",
+    "docs/edge-node-evidence/EN-03/report.md",
+    "docs/edge-node-evidence/EN-03/manifest.json"
+  ],
+  "implemented_behavior": [
+    "XDP_COUNTERS Array -> PerCpuArray: per-CPU slots eliminate multi-core RMW count loss",
+    "New counters: tx (XDP_TX terminal actions), acl_blocked (ACL-rule terminal drops)",
+    "count_action now records XDP_TX into tx instead of dropping it on the floor",
+    "block_action counts ACL-originated drops distinctly from other drop sources",
+    "userspace sum_percpu_counters aggregates all CPU slots with saturating_add",
+    "zero_counters resets all per-CPU slots via PerCpuValues",
+    "drop_stale_pinned_maps spec updated: MapType::PerCpuArray, 144B value",
+    "status/dump-maps export tx + aclBlocked fields"
+  ],
+  "compatibility_and_migrations": "XDP_ABI_VERSION 1->2. Old Array-typed XDP_COUNTERS pin is rejected by the spec check and explicitly unlinked+recreated on attach; old counter values are not migrated (telemetry only). No connection map is cleared or touched. New userspace rejects old-ABI maps via PerCpuArray::try_from failure — no silent fallback.",
+  "resource_bounds_and_full_behavior": "PerCpuArray value 144B x nr_cpus; userspace aggregation iterates nr_cpus slots per status refresh (10s interval).",
+  "failure_and_rollback_behavior": "Stale/incompatible counter pin: explicit unlink + recreate at attach (observable via load logs). Missing map: explicit error. No silent degrade path added.",
+  "invariants_covered": ["I10", "I15"],
+  "tests_covered": [
+    "percpu_counter_aggregation_sums_all_cpu_slots",
+    "percpu_counter_aggregation_saturates_instead_of_wrapping",
+    "cloud-node-xdp-common suite (7 pass, incl. 144B layout assert + ABI v2)",
+    "xdp suite 95 pass on x86-build",
+    "real eBPF attach + live traffic on veth/netns: dump-maps counters exact-match sent packets (7 pkts = 6 redirect + 1 pass)"
+  ],
+  "commands_and_exit_codes": [
+    {"command": "cargo check --lib (x86-build)", "exit_code": 0},
+    {"command": "cargo test --lib xdp (x86-build)", "exit_code": 0, "note": "95 passed"},
+    {"command": "cargo test --lib percpu (x86-build)", "exit_code": 0, "note": "2 passed"},
+    {"command": "cargo test -p cloud-node-xdp-common", "exit_code": 0, "note": "7 passed"},
+    {"command": "cargo +nightly build --target bpfel-unknown-none --release (build-node)", "exit_code": 0},
+    {"command": "xdp raw-smoke on veth-en03 + UDP inject from netns", "exit_code": 0},
+    {"command": "xdp dump-maps (cross-process pinned PerCpuArray read)", "exit_code": 0}
+  ],
+  "environment": {
+    "runtime_host": "x86-build OrbStack VM (x86_64 Linux)",
+    "ebpf_build_host": "build-node OrbStack VM (aarch64), bpfel-unknown-none target",
+    "test_topology": "veth-en03 (host) <-> veth-en03p (netns en03), skb/generic XDP attach"
+  },
+  "open_items": [
+    "T16 observability-cost baseline deferred to EN-31 long-run capacity testing",
+    "kernel 6.1 verifier re-run not performed (complexity unchanged, risk low)"
+  ]
+}
