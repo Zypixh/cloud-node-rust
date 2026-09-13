@@ -1,0 +1,76 @@
+{
+  "task": "EN-04",
+  "title": "XDP module boundary refactor",
+  "base_commit": "9602ef267ffc06e6afc39774917426992c03f17a",
+  "schema": "edge-evidence-v1",
+  "behavior_change": false,
+  "ebpf_object_sha256": "1532610c4574abb9f66b553f7ddb9bbee53bfe6bdb3f40ee5d8c6fc6345bb20f",
+  "ebpf_object_unchanged_from": "EN-03",
+  "modules": {
+    "src/xdp/mod.rs": 2022,
+    "src/xdp/policy.rs": 292,
+    "src/xdp/linux.rs": 2032,
+    "src/xdp/smoke.rs": 1214,
+    "src/xdp/tests.rs": 2353,
+    "src/xdp/af_xdp/mod.rs": 282,
+    "src/xdp/af_xdp/parser.rs": 664,
+    "src/xdp/af_xdp/tcp_reactor.rs": 1340,
+    "src/xdp/af_xdp/bridge.rs": 881
+  },
+  "verification": [
+    {
+      "command": "cargo check --lib",
+      "host": "macOS (dev)",
+      "exit_code": 0,
+      "notes": "0 unused warnings"
+    },
+    {
+      "command": "cargo test --lib xdp",
+      "host": "macOS (dev)",
+      "exit_code": 0,
+      "notes": "93 passed, 0 failed"
+    },
+    {
+      "command": "cargo check --lib --tests",
+      "host": "x86-build@orb (Linux, kernel 7.0)",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo test --lib xdp",
+      "host": "x86-build@orb",
+      "exit_code": 0,
+      "notes": "97 passed, 0 failed"
+    },
+    {
+      "command": "sudo python3 scripts/edge/runner.py --mode proxy --node-bin ./target/debug/cloud-node-rust --ebpf-object data/cloud-node-xdp-ebpf.o",
+      "host": "x86-build@orb, netns topology, real eBPF",
+      "exit_code": 0,
+      "notes": "T01 17/17; T02 4/4; T03 3/3; T04 2/2; T06 1/1; ok=true",
+      "result_file": "/tmp/en04-t01.json"
+    },
+    {
+      "command": "cargo fmt -- --check",
+      "host": "macOS (dev)",
+      "exit_code": 0,
+      "notes": "xdp files clean"
+    }
+  ],
+  "public_api_preserved": [
+    "crate::xdp::XdpManager",
+    "crate::xdp::{attach,detach,status,dump_maps,doctor,tune,reload}",
+    "crate::xdp::virtual_l4_stream",
+    "crate::xdp::af_xdp::{AfXdpRuntime,runtime,start_proxy_bridge,start_udp_bridge}",
+    "crate::xdp::af_xdp::{parse_proxy_frame,extract_ip_frame,parse_l4_packet}",
+    "crate::xdp::af_xdp::{encode_ip_reply_frame,encode_udp_reply_frame}",
+    "crate::xdp::af_xdp::{AfXdpTcpStream,AfXdpTcpStreamParts}"
+  ],
+  "external_consumers_verified": [
+    "src/udp_proxy.rs",
+    "src/quic_udp_demux.rs",
+    "src/http_proxy_manager.rs",
+    "src/tcp_proxy.rs",
+    "src/main.rs"
+  ],
+  "revertible": true,
+  "revert_method": "single-commit revert; src/xdp.rs rename preserved in git history"
+}
