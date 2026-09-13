@@ -5,6 +5,9 @@
 ## 文档目录
 
 - [架构概览](architecture.md)：说明控制面、代理运行时、缓存、WAF、日志统计和四层代理之间的关系。
+- [生产级边缘节点目标架构](edge-node-production-architecture.md)：面向 XDP、防护、代理、缓存和可靠性的目标合同、故障策略与验收要求；属于待实施设计。
+- [生产级边缘节点开发计划](../tasks/edge-node-production-plan.md)：34 个任务包、依赖、阶段门槛、验证证据和回退方法。
+- [其他模型开发交接](../tasks/edge-node-development-handoff.md)：可复制的开发与独立审阅指令，以及任务状态和证据模板。
 - [运行时说明](runtime.md)：说明进程启动、任务调度、配置热更新、证书、缓存后台任务和性能监控。
 - [功能说明](features.md)：逐项介绍协议代理、缓存、WAF、内容处理、日志统计、证书和多级分发能力。
 - [配置说明](configuration.md)：说明 `configs/api_node.yaml`、运行目录、数据文件、缓存目录和控制面配置兼容。
