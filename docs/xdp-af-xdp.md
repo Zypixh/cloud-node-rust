@@ -144,6 +144,15 @@ veth + kernel 6.1 + SKB 模式下 AF_PACKET 注入实测（32B payload，注入�
 - 新流建立（CT insert + SNAT 时一次 `NOEXIST` 端口认领）比稳态慢约 30%，SNAT 分配相对 CT insert 开销很小。
 - 端口分配失败计数 `snat_alloc_fail` 并显式回落（该包走原路径），不丢包不静默。
 
+SNAT 端口空间为每个监听元组 21000 个端口（`XDP_SNAT_PORT_BASE`=40000 起，共 `XDP_SNAT_PORT_SPAN`=21000）。高并发轮换流实测（OrbStack 7.0 / veth，注入器上限 ~1.1M pps）：
+
+| 并发流数（轮换） | 结果 |
+|---|---|
+| 1 万（< 容量） | `snat_bound`=10,000，转发 ≈100%（~800-860k pps），`snat_alloc_fail` ≈0 |
+| 3 万（> 容量） | `snat_bound`=21,000（端口空间打满），约 70% 转发、30% `snat_alloc_fail` 显式回落 |
+
+`snat_alloc` 以流元组哈希为基址做至多 8 次线性探测，每次尝试混入 `bpf_get_prandom_u32()` 重新随机基址——仅靠元组哈希会让同一流每次重试命中同一窗口，落在被占区域的流会永远失败（实测曾致约 39% 分配失败、`snat_bound` 停在 ~6k）。并发流超过端口容量是设计上限：超出部分走显式 PASS 回落并计入 `snat_alloc_fail`，可通过观测该计数器定位。
+
 ## 集成测试
 
 Linux root 环境可运行：

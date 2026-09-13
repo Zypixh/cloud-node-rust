@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     bindings::xdp_action,
-    helpers::{bpf_csum_diff, bpf_ktime_get_ns},
+    helpers::{bpf_csum_diff, bpf_get_prandom_u32, bpf_ktime_get_ns},
     macros::{map, xdp},
     maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, ProgramArray, XskMap, lpm_trie::Key as LpmKey},
     programs::XdpContext,
@@ -1335,7 +1335,10 @@ fn snat_alloc(
         h ^= ((v.client_port_be as u32) << 8) | v.backend_port_be as u32;
     }
     h = h.wrapping_mul(0x85eb_ca6b);
-    let base = (h % XDP_SNAT_PORT_SPAN as u32) as u16;
+    // Re-randomize the probe start per call: the tuple hash alone gives every
+    // packet of a flow the same 8-slot window, so a flow whose window lands
+    // on a permanently-occupied range would fail every retry forever.
+    let base = ((h ^ unsafe { bpf_get_prandom_u32() }) % XDP_SNAT_PORT_SPAN as u32) as u16;
 
     let mut tries = 0usize;
     while tries < 8 {
