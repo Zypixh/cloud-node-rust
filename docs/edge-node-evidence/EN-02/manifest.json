@@ -1,0 +1,57 @@
+{
+  "task_id": "EN-02",
+  "status": "VERIFIED",
+  "start_commit": "63cc10c51edd67b927f47342128ff0e8213ab2b4",
+  "end_commit": null,
+  "working_tree_dirty": false,
+  "contract_versions": {
+    "result_schema": "edge-runner-v1",
+    "matrix": "scripts/edge/matrix.json v1",
+    "corpus_cases": 27
+  },
+  "changed_paths": [
+    "scripts/edge/pktgen.py",
+    "scripts/edge/runner.py",
+    "scripts/edge/matrix.json",
+    "scripts/edge/README.md",
+    "src/xdp.rs",
+    "docs/edge-node-evidence/EN-02/report.md",
+    "docs/edge-node-evidence/EN-02/manifest.json"
+  ],
+  "implemented_behavior": [
+    "Deterministic packet corpus (27 cases): IPv4/6, VLAN/QinQ, IPv6 ext headers, fragments (first/non-first/atomic), truncation, bad checksum, ICMP/PTB, abnormal TCP flag combos, SYN/ACK/FIN/RST probes, UDP, QUIC Initial/short-header",
+    "AF_PACKET sender with rate control + dual-end observer + pcap writer",
+    "runner.py: isolated en2-* netns topology, dedicated node config, attach/detach lifecycle, pinned-counter delta assertions, unified JSON result",
+    "matrix.json: T01-T18 traceable entries with status/prerequisites/assertions/owner",
+    "xdp dump-maps: new 'counters' field read from pinned XDP_COUNTERS (null when unreadable)",
+    "xdp.rs: XDP_COUNTERS now pinned so verdict counters are observable cross-process"
+  ],
+  "compatibility_and_migrations": "dump-maps output is additive (new field). XDP_COUNTERS pin persists after detach; layout guarded by existing spec table. No dataplane verdict semantics changed.",
+  "resource_bounds_and_full_behavior": "Runner resources are isolated: netns en2-ns, veth en2-a/en2-b, config configs/en2-runtime.yaml with runtime.yaml backup/restore; cleanup only removes resources it created.",
+  "failure_and_rollback_behavior": "Exit codes: 0 pass, 1 assertion failure, 3 environment/prereq failure. Per-case errors recorded into results, never swallowed.",
+  "invariants_covered": ["I10", "I14", "I15"],
+  "tests_covered": [
+    "T01 17/17 runnable cases on real eBPF (netns, protect mode)",
+    "T02 4/4, T03 3/3, T04 2/2 (2000pkt @ ~4993pps), T06 1/1"
+  ],
+  "commands_and_exit_codes": [
+    {"command": "python3 -m py_compile scripts/edge/*.py", "exit_code": 0},
+    {"command": "cargo check --lib", "exit_code": 0},
+    {"command": "runner.py --list", "exit_code": 0},
+    {"command": "runner.py --only T01,T02,T03,T04,T06 --mode protect", "exit_code": 0, "host": "x86-build (kernel 7.0.14 orbstack, amd64)"},
+    {"command": "runner.py missing node binary", "exit_code": 3}
+  ],
+  "environment_and_path_profile": "x86-build OrbStack VM, Ubuntu Jammy amd64, kernel 7.0.14, veth pair, XDP skb mode; ebpf_sha256=1adcae05fb4873341a945deff1ff64dafe84219189d6363b9190fae084442180",
+  "workload_and_generator_limits": "pktgen AF_PACKET sender measured ~4993 pps for 2000-packet flood on veth; sender-limited, not node capacity.",
+  "results_and_raw_artifact_paths": ["/tmp/en2-all.json (on x86-build VM)"],
+  "unrun_checks_and_reasons": [
+    "external topology: single VM lacks a second NIC path; implemented but not exercised",
+    "pending T05/T07/T09-T15/T17/T18: depend on EN-09/13/14/16/18/20/23/24/25/29/31/33 features"
+  ],
+  "open_issues": [
+    "data/cloud-node-xdp-ebpf.o is an untracked stale-prone local artifact — a stale copy caused attach failure (invalid value size 128 vs 56); artifact identity is EN-29 scope",
+    "T01 assertions encode current protect-mode contract (PASS all); EN-05..EN-09 will flip fragment/malformed expectations"
+  ],
+  "review_evidence": "docs/edge-node-evidence/EN-02/report.md",
+  "next_eligible_tasks": ["EN-03", "EN-04", "EN-16"]
+}

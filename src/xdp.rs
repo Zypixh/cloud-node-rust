@@ -1623,7 +1623,33 @@ impl XdpManager {
             .collect::<Vec<_>>();
         let state = self.state.read();
         let now = crate::utils::time::now_timestamp();
+        #[cfg(target_os = "linux")]
+        let counters = linux::read_pinned_counters()
+            .map(|c| {
+                serde_json::json!({
+                    "packets": c.packets,
+                    "pass": c.pass,
+                    "drop": c.drop,
+                    "redirect": c.redirect,
+                    "parseErrors": c.parse_errors,
+                    "mapMiss": c.map_miss,
+                    "xskDrops": c.xsk_drops,
+                    "rateLimited": c.rate_limited,
+                    "ratelimitMapFull": c.ratelimit_map_full,
+                    "udpFwdTx": c.udp_fwd_tx,
+                    "udpFwdMapFull": c.udp_fwd_map_full,
+                    "tcpFwdTx": c.tcp_fwd_tx,
+                    "tcpFwdMapFull": c.tcp_fwd_map_full,
+                    "snatBound": c.snat_bound,
+                    "snatAllocFail": c.snat_alloc_fail,
+                    "snatReplyTx": c.snat_reply_tx,
+                })
+            })
+            .ok();
+        #[cfg(not(target_os = "linux"))]
+        let counters: Option<serde_json::Value> = None;
         serde_json::json!({
+            "counters": counters,
             "interfaces": interfaces,
             "proxyPorts": proxy_ports,
             "proxyPortSummary": {
@@ -3997,6 +4023,13 @@ mod linux {
             "XDP_DISPATCH",
             Path::new(XDP_BPF_PIN_DIR).join("XDP_DISPATCH"),
         );
+        // Counters are pinned so verdict accounting stays readable by other
+        // processes (`xdp dump-maps` while a daemon owns the attachment) and
+        // survives process exit. The spec check above still guards layout.
+        loader.map_pin_path(
+            "XDP_COUNTERS",
+            Path::new(XDP_BPF_PIN_DIR).join("XDP_COUNTERS"),
+        );
         let mut ebpf = match object_path {
             Some(path) => loader.load_file(path)?,
             None => loader.load(XDP_EBPF_EMBEDDED)?,
@@ -4231,6 +4264,20 @@ mod linux {
             .map("XDP_COUNTERS")
             .ok_or_else(|| anyhow::anyhow!("missing map XDP_COUNTERS"))?;
         let counters = Array::<_, XdpCounters>::try_from(map)?.get(&0, 0)?;
+        Ok(counters)
+    }
+
+    /// Read the dataplane counters straight from the pinned XDP_COUNTERS map
+    /// without requiring this process to own the loaded program. Used by
+    /// `xdp dump-maps` so test tooling can observe fresh verdict counters
+    /// while a separate daemon/smoke process owns the attachment.
+    pub fn read_pinned_counters() -> anyhow::Result<XdpCounters> {
+        let path = std::path::Path::new(XDP_BPF_PIN_DIR).join("XDP_COUNTERS");
+        let data = aya::maps::MapData::from_pin(&path).map_err(|err| {
+            anyhow::anyhow!("open pinned XDP_COUNTERS {}: {err}", path.display())
+        })?;
+        let map = aya::maps::Map::Array(data);
+        let counters = Array::<_, XdpCounters>::try_from(&map)?.get(&0, 0)?;
         Ok(counters)
     }
 
