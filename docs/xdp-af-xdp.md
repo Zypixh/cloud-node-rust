@@ -144,6 +144,8 @@ veth + kernel 6.1 + SKB 模式下 AF_PACKET 注入实测（32B payload，注入�
 - 新流建立（CT insert + SNAT 时一次 `NOEXIST` 端口认领）比稳态慢约 30%，SNAT 分配相对 CT insert 开销很小。
 - 端口分配失败计数 `snat_alloc_fail` 并显式回落（该包走原路径），不丢包不静默。
 
+OrbStack 7.0 / veth / SKB 复测（注入器 ~1.0M pps）：固定五元组 `snat: false` 1,011k pps 全量转发且 peer 侧 rx 确认 100% 送达；`snat: true` 933k pps（SNAT 开销 ≈8%，与 6.1 实测一致）。洪峰窗口 VM 全局 busy ≈9.7%（7 核摊薄，softirq ≈7.9% ≈ 单核 55%）。
+
 SNAT 端口空间为每个监听元组 21000 个端口（`XDP_SNAT_PORT_BASE`=40000 起，共 `XDP_SNAT_PORT_SPAN`=21000）。高并发轮换流实测（OrbStack 7.0 / veth，注入器上限 ~1.1M pps）：
 
 | 并发流数（轮换） | 结果 |
