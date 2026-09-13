@@ -276,6 +276,13 @@ pub struct XdpRateLimitConfig {
     pub udp_pps: u64,
     pub tcp_syn_pps: u64,
     pub window_ns: u64,
+    /// EN-08 prefix fairness: bucket granularity for the per-source limiter.
+    /// 0 = per-address (/32 or /128, the historical default); otherwise the
+    /// source address is masked to this prefix length before keying, so a
+    /// randomized-source flood inside one prefix cannot escape its bucket
+    /// and many benign prefixes each keep their own.
+    pub v4_prefix_len: u32,
+    pub v6_prefix_len: u32,
 }
 
 /// Per-IP fixed-window bucket; one entry per source address.
@@ -549,7 +556,7 @@ pub struct NatScratch {
 /// nonlocal_pass; XDP_LOCAL_* values gain the XDP_LOCAL_REDIRECT bit.
 /// v5: EN-06 verifier split — NatScratch +work_ip_off/work_ifindex/
 /// work_pkt_len; XDP_DISPATCH grows to 16 slots (7-10 = NAT work programs).
-pub const XDP_ABI_VERSION: u32 = 6;
+pub const XDP_ABI_VERSION: u32 = 7;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -739,6 +746,7 @@ const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevValue>() == 56);
 const _: () = assert!(core::mem::size_of::<XdpInterfacePolicy>() == 8);
 const _: () = assert!(core::mem::size_of::<XdpRateBucket>() == 16);
+const _: () = assert!(core::mem::size_of::<XdpRateLimitConfig>() == 32);
 const _: () = assert!(core::mem::size_of::<NatScratch>() == 312);
 
 #[cfg(all(feature = "aya", target_os = "linux"))]

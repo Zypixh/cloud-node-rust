@@ -1158,20 +1158,17 @@ impl XdpManager {
     /// settings apply at Elevated, halve at High, quarter at Critical, and the
     /// limiter is fully disabled at Normal (zero pps = off in eBPF).
     fn effective_rate_limit_config(&self) -> cloud_node_xdp_common::XdpRateLimitConfig {
-        let mut config = cloud_node_xdp_common::XdpRateLimitConfig::default();
+        let config = cloud_node_xdp_common::XdpRateLimitConfig::default();
         let Some(base) = &self.config.rate_limit else {
             return config;
         };
-        let divisor: u64 = match crate::l4_defense::current_pressure_level() {
+        let divisor: u64 = match xdp_rate_limit_pressure_level() {
             crate::l4_defense::L4PressureLevel::Normal => return config,
             crate::l4_defense::L4PressureLevel::Elevated => 1,
             crate::l4_defense::L4PressureLevel::High => 2,
             crate::l4_defense::L4PressureLevel::Critical => 4,
         };
-        config.udp_pps = base.udp_pps / divisor;
-        config.tcp_syn_pps = base.tcp_syn_pps / divisor;
-        config.window_ns = base.window_ms.saturating_mul(1_000_000);
-        config
+        scaled_rate_limit_config(base, divisor)
     }
 
     /// Effective aggregate budget (EN-07). Node-wide totals from
@@ -1365,6 +1362,31 @@ impl XdpManager {
                 crate::pipeline_metrics::PipelineCounter::XdpMapSyncFailed,
                 1,
             );
+        }
+    }
+
+    /// EN-08: reap idle per-source rate buckets (bounded per pass).
+    #[cfg(target_os = "linux")]
+    fn sweep_rate_buckets(&self) {
+        const MAX_REAP_PER_PASS: usize = 8192;
+        let base = self.config.rate_limit.clone().unwrap_or_default();
+        if base.window_ms == 0 || self.attached.read().is_empty() {
+            return;
+        }
+        let result = {
+            let mut guard = self.ebpf.lock();
+            match guard.as_mut() {
+                Some(ebpf) => linux::sweep_rate_maps(
+                    ebpf,
+                    base.window_ms.saturating_mul(1_000_000),
+                    base.gc_after_windows,
+                    MAX_REAP_PER_PASS,
+                ),
+                None => Ok(()),
+            }
+        };
+        if let Err(err) = result {
+            tracing::debug!("XDP rate-map GC skipped: {err}");
         }
     }
 
@@ -1589,6 +1611,53 @@ impl XdpManager {
 
 static XDP_MANAGER: OnceLock<parking_lot::RwLock<std::sync::Arc<XdpManager>>> = OnceLock::new();
 
+/// Pressure level used to scale the XDP per-source rate limiter. Release
+/// builds always use the live aggregate pressure. Debug builds honor
+/// `CLOUD_NODE_XDP_TEST_PRESSURE=normal|elevated|high|critical` so dataplane
+/// e2e probes (scripts/edge/en08_rate_probe.py) can exercise the real
+/// config→map→eBPF path without driving the host into memory pressure.
+#[cfg(debug_assertions)]
+fn xdp_rate_limit_pressure_level() -> crate::l4_defense::L4PressureLevel {
+    use crate::l4_defense::L4PressureLevel;
+    match std::env::var("CLOUD_NODE_XDP_TEST_PRESSURE").as_deref() {
+        Ok("normal") => L4PressureLevel::Normal,
+        Ok("elevated") => L4PressureLevel::Elevated,
+        Ok("high") => L4PressureLevel::High,
+        Ok("critical") => L4PressureLevel::Critical,
+        _ => crate::l4_defense::current_pressure_level(),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn xdp_rate_limit_pressure_level() -> crate::l4_defense::L4PressureLevel {
+    crate::l4_defense::current_pressure_level()
+}
+
+/// EN-08: translate operator-facing rate settings into the eBPF ABI config.
+/// Pressure scaling divides the per-source ceilings but clamps any nonzero
+/// base at >=1 — "divide to zero" must never silently disable a dimension.
+/// Prefix lengths are clamped to protocol width (32/128); 0 keeps the
+/// default per-address granularity.
+fn scaled_rate_limit_config(
+    base: &crate::runtime_mode::XdpRateLimitSettings,
+    divisor: u64,
+) -> cloud_node_xdp_common::XdpRateLimitConfig {
+    let scaled = |pps: u64| {
+        if pps == 0 {
+            0
+        } else {
+            (pps / divisor).max(1)
+        }
+    };
+    cloud_node_xdp_common::XdpRateLimitConfig {
+        udp_pps: scaled(base.udp_pps),
+        tcp_syn_pps: scaled(base.tcp_syn_pps),
+        window_ns: base.window_ms.saturating_mul(1_000_000),
+        v4_prefix_len: base.prefix_v4_len.min(32),
+        v6_prefix_len: base.prefix_v6_len.min(128),
+    }
+}
+
 fn manager_from_runtime() -> std::sync::Arc<XdpManager> {
     let config = RuntimeConfig::current()
         .map(|runtime| runtime.xdp)
@@ -1680,7 +1749,10 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
             manager.sync_rate_limit_config();
             manager.sync_budget_config();
             #[cfg(target_os = "linux")]
-            manager.sweep_nat_maps();
+            {
+                manager.sweep_nat_maps();
+                manager.sweep_rate_buckets();
+            }
         }
     });
 }

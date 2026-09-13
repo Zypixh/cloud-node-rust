@@ -1022,7 +1022,18 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         counter_unverified_limited();
         return Ok(xdp_action::XDP_DROP);
     }
-    if rate_limited_v6(ctx, source, protocol, l4_offset, now_mono_ns) {
+    // Network-order words: from_be_bytes keeps the leading address bits in
+    // the high bits of each u64 so prefix masking is ordinary shift logic.
+    let (src_hi, src_lo) = unsafe {
+        (
+            u64::from_be(core::ptr::read_unaligned(source.as_ptr() as *const u64)),
+            u64::from_be(core::ptr::read_unaligned(
+                source.as_ptr().add(8) as *const u64
+            )),
+        )
+    };
+    let rate_meta = (protocol as u64) | ((l4_offset as u64) << 8);
+    if rate_limited_v6(ctx, src_hi, src_lo, rate_meta, now_mono_ns) {
         counter_rate_limited();
         return Ok(xdp_action::XDP_DROP);
     }
@@ -1468,21 +1479,30 @@ fn rate_limited_v4(
     if limit == 0 || cfg.window_ns == 0 {
         return false;
     }
-    let key = XdpIpv4Key::new(addr_be);
+    // Prefix fairness (EN-08): mask the source to the configured prefix so
+    // a randomized flood inside one prefix shares one bucket; 0 = per-IP.
+    let masked = if cfg.v4_prefix_len >= 32 || cfg.v4_prefix_len == 0 {
+        addr_be
+    } else {
+        addr_be & (u32::MAX << (32 - cfg.v4_prefix_len))
+    };
+    let key = XdpIpv4Key::new(masked);
     rate_bucket_hit_v4(&key, limit, cfg.window_ns, now_mono_ns)
 }
 
 #[inline(never)]
 fn rate_limited_v6(
     ctx: &XdpContext,
-    source: [u8; 16],
-    protocol: u8,
-    l4_offset: usize,
+    src_hi: u64,
+    src_lo: u64,
+    meta: u64,
     now_mono_ns: u64,
 ) -> bool {
     let Some(cfg) = XDP_RATE_CFG.get(0) else {
         return false;
     };
+    let protocol = (meta & 0xff) as u8;
+    let l4_offset = (meta >> 8) as usize;
     let limit = match protocol {
         value if value == IpProto::Udp as u8 => cfg.udp_pps,
         value if value == IpProto::Tcp as u8 => {
@@ -1496,7 +1516,30 @@ fn rate_limited_v6(
     if limit == 0 || cfg.window_ns == 0 {
         return false;
     }
-    let key = XdpIpv6Key::new(source);
+    // Prefix fairness (EN-08): mask the source words to the configured v6
+    // prefix — word ops only, no variable-index byte loops and no
+    // stack-passed sixth argument (5-reg signature keeps LLVM off r11).
+    let (mut hi, mut lo) = (src_hi, src_lo);
+    if cfg.v6_prefix_len > 0 && cfg.v6_prefix_len < 128 {
+        let hi_keep = (cfg.v6_prefix_len as usize).min(64);
+        let lo_keep = (cfg.v6_prefix_len as usize).saturating_sub(64);
+        if hi_keep == 0 {
+            hi = 0;
+        } else if hi_keep < 64 {
+            hi &= u64::MAX << (64 - hi_keep);
+        }
+        if lo_keep == 0 {
+            lo = 0;
+        } else if lo_keep < 64 {
+            lo &= u64::MAX << (64 - lo_keep);
+        }
+    }
+    let key = XdpIpv6Key::new(unsafe {
+        let mut b = [0u8; 16];
+        core::ptr::write_unaligned(b.as_mut_ptr() as *mut u64, hi.to_be());
+        core::ptr::write_unaligned(b.as_mut_ptr().add(8) as *mut u64, lo.to_be());
+        b
+    });
     rate_bucket_hit_v6(&key, limit, cfg.window_ns, now_mono_ns)
 }
 

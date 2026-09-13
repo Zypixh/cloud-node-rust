@@ -331,6 +331,22 @@ pub struct XdpRateLimitSettings {
     pub tcp_syn_pps: u64,
     #[serde(rename = "windowMs", default = "default_xdp_rate_limit_window_ms")]
     pub window_ms: u64,
+    /// EN-08 prefix fairness: source-bucket granularity. 0 (default) =
+    /// per-address; 1..=32 groups IPv4 sources into prefix buckets, so a
+    /// randomized flood inside one prefix shares one bucket.
+    #[serde(rename = "prefixV4Len", default)]
+    pub prefix_v4_len: u32,
+    /// Same for IPv6; 0 (default) = /128 per-address, else 1..=128.
+    #[serde(rename = "prefixV6Len", default)]
+    pub prefix_v6_len: u32,
+    /// Rate buckets idle for this many windows are reaped by the sweeper.
+    /// Default 8.
+    #[serde(rename = "gcAfterWindows", default = "default_gc_after_windows")]
+    pub gc_after_windows: u64,
+}
+
+fn default_gc_after_windows() -> u64 {
+    8
 }
 
 impl Default for XdpRateLimitSettings {
@@ -339,6 +355,9 @@ impl Default for XdpRateLimitSettings {
             udp_pps: 0,
             tcp_syn_pps: 0,
             window_ms: default_xdp_rate_limit_window_ms(),
+            prefix_v4_len: 0,
+            prefix_v6_len: 0,
+            gc_after_windows: default_gc_after_windows(),
         }
     }
 }
