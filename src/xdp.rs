@@ -7825,11 +7825,19 @@ pub mod af_xdp {
                 downstream_budget_exhausted,
             ) {
                 std::hint::spin_loop();
-                std::thread::sleep(idle_backoff);
+                // Async sleep, not std::thread::sleep: the timer yields to the
+                // current-thread scheduler so spawned proxy tasks can run while
+                // the reactor backs off.
+                tokio::time::sleep(idle_backoff).await;
                 idle_backoff = (idle_backoff.saturating_mul(2)).min(AF_XDP_IDLE_BACKOFF_MAX);
             } else {
                 idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
             }
+            // The busy path above never awaits; without an explicit yield the
+            // current-thread runtime starves tokio::spawn'ed TCP/HTTP proxy
+            // tasks (sessions get ACKed by the smoltcp stack but no relay task
+            // is ever polled).
+            tokio::task::yield_now().await;
         }
     }
 
