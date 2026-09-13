@@ -1,0 +1,66 @@
+{
+  "task_id": "EN-00",
+  "status": "VERIFIED",
+  "start_commit": "0ca5cbd02b11f644943b25c05cdae55bd338b69b",
+  "end_commit": "0ca5cbd02b11f644943b25c05cdae55bd338b69b",
+  "working_tree_dirty": "docs-only: new evidence dir + pre-existing untracked plan docs; no code changes",
+  "patch_digest": "no code patch; evidence files only",
+  "contract_versions": {
+    "aya": "0.14.0",
+    "aya_ebpf": "0.2.1",
+    "quinn": "0.11.11",
+    "smoltcp": "0.14.0",
+    "tokio": "1.53.1",
+    "rustc": "1.98.1",
+    "bpf_linker": "0.11.1"
+  },
+  "changed_paths": [
+    "docs/edge-node-evidence/EN-00/report.md",
+    "docs/edge-node-evidence/EN-00/manifest.json",
+    "tasks/edge-node-production-plan.md (status table)"
+  ],
+  "implemented_behavior": "baseline inventory: toolchain, 8 risk re-verification, deployment boundaries, Quinn API check, test entrypoints, machine profiles, T18 support matrix",
+  "compatibility_and_migrations": "none; inventory only",
+  "resource_bounds_and_full_behavior": "rate maps 262144 entries fail-open no GC; CT OPEN-on-SYN with 180s/7200s/120s sweep params; shared (non-percpu) counter array",
+  "failure_and_rollback_behavior": "no runtime changes; rollback = delete evidence dir",
+  "invariants_covered": [],
+  "tests_covered": ["T18-matrix"],
+  "commands_and_exit_codes": {
+    "git rev-parse HEAD": 0,
+    "cargo test --lib (642 pass / 2 ignored)": 0,
+    "cargo +nightly build ebpf bpfel-unknown-none (build-node)": 0,
+    "xdp proxy-smoke veth+netns full protocol suite": 0,
+    "AF_PACKET forward rewrite verification (UDP+TCP SNAT)": 0
+  },
+  "environment_and_path_profile": {
+    "x86-build": "OrbStack x86_64, kernel 7.0.14, 7vCPU/6GB, eth0=veth, cgroup v2, generic XDP only",
+    "build-node": "OrbStack aarch64, kernel 7.0.14, 7vCPU, bpf-linker 0.11.1",
+    "host": "macOS aarch64 Darwin 27 — compile/unit-test only"
+  },
+  "workload_and_generator_limits": "no load generation; smoke only",
+  "results_and_raw_artifact_paths": {
+    "report": "docs/edge-node-evidence/EN-00/report.md",
+    "unit_tests": "642 passed / 0 failed / 2 ignored"
+  },
+  "unrun_checks_and_reasons": {
+    "native_drv_attach": "no native-capable NIC in environment",
+    "zero_copy_xsk": "requires native driver",
+    "kernel_6.1_verifier": "environment runs 7.0.14 only",
+    "xdp-netns-smoke.sh": "EN-02 tooling scope",
+    "perf matrices": "EN-02/EN-31 scope",
+    "pingora_vendored_tests": "not touched this round"
+  },
+  "open_issues": [
+    "R1 rate-limit: default unconfigured, fail-open, no GC",
+    "R2 CT: SYN->OPEN, no half-open lifecycle, 2h idle",
+    "R3 parse classification: single Err->PASS bucket",
+    "R4 XDP_COUNTERS is shared Array (cross-CPU lost counts)",
+    "R5 XSK failure couples redirect with protected service",
+    "R6 QUIC DCID cross-queue XSK violates XSKMAP constraint",
+    "R7 frame copies + session scan + linear sweep",
+    "build.rs prebuilt-object fallback lacks identity/ABI check",
+    "node A (10.0.160.13) currently unreachable; veth evidence only"
+  ],
+  "review_evidence": "self-checked; independent review pending",
+  "next_eligible_tasks": ["EN-01", "EN-02"]
+}
