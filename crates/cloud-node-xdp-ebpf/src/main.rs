@@ -199,7 +199,10 @@ static XDP_FLOW_ACCT: PerCpuHashMap<XdpUdpCtKey, XdpFlowAcct> =
 #[xdp]
 pub fn cloud_node_xdp(ctx: XdpContext) -> u32 {
     match try_cloud_node_xdp(ctx) {
-        Ok(action) => action,
+        Ok(action) => {
+            count_action(action);
+            action
+        }
         Err(_) => {
             counter_parse_error();
             xdp_action::XDP_PASS
@@ -213,7 +216,10 @@ pub fn cloud_node_xdp(ctx: XdpContext) -> u32 {
 #[xdp]
 pub fn xdp_nat_dispatch(ctx: XdpContext) -> u32 {
     match try_nat_dispatch(&ctx) {
-        Ok(action) => action,
+        Ok(action) => {
+            count_action(action);
+            action
+        }
         Err(_) => {
             counter_parse_error();
             xdp_action::XDP_PASS
@@ -335,7 +341,10 @@ fn try_nat_udp6_fwd(ctx: &XdpContext) -> Result<u32, ()> {
 #[xdp]
 pub fn xdp_nat_udp6_fwd(ctx: XdpContext) -> u32 {
     match try_nat_udp6_fwd(&ctx) {
-        Ok(action) => action,
+        Ok(action) => {
+            count_action(action);
+            action
+        }
         Err(_) => {
             counter_parse_error();
             xdp_action::XDP_PASS
@@ -386,7 +395,10 @@ fn try_nat_tcp6_fwd(ctx: &XdpContext) -> Result<u32, ()> {
 #[xdp]
 pub fn xdp_nat_tcp6_fwd(ctx: XdpContext) -> u32 {
     match try_nat_tcp6_fwd(&ctx) {
-        Ok(action) => action,
+        Ok(action) => {
+            count_action(action);
+            action
+        }
         Err(_) => {
             counter_parse_error();
             xdp_action::XDP_PASS
@@ -397,7 +409,10 @@ pub fn xdp_nat_tcp6_fwd(ctx: XdpContext) -> u32 {
 #[xdp]
 pub fn xdp_nat_tcp_dispatch(ctx: XdpContext) -> u32 {
     match try_nat_tcp_dispatch(&ctx) {
-        Ok(action) => action,
+        Ok(action) => {
+            count_action(action);
+            action
+        }
         Err(_) => {
             counter_parse_error();
             xdp_action::XDP_PASS
@@ -408,7 +423,10 @@ pub fn xdp_nat_tcp_dispatch(ctx: XdpContext) -> u32 {
 #[xdp]
 pub fn xdp_nat_udp6_dispatch(ctx: XdpContext) -> u32 {
     match try_nat_udp6_dispatch(&ctx) {
-        Ok(action) => action,
+        Ok(action) => {
+            count_action(action);
+            action
+        }
         Err(_) => {
             counter_parse_error();
             xdp_action::XDP_PASS
@@ -419,7 +437,10 @@ pub fn xdp_nat_udp6_dispatch(ctx: XdpContext) -> u32 {
 #[xdp]
 pub fn xdp_nat_tcp6_dispatch(ctx: XdpContext) -> u32 {
     match try_nat_tcp6_dispatch(&ctx) {
-        Ok(action) => action,
+        Ok(action) => {
+            count_action(action);
+            action
+        }
         Err(_) => {
             counter_parse_error();
             xdp_action::XDP_PASS
@@ -434,7 +455,10 @@ pub fn xdp_nat_tcp6_dispatch(ctx: XdpContext) -> u32 {
 #[xdp]
 pub fn xdp_sni_dispatch(ctx: XdpContext) -> u32 {
     match try_sni_dispatch(&ctx) {
-        Ok(action) => action,
+        Ok(action) => {
+            count_action(action);
+            action
+        }
         Err(_) => {
             counter_parse_error();
             xdp_action::XDP_PASS
@@ -534,11 +558,6 @@ fn try_cloud_node_xdp(ctx: XdpContext) -> Result<u32, ()> {
         value if value == EtherType::Ipv6 as u16 => handle_ipv6(&ctx, ip_offset)?,
         _ => xdp_action::XDP_PASS,
     };
-    match action {
-        x if x == xdp_action::XDP_DROP => counter_drop(),
-        x if x == xdp_action::XDP_REDIRECT => counter_redirect(),
-        _ => counter_pass(),
-    }
     Ok(action)
 }
 
@@ -2682,6 +2701,20 @@ fn counters() -> Option<&'static mut XdpCounters> {
 fn counter_packet() {
     if let Some(counters) = counters() {
         counters.packets = counters.packets.saturating_add(1);
+    }
+}
+
+/// Count a program's terminal action. Tail-called subprograms return their
+/// action straight to the kernel - the parent program's accounting never
+/// runs for them - so every entry point must count its own action. XDP_TX
+/// frames are already accounted by the forwarding counters and must not be
+/// double-counted as PASS.
+fn count_action(action: u32) {
+    match action {
+        x if x == xdp_action::XDP_DROP => counter_drop(),
+        x if x == xdp_action::XDP_REDIRECT => counter_redirect(),
+        x if x == xdp_action::XDP_TX => {}
+        _ => counter_pass(),
     }
 }
 
