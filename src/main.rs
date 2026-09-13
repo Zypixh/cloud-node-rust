@@ -873,19 +873,41 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let effective_xdp = rt.block_on(
-                cloud_node_rust::xdp_auto_config::derive_xdp_config_from_live_node_with_options(
-                    &runtime_config,
-                    cloud_node_rust::xdp_auto_config::XdpAutoConfigOptions {
-                        interfaces,
-                        mode: mode.map(Into::into).unwrap_or(XdpRuntimeMode::Proxy),
-                        attach_mode: attach_mode.map(Into::into).unwrap_or(XdpAttachMode::Auto),
-                        fallback: fallback
-                            .map(Into::into)
-                            .unwrap_or(XdpFallbackMode::FailStart),
-                    },
-                ),
-            )?;
+            let file_config_is_authoritative =
+                interfaces.is_empty() && !runtime_config.xdp.interfaces.is_empty();
+            let effective_xdp = if file_config_is_authoritative {
+                // The file's explicit interface list is authoritative: apply
+                // CLI overrides on top without consulting the live node config
+                // (attach must work with a fully-declared runtime.yaml).
+                let mut xdp = runtime_config.xdp.clone();
+                if let Some(mode) = mode {
+                    let mode = XdpRuntimeMode::from(mode);
+                    for interface in &mut xdp.interfaces {
+                        interface.mode = mode;
+                    }
+                }
+                if let Some(attach_mode) = attach_mode {
+                    xdp.attach_mode = attach_mode.into();
+                }
+                if let Some(fallback) = fallback {
+                    xdp.fallback = fallback.into();
+                }
+                xdp
+            } else {
+                rt.block_on(
+                    cloud_node_rust::xdp_auto_config::derive_xdp_config_from_live_node_with_options(
+                        &runtime_config,
+                        cloud_node_rust::xdp_auto_config::XdpAutoConfigOptions {
+                            interfaces,
+                            mode: mode.map(Into::into).unwrap_or(XdpRuntimeMode::Proxy),
+                            attach_mode: attach_mode.map(Into::into).unwrap_or(XdpAttachMode::Auto),
+                            fallback: fallback
+                                .map(Into::into)
+                                .unwrap_or(XdpFallbackMode::FailStart),
+                        },
+                    ),
+                )?
+            };
             let mut effective_xdp = effective_xdp;
             if runtime_config.xdp.rate_limit.is_some() {
                 effective_xdp.rate_limit = runtime_config.xdp.rate_limit.clone();
@@ -922,7 +944,11 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
                 return Ok(());
             }
             let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
-            save_xdp_enabled(&runtime_path, true)?;
+            if file_config_is_authoritative {
+                cloud_node_rust::xdp_config_wizard::merge_xdp_enabled(&runtime_path, true)?;
+            } else {
+                save_xdp_enabled(&runtime_path, true)?;
+            }
             #[cfg(target_os = "linux")]
             if !is_systemd_invocation() && systemd_service_is_active() {
                 run_systemctl("restart")?;
