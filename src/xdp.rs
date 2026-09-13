@@ -5426,7 +5426,9 @@ pub mod af_xdp {
         SocketHandle, SocketSet,
     };
     #[cfg(any(test, target_os = "linux"))]
-    use smoltcp::phy::{Device as SmoltcpDevice, DeviceCapabilities, Medium, RxToken, TxToken};
+    use smoltcp::phy::{
+        Checksum, Device as SmoltcpDevice, DeviceCapabilities, Medium, RxToken, TxToken,
+    };
     #[cfg(any(test, target_os = "linux"))]
     use smoltcp::socket::tcp as SmoltcpTcp;
     #[cfg(any(test, target_os = "linux"))]
@@ -5990,6 +5992,16 @@ pub mod af_xdp {
             caps.medium = Medium::Ip;
             caps.max_transmission_unit = self.max_transmission_unit;
             caps.max_burst_size = Some(64);
+            // AF_XDP delivers raw wire frames. On virtio/VM-to-VM paths the
+            // sender may offload checksum completion to the NIC, which marks
+            // the skb CHECKSUM_UNNECESSARY while leaving the field partial in
+            // the bytes we receive. The kernel stack trusts that mark; a
+            // userspace stack must declare the same capability or it drops
+            // perfectly valid frames at checksum verification. We still
+            // compute checksums on TX ourselves.
+            caps.checksum.tcp = Checksum::Tx;
+            caps.checksum.udp = Checksum::Tx;
+            caps.checksum.ipv4 = Checksum::Tx;
             caps
         }
     }
