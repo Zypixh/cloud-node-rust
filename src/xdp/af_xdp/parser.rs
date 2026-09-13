@@ -273,7 +273,11 @@ pub(crate) fn is_vlan_ethertype(ethertype: u16) -> bool {
     )
 }
 
-pub(crate) fn parse_ipv4_l4(frame: &[u8], ip_offset: usize, link: AfXdpLinkMeta) -> Option<AfXdpL4Packet> {
+pub(crate) fn parse_ipv4_l4(
+    frame: &[u8],
+    ip_offset: usize,
+    link: AfXdpLinkMeta,
+) -> Option<AfXdpL4Packet> {
     let base = frame.get(ip_offset..ip_offset + IPV4_MIN_HEADER_LEN)?;
     let version = base[0] >> 4;
     let ihl = usize::from(base[0] & 0x0f) * 4;
@@ -299,7 +303,11 @@ pub(crate) fn parse_ipv4_l4(frame: &[u8], ip_offset: usize, link: AfXdpLinkMeta)
     )
 }
 
-pub(crate) fn parse_ipv6_l4(frame: &[u8], ip_offset: usize, link: AfXdpLinkMeta) -> Option<AfXdpL4Packet> {
+pub(crate) fn parse_ipv6_l4(
+    frame: &[u8],
+    ip_offset: usize,
+    link: AfXdpLinkMeta,
+) -> Option<AfXdpL4Packet> {
     let base = frame.get(ip_offset..ip_offset + IPV6_HEADER_LEN)?;
     if base[0] >> 4 != 6 {
         return None;
@@ -324,7 +332,11 @@ pub(crate) fn parse_ipv6_l4(frame: &[u8], ip_offset: usize, link: AfXdpLinkMeta)
     )
 }
 
-pub(crate) fn transport_protocol_from_frame(frame: &[u8], ip_offset: usize, ethertype: u16) -> Option<u8> {
+pub(crate) fn transport_protocol_from_frame(
+    frame: &[u8],
+    ip_offset: usize,
+    ethertype: u16,
+) -> Option<u8> {
     match ethertype {
         ETHERTYPE_IPV4 => {
             let base = frame.get(ip_offset..ip_offset + IPV4_MIN_HEADER_LEN)?;
@@ -568,10 +580,7 @@ pub(crate) fn tcp_flow_flags_from_frame(
                         destination,
                         u16::from_be_bytes([header[2], header[3]]),
                     ),
-                    peer_addr: SocketAddr::new(
-                        source,
-                        u16::from_be_bytes([header[0], header[1]]),
-                    ),
+                    peer_addr: SocketAddr::new(source, u16::from_be_bytes([header[0], header[1]])),
                 },
                 header[13],
             ))
@@ -661,4 +670,241 @@ pub(crate) fn read_u16(buf: &[u8], offset: usize) -> Option<u16> {
         *buf.get(offset)?,
         *buf.get(offset + 1)?,
     ]))
+}
+
+// ---------------------------------------------------------------------------
+// EN-05 parse classification mirror: the same verdict taxonomy the eBPF
+// parser applies (XDP_CLASS_*). Used by tests to assert kernel/userspace
+// parse parity (T01) — the proxy dataplane itself still uses the Option-based
+// parsers above; classification is additive observability.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+const IP_PROTO_ICMP: u8 = 1;
+#[cfg(test)]
+const IP_PROTO_ICMPV6: u8 = 58;
+
+/// Mirror of the eBPF parse classes (XDP_CLASS_* in cloud-node-xdp-common),
+/// plus NonIp for frames the kernel program passes without classifying.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AfXdpFrameClass {
+    Supported,
+    Malformed,
+    Unsupported,
+    Fragmented,
+    Control,
+    /// Non-IPv4/IPv6 ethertype: the kernel passes these without a class
+    /// counter; kept distinct so parity tests can tell "uncounted pass" from
+    /// "counted unsupported".
+    NonIp,
+}
+
+/// Classify a received L2 frame exactly as the eBPF parser does:
+/// deterministic-illegal -> Malformed, IP fragments -> Fragmented (never an
+/// L4 flow), ICMP/ICMPv6 -> Control, legal-but-unresolvable -> Unsupported,
+/// fully parsed TCP/UDP -> Supported.
+#[cfg(test)]
+pub(crate) fn classify_frame(frame: &[u8]) -> AfXdpFrameClass {
+    use AfXdpFrameClass::*;
+    if frame.len() < ETH_HEADER_LEN {
+        return Malformed;
+    }
+    let mut ethertype = match read_u16(frame, 12) {
+        Some(v) => v,
+        None => return Malformed,
+    };
+    let mut ip_offset = ETH_HEADER_LEN;
+    for _ in 0..2 {
+        if !is_vlan_ethertype(ethertype) {
+            break;
+        }
+        if frame.len() < ip_offset + VLAN_HEADER_LEN {
+            return Malformed;
+        }
+        ethertype = match read_u16(frame, ip_offset + 2) {
+            Some(v) => v,
+            None => return Malformed,
+        };
+        ip_offset += VLAN_HEADER_LEN;
+    }
+    if is_vlan_ethertype(ethertype) {
+        return Unsupported;
+    }
+    match ethertype {
+        ETHERTYPE_IPV4 => classify_ipv4(frame, ip_offset),
+        ETHERTYPE_IPV6 => classify_ipv6(frame, ip_offset),
+        _ => NonIp,
+    }
+}
+
+#[cfg(test)]
+fn classify_ipv4(frame: &[u8], ip_offset: usize) -> AfXdpFrameClass {
+    use AfXdpFrameClass::*;
+    let Some(base) = frame.get(ip_offset..ip_offset + IPV4_MIN_HEADER_LEN) else {
+        return Malformed;
+    };
+    let ihl = usize::from(base[0] & 0x0f) * 4;
+    let total_len = usize::from(u16::from_be_bytes([base[2], base[3]]));
+    if base[0] >> 4 != 4
+        || ihl < IPV4_MIN_HEADER_LEN
+        || ihl > 15 * 4
+        || total_len < ihl
+        || ip_offset + total_len > frame.len()
+    {
+        return Malformed;
+    }
+    let fragment = u16::from_be_bytes([base[6], base[7]]);
+    if fragment & 0x3fff != 0 {
+        return Fragmented;
+    }
+    let packet_end = ip_offset + total_len;
+    classify_transport(frame, base[9], ip_offset + ihl, packet_end)
+}
+
+#[cfg(test)]
+fn classify_ipv6(frame: &[u8], ip_offset: usize) -> AfXdpFrameClass {
+    use AfXdpFrameClass::*;
+    let Some(base) = frame.get(ip_offset..ip_offset + IPV6_HEADER_LEN) else {
+        return Malformed;
+    };
+    if base[0] >> 4 != 6 {
+        return Malformed;
+    }
+    let payload_len = usize::from(u16::from_be_bytes([base[4], base[5]]));
+    let Some(packet_end) = ip_offset
+        .checked_add(IPV6_HEADER_LEN)
+        .and_then(|o| o.checked_add(payload_len))
+    else {
+        return Malformed;
+    };
+    if packet_end > frame.len() {
+        return Malformed;
+    }
+    match classify_ipv6_chain(frame, base[6], ip_offset + IPV6_HEADER_LEN, packet_end) {
+        Ipv6Chain::L4(protocol, l4_offset) => {
+            classify_transport(frame, protocol, l4_offset, packet_end)
+        }
+        Ipv6Chain::Fragmented => Fragmented,
+        Ipv6Chain::Unsupported => Unsupported,
+        Ipv6Chain::Malformed => Malformed,
+    }
+}
+
+#[cfg(test)]
+enum Ipv6Chain {
+    L4(u8, usize),
+    Fragmented,
+    Unsupported,
+    Malformed,
+}
+
+#[cfg(test)]
+fn classify_ipv6_chain(
+    frame: &[u8],
+    mut next_header: u8,
+    mut offset: usize,
+    packet_end: usize,
+) -> Ipv6Chain {
+    for _ in 0..8 {
+        match next_header {
+            IP_PROTO_TCP | IP_PROTO_UDP | IP_PROTO_ICMPV6 => {
+                return Ipv6Chain::L4(next_header, offset);
+            }
+            IP_PROTO_NO_NEXT => return Ipv6Chain::Unsupported,
+            IP_PROTO_HOP_BY_HOP | IP_PROTO_ROUTING | IP_PROTO_DEST_OPTS => {
+                let Some(header) = frame.get(offset..offset + 2) else {
+                    return Ipv6Chain::Malformed;
+                };
+                if offset + 2 > packet_end {
+                    return Ipv6Chain::Malformed;
+                }
+                next_header = header[0];
+                offset = match offset.checked_add((usize::from(header[1]) + 1) * 8) {
+                    Some(o) => o,
+                    None => return Ipv6Chain::Malformed,
+                };
+            }
+            IP_PROTO_AH => {
+                let Some(header) = frame.get(offset..offset + 2) else {
+                    return Ipv6Chain::Malformed;
+                };
+                if offset + 2 > packet_end {
+                    return Ipv6Chain::Malformed;
+                }
+                next_header = header[0];
+                offset = match offset.checked_add((usize::from(header[1]) + 2) * 4) {
+                    Some(o) => o,
+                    None => return Ipv6Chain::Malformed,
+                };
+            }
+            IP_PROTO_FRAGMENT => {
+                let Some(header) = frame.get(offset..offset + 8) else {
+                    return Ipv6Chain::Malformed;
+                };
+                if offset + 8 > packet_end {
+                    return Ipv6Chain::Malformed;
+                }
+                next_header = header[0];
+                let fragment = u16::from_be_bytes([header[2], header[3]]);
+                if fragment & 0xfff9 != 0 {
+                    return Ipv6Chain::Fragmented;
+                }
+                offset = match offset.checked_add(8) {
+                    Some(o) => o,
+                    None => return Ipv6Chain::Malformed,
+                };
+            }
+            _ => return Ipv6Chain::Unsupported,
+        }
+        if offset > packet_end {
+            return Ipv6Chain::Malformed;
+        }
+    }
+    Ipv6Chain::Unsupported
+}
+
+#[cfg(test)]
+fn classify_transport(
+    frame: &[u8],
+    protocol: u8,
+    l4_offset: usize,
+    packet_end: usize,
+) -> AfXdpFrameClass {
+    use AfXdpFrameClass::*;
+    match protocol {
+        IP_PROTO_TCP => {
+            let Some(header) = frame.get(l4_offset..l4_offset + TCP_MIN_HEADER_LEN) else {
+                return Malformed;
+            };
+            if l4_offset + TCP_MIN_HEADER_LEN > packet_end {
+                return Malformed;
+            }
+            let doff = usize::from(header[12] >> 4) * 4;
+            if doff < TCP_MIN_HEADER_LEN || l4_offset + doff > packet_end {
+                return Malformed;
+            }
+            // FIN|SYN|RST|PSH|ACK|URG — ECN (ECE/CWR) and NS are exempt.
+            let flags = header[13] & 0x3f;
+            if flags == 0 || (flags & 0x02 != 0 && flags & 0x05 != 0) {
+                return Malformed;
+            }
+            Supported
+        }
+        IP_PROTO_UDP => {
+            let Some(header) = frame.get(l4_offset..l4_offset + UDP_HEADER_LEN) else {
+                return Malformed;
+            };
+            if l4_offset + UDP_HEADER_LEN > packet_end {
+                return Malformed;
+            }
+            let len = usize::from(u16::from_be_bytes([header[4], header[5]]));
+            if len < UDP_HEADER_LEN || l4_offset + len > packet_end {
+                return Malformed;
+            }
+            Supported
+        }
+        IP_PROTO_ICMP | IP_PROTO_ICMPV6 => Control,
+        _ => Unsupported,
+    }
 }

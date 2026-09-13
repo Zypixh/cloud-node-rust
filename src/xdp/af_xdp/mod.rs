@@ -1,9 +1,11 @@
 use super::*;
 use bytes::Bytes;
 #[cfg(any(test, target_os = "linux"))]
+use dashmap::DashMap;
+#[cfg(any(test, target_os = "linux"))]
 use smoltcp::iface::{
-    Config as SmoltcpConfig, Interface as SmoltcpInterface, PollIngressSingleResult,
-    SocketHandle, SocketSet,
+    Config as SmoltcpConfig, Interface as SmoltcpInterface, PollIngressSingleResult, SocketHandle,
+    SocketSet,
 };
 #[cfg(any(test, target_os = "linux"))]
 use smoltcp::phy::{
@@ -13,8 +15,6 @@ use smoltcp::phy::{
 use smoltcp::socket::tcp as SmoltcpTcp;
 #[cfg(any(test, target_os = "linux"))]
 use smoltcp::time::Instant as SmoltcpInstant;
-#[cfg(any(test, target_os = "linux"))]
-use dashmap::DashMap;
 #[cfg(any(test, target_os = "linux"))]
 use smoltcp::wire::{
     HardwareAddress, IpAddress as SmoltcpIpAddress, IpCidr as SmoltcpIpCidr, IpEndpoint,
@@ -165,10 +165,7 @@ impl AfXdpTxFailureTracker {
 }
 
 type TcpWritePermitFuture = Pin<
-    Box<
-        dyn Future<Output = Result<mpsc::OwnedPermit<Bytes>, mpsc::error::SendError<()>>>
-            + Send,
-    >,
+    Box<dyn Future<Output = Result<mpsc::OwnedPermit<Bytes>, mpsc::error::SendError<()>>> + Send>,
 >;
 
 #[cfg(any(test, target_os = "linux"))]
@@ -269,14 +266,14 @@ mod bridge;
 mod parser;
 mod tcp_reactor;
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub(crate) use bridge::*;
 pub use bridge::{AfXdpRuntime, runtime, start_proxy_bridge, start_udp_bridge};
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub(crate) use parser::*;
 pub use parser::{
     encode_ip_reply_frame, encode_udp_reply_frame, extract_ip_frame, parse_l4_packet,
     parse_proxy_frame,
 };
-pub use tcp_reactor::{AfXdpTcpStream, AfXdpTcpStreamParts};
-#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
-pub(crate) use bridge::*;
-#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
-pub(crate) use parser::*;
 pub(crate) use tcp_reactor::*;
+pub use tcp_reactor::{AfXdpTcpStream, AfXdpTcpStreamParts};

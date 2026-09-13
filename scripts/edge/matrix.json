@@ -8,26 +8,509 @@
       "title": "IPv4/IPv6, VLAN, ext headers, fragments, truncation, MTU/PMTU, TCP flags/options",
       "status": "runnable",
       "topology": "netns",
-      "prerequisites": ["linux", "root", "ip", "ethtool", "node binary", "ebpf object"],
-      "coverage_note": "Current contract: protect mode PASSes all non-ACL packets incl. fragments/malformed (uniform Err->PASS). Assertions pin this; EN-05 flips fragment/malformed expectations to explicit DROP classes.",
+      "prerequisites": [
+        "linux",
+        "root",
+        "ip",
+        "ethtool",
+        "node binary",
+        "ebpf object"
+      ],
+      "coverage_note": "EN-05 parse classification: malformed (truncated, bad doff/UDP-len, NULL/SYN+FIN/SYN+RST flags) -> drop+malformed; fragments -> fragmented + policy action (default pass); ICMP/ICMPv6 -> control+pass; unparseable-but-legal -> unsupported+pass; ECN/TFO/options and bad-IPv4-checksum stay on the normal pass path.",
       "cases": [
-        {"case": "t01.tcp_syn", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}, "drop": {"eq": 0}}}},
-        {"case": "t01.tcp_null_flags", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.tcp_xmas", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.tcp_syn_fin", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.tcp_syn_rst", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.frag_first", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.frag_nonfirst", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.frag_atomic", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.ipv4_truncated", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.ipv4_bad_csum", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.vlan_tcp_syn", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.qinq_tcp_syn", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.ipv6_tcp_syn", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.ipv6_dest_opts", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.ipv6_fragment", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.icmp", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}},
-        {"case": "t01.icmp_ptb", "assert": {"counters": {"packets": {"min": 1}, "pass": {"min": 1}}}}
+        {
+          "case": "t01.tcp_syn",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              },
+              "drop": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.tcp_null_flags",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "malformed": {
+                "min": 1
+              },
+              "drop": {
+                "min": 1
+              },
+              "pass": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.tcp_xmas",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.tcp_syn_fin",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "malformed": {
+                "min": 1
+              },
+              "drop": {
+                "min": 1
+              },
+              "pass": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.tcp_syn_rst",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "malformed": {
+                "min": 1
+              },
+              "drop": {
+                "min": 1
+              },
+              "pass": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.tcp_syn_ecn",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.tcp_syn_options",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.tcp_doff_short",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "malformed": {
+                "min": 1
+              },
+              "drop": {
+                "min": 1
+              },
+              "pass": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.udp_len_short",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "malformed": {
+                "min": 1
+              },
+              "drop": {
+                "min": 1
+              },
+              "pass": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.udp_len_over",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "malformed": {
+                "min": 1
+              },
+              "drop": {
+                "min": 1
+              },
+              "pass": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.frag_first",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "fragmented": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "redirect": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.frag_nonfirst",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "fragmented": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "redirect": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.frag_atomic",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "fragmented": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.ipv4_truncated",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "malformed": {
+                "min": 1
+              },
+              "drop": {
+                "min": 1
+              },
+              "pass": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.ipv4_bad_csum",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.vlan_tcp_syn",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.qinq_tcp_syn",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.vlan3_tcp_syn",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "unsupported": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.ipv6_tcp_syn",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.ipv6_dest_opts",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.ipv6_fragment",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "fragmented": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "redirect": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.ipv6_frag_nonfirst",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "fragmented": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "redirect": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.ipv6_ext_chain_deep",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "unsupported": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.icmp",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "control": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.icmp_ptb",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "control": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.icmpv6_ns",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "control": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.icmpv6_ptb",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "control": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              }
+            }
+          }
+        },
+        {
+          "case": "t01.gre",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "unsupported": {
+                "min": 1
+              },
+              "pass": {
+                "min": 1
+              },
+              "malformed": {
+                "eq": 0
+              }
+            }
+          }
+        }
       ]
     },
     {
@@ -35,13 +518,66 @@
       "title": "Random-source SYN, dup SYN/ACK, stateless FIN/RST, expired pending, invalid cookie",
       "status": "partial",
       "topology": "netns",
-      "prerequisites": ["linux", "root", "node binary", "ebpf object"],
+      "prerequisites": [
+        "linux",
+        "root",
+        "node binary",
+        "ebpf object"
+      ],
       "coverage_note": "Today: no proxy CT — non-SYN to a proxy port is redirected and dropped by userspace (ignoredUnknown). protect-mode assertions pin current PASS contract; admission state machine arrives in EN-09/EN-13/EN-14.",
       "cases": [
-        {"case": "t02.syn", "assert": {"counters": {"packets": {"min": 1}, "drop": {"eq": 0}}}},
-        {"case": "t02.ack_no_flow", "assert": {"counters": {"packets": {"min": 1}, "drop": {"eq": 0}}}},
-        {"case": "t02.rst_no_flow", "assert": {"counters": {"packets": {"min": 1}, "drop": {"eq": 0}}}},
-        {"case": "t02.fin_no_flow", "assert": {"counters": {"packets": {"min": 1}, "drop": {"eq": 0}}}}
+        {
+          "case": "t02.syn",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "drop": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t02.ack_no_flow",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "drop": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t02.rst_no_flow",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "drop": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t02.fin_no_flow",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "drop": {
+                "eq": 0
+              }
+            }
+          }
+        }
       ]
     },
     {
@@ -49,12 +585,53 @@
       "title": "UDP same/new tuple, QUIC Initial/Retry, out-of-order CRYPTO, CID change, NAT rebinding, migration",
       "status": "partial",
       "topology": "netns",
-      "prerequisites": ["linux", "root", "node binary", "ebpf object"],
+      "prerequisites": [
+        "linux",
+        "root",
+        "node binary",
+        "ebpf object"
+      ],
       "coverage_note": "QUIC Initial/short-header corpus exercises the DCID steering path; migration/rebinding assertions land with EN-15.",
       "cases": [
-        {"case": "t03.udp", "assert": {"counters": {"packets": {"min": 1}, "drop": {"eq": 0}}}},
-        {"case": "t03.quic_initial", "assert": {"counters": {"packets": {"min": 1}, "drop": {"eq": 0}}}},
-        {"case": "t03.quic_short_header", "assert": {"counters": {"packets": {"min": 1}, "drop": {"eq": 0}}}}
+        {
+          "case": "t03.udp",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "drop": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t03.quic_initial",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "drop": {
+                "eq": 0
+              }
+            }
+          }
+        },
+        {
+          "case": "t03.quic_short_header",
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1
+              },
+              "drop": {
+                "eq": 0
+              }
+            }
+          }
+        }
       ]
     },
     {
@@ -62,13 +639,39 @@
       "title": "Source-bucket/CT/port full, CPU/queue changes, quota edges, stalled feedback",
       "status": "partial",
       "topology": "netns",
-      "prerequisites": ["linux", "root", "node binary", "ebpf object", "rateLimit config"],
+      "prerequisites": [
+        "linux",
+        "root",
+        "node binary",
+        "ebpf object",
+        "rateLimit config"
+      ],
       "coverage_note": "Flood cases run now without a configured limit (documents fail-open absence); EN-05..EN-08 add configured-limit runs asserting rateLimited/mapFull deltas and bounded overshoot.",
       "cases": [
-        {"case": "t02.syn_flood", "count": 2000, "pps": 5000,
-         "assert": {"counters": {"packets": {"min": 1900}}}},
-        {"case": "t03.udp_flood", "count": 2000, "pps": 5000,
-         "assert": {"counters": {"packets": {"min": 1900}}}}
+        {
+          "case": "t02.syn_flood",
+          "count": 2000,
+          "pps": 5000,
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1900
+              }
+            }
+          }
+        },
+        {
+          "case": "t03.udp_flood",
+          "count": 2000,
+          "pps": 5000,
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 1900
+              }
+            }
+          }
+        }
       ]
     },
     {
@@ -76,7 +679,10 @@
       "title": "TCP cookie/NAT/smoltcp full handshake, data on third ACK, retransmit/half-close/seq edges",
       "status": "pending",
       "topology": "netns+dual-end-capture",
-      "prerequisites": ["EN-13/EN-14 TCP stateless validation", "interactive handshake driver"],
+      "prerequisites": [
+        "EN-13/EN-14 TCP stateless validation",
+        "interactive handshake driver"
+      ],
       "pending_reason": "Needs the admission state machine (EN-09) and chosen TCP validation (EN-13/14). Entry will reuse pktgen corpus plus a real-socket handshake driver on the netns side with dual-end AF_PACKET capture."
     },
     {
@@ -84,11 +690,26 @@
       "title": "XSK full, fill starvation, wrong queue, RSS skew, multi-iface, multi-NUMA",
       "status": "partial",
       "topology": "netns",
-      "prerequisites": ["linux", "root", "node binary", "ebpf object"],
+      "prerequisites": [
+        "linux",
+        "root",
+        "node binary",
+        "ebpf object"
+      ],
       "coverage_note": "xskDrops counter is observable today via dump-maps; queue-fault soak entries arrive with EN-12. xdp-netns-smoke.sh covers the ready-path.",
       "cases": [
-        {"case": "t03.udp", "count": 500, "pps": 2000,
-         "assert": {"counters": {"packets": {"min": 400}}}}
+        {
+          "case": "t03.udp",
+          "count": 500,
+          "pps": 2000,
+          "assert": {
+            "counters": {
+              "packets": {
+                "min": 400
+              }
+            }
+          }
+        }
       ]
     },
     {
@@ -96,7 +717,10 @@
       "title": "Slow first-packet/ClientHello/header/body, TLS floods, H2/H3 stream/reset pressure",
       "status": "pending",
       "topology": "netns",
-      "prerequisites": ["proxy-smoke endpoints", "EN-19/EN-20 L7 budgets"],
+      "prerequisites": [
+        "proxy-smoke endpoints",
+        "EN-19/EN-20 L7 budgets"
+      ],
       "pending_reason": "Application-layer pacing tests; entry point will extend the proxy-smoke topology with slow-writer drivers."
     },
     {
@@ -104,7 +728,9 @@
       "title": "attach/reload, legacy-flow import, map ABI, tail-call slots, worker/manager crashes",
       "status": "partial",
       "topology": "netns",
-      "prerequisites": ["xdp-netns-smoke.sh"],
+      "prerequisites": [
+        "xdp-netns-smoke.sh"
+      ],
       "coverage_note": "proxy-reload-smoke covers reload/bridge-preservation; kill-survival was validated manually (EN-00). Automated crash-injection entries arrive with EN-29/EN-30."
     },
     {
@@ -112,7 +738,9 @@
       "title": "Host/SNI/authority, trusted proxies, TLS/ALPN, HTTP framing, WAF boundaries, upstream retry",
       "status": "pending",
       "topology": "netns",
-      "prerequisites": ["EN-18/EN-19"],
+      "prerequisites": [
+        "EN-18/EN-19"
+      ],
       "pending_reason": "L7 identity and authorization isolation corpus; owned by EN-18/EN-19."
     },
     {
@@ -120,7 +748,9 @@
       "title": "Cache identity, Vary/Auth, Range/304, encodings; precise/wildcard purge vs fill races",
       "status": "pending",
       "topology": "single-host",
-      "prerequisites": ["EN-21/EN-22/EN-23"],
+      "prerequisites": [
+        "EN-21/EN-22/EN-23"
+      ],
       "pending_reason": "Cache semantics corpus with content-hash assertions; owned by EN-21..EN-23."
     },
     {
@@ -128,7 +758,9 @@
       "title": "Cache publish crash stages, metadata/object corruption, purge-ACK restart, multi-process access",
       "status": "pending",
       "topology": "single-host",
-      "prerequisites": ["EN-24"],
+      "prerequisites": [
+        "EN-24"
+      ],
       "pending_reason": "Crash-recovery harness; owned by EN-24."
     },
     {
@@ -136,7 +768,10 @@
       "title": "RSS/FD/disk/log/CPU saturation, background backlog, cancellation, billing spool exhaustion",
       "status": "pending",
       "topology": "single-host+netns",
-      "prerequisites": ["EN-16 resource governance", "EN-28 observability"],
+      "prerequisites": [
+        "EN-16 resource governance",
+        "EN-28 observability"
+      ],
       "pending_reason": "Resource-exhaustion matrix; owned by EN-16/EN-28."
     },
     {
@@ -144,7 +779,9 @@
       "title": "Origin/DNS/parent failures, simultaneous recovery, non-idempotent requests",
       "status": "pending",
       "topology": "single-host",
-      "prerequisites": ["EN-20"],
+      "prerequisites": [
+        "EN-20"
+      ],
       "pending_reason": "Origin-failure matrix with real request-count assertions; owned by EN-20."
     },
     {
@@ -152,7 +789,9 @@
       "title": "Config reorder/dup/same-version-different-content, build failure, cert error, control-plane loss/LKG",
       "status": "pending",
       "topology": "single-host",
-      "prerequisites": ["EN-25/EN-26"],
+      "prerequisites": [
+        "EN-25/EN-26"
+      ],
       "pending_reason": "Generation publication harness; owned by EN-25/EN-26."
     },
     {
@@ -160,7 +799,9 @@
       "title": "Old/new binary rollback, CPU baseline, BPF/storage incompatibility, interrupted publish",
       "status": "pending",
       "topology": "netns",
-      "prerequisites": ["EN-29"],
+      "prerequisites": [
+        "EN-29"
+      ],
       "pending_reason": "Artifact-identity rollback drills; owned by EN-29."
     },
     {
@@ -168,7 +809,10 @@
       "title": "High-frequency observability, label explosion, sampling overflow, collector loss",
       "status": "pending",
       "topology": "single-host",
-      "prerequisites": ["EN-03 counters restructure", "EN-28"],
+      "prerequisites": [
+        "EN-03 counters restructure",
+        "EN-28"
+      ],
       "pending_reason": "Telemetry-cost bounds; owned by EN-03/EN-28."
     },
     {
@@ -176,7 +820,10 @@
       "title": "Multi-tenant mixed legit/attack, 24h/72h soaks, periodic reload/purge",
       "status": "pending",
       "topology": "capacity",
-      "prerequisites": ["EN-31", "dedicated sender host"],
+      "prerequisites": [
+        "EN-31",
+        "dedicated sender host"
+      ],
       "pending_reason": "Long-run soak on the external topology; owned by EN-31."
     },
     {
@@ -184,7 +831,10 @@
       "title": "Real cloud virtio + physical NIC; x86_64/aarch64; attach/copy mode matrix",
       "status": "pending",
       "topology": "external",
-      "prerequisites": ["physical/native-capable NIC", "EN-30..EN-33"],
+      "prerequisites": [
+        "physical/native-capable NIC",
+        "EN-30..EN-33"
+      ],
       "pending_reason": "Per-PathProfile qualification; owned by EN-30..EN-33."
     }
   ]

@@ -300,6 +300,80 @@ def case_icmp_ptb() -> list:
     return _wrap_v4(_v4(1, body))
 
 
+def case_tcp_syn_ecn() -> list:
+    # SYN|ECE|CWR — legal ECN negotiation, must not be treated as malformed.
+    return _wrap_v4(_v4(6, tcp(41000, 443, TCP_SYN | 0x40 | 0x80)))
+
+
+def case_tcp_syn_options() -> list:
+    # SYN carrying MSS + TFO-cookie-shaped options (doff=8).
+    opts = b"\x02\x04\x05\xb4" + b"\x22\x08" + b"\x01" * 6
+    return _wrap_v4(_v4(6, tcp(41000, 443, TCP_SYN, options=opts)))
+
+
+def case_tcp_doff_short() -> list:
+    # doff=4 < 5: header length below the TCP minimum — deterministic-illegal.
+    seg = struct.pack("!HHIIBBHHH", 41000, 443, 0, 0, 4 << 4, TCP_SYN,
+                      65535, 0, 0)
+    return _wrap_v4(_v4(6, seg))
+
+
+def case_udp_len_short() -> list:
+    # UDP length field below the 8-byte header — deterministic-illegal.
+    hdr = struct.pack("!HHHH", 41000, 443, 4, 0)
+    return _wrap_v4(_v4(17, hdr))
+
+
+def case_udp_len_over() -> list:
+    # UDP length field beyond the datagram — deterministic-illegal.
+    hdr = struct.pack("!HHHH", 41000, 443, 4000, 0)
+    return _wrap_v4(_v4(17, hdr + b"x" * 4))
+
+
+def case_vlan3_tcp_syn() -> list:
+    # Three stacked VLAN tags exceed the bounded two-tag walk: legal frame,
+    # classified UNSUPPORTED and passed, never dropped.
+    return [eth(DST_MAC, SRC_MAC, _v4(6, tcp(41000, 443, TCP_SYN)),
+                0x0800, vlans=(10, 100, 200))]
+
+
+def case_icmpv6_ns() -> list:
+    # Neighbor Solicitation — mandatory control traffic.
+    body = struct.pack("!BBH", 135, 0, 0) + b"\x00" * 4 + \
+        socket.inet_pton(socket.AF_INET6, C_IP6_DST)
+    body = body[:2] + struct.pack("!H", csum16(
+        _pseudo(C_IP6_SRC, C_IP6_DST, 58, len(body)) + body)) + body[4:]
+    return _wrap_v6(_v6(58, body))
+
+
+def case_icmpv6_ptb() -> list:
+    # Packet Too Big — the PMTU contract requires it reaches the stack.
+    body = struct.pack("!BBHI", 2, 0, 0, 1400) + b"\x00" * 48
+    body = body[:2] + struct.pack("!H", csum16(
+        _pseudo(C_IP6_SRC, C_IP6_DST, 58, len(body)) + body)) + body[4:]
+    return _wrap_v6(_v6(58, body))
+
+
+def case_ipv6_frag_nonfirst() -> list:
+    ext = ipv6_frag_ext(6, off=185)
+    return _wrap_v6(_v6(44, ext + b"\xde\xad\xbe\xef" * 4))
+
+
+def case_ipv6_ext_chain_deep() -> list:
+    # 9 chained destination-options headers exceed the 8-iteration bound:
+    # legal per RFC 8200, classified UNSUPPORTED and passed.
+    chain = b""
+    nh = 60
+    for _ in range(9):
+        chain = struct.pack("!BB", 60, 0) + b"\x00" * 6 + chain
+    return _wrap_v6(_v6(60, chain + b"\x00" * 8))
+
+
+def case_gre() -> list:
+    # GRE — a protocol this dataplane does not terminate: UNSUPPORTED, pass.
+    return _wrap_v4(_v4(47, b"\x00" * 20))
+
+
 def case_tcp_legit_synack_flow() -> list:
     """Minimal 3-packet exchange shape: SYN, SYN-ACK-looking, ACK+data.
     Sent as frames it is not a real handshake — real handshakes run through
@@ -327,6 +401,17 @@ CASES = {
     "t01.ipv6_fragment": case_ipv6_fragment,
     "t01.icmp": case_icmp,
     "t01.icmp_ptb": case_icmp_ptb,
+    "t01.tcp_syn_ecn": case_tcp_syn_ecn,
+    "t01.tcp_syn_options": case_tcp_syn_options,
+    "t01.tcp_doff_short": case_tcp_doff_short,
+    "t01.udp_len_short": case_udp_len_short,
+    "t01.udp_len_over": case_udp_len_over,
+    "t01.vlan3_tcp_syn": case_vlan3_tcp_syn,
+    "t01.icmpv6_ns": case_icmpv6_ns,
+    "t01.icmpv6_ptb": case_icmpv6_ptb,
+    "t01.ipv6_frag_nonfirst": case_ipv6_frag_nonfirst,
+    "t01.ipv6_ext_chain_deep": case_ipv6_ext_chain_deep,
+    "t01.gre": case_gre,
     # T02 admission / state probes
     "t02.syn": case_tcp_syn,
     "t02.syn_flood": case_tcp_syn_flood,
