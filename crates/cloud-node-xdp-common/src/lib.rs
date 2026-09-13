@@ -225,6 +225,13 @@ pub struct XdpCounters {
     pub snat_alloc_fail: u64,
     /// Backend replies restored to clients through a SNAT reverse binding.
     pub snat_reply_tx: u64,
+    /// Terminal XDP_TX actions (direct-forwarded replies). Forward-specific
+    /// counters still attribute per-rule; this makes
+    /// pass+drop+redirect+tx == packets hold for action accounting.
+    pub tx: u64,
+    /// Terminal drops caused by an ACL block rule (observe mode returns PASS
+    /// and does not increment this). Distinct from rate/internal drops.
+    pub acl_blocked: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -469,7 +476,8 @@ pub struct NatScratch {
 /// ABI version of the whole XDP map/contract surface. Bump when any shared
 /// key/value layout, map semantics, or dispatch slot contract changes; userspace
 /// refuses to reuse pinned objects whose spec does not match this build.
-pub const XDP_ABI_VERSION: u32 = 1;
+/// v1: EN-01 baseline. v2: XDP_COUNTERS -> PerCpuArray, +tx +acl_blocked.
+pub const XDP_ABI_VERSION: u32 = 2;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -638,7 +646,7 @@ const _: () = assert!(core::mem::size_of::<XdpFlowEvent>() == 88);
 const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
 const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 16);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 128);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 144);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);

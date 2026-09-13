@@ -79,8 +79,12 @@ static XDP_LOCAL_V6: HashMap<XdpLocalIpv6Key, u32> =
 static XDP_PROXY_PORTS: HashMap<XdpPortProtoKey, u32> =
     HashMap::<XdpPortProtoKey, u32>::with_max_entries(4096, 0);
 
+/// Per-CPU verdict counters. A shared single slot loses updates under
+/// multi-CPU RX; per-CPU storage plus userspace aggregation keeps counting
+/// lossless without atomic instructions (which eBPF lacks for map values).
 #[map(name = "XDP_COUNTERS")]
-static XDP_COUNTERS: Array<XdpCounters> = Array::<XdpCounters>::with_max_entries(1, 0);
+static XDP_COUNTERS: PerCpuArray<XdpCounters> =
+    PerCpuArray::<XdpCounters>::with_max_entries(1, 0);
 
 #[map(name = "XDP_XSKS")]
 static XDP_XSKS: XskMap = XskMap::with_max_entries(4096, 0);
@@ -653,7 +657,10 @@ fn ipv6_transport_offset(
 
 fn block_action(policy: Option<&XdpInterfacePolicy>) -> u32 {
     match policy {
-        Some(policy) if policy.mode == 1 || policy.mode == 2 => xdp_action::XDP_DROP,
+        Some(policy) if policy.mode == 1 || policy.mode == 2 => {
+            counter_acl_blocked();
+            xdp_action::XDP_DROP
+        }
         _ => xdp_action::XDP_PASS,
     }
 }
@@ -2432,8 +2439,22 @@ fn count_action(action: u32) {
     match action {
         x if x == xdp_action::XDP_DROP => counter_drop(),
         x if x == xdp_action::XDP_REDIRECT => counter_redirect(),
-        x if x == xdp_action::XDP_TX => {}
+        x if x == xdp_action::XDP_TX => counter_tx(),
         _ => counter_pass(),
+    }
+}
+
+/// ACL terminal drop: distinguishable from other drop sources so a blocklist
+/// hit is never indistinguishable from a rate-limit or internal drop (I10).
+fn counter_acl_blocked() {
+    if let Some(counters) = counters() {
+        counters.acl_blocked = counters.acl_blocked.saturating_add(1);
+    }
+}
+
+fn counter_tx() {
+    if let Some(counters) = counters() {
+        counters.tx = counters.tx.saturating_add(1);
     }
 }
 

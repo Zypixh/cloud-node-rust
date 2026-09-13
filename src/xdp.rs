@@ -115,6 +115,12 @@ pub struct XdpStatusSnapshot {
     /// Backend replies restored to clients via SNAT reverse bindings.
     #[serde(default)]
     pub snat_reply_tx: u64,
+    /// Terminal XDP_TX actions (kernel-bypassed forwards).
+    #[serde(default)]
+    pub tx: u64,
+    /// Terminal drops caused by ACL block rules.
+    #[serde(default)]
+    pub acl_blocked: u64,
     #[serde(default)]
     pub rate_limit_active: bool,
     #[serde(default)]
@@ -462,6 +468,8 @@ struct XdpManager {
     snat_bound: AtomicU64,
     snat_alloc_fail: AtomicU64,
     snat_reply_tx: AtomicU64,
+    tx: AtomicU64,
+    acl_blocked: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
@@ -514,6 +522,8 @@ impl XdpManager {
             snat_bound: AtomicU64::new(0),
             snat_alloc_fail: AtomicU64::new(0),
             snat_reply_tx: AtomicU64::new(0),
+            tx: AtomicU64::new(0),
+            acl_blocked: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
@@ -1072,6 +1082,8 @@ impl XdpManager {
             snat_bound: self.snat_bound.load(Ordering::Relaxed),
             snat_alloc_fail: self.snat_alloc_fail.load(Ordering::Relaxed),
             snat_reply_tx: self.snat_reply_tx.load(Ordering::Relaxed),
+            tx: self.tx.load(Ordering::Relaxed),
+            acl_blocked: self.acl_blocked.load(Ordering::Relaxed),
             rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
             rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
@@ -1585,6 +1597,9 @@ impl XdpManager {
                     .store(counters.snat_alloc_fail, Ordering::Relaxed);
                 self.snat_reply_tx
                     .store(counters.snat_reply_tx, Ordering::Relaxed);
+                self.tx.store(counters.tx, Ordering::Relaxed);
+                self.acl_blocked
+                    .store(counters.acl_blocked, Ordering::Relaxed);
             }
         }
     }
@@ -1643,6 +1658,8 @@ impl XdpManager {
                     "snatBound": c.snat_bound,
                     "snatAllocFail": c.snat_alloc_fail,
                     "snatReplyTx": c.snat_reply_tx,
+                    "tx": c.tx,
+                    "aclBlocked": c.acl_blocked,
                 })
             })
             .ok();
@@ -2201,6 +2218,8 @@ async fn raw_smoke_inner(
         "snatBound": status.snat_bound,
         "snatAllocFail": status.snat_alloc_fail,
         "snatReplyTx": status.snat_reply_tx,
+        "tx": status.tx,
+        "aclBlocked": status.acl_blocked,
         "samples": samples,
     });
     Ok(report)
@@ -3491,7 +3510,7 @@ mod linux {
     use super::*;
     use crate::runtime_mode::{XdpAttachMode, XdpRuntimeMode};
     use aya::maps::lpm_trie::Key as LpmKey;
-    use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, XskMap};
+    use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, PerCpuArray, XskMap};
     use aya::programs::links::PinnedLink;
     use cloud_node_xdp_common::{
         XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key,
@@ -4259,12 +4278,49 @@ mod linux {
         Ok(())
     }
 
+    /// Aggregate the per-CPU counter slots into a single snapshot. The map is
+    /// a PerCpuArray so concurrent RX on different cores never loses updates;
+    /// summing here keeps the status schema unchanged for consumers.
+    pub(crate) fn sum_percpu_counters<'a>(
+        values: impl Iterator<Item = &'a XdpCounters>,
+    ) -> XdpCounters {
+        let mut total = XdpCounters::default();
+        for v in values {
+            macro_rules! sum {
+                ($($field:ident),+) => {
+                    $(total.$field = total.$field.saturating_add(v.$field);)+
+                };
+            }
+            sum!(
+                packets,
+                pass,
+                drop,
+                redirect,
+                parse_errors,
+                map_miss,
+                xsk_drops,
+                rate_limited,
+                ratelimit_map_full,
+                udp_fwd_tx,
+                udp_fwd_map_full,
+                tcp_fwd_tx,
+                tcp_fwd_map_full,
+                snat_bound,
+                snat_alloc_fail,
+                snat_reply_tx,
+                tx,
+                acl_blocked
+            );
+        }
+        total
+    }
+
     pub fn read_counters(ebpf: &aya::Ebpf) -> anyhow::Result<XdpCounters> {
         let map = ebpf
             .map("XDP_COUNTERS")
             .ok_or_else(|| anyhow::anyhow!("missing map XDP_COUNTERS"))?;
-        let counters = Array::<_, XdpCounters>::try_from(map)?.get(&0, 0)?;
-        Ok(counters)
+        let counters = PerCpuArray::<_, XdpCounters>::try_from(map)?.get(&0, 0)?;
+        Ok(sum_percpu_counters(counters.iter()))
     }
 
     /// Read the dataplane counters straight from the pinned XDP_COUNTERS map
@@ -4273,12 +4329,11 @@ mod linux {
     /// while a separate daemon/smoke process owns the attachment.
     pub fn read_pinned_counters() -> anyhow::Result<XdpCounters> {
         let path = std::path::Path::new(XDP_BPF_PIN_DIR).join("XDP_COUNTERS");
-        let data = aya::maps::MapData::from_pin(&path).map_err(|err| {
-            anyhow::anyhow!("open pinned XDP_COUNTERS {}: {err}", path.display())
-        })?;
-        let map = aya::maps::Map::Array(data);
-        let counters = Array::<_, XdpCounters>::try_from(&map)?.get(&0, 0)?;
-        Ok(counters)
+        let data = aya::maps::MapData::from_pin(&path)
+            .map_err(|err| anyhow::anyhow!("open pinned XDP_COUNTERS {}: {err}", path.display()))?;
+        let map = aya::maps::Map::PerCpuArray(data);
+        let counters = PerCpuArray::<_, XdpCounters>::try_from(&map)?.get(&0, 0)?;
+        Ok(sum_percpu_counters(counters.iter()))
     }
 
     /// Write the per-IP rate limiter config. Returns an explicit error when the
@@ -4302,8 +4357,11 @@ mod linux {
         let map = ebpf
             .map_mut("XDP_COUNTERS")
             .ok_or_else(|| anyhow::anyhow!("missing map XDP_COUNTERS"))?;
-        let mut counters = Array::<_, XdpCounters>::try_from(map)?;
-        counters.set(0, XdpCounters::default(), 0)?;
+        let mut counters = PerCpuArray::<_, XdpCounters>::try_from(map)?;
+        let ncpu = aya::util::nr_cpus().map_err(|(_, err)| err)?;
+        let values = aya::maps::PerCpuValues::try_from(vec![XdpCounters::default(); ncpu])
+            .map_err(|err| anyhow::anyhow!("per-cpu counter reset buffer: {err}"))?;
+        counters.set(0, values, 0)?;
         Ok(())
     }
 
@@ -4844,7 +4902,7 @@ mod linux {
             ),
             (
                 "XDP_COUNTERS",
-                MapType::Array,
+                MapType::PerCpuArray,
                 u,
                 size_of::<XdpCounters>() as u32,
                 1,
@@ -10944,5 +11002,48 @@ mod tests {
             }
         }
         !(sum as u16)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn percpu_counter_aggregation_sums_all_cpu_slots() {
+        use cloud_node_xdp_common::XdpCounters;
+        let mut a = XdpCounters::default();
+        a.packets = 7;
+        a.pass = 3;
+        a.tx = 2;
+        a.acl_blocked = 1;
+        let mut b = XdpCounters::default();
+        b.packets = 5;
+        b.drop = 4;
+        b.redirect = 9;
+        b.tx = 11;
+        b.acl_blocked = 13;
+        let slots = vec![a, b, XdpCounters::default()];
+        let total = linux::sum_percpu_counters(slots.iter());
+        assert_eq!(total.packets, 12);
+        assert_eq!(total.pass, 3);
+        assert_eq!(total.drop, 4);
+        assert_eq!(total.redirect, 9);
+        assert_eq!(total.tx, 13);
+        assert_eq!(total.acl_blocked, 14);
+        assert_eq!(total.parse_errors, 0);
+        assert_eq!(total.snat_reply_tx, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn percpu_counter_aggregation_saturates_instead_of_wrapping() {
+        use cloud_node_xdp_common::XdpCounters;
+        let mut a = XdpCounters::default();
+        a.packets = u64::MAX;
+        a.tx = u64::MAX - 1;
+        let mut b = XdpCounters::default();
+        b.packets = 10;
+        b.tx = 10;
+        let slots = vec![a, b];
+        let total = linux::sum_percpu_counters(slots.iter());
+        assert_eq!(total.packets, u64::MAX);
+        assert_eq!(total.tx, u64::MAX);
     }
 }
