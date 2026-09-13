@@ -29,14 +29,9 @@ RUSTFLAGS="-C target-cpu=neoverse-n1 -C opt-level=3 -C lto=fat" cargo build --re
 
 不要在不支持对应指令集的机器上运行高阶 CPU 构建产物。
 
-XDP/AF_XDP eBPF 对象需要额外构建：
+XDP/AF_XDP eBPF 对象在 Linux 目标构建时由 `build.rs` 自动编译并**内嵌进主二进制**（需要 nightly + rust-src + bpf-linker；缺少工具链时回退嵌入 `data/cloud-node-xdp-ebpf.o` 并输出告警）。二进制与 eBPF 程序因此永远同版本，部署只需一个二进制文件。
 
-```bash
-cargo clean
-cargo xtask build-ebpf
-```
-
-构建结果会写入 `data/cloud-node-xdp-ebpf.o`。没有该对象时，`cloud-node xdp doctor` 会报告不可用，默认不会影响普通 socket 数据面。
+也可以用 `cargo xtask build-ebpf` 单独构建到 `data/cloud-node-xdp-ebpf.o`，用于调试或通过 `xdp.ebpfObject` / `CLOUD_NODE_XDP_EBPF_OBJECT_PATH` 显式指定外部对象做热替换。
 
 ## 安装
 

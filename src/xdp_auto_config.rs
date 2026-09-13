@@ -163,6 +163,7 @@ fn derive_xdp_config_with_ports_and_options(
         },
         rate_limit: None,
         sni_blocklist: Vec::new(),
+        ebpf_object: None,
     })
 }
 
