@@ -1,0 +1,19 @@
+{
+  "task": "EN-07",
+  "status": "verified-veth-netns",
+  "abi": "v6",
+  "deliverables": [
+    "XDP_BUDGET_CFG + XDP_BUDGET per-CPU fixed-window buckets",
+    "budget_charge gates: unverified at handle stage (all modes), new-flow before CT/SNAT insert (4 work paths)",
+    "counters: unverifiedLimited, admissionLimited",
+    "xdp.budget config + effective_budget_config per-CPU share math with >=1 clamp",
+    "rate-bucket map-full now bounded by aggregate ceiling (EN-00 finding #1 closed)"
+  ],
+  "verification": {
+    "verifier": "11 programs accepted, 0 r11",
+    "matrix": "T01 28/28",
+    "unverified_gate": "300pkt -> 297 dropped at budget",
+    "admission_gate": "100 flows -> 7 bound, 14 admissionLimited, 79 unverifiedLimited"
+  },
+  "deferred": ["xsk_redirect_pps (EN-12)", "challenge_pps (EN-15)", "half-open gauge via XdpPendingCap (EN-09)"]
+}

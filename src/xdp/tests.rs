@@ -2599,3 +2599,52 @@ fn classify_control_and_unsupported() {
         Malformed
     );
 }
+
+#[test]
+fn effective_budget_config_baseline_and_share_math() {
+    // Baseline is always on (Normal pressure, no config): nonzero per-CPU
+    // shares with both enforcement flags set.
+    let manager = XdpManager::new(XdpConfig {
+        enabled: true,
+        interfaces: Vec::new(),
+        ..XdpConfig::default()
+    });
+    let cfg = manager.effective_budget_config();
+    assert_ne!(cfg.flags & 0b0011, 0);
+    assert!(cfg.unverified_pps >= 1);
+    assert!(cfg.new_flow_per_sec >= 1);
+    assert!(cfg.window_ns > 0);
+
+    // Per-CPU share = ceil(total / ncpu): total quota cannot multiply with
+    // CPU count. With ncpu unknown on this host, verify the share never
+    // exceeds the configured total and never hits zero.
+    let manager = XdpManager::new(XdpConfig {
+        enabled: true,
+        interfaces: Vec::new(),
+        budget: Some(crate::runtime_mode::XdpBudgetSettings {
+            enabled: true,
+            unverified_pps: 8,
+            new_flow_per_sec: 3,
+            window_ms: 1000,
+        }),
+        ..XdpConfig::default()
+    });
+    let cfg = manager.effective_budget_config();
+    assert!(cfg.unverified_pps >= 1 && cfg.unverified_pps <= 8);
+    assert!(cfg.new_flow_per_sec >= 1 && cfg.new_flow_per_sec <= 3);
+
+    // enabled=false writes an explicit all-zero config (flag bits clear) —
+    // the only off switch, and it is operator-explicit.
+    let manager = XdpManager::new(XdpConfig {
+        enabled: true,
+        interfaces: Vec::new(),
+        budget: Some(crate::runtime_mode::XdpBudgetSettings {
+            enabled: false,
+            ..Default::default()
+        }),
+        ..XdpConfig::default()
+    });
+    let cfg = manager.effective_budget_config();
+    assert_eq!(cfg.flags, 0);
+    assert_eq!(cfg.unverified_pps, 0);
+}

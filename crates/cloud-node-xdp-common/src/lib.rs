@@ -255,6 +255,16 @@ pub struct XdpCounters {
     /// set (`local_ip_filter` on, no XDP_LOCAL_* hit): passed untouched —
     /// management and transit traffic is not this layer's concern.
     pub nonlocal_pass: u64,
+    /// Packets on the unverified path (no conntrack hit, no SNAT binding,
+    /// no forward rule) dropped because the aggregate unverified-packet
+    /// budget window was exhausted. EN-07: this is the fail-closed
+    /// admission ceiling that keeps floods from consuming table-creation
+    /// work; verified flows never touch this bucket.
+    pub unverified_limited: u64,
+    /// New-state admissions (forward-rule CT/SNAT creation) rejected because
+    /// the new-flow-per-second budget was exhausted. Counted before any
+    /// map insert, so a rejected admission creates no state at all.
+    pub admission_limited: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -539,7 +549,7 @@ pub struct NatScratch {
 /// nonlocal_pass; XDP_LOCAL_* values gain the XDP_LOCAL_REDIRECT bit.
 /// v5: EN-06 verifier split — NatScratch +work_ip_off/work_ifindex/
 /// work_pkt_len; XDP_DISPATCH grows to 16 slots (7-10 = NAT work programs).
-pub const XDP_ABI_VERSION: u32 = 5;
+pub const XDP_ABI_VERSION: u32 = 6;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -690,6 +700,19 @@ pub struct XdpBudgetConfig {
     pub flags: u64,
 }
 
+/// Per-CPU budget bucket state for `XDP_BUDGET` (EN-07). Each CPU owns its
+/// slots exclusively, so read-modify-write is race-free; userspace pre-divides
+/// the node-wide totals by the possible-CPU count when writing
+/// `XdpBudgetConfig`, keeping the aggregate quota independent of CPU/queue
+/// count. Index convention matches `XdpBudgetConfig` flag bits:
+/// 0=unverified pps, 1=new-flow admissions, 2=xsk redirect, 3=challenge.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpBudgetBucket {
+    pub window_start_ns: [u64; 4],
+    pub count: [u64; 4],
+}
+
 /// Half-open concurrency cap stored in a single-slot map value so the dataplane
 /// can compare pending_count against a ceiling without a second lookup.
 #[repr(C)]
@@ -707,8 +730,9 @@ const _: () = assert!(core::mem::size_of::<XdpFlowRecord>() == 64);
 const _: () = assert!(core::mem::size_of::<XdpFlowEvent>() == 88);
 const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
 const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 48);
+const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 64);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 16);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 192);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 208);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);
@@ -755,6 +779,7 @@ unsafe_impl_aya_pod!(
     XdpFlowEvent,
     XdpPathBinding,
     XdpBudgetConfig,
+    XdpBudgetBucket,
     XdpPendingCap,
 );
 

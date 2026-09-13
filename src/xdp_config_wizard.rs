@@ -322,6 +322,7 @@ mod tests {
                 }],
             },
             rate_limit: None,
+            budget: None,
             ebpf_object: None,
         };
 

@@ -4,9 +4,10 @@ use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, PerCpuArray, XskMap};
 use aya::programs::links::PinnedLink;
 use cloud_node_xdp_common::{
-    XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key,
-    XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
-    XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
+    XdpBudgetBucket, XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key,
+    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateLimitConfig,
+    XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey,
+    XdpUdpFwdRule,
 };
 use ipnet::IpNet;
 use std::collections::BTreeSet;
@@ -811,7 +812,9 @@ pub(crate) fn sum_percpu_counters<'a>(
             fragmented,
             control,
             acl_would_block,
-            nonlocal_pass
+            nonlocal_pass,
+            unverified_limited,
+            admission_limited
         );
     }
     total
@@ -848,6 +851,20 @@ pub fn sync_rate_limit(ebpf: &mut aya::Ebpf, config: &XdpRateLimitConfig) -> any
         )
     })?;
     let mut array = Array::<_, XdpRateLimitConfig>::try_from(map)?;
+    array.set(0, *config, 0)?;
+    Ok(())
+}
+
+/// Push the resolved aggregate budget (EN-07) into XDP_BUDGET_CFG. The
+/// per-CPU bucket map needs no writes — each CPU's fixed-window state lives
+/// only in eBPF.
+pub fn sync_budget(ebpf: &mut aya::Ebpf, config: &XdpBudgetConfig) -> anyhow::Result<()> {
+    let map = ebpf.map_mut("XDP_BUDGET_CFG").ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing map XDP_BUDGET_CFG; eBPF object predates budget gate (rebuild cloud-node-xdp-ebpf.o)"
+        )
+    })?;
+    let mut array = Array::<_, XdpBudgetConfig>::try_from(map)?;
     array.set(0, *config, 0)?;
     Ok(())
 }
@@ -1397,7 +1414,7 @@ fn drop_stale_pinned_maps() {
     let fwd_rule = size_of::<XdpUdpFwdRule>() as u32;
     let ct_key = size_of::<XdpUdpCtKey>() as u32;
     let ct_value = size_of::<XdpUdpCtValue>() as u32;
-    let specs: [(&str, MapType, u32, u32, u32); 27] = [
+    let specs: [(&str, MapType, u32, u32, u32); 29] = [
         ("XDP_BLOCKED_V4", MapType::Hash, v4, rule, 262_144),
         ("XDP_BLOCKED_V6", MapType::Hash, v6, rule, 262_144),
         ("XDP_ALLOWED_V4", MapType::Hash, v4, rule, 65_536),
@@ -1454,6 +1471,20 @@ fn drop_stale_pinned_maps() {
             MapType::Array,
             u,
             size_of::<XdpRateLimitConfig>() as u32,
+            1,
+        ),
+        (
+            "XDP_BUDGET_CFG",
+            MapType::Array,
+            u,
+            size_of::<XdpBudgetConfig>() as u32,
+            1,
+        ),
+        (
+            "XDP_BUDGET",
+            MapType::PerCpuArray,
+            u,
+            size_of::<XdpBudgetBucket>() as u32,
             1,
         ),
         (

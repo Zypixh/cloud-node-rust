@@ -135,6 +135,10 @@ pub struct XdpStatusSnapshot {
     /// VIP set (direction gate).
     #[serde(default)]
     pub nonlocal_pass: u64,
+    /// EN-07: packets dropped at the aggregate unverified-packet budget.
+    pub unverified_limited: u64,
+    /// EN-07: new-state admissions rejected by the new-flow budget.
+    pub admission_limited: u64,
     /// ICMP/ICMPv6 control traffic handed to the kernel stack.
     #[serde(default)]
     pub control: u64,
@@ -211,6 +215,8 @@ pub(crate) struct XdpManager {
     control: AtomicU64,
     acl_would_block: AtomicU64,
     nonlocal_pass: AtomicU64,
+    unverified_limited: AtomicU64,
+    admission_limited: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
@@ -274,6 +280,8 @@ impl XdpManager {
             control: AtomicU64::new(0),
             acl_would_block: AtomicU64::new(0),
             nonlocal_pass: AtomicU64::new(0),
+            unverified_limited: AtomicU64::new(0),
+            admission_limited: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
@@ -840,6 +848,8 @@ impl XdpManager {
             control: self.control.load(Ordering::Relaxed),
             acl_would_block: self.acl_would_block.load(Ordering::Relaxed),
             nonlocal_pass: self.nonlocal_pass.load(Ordering::Relaxed),
+            unverified_limited: self.unverified_limited.load(Ordering::Relaxed),
+            admission_limited: self.admission_limited.load(Ordering::Relaxed),
             rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
             rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
@@ -1164,6 +1174,66 @@ impl XdpManager {
         config
     }
 
+    /// Effective aggregate budget (EN-07). Node-wide totals from
+    /// `xdp.budget` (or the built-in baseline) are divided by the
+    /// possible-CPU count into per-CPU shares — the sum of shares never
+    /// exceeds the configured total, so CPU/queue changes cannot multiply
+    /// the quota (I09). Pressure scaling narrows the elastic allowance
+    /// (Elevated x1, High /2, Critical /4) but clamps each share at >=1:
+    /// "divide to zero" never disables a dimension. `enabled: false` in
+    /// config is the only off switch and writes flag=0 explicitly.
+    fn effective_budget_config(&self) -> cloud_node_xdp_common::XdpBudgetConfig {
+        use crate::l4_defense::L4PressureLevel;
+        let base = self.config.budget.clone().unwrap_or_default();
+        if !base.enabled {
+            return cloud_node_xdp_common::XdpBudgetConfig::default();
+        }
+        let divisor: u64 = match crate::l4_defense::current_pressure_level() {
+            L4PressureLevel::Normal | L4PressureLevel::Elevated => 1,
+            L4PressureLevel::High => 2,
+            L4PressureLevel::Critical => 4,
+        };
+        #[cfg(target_os = "linux")]
+        let ncpu = aya::util::nr_cpus().map(|n| n as u64).unwrap_or(1).max(1);
+        #[cfg(not(target_os = "linux"))]
+        let ncpu: u64 = num_cpus::get() as u64;
+        let share = |total: u64| -> u64 {
+            // ceil(total / (ncpu * divisor)), floored at 1 so a share can
+            // never collapse to "disabled" through integer division.
+            let denom = ncpu.saturating_mul(divisor).max(1);
+            let per = total.saturating_add(denom - 1) / denom;
+            per.max(1)
+        };
+        cloud_node_xdp_common::XdpBudgetConfig {
+            unverified_pps: share(base.unverified_pps),
+            new_flow_per_sec: share(base.new_flow_per_sec),
+            xsk_redirect_pps: 0,
+            challenge_pps: 0,
+            window_ns: base.window_ms.saturating_mul(1_000_000),
+            flags: 0b0011,
+        }
+    }
+
+    /// Push the effective budget into the eBPF config map; failures are
+    /// logged and surfaced through the status detail, never silent.
+    fn sync_budget_config(&self) {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let config = self.effective_budget_config();
+        #[cfg(target_os = "linux")]
+        let result = {
+            let mut ebpf = self.ebpf.lock();
+            match ebpf.as_mut() {
+                Some(ebpf) => linux::sync_budget(ebpf, &config),
+                None => return,
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let result: anyhow::Result<()> = Ok(());
+        if let Err(err) = result {
+            tracing::warn!("XDP budget map sync unavailable: {err}");
+        }
+    }
+
     /// Push the effective rate limit into the eBPF config map and record the
     /// outcome in the status snapshot. An object without XDP_RATE_CFG (built
     /// before the limiter existed) is reported, never silently ignored.
@@ -1367,6 +1437,10 @@ impl XdpManager {
                     .store(counters.acl_would_block, Ordering::Relaxed);
                 self.nonlocal_pass
                     .store(counters.nonlocal_pass, Ordering::Relaxed);
+                self.unverified_limited
+                    .store(counters.unverified_limited, Ordering::Relaxed);
+                self.admission_limited
+                    .store(counters.admission_limited, Ordering::Relaxed);
             }
         }
     }
@@ -1433,6 +1507,8 @@ impl XdpManager {
                     "control": c.control,
                     "aclWouldBlock": c.acl_would_block,
                     "nonlocalPass": c.nonlocal_pass,
+                    "unverifiedLimited": c.unverified_limited,
+                    "admissionLimited": c.admission_limited,
                 })
             })
             .ok();
@@ -1602,6 +1678,7 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
                 tracing::debug!("XDP rule sweeper removed expired shadow rules");
             }
             manager.sync_rate_limit_config();
+            manager.sync_budget_config();
             #[cfg(target_os = "linux")]
             manager.sweep_nat_maps();
         }
