@@ -106,10 +106,6 @@ pub struct XdpStatusSnapshot {
     pub tcp_fwd_tx: u64,
     #[serde(default)]
     pub tcp_fwd_map_full: u64,
-    #[serde(default)]
-    pub sni_blocked: u64,
-    #[serde(default)]
-    pub sni_incomplete: u64,
     /// SNAT source-port bindings successfully claimed.
     #[serde(default)]
     pub snat_bound: u64,
@@ -463,8 +459,6 @@ struct XdpManager {
     udp_fwd_map_full: AtomicU64,
     tcp_fwd_tx: AtomicU64,
     tcp_fwd_map_full: AtomicU64,
-    sni_blocked: AtomicU64,
-    sni_incomplete: AtomicU64,
     snat_bound: AtomicU64,
     snat_alloc_fail: AtomicU64,
     snat_reply_tx: AtomicU64,
@@ -517,8 +511,6 @@ impl XdpManager {
             udp_fwd_map_full: AtomicU64::new(0),
             tcp_fwd_tx: AtomicU64::new(0),
             tcp_fwd_map_full: AtomicU64::new(0),
-            sni_blocked: AtomicU64::new(0),
-            sni_incomplete: AtomicU64::new(0),
             snat_bound: AtomicU64::new(0),
             snat_alloc_fail: AtomicU64::new(0),
             snat_reply_tx: AtomicU64::new(0),
@@ -1077,8 +1069,6 @@ impl XdpManager {
             udp_fwd_map_full: self.udp_fwd_map_full.load(Ordering::Relaxed),
             tcp_fwd_tx: self.tcp_fwd_tx.load(Ordering::Relaxed),
             tcp_fwd_map_full: self.tcp_fwd_map_full.load(Ordering::Relaxed),
-            sni_blocked: self.sni_blocked.load(Ordering::Relaxed),
-            sni_incomplete: self.sni_incomplete.load(Ordering::Relaxed),
             snat_bound: self.snat_bound.load(Ordering::Relaxed),
             snat_alloc_fail: self.snat_alloc_fail.load(Ordering::Relaxed),
             snat_reply_tx: self.snat_reply_tx.load(Ordering::Relaxed),
@@ -1589,10 +1579,6 @@ impl XdpManager {
                     .store(counters.tcp_fwd_tx, Ordering::Relaxed);
                 self.tcp_fwd_map_full
                     .store(counters.tcp_fwd_map_full, Ordering::Relaxed);
-                self.sni_blocked
-                    .store(counters.sni_blocked, Ordering::Relaxed);
-                self.sni_incomplete
-                    .store(counters.sni_incomplete, Ordering::Relaxed);
                 self.snat_bound
                     .store(counters.snat_bound, Ordering::Relaxed);
                 self.snat_alloc_fail
@@ -1773,9 +1759,6 @@ pub async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
     derived.attach_mode = runtime.xdp.attach_mode;
     derived.fallback = runtime.xdp.fallback;
     derived.rate_limit = runtime.xdp.rate_limit.clone().or(derived.rate_limit);
-    if !runtime.xdp.sni_blocklist.is_empty() {
-        derived.sni_blocklist = runtime.xdp.sni_blocklist.clone();
-    }
     runtime.xdp = derived;
     RuntimeConfig::set_current(runtime);
     Ok(())
@@ -2189,8 +2172,6 @@ async fn raw_smoke_inner(
         "udpFwdMapFull": status.udp_fwd_map_full,
         "tcpFwdTx": status.tcp_fwd_tx,
         "tcpFwdMapFull": status.tcp_fwd_map_full,
-        "sniBlocked": status.sni_blocked,
-        "sniIncomplete": status.sni_incomplete,
         "snatBound": status.snat_bound,
         "snatAllocFail": status.snat_alloc_fail,
         "snatReplyTx": status.snat_reply_tx,
@@ -4039,10 +4020,10 @@ mod linux {
         }
         // Populate the tail-call dispatch table. Slots are per (family, proto)
         // pairs because a single SNAT-capable NAT handler is already ~10KiB of
-        // BPF: slot 0 = UDP/IPv4, 1 = SNI blocklist (chains into TCP NAT),
-        // 2 = TCP/IPv4, 3 = UDP/IPv6 replies, 4 = TCP/IPv6 replies, and the
-        // IPv6 forward halves each get their own program (5 = UDPv6 fwd,
-        // 6 = TCPv6 fwd) to stay under older kernels' verifier state budget.
+        // BPF: slot 0 = UDP/IPv4, 2 = TCP/IPv4, 3 = UDP/IPv6 replies,
+        // 4 = TCP/IPv6 replies, and the IPv6 forward halves each get their own
+        // program (5 = UDPv6 fwd, 6 = TCPv6 fwd) to stay under older kernels'
+        // verifier state budget. Slot 1 is reserved (was SNI blocklist).
         // An older object without a symbol leaves that slot empty; the tail
         // call then returns and the dispatcher falls back to the
         // redirect/PASS path explicitly.
@@ -4054,7 +4035,6 @@ mod linux {
         let mut dispatch_fds: Vec<(u32, Option<aya::programs::ProgramFd>)> = Vec::new();
         for (slot, name) in [
             (0u32, "xdp_nat_dispatch"),
-            (1, "xdp_sni_dispatch"),
             (2, "xdp_nat_tcp_dispatch"),
             (3, "xdp_nat_udp6_dispatch"),
             (4, "xdp_nat_tcp6_dispatch"),
@@ -4093,7 +4073,7 @@ mod linux {
                 }
                 if missing {
                     tracing::warn!(
-                        "eBPF object lacks a dispatch subprogram; affected direct-forward/SNI features stay on the normal dataplane"
+                        "eBPF object lacks a dispatch subprogram; affected direct-forward features stay on the normal dataplane"
                     );
                 }
             }
@@ -4106,12 +4086,6 @@ mod linux {
                 if configured > 0 {
                     tracing::warn!(
                         "eBPF object lacks XDP_DISPATCH; {configured} configured forwards are not active (stale object, rebuild cloud-node-xdp-ebpf.o)"
-                    );
-                }
-                if !config.sni_blocklist.is_empty() {
-                    tracing::warn!(
-                        "eBPF object lacks XDP_DISPATCH; {} configured SNI blocklist entries are not enforced in kernel (stale object, rebuild cloud-node-xdp-ebpf.o)",
-                        config.sni_blocklist.len()
                     );
                 }
             }
@@ -4207,7 +4181,6 @@ mod linux {
         sync_xsk_indices(ebpf, config, proxy_dataplane_active)?;
         sync_udp_forwards(ebpf, config, proxy_dataplane_active)?;
         sync_tcp_forwards(ebpf, config, proxy_dataplane_active)?;
-        sync_sni_blocklist(ebpf, config)?;
         clear_rule_maps(ebpf)?;
         let empty = RuleState::default();
         apply_rule_diff(ebpf, &empty, state)?;
@@ -4483,29 +4456,6 @@ mod linux {
                     }
                 }
             }
-        }
-        Ok(())
-    }
-
-    /// Program the SNI blocklist: FNV-1a(lower(SNI)) -> 1. The map is only a
-    /// fast-path accelerator; userspace SNI handling stays authoritative, so
-    /// a missing map with a configured list is a warning, not a silent skip.
-    fn sync_sni_blocklist(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Result<()> {
-        let Some(map) = ebpf.map_mut("XDP_SNI_BLOCK") else {
-            if !config.sni_blocklist.is_empty() {
-                tracing::warn!(
-                    "eBPF object lacks XDP_SNI_BLOCK; {} configured SNI blocklist entries are not active in kernel (stale object, rebuild cloud-node-xdp-ebpf.o)",
-                    config.sni_blocklist.len()
-                );
-            }
-            return Ok(());
-        };
-        let mut map = AyaHashMap::<_, u64, u32>::try_from(map)?;
-        clear_hash_map(&mut map)?;
-        for name in &config.sni_blocklist {
-            let hash = cloud_node_xdp_common::sni_hash(name);
-            map.insert(hash, 1u32, 0)
-                .map_err(|err| anyhow::anyhow!("insert SNI block {name}: {err}"))?;
         }
         Ok(())
     }
@@ -4808,7 +4758,7 @@ mod linux {
         let fwd_rule = size_of::<XdpUdpFwdRule>() as u32;
         let ct_key = size_of::<XdpUdpCtKey>() as u32;
         let ct_value = size_of::<XdpUdpCtValue>() as u32;
-        let specs: [(&str, MapType, u32, u32, u32); 28] = [
+        let specs: [(&str, MapType, u32, u32, u32); 27] = [
             ("XDP_BLOCKED_V4", MapType::Hash, v4, rule, 262_144),
             ("XDP_BLOCKED_V6", MapType::Hash, v6, rule, 262_144),
             ("XDP_ALLOWED_V4", MapType::Hash, v4, rule, 65_536),
@@ -4907,13 +4857,6 @@ mod linux {
                 1,
             ),
             ("XDP_DISPATCH", MapType::ProgramArray, u, u, 8),
-            (
-                "XDP_SNI_BLOCK",
-                MapType::Hash,
-                size_of::<u64>() as u32,
-                u,
-                65_536,
-            ),
             (
                 "XDP_FLOW_ACCT",
                 MapType::PerCpuHash,

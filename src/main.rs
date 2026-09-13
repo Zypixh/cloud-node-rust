@@ -912,9 +912,6 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             if runtime_config.xdp.rate_limit.is_some() {
                 effective_xdp.rate_limit = runtime_config.xdp.rate_limit.clone();
             }
-            if !runtime_config.xdp.sni_blocklist.is_empty() {
-                effective_xdp.sni_blocklist = runtime_config.xdp.sni_blocklist.clone();
-            }
             runtime_config.xdp = effective_xdp;
             runtime_config.validate()?;
             if !no_tune {
