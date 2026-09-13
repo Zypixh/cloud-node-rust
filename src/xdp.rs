@@ -4009,6 +4009,13 @@ mod linux {
         let mut attached = BTreeSet::new();
         let mut loader = aya::EbpfLoader::new();
         loader.default_map_pin_directory(XDP_BPF_PIN_DIR);
+        // The dispatch table must outlive the process: aya-ebpf maps default
+        // to PinningType::None so default_map_pin_directory alone does not pin
+        // it, and without a pin the tail-call targets die with the process.
+        loader.map_pin_path(
+            "XDP_DISPATCH",
+            Path::new(XDP_BPF_PIN_DIR).join("XDP_DISPATCH"),
+        );
         let mut ebpf = match object_path {
             Some(path) => loader.load_file(path)?,
             None => loader.load(XDP_EBPF_EMBEDDED)?,
@@ -4039,6 +4046,11 @@ mod linux {
         // An older object without a symbol leaves that slot empty; the tail
         // call then returns and the dispatcher falls back to the
         // redirect/PASS path explicitly.
+        // Pinned programs keep a kernel reference independent of our fds, so
+        // the tail-call chain stays live after a one-shot `xdp attach` exits.
+        let prog_pin_dir = Path::new(XDP_BPF_PIN_DIR).join("progs");
+        std::fs::create_dir_all(&prog_pin_dir)
+            .map_err(|err| anyhow::anyhow!("create prog pin dir {}: {err}", prog_pin_dir.display()))?;
         let mut dispatch_fds: Vec<(u32, Option<aya::programs::ProgramFd>)> = Vec::new();
         for (slot, name) in [
             (0u32, "xdp_nat_dispatch"),
@@ -4053,6 +4065,12 @@ mod linux {
                 Some(sub_program) => {
                     let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
                     sub.load()?;
+                    let pin_path = prog_pin_dir.join(name);
+                    if pin_path.exists() {
+                        std::fs::remove_file(&pin_path)?;
+                    }
+                    sub.pin(&pin_path)
+                        .map_err(|err| anyhow::anyhow!("pin {name} to {}: {err}", pin_path.display()))?;
                     Some(
                         sub.fd()?
                             .try_clone()
@@ -4150,6 +4168,28 @@ mod linux {
                         err
                     );
                 }
+            }
+        }
+        // Drop the extra kernel references taken at attach: pinned tail-call
+        // subprograms and the pinned dispatch table. Unlink order is
+        // irrelevant — each pin only removes one reference.
+        let prog_pin_dir = Path::new(XDP_BPF_PIN_DIR).join("progs");
+        if let Ok(entries) = std::fs::read_dir(&prog_pin_dir) {
+            for entry in entries.flatten() {
+                if let Err(err) = std::fs::remove_file(entry.path()) {
+                    tracing::warn!(
+                        "failed to unpin eBPF program {}: {}",
+                        entry.path().display(),
+                        err
+                    );
+                }
+            }
+            let _ = std::fs::remove_dir(&prog_pin_dir);
+        }
+        let dispatch_pin = Path::new(XDP_BPF_PIN_DIR).join("XDP_DISPATCH");
+        if dispatch_pin.exists() {
+            if let Err(err) = std::fs::remove_file(&dispatch_pin) {
+                tracing::warn!("failed to unpin XDP_DISPATCH map: {err}");
             }
         }
         Ok(())
