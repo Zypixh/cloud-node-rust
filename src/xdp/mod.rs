@@ -165,6 +165,15 @@ pub struct XdpStatusSnapshot {
     pub control_limited: u64,
     /// TCP packets rejected by the admission sequence anchors (EN-13/14).
     pub nat_seq_rejected: u64,
+    /// EN-07: new-flow admissions rejected by the per-service (listen port)
+    /// budget — a flood on one service is contained without draining
+    /// siblings' share.
+    #[serde(default)]
+    pub service_limited: u64,
+    /// EN-07: per-service buckets that could not be created because
+    /// XDP_SVC_BUDGET is at capacity (aggregate dim1 envelope still applies).
+    #[serde(default)]
+    pub svc_budget_full: u64,
     /// EN-10: lifecycle events dropped in-kernel because XDP_FLOW_EVENTS was
     /// full (consumer too slow). Feedback is advisory — loss never blocks or
     /// alters the dataplane, but is always accounted.
@@ -273,6 +282,8 @@ pub(crate) struct XdpManager {
     verified_limited: AtomicU64,
     control_limited: AtomicU64,
     nat_seq_rejected: AtomicU64,
+    service_limited: AtomicU64,
+    svc_budget_full: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     /// EN-10: owner generation written to XDP_OWNER_EPOCH at attach.
@@ -371,6 +382,8 @@ impl XdpManager {
             verified_limited: AtomicU64::new(0),
             control_limited: AtomicU64::new(0),
             nat_seq_rejected: AtomicU64::new(0),
+            service_limited: AtomicU64::new(0),
+            svc_budget_full: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             owner_epoch: AtomicU64::new(0),
@@ -1050,6 +1063,8 @@ impl XdpManager {
             verified_limited: self.verified_limited.load(Ordering::Relaxed),
             control_limited: self.control_limited.load(Ordering::Relaxed),
             nat_seq_rejected: self.nat_seq_rejected.load(Ordering::Relaxed),
+            service_limited: self.service_limited.load(Ordering::Relaxed),
+            svc_budget_full: self.svc_budget_full.load(Ordering::Relaxed),
             flow_event_lost: self.flow_event_lost.load(Ordering::Relaxed),
             flow_events_received: self.flow_events_received.load(Ordering::Relaxed),
             flow_events_stale: self.flow_events_stale.load(Ordering::Relaxed),
@@ -1431,6 +1446,10 @@ impl XdpManager {
             let per = total.saturating_add(denom - 1) / denom;
             per.max(1)
         };
+        // Per-service ceiling defaults to the aggregate new-flow cap: a
+        // single service may fill the envelope (status quo), while
+        // multi-service nodes get a fairness floor operators can tighten.
+        let service_flow_pps = base.service_flow_pps.unwrap_or(base.new_flow_per_sec);
         cloud_node_xdp_common::XdpBudgetConfig {
             unverified_pps: share(base.unverified_pps),
             new_flow_per_sec: share(base.new_flow_per_sec),
@@ -1438,10 +1457,12 @@ impl XdpManager {
             challenge_pps: 0,
             verified_pps: share(base.verified_pps),
             control_pps: share(base.control_pps),
+            service_flow_pps: share(service_flow_pps),
             window_ns: base.window_ms.saturating_mul(1_000_000),
             // dim0 unverified | dim1 new-flow | dim2 xsk-redirect |
-            // dim4 verified | dim5 control — all fail-closed counted.
-            flags: 0b11_0111,
+            // dim4 verified | dim5 control | dim6 per-service —
+            // all fail-closed counted.
+            flags: 0b111_0111,
         }
     }
 
@@ -1759,6 +1780,10 @@ impl XdpManager {
                     .store(counters.control_limited, Ordering::Relaxed);
                 self.nat_seq_rejected
                     .store(counters.nat_seq_rejected, Ordering::Relaxed);
+                self.service_limited
+                    .store(counters.service_limited, Ordering::Relaxed);
+                self.svc_budget_full
+                    .store(counters.svc_budget_full, Ordering::Relaxed);
                 self.flow_event_lost
                     .store(counters.flow_event_lost, Ordering::Relaxed);
             }
@@ -1834,6 +1859,8 @@ impl XdpManager {
                     "verifiedLimited": c.verified_limited,
                     "controlLimited": c.control_limited,
                     "natSeqRejected": c.nat_seq_rejected,
+                    "serviceLimited": c.service_limited,
+                    "svcBudgetFull": c.svc_budget_full,
                     "flowEventLost": c.flow_event_lost,
                 })
             })

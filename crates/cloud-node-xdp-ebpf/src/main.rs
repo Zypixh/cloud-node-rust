@@ -19,7 +19,7 @@ use cloud_node_xdp_common::{
     XDP_FRAGMENT_PASS, XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS, XDP_LOCAL_PRESENT,
     XDP_LOCAL_REDIRECT, XDP_PENDING_CAP_FAIL_CT_INSERT, XDP_PENDING_CAP_FAIL_PENDING_INSERT,
     XDP_PENDING_CAP_FAIL_SNAT_ALLOC, XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN, XdpBudgetBucket,
-    XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpFlowEvent, XdpInterfacePolicy, XdpIpv4Key,
+    XdpBudgetConfig, XdpCounters, XdpSvcBucket, XdpFlowAcct, XdpFlowEvent, XdpInterfacePolicy, XdpIpv4Key,
     XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey, XdpQueueKey,
     XdpQuicDcidKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
     XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
@@ -137,6 +137,15 @@ static XDP_BUDGET_CFG: Array<XdpBudgetConfig> = Array::<XdpBudgetConfig>::with_m
 #[map(name = "XDP_BUDGET")]
 static XDP_BUDGET: PerCpuArray<XdpBudgetBucket> =
     PerCpuArray::<XdpBudgetBucket>::with_max_entries(1, 0);
+
+/// EN-07 per-service fairness: per-CPU admission buckets keyed by listen
+/// port so a distributed flood on one service exhausts only its own share
+/// of the new-flow envelope — siblings keep theirs. Bounded at 256 keys;
+/// a full map degrades to the aggregate dim1 envelope (counted via
+/// svc_budget_full), never a silent bypass.
+#[map(name = "XDP_SVC_BUDGET")]
+static XDP_SVC_BUDGET: PerCpuHashMap<u32, XdpSvcBucket> =
+    PerCpuHashMap::<u32, XdpSvcBucket>::with_max_entries(256, 0);
 
 #[map(name = "XDP_QUIC_DCID")]
 static XDP_QUIC_DCID: HashMap<XdpQuicDcidKey, u32> =
@@ -2312,6 +2321,13 @@ fn try_udp_nat_v4(
             counter_admission_limited();
             return Ok(Some(xdp_action::XDP_DROP));
         }
+        // Per-service fairness (dim6): the listen port's bucket is charged
+        // after the aggregate gate so a single flooded service cannot drain
+        // sibling services' share of the new-flow envelope.
+        if !svc_budget_charge(dst_port, now_mono_ns) {
+            counter_service_limited();
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
         if rule.snat != 0 {
             unsafe {
                 let k = &mut (*scratch).snat_rev_key;
@@ -2671,6 +2687,13 @@ fn try_udp_nat_v6_fwd(
         // or SNAT state exists for this tuple.
         if !budget_charge(1, now_mono_ns) {
             counter_admission_limited();
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
+        // Per-service fairness (dim6): the listen port's bucket is charged
+        // after the aggregate gate so a single flooded service cannot drain
+        // sibling services' share of the new-flow envelope.
+        if !svc_budget_charge(dst_port, now_mono_ns) {
+            counter_service_limited();
             return Ok(Some(xdp_action::XDP_DROP));
         }
         if rule.snat != 0 {
@@ -3161,6 +3184,11 @@ fn try_tcp_nat_v4(
                     counter_admission_limited();
                     return Ok(Some(xdp_action::XDP_DROP));
                 }
+                // Per-service fairness (dim6) — same contract as UDP.
+                if !svc_budget_charge(dst_port, now_mono_ns) {
+                    counter_service_limited();
+                    return Ok(Some(xdp_action::XDP_DROP));
+                }
                 let eth = ptr_at::<EthHdr>(ctx, 0)?;
                 let client_mac = unsafe { (*eth).src_addr };
                 unsafe {
@@ -3586,6 +3614,11 @@ fn try_tcp_nat_v6_fwd(
                     counter_admission_limited();
                     return Ok(Some(xdp_action::XDP_DROP));
                 }
+                // Per-service fairness (dim6) — same contract as UDP.
+                if !svc_budget_charge(dst_port, now_mono_ns) {
+                    counter_service_limited();
+                    return Ok(Some(xdp_action::XDP_DROP));
+                }
                 let eth = ptr_at::<EthHdr>(ctx, 0)?;
                 let client_mac = unsafe { (*eth).src_addr };
                 unsafe {
@@ -4000,6 +4033,56 @@ fn counter_acl_would_block() {
 fn counter_nonlocal_pass() {
     if let Some(counters) = counters() {
         counters.nonlocal_pass = counters.nonlocal_pass.saturating_add(1);
+    }
+}
+
+fn counter_service_limited() {
+    if let Some(counters) = counters() {
+        counters.service_limited = counters.service_limited.saturating_add(1);
+    }
+}
+
+fn counter_svc_budget_full() {
+    if let Some(counters) = counters() {
+        counters.svc_budget_full = counters.svc_budget_full.saturating_add(1);
+    }
+}
+
+/// EN-07 per-service fairness: charge one new-flow admission against the
+/// listen port's per-CPU bucket (XDP_SVC_BUDGET keyed by dst port). A
+/// distributed flood on one service exhausts only its own share of the
+/// new-flow envelope; the aggregate dim1 cap still bounds the node on top.
+/// A full service map degrades to the aggregate envelope — bounded and
+/// counted, never a silent bypass of dim1.
+#[inline(never)]
+fn svc_budget_charge(dst_port: u16, now_mono_ns: u64) -> bool {
+    let Some(cfg) = XDP_BUDGET_CFG.get(0) else {
+        return true;
+    };
+    if cfg.flags & 0x40 == 0 || cfg.service_flow_pps == 0 || cfg.window_ns == 0 {
+        return true;
+    }
+    let key = u32::from(dst_port);
+    match XDP_SVC_BUDGET.get_ptr_mut(&key) {
+        Some(bucket) => {
+            let b = unsafe { &mut *bucket };
+            if now_mono_ns.saturating_sub(b.window_start_ns) >= cfg.window_ns {
+                b.window_start_ns = now_mono_ns;
+                b.count = 0;
+            }
+            b.count = b.count.saturating_add(1);
+            b.count <= cfg.service_flow_pps
+        }
+        None => {
+            let bucket = XdpSvcBucket {
+                window_start_ns: now_mono_ns,
+                count: 1,
+            };
+            if XDP_SVC_BUDGET.insert(&key, &bucket, 0).is_err() {
+                counter_svc_budget_full();
+            }
+            true
+        }
     }
 }
 

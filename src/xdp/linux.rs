@@ -964,7 +964,9 @@ pub(crate) fn sum_percpu_counters<'a>(
             nat_conflict,
             verified_limited,
             control_limited,
-            nat_seq_rejected
+            nat_seq_rejected,
+            service_limited,
+            svc_budget_full
         );
     }
     total
@@ -1693,7 +1695,7 @@ fn clear_pinned_xsk_map() -> anyhow::Result<()> {
 /// aligned with the #[map] definitions in
 /// crates/cloud-node-xdp-ebpf/src/main.rs. LPM trie keys carry a
 /// 4-byte prefix length in front of the address.
-fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 34] {
+fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 35] {
     use aya::maps::MapType;
     use cloud_node_xdp_common::*;
     use core::mem::size_of;
@@ -1778,6 +1780,13 @@ fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 34] {
             u,
             size_of::<XdpBudgetBucket>() as u32,
             1,
+        ),
+        (
+            "XDP_SVC_BUDGET",
+            MapType::PerCpuHash,
+            u,
+            size_of::<cloud_node_xdp_common::XdpSvcBucket>() as u32,
+            256,
         ),
         (
             "XDP_RATE_V4",
