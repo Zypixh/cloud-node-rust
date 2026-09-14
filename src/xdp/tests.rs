@@ -1444,6 +1444,39 @@ fn af_xdp_tcp_session_limit_uses_actual_af_xdp_budget() {
     assert!(modest < 16_384);
 }
 
+/// EN-12 T18: the whole-node session budget is divided across queue workers;
+/// adding queues must not multiply the aggregate quota.
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_session_limit_per_worker_divides_node_budget() {
+    use af_xdp::af_xdp_tcp_session_limit_per_worker as per_worker;
+    let node = 8_192usize;
+    // Aggregate capacity never exceeds the node budget when queues multiply.
+    for workers in [1usize, 2, 4, 8, 16] {
+        assert!(per_worker(node, workers) * workers <= node);
+        assert_eq!(per_worker(node, workers), node / workers);
+    }
+    // More workers than budget still admits at least one session per worker,
+    // and the aggregate stays bounded by worker count.
+    assert_eq!(per_worker(4, 16), 1);
+    assert_eq!(per_worker(0, 8), 1);
+    assert_eq!(per_worker(node, 0), node);
+}
+
+/// EN-12: xskMode config parsing and defaults — auto probes, explicit modes
+/// pin the bind attempt.
+#[test]
+fn xdp_interface_xsk_mode_parses_and_defaults_to_auto() {
+    use crate::runtime_mode::{XdpInterfaceConfig, XdpXskMode};
+    let cfg: XdpInterfaceConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(cfg.xsk_mode, XdpXskMode::Auto);
+    let cfg: XdpInterfaceConfig = serde_json::from_str(r#"{"xskMode":"copy"}"#).unwrap();
+    assert_eq!(cfg.xsk_mode, XdpXskMode::Copy);
+    let cfg: XdpInterfaceConfig = serde_json::from_str(r#"{"xskMode":"zero-copy"}"#).unwrap();
+    assert_eq!(cfg.xsk_mode, XdpXskMode::ZeroCopy);
+    assert!(serde_json::from_str::<XdpInterfaceConfig>(r#"{"xskMode":"bogus"}"#).is_err());
+}
+
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_initial_syn_accepts_ecn_variants() {
@@ -2700,4 +2733,32 @@ fn kernel_bpf_budget_is_bounded_by_state_budget() {
         .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
     assert!(snapshot.kernel_bpf_budget_bytes >= 32 * 1024 * 1024);
     assert!(snapshot.kernel_bpf_budget_bytes <= snapshot.memory_total_bytes);
+}
+
+/// EN-12: during reactor startup the worker lease keeps the bridge alive
+/// without redirect; once workers are proven the gate hands off to redirect
+/// readiness, and any degradation releases both.
+#[test]
+fn xdp_proxy_bridge_worker_lease_covers_startup_without_redirect() {
+    let _guard = crate::runtime_mode::runtime_config_test_guard();
+    RuntimeConfig::set_current(RuntimeConfig {
+        xdp: test_proxy_config("eth-new"),
+        ..RuntimeConfig::default()
+    });
+    let manager = replace_manager_from_runtime();
+    mark_test_proxy_bridge_ready(&manager);
+    // Redirect enabled but workers not starting: normal dataplane semantics.
+    manager
+        .proxy_redirect_enabled
+        .store(false, Ordering::Relaxed);
+    assert!(!af_xdp::proxy_bridge_should_continue(&manager));
+
+    // Worker lease during startup keeps reactors alive before redirect opens.
+    manager.set_proxy_workers_starting(true);
+    assert!(af_xdp::proxy_bridge_should_continue(&manager));
+
+    // Degradation during startup releases the lease and stops the workers.
+    manager.mark_proxy_dataplane_degraded("test forced degraded");
+    assert!(!manager.proxy_workers_starting());
+    assert!(!af_xdp::proxy_bridge_should_continue(&manager));
 }

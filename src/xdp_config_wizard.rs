@@ -307,6 +307,7 @@ mod tests {
                 tcp_forwards: Vec::new(),
                 fragment_action: crate::runtime_mode::XdpFragmentAction::default(),
                 protected_services: Vec::new(),
+                xsk_mode: crate::runtime_mode::XdpXskMode::default(),
             }],
             proxy: XdpProxyConfig {
                 protocols: vec![

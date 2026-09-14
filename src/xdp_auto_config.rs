@@ -267,6 +267,7 @@ fn detect_xdp_interfaces_with_options(
             tcp_forwards: Vec::new(),
             fragment_action: crate::runtime_mode::XdpFragmentAction::Pass,
             protected_services: Vec::new(),
+            xsk_mode: crate::runtime_mode::XdpXskMode::default(),
         });
     }
 

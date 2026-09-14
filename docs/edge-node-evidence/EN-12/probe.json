@@ -1,0 +1,77 @@
+{
+  "phases": {
+    "A_auto_probe_two_queues": {
+      "queues": 2,
+      "xsk_modes": {
+        "0": "copy",
+        "1": "copy"
+      },
+      "details": {
+        "0": "AF_XDP socket registered in XSK map index 0 for ifindex 227 queue 0",
+        "1": "AF_XDP socket registered in XSK map index 1 for ifindex 227 queue 1"
+      },
+      "ready": {
+        "0": true,
+        "1": true
+      },
+      "redirectEnabled": true,
+      "ok": true
+    },
+    "B_redirect_and_rx_health": {
+      "sent": 400,
+      "redirectDelta": 400,
+      "packetsDelta": 400,
+      "rxStats": {
+        "0": [
+          0,
+          0,
+          0
+        ],
+        "1": [
+          0,
+          0,
+          0
+        ]
+      },
+      "ok": true
+    },
+    "B2_worker_ready_before_redirect": {
+      "reactorReadyReports": 2,
+      "redirectEnableAfterLastReady": true,
+      "ok": true
+    },
+    "C_zerocopy_fails_explicitly": {
+      "xsk_modes": [
+        "",
+        ""
+      ],
+      "socketCreated": [
+        false,
+        false
+      ],
+      "details": [
+        "AF_XDP socket setup failed: AF_XDP zero-copy bind failed: non-zero error code returned when creating AF_XDP socket: Operation not supported (os error 95)",
+        "AF_XDP socket setup failed: AF_XDP zero-copy bind failed: non-zero error code returned when creating AF_XDP socket: Operation not supported (os error 95)"
+      ],
+      "redirectEnabled": false,
+      "passDelta": 51,
+      "ok": true
+    },
+    "D_forced_copy": {
+      "xsk_modes": [
+        "copy",
+        "copy"
+      ],
+      "details": [
+        "AF_XDP socket registered in XSK map index 0 for ifindex 227 queue 0",
+        "AF_XDP socket registered in XSK map index 1 for ifindex 227 queue 1"
+      ],
+      "ready": [
+        true,
+        true
+      ],
+      "ok": true
+    }
+  },
+  "ok": true
+}

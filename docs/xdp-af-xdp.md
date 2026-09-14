@@ -46,6 +46,10 @@ xdp:
 - `interfaces[].mode`：`observe`、`protect`、`proxy`。
 - `interfaces[].localIps`：proxy 模式下可限制只旁路目标为这些本机 IP 的包；为空表示不启用本机 IP 过滤。
 - `interfaces[].frameSize`：UMEM frame size，默认 `2048`。
+- `interfaces[].xskMode`（EN-12）：AF_XDP bind 模式探测策略，默认 `auto`。
+  - `auto`：先尝试 zero-copy bind，驱动不支持时显式回退 copy——落地模式记录到每队列状态 `xsk_mode`，探测失败原因写入 `detail`。
+  - `copy`：从不尝试 zero-copy，直接按 copy 模式 bind。
+  - `zero-copy`：强制 zero-copy；驱动不支持时该队列 socket 创建显式失败（状态可见），不静默降级。
 - `proxy.protocols`：允许进入 AF_XDP proxy 数据面的协议族。
 - `proxy.ports`：显式发布到 eBPF map 的协议和端口。
 - `interfaces[].udpForwards[]` / `interfaces[].tcpForwards[]`：L4 直通转发（XDP_TX NAT）规则，字段 `listen`、`backend`、`nextHopMac`（可空，自动按邻居表解析）、`serverId`、`snat`。
