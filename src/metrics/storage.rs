@@ -148,6 +148,12 @@ pub fn mace_metrics_bucket_options() -> BucketOptions {
         split_elems = options.split_elems,
         "Mace bucket options selected; capacities are per-bucket controls"
     );
+    // EN-16: register the metrics store's on-disk bound in the node disk
+    // ledger (cache/pool/checkpoint capacities bound its footprint).
+    crate::memory_governor::MEMORY_GOVERNOR.set_disk_class_budget(
+        crate::memory_governor::DiskLedgerClass::MetricsDb,
+        (options.cache_capacity + options.pool_capacity + options.checkpoint_size) as u64,
+    );
     options
 }
 

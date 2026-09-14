@@ -286,6 +286,7 @@ impl TcpProxyManager {
         client_stream: S,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
+        listen_addr: SocketAddr,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -299,6 +300,7 @@ impl TcpProxyManager {
             _connection_guard,
             _client_permit,
             _connection_permit,
+            _listener_permit,
             _downstream_transport,
         )) = self
             .prepare_bypass_tcp_connection(
@@ -307,6 +309,7 @@ impl TcpProxyManager {
                 &server,
                 "af_xdp",
                 server.enable_proxy_protocol,
+                listen_addr,
             )
             .await?
         else {
@@ -325,6 +328,7 @@ impl TcpProxyManager {
         server: &Arc<ServerConfig>,
         source: &'static str,
         consume_proxy_protocol: bool,
+        listener_key: SocketAddr,
     ) -> anyhow::Result<
         Option<(
             SocketAddr,
@@ -333,6 +337,7 @@ impl TcpProxyManager {
             crate::l4_connection_registry::L4ConnectionGuard,
             crate::l4_defense::ActiveIpPermit,
             crate::memory_governor::StaticAdmissionPermit,
+            crate::memory_governor::StaticListenerPoolPermit,
             crate::metrics::ShadowTransportMetricsGuard,
         )>,
     >
@@ -404,6 +409,25 @@ impl TcpProxyManager {
             return Ok(None);
         };
 
+        // EN-16: unattributed TCP must also hold a slot on its listener
+        // pool so one listener's flood cannot exhaust the node budget.
+        let Some(listener_permit) =
+            MEMORY_GOVERNOR.try_admit_listener(listener_key, AdmissionClass::TcpConnection)
+        else {
+            crate::l4_defense::record_l4_event(
+                &self.config_store,
+                &self.waf_state,
+                self.node_id,
+                client_addr.ip(),
+                L4DefenseKind::TcpAdmissionReject,
+                format!(
+                    "listener={} peer={} phase=listener_pool source={}",
+                    listener_key, client_addr, source
+                ),
+            );
+            return Ok(None);
+        };
+
         let (client_addr, client_stream) = if consume_proxy_protocol {
             let Some((addr, stream)) = maybe_consume_proxy_protocol_header_generic(
                 client_stream,
@@ -435,6 +459,7 @@ impl TcpProxyManager {
             connection_guard,
             client_permit,
             connection_permit,
+            listener_permit,
             downstream_transport,
         )))
     }
@@ -445,6 +470,7 @@ impl TcpProxyManager {
         client_stream: S,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
+        listen_addr: SocketAddr,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -456,6 +482,7 @@ impl TcpProxyManager {
             _connection_guard,
             _client_permit,
             _connection_permit,
+            _listener_permit,
             _downstream_transport,
         )) = self
             .prepare_bypass_tcp_connection(
@@ -464,6 +491,7 @@ impl TcpProxyManager {
                 &server,
                 "af_xdp",
                 server.enable_proxy_protocol,
+                listen_addr,
             )
             .await?
         else {
@@ -492,6 +520,7 @@ impl TcpProxyManager {
         client_stream: S,
         client_addr: SocketAddr,
         server: Arc<ServerConfig>,
+        listen_addr: SocketAddr,
     ) -> anyhow::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -503,6 +532,7 @@ impl TcpProxyManager {
             _connection_guard,
             _client_permit,
             _connection_permit,
+            _listener_permit,
             _downstream_transport,
         )) = self
             .prepare_bypass_tcp_connection(
@@ -511,6 +541,7 @@ impl TcpProxyManager {
                 &server,
                 "af_xdp",
                 server.enable_proxy_protocol,
+                listen_addr,
             )
             .await?
         else {
@@ -1023,10 +1054,27 @@ impl TcpProxyManager {
                 );
                 continue;
             };
+            let Some(listener_permit) =
+                MEMORY_GOVERNOR.try_admit_listener(bind_addr, AdmissionClass::TcpConnection)
+            else {
+                crate::l4_defense::record_l4_event(
+                    &self.config_store,
+                    &self.waf_state,
+                    self.node_id,
+                    client_addr.ip(),
+                    L4DefenseKind::TcpAdmissionReject,
+                    format!(
+                        "listener={} peer={} phase=listener_pool",
+                        bind_addr, client_addr
+                    ),
+                );
+                continue;
+            };
 
             tokio::spawn(async move {
                 let _client_permit = client_permit;
                 let _connection_permit = connection_permit;
+                let _listener_permit = listener_permit;
                 if let Err(e) = manager
                     .handle_connection(client_stream, client_addr, server, is_tls, acceptor_clone)
                     .await

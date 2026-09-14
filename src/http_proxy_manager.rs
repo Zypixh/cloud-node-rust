@@ -865,6 +865,26 @@ impl HttpProxyManager {
                 continue;
             };
 
+            // EN-16: hold a listener-pool slot for unattributed traffic so
+            // one listener cannot exhaust the node HTTP budget.
+            let Some(listener_permit) =
+                MEMORY_GOVERNOR.try_admit_listener(bind_addr, AdmissionClass::HttpConnection)
+            else {
+                self.record_l4_event(
+                    client_addr.ip(),
+                    L4DefenseKind::TcpAdmissionReject,
+                    format!(
+                        "listener={} peer={} protocol={} phase=listener_pool",
+                        bind_addr, client_addr, protocol_label
+                    ),
+                );
+                debug!(
+                    "HTTP listener pool exhausted on {}, dropping connection from {}",
+                    bind_addr, client_addr
+                );
+                continue;
+            };
+
             if !is_tls {
                 let proxy_inner = proxy_arc.clone();
                 let shutdown_inner = shutdown_rx.clone();
@@ -876,6 +896,7 @@ impl HttpProxyManager {
                 tokio::spawn(async move {
                     let _client_permit = client_permit;
                     let _connection_permit = connection_permit;
+                    let _listener_permit = listener_permit;
                     // Resolve the effective client address, consuming any PROXY header.
                     let Some((effective_addr, client_stream)) =
                         maybe_consume_proxy_protocol_header(
@@ -935,6 +956,7 @@ impl HttpProxyManager {
             tokio::spawn(async move {
                 let _client_permit = client_permit;
                 let connection_permit = connection_permit;
+                let _listener_permit = listener_permit;
                 let mut configured_tls_host = false;
                 let mut count_tls_handshake_failure = true;
 
@@ -1690,9 +1712,27 @@ impl HttpProxyManager {
             );
             return Ok(());
         };
+        let listener_key = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            listen_port,
+        );
+        let Some(listener_permit) =
+            MEMORY_GOVERNOR.try_admit_listener(listener_key, AdmissionClass::HttpConnection)
+        else {
+            self.record_l4_event(
+                client_addr.ip(),
+                L4DefenseKind::TcpAdmissionReject,
+                format!(
+                    "port={} peer={} protocol={} phase=listener_pool",
+                    listen_port, client_addr, protocol_label
+                ),
+            );
+            return Ok(());
+        };
 
         let _client_permit = client_permit;
         let _connection_permit = connection_permit;
+        let _listener_permit = listener_permit;
         let proxy_inner = self.proxy_for_tls(kind == AfXdpHttpPortKind::Https);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let downstream_read_timeout = crate::l4_defense::clamp_http_read_timeout(

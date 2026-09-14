@@ -3736,6 +3736,11 @@ impl HybridStorage {
             }
         }
 
+        crate::memory_governor::MEMORY_GOVERNOR.set_disk_class_budget(
+            crate::memory_governor::DiskLedgerClass::CacheL2,
+            self.max_disk_bytes.load(Ordering::Relaxed),
+        );
+
         if !config.min_free_bytes.trim().is_empty() {
             let bytes = parse_runtime_size_bytes(&config.min_free_bytes)?;
             self.min_free_bytes.store(bytes, Ordering::Relaxed);
@@ -3788,6 +3793,11 @@ impl HybridStorage {
                 self.max_disk_bytes
                     .store(bytes as u64, std::sync::atomic::Ordering::Relaxed);
             }
+
+            crate::memory_governor::MEMORY_GOVERNOR.set_disk_class_budget(
+                crate::memory_governor::DiskLedgerClass::CacheL2,
+                bytes as u64,
+            );
         }
 
         if let Some(options) = &policy.options {

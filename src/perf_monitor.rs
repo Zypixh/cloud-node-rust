@@ -79,6 +79,11 @@ struct PerfSample {
     cache_disk_hit_chunk_bytes: usize,
     memory_pressure_high: bool,
     admission_rejects_total: u64,
+    listener_pool_active: u64,
+    listener_pool_rejects: u64,
+    disk_ledger_reserved_bytes: u64,
+    disk_ledger_committed_bytes: u64,
+    disk_ledger_rejects: u64,
     top_servers: Vec<TopServer>,
     advice: Vec<Advice>,
 }
@@ -242,6 +247,11 @@ async fn sample_loop(store: SharedStore) {
             cache_disk_hit_chunk_bytes: cache_stats.disk_hit_chunk_bytes,
             memory_pressure_high: cache_stats.memory_pressure_high,
             admission_rejects_total,
+            listener_pool_active: governor_snapshot.listener_pool_active,
+            listener_pool_rejects: governor_snapshot.listener_pool_rejects,
+            disk_ledger_reserved_bytes: governor_snapshot.disk_reserved_bytes,
+            disk_ledger_committed_bytes: governor_snapshot.disk_committed_bytes,
+            disk_ledger_rejects: governor_snapshot.disk_rejects,
             top_servers,
             advice: build_advice(
                 cpu_usage,

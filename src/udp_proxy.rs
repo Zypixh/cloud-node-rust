@@ -1203,6 +1203,25 @@ impl UdpProxyManager {
             );
             return Ok(None);
         };
+
+        // EN-16: listener-pool slot for unattributed UDP sessions.
+        let listener_key =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
+        let Some(listener_permit) =
+            MEMORY_GOVERNOR.try_admit_listener(listener_key, AdmissionClass::UdpSession)
+        else {
+            self.record_l4_event(
+                client_addr.ip(),
+                L4DefenseKind::UdpAdmissionReject,
+                format!(
+                    "port={} peer={} server={} phase=listener_pool",
+                    port,
+                    client_addr,
+                    server.numeric_id()
+                ),
+            );
+            return Ok(None);
+        };
         let sid = server.id.unwrap_or(0);
         let user_id = server.user_id;
         let user_plan_id = server.user_plan_id;
@@ -1324,6 +1343,7 @@ impl UdpProxyManager {
 
         tokio::spawn(async move {
             let _session_permit = session_permit;
+            let _listener_permit = listener_permit;
             // Shadow counter for live UDP passthrough sessions.
             let _udp_session_transport = crate::metrics::transport_metrics_guard(
                 crate::metrics::ShadowTransportKind::UdpSession,

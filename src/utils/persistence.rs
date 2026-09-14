@@ -51,6 +51,20 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // EN-16: in-flight state writes hold a disk-ledger reservation so a
+    // burst of concurrent writers stays inside the node envelope. The
+    // reservation is transient — it is released after the rename.
+    let _disk_permit = crate::memory_governor::MEMORY_GOVERNOR
+        .try_reserve_disk(
+            crate::memory_governor::DiskLedgerClass::NodeState,
+            data.len() as u64,
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::QuotaExceeded,
+                "state write rejected by node disk ledger",
+            )
+        })?;
     let mut tmp_name = std::ffi::OsString::from(name);
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);

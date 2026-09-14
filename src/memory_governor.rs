@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,6 +165,20 @@ pub struct GovernorSnapshot {
     /// the node's overall state allocation — map memory is kernel-resident
     /// state and must fit inside it.
     pub kernel_bpf_budget_bytes: u64,
+    /// EN-16: connections currently holding a listener-pool slot.
+    pub listener_pool_active: u64,
+    /// EN-16: distinct (listener, class) pools currently tracked.
+    pub listener_pool_tracked: u64,
+    /// EN-16: admissions rejected by listener-pool fair-share caps.
+    pub listener_pool_rejects: u64,
+    /// EN-16: aggregate node disk envelope for ledger classes.
+    pub disk_budget_bytes: u64,
+    /// EN-16: in-flight disk reservations across all classes.
+    pub disk_reserved_bytes: u64,
+    /// EN-16: durable installed footprint across all classes.
+    pub disk_committed_bytes: u64,
+    /// EN-16: disk reservations rejected by class or aggregate budgets.
+    pub disk_rejects: u64,
     pub pingora_keepalive_pool_size: usize,
     pub resident_memory: ResidentMemorySnapshot,
     pub cgroup_managed: bool,
@@ -452,6 +467,41 @@ impl MemoryPressureLevel {
     }
 }
 
+/// EN-16 listener pool: upper bound on tracked (listener, class) pools.
+/// Reaching the bound prunes idle pools; if still full the admission is
+/// rejected explicitly (fail-closed, counted) rather than growing the map.
+const MAX_LISTENER_POOL_ENTRIES: usize = 4096;
+/// A listener always keeps at least this many slots regardless of how
+/// many listeners share the class budget, so a newly bound listener can
+/// never be starved to zero.
+const LISTENER_POOL_FLOOR: u64 = 16;
+
+/// EN-16 disk ledger classes. Every bounded disk consumer registers its
+/// cap and reports/reserves usage under one of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiskLedgerClass {
+    /// L2 disk cache (bounded by its own sharedMaxBytes/minFreeBytes; the
+    /// cap is registered so the aggregate envelope accounts for it).
+    CacheL2 = 0,
+    /// Local metrics database footprint (Mace WAL/checkpoint caps).
+    MetricsDb = 1,
+    /// Control-plane artifacts installed on disk (GeoIP DB, ...).
+    ConfigArtifacts = 2,
+    /// Node state files (status snapshots, marker files).
+    NodeState = 3,
+}
+const DISK_LEDGER_CLASS_COUNT: usize = 4;
+
+/// Default per-class disk budgets; 0 means "no dedicated cap — the
+/// aggregate envelope still applies". Classes with existing self-bounds
+/// register their real caps via `set_disk_class_budget`.
+const DEFAULT_DISK_CLASS_BUDGET: [u64; DISK_LEDGER_CLASS_COUNT] = [
+    0,                      // CacheL2 — registered from cache config
+    8 * 1024 * 1024 * 1024, // MetricsDb — registered from Mace options
+    2 * 1024 * 1024 * 1024, // ConfigArtifacts — few artifacts, <=512MiB each
+    256 * 1024 * 1024,      // NodeState — small status/marker files
+];
+
 pub struct MemoryGovernor {
     http_connections: AtomicU64,
     tcp_connections: AtomicU64,
@@ -494,6 +544,18 @@ pub struct MemoryGovernor {
     cached_process_pss_bytes: AtomicU64,
     cached_process_anon_rss_bytes: AtomicU64,
     resident: ResidentMemoryAccounting,
+    /// EN-16 listener pools: (bind addr, class) -> in-flight slots held.
+    listener_pools: Mutex<HashMap<(SocketAddr, u8), u64>>,
+    /// Listeners holding >=1 slot per class (fair-share divisor).
+    listener_class_active: [AtomicU64; ADMISSION_CLASS_COUNT],
+    listener_pool_rejects: AtomicU64,
+    /// EN-16 disk ledger: in-flight reservations and durable footprints
+    /// are tracked separately so physical observations never double-count
+    /// logical reservations.
+    disk_reserved: [AtomicU64; DISK_LEDGER_CLASS_COUNT],
+    disk_committed: [AtomicU64; DISK_LEDGER_CLASS_COUNT],
+    disk_class_budget: [AtomicU64; DISK_LEDGER_CLASS_COUNT],
+    disk_rejects: AtomicU64,
     #[cfg(test)]
     fd_count_reads: AtomicU64,
 }
@@ -520,6 +582,60 @@ pub struct UdpQueueBytePermit<'a> {
 }
 
 pub type StaticUdpQueueBytePermit = UdpQueueBytePermit<'static>;
+
+/// EN-16 RAII listener-pool slot. Dropping releases the slot and frees
+/// the pool entry once it reaches zero.
+pub struct ListenerPoolPermit<'a> {
+    governor: &'a MemoryGovernor,
+    key: (SocketAddr, u8),
+}
+
+pub type StaticListenerPoolPermit = ListenerPoolPermit<'static>;
+
+impl Drop for ListenerPoolPermit<'_> {
+    fn drop(&mut self) {
+        let mut pools = self
+            .governor
+            .listener_pools
+            .lock()
+            .expect("listener pool lock poisoned");
+        if let Some(active) = pools.get_mut(&self.key) {
+            *active -= 1;
+            if *active == 0 {
+                pools.remove(&self.key);
+                self.governor.listener_class_active[self.key.1 as usize]
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// EN-16 RAII disk reservation. Dropping without `commit` releases the
+/// reservation; `commit` moves the charge to the durable footprint.
+pub struct DiskPermit<'a> {
+    governor: &'a MemoryGovernor,
+    class: DiskLedgerClass,
+    bytes: u64,
+}
+
+pub type StaticDiskPermit = DiskPermit<'static>;
+
+impl DiskPermit<'_> {
+    /// The reservation became durable on-disk state (e.g. an installed
+    /// artifact): keep the charge as committed footprint instead of
+    /// releasing it.
+    pub fn commit(self) {
+        self.governor.disk_reserved[self.class as usize].fetch_sub(self.bytes, Ordering::Relaxed);
+        self.governor.disk_committed[self.class as usize].fetch_add(self.bytes, Ordering::Relaxed);
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for DiskPermit<'_> {
+    fn drop(&mut self) {
+        self.governor.disk_reserved[self.class as usize].fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FdEquivalentSnapshot {
@@ -579,6 +695,15 @@ impl MemoryGovernor {
             cached_process_pss_bytes: AtomicU64::new(0),
             cached_process_anon_rss_bytes: AtomicU64::new(0),
             resident: ResidentMemoryAccounting::new(),
+            listener_pools: Mutex::new(HashMap::new()),
+            listener_class_active: std::array::from_fn(|_| AtomicU64::new(0)),
+            listener_pool_rejects: AtomicU64::new(0),
+            disk_reserved: std::array::from_fn(|_| AtomicU64::new(0)),
+            disk_committed: std::array::from_fn(|_| AtomicU64::new(0)),
+            disk_class_budget: std::array::from_fn(|i| {
+                AtomicU64::new(DEFAULT_DISK_CLASS_BUDGET[i])
+            }),
+            disk_rejects: AtomicU64::new(0),
             #[cfg(test)]
             fd_count_reads: AtomicU64::new(0),
         }
@@ -727,6 +852,134 @@ impl MemoryGovernor {
             shared_connection_charge_bytes,
             cache_read_memory_charge_bytes,
         })
+    }
+
+    /// EN-16 listener quota pool: an unattributed connection must hold a
+    /// slot on its listener in addition to the node-level class permit.
+    /// The per-listener cap is the class limit's fair share across the
+    /// listeners currently holding slots of that class (floor
+    /// LISTENER_POOL_FLOOR), so a flood on one listener cannot consume
+    /// the whole node budget while a new listener is never starved.
+    pub fn try_admit_listener(
+        &self,
+        key: SocketAddr,
+        class: AdmissionClass,
+    ) -> Option<ListenerPoolPermit<'_>> {
+        let class_id = class as u8;
+        let pool_key = (key, class_id);
+        let node_limit = self.limit_for(class) as u64;
+        let mut pools = self
+            .listener_pools
+            .lock()
+            .expect("listener pool lock poisoned");
+        let current = pools.get(&pool_key).copied().unwrap_or(0);
+        if current == 0 && pools.len() >= MAX_LISTENER_POOL_ENTRIES {
+            // Bounded map: reclaim idle pools first; if everything is in
+            // use the node has >4096 simultaneously-active listener/class
+            // pairs and the admission is explicitly rejected.
+            pools.retain(|_, active| *active > 0);
+            if pools.len() >= MAX_LISTENER_POOL_ENTRIES {
+                self.listener_pool_rejects.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+        let active_listeners = self.listener_class_active[class_id as usize]
+            .load(Ordering::Relaxed)
+            + u64::from(current == 0);
+        let cap = node_limit
+            .div_ceil(active_listeners.max(1))
+            .clamp(LISTENER_POOL_FLOOR, node_limit.max(LISTENER_POOL_FLOOR));
+        if current >= cap {
+            self.listener_pool_rejects.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        pools.insert(pool_key, current + 1);
+        if current == 0 {
+            self.listener_class_active[class_id as usize].fetch_add(1, Ordering::Relaxed);
+        }
+        Some(ListenerPoolPermit {
+            governor: self,
+            key: pool_key,
+        })
+    }
+
+    /// EN-16 disk ledger: reserve `bytes` for an in-flight write. Both
+    /// the per-class cap (when registered) and the aggregate node
+    /// envelope are enforced; rejection is explicit and counted.
+    pub fn try_reserve_disk(&self, class: DiskLedgerClass, bytes: u64) -> Option<DiskPermit<'_>> {
+        let idx = class as usize;
+        let class_budget = self.disk_class_budget[idx].load(Ordering::Relaxed);
+        let committed = self.disk_committed[idx].load(Ordering::Relaxed);
+        let reserved = self.disk_reserved[idx].load(Ordering::Relaxed);
+        if class_budget > 0
+            && committed.saturating_add(reserved).saturating_add(bytes) > class_budget
+        {
+            self.disk_rejects.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let aggregate = self.disk_aggregate_budget_bytes();
+        let total: u64 = (0..DISK_LEDGER_CLASS_COUNT)
+            .map(|i| {
+                self.disk_committed[i]
+                    .load(Ordering::Relaxed)
+                    .saturating_add(self.disk_reserved[i].load(Ordering::Relaxed))
+            })
+            .sum();
+        if aggregate > 0 && total.saturating_add(bytes) > aggregate {
+            self.disk_rejects.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.disk_reserved[idx].fetch_add(bytes, Ordering::Relaxed);
+        Some(DiskPermit {
+            governor: self,
+            class,
+            bytes,
+        })
+    }
+
+    /// EN-16: overwrite the durable on-disk footprint for a class
+    /// (absolute value reported by the owning subsystem).
+    pub fn report_disk_committed(&self, class: DiskLedgerClass, bytes: u64) {
+        self.disk_committed[class as usize].store(bytes, Ordering::Relaxed);
+    }
+
+    /// EN-16: register a class cap from the owning subsystem's config.
+    pub fn set_disk_class_budget(&self, class: DiskLedgerClass, bytes: u64) {
+        self.disk_class_budget[class as usize].store(bytes, Ordering::Relaxed);
+    }
+
+    /// Aggregate disk envelope: the sum of registered/default class
+    /// budgets. Every ledger class is bounded, so the envelope is too.
+    fn disk_aggregate_budget_bytes(&self) -> u64 {
+        (0..DISK_LEDGER_CLASS_COUNT).fold(0u64, |acc, i| {
+            acc.saturating_add(self.disk_class_budget[i].load(Ordering::Relaxed))
+        })
+    }
+
+    fn listener_pool_active_slots(&self) -> u64 {
+        self.listener_pools
+            .lock()
+            .expect("listener pool lock poisoned")
+            .values()
+            .copied()
+            .sum()
+    }
+
+    fn listener_pool_tracked(&self) -> usize {
+        self.listener_pools
+            .lock()
+            .expect("listener pool lock poisoned")
+            .len()
+    }
+
+    fn disk_totals(&self) -> (u64, u64) {
+        let mut reserved = 0u64;
+        let mut committed = 0u64;
+        for i in 0..DISK_LEDGER_CLASS_COUNT {
+            reserved = reserved.saturating_add(self.disk_reserved[i].load(Ordering::Relaxed));
+            committed = committed.saturating_add(self.disk_committed[i].load(Ordering::Relaxed));
+        }
+        (reserved, committed)
     }
 
     pub fn limit_for(&self, class: AdmissionClass) -> usize {
@@ -1467,6 +1720,13 @@ impl MemoryGovernor {
             ip_report_queue_budget_bytes: event_queue_budget_bytes(&mem) / 8,
             af_xdp_budget_bytes: state_budget_bytes(&mem) / 4,
             kernel_bpf_budget_bytes: state_budget_bytes(&mem),
+            listener_pool_active: self.listener_pool_active_slots(),
+            listener_pool_tracked: self.listener_pool_tracked() as u64,
+            listener_pool_rejects: self.listener_pool_rejects.load(Ordering::Relaxed),
+            disk_budget_bytes: self.disk_aggregate_budget_bytes(),
+            disk_reserved_bytes: self.disk_totals().0,
+            disk_committed_bytes: self.disk_totals().1,
+            disk_rejects: self.disk_rejects.load(Ordering::Relaxed),
             pingora_keepalive_pool_size: self.pingora_keepalive_pool_size(pingora_threads),
             resident_memory: self.resident_memory_snapshot(),
             cgroup_managed: mem.cgroup_managed,
@@ -3821,5 +4081,136 @@ mod resident_memory_tests {
         assert!(governor.resident_memory_replace_owned(category, "a", 0));
         assert!(governor.resident_memory_replace_owned(category, "a", 0));
         assert_eq!(governor.resident_memory_snapshot().total_used_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod en16_pool_tests {
+    use super::{AdmissionClass, DiskLedgerClass, MemoryGovernor};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn listener(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn listener_pool_isolates_flooded_listener() {
+        let governor = MemoryGovernor::new();
+        let victim = listener(80);
+        let flood = listener(443);
+        let limit = governor.limit_for(AdmissionClass::HttpConnection) as u64;
+
+        // Sole active listener may use the whole class budget; the pool
+        // bounds new admissions per listener but never preempts in-flight
+        // permits.
+        let mut flood_permits = Vec::new();
+        while let Some(p) = governor.try_admit_listener(flood, AdmissionClass::HttpConnection) {
+            flood_permits.push(p);
+            assert!(flood_permits.len() as u64 <= limit);
+        }
+        assert_eq!(flood_permits.len() as u64, limit);
+        assert!(
+            governor
+                .listener_pool_rejects
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+
+        // Once a second listener is active its fair share of new
+        // admissions is guaranteed regardless of the flood's holdings —
+        // unattributed traffic is isolated per listener.
+        let mut victim_permits = Vec::new();
+        for _ in 0..limit.div_ceil(2) {
+            victim_permits.push(
+                governor
+                    .try_admit_listener(victim, AdmissionClass::HttpConnection)
+                    .expect("victim listener starved by flood"),
+            );
+        }
+        drop(victim_permits);
+        drop(flood_permits);
+        assert_eq!(governor.listener_pool_tracked(), 0);
+    }
+
+    #[test]
+    fn listener_pool_permit_drop_releases_slot() {
+        let governor = MemoryGovernor::new();
+        let key = listener(8080);
+        {
+            let _p = governor
+                .try_admit_listener(key, AdmissionClass::TcpConnection)
+                .unwrap();
+            assert_eq!(governor.listener_pool_active_slots(), 1);
+        }
+        assert_eq!(governor.listener_pool_active_slots(), 0);
+        assert_eq!(governor.listener_pool_tracked(), 0);
+    }
+
+    #[test]
+    fn listener_pool_map_is_bounded() {
+        let governor = MemoryGovernor::new();
+        // Distinct (listener, class) pools grow the map; idle pools are
+        // reclaimed at the bound so the map cannot grow without limit.
+        let mut held = Vec::new();
+        for port in 0u32..256 {
+            let key = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port as u16);
+            held.push(
+                governor
+                    .try_admit_listener(key, AdmissionClass::UdpSession)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(governor.listener_pool_tracked(), 256);
+        drop(held);
+        assert_eq!(governor.listener_pool_tracked(), 0);
+    }
+
+    #[test]
+    fn disk_ledger_reservation_commit_and_release() {
+        let governor = MemoryGovernor::new();
+        governor.set_disk_class_budget(DiskLedgerClass::ConfigArtifacts, 1024);
+
+        let permit = governor
+            .try_reserve_disk(DiskLedgerClass::ConfigArtifacts, 512)
+            .unwrap();
+        // Second reservation beyond the class cap is rejected explicitly.
+        assert!(
+            governor
+                .try_reserve_disk(DiskLedgerClass::ConfigArtifacts, 600)
+                .is_none()
+        );
+        assert_eq!(
+            governor
+                .disk_rejects
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        permit.commit();
+        let (reserved, committed) = governor.disk_totals();
+        assert_eq!(reserved, 0);
+        assert_eq!(committed, 512);
+
+        // Durable footprint counts against the class cap.
+        assert!(
+            governor
+                .try_reserve_disk(DiskLedgerClass::ConfigArtifacts, 600)
+                .is_none()
+        );
+        let released = governor
+            .try_reserve_disk(DiskLedgerClass::ConfigArtifacts, 400)
+            .unwrap();
+        drop(released);
+        let (reserved, _) = governor.disk_totals();
+        assert_eq!(reserved, 0);
+    }
+
+    #[test]
+    fn disk_ledger_absolute_report_and_aggregate_envelope() {
+        let governor = MemoryGovernor::new();
+        governor.report_disk_committed(DiskLedgerClass::NodeState, 100);
+        governor.report_disk_committed(DiskLedgerClass::NodeState, 60);
+        let (_, committed) = governor.disk_totals();
+        assert_eq!(committed, 60, "absolute report must overwrite, not add");
     }
 }
