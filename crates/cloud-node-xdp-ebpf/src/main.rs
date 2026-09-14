@@ -6,20 +6,22 @@ use aya_ebpf::{
     helpers::{bpf_csum_diff, bpf_get_prandom_u32, bpf_ktime_get_ns},
     macros::{map, xdp},
     maps::{
-        Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, ProgramArray, XskMap,
-        lpm_trie::Key as LpmKey,
+        lpm_trie::Key as LpmKey, Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, ProgramArray,
+        RingBuf, XskMap,
     },
     programs::XdpContext,
 };
 use cloud_node_xdp_common::{
-    XDP_CLASS_MALFORMED, XDP_CT_STATE_PENDING, XDP_CT_STATE_PENDING_ACKED,
-    XDP_CLASS_UNSUPPORTED, XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN,
-    XDP_FRAGMENT_DROP, XDP_FRAGMENT_PASS, XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS,
-    XDP_LOCAL_PRESENT, XDP_LOCAL_REDIRECT, XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN, XdpBudgetBucket,
-    XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key,
-    XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey, XdpQueueKey, XdpQuicDcidKey,
-    XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey,
-    XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
+    XdpBudgetBucket, XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpFlowEvent, XdpInterfacePolicy,
+    XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey,
+    XdpQueueKey, XdpQuicDcidKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
+    XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule, XDP_CLASS_MALFORMED,
+    XDP_CLASS_UNSUPPORTED, XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN, XDP_CT_STATE_PENDING,
+    XDP_CT_STATE_PENDING_ACKED, XDP_DECISION_FLOW_TABLE_FULL, XDP_DECISION_PASS,
+    XDP_FLOW_EVENT_ADMITTED, XDP_FLOW_EVENT_CLOSED, XDP_FLOW_EVENT_REJECTED,
+    XDP_FLOW_EVENT_VALIDATED, XDP_FRAGMENT_DROP, XDP_FRAGMENT_PASS, XDP_LOCAL_FRAG_DROP,
+    XDP_LOCAL_FRAG_PASS, XDP_LOCAL_PRESENT, XDP_LOCAL_REDIRECT, XDP_SNAT_PORT_BASE,
+    XDP_SNAT_PORT_SPAN,
 };
 use core::mem;
 use network_types::{
@@ -173,6 +175,25 @@ static XDP_PENDING: HashMap<XdpUdpCtKey, XdpUdpCtValue> =
 /// (pending_ttl_ns) written by userspace.
 #[map(name = "XDP_PENDING_CAP")]
 static XDP_PENDING_CAP: Array<XdpPendingCap> = Array::with_max_entries(1, 0);
+
+/// EN-10 lifecycle feedback channel: a bounded ring of `XdpFlowEvent`
+/// records published to userspace. Emission is advisory — a full ring only
+/// increments `flow_event_lost`; kernel maps stay authoritative for flow
+/// state and the dataplane never blocks on the consumer.
+#[map(name = "XDP_FLOW_EVENTS")]
+static XDP_FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// EN-10 owner epoch stamped on every emitted event: userspace writes the
+/// current manager generation at attach so a consumer can drop feedback
+/// published by an older generation (stale workers cannot renew leases on
+/// re-owned flows).
+#[map(name = "XDP_OWNER_EPOCH")]
+static XDP_OWNER_EPOCH: Array<u64> = Array::<u64>::with_max_entries(1, 0);
+
+/// EN-10 per-CPU event sequence feeding the (incarnation, owner_epoch, seq)
+/// ordering contract.
+#[map(name = "XDP_FLOW_SEQ")]
+static XDP_FLOW_SEQ: PerCpuArray<u64> = PerCpuArray::<u64>::with_max_entries(1, 0);
 
 /// SNAT reverse bindings: (listen addr, allocated node port, proto) -> client
 /// flow tuple. Claimed with BPF_NOEXIST by `snat_alloc`; orphan entries are
@@ -2236,11 +2257,23 @@ fn try_udp_nat_v4(
             )
             .is_err()
         {
+            emit_flow_event(
+                unsafe { &(*scratch).ct_value },
+                XDP_FLOW_EVENT_REJECTED,
+                XDP_DECISION_FLOW_TABLE_FULL,
+                now_mono_ns,
+            );
             // Fail explicit: report and leave the packet to the normal path so a
             // full conntrack table degrades to userspace handling, not drops.
             counter_udp_fwd_map_full();
             return Ok(None);
         }
+        emit_flow_event(
+            unsafe { &(*scratch).ct_value },
+            XDP_FLOW_EVENT_VALIDATED,
+            XDP_DECISION_PASS,
+            now_mono_ns,
+        );
     }
     // Rewrite destination -> backend.
     unsafe {
@@ -2552,9 +2585,21 @@ fn try_udp_nat_v6_fwd(
             )
             .is_err()
         {
+            emit_flow_event(
+                unsafe { &(*scratch).ct_value },
+                XDP_FLOW_EVENT_REJECTED,
+                XDP_DECISION_FLOW_TABLE_FULL,
+                now_mono_ns,
+            );
             counter_udp_fwd_map_full();
             return Ok(None);
         }
+        emit_flow_event(
+            unsafe { &(*scratch).ct_value },
+            XDP_FLOW_EVENT_VALIDATED,
+            XDP_DECISION_PASS,
+            now_mono_ns,
+        );
     }
     unsafe {
         words16_into(&(*scratch).pkt_dst, &mut (*scratch).csum_old);
@@ -2724,8 +2769,9 @@ fn try_tcp_nat_v4(
             ct.state = XDP_CT_STATE_PENDING_ACKED;
         } else {
             ct.last_seen_ns = now_mono_ns;
-            if closing {
+            if closing && ct.state == XDP_CT_STATE_OPEN {
                 ct.state = XDP_CT_STATE_CLOSING;
+                emit_flow_event(ct, XDP_FLOW_EVENT_CLOSED, XDP_DECISION_PASS, now_mono_ns);
             }
         }
         let listen_be = u32::from_be_bytes([
@@ -2870,8 +2916,9 @@ fn try_tcp_nat_v4(
                 ct.state = XDP_CT_STATE_PENDING_ACKED;
             } else {
                 ct.last_seen_ns = now_mono_ns;
-                if closing {
+                if closing && ct.state == XDP_CT_STATE_OPEN {
                     ct.state = XDP_CT_STATE_CLOSING;
+                    emit_flow_event(ct, XDP_FLOW_EVENT_CLOSED, XDP_DECISION_PASS, now_mono_ns);
                 }
             }
         }
@@ -2918,8 +2965,9 @@ fn try_tcp_nat_v4(
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
             ct.last_seen_ns = now_mono_ns;
-            if closing {
+            if closing && ct.state == XDP_CT_STATE_OPEN {
                 ct.state = XDP_CT_STATE_CLOSING;
+                emit_flow_event(ct, XDP_FLOW_EVENT_CLOSED, XDP_DECISION_PASS, now_mono_ns);
             }
             // Flows established before SNAT was configured keep plain DNAT.
             snat_port = ct.snat_port_be;
@@ -2928,11 +2976,8 @@ fn try_tcp_nat_v4(
             // EN-09: consult the bounded half-open table before treating the
             // packet as an unknown flow. Pending hits forward through the
             // shared rewrite below without extending their absolute deadline.
-            let (pend, incarnation, pending_port) = pending_touch(
-                unsafe { &(*scratch).ct_key },
-                now_mono_ns,
-                ack && !syn,
-            );
+            let (pend, incarnation, pending_port) =
+                pending_touch(unsafe { &(*scratch).ct_key }, now_mono_ns, ack && !syn);
             if pend == PENDING_ALIVE {
                 snat_port = pending_port;
             } else {
@@ -2987,8 +3032,20 @@ fn try_tcp_nat_v4(
                     .is_err()
                 {
                     counter_pending_limited();
+                    emit_flow_event(
+                        unsafe { &(*scratch).ct_value },
+                        XDP_FLOW_EVENT_REJECTED,
+                        XDP_DECISION_FLOW_TABLE_FULL,
+                        now_mono_ns,
+                    );
                     return Ok(None);
                 }
+                emit_flow_event(
+                    unsafe { &(*scratch).ct_value },
+                    XDP_FLOW_EVENT_ADMITTED,
+                    XDP_DECISION_PASS,
+                    now_mono_ns,
+                );
             }
         }
     }
@@ -3091,8 +3148,9 @@ fn try_tcp_nat_v6(
             ct.state = XDP_CT_STATE_PENDING_ACKED;
         } else {
             ct.last_seen_ns = now_mono_ns;
-            if closing {
+            if closing && ct.state == XDP_CT_STATE_OPEN {
                 ct.state = XDP_CT_STATE_CLOSING;
+                emit_flow_event(ct, XDP_FLOW_EVENT_CLOSED, XDP_DECISION_PASS, now_mono_ns);
             }
         }
         let listen_port = ct.listen_port_be;
@@ -3208,8 +3266,9 @@ fn try_tcp_nat_v6(
                 ct.state = XDP_CT_STATE_PENDING_ACKED;
             } else {
                 ct.last_seen_ns = now_mono_ns;
-                if closing {
+                if closing && ct.state == XDP_CT_STATE_OPEN {
                     ct.state = XDP_CT_STATE_CLOSING;
+                    emit_flow_event(ct, XDP_FLOW_EVENT_CLOSED, XDP_DECISION_PASS, now_mono_ns);
                 }
             }
         }
@@ -3270,17 +3329,15 @@ fn try_tcp_nat_v6_fwd(
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
             ct.last_seen_ns = now_mono_ns;
-            if closing {
+            if closing && ct.state == XDP_CT_STATE_OPEN {
                 ct.state = XDP_CT_STATE_CLOSING;
+                emit_flow_event(ct, XDP_FLOW_EVENT_CLOSED, XDP_DECISION_PASS, now_mono_ns);
             }
             snat_port = ct.snat_port_be;
         }
         None => {
-            let (pend, incarnation, pending_port) = pending_touch(
-                unsafe { &(*scratch).ct_key },
-                now_mono_ns,
-                ack && !syn,
-            );
+            let (pend, incarnation, pending_port) =
+                pending_touch(unsafe { &(*scratch).ct_key }, now_mono_ns, ack && !syn);
             if pend == PENDING_ALIVE {
                 snat_port = pending_port;
             } else {
@@ -3334,8 +3391,20 @@ fn try_tcp_nat_v6_fwd(
                     .is_err()
                 {
                     counter_pending_limited();
+                    emit_flow_event(
+                        unsafe { &(*scratch).ct_value },
+                        XDP_FLOW_EVENT_REJECTED,
+                        XDP_DECISION_FLOW_TABLE_FULL,
+                        now_mono_ns,
+                    );
                     return Ok(None);
                 }
+                emit_flow_event(
+                    unsafe { &(*scratch).ct_value },
+                    XDP_FLOW_EVENT_ADMITTED,
+                    XDP_DECISION_PASS,
+                    now_mono_ns,
+                );
             }
         }
     }
@@ -3730,6 +3799,54 @@ fn pending_ttl_ns() -> u64 {
     }
 }
 
+/// EN-10 lifecycle feedback: publish an event for the conntrack transition
+/// the caller just performed on `ct` (key is `scratch.ct_key`). Advisory
+/// only — when the ring is full the event is dropped and `flow_event_lost`
+/// is incremented; flow state itself is never gated on the consumer.
+#[inline(never)]
+fn emit_flow_event(ct: &XdpUdpCtValue, kind: u8, reason: u8, now_ns: u64) {
+    let Ok(scratch) = nat_scratch() else {
+        return;
+    };
+    let key = unsafe { &(*scratch).ct_key };
+    let seq = match XDP_FLOW_SEQ.get_ptr_mut(0) {
+        Some(ptr) => {
+            // SAFETY: per-CPU slot owned exclusively by this CPU.
+            let s = unsafe { &mut *ptr };
+            *s = s.wrapping_add(1);
+            *s
+        }
+        None => 0,
+    };
+    let epoch = XDP_OWNER_EPOCH.get(0).copied().unwrap_or(0);
+    let Some(mut entry) = XDP_FLOW_EVENTS.reserve::<XdpFlowEvent>(0) else {
+        if let Some(counters) = XDP_COUNTERS.get_ptr_mut(0) {
+            let counters = unsafe { &mut *counters };
+            counters.flow_event_lost = counters.flow_event_lost.saturating_add(1);
+        }
+        return;
+    };
+    let ev: &mut XdpFlowEvent = unsafe { &mut *entry.as_mut_ptr() };
+    unsafe {
+        copy16(&mut ev.key.client_addr, &key.client_addr);
+        copy16(&mut ev.key.service_addr, &ct.listen_addr);
+    }
+    ev.key.service_id = ct.server_id;
+    ev.key.client_port_be = key.client_port_be;
+    ev.key.service_port_be = ct.listen_port_be;
+    ev.key.security_domain = unsafe { (*scratch).work_ifindex as u16 };
+    ev.key.family = key.family;
+    ev.key.proto = key.proto;
+    ev.flow_incarnation = u64::from(ct.incarnation);
+    ev.owner_epoch = epoch;
+    ev.seq = seq;
+    ev.timestamp_ns = now_ns;
+    ev.kind = kind;
+    ev.reason = reason;
+    ev._pad = [0; 6];
+    entry.submit(0);
+}
+
 /// EN-09 half-open lookup. Returns (PENDING_MISS, next_incarnation, 0) when
 /// no live pending entry exists — a stale entry is removed first and its
 /// incarnation+1 is returned so the caller can re-admit the tuple as a fresh
@@ -3757,11 +3874,18 @@ fn pending_touch(key: &XdpUdpCtKey, now_mono_ns: u64, promote: bool) -> (u8, u32
         p.state = XDP_CT_STATE_OPEN;
         p.last_seen_ns = now_mono_ns;
         if XDP_TCP_CT.insert(key, unsafe { &*p }, 0).is_ok() {
+            emit_flow_event(p, XDP_FLOW_EVENT_VALIDATED, XDP_DECISION_PASS, now_mono_ns);
             let _ = XDP_PENDING.remove(key);
         } else {
             // Authoritative table full: counted, record stays pending with
             // its absolute deadline; the packet is still forwarded.
             counter_tcp_fwd_map_full();
+            emit_flow_event(
+                p,
+                XDP_FLOW_EVENT_REJECTED,
+                XDP_DECISION_FLOW_TABLE_FULL,
+                now_mono_ns,
+            );
         }
     }
     (PENDING_ALIVE, 0, port)

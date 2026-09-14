@@ -31,6 +31,12 @@ const AF_XDP_SOCKET_CREATE_RETRY_DELAY: std::time::Duration = std::time::Duratio
 pub struct AttachedProgram {
     pub interfaces: BTreeSet<String>,
     pub ebpf: aya::Ebpf,
+    /// EN-10 owner epoch written to XDP_OWNER_EPOCH for this attach. Events
+    /// stamped with a smaller epoch were published by an older generation.
+    pub owner_epoch: u64,
+    /// EN-10 flow records adopted from pinned state maps (reload/restart
+    /// continuity) — TCP CT + UDP CT + pending admissions still resident.
+    pub imported_flows: u64,
 }
 
 #[derive(Debug)]
@@ -597,11 +603,29 @@ pub async fn attach(
         "XDP_COUNTERS",
         Path::new(XDP_BPF_PIN_DIR).join("XDP_COUNTERS"),
     );
+    // EN-10 takeover contract: flow state and the lifecycle feedback channel
+    // are pinned so a reload/restart adopts existing flows instead of
+    // severing them. aya reuses a compatible pin purely by name; the spec
+    // table check and post-load audit reject ABI-mismatched pins, and
+    // `drop_stale_pinned_maps` above already removed those.
+    for name in [
+        "XDP_TCP_CT",
+        "XDP_UDP_CT",
+        "XDP_PENDING",
+        "XDP_SNAT_REV",
+        "XDP_FLOW_ACCT",
+        "XDP_FLOW_EVENTS",
+        "XDP_OWNER_EPOCH",
+        "XDP_FLOW_SEQ",
+    ] {
+        loader.map_pin_path(name, Path::new(XDP_BPF_PIN_DIR).join(name));
+    }
     let mut ebpf = match object_path {
         Some(path) => loader.load_file(path)?,
         None => loader.load(XDP_EBPF_EMBEDDED)?,
     };
     audit_loaded_map_specs(&ebpf)?;
+    let (owner_epoch, imported_flows) = adopt_flow_state(&mut ebpf)?;
     sync_interface_policy(&mut ebpf, config)?;
     sync_local_ip_maps(&mut ebpf, config)?;
     sync_proxy_ports(&mut ebpf, config, false)?;
@@ -719,6 +743,8 @@ pub async fn attach(
     Ok(AttachedProgram {
         interfaces: attached,
         ebpf,
+        owner_epoch,
+        imported_flows,
     })
 }
 
@@ -930,7 +956,8 @@ pub(crate) fn sum_percpu_counters<'a>(
             nonlocal_pass,
             unverified_limited,
             admission_limited,
-            pending_limited
+            pending_limited,
+            flow_event_lost
         );
     }
     total
@@ -1561,7 +1588,7 @@ fn clear_pinned_xsk_map() -> anyhow::Result<()> {
 /// aligned with the #[map] definitions in
 /// crates/cloud-node-xdp-ebpf/src/main.rs. LPM trie keys carry a
 /// 4-byte prefix length in front of the address.
-fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 31] {
+fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 34] {
     use aya::maps::MapType;
     use cloud_node_xdp_common::*;
     use core::mem::size_of;
@@ -1702,6 +1729,23 @@ fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 31] {
             size_of::<XdpFlowAcct>() as u32,
             262_144,
         ),
+        // EN-10 lifecycle feedback channel: kernel reports ring buffers with
+        // zero key/value sizes and max_entries == byte size.
+        ("XDP_FLOW_EVENTS", MapType::RingBuf, 0, 0, 256 * 1024),
+        (
+            "XDP_OWNER_EPOCH",
+            MapType::Array,
+            u,
+            size_of::<u64>() as u32,
+            1,
+        ),
+        (
+            "XDP_FLOW_SEQ",
+            MapType::PerCpuArray,
+            u,
+            size_of::<u64>() as u32,
+            1,
+        ),
     ]
 }
 
@@ -1724,6 +1768,9 @@ pub(crate) fn projected_bpf_map_bytes() -> u64 {
             }
             aya::maps::MapType::Hash => n.saturating_mul(k + v + HASH_ENTRY_OVERHEAD),
             aya::maps::MapType::LpmTrie => n.saturating_mul(k + v + LPM_ENTRY_OVERHEAD),
+            // Ring buffers reserve their declared byte size plus a couple of
+            // bookkeeping pages; key/value sizes are zero.
+            aya::maps::MapType::RingBuf => n.saturating_add(2 * 4096),
             _ => n.saturating_mul(k + v + ARRAY_ENTRY_OVERHEAD),
         };
         total = total.saturating_add(bytes);
@@ -1805,6 +1852,78 @@ fn audit_loaded_map_specs(ebpf: &aya::Ebpf) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// EN-10 takeover: claim ownership of the pinned flow-state maps.
+/// `XDP_OWNER_EPOCH` persists across attach (it is pinned), so bumping the
+/// stored value yields a strictly increasing generation sequence across
+/// reloads *and* process restarts — consumers can then order or drop
+/// feedback emitted by older generations. Returns the new epoch and the
+/// number of flow records still resident in the adopted maps.
+fn adopt_flow_state(ebpf: &mut aya::Ebpf) -> anyhow::Result<(u64, u64)> {
+    let epoch_map = ebpf.map_mut("XDP_OWNER_EPOCH").ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing map XDP_OWNER_EPOCH; eBPF object predates EN-10 ownership epochs (rebuild cloud-node-xdp-ebpf.o)"
+        )
+    })?;
+    let mut epochs = Array::<_, u64>::try_from(epoch_map)?;
+    let previous = epochs.get(&0, 0).unwrap_or(0);
+    let epoch = previous.saturating_add(1).max(1);
+    epochs.set(0, epoch, 0)?;
+
+    let mut imported = 0u64;
+    for name in ["XDP_TCP_CT", "XDP_UDP_CT", "XDP_PENDING"] {
+        let Some(map) = ebpf.map(name) else {
+            continue;
+        };
+        let ct_map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)
+            .map_err(|err| anyhow::anyhow!("open adopted state map {name}: {err}"))?;
+        let mut count = 0u64;
+        for item in ct_map.keys() {
+            item.map_err(|err| anyhow::anyhow!("iterate adopted state map {name}: {err}"))?;
+            count = count.saturating_add(1);
+        }
+        imported = imported.saturating_add(count);
+    }
+    if imported > 0 {
+        tracing::info!(
+            "XDP flow-state takeover: epoch {} adopted {} resident flow records",
+            epoch,
+            imported
+        );
+    }
+    Ok((epoch, imported))
+}
+
+/// Read the pinned owner epoch without owning the attachment — the value
+/// survives across generations, so `xdp dump-maps` can report which
+/// generation currently owns emitted feedback even from a CLI process.
+pub fn read_pinned_owner_epoch() -> Option<u64> {
+    let path = Path::new(XDP_BPF_PIN_DIR).join("XDP_OWNER_EPOCH");
+    if !path.exists() {
+        return None;
+    }
+    let data = aya::maps::MapData::from_pin(&path).ok()?;
+    let map = aya::maps::Map::Array(data);
+    let array = Array::<_, u64>::try_from(&map).ok()?;
+    array.get(&0, 0).ok()
+}
+
+/// Open the pinned lifecycle ring buffer on its own fd so the consumer task
+/// never holds the manager's eBPF lock. Returns `None` when the pinned map
+/// is absent (older object or attach failed before pinning) — callers treat
+/// that as an explicit "feedback channel unavailable" state, not success.
+pub fn open_pinned_flow_events() -> anyhow::Result<Option<aya::maps::RingBuf<aya::maps::MapData>>> {
+    let path = Path::new(XDP_BPF_PIN_DIR).join("XDP_FLOW_EVENTS");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = aya::maps::MapData::from_pin(&path)
+        .map_err(|err| anyhow::anyhow!("open pinned XDP_FLOW_EVENTS {}: {err}", path.display()))?;
+    let map = aya::maps::Map::RingBuf(data);
+    aya::maps::RingBuf::try_from(map)
+        .map(Some)
+        .map_err(|err| anyhow::anyhow!("pinned XDP_FLOW_EVENTS is not a ring buffer: {err}"))
 }
 
 fn drop_stale_pinned_maps() {

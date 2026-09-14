@@ -1,0 +1,33 @@
+{
+  "task": "EN-10",
+  "status": "verified-veth-netns",
+  "abi": "v9",
+  "base_commit": "1e712b6",
+  "ebpf_object_sha256": "b776ddfe9249c5e78358d6458f6b563aab44e9f1690e327b72f7e096dd1d8208",
+  "deliverables": [
+    "XDP_FLOW_EVENTS RingBuf (256KiB bounded): lifecycle events at pending admit, handshake promotion, CLOSING transition, and flow-table-full rejection",
+    "XDP_OWNER_EPOCH (Array x1) written per attach generation + XDP_FLOW_SEQ per-CPU sequence: events totally ordered by (flow_incarnation, owner_epoch, seq)",
+    "ring full -> flow_event_lost counter only; event channel is advisory and never blocks the dataplane",
+    "state maps pinned (XDP_TCP_CT/XDP_UDP_CT/XDP_PENDING/XDP_SNAT_REV/XDP_FLOW_ACCT + new maps): spec-matched reuse across reload/restart with drop_stale_pinned_maps + spec audit guarding ABI drift",
+    "startup import: attached manager scans pinned state maps -> importedFlows count",
+    "per-generation userspace consumer (open_pinned_flow_events, no manager lock held); exits explicitly on generation supersede or stale manager — old workers cannot lease new flows",
+    "bounded FlowEventLedger: ordering contract enforced, stale events rejected (eventsStale), terminal-first eviction at capacity (eventsEvicted); events never create trusted state — kernel maps stay authoritative",
+    "observability: flowFeedback {ownerEpoch, importedFlows, eventsReceived, eventsStale, eventsEvicted} + flowEventLost in status file and xdp dump-maps; consumer triggers throttled persist so counters are visible cross-process"
+  ],
+  "verification": {
+    "verifier": "object loads and all programs accepted (kernel 7.0.14-orbstack, x86-build); T01 matrix pass",
+    "unit": "FlowEventLedger ordering + terminal-first eviction tests; 662 lib tests pass",
+    "builds": "ARM64 (build-node) and x86 (x86-build) final source compile clean",
+    "probe": "scripts/edge/en10_flow_probe.py — all 3 phases pass (probe-result.json)",
+    "probe_results": {
+      "A_cold_start": "importedFlows=0, ownerEpoch=1, 4 lifecycle events consumed, flowEventLost=0, tcpCt=1 udpCt=1, SNAT port allocated",
+      "B_pin_persistence": "10 pinned maps survive process stop; ctEntriesAfterStop=2",
+      "C_restart_takeover": "importedFlows=2, ownerEpoch=2; imported TCP/UDP flows forward without re-admission (tcpFwdTx+3, udpFwdTx+3, packets+8, tx+6)"
+    }
+  },
+  "limitations": [
+    "event channel is advisory by design: ring full increments flow_event_lost without dataplane backpressure; CT maps remain the authority",
+    "sweeper idle-expiry reaps do not emit per-entry EXPIRED events (kind reserved); ledger is rebuilt per generation with importedFlows as the takeover baseline",
+    "evidence is veth/netns on OrbStack kernel; real-NIC profiles pending"
+  ]
+}

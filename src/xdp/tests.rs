@@ -2762,3 +2762,95 @@ fn xdp_proxy_bridge_worker_lease_covers_startup_without_redirect() {
     assert!(!manager.proxy_workers_starting());
     assert!(!af_xdp::proxy_bridge_should_continue(&manager));
 }
+
+/// EN-10: lifecycle feedback is ordered by (incarnation, owner_epoch, seq) —
+/// a stale triple must never overwrite a newer record for the same tuple.
+#[cfg(target_os = "linux")]
+#[test]
+fn flow_event_ledger_orders_by_incarnation_epoch_seq() {
+    use cloud_node_xdp_common::*;
+
+    let mut key = XdpFlowKey::default();
+    key.family = 4;
+    key.proto = XDP_PROTO_TCP;
+    key.client_port_be = 1234u16.to_be();
+
+    let event = |incarnation: u64, epoch: u64, seq: u64, kind: u8| XdpFlowEvent {
+        key,
+        flow_incarnation: incarnation,
+        owner_epoch: epoch,
+        seq,
+        kind,
+        ..Default::default()
+    };
+
+    let mut ledger = FlowEventLedger::default();
+    assert!(ledger.apply(&event(1, 3, 1, XDP_FLOW_EVENT_ADMITTED)));
+    // Same incarnation, older seq: stale.
+    assert!(!ledger.apply(&event(1, 3, 0, XDP_FLOW_EVENT_VALIDATED)));
+    assert!(ledger.apply(&event(1, 3, 2, XDP_FLOW_EVENT_VALIDATED)));
+    // Older generation (smaller owner_epoch) can never renew the record.
+    assert!(!ledger.apply(&event(1, 2, 99, XDP_FLOW_EVENT_ADMITTED)));
+    // A recycled tuple (new incarnation) gets its own record, not a merge.
+    assert!(ledger.apply(&event(2, 1, 0, XDP_FLOW_EVENT_ADMITTED)));
+    assert_eq!(ledger.entries.len(), 2);
+}
+
+/// EN-10: at capacity the ledger evicts terminal records before live ones,
+/// keeping feedback state bounded instead of growing without limit.
+#[cfg(target_os = "linux")]
+#[test]
+fn flow_event_ledger_capacity_evicts_terminal_first() {
+    use cloud_node_xdp_common::*;
+
+    let mut ledger = FlowEventLedger::default();
+    // Vary client_addr (not just port) so CAPACITY > u16::MAX stays distinct.
+    let event = |index: u32, kind: u8| {
+        let mut key = XdpFlowKey {
+            family: 4,
+            proto: XDP_PROTO_TCP,
+            ..Default::default()
+        };
+        key.client_addr[12..16].copy_from_slice(&index.to_be_bytes());
+        XdpFlowEvent {
+            key,
+            flow_incarnation: 1,
+            owner_epoch: 1,
+            seq: 1,
+            kind,
+            ..Default::default()
+        }
+    };
+
+    for index in 0..(FlowEventLedger::CAPACITY as u32) {
+        let kind = if index % 2 == 0 {
+            XDP_FLOW_EVENT_CLOSED
+        } else {
+            XDP_FLOW_EVENT_ADMITTED
+        };
+        assert!(ledger.apply(&event(index, kind)));
+    }
+    assert_eq!(ledger.entries.len(), FlowEventLedger::CAPACITY);
+    let closed_before = ledger
+        .entries
+        .values()
+        .filter(|e| e.kind == XDP_FLOW_EVENT_CLOSED)
+        .count();
+
+    // New flow: evicts a CLOSED record, keeps every live (ADMITTED) one.
+    assert!(ledger.apply(&event(u32::MAX, XDP_FLOW_EVENT_ADMITTED)));
+    assert_eq!(ledger.entries.len(), FlowEventLedger::CAPACITY);
+    assert_eq!(ledger.evicted, 1);
+    let closed_after = ledger
+        .entries
+        .values()
+        .filter(|e| e.kind == XDP_FLOW_EVENT_CLOSED)
+        .count();
+    let admitted_after = ledger
+        .entries
+        .values()
+        .filter(|e| e.kind == XDP_FLOW_EVENT_ADMITTED)
+        .count();
+    assert_eq!(closed_before - closed_after, 1);
+    assert_eq!(admitted_after, FlowEventLedger::CAPACITY / 2 + 1);
+}
