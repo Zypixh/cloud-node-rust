@@ -374,6 +374,9 @@ pub(crate) struct AfXdpTcpReactor {
 
 #[cfg(any(test, target_os = "linux"))]
 impl AfXdpTcpReactor {
+    /// Tests only: production reactors get a per-queue share of the node
+    /// session budget from `spawn_queue_reactors`, not the whole budget.
+    #[cfg(test)]
     pub(crate) fn new(
         tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
@@ -1169,6 +1172,15 @@ pub(crate) fn af_xdp_tcp_session_limit_from_budget(connection_budget_bytes: u64)
     memory_limit.clamp(AF_XDP_TCP_MIN_SESSION_LIMIT, AF_XDP_TCP_MAX_SESSION_LIMIT)
 }
 
+/// EN-12 queue-local share of the node session budget: the whole-node limit
+/// is divided across AF_XDP workers so adding queues does not multiply the
+/// aggregate session quota. The floor of 1 keeps a degenerate config able to
+/// admit a session; the aggregate stays bounded by worker count.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn af_xdp_tcp_session_limit_per_worker(node_limit: usize, worker_count: usize) -> usize {
+    (node_limit / worker_count.max(1)).max(1)
+}
+
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) fn session_idle_for(now: SmoltcpInstant, last_activity: SmoltcpInstant) -> Duration {
     let elapsed_ms = now
@@ -1229,8 +1241,8 @@ pub(crate) fn proxy_bridge_should_idle(
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) fn proxy_bridge_should_continue(manager: &Arc<XdpManager>) -> bool {
     manager_is_current(manager)
-        && manager.proxy_redirect_ready()
         && !manager.attached.read().is_empty()
+        && (manager.proxy_redirect_ready() || manager.proxy_workers_starting())
 }
 
 impl AfXdpTcpStream {

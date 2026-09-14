@@ -69,9 +69,6 @@ pub(crate) async fn start_proxy_bridge_inner(
     http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
 ) {
     let manager = manager_from_runtime();
-    if !manager.config.enabled {
-        return;
-    }
     if !XDP_PROXY_DATAPLANE_ACTIVE {
         manager.set_proxy_fallback_reason(
             "AF_XDP UDP bridge is compiled but TX dataplane is not active; traffic will PASS",
@@ -79,7 +76,62 @@ pub(crate) async fn start_proxy_bridge_inner(
         return;
     }
     #[cfg(target_os = "linux")]
-    run_proxy_bridge(manager, quic_demux, tcp_manager, http_manager).await;
+    {
+        // EN-12: supervise the bridge across manager generations. A config
+        // reload detaches the old manager — its workers exit on the stale
+        // check — and the replacement manager owns fresh sockets that still
+        // need a bridge. Respawn only when the manager changed: a bridge
+        // dying under a still-current manager is a recorded hard failure,
+        // not a reason to hot-loop restarts.
+        let mut served = manager;
+        loop {
+            if served.config.enabled {
+                run_proxy_bridge(
+                    served.clone(),
+                    quic_demux.clone(),
+                    tcp_manager.clone(),
+                    http_manager.clone(),
+                )
+                .await;
+                if manager_is_current(&served) {
+                    // The bridge stopped while its manager is still
+                    // current: the failure path already recorded an
+                    // explicit fallback reason. Do not hot-respawn.
+                    return;
+                }
+            }
+            // Disabled or stale manager: wait for the next generation to
+            // become current and finish attaching (its AF_XDP runtime is
+            // only populated by `initialize`), then serve it. Poll —
+            // manager identity changes are rare and the gap between
+            // generations is transient.
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let current = manager_from_runtime();
+                if !Arc::ptr_eq(&current, &served) {
+                    served = current;
+                }
+                // Serve the generation once `initialize` has finished its
+                // AF_XDP setup (or skip waiting while XDP is disabled or
+                // has no proxy interfaces). `af_xdp` is populated by
+                // `configure_af_xdp_runtime` — success *or* recorded
+                // per-queue failure — so this gate never waits forever on
+                // a failed setup.
+                let proxy_ifaces = served
+                    .config
+                    .interfaces
+                    .iter()
+                    .any(|interface| interface.mode == XdpRuntimeMode::Proxy);
+                let attached = !served.attached.read().is_empty();
+                let af_xdp_settled = !proxy_ifaces
+                    || served.af_xdp.lock().is_some()
+                    || !served.xsk_status.read().is_empty();
+                if !served.config.enabled || (attached && af_xdp_settled) {
+                    break;
+                }
+            }
+        }
+    }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = quic_demux;
@@ -137,51 +189,6 @@ pub(crate) async fn run_proxy_bridge(
     tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
     http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
 ) {
-    match manager.enable_proxy_redirect("AF_XDP proxy bridge") {
-        Ok(true) => {
-            let message = format!(
-                "AF_XDP proxy bridge enabled redirect for {} configured proxy ports",
-                manager.config.proxy.ports.len()
-            );
-            tracing::info!("{message}");
-            crate::logging::report_node_log(
-                "info".to_string(),
-                "xdp_proxy".to_string(),
-                message,
-                0,
-            );
-        }
-        Ok(false) => {
-            let message =
-                "AF_XDP proxy bridge did not enable redirect; sockets are not ready or proxy ports are empty, traffic will PASS"
-                    .to_string();
-            tracing::warn!("{message}");
-            crate::logging::report_node_log(
-                "warn".to_string(),
-                "xdp_proxy".to_string(),
-                message.clone(),
-                0,
-            );
-            manager.set_proxy_fallback_reason(&message);
-            manager.persist_status_now();
-            return;
-        }
-        Err(err) => {
-            let message = format!(
-                "AF_XDP proxy bridge failed to enable AF_XDP redirect: {err}; traffic will PASS"
-            );
-            tracing::warn!("{message}");
-            crate::logging::report_node_log(
-                "warn".to_string(),
-                "xdp_proxy".to_string(),
-                message.clone(),
-                0,
-            );
-            manager.disable_proxy_redirect_for_fallback(message);
-            return;
-        }
-    }
-
     // Per-queue reactor threads: each AF_XDP queue is owned by a dedicated
     // CPU-pinned OS thread running an isolated smoltcp reactor. The shared
     // af_xdp mutex and single poll loop are removed from the dataplane;
@@ -206,12 +213,23 @@ pub(crate) async fn run_proxy_bridge(
         manager.disable_proxy_redirect_for_fallback(message);
         return;
     }
-    spawn_queue_reactors(&manager, queue_handles, quic_demux, tcp_manager, http_manager).await;
+    // EN-12 worker lease: prove every reactor is running *before* opening
+    // redirect — a registered XSK is a socket, not a worker. Redirecting
+    // into an XSK nobody drains would silently drop every proxied packet.
+    spawn_queue_reactors(
+        &manager,
+        queue_handles,
+        quic_demux,
+        tcp_manager,
+        http_manager,
+    )
+    .await;
 }
 
-/// Spawn one pinned OS thread per AF_XDP queue and watch them: any reactor
-/// exiting while the bridge should still be alive disables proxy redirect
-/// so traffic falls back to kernel listeners explicitly.
+/// Spawn one pinned OS thread per AF_XDP queue, wait for every reactor to
+/// signal it is processing-capable, and only then enable redirect. Any
+/// reactor exiting while the bridge should still be alive disables proxy
+/// redirect so traffic falls back to kernel listeners explicitly.
 #[cfg(target_os = "linux")]
 pub(crate) async fn spawn_queue_reactors(
     manager: &Arc<XdpManager>,
@@ -221,6 +239,7 @@ pub(crate) async fn spawn_queue_reactors(
     http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
 ) {
     pub(crate) const AF_XDP_DOWNSTREAM_QUEUE: usize = 4096;
+    pub(crate) const AF_XDP_WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
     let online_cpus = num_cpus::get().max(1);
     let udp_routes = Arc::new(DashMap::new());
@@ -251,8 +270,15 @@ pub(crate) async fn spawn_queue_reactors(
     for ctx in &mut contexts {
         ctx.iface_fwd = iface_fwd.clone();
     }
-    let mut joins: Vec<std::thread::JoinHandle<()>> =
-        Vec::with_capacity(queue_handles.len());
+    // EN-12: the node-level TCP session budget is divided across queue
+    // reactors — adding a queue must not multiply the whole-node session
+    // quota. Floor of 1 keeps a degenerate config admitting at least one
+    // session per reactor; the sum stays bounded by worker count.
+    let per_queue_tcp_session_limit =
+        af_xdp_tcp_session_limit_per_worker(af_xdp_tcp_session_limit(), queue_handles.len());
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<(String, u32)>();
+    manager.set_proxy_workers_starting(true);
+    let mut joins: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(queue_handles.len());
     for (ordinal, (queue_handle, ctx)) in queue_handles
         .into_iter()
         .zip(contexts.into_iter())
@@ -270,28 +296,39 @@ pub(crate) async fn spawn_queue_reactors(
         let quic_demux = quic_demux.clone();
         let tcp_manager = tcp_manager.clone();
         let http_manager = http_manager.clone();
+        let ready = ready_tx.clone();
         let name = thread_name.clone();
-        let join = match std::thread::Builder::new().name(thread_name).spawn(move || {
-            if !pin_current_thread_to_cpu(cpu) {
-                tracing::warn!("{name}: failed to pin reactor thread to cpu {cpu}");
-            }
-            match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt.block_on(run_queue_bridge_loop(
-                    reactor_manager,
-                    queue_handle,
-                    ctx,
-                    quic_demux,
-                    tcp_manager,
-                    http_manager,
-                )),
-                Err(err) => {
-                    tracing::error!("{name}: failed to build reactor runtime: {err}")
+        let join = match std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                if !pin_current_thread_to_cpu(cpu) {
+                    tracing::warn!("{name}: failed to pin reactor thread to cpu {cpu}");
                 }
-            }
-        }) {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        // Worker lease: the reactor reports processing-capable
+                        // only after its runtime exists and it is about to enter
+                        // the poll loop. Redirect opens only after every queue
+                        // has reported.
+                        let _ = ready.send((queue_handle.interface.clone(), queue_handle.queue));
+                        rt.block_on(run_queue_bridge_loop(
+                            reactor_manager,
+                            queue_handle,
+                            ctx,
+                            quic_demux,
+                            tcp_manager,
+                            http_manager,
+                            per_queue_tcp_session_limit,
+                        ))
+                    }
+                    Err(err) => {
+                        tracing::error!("{name}: failed to build reactor runtime: {err}")
+                    }
+                }
+            }) {
             Ok(join) => join,
             Err(err) => {
                 manager.disable_proxy_redirect_for_fallback(format!(
@@ -305,6 +342,101 @@ pub(crate) async fn spawn_queue_reactors(
         };
         joins.push(join);
     }
+    drop(ready_tx);
+
+    // Wait for every reactor to report ready before opening redirect.
+    let expected = joins.len();
+    let ready_wait = async {
+        let mut seen = 0usize;
+        while seen < expected {
+            match ready_rx.recv().await {
+                Some((interface, queue)) => {
+                    seen += 1;
+                    tracing::debug!(
+                        "AF_XDP reactor ready interface={} queue={} ({seen}/{expected})",
+                        interface,
+                        queue
+                    );
+                }
+                None => break,
+            }
+        }
+        seen
+    };
+    match tokio::time::timeout(AF_XDP_WORKER_READY_TIMEOUT, ready_wait).await {
+        Ok(seen) if seen == expected => {}
+        Ok(seen) => {
+            manager.disable_proxy_redirect_for_fallback(format!(
+                "AF_XDP proxy bridge saw only {seen}/{expected} reactor workers ready; proxy redirect disabled, traffic will PASS"
+            ));
+            for join in joins {
+                let _ = join.join();
+            }
+            return;
+        }
+        Err(_) => {
+            manager.disable_proxy_redirect_for_fallback(format!(
+                "AF_XDP reactor workers did not all report ready within {AF_XDP_WORKER_READY_TIMEOUT:?}; proxy redirect disabled, traffic will PASS"
+            ));
+            for join in joins {
+                let _ = join.join();
+            }
+            return;
+        }
+    }
+    manager.set_proxy_workers_starting(false);
+
+    match manager.enable_proxy_redirect("AF_XDP proxy bridge") {
+        Ok(true) => {
+            let message = format!(
+                "AF_XDP proxy bridge enabled redirect for {} configured proxy ports across {} ready workers",
+                manager.config.proxy.ports.len(),
+                joins.len()
+            );
+            tracing::info!("{message}");
+            crate::logging::report_node_log(
+                "info".to_string(),
+                "xdp_proxy".to_string(),
+                message,
+                0,
+            );
+        }
+        Ok(false) => {
+            let message =
+                "AF_XDP proxy bridge did not enable redirect; sockets are not ready or proxy ports are empty, traffic will PASS"
+                    .to_string();
+            tracing::warn!("{message}");
+            crate::logging::report_node_log(
+                "warn".to_string(),
+                "xdp_proxy".to_string(),
+                message.clone(),
+                0,
+            );
+            manager.set_proxy_fallback_reason(&message);
+            manager.persist_status_now();
+            for join in joins {
+                let _ = join.join();
+            }
+            return;
+        }
+        Err(err) => {
+            let message = format!(
+                "AF_XDP proxy bridge failed to enable AF_XDP redirect: {err}; traffic will PASS"
+            );
+            tracing::warn!("{message}");
+            crate::logging::report_node_log(
+                "warn".to_string(),
+                "xdp_proxy".to_string(),
+                message.clone(),
+                0,
+            );
+            manager.disable_proxy_redirect_for_fallback(message);
+            for join in joins {
+                let _ = join.join();
+            }
+            return;
+        }
+    }
     tracing::info!(
         "AF_XDP proxy bridge running {} per-queue reactor threads",
         joins.len()
@@ -315,9 +447,7 @@ pub(crate) async fn spawn_queue_reactors(
         if joins.iter().all(|join| join.is_finished()) {
             return;
         }
-        if joins.iter().any(|join| join.is_finished())
-            && proxy_bridge_should_continue(manager)
-        {
+        if joins.iter().any(|join| join.is_finished()) && proxy_bridge_should_continue(manager) {
             manager.disable_proxy_redirect_for_fallback(
                 "AF_XDP queue reactor thread exited unexpectedly; proxy redirect disabled, traffic will PASS"
                     .to_string(),
@@ -334,6 +464,7 @@ pub(crate) async fn run_queue_bridge_loop(
     quic_demux: Arc<crate::quic_udp_demux::QuicUdpDemuxManager>,
     tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
     http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
+    tcp_session_limit: usize,
 ) {
     pub(crate) const AF_XDP_DOWNSTREAM_DRAIN_BUDGET: usize = 1024;
     pub(crate) const AF_XDP_ROUTE_CACHE_MAX: usize = 65_536;
@@ -363,7 +494,8 @@ pub(crate) async fn run_queue_bridge_loop(
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
     let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
-    let mut tcp_reactor = AfXdpTcpReactor::new(tcp_manager, http_manager);
+    let mut tcp_reactor =
+        AfXdpTcpReactor::new_with_session_limit(tcp_manager, http_manager, tcp_session_limit);
     let mut consecutive_poll_errors = 0u32;
     let mut tx_failures = AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TX_FAILURES);
     let mut udp_ingress_failures =

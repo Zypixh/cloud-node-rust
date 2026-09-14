@@ -38,6 +38,9 @@ pub struct XdpQueueStatus {
     pub rx_invalid_descs: u64,
     pub rx_ring_full: u64,
     pub tx_invalid_descs: u64,
+    /// AF_XDP bind mode the kernel granted this queue: "zero-copy", "copy",
+    /// or empty when the socket was never bound (EN-12).
+    pub xsk_mode: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -224,6 +227,12 @@ pub(crate) struct XdpManager {
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
+    /// EN-12 worker lease: true between reactor-thread spawn and the
+    /// redirect enable attempt, so queue workers stay alive while the
+    /// bridge proves they can actually process before opening redirect.
+    /// Socket registration alone is not proof a worker is running.
+    #[allow(dead_code)]
+    proxy_workers_starting: AtomicBool,
     last_state_write_at: AtomicU64,
     rule_sweeper_started: AtomicBool,
     rule_sweeper_generation: AtomicU64,
@@ -290,6 +299,7 @@ impl XdpManager {
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
+            proxy_workers_starting: AtomicBool::new(false),
             last_state_write_at: AtomicU64::new(0),
             rule_sweeper_started: AtomicBool::new(false),
             rule_sweeper_generation: AtomicU64::new(0),
@@ -461,10 +471,25 @@ impl XdpManager {
         self.proxy_redirect_enabled.load(Ordering::Relaxed) && self.proxy_xsk_ready()
     }
 
+    /// Worker lease gate: true while the bridge is proving reactor workers
+    /// can run, before redirect opens. Keeps `should_continue` alive during
+    /// startup without treating a registered socket as a working dataplane.
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn proxy_workers_starting(&self) -> bool {
+        self.proxy_workers_starting.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn set_proxy_workers_starting(&self, starting: bool) {
+        self.proxy_workers_starting
+            .store(starting, Ordering::Relaxed);
+    }
+
     #[cfg(any(test, target_os = "linux"))]
     fn mark_proxy_dataplane_degraded(&self, detail: impl Into<String>) {
         let detail = detail.into();
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
+        self.proxy_workers_starting.store(false, Ordering::Relaxed);
         self.set_proxy_fallback_reason(detail.clone());
         let mut statuses = self.xsk_status.write();
         for status in statuses.iter_mut() {

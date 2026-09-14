@@ -1,0 +1,35 @@
+{
+  "task": "EN-12",
+  "status": "verified-veth-netns",
+  "abi": "v8",
+  "base_commit": "7a486e0",
+  "ebpf_object_sha256": "00f0e34ee5350401152ae20381220f07520b6fa9d6db6cfb0d494b1b21056618",
+  "deliverables": [
+    "fill-ring produce_and_wakeup on all three fill paths (prime, replenish, RX-frame return) — XDP_USE_NEED_WAKEUP sockets now wake the driver after fill starvation instead of sleeping forever",
+    "per-worker AF_XDP TCP session budget: node budget divided across queue reactors (floor 1); adding queues no longer multiplies the whole-node session quota",
+    "worker lease: proxy_workers_starting flag + per-reactor readiness channel; redirect opens only after every expected worker reports ready (10s timeout); startup failure/timeout disables redirect explicitly with a recorded fallback reason",
+    "proxy_bridge_should_continue accepts starting workers so the lease covers the startup window without opening redirect",
+    "generation-aware bridge supervisor: reload manager replacement respawns the bridge only after the new manager attaches and AF_XDP setup settles; stale-manager workers exit via generation check; same-generation bridge failure is not blindly respawned",
+    "explicit xskMode bind policy: auto (probe zero-copy then copy), copy, zero-copy (hard failure, no silent downgrade); landed mode recorded per queue in XdpQueueStatus.xsk_mode and detail",
+    "bind error messages carry the attempted mode (e.g. 'AF_XDP zero-copy bind failed: ...')",
+    "same-interface/same-RX-queue redirect and bounded QUIC DCID steering to the owning XSK (pre-existing, re-verified)"
+  ],
+  "verification": {
+    "verifier": "all programs accepted (kernel 7.0.14-orbstack); object unchanged from EN-09 (sha 00f0e34e)",
+    "matrix": "T01 28/28 plus T02/T03/T04/T06 all pass on x86-build",
+    "unit": "106 xdp tests pass; 662 total lib tests pass",
+    "probe": "scripts/edge/en12_queue_probe.py — all 5 phases pass on veth/netns 2-queue topology",
+    "probe_results": {
+      "A_auto_probe_two_queues": "xskMode auto on veth: zero-copy rejected by kernel, copy fallback explicit; both queues ready; redirect enabled",
+      "B_redirect_and_rx_health": "400 injected UDP frames -> redirectDelta=400, packetsDelta=400, rx_dropped/invalid/ring_full all 0",
+      "B2_worker_ready_before_redirect": "2 reactor ready reports precede redirect enable in log order",
+      "C_zerocopy_fails_explicitly": "xskMode zero-copy: both queues socket_created=false, detail='AF_XDP zero-copy bind failed: ... Operation not supported', redirect disabled, traffic still PASSes (passDelta=51)",
+      "D_forced_copy": "xskMode copy binds directly in copy mode, both queues ready"
+    }
+  },
+  "limitations": [
+    "veth does not support zero-copy, so landed-mode evidence is copy-only; zero-copy success path requires a real NIC (driver mode)",
+    "per-worker TCP session floor of 1 means N workers can admit up to N sessions below the divided share — degenerate configs only",
+    "DCID steering bounded local map + eBPF XDP_QUIC_DCID verified by unit/matrix tests; cross-queue CID traffic evidence on multi-queue veth is indirect (veth RSS hashes all test flows onto queue selection determined by kernel)"
+  ]
+}

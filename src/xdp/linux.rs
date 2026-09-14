@@ -116,7 +116,7 @@ impl AfXdpQueueHandle {
         F: FnMut(&str, u32, Vec<u8>),
     {
         let mut stats = AfXdpPollStats {
-            refilled: self.replenish_fill(),
+            refilled: self.replenish_fill()?,
             ..AfXdpPollStats::default()
         };
         let limit = self.rx_batch.len();
@@ -140,45 +140,53 @@ impl AfXdpQueueHandle {
             }
             on_packet(&self.interface, self.queue, frame.to_vec());
         }
-        stats.refilled += self.return_rx_frames(received);
+        stats.refilled += self.return_rx_frames(received)?;
         Ok(stats)
     }
 
-    fn replenish_fill(&mut self) -> usize {
+    // EN-12: the socket is bound with XDP_USE_NEED_WAKEUP — after the fill
+    // ring drains empty the driver sleeps and will not consume newly
+    // produced descriptors until userspace wakes it. `produce` alone would
+    // leave RX starved forever; `produce_and_wakeup` keeps fill starvation
+    // recoverable.
+    fn replenish_fill(&mut self) -> anyhow::Result<usize> {
         let Some(fill) = self.fill.as_mut() else {
-            return 0;
+            return Ok(0);
         };
         let count = self.free_frames.len().min(AF_XDP_RX_BATCH);
         if count == 0 {
-            return 0;
+            return Ok(0);
         }
         let split_at = self.free_frames.len() - count;
         let frames = self.free_frames.split_off(split_at);
         // SAFETY: `frames` came from this queue's UMEM free list and have not been
-        // submitted to TX or fill while in `free_frames`.
-        let produced = unsafe { fill.produce(&frames) };
+        // submitted to TX or fill while in `free_frames`. `fd` is this queue's
+        // socket descriptor used only to wake the kernel when it sleeps on an
+        // empty fill ring.
+        let produced = unsafe { fill.produce_and_wakeup(&frames, self.rx.fd_mut(), 0)? };
         if produced < frames.len() {
             self.free_frames.extend_from_slice(&frames[produced..]);
         }
-        produced
+        Ok(produced)
     }
 
-    fn return_rx_frames(&mut self, count: usize) -> usize {
+    fn return_rx_frames(&mut self, count: usize) -> anyhow::Result<usize> {
         if count == 0 {
-            return 0;
+            return Ok(0);
         }
         let frames = &self.rx_batch[..count];
         let Some(fill) = self.fill.as_mut() else {
             self.free_frames.extend_from_slice(frames);
-            return 0;
+            return Ok(0);
         };
         // SAFETY: RX returned these descriptors from the same UMEM and userspace no
         // longer holds packet data references when they are handed back to fill.
-        let produced = unsafe { fill.produce(frames) };
+        // Wakeup keeps RX alive after fill-ring starvation (see replenish_fill).
+        let produced = unsafe { fill.produce_and_wakeup(frames, self.rx.fd_mut(), 0)? };
         if produced < frames.len() {
             self.free_frames.extend_from_slice(&frames[produced..]);
         }
-        produced
+        Ok(produced)
     }
 
     fn reclaim_tx_completions(&mut self) -> usize {
@@ -442,17 +450,17 @@ fn create_af_xdp_queue(
     let (umem, mut frames) = Umem::new(umem_config, frame_count, false)?;
 
     let if_name: Interface = interface.name.parse()?;
-    let mut socket_config = SocketConfig::builder();
-    socket_config
-        .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
-        .bind_flags(BindFlags::XDP_USE_NEED_WAKEUP);
-    let socket_config = socket_config.build();
-
-    // SAFETY: The UMEM, queues, and socket-backed rings are owned by the returned
-    // handle for the full socket lifetime. INHIBIT_PROG_LOAD prevents libxdp
-    // from replacing the Aya-managed XDP program on this interface.
-    let (tx, rx, fill_and_comp) = unsafe { Socket::new(socket_config, &umem, &if_name, queue) }
-        .map_err(|err| {
+    let build_socket = |bind_flags: BindFlags| {
+        let mut socket_config = SocketConfig::builder();
+        socket_config
+            .libxdp_flags(LibxdpFlags::XSK_LIBXDP_FLAGS_INHIBIT_PROG_LOAD)
+            .bind_flags(bind_flags);
+        let socket_config = socket_config.build();
+        // SAFETY: The UMEM, queues, and socket-backed rings are owned by the
+        // returned handle for the full socket lifetime. INHIBIT_PROG_LOAD
+        // prevents libxdp from replacing the Aya-managed XDP program on this
+        // interface.
+        unsafe { Socket::new(socket_config, &umem, &if_name, queue) }.map_err(|err| {
             let mut detail = err.to_string();
             let mut source = std::error::Error::source(&err);
             while let Some(err) = source {
@@ -461,7 +469,49 @@ fn create_af_xdp_queue(
                 source = err.source();
             }
             anyhow::anyhow!(detail)
-        })?;
+        })
+    };
+    // EN-12 real bind-mode probing: `auto` asks the kernel for zero-copy and
+    // falls back to copy explicitly when the driver rejects it; the landed
+    // mode is recorded in queue status. `zero-copy` fails queue setup when
+    // unsupported — a configured hard requirement, not a silent downgrade.
+    use crate::runtime_mode::XdpXskMode;
+    let mut socket_probe = None;
+    let bind_attempts: &[(&str, BindFlags)] = match interface.xsk_mode {
+        XdpXskMode::Auto => &[
+            (
+                "zero-copy",
+                BindFlags::XDP_USE_NEED_WAKEUP | BindFlags::XDP_ZEROCOPY,
+            ),
+            ("copy", BindFlags::XDP_USE_NEED_WAKEUP | BindFlags::XDP_COPY),
+        ],
+        XdpXskMode::Copy => &[("copy", BindFlags::XDP_USE_NEED_WAKEUP | BindFlags::XDP_COPY)],
+        XdpXskMode::ZeroCopy => &[(
+            "zero-copy",
+            BindFlags::XDP_USE_NEED_WAKEUP | BindFlags::XDP_ZEROCOPY,
+        )],
+    };
+    let mut last_bind_error: Option<(&str, anyhow::Error)> = None;
+    let mut landed_mode = "";
+    let mut socket_parts = None;
+    for (mode, flags) in bind_attempts {
+        match build_socket(*flags) {
+            Ok(parts) => {
+                landed_mode = mode;
+                socket_parts = Some(parts);
+                break;
+            }
+            Err(err) => {
+                socket_probe = Some(format!("{mode} bind failed: {err}"));
+                last_bind_error = Some((mode, err));
+            }
+        }
+    }
+    let (tx, mut rx, fill_and_comp) = socket_parts.ok_or_else(|| {
+        last_bind_error
+            .map(|(mode, err)| anyhow::anyhow!("AF_XDP {mode} bind failed: {err}"))
+            .unwrap_or_else(|| anyhow::anyhow!("AF_XDP bind failed"))
+    })?;
     let (fill, comp, primed_frames) = match fill_and_comp {
         Some((mut fill, comp)) => {
             let fill_count = frames.len().min(AF_XDP_RING_SIZE as usize);
@@ -469,7 +519,7 @@ fn create_af_xdp_queue(
             // SAFETY: `initial_fill` contains descriptors returned by the same UMEM
             // that owns this fill queue. Submitted descriptors are not reused until
             // the kernel returns them on RX.
-            let produced = unsafe { fill.produce(&initial_fill) };
+            let produced = unsafe { fill.produce_and_wakeup(&initial_fill, rx.fd_mut(), 0)? };
             if produced < initial_fill.len() {
                 frames.extend_from_slice(&initial_fill[produced..]);
             }
@@ -486,8 +536,12 @@ fn create_af_xdp_queue(
         registered: false,
         ready: false,
         detail: format!(
-            "AF_XDP socket created and fill ring primed with {} frames; awaiting XSK map registration",
-            primed_frames
+            "AF_XDP socket created in {landed_mode} mode and fill ring primed with {} frames; awaiting XSK map registration{}",
+            primed_frames,
+            socket_probe
+                .as_ref()
+                .map(|probe| format!("; probe: {probe}"))
+                .unwrap_or_default()
         ),
         rx_dropped: stats.map(|stats| stats.rx_dropped()).unwrap_or_default(),
         rx_invalid_descs: stats
@@ -497,6 +551,7 @@ fn create_af_xdp_queue(
         tx_invalid_descs: stats
             .map(|stats| stats.tx_invalid_descs())
             .unwrap_or_default(),
+        xsk_mode: landed_mode.to_string(),
     };
     Ok((
         AfXdpQueueHandle {

@@ -179,6 +179,11 @@ pub struct XdpInterfaceConfig {
     /// overrides are meaningless without local-IP filtering.
     #[serde(rename = "protectedServices", default)]
     pub protected_services: Vec<XdpProtectedService>,
+    /// AF_XDP socket bind mode (EN-12): "auto" (default) probes zero-copy and
+    /// falls back to copy explicitly when the driver rejects it; "copy" never
+    /// attempts zero-copy; "zero-copy" fails queue setup if unsupported.
+    #[serde(rename = "xskMode", default)]
+    pub xsk_mode: XdpXskMode,
 }
 
 /// Fragment disposition at the XDP layer (EN-05): fragments are classified
@@ -190,6 +195,28 @@ pub enum XdpFragmentAction {
     #[default]
     Pass,
     Drop,
+}
+
+/// AF_XDP bind-mode policy (EN-12). `Auto` probes zero-copy at bind time and
+/// falls back to copy mode with an explicit status record — the landed mode
+/// is reported per queue so operators can see what the NIC actually granted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XdpXskMode {
+    #[default]
+    Auto,
+    Copy,
+    ZeroCopy,
+}
+
+impl XdpXskMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Copy => "copy",
+            Self::ZeroCopy => "zero-copy",
+        }
+    }
 }
 
 /// Per-VIP protected-service policy (EN-06): protection scope and the AF_XDP
@@ -250,6 +277,7 @@ impl Default for XdpInterfaceConfig {
             tcp_forwards: Vec::new(),
             fragment_action: XdpFragmentAction::default(),
             protected_services: Vec::new(),
+            xsk_mode: XdpXskMode::default(),
         }
     }
 }

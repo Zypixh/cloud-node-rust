@@ -58,7 +58,7 @@ commit 与 patch 摘要指被测代码状态；未提交代码也可以验证，
 | EN-09 | 准入状态机与 map 生命周期 | EN-06、EN-07 | L | VERIFIED |
 | EN-10 | 连接所有者反馈与存量流 | EN-09、EN-12 | L | TODO |
 | EN-11 | NAT 正反向、SNAT 和计费 | EN-07、EN-09、EN-16 | L | TODO |
-| EN-12 | AF_XDP 队列正确性与预算 | EN-04、EN-06、EN-07、EN-16 | L | TODO |
+| EN-12 | AF_XDP 队列正确性与预算 | EN-04、EN-06、EN-07、EN-16 | L | DONE（证据 docs/edge-node-evidence/EN-12；zero-copy 成功路径待真实 NIC 验证） |
 | EN-13 | TCP 无状态验证可行性与 ADR | EN-09、EN-12 | L | TODO |
 | EN-14 | 获选 TCP 强验证实现 | EN-10、EN-11、EN-13 | L | TODO |
 | EN-15 | QUIC Retry、迁移与透传边界 | EN-09、EN-12、EN-16 | L | TODO |
