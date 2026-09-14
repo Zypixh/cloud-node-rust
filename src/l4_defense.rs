@@ -988,18 +988,61 @@ fn scale_accept_workers(
     scaled.min(online_cpus.saturating_mul(4)).max(base)
 }
 
+/// EN-16 hysteresis state: index (0..=3) of the last utilization-driven
+/// pressure level emitted by `current_pressure_level*`. Escalation is
+/// immediate; de-escalation requires the dominant utilization to fall below
+/// the stored band's exit threshold (10 points under the entry edge) so
+/// pressure response cannot flap at a boundary.
+static UTIL_PRESSURE_STATE: AtomicU64 = AtomicU64::new(0);
+
+fn l4_level_from_index(index: usize) -> L4PressureLevel {
+    match index.min(3) {
+        0 => L4PressureLevel::Normal,
+        1 => L4PressureLevel::Elevated,
+        2 => L4PressureLevel::High,
+        _ => L4PressureLevel::Critical,
+    }
+}
+
+/// Utilization scalar -> hysteretic pressure level. Entry bands match
+/// `level_from_pct` (70/85/95); exit bands sit 10 points lower (60/75/90)
+/// so a workload hovering at a boundary holds its level instead of
+/// oscillating protective behaviour on every observation.
+fn utilization_pressure_level_hysteretic(pct: u64) -> L4PressureLevel {
+    const ENTER: [u64; 4] = [0, 70, 85, 95];
+    const EXIT: [u64; 4] = [0, 60, 75, 90];
+    let mut index = UTIL_PRESSURE_STATE.load(Ordering::Relaxed).min(3) as usize;
+    while index < 3 && pct >= ENTER[index + 1] {
+        index += 1;
+    }
+    while index > 0 && pct < EXIT[index] {
+        index -= 1;
+    }
+    UTIL_PRESSURE_STATE.store(index as u64, Ordering::Relaxed);
+    l4_level_from_index(index)
+}
+
+fn memory_level_to_l4(level: MemoryPressureLevel) -> L4PressureLevel {
+    match level {
+        MemoryPressureLevel::Normal => L4PressureLevel::Normal,
+        MemoryPressureLevel::Elevated => L4PressureLevel::Elevated,
+        MemoryPressureLevel::High => L4PressureLevel::High,
+        MemoryPressureLevel::Critical => L4PressureLevel::Critical,
+    }
+}
+
 pub fn current_pressure_level() -> L4PressureLevel {
     let snapshot = MEMORY_GOVERNOR.snapshot(MEMORY_GOVERNOR.pingora_worker_threads());
     let connection_pct = snapshot
         .connection_admission_used_bytes
         .saturating_mul(100)
         .saturating_div(snapshot.connection_budget_bytes.max(1));
-    aggregate_pressure_level(
-        snapshot.memory_pressure_level,
-        connection_pct,
-        None,
-        Some(snapshot.fd_used_pct),
-    )
+    memory_level_to_l4(snapshot.memory_pressure_level)
+        .max(utilization_pressure_level_hysteretic(
+            connection_pct.max(snapshot.fd_used_pct),
+        ))
+        .max(L4_AGGREGATES.snapshot().pressure_level)
+        .max(crate::kernel_syn_defense::current_pressure_level())
 }
 
 pub fn aggregate_pressure_level(
@@ -1034,12 +1077,12 @@ pub fn current_pressure_level_with_quic_usage(
         .connection_admission_used_bytes
         .saturating_mul(100)
         .saturating_div(snapshot.connection_budget_bytes.max(1));
-    aggregate_pressure_level(
-        snapshot.memory_pressure_level,
-        connection_pct,
-        Some(quic_pct),
-        Some(snapshot.fd_used_pct),
-    )
+    memory_level_to_l4(snapshot.memory_pressure_level)
+        .max(utilization_pressure_level_hysteretic(
+            connection_pct.max(quic_pct).max(snapshot.fd_used_pct),
+        ))
+        .max(L4_AGGREGATES.snapshot().pressure_level)
+        .max(crate::kernel_syn_defense::current_pressure_level())
 }
 
 fn usage_pct(used: usize, limit: usize) -> u64 {
@@ -1700,6 +1743,65 @@ mod tests {
             pressure_level_from_utilization_pct(MemoryPressureLevel::Elevated, 1, Some(95)),
             L4PressureLevel::Critical
         );
+    }
+
+    /// EN-16: utilization-driven pressure escalation is immediate while
+    /// de-escalation requires dropping below the exit band — a workload
+    /// hovering at 84-86% must not flap between Elevated and High.
+    #[test]
+    fn utilization_pressure_level_has_hysteresis() {
+        UTIL_PRESSURE_STATE.store(0, Ordering::Relaxed);
+        assert_eq!(
+            utilization_pressure_level_hysteretic(69),
+            L4PressureLevel::Normal
+        );
+        // Escalate immediately at the entry edge.
+        assert_eq!(
+            utilization_pressure_level_hysteretic(70),
+            L4PressureLevel::Elevated
+        );
+        assert_eq!(
+            utilization_pressure_level_hysteretic(95),
+            L4PressureLevel::Critical
+        );
+        // Still inside the Critical exit band (>= 90): hold, not flap.
+        assert_eq!(
+            utilization_pressure_level_hysteretic(94),
+            L4PressureLevel::Critical
+        );
+        assert_eq!(
+            utilization_pressure_level_hysteretic(90),
+            L4PressureLevel::Critical
+        );
+        // Below 90 exits Critical; 75-89 lands on High's exit band, held.
+        assert_eq!(
+            utilization_pressure_level_hysteretic(89),
+            L4PressureLevel::High
+        );
+        assert_eq!(
+            utilization_pressure_level_hysteretic(75),
+            L4PressureLevel::High
+        );
+        // Below 75 exits High into Elevated band (>= 60).
+        assert_eq!(
+            utilization_pressure_level_hysteretic(74),
+            L4PressureLevel::Elevated
+        );
+        // Below 60 fully de-escalates.
+        assert_eq!(
+            utilization_pressure_level_hysteretic(59),
+            L4PressureLevel::Normal
+        );
+        // Boundary stability: re-escalate at 85, hover at 84 stays High.
+        assert_eq!(
+            utilization_pressure_level_hysteretic(85),
+            L4PressureLevel::High
+        );
+        assert_eq!(
+            utilization_pressure_level_hysteretic(84),
+            L4PressureLevel::High
+        );
+        UTIL_PRESSURE_STATE.store(0, Ordering::Relaxed);
     }
 
     #[test]

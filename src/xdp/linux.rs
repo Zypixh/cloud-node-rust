@@ -524,6 +524,7 @@ pub async fn attach(
         .map_err(|err| anyhow::anyhow!("create bpffs pin dir {XDP_BPF_PIN_DIR}: {err}"))?;
     detach(config).await?;
     drop_stale_pinned_maps();
+    ensure_bpf_map_budget()?;
     let mut attached = BTreeSet::new();
     let mut loader = aya::EbpfLoader::new();
     loader.default_map_pin_directory(XDP_BPF_PIN_DIR);
@@ -545,6 +546,7 @@ pub async fn attach(
         Some(path) => loader.load_file(path)?,
         None => loader.load(XDP_EBPF_EMBEDDED)?,
     };
+    audit_loaded_map_specs(&ebpf)?;
     sync_interface_policy(&mut ebpf, config)?;
     sync_local_ip_maps(&mut ebpf, config)?;
     sync_proxy_ports(&mut ebpf, config, false)?;
@@ -1500,15 +1502,15 @@ fn clear_pinned_xsk_map() -> anyhow::Result<()> {
 /// with an opaque index/size error. Mismatched maps only lose runtime
 /// state that is resynced right after load (CT/acct entries are rebuilt
 /// by traffic); the removal is logged, never silent.
-fn drop_stale_pinned_maps() {
+/// (name, map type, key size, value size, max_entries). Must stay
+/// aligned with the #[map] definitions in
+/// crates/cloud-node-xdp-ebpf/src/main.rs. LPM trie keys carry a
+/// 4-byte prefix length in front of the address.
+fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 31] {
     use aya::maps::MapType;
     use cloud_node_xdp_common::*;
     use core::mem::size_of;
 
-    // (name, map type, key size, value size, max_entries). Must stay
-    // aligned with the #[map] definitions in
-    // crates/cloud-node-xdp-ebpf/src/main.rs. LPM trie keys carry a
-    // 4-byte prefix length in front of the address.
     let u = size_of::<u32>() as u32;
     let v4 = size_of::<XdpIpv4Key>() as u32;
     let v6 = size_of::<XdpIpv6Key>() as u32;
@@ -1517,7 +1519,7 @@ fn drop_stale_pinned_maps() {
     let fwd_rule = size_of::<XdpUdpFwdRule>() as u32;
     let ct_key = size_of::<XdpUdpCtKey>() as u32;
     let ct_value = size_of::<XdpUdpCtValue>() as u32;
-    let specs: [(&str, MapType, u32, u32, u32); 31] = [
+    [
         ("XDP_BLOCKED_V4", MapType::Hash, v4, rule, 262_144),
         ("XDP_BLOCKED_V6", MapType::Hash, v6, rule, 262_144),
         ("XDP_ALLOWED_V4", MapType::Hash, v4, rule, 65_536),
@@ -1645,7 +1647,113 @@ fn drop_stale_pinned_maps() {
             size_of::<XdpFlowAcct>() as u32,
             262_144,
         ),
-    ];
+    ]
+}
+
+/// EN-16 kernel-BPF ledger: worst-case pinned kernel memory for every map in
+/// the object. Hash entries are charged `key + value + 64B` of htab
+/// bookkeeping (measured on kernel 7.0 within ~10% of memlock); per-CPU maps
+/// multiply the value by the possible-CPU count; LPM tries allocate lazily
+/// but are still bounded at their worst case.
+pub(crate) fn projected_bpf_map_bytes() -> u64 {
+    const HASH_ENTRY_OVERHEAD: u64 = 64;
+    const LPM_ENTRY_OVERHEAD: u64 = 48;
+    const ARRAY_ENTRY_OVERHEAD: u64 = 8;
+    let ncpu = aya::util::nr_cpus().unwrap_or(1).max(1) as u64;
+    let mut total = 0u64;
+    for (_name, ty, key, value, max_entries) in bpf_map_specs() {
+        let (k, v, n) = (u64::from(key), u64::from(value), u64::from(max_entries));
+        let bytes = match ty {
+            aya::maps::MapType::PerCpuArray | aya::maps::MapType::PerCpuHash => {
+                n.saturating_mul(k + v.saturating_mul(ncpu) + HASH_ENTRY_OVERHEAD)
+            }
+            aya::maps::MapType::Hash => n.saturating_mul(k + v + HASH_ENTRY_OVERHEAD),
+            aya::maps::MapType::LpmTrie => n.saturating_mul(k + v + LPM_ENTRY_OVERHEAD),
+            _ => n.saturating_mul(k + v + ARRAY_ENTRY_OVERHEAD),
+        };
+        total = total.saturating_add(bytes);
+    }
+    total
+}
+
+/// Ensure the object's projected map memory fits the kernel-BPF ledger.
+/// Called before load: map memory is preallocated and non-reclaimable, so
+/// over-budget objects must fail attach explicitly rather than silently
+/// pinning unbounded kernel memory.
+fn ensure_bpf_map_budget() -> anyhow::Result<()> {
+    let projected = projected_bpf_map_bytes();
+    let budget = crate::memory_governor::MEMORY_GOVERNOR
+        .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
+        .kernel_bpf_budget_bytes;
+    anyhow::ensure!(
+        projected <= budget,
+        "eBPF map projected memory {projected} exceeds kernel-bpf budget {budget}"
+    );
+    Ok(())
+}
+
+/// EN-16 post-load audit: every map the object actually declares must be
+/// covered by the ledger spec table. A map added to the eBPF object without a
+/// matching spec entry would silently pin kernel memory outside the budget —
+/// refuse to attach instead.
+fn audit_loaded_map_specs(ebpf: &aya::Ebpf) -> anyhow::Result<()> {
+    let specs = bpf_map_specs();
+    for (name, map) in ebpf.maps() {
+        let data = match map {
+            aya::maps::Map::Array(d)
+            | aya::maps::Map::ArrayOfMaps(d)
+            | aya::maps::Map::BloomFilter(d)
+            | aya::maps::Map::CgroupArray(d)
+            | aya::maps::Map::CgroupStorage(d)
+            | aya::maps::Map::CgrpStorage(d)
+            | aya::maps::Map::CpuMap(d)
+            | aya::maps::Map::DevMap(d)
+            | aya::maps::Map::DevMapHash(d)
+            | aya::maps::Map::HashMap(d)
+            | aya::maps::Map::HashOfMaps(d)
+            | aya::maps::Map::InodeStorage(d)
+            | aya::maps::Map::LpmTrie(d)
+            | aya::maps::Map::LruHashMap(d)
+            | aya::maps::Map::PerCpuArray(d)
+            | aya::maps::Map::PerCpuCgroupStorage(d)
+            | aya::maps::Map::PerCpuHashMap(d)
+            | aya::maps::Map::PerCpuLruHashMap(d)
+            | aya::maps::Map::PerfEventArray(d)
+            | aya::maps::Map::ProgramArray(d)
+            | aya::maps::Map::Queue(d)
+            | aya::maps::Map::ReusePortSockArray(d)
+            | aya::maps::Map::RingBuf(d)
+            | aya::maps::Map::SockHash(d)
+            | aya::maps::Map::SockMap(d)
+            | aya::maps::Map::SkStorage(d)
+            | aya::maps::Map::Stack(d)
+            | aya::maps::Map::StackTraceMap(d)
+            | aya::maps::Map::Unsupported(d)
+            | aya::maps::Map::XskMap(d) => d,
+        };
+        let info = data
+            .info()
+            .map_err(|err| anyhow::anyhow!("read map info for {name}: {err}"))?;
+        let spec = specs.iter().find(|(n, ..)| *n == name);
+        anyhow::ensure!(
+            spec.is_some_and(|(_, ty, key, value, max)| {
+                info.map_type().ok() == Some(*ty)
+                    && info.key_size() == *key
+                    && info.value_size() == *value
+                    && info.max_entries() == *max
+            }),
+            "eBPF map {name} (type {:?}, key {}B, value {}B, max {}) is not covered by the kernel-bpf ledger spec table",
+            info.map_type().ok(),
+            info.key_size(),
+            info.value_size(),
+            info.max_entries(),
+        );
+    }
+    Ok(())
+}
+
+fn drop_stale_pinned_maps() {
+    let specs = bpf_map_specs();
 
     let Ok(dir) = std::fs::read_dir(XDP_BPF_PIN_DIR) else {
         return;
