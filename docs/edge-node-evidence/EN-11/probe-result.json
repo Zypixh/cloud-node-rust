@@ -1,0 +1,42 @@
+{
+  "ok": true,
+  "phases": {
+    "A_udp_conflict": {
+      "vip1FwdDelta": 3,
+      "vip2ConflictDelta": 2,
+      "vip2FwdDelta": 0,
+      "ctEntriesAfterConflict": 1,
+      "vip1FwdDeltaAfter": 2,
+      "ok": true
+    },
+    "B_tcp_pending_conflict": {
+      "snatBoundVip1": 1,
+      "pendingAfterSyn": 1,
+      "snatRevAfterSyn": 1,
+      "vip2ConflictDelta": 2,
+      "vip2SnatBoundDelta": 0,
+      "pendingAfterVip2": 1,
+      "snatRevAfterVip2": 1,
+      "ok": true
+    },
+    "C_expiry_port_release": {
+      "snatBoundTotal": 2,
+      "snatRevAfterRenew": 1,
+      "pendingAfterRenew": 1,
+      "ok": true
+    },
+    "D_billing": {
+      "acctEntries": 2,
+      "vip1Flow": [
+        {
+          "rx_bytes": 160,
+          "tx_bytes": 31,
+          "rx_pkts": 5,
+          "tx_pkts": 1,
+          "server_id": 43
+        }
+      ],
+      "ok": true
+    }
+  }
+}
