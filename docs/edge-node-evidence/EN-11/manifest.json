@@ -1,0 +1,27 @@
+{
+  "task": "EN-11",
+  "status": "verified-veth-netns",
+  "abi": "v10",
+  "base_commit": "341591c",
+  "ebpf_object_sha256": "e6c3e0289bf3f0e39d109f0a189df150c5629b41f8378042d1129e5936fe406a",
+  "deliverables": [
+    "multi-VIP disambiguation: CT-hit and pending-hit paths now compare the bound (listen_addr, listen_port) against the packet destination; mismatch -> nat_conflict counter + REJECTED/NAT_CONFLICT flow event + explicit userspace fallback instead of silent rebind",
+    "snat_release rollback: a claimed SNAT port is released when the owning CT/pending insert fails (all four insert-failure sites), so map insert failure no longer leaks ports",
+    "pending expiry releases its SNAT binding in-datapath (previously orphaned until the sweeper pass) and emits XDP_FLOW_EVENT_EXPIRED",
+    "sweeper orphan check tightened: live sets track each entry's claimed snat_port; a binding survives only while its owning flow is live AND still claims that port (tuple reuse on a new port frees the old binding; a re-claimed port stays protected)",
+    "XdpCounters.nat_conflict (ABI v10, 232B) plumbed to status + dump-maps; XDP_DECISION_NAT_CONFLICT=10 pinned append-only",
+    "billing: FLOW_ACCT bidirectional accounting verified per flow with server attribution intact (rx/tx bytes + server_id observable via bpftool/dump)"
+  ],
+  "verification": {
+    "verifier": "object loads on kernel 7.0.14-orbstack x86-build; pending_touch returns u64-packed triple to avoid sret caller-stack pointer rejected by verifier",
+    "unit": "667 lib + 7 common + 18 integration tests pass",
+    "probe": "scripts/edge/en11_nat_probe.py all 4 phases pass (probe-result.json)",
+    "regression": "en10_flow_probe re-run green on the v10 object (takeover + event channel unchanged)"
+  },
+  "limitations": [
+    "CT/pending-full rollback path is code-reviewed but not runtime-exercised (requires filling the table in a probe)",
+    "conflict rejection semantics = explicit userspace fallback (Ok(None)), consistent with the CT-full contract; counted and evented, not silent",
+    "veth/netns evidence; real-NIC multi-queue SNAT pressure untested",
+    "TTL decrement absent by design (same-subnet L2 rewrite); neighbor via configured nextHopMac"
+  ]
+}

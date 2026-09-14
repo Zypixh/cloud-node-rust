@@ -17,11 +17,11 @@ use cloud_node_xdp_common::{
     XdpQueueKey, XdpQuicDcidKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
     XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule, XDP_CLASS_MALFORMED,
     XDP_CLASS_UNSUPPORTED, XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN, XDP_CT_STATE_PENDING,
-    XDP_CT_STATE_PENDING_ACKED, XDP_DECISION_FLOW_TABLE_FULL, XDP_DECISION_PASS,
-    XDP_FLOW_EVENT_ADMITTED, XDP_FLOW_EVENT_CLOSED, XDP_FLOW_EVENT_REJECTED,
-    XDP_FLOW_EVENT_VALIDATED, XDP_FRAGMENT_DROP, XDP_FRAGMENT_PASS, XDP_LOCAL_FRAG_DROP,
-    XDP_LOCAL_FRAG_PASS, XDP_LOCAL_PRESENT, XDP_LOCAL_REDIRECT, XDP_SNAT_PORT_BASE,
-    XDP_SNAT_PORT_SPAN,
+    XDP_CT_STATE_PENDING_ACKED, XDP_DECISION_FLOW_TABLE_FULL, XDP_DECISION_NAT_CONFLICT,
+    XDP_DECISION_PASS, XDP_FLOW_EVENT_ADMITTED, XDP_FLOW_EVENT_CLOSED, XDP_FLOW_EVENT_EXPIRED,
+    XDP_FLOW_EVENT_REJECTED, XDP_FLOW_EVENT_VALIDATED, XDP_FRAGMENT_DROP, XDP_FRAGMENT_PASS,
+    XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS, XDP_LOCAL_PRESENT, XDP_LOCAL_REDIRECT,
+    XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN,
 };
 use core::mem;
 use network_types::{
@@ -1796,6 +1796,12 @@ fn counter_snat_reply_tx() {
     }
 }
 
+fn counter_nat_conflict() {
+    if let Some(counters) = counters() {
+        counters.nat_conflict = counters.nat_conflict.saturating_add(1);
+    }
+}
+
 /// Claim a node source port for a client flow and install the reverse
 /// binding (listen addr, port, proto) -> client tuple.
 ///
@@ -1869,6 +1875,15 @@ fn snat_alloc(
     }
     counter_snat_alloc_fail();
     None
+}
+
+/// EN-11 rollback: release a SNAT binding claimed by `snat_alloc` when the
+/// owning conntrack/pending insert subsequently failed. `snat_rev_key`
+/// still carries the claimed port, so removing it returns the port to the
+/// allocatable space instead of leaking it as an orphan until the sweep.
+#[inline(never)]
+fn snat_release(scratch: *mut NatScratch) {
+    let _ = XDP_SNAT_REV.remove(unsafe { &(*scratch).snat_rev_key });
 }
 
 /// Pre-fill `scratch.snat_rev_*` for a flow about to claim a SNAT port.
@@ -2211,6 +2226,19 @@ fn try_udp_nat_v4(
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         let v = unsafe { &(*scratch).ct_value };
+        // EN-11 multi-VIP disambiguation: the flow tuple is already bound
+        // to a different listen tuple — reject instead of silently
+        // rebinding the reply owner to a VIP the client never dialed.
+        if ct.listen_addr != v.listen_addr || ct.listen_port_be != v.listen_port_be {
+            counter_nat_conflict();
+            emit_flow_event(
+                ct,
+                XDP_FLOW_EVENT_REJECTED,
+                XDP_DECISION_NAT_CONFLICT,
+                now_mono_ns,
+            );
+            return Ok(None);
+        }
         unsafe { copy16(&mut ct.listen_addr, &v.listen_addr) };
         ct.client_mac = v.client_mac;
         ct.listen_port_be = v.listen_port_be;
@@ -2257,6 +2285,11 @@ fn try_udp_nat_v4(
             )
             .is_err()
         {
+            // EN-11 rollback: a claimed SNAT port must not outlive the
+            // rejected admission — release the reverse binding first.
+            if snat_port != 0 {
+                snat_release(scratch);
+            }
             emit_flow_event(
                 unsafe { &(*scratch).ct_value },
                 XDP_FLOW_EVENT_REJECTED,
@@ -2544,6 +2577,18 @@ fn try_udp_nat_v6_fwd(
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         let v = unsafe { &(*scratch).ct_value };
+        // EN-11 multi-VIP disambiguation: reject instead of silently
+        // rebinding the reply owner to a VIP the client never dialed.
+        if ct.listen_addr != v.listen_addr || ct.listen_port_be != v.listen_port_be {
+            counter_nat_conflict();
+            emit_flow_event(
+                ct,
+                XDP_FLOW_EVENT_REJECTED,
+                XDP_DECISION_NAT_CONFLICT,
+                now_mono_ns,
+            );
+            return Ok(None);
+        }
         unsafe { copy16(&mut ct.listen_addr, &v.listen_addr) };
         ct.client_mac = v.client_mac;
         ct.listen_port_be = v.listen_port_be;
@@ -2585,6 +2630,11 @@ fn try_udp_nat_v6_fwd(
             )
             .is_err()
         {
+            // EN-11 rollback: release the claimed SNAT port so a rejected
+            // admission leaves no binding behind.
+            if snat_port != 0 {
+                snat_release(scratch);
+            }
             emit_flow_event(
                 unsafe { &(*scratch).ct_value },
                 XDP_FLOW_EVENT_REJECTED,
@@ -2964,6 +3014,18 @@ fn try_tcp_nat_v4(
         Some(ct) => {
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
+            // EN-11: flow tuple already bound to a different listen (VIP)
+            // tuple — reject rather than rebinding reply ownership.
+            if ct.listen_addr != v4_embed(dst_be) || ct.listen_port_be != dst_port {
+                counter_nat_conflict();
+                emit_flow_event(
+                    ct,
+                    XDP_FLOW_EVENT_REJECTED,
+                    XDP_DECISION_NAT_CONFLICT,
+                    now_mono_ns,
+                );
+                return Ok(None);
+            }
             ct.last_seen_ns = now_mono_ns;
             if closing && ct.state == XDP_CT_STATE_OPEN {
                 ct.state = XDP_CT_STATE_CLOSING;
@@ -2976,8 +3038,15 @@ fn try_tcp_nat_v4(
             // EN-09: consult the bounded half-open table before treating the
             // packet as an unknown flow. Pending hits forward through the
             // shared rewrite below without extending their absolute deadline.
-            let (pend, incarnation, pending_port) =
-                pending_touch(unsafe { &(*scratch).ct_key }, now_mono_ns, ack && !syn);
+            unsafe { (*scratch).pkt_dst = v4_embed(dst_be) };
+            let r = pending_touch(scratch, now_mono_ns, ack && !syn, dst_port);
+            let pend = r as u8;
+            let incarnation = (r >> 8) as u32;
+            let pending_port = (r >> 40) as u16;
+            if pend == PENDING_CONFLICT {
+                counter_nat_conflict();
+                return Ok(None);
+            }
             if pend == PENDING_ALIVE {
                 snat_port = pending_port;
             } else {
@@ -3031,6 +3100,11 @@ fn try_tcp_nat_v4(
                     )
                     .is_err()
                 {
+                    // EN-11 rollback: release the claimed SNAT port so a
+                    // rejected admission leaves no binding behind.
+                    if snat_port != 0 {
+                        snat_release(scratch);
+                    }
                     counter_pending_limited();
                     emit_flow_event(
                         unsafe { &(*scratch).ct_value },
@@ -3328,6 +3402,18 @@ fn try_tcp_nat_v6_fwd(
         Some(ct) => {
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
+            // EN-11: flow tuple already bound to a different listen (VIP)
+            // tuple — reject rather than rebinding reply ownership.
+            if ct.listen_addr != unsafe { (*scratch).pkt_dst } || ct.listen_port_be != dst_port {
+                counter_nat_conflict();
+                emit_flow_event(
+                    ct,
+                    XDP_FLOW_EVENT_REJECTED,
+                    XDP_DECISION_NAT_CONFLICT,
+                    now_mono_ns,
+                );
+                return Ok(None);
+            }
             ct.last_seen_ns = now_mono_ns;
             if closing && ct.state == XDP_CT_STATE_OPEN {
                 ct.state = XDP_CT_STATE_CLOSING;
@@ -3336,8 +3422,14 @@ fn try_tcp_nat_v6_fwd(
             snat_port = ct.snat_port_be;
         }
         None => {
-            let (pend, incarnation, pending_port) =
-                pending_touch(unsafe { &(*scratch).ct_key }, now_mono_ns, ack && !syn);
+            let r = pending_touch(scratch, now_mono_ns, ack && !syn, dst_port);
+            let pend = r as u8;
+            let incarnation = (r >> 8) as u32;
+            let pending_port = (r >> 40) as u16;
+            if pend == PENDING_CONFLICT {
+                counter_nat_conflict();
+                return Ok(None);
+            }
             if pend == PENDING_ALIVE {
                 snat_port = pending_port;
             } else {
@@ -3390,6 +3482,11 @@ fn try_tcp_nat_v6_fwd(
                     )
                     .is_err()
                 {
+                    // EN-11 rollback: release the claimed SNAT port so a
+                    // rejected admission leaves no binding behind.
+                    if snat_port != 0 {
+                        snat_release(scratch);
+                    }
                     counter_pending_limited();
                     emit_flow_event(
                         unsafe { &(*scratch).ct_value },
@@ -3790,6 +3887,9 @@ fn budget_charge(dim: usize, now_mono_ns: u64) -> bool {
 const XDP_PENDING_TTL_DEFAULT_NS: u64 = 3_000_000_000;
 const PENDING_MISS: u8 = 0;
 const PENDING_ALIVE: u8 = 1;
+/// EN-11: live pending entry owns this tuple for a different listen (VIP)
+/// tuple — the caller rejects explicitly (multi-VIP same-backend ambiguity).
+const PENDING_CONFLICT: u8 = 2;
 
 #[inline(always)]
 fn pending_ttl_ns() -> u64 {
@@ -3850,20 +3950,59 @@ fn emit_flow_event(ct: &XdpUdpCtValue, kind: u8, reason: u8, now_ns: u64) {
 /// EN-09 half-open lookup. Returns (PENDING_MISS, next_incarnation, 0) when
 /// no live pending entry exists — a stale entry is removed first and its
 /// incarnation+1 is returned so the caller can re-admit the tuple as a fresh
-/// flow. Returns (PENDING_ALIVE, _, snat_port_be) when the tuple is pending;
+/// flow. Returns (PENDING_CONFLICT, 0, 0) when a live pending entry binds
+/// this tuple to a different listen (VIP) tuple — EN-11 rejects the
+/// ambiguity. Returns (PENDING_ALIVE, _, snat_port_be) when the tuple is
+/// pending;
 /// `promote` (client ACK&&!SYN on a PENDING_ACKED entry) moves the record
 /// into the authoritative CT table. Pending hits never extend last_seen_ns.
 #[inline(never)]
-fn pending_touch(key: &XdpUdpCtKey, now_mono_ns: u64, promote: bool) -> (u8, u32, u16) {
+fn pending_touch(
+    scratch: *mut NatScratch,
+    now_mono_ns: u64,
+    promote: bool,
+    exp_port_be: u16,
+) -> u64 {
+    // SAFETY: callers pass the per-CPU scratch map pointer; `ct_key` holds
+    // the flow tuple and `pkt_dst` the expected listen address.
+    let key = unsafe { &(*scratch).ct_key };
     let Some(p) = XDP_PENDING.get_ptr_mut(key) else {
-        return (PENDING_MISS, 1, 0);
+        return pending_pack(PENDING_MISS, 1, 0);
     };
     // SAFETY: pointer into the map value for `key`.
     let p = unsafe { &mut *p };
     if now_mono_ns.saturating_sub(p.last_seen_ns) >= pending_ttl_ns() {
         let next = p.incarnation.wrapping_add(1);
+        // EN-11: release the expired entry's SNAT port claim with it —
+        // dropping pending state while the reverse binding stays would
+        // leak the port until the sweeper's next orphan pass.
+        if p.snat_port_be != 0 {
+            let rk = XdpSnatRevKey {
+                listen_addr: p.listen_addr,
+                snat_port_be: p.snat_port_be,
+                proto: 6,
+                family: p.family,
+                _pad: [0; 3],
+            };
+            let _ = XDP_SNAT_REV.remove(&rk);
+        }
+        emit_flow_event(p, XDP_FLOW_EVENT_EXPIRED, XDP_DECISION_PASS, now_mono_ns);
         let _ = XDP_PENDING.remove(key);
-        return (PENDING_MISS, next, 0);
+        return pending_pack(PENDING_MISS, next, 0);
+    }
+    // EN-11 multi-VIP disambiguation: the pending entry owns this flow
+    // tuple for a different listen (VIP) tuple — reject rather than
+    // silently rebinding replies to a VIP the client never dialed. The
+    // expected listen address is the packet destination the caller
+    // snapshotted into scratch.pkt_dst.
+    if p.listen_addr != unsafe { (*scratch).pkt_dst } || p.listen_port_be != exp_port_be {
+        emit_flow_event(
+            p,
+            XDP_FLOW_EVENT_REJECTED,
+            XDP_DECISION_NAT_CONFLICT,
+            now_mono_ns,
+        );
+        return pending_pack(PENDING_CONFLICT, 0, 0);
     }
     let port = p.snat_port_be;
     // Handshake-evidence promotion: SNAT flows require the observed backend
@@ -3888,7 +4027,16 @@ fn pending_touch(key: &XdpUdpCtKey, now_mono_ns: u64, promote: bool) -> (u8, u32
             );
         }
     }
-    (PENDING_ALIVE, 0, port)
+    pending_pack(PENDING_ALIVE, 0, port)
+}
+
+/// EN-11: pending_touch's tuple is packed into a scalar so no sret slot is
+/// passed through the call frame — a pointer into the caller stack tripped
+/// the verifier on older kernels (R11-invalid store). Layout:
+/// [state:8][incarnation:32][snat_port_be:16].
+#[inline(always)]
+fn pending_pack(state: u8, incarnation: u32, port: u16) -> u64 {
+    state as u64 | (incarnation as u64) << 8 | (port as u64) << 40
 }
 
 fn counter_unverified_limited() {

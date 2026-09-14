@@ -273,6 +273,11 @@ pub struct XdpCounters {
     /// Events are advisory feedback only — the dataplane never blocks on
     /// publication, and kernel maps stay authoritative for flow state.
     pub flow_event_lost: u64,
+    /// EN-11: packets whose flow tuple is already bound to a different
+    /// listen (VIP) tuple — the multi-VIP same-backend ambiguity. The
+    /// existing binding wins; the conflicting packet falls back to the
+    /// userspace dataplane instead of silently rebinding the reply tuple.
+    pub nat_conflict: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -584,7 +589,9 @@ pub struct NatScratch {
 /// v9: EN-10 — XdpCounters +flow_event_lost (216->224B);
 /// XDP_FLOW_EVENTS ringbuf + XDP_OWNER_EPOCH + XDP_FLOW_SEQ maps;
 /// flow-state maps pinned for generational takeover.
-pub const XDP_ABI_VERSION: u32 = 9;
+/// v10: EN-11 — XdpCounters +nat_conflict (224->232B);
+/// XDP_DECISION_NAT_CONFLICT.
+pub const XDP_ABI_VERSION: u32 = 10;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -624,6 +631,9 @@ pub const XDP_DECISION_BUDGET: u8 = 6;
 pub const XDP_DECISION_NO_XSK: u8 = 7;
 pub const XDP_DECISION_FLOW_TABLE_FULL: u8 = 8;
 pub const XDP_DECISION_TCP_FLAG: u8 = 9;
+/// EN-11: flow tuple already bound to a different listen (VIP) tuple;
+/// rejected instead of silently rebinding the existing conntrack entry.
+pub const XDP_DECISION_NAT_CONFLICT: u8 = 10;
 
 /// Parse classification (architecture §4.3): replaces the single
 /// Err→PASS bucket. CONTROL covers PMTU/ICMPv6-ND and other exempt traffic.
@@ -778,7 +788,7 @@ const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
 const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 64);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 16);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 224);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 232);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);
@@ -978,6 +988,7 @@ pub mod host {
             assert_eq!(XDP_DECISION_PASS, 0);
             assert_eq!(XDP_DECISION_NO_XSK, 7);
             assert_eq!(XDP_DECISION_TCP_FLAG, 9);
+            assert_eq!(XDP_DECISION_NAT_CONFLICT, 10);
         }
 
         /// Disabled budget bits must make the whole config inert — zero flags

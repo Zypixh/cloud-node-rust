@@ -145,6 +145,10 @@ pub struct XdpStatusSnapshot {
     /// EN-09: SYN admissions rejected because the bounded half-open table
     /// XDP_PENDING is full.
     pub pending_limited: u64,
+    /// EN-11: packets rejected because their flow tuple is already bound
+    /// to a different listen (VIP) tuple.
+    #[serde(default)]
+    pub nat_conflict: u64,
     /// EN-10: lifecycle events dropped in-kernel because XDP_FLOW_EVENTS was
     /// full (consumer too slow). Feedback is advisory — loss never blocks or
     /// alters the dataplane, but is always accounted.
@@ -248,6 +252,8 @@ pub(crate) struct XdpManager {
     unverified_limited: AtomicU64,
     admission_limited: AtomicU64,
     pending_limited: AtomicU64,
+    /// EN-11: cross-VIP flow-tuple conflicts rejected in-kernel.
+    nat_conflict: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     /// EN-10: owner generation written to XDP_OWNER_EPOCH at attach.
@@ -336,6 +342,7 @@ impl XdpManager {
             unverified_limited: AtomicU64::new(0),
             admission_limited: AtomicU64::new(0),
             pending_limited: AtomicU64::new(0),
+            nat_conflict: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             owner_epoch: AtomicU64::new(0),
@@ -936,6 +943,7 @@ impl XdpManager {
             unverified_limited: self.unverified_limited.load(Ordering::Relaxed),
             admission_limited: self.admission_limited.load(Ordering::Relaxed),
             pending_limited: self.pending_limited.load(Ordering::Relaxed),
+            nat_conflict: self.nat_conflict.load(Ordering::Relaxed),
             flow_event_lost: self.flow_event_lost.load(Ordering::Relaxed),
             flow_events_received: self.flow_events_received.load(Ordering::Relaxed),
             flow_events_stale: self.flow_events_stale.load(Ordering::Relaxed),
@@ -1602,6 +1610,8 @@ impl XdpManager {
                     .store(counters.admission_limited, Ordering::Relaxed);
                 self.pending_limited
                     .store(counters.pending_limited, Ordering::Relaxed);
+                self.nat_conflict
+                    .store(counters.nat_conflict, Ordering::Relaxed);
                 self.flow_event_lost
                     .store(counters.flow_event_lost, Ordering::Relaxed);
             }
@@ -1673,6 +1683,7 @@ impl XdpManager {
                     "unverifiedLimited": c.unverified_limited,
                     "admissionLimited": c.admission_limited,
                     "pendingLimited": c.pending_limited,
+                    "natConflict": c.nat_conflict,
                     "flowEventLost": c.flow_event_lost,
                 })
             })

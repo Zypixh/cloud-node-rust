@@ -957,7 +957,8 @@ pub(crate) fn sum_percpu_counters<'a>(
             unverified_limited,
             admission_limited,
             pending_limited,
-            flow_event_lost
+            flow_event_lost,
+            nat_conflict
         );
     }
     total
@@ -1432,8 +1433,11 @@ pub(super) fn sweep_nat_maps(
     let pending_ns = tcp_pending.as_nanos().min(u64::MAX as u128) as u64;
 
     let mut stale: Vec<XdpUdpCtKey> = Vec::new();
-    let mut udp_live: std::collections::HashSet<XdpUdpCtKey> = Default::default();
-    let mut tcp_live: std::collections::HashSet<XdpUdpCtKey> = Default::default();
+    // EN-11: live sets record each live entry's claimed SNAT port, so the
+    // orphan check can distinguish a binding whose flow was re-admitted on
+    // a new port (orphan — reap it) from the binding the live flow owns.
+    let mut udp_live: std::collections::HashMap<XdpUdpCtKey, u16> = Default::default();
+    let mut tcp_live: std::collections::HashMap<XdpUdpCtKey, u16> = Default::default();
     if let Some(map) = ebpf.map_mut("XDP_UDP_CT") {
         let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
         for item in map.iter() {
@@ -1441,7 +1445,7 @@ pub(super) fn sweep_nat_maps(
             if now_ns.saturating_sub(value.last_seen_ns) >= udp_idle_ns {
                 stale.push(key);
             } else {
-                udp_live.insert(key);
+                udp_live.insert(key, value.snat_port_be);
             }
         }
         for key in &stale {
@@ -1462,7 +1466,7 @@ pub(super) fn sweep_nat_maps(
             if idle >= limit {
                 tcp_stale.push(key);
             } else {
-                tcp_live.insert(key);
+                tcp_live.insert(key, value.snat_port_be);
             }
         }
         for key in &tcp_stale {
@@ -1483,7 +1487,7 @@ pub(super) fn sweep_nat_maps(
             if now_ns.saturating_sub(value.last_seen_ns) >= pending_ns {
                 pending_stale.push(key);
             } else {
-                tcp_live.insert(key);
+                tcp_live.insert(key, value.snat_port_be);
             }
         }
         for key in &pending_stale {
@@ -1507,10 +1511,16 @@ pub(super) fn sweep_nat_maps(
                 proto: value.proto,
                 ..Default::default()
             };
+            // A binding is live only while its owning conntrack entry both
+            // exists and still claims THIS port — a re-admitted tuple on a
+            // new port leaves the old binding an orphan to reap, and a
+            // re-claimed port stays protected because the live entry's
+            // claim matches the key.
             let alive = match value.proto {
-                6 => tcp_live.contains(&ct_key),
-                _ => udp_live.contains(&ct_key),
-            };
+                6 => tcp_live.get(&ct_key),
+                _ => udp_live.get(&ct_key),
+            }
+            .is_some_and(|port| *port == key.snat_port_be);
             if !alive {
                 orphan.push(key);
             }
