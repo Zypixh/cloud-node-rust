@@ -1432,6 +1432,18 @@ impl XdpManager {
     #[cfg(not(target_os = "linux"))]
     fn flush_maps_full_blocking(&self, _proxy_dataplane_active: bool) {}
 
+    /// EN-16: projected pinned kernel memory of the loaded eBPF object's
+    /// maps (0 on non-Linux where no eBPF object is loaded).
+    #[cfg(target_os = "linux")]
+    fn bpf_map_projected_bytes(&self) -> u64 {
+        linux::projected_bpf_map_bytes()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn bpf_map_projected_bytes(&self) -> u64 {
+        0
+    }
+
     #[cfg(target_os = "linux")]
     fn detach_after_runtime_failure(&self, reason: String) {
         if let Err(err) = linux::detach_blocking(&self.config) {
@@ -1587,6 +1599,12 @@ impl XdpManager {
                 "supported": xdp_supported_proxy_port_count(&self.config),
                 "unsupported": self.config.proxy.ports.len().saturating_sub(xdp_supported_proxy_port_count(&self.config)),
                 "redirectEnabled": self.proxy_redirect_enabled.load(Ordering::Relaxed),
+            },
+            "kernelBpfBudget": {
+                "projectedBytes": self.bpf_map_projected_bytes(),
+                "budgetBytes": crate::memory_governor::MEMORY_GOVERNOR
+                    .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
+                    .kernel_bpf_budget_bytes,
             },
             "tcpDataplane": {
                 "ready": xdp_tcp_dataplane_supported(),

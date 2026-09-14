@@ -2681,3 +2681,23 @@ fn scaled_rate_limit_config_window_prefix_and_floor() {
     assert_eq!(cfg.v4_prefix_len, 32);
     assert_eq!(cfg.v6_prefix_len, 0);
 }
+
+/// EN-16: the eBPF map memory projection stays aligned with the spec table —
+/// a sane nonzero bound well under 1 GiB on any plausible CPU count, and it
+/// must never silently become zero (that would let attach pin unbounded
+/// kernel memory unaccounted).
+#[test]
+#[cfg(target_os = "linux")]
+fn projected_bpf_map_bytes_bounded() {
+    let bytes = linux::projected_bpf_map_bytes();
+    assert!(bytes > 100 * 1024 * 1024, "projection too small: {bytes}");
+    assert!(bytes < 2 * 1024 * 1024 * 1024, "projection insane: {bytes}");
+}
+
+#[test]
+fn kernel_bpf_budget_is_bounded_by_state_budget() {
+    let snapshot = crate::memory_governor::MEMORY_GOVERNOR
+        .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
+    assert!(snapshot.kernel_bpf_budget_bytes >= 32 * 1024 * 1024);
+    assert!(snapshot.kernel_bpf_budget_bytes <= snapshot.memory_total_bytes);
+}

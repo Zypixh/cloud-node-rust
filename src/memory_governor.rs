@@ -159,6 +159,11 @@ pub struct GovernorSnapshot {
     pub local_log_queue_budget_bytes: u64,
     pub ip_report_queue_budget_bytes: u64,
     pub af_xdp_budget_bytes: u64,
+    /// EN-16 kernel-resident BPF ledger: the maximum total eBPF map memory
+    /// (preallocated, non-reclaimable) the XDP dataplane may pin. Bounded by
+    /// the node's overall state allocation — map memory is kernel-resident
+    /// state and must fit inside it.
+    pub kernel_bpf_budget_bytes: u64,
     pub pingora_keepalive_pool_size: usize,
     pub resident_memory: ResidentMemorySnapshot,
     pub cgroup_managed: bool,
@@ -1461,6 +1466,7 @@ impl MemoryGovernor {
             local_log_queue_budget_bytes: event_queue_budget_bytes(&mem) / 8,
             ip_report_queue_budget_bytes: event_queue_budget_bytes(&mem) / 8,
             af_xdp_budget_bytes: state_budget_bytes(&mem) / 4,
+            kernel_bpf_budget_bytes: state_budget_bytes(&mem),
             pingora_keepalive_pool_size: self.pingora_keepalive_pool_size(pingora_threads),
             resident_memory: self.resident_memory_snapshot(),
             cgroup_managed: mem.cgroup_managed,

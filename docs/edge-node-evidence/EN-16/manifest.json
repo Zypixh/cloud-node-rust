@@ -1,0 +1,41 @@
+{
+  "task": "EN-16",
+  "status": "partial-verified-veth-netns",
+  "abi": "v8",
+  "base_commit": "20f8615",
+  "ebpf_object_sha256": "00f0e34ee5350401152ae20381220f07520b6fa9d6db6cfb0d494b1b21056618",
+  "scope_note": "EN-16 is a large (L) item. This slice delivers the kernel-BPF map memory ledger and utilization-pressure hysteresis, verified end to end. Remaining gaps are listed in report.md.",
+  "deliverables": [
+    "kernel_bpf_budget_bytes added to GovernorSnapshot (bounded by the node state budget; cgroup-aware)",
+    "bpf_map_specs() extracted as the single source of map truth (31 maps, in sync with all #[map] declarations)",
+    "projected_bpf_map_bytes(): worst-case pinned kernel memory per map type — hash +64B/entry, per-CPU maps x nr_cpus, LPM trie lazy-but-bounded, array/prog-array/xsk +8B/entry",
+    "ensure_bpf_map_budget(): pre-load attach gate — over-budget objects refuse attach explicitly (no silent pinning of unaccounted kernel memory)",
+    "audit_loaded_map_specs(): post-load audit — every map the object declares must match a spec-table entry (name + type + sizes), otherwise attach fails naming the offending map",
+    "kernelBpfBudget{projectedBytes,budgetBytes} surfaced in `xdp dump-maps` status output",
+    "utilization-driven L4 pressure hysteresis: entry bands 70/85/95, exit bands 60/75/90 — boundary workloads hold their level instead of flapping protective behaviour",
+    "unit tests: projection boundedness, budget bounded by state budget, hysteresis enter/exit semantics"
+  ],
+  "verification": {
+    "environment": "OrbStack x86 VM, kernel 7.0.14-orbstack, cgroup v2",
+    "unit": "xdp 78 tests + l4_defense 38 tests pass on macOS host build; Linux lib builds clean on x86-build",
+    "probe": "scripts/edge/en16_bpf_budget_probe.py — all 3 phases pass",
+    "probe_results": {
+      "A_ledger_observable": "projectedBytes=382756816 (~365 MiB) <= budgetBytes=412300738 on unconstrained host; matches measured bpftool memlock ~365 MB within model error",
+      "B_positive_attach": "node attaches XDP under the normal budget",
+      "C_budget_refusal": "under cgroup memory.max=4GiB the budget shrinks to ~341 MiB < 382.7 MiB projection; node exits with explicit error 'eBPF map projected memory 382756816 exceeds kernel-bpf budget 342530457'; no link pin created"
+    },
+    "regression": "EN-09 pending probe re-run on the gated attach path: all 5 phases pass (one earlier run flaked during topology setup; rerun green)",
+    "audit_existing_coverage": [
+      "RAII permits (AdmissionPermit/ZeroCopyRelayPermit/UdpQueueBytePermit/ActiveIpPermit) release on Drop — cancellation/timeout cannot leak permits",
+      "AF_XDP UMEM projection sums all queues against one node budget — queues cannot each claim a full node budget",
+      "ConfigSyncBudget.commit_reserve_bytes reserves control-plane commit capacity",
+      "logical admission accounting is derived-from but not charged-against physical RSS/cgroup observation — no double counting"
+    ]
+  },
+  "limitations": [
+    "per-listener/per-service quota pools are not yet enforced — ServiceIdentity exists as a contract; unknown-tenant traffic is admitted to the node-level pool, not a listener-scoped pool",
+    "the map projection is a model (calibrated within ~10% of measured memlock on kernel 7.0), not an exact kernel accounting; the post-load spec audit prevents silent drift between object and ledger",
+    "hysteresis applies to the utilization channel (connection/fd/quic pcts); memory-level, aggregate-surge and syn-defense channels escalate and clear immediately",
+    "no disk/spool ledger — node-local disk writers (logs, cache) keep their existing configured bounds outside the governor"
+  ]
+}

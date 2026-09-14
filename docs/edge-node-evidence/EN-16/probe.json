@@ -1,0 +1,29 @@
+{
+  "phases": [
+    {
+      "phase": "A_ledger_observable",
+      "projectedBytes": 382756816,
+      "budgetBytes": 412300738,
+      "ok": true,
+      "note": "dump-maps exposes the kernel-BPF ledger; projection is nonzero and fits the governor-derived budget"
+    },
+    {
+      "phase": "B_positive_attach",
+      "attachOutcome": "attached",
+      "pinnedMapCount": 0,
+      "pinnedBytesTotal": 0,
+      "ok": true,
+      "note": "node attaches XDP when the projected footprint fits the kernel-BPF budget"
+    },
+    {
+      "phase": "C_budget_refusal",
+      "attachOutcome": "exited",
+      "cgroupMemoryMax": 4294967296,
+      "budgetErrorLogged": true,
+      "linkPinCreated": false,
+      "ok": true,
+      "note": "when kernel_bpf_budget_bytes < projected map memory, attach fails explicitly naming the budget and no link pin is created"
+    }
+  ],
+  "ok": true
+}
