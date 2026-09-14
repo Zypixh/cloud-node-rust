@@ -4,7 +4,7 @@ use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, PerCpuArray, XskMap};
 use aya::programs::links::PinnedLink;
 use cloud_node_xdp_common::{
-    XdpBudgetBucket, XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key,
+    XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key,
     XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey, XdpQueueKey,
     XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey,
     XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
@@ -586,11 +586,19 @@ pub async fn attach(
     std::fs::create_dir_all(XDP_BPF_PIN_DIR)
         .map_err(|err| anyhow::anyhow!("create bpffs pin dir {XDP_BPF_PIN_DIR}: {err}"))?;
     detach(config).await?;
-    drop_stale_pinned_maps();
-    ensure_bpf_map_budget()?;
+    drop_stale_pinned_maps(config);
+    ensure_bpf_map_budget(config)?;
     let mut attached = BTreeSet::new();
     let mut loader = aya::EbpfLoader::new();
     loader.default_map_pin_directory(XDP_BPF_PIN_DIR);
+    // EN-16: apply operator-sized state tables before load; the ledger above
+    // already rejected the attach when the configured total exceeds the node
+    // budget, so these sizes are guaranteed to fit.
+    for spec in &bpf_map_specs(config) {
+        if let Some(max) = state_table_override(spec.0, config) {
+            loader.map_max_entries(spec.0, max);
+        }
+    }
     // The dispatch table must outlive the process: aya-ebpf maps default
     // to PinningType::None so default_map_pin_directory alone does not pin
     // it, and without a pin the tail-call targets die with the process.
@@ -619,6 +627,7 @@ pub async fn attach(
         "XDP_FLOW_EVENTS",
         "XDP_OWNER_EPOCH",
         "XDP_FLOW_SEQ",
+        "XDP_COOKIE_KEY",
     ] {
         loader.map_pin_path(name, Path::new(XDP_BPF_PIN_DIR).join(name));
     }
@@ -626,7 +635,7 @@ pub async fn attach(
         Some(path) => loader.load_file(path)?,
         None => loader.load(XDP_EBPF_EMBEDDED)?,
     };
-    audit_loaded_map_specs(&ebpf)?;
+    audit_loaded_map_specs(&ebpf, config)?;
     let (owner_epoch, imported_flows) = adopt_flow_state(&mut ebpf)?;
     sync_interface_policy(&mut ebpf, config)?;
     sync_local_ip_maps(&mut ebpf, config)?;
@@ -671,6 +680,13 @@ pub async fn attach(
         (8, "xdp_nat_tcp4_work"),
         (9, "xdp_nat_udp6_work"),
         (10, "xdp_nat_tcp6_work"),
+        // EN-14: challenge/splice worker — the stateless-cookie forge
+        // chain exceeds the 512B combined-stack budget inside the TCP4
+        // work program, so it runs behind its own tail call. A stale
+        // object without this program leaves the slot empty; the callers
+        // fail closed (counted drop) rather than forwarding unverified
+        // challenge traffic.
+        (11, "xdp_tcp4_challenge"),
     ] {
         let fd = match ebpf.program_mut(name) {
             Some(sub_program) => {
@@ -966,7 +982,9 @@ pub(crate) fn sum_percpu_counters<'a>(
             control_limited,
             nat_seq_rejected,
             service_limited,
-            svc_budget_full
+            svc_budget_full,
+            challenge_sent,
+            challenge_rejected
         );
     }
     total
@@ -1024,10 +1042,32 @@ pub fn sync_budget(ebpf: &mut aya::Ebpf, config: &XdpBudgetConfig) -> anyhow::Re
 /// Push the EN-09 pending admission contract. `max_pending` mirrors the
 /// pending table's map bound (the actual hard limit); `pending_ttl_ns` is
 /// the absolute half-open deadline enforced in the dataplane.
+/// EN-14: install the cookie key ring on first attach. The map is pinned so
+/// in-flight challenges survive a reload; an all-zero `cur` means "no key
+/// installed" and the dataplane fails challenged SYNs closed (counted).
+/// Rotation (cur->prev, fresh cur) is an explicit later API.
+pub fn sync_cookie_key(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
+    let map = ebpf.map_mut("XDP_COOKIE_KEY").ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing map XDP_COOKIE_KEY; eBPF object predates EN-14 cookie key ring (rebuild cloud-node-xdp-ebpf.o)"
+        )
+    })?;
+    let mut array = Array::<_, cloud_node_xdp_common::XdpCookieKey>::try_from(map)?;
+    let cur = array.get(&0, 0)?;
+    if cur.cur != [0u8; 16] {
+        return Ok(());
+    }
+    let mut key = cloud_node_xdp_common::XdpCookieKey::default();
+    key.cur = rand::random::<[u8; 16]>();
+    array.set(0, key, 0)?;
+    Ok(())
+}
+
 pub fn sync_pending_cap(
     ebpf: &mut aya::Ebpf,
     pending_ttl_ns: u64,
     flags: u64,
+    max_pending: u32,
 ) -> anyhow::Result<()> {
     let map = ebpf.map_mut("XDP_PENDING_CAP").ok_or_else(|| {
         anyhow::anyhow!(
@@ -1038,7 +1078,7 @@ pub fn sync_pending_cap(
     array.set(
         0,
         XdpPendingCap {
-            max_pending: 65_536,
+            max_pending: u64::from(max_pending),
             pending_ttl_ns,
             flags,
         },
@@ -1258,6 +1298,7 @@ fn sync_udp_forwards(
         ebpf,
         "XDP_UDP_FWD",
         "UDP",
+        false,
         config,
         dataplane_active,
         |iface| &iface.udp_forwards,
@@ -1275,6 +1316,7 @@ fn sync_tcp_forwards(
         ebpf,
         "XDP_TCP_FWD",
         "TCP",
+        true,
         config,
         dataplane_active,
         |iface| &iface.tcp_forwards,
@@ -1285,6 +1327,7 @@ fn sync_forward_map(
     ebpf: &mut aya::Ebpf,
     map_name: &str,
     proto: &str,
+    is_tcp: bool,
     config: &XdpConfig,
     dataplane_active: bool,
     forwards: impl Fn(
@@ -1307,7 +1350,7 @@ fn sync_forward_map(
     }
     for iface in &config.interfaces {
         for fwd in forwards(iface) {
-            match udp_forward_entry(fwd) {
+            match udp_forward_entry(fwd, is_tcp) {
                 Ok((key, rule)) => {
                     if let Err(err) = map.insert(key, rule, 0) {
                         tracing::warn!(
@@ -1334,6 +1377,7 @@ fn sync_forward_map(
 
 pub(super) fn udp_forward_entry(
     fwd: &crate::runtime_mode::XdpUdpForwardConfig,
+    is_tcp: bool,
 ) -> anyhow::Result<(XdpUdpFwdKey, XdpUdpFwdRule)> {
     use std::net::ToSocketAddrs;
     let backend = fwd
@@ -1370,6 +1414,14 @@ pub(super) fn udp_forward_entry(
         ),
         _ => unreachable!(),
     };
+    // EN-14 challenge gating is explicit: unsupported combinations fail the
+    // rule with a logged reason instead of silently downgrading to bounded
+    // admission on a service the operator believes is strongly validated.
+    if fwd.challenge {
+        anyhow::ensure!(is_tcp, "challenge is TCP-only (UDP rules ignore it)");
+        anyhow::ensure!(fwd.snat, "challenge requires snat (the splice needs observable backend replies)");
+        anyhow::ensure!(key.family == 4, "challenge is IPv4-only in this slice (IPv6 keeps bounded admission)");
+    }
     Ok((
         key,
         XdpUdpFwdRule {
@@ -1379,6 +1431,8 @@ pub(super) fn udp_forward_entry(
             family: key.family,
             snat: u8::from(fwd.snat),
             server_id: fwd.server_id,
+            challenge: u8::from(fwd.challenge && is_tcp),
+            ..Default::default()
         },
     ))
 }
@@ -1695,7 +1749,29 @@ fn clear_pinned_xsk_map() -> anyhow::Result<()> {
 /// aligned with the #[map] definitions in
 /// crates/cloud-node-xdp-ebpf/src/main.rs. LPM trie keys carry a
 /// 4-byte prefix length in front of the address.
-fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 35] {
+/// EN-16: `xdp.stateTables` overrides for the sizeable state maps. Returns
+/// the configured max_entries or `None` to keep the object's default.
+fn state_table_override(name: &str, config: &XdpConfig) -> Option<u32> {
+    let t = config.state_tables.as_ref()?;
+    match name {
+        "XDP_TCP_CT" | "XDP_UDP_CT" => t.ct_max_entries,
+        "XDP_PENDING" => t.pending_max_entries,
+        "XDP_SNAT_REV" => t.snat_rev_max_entries,
+        "XDP_FLOW_ACCT" => t.flow_acct_max_entries,
+        "XDP_RATE_V6" => t.rate_v6_max_entries,
+        "XDP_QUIC_DCID" => t.quic_dcid_max_entries,
+        "XDP_BLOCKED_V4" | "XDP_BLOCKED_V6" | "XDP_BLOCKED_V4_LPM"
+        | "XDP_BLOCKED_V6_LPM" => t.acl_blocked_max_entries,
+        "XDP_ALLOWED_V4" | "XDP_ALLOWED_V6" | "XDP_ALLOWED_V4_LPM"
+        | "XDP_ALLOWED_V6_LPM" => t.acl_allowed_max_entries,
+        "XDP_RATE_V4" => t.rate_v4_max_entries,
+        _ => None,
+    }
+}
+
+fn bpf_map_specs(
+    config: &XdpConfig,
+) -> [(&'static str, aya::maps::MapType, u32, u32, u32); 37] {
     use aya::maps::MapType;
     use cloud_node_xdp_common::*;
     use core::mem::size_of;
@@ -1708,7 +1784,7 @@ fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 35] {
     let fwd_rule = size_of::<XdpUdpFwdRule>() as u32;
     let ct_key = size_of::<XdpUdpCtKey>() as u32;
     let ct_value = size_of::<XdpUdpCtValue>() as u32;
-    [
+    let mut specs = [
         ("XDP_BLOCKED_V4", MapType::Hash, v4, rule, 262_144),
         ("XDP_BLOCKED_V6", MapType::Hash, v6, rule, 262_144),
         ("XDP_ALLOWED_V4", MapType::Hash, v4, rule, 65_536),
@@ -1822,6 +1898,13 @@ fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 35] {
             1,
         ),
         (
+            "XDP_COOKIE_KEY",
+            MapType::Array,
+            u,
+            size_of::<cloud_node_xdp_common::XdpCookieKey>() as u32,
+            1,
+        ),
+        (
             "XDP_SNAT_REV",
             MapType::Hash,
             size_of::<XdpSnatRevKey>() as u32,
@@ -1836,6 +1919,9 @@ fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 35] {
             1,
         ),
         ("XDP_DISPATCH", MapType::ProgramArray, u, u, 16),
+        // Compiler-generated constant pool (EN-14 cookie compare/MSS table):
+        // counted like every other map — it is kernel memory too.
+        (".rodata.cst16", MapType::Array, u, 16, 1),
         (
             "XDP_FLOW_ACCT",
             MapType::PerCpuHash,
@@ -1860,7 +1946,13 @@ fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 35] {
             size_of::<u64>() as u32,
             1,
         ),
-    ]
+    ];
+    for spec in specs.iter_mut() {
+        if let Some(max) = state_table_override(spec.0, config) {
+            spec.4 = max;
+        }
+    }
+    specs
 }
 
 /// EN-16 kernel-BPF ledger: worst-case pinned kernel memory for every map in
@@ -1868,13 +1960,13 @@ fn bpf_map_specs() -> [(&'static str, aya::maps::MapType, u32, u32, u32); 35] {
 /// bookkeeping (measured on kernel 7.0 within ~10% of memlock); per-CPU maps
 /// multiply the value by the possible-CPU count; LPM tries allocate lazily
 /// but are still bounded at their worst case.
-pub(crate) fn projected_bpf_map_bytes() -> u64 {
+pub(crate) fn projected_bpf_map_bytes(config: &XdpConfig) -> u64 {
     const HASH_ENTRY_OVERHEAD: u64 = 64;
     const LPM_ENTRY_OVERHEAD: u64 = 48;
     const ARRAY_ENTRY_OVERHEAD: u64 = 8;
     let ncpu = aya::util::nr_cpus().unwrap_or(1).max(1) as u64;
     let mut total = 0u64;
-    for (_name, ty, key, value, max_entries) in bpf_map_specs() {
+    for (_name, ty, key, value, max_entries) in bpf_map_specs(config) {
         let (k, v, n) = (u64::from(key), u64::from(value), u64::from(max_entries));
         let bytes = match ty {
             aya::maps::MapType::PerCpuArray | aya::maps::MapType::PerCpuHash => {
@@ -1896,8 +1988,8 @@ pub(crate) fn projected_bpf_map_bytes() -> u64 {
 /// Called before load: map memory is preallocated and non-reclaimable, so
 /// over-budget objects must fail attach explicitly rather than silently
 /// pinning unbounded kernel memory.
-fn ensure_bpf_map_budget() -> anyhow::Result<()> {
-    let projected = projected_bpf_map_bytes();
+fn ensure_bpf_map_budget(config: &XdpConfig) -> anyhow::Result<()> {
+    let projected = projected_bpf_map_bytes(config);
     let budget = crate::memory_governor::MEMORY_GOVERNOR
         .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
         .kernel_bpf_budget_bytes;
@@ -1912,8 +2004,8 @@ fn ensure_bpf_map_budget() -> anyhow::Result<()> {
 /// covered by the ledger spec table. A map added to the eBPF object without a
 /// matching spec entry would silently pin kernel memory outside the budget —
 /// refuse to attach instead.
-fn audit_loaded_map_specs(ebpf: &aya::Ebpf) -> anyhow::Result<()> {
-    let specs = bpf_map_specs();
+fn audit_loaded_map_specs(ebpf: &aya::Ebpf, config: &XdpConfig) -> anyhow::Result<()> {
+    let specs = bpf_map_specs(config);
     for (name, map) in ebpf.maps() {
         let data = match map {
             aya::maps::Map::Array(d)
@@ -2040,8 +2132,8 @@ pub fn open_pinned_flow_events() -> anyhow::Result<Option<aya::maps::RingBuf<aya
         .map_err(|err| anyhow::anyhow!("pinned XDP_FLOW_EVENTS is not a ring buffer: {err}"))
 }
 
-fn drop_stale_pinned_maps() {
-    let specs = bpf_map_specs();
+fn drop_stale_pinned_maps(config: &XdpConfig) {
+    let specs = bpf_map_specs(config);
 
     let Ok(dir) = std::fs::read_dir(XDP_BPF_PIN_DIR) else {
         return;

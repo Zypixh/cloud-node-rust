@@ -174,6 +174,13 @@ pub struct XdpStatusSnapshot {
     /// XDP_SVC_BUDGET is at capacity (aggregate dim1 envelope still applies).
     #[serde(default)]
     pub svc_budget_full: u64,
+    /// EN-14: stateless challenge SYN-ACKs emitted (dim3-gated).
+    #[serde(default)]
+    pub challenge_sent: u64,
+    /// EN-14: challenge responses/cookie ACKs rejected (budget, no key,
+    /// bad cookie) — explicit fail-closed accounting.
+    #[serde(default)]
+    pub challenge_rejected: u64,
     /// EN-10: lifecycle events dropped in-kernel because XDP_FLOW_EVENTS was
     /// full (consumer too slow). Feedback is advisory — loss never blocks or
     /// alters the dataplane, but is always accounted.
@@ -284,6 +291,8 @@ pub(crate) struct XdpManager {
     nat_seq_rejected: AtomicU64,
     service_limited: AtomicU64,
     svc_budget_full: AtomicU64,
+    challenge_sent: AtomicU64,
+    challenge_rejected: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     /// EN-10: owner generation written to XDP_OWNER_EPOCH at attach.
@@ -384,6 +393,8 @@ impl XdpManager {
             nat_seq_rejected: AtomicU64::new(0),
             service_limited: AtomicU64::new(0),
             svc_budget_full: AtomicU64::new(0),
+            challenge_sent: AtomicU64::new(0),
+            challenge_rejected: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             owner_epoch: AtomicU64::new(0),
@@ -471,6 +482,9 @@ impl XdpManager {
                     // sweep tick, so test-only fault flags written through
                     // the map are not clobbered between sweeps.
                     self.sync_pending_cap();
+                    // EN-14: populate the pinned cookie key ring on first
+                    // attach (no-op when a generation already holds a key).
+                    self.sync_cookie_key();
                     // New attach generation: queue withdrawals applied to
                     // the previous socket set must not leak into this
                     // generation's index sync — fresh sockets get fresh
@@ -1065,6 +1079,8 @@ impl XdpManager {
             nat_seq_rejected: self.nat_seq_rejected.load(Ordering::Relaxed),
             service_limited: self.service_limited.load(Ordering::Relaxed),
             svc_budget_full: self.svc_budget_full.load(Ordering::Relaxed),
+            challenge_sent: self.challenge_sent.load(Ordering::Relaxed),
+            challenge_rejected: self.challenge_rejected.load(Ordering::Relaxed),
             flow_event_lost: self.flow_event_lost.load(Ordering::Relaxed),
             flow_events_received: self.flow_events_received.load(Ordering::Relaxed),
             flow_events_stale: self.flow_events_stale.load(Ordering::Relaxed),
@@ -1454,15 +1470,35 @@ impl XdpManager {
             unverified_pps: share(base.unverified_pps),
             new_flow_per_sec: share(base.new_flow_per_sec),
             xsk_redirect_pps: share(base.xsk_redirect_pps),
-            challenge_pps: 0,
+            // dim3 challenge responses: bounded like the new-flow
+            // envelope (default) — forged-packet egress stays capped
+            // under SYN flood; override via budget.challengePps.
+            challenge_pps: share(base.challenge_pps.unwrap_or(base.new_flow_per_sec)),
             verified_pps: share(base.verified_pps),
             control_pps: share(base.control_pps),
             service_flow_pps: share(service_flow_pps),
             window_ns: base.window_ms.saturating_mul(1_000_000),
             // dim0 unverified | dim1 new-flow | dim2 xsk-redirect |
-            // dim4 verified | dim5 control | dim6 per-service —
-            // all fail-closed counted.
-            flags: 0b111_0111,
+            // dim3 challenge | dim4 verified | dim5 control |
+            // dim6 per-service — all fail-closed counted.
+            flags: 0b111_1111,
+        }
+    }
+
+    /// EN-14: install the cookie key ring if the pinned map has none.
+    fn sync_cookie_key(&self) {
+        #[cfg(target_os = "linux")]
+        let result = {
+            let mut ebpf = self.ebpf.lock();
+            match ebpf.as_mut() {
+                Some(ebpf) => linux::sync_cookie_key(ebpf),
+                None => return,
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let result: anyhow::Result<()> = Ok(());
+        if let Err(err) = result {
+            tracing::warn!("XDP cookie key install unavailable: {err}");
         }
     }
 
@@ -1503,11 +1539,20 @@ impl XdpManager {
             .as_ref()
             .map(|a| a.debug_fail_flags)
             .unwrap_or(0);
+        // EN-16: the admission cap tracks the configured pending-table size
+        // so the eBPF bound and the pinned map never disagree.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let max_pending = self
+            .config
+            .state_tables
+            .as_ref()
+            .and_then(|t| t.pending_max_entries)
+            .unwrap_or(65_536);
         #[cfg(target_os = "linux")]
         let result = {
             let mut ebpf = self.ebpf.lock();
             match ebpf.as_mut() {
-                Some(ebpf) => linux::sync_pending_cap(ebpf, ttl_ns, flags),
+                Some(ebpf) => linux::sync_pending_cap(ebpf, ttl_ns, flags, max_pending),
                 None => return,
             }
         };
@@ -1692,7 +1737,7 @@ impl XdpManager {
     /// maps (0 on non-Linux where no eBPF object is loaded).
     #[cfg(target_os = "linux")]
     fn bpf_map_projected_bytes(&self) -> u64 {
-        linux::projected_bpf_map_bytes()
+        linux::projected_bpf_map_bytes(&self.config)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1784,6 +1829,10 @@ impl XdpManager {
                     .store(counters.service_limited, Ordering::Relaxed);
                 self.svc_budget_full
                     .store(counters.svc_budget_full, Ordering::Relaxed);
+                self.challenge_sent
+                    .store(counters.challenge_sent, Ordering::Relaxed);
+                self.challenge_rejected
+                    .store(counters.challenge_rejected, Ordering::Relaxed);
                 self.flow_event_lost
                     .store(counters.flow_event_lost, Ordering::Relaxed);
             }
@@ -1861,6 +1910,8 @@ impl XdpManager {
                     "natSeqRejected": c.nat_seq_rejected,
                     "serviceLimited": c.service_limited,
                     "svcBudgetFull": c.svc_budget_full,
+                    "challengeSent": c.challenge_sent,
+                    "challengeRejected": c.challenge_rejected,
                     "flowEventLost": c.flow_event_lost,
                 })
             })

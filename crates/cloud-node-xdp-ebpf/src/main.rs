@@ -3,7 +3,10 @@
 
 use aya_ebpf::{
     bindings::xdp_action,
-    helpers::{bpf_csum_diff, bpf_get_prandom_u32, bpf_ktime_get_ns},
+    helpers::{
+        bpf_csum_diff, bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_xdp_adjust_tail,
+        bpf_xdp_load_bytes, bpf_xdp_store_bytes,
+    },
     macros::{map, xdp},
     maps::{
         Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, ProgramArray, RingBuf, XskMap,
@@ -18,8 +21,10 @@ use cloud_node_xdp_common::{
     XDP_FLOW_EVENT_EXPIRED, XDP_FLOW_EVENT_REJECTED, XDP_FLOW_EVENT_VALIDATED, XDP_FRAGMENT_DROP,
     XDP_FRAGMENT_PASS, XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS, XDP_LOCAL_PRESENT,
     XDP_LOCAL_REDIRECT, XDP_PENDING_CAP_FAIL_CT_INSERT, XDP_PENDING_CAP_FAIL_PENDING_INSERT,
+    XDP_SPLICE_DONE, XDP_SPLICE_NONE, XDP_SPLICE_WAIT,
     XDP_PENDING_CAP_FAIL_SNAT_ALLOC, XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN, XdpBudgetBucket,
-    XdpBudgetConfig, XdpCounters, XdpSvcBucket, XdpFlowAcct, XdpFlowEvent, XdpInterfacePolicy, XdpIpv4Key,
+    XdpBudgetConfig, XdpCookieKey, XdpCounters, XdpFlowAcct, XdpFlowEvent, XdpInterfacePolicy,
+    XdpIpv4Key, XdpSvcBucket,
     XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey, XdpQueueKey,
     XdpQuicDcidKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
     XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
@@ -147,6 +152,14 @@ static XDP_BUDGET: PerCpuArray<XdpBudgetBucket> =
 static XDP_SVC_BUDGET: PerCpuHashMap<u32, XdpSvcBucket> =
     PerCpuHashMap::<u32, XdpSvcBucket>::with_max_entries(256, 0);
 
+/// EN-14 (ADR-001): TCP cookie challenge key ring. Userspace writes a
+/// random {cur, prev} pair at attach; `cur` signs new challenges and both
+/// validate ACKs so one rotation never invalidates in-flight handshakes.
+/// An all-zero key means "no challenge capability" — challenged rules
+/// fail closed (counted) rather than silently forwarding unverified SYNs.
+#[map(name = "XDP_COOKIE_KEY")]
+static XDP_COOKIE_KEY: Array<XdpCookieKey> = Array::<XdpCookieKey>::with_max_entries(1, 0);
+
 #[map(name = "XDP_QUIC_DCID")]
 static XDP_QUIC_DCID: HashMap<XdpQuicDcidKey, u32> =
     HashMap::<XdpQuicDcidKey, u32>::with_max_entries(131_072, 0);
@@ -248,6 +261,32 @@ struct NatScratch {
     /// points — the per-CPU scratch read keeps fault-injection checks a
     /// plain load instead of a map lookup per call site.
     debug_flags: u64,
+    /// EN-14 forged-packet staging (mirror of the shared NatScratch tail).
+    forge_seq: u32,
+    forge_ack: u32,
+    forge_mss: u16,
+    forge_flags: u8,
+    forge_pad0: u8,
+    forge_win: u16,
+    forge_src_port: u16,
+    forge_next_hop: [u8; 6],
+    forge_pad1: [u8; 2],
+    forge_incarnation: u32,
+    /// Worker opcode for the slot-11 program: 0 = challenge, 1 = splice.
+    forge_op: u8,
+    forge_pad4: u8,
+    forge_pad5: u16,
+    /// Forward-rule server_id parked before the challenge tail call —
+    /// full i64 width, matching XdpUdpFwdRule::server_id.
+    forge_server_id: i64,
+    /// EN-14: forged IPv4/TCP header staging buffers — kept in the
+    /// per-CPU scratch map value so the challenge -> forge call chain
+    /// stays under the 512-byte combined-stack verifier limit.
+    forge_ipb: [u8; 20],
+    forge_tb: [u8; 24],
+    /// Transient copies of the original addrs/ports while building.
+    forge_tmp: [u8; 8],
+    forge_pad3: u32,
 }
 
 #[map(name = "XDP_NAT_SCRATCH")]
@@ -273,6 +312,19 @@ const XDP_DISPATCH_NAT_UDP4_WORK: u32 = 7;
 const XDP_DISPATCH_NAT_TCP4_WORK: u32 = 8;
 const XDP_DISPATCH_NAT_UDP6_WORK: u32 = 9;
 const XDP_DISPATCH_NAT_TCP6_WORK: u32 = 10;
+/// EN-14: challenge/splice worker. The stateless-cookie path's combined
+/// stack (parse -> NAT -> challenge -> forge) exceeded the 512-byte
+/// verifier limit even with scratch staging, so the heavyweight part runs
+/// as its own program reached by tail call — the call boundary resets the
+/// stack budget. All cross-program state is parked in NatScratch.
+const XDP_DISPATCH_TCP4_CHALLENGE: u32 = 11;
+/// forge_op values staged in NatScratch. The tail call itself must happen
+/// at program scope — kernel 6.1 rejects tail_call inside bpf2bpf subprogs
+/// without BTF — so the deep call sites park the opcode and return None;
+/// try_nat_tcp4_work clears it per packet and dispatches afterwards.
+const XDP_FORGE_OP_NONE: u8 = 0;
+const XDP_FORGE_OP_CHALLENGE: u8 = 1;
+const XDP_FORGE_OP_SPLICE: u8 = 2;
 
 #[inline(always)]
 fn nat_scratch() -> Result<*mut NatScratch, ()> {
@@ -531,6 +583,44 @@ pub fn xdp_nat_udp6_fwd(ctx: XdpContext) -> u32 {
     }
 }
 
+/// EN-14 challenge/splice worker (dispatch slot 11). Reached only by tail
+/// call from try_tcp_nat_v4's challenged-rule branches; the parked work
+/// context plus forge_* scratch fields carry everything the call site
+/// could not keep in registers. A `None` from the worker helper means
+/// "not ours" — resolved through the same redirect fallback the TCP4 work
+/// program uses, so semantics match the pre-split call chain exactly.
+#[xdp]
+pub fn xdp_tcp4_challenge(ctx: XdpContext) -> u32 {
+    match try_tcp4_challenge(&ctx) {
+        Ok(action) => {
+            count_action(action);
+            action
+        }
+        Err(_) => {
+            counter_parse_error();
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+fn try_tcp4_challenge(ctx: &XdpContext) -> Result<u32, ()> {
+    let (ip_offset, l4_offset, _, local_flags, proto, ifindex) = work_ctx()?;
+    let scratch = nat_scratch()?;
+    let op = unsafe { (*scratch).forge_op };
+    let action = if op == XDP_FORGE_OP_SPLICE {
+        tcp_splice_anchor_v4(ctx, scratch, ip_offset | l4_offset << 16)?
+    } else {
+        tcp_challenge_v4(ctx, scratch, ip_offset, l4_offset)?
+    };
+    match action {
+        Some(a) => Ok(a),
+        None => {
+            let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
+            Ok(maybe_redirect_scratch(ctx, policy, local_flags, proto, l4_offset))
+        }
+    }
+}
+
 fn try_nat_tcp_dispatch(ctx: &XdpContext) -> Result<u32, ()> {
     let (_, ip_offset, proto, l4_offset, packet_len, ifindex, policy, local_flags) =
         parse_frame::<4>(ctx)?;
@@ -559,8 +649,22 @@ fn try_nat_tcp4_work(ctx: &XdpContext) -> Result<u32, ()> {
     let (ip_offset, l4_offset, packet_len, local_flags, proto, ifindex) = work_ctx()?;
     let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
     let now_ns = unsafe { bpf_ktime_get_ns() };
+    let scratch = nat_scratch()?;
+    unsafe { (*scratch).forge_op = XDP_FORGE_OP_NONE };
     if let Some(action) = try_tcp_nat_v4(ctx, ip_offset, l4_offset, packet_len, now_ns)? {
         return Ok(action);
+    }
+    // EN-14: the challenged-rule branches parked a worker opcode in
+    // scratch and returned None; the tail call must live at program scope
+    // (kernel rejects tail_call inside bpf2bpf subprogs without BTF).
+    if unsafe { (*scratch).forge_op } != XDP_FORGE_OP_NONE {
+        unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_TCP4_CHALLENGE) };
+        // Slot empty (stale object): fail closed and counted — an
+        // unverified packet on a challenged rule never enters the
+        // normal path; for the splice op the backend retransmits and
+        // re-enters the anchor once a slot-11 program exists.
+        counter_challenge_rejected();
+        return Ok(xdp_action::XDP_DROP);
     }
     Ok(maybe_redirect_scratch(
         ctx,
@@ -967,6 +1071,29 @@ fn stash_work_ctx(
     }
 }
 
+/// Re-bind parked worker offsets at the point of use. Returns CLAMPED
+/// values rather than checking: with no preceding range proof the min()
+/// is a real ALU select LLVM cannot fold, so the bounded SSA value is
+/// what gets spilled/passed onward — a bare `x > K` check fails here
+/// because LLVM can spill the pre-check argument and the reload arrives
+/// unbounded at packet-pointer arithmetic (observed on kernel 6.1). The
+/// bounds differ so `(a|b) > K` merging cannot produce a single compare
+/// the verifier cannot decompose. Real parked offsets are far below the
+/// bounds, so clamping is identity on every real input; a hypothetical
+/// corrupt scratch entry degrades to a bounded in-range read that fails
+/// parsing downstream instead of an unverifiable access.
+#[inline(always)]
+fn bound_work_offsets(ip_offset: usize, l4_offset: usize) -> (usize, usize) {
+    // AND-mask rather than min()/compare: a comparison only narrows the
+    // register on one branch path and a min() may be folded when LLVM
+    // already carries a range for the argument — while the verifier can
+    // still see an unbounded spill slot from before the bound (kernel
+    // 6.1 keeps the store-time type). The AND is a single ALU op that
+    // always executes, cannot fold away for unbounded inputs, and leaves
+    // every downstream spill holding a verifier-visible umax<=0x7ff.
+    (ip_offset & 0x7ff, l4_offset & 0x7ff)
+}
+
 /// Read back the worker context parked by `stash_work_ctx`. Offsets arrive as
 /// unbounded scalars; every packet access in the worker re-checks bounds via
 /// `ptr_at`/`ptr_at_mut`, so no verifier provenance is needed here.
@@ -974,14 +1101,18 @@ fn stash_work_ctx(
 fn work_ctx() -> Result<(usize, usize, u64, u32, u8, u32), ()> {
     let scratch = nat_scratch()?;
     unsafe {
-        let ip_offset = (*scratch).work_ip_off as usize;
-        let l4_offset = (*scratch).redir_l4off as usize;
-        // Bound the scalars before they meet packet pointers: a full-width
-        // u32/u16 range defeats the verifier's variable-offset tracking, and
-        // every real offset is under a few hundred bytes anyway.
-        if ip_offset > 2048 || l4_offset > 2048 {
-            return Err(());
-        }
+        // Mask (not min/check): the AND produces a bounded SSA value in a
+        // single ALU op that LLVM cannot fold, and after it executes the
+        // raw load is dead — so any defensive spill/reload anywhere
+        // downstream carries a verifier-visible umax<=0x7ff. A conditional
+        // clamp fails on strict kernels: the pre-clamp value may be
+        // spilled before the bound runs and the slot's tracked type is
+        // fixed at store time (observed on kernel 6.1). Parked offsets
+        // always describe the current frame (<~200B) so masking is a
+        // no-op on every real value; a corrupt scratch entry wraps to a
+        // bounded in-range offset that fails parsing downstream.
+        let ip_offset = ((*scratch).work_ip_off as usize) & 0x7ff;
+        let l4_offset = ((*scratch).redir_l4off as usize) & 0x7ff;
         Ok((
             ip_offset,
             l4_offset,
@@ -1384,7 +1515,9 @@ fn maybe_redirect(
         (
             (*scratch).redir_flags,
             (*scratch).redir_proto,
-            (*scratch).redir_l4off as usize,
+            // Mask at the load site so the raw map value is dead before any
+            // defensive spill — the >512 check below then decides explicitly.
+            ((*scratch).redir_l4off as usize) & 0x7ff,
         )
     };
     // A map-loaded scalar has no verifier range; bound it before it becomes a
@@ -1581,7 +1714,9 @@ fn rate_limited_v6(
         return false;
     };
     let protocol = (meta & 0xff) as u8;
-    let l4_offset = (meta >> 8) as usize;
+    // Bound the packed offset before it is added to a packet pointer — an
+    // unbounded variable offset defeats the verifier's range tracking.
+    let l4_offset = ((meta >> 8) & 0x3fff) as usize;
     let limit = match protocol {
         value if value == IpProto::Udp as u8 => cfg.udp_pps,
         value if value == IpProto::Tcp as u8 => {
@@ -2053,6 +2188,7 @@ fn try_udp_nat_v4(
     packet_len: u64,
     now_mono_ns: u64,
 ) -> Result<Option<u32>, ()> {
+    let (ip_offset, l4_offset) = bound_work_offsets(ip_offset, l4_offset);
     let udp = ptr_at::<UdpHdr>(ctx, l4_offset)?;
     let src_port = unsafe { u16::from_ne_bytes((*udp).src) };
     let dst_port = unsafe { u16::from_ne_bytes((*udp).dst) };
@@ -2138,7 +2274,7 @@ fn try_udp_nat_v4(
         k.snat_port_be = dst_port;
         k.proto = 17;
         k.family = 4;
-        k._pad = [0; 3];
+        k._pad = [0; 4];
     }
     if snat_rev_lookup(scratch)
         && unsafe {
@@ -2335,7 +2471,7 @@ fn try_udp_nat_v4(
                 k.snat_port_be = 0;
                 k.proto = 17;
                 k.family = 4;
-                k._pad = [0; 3];
+                k._pad = [0; 4];
             }
             snat_prefill(scratch, client_mac, rule.server_id);
             match snat_alloc(scratch, &XDP_UDP_FWD) {
@@ -2453,6 +2589,7 @@ fn try_udp_nat_v6(
     packet_len: u64,
     now_mono_ns: u64,
 ) -> Result<Option<u32>, ()> {
+    let (ip_offset, l4_offset) = bound_work_offsets(ip_offset, l4_offset);
     let udp = ptr_at::<UdpHdr>(ctx, l4_offset)?;
     let src_port = unsafe { u16::from_ne_bytes((*udp).src) };
     let dst_port = unsafe { u16::from_ne_bytes((*udp).dst) };
@@ -2516,7 +2653,7 @@ fn try_udp_nat_v6(
         k.snat_port_be = dst_port;
         k.proto = 17;
         k.family = 6;
-        k._pad = [0; 3];
+        k._pad = [0; 4];
     }
     if snat_rev_lookup(scratch)
         && unsafe {
@@ -2617,6 +2754,7 @@ fn try_udp_nat_v6_fwd(
     packet_len: u64,
     now_mono_ns: u64,
 ) -> Result<Option<u32>, ()> {
+    let (ip_offset, l4_offset) = bound_work_offsets(ip_offset, l4_offset);
     let udp = ptr_at::<UdpHdr>(ctx, l4_offset)?;
     let src_port = unsafe { u16::from_ne_bytes((*udp).src) };
     let dst_port = unsafe { u16::from_ne_bytes((*udp).dst) };
@@ -2703,7 +2841,7 @@ fn try_udp_nat_v6_fwd(
                 k.snat_port_be = 0;
                 k.proto = 17;
                 k.family = 6;
-                k._pad = [0; 3];
+                k._pad = [0; 4];
             }
             snat_prefill(scratch, client_mac, rule.server_id);
             match snat_alloc(scratch, &XDP_UDP_FWD) {
@@ -2876,6 +3014,7 @@ fn try_tcp_nat_v4(
     packet_len: u64,
     now_mono_ns: u64,
 ) -> Result<Option<u32>, ()> {
+    let (ip_offset, l4_offset) = bound_work_offsets(ip_offset, l4_offset);
     let tcp = ptr_at::<TcpHdr>(ctx, l4_offset)?;
     let src_port = unsafe { u16::from_ne_bytes((*tcp).source) };
     let dst_port = unsafe { u16::from_ne_bytes((*tcp).dest) };
@@ -2980,7 +3119,7 @@ fn try_tcp_nat_v4(
         k.snat_port_be = dst_port;
         k.proto = 6;
         k.family = 4;
-        k._pad = [0; 3];
+        k._pad = [0; 4];
     }
     if snat_rev_lookup(scratch)
         && unsafe {
@@ -3012,6 +3151,34 @@ fn try_tcp_nat_v4(
             k.backend_port_be = rv.backend_port_be;
             k.family = 4;
             k.proto = 6;
+        }
+        // EN-14 splice gate — checked BEFORE the client-directed rewrite:
+        // the slot-11 anchor worker forges the handshake-completing ACK on
+        // the ORIGINAL backend-directed frame, whose eth.src is the
+        // backend next-hop MAC and whose ip.dst is the VIP. After the
+        // rewrite below both would already point at the client and the
+        // forged ACK would carry the client address as its source.
+        if let Some(ct) = XDP_TCP_CT
+            .get_ptr_mut(unsafe { &(*scratch).ct_key })
+            .or_else(|| XDP_PENDING.get_ptr_mut(unsafe { &(*scratch).ct_key }))
+        {
+            // SAFETY: pointer into the map value for `ct_key`.
+            let ct = unsafe { &mut *ct };
+            if (ct.state == XDP_CT_STATE_PENDING
+                || ct.state == XDP_CT_STATE_PENDING_ACKED)
+                && ct.splice_state == XDP_SPLICE_WAIT
+                && syn && ack && ackno == ct.expect_seq
+            {
+                // Backend SYN-ACK anchors the splice — stage the wire seq
+                // (b_isn) and hand off to the slot-11 worker via the
+                // program-scope tail call in try_nat_tcp4_work. The worker
+                // re-looks-up the record and re-checks the splice gate.
+                unsafe {
+                    (*scratch).forge_seq = seq;
+                    (*scratch).forge_op = XDP_FORGE_OP_SPLICE;
+                }
+                return Ok(None);
+            }
         }
         // Source becomes the listen tuple the client originally dialed.
         unsafe {
@@ -3072,7 +3239,24 @@ fn try_tcp_nat_v4(
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
             if ct.state == XDP_CT_STATE_PENDING || ct.state == XDP_CT_STATE_PENDING_ACKED {
-                if syn && ack && ackno == ct.expect_seq {
+                if ct.splice_state == XDP_SPLICE_WAIT {
+                    // EN-14: backend SYN-ACK anchors the splice — consume it
+                    // and answer the backend handshake; any other backend
+                    // packet (e.g. RST refusing the replay) falls through to
+                    // the normal rewrite so the client sees the refusal.
+                    if syn && ack && ackno == ct.expect_seq {
+                        // Stage the wire seq (b_isn) and hand off to the
+                        // slot-11 worker via the program-scope tail call
+                        // in try_nat_tcp4_work (subprog tail calls are
+                        // rejected without BTF). The worker re-looks-up
+                        // the record and re-checks the splice gate.
+                        unsafe {
+                            (*scratch).forge_seq = seq;
+                            (*scratch).forge_op = XDP_FORGE_OP_SPLICE;
+                        }
+                        return Ok(None);
+                    }
+                } else if syn && ack && ackno == ct.expect_seq {
                     ct.state = XDP_CT_STATE_PENDING_ACKED;
                     ct.expect_ack = seq.wrapping_add(1);
                 }
@@ -3084,6 +3268,10 @@ fn try_tcp_nat_v4(
                 if closing && ct.state == XDP_CT_STATE_OPEN {
                     ct.state = XDP_CT_STATE_CLOSING;
                     emit_flow_event(ct, XDP_FLOW_EVENT_CLOSED, XDP_DECISION_PASS, now_mono_ns);
+                }
+                // EN-14 splice: backend seq space -> challenge seq space.
+                if ct.splice_state == XDP_SPLICE_DONE {
+                    tcp_patch_u32(ctx, l4_offset, 4, seq.wrapping_add(ct.seq_delta as u32))?;
                 }
             }
         }
@@ -3125,6 +3313,7 @@ fn try_tcp_nat_v4(
         k.proto = 6;
     }
     let mut snat_port = 0u16;
+    let mut splice_delta = 0i32;
     match XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         Some(ct) => {
             // SAFETY: pointer into the map value for `ct_key`.
@@ -3151,6 +3340,11 @@ fn try_tcp_nat_v4(
             }
             // Flows established before SNAT was configured keep plain DNAT.
             snat_port = ct.snat_port_be;
+            // EN-14 splice: client ACK numbers live in challenge space —
+            // translate to backend space on the wire.
+            if ct.splice_state == XDP_SPLICE_DONE && ack {
+                splice_delta = ct.seq_delta;
+            }
         }
         None => {
             // EN-09: consult the bounded half-open table before treating the
@@ -3173,7 +3367,29 @@ fn try_tcp_nat_v4(
             }
             if pend == PENDING_ALIVE {
                 snat_port = pending_port;
+            } else if pend == PENDING_SPLICING {
+                // Post-cookie splice in flight (backend handshake not yet
+                // anchored): consume client packets — forwarding them would
+                // reach a SYN-RECV backend with un-anchored sequence space.
+                return Ok(Some(xdp_action::XDP_DROP));
             } else {
+                if rule.challenge != 0 && rule.snat != 0 {
+                    // EN-14 stateless challenge path (ADR-001): state is
+                    // created only after cookie proof in the worker. The
+                    // heavyweight forge chain runs in the slot-11 program
+                    // (512B stack budget); rule fields it needs are parked
+                    // in scratch because map pointers cannot cross the
+                    // tail-call boundary. The opcode + None return hands
+                    // dispatch to the program-scope tail call in
+                    // try_nat_tcp4_work.
+                    unsafe {
+                        (*scratch).forge_incarnation = incarnation;
+                        (*scratch).forge_server_id = rule.server_id;
+                        (*scratch).forge_next_hop = rule.next_hop_mac;
+                        (*scratch).forge_op = XDP_FORGE_OP_CHALLENGE;
+                    }
+                    return Ok(None);
+                }
                 if !(syn && !ack) {
                     return Ok(None);
                 }
@@ -3212,7 +3428,7 @@ fn try_tcp_nat_v4(
                         k.snat_port_be = 0;
                         k.proto = 6;
                         k.family = 4;
-                        k._pad = [0; 3];
+                        k._pad = [0; 4];
                     }
                     snat_prefill(scratch, client_mac, rule.server_id);
                     match snat_alloc(scratch, &XDP_TCP_FWD) {
@@ -3306,6 +3522,9 @@ fn try_tcp_nat_v4(
             snat_port,
         )?;
     }
+    if splice_delta != 0 {
+        tcp_patch_u32(ctx, l4_offset, 8, ackno.wrapping_sub(splice_delta as u32))?;
+    }
     eth_rewrite(ctx, rule.next_hop_mac)?;
     acct_flow(
         unsafe { &(*scratch).ct_key },
@@ -3327,6 +3546,7 @@ fn try_tcp_nat_v6(
     packet_len: u64,
     now_mono_ns: u64,
 ) -> Result<Option<u32>, ()> {
+    let (ip_offset, l4_offset) = bound_work_offsets(ip_offset, l4_offset);
     let tcp = ptr_at::<TcpHdr>(ctx, l4_offset)?;
     let src_port = unsafe { u16::from_ne_bytes((*tcp).source) };
     let dst_port = unsafe { u16::from_ne_bytes((*tcp).dest) };
@@ -3414,7 +3634,7 @@ fn try_tcp_nat_v6(
         k.snat_port_be = dst_port;
         k.proto = 6;
         k.family = 6;
-        k._pad = [0; 3];
+        k._pad = [0; 4];
     }
     if snat_rev_lookup(scratch)
         && unsafe {
@@ -3529,6 +3749,7 @@ fn try_tcp_nat_v6_fwd(
     packet_len: u64,
     now_mono_ns: u64,
 ) -> Result<Option<u32>, ()> {
+    let (ip_offset, l4_offset) = bound_work_offsets(ip_offset, l4_offset);
     let tcp = ptr_at::<TcpHdr>(ctx, l4_offset)?;
     let src_port = unsafe { u16::from_ne_bytes((*tcp).source) };
     let dst_port = unsafe { u16::from_ne_bytes((*tcp).dest) };
@@ -3642,7 +3863,7 @@ fn try_tcp_nat_v6_fwd(
                         k.snat_port_be = 0;
                         k.proto = 6;
                         k.family = 6;
-                        k._pad = [0; 3];
+                        k._pad = [0; 4];
                     }
                     snat_prefill(scratch, client_mac, rule.server_id);
                     match snat_alloc(scratch, &XDP_TCP_FWD) {
@@ -4101,6 +4322,7 @@ fn budget_charge(dim: usize, now_mono_ns: u64) -> bool {
         0 => (cfg.unverified_pps, cfg.flags & 1 != 0),
         1 => (cfg.new_flow_per_sec, cfg.flags & 2 != 0),
         2 => (cfg.xsk_redirect_pps, cfg.flags & 4 != 0),
+        3 => (cfg.challenge_pps, cfg.flags & 8 != 0),
         4 => (cfg.verified_pps, cfg.flags & 0x10 != 0),
         5 => (cfg.control_pps, cfg.flags & 0x20 != 0),
         _ => return true,
@@ -4164,6 +4386,10 @@ const PENDING_ALIVE: u8 = 1;
 /// EN-11: live pending entry owns this tuple for a different listen (VIP)
 /// tuple — the caller rejects explicitly (multi-VIP same-backend ambiguity).
 const PENDING_CONFLICT: u8 = 2;
+/// EN-14: tuple is a post-cookie splice in flight (backend handshake not
+/// anchored yet). The caller must consume the packet — forwarding it to a
+/// SYN-RECV backend would race the replayed handshake.
+const PENDING_SPLICING: u8 = 3;
 
 #[inline(always)]
 fn pending_cap_flags() -> u64 {
@@ -4265,7 +4491,7 @@ fn pending_touch(
                 snat_port_be: p.snat_port_be,
                 proto: 6,
                 family: p.family,
-                _pad: [0; 3],
+                _pad: [0; 4],
             };
             let _ = XDP_SNAT_REV.remove(&rk);
         }
@@ -4286,6 +4512,14 @@ fn pending_touch(
             now_mono_ns,
         );
         return pending_pack(PENDING_CONFLICT, 0, 0);
+    }
+    // EN-14: a post-cookie splice entry is not promotable by client ACKs —
+    // promotion is driven by the consumed backend SYN-ACK on the reply
+    // path. Client packets arriving while the splice is in flight are
+    // consumed (PENDING_SPLICING): forwarding them would reach a backend
+    // still in SYN-RECV with un-anchored sequence numbers.
+    if p.splice_state != XDP_SPLICE_NONE {
+        return pending_pack(PENDING_SPLICING, 0, p.snat_port_be);
     }
     let port = p.snat_port_be;
     // Handshake-evidence promotion: SNAT flows require the observed backend
@@ -4353,6 +4587,764 @@ fn pending_touch(
 #[inline(always)]
 fn pending_pack(state: u8, incarnation: u32, port: u16) -> u64 {
     state as u64 | (incarnation as u64) << 8 | (port as u64) << 40
+}
+
+// ---------------------------------------------------------------------------
+// EN-14 (ADR-001): TCP cookie challenge + sequence splice for SNAT forwards.
+// A challenged rule never creates state for an unverified SYN: the node
+// answers a SYN-ACK whose ISN is a keyed cookie, and only the client's
+// proving ACK (ack == cookie+1) allocates pending/SNAT resources, replays
+// the SYN to the backend, and anchors the seq delta once the backend's
+// SYN-ACK arrives. All forgery rewrites the ingress frame in place and
+// retransmits it with XDP_TX — every builder bounds-checks before writing.
+// ---------------------------------------------------------------------------
+
+/// Kernel-compatible MSS index table: the 3 low cookie bits carry the
+/// negotiated MSS so the SYN replay can re-offer it without state.
+const MSS_TAB: [u16; 8] = [536, 1300, 1440, 1460, 4310, 8960, 9000, 65535];
+
+#[inline(always)]
+fn sipround(v: &mut [u64; 4]) {
+    v[0] = v[0].wrapping_add(v[1]);
+    v[1] = v[1].rotate_left(13);
+    v[1] ^= v[0];
+    v[0] = v[0].rotate_left(32);
+    v[2] = v[2].wrapping_add(v[3]);
+    v[3] = v[3].rotate_left(16);
+    v[3] ^= v[2];
+    v[0] = v[0].wrapping_add(v[3]);
+    v[3] = v[3].rotate_left(21);
+    v[3] ^= v[0];
+    v[2] = v[2].wrapping_add(v[1]);
+    v[1] = v[1].rotate_left(17);
+    v[1] ^= v[2];
+    v[2] = v[2].rotate_left(32);
+}
+
+/// SipHash-2-4 over exactly 16 bytes of input — the standard keyed hash
+/// (not a novel construction), chosen for ~64 straight-line instructions.
+#[inline(never)]
+fn siphash24_16(k: &[u8; 16], w0: u64, w1: u64) -> u64 {
+    let k0 = u64::from_le_bytes([
+        k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7],
+    ]);
+    let k1 = u64::from_le_bytes([
+        k[8], k[9], k[10], k[11], k[12], k[13], k[14], k[15],
+    ]);
+    let mut v = [
+        k0 ^ 0x736f6d6570736575,
+        k1 ^ 0x646f72616e646f6d,
+        k0 ^ 0x6c7967656e657261,
+        k1 ^ 0x7465646279746573,
+    ];
+    v[3] ^= w0;
+    sipround(&mut v);
+    sipround(&mut v);
+    v[0] ^= w0;
+    v[3] ^= w1;
+    sipround(&mut v);
+    sipround(&mut v);
+    v[0] ^= w1;
+    // Final block: input length (16) in the top byte, no trailing bytes.
+    let b = 16u64 << 56;
+    v[3] ^= b;
+    sipround(&mut v);
+    sipround(&mut v);
+    v[0] ^= b;
+    v[2] ^= 0xff;
+    sipround(&mut v);
+    sipround(&mut v);
+    sipround(&mut v);
+    sipround(&mut v);
+    v[0] ^ v[1] ^ v[2] ^ v[3]
+}
+
+/// Cookie time slot (~4 s granularity); validation accepts the current
+/// and previous slot under both key-ring entries.
+#[inline(always)]
+fn cookie_slot(now_mono_ns: u64) -> u32 {
+    // ~4.3s slots (2^32 ns). Validation accepts the current and previous
+    // slot (~8.6s window): comfortably covers real RTTs plus retransmit
+    // cycles, still bounded so a captured cookie cannot be replayed
+    // indefinitely. A retransmitted SYN that lands in a new slot gets a
+    // fresh (different) cookie — correct SYN-cookie semantics.
+    (now_mono_ns >> 32) as u32
+}
+
+/// Cookie tuple packed for the 5-register calling convention:
+/// [client_be:32][client_port_be:16][listen_port_be:16].
+#[inline(always)]
+fn cookie_pack(client_be: u32, client_port_be: u16, listen_port_be: u16) -> u64 {
+    (client_be as u64) << 32
+        | (client_port_be as u64) << 16
+        | listen_port_be as u64
+}
+
+/// SipHash over the packed tuple + listen addr + time slot. A tuple
+/// return would spill through the caller frame (R11) — keep it scalar.
+#[inline(never)]
+fn cookie_hash(key: &[u8; 16], tuple: u64, listen_be: u32, slot: u32) -> u64 {
+    let w0 = tuple;
+    let w1 = (listen_be as u64) << 32 | slot as u64;
+    siphash24_16(key, w0, w1)
+}
+
+/// Sign a challenge ISN: SipHash(tuple, slot) with the MSS index in the
+/// low 3 bits. Returns None when no key is installed (fail-closed).
+#[inline(never)]
+fn cookie_make_v4(
+    tuple: u64,
+    listen_be: u32,
+    mss_idx: u8,
+    now_mono_ns: u64,
+) -> Option<u32> {
+    let key = XDP_COOKIE_KEY.get(0)?;
+    if key.cur == [0u8; 16] {
+        return None;
+    }
+    let h = cookie_hash(&key.cur, tuple, listen_be, cookie_slot(now_mono_ns)) as u32;
+    Some((h & !7u32) | u32::from(mss_idx & 7))
+}
+
+/// Validate a challenge response: `cookie` is the client's ack number - 1.
+/// Returns the embedded MSS index on success under cur or prev key and the
+/// current or previous slot — four masked comparisons, all straight-line.
+#[inline(never)]
+fn cookie_check_v4(
+    tuple: u64,
+    listen_be: u32,
+    cookie: u32,
+    now_mono_ns: u64,
+) -> Option<u8> {
+    let key = XDP_COOKIE_KEY.get(0)?;
+    let slot = cookie_slot(now_mono_ns);
+    let masked = cookie & !7u32;
+    if (cookie_hash(&key.cur, tuple, listen_be, slot) as u32) & !7 == masked
+        || (key.prev != [0u8; 16]
+            && (cookie_hash(&key.prev, tuple, listen_be, slot) as u32) & !7 == masked)
+    {
+        return Some((cookie & 7) as u8);
+    }
+    let prev_slot = slot.wrapping_sub(1);
+    if (cookie_hash(&key.cur, tuple, listen_be, prev_slot) as u32) & !7 == masked
+        || (key.prev != [0u8; 16]
+            && (cookie_hash(&key.prev, tuple, listen_be, prev_slot) as u32) & !7 == masked)
+    {
+        return Some((cookie & 7) as u8);
+    }
+    None
+}
+
+/// Read bytes out of the packet through bpf_xdp_load_bytes — variable
+/// offsets never become packet pointers, so LLVM's 32-bit compare folding
+/// (`ptr <<= 32`, rejected by the verifier) cannot appear. Direct reads
+/// via `ptr_at` are still used for fixed-offset header fields.
+#[inline(always)]
+fn pkt_u16be(ctx: &XdpContext, off: usize) -> Result<u16, ()> {
+    let mut b = [0u8; 2];
+    let rc = unsafe {
+        bpf_xdp_load_bytes(
+            ctx.ctx,
+            off as u32,
+            b.as_mut_ptr() as *mut _,
+            2,
+        )
+    };
+    if rc != 0 {
+        return Err(());
+    }
+    Ok(u16::from_be_bytes(b))
+}
+
+#[inline(always)]
+fn pkt_u8(ctx: &XdpContext, off: usize) -> Result<u8, ()> {
+    let mut b = [0u8; 1];
+    let rc = unsafe {
+        bpf_xdp_load_bytes(
+            ctx.ctx,
+            off as u32,
+            b.as_mut_ptr() as *mut _,
+            1,
+        )
+    };
+    if rc != 0 {
+        return Err(());
+    }
+    Ok(b[0])
+}
+
+#[inline(always)]
+fn pkt_load(ctx: &XdpContext, off: usize, buf: &mut [u8]) -> Result<(), ()> {
+    let rc = unsafe {
+        bpf_xdp_load_bytes(
+            ctx.ctx,
+            off as u32,
+            buf.as_mut_ptr() as *mut _,
+            buf.len() as u32,
+        )
+    };
+    if rc != 0 {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn pkt_store(ctx: &XdpContext, off: usize, buf: &[u8]) -> Result<(), ()> {
+    pkt_store_n(ctx, off, buf, buf.len())
+}
+
+#[inline(always)]
+fn pkt_store_n(ctx: &XdpContext, off: usize, buf: &[u8], len: usize) -> Result<(), ()> {
+    let rc = unsafe {
+        bpf_xdp_store_bytes(
+            ctx.ctx,
+            off as u32,
+            buf.as_ptr() as *mut _,
+            len as u32,
+        )
+    };
+    if rc != 0 {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Parse the client MSS option out of a SYN and map it to a table index.
+/// Straight-line probe of the first three option slots (MSS, NOP+MSS,
+/// NOP+NOP+MSS covers every mainstream TCP stack); a deeper or absent MSS
+/// falls back to the 1460 index — a sane default, never a parse failure.
+/// A bounded loop would need either per-byte helper calls (jump-sequence
+/// budget) or variable-offset stack reads (rejected by strict kernels).
+#[inline(never)]
+fn tcp_syn_mss_idx(ctx: &XdpContext, l4_offset: usize) -> u8 {
+    let doff = match pkt_u8(ctx, l4_offset + 12) {
+        Ok(b) => (b >> 4) as usize,
+        Err(()) => return 3,
+    };
+    if doff <= 5 {
+        return 3;
+    }
+    // Probe option slots at fixed offsets 0/1/2 past the header, skipping
+    // leading NOPs (kind 1). kind==2 && len==4 is an MSS option.
+    let mut i = 0usize;
+    let mut probes = 0u8;
+    loop {
+        let kind = match pkt_u8(ctx, l4_offset + 20 + i) {
+            Ok(k) => k,
+            Err(()) => return 3,
+        };
+        if kind == 1 && probes < 2 {
+            i += 1;
+            probes += 1;
+            continue;
+        }
+        if kind != 2 {
+            return 3;
+        }
+        if doff * 4 < 20 + i + 4 {
+            return 3;
+        }
+        let len = match pkt_u8(ctx, l4_offset + 20 + i + 1) {
+            Ok(l) => l,
+            Err(()) => return 3,
+        };
+        if len != 4 {
+            return 3;
+        }
+        return match pkt_u16be(ctx, l4_offset + 20 + i + 2) {
+            Ok(mss) => mss_to_idx(mss),
+            Err(()) => 3,
+        };
+    }
+}
+
+/// Bounds-check-free table read: indexing would emit a panic_bounds_check
+/// call into .text.unlikely, and a program image ending in that call fails
+/// verification ("last insn is not an exit or jmp").
+#[inline(always)]
+fn mss_tab(idx: u8) -> u16 {
+    MSS_TAB.get((idx & 7) as usize).copied().unwrap_or(1460)
+}
+
+#[inline(always)]
+fn mss_to_idx(mss: u16) -> u8 {
+    // Largest table entry <= offered MSS (kernel msstab semantics).
+    let mut idx = 0u8;
+    let mut i = 0usize;
+    while let Some(&v) = MSS_TAB.get(i) {
+        if v <= mss {
+            idx = i as u8;
+        }
+        i += 1;
+    }
+    idx
+}
+
+/// Full TCP checksum of a segment being forged in a caller stack buffer
+/// (check field already zeroed): pseudo-header + segment, two chained
+/// bpf_csum_diff calls over stack memory only — no packet pointers, so
+/// no variable-offset range proofs are needed anywhere in the forge path.
+#[inline(always)]
+fn tcp_pseudo_csum(src_ne: u32, dst_ne: u32, seg: &mut [u8; 24], tcp_len: usize) -> u64 {
+    // Pseudo-header words carry the wire byte order — the addr args are
+    // already the verbatim u32s of the wire [u8;4] fields.
+    let len_be = (tcp_len as u32).to_be_bytes();
+    let mut pseudo = [
+        src_ne,
+        dst_ne,
+        u32::from_ne_bytes([0, 6, len_be[2], len_be[3]]),
+    ];
+    // csum_diff(NULL,0,buf,len,seed) = csum(buf) + seed.
+    let s1 = unsafe {
+        bpf_csum_diff(
+            core::ptr::null_mut(),
+            0,
+            seg.as_mut_ptr() as *mut u32,
+            tcp_len as u32,
+            0,
+        )
+    };
+    unsafe {
+        bpf_csum_diff(
+            core::ptr::null_mut(),
+            0,
+            pseudo.as_mut_ptr(),
+            12,
+            s1 as u32,
+        ) as u64
+    }
+}
+
+/// Forge a challenge SYN-ACK in place of the incoming client SYN:
+/// swap L2/L3 endpoints, cookie ISN, anchored ack, minimal options
+/// (MSS only — no TS/SACK/wscale/ECN, per ADR-001 normalization).
+/// `have_opt` — the ingress frame exposes >=4 writable option bytes so the
+/// MSS option fits without growing the packet.
+#[inline(never)]
+fn forge_challenge_synack_v4(
+    ctx: &XdpContext,
+    offsets: usize,
+    have_opt: bool,
+) -> Result<(), ()> {
+    let ip_offset = offsets & 0xffff;
+    let l4_offset = (offsets >> 16) & 0x3fff;
+    let s = nat_scratch()?;
+    let eth = ptr_at_mut::<EthHdr>(ctx, 0)?;
+    unsafe {
+        core::mem::swap(&mut (*eth).src_addr, &mut (*eth).dst_addr);
+    }
+    let f_mss = unsafe { (*s).forge_mss };
+    let tcp_len: usize = if have_opt && f_mss != 0 { 24 } else { 20 };
+    // All variable-offset header surgery runs through the load/store
+    // helpers against scratch-map staging: on strict kernels the verifier
+    // neither propagates a range back to a `data + var_off` pointer nor
+    // affords the stack these buffers would cost in a nested call chain.
+    let ipb = unsafe { &mut (*s).forge_ipb };
+    pkt_load(ctx, ip_offset, ipb)?;
+    let tmp = unsafe { &mut (*s).forge_tmp };
+    tmp[0..4].copy_from_slice(&ipb[12..16]); // orig src
+    tmp[4..8].copy_from_slice(&ipb[16..20]); // orig dst
+    ipb[2..4].copy_from_slice(&(20u16 + tcp_len as u16).to_be_bytes());
+    ipb[4] = 0;
+    ipb[5] = 0;
+    ipb[6..8].copy_from_slice(&u16::to_be_bytes(0x4000));
+    ipb[8] = 64;
+    ipb[10..12].copy_from_slice(&[0, 0]);
+    ipb[12..16].copy_from_slice(&tmp[4..8]);
+    ipb[16..20].copy_from_slice(&tmp[0..4]);
+    let ip_check = csum_fold(unsafe {
+        bpf_csum_diff(core::ptr::null_mut(), 0, ipb.as_mut_ptr() as *mut u32, 20, 0) as u64
+    });
+    ipb[10..12].copy_from_slice(&ip_check.to_be_bytes());
+    pkt_store(ctx, ip_offset, ipb)?;
+    // Client ports into tb[0..4] then swapped in place: forged source =
+    // original dest, and vice versa. tmp[0..8] keeps the orig addrs for
+    // the pseudo-header checksum.
+    let tb = unsafe { &mut (*s).forge_tb };
+    pkt_load(ctx, l4_offset, &mut tb[0..4])?;
+    let (p0, p1) = (tb[0], tb[1]);
+    tb[0] = tb[2];
+    tb[1] = tb[3];
+    tb[2] = p0;
+    tb[3] = p1;
+    tb[4..8].copy_from_slice(&unsafe { (*s).forge_seq }.to_be_bytes());
+    tb[8..12].copy_from_slice(&unsafe { (*s).forge_ack }.to_be_bytes());
+    tb[12] = ((tcp_len / 4) as u8) << 4;
+    tb[13] = 0x12; // SYN|ACK
+    tb[14..16].copy_from_slice(&unsafe { (*s).forge_win }.to_be_bytes());
+    if tcp_len == 24 {
+        tb[20..24].copy_from_slice(&(0x0204_0000u32 | f_mss as u32).to_be_bytes());
+    }
+    // Forged src = original dst, forged dst = original src.
+    let src_ne = u32::from_ne_bytes([tmp[4], tmp[5], tmp[6], tmp[7]]);
+    let dst_ne = u32::from_ne_bytes([tmp[0], tmp[1], tmp[2], tmp[3]]);
+    let tcp_check = csum_fold(tcp_pseudo_csum(src_ne, dst_ne, tb, tcp_len));
+    tb[16..18].copy_from_slice(&tcp_check.to_be_bytes());
+    pkt_store_n(ctx, l4_offset, tb, tcp_len)?;
+    let new_len = (14 + 20 + tcp_len) as i64;
+    let delta = new_len - packet_len_of(ctx) as i64;
+    if delta != 0 && unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta as i32) } != 0 {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn packet_len_of(ctx: &XdpContext) -> usize {
+    ctx.data_end() - ctx.data()
+}
+
+/// Forge a backend-directed TCP packet in place of the incoming frame
+/// (SYN replay or handshake-completing ACK): dst MAC = rule next hop
+/// (staged in scratch), src = listen VIP + claimed SNAT port.
+#[inline(never)]
+fn forge_to_backend_v4(
+    ctx: &XdpContext,
+    offsets: usize,
+    have_opt: bool,
+) -> Result<(), ()> {
+    let ip_offset = offsets & 0xffff;
+    let l4_offset = (offsets >> 16) & 0x3fff;
+    let s = nat_scratch()?;
+    // Backend endpoint: replay SYN (client->VIP frame) or handshake ACK
+    // (backend->VIP frame) — the backend address is always the CT tuple's
+    // backend_addr; the forged source is the packet's destination (VIP).
+    let eth = ptr_at_mut::<EthHdr>(ctx, 0)?;
+    unsafe {
+        (*eth).src_addr = (*eth).dst_addr;
+        (*eth).dst_addr = (*s).forge_next_hop;
+    }
+    // Forge fields are read just-in-time from the scratch map value —
+    // hoisting them into locals would make LLVM spill ~40B of registers
+    // across the helper calls and push the call chain over 512B of stack.
+    let f_mss = unsafe { (*s).forge_mss };
+    let tcp_len: usize = if have_opt && f_mss != 0 { 24 } else { 20 };
+    // Same scratch-staged, checksum-before-store surgery as
+    // forge_challenge_synack_v4 — variable offsets never become packet
+    // pointers and the frame stays small on strict kernels.
+    let ipb = unsafe { &mut (*s).forge_ipb };
+    pkt_load(ctx, ip_offset, ipb)?;
+    let tmp = unsafe { &mut (*s).forge_tmp };
+    tmp[0..4].copy_from_slice(&ipb[16..20]); // listen VIP (orig dst)
+    tmp[4..8].copy_from_slice(&unsafe { (*s).ct_key.backend_addr }[0..4]);
+    ipb[2..4].copy_from_slice(&(20u16 + tcp_len as u16).to_be_bytes());
+    ipb[4] = 0;
+    ipb[5] = 0;
+    ipb[6..8].copy_from_slice(&u16::to_be_bytes(0x4000));
+    ipb[8] = 64;
+    ipb[10..12].copy_from_slice(&[0, 0]);
+    ipb[12..16].copy_from_slice(&tmp[0..4]);
+    ipb[16..20].copy_from_slice(&tmp[4..8]);
+    let ip_check = csum_fold(unsafe {
+        bpf_csum_diff(core::ptr::null_mut(), 0, ipb.as_mut_ptr() as *mut u32, 20, 0) as u64
+    });
+    ipb[10..12].copy_from_slice(&ip_check.to_be_bytes());
+    pkt_store(ctx, ip_offset, ipb)?;
+    let tb = unsafe { &mut (*s).forge_tb };
+    tb[0..2].copy_from_slice(&unsafe { (*s).forge_src_port }.to_ne_bytes());
+    tb[2..4].copy_from_slice(&unsafe { (*s).ct_key.backend_port_be }.to_ne_bytes());
+    tb[4..8].copy_from_slice(&unsafe { (*s).forge_seq }.to_be_bytes());
+    tb[8..12].copy_from_slice(&unsafe { (*s).forge_ack }.to_be_bytes());
+    tb[12] = ((tcp_len / 4) as u8) << 4;
+    tb[13] = unsafe { (*s).forge_flags };
+    tb[14..16].copy_from_slice(&unsafe { (*s).forge_win }.to_be_bytes());
+    if tcp_len == 24 {
+        tb[20..24].copy_from_slice(&(0x0204_0000u32 | f_mss as u32).to_be_bytes());
+    }
+    let src_ne = u32::from_ne_bytes([tmp[0], tmp[1], tmp[2], tmp[3]]);
+    let dst_ne = u32::from_ne_bytes([tmp[4], tmp[5], tmp[6], tmp[7]]);
+    let tcp_check = csum_fold(tcp_pseudo_csum(src_ne, dst_ne, tb, tcp_len));
+    tb[16..18].copy_from_slice(&tcp_check.to_be_bytes());
+    pkt_store_n(ctx, l4_offset, tb, tcp_len)?;
+    let new_len = (14 + 20 + tcp_len) as i64;
+    let delta = new_len - packet_len_of(ctx) as i64;
+    if delta != 0 && unsafe { bpf_xdp_adjust_tail(ctx.ctx, delta as i32) } != 0 {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Incrementally patch one 32-bit TCP field (seq or ack_seq) and its
+/// checksum — used for the post-splice sequence translation. `new_val`
+/// is the host-order value; the wire gets its big-endian bytes.
+#[inline(always)]
+fn tcp_patch_u32(
+    ctx: &XdpContext,
+    l4_offset: usize,
+    field_off: usize,
+    new_val: u32,
+) -> Result<(), ()> {
+    // Helper-only access: a `data + var_off` pointer through the field
+    // writes below fails range propagation on strict kernels.
+    let new_bytes = new_val.to_be_bytes();
+    let mut old_b = [0u8; 4];
+    pkt_load(ctx, l4_offset + field_off, &mut old_b)?;
+    let mut old_v = u32::from_ne_bytes(old_b);
+    let mut new_v = u32::from_ne_bytes(new_bytes);
+    let diff = csum_diff_u32(&mut old_v, &mut new_v);
+    pkt_store(ctx, l4_offset + field_off, &new_bytes)?;
+    let mut cb = [0u8; 2];
+    pkt_load(ctx, l4_offset + 16, &mut cb)?;
+    let old_check = u16::from_ne_bytes(cb);
+    pkt_store(ctx, l4_offset + 16, &csum_apply_diff(old_check, diff).to_ne_bytes())?;
+    Ok(())
+}
+
+fn counter_challenge_sent() {
+    if let Some(counters) = counters() {
+        counters.challenge_sent = counters.challenge_sent.saturating_add(1);
+    }
+}
+
+fn counter_challenge_rejected() {
+    if let Some(counters) = counters() {
+        counters.challenge_rejected = counters.challenge_rejected.saturating_add(1);
+    }
+}
+
+/// EN-14 (ADR-001): challenged-rule entry point for packets without
+/// conntrack/pending state. The SYN gets a stateless cookie challenge; the
+/// proving ACK performs the real admission (dim1+dim6, SNAT claim, pending
+/// SPLICING record) and emits the SYN replay to the backend. Everything is
+/// staged through `scratch` so the signature stays within 5 registers.
+/// Runs in the dedicated slot-11 worker program: rule fields the callee
+/// needs (server_id, next_hop_mac) are staged into scratch by the caller
+/// because map pointers cannot cross the tail-call boundary.
+#[inline(never)]
+fn tcp_challenge_v4(
+    ctx: &XdpContext,
+    scratch: *mut NatScratch,
+    ip_offset: usize,
+    l4_offset: usize,
+) -> Result<Option<u32>, ()> {
+    let (ip_offset, l4_offset) = bound_work_offsets(ip_offset, l4_offset);
+    let now_mono_ns = unsafe { bpf_ktime_get_ns() };
+    let tcp = ptr_at::<TcpHdr>(ctx, l4_offset)?;
+    let ip = ptr_at::<Ipv4Hdr>(ctx, ip_offset)?;
+    let (src_port, dst_port, seq, ackno) = unsafe {
+        (
+            u16::from_ne_bytes((*tcp).source),
+            u16::from_ne_bytes((*tcp).dest),
+            u32::from_be_bytes((*tcp).seq),
+            u32::from_be_bytes((*tcp).ack_seq),
+        )
+    };
+    let syn = unsafe { (*tcp).syn() } == 1;
+    let ack = unsafe { (*tcp).ack() } == 1;
+    let window = unsafe { u16::from_be_bytes([(*tcp).window[0], (*tcp).window[1]]) };
+    let src_be = unsafe { u32::from_be_bytes((*ip).src_addr) };
+    let dst_be = unsafe { u32::from_be_bytes((*ip).dst_addr) };
+    // Writable option space: the MSS option needs 4 bytes inside the
+    // current frame (adjust_tail can shrink but not expose new bytes).
+    // Scalar-length compare: a `data + off <= data_end` pointer compare
+    // gets folded into prohibited 32-bit pointer shifts by LLVM here.
+    let have_opt = l4_offset + 24 <= ctx.data_end().saturating_sub(ctx.data());
+
+    if syn && !ack {
+        // Stateless challenge — dim3 budget first, no state on miss.
+        if !budget_charge(3, now_mono_ns) {
+            counter_challenge_rejected();
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
+        let mss_idx = tcp_syn_mss_idx(ctx, l4_offset);
+        let tuple = cookie_pack(src_be, src_port.to_be(), dst_port);
+        let Some(cookie) = cookie_make_v4(tuple, dst_be, mss_idx, now_mono_ns)
+        else {
+            // No key installed: fail closed, counted — never silently
+            // forward an unverified SYN on a challenged rule.
+            counter_challenge_rejected();
+            return Ok(Some(xdp_action::XDP_DROP));
+        };
+        unsafe {
+            (*scratch).forge_seq = cookie;
+            (*scratch).forge_ack = seq.wrapping_add(1);
+            (*scratch).forge_mss = mss_tab(mss_idx);
+            (*scratch).forge_win = 64240;
+        }
+        forge_challenge_synack_v4(ctx, ip_offset | l4_offset << 16, have_opt)?;
+        counter_challenge_sent();
+        return Ok(Some(xdp_action::XDP_TX));
+    }
+
+    if ack && !syn && ackno != 0 {
+        let cookie = ackno.wrapping_sub(1);
+        let tuple = cookie_pack(src_be, src_port.to_be(), dst_port);
+        let Some(mss_idx) = cookie_check_v4(tuple, dst_be, cookie, now_mono_ns)
+        else {
+            counter_challenge_rejected();
+            return Ok(Some(xdp_action::XDP_DROP));
+        };
+        // Verified client: the admission budgets are paid HERE — the
+        // challenge above created no state, so this is the real
+        // new-flow commitment (dim1 aggregate + dim6 per-service).
+        if !budget_charge(1, now_mono_ns) {
+            counter_admission_limited();
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
+        if !svc_budget_charge(dst_port, now_mono_ns) {
+            counter_service_limited();
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
+        let eth = ptr_at::<EthHdr>(ctx, 0)?;
+        let client_mac = unsafe { (*eth).src_addr };
+        let incarnation = unsafe { (*scratch).forge_incarnation };
+        let mut snat_port = 0u16;
+        unsafe {
+            let v = &mut (*scratch).ct_value;
+            v.listen_addr = v4_embed(dst_be);
+            v.client_mac = client_mac;
+            v.listen_port_be = dst_port;
+            v.family = 4;
+            v.state = XDP_CT_STATE_PENDING;
+            v.expect_seq = seq; // client next seq = c_isn+1
+            v.expect_ack = 0;
+            v.splice_isn = cookie;
+            v.seq_delta = 0;
+            v.splice_state = XDP_SPLICE_WAIT;
+            v._pad2 = [0; 3];
+            v.snat_port_be = 0;
+            v.server_id = (*scratch).forge_server_id;
+            v.last_seen_ns = now_mono_ns;
+            v.incarnation = incarnation;
+            let k = &mut (*scratch).snat_rev_key;
+            k.listen_addr = v4_embed(dst_be);
+            k.snat_port_be = 0;
+            k.proto = 6;
+            k.family = 4;
+            k._pad = [0; 4];
+        }
+        snat_prefill(scratch, client_mac, unsafe { (*scratch).forge_server_id });
+        match snat_alloc(scratch, &XDP_TCP_FWD) {
+            Some(port) => {
+                snat_port = port;
+                unsafe { (*scratch).ct_value.snat_port_be = port };
+            }
+            None => return Ok(None),
+        }
+        let pending_insert_ok =
+            unsafe { (*scratch).debug_flags } & XDP_PENDING_CAP_FAIL_PENDING_INSERT == 0
+                && XDP_PENDING
+                    .insert(
+                        unsafe { &(*scratch).ct_key },
+                        unsafe { &(*scratch).ct_value },
+                        0,
+                    )
+                    .is_ok();
+        if !pending_insert_ok {
+            if snat_port != 0 {
+                snat_release(scratch);
+            }
+            counter_pending_limited();
+            emit_flow_event(
+                unsafe { &(*scratch).ct_value },
+                XDP_FLOW_EVENT_REJECTED,
+                XDP_DECISION_FLOW_TABLE_FULL,
+                now_mono_ns,
+            );
+            return Ok(None);
+        }
+        emit_flow_event(
+            unsafe { &(*scratch).ct_value },
+            XDP_FLOW_EVENT_ADMITTED,
+            XDP_DECISION_PASS,
+            now_mono_ns,
+        );
+        // SYN replay to the backend (options normalized per ADR-001).
+        unsafe {
+            (*scratch).forge_seq = seq.wrapping_sub(1); // c_isn
+            (*scratch).forge_ack = 0;
+            (*scratch).forge_flags = 0x02; // SYN
+            (*scratch).forge_win = window;
+            (*scratch).forge_mss = mss_tab(mss_idx);
+            (*scratch).forge_src_port = snat_port;
+            // forge_next_hop was staged by the caller from the rule —
+            // map pointers cannot cross the tail-call boundary.
+        }
+        forge_to_backend_v4(ctx, ip_offset | l4_offset << 16, have_opt)?;
+        counter_tcp_fwd_tx();
+        return Ok(Some(xdp_action::XDP_TX));
+    }
+
+    // FIN/RST/other without state on a challenged rule: not our concern —
+    // hand to the normal dataplane path unchanged.
+    Ok(None)
+}
+
+/// EN-14: consume the backend SYN-ACK on a post-cookie splice — anchor the
+/// sequence delta (s_isn - b_isn), promote the pending record into the
+/// authoritative CT table as OPEN+SPLICED, and answer the backend's
+/// handshake with a forged ACK. The consumed SYN-ACK is never forwarded:
+/// the client already holds the challenge SYN-ACK's sequence space.
+/// `scratch.forge_seq` carries the wire seq (b_isn) staged by the caller.
+/// Runs in the slot-11 worker program: the pending/CT map pointer the
+/// caller verified cannot cross the tail-call boundary, so the value is
+/// re-looked-up here and the splice gate re-checked — a concurrent CPU
+/// could have anchored or expired the record in between.
+#[inline(never)]
+fn tcp_splice_anchor_v4(
+    ctx: &XdpContext,
+    scratch: *mut NatScratch,
+    offsets: usize,
+) -> Result<Option<u32>, ()> {
+    let now_mono_ns = unsafe { bpf_ktime_get_ns() };
+    let b_isn = unsafe { (*scratch).forge_seq };
+    let p = XDP_TCP_CT
+        .get_ptr_mut(unsafe { &(*scratch).ct_key })
+        .or_else(|| XDP_PENDING.get_ptr_mut(unsafe { &(*scratch).ct_key }));
+    let Some(p) = p else {
+        // The record vanished between the caller's check and this worker:
+        // the consumed SYN-ACK cannot be answered, drop it — a backend
+        // retransmit re-enters the anchor once state is consistent.
+        counter_challenge_rejected();
+        return Ok(Some(xdp_action::XDP_DROP));
+    };
+    // SAFETY: pointer into the map value for ct_key.
+    let p = unsafe { &mut *p };
+    if p.splice_state != XDP_SPLICE_WAIT {
+        // Another CPU already anchored (or promoted) this flow — this
+        // retransmitted SYN-ACK is a duplicate; dropping it is correct
+        // because the client already holds the challenge sequence space.
+        return Ok(Some(xdp_action::XDP_DROP));
+    }
+    let (splice_isn, expect_seq, snat_port) = (p.splice_isn, p.expect_seq, p.snat_port_be);
+    let ct_insert_ok =
+        unsafe { (*scratch).debug_flags } & XDP_PENDING_CAP_FAIL_CT_INSERT == 0
+            && XDP_TCP_CT
+                .insert(unsafe { &(*scratch).ct_key }, &*p, 0)
+                .is_ok();
+    if !ct_insert_ok {
+        // Authoritative table full: the pending record is untouched and the
+        // consumed SYN-ACK is simply retransmitted by the backend — the next
+        // arrival retries the anchor. Counted, never a partial splice.
+        counter_tcp_fwd_map_full();
+        return Ok(Some(xdp_action::XDP_DROP));
+    }
+    if let Some(ct) = XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
+        let ct = unsafe { &mut *ct };
+        ct.state = XDP_CT_STATE_OPEN;
+        ct.splice_state = XDP_SPLICE_DONE;
+        ct.seq_delta = splice_isn.wrapping_sub(b_isn) as i32;
+        ct.expect_ack = b_isn.wrapping_add(1);
+        ct.last_seen_ns = now_mono_ns;
+        emit_flow_event(ct, XDP_FLOW_EVENT_VALIDATED, XDP_DECISION_PASS, now_mono_ns);
+    }
+    let _ = XDP_PENDING.remove(unsafe { &(*scratch).ct_key });
+    // Forge the handshake-completing ACK to the backend: seq = c_isn+1
+    // (the client seq space the replay established), ack = b_isn+1.
+    let eth = ptr_at::<EthHdr>(ctx, 0)?;
+    let backend_mac = unsafe { (*eth).src_addr };
+    unsafe {
+        (*scratch).forge_seq = expect_seq;
+        (*scratch).forge_ack = b_isn.wrapping_add(1);
+        (*scratch).forge_flags = 0x10; // ACK
+        (*scratch).forge_win = 65535;
+        (*scratch).forge_mss = 0;
+        (*scratch).forge_src_port = snat_port;
+        (*scratch).forge_next_hop = backend_mac;
+    }
+    forge_to_backend_v4(ctx, offsets, false)?;
+    Ok(Some(xdp_action::XDP_TX))
 }
 
 fn counter_unverified_limited() {

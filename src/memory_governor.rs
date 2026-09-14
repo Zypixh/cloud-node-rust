@@ -747,11 +747,23 @@ impl MemoryGovernor {
             return None;
         }
 
+        // CAS admission so the relay counter never exceeds the limit even
+        // transiently (see try_admit_with_charges).
         let limit = self.zero_copy_relay_limit() as u64;
-        let current = self.zero_copy_relays.fetch_add(1, Ordering::AcqRel) + 1;
-        if current > limit {
-            self.zero_copy_relays.fetch_sub(1, Ordering::AcqRel);
-            return None;
+        let mut current = self.zero_copy_relays.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match self.zero_copy_relays.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
 
         let budget = self.zero_copy_relay_budget_bytes().max(1);
@@ -803,12 +815,26 @@ impl MemoryGovernor {
         class: AdmissionClass,
         cache_read_memory_charge_bytes: u64,
     ) -> Option<AdmissionPermit<'_>> {
+        // CAS admission: the counter must never exceed the limit even
+        // transiently — fetch_add-then-check lets concurrent observers read
+        // a value above the hard cap between the add and the rollback.
         let counter = self.counter(class);
-        let current = counter.fetch_add(1, Ordering::AcqRel) + 1;
-        if current > self.limit_for(class) as u64 {
-            counter.fetch_sub(1, Ordering::AcqRel);
-            self.record_reject(class);
-            return None;
+        let limit = self.limit_for(class) as u64;
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                self.record_reject(class);
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
 
         let shared_connection_charge_bytes = shared_connection_charge_bytes(class);

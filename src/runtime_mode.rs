@@ -262,6 +262,14 @@ pub struct XdpUdpForwardConfig {
     /// Default false = plain DNAT preserving the client IP.
     #[serde(rename = "snat", default)]
     pub snat: bool,
+    /// EN-14 stateless TCP cookie challenge (ADR-001): SYNs to this rule get
+    /// a SYNPROXY-style challenge; state is allocated only after the client's
+    /// proving ACK. TCP+SNAT+IPv4 only — the flag is rejected explicitly for
+    /// UDP rules, plain-DNAT rules (no observable backend SYN-ACK to splice
+    /// against), and IPv6 rules (challenge path is v4-only in this slice;
+    /// v6 keeps bounded admission).
+    #[serde(rename = "challenge", default)]
+    pub challenge: bool,
 }
 
 impl Default for XdpInterfaceConfig {
@@ -343,6 +351,11 @@ pub struct XdpBudgetSettings {
     /// to reserve admission headroom across many services).
     #[serde(rename = "serviceFlowPps")]
     pub service_flow_pps: Option<u64>,
+    /// Node-wide ceiling on stateless challenge responses/sec (cookie
+    /// SYN-ACKs, dim3) — bounds forged-packet egress under SYN flood.
+    /// Default: equal to the aggregate new-flow cap.
+    #[serde(rename = "challengePps")]
+    pub challenge_pps: Option<u64>,
     /// Accounting window for the fixed-window buckets.
     #[serde(rename = "windowMs", default = "default_xdp_rate_limit_window_ms")]
     pub window_ms: u64,
@@ -378,6 +391,7 @@ impl Default for XdpBudgetSettings {
             xsk_redirect_pps: default_xsk_redirect_pps(),
             control_pps: default_control_pps(),
             service_flow_pps: None,
+            challenge_pps: None,
             window_ms: default_xdp_rate_limit_window_ms(),
         }
     }
@@ -484,6 +498,48 @@ pub struct XdpConfig {
     /// never drift apart). Set only for eBPF hotfix/debugging.
     #[serde(rename = "ebpfObject", default)]
     pub ebpf_object: Option<String>,
+    /// EN-16 explicit eBPF state-table sizing for memory-constrained nodes.
+    /// Absent fields keep production defaults; declared sizes are applied at
+    /// load and counted by the kernel-BPF memory ledger, which still rejects
+    /// attach when the projected total exceeds the node budget.
+    #[serde(rename = "stateTables", default)]
+    pub state_tables: Option<XdpStateTables>,
+}
+
+/// Operator-sized eBPF state tables (EN-16). Absent = built-in production
+/// default for that table.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpStateTables {
+    /// Max entries in each connection-tracking table (XDP_TCP_CT/UDP_CT).
+    #[serde(rename = "ctMaxEntries", default)]
+    pub ct_max_entries: Option<u32>,
+    /// Bounded half-open admission table (XDP_PENDING).
+    #[serde(rename = "pendingMaxEntries", default)]
+    pub pending_max_entries: Option<u32>,
+    /// SNAT reverse-mapping table (XDP_SNAT_REV).
+    #[serde(rename = "snatRevMaxEntries", default)]
+    pub snat_rev_max_entries: Option<u32>,
+    /// Per-CPU flow accounting table (XDP_FLOW_ACCT).
+    #[serde(rename = "flowAcctMaxEntries", default)]
+    pub flow_acct_max_entries: Option<u32>,
+    /// IPv6 rate-limit table (XDP_RATE_V6).
+    #[serde(rename = "rateV6MaxEntries", default)]
+    pub rate_v6_max_entries: Option<u32>,
+    /// QUIC DCID routing table (XDP_QUIC_DCID).
+    #[serde(rename = "quicDcidMaxEntries", default)]
+    pub quic_dcid_max_entries: Option<u32>,
+    /// ACL block lists — exact-match hashes AND prefix tries
+    /// (XDP_BLOCKED_V4/V6 + XDP_BLOCKED_V4_LPM/V6_LPM). One knob covers all
+    /// four: the block capacity is a policy footprint the operator sizes
+    /// once per node.
+    #[serde(rename = "aclBlockedMaxEntries", default)]
+    pub acl_blocked_max_entries: Option<u32>,
+    /// ACL allow lists — same shape as aclBlockedMaxEntries.
+    #[serde(rename = "aclAllowedMaxEntries", default)]
+    pub acl_allowed_max_entries: Option<u32>,
+    /// IPv4 per-source rate-limit table (XDP_RATE_V4).
+    #[serde(rename = "rateV4MaxEntries", default)]
+    pub rate_v4_max_entries: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -86,9 +86,15 @@ fn embed_xdp_ebpf_object() -> Result<(), Box<dyn std::error::Error>> {
 
     let ebpf_target = "bpfel-unknown-none";
     let manifest = "crates/cloud-node-xdp-ebpf/Cargo.toml";
-    let mut cmd = Command::new("cargo");
+    // Spawn via `rustup run` so the nested build resolves the nightly
+    // sysroot even though the parent cargo exports RUSTUP_TOOLCHAIN=<stable>
+    // (an env leak that would make `cargo +nightly` look for rust-src under
+    // the stable toolchain dir and fail).
+    let mut cmd = Command::new("rustup");
     cmd.args([
-        "+nightly",
+        "run",
+        "nightly",
+        "cargo",
         "build",
         "--manifest-path",
         manifest,
@@ -101,6 +107,11 @@ fn embed_xdp_ebpf_object() -> Result<(), Box<dyn std::error::Error>> {
     // Do not inherit the host's .cargo/config rustflags (target-cpu=native
     // breaks the bpf target); panic=abort is required for eBPF.
     cmd.env("CARGO_ENCODED_RUSTFLAGS", "-C\u{1f}panic=abort");
+    // Parent cargo exports RUSTC/RUSTUP_TOOLCHAIN pointing at the pinned
+    // stable toolchain; the nested nightly build must resolve its own
+    // sysroot or -Z build-std looks for rust-src under the stable dir.
+    cmd.env_remove("RUSTC");
+    cmd.env_remove("RUSTUP_TOOLCHAIN");
     let built = cmd
         .status()
         .map(|status| status.success())

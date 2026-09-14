@@ -517,7 +517,8 @@ impl L4AggregateState {
             })
             .max()
             .unwrap_or_default();
-        let pressure_level = surge_pressure_level(distinct_ips_recent);
+        let pressure_level =
+            AGGREGATE_PRESSURE_STATE.apply(surge_pressure_level(distinct_ips_recent));
         let (top_prefix, top_prefix_events) = self
             .prefix_counts
             .iter()
@@ -1022,6 +1023,86 @@ fn utilization_pressure_level_hysteretic(pct: u64) -> L4PressureLevel {
     l4_level_from_index(index)
 }
 
+fn l4_index_of(level: L4PressureLevel) -> u64 {
+    match level {
+        L4PressureLevel::Normal => 0,
+        L4PressureLevel::Elevated => 1,
+        L4PressureLevel::High => 2,
+        L4PressureLevel::Critical => 3,
+    }
+}
+
+/// EN-16: dwell-based de-escalation for the non-utilization pressure
+/// channels (memory, aggregate surge, kernel SYN). Those signals arrive
+/// already quantized as levels rather than a utilization percentage, so
+/// the hysteresis is temporal: escalation is immediate, while
+/// de-escalation only commits after the raw level has stayed below the
+/// emitted level for `L4_PRESSURE_DEESCALATE_DWELL_MS` continuously. A
+/// boundary-flickering signal can therefore never flap protection, and
+/// read-path frequency cannot shorten the dwell because it is timed.
+struct LevelHysteresis {
+    level: AtomicU64,
+    /// ms timestamp the raw level first fell below `level`; 0 = none.
+    lower_since_ms: AtomicI64,
+}
+
+/// De-escalation dwell for the level-quantized pressure channels: the raw
+/// level must stay below the emitted level for 5s before the emitted
+/// level follows it down.
+const L4_PRESSURE_DEESCALATE_DWELL_MS: i64 = 5_000;
+
+impl LevelHysteresis {
+    const fn new() -> Self {
+        Self {
+            level: AtomicU64::new(0),
+            lower_since_ms: AtomicI64::new(0),
+        }
+    }
+
+    fn apply(&self, raw: L4PressureLevel) -> L4PressureLevel {
+        self.apply_at(raw, crate::utils::time::now_timestamp_millis())
+    }
+
+    fn apply_at(&self, raw: L4PressureLevel, now: i64) -> L4PressureLevel {
+        let current = l4_level_from_index(
+            self.level.load(Ordering::Relaxed).min(3) as usize,
+        );
+        if raw >= current {
+            // Escalate (or hold) immediately — pressure protection never
+            // waits for the dwell window.
+            self.lower_since_ms.store(0, Ordering::Relaxed);
+            self.level.store(l4_index_of(raw), Ordering::Relaxed);
+            return raw;
+        }
+        let since = self.lower_since_ms.load(Ordering::Relaxed);
+        if since == 0 {
+            self.lower_since_ms.store(now.max(1), Ordering::Relaxed);
+            return current;
+        }
+        if now.saturating_sub(since) < L4_PRESSURE_DEESCALATE_DWELL_MS {
+            return current;
+        }
+        self.lower_since_ms.store(0, Ordering::Relaxed);
+        self.level.store(l4_index_of(raw), Ordering::Relaxed);
+        raw
+    }
+}
+
+/// Memory-pressure channel (governor `available_bytes` bands) seen by the
+/// L4 rollup.
+static MEMORY_PRESSURE_STATE: LevelHysteresis = LevelHysteresis::new();
+/// Aggregate distinct-source surge channel (`L4_AGGREGATES`).
+static AGGREGATE_PRESSURE_STATE: LevelHysteresis = LevelHysteresis::new();
+/// Kernel TCP/SYN counters channel (`kernel_syn_defense` monitor).
+static SYN_PRESSURE_STATE: LevelHysteresis = LevelHysteresis::new();
+
+/// Kernel-SYN monitor de-escalation point: the monitor loop computes the
+/// raw level from per-second TcpExt deltas; the stored/emitted level only
+/// steps down after the dwell window.
+pub(crate) fn syn_pressure_level_hysteretic(raw: L4PressureLevel) -> L4PressureLevel {
+    SYN_PRESSURE_STATE.apply(raw)
+}
+
 fn memory_level_to_l4(level: MemoryPressureLevel) -> L4PressureLevel {
     match level {
         MemoryPressureLevel::Normal => L4PressureLevel::Normal,
@@ -1037,7 +1118,8 @@ pub fn current_pressure_level() -> L4PressureLevel {
         .connection_admission_used_bytes
         .saturating_mul(100)
         .saturating_div(snapshot.connection_budget_bytes.max(1));
-    memory_level_to_l4(snapshot.memory_pressure_level)
+    MEMORY_PRESSURE_STATE
+        .apply(memory_level_to_l4(snapshot.memory_pressure_level))
         .max(utilization_pressure_level_hysteretic(
             connection_pct.max(snapshot.fd_used_pct),
         ))
@@ -1077,7 +1159,8 @@ pub fn current_pressure_level_with_quic_usage(
         .connection_admission_used_bytes
         .saturating_mul(100)
         .saturating_div(snapshot.connection_budget_bytes.max(1));
-    memory_level_to_l4(snapshot.memory_pressure_level)
+    MEMORY_PRESSURE_STATE
+        .apply(memory_level_to_l4(snapshot.memory_pressure_level))
         .max(utilization_pressure_level_hysteretic(
             connection_pct.max(quic_pct).max(snapshot.fd_used_pct),
         ))
@@ -1802,6 +1885,71 @@ mod tests {
             L4PressureLevel::High
         );
         UTIL_PRESSURE_STATE.store(0, Ordering::Relaxed);
+    }
+
+    /// EN-16: level-quantized channels (memory/aggregate/SYN) escalate
+    /// immediately but only de-escalate after the raw signal stays lower
+    /// for the full dwell window — a flickering signal cannot flap.
+    #[test]
+    fn level_hysteresis_escalates_immediately_and_dwells() {
+        let h = LevelHysteresis::new();
+        let t0 = 100_000i64;
+        assert_eq!(
+            h.apply_at(L4PressureLevel::Normal, t0),
+            L4PressureLevel::Normal
+        );
+        // Escalation is immediate, multi-level jumps included.
+        assert_eq!(
+            h.apply_at(L4PressureLevel::Critical, t0 + 1),
+            L4PressureLevel::Critical
+        );
+        // Raw drops below: emitted level holds through the dwell.
+        assert_eq!(
+            h.apply_at(L4PressureLevel::Normal, t0 + 2),
+            L4PressureLevel::Critical
+        );
+        assert_eq!(
+            h.apply_at(L4PressureLevel::Normal, t0 + 2 + 4_999),
+            L4PressureLevel::Critical
+        );
+        // Dwell elapsed at the boundary: de-escalates to the raw level.
+        assert_eq!(
+            h.apply_at(L4PressureLevel::Normal, t0 + 2 + 5_000),
+            L4PressureLevel::Normal
+        );
+    }
+
+    /// A single re-escalating sample (raw >= emitted) resets the dwell —
+    /// the emitted level cannot ratchet down through alternating
+    /// high/low readings, and a sub-level reading neither resets nor
+    /// de-escalates.
+    #[test]
+    fn level_hysteresis_dwell_resets_on_reescalation() {
+        let h = LevelHysteresis::new();
+        let t0 = 200_000i64;
+        h.apply_at(L4PressureLevel::High, t0);
+        h.apply_at(L4PressureLevel::Normal, t0 + 1); // dwell starts
+        h.apply_at(L4PressureLevel::Normal, t0 + 4_000);
+        // A reading below the emitted level but above Normal is still a
+        // de-escalation candidate — dwell continues, level holds.
+        assert_eq!(
+            h.apply_at(L4PressureLevel::Elevated, t0 + 4_500),
+            L4PressureLevel::High
+        );
+        // Re-escalation at/above the emitted level resets the dwell.
+        assert_eq!(
+            h.apply_at(L4PressureLevel::Critical, t0 + 5_000),
+            L4PressureLevel::Critical
+        );
+        // Dropped again — a NEW dwell window is required from here.
+        assert_eq!(
+            h.apply_at(L4PressureLevel::Normal, t0 + 9_000),
+            L4PressureLevel::Critical
+        );
+        assert_eq!(
+            h.apply_at(L4PressureLevel::Normal, t0 + 14_000),
+            L4PressureLevel::Normal
+        );
     }
 
     #[test]

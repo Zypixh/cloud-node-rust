@@ -326,6 +326,7 @@ mod tests {
             budget: None,
             admission: None,
             ebpf_object: None,
+            state_tables: None,
         };
 
         let yaml = serde_yaml::to_string(&xdp).unwrap();

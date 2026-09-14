@@ -297,6 +297,12 @@ pub struct XdpCounters {
     /// the aggregate dim1 envelope; the count makes the fairness gap
     /// observable instead of silent.
     pub svc_budget_full: u64,
+    /// EN-14: stateless challenge SYN-ACKs generated for challenged
+    /// services (dim3 challenge_pps gated).
+    pub challenge_sent: u64,
+    /// EN-14: packets rejected by cookie validation — bad/expired cookie
+    /// or a non-SYN/ACK packet on a challenged rule without state.
+    pub challenge_rejected: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -404,6 +410,11 @@ pub struct XdpUdpFwdRule {
     pub snat: u8,
     /// Billing dimension: forwarded bytes are attributed to this server id.
     pub server_id: i64,
+    /// EN-14: stateless cookie challenge. 1 = SYNs to this rule get a
+    /// SYNPROXY-style challenge instead of immediate forwarding; requires
+    /// `snat` (the splice needs observable backend replies).
+    pub challenge: u8,
+    pub _pad2: [u8; 7],
 }
 
 /// Conntrack entry: a client 4-tuple pinned to a backend so reply traffic can
@@ -469,6 +480,37 @@ pub struct XdpUdpCtValue {
     /// client's ack number to match, so an off-path ACK cannot promote.
     /// 0 = no backend reply observed yet.
     pub expect_ack: u32,
+    /// EN-14 splice: node-challenge ISN (s_isn). Set at post-cookie
+    /// admission; used to compute `seq_delta` when the backend SYN-ACK
+    /// is consumed. 0 when `splice_state` == SPLICE_NONE.
+    pub splice_isn: u32,
+    /// EN-14 splice: sequence delta s_isn - b_isn applied to backend->client
+    /// seq numbers and subtracted from client->backend ack numbers for the
+    /// flow lifetime once `splice_state` == SPLICE_SPLICED.
+    pub seq_delta: i32,
+    /// EN-14: XDP_SPLICE_* — challenge/splice progress for this flow.
+    pub splice_state: u8,
+    pub _pad2: [u8; 3],
+}
+
+/// EN-14: flow carries no challenge splice.
+pub const XDP_SPLICE_NONE: u8 = 0;
+/// EN-14: cookie validated, SYN replayed; awaiting the backend SYN-ACK so
+/// the sequence delta can be anchored. Client packets in this state are
+/// consumed (challenge ACK) or dropped, never forwarded half-spliced.
+pub const XDP_SPLICE_WAIT: u8 = 1;
+/// EN-14: backend handshake complete; seq_delta translation active.
+pub const XDP_SPLICE_DONE: u8 = 2;
+
+/// EN-14 cookie key ring: `cur` signs new challenges; `prev` still
+/// validates challenges issued before the last rotation. Userspace rotates
+/// cur->prev and installs a fresh cur; a two-slot window keeps in-flight
+/// handshakes valid across one rotation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpCookieKey {
+    pub cur: [u8; 16],
+    pub prev: [u8; 16],
 }
 
 /// SNAT reverse-binding key: backend replies arrive addressed to
@@ -481,7 +523,10 @@ pub struct XdpSnatRevKey {
     /// IP protocol number (17 = UDP, 6 = TCP).
     pub proto: u8,
     pub family: u8,
-    pub _pad: [u8; 3],
+    /// Explicit tail padding keeps every key byte an initialized field — a
+    /// compiler-added padding byte reads as uninitialized stack under the
+    /// verifier on strict kernels.
+    pub _pad: [u8; 4],
 }
 
 /// SNAT reverse-binding value: the full client flow tuple, needed both for
@@ -593,6 +638,43 @@ pub struct NatScratch {
     /// points — the per-CPU scratch read keeps fault-injection checks a
     /// plain load instead of a map lookup per call site.
     pub debug_flags: u64,
+    /// EN-14: forged-packet parameters staged by the caller before the
+    /// challenge/splice builders run (map-pointer arg passing keeps the
+    /// helpers inside the 5-register calling convention).
+    pub forge_seq: u32,
+    pub forge_ack: u32,
+    /// MSS option value to emit; 0 = emit no options (doff 5).
+    pub forge_mss: u16,
+    pub forge_flags: u8,
+    pub forge_pad0: u8,
+    /// Advertised window for the forged packet.
+    pub forge_win: u16,
+    /// Source port for backend-directed forgeries (claimed SNAT port).
+    pub forge_src_port: u16,
+    /// L2 destination for backend-directed forgeries (rule next_hop or
+    /// the backend frame's source MAC for reply-direction packets).
+    pub forge_next_hop: [u8; 6],
+    pub forge_pad1: [u8; 2],
+    /// EN-14: pending incarnation staged for post-cookie admission.
+    pub forge_incarnation: u32,
+    /// EN-14 worker opcode staged before the XDP_DISPATCH_TCP4_CHALLENGE
+    /// tail call: 0 = challenge dispatch (SYN/ACK handling), 1 = splice
+    /// anchor (backend SYN-ACK consumption).
+    pub forge_op: u8,
+    pub forge_pad4: u8,
+    pub forge_pad5: u16,
+    /// Forward-rule server_id staged before the challenge tail call —
+    /// the rule pointer itself cannot cross program boundaries. Full
+    /// i64 width: server ids are operator-chosen and must not truncate.
+    pub forge_server_id: i64,
+    /// EN-14: forged IPv4/TCP header staging buffers — kept in the
+    /// per-CPU scratch map value so the challenge -> forge call chain
+    /// stays under the 512-byte combined-stack verifier limit.
+    pub forge_ipb: [u8; 20],
+    pub forge_tb: [u8; 24],
+    /// Transient copies of the original addrs/ports while building.
+    pub forge_tmp: [u8; 8],
+    pub forge_pad3: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -633,7 +715,17 @@ pub struct NatScratch {
 /// v13: EN-07 fairness — XdpBudgetConfig +service_flow_pps (64->72B, flag
 /// bit6), new XdpSvcBucket + XDP_SVC_BUDGET per-CPU per-port admission map,
 /// XdpCounters +service_limited/svc_budget_full (256->272B).
-pub const XDP_ABI_VERSION: u32 = 13;
+/// v14: EN-14 — XdpUdpFwdRule +challenge flag (40->48B), XdpUdpCtValue
+/// +splice_isn/seq_delta/splice_state (56->72B), XdpCookieKey +
+/// XDP_COOKIE_KEY map, XdpCounters +challenge_sent/challenge_rejected
+/// (272->288B), XdpBudgetConfig flag bit3 (challenge_pps) now live.
+/// v15: EN-14 — NatScratch +forge_ipb/forge_tb/forge_tmp staging buffers
+/// +forge_server_id/forge_op tail-call staging (376->440B) so the
+/// challenge/splice work runs in its own XDP_DISPATCH program (slot 11)
+/// and the combined stack stays under the 512B verifier limit;
+/// XdpSnatRevKey._pad 3->4B (explicit tail byte for strict verifier
+/// stack-init checks; layout stays 24B).
+pub const XDP_ABI_VERSION: u32 = 15;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -871,15 +963,17 @@ const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 72);
 const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 96);
 const _: () = assert!(core::mem::size_of::<XdpSvcBucket>() == 16);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 24);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 272);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 288);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
-const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 56);
+const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 72);
+const _: () = assert!(core::mem::size_of::<XdpUdpFwdRule>() == 48);
+const _: () = assert!(core::mem::size_of::<XdpCookieKey>() == 32);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevValue>() == 56);
 const _: () = assert!(core::mem::size_of::<XdpInterfacePolicy>() == 8);
 const _: () = assert!(core::mem::size_of::<XdpRateBucket>() == 16);
 const _: () = assert!(core::mem::size_of::<XdpRateLimitConfig>() == 32);
-const _: () = assert!(core::mem::size_of::<NatScratch>() == 328);
+const _: () = assert!(core::mem::size_of::<NatScratch>() == 440);
 
 #[cfg(all(feature = "aya", target_os = "linux"))]
 macro_rules! unsafe_impl_aya_pod {
@@ -908,6 +1002,7 @@ unsafe_impl_aya_pod!(
     XdpQuicDcidKey,
     XdpUdpFwdKey,
     XdpUdpFwdRule,
+    XdpCookieKey,
     XdpUdpCtKey,
     XdpUdpCtValue,
     XdpSnatRevKey,
