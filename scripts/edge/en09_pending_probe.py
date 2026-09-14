@@ -332,6 +332,10 @@ def main():
     proc = None
 
     try:
+        # Pinned state maps survive a previous probe run's node (EN-10
+        # takeover contract); clear them so imported flows don't count
+        # against this run's fresh-table assertions.
+        subprocess.run(["rm", "-rf", PIN_DIR], capture_output=True)
         dst_mac = setup_netns()
         proc = start_node(args.node_bin, home, cwd, pending_ms=1500,
                           snat="true")

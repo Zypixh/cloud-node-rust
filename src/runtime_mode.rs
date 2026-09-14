@@ -336,6 +336,13 @@ pub struct XdpBudgetSettings {
     /// Default 100k pps.
     #[serde(rename = "controlPps", default = "default_control_pps")]
     pub control_pps: u64,
+    /// Per-service ceiling on new-flow admissions/sec keyed by listen port —
+    /// a distributed flood on one service cannot drain sibling services'
+    /// share of the new-flow envelope. Default: equal to the aggregate
+    /// new-flow cap (single-service nodes see no behavior change; tighten it
+    /// to reserve admission headroom across many services).
+    #[serde(rename = "serviceFlowPps")]
+    pub service_flow_pps: Option<u64>,
     /// Accounting window for the fixed-window buckets.
     #[serde(rename = "windowMs", default = "default_xdp_rate_limit_window_ms")]
     pub window_ms: u64,
@@ -370,6 +377,7 @@ impl Default for XdpBudgetSettings {
             verified_pps: default_verified_pps(),
             xsk_redirect_pps: default_xsk_redirect_pps(),
             control_pps: default_control_pps(),
+            service_flow_pps: None,
             window_ms: default_xdp_rate_limit_window_ms(),
         }
     }

@@ -428,8 +428,15 @@ def main():
         proc = start_node(node_bin, args.home, args.work)
         try:
             fb = wait_flow_feedback(node_bin, args.home, args.work, 0, timeout=25)
-            fb = flow_feedback(node_bin, args.home, args.work)
-            imported = int(fb.get("importedFlows", 0))
+            # Flow import runs async after attach — poll the ledger until
+            # the pinned CT entries are adopted (bounded).
+            imported = 0
+            for _ in range(20):
+                fb = flow_feedback(node_bin, args.home, args.work)
+                imported = int(fb.get("importedFlows", 0))
+                if imported >= 2:
+                    break
+                time.sleep(0.5)
             epoch = int(fb.get("ownerEpoch", 0))
             before = dump_maps(node_bin, args.work).get("counters", {})
             # Imported flows keep transiting the dataplane without any

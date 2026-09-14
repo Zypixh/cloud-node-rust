@@ -73,12 +73,18 @@ xdp:
     enabled: true          # 默认 true；唯一关闭方式
     unverifiedPps: 2000000 # 整机未验证包/秒（本地 TCP/UDP，ACL 之后）
     newFlowPerSec: 100000  # 整机新建 CT/SNAT 准入/秒
+    verifiedPps: 8000000   # 整机已验证流包/秒（独占池，洪泛无法挤占）
+    xskRedirectPps: 4000000 # 整机 AF_XDP 重定向包/秒
+    controlPps: 100000     # 必要控制报文/秒（ICMP/ND/PMTU）
+    serviceFlowPps: ~      # 每监听服务（dst port）新建准入/秒；
+                           # 缺省 = newFlowPerSec（单服务节点行为不变）
     windowMs: 1000         # 固定窗口
 ```
 
 - 整机总额由用户态按 possible-CPU 数预分成每 CPU 份额（向上取整、下限 1），CPU/队列数变化不会倍增总配额。
 - 基线保护在 Normal 压力下也存在；压力反馈只收窄弹性额度（High ÷2、Critical ÷4，份额下限 1），不存在"除到 0 变关闭"的路径。
-- 命中按 `unverifiedLimited` / `admissionLimited` 计数器上报；新状态拒绝发生在任何 CT/SNAT 写入之前，不产生残留状态。
+- 命中按 `unverifiedLimited` / `admissionLimited` / `verifiedLimited` / `controlLimited` 计数器上报；新状态拒绝发生在任何 CT/SNAT 写入之前，不产生残留状态。
+- `serviceFlowPps`（EN-07 公平维度，dim6）按监听端口在 `XDP_SVC_BUDGET`（每 CPU 哈希表，256 项）分桶：针对单一服务的分布式洪泛只耗尽其自身份额，兄弟服务的新建准入不受影响，聚合 dim1 上限仍然生效。表满时新桶创建失败由 `svcBudgetFull` 计数并回落到聚合 dim1 信封（有界、可观测，不是静默放行）；单服务拒绝计入 `serviceLimited`。
 
 源地址限流（EN-08）——按源 IP（或源前缀）分桶的固定窗口限制器：
 

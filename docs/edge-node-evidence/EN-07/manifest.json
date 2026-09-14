@@ -1,19 +1,44 @@
 {
   "task": "EN-07",
   "status": "verified-veth-netns",
-  "abi": "v6",
+  "abi": "v13",
+  "base_commit": "cd4b927",
+  "ebpf_object_sha256": "ec673d6c813ffa05603e2b1f3a674915bf9f8751437d933decab418af84fe292",
   "deliverables": [
-    "XDP_BUDGET_CFG + XDP_BUDGET per-CPU fixed-window buckets",
-    "budget_charge gates: unverified at handle stage (all modes), new-flow before CT/SNAT insert (4 work paths)",
-    "counters: unverifiedLimited, admissionLimited",
-    "xdp.budget config + effective_budget_config per-CPU share math with >=1 clamp",
-    "rate-bucket map-full now bounded by aggregate ceiling (EN-00 finding #1 closed)"
+    "XDP_BUDGET_CFG (Array x1, XdpBudgetConfig 72B): unverified_pps / new_flow_per_sec / xsk_redirect_pps / challenge_pps / verified_pps / control_pps / service_flow_pps / window_ns / flags (bit0-6 enforce bits)",
+    "XDP_BUDGET (PerCpuArray x1, XdpBudgetBucket 96B, six dims): per-CPU fixed-window buckets; userspace pre-divides node totals by possible-CPU count (ceil, floor 1) so quota never multiplies with CPU/queue count",
+    "dim0 unverified at handle stage (all modes, after ACL, before source buckets); dim1 new-flow before CT/SNAT insert on all 4 NAT admission paths (udp4/tcp4/udp6_fwd/tcp6_fwd); dim2 xsk-redirect at AF_XDP redirect; dim4 verified packets on CT-hit paths; dim5 control (ICMP/ND/PMTU)",
+    "verified pool is exclusive: CT-hit / SNAT_REV-hit traffic charges dim4 and refunds dim0 — an unverified flood can never starve established flows",
+    "ABI v13: XdpSvcBucket (16B) + XDP_SVC_BUDGET (PerCpuHashMap u32->bucket, 256 entries) keyed by listen dst-port; dim6 gate after aggregate dim1 on every new-flow admission path — a distributed flood on one service cannot drain sibling services' share",
+    "service map capacity exhaustion is bounded and observable: insert failure counts svcBudgetFull and the packet still passes/fails on the aggregate dim1 envelope — never a silent bypass",
+    "missing dim1 charges added on IPv6 NAT admission paths (udp6_fwd, tcp6_fwd, and the v6 reply-side fresh-admission sites) so v4/v6 are symmetric",
+    "counters: unverifiedLimited, admissionLimited, verifiedLimited, controlLimited, serviceLimited, svcBudgetFull (dump-maps + status)",
+    "xdp.budget config gains verifiedPps/xskRedirectPps/controlPps/serviceFlowPps; serviceFlowPps defaults to newFlowPerSec (single-service nodes see no behavior change)"
   ],
   "verification": {
-    "verifier": "11 programs accepted, 0 r11",
-    "matrix": "T01 28/28",
-    "unverified_gate": "300pkt -> 297 dropped at budget",
-    "admission_gate": "100 flows -> 7 bound, 14 admissionLimited, 79 unverifiedLimited"
+    "verifier": "all programs accepted (kernel 7.0.14-orbstack); object sha256 ec673d6c",
+    "unit": "107 xdp tests pass; 668 total lib tests pass; effective_budget_config covers dim6 default+share math",
+    "probe": "scripts/edge/en07_svc_budget_probe.py — 4/4 phases pass on veth/netns (serviceFlowPps=64, per-CPU share 10 on 7 CPUs)",
+    "probe_results": {
+      "A_baseline": "fresh flows on UDP:8543 + TCP:8443 admitted; serviceLimited=0 below cap",
+      "B_service_flood": "400 distinct-tuple UDP packets to :8543 -> udpFwdTx delta=56 (bounded by share+window), serviceLimited delta=344, admissionLimited delta=0 — capped at dim6, not zeroed, aggregate envelope untouched",
+      "C_sibling_fairness": "4 fresh SYNs to :8443 all admitted (pending entries) with serviceLimited/admissionLimited deltas 0 — flood on :8543 did not consume sibling headroom",
+      "D_established_unaffected": "re-sent admitted tuple keeps forwarding (udpFwdTx=2, serviceLimited=0) — CT-hit path pays no admission/service charge"
+    },
+    "regressions": {
+      "en08_rate_probe": "pass (debug build, elevated pressure)",
+      "en09_pending_probe": "pass (startup pin-hygiene fix: stale pinned CT from a previous run no longer breaks fresh-table assertions)",
+      "en10_flow_probe": "pass (phase-C import wait made bounded-poll instead of single read)",
+      "en11_nat_probe": "8/8 phases pass",
+      "en12_queue_probe": "all phases pass"
+    }
   },
-  "deferred": ["xsk_redirect_pps (EN-12)", "challenge_pps (EN-15)", "half-open gauge via XdpPendingCap (EN-09)"]
+  "limitations": [
+    "service key is the wire dst port only — VIP+port granularity (same port on different VIPs shares a bucket); VIP-aware keys are a future refinement if multi-tenant VIPs need isolation",
+    "XDP_SVC_BUDGET capacity (256/CPU) beyond the configured service set degrades to the aggregate dim1 envelope — counted via svcBudgetFull, not silent",
+    "fixed-window fairness is approximate at window boundaries (share resets per window); not an exact token bucket",
+    "challenge_pps dim3 remains reserved for EN-15 (QUIC Retry/cookie replies)",
+    "per-queue/backend PPS/BPS beyond the CPU-bucket granularity remains EN-12/EN-16 scope"
+  ],
+  "rollback": "serviceFlowPps absent -> dim6 rate = aggregate new-flow cap (no behavior change); budget.enabled=false -> explicit all-zero config; map-spec audit rejects stale pinned maps on ABI mismatch"
 }

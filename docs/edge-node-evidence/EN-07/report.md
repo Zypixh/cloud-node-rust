@@ -1,47 +1,60 @@
-# EN-07 — 聚合预算与每路径容量保护
+# EN-07 — 分层预算与每服务公平
 
-状态：**VERIFIED（veth/netns）**。
+状态：**VERIFIED（veth/netns，ABI v13）**。
 
 ## 交付
 
-### eBPF（ABI v6）
+### eBPF
 
-- `XDP_BUDGET_CFG`（Array×1，`XdpBudgetConfig` 48B）：`unverified_pps` / `new_flow_per_sec` / `xsk_redirect_pps` / `challenge_pps` / `window_ns` / `flags`（bit0=unverified、bit1=new-flow 生效位；bit2/3 预留 EN-12/15）。
-- `XDP_BUDGET`（PerCpuArray×1，`XdpBudgetBucket` 64B）：每 CPU 独占固定窗口桶——每 CPU 内读改写无竞争，聚合配额由用户态预分，不随 CPU/队列数倍增（I09）。
+- `XDP_BUDGET_CFG`（Array×1，`XdpBudgetConfig` 72B）：`unverified_pps` / `new_flow_per_sec` / `xsk_redirect_pps` / `challenge_pps` / `verified_pps` / `control_pps` / `service_flow_pps` / `window_ns` / `flags`（bit0-6 生效位）。
+- `XDP_BUDGET`（PerCpuArray×1，`XdpBudgetBucket` 96B，6 个聚合维度）：每 CPU 独占固定窗口桶——读改写无竞争，聚合配额由用户态按 possible-CPU 数预分（ceil、下限 1），CPU/队列数变化不倍增总配额。
+- `XDP_SVC_BUDGET`（PerCpuHashMap `u32→XdpSvcBucket`，256 项/CPU，dim6）：按**监听 dst port** 分桶的每服务新建准入额度。分布式洪泛只耗尽目标服务自身份额；兄弟服务不受影响。
 - 计费点：
-  - **unverified（dim 0）**：`handle_ipv4`/`handle_ipv6` 中，本地 TCP/UDP、ACL 之后、per-source 桶创建之前——三模式一致。
-  - **new-flow（dim 1）**：4 个 NAT work 路径（udp4/tcp4/udp6/tcp6）的 CT-miss 分支，`snat_alloc`/`CT.insert` 之前。拒绝即 DROP + `admissionLimited`，零残留状态。
-- 已验证流保留池：CT-hit 与 SNAT_REV-hit 路径不消耗 new-flow 预算——洪峰无法剥夺已建流的状态。
-- 源桶耗尽回退：`rate_bucket_hit_*` insert 失败 → 记 `ratelimitMapFull` 后仅受聚合上限约束（EN-00 发现#1 的 fail-open 已收敛为有界回退）。
-- 新增计数器：`unverifiedLimited`、`admissionLimited`（`dump-maps`/status 透出）。
+  - dim0 unverified：handle 阶段（三模式，ACL 之后、源桶之前）。
+  - dim1 new-flow：全部 4 条 NAT 准入路径（udp4/tcp4/udp6_fwd/tcp6_fwd）的 CT-miss 分支，`snat_alloc`/insert 之前——拒绝零残留。**补齐了 v6 路径此前缺失的计费点**（v4/v6 对称）。
+  - dim2 xsk-redirect：AF_XDP 重定向。
+  - dim4 verified：CT-hit / SNAT_REV-hit 路径（独占池，unverified 洪泛永不挤占已建流）。
+  - dim5 control：ICMP/ND/PMTU 必要控制报文。
+  - dim6 per-service：dim1 通过之后、状态创建之前——先聚合门、再服务门，两级都不放行即 DROP。
+- 服务表容量耗尽是有界可观测回退：insert 失败计 `svcBudgetFull`，包仍受聚合 dim1 信封约束——不是静默绕过。
+- 计数器透出：`unverifiedLimited` / `admissionLimited` / `verifiedLimited` / `controlLimited` / `serviceLimited` / `svcBudgetFull`（`dump-maps` 与 status）。
 
 ### 用户态
 
-- `xdp.budget` 配置（`enabled`/`unverifiedPps`/`newFlowPerSec`/`windowMs`），缺省启用内置基线（2M pps / 100k flow/s / 1s）。
-- `effective_budget_config()`：节点总额 → ceil(total/ncpu/divisor) 每 CPU 份额，下限 1；压力缩放 Elevated×1/High÷2/Critical÷4——"除到 0"永不等于关闭；`enabled:false` 是唯一显式关闭路径。
-- `sync_budget` 随 sweeper tick（5s）写入 `XDP_BUDGET_CFG`；写入失败只告警不静默。
+- `xdp.budget` 增加 `verifiedPps` / `xskRedirectPps` / `controlPps` / `serviceFlowPps`；`serviceFlowPps` 缺省等于 `newFlowPerSec`——单服务节点行为不变，多服务节点获得可调公平下限。
+- `effective_budget_config()`：全部维度按 `ceil(total/ncpu)` 预分、下限 1；`enabled:false` 是唯一显式关闭路径；flags=0b1110111。
+- map-spec 表新增 `XDP_SVC_BUDGET`（PerCpuHash, key u32, value 16B, 256 项）；pinned map 审计按 ABI 拒绝不匹配布局。
 
 ## 验证
 
 | 证据 | 结果 |
 |---|---|
-| verifier | 11 程序 kernel 7.0 全部接受；`llvm-objdump` 零 r11 |
-| T01 | 28/28 |
-| unverified 门 | `unverifiedPps:20` 下 300 UDP→代理口：`unverifiedLimited=297, drop=297, pass=5` |
-| new-flow 门 | `newFlowPerSec:5` 下 100 个独立 UDP 四元组→FWD 口：`snatBound=7, udpFwdTx=7, admissionLimited=14, unverifiedLimited=79` —— 拒绝先于建表 |
-| CPU 倍增防护 | 份额=ceil(总/ncpu) 且 min 1，单测 `effective_budget_config_baseline_and_share_math` |
-| Normal 基线 | 无配置时 flags≠0、份额≥1（单测） |
+| verifier | 全部程序 kernel 7.0.14-orbstack 接受；对象 sha256 `ec673d6c` |
+| 单测 | 107 xdp / 668 lib 全过；`effective_budget_config` 覆盖 dim6 缺省与份额数学 |
+| 服务预算探针 | `en07_svc_budget_probe.py` 4/4 阶段（serviceFlowPps=64，7 CPU → 份额 10） |
+| EN-08/09/10/11/12 回归 | 全绿（见 manifest） |
+
+探针实测（veth/netns）：
+
+- **A 基线**：UDP:8543 + TCP:8443 少量新流正常准入，`serviceLimited=0`。
+- **B 服务洪泛**：400 个独立 tuple 打 :8543 → `udpFwdTx=56`（份额+窗口边界内），`serviceLimited=344`，`admissionLimited=0`——dim6 封顶但未归零，聚合信封未被消耗。
+- **C 兄弟公平**：4 个新 SYN 打 :8443 全部准入（pending 表有记录），`serviceLimited/admissionLimited` 增量均 0——:8543 的洪泛没消耗 :8443 的额度。
+- **D 已建流不受影响**：已准入 tuple 重发继续转发（`udpFwdTx=2`，`serviceLimited=0`）——CT-hit 路径不再付准入/服务计费。
 
 ## 与验收对照
 
-- 拒绝发生在源桶/CT/SNAT 创建前 ✓（unverified 门在源桶前；admission 门在 insert 前）
-- 重复同 tuple 不绕过处理预算 ✓（CT-miss 重传每包计费）
-- CPU/队列变化不倍增总配额 ✓（预分份额）
-- Normal 有基础上限 ✓（内置基线）
-- 用户态反馈停止仍有保护 ✓（eBPF 内静态执行，sweeper 只重推配置）
+- 未验证/新状态/服务/AF_XDP/已验证/控制六维有总上限 ✓
+- 拒绝先于源桶/CT/SNAT/pending 创建 ✓
+- 同 tuple 重复包持续付费 ✓（CT-miss 每包计费；CT-hit 走 dim4 不走 dim1）
+- 配额不随 CPU/队列数倍增 ✓（预分份额，下限 1）
+- 正常流量保留池 ✓（dim4 独占 + dim0 退款；探针 C/D 实测兄弟服务与存量流不受洪泛影响）
+- 用户态反馈停止仍有保护 ✓（eBPF 内静态执行）
+- 细粒度控制不可用时回退明确可观测 ✓（`svcBudgetFull` 计数 + 聚合信封兜底）
 
 ## 限制（如实记录）
 
-- `xsk_redirect_pps`/`challenge_pps` 维度定义已入 ABI，执行点属 EN-12（每队列）/EN-15（挑战响应）。
-- 已验证流的带宽预留=状态持有+免 admission 计费；共享 unverified 上限下的带宽隔离为简化实现，per-队列/后端 PPS/BPS 属 EN-12。
-- 半开并发上限由 TCP CT 容量+sweeper 提供，`XdpPendingCap` 合同已定义，接入待 EN-09。
+- 服务键仅为报文 dst port——同端口不同 VIP 共享一个桶；如需按 VIP 隔离是未来扩展。
+- `XDP_SVC_BUDGET` 容量（256/CPU）外的服务回落到聚合 dim1 信封——`svcBudgetFull` 计数，非静默。
+- 固定窗口在边界处是近似公平，非精确令牌桶。
+- `challenge_pps`（dim3）为 EN-15 预留；每后端 PPS/BPS 属 EN-16 范围。
+- 证据环境为 veth/netns；真实 NIC 多队列下的每 CPU 分布验证待真实网卡环境。

@@ -288,6 +288,15 @@ pub struct XdpCounters {
     /// anchors — counted separately from conflicts so blind-ACK floods
     /// are observable.
     pub nat_seq_rejected: u64,
+    /// New-flow admissions rejected by the per-service budget (dim6):
+    /// the listen port's per-CPU bucket was exhausted, so a flood aimed
+    /// at one service is contained without draining siblings.
+    pub service_limited: u64,
+    /// Per-service budget buckets that could not be created because
+    /// XDP_SVC_BUDGET is at capacity — those packets still pass/fail on
+    /// the aggregate dim1 envelope; the count makes the fairness gap
+    /// observable instead of silent.
+    pub svc_budget_full: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -617,11 +626,14 @@ pub struct NatScratch {
 /// v11: EN-11 — XdpCounters +snat_alloc_fail (232->240B);
 /// XdpPendingCap +flags (test-only fault injection);
 /// NatScratch +debug_flags.
-/// v12: EN-06/07/13 — XdpBudgetConfig +verified_pps/control_pps (32->48B),
-/// XdpBudgetBucket grows to six dims (40->64B), XdpUdpCtValue
+/// v12: EN-06/07/13 — XdpBudgetConfig +verified_pps/control_pps (48->64B),
+/// XdpBudgetBucket grows to six dims (64->96B), XdpUdpCtValue
 /// +expect_seq/expect_ack (40->48B), XdpCounters +verified_limited/
-/// control_limited/nat_seq_rejected (240->264B), NatScratch 320->328B.
-pub const XDP_ABI_VERSION: u32 = 12;
+/// control_limited/nat_seq_rejected (240->256B), NatScratch 320->328B.
+/// v13: EN-07 fairness — XdpBudgetConfig +service_flow_pps (64->72B, flag
+/// bit6), new XdpSvcBucket + XDP_SVC_BUDGET per-CPU per-port admission map,
+/// XdpCounters +service_limited/svc_budget_full (256->272B).
+pub const XDP_ABI_VERSION: u32 = 13;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -781,11 +793,16 @@ pub struct XdpBudgetConfig {
     pub verified_pps: u64,
     /// Max necessary-control packets/sec (ICMP et al. passed early).
     pub control_pps: u64,
+    /// Max new-state admissions/sec per listen service (dst port). A
+    /// distributed flood against one service cannot exhaust the shared
+    /// new-flow envelope for sibling services; the aggregate dim1 cap
+    /// still applies on top.
+    pub service_flow_pps: u64,
     /// Accounting window shared by the buckets.
     pub window_ns: u64,
     /// Enable bitset; bit0 = enforce unverified_pps, bit1 = new_flow,
     /// bit2 = xsk_redirect, bit3 = challenge, bit4 = verified,
-    /// bit5 = control.
+    /// bit5 = control, bit6 = per-service new-flow.
     pub flags: u64,
 }
 
@@ -801,6 +818,18 @@ pub struct XdpBudgetConfig {
 pub struct XdpBudgetBucket {
     pub window_start_ns: [u64; 6],
     pub count: [u64; 6],
+}
+
+/// Per-CPU per-service admission bucket for `XDP_SVC_BUDGET` (EN-07
+/// fairness): keyed by listen port (network order, widened to u32), so a
+/// distributed flood against one service cannot drain sibling services'
+/// share of the new-flow budget. The map is bounded — capacity beyond the
+/// configured service set degrades to the aggregate dim1 envelope only.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpSvcBucket {
+    pub window_start_ns: u64,
+    pub count: u64,
 }
 
 /// Half-open concurrency cap stored in a single-slot map value so the dataplane
@@ -838,10 +867,11 @@ const _: () = assert!(core::mem::size_of::<XdpFlowKey>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpFlowRecord>() == 64);
 const _: () = assert!(core::mem::size_of::<XdpFlowEvent>() == 88);
 const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
-const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 64);
+const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 72);
 const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 96);
+const _: () = assert!(core::mem::size_of::<XdpSvcBucket>() == 16);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 24);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 256);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 272);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 56);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);
@@ -890,6 +920,7 @@ unsafe_impl_aya_pod!(
     XdpPathBinding,
     XdpBudgetConfig,
     XdpBudgetBucket,
+    XdpSvcBucket,
     XdpPendingCap,
 );
 

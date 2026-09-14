@@ -2672,12 +2672,14 @@ fn effective_budget_config_baseline_and_share_math() {
         ..XdpConfig::default()
     });
     let cfg = manager.effective_budget_config();
-    assert_eq!(cfg.flags, 0b11_0111);
+    assert_eq!(cfg.flags, 0b111_0111);
     assert!(cfg.unverified_pps >= 1);
     assert!(cfg.new_flow_per_sec >= 1);
     assert!(cfg.verified_pps >= 1);
     assert!(cfg.xsk_redirect_pps >= 1);
     assert!(cfg.control_pps >= 1);
+    // dim6 defaults to the aggregate new-flow cap.
+    assert_eq!(cfg.service_flow_pps, cfg.new_flow_per_sec);
     assert!(cfg.window_ns > 0);
 
     // Per-CPU share = ceil(total / ncpu): total quota cannot multiply with
@@ -2693,6 +2695,7 @@ fn effective_budget_config_baseline_and_share_math() {
             verified_pps: 16,
             xsk_redirect_pps: 4,
             control_pps: 2,
+            service_flow_pps: None,
             window_ms: 1000,
         }),
         ..XdpConfig::default()
@@ -2703,6 +2706,7 @@ fn effective_budget_config_baseline_and_share_math() {
     assert!(cfg.verified_pps >= 1 && cfg.verified_pps <= 16);
     assert!(cfg.xsk_redirect_pps >= 1 && cfg.xsk_redirect_pps <= 4);
     assert!(cfg.control_pps >= 1 && cfg.control_pps <= 2);
+    assert!(cfg.service_flow_pps >= 1 && cfg.service_flow_pps <= 3);
 
     // enabled=false writes an explicit all-zero config (flag bits clear) —
     // the only off switch, and it is operator-explicit.
