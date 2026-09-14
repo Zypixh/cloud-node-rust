@@ -145,6 +145,30 @@ pub struct XdpStatusSnapshot {
     /// EN-09: SYN admissions rejected because the bounded half-open table
     /// XDP_PENDING is full.
     pub pending_limited: u64,
+    /// EN-10: lifecycle events dropped in-kernel because XDP_FLOW_EVENTS was
+    /// full (consumer too slow). Feedback is advisory — loss never blocks or
+    /// alters the dataplane, but is always accounted.
+    #[serde(default)]
+    pub flow_event_lost: u64,
+    /// EN-10: lifecycle events applied to the userspace feedback ledger.
+    #[serde(default)]
+    pub flow_events_received: u64,
+    /// EN-10: events dropped by the ordering contract — a stale
+    /// (incarnation, owner_epoch, seq) triple or a record for a tuple whose
+    /// ledger entry is newer. Old-generation feedback can never renew
+    /// state owned by a newer generation.
+    #[serde(default)]
+    pub flow_events_stale: u64,
+    /// EN-10: ledger entries evicted at capacity (bounded feedback state).
+    #[serde(default)]
+    pub flow_events_evicted: u64,
+    /// EN-10: flow records adopted from pinned state maps at attach —
+    /// evidence a reload/restart did not sever imported connections.
+    #[serde(default)]
+    pub imported_flows: u64,
+    /// EN-10: owner generation stamped on emitted lifecycle events.
+    #[serde(default)]
+    pub owner_epoch: u64,
     /// ICMP/ICMPv6 control traffic handed to the kernel stack.
     #[serde(default)]
     pub control: u64,
@@ -226,6 +250,22 @@ pub(crate) struct XdpManager {
     pending_limited: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
+    /// EN-10: owner generation written to XDP_OWNER_EPOCH at attach.
+    owner_epoch: AtomicU64,
+    /// EN-10: flow records adopted from pinned maps at the last attach.
+    imported_flows: AtomicU64,
+    /// EN-10: kernel-side lifecycle events lost to a full ring.
+    flow_event_lost: AtomicU64,
+    /// EN-10: events applied / rejected / evicted by the feedback consumer.
+    flow_events_received: AtomicU64,
+    flow_events_stale: AtomicU64,
+    flow_events_evicted: AtomicU64,
+    /// EN-10 bounded advisory mirror of dataplane lifecycle transitions.
+    /// Kernel maps are the sole authority; this ledger never admits trust.
+    #[cfg(target_os = "linux")]
+    flow_event_ledger: parking_lot::Mutex<FlowEventLedger>,
+    flow_event_consumer_started: AtomicBool,
+    flow_event_consumer_generation: AtomicU64,
     proxy_redirect_enabled: AtomicBool,
     /// EN-12 worker lease: true between reactor-thread spawn and the
     /// redirect enable attempt, so queue workers stay alive while the
@@ -298,6 +338,16 @@ impl XdpManager {
             pending_limited: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
+            owner_epoch: AtomicU64::new(0),
+            imported_flows: AtomicU64::new(0),
+            flow_event_lost: AtomicU64::new(0),
+            flow_events_received: AtomicU64::new(0),
+            flow_events_stale: AtomicU64::new(0),
+            flow_events_evicted: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            flow_event_ledger: parking_lot::Mutex::new(FlowEventLedger::default()),
+            flow_event_consumer_started: AtomicBool::new(false),
+            flow_event_consumer_generation: AtomicU64::new(0),
             proxy_redirect_enabled: AtomicBool::new(false),
             proxy_workers_starting: AtomicBool::new(false),
             last_state_write_at: AtomicU64::new(0),
@@ -358,6 +408,10 @@ impl XdpManager {
         {
             match linux::attach(&self.config, object_override.as_deref()).await {
                 Ok(attached_program) => {
+                    self.owner_epoch
+                        .store(attached_program.owner_epoch, Ordering::Relaxed);
+                    self.imported_flows
+                        .store(attached_program.imported_flows, Ordering::Relaxed);
                     *self.ebpf.lock() = Some(attached_program.ebpf);
                     let attached = attached_program.interfaces;
                     *self.attached.write() = attached;
@@ -391,6 +445,7 @@ impl XdpManager {
         }
         self.stop_rule_sweeper();
         self.stop_map_sync_worker();
+        self.stop_flow_event_consumer();
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
@@ -881,6 +936,12 @@ impl XdpManager {
             unverified_limited: self.unverified_limited.load(Ordering::Relaxed),
             admission_limited: self.admission_limited.load(Ordering::Relaxed),
             pending_limited: self.pending_limited.load(Ordering::Relaxed),
+            flow_event_lost: self.flow_event_lost.load(Ordering::Relaxed),
+            flow_events_received: self.flow_events_received.load(Ordering::Relaxed),
+            flow_events_stale: self.flow_events_stale.load(Ordering::Relaxed),
+            flow_events_evicted: self.flow_events_evicted.load(Ordering::Relaxed),
+            imported_flows: self.imported_flows.load(Ordering::Relaxed),
+            owner_epoch: self.owner_epoch.load(Ordering::Relaxed),
             rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
             rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
@@ -1541,6 +1602,8 @@ impl XdpManager {
                     .store(counters.admission_limited, Ordering::Relaxed);
                 self.pending_limited
                     .store(counters.pending_limited, Ordering::Relaxed);
+                self.flow_event_lost
+                    .store(counters.flow_event_lost, Ordering::Relaxed);
             }
         }
     }
@@ -1610,6 +1673,7 @@ impl XdpManager {
                     "unverifiedLimited": c.unverified_limited,
                     "admissionLimited": c.admission_limited,
                     "pendingLimited": c.pending_limited,
+                    "flowEventLost": c.flow_event_lost,
                 })
             })
             .ok();
@@ -1635,6 +1699,7 @@ impl XdpManager {
                 "ready": xdp_tcp_dataplane_supported(),
                 "detail": self.tcp_dataplane_detail(),
             },
+            "flowFeedback": self.flow_feedback_json(),
             "xskQueues": queue_statuses,
             "blockedIps": state.blocked_ips.iter().filter(|(_, expiry)| **expiry > now).map(|(ip, expiry)| serde_json::json!({"ip": ip.to_string(), "expiresAt": expiry})).collect::<Vec<_>>(),
             "allowedIps": state.allowed_ips.iter().filter(|(_, expiry)| **expiry > now).map(|(ip, expiry)| serde_json::json!({"ip": ip.to_string(), "expiresAt": expiry})).collect::<Vec<_>>(),
@@ -1642,6 +1707,45 @@ impl XdpManager {
             "allowedNetworks": state.allowed_networks.values().filter(|(_, expiry)| *expiry > now).map(|(net, expiry)| serde_json::json!({"network": net.to_string(), "expiresAt": expiry})).collect::<Vec<_>>(),
             "blockedRanges": state.blocked_ranges.iter().filter(|(_, expiry)| **expiry > now).map(|(range, expiry)| serde_json::json!({"from": range_bound_to_ip(range.from, range.v6).to_string(), "to": range_bound_to_ip(range.to, range.v6).to_string(), "expiresAt": expiry})).collect::<Vec<_>>(),
             "allowedRanges": state.allowed_ranges.iter().filter(|(_, expiry)| **expiry > now).map(|(range, expiry)| serde_json::json!({"from": range_bound_to_ip(range.from, range.v6).to_string(), "to": range_bound_to_ip(range.to, range.v6).to_string(), "expiresAt": expiry})).collect::<Vec<_>>(),
+        })
+    }
+
+    /// EN-10 feedback/takeover state. `ownerEpoch` is read from the pinned
+    /// map so a separate `xdp dump-maps` process reports the owning
+    /// generation; the rest is per-manager state — when this manager never
+    /// attached (CLI process), fall back to the daemon's persisted status
+    /// snapshot so the numbers stay observable cross-process.
+    fn flow_feedback_json(&self) -> serde_json::Value {
+        let attached = !self.attached.read().is_empty();
+        let persisted = if attached {
+            None
+        } else {
+            persisted_status_snapshot()
+        };
+        let owner_epoch = {
+            #[cfg(target_os = "linux")]
+            {
+                linux::read_pinned_owner_epoch()
+                    .unwrap_or_else(|| self.owner_epoch.load(Ordering::Relaxed))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.owner_epoch.load(Ordering::Relaxed)
+            }
+        };
+        let value = |local: &AtomicU64, field: fn(&XdpStatusSnapshot) -> u64| {
+            if attached {
+                local.load(Ordering::Relaxed)
+            } else {
+                persisted.as_ref().map(field).unwrap_or(0)
+            }
+        };
+        serde_json::json!({
+            "ownerEpoch": owner_epoch,
+            "importedFlows": value(&self.imported_flows, |s| s.imported_flows),
+            "eventsReceived": value(&self.flow_events_received, |s| s.flow_events_received),
+            "eventsStale": value(&self.flow_events_stale, |s| s.flow_events_stale),
+            "eventsEvicted": value(&self.flow_events_evicted, |s| s.flow_events_evicted),
         })
     }
 
@@ -1654,6 +1758,7 @@ impl XdpManager {
     async fn detach_runtime(&self, reason: &'static str) -> anyhow::Result<()> {
         self.stop_rule_sweeper();
         self.stop_map_sync_worker();
+        self.stop_flow_event_consumer();
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
@@ -1691,6 +1796,17 @@ impl XdpManager {
     fn stop_rule_sweeper(&self) {
         self.rule_sweeper_generation.fetch_add(1, Ordering::Relaxed);
         self.rule_sweeper_started.store(false, Ordering::Relaxed);
+    }
+
+    /// EN-10: retire this generation's feedback consumer. The next consumer
+    /// only starts after a new manager attaches and claims a newer
+    /// XDP_OWNER_EPOCH, so feedback from a dead generation cannot be
+    /// applied as if it were current.
+    fn stop_flow_event_consumer(&self) {
+        self.flow_event_consumer_generation
+            .fetch_add(1, Ordering::Relaxed);
+        self.flow_event_consumer_started
+            .store(false, Ordering::Relaxed);
     }
 }
 
@@ -1764,6 +1880,7 @@ fn manager_from_runtime() -> std::sync::Arc<XdpManager> {
         *current = std::sync::Arc::new(XdpManager::new(config));
         previous.stop_rule_sweeper();
         previous.stop_map_sync_worker();
+        previous.stop_flow_event_consumer();
     }
     current.clone()
 }
@@ -1780,6 +1897,7 @@ fn replace_manager_from_runtime() -> std::sync::Arc<XdpManager> {
     *current = std::sync::Arc::new(XdpManager::new(config));
     previous.stop_rule_sweeper();
     previous.stop_map_sync_worker();
+    previous.stop_flow_event_consumer();
     current.clone()
 }
 
@@ -1808,6 +1926,227 @@ pub async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
     runtime.xdp = derived;
     RuntimeConfig::set_current(runtime);
     Ok(())
+}
+
+/// EN-10 bounded advisory mirror of dataplane lifecycle transitions. Keyed
+/// by (flow key, incarnation) so a recycled tuple never merges with state
+/// an older admission left behind. Entries are observability only —
+/// kernel maps remain the sole authority and nothing here admits trust.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct FlowEventLedger {
+    entries:
+        std::collections::HashMap<(cloud_node_xdp_common::XdpFlowKey, u64), FlowEventLedgerEntry>,
+    evicted: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct FlowEventLedgerEntry {
+    owner_epoch: u64,
+    seq: u64,
+    /// Event kind — read by the eviction policy (terminal records first).
+    kind: u8,
+}
+
+#[cfg(target_os = "linux")]
+impl FlowEventLedger {
+    const CAPACITY: usize = 65_536;
+
+    /// Apply one event. Returns true when the event was accepted; a false
+    /// result means it was older than the recorded triple for the tuple.
+    fn apply(&mut self, event: &cloud_node_xdp_common::XdpFlowEvent) -> bool {
+        let key = (event.key, event.flow_incarnation);
+        if let Some(existing) = self.entries.get(&key) {
+            if (event.flow_incarnation, event.owner_epoch, event.seq)
+                <= (event.flow_incarnation, existing.owner_epoch, existing.seq)
+            {
+                return false;
+            }
+        } else if self.entries.len() >= Self::CAPACITY {
+            // Bounded feedback: evict a terminal-state record first (it can
+            // never transition again), otherwise the oldest-order entry.
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, e)| {
+                    e.kind == cloud_node_xdp_common::XDP_FLOW_EVENT_CLOSED
+                        || e.kind == cloud_node_xdp_common::XDP_FLOW_EVENT_REJECTED
+                })
+                .map(|(k, _)| *k)
+                .next()
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .min_by_key(|(k, e)| (k.1, e.owner_epoch, e.seq))
+                        .map(|(k, _)| *k)
+                });
+            match victim {
+                Some(victim) => {
+                    self.entries.remove(&victim);
+                    self.evicted = self.evicted.saturating_add(1);
+                }
+                None => return false,
+            }
+        }
+        self.entries.insert(
+            key,
+            FlowEventLedgerEntry {
+                owner_epoch: event.owner_epoch,
+                seq: event.seq,
+                kind: event.kind,
+            },
+        );
+        true
+    }
+}
+
+/// EN-10 feedback consumer: drains the pinned XDP_FLOW_EVENTS ring into the
+/// manager's advisory ledger. Lifecycle: tied to the manager's consumer
+/// generation — manager replacement bumps the generation so an old
+/// generation's consumer can never apply events to a new manager's ledger.
+/// The ring itself is opened through its pin (own fd), so the consumer
+/// never holds the manager's eBPF lock.
+#[cfg(target_os = "linux")]
+fn start_flow_event_consumer(manager: &std::sync::Arc<XdpManager>) {
+    if manager
+        .flow_event_consumer_started
+        .swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    let generation = manager
+        .flow_event_consumer_generation
+        .load(Ordering::Relaxed);
+    let manager = std::sync::Arc::clone(manager);
+    tokio::spawn(async move {
+        run_flow_event_consumer(manager, generation).await;
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_flow_event_consumer(_manager: &std::sync::Arc<XdpManager>) {}
+
+#[cfg(target_os = "linux")]
+async fn run_flow_event_consumer(manager: std::sync::Arc<XdpManager>, generation: u64) {
+    use tokio::io::unix::AsyncFd;
+    tracing::info!("XDP flow-event consumer started (generation {generation})");
+    let mut ring: Option<AsyncFd<aya::maps::RingBuf<aya::maps::MapData>>> = None;
+    // A drain that loses the 10s status-write throttle would otherwise never
+    // be persisted — retry on each loop tick until the write lands.
+    let mut persist_pending = false;
+    loop {
+        if !manager_is_current(&manager) {
+            tracing::info!("XDP flow-event consumer exiting: manager no longer current");
+            break;
+        }
+        if manager
+            .flow_event_consumer_generation
+            .load(Ordering::Relaxed)
+            != generation
+        {
+            tracing::info!("XDP flow-event consumer exiting: generation superseded");
+            break;
+        }
+        if ring.is_none() {
+            if manager.attached.read().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            match linux::open_pinned_flow_events() {
+                Ok(Some(rb)) => match AsyncFd::new(rb) {
+                    Ok(fd) => {
+                        tracing::info!("XDP flow-event consumer: ring open");
+                        ring = Some(fd);
+                    }
+                    Err(err) => {
+                        tracing::warn!("XDP flow-event consumer: AsyncFd failed: {err}");
+                        return;
+                    }
+                },
+                Ok(None) => {
+                    // Attached object predates EN-10 or pinning failed:
+                    // feedback channel is explicitly unavailable — record
+                    // it rather than pretending the channel is live.
+                    manager
+                        .tcp_dataplane_detail
+                        .write()
+                        .push_str("; flow feedback channel unavailable");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!("XDP flow-event consumer: open pinned ring failed: {err}");
+                    return;
+                }
+            }
+        }
+        if persist_pending {
+            // Retry the throttled status write on the next tick — the loop
+            // wakes at least once per second via the poll timeout.
+            let now = crate::utils::time::now_timestamp() as u64;
+            if manager.claim_status_write_slot(now, false) {
+                manager.write_status_snapshot();
+                persist_pending = false;
+            }
+        }
+        let Some(poll) = ring.as_mut() else {
+            continue;
+        };
+        let mut guard = match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            poll.readable_mut(),
+        )
+        .await
+        {
+            Ok(Ok(guard)) => guard,
+            Ok(Err(err)) => {
+                tracing::warn!("XDP flow-event consumer: poll failed: {err}");
+                return;
+            }
+            Err(_) => continue,
+        };
+        let rb = guard.get_inner_mut();
+        let mut drained = false;
+        let mut batch = 0u64;
+        while let Some(item) = rb.next() {
+            let bytes: &[u8] = &item;
+            if bytes.len() != core::mem::size_of::<cloud_node_xdp_common::XdpFlowEvent>() {
+                manager.flow_events_stale.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // SAFETY: ring-buffer records are 8-byte aligned and XdpFlowEvent
+            // is a repr(C) Pod struct; read_unaligned tolerates either way.
+            let event = unsafe {
+                core::ptr::read_unaligned(
+                    bytes.as_ptr() as *const cloud_node_xdp_common::XdpFlowEvent
+                )
+            };
+            let mut ledger = manager.flow_event_ledger.lock();
+            if ledger.apply(&event) {
+                manager.flow_events_received.fetch_add(1, Ordering::Relaxed);
+            } else {
+                manager.flow_events_stale.fetch_add(1, Ordering::Relaxed);
+            }
+            let evicted = ledger.evicted;
+            drop(ledger);
+            manager
+                .flow_events_evicted
+                .store(evicted, Ordering::Relaxed);
+            drained = true;
+            batch += 1;
+        }
+        if batch > 0 {
+            tracing::debug!("XDP flow-event consumer drained {batch} events");
+        }
+        guard.clear_ready();
+        if drained {
+            // Counters live in this process; make them visible in the
+            // persisted status file. The write is throttled
+            // (XDP_STATE_WRITE_INTERVAL_SECS) and retried on the next tick,
+            // so this stays bounded I/O that always lands.
+            persist_pending = true;
+        }
+    }
 }
 
 fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
@@ -1875,6 +2214,7 @@ pub async fn initialize_from_runtime() -> anyhow::Result<()> {
     manager.initialize().await?;
     start_rule_sweeper(&manager);
     start_map_sync_worker(&manager);
+    start_flow_event_consumer(&manager);
     Ok(())
 }
 
@@ -1901,6 +2241,7 @@ pub async fn build_kernel_filter() -> Option<Box<dyn KernelFilter>> {
         return None;
     }
     start_rule_sweeper(&manager);
+    start_flow_event_consumer(&manager);
     Some(Box::new(XdpKernelFilter { manager }))
 }
 
@@ -1923,6 +2264,7 @@ pub async fn attach_from_runtime() -> anyhow::Result<()> {
     let manager = manager_from_runtime();
     manager.initialize().await?;
     start_rule_sweeper(&manager);
+    start_flow_event_consumer(&manager);
     manager.persist_status_blocking();
     Ok(())
 }
@@ -1949,6 +2291,7 @@ pub async fn reload_from_runtime() -> anyhow::Result<()> {
     manager.sync_snapshot(&snapshot);
     manager.initialize().await?;
     start_rule_sweeper(&manager);
+    start_flow_event_consumer(&manager);
     manager.persist_status_blocking();
     Ok(())
 }

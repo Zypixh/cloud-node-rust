@@ -1,0 +1,53 @@
+{
+  "phases": {
+    "A": {
+      "flowFeedback": {
+        "ownerEpoch": 1,
+        "eventsReceived": 4,
+        "eventsStale": 0,
+        "eventsEvicted": 0,
+        "importedFlows": 0
+      },
+      "flowEventLost": 0,
+      "tcpCtEntries": 1,
+      "udpCtEntries": 1,
+      "snatPort": 55647
+    },
+    "B_pins": {
+      "pinnedStateMaps": [
+        "XDP_COUNTERS",
+        "XDP_DISPATCH",
+        "XDP_FLOW_ACCT",
+        "XDP_FLOW_EVENTS",
+        "XDP_FLOW_SEQ",
+        "XDP_OWNER_EPOCH",
+        "XDP_PENDING",
+        "XDP_SNAT_REV",
+        "XDP_TCP_CT",
+        "XDP_UDP_CT"
+      ],
+      "ctEntriesAfterStop": 2
+    },
+    "C": {
+      "importedFlows": 2,
+      "ownerEpoch": 2,
+      "tcpFwdTxDelta": 3,
+      "udpFwdTxDelta": 3,
+      "counterDeltas": {
+        "packets": 8,
+        "tx": 6,
+        "udpFwdTx": 3,
+        "pass": 2,
+        "tcpFwdTx": 3
+      },
+      "flowFeedbackAfterRestart": {
+        "ownerEpoch": 2,
+        "eventsReceived": 0,
+        "eventsStale": 0,
+        "eventsEvicted": 0,
+        "importedFlows": 2
+      }
+    }
+  },
+  "ok": true
+}

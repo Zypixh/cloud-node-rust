@@ -269,6 +269,10 @@ pub struct XdpCounters {
     /// `XDP_PENDING` is full. The packet falls through to the normal path;
     /// no state is created and no existing entry is evicted.
     pub pending_limited: u64,
+    /// EN-10: lifecycle events dropped because XDP_FLOW_EVENTS was full.
+    /// Events are advisory feedback only — the dataplane never blocks on
+    /// publication, and kernel maps stay authoritative for flow state.
+    pub flow_event_lost: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -577,7 +581,10 @@ pub struct NatScratch {
 /// v7: EN-08 — XdpRateLimitConfig +v4/v6_prefix_len.
 /// v8: EN-09 — XdpUdpCtValue._pad->incarnation, XdpPendingCap._pad->
 /// pending_ttl_ns, XdpCounters +pending_limited, XDP_PENDING table.
-pub const XDP_ABI_VERSION: u32 = 8;
+/// v9: EN-10 — XdpCounters +flow_event_lost (216->224B);
+/// XDP_FLOW_EVENTS ringbuf + XDP_OWNER_EPOCH + XDP_FLOW_SEQ maps;
+/// flow-state maps pinned for generational takeover.
+pub const XDP_ABI_VERSION: u32 = 9;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -674,6 +681,13 @@ pub struct XdpFlowRecord {
     pub _pad: u32,
 }
 
+/// XdpFlowEvent::kind values (EN-10). Append only.
+pub const XDP_FLOW_EVENT_ADMITTED: u8 = 0;
+pub const XDP_FLOW_EVENT_VALIDATED: u8 = 1;
+pub const XDP_FLOW_EVENT_CLOSED: u8 = 2;
+pub const XDP_FLOW_EVENT_REJECTED: u8 = 3;
+pub const XDP_FLOW_EVENT_EXPIRED: u8 = 4;
+
 /// Flow lifecycle event (userspace ↔ dataplane feedback contract, EN-10).
 /// Old events must not override newer state on a reused tuple — compare
 /// (incarnation, owner_epoch, seq) before applying.
@@ -764,7 +778,7 @@ const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
 const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 64);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 16);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 216);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 224);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);
