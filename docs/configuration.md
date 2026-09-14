@@ -97,6 +97,20 @@ xdp:
 - `prefixV4Len`/`prefixV6Len` 是公平性粒度：同一前缀内的随机源共享一个桶，前缀洪泛无法耗尽其额度，良性前缀各自独立。语义是**近似**的 per-source/prefix 限制，不是精确配额；满表时新源回落到聚合预算并由 `ratelimitMapFull` 计数，不会静默放行也不会误杀。
 - GC 由 5s sweeper 执行，单次每表最多回收 8192 项——随机源 churn 不会永久占满表，也不会造成单 tick 无界扫描。
 
+半开连接准入（EN-09）——TCP 直连转发（tcpForwards）的握手前状态隔离：
+
+```yaml
+xdp:
+  admission:
+    tcpPendingMs: 3000   # 半开条目绝对期限（毫秒）
+```
+
+- 裸 SYN 准入后进入**独立有界半开表** `XDP_PENDING`（固定 65536 项，硬上限），不占用权威 CT 表 `XDP_TCP_CT`——SYN 洪泛永远无法挤占已建立流的表空间。
+- 晋升需握手证据：SNAT 流要求回复路径观测到后端 SYN-ACK（PENDING_ACKED 子状态）后客户端 ACK 晋升；纯 DNAT 流的回包对节点不可见（nonlocal 过境），客户端 ACK 即晋升。
+- `last_seen` 在准入时刻冻结 = 绝对期限；重传/任意命中均不续期，到期条目按陈旧处理并重新准入（incarnation 单调递增，防止旧事件覆盖重用 tuple）。
+- 表满时新 SYN 记 `pendingLimited` 并回退到常规判决路径——不产生状态、不驱逐既有条目、不静默放行。
+- UDP 无握手概念，仍直接进入 UDP CT 表（与既有行为一致）。
+
 ## 控制面配置
 
 大部分运行时配置由控制面下发，包括：

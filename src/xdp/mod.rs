@@ -139,6 +139,9 @@ pub struct XdpStatusSnapshot {
     pub unverified_limited: u64,
     /// EN-07: new-state admissions rejected by the new-flow budget.
     pub admission_limited: u64,
+    /// EN-09: SYN admissions rejected because the bounded half-open table
+    /// XDP_PENDING is full.
+    pub pending_limited: u64,
     /// ICMP/ICMPv6 control traffic handed to the kernel stack.
     #[serde(default)]
     pub control: u64,
@@ -217,6 +220,7 @@ pub(crate) struct XdpManager {
     nonlocal_pass: AtomicU64,
     unverified_limited: AtomicU64,
     admission_limited: AtomicU64,
+    pending_limited: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     proxy_redirect_enabled: AtomicBool,
@@ -282,6 +286,7 @@ impl XdpManager {
             nonlocal_pass: AtomicU64::new(0),
             unverified_limited: AtomicU64::new(0),
             admission_limited: AtomicU64::new(0),
+            pending_limited: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             proxy_redirect_enabled: AtomicBool::new(false),
@@ -850,6 +855,7 @@ impl XdpManager {
             nonlocal_pass: self.nonlocal_pass.load(Ordering::Relaxed),
             unverified_limited: self.unverified_limited.load(Ordering::Relaxed),
             admission_limited: self.admission_limited.load(Ordering::Relaxed),
+            pending_limited: self.pending_limited.load(Ordering::Relaxed),
             rate_limit_active: self.rate_limit_active.load(Ordering::Relaxed) != 0,
             rate_limit_detail: self.rate_limit_detail.lock().clone(),
             updated_at: crate::utils::time::now_timestamp(),
@@ -1231,6 +1237,31 @@ impl XdpManager {
         }
     }
 
+    /// Push the EN-09 absolute pending deadline into XDP_PENDING_CAP.
+    fn sync_pending_cap(&self) {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let ttl_ns = self
+            .config
+            .admission
+            .as_ref()
+            .map(|a| a.tcp_pending_ms)
+            .unwrap_or_else(crate::runtime_mode::default_tcp_pending_ms)
+            .saturating_mul(1_000_000);
+        #[cfg(target_os = "linux")]
+        let result = {
+            let mut ebpf = self.ebpf.lock();
+            match ebpf.as_mut() {
+                Some(ebpf) => linux::sync_pending_cap(ebpf, ttl_ns),
+                None => return,
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let result: anyhow::Result<()> = Ok(());
+        if let Err(err) = result {
+            tracing::warn!("XDP pending-cap map sync unavailable: {err}");
+        }
+    }
+
     /// Push the effective rate limit into the eBPF config map and record the
     /// outcome in the status snapshot. An object without XDP_RATE_CFG (built
     /// before the limiter existed) is reported, never silently ignored.
@@ -1342,6 +1373,13 @@ impl XdpManager {
         if !configured || self.attached.read().is_empty() {
             return;
         }
+        let pending_ttl = std::time::Duration::from_millis(
+            self.config
+                .admission
+                .as_ref()
+                .map(|a| a.tcp_pending_ms)
+                .unwrap_or_else(crate::runtime_mode::default_tcp_pending_ms),
+        );
         let result = {
             let mut guard = self.ebpf.lock();
             let mut shadow = self.udp_flow_shadow.lock();
@@ -1352,6 +1390,7 @@ impl XdpManager {
                     std::time::Duration::from_secs(180),
                     std::time::Duration::from_secs(7200),
                     std::time::Duration::from_secs(120),
+                    pending_ttl,
                 ),
                 None => Ok(()),
             }
@@ -1463,6 +1502,8 @@ impl XdpManager {
                     .store(counters.unverified_limited, Ordering::Relaxed);
                 self.admission_limited
                     .store(counters.admission_limited, Ordering::Relaxed);
+                self.pending_limited
+                    .store(counters.pending_limited, Ordering::Relaxed);
             }
         }
     }
@@ -1531,6 +1572,7 @@ impl XdpManager {
                     "nonlocalPass": c.nonlocal_pass,
                     "unverifiedLimited": c.unverified_limited,
                     "admissionLimited": c.admission_limited,
+                    "pendingLimited": c.pending_limited,
                 })
             })
             .ok();
@@ -1748,6 +1790,7 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
             }
             manager.sync_rate_limit_config();
             manager.sync_budget_config();
+            manager.sync_pending_cap();
             #[cfg(target_os = "linux")]
             {
                 manager.sweep_nat_maps();

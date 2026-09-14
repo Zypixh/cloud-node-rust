@@ -1,0 +1,35 @@
+{
+  "task": "EN-09",
+  "status": "verified-veth-netns",
+  "abi": "v8",
+  "base_commit": "863383b",
+  "ebpf_object_sha256": "00f0e34ee5350401152ae20381220f07520b6fa9d6db6cfb0d494b1b21056618",
+  "deliverables": [
+    "XDP_PENDING bounded half-open table (HashMap, 65536 hard cap) isolated from authoritative XDP_TCP_CT",
+    "XDP_PENDING_CAP admission contract (pending_ttl_ns absolute deadline)",
+    "handshake-evidence promotion: SNAT flows require PENDING_ACKED (observed backend SYN-ACK) + client ACK; plain-DNAT flows promote on client ACK (no observable SYN-ACK)",
+    "absolute pending deadline: last_seen_ns frozen at admission, hits never extend, stale entries removed then re-admitted as fresh incarnation",
+    "XdpUdpCtValue._pad -> incarnation (tuple-reuse guard for EN-10 events)",
+    "pendingLimited counter; pending-full falls back to normal verdict path (no state, no eviction, no silent pass)",
+    "sweeper: pending reap at absolute deadline; SNAT orphan check counts live pending entries; flow-acct folded on pending reap",
+    "xdp.admission.tcpPendingMs config (default 3000ms)"
+  ],
+  "verification": {
+    "verifier": "all programs accepted (kernel 7.0.14-orbstack, 7 CPU); 0 r11 in object",
+    "matrix": "T01 28/28, T02, T03, T04 all pass",
+    "unit": "102 xdp tests pass",
+    "probe": "scripts/edge/en09_pending_probe.py — all 5 phases pass",
+    "probe_results": {
+      "A_pending_admission": "SYN -> XDP_PENDING=1, XDP_TCP_CT=0, tcpFwdTx=1, snatBound=1",
+      "B_absolute_deadline": "retransmits keep exactly 1 entry; post-deadline SYN re-admits fresh incarnation",
+      "C_handshake_promotion": "SYN -> SYN-ACK -> ACK: pending=0, CT=1, snatReplyTx=1",
+      "D_blind_ack_no_promote": "ACK on non-ACKED SNAT pending stays pending; CT unchanged",
+      "E_pending_bound": "70k SYN flood -> pending=65536 exactly, pendingLimited=4464, CT=0"
+    }
+  },
+  "limitations": [
+    "plain-DNAT (snat: false) flows promote on client ACK alone — replies addressed to the client transit the kernel as nonlocal and cannot be observed for SYN-ACK evidence",
+    "pending table capacity is a fixed map bound (65536), not runtime-configurable; tcpPendingMs controls only the absolute deadline",
+    "expired-then-readmitted tuples restart at incarnation+1 via the stale entry's counter; fresh tuples start at 1"
+  ]
+}

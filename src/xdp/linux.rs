@@ -5,9 +5,9 @@ use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, PerCpuArray, XskMap};
 use aya::programs::links::PinnedLink;
 use cloud_node_xdp_common::{
     XdpBudgetBucket, XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key,
-    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpRateBucket,
-    XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue,
-    XdpUdpFwdKey, XdpUdpFwdRule,
+    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey, XdpQueueKey,
+    XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey,
+    XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
 };
 use ipnet::IpNet;
 use std::collections::BTreeSet;
@@ -872,7 +872,8 @@ pub(crate) fn sum_percpu_counters<'a>(
             acl_would_block,
             nonlocal_pass,
             unverified_limited,
-            admission_limited
+            admission_limited,
+            pending_limited
         );
     }
     total
@@ -924,6 +925,27 @@ pub fn sync_budget(ebpf: &mut aya::Ebpf, config: &XdpBudgetConfig) -> anyhow::Re
     })?;
     let mut array = Array::<_, XdpBudgetConfig>::try_from(map)?;
     array.set(0, *config, 0)?;
+    Ok(())
+}
+
+/// Push the EN-09 pending admission contract. `max_pending` mirrors the
+/// pending table's map bound (the actual hard limit); `pending_ttl_ns` is
+/// the absolute half-open deadline enforced in the dataplane.
+pub fn sync_pending_cap(ebpf: &mut aya::Ebpf, pending_ttl_ns: u64) -> anyhow::Result<()> {
+    let map = ebpf.map_mut("XDP_PENDING_CAP").ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing map XDP_PENDING_CAP; eBPF object predates EN-09 pending table (rebuild cloud-node-xdp-ebpf.o)"
+        )
+    })?;
+    let mut array = Array::<_, XdpPendingCap>::try_from(map)?;
+    array.set(
+        0,
+        XdpPendingCap {
+            max_pending: 65_536,
+            pending_ttl_ns,
+        },
+        0,
+    )?;
     Ok(())
 }
 
@@ -1316,12 +1338,14 @@ pub(super) fn sweep_nat_maps(
     udp_idle: std::time::Duration,
     tcp_idle: std::time::Duration,
     tcp_closing_grace: std::time::Duration,
+    tcp_pending: std::time::Duration,
 ) -> anyhow::Result<()> {
     use cloud_node_xdp_common::XDP_CT_STATE_CLOSING;
     let now_ns = monotonic_now_ns();
     let udp_idle_ns = udp_idle.as_nanos().min(u64::MAX as u128) as u64;
     let tcp_idle_ns = tcp_idle.as_nanos().min(u64::MAX as u128) as u64;
     let closing_ns = tcp_closing_grace.as_nanos().min(u64::MAX as u128) as u64;
+    let pending_ns = tcp_pending.as_nanos().min(u64::MAX as u128) as u64;
 
     let mut stale: Vec<XdpUdpCtKey> = Vec::new();
     let mut udp_live: std::collections::HashSet<XdpUdpCtKey> = Default::default();
@@ -1361,6 +1385,27 @@ pub(super) fn sweep_nat_maps(
             let _ = map.remove(key);
         }
         stale.extend(tcp_stale);
+    }
+
+    // EN-09: reap half-open entries whose absolute deadline has passed.
+    // Pending last_seen_ns is frozen at admission, so this cannot be held
+    // open by retransmits. Live pending entries count as owning conntrack
+    // for the SNAT orphan check below.
+    if let Some(map) = ebpf.map_mut("XDP_PENDING") {
+        let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
+        let mut pending_stale = Vec::new();
+        for item in map.iter() {
+            let (key, value) = item?;
+            if now_ns.saturating_sub(value.last_seen_ns) >= pending_ns {
+                pending_stale.push(key);
+            } else {
+                tcp_live.insert(key);
+            }
+        }
+        for key in &pending_stale {
+            let _ = map.remove(key);
+        }
+        stale.extend(pending_stale);
     }
 
     // Reap SNAT reverse bindings whose owning conntrack entry is gone.
@@ -1472,7 +1517,7 @@ fn drop_stale_pinned_maps() {
     let fwd_rule = size_of::<XdpUdpFwdRule>() as u32;
     let ct_key = size_of::<XdpUdpCtKey>() as u32;
     let ct_value = size_of::<XdpUdpCtValue>() as u32;
-    let specs: [(&str, MapType, u32, u32, u32); 29] = [
+    let specs: [(&str, MapType, u32, u32, u32); 31] = [
         ("XDP_BLOCKED_V4", MapType::Hash, v4, rule, 262_144),
         ("XDP_BLOCKED_V6", MapType::Hash, v6, rule, 262_144),
         ("XDP_ALLOWED_V4", MapType::Hash, v4, rule, 65_536),
@@ -1570,6 +1615,14 @@ fn drop_stale_pinned_maps() {
         ("XDP_TCP_FWD", MapType::Hash, fwd_key, fwd_rule, 4_096),
         ("XDP_UDP_CT", MapType::Hash, ct_key, ct_value, 262_144),
         ("XDP_TCP_CT", MapType::Hash, ct_key, ct_value, 262_144),
+        ("XDP_PENDING", MapType::Hash, ct_key, ct_value, 65_536),
+        (
+            "XDP_PENDING_CAP",
+            MapType::Array,
+            u,
+            size_of::<XdpPendingCap>() as u32,
+            1,
+        ),
         (
             "XDP_SNAT_REV",
             MapType::Hash,
