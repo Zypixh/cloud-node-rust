@@ -341,6 +341,39 @@ pub struct HTTP3Policy {
     pub port: i32,
     #[serde(rename = "supportMobileBrowsers", default)]
     pub support_mobile_browsers: bool,
+    #[serde(rename = "addressValidation", default = "default_http3_address_validation")]
+    pub address_validation: String,
+}
+
+fn default_http3_address_validation() -> String {
+    "adaptive".to_string()
+}
+
+/// EN-15: terminating-H3 address-validation policy for unvalidated QUIC
+/// Initial packets. The decision is made on `quinn::Incoming` before any
+/// handshake state, admission permits, or tasks are allocated.
+///
+/// - `adaptive` (default): issue a stateless Retry while L4 pressure is
+///   Elevated or worse; accept directly otherwise. Zero added RTT in
+///   normal operation, bounded state under an Initial flood.
+/// - `always`: require a Retry round trip for every unvalidated address.
+/// - `off`: never issue Retry (operator-declared lower protection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Http3AddressValidation {
+    #[default]
+    Adaptive,
+    Always,
+    Off,
+}
+
+impl HTTP3Policy {
+    pub fn address_validation_mode(&self) -> Http3AddressValidation {
+        match self.address_validation.trim().to_ascii_lowercase().as_str() {
+            "always" => Http3AddressValidation::Always,
+            "off" | "none" | "disabled" => Http3AddressValidation::Off,
+            _ => Http3AddressValidation::Adaptive,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -3356,6 +3389,37 @@ pub fn parse_life_to_seconds(v: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http3_policy_address_validation_defaults_and_parses() {
+        let policy: HTTP3Policy = serde_json::from_value(serde_json::json!({
+            "isOn": true,
+            "port": 443
+        }))
+        .expect("http3 policy should parse without addressValidation");
+        assert_eq!(
+            policy.address_validation_mode(),
+            Http3AddressValidation::Adaptive
+        );
+
+        for (value, expected) in [
+            ("always", Http3AddressValidation::Always),
+            ("ALWAYS", Http3AddressValidation::Always),
+            ("off", Http3AddressValidation::Off),
+            ("none", Http3AddressValidation::Off),
+            ("disabled", Http3AddressValidation::Off),
+            ("adaptive", Http3AddressValidation::Adaptive),
+            ("bogus", Http3AddressValidation::Adaptive),
+            ("", Http3AddressValidation::Adaptive),
+        ] {
+            let policy: HTTP3Policy = serde_json::from_value(serde_json::json!({
+                "isOn": true,
+                "addressValidation": value
+            }))
+            .expect("http3 policy should parse");
+            assert_eq!(policy.address_validation_mode(), expected, "value={value}");
+        }
+    }
 
     #[test]
     fn metric_item_category_defaults_and_normalizes() {
