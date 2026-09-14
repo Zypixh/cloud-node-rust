@@ -323,6 +323,7 @@ mod tests {
             },
             rate_limit: None,
             budget: None,
+            admission: None,
             ebpf_object: None,
         };
 

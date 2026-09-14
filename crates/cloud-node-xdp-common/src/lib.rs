@@ -265,6 +265,10 @@ pub struct XdpCounters {
     /// the new-flow-per-second budget was exhausted. Counted before any
     /// map insert, so a rejected admission creates no state at all.
     pub admission_limited: u64,
+    /// EN-09: SYN admissions rejected because the bounded half-open table
+    /// `XDP_PENDING` is full. The packet falls through to the normal path;
+    /// no state is created and no existing entry is evicted.
+    pub pending_limited: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -397,6 +401,17 @@ pub const XDP_CT_STATE_OPEN: u8 = 0;
 /// Conntrack state: a FIN or RST was observed; the entry is reaped after a
 /// short grace window instead of the full idle timeout.
 pub const XDP_CT_STATE_CLOSING: u8 = 1;
+/// EN-09 half-open admission state, stored in `XDP_PENDING` (not the
+/// authoritative CT table): SYN was admitted but no handshake evidence yet.
+/// `last_seen_ns` is the admission timestamp — an absolute deadline, never
+/// extended by retransmits (any hit must not refresh it).
+pub const XDP_CT_STATE_PENDING: u8 = 2;
+/// Pending sub-state: the backend's SYN-ACK was observed on the reply path.
+/// A client packet with ACK&&!SYN on a PENDING_ACKED entry promotes it into
+/// the authoritative CT table. Plain-DNAT flows (snat_port_be == 0) have no
+/// observable SYN-ACK — their replies transit the kernel as nonlocal — so
+/// the client's ACK alone promotes them.
+pub const XDP_CT_STATE_PENDING_ACKED: u8 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -410,7 +425,10 @@ pub struct XdpUdpCtValue {
     /// Node-allocated SNAT source port claimed for this flow
     /// (XDP_SNAT_PORT_BASE..); 0 means the flow runs plain DNAT.
     pub snat_port_be: u16,
-    pub _pad: [u8; 4],
+    /// Tuple-reuse guard (EN-09): monotonically increasing per admission so
+    /// events/state belonging to an older incarnation of a recycled tuple
+    /// can be told apart (consumed by the EN-10 event channel).
+    pub incarnation: u32,
     /// Billing dimension mirrored from the forward rule.
     pub server_id: i64,
     pub last_seen_ns: u64,
@@ -556,7 +574,10 @@ pub struct NatScratch {
 /// nonlocal_pass; XDP_LOCAL_* values gain the XDP_LOCAL_REDIRECT bit.
 /// v5: EN-06 verifier split — NatScratch +work_ip_off/work_ifindex/
 /// work_pkt_len; XDP_DISPATCH grows to 16 slots (7-10 = NAT work programs).
-pub const XDP_ABI_VERSION: u32 = 7;
+/// v7: EN-08 — XdpRateLimitConfig +v4/v6_prefix_len.
+/// v8: EN-09 — XdpUdpCtValue._pad->incarnation, XdpPendingCap._pad->
+/// pending_ttl_ns, XdpCounters +pending_limited, XDP_PENDING table.
+pub const XDP_ABI_VERSION: u32 = 8;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -725,8 +746,12 @@ pub struct XdpBudgetBucket {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct XdpPendingCap {
+    /// Informational capacity of the pending table (the map bound is the
+    /// actual hard limit; userspace mirrors it here for observability).
     pub max_pending: u64,
-    pub _pad: u64,
+    /// Absolute half-open deadline in nanoseconds. A pending entry whose
+    /// age exceeds this is treated as absent and re-admitted as a new flow.
+    pub pending_ttl_ns: u64,
 }
 
 // Compile-time ABI assertions. If any of these fire, a shared layout changed:
@@ -739,7 +764,7 @@ const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
 const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 64);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 16);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 208);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 216);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);

@@ -12,13 +12,14 @@ use aya_ebpf::{
     programs::XdpContext,
 };
 use cloud_node_xdp_common::{
-    XDP_CLASS_MALFORMED, XDP_CLASS_UNSUPPORTED, XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN,
+    XDP_CLASS_MALFORMED, XDP_CT_STATE_PENDING, XDP_CT_STATE_PENDING_ACKED,
+    XDP_CLASS_UNSUPPORTED, XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN,
     XDP_FRAGMENT_DROP, XDP_FRAGMENT_PASS, XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS,
     XDP_LOCAL_PRESENT, XDP_LOCAL_REDIRECT, XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN, XdpBudgetBucket,
     XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key, XdpIpv6Key,
-    XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPortProtoKey, XdpQueueKey, XdpQuicDcidKey, XdpRateBucket,
-    XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue,
-    XdpUdpFwdKey, XdpUdpFwdRule,
+    XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey, XdpQueueKey, XdpQuicDcidKey,
+    XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey,
+    XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
 };
 use core::mem;
 use network_types::{
@@ -160,6 +161,18 @@ static XDP_TCP_FWD: HashMap<XdpUdpFwdKey, XdpUdpFwdRule> =
 #[map(name = "XDP_TCP_CT")]
 static XDP_TCP_CT: HashMap<XdpUdpCtKey, XdpUdpCtValue> =
     HashMap::<XdpUdpCtKey, XdpUdpCtValue>::with_max_entries(262_144, 0);
+
+/// EN-09 bounded half-open table: admitted TCP flows that have not yet shown
+/// handshake evidence live here, not in XDP_TCP_CT. The map bound is the
+/// hard capacity — a SYN flood can fill this table without ever touching the
+/// authoritative CT space used by established flows.
+#[map(name = "XDP_PENDING")]
+static XDP_PENDING: HashMap<XdpUdpCtKey, XdpUdpCtValue> =
+    HashMap::<XdpUdpCtKey, XdpUdpCtValue>::with_max_entries(65_536, 0);
+/// EN-09 admission contract: carries the absolute pending deadline
+/// (pending_ttl_ns) written by userspace.
+#[map(name = "XDP_PENDING_CAP")]
+static XDP_PENDING_CAP: Array<XdpPendingCap> = Array::with_max_entries(1, 0);
 
 /// SNAT reverse bindings: (listen addr, allocated node port, proto) -> client
 /// flow tuple. Claimed with BPF_NOEXIST by `snat_alloc`; orphan entries are
@@ -2699,12 +2712,21 @@ fn try_tcp_nat_v4(
         k.family = 4;
         k.proto = 6;
     };
-    if let Some(ct) = XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
+    if let Some(ct) = XDP_TCP_CT
+        .get_ptr_mut(unsafe { &(*scratch).ct_key })
+        .or_else(|| XDP_PENDING.get_ptr_mut(unsafe { &(*scratch).ct_key }))
+    {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
-        ct.last_seen_ns = now_mono_ns;
-        if closing {
-            ct.state = XDP_CT_STATE_CLOSING;
+        if ct.state == XDP_CT_STATE_PENDING || ct.state == XDP_CT_STATE_PENDING_ACKED {
+            // Backend-side traffic on a half-open flow records handshake
+            // evidence. Absolute deadline: last_seen_ns is never extended.
+            ct.state = XDP_CT_STATE_PENDING_ACKED;
+        } else {
+            ct.last_seen_ns = now_mono_ns;
+            if closing {
+                ct.state = XDP_CT_STATE_CLOSING;
+            }
         }
         let listen_be = u32::from_be_bytes([
             ct.listen_addr[0],
@@ -2838,12 +2860,19 @@ fn try_tcp_nat_v4(
             client_port,
         )?;
         eth_rewrite(ctx, client_mac)?;
-        if let Some(ct) = XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
+        if let Some(ct) = XDP_TCP_CT
+            .get_ptr_mut(unsafe { &(*scratch).ct_key })
+            .or_else(|| XDP_PENDING.get_ptr_mut(unsafe { &(*scratch).ct_key }))
+        {
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
-            ct.last_seen_ns = now_mono_ns;
-            if closing {
-                ct.state = XDP_CT_STATE_CLOSING;
+            if ct.state == XDP_CT_STATE_PENDING || ct.state == XDP_CT_STATE_PENDING_ACKED {
+                ct.state = XDP_CT_STATE_PENDING_ACKED;
+            } else {
+                ct.last_seen_ns = now_mono_ns;
+                if closing {
+                    ct.state = XDP_CT_STATE_CLOSING;
+                }
             }
         }
         acct_flow(
@@ -2896,57 +2925,70 @@ fn try_tcp_nat_v4(
             snat_port = ct.snat_port_be;
         }
         None => {
-            if !(syn && !ack) {
-                return Ok(None);
-            }
-            // Fresh SYN creating new conntrack state: charge the new-flow
-            // budget before snat_alloc / CT insert — a rejected admission
-            // leaves no state behind.
-            if !budget_charge(1, now_mono_ns) {
-                counter_admission_limited();
-                return Ok(Some(xdp_action::XDP_DROP));
-            }
-            let eth = ptr_at::<EthHdr>(ctx, 0)?;
-            let client_mac = unsafe { (*eth).src_addr };
-            unsafe {
-                let v = &mut (*scratch).ct_value;
-                v.listen_addr = v4_embed(dst_be);
-                v.client_mac = client_mac;
-                v.listen_port_be = dst_port;
-                v.family = 4;
-                v.state = XDP_CT_STATE_OPEN;
-                v.snat_port_be = 0;
-                v.server_id = rule.server_id;
-                v.last_seen_ns = now_mono_ns;
-            }
-            if rule.snat != 0 {
+            // EN-09: consult the bounded half-open table before treating the
+            // packet as an unknown flow. Pending hits forward through the
+            // shared rewrite below without extending their absolute deadline.
+            let (pend, incarnation, pending_port) = pending_touch(
+                unsafe { &(*scratch).ct_key },
+                now_mono_ns,
+                ack && !syn,
+            );
+            if pend == PENDING_ALIVE {
+                snat_port = pending_port;
+            } else {
+                if !(syn && !ack) {
+                    return Ok(None);
+                }
+                // Fresh SYN creating new conntrack state: charge the new-flow
+                // budget before snat_alloc / pending insert — a rejected
+                // admission leaves no state behind.
+                if !budget_charge(1, now_mono_ns) {
+                    counter_admission_limited();
+                    return Ok(Some(xdp_action::XDP_DROP));
+                }
+                let eth = ptr_at::<EthHdr>(ctx, 0)?;
+                let client_mac = unsafe { (*eth).src_addr };
                 unsafe {
-                    let k = &mut (*scratch).snat_rev_key;
-                    k.listen_addr = v4_embed(dst_be);
-                    k.snat_port_be = 0;
-                    k.proto = 6;
-                    k.family = 4;
-                    k._pad = [0; 3];
+                    let v = &mut (*scratch).ct_value;
+                    v.listen_addr = v4_embed(dst_be);
+                    v.client_mac = client_mac;
+                    v.listen_port_be = dst_port;
+                    v.family = 4;
+                    v.state = XDP_CT_STATE_PENDING;
+                    v.snat_port_be = 0;
+                    v.server_id = rule.server_id;
+                    v.last_seen_ns = now_mono_ns;
+                    v.incarnation = incarnation;
                 }
-                snat_prefill(scratch, client_mac, rule.server_id);
-                match snat_alloc(scratch, &XDP_TCP_FWD) {
-                    Some(port) => {
-                        snat_port = port;
-                        unsafe { (*scratch).ct_value.snat_port_be = port };
+                if rule.snat != 0 {
+                    unsafe {
+                        let k = &mut (*scratch).snat_rev_key;
+                        k.listen_addr = v4_embed(dst_be);
+                        k.snat_port_be = 0;
+                        k.proto = 6;
+                        k.family = 4;
+                        k._pad = [0; 3];
                     }
-                    None => return Ok(None),
+                    snat_prefill(scratch, client_mac, rule.server_id);
+                    match snat_alloc(scratch, &XDP_TCP_FWD) {
+                        Some(port) => {
+                            snat_port = port;
+                            unsafe { (*scratch).ct_value.snat_port_be = port };
+                        }
+                        None => return Ok(None),
+                    }
                 }
-            }
-            if XDP_TCP_CT
-                .insert(
-                    unsafe { &(*scratch).ct_key },
-                    unsafe { &(*scratch).ct_value },
-                    0,
-                )
-                .is_err()
-            {
-                counter_tcp_fwd_map_full();
-                return Ok(None);
+                if XDP_PENDING
+                    .insert(
+                        unsafe { &(*scratch).ct_key },
+                        unsafe { &(*scratch).ct_value },
+                        0,
+                    )
+                    .is_err()
+                {
+                    counter_pending_limited();
+                    return Ok(None);
+                }
             }
         }
     }
@@ -3037,12 +3079,21 @@ fn try_tcp_nat_v6(
         k.family = 6;
         k.proto = 6;
     };
-    if let Some(ct) = XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
+    if let Some(ct) = XDP_TCP_CT
+        .get_ptr_mut(unsafe { &(*scratch).ct_key })
+        .or_else(|| XDP_PENDING.get_ptr_mut(unsafe { &(*scratch).ct_key }))
+    {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
-        ct.last_seen_ns = now_mono_ns;
-        if closing {
-            ct.state = XDP_CT_STATE_CLOSING;
+        if ct.state == XDP_CT_STATE_PENDING || ct.state == XDP_CT_STATE_PENDING_ACKED {
+            // Backend-side traffic on a half-open flow records handshake
+            // evidence. Absolute deadline: last_seen_ns is never extended.
+            ct.state = XDP_CT_STATE_PENDING_ACKED;
+        } else {
+            ct.last_seen_ns = now_mono_ns;
+            if closing {
+                ct.state = XDP_CT_STATE_CLOSING;
+            }
         }
         let listen_port = ct.listen_port_be;
         unsafe {
@@ -3147,12 +3198,19 @@ fn try_tcp_nat_v6(
             client_port,
         )?;
         eth_rewrite(ctx, client_mac)?;
-        if let Some(ct) = XDP_TCP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
+        if let Some(ct) = XDP_TCP_CT
+            .get_ptr_mut(unsafe { &(*scratch).ct_key })
+            .or_else(|| XDP_PENDING.get_ptr_mut(unsafe { &(*scratch).ct_key }))
+        {
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
-            ct.last_seen_ns = now_mono_ns;
-            if closing {
-                ct.state = XDP_CT_STATE_CLOSING;
+            if ct.state == XDP_CT_STATE_PENDING || ct.state == XDP_CT_STATE_PENDING_ACKED {
+                ct.state = XDP_CT_STATE_PENDING_ACKED;
+            } else {
+                ct.last_seen_ns = now_mono_ns;
+                if closing {
+                    ct.state = XDP_CT_STATE_CLOSING;
+                }
             }
         }
         acct_flow(
@@ -3218,56 +3276,66 @@ fn try_tcp_nat_v6_fwd(
             snat_port = ct.snat_port_be;
         }
         None => {
-            if !(syn && !ack) {
-                return Ok(None);
-            }
-            // Fresh SYN creating new conntrack state: charge the new-flow
-            // budget before snat_alloc / CT insert.
-            if !budget_charge(1, now_mono_ns) {
-                counter_admission_limited();
-                return Ok(Some(xdp_action::XDP_DROP));
-            }
-            let eth = ptr_at::<EthHdr>(ctx, 0)?;
-            let client_mac = unsafe { (*eth).src_addr };
-            unsafe {
-                let v = &mut (*scratch).ct_value;
-                copy16(&mut v.listen_addr, &(*scratch).pkt_dst);
-                v.client_mac = client_mac;
-                v.listen_port_be = dst_port;
-                v.family = 6;
-                v.state = XDP_CT_STATE_OPEN;
-                v.snat_port_be = 0;
-                v.server_id = rule.server_id;
-                v.last_seen_ns = now_mono_ns;
-            }
-            if rule.snat != 0 {
+            let (pend, incarnation, pending_port) = pending_touch(
+                unsafe { &(*scratch).ct_key },
+                now_mono_ns,
+                ack && !syn,
+            );
+            if pend == PENDING_ALIVE {
+                snat_port = pending_port;
+            } else {
+                if !(syn && !ack) {
+                    return Ok(None);
+                }
+                // Fresh SYN creating new conntrack state: charge the new-flow
+                // budget before snat_alloc / pending insert.
+                if !budget_charge(1, now_mono_ns) {
+                    counter_admission_limited();
+                    return Ok(Some(xdp_action::XDP_DROP));
+                }
+                let eth = ptr_at::<EthHdr>(ctx, 0)?;
+                let client_mac = unsafe { (*eth).src_addr };
                 unsafe {
-                    let k = &mut (*scratch).snat_rev_key;
-                    copy16(&mut k.listen_addr, &(*scratch).pkt_dst);
-                    k.snat_port_be = 0;
-                    k.proto = 6;
-                    k.family = 6;
-                    k._pad = [0; 3];
+                    let v = &mut (*scratch).ct_value;
+                    copy16(&mut v.listen_addr, &(*scratch).pkt_dst);
+                    v.client_mac = client_mac;
+                    v.listen_port_be = dst_port;
+                    v.family = 6;
+                    v.state = XDP_CT_STATE_PENDING;
+                    v.snat_port_be = 0;
+                    v.server_id = rule.server_id;
+                    v.last_seen_ns = now_mono_ns;
+                    v.incarnation = incarnation;
                 }
-                snat_prefill(scratch, client_mac, rule.server_id);
-                match snat_alloc(scratch, &XDP_TCP_FWD) {
-                    Some(port) => {
-                        snat_port = port;
-                        unsafe { (*scratch).ct_value.snat_port_be = port };
+                if rule.snat != 0 {
+                    unsafe {
+                        let k = &mut (*scratch).snat_rev_key;
+                        copy16(&mut k.listen_addr, &(*scratch).pkt_dst);
+                        k.snat_port_be = 0;
+                        k.proto = 6;
+                        k.family = 6;
+                        k._pad = [0; 3];
                     }
-                    None => return Ok(None),
+                    snat_prefill(scratch, client_mac, rule.server_id);
+                    match snat_alloc(scratch, &XDP_TCP_FWD) {
+                        Some(port) => {
+                            snat_port = port;
+                            unsafe { (*scratch).ct_value.snat_port_be = port };
+                        }
+                        None => return Ok(None),
+                    }
                 }
-            }
-            if XDP_TCP_CT
-                .insert(
-                    unsafe { &(*scratch).ct_key },
-                    unsafe { &(*scratch).ct_value },
-                    0,
-                )
-                .is_err()
-            {
-                counter_tcp_fwd_map_full();
-                return Ok(None);
+                if XDP_PENDING
+                    .insert(
+                        unsafe { &(*scratch).ct_key },
+                        unsafe { &(*scratch).ct_value },
+                        0,
+                    )
+                    .is_err()
+                {
+                    counter_pending_limited();
+                    return Ok(None);
+                }
             }
         }
     }
@@ -3650,6 +3718,55 @@ fn budget_charge(dim: usize, now_mono_ns: u64) -> bool {
     b.count[dim] <= limit
 }
 
+const XDP_PENDING_TTL_DEFAULT_NS: u64 = 3_000_000_000;
+const PENDING_MISS: u8 = 0;
+const PENDING_ALIVE: u8 = 1;
+
+#[inline(always)]
+fn pending_ttl_ns() -> u64 {
+    match XDP_PENDING_CAP.get(0) {
+        Some(cap) if cap.pending_ttl_ns != 0 => cap.pending_ttl_ns,
+        _ => XDP_PENDING_TTL_DEFAULT_NS,
+    }
+}
+
+/// EN-09 half-open lookup. Returns (PENDING_MISS, next_incarnation, 0) when
+/// no live pending entry exists — a stale entry is removed first and its
+/// incarnation+1 is returned so the caller can re-admit the tuple as a fresh
+/// flow. Returns (PENDING_ALIVE, _, snat_port_be) when the tuple is pending;
+/// `promote` (client ACK&&!SYN on a PENDING_ACKED entry) moves the record
+/// into the authoritative CT table. Pending hits never extend last_seen_ns.
+#[inline(never)]
+fn pending_touch(key: &XdpUdpCtKey, now_mono_ns: u64, promote: bool) -> (u8, u32, u16) {
+    let Some(p) = XDP_PENDING.get_ptr_mut(key) else {
+        return (PENDING_MISS, 1, 0);
+    };
+    // SAFETY: pointer into the map value for `key`.
+    let p = unsafe { &mut *p };
+    if now_mono_ns.saturating_sub(p.last_seen_ns) >= pending_ttl_ns() {
+        let next = p.incarnation.wrapping_add(1);
+        let _ = XDP_PENDING.remove(key);
+        return (PENDING_MISS, next, 0);
+    }
+    let port = p.snat_port_be;
+    // Handshake-evidence promotion: SNAT flows require the observed backend
+    // SYN-ACK (PENDING_ACKED, set by the reply path). Plain-DNAT flows have
+    // no observable SYN-ACK — replies addressed to the client are nonlocal
+    // and transit the kernel — so the client's ACK is the only evidence.
+    if promote && (p.state == XDP_CT_STATE_PENDING_ACKED || p.snat_port_be == 0) {
+        p.state = XDP_CT_STATE_OPEN;
+        p.last_seen_ns = now_mono_ns;
+        if XDP_TCP_CT.insert(key, unsafe { &*p }, 0).is_ok() {
+            let _ = XDP_PENDING.remove(key);
+        } else {
+            // Authoritative table full: counted, record stays pending with
+            // its absolute deadline; the packet is still forwarded.
+            counter_tcp_fwd_map_full();
+        }
+    }
+    (PENDING_ALIVE, 0, port)
+}
+
 fn counter_unverified_limited() {
     if let Some(counters) = XDP_COUNTERS.get_ptr_mut(0) {
         let counters = unsafe { &mut *counters };
@@ -3661,6 +3778,13 @@ fn counter_admission_limited() {
     if let Some(counters) = XDP_COUNTERS.get_ptr_mut(0) {
         let counters = unsafe { &mut *counters };
         counters.admission_limited = counters.admission_limited.saturating_add(1);
+    }
+}
+
+fn counter_pending_limited() {
+    if let Some(counters) = XDP_COUNTERS.get_ptr_mut(0) {
+        let counters = unsafe { &mut *counters };
+        counters.pending_limited = counters.pending_limited.saturating_add(1);
     }
 }
 

@@ -349,6 +349,31 @@ fn default_gc_after_windows() -> u64 {
     8
 }
 
+pub(crate) fn default_tcp_pending_ms() -> u64 {
+    3_000
+}
+
+/// EN-09 half-open admission contract. TCP flows admitted on a bare SYN live
+/// in the bounded XDP_PENDING table until handshake evidence (backend SYN-ACK
+/// then client ACK) promotes them into the authoritative CT table. The
+/// pending table is a separate bounded map (capacity 65536) so a SYN flood
+/// can never occupy established-flow space. The deadline below is absolute:
+/// pending hits never extend it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpAdmissionSettings {
+    /// Absolute half-open deadline in milliseconds. Default 3000.
+    #[serde(rename = "tcpPendingMs", default = "default_tcp_pending_ms")]
+    pub tcp_pending_ms: u64,
+}
+
+impl Default for XdpAdmissionSettings {
+    fn default() -> Self {
+        Self {
+            tcp_pending_ms: default_tcp_pending_ms(),
+        }
+    }
+}
+
 impl Default for XdpRateLimitSettings {
     fn default() -> Self {
         Self {
@@ -379,6 +404,10 @@ pub struct XdpConfig {
     /// Aggregate budget gate (EN-07). Absent = built-in baseline.
     #[serde(rename = "budget", default)]
     pub budget: Option<XdpBudgetSettings>,
+    /// Half-open admission contract (EN-09). Absent = default 3s absolute
+    /// pending deadline with the bounded pending table.
+    #[serde(rename = "admission", default)]
+    pub admission: Option<XdpAdmissionSettings>,
     /// Explicit path to an external eBPF object. When unset, the binary uses
     /// the object embedded at build time (recommended: binary and program can
     /// never drift apart). Set only for eBPF hotfix/debugging.
