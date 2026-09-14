@@ -41,6 +41,16 @@ pub struct XdpQueueStatus {
     /// AF_XDP bind mode the kernel granted this queue: "zero-copy", "copy",
     /// or empty when the socket was never bound (EN-12).
     pub xsk_mode: String,
+    /// True once the queue's XSK_INDEX/XSKS slots were withdrawn after a
+    /// queue-scoped fault. The queue's redirected traffic takes the explicit
+    /// dataplane fallback; other queues keep serving (EN-05).
+    #[serde(default)]
+    pub faulted: bool,
+    /// New-flow admissions dropped while this queue was TX-backpressured.
+    /// Existing sessions stay admitted; only new work is refused so the
+    /// queue can drain instead of collapsing (EN-05).
+    #[serde(default)]
+    pub congested_drops: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -288,6 +298,12 @@ pub(crate) struct XdpManager {
     /// Socket registration alone is not proof a worker is running.
     #[allow(dead_code)]
     proxy_workers_starting: AtomicBool,
+    /// EN-05: (ifindex, queue) pairs whose XSK_INDEX/XSKS slots were
+    /// withdrawn after a queue-scoped fault. Periodic map syncs consult
+    /// this so they never resurrect a dead queue's redirect entry; cleared
+    /// when a new attach generation registers fresh sockets.
+    #[cfg(target_os = "linux")]
+    xsk_withdrawn: parking_lot::Mutex<std::collections::HashSet<(u32, u32)>>,
     last_state_write_at: AtomicU64,
     rule_sweeper_started: AtomicBool,
     rule_sweeper_generation: AtomicU64,
@@ -369,6 +385,8 @@ impl XdpManager {
             flow_event_consumer_generation: AtomicU64::new(0),
             proxy_redirect_enabled: AtomicBool::new(false),
             proxy_workers_starting: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            xsk_withdrawn: parking_lot::Mutex::new(std::collections::HashSet::new()),
             last_state_write_at: AtomicU64::new(0),
             rule_sweeper_started: AtomicBool::new(false),
             rule_sweeper_generation: AtomicU64::new(0),
@@ -440,6 +458,11 @@ impl XdpManager {
                     // sweep tick, so test-only fault flags written through
                     // the map are not clobbered between sweeps.
                     self.sync_pending_cap();
+                    // New attach generation: queue withdrawals applied to
+                    // the previous socket set must not leak into this
+                    // generation's index sync — fresh sockets get fresh
+                    // slots.
+                    self.xsk_withdrawn.lock().clear();
                     self.flush_maps_full_blocking(self.proxy_redirect_ready());
                     self.configure_af_xdp_runtime()?;
                 }
@@ -540,7 +563,11 @@ impl XdpManager {
                         statuses.iter().any(|status| {
                             status.interface == interface.name
                                 && status.queue == *queue
-                                && status.ready
+                                // A faulted queue is deliberately withdrawn:
+                                // its slots are gone and its traffic takes the
+                                // explicit dataplane fallback, so it must not
+                                // stall readiness for surviving queues.
+                                && (status.ready || status.faulted)
                         })
                     })
             })
@@ -599,6 +626,65 @@ impl XdpManager {
                 "{detail}; failed to disable AF_XDP proxy redirect maps: {err}"
             ));
             tracing::warn!("failed to disable AF_XDP proxy redirect maps: {}", err);
+        }
+        self.persist_status_now();
+    }
+
+    /// True when the queue already went through queue-scoped withdrawal —
+    /// the supervisor uses it to avoid overwriting the original fault
+    /// detail with a generic "worker exited" reason.
+    #[cfg(target_os = "linux")]
+    fn xsk_queue_faulted(&self, interface: &str, queue: u32) -> bool {
+        self.xsk_status
+            .read()
+            .iter()
+            .any(|status| status.interface == interface && status.queue == queue && status.faulted)
+    }
+
+    /// EN-05 queue-scoped fault containment: withdraw one queue's
+    /// XSK_INDEX/XSKS slots so its redirected traffic takes the explicit
+    /// dataplane fallback (map_miss → PASS/DROP per policy) while sibling
+    /// queues keep serving. The withdrawal is recorded in `xsk_withdrawn`
+    /// so periodic map syncs cannot resurrect the slot. If the map update
+    /// itself fails, containment is impossible — escalate honestly to the
+    /// global disable rather than leaving a half-withdrawn queue.
+    #[cfg(target_os = "linux")]
+    fn disable_queue_redirect_for_fault(
+        &self,
+        interface: &str,
+        queue: u32,
+        detail: impl Into<String>,
+    ) {
+        let detail = format!(
+            "{}; queue {}/{} withdrawn — remaining queues unaffected, this queue's traffic falls back explicitly",
+            detail.into(),
+            interface,
+            queue
+        );
+        tracing::warn!("{detail}");
+        let ifindex = linux::ifindex_from_name(interface).unwrap_or(0);
+        if ifindex != 0 {
+            self.xsk_withdrawn.lock().insert((ifindex, queue));
+        }
+        self.update_xsk_queue_status(interface, queue, |status| {
+            status.registered = false;
+            status.ready = false;
+            status.faulted = true;
+            status.detail = detail.clone();
+        });
+        self.set_proxy_fallback_reason(detail.clone());
+        let result = {
+            let mut ebpf = self.ebpf.lock();
+            match ebpf.as_mut() {
+                Some(ebpf) => linux::disable_queue_redirect(ebpf, interface, queue),
+                None => Ok(false),
+            }
+        };
+        if let Err(err) = result {
+            self.disable_proxy_redirect_for_fallback(format!(
+                "{detail}; queue-local withdrawal failed ({err}); widening to global redirect disable"
+            ));
+            return;
         }
         self.persist_status_now();
     }
@@ -1066,7 +1152,7 @@ impl XdpManager {
 
     #[cfg(target_os = "linux")]
     fn refresh_af_xdp_statuses(&self, force: bool) {
-        let statuses = {
+        let mut statuses = {
             let mut runtime = self.af_xdp.lock();
             let Some(runtime) = runtime.as_mut() else {
                 return;
@@ -1074,6 +1160,23 @@ impl XdpManager {
             runtime.refresh_statuses(force);
             runtime.statuses.clone()
         };
+        // The runtime image only knows socket registration state; preserve
+        // queue-scoped fault/withdrawal and congestion marks applied since.
+        let previous = self.xsk_status.read().clone();
+        for status in statuses.iter_mut() {
+            if let Some(prev) = previous
+                .iter()
+                .find(|prev| prev.interface == status.interface && prev.queue == status.queue)
+            {
+                status.congested_drops = prev.congested_drops;
+                if prev.faulted {
+                    status.faulted = true;
+                    status.registered = false;
+                    status.ready = false;
+                    status.detail = prev.detail.clone();
+                }
+            }
+        }
         *self.xsk_status.write() = statuses;
     }
 
@@ -1225,10 +1328,17 @@ impl XdpManager {
             return;
         }
         let state = self.state.read().clone();
+        let withdrawn = self.xsk_withdrawn.lock().clone();
         let result = {
             let mut ebpf = self.ebpf.lock();
             match ebpf.as_mut() {
-                Some(ebpf) => linux::sync_maps(ebpf, &self.config, &state, proxy_dataplane_active),
+                Some(ebpf) => linux::sync_maps(
+                    ebpf,
+                    &self.config,
+                    &state,
+                    proxy_dataplane_active,
+                    &withdrawn,
+                ),
                 None => Ok(()),
             }
         };
@@ -1883,6 +1993,23 @@ fn xdp_rate_limit_pressure_level() -> crate::l4_defense::L4PressureLevel {
 #[cfg(not(debug_assertions))]
 fn xdp_rate_limit_pressure_level() -> crate::l4_defense::L4PressureLevel {
     crate::l4_defense::current_pressure_level()
+}
+
+/// Test-only EN-05 queue-withdrawal trigger (debug builds only): set
+/// `CLOUD_NODE_XDP_TEST_WITHDRAW_QUEUE=iface:queue` and the bridge will run
+/// the queue-local fault path once after redirect opens, so e2e probes can
+/// verify slot withdrawal, status marking, and sibling-queue survival.
+/// Release builds ignore the variable entirely.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) fn test_withdraw_queue_request() -> Option<(String, u32)> {
+    let spec = std::env::var("CLOUD_NODE_XDP_TEST_WITHDRAW_QUEUE").ok()?;
+    let (interface, queue) = spec.split_once(':')?;
+    Some((interface.to_string(), queue.parse().ok()?))
+}
+
+#[cfg(all(not(debug_assertions), target_os = "linux"))]
+pub(crate) fn test_withdraw_queue_request() -> Option<(String, u32)> {
+    None
 }
 
 /// EN-08: translate operator-facing rate settings into the eBPF ABI config.

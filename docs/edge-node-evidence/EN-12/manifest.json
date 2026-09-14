@@ -12,24 +12,32 @@
     "generation-aware bridge supervisor: reload manager replacement respawns the bridge only after the new manager attaches and AF_XDP setup settles; stale-manager workers exit via generation check; same-generation bridge failure is not blindly respawned",
     "explicit xskMode bind policy: auto (probe zero-copy then copy), copy, zero-copy (hard failure, no silent downgrade); landed mode recorded per queue in XdpQueueStatus.xsk_mode and detail",
     "bind error messages carry the attempted mode (e.g. 'AF_XDP zero-copy bind failed: ...')",
-    "same-interface/same-RX-queue redirect and bounded QUIC DCID steering to the owning XSK (pre-existing, re-verified)"
+    "same-interface/same-RX-queue redirect and bounded QUIC DCID steering to the owning XSK (pre-existing, re-verified)",
+    "EN-05 queue-scoped fault containment: disable_queue_redirect withdraws one queue's XSK_INDEX/XSKS slots; xsk_withdrawn set prevents periodic sync from resurrecting them; cleared at new attach generation",
+    "XdpQueueStatus.faulted + congested_drops: withdrawn queues count as handled in proxy_xsk_ready (explicit fallback, not readiness blocker); refresh_af_xdp_statuses merges fault/congestion marks instead of clobbering",
+    "congestion gate: TX backpressure refuses new UDP route admission and new TCP sessions (has_session check) while established flows keep being served; Sent records clear it",
+    "worker-lease startup race fix: workers_starting stays true until enable_proxy_redirect resolves — workers no longer exit in the starting=false/enabled=false gap",
+    "supervisor dedup: reported_dead set + xsk_queue_faulted skip preserve the worker's original fault detail instead of overwriting with 'exited unexpectedly'",
+    "debug-only e2e hook CLOUD_NODE_XDP_TEST_WITHDRAW_QUEUE=iface:queue drives the real queue-withdrawal path after redirect opens; release builds ignore it"
   ],
   "verification": {
     "verifier": "all programs accepted (kernel 7.0.14-orbstack); object unchanged from EN-09 (sha 00f0e34e)",
     "matrix": "T01 28/28 plus T02/T03/T04/T06 all pass on x86-build",
-    "unit": "106 xdp tests pass; 662 total lib tests pass",
-    "probe": "scripts/edge/en12_queue_probe.py — all 5 phases pass on veth/netns 2-queue topology",
+    "unit": "107 xdp tests pass; 668 total lib tests pass",
+    "probe": "scripts/edge/en12_queue_probe.py — all 6 phases pass on veth/netns 2-queue topology",
     "probe_results": {
       "A_auto_probe_two_queues": "xskMode auto on veth: zero-copy rejected by kernel, copy fallback explicit; both queues ready; redirect enabled",
       "B_redirect_and_rx_health": "400 injected UDP frames -> redirectDelta=400, packetsDelta=400, rx_dropped/invalid/ring_full all 0",
       "B2_worker_ready_before_redirect": "2 reactor ready reports precede redirect enable in log order",
       "C_zerocopy_fails_explicitly": "xskMode zero-copy: both queues socket_created=false, detail='AF_XDP zero-copy bind failed: ... Operation not supported', redirect disabled, traffic still PASSes (passDelta=51)",
-      "D_forced_copy": "xskMode copy binds directly in copy mode, both queues ready"
+      "D_forced_copy": "xskMode copy binds directly in copy mode, both queues ready",
+      "E_queue_fault_withdrawal": "queue 1 withdrawn via test hook: faulted=true, XSK_INDEX 2->1 stable across sync window; queue 0 stays ready and forwards (redirectDelta=400); proxy_redirect_enabled stays true — fault not widened globally"
     }
   },
   "limitations": [
     "veth does not support zero-copy, so landed-mode evidence is copy-only; zero-copy success path requires a real NIC (driver mode)",
     "per-worker TCP session floor of 1 means N workers can admit up to N sessions below the divided share — degenerate configs only",
-    "DCID steering bounded local map + eBPF XDP_QUIC_DCID verified by unit/matrix tests; cross-queue CID traffic evidence on multi-queue veth is indirect (veth RSS hashes all test flows onto queue selection determined by kernel)"
+    "DCID steering bounded local map + eBPF XDP_QUIC_DCID verified by unit/matrix tests; cross-queue CID traffic evidence on multi-queue veth is indirect (veth RSS hashes all test flows onto queue selection determined by kernel)",
+    "queue-withdrawal e2e uses the debug hook path (real map ops + status + resurrection guard); TX-failure-counter trigger paths share the same machinery but are not independently e2e-driven"
   ]
 }

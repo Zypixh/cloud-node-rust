@@ -55,6 +55,34 @@ def sh(cmd, check=True, capture=True, netns=None, cwd=None):
     return p
 
 
+BPFTOOL_CANDIDATES = [
+    "/usr/lib/linux-tools-5.15.0-191/bpftool",
+    "bpftool",
+    "/usr/sbin/bpftool",
+]
+
+
+def bpftool():
+    for cand in BPFTOOL_CANDIDATES:
+        if os.path.exists(cand) or cand == "bpftool":
+            try:
+                p = subprocess.run([cand, "version"], capture_output=True)
+                if p.returncode == 0:
+                    return cand
+            except OSError:
+                continue
+    raise RuntimeError("bpftool not found")
+
+
+def xsk_index_entries():
+    out = sh([bpftool(), "-j", "map", "dump", "pinned",
+              f"{PIN_DIR}/XDP_XSK_INDEX"], check=False).stdout
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return []
+
+
 def setup_netns():
     teardown_netns()
     clear_pins()
@@ -126,7 +154,7 @@ def write_api_config(path):
                 'kernelTuning:\n  enabled: false\n')
 
 
-def start_node(node_bin, home, cwd, xsk_mode):
+def start_node(node_bin, home, cwd, xsk_mode, extra_env=None):
     stale_state = os.path.join(home, "data", "xdp-state.json")
     if os.path.exists(stale_state):
         os.remove(stale_state)
@@ -144,6 +172,8 @@ def start_node(node_bin, home, cwd, xsk_mode):
         shutil.copyfile(obj_src,
                         os.path.join(home, "data", "cloud-node-xdp-ebpf.o"))
     env = dict(os.environ, CLOUD_NODE_HOME=home, RUST_LOG="debug")
+    if extra_env:
+        env.update(extra_env)
     log = open(os.path.join(cwd, "node.log"), "w")
     proc = subprocess.Popen([os.path.abspath(node_bin)],
                             cwd=cwd, env=env, stdout=log, stderr=log,
@@ -409,6 +439,77 @@ def main():
         results["phases"]["D_forced_copy"] = phase_d
     except Exception as e:
         results["phases"]["D_forced_copy"] = {"ok": False, "error": str(e)}
+    finally:
+        stop_node(proc)
+
+    # ---- Phase E: queue-scoped fault withdrawal (EN-05). The debug-only
+    # hook drives queue 1 through the real queue-local fault path after
+    # redirect opens: its XSK_INDEX/XSKS slots are removed so its traffic
+    # takes the explicit dataplane fallback, while queue 0 keeps serving.
+    try:
+        started_at = time.time()
+        proc = start_node(
+            args.node_bin, home, cwd, "copy",
+            extra_env={"CLOUD_NODE_XDP_TEST_WITHDRAW_QUEUE": f"{HOST_IF}:1"},
+        )
+        state = {}
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            state = wait_state(home, started_at, timeout=2)
+            if any(q.get("faulted") for q in xsk_queues(home)):
+                break
+            time.sleep(0.5)
+        queues = xsk_queues(home)
+        by_queue = {q["queue"]: q for q in queues}
+        idx_entries = len(xsk_index_entries())
+        # The surviving queue must still redirect live traffic; packets
+        # hashed to the withdrawn queue take the explicit fallback (pass).
+        doc = dump_maps(os.path.abspath(args.node_bin), cwd)
+        counters = doc.get("counters", {}) or {}
+        redirect_before = int(counters.get("redirect", 0))
+        pass_before = int(counters.get("pass", 0))
+        send_udp(400, host_mac)
+        time.sleep(1.5)
+        counters = dump_maps(os.path.abspath(args.node_bin), cwd) \
+            .get("counters", {}) or {}
+        redirect_delta = int(counters.get("redirect", 0)) - redirect_before
+        pass_delta = int(counters.get("pass", 0)) - pass_before
+        # Give any periodic map sync a chance to resurrect the slot —
+        # the withdrawal set must keep it gone.
+        time.sleep(6)
+        idx_after = len(xsk_index_entries())
+        queues = xsk_queues(home)
+        by_queue = {q["queue"]: q for q in queues}
+        phase_e = {
+            "queues": {
+                str(q): {
+                    "ready": by_queue.get(q, {}).get("ready"),
+                    "faulted": by_queue.get(q, {}).get("faulted"),
+                    "registered": by_queue.get(q, {}).get("registered"),
+                    "detail": by_queue.get(q, {}).get("detail"),
+                }
+                for q in (0, 1)
+            },
+            "redirectEnabled": state.get("proxy_redirect_enabled"),
+            "xskIndexEntries": [idx_entries, idx_after],
+            "redirectDelta": redirect_delta,
+            "passDelta": pass_delta,
+            "ok": (
+                len(queues) == 2
+                and by_queue.get(0, {}).get("ready") is True
+                and by_queue.get(0, {}).get("faulted") is not True
+                and by_queue.get(1, {}).get("faulted") is True
+                and by_queue.get(1, {}).get("ready") is False
+                and state.get("proxy_redirect_enabled") is True
+                and idx_entries == 1
+                and idx_after == 1
+                and redirect_delta > 0
+            ),
+        }
+        results["phases"]["E_queue_fault_withdrawal"] = phase_e
+    except Exception as e:
+        results["phases"]["E_queue_fault_withdrawal"] = {
+            "ok": False, "error": str(e)}
     finally:
         stop_node(proc)
 
