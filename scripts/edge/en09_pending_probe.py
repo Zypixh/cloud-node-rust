@@ -455,6 +455,11 @@ def main():
         # otherwise exhaust before the pending table. 70k distinct-source
         # SYNs vs the 65536-entry pending table: overflow is counted via
         # pendingLimited and never touches the authoritative CT table.
+        # Phase E tests a fresh table: clear pinned maps so imported flows
+        # from earlier phases don't count against the post-flood CT bound.
+        if proc is not None:
+            stop_node(proc)
+        subprocess.run(["rm", "-rf", PIN_DIR], capture_output=True)
         proc = start_node(args.node_bin, home, cwd, pending_ms=1500,
                           snat="false")
         deadline = time.time() + 30

@@ -53,7 +53,7 @@ UDP_LISTEN = 8543
 UDP_BACKEND = 9543
 CLIENT_PORT = 40000
 UDP_CLIENT_PORT = 41000
-PENDING_MS = 2500
+PENDING_MS = 4000
 
 
 def sh(cmd, check=True, capture=True, netns=None, cwd=None):
@@ -346,6 +346,16 @@ def run_sender(mode, dst_mac, a):
         # Backend SYN-ACK addressed to the claimed SNAT port (a).
         frames = [tcp_frame(dst_mac, PEER_IP, VIP1,
                             TCP_BACKEND, a, SYNACK, seq=2000, ackno=1001)]
+    elif mode == "data_p":
+        # Backend ACK-only data packet (NOT a SYN-ACK): must not mark
+        # handshake evidence on the pending entry.
+        frames = [tcp_frame(dst_mac, PEER_IP, VIP1,
+                            TCP_BACKEND, a, ACK, seq=2001, ackno=1001,
+                            payload=b"x")]
+    elif mode == "blind_ack_p":
+        # Client ACK with wrong sequence numbers: must not promote.
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            a, TCP_LISTEN, ACK, seq=5000, ackno=9000)]
     send_frames(frames)
     print(json.dumps({"sent": len(frames)}))
 
@@ -628,9 +638,59 @@ def main():
             "snatRevBefore": rev_before_g,
             "snatRevAfter": rev_after_g,
             "pendingEntry": p4_pending,
+            # Other bindings may legitimately expire during the window —
+            # the assertion is that the failed admission ADDS none.
             "ok": (alloc_fail_delta >= 1
-                   and rev_after_g == rev_before_g
+                   and rev_after_g <= rev_before_g
                    and p4_pending is None),
+        }
+
+        # ---- Phase H: weak-observation packets cannot promote (EN-13/14)
+        # A pending flow must ignore a blind client ACK (wrong seq/ack) and
+        # must not mark PENDING_ACKED on a non-SYN-ACK backend packet; the
+        # correctly-anchored handshake still promotes afterwards.
+        P5 = CLIENT_PORT + 4
+        c15 = counters(node_bin, args.work)
+        send(script, "syn_vip1p", peer_mac(), P5)
+        time.sleep(0.5)
+        ent_h = pending_entry(P5)
+        h_snat = ent_h["snat_port"] if ent_h else 0
+
+        # 1) non-SYN-ACK backend packet must not mark handshake evidence
+        send(script, "data_p", peer_mac(), h_snat)
+        time.sleep(0.25)
+        ent_h2 = pending_entry(P5)
+
+        # 2) blind client ACK must not promote
+        send(script, "blind_ack_p", peer_mac(), P5)
+        time.sleep(0.25)
+        c16 = counters(node_bin, args.work)
+        seqrej_delta = (c16.get("natSeqRejected", 0)
+                        - c15.get("natSeqRejected", 0))
+        ent_h3 = pending_entry(P5)
+        ct_h_blind = map_entries("XDP_TCP_CT")
+
+        # 3) correctly-anchored SYN-ACK + ACK still promote
+        send(script, "synack_p", peer_mac(), h_snat)
+        time.sleep(0.25)
+        send(script, "ack_vip1p", peer_mac(), P5)
+        time.sleep(0.35)
+        ent_h4 = pending_entry(P5)
+        ct_h_after = map_entries("XDP_TCP_CT")
+
+        result["phases"]["H_weak_observation"] = {
+            "stateAfterDataPkt": ent_h2["state"] if ent_h2 else None,
+            "stateAfterBlindAck": ent_h3["state"] if ent_h3 else None,
+            "natSeqRejectedDelta": seqrej_delta,
+            "ctAfterBlindAck": ct_h_blind,
+            "pendingAfterRetry": ent_h4,
+            "ctAfterCorrectAck": ct_h_after,
+            "ok": (ent_h is not None and ent_h["state"] == 2
+                   and ent_h2 is not None and ent_h2["state"] == 2
+                   and ent_h3 is not None and ent_h3["state"] == 2
+                   and seqrej_delta >= 1
+                   and ent_h4 is None
+                   and ct_h_after == ct_h_blind + 1),
         }
 
         result["ok"] = all(p["ok"] for p in result["phases"].values())

@@ -1,9 +1,9 @@
 {
   "task": "EN-11",
   "status": "verified-veth-netns",
-  "abi": "v11",
+  "abi": "v12",
   "base_commit": "ff330b4",
-  "ebpf_object_sha256": "ac65cfca270147735bfa0e5e48043a46412323b873bcb122c9e03a740269ebc1",
+  "ebpf_object_sha256": "f11bb90544c01edd76f0471f98a44c0e114606a318edfba66ddf32c7738a7580",
   "deliverables": [
     "multi-VIP disambiguation: CT-hit and pending-hit paths now compare the bound (listen_addr, listen_port) against the packet destination; mismatch -> nat_conflict counter + REJECTED/NAT_CONFLICT flow event + explicit userspace fallback instead of silent rebind",
     "snat_release rollback: a claimed SNAT port is released when the owning CT/pending insert fails (all four insert-failure sites), so map insert failure no longer leaks ports",
@@ -16,18 +16,25 @@
     "sweeper GC bounds: per-map reap cap 4096/round with guaranteed progress (deferred stales are collected first next round), stale membership moved to HashSet (was O(flows x stale) Vec scan), conditional remove re-validates last_seen so a concurrent refresh / tuple re-admission between scan and delete cannot kill the newer entry",
     "billing aggregation is per-server_id batched per sweep round (bounded by distinct servers, no per-flow metric calls, no dropped deltas)",
     "sync_pending_cap moved from the 5s sweeper tick to attach time (config-derived, pinned map) so in-map fault flags are not clobbered between sweeps",
-    "ABI v11: XdpPendingCap +flags (24B), NatScratch +debug_flags (320B)"
+    "ABI v11: XdpPendingCap +flags (24B), NatScratch +debug_flags (320B)",
+    "EN-06 ACL ownership fix: Allow verdicts no longer early-PASS — they skip block rules and the per-source limiter only, still pay the aggregate unverified budget, and continue into dispatch_local so an established flow reaches its kernel/AF_XDP/NAT owner instead of being re-bound to the kernel path",
+    "EN-07 layered budgets: budget dims extended to unverified(0)/new-flow(1)/xsk-redirect(2)/verified(4)/control(5); verified_state hits refund the unverified charge and bill the verified pool (flood reserve), control (ICMP/ND/PMTU) has its own bounded budget, redirect work is charged per packet; all rejections counted fail-closed",
+    "EN-13/14 first slice: TCP handshake anchors — pending admission stores expect_seq=client_isn+1; reply path marks PENDING_ACKED only on a backend SYN-ACK whose ackno==expect_seq (and anchors expect_ack=backend_isn+1); promotion requires the client ACK seq==expect_seq (+SNAT: ackno==expect_ack); failures counted via nat_seq_rejected",
+    "xdp.budget config +verifiedPps/xskRedirectPps/controlPps (defaults 8M/4M/100k pps node-wide, ceil-divided per CPU, floored at 1)",
+    "ABI v12: XdpBudgetConfig 32->48B, XdpBudgetBucket 6 dims (40->64B), XdpUdpCtValue +expect_seq/+expect_ack (40->48B), XdpCounters +verified_limited/+control_limited/+nat_seq_rejected (240->264B), NatScratch 328B"
   ],
   "verification": {
     "verifier": "object loads on kernel 7.0.14-orbstack x86-build; pending_touch returns u64-packed triple to avoid sret caller-stack pointer rejected by verifier",
-    "unit": "667 lib + 7 common + 18 integration tests pass",
-    "probe": "en11_nat_probe all 7 phases pass: A UDP conflict, B TCP pending conflict, C expiry port release, D billing, E CT-insert-fail rollback + retry, F pending-insert-fail SNAT rollback, G SNAT exhaustion",
-    "regression": "en10_flow_probe re-run green on the v10 object (takeover + event channel unchanged)"
+    "unit": "667 lib + 7 common tests pass",
+    "probe": "en11_nat_probe all 8 phases pass on ABI v12 object: A UDP conflict, B TCP pending conflict, C expiry port release, D billing, E CT-insert-fail rollback + retry, F pending-insert-fail SNAT rollback, G SNAT exhaustion, H weak-observation rejection (non-SYN-ACK backend packet keeps PENDING, blind ACK seq/ack mismatch cannot promote and is counted natSeqRejected, correctly-anchored handshake promotes)",
+    "regression": "en10_flow_probe + en09_pending_probe + en12_queue_probe re-run green on the v12 object; en09 phase E probe fixed to clear pinned maps so imported flows don't pollute the fresh-table assertion"
   },
   "limitations": [
     "concurrent-promotion (two CPUs racing the same tuple) is covered by BPF_NOEXIST on insert + single-writer pending entry; not separately instrumented",
     "conflict rejection semantics = explicit userspace fallback (Ok(None)), consistent with the CT-full contract; counted and evented, not silent",
     "veth/netns evidence; real-NIC multi-queue SNAT pressure untested",
-    "TTL decrement absent by design (same-subnet L2 rewrite); neighbor via configured nextHopMac"
+    "TTL decrement absent by design (same-subnet L2 rewrite); neighbor via configured nextHopMac",
+    "verified pool treats 'holds live CT/SNAT state' as the classification evidence — a tuple-guessing packet on an existing flow still pays verified budget; stronger identity (per-flow seq windows) is EN-13/14 scope",
+    "per-service/per-queue fairness dimensions not yet wired — listener pools (EN-16) cover userspace admissions; queue-local dataplane budget remains"
   ]
 }

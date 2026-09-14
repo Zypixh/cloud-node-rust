@@ -149,6 +149,12 @@ pub struct XdpStatusSnapshot {
     /// to a different listen (VIP) tuple.
     #[serde(default)]
     pub nat_conflict: u64,
+    /// Verified-state packets dropped by the verified-packet budget (dim4).
+    pub verified_limited: u64,
+    /// Necessary-control packets dropped by the control budget (dim5).
+    pub control_limited: u64,
+    /// TCP packets rejected by the admission sequence anchors (EN-13/14).
+    pub nat_seq_rejected: u64,
     /// EN-10: lifecycle events dropped in-kernel because XDP_FLOW_EVENTS was
     /// full (consumer too slow). Feedback is advisory — loss never blocks or
     /// alters the dataplane, but is always accounted.
@@ -254,6 +260,9 @@ pub(crate) struct XdpManager {
     pending_limited: AtomicU64,
     /// EN-11: cross-VIP flow-tuple conflicts rejected in-kernel.
     nat_conflict: AtomicU64,
+    verified_limited: AtomicU64,
+    control_limited: AtomicU64,
+    nat_seq_rejected: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     /// EN-10: owner generation written to XDP_OWNER_EPOCH at attach.
@@ -343,6 +352,9 @@ impl XdpManager {
             admission_limited: AtomicU64::new(0),
             pending_limited: AtomicU64::new(0),
             nat_conflict: AtomicU64::new(0),
+            verified_limited: AtomicU64::new(0),
+            control_limited: AtomicU64::new(0),
+            nat_seq_rejected: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             owner_epoch: AtomicU64::new(0),
@@ -949,6 +961,9 @@ impl XdpManager {
             admission_limited: self.admission_limited.load(Ordering::Relaxed),
             pending_limited: self.pending_limited.load(Ordering::Relaxed),
             nat_conflict: self.nat_conflict.load(Ordering::Relaxed),
+            verified_limited: self.verified_limited.load(Ordering::Relaxed),
+            control_limited: self.control_limited.load(Ordering::Relaxed),
+            nat_seq_rejected: self.nat_seq_rejected.load(Ordering::Relaxed),
             flow_event_lost: self.flow_event_lost.load(Ordering::Relaxed),
             flow_events_received: self.flow_events_received.load(Ordering::Relaxed),
             flow_events_stale: self.flow_events_stale.load(Ordering::Relaxed),
@@ -1309,10 +1324,14 @@ impl XdpManager {
         cloud_node_xdp_common::XdpBudgetConfig {
             unverified_pps: share(base.unverified_pps),
             new_flow_per_sec: share(base.new_flow_per_sec),
-            xsk_redirect_pps: 0,
+            xsk_redirect_pps: share(base.xsk_redirect_pps),
             challenge_pps: 0,
+            verified_pps: share(base.verified_pps),
+            control_pps: share(base.control_pps),
             window_ns: base.window_ms.saturating_mul(1_000_000),
-            flags: 0b0011,
+            // dim0 unverified | dim1 new-flow | dim2 xsk-redirect |
+            // dim4 verified | dim5 control — all fail-closed counted.
+            flags: 0b11_0111,
         }
     }
 
@@ -1624,6 +1643,12 @@ impl XdpManager {
                     .store(counters.pending_limited, Ordering::Relaxed);
                 self.nat_conflict
                     .store(counters.nat_conflict, Ordering::Relaxed);
+                self.verified_limited
+                    .store(counters.verified_limited, Ordering::Relaxed);
+                self.control_limited
+                    .store(counters.control_limited, Ordering::Relaxed);
+                self.nat_seq_rejected
+                    .store(counters.nat_seq_rejected, Ordering::Relaxed);
                 self.flow_event_lost
                     .store(counters.flow_event_lost, Ordering::Relaxed);
             }
@@ -1696,6 +1721,9 @@ impl XdpManager {
                     "admissionLimited": c.admission_limited,
                     "pendingLimited": c.pending_limited,
                     "natConflict": c.nat_conflict,
+                    "verifiedLimited": c.verified_limited,
+                    "controlLimited": c.control_limited,
+                    "natSeqRejected": c.nat_seq_rejected,
                     "flowEventLost": c.flow_event_lost,
                 })
             })
