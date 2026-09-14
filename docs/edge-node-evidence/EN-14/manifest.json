@@ -1,0 +1,38 @@
+{
+  "task": "EN-14",
+  "status": "verified-veth-netns",
+  "abi": "v15",
+  "ebpf_object_sha256": "e549c8352a5d6ba7329ec6b5467d9f2f67a79732518db7ebd2389d3a8f501338",
+  "node_bin_sha256": "b8c0ab7c45b2f13bca1e237f9b9f236fe5ea4aa8e268d4a7c4df7b2ecbee3532",
+  "environment": {
+    "host": "162.251.92.120",
+    "kernel": "6.1.0-10-amd64",
+    "os": "Debian GNU/Linux 12",
+    "topology": "netns en14-ns (client+backend 10.99.0.9/10.99.0.6) <-> veth <-> host en14-a VIP 10.99.0.5"
+  },
+  "deliverables": [
+    "stateless TCP cookie challenge on challenged+snat rules: SYN gets SipHash-signed SYN-ACK (cookie ISN embeds MSS index in low 3 bits) with zero state created",
+    "proving ACK performs real admission: dim1+dim6 budgets, SNAT claim, pending SPLICE_WAIT, SYN replay preserving client ISN",
+    "backend SYN-ACK anchors splice: pending promoted to authoritative CT OPEN+SPLICE_DONE, seq_delta=splice_isn-b_isn, handshake-completing ACK forged to backend, consumed SYN-ACK never forwarded",
+    "post-splice seq translation both directions via ct.seq_delta (client lives in challenge seq space)",
+    "key ring {cur,prev}: cookie_make fail-closed on zero key; cookie_check accepts cur/prev key x cur/prev time slot (4 masked compares)",
+    "cookie time slot now>>32 (~4.3s, ~8.6s validity window) — covers real RTTs and retransmit cycles",
+    "XDP_DISPATCH slot 11 = xdp_tcp4_challenge tail-call worker keeps combined stack under 512B (was 672B); state crosses via NatScratch (440B), map pointers re-looked-up in worker",
+    "missing slot-11 program (stale object) -> challenge_rejected++ + XDP_DROP, explicit and counted",
+    "verifier-6.1-safe scalar handling: packet offsets masked with &0x7ff at load/boundary so raw unbounded values never survive into a spill slot (spill slots keep store-time types on strict kernels)",
+    "all variable-offset packet access in forge/patch paths via bpf_xdp_load_bytes/store_bytes; checksums computed on stack buffers before store; no data+var_off pointer arithmetic remains",
+    "splice gate moved before the client-directed SNAT-reply rewrite so the anchor worker forges on the original backend-directed frame",
+    "challenge response TX pays dim3 budget; flood rejected stateless (probe H: 300 SYN -> 0 new state)",
+    "NatScratch +forge_* fields (440B), XdpSnatRevKey _pad widened to 4B (eliminates uninit tail padding rejected by verifier on map_delete)"
+  ],
+  "verification": {
+    "verifier": "all programs including slot-11 worker load and attach on kernel 6.1.0-10-amd64",
+    "probe": "en14_cookie_probe.py all phases pass: A challenge/no-state, F retransmitted SYN challenged (same slot => same cookie), B bad cookie rejected+counted, C valid cookie -> SPLICE_WAIT+SNAT+SYN replay(seq=c_isn), D backend SYN-ACK -> CT OPEN+SPLICE_DONE+forged ACK(seq=c_isn+1,ack=b_isn+1), E bidirectional seq translation, G keyless SYN rejected fail-closed with live flow intact, H 300-SYN flood stateless+counted",
+    "userspace": "workspace tests green on .110 (see execution-status for run log)"
+  },
+  "limitations": [
+    "veth/netns evidence; real-NIC multi-queue challenge throughput is external hardware acceptance",
+    "cookie validity ~8.6s (cur+prev slots); later ACKs rejected+counted — bounded by design",
+    "third-ACK-with-data on the challenge path: the proving ACK creates state then the packet itself is consumed by the splice handshake — data-on-ACK payload is not yet forwarded to backend (TCP allows data on third ACK; rare in practice, tracked as a follow-up)"
+  ]
+}

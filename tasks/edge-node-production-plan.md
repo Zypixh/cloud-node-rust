@@ -4,6 +4,8 @@
 
 设计依据：[目标架构](../docs/edge-node-production-architecture.md)。执行入口：[模型开发交接](edge-node-development-handoff.md)。
 
+2026-09-14 手动执行入口：[Devin VPS 续接计划](devin-vps-continuation.md)。保留当前开发修改，先迁移构建与验证环境，再按依赖闭环；本机（含本机 VM）不再编译/测试。下文任务状态是开发进度记录，存在待补验收，具体按证据判断。
+
 本文件包含 34 个任务包。初始全部为 TODO；本次完成的是架构和计划，不代表任何实现或验收已完成。所有源文件路径是定位入口，不是要求创建一套同名替代实现。其他工作已修复的内容应以最新代码和测试证据合并结项。
 
 ## 1. 发布门槛和依赖
@@ -59,8 +61,8 @@ commit 与 patch 摘要指被测代码状态；未提交代码也可以验证，
 | EN-10 | 连接所有者反馈与存量流 | EN-09、EN-12 | L | VERIFIED（证据 docs/edge-node-evidence/EN-10；veth/netns 验证，真实 NIC profile 待续） |
 | EN-11 | NAT 正反向、SNAT 和计费 | EN-07、EN-09、EN-16 | L | VERIFIED（veth 探针 4 阶段全过；CT-full 回滚路径未实测，见 EN-11 报告限制） |
 | EN-12 | AF_XDP 队列正确性与预算 | EN-04、EN-06、EN-07、EN-16 | L | DONE（证据 docs/edge-node-evidence/EN-12；zero-copy 成功路径待真实 NIC 验证） |
-| EN-13 | TCP 无状态验证可行性与 ADR | EN-09、EN-12 | L | TODO |
-| EN-14 | 获选 TCP 强验证实现 | EN-10、EN-11、EN-13 | L | TODO |
+| EN-13 | TCP 无状态验证可行性与 ADR | EN-09、EN-12 | L | VERIFIED（ADR-001 + 端到端 SYN→cookie→ACK→数据抓包证明，见 EN-14 证据） |
+| EN-14 | 获选 TCP 强验证实现 | EN-10、EN-11、EN-13 | L | VERIFIED（IPv4 veth/netns kernel 6.1 verifier 通过 + 探针 8 阶段全过，证据 docs/edge-node-evidence/EN-14；IPv6 挑战、密钥轮换 API、第三 ACK 载荷转发见报告限制） |
 | EN-15 | QUIC Retry、迁移与透传边界 | EN-09、EN-12、EN-16 | L | TODO |
 | EN-16 | 扩展统一资源治理 | EN-01、EN-02 | L | IN_PROGRESS（已验证切片：kernel-BPF map 账本+attach 门+压力迟滞+listener 配额池+disk 账本，证据 docs/edge-node-evidence/EN-16；tenant 配额与本仓无 tenant 概念、memory/syn 通道迟滞待续） |
 | EN-17 | 用户态传输调度与拷贝优化 | EN-10、EN-12、EN-16 | L | TODO |

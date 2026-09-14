@@ -165,6 +165,7 @@ fn derive_xdp_config_with_ports_and_options(
         budget: None,
         admission: None,
         ebpf_object: None,
+        state_tables: None,
     })
 }
 

@@ -908,6 +908,7 @@ async fn xdp_proxy_smoke_config_store(
             is_on: true,
             port: 0,
             support_mobile_browsers: true,
+            ..Default::default()
         },
     );
     store

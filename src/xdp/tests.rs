@@ -1670,8 +1670,9 @@ fn udp_forward_parse_mac_and_entry_validation() {
         next_hop_mac: "02:00:00:00:00:01".to_string(),
         server_id: 42,
         snat: false,
+        challenge: false,
     };
-    let (key, rule) = linux::udp_forward_entry(&fwd).unwrap();
+    let (key, rule) = linux::udp_forward_entry(&fwd, false).unwrap();
     assert_eq!(key.family, 4);
     assert_eq!(&key.addr[..4], &[192, 0, 2, 10]);
     assert_eq!(key.port_be, 5353u16.to_be());
@@ -1682,7 +1683,7 @@ fn udp_forward_parse_mac_and_entry_validation() {
     assert_eq!(rule.next_hop_mac, [0x02, 0, 0, 0, 0, 1]);
 
     let fwd_snat = crate::runtime_mode::XdpUdpForwardConfig { snat: true, ..fwd };
-    let (_, rule_snat) = linux::udp_forward_entry(&fwd_snat).unwrap();
+    let (_, rule_snat) = linux::udp_forward_entry(&fwd_snat, false).unwrap();
     assert_eq!(rule_snat.snat, 1);
 
     // Family mismatch is rejected explicitly.
@@ -1692,8 +1693,31 @@ fn udp_forward_parse_mac_and_entry_validation() {
         next_hop_mac: "02:00:00:00:00:01".to_string(),
         server_id: 0,
         snat: false,
+        challenge: false,
     };
-    assert!(linux::udp_forward_entry(&bad).is_err());
+    assert!(linux::udp_forward_entry(&bad, false).is_err());
+
+    // EN-14 gating is explicit: challenge on UDP / non-SNAT / v6 rules is
+    // rejected at sync time rather than silently ignored.
+    let base = |challenge: bool, snat: bool| crate::runtime_mode::XdpUdpForwardConfig {
+        listen: SocketAddr::from(([192, 0, 2, 10], 5353)),
+        backend: "10.0.0.5:53".to_string(),
+        next_hop_mac: "02:00:00:00:00:01".to_string(),
+        server_id: 42,
+        snat,
+        challenge,
+    };
+    assert!(linux::udp_forward_entry(&base(true, true), false).is_err());
+    assert!(linux::udp_forward_entry(&base(true, false), true).is_err());
+    let chal_v6 = crate::runtime_mode::XdpUdpForwardConfig {
+        listen: SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 10], 5353)),
+        backend: "[2001:db8::5]:53".to_string(),
+        ..base(true, true)
+    };
+    assert!(linux::udp_forward_entry(&chal_v6, true).is_err());
+    // The supported combination sets the flag on the rule.
+    let (_, rule_ok) = linux::udp_forward_entry(&base(true, true), true).unwrap();
+    assert_eq!(rule_ok.challenge, 1);
 }
 
 #[test]
@@ -2672,7 +2696,7 @@ fn effective_budget_config_baseline_and_share_math() {
         ..XdpConfig::default()
     });
     let cfg = manager.effective_budget_config();
-    assert_eq!(cfg.flags, 0b111_0111);
+    assert_eq!(cfg.flags, 0b111_1111);
     assert!(cfg.unverified_pps >= 1);
     assert!(cfg.new_flow_per_sec >= 1);
     assert!(cfg.verified_pps >= 1);
@@ -2696,6 +2720,7 @@ fn effective_budget_config_baseline_and_share_math() {
             xsk_redirect_pps: 4,
             control_pps: 2,
             service_flow_pps: None,
+            challenge_pps: None,
             window_ms: 1000,
         }),
         ..XdpConfig::default()
@@ -2764,9 +2789,35 @@ fn scaled_rate_limit_config_window_prefix_and_floor() {
 #[test]
 #[cfg(target_os = "linux")]
 fn projected_bpf_map_bytes_bounded() {
-    let bytes = linux::projected_bpf_map_bytes();
+    let bytes = linux::projected_bpf_map_bytes(&crate::runtime_mode::XdpConfig::default());
     assert!(bytes > 100 * 1024 * 1024, "projection too small: {bytes}");
     assert!(bytes < 2 * 1024 * 1024 * 1024, "projection insane: {bytes}");
+}
+
+/// EN-16: stateTables overrides shrink the projection deterministically —
+/// the ledger must count configured sizes, not just object defaults.
+#[test]
+#[cfg(target_os = "linux")]
+fn projected_bpf_map_bytes_respects_state_table_overrides() {
+    use crate::runtime_mode::{XdpConfig, XdpStateTables};
+    let default = linux::projected_bpf_map_bytes(&XdpConfig::default());
+    let mut cfg = XdpConfig::default();
+    cfg.state_tables = Some(XdpStateTables {
+        ct_max_entries: Some(8_192),
+        pending_max_entries: Some(4_096),
+        snat_rev_max_entries: Some(4_096),
+        flow_acct_max_entries: Some(8_192),
+        rate_v6_max_entries: Some(8_192),
+        quic_dcid_max_entries: Some(4_096),
+        acl_blocked_max_entries: Some(16_384),
+        acl_allowed_max_entries: Some(4_096),
+        rate_v4_max_entries: Some(16_384),
+    });
+    let shrunk = linux::projected_bpf_map_bytes(&cfg);
+    assert!(
+        shrunk < default / 2,
+        "shrunk projection {shrunk} should be well below default {default}"
+    );
 }
 
 #[test]
