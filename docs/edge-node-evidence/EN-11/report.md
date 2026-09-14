@@ -90,10 +90,34 @@ TCP pending 经 `pending_touch`）检查存量绑定的 `(listen_addr, listen_po
   5s tick 覆写运行期注入的 flags。
 - NatScratch +debug_flags（每包一次快照，flag 检查是普通 load）。
 
+## 第三批改动（ABI v12，EN-06/07/13 首切片）
+
+- EN-06 ACL 所有权：Allow 判定不再提前 XDP_PASS——白名单只跳过 block
+  规则与 per-source 限流，仍须支付 dim0 未验证聚合预算，并继续走
+  dispatch_local，已接管连接仍到达其 kernel/AF_XDP/NAT 所有者。
+- EN-07 分层预算：dims 扩为 unverified(0)/new-flow(1)/xsk-redirect(2)/
+  verified(4)/control(5)。verified 命中退还入口时的 unverified 计价并
+  改记 verified 池（洪泛无法耗尽的保留额度）；control（ICMP/ND/PMTU）
+  独立有界；redirect 逐包计价。所有拒绝 fail-closed 且有独立计数器。
+- EN-13/14 首切片 TCP 序号锚点：准入存 expect_seq=client_isn+1；
+  仅当后端 SYN-ACK 的 ackno==expect_seq 才标 PENDING_ACKED 并锚定
+  expect_ack=backend_isn+1；晋级要求 client ACK seq==expect_seq，
+  SNAT 流另需 ackno==expect_ack。弱观察包计数 nat_seq_rejected。
+- 配置 `xdp.budget` +verifiedPps/xskRedirectPps/controlPps（默认
+  8M/4M/100k pps 节点级，按 CPU 向上取整分摊，下限 1）。
+- 探针 +Phase H：非 SYN-ACK 后端包保持 PENDING（state=2）、盲 ACK
+  不晋级且 natSeqRejected+1、正确锚定握手正常晋级。
+- en09 探针 phase E 修正：重启前清 pinned map，避免 EN-10 导入流
+  污染"fresh table"断言。
+
 ## 仍存在的限制
 
 - 并发晋级（双 CPU 同 tuple 竞争）由 insert 的 BPF_NOEXIST 与 pending
   单写者语义覆盖，未单独仪表化。
+- verified 池的分类证据是"持有活跃 CT/SNAT 状态"——tuple 猜测命中
+  既有流的包仍计入 verified 预算；更强的按流序号窗口属 EN-13/14 后续。
+- 每服务/每队列公平维度尚未接线——listener 池（EN-16）只覆盖用户态
+  准入，数据面队列级预算待 EN-05/EN-17。
 - 冲突拒绝的语义是"回退用户态路径"（Ok(None)），不是丢包——与
   CT-full 回退一致；若接口无用户态监听则该连接实际上不可达，但拒绝
   是可观测的（counter + event）。

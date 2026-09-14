@@ -958,7 +958,10 @@ pub(crate) fn sum_percpu_counters<'a>(
             admission_limited,
             pending_limited,
             flow_event_lost,
-            nat_conflict
+            nat_conflict,
+            verified_limited,
+            control_limited,
+            nat_seq_rejected
         );
     }
     total

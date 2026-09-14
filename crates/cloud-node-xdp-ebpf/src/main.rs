@@ -826,7 +826,15 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     match l4_sanity(ctx, protocol, l4_offset, packet_end) {
         L4Class::Ok => {}
         L4Class::Malformed => return Ok(malformed_drop()),
-        L4Class::Control => return Ok(control_pass()),
+        L4Class::Control => {
+            // EN-07: necessary-control traffic (ICMP/ND/PMTU) has its own
+            // bounded budget — never free, never unbounded.
+            if !budget_charge(5, unsafe { bpf_ktime_get_ns() }) {
+                counter_control_limited();
+                return Ok(xdp_action::XDP_DROP);
+            }
+            return Ok(control_pass());
+        }
         L4Class::Unsupported => return Ok(unsupported_pass()),
     }
     // SAFETY: XDP programs may call the ktime helper; the returned monotonic
@@ -835,11 +843,15 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     // Whitelist priority is explicit: an allowed source skips ACL block rules
     // and per-source rate limiting — but it already passed malformed,
     // fragment and L4 sanity checks above, so hard bounds still apply.
-    match acl_verdict_v4(source_be, source_be, now_mono_ns) {
-        AclVerdict::Allow => return Ok(xdp_action::XDP_PASS),
+    // EN-06: an Allow verdict skips block rules and the per-source limiter
+    // only — it never bypasses the aggregate budget below and never
+    // short-circuits dispatch_local, so an already-owned flow still reaches
+    // its kernel/AF_XDP/NAT owner instead of being re-bound to the kernel.
+    let acl_allowed = match acl_verdict_v4(source_be, source_be, now_mono_ns) {
+        AclVerdict::Allow => true,
         AclVerdict::Block => return Ok(block_action(policy)),
-        AclVerdict::None => {}
-    }
+        AclVerdict::None => false,
+    };
     // Aggregate unverified-packet budget (EN-07): charged once here for
     // every local TCP/UDP packet — before the per-source bucket, before NAT
     // dispatch, and identically across observe/protect/proxy. Verified
@@ -852,7 +864,7 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         counter_unverified_limited();
         return Ok(xdp_action::XDP_DROP);
     }
-    if rate_limited_v4(ctx, source_be, protocol, l4_offset, now_mono_ns) {
+    if !acl_allowed && rate_limited_v4(ctx, source_be, protocol, l4_offset, now_mono_ns) {
         counter_rate_limited();
         return Ok(xdp_action::XDP_DROP);
     }
@@ -1040,17 +1052,27 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     match l4_sanity(ctx, protocol, l4_offset, packet_end) {
         L4Class::Ok => {}
         L4Class::Malformed => return Ok(malformed_drop()),
-        L4Class::Control => return Ok(control_pass()),
+        L4Class::Control => {
+            // EN-07: necessary-control traffic (ICMP/ND/PMTU) has its own
+            // bounded budget — never free, never unbounded.
+            if !budget_charge(5, unsafe { bpf_ktime_get_ns() }) {
+                counter_control_limited();
+                return Ok(xdp_action::XDP_DROP);
+            }
+            return Ok(control_pass());
+        }
         L4Class::Unsupported => return Ok(unsupported_pass()),
     }
     // SAFETY: XDP programs may call the ktime helper; the returned monotonic
     // timestamp is only used for read-only rule deadline comparisons.
     let now_mono_ns = unsafe { bpf_ktime_get_ns() };
-    match acl_verdict_v6(source, now_mono_ns) {
-        AclVerdict::Allow => return Ok(xdp_action::XDP_PASS),
+    // EN-06: see the IPv4 entry — Allow skips block rules and the limiter
+    // only, never the aggregate budget or the owner's dispatch path.
+    let acl_allowed = match acl_verdict_v6(source, now_mono_ns) {
+        AclVerdict::Allow => true,
         AclVerdict::Block => return Ok(block_action(policy)),
-        AclVerdict::None => {}
-    }
+        AclVerdict::None => false,
+    };
     // Aggregate unverified-packet budget (EN-07): same gate as IPv4 —
     // once per local TCP/UDP packet, before the per-source bucket and
     // before NAT dispatch.
@@ -1072,7 +1094,7 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         )
     };
     let rate_meta = (protocol as u64) | ((l4_offset as u64) << 8);
-    if rate_limited_v6(ctx, src_hi, src_lo, rate_meta, now_mono_ns) {
+    if !acl_allowed && rate_limited_v6(ctx, src_hi, src_lo, rate_meta, now_mono_ns) {
         counter_rate_limited();
         return Ok(xdp_action::XDP_DROP);
     }
@@ -1425,6 +1447,15 @@ fn maybe_redirect(
         }
     };
 
+    // EN-07: redirect work has its own bounded budget — exhaustion drops
+    // here with the explicit fallback, never silently re-routes ownership.
+    if !budget_charge(2, unsafe { bpf_ktime_get_ns() }) {
+        counter_xsk_drop();
+        if policy.fallback_pass != 0 {
+            return xdp_action::XDP_PASS;
+        }
+        return xdp_action::XDP_DROP;
+    }
     match XDP_XSKS.redirect(xsk_index, 0) {
         Ok(_) => xdp_action::XDP_REDIRECT,
         Err(_) => {
@@ -2039,6 +2070,9 @@ fn try_udp_nat_v4(
     if let Some(ct) = XDP_UDP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
+        if !verified_hit(now_mono_ns) {
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
         ct.last_seen_ns = now_mono_ns;
         let listen_be = u32::from_be_bytes([
             ct.listen_addr[0],
@@ -2103,6 +2137,9 @@ fn try_udp_nat_v4(
             rv.backend_port_be == src_port && rv.backend_addr[..4] == src_be.to_be_bytes()
         }
     {
+        if !verified_hit(now_mono_ns) {
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
         let client_be = u32::from_be_bytes(unsafe {
             let rv = &(*scratch).snat_rev_value;
             [
@@ -2240,6 +2277,9 @@ fn try_udp_nat_v4(
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         let v = unsafe { &(*scratch).ct_value };
+        if !verified_hit(now_mono_ns) {
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
         // EN-11 multi-VIP disambiguation: the flow tuple is already bound
         // to a different listen tuple — reject instead of silently
         // rebinding the reply owner to a VIP the client never dialed.
@@ -2418,6 +2458,9 @@ fn try_udp_nat_v6(
     if let Some(ct) = XDP_UDP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
+        if !verified_hit(now_mono_ns) {
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
         ct.last_seen_ns = now_mono_ns;
         let listen_port = ct.listen_port_be;
         unsafe {
@@ -2465,6 +2508,9 @@ fn try_udp_nat_v6(
             rv.backend_port_be == src_port && rv.backend_addr == (*scratch).pkt_src
         }
     {
+        if !verified_hit(now_mono_ns) {
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
         let client_port = unsafe { (*scratch).snat_rev_value.client_port_be };
         let client_mac = unsafe { (*scratch).snat_rev_value.client_mac };
         let listen_port = unsafe { (*scratch).snat_rev_value.listen_port_be };
@@ -2597,6 +2643,9 @@ fn try_udp_nat_v6_fwd(
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         let v = unsafe { &(*scratch).ct_value };
+        if !verified_hit(now_mono_ns) {
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
         // EN-11 multi-VIP disambiguation: reject instead of silently
         // rebinding the reply owner to a VIP the client never dialed.
         if ct.listen_addr != v.listen_addr || ct.listen_port_be != v.listen_port_be {
@@ -2810,6 +2859,8 @@ fn try_tcp_nat_v4(
     let syn = unsafe { (*tcp).syn() } == 1;
     let ack = unsafe { (*tcp).ack() } == 1;
     let closing = unsafe { (*tcp).fin() } == 1 || unsafe { (*tcp).rst() } == 1;
+    let seq = unsafe { u32::from_be_bytes((*tcp).seq) };
+    let ackno = unsafe { u32::from_be_bytes((*tcp).ack_seq) };
     let ip = ptr_at::<Ipv4Hdr>(ctx, ip_offset)?;
     let src_addr = unsafe { (*ip).src_addr };
     let dst_addr = unsafe { (*ip).dst_addr };
@@ -2837,10 +2888,19 @@ fn try_tcp_nat_v4(
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         if ct.state == XDP_CT_STATE_PENDING || ct.state == XDP_CT_STATE_PENDING_ACKED {
-            // Backend-side traffic on a half-open flow records handshake
-            // evidence. Absolute deadline: last_seen_ns is never extended.
-            ct.state = XDP_CT_STATE_PENDING_ACKED;
+            // EN-13/14: handshake evidence is only a backend SYN-ACK that
+            // acknowledges the client's ISN (ackno == client_isn+1 anchored
+            // at admission). Any other backend packet keeps the entry
+            // half-open — blind replies must not mark strong verification.
+            // Absolute deadline: last_seen_ns is never extended.
+            if syn && ack && ackno == ct.expect_seq {
+                ct.state = XDP_CT_STATE_PENDING_ACKED;
+                ct.expect_ack = seq.wrapping_add(1);
+            }
         } else {
+            if !verified_hit(now_mono_ns) {
+                return Ok(Some(xdp_action::XDP_DROP));
+            }
             ct.last_seen_ns = now_mono_ns;
             if closing && ct.state == XDP_CT_STATE_OPEN {
                 ct.state = XDP_CT_STATE_CLOSING;
@@ -2905,6 +2965,9 @@ fn try_tcp_nat_v4(
             rv.backend_port_be == src_port && rv.backend_addr[..4] == src_be.to_be_bytes()
         }
     {
+        if !verified_hit(now_mono_ns) {
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
         let client_be = u32::from_be_bytes(unsafe {
             let rv = &(*scratch).snat_rev_value;
             [
@@ -2986,8 +3049,14 @@ fn try_tcp_nat_v4(
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
             if ct.state == XDP_CT_STATE_PENDING || ct.state == XDP_CT_STATE_PENDING_ACKED {
-                ct.state = XDP_CT_STATE_PENDING_ACKED;
+                if syn && ack && ackno == ct.expect_seq {
+                    ct.state = XDP_CT_STATE_PENDING_ACKED;
+                    ct.expect_ack = seq.wrapping_add(1);
+                }
             } else {
+                if !verified_hit(now_mono_ns) {
+                    return Ok(Some(xdp_action::XDP_DROP));
+                }
                 ct.last_seen_ns = now_mono_ns;
                 if closing && ct.state == XDP_CT_STATE_OPEN {
                     ct.state = XDP_CT_STATE_CLOSING;
@@ -3037,6 +3106,9 @@ fn try_tcp_nat_v4(
         Some(ct) => {
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
+            if !verified_hit(now_mono_ns) {
+                return Ok(Some(xdp_action::XDP_DROP));
+            }
             // EN-11: flow tuple already bound to a different listen (VIP)
             // tuple — reject rather than rebinding reply ownership.
             if ct.listen_addr != v4_embed(dst_be) || ct.listen_port_be != dst_port {
@@ -3062,7 +3134,13 @@ fn try_tcp_nat_v4(
             // packet as an unknown flow. Pending hits forward through the
             // shared rewrite below without extending their absolute deadline.
             unsafe { (*scratch).pkt_dst = v4_embed(dst_be) };
-            let r = pending_touch(scratch, now_mono_ns, ack && !syn, dst_port);
+            let r = pending_touch(
+                scratch,
+                now_mono_ns,
+                ack && !syn,
+                dst_port,
+                seq as u64 | (ackno as u64) << 32,
+            );
             let pend = r as u8;
             let incarnation = (r >> 8) as u32;
             let pending_port = (r >> 40) as u16;
@@ -3092,6 +3170,8 @@ fn try_tcp_nat_v4(
                     v.listen_port_be = dst_port;
                     v.family = 4;
                     v.state = XDP_CT_STATE_PENDING;
+                    v.expect_seq = seq.wrapping_add(1);
+                    v.expect_ack = 0;
                     v.snat_port_be = 0;
                     v.server_id = rule.server_id;
                     v.last_seen_ns = now_mono_ns;
@@ -3225,6 +3305,8 @@ fn try_tcp_nat_v6(
     let syn = unsafe { (*tcp).syn() } == 1;
     let ack = unsafe { (*tcp).ack() } == 1;
     let closing = unsafe { (*tcp).fin() } == 1 || unsafe { (*tcp).rst() } == 1;
+    let seq = unsafe { u32::from_be_bytes((*tcp).seq) };
+    let ackno = unsafe { u32::from_be_bytes((*tcp).ack_seq) };
     let scratch = nat_scratch()?;
     // Snapshot test-only fault flags once per packet — inner checks read
     // this scratch field instead of paying a map lookup per call site.
@@ -3247,10 +3329,19 @@ fn try_tcp_nat_v6(
         // SAFETY: pointer into the map value for `ct_key`.
         let ct = unsafe { &mut *ct };
         if ct.state == XDP_CT_STATE_PENDING || ct.state == XDP_CT_STATE_PENDING_ACKED {
-            // Backend-side traffic on a half-open flow records handshake
-            // evidence. Absolute deadline: last_seen_ns is never extended.
-            ct.state = XDP_CT_STATE_PENDING_ACKED;
+            // EN-13/14: handshake evidence is only a backend SYN-ACK that
+            // acknowledges the client's ISN (ackno == client_isn+1 anchored
+            // at admission). Any other backend packet keeps the entry
+            // half-open — blind replies must not mark strong verification.
+            // Absolute deadline: last_seen_ns is never extended.
+            if syn && ack && ackno == ct.expect_seq {
+                ct.state = XDP_CT_STATE_PENDING_ACKED;
+                ct.expect_ack = seq.wrapping_add(1);
+            }
         } else {
+            if !verified_hit(now_mono_ns) {
+                return Ok(Some(xdp_action::XDP_DROP));
+            }
             ct.last_seen_ns = now_mono_ns;
             if closing && ct.state == XDP_CT_STATE_OPEN {
                 ct.state = XDP_CT_STATE_CLOSING;
@@ -3303,6 +3394,9 @@ fn try_tcp_nat_v6(
             rv.backend_port_be == src_port && rv.backend_addr == (*scratch).pkt_src
         }
     {
+        if !verified_hit(now_mono_ns) {
+            return Ok(Some(xdp_action::XDP_DROP));
+        }
         let client_port = unsafe { (*scratch).snat_rev_value.client_port_be };
         let client_mac = unsafe { (*scratch).snat_rev_value.client_mac };
         let listen_port = unsafe { (*scratch).snat_rev_value.listen_port_be };
@@ -3367,8 +3461,14 @@ fn try_tcp_nat_v6(
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
             if ct.state == XDP_CT_STATE_PENDING || ct.state == XDP_CT_STATE_PENDING_ACKED {
-                ct.state = XDP_CT_STATE_PENDING_ACKED;
+                if syn && ack && ackno == ct.expect_seq {
+                    ct.state = XDP_CT_STATE_PENDING_ACKED;
+                    ct.expect_ack = seq.wrapping_add(1);
+                }
             } else {
+                if !verified_hit(now_mono_ns) {
+                    return Ok(Some(xdp_action::XDP_DROP));
+                }
                 ct.last_seen_ns = now_mono_ns;
                 if closing && ct.state == XDP_CT_STATE_OPEN {
                     ct.state = XDP_CT_STATE_CLOSING;
@@ -3407,6 +3507,8 @@ fn try_tcp_nat_v6_fwd(
     let syn = unsafe { (*tcp).syn() } == 1;
     let ack = unsafe { (*tcp).ack() } == 1;
     let closing = unsafe { (*tcp).fin() } == 1 || unsafe { (*tcp).rst() } == 1;
+    let seq = unsafe { u32::from_be_bytes((*tcp).seq) };
+    let ackno = unsafe { u32::from_be_bytes((*tcp).ack_seq) };
     let scratch = nat_scratch()?;
     // Snapshot test-only fault flags once per packet — inner checks read
     // this scratch field instead of paying a map lookup per call site.
@@ -3435,6 +3537,9 @@ fn try_tcp_nat_v6_fwd(
         Some(ct) => {
             // SAFETY: pointer into the map value for `ct_key`.
             let ct = unsafe { &mut *ct };
+            if !verified_hit(now_mono_ns) {
+                return Ok(Some(xdp_action::XDP_DROP));
+            }
             // EN-11: flow tuple already bound to a different listen (VIP)
             // tuple — reject rather than rebinding reply ownership.
             if ct.listen_addr != unsafe { (*scratch).pkt_dst } || ct.listen_port_be != dst_port {
@@ -3455,7 +3560,13 @@ fn try_tcp_nat_v6_fwd(
             snat_port = ct.snat_port_be;
         }
         None => {
-            let r = pending_touch(scratch, now_mono_ns, ack && !syn, dst_port);
+            let r = pending_touch(
+                scratch,
+                now_mono_ns,
+                ack && !syn,
+                dst_port,
+                seq as u64 | (ackno as u64) << 32,
+            );
             let pend = r as u8;
             let incarnation = (r >> 8) as u32;
             let pending_port = (r >> 40) as u16;
@@ -3484,6 +3595,8 @@ fn try_tcp_nat_v6_fwd(
                     v.listen_port_be = dst_port;
                     v.family = 6;
                     v.state = XDP_CT_STATE_PENDING;
+                    v.expect_seq = seq.wrapping_add(1);
+                    v.expect_ack = 0;
                     v.snat_port_be = 0;
                     v.server_id = rule.server_id;
                     v.last_seen_ns = now_mono_ns;
@@ -3904,6 +4017,9 @@ fn budget_charge(dim: usize, now_mono_ns: u64) -> bool {
     let (limit, enabled) = match dim {
         0 => (cfg.unverified_pps, cfg.flags & 1 != 0),
         1 => (cfg.new_flow_per_sec, cfg.flags & 2 != 0),
+        2 => (cfg.xsk_redirect_pps, cfg.flags & 4 != 0),
+        4 => (cfg.verified_pps, cfg.flags & 0x10 != 0),
+        5 => (cfg.control_pps, cfg.flags & 0x20 != 0),
         _ => return true,
     };
     if !enabled || limit == 0 || cfg.window_ns == 0 {
@@ -3919,6 +4035,44 @@ fn budget_charge(dim: usize, now_mono_ns: u64) -> bool {
     }
     b.count[dim] = b.count[dim].saturating_add(1);
     b.count[dim] <= limit
+}
+
+/// Return one unit of `dim`'s current-window count (saturating). Used when
+/// a packet charged to the unverified pool at entry turns out to hold
+/// verified conntrack state — the unverified ceiling then reflects only
+/// not-yet-verified traffic. A rolled window needs no refund: the charge
+/// already amortized with it.
+#[inline(always)]
+fn budget_refund(dim: usize, now_mono_ns: u64) {
+    let Some(cfg) = XDP_BUDGET_CFG.get(0) else {
+        return;
+    };
+    if cfg.flags & 1 == 0 || cfg.unverified_pps == 0 || cfg.window_ns == 0 {
+        return;
+    }
+    let Some(bucket) = XDP_BUDGET.get_ptr_mut(0) else {
+        return;
+    };
+    let b = unsafe { &mut *bucket };
+    if now_mono_ns.saturating_sub(b.window_start_ns[dim]) < cfg.window_ns {
+        b.count[dim] = b.count[dim].saturating_sub(1);
+    }
+}
+
+/// EN-07 verified-state hit accounting: the packet proved membership in
+/// live conntrack/SNAT state, so refund the entry-time unverified charge
+/// and bill the verified pool instead. Established flows therefore keep a
+/// reserved share an unverified flood cannot drain. Returns false when the
+/// verified pool itself is exhausted — the caller must drop explicitly.
+#[inline(never)]
+fn verified_hit(now_mono_ns: u64) -> bool {
+    budget_refund(0, now_mono_ns);
+    if budget_charge(4, now_mono_ns) {
+        true
+    } else {
+        counter_verified_limited();
+        false
+    }
 }
 
 const XDP_PENDING_TTL_DEFAULT_NS: u64 = 3_000_000_000;
@@ -4003,7 +4157,12 @@ fn pending_touch(
     now_mono_ns: u64,
     promote: bool,
     exp_port_be: u16,
+    seq_ack: u64,
 ) -> u64 {
+    // seq/ackno arrive packed — a sixth argument would spill through the
+    // caller's frame (R11), which the verifier rejects.
+    let seq = seq_ack as u32;
+    let ackno = (seq_ack >> 32) as u32;
     // SAFETY: callers pass the per-CPU scratch map pointer; `ct_key` holds
     // the flow tuple and `pkt_dst` the expected listen address.
     let key = unsafe { &(*scratch).ct_key };
@@ -4050,7 +4209,26 @@ fn pending_touch(
     // SYN-ACK (PENDING_ACKED, set by the reply path). Plain-DNAT flows have
     // no observable SYN-ACK — replies addressed to the client are nonlocal
     // and transit the kernel — so the client's ACK is the only evidence.
-    if promote && (p.state == XDP_CT_STATE_PENDING_ACKED || p.snat_port_be == 0) {
+    // EN-13/14: promotion requires the handshake ACK, not just any ACK —
+    // the client's seq must equal client_isn+1 anchored at admission, and
+    // SNAT flows additionally require the reply path to have observed a
+    // real SYN-ACK (PENDING_ACKED) plus the ACK acknowledging the backend
+    // ISN+1. An ACK failing the anchors is a weak observation: it keeps
+    // the entry half-open, cannot extend its absolute deadline, and is
+    // counted so blind-ACK floods stay observable.
+    let seq_ok = seq == p.expect_seq;
+    let can_promote = if p.snat_port_be == 0 {
+        // Plain-DNAT flows have no observable SYN-ACK — replies addressed
+        // to the client are nonlocal and transit the kernel — so the
+        // client's anchored ACK is the only promotion evidence.
+        seq_ok
+    } else {
+        p.state == XDP_CT_STATE_PENDING_ACKED && seq_ok && ackno == p.expect_ack
+    };
+    if promote && !can_promote {
+        counter_nat_seq_rejected();
+    }
+    if promote && can_promote {
         // Insert the pending record verbatim and only then flip the CT copy
         // to OPEN: the pending record — state AND the absolute admission
         // deadline — must stay untouched until the authoritative insert
@@ -4130,6 +4308,27 @@ fn counter_xsk_drop() {
 fn counter_rate_limited() {
     if let Some(counters) = counters() {
         counters.rate_limited = counters.rate_limited.saturating_add(1);
+    }
+}
+
+fn counter_verified_limited() {
+    if let Some(counters) = XDP_COUNTERS.get_ptr_mut(0) {
+        let counters = unsafe { &mut *counters };
+        counters.verified_limited = counters.verified_limited.saturating_add(1);
+    }
+}
+
+fn counter_control_limited() {
+    if let Some(counters) = XDP_COUNTERS.get_ptr_mut(0) {
+        let counters = unsafe { &mut *counters };
+        counters.control_limited = counters.control_limited.saturating_add(1);
+    }
+}
+
+fn counter_nat_seq_rejected() {
+    if let Some(counters) = XDP_COUNTERS.get_ptr_mut(0) {
+        let counters = unsafe { &mut *counters };
+        counters.nat_seq_rejected = counters.nat_seq_rejected.saturating_add(1);
     }
 }
 

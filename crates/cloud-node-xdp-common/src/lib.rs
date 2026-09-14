@@ -278,6 +278,16 @@ pub struct XdpCounters {
     /// existing binding wins; the conflicting packet falls back to the
     /// userspace dataplane instead of silently rebinding the reply tuple.
     pub nat_conflict: u64,
+    /// Packets on state-verified flows dropped by the verified-packet
+    /// budget (dim4).
+    pub verified_limited: u64,
+    /// Necessary-control packets (ICMP etc.) dropped by the control
+    /// budget (dim5).
+    pub control_limited: u64,
+    /// TCP packets whose sequence/ack numbers failed the admission
+    /// anchors — counted separately from conflicts so blind-ACK floods
+    /// are observable.
+    pub nat_seq_rejected: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -441,6 +451,15 @@ pub struct XdpUdpCtValue {
     /// Billing dimension mirrored from the forward rule.
     pub server_id: i64,
     pub last_seen_ns: u64,
+    /// TCP sequence anchor: at admission this is the client SYN's seq+1 —
+    /// the client's ACK must carry exactly this seq to promote, so a blind
+    /// ACK flood cannot promote a DNAT pending entry. 0 for UDP (unused).
+    pub expect_seq: u32,
+    /// For SNAT flows the backend SYN-ACK's seq+1, recorded when the reply
+    /// path marks PENDING_ACKED — promotion additionally requires the
+    /// client's ack number to match, so an off-path ACK cannot promote.
+    /// 0 = no backend reply observed yet.
+    pub expect_ack: u32,
 }
 
 /// SNAT reverse-binding key: backend replies arrive addressed to
@@ -595,7 +614,14 @@ pub struct NatScratch {
 /// flow-state maps pinned for generational takeover.
 /// v10: EN-11 — XdpCounters +nat_conflict (224->232B);
 /// XDP_DECISION_NAT_CONFLICT.
-pub const XDP_ABI_VERSION: u32 = 11;
+/// v11: EN-11 — XdpCounters +snat_alloc_fail (232->240B);
+/// XdpPendingCap +flags (test-only fault injection);
+/// NatScratch +debug_flags.
+/// v12: EN-06/07/13 — XdpBudgetConfig +verified_pps/control_pps (32->48B),
+/// XdpBudgetBucket grows to six dims (40->64B), XdpUdpCtValue
+/// +expect_seq/expect_ack (40->48B), XdpCounters +verified_limited/
+/// control_limited/nat_seq_rejected (240->264B), NatScratch 320->328B.
+pub const XDP_ABI_VERSION: u32 = 12;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -749,10 +775,17 @@ pub struct XdpBudgetConfig {
     pub xsk_redirect_pps: u64,
     /// Max challenge responses/sec (cookie/Retry replies).
     pub challenge_pps: u64,
+    /// Max packets/sec on flows holding verified conntrack state. The
+    /// verified pool is exclusive: verified hits refund the unverified
+    /// charge, so an unverified flood can never starve established flows.
+    pub verified_pps: u64,
+    /// Max necessary-control packets/sec (ICMP et al. passed early).
+    pub control_pps: u64,
     /// Accounting window shared by the buckets.
     pub window_ns: u64,
     /// Enable bitset; bit0 = enforce unverified_pps, bit1 = new_flow,
-    /// bit2 = xsk_redirect, bit3 = challenge.
+    /// bit2 = xsk_redirect, bit3 = challenge, bit4 = verified,
+    /// bit5 = control.
     pub flags: u64,
 }
 
@@ -761,12 +794,13 @@ pub struct XdpBudgetConfig {
 /// the node-wide totals by the possible-CPU count when writing
 /// `XdpBudgetConfig`, keeping the aggregate quota independent of CPU/queue
 /// count. Index convention matches `XdpBudgetConfig` flag bits:
-/// 0=unverified pps, 1=new-flow admissions, 2=xsk redirect, 3=challenge.
+/// 0=unverified pps, 1=new-flow admissions, 2=xsk redirect, 3=challenge,
+/// 4=verified pps, 5=control pps.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct XdpBudgetBucket {
-    pub window_start_ns: [u64; 4],
-    pub count: [u64; 4],
+    pub window_start_ns: [u64; 6],
+    pub count: [u64; 6],
 }
 
 /// Half-open concurrency cap stored in a single-slot map value so the dataplane
@@ -804,18 +838,18 @@ const _: () = assert!(core::mem::size_of::<XdpFlowKey>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpFlowRecord>() == 64);
 const _: () = assert!(core::mem::size_of::<XdpFlowEvent>() == 88);
 const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
-const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 48);
-const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 64);
+const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 64);
+const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 96);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 24);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 232);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 256);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
-const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 48);
+const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 56);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevKey>() == 24);
 const _: () = assert!(core::mem::size_of::<XdpSnatRevValue>() == 56);
 const _: () = assert!(core::mem::size_of::<XdpInterfacePolicy>() == 8);
 const _: () = assert!(core::mem::size_of::<XdpRateBucket>() == 16);
 const _: () = assert!(core::mem::size_of::<XdpRateLimitConfig>() == 32);
-const _: () = assert!(core::mem::size_of::<NatScratch>() == 320);
+const _: () = assert!(core::mem::size_of::<NatScratch>() == 328);
 
 #[cfg(all(feature = "aya", target_os = "linux"))]
 macro_rules! unsafe_impl_aya_pod {

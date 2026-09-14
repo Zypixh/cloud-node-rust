@@ -323,6 +323,19 @@ pub struct XdpBudgetSettings {
     /// Default 100k/s.
     #[serde(rename = "newFlowPerSec", default = "default_new_flow_per_sec")]
     pub new_flow_per_sec: u64,
+    /// Node-wide ceiling on packets/sec holding verified conntrack or SNAT
+    /// state — the reserve a flood of unverified traffic cannot drain.
+    /// Default 8M pps.
+    #[serde(rename = "verifiedPps", default = "default_verified_pps")]
+    pub verified_pps: u64,
+    /// Node-wide ceiling on AF_XDP redirect work per second.
+    /// Default 4M pps.
+    #[serde(rename = "xskRedirectPps", default = "default_xsk_redirect_pps")]
+    pub xsk_redirect_pps: u64,
+    /// Node-wide ceiling on necessary-control packets/sec (ICMP/ND/PMTU).
+    /// Default 100k pps.
+    #[serde(rename = "controlPps", default = "default_control_pps")]
+    pub control_pps: u64,
     /// Accounting window for the fixed-window buckets.
     #[serde(rename = "windowMs", default = "default_xdp_rate_limit_window_ms")]
     pub window_ms: u64,
@@ -336,12 +349,27 @@ fn default_new_flow_per_sec() -> u64 {
     100_000
 }
 
+fn default_verified_pps() -> u64 {
+    8_000_000
+}
+
+fn default_xsk_redirect_pps() -> u64 {
+    4_000_000
+}
+
+fn default_control_pps() -> u64 {
+    100_000
+}
+
 impl Default for XdpBudgetSettings {
     fn default() -> Self {
         Self {
             enabled: true,
             unverified_pps: default_unverified_pps(),
             new_flow_per_sec: default_new_flow_per_sec(),
+            verified_pps: default_verified_pps(),
+            xsk_redirect_pps: default_xsk_redirect_pps(),
+            control_pps: default_control_pps(),
             window_ms: default_xdp_rate_limit_window_ms(),
         }
     }
