@@ -1016,7 +1016,11 @@ pub fn sync_budget(ebpf: &mut aya::Ebpf, config: &XdpBudgetConfig) -> anyhow::Re
 /// Push the EN-09 pending admission contract. `max_pending` mirrors the
 /// pending table's map bound (the actual hard limit); `pending_ttl_ns` is
 /// the absolute half-open deadline enforced in the dataplane.
-pub fn sync_pending_cap(ebpf: &mut aya::Ebpf, pending_ttl_ns: u64) -> anyhow::Result<()> {
+pub fn sync_pending_cap(
+    ebpf: &mut aya::Ebpf,
+    pending_ttl_ns: u64,
+    flags: u64,
+) -> anyhow::Result<()> {
     let map = ebpf.map_mut("XDP_PENDING_CAP").ok_or_else(|| {
         anyhow::anyhow!(
             "missing map XDP_PENDING_CAP; eBPF object predates EN-09 pending table (rebuild cloud-node-xdp-ebpf.o)"
@@ -1028,6 +1032,7 @@ pub fn sync_pending_cap(ebpf: &mut aya::Ebpf, pending_ttl_ns: u64) -> anyhow::Re
         XdpPendingCap {
             max_pending: 65_536,
             pending_ttl_ns,
+            flags,
         },
         0,
     )?;
@@ -1417,6 +1422,11 @@ fn run_ip_json(args: &[&str]) -> anyhow::Result<Vec<serde_json::Value>> {
 /// a reaped flow's last bytes are billed exactly once. TCP entries in
 /// CLOSING state are reaped after `tcp_closing_grace`; all others use the
 /// protocol's idle timeout.
+/// EN-11 sweep budget: caps the syscall-bound removals each map performs
+/// per round (see sweep_nat_maps). Bulk scans stay bounded by the map's
+/// max_entries; stale entries past the cap are collected first next round.
+const SWEEP_MAX_REAP_PER_MAP: usize = 4096;
+
 pub(super) fn sweep_nat_maps(
     ebpf: &mut aya::Ebpf,
     shadow: &mut std::collections::HashMap<XdpUdpCtKey, XdpFlowAcct>,
@@ -1432,7 +1442,13 @@ pub(super) fn sweep_nat_maps(
     let closing_ns = tcp_closing_grace.as_nanos().min(u64::MAX as u128) as u64;
     let pending_ns = tcp_pending.as_nanos().min(u64::MAX as u128) as u64;
 
-    let mut stale: Vec<XdpUdpCtKey> = Vec::new();
+    // Per-round work budget: map removals are one syscall each, so every
+    // map reaps at most SWEEP_MAX_REAP_PER_MAP stale entries per round.
+    // Stale entries past the cap stay in the live set — they still exist
+    // in the kernel map and may own SNAT bindings — and are collected
+    // first next round, so reaping progresses regardless of churn. The
+    // bulk iteration itself is bounded by the map's max_entries.
+    let mut stale: std::collections::HashSet<XdpUdpCtKey> = Default::default();
     // EN-11: live sets record each live entry's claimed SNAT port, so the
     // orphan check can distinguish a binding whose flow was re-admitted on
     // a new port (orphan — reap it) from the binding the live flow owns.
@@ -1440,21 +1456,34 @@ pub(super) fn sweep_nat_maps(
     let mut tcp_live: std::collections::HashMap<XdpUdpCtKey, u16> = Default::default();
     if let Some(map) = ebpf.map_mut("XDP_UDP_CT") {
         let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
+        // (key, last_seen snapshot): the entry is only removed when the
+        // value is unchanged — a concurrent refresh or tuple re-admission
+        // between scan and removal must not delete the newer record.
+        let mut reap: Vec<(XdpUdpCtKey, u64)> = Vec::new();
         for item in map.iter() {
             let (key, value) = item?;
-            if now_ns.saturating_sub(value.last_seen_ns) >= udp_idle_ns {
-                stale.push(key);
+            if now_ns.saturating_sub(value.last_seen_ns) >= udp_idle_ns
+                && reap.len() < SWEEP_MAX_REAP_PER_MAP
+            {
+                reap.push((key, value.last_seen_ns));
+                stale.insert(key);
             } else {
                 udp_live.insert(key, value.snat_port_be);
             }
         }
-        for key in &stale {
-            let _ = map.remove(key);
+        for (key, seen) in &reap {
+            let still_stale = map
+                .get(key, 0)
+                .map(|v| v.last_seen_ns == *seen)
+                .unwrap_or(false);
+            if still_stale {
+                let _ = map.remove(key);
+            }
         }
     }
     if let Some(map) = ebpf.map_mut("XDP_TCP_CT") {
         let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
-        let mut tcp_stale = Vec::new();
+        let mut reap: Vec<(XdpUdpCtKey, u64)> = Vec::new();
         for item in map.iter() {
             let (key, value) = item?;
             let idle = now_ns.saturating_sub(value.last_seen_ns);
@@ -1463,16 +1492,22 @@ pub(super) fn sweep_nat_maps(
             } else {
                 tcp_idle_ns
             };
-            if idle >= limit {
-                tcp_stale.push(key);
+            if idle >= limit && reap.len() < SWEEP_MAX_REAP_PER_MAP {
+                reap.push((key, value.last_seen_ns));
+                stale.insert(key);
             } else {
                 tcp_live.insert(key, value.snat_port_be);
             }
         }
-        for key in &tcp_stale {
-            let _ = map.remove(key);
+        for (key, seen) in &reap {
+            let still_stale = map
+                .get(key, 0)
+                .map(|v| v.last_seen_ns == *seen)
+                .unwrap_or(false);
+            if still_stale {
+                let _ = map.remove(key);
+            }
         }
-        stale.extend(tcp_stale);
     }
 
     // EN-09: reap half-open entries whose absolute deadline has passed.
@@ -1481,19 +1516,29 @@ pub(super) fn sweep_nat_maps(
     // for the SNAT orphan check below.
     if let Some(map) = ebpf.map_mut("XDP_PENDING") {
         let mut map = AyaHashMap::<_, XdpUdpCtKey, XdpUdpCtValue>::try_from(map)?;
-        let mut pending_stale = Vec::new();
+        let mut reap: Vec<(XdpUdpCtKey, u64)> = Vec::new();
         for item in map.iter() {
             let (key, value) = item?;
-            if now_ns.saturating_sub(value.last_seen_ns) >= pending_ns {
-                pending_stale.push(key);
+            if now_ns.saturating_sub(value.last_seen_ns) >= pending_ns
+                && reap.len() < SWEEP_MAX_REAP_PER_MAP
+            {
+                reap.push((key, value.last_seen_ns));
+                stale.insert(key);
             } else {
                 tcp_live.insert(key, value.snat_port_be);
             }
         }
-        for key in &pending_stale {
-            let _ = map.remove(key);
+        for (key, seen) in &reap {
+            // A pending entry re-admitted after the scan carries a new
+            // last_seen (and incarnation); skip removal in that case.
+            let still_stale = map
+                .get(key, 0)
+                .map(|v| v.last_seen_ns == *seen)
+                .unwrap_or(false);
+            if still_stale {
+                let _ = map.remove(key);
+            }
         }
-        stale.extend(pending_stale);
     }
 
     // Reap SNAT reverse bindings whose owning conntrack entry is gone.
@@ -1530,6 +1575,7 @@ pub(super) fn sweep_nat_maps(
         }
     }
 
+    let mut bill: std::collections::HashMap<i64, (u64, u64)> = Default::default();
     if let Some(map) = ebpf.map_mut("XDP_FLOW_ACCT") {
         let mut map = aya::maps::PerCpuHashMap::<_, XdpUdpCtKey, XdpFlowAcct>::try_from(map)?;
         let mut acct_remove = Vec::new();
@@ -1548,7 +1594,13 @@ pub(super) fn sweep_nat_maps(
             let delta_rx = total.rx_bytes.saturating_sub(previous.rx_bytes);
             let delta_tx = total.tx_bytes.saturating_sub(previous.tx_bytes);
             if delta_rx > 0 || delta_tx > 0 {
-                crate::metrics::record::record_transfer(total.server_id, delta_tx, delta_rx, None);
+                // Aggregate deltas per server_id: billing calls per round
+                // are bounded by the number of distinct servers (itself
+                // bounded by the forward-rule count) instead of the flow
+                // count, and no delta is ever dropped or deferred.
+                let entry = bill.entry(total.server_id).or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(delta_tx);
+                entry.1 = entry.1.saturating_add(delta_rx);
             }
             if stale.contains(&key) {
                 acct_remove.push(key);
@@ -1559,6 +1611,9 @@ pub(super) fn sweep_nat_maps(
         }
         for key in acct_remove {
             let _ = map.remove(&key);
+        }
+        for (server_id, (tx, rx)) in bill {
+            crate::metrics::record::record_transfer(server_id, tx, rx, None);
         }
     }
     // Shadow entries whose flow was already reaped stay; they are dropped

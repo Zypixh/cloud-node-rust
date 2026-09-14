@@ -55,7 +55,7 @@ TCP pending 经 `pending_touch`）检查存量绑定的 `(listen_addr, listen_po
 
 ## 验证
 
-- `scripts/edge/en11_nat_probe.py`（`probe-result.json`）四阶段全过：
+- `scripts/edge/en11_nat_probe.py`（`probe-result.json`）七阶段全过：
   - A UDP 冲突：VIP1 fwd +3 → VIP2 同 tuple ×2 全部 conflict（fwdDelta=0，
     CT 仍 1 条）→ VIP1 继续 fwd +2，绑定未动。
   - B TCP pending 冲突：VIP1 SYN 建 pending+SNAT 认领 → VIP2 同 tuple ×2
@@ -63,18 +63,37 @@ TCP pending 经 `pending_touch`）检查存量绑定的 `(listen_addr, listen_po
   - C pending 过期端口释放：TTL 到期后同 tuple 再入 → 旧端口随逐出释放，
     SNAT_REV 仍 1 条（未累积孤儿）。
   - D 计费：FLOW_ACCT 中该流 `server_id=43`，rx=160B/5p、tx=31B/1p 双向齐全。
+  - E CT 满晋级失败（故障注入 FAIL_CT_INSERT）：SYN→PENDING、
+    SYN-ACK→PENDING_ACKED(3)，ACK 晋级失败 → pending 仍是 state=3 且
+    last_seen 不变（绝对期限未被 ACK 延长）、tcpFwdMapFull+1、无 CT 项；
+    清 flag 后重发 ACK → 晋级成功（CT +1、pending 移除）。
+  - F pending 满插入失败（FAIL_PENDING_INSERT）：SYN → pendingLimited+1、
+    SNAT_REV 无残留（端口回滚）、无 pending 项。
+  - G SNAT 端口耗尽（FAIL_SNAT_ALLOC）：SYN → snatAllocFail+1、无绑定、
+    无 pending——回退显式可观测。
 - EN-10 探针回归全绿（重启接管 + 事件通道在新 ABI 下不变）。
 - `cargo test --lib` 667 通过；`cloud-node-xdp-common` 7 通过（含 ABI
   断言与 decision 常量 pin）；集成测试 18 通过。
 - eBPF 对象在 x86-build 通过 verifier 并成功 attach（T01 路径被
   EN-10/EN-11 探针覆盖）。
 
+## 第二批改动（ABI v11）
+
+- pending 晋级不再先污染 pending 记录：原样 insert，成功后才对 CT 副本
+  置 OPEN/刷新 last_seen；失败时 pending 状态与绝对期限原封不动。
+- sweeper：每 map 每轮删除上限 4096（syscall 有界、长期进度保证——下轮
+  优先收集）；stale 判定改为 HashSet（消除 O(流数×stale)）；删除前重读
+  last_seen 校验，扫描与删除之间的并发刷新/tuple 复用不会误删新条目；
+  计费按 server_id 聚合后每轮一次 record_transfer（调用数有界于服务数）。
+- XdpPendingCap.flags 故障注入位（配置 `xdp.admission.debugFailFlags`，
+  测试专用、生产为 0）；`sync_pending_cap` 移到 attach 时一次写入，避免
+  5s tick 覆写运行期注入的 flags。
+- NatScratch +debug_flags（每包一次快照，flag 检查是普通 load）。
+
 ## 仍存在的限制
 
-- CT map 满 / pending 满导致的端口回滚路径无法在 netns 探针中触发
-  （需灌满整张表）；已按代码路径审查 + sweeper 收紧兜底，无实测证据。
-- sweeper 每周期 O(map) 扫描（既有行为，无上界恶化）；`stale` Vec 大小
-  随失流数线性增长但只活在一个 sweep 周期内。
+- 并发晋级（双 CPU 同 tuple 竞争）由 insert 的 BPF_NOEXIST 与 pending
+  单写者语义覆盖，未单独仪表化。
 - 冲突拒绝的语义是"回退用户态路径"（Ok(None)），不是丢包——与
   CT-full 回退一致；若接口无用户态监听则该连接实际上不可达，但拒绝
   是可观测的（counter + event）。

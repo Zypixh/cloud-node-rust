@@ -392,12 +392,19 @@ pub struct XdpAdmissionSettings {
     /// Absolute half-open deadline in milliseconds. Default 3000.
     #[serde(rename = "tcpPendingMs", default = "default_tcp_pending_ms")]
     pub tcp_pending_ms: u64,
+    /// Test-only fault-injection bits pushed into XDP_PENDING_CAP.flags
+    /// (XDP_PENDING_CAP_FAIL_*). Production configs must leave this 0; each
+    /// bit forces the corresponding datapath admission step onto its
+    /// explicit, observable failure path.
+    #[serde(rename = "debugFailFlags", default)]
+    pub debug_fail_flags: u64,
 }
 
 impl Default for XdpAdmissionSettings {
     fn default() -> Self {
         Self {
             tcp_pending_ms: default_tcp_pending_ms(),
+            debug_fail_flags: 0,
         }
     }
 }

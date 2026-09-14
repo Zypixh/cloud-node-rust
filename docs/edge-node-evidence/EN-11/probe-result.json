@@ -37,6 +37,30 @@
         }
       ],
       "ok": true
+    },
+    "E_ct_insert_fail": {
+      "stateAfterSynAck": 3,
+      "stateAfterFailedPromote": 3,
+      "deadlineKept": true,
+      "tcpFwdMapFullDelta": 1,
+      "ctEntriesDuringFail": 0,
+      "pendingAfterRetry": null,
+      "ctEntriesAfterRetry": 1,
+      "ok": true
+    },
+    "F_pending_insert_fail": {
+      "pendingLimitedDelta": 1,
+      "snatRevBefore": 1,
+      "snatRevAfter": 1,
+      "pendingEntry": null,
+      "ok": true
+    },
+    "G_snat_exhausted": {
+      "snatAllocFailDelta": 1,
+      "snatRevBefore": 1,
+      "snatRevAfter": 1,
+      "pendingEntry": null,
+      "ok": true
     }
   }
 }
