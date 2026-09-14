@@ -7,8 +7,8 @@
         "1": "copy"
       },
       "details": {
-        "0": "AF_XDP socket registered in XSK map index 0 for ifindex 227 queue 0",
-        "1": "AF_XDP socket registered in XSK map index 1 for ifindex 227 queue 1"
+        "0": "AF_XDP socket registered in XSK map index 0 for ifindex 54 queue 0",
+        "1": "AF_XDP socket registered in XSK map index 1 for ifindex 54 queue 1"
       },
       "ready": {
         "0": true,
@@ -63,13 +63,37 @@
         "copy"
       ],
       "details": [
-        "AF_XDP socket registered in XSK map index 0 for ifindex 227 queue 0",
-        "AF_XDP socket registered in XSK map index 1 for ifindex 227 queue 1"
+        "AF_XDP socket registered in XSK map index 0 for ifindex 54 queue 0",
+        "AF_XDP socket registered in XSK map index 1 for ifindex 54 queue 1"
       ],
       "ready": [
         true,
         true
       ],
+      "ok": true
+    },
+    "E_queue_fault_withdrawal": {
+      "queues": {
+        "0": {
+          "ready": true,
+          "faulted": false,
+          "registered": true,
+          "detail": "AF_XDP socket registered in XSK map index 0 for ifindex 54 queue 0"
+        },
+        "1": {
+          "ready": false,
+          "faulted": true,
+          "registered": false,
+          "detail": "test-only withdrawal via CLOUD_NODE_XDP_TEST_WITHDRAW_QUEUE; queue en2-a/1 withdrawn \u2014 remaining queues unaffected, this queue's traffic falls back explicitly"
+        }
+      },
+      "redirectEnabled": true,
+      "xskIndexEntries": [
+        1,
+        1
+      ],
+      "redirectDelta": 400,
+      "passDelta": 0,
       "ok": true
     }
   },

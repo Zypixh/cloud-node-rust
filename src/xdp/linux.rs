@@ -392,9 +392,9 @@ pub fn register_af_xdp_sockets(
     enable_redirect: bool,
 ) -> anyhow::Result<()> {
     sync_proxy_ports(ebpf, config, false)?;
-    sync_xsk_indices(ebpf, config, false)?;
+    sync_xsk_indices(ebpf, config, false, &Default::default())?;
     clear_xsk_map(ebpf)?;
-    sync_xsk_indices(ebpf, config, true)?;
+    sync_xsk_indices(ebpf, config, true, &Default::default())?;
 
     let entries = xsk_map_entries(config)?;
     let map = ebpf
@@ -558,6 +558,8 @@ fn create_af_xdp_queue(
             .map(|stats| stats.tx_invalid_descs())
             .unwrap_or_default(),
         xsk_mode: landed_mode.to_string(),
+        faulted: false,
+        congested_drops: 0,
     };
     Ok((
         AfXdpQueueHandle {
@@ -629,7 +631,7 @@ pub async fn attach(
     sync_interface_policy(&mut ebpf, config)?;
     sync_local_ip_maps(&mut ebpf, config)?;
     sync_proxy_ports(&mut ebpf, config, false)?;
-    sync_xsk_indices(&mut ebpf, config, false)?;
+    sync_xsk_indices(&mut ebpf, config, false, &Default::default())?;
     zero_counters(&mut ebpf)?;
     let mode = match config.attach_mode {
         XdpAttachMode::Auto => aya::programs::XdpMode::default(),
@@ -806,11 +808,12 @@ pub fn sync_maps(
     config: &XdpConfig,
     state: &RuleState,
     proxy_dataplane_active: bool,
+    xsk_withdrawn: &std::collections::HashSet<(u32, u32)>,
 ) -> anyhow::Result<()> {
     sync_interface_policy(ebpf, config)?;
     sync_local_ip_maps(ebpf, config)?;
     sync_proxy_ports(ebpf, config, proxy_dataplane_active)?;
-    sync_xsk_indices(ebpf, config, proxy_dataplane_active)?;
+    sync_xsk_indices(ebpf, config, proxy_dataplane_active, xsk_withdrawn)?;
     sync_udp_forwards(ebpf, config, proxy_dataplane_active)?;
     sync_tcp_forwards(ebpf, config, proxy_dataplane_active)?;
     clear_rule_maps(ebpf)?;
@@ -911,7 +914,7 @@ pub(super) fn sweep_rate_maps(
 
 pub fn disable_proxy_redirect(ebpf: &mut aya::Ebpf, config: &XdpConfig) -> anyhow::Result<()> {
     sync_proxy_ports(ebpf, config, false)?;
-    sync_xsk_indices(ebpf, config, false)?;
+    sync_xsk_indices(ebpf, config, false, &Default::default())?;
     clear_xsk_map(ebpf)?;
     Ok(())
 }
@@ -1190,6 +1193,7 @@ fn sync_xsk_indices(
     ebpf: &mut aya::Ebpf,
     config: &XdpConfig,
     dataplane_active: bool,
+    withdrawn: &std::collections::HashSet<(u32, u32)>,
 ) -> anyhow::Result<()> {
     let map = ebpf
         .map_mut("XDP_XSK_INDEX")
@@ -1200,9 +1204,42 @@ fn sync_xsk_indices(
         return Ok(());
     }
     for entry in xsk_map_entries(config)? {
+        // EN-05: never resurrect a queue-scoped withdrawal — the faulted
+        // queue's traffic must keep taking the explicit dataplane fallback.
+        if withdrawn.contains(&(entry.ifindex, entry.queue)) {
+            continue;
+        }
         map.insert(XdpQueueKey::new(entry.ifindex, entry.queue), entry.index, 0)?;
     }
     Ok(())
+}
+
+/// EN-05 queue-scoped withdrawal: remove one queue's XSK_INDEX entry and
+/// unset its XSKS socket slot. Redirect for that queue then resolves to
+/// the explicit dataplane fallback instead of a dead socket; sibling
+/// queues keep serving. Returns true when an index entry existed.
+pub fn disable_queue_redirect(
+    ebpf: &mut aya::Ebpf,
+    interface: &str,
+    queue: u32,
+) -> anyhow::Result<bool> {
+    let ifindex = ifindex_from_name(interface)?;
+    let map = ebpf
+        .map_mut("XDP_XSK_INDEX")
+        .ok_or_else(|| anyhow::anyhow!("missing map XDP_XSK_INDEX"))?;
+    let mut index_map = AyaHashMap::<_, XdpQueueKey, u32>::try_from(map)?;
+    let key = XdpQueueKey::new(ifindex, queue);
+    let slot = index_map.get(&key, 0).ok();
+    index_map.remove(&key)?;
+    let Some(slot) = slot else {
+        return Ok(false);
+    };
+    let map = ebpf
+        .map_mut("XDP_XSKS")
+        .ok_or_else(|| anyhow::anyhow!("missing map XDP_XSKS"))?;
+    let mut xsks = XskMap::try_from(map)?;
+    xsks.unset(slot)?;
+    Ok(true)
 }
 
 /// Program explicit UDP direct-forward rules. Each entry needs a resolved

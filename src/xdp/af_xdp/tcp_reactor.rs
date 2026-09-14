@@ -490,6 +490,15 @@ impl AfXdpTcpReactor {
         !self.sessions.contains_key(flow) && !tcp_flags_are_initial_syn(flags)
     }
 
+    /// EN-05 congestion gate: while the queue's TX path is backpressured the
+    /// bridge refuses *new* session admissions but keeps feeding existing
+    /// sessions, so pressure is shed at the admission boundary instead of
+    /// collapsing the whole queue.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_session(&self, flow: &AfXdpTcpFlowKey) -> bool {
+        self.sessions.contains_key(flow)
+    }
+
     pub(crate) fn record_ignored_unknown_non_syn(&self, flow: AfXdpTcpFlowKey, bytes: usize) {
         #[cfg(target_os = "linux")]
         AF_XDP_TCP_DIAG_IGNORED_UNKNOWN.fetch_add(1, Ordering::Relaxed);

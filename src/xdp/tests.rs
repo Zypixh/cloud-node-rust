@@ -131,11 +131,9 @@ fn xdp_rule_sweeper_removes_expired_shadow_rules() {
         let state = manager.state.read();
         assert!(!state.blocked_ips.contains_key(&expired_ip));
         assert!(state.blocked_ips.contains_key(&active_ip));
-        assert!(
-            !state
-                .blocked_networks
-                .contains_key(&expired_net.to_string())
-        );
+        assert!(!state
+            .blocked_networks
+            .contains_key(&expired_net.to_string()));
         assert!(state.blocked_networks.contains_key(&active_net.to_string()));
         assert!(!state.blocked_ranges.contains_key(&expired_range));
         assert!(state.blocked_ranges.contains_key(&active_range));
@@ -359,60 +357,40 @@ fn apply_rule_diff_adds_removes_only_deltas() {
     let new_img = super::linux::rule_map_images(&new_state);
 
     // Exact v4 blocked: 192.0.2.1 removed, 192.0.2.3 added, 192.0.2.2 kept (no-op)
-    assert!(
-        old_img
-            .blocked_v4
-            .contains_key(&u32::from_be_bytes([192, 0, 2, 1]))
-    );
-    assert!(
-        old_img
-            .blocked_v4
-            .contains_key(&u32::from_be_bytes([192, 0, 2, 2]))
-    );
-    assert!(
-        !old_img
-            .blocked_v4
-            .contains_key(&u32::from_be_bytes([192, 0, 2, 3]))
-    );
+    assert!(old_img
+        .blocked_v4
+        .contains_key(&u32::from_be_bytes([192, 0, 2, 1])));
+    assert!(old_img
+        .blocked_v4
+        .contains_key(&u32::from_be_bytes([192, 0, 2, 2])));
+    assert!(!old_img
+        .blocked_v4
+        .contains_key(&u32::from_be_bytes([192, 0, 2, 3])));
 
-    assert!(
-        !new_img
-            .blocked_v4
-            .contains_key(&u32::from_be_bytes([192, 0, 2, 1]))
-    );
-    assert!(
-        new_img
-            .blocked_v4
-            .contains_key(&u32::from_be_bytes([192, 0, 2, 2]))
-    );
-    assert!(
-        new_img
-            .blocked_v4
-            .contains_key(&u32::from_be_bytes([192, 0, 2, 3]))
-    );
+    assert!(!new_img
+        .blocked_v4
+        .contains_key(&u32::from_be_bytes([192, 0, 2, 1])));
+    assert!(new_img
+        .blocked_v4
+        .contains_key(&u32::from_be_bytes([192, 0, 2, 2])));
+    assert!(new_img
+        .blocked_v4
+        .contains_key(&u32::from_be_bytes([192, 0, 2, 3])));
 
     // Exact v4 allowed: 198.51.100.2 added, 198.51.100.1 kept
-    assert!(
-        old_img
-            .allowed_v4
-            .contains_key(&u32::from_be_bytes([198, 51, 100, 1]))
-    );
-    assert!(
-        !old_img
-            .allowed_v4
-            .contains_key(&u32::from_be_bytes([198, 51, 100, 2]))
-    );
+    assert!(old_img
+        .allowed_v4
+        .contains_key(&u32::from_be_bytes([198, 51, 100, 1])));
+    assert!(!old_img
+        .allowed_v4
+        .contains_key(&u32::from_be_bytes([198, 51, 100, 2])));
 
-    assert!(
-        new_img
-            .allowed_v4
-            .contains_key(&u32::from_be_bytes([198, 51, 100, 1]))
-    );
-    assert!(
-        new_img
-            .allowed_v4
-            .contains_key(&u32::from_be_bytes([198, 51, 100, 2]))
-    );
+    assert!(new_img
+        .allowed_v4
+        .contains_key(&u32::from_be_bytes([198, 51, 100, 1])));
+    assert!(new_img
+        .allowed_v4
+        .contains_key(&u32::from_be_bytes([198, 51, 100, 2])));
 
     // LPM v4 blocked: 203.0.113.0/24 removed
     assert!(!old_img.blocked_v4_lpm.is_empty());
@@ -481,16 +459,12 @@ fn xdp_range_to_nets_covers_only_requested_span() {
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, last_octet));
         assert!(nets.iter().any(|net| net.contains(&ip)));
     }
-    assert!(
-        !nets
-            .iter()
-            .any(|net| net.contains(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))))
-    );
-    assert!(
-        !nets
-            .iter()
-            .any(|net| net.contains(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21))))
-    );
+    assert!(!nets
+        .iter()
+        .any(|net| net.contains(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)))));
+    assert!(!nets
+        .iter()
+        .any(|net| net.contains(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21)))));
 }
 
 #[test]
@@ -926,11 +900,9 @@ fn xdp_proxy_ready_requires_explicit_redirect_enable_after_xsk_registration() {
     assert!(status.interfaces[0].xsk_ready);
     assert!(!status.proxy_ready);
     assert!(!status.proxy_redirect_enabled);
-    assert!(
-        status.interfaces[0]
-            .detail
-            .contains("redirect disabled until proxy bridge starts")
-    );
+    assert!(status.interfaces[0]
+        .detail
+        .contains("redirect disabled until proxy bridge starts"));
 
     manager
         .proxy_redirect_enabled
@@ -1006,21 +978,84 @@ fn xdp_proxy_degradation_disables_ready_queues() {
     assert!(!status.proxy_ready);
     assert_eq!(status.xsk_ready_queues, 0);
     assert!(status.proxy_fallback_reason.contains("redirect disabled"));
-    assert!(
-        status.interfaces[0].xsk_queues[0]
-            .detail
-            .contains("redirect disabled")
-    );
+    assert!(status.interfaces[0].xsk_queues[0]
+        .detail
+        .contains("redirect disabled"));
     assert_eq!(
         status.interfaces[0].xsk_queues[1].detail,
         "AF_XDP socket setup failed"
     );
+    assert!(status.interfaces[0]
+        .xsk_queues
+        .iter()
+        .all(|queue| !queue.registered && !queue.ready));
+}
+
+#[test]
+fn xdp_proxy_queue_fault_keeps_sibling_ready() {
+    // EN-05: withdrawing a faulted queue must not tear down redirect for
+    // its siblings. A faulted queue counts as handled — its traffic takes
+    // the explicit dataplane fallback — not as a readiness blocker.
+    let manager = XdpManager::new(XdpConfig {
+        enabled: true,
+        interfaces: vec![crate::runtime_mode::XdpInterfaceConfig {
+            name: "eth0".to_string(),
+            queues: vec![0, 1],
+            cpus: Vec::new(),
+            mode: XdpRuntimeMode::Proxy,
+            ..Default::default()
+        }],
+        proxy: crate::runtime_mode::XdpProxyConfig {
+            ports: vec![crate::runtime_mode::XdpProxyPortConfig {
+                protocol: XdpProxyProtocol::Udp,
+                port: 443,
+            }],
+            ..Default::default()
+        },
+        ..XdpConfig::default()
+    });
+    *manager.xsk_status.write() = vec![
+        XdpQueueStatus {
+            interface: "eth0".to_string(),
+            queue: 0,
+            configured: true,
+            socket_created: true,
+            registered: true,
+            ready: true,
+            detail: "AF_XDP ready".to_string(),
+            ..Default::default()
+        },
+        XdpQueueStatus {
+            interface: "eth0".to_string(),
+            queue: 1,
+            configured: true,
+            socket_created: true,
+            registered: false,
+            ready: false,
+            faulted: true,
+            detail: "withdrawn after queue fault".to_string(),
+            ..Default::default()
+        },
+    ];
+    manager
+        .proxy_redirect_enabled
+        .store(true, Ordering::Relaxed);
     assert!(
-        status.interfaces[0]
-            .xsk_queues
-            .iter()
-            .all(|queue| !queue.registered && !queue.ready)
+        manager.proxy_redirect_ready(),
+        "a withdrawn queue must not block redirect for its siblings"
     );
+
+    // A queue that is simply not-ready (never withdrew cleanly) still
+    // blocks readiness — faulted is not a free pass.
+    if let Some(status) = manager
+        .xsk_status
+        .write()
+        .iter_mut()
+        .find(|status| status.queue == 1)
+    {
+        status.faulted = false;
+    }
+    assert!(!manager.proxy_redirect_ready());
 }
 
 #[test]
@@ -1065,11 +1100,9 @@ fn xdp_map_sync_failure_status_is_fail_open() {
     assert!(!status.proxy_redirect_enabled);
     assert_eq!(status.xsk_ready_queues, 0);
     assert!(status.fallback_reason.contains("map sync failed"));
-    assert!(
-        status
-            .proxy_fallback_reason
-            .contains("socket path is active")
-    );
+    assert!(status
+        .proxy_fallback_reason
+        .contains("socket path is active"));
 }
 
 #[test]
@@ -1384,11 +1417,9 @@ fn af_xdp_tcp_reactor_resolves_egress_route_before_reaping_session() {
 
     let egress = reactor.poll();
 
-    assert!(
-        egress
-            .iter()
-            .any(|(egress_route, ip_packet)| *egress_route == route && *ip_packet == reply_packet)
-    );
+    assert!(egress
+        .iter()
+        .any(|(egress_route, ip_packet)| *egress_route == route && *ip_packet == reply_packet));
     assert_eq!(reactor.session_count(), 0);
 }
 
@@ -1772,11 +1803,9 @@ async fn af_xdp_tcp_stream_chunks_large_writes_with_backpressure() {
     assert_eq!(chunks[0].len(), 16 * 1024);
     assert_eq!(chunks[1].len(), 16 * 1024);
     assert_eq!(chunks[2].len(), 8 * 1024);
-    assert!(
-        chunks
-            .iter()
-            .all(|chunk| chunk.iter().all(|byte| *byte == 0x5a))
-    );
+    assert!(chunks
+        .iter()
+        .all(|chunk| chunk.iter().all(|byte| *byte == 0x5a)));
 }
 
 #[tokio::test]
@@ -2524,7 +2553,7 @@ fn classify_malformed_tcp_flag_combos() {
         af_xdp::classify_frame(&ipv4_tcp_flags_frame(0x10, 5)),
         Supported
     ); // ACK
-    // ECN flags are legal: SYN|ECE|CWR must not be hurt.
+       // ECN flags are legal: SYN|ECE|CWR must not be hurt.
     assert_eq!(
         af_xdp::classify_frame(&ipv4_tcp_flags_frame(0xc2, 5)),
         Supported

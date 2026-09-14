@@ -278,7 +278,8 @@ pub(crate) async fn spawn_queue_reactors(
         af_xdp_tcp_session_limit_per_worker(af_xdp_tcp_session_limit(), queue_handles.len());
     let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<(String, u32)>();
     manager.set_proxy_workers_starting(true);
-    let mut joins: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(queue_handles.len());
+    let mut joins: Vec<(String, u32, std::thread::JoinHandle<()>)> =
+        Vec::with_capacity(queue_handles.len());
     for (ordinal, (queue_handle, ctx)) in queue_handles
         .into_iter()
         .zip(contexts.into_iter())
@@ -292,6 +293,8 @@ pub(crate) async fn spawn_queue_reactors(
             online_cpus,
         );
         let thread_name = format!("afxdp-{}-{}", queue_handle.interface, queue_handle.queue);
+        let join_interface = queue_handle.interface.clone();
+        let join_queue = queue_handle.queue;
         let reactor_manager = manager.clone();
         let quic_demux = quic_demux.clone();
         let tcp_manager = tcp_manager.clone();
@@ -334,13 +337,13 @@ pub(crate) async fn spawn_queue_reactors(
                 manager.disable_proxy_redirect_for_fallback(format!(
                     "AF_XDP proxy bridge failed to spawn reactor thread: {err}; proxy redirect disabled, traffic will PASS"
                 ));
-                for join in joins {
+                for (_, _, join) in joins {
                     let _ = join.join();
                 }
                 return;
             }
         };
-        joins.push(join);
+        joins.push((join_interface, join_queue, join));
     }
     drop(ready_tx);
 
@@ -369,7 +372,7 @@ pub(crate) async fn spawn_queue_reactors(
             manager.disable_proxy_redirect_for_fallback(format!(
                 "AF_XDP proxy bridge saw only {seen}/{expected} reactor workers ready; proxy redirect disabled, traffic will PASS"
             ));
-            for join in joins {
+            for (_, _, join) in joins {
                 let _ = join.join();
             }
             return;
@@ -378,14 +381,16 @@ pub(crate) async fn spawn_queue_reactors(
             manager.disable_proxy_redirect_for_fallback(format!(
                 "AF_XDP reactor workers did not all report ready within {AF_XDP_WORKER_READY_TIMEOUT:?}; proxy redirect disabled, traffic will PASS"
             ));
-            for join in joins {
+            for (_, _, join) in joins {
                 let _ = join.join();
             }
             return;
         }
     }
-    manager.set_proxy_workers_starting(false);
-
+    // Keep the worker lease open until enable_proxy_redirect resolves:
+    // clearing it first opens a window where should_continue sees
+    // (starting=false, enabled=false) and freshly spawned workers exit
+    // before redirect ever opens.
     match manager.enable_proxy_redirect("AF_XDP proxy bridge") {
         Ok(true) => {
             let message = format!(
@@ -400,6 +405,7 @@ pub(crate) async fn spawn_queue_reactors(
                 message,
                 0,
             );
+            manager.set_proxy_workers_starting(false);
         }
         Ok(false) => {
             let message =
@@ -414,7 +420,8 @@ pub(crate) async fn spawn_queue_reactors(
             );
             manager.set_proxy_fallback_reason(&message);
             manager.persist_status_now();
-            for join in joins {
+            manager.set_proxy_workers_starting(false);
+            for (_, _, join) in joins {
                 let _ = join.join();
             }
             return;
@@ -431,7 +438,8 @@ pub(crate) async fn spawn_queue_reactors(
                 0,
             );
             manager.disable_proxy_redirect_for_fallback(message);
-            for join in joins {
+            manager.set_proxy_workers_starting(false);
+            for (_, _, join) in joins {
                 let _ = join.join();
             }
             return;
@@ -442,16 +450,44 @@ pub(crate) async fn spawn_queue_reactors(
         joins.len()
     );
 
+    // EN-05 test hook (debug builds only): force one queue through the
+    // queue-local fault path so e2e probes can observe slot withdrawal,
+    // status marking, and sibling-queue survival without killing a worker.
+    if let Some((interface, queue)) = crate::xdp::test_withdraw_queue_request() {
+        manager.disable_queue_redirect_for_fault(
+            &interface,
+            queue,
+            "test-only withdrawal via CLOUD_NODE_XDP_TEST_WITHDRAW_QUEUE".to_string(),
+        );
+    }
+
+    let mut reported_dead: std::collections::HashSet<(String, u32)> =
+        std::collections::HashSet::new();
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        if joins.iter().all(|join| join.is_finished()) {
+        if joins.iter().all(|(_, _, join)| join.is_finished()) {
             return;
         }
-        if joins.iter().any(|join| join.is_finished()) && proxy_bridge_should_continue(manager) {
-            manager.disable_proxy_redirect_for_fallback(
-                "AF_XDP queue reactor thread exited unexpectedly; proxy redirect disabled, traffic will PASS"
-                    .to_string(),
-            );
+        if proxy_bridge_should_continue(manager) {
+            // EN-05: a dead reactor withdraws only its own queue — the
+            // queue's XSK slots are removed so its traffic takes the
+            // explicit dataplane fallback while sibling queues keep
+            // serving. A queue's fault must not widen globally.
+            for (interface, queue, join) in &joins {
+                // Skip queues the worker already withdrew itself — its
+                // original fault detail is more precise than a generic
+                // "thread exited" reason.
+                if join.is_finished()
+                    && reported_dead.insert((interface.clone(), *queue))
+                    && !manager.xsk_queue_faulted(interface, *queue)
+                {
+                    manager.disable_queue_redirect_for_fault(
+                        interface,
+                        *queue,
+                        "AF_XDP queue reactor thread exited unexpectedly".to_string(),
+                    );
+                }
+            }
         }
     }
 }
@@ -502,6 +538,12 @@ pub(crate) async fn run_queue_bridge_loop(
         AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES);
     let mut tcp_admission_failures =
         AfXdpTcpAdmissionFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS);
+    // EN-05 congestion gate: TX backpressure refuses *new* flow admission
+    // (UDP route inserts, TCP session starts) while established flows keep
+    // being served, so a congested queue sheds work at the boundary
+    // instead of failing open or collapsing outright.
+    let mut congested = false;
+    let mut congested_drops = 0u64;
     let mut frames = Vec::with_capacity(64);
     let mut last_status_refresh = std::time::Instant::now();
 
@@ -521,18 +563,20 @@ pub(crate) async fn run_queue_bridge_loop(
         }
         if last_status_refresh.elapsed() >= AF_XDP_STATUS_REFRESH_INTERVAL {
             last_status_refresh = std::time::Instant::now();
-            if let Ok(stats) = queue_handle.rx.fd().xdp_statistics() {
-                manager.update_xsk_queue_status(
-                    &queue_handle.interface,
-                    queue_handle.queue,
-                    |status| {
+            let stats = queue_handle.rx.fd().xdp_statistics().ok();
+            manager.update_xsk_queue_status(
+                &queue_handle.interface,
+                queue_handle.queue,
+                |status| {
+                    if let Some(stats) = &stats {
                         status.rx_dropped = stats.rx_dropped();
                         status.rx_invalid_descs = stats.rx_invalid_descs();
                         status.rx_ring_full = stats.rx_ring_full();
                         status.tx_invalid_descs = stats.tx_invalid_descs();
-                    },
-                );
-            }
+                    }
+                    status.congested_drops = congested_drops;
+                },
+            );
         }
         frames.clear();
         let poll_result = queue_handle.poll_raw_once(&mut |interface, queue, frame| {
@@ -553,9 +597,11 @@ pub(crate) async fn run_queue_bridge_loop(
                 manager.set_proxy_fallback_reason(detail.clone());
                 tracing::warn!("{}", detail);
                 if consecutive_poll_errors >= AF_XDP_MAX_CONSECUTIVE_POLL_ERRORS {
-                    manager.disable_proxy_redirect_for_fallback(format!(
-                        "AF_XDP proxy bridge poll failed repeatedly: {err}; proxy redirect disabled, traffic will PASS"
-                    ));
+                    manager.disable_queue_redirect_for_fault(
+                        &own_interface,
+                        queue_handle.queue,
+                        format!("AF_XDP proxy bridge poll failed repeatedly: {err}"),
+                    );
                     return;
                 }
                 std::thread::sleep(idle_backoff);
@@ -601,6 +647,14 @@ pub(crate) async fn run_queue_bridge_loop(
             }
             match parse_proxy_frame(&interface, queue, &frame) {
                 Some(AfXdpProxyFrame::Udp { route, packet }) => {
+                    // Congestion gate: refuse new flow-route admission while
+                    // this queue is TX-backpressured; known flows still get
+                    // their route refreshed and packet demuxed.
+                    if congested && !udp_routes.contains_key(&(packet.local_addr, packet.peer_addr))
+                    {
+                        congested_drops = congested_drops.saturating_add(1);
+                        continue;
+                    }
                     let now_ms = crate::udp_proxy::udp_activity_now_ms();
                     if udp_routes.len() >= AF_XDP_ROUTE_CACHE_MAX {
                         compact_udp_route_cache(
@@ -667,19 +721,28 @@ pub(crate) async fn run_queue_bridge_loop(
                         }
                         Ok(crate::udp_proxy::UdpIngressDatagramStatus::Full) => {
                             tracing::debug!("AF_XDP proxy bridge upstream session queue full");
+                            congested = true;
                             if udp_ingress_failures.record(AfXdpTxStatus::Backpressured) {
-                                manager.disable_proxy_redirect_for_fallback(format!(
-                                    "AF_XDP UDP ingress queues stayed full for {AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES} redirected datagrams; proxy redirect disabled, traffic will PASS"
-                                ));
+                                manager.disable_queue_redirect_for_fault(
+                                    &own_interface,
+                                    queue_handle.queue,
+                                    format!(
+                                        "AF_XDP UDP ingress queues stayed full for {AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES} redirected datagrams"
+                                    ),
+                                );
                                 return;
                             }
                         }
                         Ok(crate::udp_proxy::UdpIngressDatagramStatus::Closed) => {
                             tracing::debug!("AF_XDP proxy bridge upstream session closed");
                             if udp_ingress_failures.record(AfXdpTxStatus::Failed) {
-                                manager.disable_proxy_redirect_for_fallback(format!(
-                                    "AF_XDP UDP ingress sessions stayed closed for {AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES} redirected datagrams; proxy redirect disabled, traffic will PASS"
-                                ));
+                                manager.disable_queue_redirect_for_fault(
+                                    &own_interface,
+                                    queue_handle.queue,
+                                    format!(
+                                        "AF_XDP UDP ingress sessions stayed closed for {AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES} redirected datagrams"
+                                    ),
+                                );
                                 return;
                             }
                         }
@@ -689,9 +752,13 @@ pub(crate) async fn run_queue_bridge_loop(
                                 err
                             );
                             if udp_ingress_failures.record(AfXdpTxStatus::Failed) {
-                                manager.disable_proxy_redirect_for_fallback(format!(
-                                    "AF_XDP UDP ingress failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES} redirected datagrams: {err}; proxy redirect disabled, traffic will PASS"
-                                ));
+                                manager.disable_queue_redirect_for_fault(
+                                    &own_interface,
+                                    queue_handle.queue,
+                                    format!(
+                                        "AF_XDP UDP ingress failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES} redirected datagrams: {err}"
+                                    ),
+                                );
                                 return;
                             }
                         }
@@ -702,11 +769,22 @@ pub(crate) async fn run_queue_bridge_loop(
                     flow,
                     ip_packet,
                 }) => {
+                    // Congestion gate: unknown non-SYN packets were already
+                    // dropped above, so reaching here without a session means
+                    // a new SYN — refuse it while the queue is backpressured.
+                    if congested && !tcp_reactor.has_session(&flow) {
+                        congested_drops = congested_drops.saturating_add(1);
+                        continue;
+                    }
                     let status = tcp_reactor.ingest(route, flow, ip_packet);
                     if tcp_admission_failures.record(status) {
-                        manager.disable_proxy_redirect_for_fallback(format!(
-                            "AF_XDP TCP reactor refused {AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS} new sessions consecutively; proxy redirect disabled, traffic will PASS"
-                        ));
+                        manager.disable_queue_redirect_for_fault(
+                            &own_interface,
+                            queue_handle.queue,
+                            format!(
+                                "AF_XDP TCP reactor refused {AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS} new sessions consecutively"
+                            ),
+                        );
                         return;
                     }
                 }
@@ -755,10 +833,15 @@ pub(crate) async fn run_queue_bridge_loop(
                                 "AF_XDP proxy bridge forward channel to interface {} is full; dropping downstream datagram",
                                 route.interface
                             );
+                            congested = true;
                             if tx_failures.record(AfXdpTxStatus::Backpressured) {
-                                manager.disable_proxy_redirect_for_fallback(format!(
-                                    "AF_XDP cross-interface forward channel stayed full for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} datagrams; proxy redirect disabled, traffic will PASS"
-                                ));
+                                manager.disable_queue_redirect_for_fault(
+                                    &own_interface,
+                                    queue_handle.queue,
+                                    format!(
+                                        "AF_XDP cross-interface forward channel stayed full for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} datagrams"
+                                    ),
+                                );
                                 return;
                             }
                             continue;
@@ -788,6 +871,7 @@ pub(crate) async fn run_queue_bridge_loop(
             );
             match sent {
                 Ok(true) => {
+                    congested = false;
                     tx_failures.record(AfXdpTxStatus::Sent);
                 }
                 Ok(false) => {
@@ -797,10 +881,15 @@ pub(crate) async fn run_queue_bridge_loop(
                         datagram.peer_addr,
                         datagram.payload.len()
                     );
+                    congested = true;
                     if tx_failures.record(AfXdpTxStatus::Backpressured) {
-                        manager.disable_proxy_redirect_for_fallback(format!(
-                            "AF_XDP proxy bridge TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times; proxy redirect disabled, traffic will PASS"
-                        ));
+                        manager.disable_queue_redirect_for_fault(
+                            &own_interface,
+                            queue_handle.queue,
+                            format!(
+                                "AF_XDP proxy bridge TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times"
+                            ),
+                        );
                         return;
                     }
                 }
@@ -813,9 +902,13 @@ pub(crate) async fn run_queue_bridge_loop(
                         err
                     );
                     if tx_failures.record(AfXdpTxStatus::Failed) {
-                        manager.disable_proxy_redirect_for_fallback(format!(
-                            "AF_XDP proxy bridge TX failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} attempts: {err}; proxy redirect disabled, traffic will PASS"
-                        ));
+                        manager.disable_queue_redirect_for_fault(
+                            &own_interface,
+                            queue_handle.queue,
+                            format!(
+                                "AF_XDP proxy bridge TX failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} attempts: {err}"
+                            ),
+                        );
                         return;
                     }
                 }
@@ -858,22 +951,32 @@ pub(crate) async fn run_queue_bridge_loop(
             };
             match sent {
                 Ok(true) => {
+                    congested = false;
                     tx_failures.record(AfXdpTxStatus::Sent);
                 }
                 Ok(false) => {
+                    congested = true;
                     if tx_failures.record(AfXdpTxStatus::Backpressured) {
-                        manager.disable_proxy_redirect_for_fallback(format!(
-                            "AF_XDP forwarded TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times; proxy redirect disabled, traffic will PASS"
-                        ));
+                        manager.disable_queue_redirect_for_fault(
+                            &own_interface,
+                            queue_handle.queue,
+                            format!(
+                                "AF_XDP forwarded TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times"
+                            ),
+                        );
                         return;
                     }
                 }
                 Err(err) => {
                     tracing::debug!("AF_XDP forwarded TX failed: {err}");
                     if tx_failures.record(AfXdpTxStatus::Failed) {
-                        manager.disable_proxy_redirect_for_fallback(format!(
-                            "AF_XDP forwarded TX failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} attempts: {err}; proxy redirect disabled, traffic will PASS"
-                        ));
+                        manager.disable_queue_redirect_for_fault(
+                            &own_interface,
+                            queue_handle.queue,
+                            format!(
+                                "AF_XDP forwarded TX failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} attempts: {err}"
+                            ),
+                        );
                         return;
                     }
                 }
@@ -903,6 +1006,7 @@ pub(crate) async fn run_queue_bridge_loop(
             let sent = queue_handle.send_raw_frame(&frame);
             match sent {
                 Ok(true) => {
+                    congested = false;
                     tx_failures.record(AfXdpTxStatus::Sent);
                 }
                 Ok(false) => {
@@ -912,10 +1016,15 @@ pub(crate) async fn run_queue_bridge_loop(
                         route.queue,
                         frame.len()
                     );
+                    congested = true;
                     if tx_failures.record(AfXdpTxStatus::Backpressured) {
-                        manager.disable_proxy_redirect_for_fallback(format!(
-                            "AF_XDP TCP reactor TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times; proxy redirect disabled, traffic will PASS"
-                        ));
+                        manager.disable_queue_redirect_for_fault(
+                            &own_interface,
+                            queue_handle.queue,
+                            format!(
+                                "AF_XDP TCP reactor TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times"
+                            ),
+                        );
                         return;
                     }
                 }
@@ -928,9 +1037,13 @@ pub(crate) async fn run_queue_bridge_loop(
                         err
                     );
                     if tx_failures.record(AfXdpTxStatus::Failed) {
-                        manager.disable_proxy_redirect_for_fallback(format!(
-                            "AF_XDP TCP reactor TX failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} attempts: {err}; proxy redirect disabled, traffic will PASS"
-                        ));
+                        manager.disable_queue_redirect_for_fault(
+                            &own_interface,
+                            queue_handle.queue,
+                            format!(
+                                "AF_XDP TCP reactor TX failed repeatedly after {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} attempts: {err}"
+                            ),
+                        );
                         return;
                     }
                 }
