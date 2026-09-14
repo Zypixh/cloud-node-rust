@@ -770,7 +770,8 @@ impl AfXdpTcpReactor {
         session: &mut AfXdpTcpSession,
     ) -> bool {
         let peer_addr = session.flow.peer_addr;
-        let listen_port = session.flow.local_addr.port();
+        let listen_addr = session.flow.local_addr;
+        let listen_port = listen_addr.port();
         let AfXdpTcpStreamParts {
             stream,
             ingress_tx,
@@ -794,11 +795,11 @@ impl AfXdpTcpReactor {
                 tokio::spawn(async move {
                     let result = if is_tls {
                         tcp_manager
-                            .handle_af_xdp_tls_tcp_stream(stream, peer_addr, server)
+                            .handle_af_xdp_tls_tcp_stream(stream, peer_addr, server, listen_addr)
                             .await
                     } else {
                         tcp_manager
-                            .handle_af_xdp_tcp_stream(stream, peer_addr, server)
+                            .handle_af_xdp_tcp_stream(stream, peer_addr, server, listen_addr)
                             .await
                     };
                     if let Err(err) = result {

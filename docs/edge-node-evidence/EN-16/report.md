@@ -52,11 +52,38 @@ XDP 对象 pin 住 31 个 eBPF map，实测 memlock 约 365 MB（FLOW_ACCT 独�
 - 控制面预留：`ConfigSyncBudget.commit_reserve_bytes` 保留 config commit 容量。
 - 物理观测与逻辑账目不双算：准入账本只记逻辑估计值；RSS/cgroup 仅作观测与预算推导输入，不再二次计费。
 
+## 第二切片（本提交）：listener 配额池 + disk/spool 账本
+
+### listener 配额池
+
+未识别租户流量现在落在 listener 级隔离池上：`MemoryGovernor::try_admit_listener(key, class)` 在节点级 class permit 之外要求一个 per-(listener, class) 槽位：
+
+- cap = `ceil(class_limit / 活跃 listener 数)`，下限 `LISTENER_POOL_FLOOR=16`——新 listener 永不被饿死，单一 listener 独占时可达整机预算；池只约束**新准入**，不抢占在途连接。
+- map 有界（4096 条 (listener,class) 项，满时先回收空闲池，仍满则显式拒绝并计数）。
+- RAII `ListenerPoolPermit`，释放即归还槽位并删除空池。
+- 接入全部 6 个准入点：HTTP kernel accept、HTTP AF_XDP、TCP kernel accept、TCP AF_XDP bypass（reactor 传 `session.flow.local_addr`）、H3、UDP session。拒绝路径记录 L4 事件（`phase=listener_pool`）+ `listener_pool_rejects` 计数。
+- 透出：`GovernorSnapshot.listener_pool_{active,tracked,rejects}`；perf monitor `PerfSample` 带 `listener_pool_active`/`listener_pool_rejects`。
+
+### disk/spool 账本
+
+governor 新增统一磁盘账本，reserved（在途预约，RAII）与 committed（持久占用，绝对上报）分开，杜绝物理观测与逻辑预约双算：
+
+- `try_reserve_disk(class, bytes)`：逐类 cap（注册值或默认）+ 聚合包络（全部类预算之和）双校验，拒绝显式计数。
+- `DiskPermit::commit()`：预约转持久占用；未 commit 的 drop 释放预约。
+- 类预算注册：cache `sharedMaxBytes`/`maxDiskBytes` → `CacheL2`；Mace cache+pool+checkpoint 容量 → `MetricsDb`；默认 `ConfigArtifacts=2GiB`、`NodeState=256MiB`。
+- 写入点：IP 库 artifact 下载前预约、安装成功后上报 committed；`atomic_write` 状态文件在写期间持 `NodeState` 预约（拒绝返回 `QuotaExceeded` io 错误，不静默）。
+- 透出：`disk_{budget,reserved,committed}_bytes` + `disk_rejects`；perf monitor 同步透出。
+
+### 第二切片验证
+
+- 单测 5 项：flood listener 隔离（新 listener 保公平份额）、RAII 释放即删池、map 有界、reserve/commit/release 与类 cap、committed 绝对上报。
+- 全量 667 lib 测试 + 18 集成测试通过；EN-10 流接管探针在带 listener 池的数据面上重跑仍全绿（x86-build）。
+
 ## 剩余缺口（如实声明，EN-16 未整体完成）
 
-1. **listener/tenant 配额池未实施**：`ServiceIdentity` 合同存在且 `service_id` 已随 `XdpUdpFwdRule` 携带，但所有 `try_admit` 都是节点级；未知租户流量没有 listener 级隔离池。
-2. **投影是校准模型而非精确内核计数**：LPM trie 惰性分配按最坏值计费；attach 后可用 bpftool memlock 复核。
-3. **无 disk/spool 账本**：本地日志/缓存盘写入沿用各自配置上限，未纳入 governor。
-4. memory/aggregate/syn 压力通道无迟滞（利用率通道已有）。
+1. **投影是校准模型而非精确内核计数**：LPM trie 惰性分配按最坏值计费；attach 后可用 bpftool memlock 复核。
+2. memory/aggregate/syn 压力通道无迟滞（利用率通道已有）。
+3. listener 池的 e2e 证据为单测 + 探针回归；真实 listener 配置下的洪泛隔离尚需带业务 server 的环境验证。
+4. tenant 级配额未实施——本仓库无 tenant 概念，listener 池是当前的隔离粒度。
 
-回退方式：账本纯增量——移除 `ensure_bpf_map_budget`/`audit_loaded_map_specs` 调用即回到旧 attach 行为；迟滞移除即回到无状态即时等级。两者都不放松任何既有硬上限。
+回退方式：账本与池均为纯增量——移除 `ensure_bpf_map_budget`/`audit_loaded_map_specs`/`try_admit_listener`/`try_reserve_disk` 调用即回到旧行为；迟滞移除即回到无状态即时等级。不放松任何既有硬上限。

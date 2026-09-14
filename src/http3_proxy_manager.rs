@@ -207,11 +207,32 @@ impl Http3ProxyManager {
                 continue;
             };
 
+            // EN-16: listener-pool slot for unattributed H3 traffic.
+            let listener_key = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+            let Some(listener_permit) =
+                MEMORY_GOVERNOR.try_admit_listener(listener_key, AdmissionClass::Http3Connection)
+            else {
+                self.record_l4_event(
+                    remote_addr.ip(),
+                    L4DefenseKind::H3AdmissionReject,
+                    format!(
+                        "port={} peer={} class=connection phase=listener_pool",
+                        port, remote_addr
+                    ),
+                );
+                debug!(
+                    "H3 listener pool exhausted, rejecting connection from {} on port {}",
+                    remote_addr, port
+                );
+                continue;
+            };
+
             let manager = self.clone();
             let proxy = proxy.clone();
             let shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
                 let _connection_permit = connection_permit;
+                let _listener_permit = listener_permit;
                 // Shadow counter for live QUIC connections.
                 let _quic_transport = crate::metrics::transport_metrics_guard(
                     crate::metrics::ShadowTransportKind::QuicConnection,

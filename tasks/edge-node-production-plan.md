@@ -62,7 +62,7 @@ commit 与 patch 摘要指被测代码状态；未提交代码也可以验证，
 | EN-13 | TCP 无状态验证可行性与 ADR | EN-09、EN-12 | L | TODO |
 | EN-14 | 获选 TCP 强验证实现 | EN-10、EN-11、EN-13 | L | TODO |
 | EN-15 | QUIC Retry、迁移与透传边界 | EN-09、EN-12、EN-16 | L | TODO |
-| EN-16 | 扩展统一资源治理 | EN-01、EN-02 | L | IN_PROGRESS（已验证切片：kernel-BPF map 账本+attach 预算门+压力迟滞，证据 docs/edge-node-evidence/EN-16；listener/tenant 配额池与 disk/spool 账本待续） |
+| EN-16 | 扩展统一资源治理 | EN-01、EN-02 | L | IN_PROGRESS（已验证切片：kernel-BPF map 账本+attach 门+压力迟滞+listener 配额池+disk 账本，证据 docs/edge-node-evidence/EN-16；tenant 配额与本仓无 tenant 概念、memory/syn 通道迟滞待续） |
 | EN-17 | 用户态传输调度与拷贝优化 | EN-10、EN-12、EN-16 | L | TODO |
 | EN-18 | 协议、客户身份与证书边界 | EN-01、EN-16 | L | TODO |
 | EN-19 | 有成本上限的 WAF | EN-16、EN-18 | L | TODO |
