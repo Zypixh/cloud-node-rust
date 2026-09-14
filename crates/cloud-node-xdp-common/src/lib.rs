@@ -561,6 +561,10 @@ pub struct NatScratch {
     pub work_ip_off: u32,
     pub work_ifindex: u32,
     pub work_pkt_len: u64,
+    /// XdpPendingCap.flags snapshot taken once per packet at the NAT entry
+    /// points — the per-CPU scratch read keeps fault-injection checks a
+    /// plain load instead of a map lookup per call site.
+    pub debug_flags: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -591,7 +595,7 @@ pub struct NatScratch {
 /// flow-state maps pinned for generational takeover.
 /// v10: EN-11 — XdpCounters +nat_conflict (224->232B);
 /// XDP_DECISION_NAT_CONFLICT.
-pub const XDP_ABI_VERSION: u32 = 10;
+pub const XDP_ABI_VERSION: u32 = 11;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -776,7 +780,22 @@ pub struct XdpPendingCap {
     /// Absolute half-open deadline in nanoseconds. A pending entry whose
     /// age exceeds this is treated as absent and re-admitted as a new flow.
     pub pending_ttl_ns: u64,
+    /// Test-only fault-injection bits (XDP_PENDING_CAP_FAIL_*). Production
+    /// configs leave this zero; each set bit forces the corresponding
+    /// datapath admission step onto its explicit failure path so rollback
+    /// semantics can be exercised without filling a production-scale map.
+    pub flags: u64,
 }
+
+/// `XdpPendingCap.flags` bit: the pending→CT promotion acts as if the
+/// authoritative CT insert failed (pending record must stay untouched).
+pub const XDP_PENDING_CAP_FAIL_CT_INSERT: u64 = 1 << 0;
+/// `XdpPendingCap.flags` bit: fresh pending admissions act as if the
+/// bounded pending table insert failed (claimed SNAT port must roll back).
+pub const XDP_PENDING_CAP_FAIL_PENDING_INSERT: u64 = 1 << 1;
+/// `XdpPendingCap.flags` bit: SNAT port allocation acts exhausted so the
+/// explicit userspace fallback is exercised on demand.
+pub const XDP_PENDING_CAP_FAIL_SNAT_ALLOC: u64 = 1 << 2;
 
 // Compile-time ABI assertions. If any of these fire, a shared layout changed:
 // bump XDP_ABI_VERSION and update the map spec table so stale pinned maps are
@@ -787,7 +806,7 @@ const _: () = assert!(core::mem::size_of::<XdpFlowEvent>() == 88);
 const _: () = assert!(core::mem::size_of::<XdpPathBinding>() == 32);
 const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 48);
 const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 64);
-const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 16);
+const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 24);
 const _: () = assert!(core::mem::size_of::<XdpCounters>() == 232);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 48);
@@ -796,7 +815,7 @@ const _: () = assert!(core::mem::size_of::<XdpSnatRevValue>() == 56);
 const _: () = assert!(core::mem::size_of::<XdpInterfacePolicy>() == 8);
 const _: () = assert!(core::mem::size_of::<XdpRateBucket>() == 16);
 const _: () = assert!(core::mem::size_of::<XdpRateLimitConfig>() == 32);
-const _: () = assert!(core::mem::size_of::<NatScratch>() == 312);
+const _: () = assert!(core::mem::size_of::<NatScratch>() == 320);
 
 #[cfg(all(feature = "aya", target_os = "linux"))]
 macro_rules! unsafe_impl_aya_pod {

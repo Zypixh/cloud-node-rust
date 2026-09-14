@@ -1,25 +1,31 @@
 {
   "task": "EN-11",
   "status": "verified-veth-netns",
-  "abi": "v10",
-  "base_commit": "341591c",
-  "ebpf_object_sha256": "e6c3e0289bf3f0e39d109f0a189df150c5629b41f8378042d1129e5936fe406a",
+  "abi": "v11",
+  "base_commit": "ff330b4",
+  "ebpf_object_sha256": "ac65cfca270147735bfa0e5e48043a46412323b873bcb122c9e03a740269ebc1",
   "deliverables": [
     "multi-VIP disambiguation: CT-hit and pending-hit paths now compare the bound (listen_addr, listen_port) against the packet destination; mismatch -> nat_conflict counter + REJECTED/NAT_CONFLICT flow event + explicit userspace fallback instead of silent rebind",
     "snat_release rollback: a claimed SNAT port is released when the owning CT/pending insert fails (all four insert-failure sites), so map insert failure no longer leaks ports",
     "pending expiry releases its SNAT binding in-datapath (previously orphaned until the sweeper pass) and emits XDP_FLOW_EVENT_EXPIRED",
     "sweeper orphan check tightened: live sets track each entry's claimed snat_port; a binding survives only while its owning flow is live AND still claims that port (tuple reuse on a new port frees the old binding; a re-claimed port stays protected)",
     "XdpCounters.nat_conflict (ABI v10, 232B) plumbed to status + dump-maps; XDP_DECISION_NAT_CONFLICT=10 pinned append-only",
-    "billing: FLOW_ACCT bidirectional accounting verified per flow with server attribution intact (rx/tx bytes + server_id observable via bpftool/dump)"
+    "billing: FLOW_ACCT bidirectional accounting verified per flow with server attribution intact (rx/tx bytes + server_id observable via bpftool/dump)",
+    "pending promotion no longer mutates the pending record before the authoritative CT insert: the record is inserted verbatim and flipped to OPEN only on success, so a full CT table leaves the pending state AND its absolute deadline untouched (retransmitted ACKs cannot extend half-open lifetime or wedge the entry)",
+    "test-only fault injection: XdpPendingCap.flags (debugFailFlags config) forces CT-insert / pending-insert / SNAT-alloc failure paths without filling production maps — exercised live in probe phases E/F/G",
+    "sweeper GC bounds: per-map reap cap 4096/round with guaranteed progress (deferred stales are collected first next round), stale membership moved to HashSet (was O(flows x stale) Vec scan), conditional remove re-validates last_seen so a concurrent refresh / tuple re-admission between scan and delete cannot kill the newer entry",
+    "billing aggregation is per-server_id batched per sweep round (bounded by distinct servers, no per-flow metric calls, no dropped deltas)",
+    "sync_pending_cap moved from the 5s sweeper tick to attach time (config-derived, pinned map) so in-map fault flags are not clobbered between sweeps",
+    "ABI v11: XdpPendingCap +flags (24B), NatScratch +debug_flags (320B)"
   ],
   "verification": {
     "verifier": "object loads on kernel 7.0.14-orbstack x86-build; pending_touch returns u64-packed triple to avoid sret caller-stack pointer rejected by verifier",
     "unit": "667 lib + 7 common + 18 integration tests pass",
-    "probe": "scripts/edge/en11_nat_probe.py all 4 phases pass (probe-result.json)",
+    "probe": "en11_nat_probe all 7 phases pass: A UDP conflict, B TCP pending conflict, C expiry port release, D billing, E CT-insert-fail rollback + retry, F pending-insert-fail SNAT rollback, G SNAT exhaustion",
     "regression": "en10_flow_probe re-run green on the v10 object (takeover + event channel unchanged)"
   },
   "limitations": [
-    "CT/pending-full rollback path is code-reviewed but not runtime-exercised (requires filling the table in a probe)",
+    "concurrent-promotion (two CPUs racing the same tuple) is covered by BPF_NOEXIST on insert + single-writer pending entry; not separately instrumented",
     "conflict rejection semantics = explicit userspace fallback (Ok(None)), consistent with the CT-full contract; counted and evented, not silent",
     "veth/netns evidence; real-NIC multi-queue SNAT pressure untested",
     "TTL decrement absent by design (same-subnet L2 rewrite); neighbor via configured nextHopMac"

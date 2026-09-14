@@ -6,22 +6,23 @@ use aya_ebpf::{
     helpers::{bpf_csum_diff, bpf_get_prandom_u32, bpf_ktime_get_ns},
     macros::{map, xdp},
     maps::{
-        lpm_trie::Key as LpmKey, Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, ProgramArray,
-        RingBuf, XskMap,
+        Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, ProgramArray, RingBuf, XskMap,
+        lpm_trie::Key as LpmKey,
     },
     programs::XdpContext,
 };
 use cloud_node_xdp_common::{
-    XdpBudgetBucket, XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpFlowEvent, XdpInterfacePolicy,
-    XdpIpv4Key, XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey,
-    XdpQueueKey, XdpQuicDcidKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
-    XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule, XDP_CLASS_MALFORMED,
-    XDP_CLASS_UNSUPPORTED, XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN, XDP_CT_STATE_PENDING,
-    XDP_CT_STATE_PENDING_ACKED, XDP_DECISION_FLOW_TABLE_FULL, XDP_DECISION_NAT_CONFLICT,
-    XDP_DECISION_PASS, XDP_FLOW_EVENT_ADMITTED, XDP_FLOW_EVENT_CLOSED, XDP_FLOW_EVENT_EXPIRED,
-    XDP_FLOW_EVENT_REJECTED, XDP_FLOW_EVENT_VALIDATED, XDP_FRAGMENT_DROP, XDP_FRAGMENT_PASS,
-    XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS, XDP_LOCAL_PRESENT, XDP_LOCAL_REDIRECT,
-    XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN,
+    XDP_CLASS_MALFORMED, XDP_CLASS_UNSUPPORTED, XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN,
+    XDP_CT_STATE_PENDING, XDP_CT_STATE_PENDING_ACKED, XDP_DECISION_FLOW_TABLE_FULL,
+    XDP_DECISION_NAT_CONFLICT, XDP_DECISION_PASS, XDP_FLOW_EVENT_ADMITTED, XDP_FLOW_EVENT_CLOSED,
+    XDP_FLOW_EVENT_EXPIRED, XDP_FLOW_EVENT_REJECTED, XDP_FLOW_EVENT_VALIDATED, XDP_FRAGMENT_DROP,
+    XDP_FRAGMENT_PASS, XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS, XDP_LOCAL_PRESENT,
+    XDP_LOCAL_REDIRECT, XDP_PENDING_CAP_FAIL_CT_INSERT, XDP_PENDING_CAP_FAIL_PENDING_INSERT,
+    XDP_PENDING_CAP_FAIL_SNAT_ALLOC, XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN, XdpBudgetBucket,
+    XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpFlowEvent, XdpInterfacePolicy, XdpIpv4Key,
+    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey, XdpQueueKey,
+    XdpQuicDcidKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
+    XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
 };
 use core::mem;
 use network_types::{
@@ -234,6 +235,10 @@ struct NatScratch {
     work_ip_off: u32,
     work_ifindex: u32,
     work_pkt_len: u64,
+    /// XdpPendingCap.flags snapshot taken once per packet at the NAT entry
+    /// points — the per-CPU scratch read keeps fault-injection checks a
+    /// plain load instead of a map lookup per call site.
+    debug_flags: u64,
 }
 
 #[map(name = "XDP_NAT_SCRATCH")]
@@ -1822,6 +1827,12 @@ fn snat_alloc(
     scratch: *mut NatScratch,
     fwd_map: &HashMap<XdpUdpFwdKey, XdpUdpFwdRule>,
 ) -> Option<u16> {
+    // Test hook: pretend port exhaustion so callers exercise the explicit
+    // fallback without waiting for 20k ports to be claimed.
+    if unsafe { (*scratch).debug_flags } & XDP_PENDING_CAP_FAIL_SNAT_ALLOC != 0 {
+        counter_snat_alloc_fail();
+        return None;
+    }
     // Word-wise mixing keeps this straight-line for the verifier; the hash
     // only feeds the SNAT probe start so any deterministic mix is valid.
     let mut h = 0x9e37_79b9u32;
@@ -2011,6 +2022,9 @@ fn try_udp_nat_v4(
     let src_be = u32::from_be_bytes(src_addr);
     let dst_be = u32::from_be_bytes(dst_addr);
     let scratch = nat_scratch()?;
+    // Snapshot test-only fault flags once per packet — inner checks read
+    // this scratch field instead of paying a map lookup per call site.
+    unsafe { (*scratch).debug_flags = pending_cap_flags() };
 
     // Reply path: source is a backend serving a tracked client flow.
     unsafe {
@@ -2387,6 +2401,9 @@ fn try_udp_nat_v6(
     let src_port = unsafe { u16::from_ne_bytes((*udp).src) };
     let dst_port = unsafe { u16::from_ne_bytes((*udp).dst) };
     let scratch = nat_scratch()?;
+    // Snapshot test-only fault flags once per packet — inner checks read
+    // this scratch field instead of paying a map lookup per call site.
+    unsafe { (*scratch).debug_flags = pending_cap_flags() };
     copy_v6_addrs(ctx, ip_offset, scratch)?;
 
     unsafe {
@@ -2542,6 +2559,9 @@ fn try_udp_nat_v6_fwd(
     let src_port = unsafe { u16::from_ne_bytes((*udp).src) };
     let dst_port = unsafe { u16::from_ne_bytes((*udp).dst) };
     let scratch = nat_scratch()?;
+    // Snapshot test-only fault flags once per packet — inner checks read
+    // this scratch field instead of paying a map lookup per call site.
+    unsafe { (*scratch).debug_flags = pending_cap_flags() };
     copy_v6_addrs(ctx, ip_offset, scratch)?;
     unsafe {
         let k = &mut (*scratch).fwd_key;
@@ -2796,6 +2816,9 @@ fn try_tcp_nat_v4(
     let src_be = u32::from_be_bytes(src_addr);
     let dst_be = u32::from_be_bytes(dst_addr);
     let scratch = nat_scratch()?;
+    // Snapshot test-only fault flags once per packet — inner checks read
+    // this scratch field instead of paying a map lookup per call site.
+    unsafe { (*scratch).debug_flags = pending_cap_flags() };
 
     // Reply path: source is a backend serving a tracked client flow.
     unsafe {
@@ -3092,14 +3115,18 @@ fn try_tcp_nat_v4(
                         None => return Ok(None),
                     }
                 }
-                if XDP_PENDING
-                    .insert(
-                        unsafe { &(*scratch).ct_key },
-                        unsafe { &(*scratch).ct_value },
-                        0,
-                    )
-                    .is_err()
-                {
+                // Test hook: FAIL_PENDING_INSERT forces the bounded-table
+                // failure path (rollback + counter + explicit fallback).
+                let pending_insert_ok =
+                    unsafe { (*scratch).debug_flags } & XDP_PENDING_CAP_FAIL_PENDING_INSERT == 0
+                        && XDP_PENDING
+                            .insert(
+                                unsafe { &(*scratch).ct_key },
+                                unsafe { &(*scratch).ct_value },
+                                0,
+                            )
+                            .is_ok();
+                if !pending_insert_ok {
                     // EN-11 rollback: release the claimed SNAT port so a
                     // rejected admission leaves no binding behind.
                     if snat_port != 0 {
@@ -3199,6 +3226,9 @@ fn try_tcp_nat_v6(
     let ack = unsafe { (*tcp).ack() } == 1;
     let closing = unsafe { (*tcp).fin() } == 1 || unsafe { (*tcp).rst() } == 1;
     let scratch = nat_scratch()?;
+    // Snapshot test-only fault flags once per packet — inner checks read
+    // this scratch field instead of paying a map lookup per call site.
+    unsafe { (*scratch).debug_flags = pending_cap_flags() };
     copy_v6_addrs(ctx, ip_offset, scratch)?;
 
     unsafe {
@@ -3378,6 +3408,9 @@ fn try_tcp_nat_v6_fwd(
     let ack = unsafe { (*tcp).ack() } == 1;
     let closing = unsafe { (*tcp).fin() } == 1 || unsafe { (*tcp).rst() } == 1;
     let scratch = nat_scratch()?;
+    // Snapshot test-only fault flags once per packet — inner checks read
+    // this scratch field instead of paying a map lookup per call site.
+    unsafe { (*scratch).debug_flags = pending_cap_flags() };
     copy_v6_addrs(ctx, ip_offset, scratch)?;
     unsafe {
         let k = &mut (*scratch).fwd_key;
@@ -3474,14 +3507,18 @@ fn try_tcp_nat_v6_fwd(
                         None => return Ok(None),
                     }
                 }
-                if XDP_PENDING
-                    .insert(
-                        unsafe { &(*scratch).ct_key },
-                        unsafe { &(*scratch).ct_value },
-                        0,
-                    )
-                    .is_err()
-                {
+                // Test hook: FAIL_PENDING_INSERT forces the bounded-table
+                // failure path (rollback + counter + explicit fallback).
+                let pending_insert_ok =
+                    unsafe { (*scratch).debug_flags } & XDP_PENDING_CAP_FAIL_PENDING_INSERT == 0
+                        && XDP_PENDING
+                            .insert(
+                                unsafe { &(*scratch).ct_key },
+                                unsafe { &(*scratch).ct_value },
+                                0,
+                            )
+                            .is_ok();
+                if !pending_insert_ok {
                     // EN-11 rollback: release the claimed SNAT port so a
                     // rejected admission leaves no binding behind.
                     if snat_port != 0 {
@@ -3892,6 +3929,10 @@ const PENDING_ALIVE: u8 = 1;
 const PENDING_CONFLICT: u8 = 2;
 
 #[inline(always)]
+fn pending_cap_flags() -> u64 {
+    XDP_PENDING_CAP.get(0).map(|cap| cap.flags).unwrap_or(0)
+}
+
 fn pending_ttl_ns() -> u64 {
     match XDP_PENDING_CAP.get(0) {
         Some(cap) if cap.pending_ttl_ns != 0 => cap.pending_ttl_ns,
@@ -4010,14 +4051,28 @@ fn pending_touch(
     // no observable SYN-ACK — replies addressed to the client are nonlocal
     // and transit the kernel — so the client's ACK is the only evidence.
     if promote && (p.state == XDP_CT_STATE_PENDING_ACKED || p.snat_port_be == 0) {
-        p.state = XDP_CT_STATE_OPEN;
-        p.last_seen_ns = now_mono_ns;
-        if XDP_TCP_CT.insert(key, unsafe { &*p }, 0).is_ok() {
-            emit_flow_event(p, XDP_FLOW_EVENT_VALIDATED, XDP_DECISION_PASS, now_mono_ns);
+        // Insert the pending record verbatim and only then flip the CT copy
+        // to OPEN: the pending record — state AND the absolute admission
+        // deadline — must stay untouched until the authoritative insert
+        // succeeds, otherwise a full CT table would wedge the entry into a
+        // state that can never retry promotion while retransmitted ACKs keep
+        // its deadline alive.
+        // Test hook: FAIL_CT_INSERT forces the full-table path so rollback
+        // semantics are exercised without filling 262k entries.
+        let ct_insert_ok = unsafe { (*scratch).debug_flags } & XDP_PENDING_CAP_FAIL_CT_INSERT == 0
+            && XDP_TCP_CT.insert(key, unsafe { &*p }, 0).is_ok();
+        if ct_insert_ok {
+            if let Some(ct) = XDP_TCP_CT.get_ptr_mut(key) {
+                let ct = unsafe { &mut *ct };
+                ct.state = XDP_CT_STATE_OPEN;
+                ct.last_seen_ns = now_mono_ns;
+                emit_flow_event(ct, XDP_FLOW_EVENT_VALIDATED, XDP_DECISION_PASS, now_mono_ns);
+            }
             let _ = XDP_PENDING.remove(key);
         } else {
-            // Authoritative table full: counted, record stays pending with
-            // its absolute deadline; the packet is still forwarded.
+            // Authoritative table full: counted; the pending record keeps
+            // its original state and absolute deadline, so the ACK neither
+            // extends half-open lifetime nor marks the flow promoted.
             counter_tcp_fwd_map_full();
             emit_flow_event(
                 p,

@@ -53,7 +53,7 @@ UDP_LISTEN = 8543
 UDP_BACKEND = 9543
 CLIENT_PORT = 40000
 UDP_CLIENT_PORT = 41000
-PENDING_MS = 1200
+PENDING_MS = 2500
 
 
 def sh(cmd, check=True, capture=True, netns=None, cwd=None):
@@ -201,6 +201,45 @@ def udp_snat_port():
     raise RuntimeError("no UDP SNAT binding found")
 
 
+def tcp_snat_port_for(cport):
+    """SNAT port claimed by the pending/CT TCP flow for client port cport."""
+    out = sh([bpftool(), "map", "dump", "-j", "id",
+              str(map_id("XDP_PENDING"))]).stdout
+    for item in json.loads(out):
+        key = bytes(int(b, 16) for b in item["key"])
+        val = bytes(int(b, 16) for b in item["value"])
+        if struct.unpack(">H", key[32:34])[0] == cport:
+            return struct.unpack(">H", val[26:28])[0]
+    raise RuntimeError(f"no pending SNAT binding for client port {cport}")
+
+
+def pending_entry(cport):
+    """Decode the XDP_PENDING value for client port cport (or None)."""
+    out = sh([bpftool(), "map", "dump", "-j", "id",
+              str(map_id("XDP_PENDING"))]).stdout
+    for item in json.loads(out):
+        key = bytes(int(b, 16) for b in item["key"])
+        val = bytes(int(b, 16) for b in item["value"])
+        if struct.unpack(">H", key[32:34])[0] == cport:
+            # XdpUdpCtValue: state@25, snat_port_be@26, last_seen_ns@40.
+            return {"state": val[25],
+                    "snat_port": struct.unpack(">H", val[26:28])[0],
+                    "last_seen": struct.unpack("<Q", val[40:48])[0]}
+    return None
+
+
+def set_pending_flags(flags):
+    """Write XdpPendingCap.flags in the XDP_PENDING_CAP array (id 0 slot)."""
+    mid = map_id("XDP_PENDING_CAP")
+    out = sh([bpftool(), "map", "dump", "-j", "id", str(mid)]).stdout
+    raw = bytearray(int(b, 16) for b in json.loads(out)[0]["value"])
+    assert len(raw) == 24, f"unexpected XdpPendingCap size {len(raw)}"
+    raw[16:24] = flags.to_bytes(8, "little")
+    sh([bpftool(), "map", "update", "id", str(mid),
+        "key", "hex", "00", "00", "00", "00",
+        "value", "hex"] + [f"{b:02x}" for b in raw])
+
+
 def flow_acct_entries():
     """Decode XDP_FLOW_ACCT per-cpu values -> list of dicts (summed)."""
     out = sh([bpftool(), "map", "dump", "-j", "id",
@@ -296,6 +335,17 @@ def run_sender(mode, dst_mac, a):
         frames = [tcp_frame(dst_mac, CLIENT_IP, VIP2,
                             CLIENT_PORT, TCP_LISTEN, SYN)
                   for _ in range(a)]
+    elif mode == "syn_vip1p":
+        # a = client port: fresh tuple for isolated fault-injection phases.
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            a, TCP_LISTEN, SYN)]
+    elif mode == "ack_vip1p":
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            a, TCP_LISTEN, ACK, seq=1001, ackno=2001)]
+    elif mode == "synack_p":
+        # Backend SYN-ACK addressed to the claimed SNAT port (a).
+        frames = [tcp_frame(dst_mac, PEER_IP, VIP1,
+                            TCP_BACKEND, a, SYNACK, seq=2000, ackno=1001)]
     send_frames(frames)
     print(json.dumps({"sent": len(frames)}))
 
@@ -481,6 +531,106 @@ def main():
             "acctEntries": len(acct),
             "vip1Flow": udp_acct,
             "ok": billed,
+        }
+
+        # ---- Phase E: CT-insert failure keeps pending state intact ----
+        # Fault flag 1 (FAIL_CT_INSERT): promotion must take the explicit
+        # failure path — pending record keeps its state AND its absolute
+        # admission deadline; clearing the flag lets the retry promote.
+        P2 = CLIENT_PORT + 1
+        c9 = counters(node_bin, args.work)
+        set_pending_flags(1)
+        ent = None
+        for _ in range(10):
+            send(script, "syn_vip1p", peer_mac(), P2)
+            time.sleep(0.4)
+            ent = pending_entry(P2)
+            if ent:
+                break
+        assert ent, "phase E: pending entry never admitted"
+        # Backend SYN-ACK marks the entry PENDING_ACKED (weak observation;
+        # strong sequence validation is EN-13/14 scope).
+        send(script, "synack_p", peer_mac(), ent["snat_port"])
+        time.sleep(0.3)
+        ent2 = pending_entry(P2)
+        # Client ACK: promotion attempt hits the injected CT-full path.
+        send(script, "ack_vip1p", peer_mac(), P2)
+        time.sleep(0.4)
+        c10 = counters(node_bin, args.work)
+        ent3 = pending_entry(P2)
+        ct_during_fail = map_entries("XDP_TCP_CT")
+        mapfull_delta = (c10.get("tcpFwdMapFull", 0)
+                         - c9.get("tcpFwdMapFull", 0))
+        # Recover: clear the flag, retransmit ACK — promotion must succeed.
+        set_pending_flags(0)
+        send(script, "ack_vip1p", peer_mac(), P2)
+        time.sleep(0.5)
+        ent4 = pending_entry(P2)
+        ct_after_retry = map_entries("XDP_TCP_CT")
+
+        result["phases"]["E_ct_insert_fail"] = {
+            "stateAfterSynAck": ent2["state"] if ent2 else None,
+            "stateAfterFailedPromote": ent3["state"] if ent3 else None,
+            "deadlineKept": (ent3 is not None
+                             and ent3["last_seen"] == ent["last_seen"]),
+            "tcpFwdMapFullDelta": mapfull_delta,
+            "ctEntriesDuringFail": ct_during_fail,
+            "pendingAfterRetry": ent4,
+            "ctEntriesAfterRetry": ct_after_retry,
+            "ok": (ent2 is not None and ent2["state"] == 3
+                   and ent3 is not None and ent3["state"] == 3
+                   and ent3["last_seen"] == ent["last_seen"]
+                   and mapfull_delta >= 1
+                   and ent4 is None
+                   and ct_after_retry == ct_during_fail + 1),
+        }
+
+        # ---- Phase F: pending-insert failure rolls back SNAT claim ----
+        P3 = CLIENT_PORT + 2
+        c11 = counters(node_bin, args.work)
+        rev_before_f = snat_rev_count(6)
+        set_pending_flags(2)
+        send(script, "syn_vip1p", peer_mac(), P3)
+        time.sleep(0.8)
+        c12 = counters(node_bin, args.work)
+        pending_limited_delta = (c12.get("pendingLimited", 0)
+                                 - c11.get("pendingLimited", 0))
+        rev_after_f = snat_rev_count(6)
+        p3_pending = pending_entry(P3)
+        set_pending_flags(0)
+
+        result["phases"]["F_pending_insert_fail"] = {
+            "pendingLimitedDelta": pending_limited_delta,
+            "snatRevBefore": rev_before_f,
+            "snatRevAfter": rev_after_f,
+            "pendingEntry": p3_pending,
+            "ok": (pending_limited_delta >= 1
+                   and rev_after_f == rev_before_f
+                   and p3_pending is None),
+        }
+
+        # ---- Phase G: SNAT allocation exhaustion is explicit ----------
+        P4 = CLIENT_PORT + 3
+        c13 = counters(node_bin, args.work)
+        rev_before_g = snat_rev_count(6)
+        set_pending_flags(4)
+        send(script, "syn_vip1p", peer_mac(), P4)
+        time.sleep(0.8)
+        c14 = counters(node_bin, args.work)
+        alloc_fail_delta = (c14.get("snatAllocFail", 0)
+                            - c13.get("snatAllocFail", 0))
+        rev_after_g = snat_rev_count(6)
+        p4_pending = pending_entry(P4)
+        set_pending_flags(0)
+
+        result["phases"]["G_snat_exhausted"] = {
+            "snatAllocFailDelta": alloc_fail_delta,
+            "snatRevBefore": rev_before_g,
+            "snatRevAfter": rev_after_g,
+            "pendingEntry": p4_pending,
+            "ok": (alloc_fail_delta >= 1
+                   and rev_after_g == rev_before_g
+                   and p4_pending is None),
         }
 
         result["ok"] = all(p["ok"] for p in result["phases"].values())

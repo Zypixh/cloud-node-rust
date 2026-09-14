@@ -423,6 +423,11 @@ impl XdpManager {
                     let attached = attached_program.interfaces;
                     *self.attached.write() = attached;
                     self.set_fallback_reason(String::new());
+                    // Admission contract is config-derived and the map is
+                    // pinned — write it once at attach rather than every
+                    // sweep tick, so test-only fault flags written through
+                    // the map are not clobbered between sweeps.
+                    self.sync_pending_cap();
                     self.flush_maps_full_blocking(self.proxy_redirect_ready());
                     self.configure_af_xdp_runtime()?;
                 }
@@ -1341,11 +1346,18 @@ impl XdpManager {
             .map(|a| a.tcp_pending_ms)
             .unwrap_or_else(crate::runtime_mode::default_tcp_pending_ms)
             .saturating_mul(1_000_000);
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let flags = self
+            .config
+            .admission
+            .as_ref()
+            .map(|a| a.debug_fail_flags)
+            .unwrap_or(0);
         #[cfg(target_os = "linux")]
         let result = {
             let mut ebpf = self.ebpf.lock();
             match ebpf.as_mut() {
-                Some(ebpf) => linux::sync_pending_cap(ebpf, ttl_ns),
+                Some(ebpf) => linux::sync_pending_cap(ebpf, ttl_ns, flags),
                 None => return,
             }
         };
@@ -2183,7 +2195,6 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
             }
             manager.sync_rate_limit_config();
             manager.sync_budget_config();
-            manager.sync_pending_cap();
             #[cfg(target_os = "linux")]
             {
                 manager.sweep_nat_maps();
