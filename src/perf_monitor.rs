@@ -81,6 +81,9 @@ struct PerfSample {
     admission_rejects_total: u64,
     listener_pool_active: u64,
     listener_pool_rejects: u64,
+    h3_retry_issued: u64,
+    h3_retry_failed: u64,
+    h3_validated_incoming: u64,
     disk_ledger_reserved_bytes: u64,
     disk_ledger_committed_bytes: u64,
     disk_ledger_rejects: u64,
@@ -196,6 +199,8 @@ async fn sample_loop(store: SharedStore) {
         };
         let memory_pressure_level = governor_snapshot.memory_pressure_level.as_str();
         let admission_rejects_total = governor_snapshot.admission_rejects.total();
+        let (h3_retry_issued, h3_retry_failed, h3_validated_incoming) =
+            crate::http3_proxy_manager::h3_retry_counters();
         let snapshot_list: Vec<_> = snapshots.iter().map(|s| s.1.clone()).collect();
         let top_servers = top_servers(&snapshot_list);
         let request_per_sec = request_delta as f64 / elapsed as f64;
@@ -249,6 +254,9 @@ async fn sample_loop(store: SharedStore) {
             admission_rejects_total,
             listener_pool_active: governor_snapshot.listener_pool_active,
             listener_pool_rejects: governor_snapshot.listener_pool_rejects,
+            h3_retry_issued,
+            h3_retry_failed,
+            h3_validated_incoming,
             disk_ledger_reserved_bytes: governor_snapshot.disk_reserved_bytes,
             disk_ledger_committed_bytes: governor_snapshot.disk_committed_bytes,
             disk_ledger_rejects: governor_snapshot.disk_rejects,

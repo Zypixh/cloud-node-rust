@@ -11,6 +11,7 @@ use quinn::Endpoint;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info};
 
@@ -23,6 +24,35 @@ use crate::ssl::DynamicCertSelector;
 
 struct ListenerHandle {
     shutdown_tx: watch::Sender<bool>,
+}
+
+// EN-15 retry observability: stateless Retry packets issued to unvalidated
+// clients, retry() failures, and incoming connections whose address was
+// already validated (retry token or NEW_TOKEN). Retry issuance is a normal
+// handshake step, not hostile evidence, so it is deliberately NOT recorded
+// through record_l4_event (which feeds per-IP auto-block scoring).
+static H3_RETRY_ISSUED: AtomicU64 = AtomicU64::new(0);
+static H3_RETRY_FAILED: AtomicU64 = AtomicU64::new(0);
+static H3_VALIDATED_INCOMING: AtomicU64 = AtomicU64::new(0);
+
+pub fn h3_retry_counters() -> (u64, u64, u64) {
+    (
+        H3_RETRY_ISSUED.load(Ordering::Relaxed),
+        H3_RETRY_FAILED.load(Ordering::Relaxed),
+        H3_VALIDATED_INCOMING.load(Ordering::Relaxed),
+    )
+}
+
+fn h3_retry_required(
+    mode: crate::config_models::Http3AddressValidation,
+    level: crate::l4_defense::L4PressureLevel,
+) -> bool {
+    use crate::config_models::Http3AddressValidation::*;
+    match mode {
+        Always => true,
+        Off => false,
+        Adaptive => level >= crate::l4_defense::L4PressureLevel::Elevated,
+    }
 }
 
 pub struct Http3ProxyManager {
@@ -189,6 +219,52 @@ impl Http3ProxyManager {
                 remote_addr.ip(),
             ) {
                 continue;
+            }
+
+            // EN-15: stateless address validation before any handshake
+            // state, admission permits, or tasks are allocated. An
+            // unvalidated Initial under the configured policy is answered
+            // with a Retry packet; the client completes one round trip and
+            // returns with a validated address (quinn guarantees
+            // may_retry() whenever remote_address_validated() is false, and
+            // enforces anti-amplification internally). A client that
+            // answered Retry — or presented a NEW_TOKEN — arrives here with
+            // remote_address_validated() == true and is never re-retried,
+            // so a valid Retry cannot loop. Post-handshake migration to a
+            // new path is validated by quinn's own PATH_CHALLENGE flow and
+            // does not re-enter this gate. QUIC passthrough servers never
+            // reach this listener (desired_ports excludes them), so no
+            // Retry is injected into passthrough traffic.
+            if connecting.remote_address_validated() {
+                H3_VALIDATED_INCOMING.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let mode = self
+                    .config_store
+                    .get_global_http3_policy_sync()
+                    .map(|policy| policy.address_validation_mode())
+                    .unwrap_or_default();
+                if h3_retry_required(mode, crate::l4_defense::current_pressure_level()) {
+                    match connecting.retry() {
+                        Ok(()) => {
+                            H3_RETRY_ISSUED.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                "H3 stateless retry issued to {} on UDP port {}",
+                                remote_addr, port
+                            );
+                        }
+                        Err(err) => {
+                            // Unreachable per quinn's may_retry() guarantee;
+                            // the Incoming is consumed either way so no
+                            // handshake state is left behind.
+                            H3_RETRY_FAILED.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                "H3 retry failed for {} on UDP port {}: {}",
+                                remote_addr, port, err
+                            );
+                        }
+                    }
+                    continue;
+                }
             }
             debug!("HTTP/3 incoming connection on UDP port {}", port);
 
@@ -503,4 +579,187 @@ fn authority_host_for_resolve(authority: &str) -> String {
         return host.to_string();
     }
     authority.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_models::Http3AddressValidation;
+    use crate::l4_defense::L4PressureLevel;
+
+    #[test]
+    fn h3_retry_required_matrix() {
+        for level in [
+            L4PressureLevel::Normal,
+            L4PressureLevel::Elevated,
+            L4PressureLevel::High,
+            L4PressureLevel::Critical,
+        ] {
+            assert!(h3_retry_required(Http3AddressValidation::Always, level));
+            assert!(!h3_retry_required(Http3AddressValidation::Off, level));
+        }
+        assert!(!h3_retry_required(
+            Http3AddressValidation::Adaptive,
+            L4PressureLevel::Normal
+        ));
+        for level in [
+            L4PressureLevel::Elevated,
+            L4PressureLevel::High,
+            L4PressureLevel::Critical,
+        ] {
+            assert!(h3_retry_required(Http3AddressValidation::Adaptive, level));
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoVerifier;
+
+    impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ED25519,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            ]
+        }
+    }
+
+    fn test_server_config() -> quinn::ServerConfig {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = rustls_pemfile::certs(
+            &mut include_bytes!("../pingora-main/pingora-core/examples/keys/server/cert.pem")
+                .as_slice(),
+        )
+        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .unwrap();
+        let key = rustls_pemfile::private_key(
+            &mut include_bytes!("../pingora-main/pingora-core/examples/keys/server/key.pem")
+                .as_slice(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut tls = rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, PrivateKeyDer::clone_key(&key))
+        .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls)).unwrap(),
+        ))
+    }
+
+    fn test_client_endpoint() -> quinn::Endpoint {
+        let mut tls = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).unwrap(),
+        ));
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        endpoint
+    }
+
+    // EN-15: a real Retry round trip must terminate — the client returns
+    // with a validated address and is accepted without a second retry, and
+    // a subsequent connection is validated immediately via NEW_TOKEN.
+    #[tokio::test]
+    async fn h3_retry_roundtrip_validates_without_loop() {
+        let endpoint =
+            Endpoint::server(test_server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let retries = Arc::new(AtomicU64::new(0));
+        let validated = Arc::new(AtomicU64::new(0));
+        let server = {
+            let retries = retries.clone();
+            let validated = validated.clone();
+            tokio::spawn(async move {
+                let mut accepted = 0u32;
+                while accepted < 2 {
+                    let Some(incoming) = endpoint.accept().await else {
+                        break;
+                    };
+                    if !incoming.remote_address_validated() {
+                        assert!(incoming.may_retry());
+                        incoming.retry().expect("retry must be legal");
+                        retries.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    validated.fetch_add(1, Ordering::Relaxed);
+                    match incoming.await {
+                        Ok(conn) => {
+                            accepted += 1;
+                            conn.closed().await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+
+        let client = test_client_endpoint();
+        for _ in 0..2 {
+            let conn = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.connect(addr, "localhost").unwrap(),
+            )
+            .await
+            .expect("connect timed out")
+            .expect("connect failed");
+            conn.close(0u32.into(), b"done");
+            conn.closed().await;
+        }
+        client.wait_idle().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("server task timed out")
+            .expect("server task panicked");
+        // First connection: one Retry then a validated retry-token Initial.
+        // Second connection: validated immediately via NEW_TOKEN — no Retry.
+        assert_eq!(retries.load(Ordering::Relaxed), 1);
+        assert_eq!(validated.load(Ordering::Relaxed), 2);
+    }
 }
