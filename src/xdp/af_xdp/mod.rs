@@ -140,6 +140,41 @@ static AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_BUDGET_STALLS: AtomicU64 = AtomicU64::new(0);
 
+/// T1: live per-session transport snapshots surfaced through /status.
+/// Queue workers refresh their rows during each amortized sweep; rows are
+/// deleted when a session is reaped or the reactor drops. The map is
+/// bounded by Σ per-queue session limits; the status export below is
+/// additionally capped so a saturated node cannot emit an unbounded body.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_SESSION_SNAPSHOTS: std::sync::LazyLock<
+    DashMap<String, serde_json::Value>,
+> = std::sync::LazyLock::new(DashMap::new);
+
+/// T1: cap on session rows exported into a single /status response.
+#[cfg(target_os = "linux")]
+pub(crate) const AF_XDP_TCP_SNAPSHOT_EXPORT_MAX: usize = 4096;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn publish_tcp_session_snapshot(key: String, snapshot: serde_json::Value) {
+    AF_XDP_TCP_SESSION_SNAPSHOTS.insert(key, snapshot);
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_tcp_session_snapshot(key: &str) {
+    AF_XDP_TCP_SESSION_SNAPSHOTS.remove(key);
+}
+
+/// T1: drop every snapshot row a reactor owned — called when a queue
+/// worker exits so /status never shows sessions of a dead reactor.
+#[cfg(target_os = "linux")]
+pub(crate) fn purge_tcp_session_snapshots(label_prefix: &str) {
+    if label_prefix.is_empty() {
+        return;
+    }
+    let prefix = format!("{label_prefix}|");
+    AF_XDP_TCP_SESSION_SNAPSHOTS.retain(|key, _| !key.starts_with(&prefix));
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn reset_tcp_diag() {
     AF_XDP_TCP_DIAG_ACCEPTED.store(0, Ordering::Relaxed);
@@ -175,6 +210,24 @@ pub(crate) fn tcp_diag_snapshot() -> serde_json::Value {
         "queueBudgetStalls": AF_XDP_TCP_DIAG_BUDGET_STALLS.load(Ordering::Relaxed),
         "tcpQueueBytes": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes(),
         "tcpQueueBytesBudget": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes_budget(),
+        "sessions": tcp_session_snapshots_json(),
+    })
+}
+
+/// T1: bounded export of live per-session snapshots — `total` reflects
+/// every tracked session, `rows` is capped at AF_XDP_TCP_SNAPSHOT_EXPORT_MAX.
+#[cfg(target_os = "linux")]
+fn tcp_session_snapshots_json() -> serde_json::Value {
+    let total = AF_XDP_TCP_SESSION_SNAPSHOTS.len();
+    let rows: Vec<serde_json::Value> = AF_XDP_TCP_SESSION_SNAPSHOTS
+        .iter()
+        .take(AF_XDP_TCP_SNAPSHOT_EXPORT_MAX)
+        .map(|entry| entry.value().clone())
+        .collect();
+    serde_json::json!({
+        "total": total,
+        "truncated": total.saturating_sub(rows.len()),
+        "rows": rows,
     })
 }
 
