@@ -166,6 +166,13 @@ impl RateSampler {
         self.app_limited_mark = self.delivered;
     }
 
+    /// Whether a segment stamped right now would carry the app-limited
+    /// flag — the same predicate `note_sent` applies internally, exposed
+    /// for stacks that stamp records through their own scoreboard.
+    pub fn app_limited_now(&self) -> bool {
+        self.delivered <= self.app_limited_mark && self.app_limited_mark > 0
+    }
+
     /// Process one ACK event.
     ///
     /// `newly_acked` are the TxRecords this ACK/SACK newly confirmed, in

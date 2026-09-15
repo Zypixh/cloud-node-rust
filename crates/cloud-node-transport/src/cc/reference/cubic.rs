@@ -48,6 +48,10 @@ pub struct CubicRef {
     ce_responded_at: Option<TransportInstant>,
     min_rtt: Option<Duration>,
     srtt: Option<Duration>,
+    /// Eifel checkpoint at loss/RTO entry: (cwnd, ssthresh, mode,
+    /// w_max_seg, k_seconds) so a spurious-loss verdict can undo the
+    /// response including the cubic epoch derivation.
+    saved: Option<(u64, u64, &'static str, f64, f64)>,
 }
 
 impl CubicRef {
@@ -69,6 +73,7 @@ impl CubicRef {
             ce_responded_at: None,
             min_rtt: None,
             srtt: None,
+            saved: None,
         }
     }
 
@@ -155,6 +160,7 @@ impl CongestionController for CubicRef {
                     self.cwnd = self.ssthresh;
                     self.epoch_start = Some(rs.now);
                     self.epoch_min_rtt = self.min_rtt;
+                    self.saved = None;
                 }
             }
             return;
@@ -222,6 +228,15 @@ impl CongestionController for CubicRef {
             return;
         }
         if !self.prr.active {
+            // Keep the earliest checkpoint so cascaded responses undo
+            // fully back to the pre-verdict state.
+            self.saved = self.saved.or(Some((
+                self.cwnd,
+                self.ssthresh,
+                self.mode,
+                self.w_max_seg,
+                self.k_seconds,
+            )));
             self.on_congestion(in_flight);
             self.prr.enter(in_flight, self.sent_total);
             self.mode = MODE_REC;
@@ -244,6 +259,13 @@ impl CongestionController for CubicRef {
     }
 
     fn on_rto(&mut self, _now: TransportInstant, _in_flight: u64) {
+        self.saved = self.saved.or(Some((
+            self.cwnd,
+            self.ssthresh,
+            self.mode,
+            self.w_max_seg,
+            self.k_seconds,
+        )));
         self.ssthresh = (self.cwnd / 2).max(2 * self.mss);
         self.cwnd = self.mss;
         self.mode = MODE_SS;
@@ -253,6 +275,22 @@ impl CongestionController for CubicRef {
         self.epoch_start = None;
         self.epoch_min_rtt = None;
         self.hystart.reset(self.sent_total);
+    }
+
+    fn on_loss_undo(&mut self, now: TransportInstant) {
+        // Eifel: the loss/RTO verdict was spurious — restore the
+        // checkpointed window and cubic epoch, cancel the PRR episode.
+        if let Some((cwnd, ssthresh, mode, w_max_seg, k_seconds)) = self.saved.take() {
+            self.cwnd = cwnd;
+            self.ssthresh = ssthresh;
+            self.mode = mode;
+            self.w_max_seg = w_max_seg;
+            self.k_seconds = k_seconds;
+            self.epoch_start = Some(now);
+            self.epoch_min_rtt = self.min_rtt;
+            self.reason = "loss_undo";
+            self.prr = Prr::default();
+        }
     }
 
     fn on_idle_restart(&mut self, now: TransportInstant, idle_for: Duration) {

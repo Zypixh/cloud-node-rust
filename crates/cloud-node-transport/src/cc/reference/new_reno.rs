@@ -34,6 +34,9 @@ pub struct NewRenoRef {
     ce_responded_at: Option<TransportInstant>,
     min_rtt: Option<Duration>,
     srtt: Option<Duration>,
+    /// Eifel checkpoint: (cwnd, ssthresh, mode) at loss/RTO entry so a
+    /// spurious-loss verdict can undo the response.
+    saved: Option<(u64, u64, &'static str)>,
 }
 
 impl NewRenoRef {
@@ -52,12 +55,15 @@ impl NewRenoRef {
             ce_responded_at: None,
             min_rtt: None,
             srtt: None,
+            saved: None,
         }
     }
 
     fn enter_recovery(&mut self, now: TransportInstant, in_flight: u64) {
         // RFC 5681: ssthresh = max(FlightSize/2, 2*SMSS); PRR then drives
         // the send allowance through recovery.
+        // Keep the earliest checkpoint so cascaded responses undo fully.
+        self.saved = self.saved.or(Some((self.cwnd, self.ssthresh, self.mode)));
         self.ssthresh = (in_flight / 2).max(2 * self.mss);
         self.prr.enter(in_flight, self.sent_total);
         self.mode = MODE_REC;
@@ -102,6 +108,9 @@ impl CongestionController for NewRenoRef {
                     self.mode = MODE_CA;
                     self.reason = "recovery_done";
                     self.cwnd = self.ssthresh;
+                    // Episode ended legitimately — a stale checkpoint must
+                    // not undo a later, unrelated loss response.
+                    self.saved = None;
                 }
             }
             return;
@@ -159,11 +168,24 @@ impl CongestionController for NewRenoRef {
 
     fn on_rto(&mut self, _now: TransportInstant, _in_flight: u64) {
         // RFC 5681: ssthresh = FlightSize/2, cwnd = LW, restart slow start.
+        self.saved = self.saved.or(Some((self.cwnd, self.ssthresh, self.mode)));
         self.ssthresh = (self.cwnd / 2).max(2 * self.mss);
         self.cwnd = self.mss;
         self.mode = MODE_SS;
         self.reason = "rto";
         self.prr = Prr::default();
+    }
+
+    fn on_loss_undo(&mut self, _now: TransportInstant) {
+        // Eifel: the loss/RTO verdict was spurious — restore the
+        // checkpointed window and cancel the PRR episode.
+        if let Some((cwnd, ssthresh, mode)) = self.saved.take() {
+            self.cwnd = cwnd;
+            self.ssthresh = ssthresh;
+            self.mode = mode;
+            self.reason = "loss_undo";
+            self.prr = Prr::default();
+        }
     }
 
     fn on_idle_restart(&mut self, _now: TransportInstant, idle_for: Duration) {
