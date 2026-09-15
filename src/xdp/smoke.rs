@@ -64,7 +64,7 @@ async fn raw_smoke_inner(
 
         for (interface, queue, frame) in frames {
             frames_seen = frames_seen.saturating_add(1);
-            match af_xdp::parse_proxy_frame(&interface, queue, &frame) {
+            match af_xdp::parse_proxy_frame(interface.as_str(), queue, &frame) {
                 Some(af_xdp::AfXdpProxyFrame::Udp { packet, .. }) => {
                     udp_seen = udp_seen.saturating_add(1);
                     if samples.len() < 8 {

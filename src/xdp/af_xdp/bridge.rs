@@ -524,7 +524,7 @@ pub(crate) async fn run_queue_bridge_loop(
         quic_dcid_steers,
         iface_fwd,
     } = ctx;
-    let own_interface = queue_handle.interface.clone();
+    let own_interface: Arc<str> = Arc::from(queue_handle.interface.as_str());
     let own_ifindex = linux::ifindex_from_name(&own_interface).unwrap_or(0);
     let mut quic_dcid_map_unavailable = false;
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -545,6 +545,9 @@ pub(crate) async fn run_queue_bridge_loop(
     let mut congested = false;
     let mut congested_drops = 0u64;
     let mut frames = Vec::with_capacity(64);
+    // EN-17: reusable encode buffer for same-interface TCP egress — encodes
+    // once per frame, no clone before `send_raw_frame`.
+    let mut encode_scratch: Vec<u8> = Vec::with_capacity(2048);
     let mut last_status_refresh = std::time::Instant::now();
 
     loop {
@@ -579,8 +582,11 @@ pub(crate) async fn run_queue_bridge_loop(
             );
         }
         frames.clear();
-        let poll_result = queue_handle.poll_raw_once(&mut |interface, queue, frame| {
-            frames.push((interface.to_string(), queue, frame));
+        // EN-17: `poll_raw_once` on a queue handle only ever yields frames
+        // for this queue/interface — keep just the frame bytes instead of
+        // allocating a `String` per packet on the RX path.
+        let poll_result = queue_handle.poll_raw_once(&mut |_interface, _queue, frame| {
+            frames.push(frame);
         });
 
         let polled_packets = match poll_result {
@@ -638,14 +644,14 @@ pub(crate) async fn run_queue_bridge_loop(
             last_route_cache_sweep_ms = now_ms;
         }
 
-        for (interface, queue, frame) in frames.drain(..) {
+        for frame in frames.drain(..) {
             if let Some((flow, flags)) = parse_tcp_flow_flags_from_frame(&frame)
                 && tcp_reactor.should_ignore_unknown_non_syn(&flow, flags)
             {
                 tcp_reactor.record_ignored_unknown_non_syn(flow, frame.len());
                 continue;
             }
-            match parse_proxy_frame(&interface, queue, &frame) {
+            match parse_proxy_frame(own_interface.clone(), queue_handle.queue, &frame) {
                 Some(AfXdpProxyFrame::Udp { route, packet }) => {
                     // Congestion gate: refuse new flow-route admission while
                     // this queue is TX-backpressured; known flows still get
@@ -696,7 +702,7 @@ pub(crate) async fn run_queue_bridge_loop(
                                     quic_dcid_map_unavailable = true;
                                     tracing::warn!(
                                         "AF_XDP QUIC DCID steering unavailable (eBPF object lacks XDP_QUIC_DCID or XSK index for {} queue {}); RSS queue affinity remains the fallback",
-                                        own_interface,
+                                        own_interface.as_ref(),
                                         queue_handle.queue
                                     );
                                 }
@@ -791,8 +797,8 @@ pub(crate) async fn run_queue_bridge_loop(
                 None => {
                     tracing::debug!(
                         "AF_XDP proxy bridge received unparseable redirected frame interface={} queue={} bytes={}",
-                        interface,
-                        queue,
+                        own_interface.as_ref(),
+                        queue_handle.queue,
                         frame.len()
                     );
                 }
@@ -825,13 +831,13 @@ pub(crate) async fn run_queue_bridge_loop(
                 entry.route.clone()
             };
             if route.interface != own_interface {
-                match iface_fwd.get(&route.interface) {
+                match iface_fwd.get(route.interface.as_ref()) {
                     Some(tx) => match tx.try_send(AfXdpForward::Udp(datagram)) {
                         Ok(()) => continue,
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             tracing::warn!(
                                 "AF_XDP proxy bridge forward channel to interface {} is full; dropping downstream datagram",
-                                route.interface
+                                route.interface.as_ref()
                             );
                             congested = true;
                             if tx_failures.record(AfXdpTxStatus::Backpressured) {
@@ -849,7 +855,7 @@ pub(crate) async fn run_queue_bridge_loop(
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             tracing::warn!(
                                 "AF_XDP proxy bridge forward channel to interface {} is closed",
-                                route.interface
+                                route.interface.as_ref()
                             );
                             continue;
                         }
@@ -857,7 +863,7 @@ pub(crate) async fn run_queue_bridge_loop(
                     None => {
                         tracing::warn!(
                             "AF_XDP proxy bridge has no reactor channel for route interface {}; dropping downstream datagram",
-                            route.interface
+                            route.interface.as_ref()
                         );
                         continue;
                     }
@@ -988,22 +994,38 @@ pub(crate) async fn run_queue_bridge_loop(
         #[cfg(target_os = "linux")]
         AF_XDP_TCP_DIAG_EGRESS_FRAMES.fetch_add(tcp_egress_frames as u64, Ordering::Relaxed);
         for (route, ip_packet) in tcp_egress {
-            let Some(frame) = tcp_reactor.encode_egress_frame(&route, &ip_packet) else {
+            if route.interface != own_interface {
+                // Cross-interface forwarding needs an owned frame; the
+                // reactor-side scratch clone only happens on this path.
+                match tcp_reactor.encode_egress_frame(&route, &ip_packet) {
+                    Some(frame) => {
+                        if let Some(tx) = iface_fwd.get(route.interface.as_ref()) {
+                            let _ = tx.try_send(AfXdpForward::TcpFrame(frame));
+                        }
+                    }
+                    None => {
+                        tracing::debug!(
+                            "AF_XDP TCP reactor failed to encode egress frame interface={} queue={} bytes={}",
+                            route.interface.as_ref(),
+                            route.queue,
+                            ip_packet.len()
+                        );
+                    }
+                }
+                continue;
+            }
+            // EN-17: encode straight into the bridge scratch — `send_raw_frame`
+            // only borrows it, so no per-frame clone on the hot TX path.
+            if encode_ip_reply_frame(&route.link, &ip_packet, &mut encode_scratch).is_none() {
                 tracing::debug!(
                     "AF_XDP TCP reactor failed to encode egress frame interface={} queue={} bytes={}",
-                    route.interface,
+                    route.interface.as_ref(),
                     route.queue,
                     ip_packet.len()
                 );
                 continue;
-            };
-            if route.interface != own_interface {
-                if let Some(tx) = iface_fwd.get(&route.interface) {
-                    let _ = tx.try_send(AfXdpForward::TcpFrame(frame));
-                }
-                continue;
             }
-            let sent = queue_handle.send_raw_frame(&frame);
+            let sent = queue_handle.send_raw_frame(&encode_scratch);
             match sent {
                 Ok(true) => {
                     congested = false;
@@ -1012,9 +1034,9 @@ pub(crate) async fn run_queue_bridge_loop(
                 Ok(false) => {
                     tracing::debug!(
                         "AF_XDP TCP reactor could not send frame interface={} queue={} bytes={}",
-                        route.interface,
+                        route.interface.as_ref(),
                         route.queue,
-                        frame.len()
+                        encode_scratch.len()
                     );
                     congested = true;
                     if tx_failures.record(AfXdpTxStatus::Backpressured) {
@@ -1031,9 +1053,9 @@ pub(crate) async fn run_queue_bridge_loop(
                 Err(err) => {
                     tracing::debug!(
                         "AF_XDP TCP reactor TX failed interface={} queue={} bytes={}: {}",
-                        route.interface,
+                        route.interface.as_ref(),
                         route.queue,
-                        frame.len(),
+                        encode_scratch.len(),
                         err
                     );
                     if tx_failures.record(AfXdpTxStatus::Failed) {

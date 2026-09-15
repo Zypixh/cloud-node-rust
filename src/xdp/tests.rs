@@ -886,7 +886,7 @@ fn xdp_proxy_ready_requires_explicit_redirect_enable_after_xsk_registration() {
     });
     manager.attached.write().insert("eth0".to_string());
     *manager.xsk_status.write() = vec![XdpQueueStatus {
-        interface: "eth0".to_string(),
+        interface: "eth0".into(),
         queue: 0,
         configured: true,
         socket_created: true,
@@ -947,7 +947,7 @@ fn xdp_proxy_degradation_disables_ready_queues() {
     });
     *manager.xsk_status.write() = vec![
         XdpQueueStatus {
-            interface: "eth0".to_string(),
+            interface: "eth0".into(),
             queue: 0,
             configured: true,
             socket_created: true,
@@ -957,7 +957,7 @@ fn xdp_proxy_degradation_disables_ready_queues() {
             ..Default::default()
         },
         XdpQueueStatus {
-            interface: "eth0".to_string(),
+            interface: "eth0".into(),
             queue: 1,
             configured: true,
             detail: "AF_XDP socket setup failed".to_string(),
@@ -1016,7 +1016,7 @@ fn xdp_proxy_queue_fault_keeps_sibling_ready() {
     });
     *manager.xsk_status.write() = vec![
         XdpQueueStatus {
-            interface: "eth0".to_string(),
+            interface: "eth0".into(),
             queue: 0,
             configured: true,
             socket_created: true,
@@ -1026,7 +1026,7 @@ fn xdp_proxy_queue_fault_keeps_sibling_ready() {
             ..Default::default()
         },
         XdpQueueStatus {
-            interface: "eth0".to_string(),
+            interface: "eth0".into(),
             queue: 1,
             configured: true,
             socket_created: true,
@@ -1077,7 +1077,7 @@ fn xdp_map_sync_failure_status_is_fail_open() {
         .proxy_redirect_enabled
         .store(true, Ordering::Relaxed);
     *manager.xsk_status.write() = vec![XdpQueueStatus {
-        interface: "eth0".to_string(),
+        interface: "eth0".into(),
         queue: 0,
         configured: true,
         socket_created: true,
@@ -1126,7 +1126,7 @@ fn af_xdp_proxy_frame_classifies_udp_with_route_meta() {
     let af_xdp::AfXdpProxyFrame::Udp { route, packet } = proxy_frame else {
         panic!("expected UDP proxy frame");
     };
-    assert_eq!(route.interface, "eth0");
+    assert_eq!(route.interface.as_ref(), "eth0");
     assert_eq!(route.queue, 3);
     assert_eq!(packet.protocol, af_xdp::AfXdpTransportProtocol::Udp);
     assert_eq!(packet.peer_addr, "192.0.2.10:53000".parse().unwrap());
@@ -1147,7 +1147,7 @@ fn af_xdp_proxy_frame_classifies_tcp_and_preserves_ip_packet() {
     else {
         panic!("expected TCP proxy frame");
     };
-    assert_eq!(route.interface, "eth1");
+    assert_eq!(route.interface.as_ref(), "eth1");
     assert_eq!(route.queue, 7);
     assert_eq!(route.link.vlan_tag_count, 1);
     assert_eq!(flow.peer_addr, "192.0.2.10:53000".parse().unwrap());
@@ -1197,7 +1197,7 @@ fn af_xdp_proxy_frame_classifies_ipv6_tcp_with_destination_options() {
     else {
         panic!("expected TCP proxy frame");
     };
-    assert_eq!(route.interface, "eth0");
+    assert_eq!(route.interface.as_ref(), "eth0");
     assert_eq!(route.queue, 2);
     assert_eq!(flow.peer_addr, "[2001:db8::1]:53000".parse().unwrap());
     assert_eq!(flow.local_addr, "[2001:db8::2]:443".parse().unwrap());
@@ -1415,7 +1415,11 @@ fn af_xdp_tcp_reactor_resolves_egress_route_before_reaping_session() {
     let reply_packet = ipv4_tcp_reply_ip_packet();
     reactor.close_session_and_push_routeless_egress_for_test(flow, reply_packet.clone());
 
-    let egress = reactor.poll();
+    // EN-17: reaping is cadence-gated, so the timed poll advances past the
+    // sweep interval — the routeless egress frame is still resolved against
+    // the session's route *before* the reaper removes it in the same pass.
+    let now = smoltcp::time::Instant::from_millis(crate::utils::time::now_timestamp_millis() + 500);
+    let egress = reactor.poll_at_for_test(now);
 
     assert!(egress
         .iter()
@@ -1630,7 +1634,7 @@ fn af_xdp_udp_route_cache_expires_and_evicts_oldest_without_clearing_all() {
             (local, peer),
             af_xdp::AfXdpUdpRouteEntry {
                 route: af_xdp::AfXdpRouteMeta {
-                    interface: "eth0".to_string(),
+                    interface: "eth0".into(),
                     queue: u32::from(idx),
                     link: test_link_meta(false),
                 },
@@ -1879,6 +1883,161 @@ async fn af_xdp_tcp_stream_reports_broken_pipe_when_reactor_side_closes() {
 
     let err = stream.write_all(b"boom").await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_hot_set_dedups_and_drains() {
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+
+    assert_eq!(
+        reactor.ingest(route.clone(), flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    assert_eq!(reactor.hot_session_count(), 1);
+
+    // A second packet for the same flow must not enqueue a duplicate hot
+    // entry — the session's `hot` flag dedups scheduling.
+    let data_frame = ipv4_tcp_frame(false, b"x");
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route: data_route,
+        flow: data_flow,
+        ip_packet: data_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &data_frame).expect("valid TCP frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert_eq!(data_flow, flow);
+    assert_eq!(
+        reactor.ingest(data_route, data_flow, data_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    assert_eq!(reactor.hot_session_count(), 1);
+
+    // After a poll the hot entry is consumed; an idle auto-started session
+    // with no pending work goes cold.
+    reactor.poll();
+    assert_eq!(reactor.hot_session_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[tokio::test]
+async fn af_xdp_tcp_stream_write_and_shutdown_signal_reactor_wake() {
+    use tokio::io::AsyncWriteExt;
+
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    assert_eq!(
+        reactor.ingest(route, flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    reactor.poll();
+    assert_eq!(reactor.pending_wake_count(), 0);
+
+    let af_xdp::AfXdpTcpStreamParts {
+        mut stream,
+        mut egress_rx,
+        ..
+    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(4, flow, reactor.wake_tx.clone());
+
+    stream.write_all(b"hello").await.unwrap();
+    assert_eq!(reactor.pending_wake_count(), 1);
+    stream.shutdown().await.unwrap();
+    assert_eq!(reactor.pending_wake_count(), 2);
+    assert_eq!(
+        egress_rx.recv().await.unwrap(),
+        bytes::Bytes::from_static(b"hello")
+    );
+
+    // The next poll drains the wake queue and marks the session hot.
+    reactor.poll();
+    assert_eq!(reactor.pending_wake_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_ingress_queue_overflow_is_explicit_refusal() {
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    assert_eq!(
+        reactor.ingest(route.clone(), flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+
+    let data_frame = ipv4_tcp_frame(false, b"x");
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        ip_packet: data_packet,
+        ..
+    } = af_xdp::parse_proxy_frame("eth0", 0, &data_frame).expect("valid TCP frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    // Fill the bounded queue: 1 SYN + (MAX - 1) data frames = MAX queued.
+    for _ in 1..af_xdp::AF_XDP_TCP_INGRESS_QUEUE_MAX {
+        assert_eq!(
+            reactor.ingest(route.clone(), flow, data_packet.clone()),
+            af_xdp::AfXdpTcpIngestStatus::Accepted
+        );
+    }
+    // The next packet hits the explicit bound — refused, counted, not grown.
+    assert_eq!(
+        reactor.ingest(route, flow, data_packet),
+        af_xdp::AfXdpTcpIngestStatus::IngressQueueFull
+    );
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_unstarted_sessions_stay_hot_until_swept() {
+    // Without proxy managers a session can never start: it must stay in the
+    // hot set (re-pumped each round) until the cadence-gated reaper collects
+    // it — never stranded by a missed signal.
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ..
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    assert!(reactor.ensure_session(route, flow, af_xdp::AfXdpTcpProxyClass::TcpPlain));
+    assert_eq!(reactor.hot_session_count(), 0);
+
+    // A wake signal (the real proxy→reactor path) marks the session hot; the
+    // poll drains it and the unstarted session re-marks itself.
+    reactor.wake_tx.send(flow).unwrap();
+    assert_eq!(reactor.pending_wake_count(), 1);
+    reactor.poll();
+    assert_eq!(reactor.pending_wake_count(), 0);
+    assert_eq!(reactor.session_count(), 1);
+    assert_eq!(reactor.hot_session_count(), 1);
 }
 
 #[test]

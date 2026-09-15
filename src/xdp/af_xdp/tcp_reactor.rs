@@ -3,6 +3,9 @@ use super::*;
 pub struct AfXdpTcpStream {
     incoming_rx: mpsc::Receiver<Bytes>,
     outgoing_tx: Option<mpsc::Sender<Bytes>>,
+    /// EN-17: after queueing egress bytes the stream signals the reactor so
+    /// the session is pumped without a full-table scan.
+    wake: Option<(AfXdpTcpFlowKey, mpsc::UnboundedSender<AfXdpTcpFlowKey>)>,
     read_buf: Bytes,
     write_permit: Option<TcpWritePermitFuture>,
 }
@@ -133,6 +136,9 @@ pub(crate) struct AfXdpTcpSession {
     pub(crate) proxy_started: bool,
     pub(crate) closing: bool,
     pub(crate) egress_closed: bool,
+    /// EN-17: queued in `hot_sessions` — dedup flag so each flow key is in
+    /// the wake queue at most once.
+    pub(crate) hot: bool,
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -176,6 +182,9 @@ pub(crate) enum AfXdpTcpIngestStatus {
     IgnoredUnknownFlow,
     NoHandler,
     RefusedAtCapacity,
+    /// EN-17: the per-reactor unprocessed-ingress queue is full — an
+    /// explicit bounded-capacity refusal, counted, never silent growth.
+    IngressQueueFull,
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -205,7 +214,8 @@ impl AfXdpTcpAdmissionFailureTracker {
                 false
             }
             AfXdpTcpIngestStatus::IgnoredUnknownFlow => false,
-            AfXdpTcpIngestStatus::RefusedAtCapacity => {
+            AfXdpTcpIngestStatus::RefusedAtCapacity
+            | AfXdpTcpIngestStatus::IngressQueueFull => {
                 self.consecutive_refusals = self.consecutive_refusals.saturating_add(1);
                 self.consecutive_refusals >= self.max_consecutive_refusals
             }
@@ -360,9 +370,18 @@ pub(crate) struct AfXdpTcpReactor {
     sockets: SocketSet<'static>,
     device: SmoltcpAfXdpDevice,
     sessions: HashMap<AfXdpTcpFlowKey, AfXdpTcpSession>,
+    /// EN-17: sessions with observed work (ingress packet or egress wake).
+    /// Entries are dedup'd by `AfXdpTcpSession.hot`; stale keys are skipped.
+    hot_sessions: std::collections::VecDeque<AfXdpTcpFlowKey>,
+    /// EN-17: proxy tasks signal egress writes here; drained per poll round.
+    pub(crate) wake_tx: mpsc::UnboundedSender<AfXdpTcpFlowKey>,
+    wake_rx: mpsc::UnboundedReceiver<AfXdpTcpFlowKey>,
+    /// EN-17: last amortized full-table sweep (progress backstop + reap).
+    last_sweep: SmoltcpInstant,
+    /// EN-17: last reaping pass — cadence-gated, independent of `last_sweep`.
+    last_retain: SmoltcpInstant,
     session_limit: usize,
     tx_scratch: Vec<u8>,
-    rx_scratch: Vec<u8>,
     tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
     http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
     cached_pressure_level: crate::l4_defense::L4PressureLevel,
@@ -408,14 +427,19 @@ impl AfXdpTcpReactor {
         let mut iface =
             SmoltcpInterface::new(config, &mut device, SmoltcpInstant::from_millis(0));
         iface.set_any_ip(true);
+        let (wake_tx, wake_rx) = mpsc::unbounded_channel();
         Self {
             iface,
             sockets: SocketSet::new(Vec::new()),
             device,
             sessions: HashMap::new(),
+            hot_sessions: std::collections::VecDeque::new(),
+            wake_tx,
+            wake_rx,
+            last_sweep: SmoltcpInstant::from_millis(0),
+            last_retain: SmoltcpInstant::from_millis(0),
             session_limit: session_limit.max(1),
             tx_scratch: Vec::with_capacity(2048),
-            rx_scratch: vec![0u8; AF_XDP_TCP_RECV_SCRATCH_BYTES],
             tcp_manager,
             http_manager,
             cached_pressure_level: crate::l4_defense::L4PressureLevel::Normal,
@@ -551,7 +575,9 @@ impl AfXdpTcpReactor {
                         } else {
                             #[cfg(target_os = "linux")]
                             AF_XDP_TCP_DIAG_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-                            self.device.push_ingress(route, flow, ip_packet);
+                            if !self.enqueue_ingress(route, flow, ip_packet) {
+                                return AfXdpTcpIngestStatus::IngressQueueFull;
+                            }
                             AfXdpTcpIngestStatus::Accepted
                         };
                     }
@@ -595,8 +621,40 @@ impl AfXdpTcpReactor {
         }
         #[cfg(target_os = "linux")]
         AF_XDP_TCP_DIAG_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-        self.device.push_ingress(route, flow, ip_packet);
+        if !self.enqueue_ingress(route, flow, ip_packet) {
+            return AfXdpTcpIngestStatus::IngressQueueFull;
+        }
         AfXdpTcpIngestStatus::Accepted
+    }
+
+    /// EN-17: queue a packet for the bounded smoltcp ingress loop and mark
+    /// its session hot. Returns false (explicit refusal, counted) when the
+    /// per-reactor ingress queue is full — memory stays bounded under an
+    /// RX flood; TCP retransmit is the recovery path.
+    fn enqueue_ingress(
+        &mut self,
+        route: AfXdpRouteMeta,
+        flow: AfXdpTcpFlowKey,
+        ip_packet: Bytes,
+    ) -> bool {
+        if self.device.ingress.len() >= AF_XDP_TCP_INGRESS_QUEUE_MAX {
+            #[cfg(target_os = "linux")]
+            AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.device.push_ingress(route, flow, ip_packet);
+        self.mark_hot(flow);
+        true
+    }
+
+    /// EN-17: queue `flow` for pumping this round (dedup via `hot` flag).
+    fn mark_hot(&mut self, flow: AfXdpTcpFlowKey) {
+        if let Some(session) = self.sessions.get_mut(&flow)
+            && !session.hot
+        {
+            session.hot = true;
+            self.hot_sessions.push_back(flow);
+        }
     }
 
     pub(crate) fn poll(&mut self) -> Vec<(AfXdpRouteMeta, Vec<u8>)> {
@@ -613,7 +671,10 @@ impl AfXdpTcpReactor {
     }
 
     pub(crate) fn poll_at(&mut self, now: SmoltcpInstant) -> Vec<(AfXdpRouteMeta, Vec<u8>)> {
-        loop {
+        // EN-17: bounded ingress processing per round — an RX flood cannot
+        // postpone session pumping, egress TX or timer work indefinitely.
+        // Leftover packets stay in the bounded queue for the next round.
+        for _ in 0..AF_XDP_TCP_INGRESS_BUDGET {
             match self
                 .iface
                 .poll_ingress_single(now, &mut self.device, &mut self.sockets)
@@ -656,6 +717,17 @@ impl AfXdpTcpReactor {
     ) -> Option<Vec<u8>> {
         encode_ip_reply_frame(&route.link, ip_packet, &mut self.tx_scratch)?;
         Some(self.tx_scratch.clone())
+    }
+
+    /// EN-17 test hooks: observe hot-set scheduling state.
+    #[cfg(test)]
+    pub(crate) fn hot_session_count(&self) -> usize {
+        self.hot_sessions.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_wake_count(&self) -> usize {
+        self.wake_rx.len()
     }
 
     #[cfg(test)]
@@ -749,6 +821,7 @@ impl AfXdpTcpReactor {
             },
             closing: false,
             egress_closed: false,
+            hot: false,
         };
         self.sessions.insert(flow, session);
         true
@@ -777,6 +850,7 @@ impl AfXdpTcpReactor {
         tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
         session: &mut AfXdpTcpSession,
+        wake_tx: mpsc::UnboundedSender<AfXdpTcpFlowKey>,
     ) -> bool {
         let peer_addr = session.flow.peer_addr;
         let listen_addr = session.flow.local_addr;
@@ -785,7 +859,11 @@ impl AfXdpTcpReactor {
             stream,
             ingress_tx,
             egress_rx,
-        } = AfXdpTcpStream::default_channel_pair();
+        } = AfXdpTcpStream::channel_pair_with_wake(
+            AF_XDP_TCP_STREAM_CHANNEL_DEPTH,
+            session.flow,
+            wake_tx,
+        );
         match session.proxy_class {
             AfXdpTcpProxyClass::TcpPlain | AfXdpTcpProxyClass::TcpTls => {
                 let Some(tcp_manager) = tcp_manager else {
@@ -851,10 +929,88 @@ impl AfXdpTcpReactor {
         }
     }
 
+    /// EN-17: bounded session scheduling. Each poll round pumps only the
+    /// "hot" set — sessions with an observed work signal (ingress packet
+    /// via `enqueue_ingress`, egress write via the stream wake channel, or
+    /// leftover pending state from the previous round) — capped by
+    /// `AF_XDP_TCP_PUMP_BUDGET`. Every `AF_XDP_TCP_SWEEP_INTERVAL` a full
+    /// sweep runs as backstop so an unsignaled transition still progresses
+    /// within a bounded delay.
     pub(crate) fn pump_sessions(&mut self, now: SmoltcpInstant) {
+        for _ in 0..AF_XDP_TCP_WAKE_DRAIN_BUDGET {
+            match self.wake_rx.try_recv() {
+                Ok(flow) => {
+                    #[cfg(target_os = "linux")]
+                    AF_XDP_TCP_DIAG_WAKE_SIGNALS.fetch_add(1, Ordering::Relaxed);
+                    self.mark_hot(flow);
+                }
+                Err(_) => break,
+            }
+        }
+        if session_idle_for(now, self.last_sweep) >= AF_XDP_TCP_SWEEP_INTERVAL {
+            self.last_sweep = now;
+            let keys: Vec<AfXdpTcpFlowKey> = self.sessions.keys().copied().collect();
+            self.hot_sessions.clear();
+            for flow in keys {
+                if let Some(session) = self.sessions.get_mut(&flow) {
+                    session.hot = false;
+                }
+                self.pump_session(now, flow);
+                if self.session_still_active(flow) {
+                    self.mark_hot(flow);
+                }
+            }
+            return;
+        }
+        let mut budget = AF_XDP_TCP_PUMP_BUDGET;
+        while budget > 0 {
+            let Some(flow) = self.hot_sessions.pop_front() else {
+                break;
+            };
+            let Some(session) = self.sessions.get_mut(&flow) else {
+                continue; // reaped while queued
+            };
+            session.hot = false;
+            budget -= 1;
+            self.pump_session(now, flow);
+            if self.session_still_active(flow) {
+                self.mark_hot(flow);
+            }
+        }
+    }
+
+    /// EN-17: a session keeps its hot slot while it still has observable
+    /// work — undelivered ingress, unflushed egress, an unstarted proxy, a
+    /// close in flight, or more socket receive data.
+    fn session_still_active(&self, flow: AfXdpTcpFlowKey) -> bool {
+        let Some(session) = self.sessions.get(&flow) else {
+            return false;
+        };
+        let socket = self
+            .sockets
+            .get::<SmoltcpTcp::Socket<'static>>(session.socket);
+        // A reapable session is the cadence-gated reaper's job — keeping it
+        // hot would just re-run an already-dead pump every round.
+        if af_xdp_tcp_session_reapable(session.closing, socket.state()) {
+            return false;
+        }
+        if session.closing
+            || !session.proxy_started
+            || !session.pending_ingress.is_empty()
+            || !session.pending_egress.is_empty()
+        {
+            return true;
+        }
+        socket.can_recv()
+    }
+
+    fn pump_session(&mut self, now: SmoltcpInstant, flow: AfXdpTcpFlowKey) {
         let tcp_manager = self.tcp_manager.clone();
         let http_manager = self.http_manager.clone();
-        for session in self.sessions.values_mut() {
+        let Some(session) = self.sessions.get_mut(&flow) else {
+            return;
+        };
+        {
             let socket = self
                 .sockets
                 .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
@@ -865,13 +1021,14 @@ impl AfXdpTcpReactor {
                         tcp_manager.clone(),
                         http_manager.clone(),
                         session,
+                        self.wake_tx.clone(),
                     ) {
                         socket.abort();
                         session.closing = true;
-                        continue;
+                        return;
                     }
                 } else {
-                    continue;
+                    return;
                 }
             }
 
@@ -885,35 +1042,40 @@ impl AfXdpTcpReactor {
                             session.flow.peer_addr,
                             session.pending_ingress.len()
                         );
-                        continue;
+                        return;
                     }
                     IngressDelivery::Closed => {
                         socket.close();
                         session.closing = true;
-                        continue;
+                        return;
                     }
                 }
             }
 
             while socket.can_recv() {
-                match socket.recv_slice(&mut self.rx_scratch) {
-                    Ok(0) => break,
-                    Ok(n) => {
+                // EN-17: single copy — smoltcp's receive buffer is copied
+                // straight into the egress `Bytes`; no scratch round-trip.
+                match socket.recv(|data| {
+                    let n = data.len().min(AF_XDP_TCP_RECV_SCRATCH_BYTES);
+                    (n, Bytes::copy_from_slice(&data[..n]))
+                }) {
+                    Ok(bytes) if bytes.is_empty() => break,
+                    Ok(bytes) => {
+                        let n = bytes.len();
                         session.last_activity = now;
                         #[cfg(target_os = "linux")]
                         AF_XDP_TCP_DIAG_SOCKET_RECV_BYTES
                             .fetch_add(n as u64, Ordering::Relaxed);
-                        let bytes = Bytes::copy_from_slice(&self.rx_scratch[..n]);
                         if let Some(ingress_tx) = session.ingress_tx.as_ref() {
                             match send_or_store_ingress(
                                 ingress_tx,
                                 &mut session.pending_ingress,
-                                bytes.clone(),
+                                bytes,
                             ) {
                                 IngressDelivery::Delivered => {
                                     #[cfg(target_os = "linux")]
                                     AF_XDP_TCP_DIAG_STREAM_INGRESS_BYTES
-                                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                                        .fetch_add(n as u64, Ordering::Relaxed);
                                 }
                                 IngressDelivery::Backpressured => {
                                     tracing::debug!(
@@ -1026,6 +1188,13 @@ impl AfXdpTcpReactor {
         if self.sessions.is_empty() {
             return;
         }
+        // EN-17: reaping is cadence-gated — idle timeouts are seconds-scale
+        // and closing sessions are re-pumped via the hot set meanwhile, so a
+        // per-poll full-table scan buys nothing.
+        if session_idle_for(now, self.last_retain) < AF_XDP_TCP_SWEEP_INTERVAL {
+            return;
+        }
+        self.last_retain = now;
         self.refresh_idle_profile_if_due(now);
         let pressure_level = self.cached_pressure_level;
         let proxy_idle_timeout = self.cached_proxy_idle_timeout;
@@ -1264,6 +1433,7 @@ impl AfXdpTcpStream {
             stream: Self {
                 incoming_rx,
                 outgoing_tx: Some(outgoing_tx),
+                wake: None,
                 read_buf: Bytes::new(),
                 write_permit: None,
             },
@@ -1272,8 +1442,28 @@ impl AfXdpTcpStream {
         }
     }
 
+    /// EN-17: channel pair whose stream wakes the reactor after every
+    /// queued egress write / shutdown so pumping needs no table scan.
+    pub fn channel_pair_with_wake(
+        buffer: usize,
+        flow: AfXdpTcpFlowKey,
+        wake_tx: mpsc::UnboundedSender<AfXdpTcpFlowKey>,
+    ) -> AfXdpTcpStreamParts {
+        let mut parts = Self::channel_pair(buffer);
+        parts.stream.wake = Some((flow, wake_tx));
+        parts
+    }
+
     pub fn default_channel_pair() -> AfXdpTcpStreamParts {
         Self::channel_pair(AF_XDP_TCP_STREAM_CHANNEL_DEPTH)
+    }
+
+    /// Best-effort wake signal — a missed signal only delays the session
+    /// until the reactor's periodic sweep, never loses it.
+    fn signal_wake(&self) {
+        if let Some((flow, tx)) = &self.wake {
+            let _ = tx.send(*flow);
+        }
     }
 }
 
@@ -1347,6 +1537,7 @@ impl AsyncWrite for AfXdpTcpStream {
         };
         let len = buf.len().min(AF_XDP_TCP_STREAM_WRITE_CHUNK);
         permit.send(Bytes::copy_from_slice(&buf[..len]));
+        self.signal_wake();
         Poll::Ready(Ok(len))
     }
 
@@ -1357,6 +1548,7 @@ impl AsyncWrite for AfXdpTcpStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.write_permit = None;
         self.outgoing_tx = None;
+        self.signal_wake();
         Poll::Ready(Ok(()))
     }
 }
