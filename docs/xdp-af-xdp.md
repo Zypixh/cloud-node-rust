@@ -52,10 +52,14 @@ xdp:
   - `zero-copy`：强制 zero-copy；驱动不支持时该队列 socket 创建显式失败（状态可见），不静默降级。
 - `proxy.protocols`：允许进入 AF_XDP proxy 数据面的协议族。
 - `proxy.ports`：显式发布到 eBPF map 的协议和端口。
-- `interfaces[].udpForwards[]` / `interfaces[].tcpForwards[]`：L4 直通转发（XDP_TX NAT）规则，字段 `listen`、`backend`、`nextHopMac`（可空，自动按邻居表解析）、`serverId`、`snat`。
+- `interfaces[].udpForwards[]` / `interfaces[].tcpForwards[]`：L4 直通转发（XDP_TX NAT）规则，字段 `listen`、`backend`、`nextHopMac`（可空，自动按邻居表解析）、`serverId`、`snat`、`challenge`。
   - `snat: false`（默认）：纯 DNAT，保留客户端源 IP。要求网络不过滤源 IP——多数云厂商的 vSwitch 按端口绑定源 IP 做 anti-spoof，会把这种帧丢掉（已实测：帧计数发出但对端不可达）。
   - `snat: true`：源改写为 `(listen IP, 节点分配端口 40000-60999)`，回包经 `XDP_SNAT_REV` 反向绑定还原客户端 tuple。可在 anti-spoof 云上工作；代价是 backend 看到的源是本节点而非真实客户端。端口分配失败会计 `snat_alloc_fail` 并回落用户态路径（不丢包）。
   - SNAT 模式下 backend 拿不到真实客户端 IP；如需保留可叠加 PROXY 协议（未实现）。
+  - `challenge: true`（默认 false，EN-14/ADR-001）：SYNPROXY 式无状态 cookie 挑战。SYN 只换回应答式 SYN-ACK（cookie ISN），不产生任何状态；客户端证明 ACK 通过 keyed-hash 校验后才分配 pending/SNAT/CT 并向 backend 重放 SYN，序号差经 `seq_delta` 常量拼接。
+    - **适用范围**：仅 TCP + `snat: true` + IPv4。UDP、纯 DNAT（无可见后端 SYN-ACK 可拼接）、IPv6 规则配置该标志会被**显式拒绝**（规则加载失败并给出原因），不会静默降级为有界准入。
+    - **TCP 选项 profile（限定）**：挑战 SYN-ACK 与重放 SYN 均只携带 MSS——被挑战连接两端协商不到 window scale / SACK / timestamps / ECN（有意的保守互操作 profile，见 ADR-001 决策 2）。后果：接收窗口上限 64KB（长肥管道吞吐受限）、无 SACK 快速重传增强、无 PAWS。**需要完整选项协商的高吞吐 TCP 服务不应开启 challenge**；该标志面向 SYN 洪泛防护场景，而不是通用转发路径。
+    - 挑战响应受 `budget.challengePps` 聚合限额（默认继承 `newFlowPerSec`）；超额 SYN 记 `challengeRejected` 并丢弃。cookie 密钥为 `XDP_COOKIE_KEY` 双槽（cur/prev）128-bit，校验接受当前与前一时间槽；轮换时上一代密钥签发的 cookie 仍可完成准入，已拼接流不受影响。
 
 ## 模式
 
