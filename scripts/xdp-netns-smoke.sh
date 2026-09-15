@@ -415,10 +415,10 @@ label = sys.argv[1]
 report = json.loads(os.environ["PROXY_RELOAD_SMOKE_OUTPUT"])
 before = report.get("beforeReload") or {}
 after = report.get("afterReload") or {}
-if report.get("bridgePreserved") is not True:
-    raise SystemExit(f"{label}: active bridge was not preserved for unchanged AF_XDP queues")
-if report.get("managerReplaced") is not False:
-    raise SystemExit(f"{label}: unchanged AF_XDP reload should not replace the active manager")
+if report.get("bridgeSupervisorAlive") is not True:
+    raise SystemExit(f"{label}: bridge supervisor exited across the reload handover")
+if report.get("managerReplaced") is not True:
+    raise SystemExit(f"{label}: reload did not replace the XDP manager generation")
 for phase, section in (("before", before), ("after", after)):
     if section.get("proxyReady") is not True:
         raise SystemExit(f"{label}: {phase} reload proxyReady was not true")
@@ -555,7 +555,7 @@ printf '%s\n' "$proxy_doctor_output"
 grep -q "dataplane:     AF_XDP proxy ports supported=5 total=5" <<<"$proxy_doctor_output" \
     || die "proxy doctor did not expose full proxy dataplane support"
 
-run_proxy_reload_smoke "active bridge reload exits old bridge and restores redirect"
+run_proxy_reload_smoke "owner-respecting reload replaces the manager generation while the bridge supervisor re-serves it"
 sleep 5
 run_raw_smoke "default full proxy dataplane" "$HOST_IP" yes
 run_raw_smoke "localIps bypass keeps unlisted destination on socket path" "$HOST_BYPASS_IP" no
