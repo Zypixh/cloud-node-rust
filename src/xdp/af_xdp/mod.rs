@@ -83,9 +83,16 @@ pub(crate) const AF_XDP_TCP_INGRESS_BUDGET: usize = 512;
 /// Overflow is an explicit, counted refusal — never silent memory growth.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_INGRESS_QUEUE_MAX: usize = 4096;
-/// EN-17: egress wake signals drained per round (unbounded channel).
+/// EN-17: dirty-mark entries drained from the shared wake set per round.
+/// The set itself is hard-bounded by the session limit (one entry per live
+/// flow); the budget caps per-round drain work, leftovers stay queued.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_WAKE_DRAIN_BUDGET: usize = 8192;
+/// EN-17: one full-table sweep cycle starts every SWEEP_INTERVAL, but the
+/// cursor advances at most this many entries per poll round — sweeps share
+/// the round's work budget instead of doing an unbounded pass.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_SWEEP_BATCH_BUDGET: usize = 256;
 /// EN-17: amortized full-session sweep cadence — backstop for sessions
 /// whose progress signal (packet or egress wake) was not observed, and
 /// the reap/idle-timeout granularity.

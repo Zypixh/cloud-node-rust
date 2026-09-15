@@ -3,9 +3,9 @@ use super::*;
 pub struct AfXdpTcpStream {
     incoming_rx: mpsc::Receiver<Bytes>,
     outgoing_tx: Option<mpsc::Sender<Bytes>>,
-    /// EN-17: after queueing egress bytes the stream signals the reactor so
-    /// the session is pumped without a full-table scan.
-    wake: Option<(AfXdpTcpFlowKey, mpsc::UnboundedSender<AfXdpTcpFlowKey>)>,
+    /// EN-17: after queueing egress bytes the stream marks its flow dirty in
+    /// the shared wake set so the session is pumped without a table scan.
+    wake: Option<(AfXdpTcpFlowKey, Arc<DashMap<AfXdpTcpFlowKey, ()>>)>,
     read_buf: Bytes,
     write_permit: Option<TcpWritePermitFuture>,
 }
@@ -137,7 +137,7 @@ pub(crate) struct AfXdpTcpSession {
     pub(crate) closing: bool,
     pub(crate) egress_closed: bool,
     /// EN-17: queued in `hot_sessions` — dedup flag so each flow key is in
-    /// the wake queue at most once.
+    /// the hot queue at most once.
     pub(crate) hot: bool,
 }
 
@@ -373,9 +373,15 @@ pub(crate) struct AfXdpTcpReactor {
     /// EN-17: sessions with observed work (ingress packet or egress wake).
     /// Entries are dedup'd by `AfXdpTcpSession.hot`; stale keys are skipped.
     hot_sessions: std::collections::VecDeque<AfXdpTcpFlowKey>,
-    /// EN-17: proxy tasks signal egress writes here; drained per poll round.
-    pub(crate) wake_tx: mpsc::UnboundedSender<AfXdpTcpFlowKey>,
-    wake_rx: mpsc::UnboundedReceiver<AfXdpTcpFlowKey>,
+    /// EN-17: shared dirty set — proxy tasks insert their flow key after
+    /// queueing egress bytes. Hard-bounded by `session_limit` (at most one
+    /// entry per live flow plus in-flight stale keys), insert is lossless
+    /// (no "full" path), and the map key dedups at enqueue time.
+    pub(crate) wake_set: Arc<DashMap<AfXdpTcpFlowKey, ()>>,
+    /// EN-17: incremental sweep cursor — a bounded batch is processed per
+    /// round instead of one unbounded full-table pass.
+    sweep_keys: Vec<AfXdpTcpFlowKey>,
+    sweep_pos: usize,
     /// EN-17: last amortized full-table sweep (progress backstop + reap).
     last_sweep: SmoltcpInstant,
     /// EN-17: last reaping pass — cadence-gated, independent of `last_sweep`.
@@ -427,15 +433,16 @@ impl AfXdpTcpReactor {
         let mut iface =
             SmoltcpInterface::new(config, &mut device, SmoltcpInstant::from_millis(0));
         iface.set_any_ip(true);
-        let (wake_tx, wake_rx) = mpsc::unbounded_channel();
+        let wake_set = Arc::new(DashMap::new());
         Self {
             iface,
             sockets: SocketSet::new(Vec::new()),
             device,
             sessions: HashMap::new(),
             hot_sessions: std::collections::VecDeque::new(),
-            wake_tx,
-            wake_rx,
+            wake_set,
+            sweep_keys: Vec::new(),
+            sweep_pos: 0,
             last_sweep: SmoltcpInstant::from_millis(0),
             last_retain: SmoltcpInstant::from_millis(0),
             session_limit: session_limit.max(1),
@@ -727,7 +734,12 @@ impl AfXdpTcpReactor {
 
     #[cfg(test)]
     pub(crate) fn pending_wake_count(&self) -> usize {
-        self.wake_rx.len()
+        self.wake_set.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_ingress_count(&self) -> usize {
+        self.device.ingress.len()
     }
 
     #[cfg(test)]
@@ -850,7 +862,7 @@ impl AfXdpTcpReactor {
         tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
         session: &mut AfXdpTcpSession,
-        wake_tx: mpsc::UnboundedSender<AfXdpTcpFlowKey>,
+        wake_set: Arc<DashMap<AfXdpTcpFlowKey, ()>>,
     ) -> bool {
         let peer_addr = session.flow.peer_addr;
         let listen_addr = session.flow.local_addr;
@@ -862,7 +874,7 @@ impl AfXdpTcpReactor {
         } = AfXdpTcpStream::channel_pair_with_wake(
             AF_XDP_TCP_STREAM_CHANNEL_DEPTH,
             session.flow,
-            wake_tx,
+            wake_set,
         );
         match session.proxy_class {
             AfXdpTcpProxyClass::TcpPlain | AfXdpTcpProxyClass::TcpTls => {
@@ -937,30 +949,36 @@ impl AfXdpTcpReactor {
     /// sweep runs as backstop so an unsignaled transition still progresses
     /// within a bounded delay.
     pub(crate) fn pump_sessions(&mut self, now: SmoltcpInstant) {
-        for _ in 0..AF_XDP_TCP_WAKE_DRAIN_BUDGET {
-            match self.wake_rx.try_recv() {
-                Ok(flow) => {
-                    #[cfg(target_os = "linux")]
-                    AF_XDP_TCP_DIAG_WAKE_SIGNALS.fetch_add(1, Ordering::Relaxed);
-                    self.mark_hot(flow);
+        // Drain at most WAKE_DRAIN_BUDGET dirty marks per round; entries not
+        // drained stay in the set (lossless) and are retried next round.
+        if !self.wake_set.is_empty() {
+            let mut drained = Vec::new();
+            self.wake_set.retain(|flow, _| {
+                if drained.len() < AF_XDP_TCP_WAKE_DRAIN_BUDGET {
+                    drained.push(*flow);
+                    false
+                } else {
+                    true
                 }
-                Err(_) => break,
+            });
+            #[cfg(target_os = "linux")]
+            AF_XDP_TCP_DIAG_WAKE_SIGNALS.fetch_add(drained.len() as u64, Ordering::Relaxed);
+            for flow in drained {
+                self.mark_hot(flow);
             }
         }
-        if session_idle_for(now, self.last_sweep) >= AF_XDP_TCP_SWEEP_INTERVAL {
-            self.last_sweep = now;
-            let keys: Vec<AfXdpTcpFlowKey> = self.sessions.keys().copied().collect();
-            self.hot_sessions.clear();
-            for flow in keys {
-                if let Some(session) = self.sessions.get_mut(&flow) {
-                    session.hot = false;
-                }
-                self.pump_session(now, flow);
-                if self.session_still_active(flow) {
-                    self.mark_hot(flow);
-                }
-            }
-            return;
+        // A sweep cycle starts when the interval elapsed: the key set is
+        // collected once, then the cursor advances a bounded batch per round
+        // — a large table never monopolizes a single poll round. Sessions
+        // already queued in the hot set are skipped (their pump comes via
+        // the queue); sessions created mid-cycle are hot by construction and
+        // join the next cycle.
+        if self.sweep_pos >= self.sweep_keys.len()
+            && session_idle_for(now, self.last_sweep) >= AF_XDP_TCP_SWEEP_INTERVAL
+        {
+            self.sweep_keys.clear();
+            self.sweep_keys.extend(self.sessions.keys().copied());
+            self.sweep_pos = 0;
         }
         let mut budget = AF_XDP_TCP_PUMP_BUDGET;
         while budget > 0 {
@@ -976,6 +994,25 @@ impl AfXdpTcpReactor {
             if self.session_still_active(flow) {
                 self.mark_hot(flow);
             }
+        }
+        // Batched sweep progress — each round advances the cursor by at most
+        // SWEEP_BATCH entries regardless of table size.
+        let mut swept = 0usize;
+        while self.sweep_pos < self.sweep_keys.len() && swept < AF_XDP_TCP_SWEEP_BATCH_BUDGET {
+            let flow = self.sweep_keys[self.sweep_pos];
+            self.sweep_pos += 1;
+            swept += 1;
+            if self.sessions.get(&flow).is_some_and(|s| s.hot) {
+                continue;
+            }
+            self.pump_session(now, flow);
+            if self.session_still_active(flow) {
+                self.mark_hot(flow);
+            }
+        }
+        if self.sweep_pos >= self.sweep_keys.len() {
+            self.sweep_keys.clear();
+            self.last_sweep = now;
         }
     }
 
@@ -1021,7 +1058,7 @@ impl AfXdpTcpReactor {
                         tcp_manager.clone(),
                         http_manager.clone(),
                         session,
-                        self.wake_tx.clone(),
+                        self.wake_set.clone(),
                     ) {
                         socket.abort();
                         session.closing = true;
@@ -1447,10 +1484,10 @@ impl AfXdpTcpStream {
     pub fn channel_pair_with_wake(
         buffer: usize,
         flow: AfXdpTcpFlowKey,
-        wake_tx: mpsc::UnboundedSender<AfXdpTcpFlowKey>,
+        wake_set: Arc<DashMap<AfXdpTcpFlowKey, ()>>,
     ) -> AfXdpTcpStreamParts {
         let mut parts = Self::channel_pair(buffer);
-        parts.stream.wake = Some((flow, wake_tx));
+        parts.stream.wake = Some((flow, wake_set));
         parts
     }
 
@@ -1458,11 +1495,12 @@ impl AfXdpTcpStream {
         Self::channel_pair(AF_XDP_TCP_STREAM_CHANNEL_DEPTH)
     }
 
-    /// Best-effort wake signal — a missed signal only delays the session
-    /// until the reactor's periodic sweep, never loses it.
+    /// Mark this flow dirty for the reactor. Insert is lossless and dedup'd
+    /// by the map — a second mark while the entry is still pending costs
+    /// nothing and nothing can be dropped.
     fn signal_wake(&self) {
-        if let Some((flow, tx)) = &self.wake {
-            let _ = tx.send(*flow);
+        if let Some((flow, set)) = &self.wake {
+            set.insert(*flow, ());
         }
     }
 }

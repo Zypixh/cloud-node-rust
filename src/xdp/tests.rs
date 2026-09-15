@@ -1955,12 +1955,14 @@ async fn af_xdp_tcp_stream_write_and_shutdown_signal_reactor_wake() {
         mut stream,
         mut egress_rx,
         ..
-    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(4, flow, reactor.wake_tx.clone());
+    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(4, flow, reactor.wake_set.clone());
 
     stream.write_all(b"hello").await.unwrap();
     assert_eq!(reactor.pending_wake_count(), 1);
+    // Dedup happens at enqueue: a second mark for the same flow does not
+    // grow the wake set — the entry is already pending.
     stream.shutdown().await.unwrap();
-    assert_eq!(reactor.pending_wake_count(), 2);
+    assert_eq!(reactor.pending_wake_count(), 1);
     assert_eq!(
         egress_rx.recv().await.unwrap(),
         bytes::Bytes::from_static(b"hello")
@@ -2032,12 +2034,153 @@ fn af_xdp_tcp_reactor_unstarted_sessions_stay_hot_until_swept() {
 
     // A wake signal (the real proxy→reactor path) marks the session hot; the
     // poll drains it and the unstarted session re-marks itself.
-    reactor.wake_tx.send(flow).unwrap();
+    reactor.wake_set.insert(flow, ());
     assert_eq!(reactor.pending_wake_count(), 1);
     reactor.poll();
     assert_eq!(reactor.pending_wake_count(), 0);
     assert_eq!(reactor.session_count(), 1);
     assert_eq!(reactor.hot_session_count(), 1);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_sweep_is_batched_not_unbounded() {
+    // More sessions than one sweep batch: a sweep cycle must advance the
+    // cursor by at most AF_XDP_TCP_SWEEP_BATCH_BUDGET entries per round.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 4096);
+    let t0 = smoltcp::time::Instant::from_millis(crate::utils::time::now_timestamp_millis());
+    let session_total = af_xdp::AF_XDP_TCP_SWEEP_BATCH_BUDGET + 44;
+    for idx in 0..session_total {
+        let frame = ipv4_tcp_syn_frame_with_source_port(false, 53000 + idx as u16);
+        let af_xdp::AfXdpProxyFrame::Tcp { route, flow, .. } =
+            af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+        else {
+            panic!("expected TCP proxy frame");
+        };
+        assert!(reactor.ensure_session_at(route, flow, af_xdp::AfXdpTcpProxyClass::TcpPlain, t0));
+    }
+    assert_eq!(reactor.hot_session_count(), 0);
+
+    // First round past the interval: exactly one batch is pumped. Unstarted
+    // sessions stay active, so each swept session lands in the hot set.
+    let t1 = smoltcp::time::Instant::from_millis(
+        t0.total_millis() + af_xdp::AF_XDP_TCP_SWEEP_INTERVAL.as_millis() as i64 + 1,
+    );
+    reactor.poll_at_for_test(t1);
+    assert_eq!(
+        reactor.hot_session_count(),
+        af_xdp::AF_XDP_TCP_SWEEP_BATCH_BUDGET
+    );
+
+    // Second round finishes the cycle: hot sessions re-pump via the queue
+    // (budget 512 >= batch) and the remaining entries are swept.
+    reactor.poll_at_for_test(smoltcp::time::Instant::from_millis(t1.total_millis() + 1));
+    assert_eq!(reactor.hot_session_count(), session_total);
+    assert_eq!(reactor.session_count(), session_total);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_ingress_budget_leaves_backlog_bounded() {
+    // RX flood: more queued packets than one round's ingress budget — the
+    // poll must process exactly the budget and leave the rest for next
+    // round (bounded per-round work under flood).
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    assert_eq!(
+        reactor.ingest(route.clone(), flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+
+    let data_frame = ipv4_tcp_frame(false, b"x");
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        ip_packet: data_packet,
+        ..
+    } = af_xdp::parse_proxy_frame("eth0", 0, &data_frame).expect("valid TCP frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let queued = af_xdp::AF_XDP_TCP_INGRESS_BUDGET + 96;
+    for _ in 0..queued {
+        assert_eq!(
+            reactor.ingest(route.clone(), flow, data_packet.clone()),
+            af_xdp::AfXdpTcpIngestStatus::Accepted
+        );
+    }
+    assert_eq!(reactor.queued_ingress_count(), queued + 1);
+
+    reactor.poll();
+    assert_eq!(
+        reactor.queued_ingress_count(),
+        queued + 1 - af_xdp::AF_XDP_TCP_INGRESS_BUDGET
+    );
+    // Second round drains the remainder — nothing is dropped or lost.
+    reactor.poll();
+    assert_eq!(reactor.queued_ingress_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[tokio::test]
+async fn af_xdp_tcp_wake_set_stays_bounded_under_write_storm() {
+    use tokio::io::AsyncWriteExt;
+
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    assert_eq!(
+        reactor.ingest(route, flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    reactor.poll();
+
+    let af_xdp::AfXdpTcpStreamParts {
+        mut stream,
+        mut egress_rx,
+        ..
+    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(64, flow, reactor.wake_set.clone());
+
+    // A write storm across many chunks must never grow the wake set past
+    // one entry per flow — marks dedup at enqueue.
+    for _ in 0..32 {
+        stream.write_all(b"chunk").await.unwrap();
+    }
+    assert_eq!(reactor.pending_wake_count(), 1);
+    while egress_rx.try_recv().is_ok() {}
+    reactor.poll();
+    assert_eq!(reactor.pending_wake_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_stale_wake_mark_is_a_noop() {
+    // A wake mark for a flow with no session (e.g. worker exit, reaped
+    // tuple) must drain without creating work or sessions.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let flow = af_xdp::AfXdpTcpFlowKey {
+        local_addr: "198.51.100.5:443".parse().unwrap(),
+        peer_addr: "192.0.2.10:53000".parse().unwrap(),
+    };
+    reactor.wake_set.insert(flow, ());
+    assert_eq!(reactor.pending_wake_count(), 1);
+    reactor.poll();
+    assert_eq!(reactor.pending_wake_count(), 0);
+    assert_eq!(reactor.session_count(), 0);
+    assert_eq!(reactor.hot_session_count(), 0);
 }
 
 #[test]

@@ -26,15 +26,20 @@ EN-17 是 L 规模条目。本切片交付并验证了 **AF_XDP TCP reactor 的�
 
 - `sessions` 仍持有全部会话，但每轮只泵送"热集"：
   - 新 ingress 包 → `mark_hot(flow)`（`session.hot` 标志去重，队列内至多一条）；
-  - proxy 任务写 egress channel → `mpsc::UnboundedSender` wake 信号（携带 flow key），
-    每轮至多 drain `AF_XDP_TCP_WAKE_DRAIN_BUDGET = 8192` 条 → `mark_hot`；
+  - proxy 任务写 egress channel → 共享 `wake_set: Arc<DashMap<FlowKey, ()>>`
+    脏标记——**硬有界**（≤ session_limit 活流 + drain 中瞬态 stale key），
+    入队即去重（map key 语义），`insert` 无"满"路径故**无丢信号分支**；
+    每轮至多 drain `AF_XDP_TCP_WAKE_DRAIN_BUDGET = 8192` 条 → `mark_hot`，
+    未 drain 条目留在集内下轮继续（不丢）。
   - 热集每轮泵送上限 `AF_XDP_TCP_PUMP_BUDGET = 512`；泵完仍有工作
     （`session_still_active`：未启动 proxy / pending_ingress / pending_egress /
     closing / socket.can_recv）的会话重入热集，下一轮继续。
-- **正确性兜底**：每 `AF_XDP_TCP_SWEEP_INTERVAL = 250ms` 做一次全表 sweep——
-  漏掉的 wake 信号只延迟到下一次 sweep，永不丢失。sweep 先清空热队列再逐会话
-  泵送+重标，避免陈旧 key 与 sweep 内新生 key 混淆。
-- **回收**：`retain_live_sessions` 改为按同一 250ms cadence 门控
+- **正确性兜底（分批）**：每 `AF_XDP_TCP_SWEEP_INTERVAL = 250ms` 起一个 sweep
+  周期，周期内收集 key 集、游标 `sweep_pos` 每轮推进至多
+  `AF_XDP_TCP_SWEEP_BATCH_BUDGET = 256` 条——大表不会单轮独占；已在热队列
+  的会话跳过（其泵送经队列），周期中新建的会话天然带热标记。
+  漏掉的信号只延迟到下一次 sweep，永不丢失。
+- **回收**：`retain_live_sessions` 按同一 250ms cadence 门控
   （`last_retain` 独立时间戳）；可回收会话（closing+Closed/TimeWait）先被
   `session_still_active` 排除出热集，等门控 reaper 摘除——不再每轮全表扫。
 
@@ -63,7 +68,7 @@ EN-17 是 L 规模条目。本切片交付并验证了 **AF_XDP TCP reactor 的�
 新增计数（`af_xdp_tcp_diagnostics_json` 透出）：
 
 - `ingressQueueDropped`——ingress 队列满拒绝的包数；
-- `wakeSignals`——drain 到的 proxy→reactor wake 信号数。
+- `wakeSignals`——drain 到的 proxy→reactor 脏标记数。
 
 既有 `accepted`/`refusedAtCapacity`/`ignoredUnknown`/`preProxyTimeout`/
 `proxyStarted`/`socketRecvBytes`/`streamIngressBytes`/`streamEgressBytes`/
@@ -74,8 +79,8 @@ EN-17 是 L 规模条目。本切片交付并验证了 **AF_XDP TCP reactor 的�
 | 项 | 结果 |
 |---|---|
 | `cargo check --lib` / `--all-targets` | 通过（仅既有 warning） |
-| `cargo test --lib af_xdp`（定向） | 46 passed / 0 failed |
-| `cargo test --lib`（全量） | **693 passed / 0 failed** |
+| `cargo test --lib af_xdp`（定向） | 50 passed / 0 failed |
+| `cargo test --lib`（全量） | **697 passed / 0 failed** |
 | eBPF 对象 | 未重建需求；.110/.120 均为 `3b8549a9`（源码哈希经 manifest 校验一致） |
 
 新增测试：
@@ -83,13 +88,21 @@ EN-17 是 L 规模条目。本切片交付并验证了 **AF_XDP TCP reactor 的�
 - `af_xdp_tcp_reactor_hot_set_dedups_and_drains`——SYN 建会话入热集；同流第二包
   不产生重复热条目；泵后无工作会话冷却（hot=0）。
 - `af_xdp_tcp_stream_write_and_shutdown_signal_reactor_wake`——真实
-  `channel_pair_with_wake` 路径：`write_all` 与 `shutdown` 各产生一条 wake；
-  poll drain 后归零。
+  `channel_pair_with_wake` 路径：`write_all`/`shutdown` 各标记脏位；
+  同流去重后 wake_set 恒为 1；poll drain 后归零。
 - `af_xdp_tcp_reactor_ingress_queue_overflow_is_explicit_refusal`——填满
   4096 项后下一包返回 `IngressQueueFull`（显式拒绝，非增长）。
 - `af_xdp_tcp_reactor_unstarted_sessions_stay_hot_until_swept`——无 manager 的
   会话经真实 wake 信号入热集；泵后因 `!proxy_started` 保持热（不被信号遗漏
   永久滞留）。
+- `af_xdp_tcp_reactor_sweep_is_batched_not_unbounded`——会话数 > 单批预算时
+  sweep 游标每轮恰推进一个批次，两完成周期。
+- `af_xdp_tcp_reactor_stale_wake_mark_is_a_noop`——无会话流的脏标记 drain 后
+  不产生会话/工作（tuple 重用、worker 退出安全）。
+- `af_xdp_tcp_reactor_ingress_budget_leaves_backlog_bounded`——RX 洪泛下每轮
+  恰好处理 ingress 预算额，余量下轮继续，不丢不越界。
+- `af_xdp_tcp_wake_set_stays_bounded_under_write_storm`——32 次分块写风暴下
+  wake set 恒为 1（入队去重），drain 后归零。
 
 更新测试（语义随 cadence 门控变化，断言收紧而非放宽）：
 
@@ -102,11 +115,10 @@ EN-17 是 L 规模条目。本切片交付并验证了 **AF_XDP TCP reactor 的�
 
 ## 遗留/限制（如实记录）
 
-- wake 通道为 `UnboundedSender`：信号本身去重（hot 标志）+ 每轮 drain 预算 8192；
-  生产速率由 egress channel 深度（每会话有界）天然限速，实践中队列有界——
-  但若 proxy 端出现病态写风暴，wake 队列理论无界。列为设计限制，后续可换
-  bounded channel + `try_send`（miss 由 sweep 兜底，语义不变）。
-- 无信号的最坏推进延迟 = 250ms sweep 间隔（秒级 idle 超时尺度下可接受）。
+- `poll_egress` 仍由 smoltcp 内部逐 socket 推进（vendored 协议栈不改）——
+  每轮 O(session_limit) 但每 socket 工作量小；为既有架构内界，列为记录项。
+- 无信号的最坏推进延迟 = 250ms sweep 间隔（大表下周期本身随批次摊销；
+  秒级 idle 超时尺度下可接受）。
 - 每包 UMEM→`Vec` 拷贝（`frame.to_vec()`）保留：async demux 需要 owned 帧，
   无法在跨 `.await` 处持有 UMEM 引用——属架构内固有拷贝，非本切片范围。
 - 未做真 NIC/多队列压测：2c2g VPS 无 AF_XDP 硬件路径，T05/T06/T07 的高会话/
