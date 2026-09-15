@@ -303,6 +303,10 @@ pub struct XdpCounters {
     /// EN-14: packets rejected by cookie validation — bad/expired cookie
     /// or a non-SYN/ACK packet on a challenged rule without state.
     pub challenge_rejected: u64,
+    /// EN-14: challenge/splice worker faults — helper or forge failures
+    /// after a packet entered the slot-11 worker. Dropped, never passed:
+    /// a half-forged frame must not reach the kernel stack.
+    pub challenge_worker_err: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -725,7 +729,9 @@ pub struct NatScratch {
 /// and the combined stack stays under the 512B verifier limit;
 /// XdpSnatRevKey._pad 3->4B (explicit tail byte for strict verifier
 /// stack-init checks; layout stays 24B).
-pub const XDP_ABI_VERSION: u32 = 15;
+/// v16: EN-14 review hardening — XdpCounters +challenge_worker_err
+/// (288->296B); XdpPendingCap.flags gains XDP_PENDING_CAP_FAIL_FORGE.
+pub const XDP_ABI_VERSION: u32 = 16;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -768,6 +774,9 @@ pub const XDP_DECISION_TCP_FLAG: u8 = 9;
 /// EN-11: flow tuple already bound to a different listen (VIP) tuple;
 /// rejected instead of silently rebinding the existing conntrack entry.
 pub const XDP_DECISION_NAT_CONFLICT: u8 = 10;
+/// EN-14: internal dataplane fault (forge/helper failure) — allocations
+/// rolled back and the frame dropped; distinct from policy rejections.
+pub const XDP_DECISION_INTERNAL_ERR: u8 = 11;
 
 /// Parse classification (architecture §4.3): replaces the single
 /// Err→PASS bucket. CONTROL covers PMTU/ICMPv6-ND and other exempt traffic.
@@ -951,6 +960,10 @@ pub const XDP_PENDING_CAP_FAIL_PENDING_INSERT: u64 = 1 << 1;
 /// `XdpPendingCap.flags` bit: SNAT port allocation acts exhausted so the
 /// explicit userspace fallback is exercised on demand.
 pub const XDP_PENDING_CAP_FAIL_SNAT_ALLOC: u64 = 1 << 2;
+/// `XdpPendingCap.flags` bit: packet forging acts as if the write helpers
+/// failed — exercises worker error rollback (pending/SNAT state must not
+/// leak, verdict must be DROP not PASS).
+pub const XDP_PENDING_CAP_FAIL_FORGE: u64 = 1 << 3;
 
 // Compile-time ABI assertions. If any of these fire, a shared layout changed:
 // bump XDP_ABI_VERSION and update the map spec table so stale pinned maps are
@@ -963,7 +976,7 @@ const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 72);
 const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 96);
 const _: () = assert!(core::mem::size_of::<XdpSvcBucket>() == 16);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 24);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 288);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 296);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 72);
 const _: () = assert!(core::mem::size_of::<XdpUdpFwdRule>() == 48);
