@@ -60,10 +60,10 @@ commit 与 patch 摘要指被测代码状态；未提交代码也可以验证，
 | EN-09 | 准入状态机与 map 生命周期 | EN-06、EN-07 | L | VERIFIED |
 | EN-10 | 连接所有者反馈与存量流 | EN-09、EN-12 | L | VERIFIED（证据 docs/edge-node-evidence/EN-10；veth/netns 验证，真实 NIC profile 待续） |
 | EN-11 | NAT 正反向、SNAT 和计费 | EN-07、EN-09、EN-16 | L | VERIFIED（veth 探针 4 阶段全过；CT-full 回滚路径未实测，见 EN-11 报告限制） |
-| EN-12 | AF_XDP 队列正确性与预算 | EN-04、EN-06、EN-07、EN-16 | L | DONE（证据 docs/edge-node-evidence/EN-12；zero-copy 成功路径待真实 NIC 验证） |
-| EN-13 | TCP 无状态验证可行性与 ADR | EN-09、EN-12 | L | VERIFIED（ADR-001 + 端到端 SYN→cookie→ACK→数据抓包证明，见 EN-14 证据） |
-| EN-14 | 获选 TCP 强验证实现 | EN-10、EN-11、EN-13 | L | VERIFIED（IPv4 veth/netns kernel 6.1 verifier 通过 + 探针 8 阶段全过，证据 docs/edge-node-evidence/EN-14；IPv6 挑战、密钥轮换 API、第三 ACK 载荷转发见报告限制） |
-| EN-15 | QUIC Retry、迁移与透传边界 | EN-09、EN-12、EN-16 | L | TODO |
+| EN-12 | AF_XDP 队列正确性与预算 | EN-04、EN-06、EN-07、EN-16 | L | IMPLEMENTED（保留 docs/edge-node-evidence/EN-12 的已测切片；zero-copy 成功路径待真实 NIC 验证，原 DONE 规范化） |
+| EN-13 | TCP 无状态验证可行性与 ADR | EN-09、EN-12 | L | IN_PROGRESS（ADR-001 与 raw 帧实验已有；真实内核 TCP 端到端及各路径合同待闭合，见 2026-09-15 静态审阅） |
+| EN-14 | 获选 TCP 强验证实现 | EN-10、EN-11、EN-13 | L | IMPLEMENTED（保留 kernel 6.1 verifier/veth 探针记录；零 key 校验、造包 checksum、错误 PASS 及验收盲区待修，见 devin-next-round-2026-09-15.md） |
+| EN-15 | QUIC Retry、迁移与透传边界 | EN-09、EN-12、EN-16 | L | IMPLEMENTED（e3fb282；库级 Retry/NEW_TOKEN 回归已有，生产入口聚合响应预算、静默拒绝与迁移验收待补） |
 | EN-16 | 扩展统一资源治理 | EN-01、EN-02 | L | IN_PROGRESS（已验证切片：kernel-BPF map 账本+attach 门+压力迟滞+listener 配额池+disk 账本，证据 docs/edge-node-evidence/EN-16；tenant 配额与本仓无 tenant 概念、memory/syn 通道迟滞待续） |
 | EN-17 | 用户态传输调度与拷贝优化 | EN-10、EN-12、EN-16 | L | TODO |
 | EN-18 | 协议、客户身份与证书边界 | EN-01、EN-16 | L | TODO |

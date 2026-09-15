@@ -34,12 +34,58 @@ struct ListenerHandle {
 static H3_RETRY_ISSUED: AtomicU64 = AtomicU64::new(0);
 static H3_RETRY_FAILED: AtomicU64 = AtomicU64::new(0);
 static H3_VALIDATED_INCOMING: AtomicU64 = AtomicU64::new(0);
+static H3_RETRY_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
+static H3_RETRY_LIMITED: AtomicU64 = AtomicU64::new(0);
+static H3_IGNORED_INCOMING: AtomicU64 = AtomicU64::new(0);
+static H3_REFUSED_INCOMING: AtomicU64 = AtomicU64::new(0);
 
-pub fn h3_retry_counters() -> (u64, u64, u64) {
+/// Default node-wide Retry responses/sec ceiling when the policy does
+/// not set `retryPps`. One aggregate bucket for the whole node — the
+/// XDP dim3 gate is the outer bound; this caps user-space Retry work
+/// even on ingress paths that never crossed that gate.
+pub const H3_RETRY_DEFAULT_PPS: u64 = 1024;
+
+/// Packed fixed-window budget shared by every H3 listener:
+/// (window_epoch_secs << 32) | used. A single compare_exchange reserves
+/// one slot, so the ceiling is node-wide and never multiplied by
+/// listener/worker count.
+static H3_RETRY_WINDOW: AtomicU64 = AtomicU64::new(0);
+
+fn h3_retry_reserve(pps: u64, now_secs: u64) -> bool {
+    if pps == 0 {
+        return false;
+    }
+    let mut cur = H3_RETRY_WINDOW.load(Ordering::Relaxed);
+    loop {
+        let next = if cur >> 32 == now_secs {
+            if cur & 0xFFFF_FFFF >= pps {
+                return false;
+            }
+            cur + 1
+        } else {
+            (now_secs << 32) | 1
+        };
+        match H3_RETRY_WINDOW.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+pub fn h3_retry_counters() -> (u64, u64, u64, u64, u64, u64, u64) {
     (
+        H3_RETRY_ATTEMPTED.load(Ordering::Relaxed),
         H3_RETRY_ISSUED.load(Ordering::Relaxed),
         H3_RETRY_FAILED.load(Ordering::Relaxed),
+        H3_RETRY_LIMITED.load(Ordering::Relaxed),
         H3_VALIDATED_INCOMING.load(Ordering::Relaxed),
+        H3_IGNORED_INCOMING.load(Ordering::Relaxed),
+        H3_REFUSED_INCOMING.load(Ordering::Relaxed),
     )
 }
 
@@ -218,6 +264,11 @@ impl Http3ProxyManager {
                 &self.proxy_logic.waf_state,
                 remote_addr.ip(),
             ) {
+                // Blocked source: explicitly silent — no Retry, no
+                // CONNECTION_REFUSED. `Incoming::ignore()` is the
+                // no-response API; a bare drop would refuse().
+                H3_IGNORED_INCOMING.fetch_add(1, Ordering::Relaxed);
+                connecting.ignore();
                 continue;
             }
 
@@ -238,12 +289,29 @@ impl Http3ProxyManager {
             if connecting.remote_address_validated() {
                 H3_VALIDATED_INCOMING.fetch_add(1, Ordering::Relaxed);
             } else {
-                let mode = self
-                    .config_store
-                    .get_global_http3_policy_sync()
-                    .map(|policy| policy.address_validation_mode())
+                let policy = self.config_store.get_global_http3_policy_sync();
+                let mode = policy
+                    .as_ref()
+                    .map(|p| p.address_validation_mode())
                     .unwrap_or_default();
                 if h3_retry_required(mode, crate::l4_defense::current_pressure_level()) {
+                    H3_RETRY_ATTEMPTED.fetch_add(1, Ordering::Relaxed);
+                    // Aggregate node-wide response budget (dim3 is the
+                    // dataplane bound; this bounds user-space Retry work
+                    // on ingress that never crossed XDP). Over-budget
+                    // Initials are explicitly ignored — refusing would be
+                    // another unbudgeted reply.
+                    let now_secs = crate::utils::time::now_timestamp() as u64;
+                    if !h3_retry_reserve(policy.as_ref().map_or(
+                        H3_RETRY_DEFAULT_PPS,
+                        |p| p.retry_pps_limit(),
+                    ), now_secs)
+                    {
+                        H3_RETRY_LIMITED.fetch_add(1, Ordering::Relaxed);
+                        H3_IGNORED_INCOMING.fetch_add(1, Ordering::Relaxed);
+                        connecting.ignore();
+                        continue;
+                    }
                     match connecting.retry() {
                         Ok(()) => {
                             H3_RETRY_ISSUED.fetch_add(1, Ordering::Relaxed);
@@ -277,9 +345,13 @@ impl Http3ProxyManager {
                     format!("port={} peer={} class=connection", port, remote_addr),
                 );
                 debug!(
-                    "H3 connection admission limit reached, rejecting connection from {} on port {}",
+                    "H3 connection admission limit reached, refusing connection from {} on port {}",
                     remote_addr, port
                 );
+                // Explicit refusal — a validated address gets a definitive
+                // CONNECTION_REFUSED instead of an ambiguous timeout.
+                H3_REFUSED_INCOMING.fetch_add(1, Ordering::Relaxed);
+                connecting.refuse();
                 continue;
             };
 
@@ -297,9 +369,11 @@ impl Http3ProxyManager {
                     ),
                 );
                 debug!(
-                    "H3 listener pool exhausted, rejecting connection from {} on port {}",
+                    "H3 listener pool exhausted, refusing connection from {} on port {}",
                     remote_addr, port
                 );
+                H3_REFUSED_INCOMING.fetch_add(1, Ordering::Relaxed);
+                connecting.refuse();
                 continue;
             };
 
@@ -761,5 +835,193 @@ mod tests {
         // Second connection: validated immediately via NEW_TOKEN — no Retry.
         assert_eq!(retries.load(Ordering::Relaxed), 1);
         assert_eq!(validated.load(Ordering::Relaxed), 2);
+    }
+
+    // EN-15 R3: the aggregate Retry budget is a hard ceiling — reserves
+    // stop at pps per window, a later window refills, and pps=0 disables
+    // issuance entirely.
+    #[test]
+    fn h3_retry_budget_bounded() {
+        let t0 = 1_700_000_000u64;
+        assert!(h3_retry_reserve(2, t0));
+        assert!(h3_retry_reserve(2, t0));
+        assert!(!h3_retry_reserve(2, t0));
+        // Same-window calls stay exhausted; a new window refills.
+        assert!(!h3_retry_reserve(2, t0));
+        assert!(h3_retry_reserve(2, t0 + 1));
+        // pps=0 disables issuance.
+        assert!(!h3_retry_reserve(0, t0 + 2));
+    }
+
+    // EN-15 R3 wire contract: `ignore()` sends NOTHING — the client sees
+    // a handshake stall (elapsed timeout), never a refusal. Verified
+    // against real quinn endpoints so wire behavior is observed, not
+    // inferred from API names.
+    #[tokio::test]
+    async fn h3_incoming_ignore_is_silent() {
+        let endpoint =
+            Endpoint::server(test_server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Some(incoming) = endpoint.accept().await {
+                incoming.ignore();
+            }
+        });
+        let client = test_client_endpoint();
+        let stalled = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.connect(addr, "localhost").unwrap(),
+        )
+        .await;
+        // Outer Err = the tokio timeout elapsed — no Retry and no
+        // CONNECTION_REFUSED ever reached the client.
+        assert!(stalled.is_err(), "ignored Initial must stall: {stalled:?}");
+        client.wait_idle().await;
+        server.abort();
+    }
+
+    // `refuse()` produces a prompt CONNECTION_REFUSED — the inner connect
+    // fails fast rather than stalling.
+    #[tokio::test]
+    async fn h3_incoming_refuse_is_prompt() {
+        let endpoint =
+            Endpoint::server(test_server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                incoming.refuse();
+            }
+        });
+        let client = test_client_endpoint();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.connect(addr, "localhost").unwrap(),
+        )
+        .await
+        .expect("refused connect timed out — refuse() did not answer");
+        assert!(refused.is_err(), "refused connect should fail");
+        client.wait_idle().await;
+        server.abort();
+    }
+
+    async fn test_manager(
+        policy: crate::config_models::HTTP3Policy,
+    ) -> Arc<Http3ProxyManager> {
+        let store = crate::config::ConfigStore::new();
+        store.test_set_http3_policy(policy);
+        let cert_selector = Arc::new(DynamicCertSelector::new());
+        crate::ssl::sync_certs(
+            &cert_selector,
+            &[crate::config_models::SSLCertConfig {
+                id: 1,
+                is_on: true,
+                is_default: true,
+                cert_data_json: Some(serde_json::json!(include_str!(
+                    "../pingora-main/pingora-core/examples/keys/server/cert.pem"
+                ))),
+                key_data_json: Some(serde_json::json!(include_str!(
+                    "../pingora-main/pingora-core/examples/keys/server/key.pem"
+                ))),
+                dns_names: vec!["localhost".to_string()],
+            }],
+        )
+        .await;
+        let api_config = Arc::new(crate::api_config::ApiConfig {
+            rpc_endpoints: Vec::new(),
+            rpc_disable_update: true,
+            node_id: "1".to_string(),
+            secret: "h3-test".to_string(),
+            billing_count_inbound_traffic: false,
+            access_log_pipeline:
+                crate::api_config::AccessLogPipelineConfig::default(),
+            relay: crate::api_config::RelayConfig::default(),
+            kernel_tuning: crate::api_config::KernelTuningConfig::default(),
+        });
+        let waf_state = Arc::new(crate::firewall::state::WafStateManager::new());
+        let proxy_logic = crate::proxy::EdgeProxy {
+            config: Arc::new(store.clone()),
+            waf_state: waf_state.clone(),
+            api_config: api_config.clone(),
+            cert_selector: cert_selector.clone(),
+            waf_verifier: Arc::new(crate::firewall::verifier::WafVerifier::new(
+                &api_config.secret,
+            )),
+            tls_downstream: false,
+        };
+        Http3ProxyManager::new(
+            store,
+            cert_selector,
+            proxy_logic,
+            Arc::new(ServerConf::default()),
+        )
+    }
+
+    // EN-15 R3: the PRODUCTION accept loop (run_endpoint) — not a
+    // reimplemented fixture. With policy `always` + retryPps=1, the first
+    // client is Retried once then validated and accepted; after the
+    // policy switches to retryPps=0 a second, fresh-endpoint client is
+    // explicitly ignored (no response, connect stalls).
+    #[tokio::test]
+    async fn h3_run_endpoint_retry_gate_and_budget() {
+        let attempted0 = H3_RETRY_ATTEMPTED.load(Ordering::Relaxed);
+        let issued0 = H3_RETRY_ISSUED.load(Ordering::Relaxed);
+        let manager = test_manager(crate::config_models::HTTP3Policy {
+            is_on: true,
+            port: 0,
+            address_validation: "always".to_string(),
+            retry_pps: Some(1),
+            ..Default::default()
+        })
+        .await;
+        let server_config = manager.build_quinn_server_config().await.unwrap();
+        let endpoint =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let runner = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.run_endpoint(addr.port(), endpoint, rx).await })
+        };
+
+        // First client: Retry issued under the aggregate budget, then the
+        // returning validated Initial is accepted end-to-end.
+        let client = test_client_endpoint();
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.connect(addr, "localhost").unwrap(),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+        conn.close(0u32.into(), b"done");
+        assert!(H3_RETRY_ATTEMPTED.load(Ordering::Relaxed) > attempted0);
+        assert!(H3_RETRY_ISSUED.load(Ordering::Relaxed) > issued0);
+
+        // Budget now disables issuance (retryPps=0): a fresh unvalidated
+        // endpoint is explicitly ignored — connect stalls with no reply.
+        manager.config_store.test_set_http3_policy(
+            crate::config_models::HTTP3Policy {
+                is_on: true,
+                port: 0,
+                address_validation: "always".to_string(),
+                retry_pps: Some(0),
+                ..Default::default()
+            },
+        );
+        let ignored0 = H3_IGNORED_INCOMING.load(Ordering::Relaxed);
+        let limited0 = H3_RETRY_LIMITED.load(Ordering::Relaxed);
+        let client2 = test_client_endpoint();
+        let stalled = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client2.connect(addr, "localhost").unwrap(),
+        )
+        .await;
+        assert!(stalled.is_err(), "over-budget Initial must be ignored");
+        assert!(H3_RETRY_LIMITED.load(Ordering::Relaxed) > limited0);
+        assert!(H3_IGNORED_INCOMING.load(Ordering::Relaxed) > ignored0);
+
+        client.wait_idle().await;
+        client2.wait_idle().await;
+        runner.abort();
     }
 }

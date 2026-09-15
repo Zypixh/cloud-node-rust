@@ -343,6 +343,12 @@ pub struct HTTP3Policy {
     pub support_mobile_browsers: bool,
     #[serde(rename = "addressValidation", default = "default_http3_address_validation")]
     pub address_validation: String,
+    /// Node-wide ceiling on QUIC Retry responses per second, shared by
+    /// every H3 listener (never multiplied per listener/worker). `0`
+    /// disables Retry issuance — over-budget Initials are explicitly
+    /// ignored and counted. Absent = built-in default (1024/s).
+    #[serde(rename = "retryPps")]
+    pub retry_pps: Option<u64>,
 }
 
 fn default_http3_address_validation() -> String {
@@ -373,6 +379,12 @@ impl HTTP3Policy {
             "off" | "none" | "disabled" => Http3AddressValidation::Off,
             _ => Http3AddressValidation::Adaptive,
         }
+    }
+
+    /// Aggregate Retry responses/sec ceiling (0 disables issuance).
+    pub fn retry_pps_limit(&self) -> u64 {
+        self.retry_pps
+            .unwrap_or(crate::http3_proxy_manager::H3_RETRY_DEFAULT_PPS)
     }
 }
 
