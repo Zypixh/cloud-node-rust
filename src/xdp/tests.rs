@@ -22,6 +22,14 @@ fn test_proxy_config(interface: &str) -> XdpConfig {
     }
 }
 
+/// Serializes tests that manipulate the global TCP queue byte ledger —
+/// saturating reservations must not race charge-accounting assertions.
+#[cfg(any(test, target_os = "linux"))]
+fn tcp_queue_budget_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 fn mark_test_proxy_bridge_ready(manager: &std::sync::Arc<XdpManager>) {
     let interface = manager.config.interfaces[0].name.clone();
     let queue = manager.config.interfaces[0].queues[0];
@@ -2286,6 +2294,9 @@ fn af_xdp_tcp_ingress_byte_budget_refusal_is_explicit() {
     // F3: when the node TCP queue byte budget is exhausted, ingress is an
     // explicit counted refusal (TCP retransmit recovers) — never a silent
     // unaccounted queue growth.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp {
@@ -2315,6 +2326,9 @@ fn af_xdp_tcp_ingress_byte_budget_refusal_is_explicit() {
 fn af_xdp_tcp_ingress_frame_holds_queue_charge_until_consumed() {
     // F3: a queued ingress packet must be charged to the byte ledger for
     // its full residency — the charge releases when smoltcp consumes it.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp {
@@ -2348,6 +2362,9 @@ async fn af_xdp_tcp_write_budget_stall_wakes_on_release() {
     // F3: a stream write refused by the queue byte budget must suspend
     // (register + Pending) and resume once ledger headroom returns —
     // never silently drop or spin.
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
     let frame = ipv4_tcp_syn_frame(false);
     let af_xdp::AfXdpProxyFrame::Tcp { flow, .. } =
@@ -3311,7 +3328,6 @@ fn projected_bpf_map_bytes_respects_state_table_overrides() {
         snat_rev_max_entries: Some(4_096),
         flow_acct_max_entries: Some(8_192),
         rate_v6_max_entries: Some(8_192),
-        quic_dcid_max_entries: Some(4_096),
         acl_blocked_max_entries: Some(16_384),
         acl_allowed_max_entries: Some(4_096),
         rate_v4_max_entries: Some(16_384),

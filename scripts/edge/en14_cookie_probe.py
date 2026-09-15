@@ -196,7 +196,6 @@ xdp:
     snatRevMaxEntries: 4096
     flowAcctMaxEntries: 8192
     rateV6MaxEntries: 8192
-    quicDcidMaxEntries: 4096
     aclBlockedMaxEntries: 16384
     aclAllowedMaxEntries: 4096
     rateV4MaxEntries: 16384

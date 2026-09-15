@@ -127,10 +127,6 @@ static XDP_RATE_V4: HashMap<XdpIpv4Key, XdpRateBucket> =
 static XDP_RATE_V6: HashMap<XdpIpv6Key, XdpRateBucket> =
     HashMap::<XdpIpv6Key, XdpRateBucket>::with_max_entries(262_144, 0);
 
-/// QUIC long-header DCID -> XSK map index. Keeps a connection's handshake and
-/// migrated long-header traffic on the queue that owns its userspace session
-/// instead of following RSS rehashes. Short-header DCIDs have no encoded
-/// length, so those packets always take the normal RSS queue path.
 /// EN-07 aggregate budgets: node-wide quotas pre-divided by possible CPUs
 /// in userspace so totals never scale with CPU/queue count. `flags` bit0
 /// enforces the unverified-packet budget, bit1 the new-state admission
@@ -161,10 +157,6 @@ static XDP_SVC_BUDGET: PerCpuHashMap<u32, XdpSvcBucket> =
 /// fail closed (counted) rather than silently forwarding unverified SYNs.
 #[map(name = "XDP_COOKIE_KEY")]
 static XDP_COOKIE_KEY: Array<XdpCookieKey> = Array::<XdpCookieKey>::with_max_entries(1, 0);
-
-#[map(name = "XDP_QUIC_DCID")]
-static XDP_QUIC_DCID: HashMap<XdpQuicDcidKey, u32> =
-    HashMap::<XdpQuicDcidKey, u32>::with_max_entries(131_072, 0);
 
 /// Explicitly configured UDP listen tuples that bypass the userspace
 /// dataplane: DNAT to the backend and XDP_TX out the same interface.
@@ -1551,7 +1543,6 @@ fn maybe_redirect(
         _ => return xdp_action::XDP_PASS,
     }
 
-    let mut steered_xsk: Option<u32> = None;
     match protocol {
         value if value == IpProto::Tcp as u8 => {
             let Ok(tcp) = ptr_at::<TcpHdr>(ctx, l4_offset) else {
@@ -1572,9 +1563,12 @@ fn maybe_redirect(
             if !proxy_port_enabled(dst_port_be, protocol) {
                 return xdp_action::XDP_PASS;
             }
-            steered_xsk = ptr_at::<u8>(ctx, l4_offset + mem::size_of::<UdpHdr>())
-                .ok()
-                .and_then(|base| quic_dcid_xsk_index(ctx, base));
+            // F7: no DCID→XSK steering here. XSKMAP redirect is only valid
+            // when the target socket is bound to the *current* ingress
+            // netdev/queue — steering a packet to another queue's XSK is
+            // silently dropped by the kernel. Cross-queue CID delivery is
+            // the shared userspace demux's job (per-listen-port CID route
+            // table), so the redirect target is always this queue's XSK.
         }
         _ => return xdp_action::XDP_PASS,
     }
@@ -1583,8 +1577,7 @@ fn maybe_redirect(
         ifindex,
         queue_id: queue,
     };
-    let default_xsk_index = unsafe { XDP_XSK_INDEX.get(&xsk_key) }.copied();
-    let xsk_index = match steered_xsk.or(default_xsk_index) {
+    let xsk_index = match unsafe { XDP_XSK_INDEX.get(&xsk_key) }.copied() {
         Some(index) => index,
         None => {
             counter_map_miss();
@@ -1615,58 +1608,6 @@ fn maybe_redirect(
             }
         }
     }
-}
-
-/// Steer QUIC long-header packets to the XSK queue owning their connection.
-/// Parses the long-header form `flags | version | dcid_len | dcid | scid_len |
-/// scid`; short headers carry no DCID length and cannot be parsed statelessly,
-/// so they keep RSS queue affinity (userspace resolves those flows through the
-/// shared demux route table). Returns the mapped XSK index, or None to use the
-/// receiving queue.
-/// Takes a packet pointer (not a scalar offset): the pointer carries its
-/// bounds binding across the subprogram boundary, while a scalar argument
-/// arrives with no packet range and the verifier rejects `data + arg`.
-#[inline(never)]
-fn quic_dcid_xsk_index(ctx: &XdpContext, base: *const u8) -> Option<u32> {
-    // black_box keeps LLVM from hoisting the data_end load into the caller
-    // and handing it in as a pkt_end argument — truncating that pointer in
-    // here trips "pointer arithmetic on pkt_end prohibited".
-    let end = core::hint::black_box(ctx).data_end() as *const u8;
-    // One bound check covers the fixed long-header prefix: first byte,
-    // 4-byte version, DCID length.
-    if unsafe { base.add(6) } > end {
-        return None;
-    }
-    let first = unsafe { *base };
-    if first & 0x80 == 0 {
-        return None;
-    }
-    let version =
-        u32::from_be_bytes(unsafe { [*base.add(1), *base.add(2), *base.add(3), *base.add(4)] });
-    if version == 0 {
-        return None;
-    }
-    let dcid_len = unsafe { *base.add(5) } as usize;
-    if dcid_len == 0 || dcid_len > 20 {
-        return None;
-    }
-    let scratch = nat_scratch().ok()?;
-    let key = unsafe { &mut (*scratch).dcid_key };
-    key.len = dcid_len as u8;
-    key._pad = [0; 3];
-    for i in 0..20usize {
-        if i >= dcid_len {
-            key.bytes[i] = 0;
-        } else {
-            // Per-iteration bound: a variable-length check up front gives the
-            // verifier no constant range for the unrolled reads.
-            if unsafe { base.add(7 + i) } > end {
-                return None;
-            }
-            key.bytes[i] = unsafe { *base.add(6 + i) };
-        }
-    }
-    unsafe { XDP_QUIC_DCID.get(&(*scratch).dcid_key).copied() }
 }
 
 /// Per-IP fixed-window pps limiter. Only UDP datagrams and TCP SYN-without-ACK

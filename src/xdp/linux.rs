@@ -1930,7 +1930,6 @@ fn state_table_override(name: &str, config: &XdpConfig) -> Option<u32> {
         "XDP_SNAT_REV" => t.snat_rev_max_entries,
         "XDP_FLOW_ACCT" => t.flow_acct_max_entries,
         "XDP_RATE_V6" => t.rate_v6_max_entries,
-        "XDP_QUIC_DCID" => t.quic_dcid_max_entries,
         "XDP_BLOCKED_V4" | "XDP_BLOCKED_V6" | "XDP_BLOCKED_V4_LPM"
         | "XDP_BLOCKED_V6_LPM" => t.acl_blocked_max_entries,
         "XDP_ALLOWED_V4" | "XDP_ALLOWED_V6" | "XDP_ALLOWED_V4_LPM"
@@ -1942,7 +1941,7 @@ fn state_table_override(name: &str, config: &XdpConfig) -> Option<u32> {
 
 fn bpf_map_specs(
     config: &XdpConfig,
-) -> [(&'static str, aya::maps::MapType, u32, u32, u32); 37] {
+) -> [(&'static str, aya::maps::MapType, u32, u32, u32); 36] {
     use aya::maps::MapType;
     use cloud_node_xdp_common::*;
     use core::mem::size_of;
@@ -2048,13 +2047,6 @@ fn bpf_map_specs(
             v6,
             size_of::<XdpRateBucket>() as u32,
             262_144,
-        ),
-        (
-            "XDP_QUIC_DCID",
-            MapType::Hash,
-            size_of::<XdpQuicDcidKey>() as u32,
-            u,
-            131_072,
         ),
         ("XDP_UDP_FWD", MapType::Hash, fwd_key, fwd_rule, 4_096),
         ("XDP_TCP_FWD", MapType::Hash, fwd_key, fwd_rule, 4_096),
@@ -2248,12 +2240,11 @@ fn auto_scale_state_tables(config: &XdpConfig, budget: u64) -> anyhow::Result<Op
     let snat_rev = get("snat_rev");
     let flow_acct = get("flow_acct");
     let rate_v6 = get("rate_v6");
-    let quic_dcid = get("quic_dcid");
     let acl_blocked = get("acl_blocked");
     let acl_allowed = get("acl_allowed");
     let rate_v4 = get("rate_v4");
     tracing::warn!(
-        "eBPF state tables auto-scaled to fit kernel-bpf budget {budget}B (projected {projected}B): ct={ct:?} pending={pending:?} snatRev={snat_rev:?} flowAcct={flow_acct:?} rateV4={rate_v4:?} rateV6={rate_v6:?} quicDcid={quic_dcid:?} aclBlocked={acl_blocked:?} aclAllowed={acl_allowed:?}"
+        "eBPF state tables auto-scaled to fit kernel-bpf budget {budget}B (projected {projected}B): ct={ct:?} pending={pending:?} snatRev={snat_rev:?} flowAcct={flow_acct:?} rateV4={rate_v4:?} rateV6={rate_v6:?} aclBlocked={acl_blocked:?} aclAllowed={acl_allowed:?}"
     );
     Ok(Some(XdpStateTables {
         ct_max_entries: ct,
@@ -2261,7 +2252,6 @@ fn auto_scale_state_tables(config: &XdpConfig, budget: u64) -> anyhow::Result<Op
         snat_rev_max_entries: snat_rev,
         flow_acct_max_entries: flow_acct,
         rate_v6_max_entries: rate_v6,
-        quic_dcid_max_entries: quic_dcid,
         acl_blocked_max_entries: acl_blocked,
         acl_allowed_max_entries: acl_allowed,
         rate_v4_max_entries: rate_v4,
@@ -2283,7 +2273,6 @@ fn state_table_knob(name: &str) -> &'static str {
         "XDP_SNAT_REV" => "snat_rev",
         "XDP_FLOW_ACCT" => "flow_acct",
         "XDP_RATE_V6" => "rate_v6",
-        "XDP_QUIC_DCID" => "quic_dcid",
         "XDP_BLOCKED_V4" | "XDP_BLOCKED_V6" | "XDP_BLOCKED_V4_LPM"
         | "XDP_BLOCKED_V6_LPM" => "acl_blocked",
         "XDP_ALLOWED_V4" | "XDP_ALLOWED_V6" | "XDP_ALLOWED_V4_LPM"

@@ -130,7 +130,7 @@ proxy 模式命中端口后内核 socket 不再收到该包；未命中、降级
 - **终止型**（`h3` proxy 端口）：QUIC 由 quinn 端点正常终止——Retry/地址验证走 `http3Policy.addressValidation` + `retryPps` 聚合预算；超限 Initial 显式 `ignore`（客户端重试恢复），准入拒绝显式 `refuse`。
 - **透传型**（`@quic` 服务器）：demux 只做 UDP 转发，**不会**注入节点自生成的 Retry——Retry token 绑定的是真实后端地址，节点伪造会让合法客户端失败。
 - **迁移**：短包头包无法被 eBPF 无状态解析，靠 RSS 队列亲和 + 用户态共享 `CidRoutes` 表（跨队列）按 DCID 路由到既有 session；`NEW_CONNECTION_ID`/`RETIRE_CONNECTION_ID` 更新经 `apply_session_cid_update` 同步进路由表。合法迁移保持连接。
-- **跨队列 CID 路由**：长包头包（Initial/Retry/Handshake）由 eBPF 解析 DCID → `XDP_QUIC_DCID` → 目标 XSK index，经 `XDP_XSKS.redirect` 投递——始终在同一 netdev 内的 XSK 之间转发，不违反 queue 绑定。userspace 在首次见到某 DCID 时把它 pin 到当前队列的 XSK，空闲 180s 后过期并从 eBPF map 移除。
+- **跨队列 CID 路由**：eBPF 不做跨队列 XSK 转发——XSKMAP redirect 要求目标 XSK 绑定在**当前 ingress (netdev, rx_queue)** 上，跨队列重定向会被内核丢弃。此前按 DCID pin 目标 XSK 的方案在包被 RSS 哈希到错误队列时必然丢包，已整体移除（`XDP_QUIC_DCID` map 及 `upsert_quic_dcid` 链路删除）。现行语义：包固定经 `XDP_XSK_INDEX` 投递到当前 ingress 队列的 XSK，queue reactor 解出 DCID 后交给共享 `quic_udp_demux`/`CidRoutes` 路由到正确 session——跨队列归路由在用户态完成，不依赖内核 redirect。
 - `PATH_CHALLENGE`/`PATH_RESPONSE` 是 quinn 内部的迁移验证，不是也不替代 ACL/封禁策略。
 
 ## 内核程序布局（tail-call）

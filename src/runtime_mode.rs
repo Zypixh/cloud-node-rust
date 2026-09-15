@@ -525,9 +525,6 @@ pub struct XdpStateTables {
     /// IPv6 rate-limit table (XDP_RATE_V6).
     #[serde(rename = "rateV6MaxEntries", default)]
     pub rate_v6_max_entries: Option<u32>,
-    /// QUIC DCID routing table (XDP_QUIC_DCID).
-    #[serde(rename = "quicDcidMaxEntries", default)]
-    pub quic_dcid_max_entries: Option<u32>,
     /// ACL block lists — exact-match hashes AND prefix tries
     /// (XDP_BLOCKED_V4/V6 + XDP_BLOCKED_V4_LPM/V6_LPM). One knob covers all
     /// four: the block capacity is a policy footprint the operator sizes
