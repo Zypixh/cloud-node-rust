@@ -1,5 +1,6 @@
 use super::*;
 use crate::memory_governor::{MEMORY_GOVERNOR, StaticTcpQueueBytePermit};
+use crate::transport_clock::TransportClock;
 
 /// EN-17/F3: payload bytes charged against the node-wide AF_XDP TCP queue
 /// ledger. The RAII permit lives exactly as long as the queued bytes —
@@ -501,6 +502,13 @@ pub(crate) struct AfXdpTcpReactor {
     /// the ledger has headroom again; TCP window shrinks meanwhile.
     ingress_stalled: std::collections::HashSet<AfXdpTcpFlowKey>,
     session_limit: usize,
+    /// T1: monotonic µs transport clock — all protocol time (smoltcp
+    /// instants, sweep cadence, idle reaping) derives from it; wall clock
+    /// steps cannot move a deadline.
+    clock: TransportClock,
+    /// T1: "iface:queue" label used as the snapshot-map key prefix so the
+    /// same 4-tuple on different queues does not collide in /status.
+    label: String,
     tx_scratch: Vec<u8>,
     tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
     http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
@@ -563,6 +571,8 @@ impl AfXdpTcpReactor {
             budget_stall: Arc::new(parking_lot::Mutex::new(Vec::new())),
             ingress_stalled: std::collections::HashSet::new(),
             session_limit: session_limit.max(1),
+            clock: TransportClock::real(),
+            label: String::new(),
             tx_scratch: Vec::with_capacity(2048),
             tcp_manager,
             http_manager,
@@ -787,8 +797,23 @@ impl AfXdpTcpReactor {
         }
     }
 
+    /// T1: bridge labels the reactor "iface:queue" so per-session snapshots
+    /// in the shared map are unambiguous across workers.
+    pub(crate) fn set_label(&mut self, label: String) {
+        self.label = label;
+    }
+
+    /// T1: tests install a manual clock and drive protocol time with
+    /// `advance` — sweep cadence and idle reaping become deterministic.
+    #[cfg(test)]
+    pub(crate) fn install_manual_clock_for_test(&mut self) -> TransportClock {
+        let clock = TransportClock::manual();
+        self.clock = clock.clone();
+        clock
+    }
+
     pub(crate) fn poll(&mut self) -> Vec<(AfXdpRouteMeta, Vec<u8>)> {
-        let now = SmoltcpInstant::from_millis(crate::utils::time::now_timestamp_millis());
+        let now = SmoltcpInstant::from_micros(self.clock.now_micros());
         self.poll_at(now)
     }
 
@@ -905,7 +930,7 @@ impl AfXdpTcpReactor {
         flow: AfXdpTcpFlowKey,
         proxy_class: AfXdpTcpProxyClass,
     ) -> bool {
-        let now = SmoltcpInstant::from_millis(crate::utils::time::now_timestamp_millis());
+        let now = SmoltcpInstant::from_micros(self.clock.now_micros());
         self.ensure_session_at(route, flow, proxy_class, now)
     }
 
@@ -974,7 +999,58 @@ impl AfXdpTcpReactor {
             hot: false,
         };
         self.sessions.insert(flow, session);
+        #[cfg(target_os = "linux")]
+        if let Some(session) = self.sessions.get(&flow) {
+            self.publish_session_snapshot(&flow, session);
+        }
         true
+    }
+
+    /// T1: publish this session's transport snapshot into the shared
+    /// /status table. smoltcp 0.14 exposes state, queue lengths and the
+    /// selected congestion controller only — cwnd, in_flight, RTT, pacing
+    /// and delivery counters stay `null` until the transport crate (T2) or
+    /// the smoltcp-edge fork (T3) surfaces them; nothing is fabricated.
+    #[cfg(target_os = "linux")]
+    fn publish_session_snapshot(&self, flow: &AfXdpTcpFlowKey, session: &AfXdpTcpSession) {
+        let socket = self
+            .sockets
+            .get::<SmoltcpTcp::Socket<'static>>(session.socket);
+        publish_tcp_session_snapshot(
+            format!("{}|{}|{}", self.label, flow.local_addr, flow.peer_addr),
+            serde_json::json!({
+                "ifaceQueue": self.label,
+                "local": flow.local_addr.to_string(),
+                "peer": flow.peer_addr.to_string(),
+                "direction": "accepted",
+                "class": session.proxy_class.label(),
+                "state": socket.state().to_string(),
+                "ccAlgorithm": format!("{:?}", socket.congestion_control()).to_lowercase(),
+                "ccImpl": "smoltcp-0.14",
+                "cwndBytes": serde_json::Value::Null,
+                "inFlightBytes": serde_json::Value::Null,
+                "srttMicros": serde_json::Value::Null,
+                "minRttMicros": serde_json::Value::Null,
+                "pacingRateBps": serde_json::Value::Null,
+                "delivered": serde_json::Value::Null,
+                "lost": serde_json::Value::Null,
+                "ecnMode": serde_json::Value::Null,
+                "sendQueueBytes": socket.send_queue(),
+                "recvQueueBytes": socket.recv_queue(),
+                "pendingIngressBytes": session.pending_ingress.len(),
+                "pendingEgressBytes": session.pending_egress.len(),
+                "proxyStarted": session.proxy_started,
+                "closing": session.closing,
+            }),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drop_session_snapshot(&self, flow: &AfXdpTcpFlowKey) {
+        remove_tcp_session_snapshot(&format!(
+            "{}|{}|{}",
+            self.label, flow.local_addr, flow.peer_addr
+        ));
     }
 
     pub(crate) fn ensure_local_ip(&mut self, ip: IpAddr) {
@@ -1151,6 +1227,10 @@ impl AfXdpTcpReactor {
                     continue;
                 }
                 self.pump_session(now, flow);
+                #[cfg(target_os = "linux")]
+                if let Some(session) = self.sessions.get(&flow) {
+                    self.publish_session_snapshot(&flow, session);
+                }
                 if self.session_still_active(flow) {
                     self.mark_hot(flow);
                 }
@@ -1476,10 +1556,27 @@ impl AfXdpTcpReactor {
         }
         for flow in finished {
             self.ingress_stalled.remove(&flow);
+            #[cfg(target_os = "linux")]
+            self.drop_session_snapshot(&flow);
             if let Some(session) = self.sessions.remove(&flow) {
                 let socket = self
                     .sockets
                     .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
+                // T1: final transport snapshot to tracing — per-session
+                // lifecycle is observable even when the flow was never
+                // scraped through /status.
+                tracing::debug!(
+                    "AF_XDP TCP session reaped iface_queue={} local={} peer={} class={} state={} cc={:?} send_queue={} recv_queue={} proxy_started={}",
+                    self.label,
+                    session.flow.local_addr,
+                    session.flow.peer_addr,
+                    session.proxy_class.label(),
+                    socket.state(),
+                    socket.congestion_control(),
+                    socket.send_queue(),
+                    socket.recv_queue(),
+                    session.proxy_started,
+                );
                 socket.abort();
                 let _ = self.sockets.remove(session.socket);
             }
@@ -1829,6 +1926,15 @@ impl AsyncWrite for AfXdpTcpStream {
         self.outgoing_tx = None;
         self.signal_wake();
         Poll::Ready(Ok(()))
+    }
+}
+
+/// T1: a dying reactor purges its /status snapshot rows — a dead queue's
+/// sessions must never linger in the export.
+#[cfg(target_os = "linux")]
+impl Drop for AfXdpTcpReactor {
+    fn drop(&mut self) {
+        purge_tcp_session_snapshots(&self.label);
     }
 }
 

@@ -2111,12 +2111,15 @@ fn af_xdp_tcp_reactor_sweep_is_batched_not_unbounded() {
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_sweep_keeps_cadence_under_fast_polling() {
-    // F4 regression: polling every 1ms must not keep deferring the periodic
-    // sweep. With the old bookkeeping every poll round updated the
-    // "last sweep" timestamp, so under the bridge's continuous fast polling
-    // the 250ms interval never elapsed and the backstop never ran.
+    use std::time::Duration;
+    // F4 regression on the injected T1 transport clock: `poll()` driven by
+    // a manual clock advanced 1ms per round must not keep deferring the
+    // periodic sweep. With the old bookkeeping every poll round updated
+    // the "last sweep" timestamp, so under the bridge's continuous fast
+    // polling the 250ms interval never elapsed and the backstop never ran.
     let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
-    let t0 = smoltcp::time::Instant::from_millis(crate::utils::time::now_timestamp_millis());
+    let clock = reactor.install_manual_clock_for_test();
+    let t0 = smoltcp::time::Instant::from_micros(clock.now_micros());
     for idx in 0..4u16 {
         let frame = ipv4_tcp_syn_frame_with_source_port(false, 53000 + idx);
         let af_xdp::AfXdpProxyFrame::Tcp { route, flow, .. } =
@@ -2128,29 +2131,30 @@ fn af_xdp_tcp_reactor_sweep_keeps_cadence_under_fast_polling() {
     }
 
     // First poll starts and completes a cycle (4 sessions < one batch).
-    reactor.poll_at_for_test(t0);
-    assert_eq!(reactor.last_sweep_at(), t0);
+    reactor.poll();
+    let first_sweep = reactor.last_sweep_at();
+    assert_eq!(first_sweep, t0);
 
     // Continuous 1ms polling below the interval must NOT advance
     // last_sweep — the timestamp belongs to real completed cycles only.
-    for step in 1..=200i64 {
-        reactor.poll_at_for_test(smoltcp::time::Instant::from_millis(t0.total_millis() + step));
+    for _ in 0..200 {
+        clock.advance(Duration::from_millis(1));
+        reactor.poll();
     }
-    assert_eq!(reactor.last_sweep_at(), t0);
+    assert_eq!(reactor.last_sweep_at(), first_sweep);
 
     // Once the interval actually elapses, the next poll runs the next cycle.
-    let t_next = smoltcp::time::Instant::from_millis(
-        t0.total_millis() + af_xdp::AF_XDP_TCP_SWEEP_INTERVAL.as_millis() as i64 + 1,
-    );
-    reactor.poll_at_for_test(t_next);
-    assert_eq!(reactor.last_sweep_at(), t_next);
+    clock.advance(af_xdp::AF_XDP_TCP_SWEEP_INTERVAL + Duration::from_millis(1));
+    reactor.poll();
+    let second_sweep = reactor.last_sweep_at();
+    assert!(second_sweep > first_sweep);
 
     // And continuous fast polling again must not hide the following cycle.
-    for step in 1..=200i64 {
-        reactor
-            .poll_at_for_test(smoltcp::time::Instant::from_millis(t_next.total_millis() + step));
+    for _ in 0..200 {
+        clock.advance(Duration::from_millis(1));
+        reactor.poll();
     }
-    assert_eq!(reactor.last_sweep_at(), t_next);
+    assert_eq!(reactor.last_sweep_at(), second_sweep);
 }
 
 #[cfg(any(test, target_os = "linux"))]

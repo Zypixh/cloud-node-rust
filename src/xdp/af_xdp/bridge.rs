@@ -523,6 +523,9 @@ pub(crate) async fn run_queue_bridge_loop(
     let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
     let mut tcp_reactor =
         AfXdpTcpReactor::new_with_session_limit(tcp_manager, http_manager, tcp_session_limit);
+    // T1: label the reactor so per-session /status snapshots are keyed by
+    // the owning queue (the same 4-tuple may exist on multiple queues).
+    tcp_reactor.set_label(format!("{own_interface}:{}", queue_handle.queue));
     let mut consecutive_poll_errors = 0u32;
     let mut tx_failures = AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TX_FAILURES);
     let mut udp_ingress_failures =
