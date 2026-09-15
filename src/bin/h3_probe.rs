@@ -141,7 +141,14 @@ async fn run_connection(config: ProbeConfig, next: Arc<AtomicUsize>) -> anyhow::
     let client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))?,
     ));
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    // Bind the client socket to the address family of the target — a
+    // v6 target cannot be reached from a v4-only socket.
+    let bind_addr: SocketAddr = if config.addr.is_ipv6() {
+        "[::]:0".parse()?
+    } else {
+        "0.0.0.0:0".parse()?
+    };
+    let mut endpoint = Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_config);
 
     let connecting = endpoint.connect(config.addr, &config.host)?;

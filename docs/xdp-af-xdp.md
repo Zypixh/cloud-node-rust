@@ -106,9 +106,29 @@ proxy 模式命中端口后内核 socket 不再收到该包；未命中、降级
 - 配置 reload 时，如果接口、队列和 proxy 端口未变化，运行时保留现有 AF_XDP bridge，避免队列重复绑定。
 - `detach` 会撤销当前进程管理的 XDP attach，并将状态标记为 detached。
 
+### Attach / reload 生命周期（prepare-before-commit）
+
+`attach` 分两个阶段：
+
+1. **Prepare（不触碰运行中数据面）**：map 预算检查 → pinned map ABI 检查 → 加载新对象（兼容 pin 复用）→ map spec 审计 → root 程序与全部 dispatch 子程序的 verifier 加载。任何一步失败都直接报错，**旧程序保持 attach**，流量不受影响。
+2. **Commit**：先 detach 旧 links/子程序 pin/dispatch pin → 重新 pin dispatch map 与子程序 → 写 dispatch 槽位 → adopt flow state → 同步策略/localIP/端口/XSK 索引 → 清计数器 → 逐接口 attach 新 link 并 pin。commit 窗口约毫秒级，期间流量走内核路径。
+
+- **Pinned state map ABI 不兼容**：attach 拒绝并列出具体 map 名，旧数据面保持运行；不会删除 pin 后声称无损升级。确认接受状态丢失时执行 `cloud-node xdp detach --purge-state`（显式删除全部 pinned state map 并打 warn 日志），再 attach。
+- **reload**：旧 manager 的 kernel links 与 AF_XDP socket 在新代 prepare 期间保持服务；新代 commit 完成后再释放旧代句柄，新 socket 绑定同一队列（socket 创建自带重试，吸收旧 worker 退出窗口）。prepare 失败则恢复旧 manager 继续服务；commit 中途失败则清理半成品 pin 并让旧代重新 attach。
+- **AF_XDP 流在 reload 时的语义**：smoltcp 会话绑定在旧 socket 上，无法迁移到内核路径，也无法跨 socket 迁移到新代——handover 时旧 socket 关闭、会话终止（有显式日志与状态记录）。同一（ifindex, queue）上两个 XSK socket 无法共存，这是 AF_XDP 的硬约束；排空不是把旧流"改成 PASS"——活跃 smoltcp TCP 不能透明移交内核。
+- 接口从配置中移除时，detach 会扫描 pin 目录下所有 `link-*`，旧代遗留 link 不会挂在已不受管理的接口上。
+
+## QUIC 终止 vs 透传
+
+- **终止型**（`h3` proxy 端口）：QUIC 由 quinn 端点正常终止——Retry/地址验证走 `http3Policy.addressValidation` + `retryPps` 聚合预算；超限 Initial 显式 `ignore`（客户端重试恢复），准入拒绝显式 `refuse`。
+- **透传型**（`@quic` 服务器）：demux 只做 UDP 转发，**不会**注入节点自生成的 Retry——Retry token 绑定的是真实后端地址，节点伪造会让合法客户端失败。
+- **迁移**：短包头包无法被 eBPF 无状态解析，靠 RSS 队列亲和 + 用户态共享 `CidRoutes` 表（跨队列）按 DCID 路由到既有 session；`NEW_CONNECTION_ID`/`RETIRE_CONNECTION_ID` 更新经 `apply_session_cid_update` 同步进路由表。合法迁移保持连接。
+- **跨队列 CID 路由**：长包头包（Initial/Retry/Handshake）由 eBPF 解析 DCID → `XDP_QUIC_DCID` → 目标 XSK index，经 `XDP_XSKS.redirect` 投递——始终在同一 netdev 内的 XSK 之间转发，不违反 queue 绑定。userspace 在首次见到某 DCID 时把它 pin 到当前队列的 XSK，空闲 180s 后过期并从 eBPF map 移除。
+- `PATH_CHALLENGE`/`PATH_RESPONSE` 是 quinn 内部的迁移验证，不是也不替代 ACL/封禁策略。
+
 ## 内核程序布局（tail-call）
 
-主程序 `cloud_node_xdp` 按 family/proto 经 `XDP_DISPATCH`（prog array，8 槽位）尾调用到各 NAT 子程序——每个 SNAT-capable handler 约 10KiB BPF 指令，拆分后单个程序才能通过旧内核（6.1 已实测）的 verifier 状态预算：
+主程序 `cloud_node_xdp` 按 family/proto 经 `XDP_DISPATCH`（prog array）尾调用到各 NAT 子程序——每个 SNAT-capable handler 约 10KiB BPF 指令，拆分后单个程序才能通过旧内核（6.1 已实测）的 verifier 状态预算：
 
 | 槽位 | 程序 | 覆盖 |
 |---|---|---|
@@ -119,12 +139,21 @@ proxy 模式命中端口后内核 socket 不再收到该包；未命中、降级
 | 4 | `xdp_nat_tcp6_dispatch` | TCP/IPv6 reply，forward 尾调用槽位 6 |
 | 5 | `xdp_nat_udp6_fwd` | UDP/IPv6 forward |
 | 6 | `xdp_nat_tcp6_fwd` | TCP/IPv6 forward |
+| 7 | `xdp_nat_udp4_work` | UDP/IPv4 工作子程序 |
+| 8 | `xdp_nat_tcp4_work` | TCP/IPv4 工作子程序 |
+| 9 | `xdp_nat_udp6_work` | UDP/IPv6 工作子程序 |
+| 10 | `xdp_nat_tcp6_work` | TCP/IPv6 工作子程序 |
+| 11 | `xdp_tcp4_challenge` | EN-14 无状态 cookie challenge/splice（超出 TCP4 work 的栈预算，独立尾调用） |
 
 槽位为空（旧 .o 缺符号）时 tail-call 落空返回，流量显式走 redirect/PASS 路径，attach 时会有 warning。
 
 ## Pinned map 迁移
 
-`/sys/fs/bpf/cloud-node-xdp/` 下的 map pin 跨重启复用。attach 前会逐张比对内核报告的 spec（type/key size/value size/max_entries）与当前 .o 定义；不一致的 pin 会被删除并重建（有 warn 日志），其运行时内容——conntrack、计费快照——丢弃后由流量自然重建。正常升级无需手工清理；手工迁移时可整体删除该目录后重启。
+`/sys/fs/bpf/cloud-node-xdp/` 下的 map pin 跨重启复用。attach 前逐张比对内核报告的 spec（type/key size/value size/max_entries）与当前 .o 定义：
+
+- **兼容**：pin 复用，conntrack/SNAT/计费状态无损交接（`adopt_flow_state` bump `XDP_OWNER_EPOCH`）。
+- **不兼容的非状态 map**（dispatch 表、计数器、规则表）：删除重建，有 warn 日志，内容本就每次 attach 重建。
+- **不兼容的状态 map**（`XDP_TCP_CT`/`XDP_UDP_CT`/`XDP_PENDING`/`XDP_SNAT_REV`/`XDP_FLOW_ACCT`/`XDP_FLOW_EVENTS`/`XDP_OWNER_EPOCH`/`XDP_FLOW_SEQ`/`XDP_COOKIE_KEY`）：attach **拒绝**并报出具体 map 名，运行中数据面不受影响。这是显式的迁移边界——确认接受状态丢失后运行 `cloud-node xdp detach --purge-state` 再 attach。
 
 ## 性能基线
 
