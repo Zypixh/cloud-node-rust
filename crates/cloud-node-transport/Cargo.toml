@@ -1,0 +1,9 @@
+[package]
+name = "cloud-node-transport"
+version = "0.1.0"
+edition = "2024"
+description = "Pure transport algorithms for the edge dataplane: TCP-rate sampling (Linux tcp_rate.c semantics), congestion-controller trait, NewReno/PRR and CUBIC+HyStart++, and a deterministic network simulator. No tokio/smoltcp/quinn dependencies — reusable by userspace stacks and tests."
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
