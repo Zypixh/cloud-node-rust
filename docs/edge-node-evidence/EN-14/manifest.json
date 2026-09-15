@@ -5,7 +5,7 @@
   "ebpf_object_sha256": "e549c8352a5d6ba7329ec6b5467d9f2f67a79732518db7ebd2389d3a8f501338",
   "node_bin_sha256": "b8c0ab7c45b2f13bca1e237f9b9f236fe5ea4aa8e268d4a7c4df7b2ecbee3532",
   "environment": {
-    "host": "162.251.92.120",
+    "host": "vps-120",
     "kernel": "6.1.0-10-amd64",
     "os": "Debian GNU/Linux 12",
     "topology": "netns en14-ns (client+backend 10.99.0.9/10.99.0.6) <-> veth <-> host en14-a VIP 10.99.0.5"
