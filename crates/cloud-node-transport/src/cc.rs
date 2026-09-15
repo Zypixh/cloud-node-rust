@@ -103,6 +103,13 @@ pub trait CongestionController {
     /// Retransmission timeout fired.
     fn on_rto(&mut self, now: TransportInstant, in_flight: u64);
 
+    /// The stack proved a recent loss/RTO response spurious (DSACK of a
+    /// retransmitted range, or a TSecr echoing a pre-retransmission
+    /// timestamp — Eifel). Controllers that checkpoint their window at
+    /// loss entry restore it here; the default is a no-op for
+    /// controllers that do not checkpoint.
+    fn on_loss_undo(&mut self, _now: TransportInstant) {}
+
     /// Sender was idle (nothing in flight) for `idle_for` and resumes.
     fn on_idle_restart(&mut self, now: TransportInstant, idle_for: Duration);
 

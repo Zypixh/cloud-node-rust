@@ -89,6 +89,7 @@ aya = "0.14.0"
 neli = "0.7.4"
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "async", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "socket-udp"] }
 xsk-rs = "0.9.0"
+cloud-node-transport = { path = "crates/cloud-node-transport" }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
@@ -178,6 +179,13 @@ members = ["crates/cloud-node-transport"]
 # pingora-main is a vendored checkout with its own workspace root —
 # both must stay outside this workspace's auto-membership.
 exclude = ["crates/cloud-node-xdp-ebpf", "pingora-main"]
+
+# smoltcp-edge is a controlled fork of smoltcp 0.14.0 (T3): transport
+# hooks in socket/tcp.rs + minimal wire repr surface, every divergence
+# recorded in vendor/smoltcp-edge/DIVERGENCE.md. This patch redirects
+# both dependency declarations (linux target + dev-dependencies).
+[patch.crates-io]
+smoltcp = { path = "vendor/smoltcp-edge" }
 
 [profile.release]
 lto = "fat"

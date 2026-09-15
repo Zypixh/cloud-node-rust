@@ -958,8 +958,17 @@ impl AfXdpTcpReactor {
         // F8: AF_XDP TCP must run a real congestion controller — without an
         // explicit selection smoltcp silently falls back to NoControl
         // (window = usize::MAX), which XDP pps budgets cannot replace.
-        // Cubic is the production default until the transport crate lands.
         socket.set_congestion_control(SmoltcpTcp::CongestionControl::Cubic);
+        // T3: production accepted sessions run the external transport
+        // controller — CubicRef from cloud-node-transport, driven by the
+        // fork's scoreboard (per-segment records, SACK/RACK-TLP/DSACK,
+        // Eifel undo, pacing gate). The builtin Cubic remains installed
+        // as the comparison path but is not consulted while ext is set.
+        socket.set_transport_controller(Box::new(
+            // Initial MSS is the conservative default; the socket calls
+            // on_mss_update with the peer's MSS at handshake time.
+            cloud_node_transport::cc::CubicRef::new(536),
+        ));
         if let Err(err) =
             socket.listen(IpListenEndpoint::from(IpEndpoint::from(flow.local_addr)))
         {
@@ -1007,15 +1016,17 @@ impl AfXdpTcpReactor {
     }
 
     /// T1: publish this session's transport snapshot into the shared
-    /// /status table. smoltcp 0.14 exposes state, queue lengths and the
-    /// selected congestion controller only — cwnd, in_flight, RTT, pacing
-    /// and delivery counters stay `null` until the transport crate (T2) or
-    /// the smoltcp-edge fork (T3) surfaces them; nothing is fabricated.
+    /// /status table. T3 (smoltcp-edge): sessions with an external
+    /// transport controller surface the real `CcSnapshot` — cwnd,
+    /// ssthresh, pacing, min-RTT and the EdgeCC observability fields;
+    /// fields the controller does not track stay `null`, never
+    /// fabricated.
     #[cfg(target_os = "linux")]
     fn publish_session_snapshot(&self, flow: &AfXdpTcpFlowKey, session: &AfXdpTcpSession) {
         let socket = self
             .sockets
             .get::<SmoltcpTcp::Socket<'static>>(session.socket);
+        let cc = socket.transport_snapshot();
         publish_tcp_session_snapshot(
             format!("{}|{}|{}", self.label, flow.local_addr, flow.peer_addr),
             serde_json::json!({
@@ -1025,16 +1036,30 @@ impl AfXdpTcpReactor {
                 "direction": "accepted",
                 "class": session.proxy_class.label(),
                 "state": socket.state().to_string(),
-                "ccAlgorithm": format!("{:?}", socket.congestion_control()).to_lowercase(),
-                "ccImpl": "smoltcp-0.14",
-                "cwndBytes": serde_json::Value::Null,
+                // Builtin variants are feature-gated; format whatever
+                // the enabled feature set produced.
+                "ccAlgorithm": cc.as_ref().map(|c| c.algo.to_string())
+                    .unwrap_or_else(|| format!("{:?}", socket.congestion_control()).to_lowercase()),
+                "ccImpl": if cc.is_some() { "smoltcp-edge" } else { "smoltcp-0.14" },
+                "ccVersionPin": cc.as_ref().map(|c| c.version_pin),
+                "ccMode": cc.as_ref().map(|c| c.mode),
+                "reasonCode": cc.as_ref().map(|c| c.reason_code),
+                "cwndBytes": cc.as_ref().map(|c| c.cwnd_bytes),
+                "ssthreshBytes": cc.as_ref().map(|c| c.ssthresh_bytes),
                 "inFlightBytes": serde_json::Value::Null,
                 "srttMicros": serde_json::Value::Null,
-                "minRttMicros": serde_json::Value::Null,
-                "pacingRateBps": serde_json::Value::Null,
+                "minRttMicros": cc.as_ref()
+                    .and_then(|c| c.min_rtt)
+                    .map(|d| d.as_micros() as u64),
+                "pacingRateBps": cc.as_ref().and_then(|c| c.pacing_rate_bps),
                 "delivered": serde_json::Value::Null,
                 "lost": serde_json::Value::Null,
                 "ecnMode": serde_json::Value::Null,
+                "beliefMilli": cc.as_ref().and_then(|c| c.belief_milli),
+                "queueEstimateBytes": cc.as_ref().and_then(|c| c.queue_estimate_bytes),
+                "pRandMilli": cc.as_ref().and_then(|c| c.p_rand_milli),
+                "bwSigmaBps": cc.as_ref().and_then(|c| c.bw_sigma_bps),
+                "envelopeBytes": cc.as_ref().and_then(|c| c.envelope_bytes),
                 "sendQueueBytes": socket.send_queue(),
                 "recvQueueBytes": socket.recv_queue(),
                 "pendingIngressBytes": session.pending_ingress.len(),
