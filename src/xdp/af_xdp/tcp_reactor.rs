@@ -1,19 +1,104 @@
 use super::*;
+use crate::memory_governor::{MEMORY_GOVERNOR, StaticTcpQueueBytePermit};
+
+/// EN-17/F3: payload bytes charged against the node-wide AF_XDP TCP queue
+/// ledger. The RAII permit lives exactly as long as the queued bytes —
+/// stream channels, reactor pendings and device ingress frames all carry
+/// it — so queue memory is accounted through its full lifecycle and the
+/// budget cannot be exceeded silently.
+pub struct AfXdpTcpChargedBytes {
+    bytes: Bytes,
+    _permit: Option<StaticTcpQueueBytePermit>,
+}
+
+impl AfXdpTcpChargedBytes {
+    pub(crate) fn empty() -> Self {
+        Self {
+            bytes: Bytes::new(),
+            _permit: None,
+        }
+    }
+
+    /// Reserve `bytes.len()` in the ledger first; `None` means the budget
+    /// is exhausted and the caller must apply explicit backpressure.
+    #[cfg(test)]
+    pub(crate) fn charged(bytes: Bytes) -> Option<Self> {
+        MEMORY_GOVERNOR
+            .try_reserve_tcp_queue_bytes(bytes.len())
+            .map(|permit| Self {
+                bytes,
+                _permit: Some(permit),
+            })
+    }
+
+    /// Wrap bytes under a pre-acquired permit. Used when the reservation
+    /// must happen before the payload exists (e.g. smoltcp `recv`, where
+    /// the copy consumes the socket buffer inside the closure).
+    pub(crate) fn with_permit(bytes: Bytes, permit: StaticTcpQueueBytePermit) -> Self {
+        Self {
+            bytes,
+            _permit: Some(permit),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.bytes = Bytes::new();
+        self._permit = None;
+    }
+
+    pub(crate) fn split_to(&mut self, at: usize) -> Bytes {
+        self.bytes.split_to(at)
+    }
+}
+
+impl Default for AfXdpTcpChargedBytes {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::ops::Deref for AfXdpTcpChargedBytes {
+    type Target = Bytes;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+/// EN-17/F3: wakers of proxy tasks suspended on the TCP queue byte budget.
+/// Drained by the reactor once ledger headroom returns — each re-polled
+/// task either writes or re-registers, so the set stays bounded by the
+/// number of concurrently stalled writers.
+pub(crate) type AfXdpTcpBudgetStallSet = Arc<parking_lot::Mutex<Vec<std::task::Waker>>>;
 
 pub struct AfXdpTcpStream {
-    incoming_rx: mpsc::Receiver<Bytes>,
-    outgoing_tx: Option<mpsc::Sender<Bytes>>,
+    incoming_rx: mpsc::Receiver<AfXdpTcpChargedBytes>,
+    outgoing_tx: Option<mpsc::Sender<AfXdpTcpChargedBytes>>,
     /// EN-17: after queueing egress bytes the stream marks its flow dirty in
     /// the shared wake set so the session is pumped without a table scan.
     wake: Option<(AfXdpTcpFlowKey, Arc<DashMap<AfXdpTcpFlowKey, ()>>)>,
-    read_buf: Bytes,
+    /// EN-17/F3: shared stall registry — a writer suspended on the queue
+    /// byte budget registers here and the reactor wakes it on headroom.
+    budget_stall: AfXdpTcpBudgetStallSet,
+    read_buf: AfXdpTcpChargedBytes,
     write_permit: Option<TcpWritePermitFuture>,
 }
 
 pub struct AfXdpTcpStreamParts {
     pub stream: AfXdpTcpStream,
-    pub ingress_tx: mpsc::Sender<Bytes>,
-    pub egress_rx: mpsc::Receiver<Bytes>,
+    pub ingress_tx: mpsc::Sender<AfXdpTcpChargedBytes>,
+    pub egress_rx: mpsc::Receiver<AfXdpTcpChargedBytes>,
+    /// EN-17/F3: the stall set shared by this stream — reactors keep the
+    /// authoritative copy and drain it when the byte budget frees.
+    pub budget_stall: AfXdpTcpBudgetStallSet,
 }
 
 pub(crate) struct AfXdpVirtualSocket<S> {
@@ -113,6 +198,9 @@ pub(crate) struct AfXdpTcpIngressFrame {
     pub(crate) route: AfXdpRouteMeta,
     pub(crate) flow: AfXdpTcpFlowKey,
     pub(crate) ip_packet: Bytes,
+    /// EN-17/F3: queue-byte charge held while the frame waits for smoltcp
+    /// to consume it — released when the frame is popped or dropped.
+    pub(crate) _charge: Option<StaticTcpQueueBytePermit>,
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -127,10 +215,10 @@ pub(crate) struct AfXdpTcpSession {
     pub(crate) route: AfXdpRouteMeta,
     pub(crate) proxy_class: AfXdpTcpProxyClass,
     pub(crate) socket: SocketHandle,
-    pub(crate) ingress_tx: Option<mpsc::Sender<Bytes>>,
-    pub(crate) egress_rx: Option<mpsc::Receiver<Bytes>>,
-    pub(crate) pending_ingress: Bytes,
-    pub(crate) pending_egress: Bytes,
+    pub(crate) ingress_tx: Option<mpsc::Sender<AfXdpTcpChargedBytes>>,
+    pub(crate) egress_rx: Option<mpsc::Receiver<AfXdpTcpChargedBytes>>,
+    pub(crate) pending_ingress: AfXdpTcpChargedBytes,
+    pub(crate) pending_egress: AfXdpTcpChargedBytes,
     pub(crate) created_at: SmoltcpInstant,
     pub(crate) last_activity: SmoltcpInstant,
     pub(crate) proxy_started: bool,
@@ -203,6 +291,11 @@ impl AfXdpTcpAdmissionFailureTracker {
         }
     }
 
+    /// Returns true exactly once when the consecutive-refusal streak reaches
+    /// the threshold — a warn edge, not a teardown signal. F2: capacity
+    /// refusals only shed new work; the worker keeps serving existing
+    /// sessions and admissions resume as soon as capacity frees (the streak
+    /// resets on the next Accepted/non-capacity outcome).
     pub(crate) fn record(&mut self, status: AfXdpTcpIngestStatus) -> bool {
         match status {
             AfXdpTcpIngestStatus::Accepted => {
@@ -217,7 +310,7 @@ impl AfXdpTcpAdmissionFailureTracker {
             AfXdpTcpIngestStatus::RefusedAtCapacity
             | AfXdpTcpIngestStatus::IngressQueueFull => {
                 self.consecutive_refusals = self.consecutive_refusals.saturating_add(1);
-                self.consecutive_refusals >= self.max_consecutive_refusals
+                self.consecutive_refusals == self.max_consecutive_refusals
             }
         }
     }
@@ -247,11 +340,18 @@ impl SmoltcpAfXdpDevice {
         }
     }
 
-    pub(crate) fn push_ingress(&mut self, route: AfXdpRouteMeta, flow: AfXdpTcpFlowKey, ip_packet: Bytes) {
+    pub(crate) fn push_ingress(
+        &mut self,
+        route: AfXdpRouteMeta,
+        flow: AfXdpTcpFlowKey,
+        ip_packet: Bytes,
+        charge: StaticTcpQueueBytePermit,
+    ) {
         self.ingress.push_back(AfXdpTcpIngressFrame {
             route,
             flow,
             ip_packet,
+            _charge: Some(charge),
         });
     }
 
@@ -379,13 +479,27 @@ pub(crate) struct AfXdpTcpReactor {
     /// (no "full" path), and the map key dedups at enqueue time.
     pub(crate) wake_set: Arc<DashMap<AfXdpTcpFlowKey, ()>>,
     /// EN-17: incremental sweep cursor — a bounded batch is processed per
-    /// round instead of one unbounded full-table pass.
+    /// round instead of one unbounded full-table pass. `sweep_active`
+    /// distinguishes "a cycle is mid-flight" from "idle between cycles":
+    /// `sweep_pos >= sweep_keys.len()` is true in both states, so without
+    /// the flag every poll round would look like a just-completed sweep and
+    /// keep pushing `last_sweep` forward — under continuous fast polling the
+    /// 250ms interval would then never elapse and the backstop never run.
     sweep_keys: Vec<AfXdpTcpFlowKey>,
     sweep_pos: usize,
-    /// EN-17: last amortized full-table sweep (progress backstop + reap).
+    sweep_active: bool,
+    /// EN-17: completion time of the last amortized full-table sweep.
     last_sweep: SmoltcpInstant,
     /// EN-17: last reaping pass — cadence-gated, independent of `last_sweep`.
     last_retain: SmoltcpInstant,
+    /// EN-17/F3: wakers of stream writers suspended on the node TCP queue
+    /// byte budget — shared with every spawned stream so a writer parked on
+    /// budget gets woken as soon as any session's queued bytes free up.
+    pub(crate) budget_stall: AfXdpTcpBudgetStallSet,
+    /// EN-17/F3: sessions that stopped draining `socket.recv` because the
+    /// queue byte budget was exhausted. Re-marked hot (bounded retry) once
+    /// the ledger has headroom again; TCP window shrinks meanwhile.
+    ingress_stalled: std::collections::HashSet<AfXdpTcpFlowKey>,
     session_limit: usize,
     tx_scratch: Vec<u8>,
     tcp_manager: Option<Arc<crate::tcp_proxy::TcpProxyManager>>,
@@ -443,8 +557,11 @@ impl AfXdpTcpReactor {
             wake_set,
             sweep_keys: Vec::new(),
             sweep_pos: 0,
+            sweep_active: false,
             last_sweep: SmoltcpInstant::from_millis(0),
             last_retain: SmoltcpInstant::from_millis(0),
+            budget_stall: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            ingress_stalled: std::collections::HashSet::new(),
             session_limit: session_limit.max(1),
             tx_scratch: Vec::with_capacity(2048),
             tcp_manager,
@@ -636,8 +753,9 @@ impl AfXdpTcpReactor {
 
     /// EN-17: queue a packet for the bounded smoltcp ingress loop and mark
     /// its session hot. Returns false (explicit refusal, counted) when the
-    /// per-reactor ingress queue is full — memory stays bounded under an
-    /// RX flood; TCP retransmit is the recovery path.
+    /// per-reactor ingress queue or the node TCP byte budget is full —
+    /// memory stays bounded under an RX flood; TCP retransmit is the
+    /// recovery path.
     fn enqueue_ingress(
         &mut self,
         route: AfXdpRouteMeta,
@@ -649,7 +767,12 @@ impl AfXdpTcpReactor {
             AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        self.device.push_ingress(route, flow, ip_packet);
+        let Some(charge) = MEMORY_GOVERNOR.try_reserve_tcp_queue_bytes(ip_packet.len()) else {
+            #[cfg(target_os = "linux")]
+            AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        self.device.push_ingress(route, flow, ip_packet, charge);
         self.mark_hot(flow);
         true
     }
@@ -695,6 +818,7 @@ impl AfXdpTcpReactor {
             .iface
             .poll_egress(now, &mut self.device, &mut self.sockets);
         self.pump_sessions(now);
+        self.release_budget_backpressure();
         let frames = self.device.drain_egress().collect::<Vec<_>>();
         let mut egress = Vec::with_capacity(frames.len());
         for frame in frames {
@@ -735,6 +859,15 @@ impl AfXdpTcpReactor {
     #[cfg(test)]
     pub(crate) fn pending_wake_count(&self) -> usize {
         self.wake_set.len()
+    }
+
+    /// Tests only: completion timestamp of the last real sweep cycle. The
+    /// sweep must keep its own cadence — under continuous sub-interval
+    /// polling this timestamp must stay pinned at the last completed cycle,
+    /// not drift forward with every poll.
+    #[cfg(test)]
+    pub(crate) fn last_sweep_at(&self) -> SmoltcpInstant {
+        self.last_sweep
     }
 
     #[cfg(test)]
@@ -797,6 +930,11 @@ impl AfXdpTcpReactor {
         let tx_buffer = SmoltcpTcp::SocketBuffer::new(vec![0; AF_XDP_TCP_SOCKET_BUFFER_BYTES]);
         let mut socket = SmoltcpTcp::Socket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
+        // F8: AF_XDP TCP must run a real congestion controller — without an
+        // explicit selection smoltcp silently falls back to NoControl
+        // (window = usize::MAX), which XDP pps budgets cannot replace.
+        // Cubic is the production default until the transport crate lands.
+        socket.set_congestion_control(SmoltcpTcp::CongestionControl::Cubic);
         if let Err(err) =
             socket.listen(IpListenEndpoint::from(IpEndpoint::from(flow.local_addr)))
         {
@@ -817,8 +955,8 @@ impl AfXdpTcpReactor {
             socket,
             ingress_tx: None,
             egress_rx: None,
-            pending_ingress: Bytes::new(),
-            pending_egress: Bytes::new(),
+            pending_ingress: AfXdpTcpChargedBytes::empty(),
+            pending_egress: AfXdpTcpChargedBytes::empty(),
             created_at: now,
             last_activity: now,
             proxy_started: {
@@ -863,6 +1001,7 @@ impl AfXdpTcpReactor {
         http_manager: Option<Arc<crate::http_proxy_manager::HttpProxyManager>>,
         session: &mut AfXdpTcpSession,
         wake_set: Arc<DashMap<AfXdpTcpFlowKey, ()>>,
+        budget_stall: AfXdpTcpBudgetStallSet,
     ) -> bool {
         let peer_addr = session.flow.peer_addr;
         let listen_addr = session.flow.local_addr;
@@ -871,10 +1010,12 @@ impl AfXdpTcpReactor {
             stream,
             ingress_tx,
             egress_rx,
+            budget_stall: _,
         } = AfXdpTcpStream::channel_pair_with_wake(
             AF_XDP_TCP_STREAM_CHANNEL_DEPTH,
             session.flow,
             wake_set,
+            budget_stall,
         );
         match session.proxy_class {
             AfXdpTcpProxyClass::TcpPlain | AfXdpTcpProxyClass::TcpTls => {
@@ -973,12 +1114,13 @@ impl AfXdpTcpReactor {
         // already queued in the hot set are skipped (their pump comes via
         // the queue); sessions created mid-cycle are hot by construction and
         // join the next cycle.
-        if self.sweep_pos >= self.sweep_keys.len()
+        if !self.sweep_active
             && session_idle_for(now, self.last_sweep) >= AF_XDP_TCP_SWEEP_INTERVAL
         {
             self.sweep_keys.clear();
             self.sweep_keys.extend(self.sessions.keys().copied());
             self.sweep_pos = 0;
+            self.sweep_active = true;
         }
         let mut budget = AF_XDP_TCP_PUMP_BUDGET;
         while budget > 0 {
@@ -997,22 +1139,29 @@ impl AfXdpTcpReactor {
         }
         // Batched sweep progress — each round advances the cursor by at most
         // SWEEP_BATCH entries regardless of table size.
-        let mut swept = 0usize;
-        while self.sweep_pos < self.sweep_keys.len() && swept < AF_XDP_TCP_SWEEP_BATCH_BUDGET {
-            let flow = self.sweep_keys[self.sweep_pos];
-            self.sweep_pos += 1;
-            swept += 1;
-            if self.sessions.get(&flow).is_some_and(|s| s.hot) {
-                continue;
+        if self.sweep_active {
+            let mut swept = 0usize;
+            while self.sweep_pos < self.sweep_keys.len()
+                && swept < AF_XDP_TCP_SWEEP_BATCH_BUDGET
+            {
+                let flow = self.sweep_keys[self.sweep_pos];
+                self.sweep_pos += 1;
+                swept += 1;
+                if self.sessions.get(&flow).is_some_and(|s| s.hot) {
+                    continue;
+                }
+                self.pump_session(now, flow);
+                if self.session_still_active(flow) {
+                    self.mark_hot(flow);
+                }
             }
-            self.pump_session(now, flow);
-            if self.session_still_active(flow) {
-                self.mark_hot(flow);
+            if self.sweep_pos >= self.sweep_keys.len() {
+                // Only a real completed cycle retires the sweep timestamp;
+                // an idle round must not push `last_sweep` forward.
+                self.sweep_active = false;
+                self.sweep_keys.clear();
+                self.last_sweep = now;
             }
-        }
-        if self.sweep_pos >= self.sweep_keys.len() {
-            self.sweep_keys.clear();
-            self.last_sweep = now;
         }
     }
 
@@ -1038,6 +1187,12 @@ impl AfXdpTcpReactor {
         {
             return true;
         }
+        // F3: a session parked on the queue byte budget keeps `can_recv`
+        // true while data sits in the socket — staying hot would busy-pump
+        // it every round. The budget release path re-marks it instead.
+        if self.ingress_stalled.contains(&flow) {
+            return false;
+        }
         socket.can_recv()
     }
 
@@ -1054,11 +1209,23 @@ impl AfXdpTcpReactor {
 
             if !session.proxy_started {
                 if af_xdp_tcp_proxy_ready(session.proxy_class, socket) {
+                    // F8: a connected socket must never run NoControl — the
+                    // controller is set at creation; if it is ever missing
+                    // the failure must be loud, not a silent unbounded
+                    // window.
+                    if socket.congestion_control() == SmoltcpTcp::CongestionControl::None {
+                        tracing::error!(
+                            "AF_XDP TCP connected socket has no congestion control local={} peer={}",
+                            flow.local_addr,
+                            flow.peer_addr
+                        );
+                    }
                     if !Self::spawn_proxy_task_with_managers(
                         tcp_manager.clone(),
                         http_manager.clone(),
                         session,
                         self.wake_set.clone(),
+                        self.budget_stall.clone(),
                     ) {
                         socket.abort();
                         session.closing = true;
@@ -1090,6 +1257,22 @@ impl AfXdpTcpReactor {
             }
 
             while socket.can_recv() {
+                // EN-17/F3: reserve queue bytes BEFORE consuming the socket
+                // buffer — `recv` is destructive, so a budget failure after
+                // the copy would leave the payload uncharged. On refusal the
+                // bytes stay in smoltcp's buffer (window shrinks → peer
+                // backs off); the session parks in `ingress_stalled` and is
+                // re-marked hot once the ledger frees.
+                let want = socket.recv_queue().min(AF_XDP_TCP_RECV_SCRATCH_BYTES);
+                if want == 0 {
+                    break;
+                }
+                let Some(charge) = MEMORY_GOVERNOR.try_reserve_tcp_queue_bytes(want) else {
+                    #[cfg(target_os = "linux")]
+                    AF_XDP_TCP_DIAG_BUDGET_STALLS.fetch_add(1, Ordering::Relaxed);
+                    self.ingress_stalled.insert(flow);
+                    break;
+                };
                 // EN-17: single copy — smoltcp's receive buffer is copied
                 // straight into the egress `Bytes`; no scratch round-trip.
                 match socket.recv(|data| {
@@ -1107,7 +1290,7 @@ impl AfXdpTcpReactor {
                             match send_or_store_ingress(
                                 ingress_tx,
                                 &mut session.pending_ingress,
-                                bytes,
+                                AfXdpTcpChargedBytes::with_permit(bytes, charge),
                             ) {
                                 IngressDelivery::Delivered => {
                                     #[cfg(target_os = "linux")]
@@ -1292,6 +1475,7 @@ impl AfXdpTcpReactor {
             );
         }
         for flow in finished {
+            self.ingress_stalled.remove(&flow);
             if let Some(session) = self.sessions.remove(&flow) {
                 let socket = self
                     .sockets
@@ -1299,6 +1483,30 @@ impl AfXdpTcpReactor {
                 socket.abort();
                 let _ = self.sockets.remove(session.socket);
             }
+        }
+    }
+
+    /// EN-17/F3: byte-budget recovery — when the node TCP queue ledger has
+    /// headroom again, wake writers parked in `poll_write` and re-mark
+    /// ingress-stalled sessions hot so `socket.recv` resumes. Headroom for
+    /// a full write chunk is required so released tasks do not immediately
+    /// re-stall on a sliver of budget.
+    fn release_budget_backpressure(&mut self) {
+        if self.ingress_stalled.is_empty() && self.budget_stall.lock().is_empty() {
+            return;
+        }
+        let budget = MEMORY_GOVERNOR.tcp_queue_bytes_budget();
+        let used = MEMORY_GOVERNOR.tcp_queue_bytes();
+        if used.saturating_add(AF_XDP_TCP_STREAM_WRITE_CHUNK as u64) > budget {
+            return;
+        }
+        let wakers = std::mem::take(&mut *self.budget_stall.lock());
+        for waker in wakers {
+            waker.wake();
+        }
+        let stalled = std::mem::take(&mut self.ingress_stalled);
+        for flow in stalled {
+            self.mark_hot(flow);
         }
     }
 
@@ -1408,8 +1616,8 @@ pub(crate) fn session_idle_for(now: SmoltcpInstant, last_activity: SmoltcpInstan
 
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) fn flush_pending_ingress(
-    ingress_tx: &mpsc::Sender<Bytes>,
-    pending_ingress: &mut Bytes,
+    ingress_tx: &mpsc::Sender<AfXdpTcpChargedBytes>,
+    pending_ingress: &mut AfXdpTcpChargedBytes,
 ) -> IngressDelivery {
     if pending_ingress.is_empty() {
         return IngressDelivery::Delivered;
@@ -1420,9 +1628,9 @@ pub(crate) fn flush_pending_ingress(
 
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) fn send_or_store_ingress(
-    ingress_tx: &mpsc::Sender<Bytes>,
-    pending_ingress: &mut Bytes,
-    bytes: Bytes,
+    ingress_tx: &mpsc::Sender<AfXdpTcpChargedBytes>,
+    pending_ingress: &mut AfXdpTcpChargedBytes,
+    bytes: AfXdpTcpChargedBytes,
 ) -> IngressDelivery {
     match ingress_tx.try_send(bytes) {
         Ok(()) => IngressDelivery::Delivered,
@@ -1463,6 +1671,13 @@ pub(crate) fn proxy_bridge_should_continue(manager: &Arc<XdpManager>) -> bool {
 
 impl AfXdpTcpStream {
     pub fn channel_pair(buffer: usize) -> AfXdpTcpStreamParts {
+        Self::channel_pair_with_budget(buffer, Arc::new(parking_lot::Mutex::new(Vec::new())))
+    }
+
+    fn channel_pair_with_budget(
+        buffer: usize,
+        budget_stall: AfXdpTcpBudgetStallSet,
+    ) -> AfXdpTcpStreamParts {
         let depth = buffer.max(1);
         let (ingress_tx, incoming_rx) = mpsc::channel(depth);
         let (outgoing_tx, egress_rx) = mpsc::channel(depth);
@@ -1471,22 +1686,27 @@ impl AfXdpTcpStream {
                 incoming_rx,
                 outgoing_tx: Some(outgoing_tx),
                 wake: None,
-                read_buf: Bytes::new(),
+                budget_stall: budget_stall.clone(),
+                read_buf: AfXdpTcpChargedBytes::empty(),
                 write_permit: None,
             },
             ingress_tx,
             egress_rx,
+            budget_stall,
         }
     }
 
     /// EN-17: channel pair whose stream wakes the reactor after every
-    /// queued egress write / shutdown so pumping needs no table scan.
+    /// queued egress write / shutdown so pumping needs no table scan. The
+    /// reactor's budget-stall set is shared so suspended writers get woken
+    /// the round the queue byte budget frees.
     pub fn channel_pair_with_wake(
         buffer: usize,
         flow: AfXdpTcpFlowKey,
         wake_set: Arc<DashMap<AfXdpTcpFlowKey, ()>>,
+        budget_stall: AfXdpTcpBudgetStallSet,
     ) -> AfXdpTcpStreamParts {
-        let mut parts = Self::channel_pair(buffer);
+        let mut parts = Self::channel_pair_with_budget(buffer, budget_stall);
         parts.stream.wake = Some((flow, wake_set));
         parts
     }
@@ -1574,7 +1794,28 @@ impl AsyncWrite for AfXdpTcpStream {
             }
         };
         let len = buf.len().min(AF_XDP_TCP_STREAM_WRITE_CHUNK);
-        permit.send(Bytes::copy_from_slice(&buf[..len]));
+        // F3: charge the node TCP queue ledger before queueing. On refusal
+        // the write suspends (register + Pending) — explicit backpressure
+        // toward the application; the reactor wakes registered writers once
+        // ledger headroom returns. Never drop or bypass the charge.
+        let Some(byte_charge) = MEMORY_GOVERNOR.try_reserve_tcp_queue_bytes(len) else {
+            #[cfg(target_os = "linux")]
+            AF_XDP_TCP_DIAG_BUDGET_STALLS.fetch_add(1, Ordering::Relaxed);
+            let mut stall = self.budget_stall.lock();
+            if stall.len() < AF_XDP_TCP_BUDGET_STALL_MAX {
+                stall.push(cx.waker().clone());
+            } else {
+                tracing::warn!(
+                    "AF_XDP TCP budget stall set at capacity len={} — writer stays parked until a stalled peer wakes",
+                    stall.len()
+                );
+            }
+            return Poll::Pending;
+        };
+        permit.send(AfXdpTcpChargedBytes::with_permit(
+            Bytes::copy_from_slice(&buf[..len]),
+            byte_charge,
+        ));
         self.signal_wake();
         Poll::Ready(Ok(len))
     }
@@ -1588,5 +1829,15 @@ impl AsyncWrite for AfXdpTcpStream {
         self.outgoing_tx = None;
         self.signal_wake();
         Poll::Ready(Ok(()))
+    }
+}
+
+/// Dropping the stream (proxy task finished, app dropped the handle, or the
+/// task was cancelled) must not wait for the sweep backstop to be noticed:
+/// mark the flow dirty so the next pump round observes the closed channels
+/// and transitions the session to closing within one reactor round.
+impl Drop for AfXdpTcpStream {
+    fn drop(&mut self) {
+        self.signal_wake();
     }
 }

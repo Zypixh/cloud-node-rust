@@ -93,6 +93,12 @@ pub(crate) const AF_XDP_TCP_WAKE_DRAIN_BUDGET: usize = 8192;
 /// the round's work budget instead of doing an unbounded pass.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_SWEEP_BATCH_BUDGET: usize = 256;
+/// EN-17/F3: cap on the per-reactor stalled-writer set. One entry per
+/// suspended writer task (re-registered on each wake), so the bound is
+/// defensive — beyond it a writer stays parked until a peer's wake frees
+/// budget and the next poll re-registers.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_BUDGET_STALL_MAX: usize = 2 * AF_XDP_TCP_MAX_SESSION_LIMIT;
 /// EN-17: amortized full-session sweep cadence — backstop for sessions
 /// whose progress signal (packet or egress wake) was not observed, and
 /// the reap/idle-timeout granularity.
@@ -125,6 +131,14 @@ static AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// EN-17: egress wake signals received from proxy tasks.
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_WAKE_SIGNALS: AtomicU64 = AtomicU64::new(0);
+/// EN-17/F3: ingress packets refused because the node TCP queue byte
+/// budget was exhausted (distinct from the per-reactor frame queue).
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// EN-17/F3: queue-byte-budget backpressure events — a recv drain parked
+/// or a stream write suspended.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_BUDGET_STALLS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
 pub(crate) fn reset_tcp_diag() {
@@ -139,6 +153,8 @@ pub(crate) fn reset_tcp_diag() {
     AF_XDP_TCP_DIAG_EGRESS_FRAMES.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_WAKE_SIGNALS.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_BUDGET_STALLS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(target_os = "linux")]
@@ -155,6 +171,10 @@ pub(crate) fn tcp_diag_snapshot() -> serde_json::Value {
         "egressFrames": AF_XDP_TCP_DIAG_EGRESS_FRAMES.load(Ordering::Relaxed),
         "ingressQueueDropped": AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.load(Ordering::Relaxed),
         "wakeSignals": AF_XDP_TCP_DIAG_WAKE_SIGNALS.load(Ordering::Relaxed),
+        "ingressBudgetDropped": AF_XDP_TCP_DIAG_INGRESS_BUDGET_DROPPED.load(Ordering::Relaxed),
+        "queueBudgetStalls": AF_XDP_TCP_DIAG_BUDGET_STALLS.load(Ordering::Relaxed),
+        "tcpQueueBytes": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes(),
+        "tcpQueueBytesBudget": crate::memory_governor::MEMORY_GOVERNOR.tcp_queue_bytes_budget(),
     })
 }
 
@@ -182,13 +202,23 @@ impl AfXdpTxFailureTracker {
         }
     }
 
+    /// F2 split semantics. `Backpressured` is a capacity signal: it returns
+    /// true exactly once when the streak reaches the threshold (a warn edge)
+    /// and must never tear the queue down. `Failed` is a real TX error: it
+    /// returns true on the threshold and stays true while the streak runs,
+    /// so a device/worker fault buried in a backpressure streak still
+    /// isolates the queue.
     pub(crate) fn record(&mut self, status: AfXdpTxStatus) -> bool {
         match status {
             AfXdpTxStatus::Sent => {
                 self.consecutive_failures = 0;
                 false
             }
-            AfXdpTxStatus::Backpressured | AfXdpTxStatus::Failed => {
+            AfXdpTxStatus::Backpressured => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                self.consecutive_failures == self.max_consecutive_failures
+            }
+            AfXdpTxStatus::Failed => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.consecutive_failures >= self.max_consecutive_failures
             }
@@ -202,7 +232,14 @@ impl AfXdpTxFailureTracker {
 }
 
 type TcpWritePermitFuture = Pin<
-    Box<dyn Future<Output = Result<mpsc::OwnedPermit<Bytes>, mpsc::error::SendError<()>>> + Send>,
+    Box<
+        dyn Future<
+                Output = Result<
+                    mpsc::OwnedPermit<AfXdpTcpChargedBytes>,
+                    mpsc::error::SendError<()>,
+                >,
+            > + Send,
+    >,
 >;
 
 #[cfg(any(test, target_os = "linux"))]

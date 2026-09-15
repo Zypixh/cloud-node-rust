@@ -544,6 +544,10 @@ pub(crate) async fn run_queue_bridge_loop(
     // instead of failing open or collapsing outright.
     let mut congested = false;
     let mut congested_drops = 0u64;
+    // F2: TCP admission refusals are counted for status, never escalate to
+    // queue teardown — the worker keeps serving existing sessions and new
+    // admissions resume automatically when capacity frees.
+    let mut admission_refusals = 0u64;
     let mut frames = Vec::with_capacity(64);
     // EN-17: reusable encode buffer for same-interface TCP egress — encodes
     // once per frame, no clone before `send_raw_frame`.
@@ -578,6 +582,7 @@ pub(crate) async fn run_queue_bridge_loop(
                         status.tx_invalid_descs = stats.tx_invalid_descs();
                     }
                     status.congested_drops = congested_drops;
+                    status.admission_refusals = admission_refusals;
                 },
             );
         }
@@ -726,17 +731,16 @@ pub(crate) async fn run_queue_bridge_loop(
                             udp_ingress_failures.record(AfXdpTxStatus::Sent);
                         }
                         Ok(crate::udp_proxy::UdpIngressDatagramStatus::Full) => {
-                            tracing::debug!("AF_XDP proxy bridge upstream session queue full");
+                            // F2: upstream queue full is capacity pressure,
+                            // not a fault — shed this datagram, keep the
+                            // queue alive so existing sessions drain and new
+                            // admissions resume when the queues free up.
                             congested = true;
+                            congested_drops = congested_drops.saturating_add(1);
                             if udp_ingress_failures.record(AfXdpTxStatus::Backpressured) {
-                                manager.disable_queue_redirect_for_fault(
-                                    &own_interface,
-                                    queue_handle.queue,
-                                    format!(
-                                        "AF_XDP UDP ingress queues stayed full for {AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES} redirected datagrams"
-                                    ),
+                                tracing::warn!(
+                                    "AF_XDP UDP ingress queues stayed full for {AF_XDP_MAX_CONSECUTIVE_UDP_INGRESS_FAILURES} consecutive redirected datagrams; queue stays up and sheds new work until capacity frees"
                                 );
-                                return;
                             }
                         }
                         Ok(crate::udp_proxy::UdpIngressDatagramStatus::Closed) => {
@@ -783,15 +787,23 @@ pub(crate) async fn run_queue_bridge_loop(
                         continue;
                     }
                     let status = tcp_reactor.ingest(route, flow, ip_packet);
+                    if matches!(
+                        status,
+                        AfXdpTcpIngestStatus::RefusedAtCapacity
+                            | AfXdpTcpIngestStatus::IngressQueueFull
+                    ) {
+                        admission_refusals = admission_refusals.saturating_add(1);
+                    }
+                    // F2: a refusal streak only sheds new SYNs — the queue
+                    // keeps pumping existing sessions and recovers the
+                    // moment capacity frees; no redirect withdrawal, no
+                    // worker exit.
                     if tcp_admission_failures.record(status) {
-                        manager.disable_queue_redirect_for_fault(
-                            &own_interface,
-                            queue_handle.queue,
-                            format!(
-                                "AF_XDP TCP reactor refused {AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS} new sessions consecutively"
-                            ),
+                        tracing::warn!(
+                            "AF_XDP TCP reactor refused {AF_XDP_MAX_CONSECUTIVE_TCP_ADMISSION_REFUSALS} new sessions consecutively on {} queue {}; queue stays up and resumes admitting when capacity frees",
+                            own_interface.as_ref(),
+                            queue_handle.queue
                         );
-                        return;
                     }
                 }
                 None => {
@@ -835,20 +847,21 @@ pub(crate) async fn run_queue_bridge_loop(
                     Some(tx) => match tx.try_send(AfXdpForward::Udp(datagram)) {
                         Ok(()) => continue,
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!(
-                                "AF_XDP proxy bridge forward channel to interface {} is full; dropping downstream datagram",
-                                route.interface.as_ref()
-                            );
+                            // F2: a full cross-interface channel is
+                            // backpressure, not a fault — drop this
+                            // datagram, stay congested, keep serving.
                             congested = true;
+                            congested_drops = congested_drops.saturating_add(1);
                             if tx_failures.record(AfXdpTxStatus::Backpressured) {
-                                manager.disable_queue_redirect_for_fault(
-                                    &own_interface,
-                                    queue_handle.queue,
-                                    format!(
-                                        "AF_XDP cross-interface forward channel stayed full for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} datagrams"
-                                    ),
+                                tracing::warn!(
+                                    "AF_XDP cross-interface forward channel to {} stayed full for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} consecutive datagrams; queue stays up and sheds new work until the channel drains",
+                                    route.interface.as_ref()
                                 );
-                                return;
+                            } else {
+                                tracing::debug!(
+                                    "AF_XDP proxy bridge forward channel to interface {} is full; dropping downstream datagram",
+                                    route.interface.as_ref()
+                                );
                             }
                             continue;
                         }
@@ -881,22 +894,24 @@ pub(crate) async fn run_queue_bridge_loop(
                     tx_failures.record(AfXdpTxStatus::Sent);
                 }
                 Ok(false) => {
-                    tracing::debug!(
-                        "AF_XDP proxy bridge could not send downstream datagram listen={} peer={} bytes={}",
-                        datagram.listen_addr,
-                        datagram.peer_addr,
-                        datagram.payload.len()
-                    );
+                    // F2: TX ring full is backpressure — drop this
+                    // datagram, stay congested, keep serving. The queue
+                    // only isolates on real TX errors below.
                     congested = true;
+                    congested_drops = congested_drops.saturating_add(1);
                     if tx_failures.record(AfXdpTxStatus::Backpressured) {
-                        manager.disable_queue_redirect_for_fault(
-                            &own_interface,
-                            queue_handle.queue,
-                            format!(
-                                "AF_XDP proxy bridge TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times"
-                            ),
+                        tracing::warn!(
+                            "AF_XDP proxy bridge TX backpressure on {} queue {} persisted for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} consecutive datagrams; queue stays up and sheds new work until the ring drains",
+                            own_interface.as_ref(),
+                            queue_handle.queue
                         );
-                        return;
+                    } else {
+                        tracing::debug!(
+                            "AF_XDP proxy bridge could not send downstream datagram listen={} peer={} bytes={}",
+                            datagram.listen_addr,
+                            datagram.peer_addr,
+                            datagram.payload.len()
+                        );
                     }
                 }
                 Err(err) => {
@@ -962,15 +977,13 @@ pub(crate) async fn run_queue_bridge_loop(
                 }
                 Ok(false) => {
                     congested = true;
+                    congested_drops = congested_drops.saturating_add(1);
                     if tx_failures.record(AfXdpTxStatus::Backpressured) {
-                        manager.disable_queue_redirect_for_fault(
-                            &own_interface,
-                            queue_handle.queue,
-                            format!(
-                                "AF_XDP forwarded TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times"
-                            ),
+                        tracing::warn!(
+                            "AF_XDP forwarded TX backpressure on {} queue {} persisted for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} consecutive frames; queue stays up and sheds new work until the ring drains",
+                            own_interface.as_ref(),
+                            queue_handle.queue
                         );
-                        return;
                     }
                 }
                 Err(err) => {
@@ -1032,22 +1045,25 @@ pub(crate) async fn run_queue_bridge_loop(
                     tx_failures.record(AfXdpTxStatus::Sent);
                 }
                 Ok(false) => {
-                    tracing::debug!(
-                        "AF_XDP TCP reactor could not send frame interface={} queue={} bytes={}",
-                        route.interface.as_ref(),
-                        route.queue,
-                        encode_scratch.len()
-                    );
+                    // F2: TX ring full while flushing reactor egress is
+                    // backpressure — the frame is dropped, the smoltcp
+                    // retransmit path covers real loss, and the queue keeps
+                    // serving instead of exiting.
                     congested = true;
+                    congested_drops = congested_drops.saturating_add(1);
                     if tx_failures.record(AfXdpTxStatus::Backpressured) {
-                        manager.disable_queue_redirect_for_fault(
-                            &own_interface,
-                            queue_handle.queue,
-                            format!(
-                                "AF_XDP TCP reactor TX backpressure repeated {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} times"
-                            ),
+                        tracing::warn!(
+                            "AF_XDP TCP egress TX backpressure on {} queue {} persisted for {AF_XDP_MAX_CONSECUTIVE_TX_FAILURES} consecutive frames; queue stays up and sheds new work until the ring drains",
+                            own_interface.as_ref(),
+                            queue_handle.queue
                         );
-                        return;
+                    } else {
+                        tracing::debug!(
+                            "AF_XDP TCP reactor could not send frame interface={} queue={} bytes={}",
+                            route.interface.as_ref(),
+                            route.queue,
+                            encode_scratch.len()
+                        );
                     }
                 }
                 Err(err) => {

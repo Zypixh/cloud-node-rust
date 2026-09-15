@@ -567,6 +567,7 @@ fn create_af_xdp_queue(
         xsk_mode: landed_mode.to_string(),
         faulted: false,
         congested_drops: 0,
+        admission_refusals: 0,
     };
     Ok((
         AfXdpQueueHandle {

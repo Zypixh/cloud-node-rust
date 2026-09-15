@@ -1461,6 +1461,15 @@ fn af_xdp_tcp_admission_failure_tracker_requires_consecutive_refusals() {
     assert_eq!(tracker.consecutive_refusals(), 0);
     assert!(!tracker.record(af_xdp::AfXdpTcpIngestStatus::RefusedAtCapacity));
     assert!(tracker.record(af_xdp::AfXdpTcpIngestStatus::RefusedAtCapacity));
+    // F2: the threshold is a one-shot warn edge — the streak keeps counting
+    // for observability but never re-fires or escalates to teardown.
+    assert!(!tracker.record(af_xdp::AfXdpTcpIngestStatus::RefusedAtCapacity));
+    assert_eq!(tracker.consecutive_refusals(), 3);
+    // Recovery is automatic: the first non-refusal outcome resets the
+    // streak, and a new streak can alarm again.
+    assert!(!tracker.record(af_xdp::AfXdpTcpIngestStatus::Accepted));
+    assert!(!tracker.record(af_xdp::AfXdpTcpIngestStatus::RefusedAtCapacity));
+    assert!(tracker.record(af_xdp::AfXdpTcpIngestStatus::RefusedAtCapacity));
 
     let mut immediate = af_xdp::AfXdpTcpAdmissionFailureTracker::new(0);
     assert!(immediate.record(af_xdp::AfXdpTcpIngestStatus::RefusedAtCapacity));
@@ -1784,9 +1793,13 @@ async fn af_xdp_tcp_stream_bridges_bounded_channels() {
         mut stream,
         ingress_tx,
         mut egress_rx,
+        ..
     } = af_xdp::AfXdpTcpStream::channel_pair(1);
 
-    ingress_tx.send(Bytes::from_static(b"hello")).await.unwrap();
+    ingress_tx
+        .send(af_xdp::AfXdpTcpChargedBytes::charged(Bytes::from_static(b"hello")).unwrap())
+        .await
+        .unwrap();
     let mut read = [0u8; 3];
     stream.read_exact(&mut read).await.unwrap();
     assert_eq!(&read, b"hel");
@@ -1797,8 +1810,8 @@ async fn af_xdp_tcp_stream_bridges_bounded_channels() {
 
     stream.write_all(b"world").await.unwrap();
     assert_eq!(
-        egress_rx.recv().await.unwrap(),
-        Bytes::from_static(b"world")
+        &egress_rx.recv().await.unwrap()[..],
+        b"world"
     );
 
     stream.shutdown().await.unwrap();
@@ -1841,28 +1854,31 @@ async fn af_xdp_ingress_delivery_preserves_backpressured_chunk() {
     use bytes::Bytes;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    let mut pending = Bytes::new();
+    let mut pending = af_xdp::AfXdpTcpChargedBytes::empty();
+    let charged = |data: &'static [u8]| {
+        af_xdp::AfXdpTcpChargedBytes::charged(Bytes::from_static(data)).unwrap()
+    };
 
     assert_eq!(
-        af_xdp::send_or_store_ingress(&tx, &mut pending, Bytes::from_static(b"first")),
+        af_xdp::send_or_store_ingress(&tx, &mut pending, charged(b"first")),
         af_xdp::IngressDelivery::Delivered
     );
     assert_eq!(
-        af_xdp::send_or_store_ingress(&tx, &mut pending, Bytes::from_static(b"second")),
+        af_xdp::send_or_store_ingress(&tx, &mut pending, charged(b"second")),
         af_xdp::IngressDelivery::Backpressured
     );
     assert_eq!(&pending[..], b"second");
-    assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"first"));
+    assert_eq!(&rx.recv().await.unwrap()[..], b"first");
 
     assert_eq!(
         af_xdp::flush_pending_ingress(&tx, &mut pending),
         af_xdp::IngressDelivery::Delivered
     );
     assert!(pending.is_empty());
-    assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"second"));
+    assert_eq!(&rx.recv().await.unwrap()[..], b"second");
 
     drop(rx);
-    pending = Bytes::from_static(b"orphaned");
+    pending = charged(b"orphaned");
     assert_eq!(
         af_xdp::flush_pending_ingress(&tx, &mut pending),
         af_xdp::IngressDelivery::Closed
@@ -1955,7 +1971,12 @@ async fn af_xdp_tcp_stream_write_and_shutdown_signal_reactor_wake() {
         mut stream,
         mut egress_rx,
         ..
-    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(4, flow, reactor.wake_set.clone());
+    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(
+        4,
+        flow,
+        reactor.wake_set.clone(),
+        reactor.budget_stall.clone(),
+    );
 
     stream.write_all(b"hello").await.unwrap();
     assert_eq!(reactor.pending_wake_count(), 1);
@@ -1964,8 +1985,8 @@ async fn af_xdp_tcp_stream_write_and_shutdown_signal_reactor_wake() {
     stream.shutdown().await.unwrap();
     assert_eq!(reactor.pending_wake_count(), 1);
     assert_eq!(
-        egress_rx.recv().await.unwrap(),
-        bytes::Bytes::from_static(b"hello")
+        &egress_rx.recv().await.unwrap()[..],
+        b"hello"
     );
 
     // The next poll drains the wake queue and marks the session hot.
@@ -2081,6 +2102,77 @@ fn af_xdp_tcp_reactor_sweep_is_batched_not_unbounded() {
 
 #[cfg(any(test, target_os = "linux"))]
 #[test]
+fn af_xdp_tcp_reactor_sweep_keeps_cadence_under_fast_polling() {
+    // F4 regression: polling every 1ms must not keep deferring the periodic
+    // sweep. With the old bookkeeping every poll round updated the
+    // "last sweep" timestamp, so under the bridge's continuous fast polling
+    // the 250ms interval never elapsed and the backstop never ran.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let t0 = smoltcp::time::Instant::from_millis(crate::utils::time::now_timestamp_millis());
+    for idx in 0..4u16 {
+        let frame = ipv4_tcp_syn_frame_with_source_port(false, 53000 + idx);
+        let af_xdp::AfXdpProxyFrame::Tcp { route, flow, .. } =
+            af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+        else {
+            panic!("expected TCP proxy frame");
+        };
+        assert!(reactor.ensure_session_at(route, flow, af_xdp::AfXdpTcpProxyClass::TcpPlain, t0));
+    }
+
+    // First poll starts and completes a cycle (4 sessions < one batch).
+    reactor.poll_at_for_test(t0);
+    assert_eq!(reactor.last_sweep_at(), t0);
+
+    // Continuous 1ms polling below the interval must NOT advance
+    // last_sweep — the timestamp belongs to real completed cycles only.
+    for step in 1..=200i64 {
+        reactor.poll_at_for_test(smoltcp::time::Instant::from_millis(t0.total_millis() + step));
+    }
+    assert_eq!(reactor.last_sweep_at(), t0);
+
+    // Once the interval actually elapses, the next poll runs the next cycle.
+    let t_next = smoltcp::time::Instant::from_millis(
+        t0.total_millis() + af_xdp::AF_XDP_TCP_SWEEP_INTERVAL.as_millis() as i64 + 1,
+    );
+    reactor.poll_at_for_test(t_next);
+    assert_eq!(reactor.last_sweep_at(), t_next);
+
+    // And continuous fast polling again must not hide the following cycle.
+    for step in 1..=200i64 {
+        reactor
+            .poll_at_for_test(smoltcp::time::Instant::from_millis(t_next.total_millis() + step));
+    }
+    assert_eq!(reactor.last_sweep_at(), t_next);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_stream_drop_signals_reactor() {
+    // F4 contract: dropping the stream (proxy task exit / app drop) marks
+    // the flow dirty so the closed channels are observed on the very next
+    // pump round instead of waiting for the sweep backstop.
+    let (flow, wake_set) = {
+        let frame = ipv4_tcp_syn_frame(false);
+        let af_xdp::AfXdpProxyFrame::Tcp { flow, .. } =
+            af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+        else {
+            panic!("expected TCP proxy frame");
+        };
+        (flow, std::sync::Arc::new(dashmap::DashMap::new()))
+    };
+    let parts = af_xdp::AfXdpTcpStream::channel_pair_with_wake(
+        8,
+        flow,
+        wake_set.clone(),
+        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+    );
+    assert!(wake_set.is_empty());
+    drop(parts.stream);
+    assert!(wake_set.contains_key(&flow));
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
 fn af_xdp_tcp_reactor_ingress_budget_leaves_backlog_bounded() {
     // RX flood: more queued packets than one round's ingress budget — the
     // poll must process exactly the budget and leave the rest for next
@@ -2152,7 +2244,12 @@ async fn af_xdp_tcp_wake_set_stays_bounded_under_write_storm() {
         mut stream,
         mut egress_rx,
         ..
-    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(64, flow, reactor.wake_set.clone());
+    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(
+        64,
+        flow,
+        reactor.wake_set.clone(),
+        reactor.budget_stall.clone(),
+    );
 
     // A write storm across many chunks must never grow the wake set past
     // one entry per flow — marks dedup at enqueue.
@@ -2181,6 +2278,110 @@ fn af_xdp_tcp_reactor_stale_wake_mark_is_a_noop() {
     assert_eq!(reactor.pending_wake_count(), 0);
     assert_eq!(reactor.session_count(), 0);
     assert_eq!(reactor.hot_session_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_ingress_byte_budget_refusal_is_explicit() {
+    // F3: when the node TCP queue byte budget is exhausted, ingress is an
+    // explicit counted refusal (TCP retransmit recovers) — never a silent
+    // unaccounted queue growth.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let governor = &*crate::memory_governor::MEMORY_GOVERNOR;
+    // Saturate the ledger with a single blocking reservation; released at
+    // scope end so other parallel tests are unaffected.
+    let budget = governor.tcp_queue_bytes_budget();
+    let _block = governor
+        .try_reserve_tcp_queue_bytes(budget as usize)
+        .expect("test must be able to hold the whole TCP queue budget");
+    assert_eq!(
+        reactor.ingest(route, flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::IngressQueueFull
+    );
+    assert_eq!(reactor.queued_ingress_count(), 0);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_ingress_frame_holds_queue_charge_until_consumed() {
+    // F3: a queued ingress packet must be charged to the byte ledger for
+    // its full residency — the charge releases when smoltcp consumes it.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let packet_len = ip_packet.len() as u64;
+    let governor = &*crate::memory_governor::MEMORY_GOVERNOR;
+    let before = governor.tcp_queue_bytes();
+    assert_eq!(
+        reactor.ingest(route, flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    // Concurrent tests may charge too — assert at least this packet landed.
+    assert!(governor.tcp_queue_bytes() >= before + packet_len);
+    reactor.poll();
+    // After consumption the frame's charge must be released.
+    assert!(governor.tcp_queue_bytes() < before + packet_len);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[tokio::test]
+async fn af_xdp_tcp_write_budget_stall_wakes_on_release() {
+    use futures_util::FutureExt;
+    use tokio::io::AsyncWriteExt;
+
+    // F3: a stream write refused by the queue byte budget must suspend
+    // (register + Pending) and resume once ledger headroom returns —
+    // never silently drop or spin.
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp { flow, .. } =
+        af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let af_xdp::AfXdpTcpStreamParts {
+        mut stream,
+        mut egress_rx,
+        budget_stall,
+        ..
+    } = af_xdp::AfXdpTcpStream::channel_pair_with_wake(
+        8,
+        flow,
+        reactor.wake_set.clone(),
+        reactor.budget_stall.clone(),
+    );
+    let governor = &*crate::memory_governor::MEMORY_GOVERNOR;
+    let block = governor
+        .try_reserve_tcp_queue_bytes(governor.tcp_queue_bytes_budget() as usize)
+        .expect("test must be able to hold the whole TCP queue budget");
+
+    let mut write = Box::pin(stream.write_all(b"abc"));
+    assert!(write.as_mut().now_or_never().is_none());
+    assert_eq!(budget_stall.lock().len(), 1);
+
+    drop(block);
+    reactor.poll();
+    // The stalled writer is woken by the reactor's budget release; on its
+    // next poll the reservation succeeds and the chunk lands in egress.
+    write.as_mut().await.unwrap();
+    let chunk = egress_rx.recv().await.expect("write must be delivered");
+    assert_eq!(&chunk[..], b"abc");
 }
 
 #[test]
