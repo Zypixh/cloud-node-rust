@@ -579,17 +579,45 @@ fn create_af_xdp_queue(
     ))
 }
 
+/// Prepare-before-commit attach (R5): the previous dataplane keeps
+/// running until the new generation is fully verified. Phase 1 (no side
+/// effects on the live dataplane): budget check, stale-pin gate, object
+/// load with pin reuse, map-spec audit, and verifier loads of the root
+/// program plus every dispatch subprogram. Phase 2 (commit): detach the
+/// old links/subprogram pins/dispatch pin, pin the verified subprograms,
+/// populate the dispatch table, adopt flow state, sync maps, then attach
+/// and pin the new links. A failure anywhere in phase 1 leaves the old
+/// program running; a failure in phase 2 surfaces as an attach error with
+/// the dataplane on the kernel path (bounded commit window, ms-scale).
 pub async fn attach(
     config: &XdpConfig,
     object_path: Option<&Path>,
+    purge_stale_state: bool,
+    commit_started: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<AttachedProgram> {
     std::fs::create_dir_all(xdp_bpf_pin_dir())
         .map_err(|err| {
             anyhow::anyhow!("create bpffs pin dir {}: {err}", xdp_bpf_pin_dir())
         })?;
-    detach(config).await?;
-    drop_stale_pinned_maps(config);
     ensure_bpf_map_budget(config)?;
+    // State-pin gate runs before any load attempt: an ABI-incompatible
+    // pinned state map is a migration boundary, not an attach side effect.
+    // Refusing keeps the live dataplane running and reports exactly which
+    // maps block the upgrade; the operator opts into state loss with an
+    // explicit purge.
+    let stale_state: Vec<String> = stale_pinned_maps(config)
+        .into_iter()
+        .filter(|name| is_state_map_pin(name))
+        .collect();
+    if !stale_state.is_empty() && !purge_stale_state {
+        anyhow::bail!(
+            "pinned eBPF state maps are ABI-incompatible with this object: {stale_state:?}; \
+             the live dataplane was left running and no state was destroyed. \
+             Flow-state migration across this change is not implemented — \
+             to accept the loss run `cloud-node xdp detach --purge-state`, then attach again"
+        );
+    }
+    drop_stale_pinned_maps(config, purge_stale_state);
     let mut attached = BTreeSet::new();
     let mut loader = aya::EbpfLoader::new();
     loader.default_map_pin_directory(xdp_bpf_pin_dir());
@@ -618,8 +646,8 @@ pub async fn attach(
     // EN-10 takeover contract: flow state and the lifecycle feedback channel
     // are pinned so a reload/restart adopts existing flows instead of
     // severing them. aya reuses a compatible pin purely by name; the spec
-    // table check and post-load audit reject ABI-mismatched pins, and
-    // `drop_stale_pinned_maps` above already removed those.
+    // table check and post-load audit reject ABI-mismatched pins, and the
+    // stale-pin gate above already refused or purged those.
     for name in [
         "XDP_TCP_CT",
         "XDP_UDP_CT",
@@ -638,12 +666,6 @@ pub async fn attach(
         None => loader.load(XDP_EBPF_EMBEDDED)?,
     };
     audit_loaded_map_specs(&ebpf, config)?;
-    let (owner_epoch, imported_flows) = adopt_flow_state(&mut ebpf)?;
-    sync_interface_policy(&mut ebpf, config)?;
-    sync_local_ip_maps(&mut ebpf, config)?;
-    sync_proxy_ports(&mut ebpf, config, false)?;
-    sync_xsk_indices(&mut ebpf, config, false, &Default::default())?;
-    zero_counters(&mut ebpf)?;
     let mode = match config.attach_mode {
         XdpAttachMode::Auto => aya::programs::XdpMode::default(),
         XdpAttachMode::Drv => aya::programs::XdpMode::Driver,
@@ -656,20 +678,17 @@ pub async fn attach(
             .try_into()?;
         program.load()?;
     }
-    // Populate the tail-call dispatch table. Slots are per (family, proto)
-    // pairs because a single SNAT-capable NAT handler is already ~10KiB of
-    // BPF: slot 0 = UDP/IPv4, 2 = TCP/IPv4, 3 = UDP/IPv6 replies,
-    // 4 = TCP/IPv6 replies, and the IPv6 forward halves each get their own
-    // program (5 = UDPv6 fwd, 6 = TCPv6 fwd) to stay under older kernels'
-    // verifier state budget. Slot 1 is reserved (was SNI blocklist).
-    // An older object without a symbol leaves that slot empty; the tail
-    // call then returns and the dispatcher falls back to the
-    // redirect/PASS path explicitly.
+    // Verify every dispatch subprogram while the previous dataplane is
+    // still live. Slots are per (family, proto) pairs because a single
+    // SNAT-capable NAT handler is already ~10KiB of BPF: slot 0 =
+    // UDP/IPv4, 2 = TCP/IPv4, 3 = UDP/IPv6 replies, 4 = TCP/IPv6 replies,
+    // and the IPv6 forward halves each get their own program (5 = UDPv6
+    // fwd, 6 = TCPv6 fwd) to stay under older kernels' verifier state
+    // budget. Slot 1 is reserved (was SNI blocklist). An older object
+    // without a symbol leaves that slot empty; the tail call then returns
+    // and the dispatcher falls back to the redirect/PASS path explicitly.
     // Pinned programs keep a kernel reference independent of our fds, so
     // the tail-call chain stays live after a one-shot `xdp attach` exits.
-    let prog_pin_dir = Path::new(xdp_bpf_pin_dir()).join("progs");
-    std::fs::create_dir_all(&prog_pin_dir)
-        .map_err(|err| anyhow::anyhow!("create prog pin dir {}: {err}", prog_pin_dir.display()))?;
     let mut dispatch_fds: Vec<(u32, Option<aya::programs::ProgramFd>)> = Vec::new();
     for (slot, name) in [
         (0u32, "xdp_nat_dispatch"),
@@ -694,13 +713,6 @@ pub async fn attach(
             Some(sub_program) => {
                 let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
                 sub.load()?;
-                let pin_path = prog_pin_dir.join(name);
-                if pin_path.exists() {
-                    std::fs::remove_file(&pin_path)?;
-                }
-                sub.pin(&pin_path).map_err(|err| {
-                    anyhow::anyhow!("pin {name} to {}: {err}", pin_path.display())
-                })?;
                 Some(
                     sub.fd()?
                         .try_clone()
@@ -710,6 +722,54 @@ pub async fn attach(
             None => None,
         };
         dispatch_fds.push((slot, fd));
+    }
+
+    // ---- commit: everything below may change the live dataplane ----
+    if let Some(flag) = commit_started {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    detach(config).await?;
+    // detach() removed the XDP_DISPATCH pin; our object still holds the
+    // map fd (reused during load), so re-pin it — pinned links must keep a
+    // live tail-call table after a one-shot `xdp attach` exits.
+    if let Some(map) = ebpf.map("XDP_DISPATCH") {
+        let dispatch_pin = Path::new(xdp_bpf_pin_dir()).join("XDP_DISPATCH");
+        map.pin(&dispatch_pin).map_err(|err| {
+            anyhow::anyhow!("re-pin XDP_DISPATCH to {}: {err}", dispatch_pin.display())
+        })?;
+    }
+    let prog_pin_dir = Path::new(xdp_bpf_pin_dir()).join("progs");
+    std::fs::create_dir_all(&prog_pin_dir)
+        .map_err(|err| anyhow::anyhow!("create prog pin dir {}: {err}", prog_pin_dir.display()))?;
+    // Pin the already-verified subprograms; the dispatch table is then
+    // populated from the cloned fds captured during prepare.
+    for (slot, name) in [
+        (0u32, "xdp_nat_dispatch"),
+        (2, "xdp_nat_tcp_dispatch"),
+        (3, "xdp_nat_udp6_dispatch"),
+        (4, "xdp_nat_tcp6_dispatch"),
+        (5, "xdp_nat_udp6_fwd"),
+        (6, "xdp_nat_tcp6_fwd"),
+        (7, "xdp_nat_udp4_work"),
+        (8, "xdp_nat_tcp4_work"),
+        (9, "xdp_nat_udp6_work"),
+        (10, "xdp_nat_tcp6_work"),
+        (11, "xdp_tcp4_challenge"),
+    ] {
+        let Some(sub_program) = ebpf.program_mut(name) else {
+            continue;
+        };
+        debug_assert!(dispatch_fds
+            .iter()
+            .any(|(s, fd)| *s == slot && fd.is_some()));
+        let sub: &mut aya::programs::Xdp = sub_program.try_into()?;
+        let pin_path = prog_pin_dir.join(name);
+        if pin_path.exists() {
+            std::fs::remove_file(&pin_path)?;
+        }
+        sub.pin(&pin_path).map_err(|err| {
+            anyhow::anyhow!("pin {name} to {}: {err}", pin_path.display())
+        })?;
     }
     match ebpf.map_mut("XDP_DISPATCH") {
         Some(map) => {
@@ -740,6 +800,12 @@ pub async fn attach(
             }
         }
     }
+    let (owner_epoch, imported_flows) = adopt_flow_state(&mut ebpf)?;
+    sync_interface_policy(&mut ebpf, config)?;
+    sync_local_ip_maps(&mut ebpf, config)?;
+    sync_proxy_ports(&mut ebpf, config, false)?;
+    sync_xsk_indices(&mut ebpf, config, false, &Default::default())?;
+    zero_counters(&mut ebpf)?;
     let program: &mut aya::programs::Xdp = ebpf
         .program_mut("cloud_node_xdp")
         .ok_or_else(|| anyhow::anyhow!("missing eBPF program cloud_node_xdp"))?
@@ -772,12 +838,60 @@ pub async fn detach(config: &XdpConfig) -> anyhow::Result<()> {
     detach_blocking(config)
 }
 
+/// Remove every remaining pinned map under the bpffs pin dir —
+/// conntrack, SNAT, pending, accounting, cookie keys, counters and XSK
+/// slots are all destroyed. Destructive and explicit: callers must only
+/// reach this through the operator-facing `--purge-state` flag, after
+/// `detach` has already removed links/programs.
+pub fn purge_pinned_state() -> usize {
+    let mut removed = 0usize;
+    let Ok(dir) = std::fs::read_dir(xdp_bpf_pin_dir()) else {
+        return removed;
+    };
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                removed += 1;
+                tracing::warn!(
+                    "purged pinned eBPF state {} (explicit --purge-state)",
+                    path.display()
+                );
+            }
+            Err(err) => {
+                tracing::warn!("failed to purge pinned map {}: {err}", path.display());
+            }
+        }
+    }
+    removed
+}
+
 pub fn detach_blocking(config: &XdpConfig) -> anyhow::Result<()> {
     if let Err(err) = clear_pinned_xsk_map() {
         tracing::warn!("failed to clear pinned AF_XDP socket map: {}", err);
     }
-    for interface in &config.interfaces {
-        let pin_path = link_pin_path(&interface.name);
+    // Detach every pinned link this process owns — including links for
+    // interfaces that were removed from the config since they were pinned.
+    // Iterating config.interfaces alone would leak those links (the old
+    // program would keep running on an unmanaged interface).
+    let mut link_pins: Vec<PathBuf> = config
+        .interfaces
+        .iter()
+        .map(|interface| link_pin_path(&interface.name))
+        .collect();
+    if let Ok(dir) = std::fs::read_dir(xdp_bpf_pin_dir()) {
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if name.starts_with("link-") && !link_pins.iter().any(|p| *p == path) {
+                link_pins.push(path);
+            }
+        }
+    }
+    for pin_path in link_pins {
         match PinnedLink::from_pin(&pin_path) {
             Ok(pinned) => {
                 if let Err(err) = pinned.unpin() {
@@ -2135,11 +2249,16 @@ pub fn open_pinned_flow_events() -> anyhow::Result<Option<aya::maps::RingBuf<aya
         .map_err(|err| anyhow::anyhow!("pinned XDP_FLOW_EVENTS is not a ring buffer: {err}"))
 }
 
-fn drop_stale_pinned_maps(config: &XdpConfig) {
+/// Pinned maps whose kernel-reported spec differs from the object's spec
+/// table. Detect-only: callers decide whether dropping the pin is safe —
+/// state maps carry conntrack/SNAT/pending data whose loss must be an
+/// explicit operator decision, never a silent attach side effect.
+fn stale_pinned_maps(config: &XdpConfig) -> Vec<String> {
     let specs = bpf_map_specs(config);
+    let mut stale = Vec::new();
 
     let Ok(dir) = std::fs::read_dir(xdp_bpf_pin_dir()) else {
-        return;
+        return stale;
     };
     for entry in dir.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -2157,7 +2276,7 @@ fn drop_stale_pinned_maps(config: &XdpConfig) {
             continue;
         }
         tracing::warn!(
-            "removing stale pinned eBPF map {name}: kernel spec (type {:?}, key {}B, value {}B, max {}) != object spec (type {:?}, key {}B, value {}B, max {}); it is recreated on load and its previous contents are lost",
+            "stale pinned eBPF map {name}: kernel spec (type {:?}, key {}B, value {}B, max {}) != object spec (type {:?}, key {}B, value {}B, max {})",
             info.map_type().ok(),
             info.key_size(),
             info.value_size(),
@@ -2167,12 +2286,49 @@ fn drop_stale_pinned_maps(config: &XdpConfig) {
             spec.3,
             spec.4,
         );
-        if let Err(err) = std::fs::remove_file(entry.path()) {
+        stale.push(name);
+    }
+    stale
+}
+
+/// State maps whose contents are irreplaceable flow/billing/cookie state.
+/// A spec-incompatible pin of one of these is a migration boundary:
+/// attach refuses rather than silently destroying the data. Plumbing maps
+/// (dispatch table, counters, XSK slots) are rebuilt empty at every
+/// attach and may be dropped without consent.
+fn is_state_map_pin(name: &str) -> bool {
+    matches!(
+        name,
+        "XDP_TCP_CT"
+            | "XDP_UDP_CT"
+            | "XDP_PENDING"
+            | "XDP_SNAT_REV"
+            | "XDP_FLOW_ACCT"
+            | "XDP_FLOW_EVENTS"
+            | "XDP_OWNER_EPOCH"
+            | "XDP_FLOW_SEQ"
+            | "XDP_COOKIE_KEY"
+    )
+}
+
+/// Remove stale plumbing pins and — only with `purge_state` — stale state
+/// pins. Returns the names actually removed.
+fn drop_stale_pinned_maps(config: &XdpConfig, purge_state: bool) -> Vec<String> {
+    let mut dropped = Vec::new();
+    for name in stale_pinned_maps(config) {
+        if !purge_state && is_state_map_pin(&name) {
+            continue;
+        }
+        let path = Path::new(xdp_bpf_pin_dir()).join(&name);
+        if let Err(err) = std::fs::remove_file(&path) {
             tracing::warn!(
                 "failed to remove stale pinned eBPF map {name}: {err}; attach may fail on the stale definition"
             );
+            continue;
         }
+        dropped.push(name);
     }
+    dropped
 }
 
 fn clear_xsk_map_entries<T>(map: &mut XskMap<T>)

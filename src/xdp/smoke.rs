@@ -10,7 +10,7 @@ pub async fn raw_smoke(
     start_rule_sweeper(&manager);
     manager.enable_proxy_redirect("raw smoke")?;
     let result = raw_smoke_inner(manager, duration, ready_file).await;
-    if let Err(err) = detach().await {
+    if let Err(err) = detach(false).await {
         tracing::warn!("failed to detach XDP after raw smoke: {}", err);
     }
     result
@@ -155,7 +155,7 @@ pub async fn proxy_smoke(
     let services = match XdpProxySmokeServices::start().await {
         Ok(services) => services,
         Err(err) => {
-            if let Err(detach_err) = detach().await {
+            if let Err(detach_err) = detach(false).await {
                 tracing::warn!("failed to detach XDP after proxy smoke setup error: {detach_err}");
             }
             return Err(err);
@@ -166,7 +166,7 @@ pub async fn proxy_smoke(
             Ok(managers) => managers,
             Err(err) => {
                 services.abort();
-                if let Err(detach_err) = detach().await {
+                if let Err(detach_err) = detach(false).await {
                     tracing::warn!(
                         "failed to detach XDP after proxy smoke manager setup error: {detach_err}"
                     );
@@ -183,7 +183,7 @@ pub async fn proxy_smoke(
     let result = proxy_smoke_inner(manager, services, ports, duration, ready_file, &bridge).await;
     bridge.abort();
     let _ = bridge.await;
-    if let Err(err) = detach().await {
+    if let Err(err) = detach(false).await {
         tracing::warn!("failed to detach XDP after proxy smoke: {}", err);
     }
     result
@@ -205,7 +205,7 @@ pub async fn proxy_reload_smoke(
     let services = match XdpProxySmokeServices::start().await {
         Ok(services) => services,
         Err(err) => {
-            if let Err(detach_err) = detach().await {
+            if let Err(detach_err) = detach(false).await {
                 tracing::warn!(
                     "failed to detach XDP after proxy reload smoke setup error: {detach_err}"
                 );
@@ -221,7 +221,7 @@ pub async fn proxy_reload_smoke(
         Ok(managers) => managers,
         Err(err) => {
             services.abort();
-            if let Err(detach_err) = detach().await {
+            if let Err(detach_err) = detach(false).await {
                 tracing::warn!(
                     "failed to detach XDP after proxy reload smoke manager setup error: {detach_err}"
                 );
@@ -244,7 +244,7 @@ pub async fn proxy_reload_smoke(
         old_bridge,
     )
     .await;
-    if let Err(err) = detach().await {
+    if let Err(err) = detach(false).await {
         tracing::warn!("failed to detach XDP after proxy reload smoke: {}", err);
     }
     result

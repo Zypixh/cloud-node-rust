@@ -331,6 +331,12 @@ pub(crate) struct XdpManager {
     flow_event_consumer_started: AtomicBool,
     flow_event_consumer_generation: AtomicU64,
     proxy_redirect_enabled: AtomicBool,
+    /// R5: set by `linux::attach` once it passes verification and enters
+    /// the commit phase (where the previous generation's links are
+    /// detached). Rollback distinguishes prepare failures (old links
+    /// still live — never detach) from partial commits (must re-attach
+    /// the previous generation).
+    attach_committed: AtomicBool,
     /// EN-12 worker lease: true between reactor-thread spawn and the
     /// redirect enable attempt, so queue workers stay alive while the
     /// bridge proves they can actually process before opening redirect.
@@ -428,6 +434,7 @@ impl XdpManager {
             flow_event_consumer_started: AtomicBool::new(false),
             flow_event_consumer_generation: AtomicU64::new(0),
             proxy_redirect_enabled: AtomicBool::new(false),
+            attach_committed: AtomicBool::new(false),
             proxy_workers_starting: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             xsk_withdrawn: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -445,6 +452,17 @@ impl XdpManager {
     }
 
     async fn initialize(&self) -> anyhow::Result<()> {
+        self.initialize_inner(None).await
+    }
+
+    /// `predecessor` is set during an owner-respecting reload: the old
+    /// generation keeps its kernel links and AF_XDP sockets until the new
+    /// attach commits, then releases them so the new sockets can bind the
+    /// same queues.
+    async fn initialize_inner(
+        &self,
+        predecessor: Option<&std::sync::Arc<XdpManager>>,
+    ) -> anyhow::Result<()> {
         if !self.config.enabled {
             self.ensure_detached_when_disabled().await;
             return Ok(());
@@ -487,7 +505,18 @@ impl XdpManager {
 
         #[cfg(target_os = "linux")]
         {
-            match linux::attach(&self.config, object_override.as_deref()).await {
+            // The daemon never purges pinned state implicitly: an
+            // ABI-incompatible state map is a migration boundary and must
+            // surface as an explicit fallback reason, not silent state loss.
+            self.attach_committed.store(false, Ordering::Relaxed);
+            match linux::attach(
+                &self.config,
+                object_override.as_deref(),
+                false,
+                Some(&self.attach_committed),
+            )
+            .await
+            {
                 Ok(attached_program) => {
                     self.owner_epoch
                         .store(attached_program.owner_epoch, Ordering::Relaxed);
@@ -511,6 +540,16 @@ impl XdpManager {
                     // slots.
                     self.xsk_withdrawn.lock().clear();
                     self.flush_maps_full_blocking(self.proxy_redirect_ready());
+                    if let Some(old) = predecessor {
+                        // The attach commit already swapped the kernel
+                        // links. Release the previous generation's AF_XDP
+                        // sockets and eBPF handle so this generation can
+                        // bind the same queues. Flows owned by the old
+                        // smoltcp sockets terminate at this handover —
+                        // they cannot migrate to the kernel path and are
+                        // never left as silent zombies.
+                        old.release_for_handover();
+                    }
                     self.configure_af_xdp_runtime()?;
                 }
                 Err(err) => {
@@ -2018,6 +2057,26 @@ impl XdpManager {
             .active_snapshot(crate::utils::time::now_timestamp())
     }
 
+    /// Release this generation's in-process dataplane resources after a
+    /// reload handover: the kernel links were already swapped by the new
+    /// attach commit, so only the userspace handles (AF_XDP sockets, eBPF
+    /// object fd) are dropped. The bridge reactor threads exit on the
+    /// stale-manager check and close their queue sockets; the socket
+    /// create path on the new generation retries across that window.
+    fn release_for_handover(&self) {
+        self.stop_rule_sweeper();
+        self.stop_map_sync_worker();
+        self.stop_flow_event_consumer();
+        self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        {
+            *self.af_xdp.lock() = None;
+            *self.ebpf.lock() = None;
+        }
+        self.attached.write().clear();
+        self.xsk_status.write().clear();
+    }
+
     async fn detach_runtime(&self, reason: &'static str) -> anyhow::Result<()> {
         self.stop_rule_sweeper();
         self.stop_map_sync_worker();
@@ -2548,9 +2607,21 @@ pub async fn attach_from_runtime() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn detach() -> anyhow::Result<()> {
+pub async fn detach(purge_state: bool) -> anyhow::Result<()> {
     let manager = manager_from_runtime();
-    manager.detach_runtime("detached by CLI").await
+    manager.detach_runtime("detached by CLI").await?;
+    if purge_state {
+        #[cfg(target_os = "linux")]
+        {
+            let removed = linux::purge_pinned_state();
+            tracing::warn!("xdp detach --purge-state removed {removed} pinned eBPF maps; all conntrack/SNAT/pending/accounting/cookie state is lost");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            tracing::warn!("--purge-state is a no-op on non-Linux platforms (no bpffs state)");
+        }
+    }
+    Ok(())
 }
 
 pub async fn reload_from_runtime() -> anyhow::Result<()> {
@@ -2565,23 +2636,60 @@ pub async fn reload_from_runtime() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let snapshot = detach_current_for_reload().await?;
+    // Owner-respecting reload (R5): keep the old generation's kernel
+    // links and AF_XDP sockets live while the new generation prepares.
+    // `linux::attach` only detaches at its commit point, so a prepare
+    // failure (bad object, stale pins, verifier rejection) leaves the old
+    // dataplane untouched.
+    let snapshot = current.active_rule_snapshot();
+    let old_manager = current;
     let manager = replace_manager_from_runtime();
     manager.sync_snapshot(&snapshot);
-    manager.initialize().await?;
-    start_rule_sweeper(&manager);
-    start_flow_event_consumer(&manager);
-    manager.persist_status_blocking();
-    Ok(())
+    match manager.initialize_inner(Some(&old_manager)).await {
+        Ok(()) => {
+            start_rule_sweeper(&manager);
+            start_flow_event_consumer(&manager);
+            manager.persist_status_blocking();
+            Ok(())
+        }
+        Err(err) => {
+            // Roll back to the old generation. A prepare-phase failure
+            // left its links live — restore bookkeeping only and never
+            // detach. A commit-phase failure may have detached the old
+            // links and pinned partial new ones: remove the partial
+            // generation's links, then re-attach the previous object so
+            // a half-committed reload does not leave the dataplane down.
+            let committed = manager.attach_committed.load(Ordering::Relaxed);
+            restore_manager(old_manager.clone());
+            if committed {
+                #[cfg(target_os = "linux")]
+                if let Err(detach_err) = linux::detach(&manager.config).await {
+                    tracing::warn!(
+                        "XDP reload rollback detach of partial generation failed: {detach_err}"
+                    );
+                }
+                old_manager.attached.write().clear();
+                old_manager.ebpf.lock().take();
+                if let Err(reattach_err) = old_manager.initialize().await {
+                    tracing::warn!(
+                        "XDP reload rollback re-attach failed: {reattach_err}"
+                    );
+                }
+            }
+            manager.release_for_handover();
+            old_manager.persist_status_blocking();
+            Err(err)
+        }
+    }
 }
 
-async fn detach_current_for_reload() -> anyhow::Result<KernelFilterSnapshot> {
-    let old_manager = manager_from_runtime();
-    let snapshot = old_manager.active_rule_snapshot();
-    old_manager
-        .detach_runtime("detached for XDP reload")
-        .await?;
-    Ok(snapshot)
+/// Swap the global manager back after a failed reload. Does not touch
+/// kernel state — the caller decides whether the failed generation left
+/// pinned links that need cleanup.
+fn restore_manager(candidate: std::sync::Arc<XdpManager>) {
+    if let Some(manager) = XDP_MANAGER.get() {
+        *manager.write() = candidate;
+    }
 }
 
 pub fn doctor_report() -> String {

@@ -393,7 +393,13 @@ enum XdpCommands {
     },
     /// Stop XDP automatic takeover
     #[command(alias = "detach")]
-    Stop,
+    Stop {
+        /// Also destroy all pinned eBPF state maps (conntrack, SNAT, pending,
+        /// accounting, cookie keys). Required once after an eBPF ABI change
+        /// when attach refuses an incompatible pinned state map.
+        #[arg(long)]
+        purge_state: bool,
+    },
     /// Inspect or apply XDP netdev tuning
     Tune {
         /// Restrict tuning to this interface. Repeat for multiple interfaces.
@@ -961,13 +967,13 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             rt.block_on(cloud_node_rust::xdp::attach_from_runtime())?;
             print_xdp_status();
         }
-        XdpCommands::Stop => {
+        XdpCommands::Stop { purge_state } => {
             let mut runtime_config = RuntimeConfig::load_default()?;
             RuntimeConfig::set_current(runtime_config.clone());
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(cloud_node_rust::xdp::detach())?;
+            rt.block_on(cloud_node_rust::xdp::detach(purge_state))?;
             runtime_config.xdp.enabled = false;
             let runtime_path = cloud_node_rust::paths::NodePaths::current().runtime_config_file();
             save_xdp_enabled(&runtime_path, false)?;
