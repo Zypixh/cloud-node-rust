@@ -265,6 +265,11 @@ fn xsk_status_refresh_due(
 #[derive(Debug)]
 pub(crate) struct XdpManager {
     config: XdpConfig,
+    /// State-table sizes actually loaded — set by attach when no explicit
+    /// `xdp.stateTables` was configured and the defaults were auto-scaled
+    /// to fit this node's kernel-BPF budget. Status reports the real
+    /// footprint, not the unsized defaults.
+    effective_state_tables: parking_lot::RwLock<Option<crate::runtime_mode::XdpStateTables>>,
     state: parking_lot::RwLock<RuleState>,
     fallback_reason: parking_lot::RwLock<String>,
     proxy_fallback_reason: parking_lot::RwLock<String>,
@@ -375,6 +380,7 @@ impl XdpManager {
     fn new(config: XdpConfig) -> Self {
         Self {
             config,
+            effective_state_tables: parking_lot::RwLock::new(None),
             state: parking_lot::RwLock::new(RuleState::default()),
             fallback_reason: parking_lot::RwLock::new(String::new()),
             proxy_fallback_reason: parking_lot::RwLock::new(String::new()),
@@ -522,6 +528,8 @@ impl XdpManager {
                         .store(attached_program.owner_epoch, Ordering::Relaxed);
                     self.imported_flows
                         .store(attached_program.imported_flows, Ordering::Relaxed);
+                    *self.effective_state_tables.write() =
+                        attached_program.effective_state_tables;
                     *self.ebpf.lock() = Some(attached_program.ebpf);
                     let attached = attached_program.interfaces;
                     *self.attached.write() = attached;
@@ -1797,7 +1805,11 @@ impl XdpManager {
     /// maps (0 on non-Linux where no eBPF object is loaded).
     #[cfg(target_os = "linux")]
     fn bpf_map_projected_bytes(&self) -> u64 {
-        linux::projected_bpf_map_bytes(&self.config)
+        let mut config = self.config.clone();
+        if let Some(tables) = self.effective_state_tables.read().clone() {
+            config.state_tables = Some(tables);
+        }
+        linux::projected_bpf_map_bytes(&config)
     }
 
     #[cfg(not(target_os = "linux"))]

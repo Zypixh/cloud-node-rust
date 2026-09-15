@@ -1,5 +1,7 @@
 use super::*;
-use crate::runtime_mode::{XdpAttachMode, XdpInterfaceConfig, XdpRuntimeMode};
+use crate::runtime_mode::{
+    XdpAttachMode, XdpInterfaceConfig, XdpRuntimeMode, XdpStateTables,
+};
 use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, PerCpuArray, XskMap};
 use aya::programs::links::PinnedLink;
@@ -37,6 +39,11 @@ pub struct AttachedProgram {
     /// EN-10 flow records adopted from pinned state maps (reload/restart
     /// continuity) — TCP CT + UDP CT + pending admissions still resident.
     pub imported_flows: u64,
+    /// State-table sizes actually applied. When the operator gave no
+    /// explicit `xdp.stateTables` this is the budget-scaled result;
+    /// callers record it so status reports and later reloads see the real
+    /// map sizes rather than the unsized defaults.
+    pub effective_state_tables: Option<XdpStateTables>,
 }
 
 #[derive(Debug)]
@@ -599,7 +606,20 @@ pub async fn attach(
         .map_err(|err| {
             anyhow::anyhow!("create bpffs pin dir {}: {err}", xdp_bpf_pin_dir())
         })?;
-    ensure_bpf_map_budget(config)?;
+    // When the operator gave no explicit stateTables, size the scalable
+    // state maps to this node's kernel-BPF budget — default tables can
+    // exceed the budget on small nodes and would otherwise fail attach.
+    // Explicit operator sizes are never silently shrunk: they either fit
+    // or fail the budget check below.
+    let bpf_budget = crate::memory_governor::MEMORY_GOVERNOR
+        .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
+        .kernel_bpf_budget_bytes;
+    let mut effective_config = config.clone();
+    if effective_config.state_tables.is_none() {
+        effective_config.state_tables = auto_scale_state_tables(config, bpf_budget)?;
+    }
+    let config = &effective_config;
+    ensure_bpf_map_budget(config, bpf_budget)?;
     // State-pin gate runs before any load attempt: an ABI-incompatible
     // pinned state map is a migration boundary, not an attach side effect.
     // Refusing keeps the live dataplane running and reports exactly which
@@ -811,7 +831,39 @@ pub async fn attach(
         .ok_or_else(|| anyhow::anyhow!("missing eBPF program cloud_node_xdp"))?
         .try_into()?;
     for interface in &config.interfaces {
-        let link_id = program.attach(&interface.name, mode)?;
+        // The commit-phase detach just released the previous link; kernel
+        // link teardown can lag the pin removal by an RCU grace period, so
+        // retry EBUSY briefly rather than racing bpf_link_create once.
+        let mut attach_err = None;
+        let mut link_id = None;
+        for _ in 0..20 {
+            match program.attach(&interface.name, mode) {
+                Ok(id) => {
+                    link_id = Some(id);
+                    break;
+                }
+                Err(err) => {
+                    let busy = match &err {
+                        aya::programs::ProgramError::SyscallError(e) => {
+                            e.io_error.raw_os_error() == Some(libc::EBUSY)
+                        }
+                        _ => false,
+                    };
+                    attach_err = Some(err);
+                    if !busy {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        let link_id = link_id.ok_or_else(|| {
+            anyhow::anyhow!(
+                "attach XDP to {} after bounded EBUSY wait: {}",
+                interface.name,
+                attach_err.map(|e| e.to_string()).unwrap_or_default()
+            )
+        })?;
         let link = program.take_link(link_id)?;
         let fd_link: aya::programs::links::FdLink = link.try_into().map_err(|err| {
             anyhow::anyhow!(
@@ -831,6 +883,7 @@ pub async fn attach(
         ebpf,
         owner_epoch,
         imported_flows,
+        effective_state_tables: effective_config.state_tables,
     })
 }
 
@@ -2072,44 +2125,182 @@ fn bpf_map_specs(
     specs
 }
 
+/// Worst-case pinned kernel memory for one spec-table entry set.
+fn map_spec_bytes(ty: aya::maps::MapType, key: u32, value: u32, max_entries: u32) -> u64 {
+    const HASH_ENTRY_OVERHEAD: u64 = 64;
+    const LPM_ENTRY_OVERHEAD: u64 = 48;
+    const ARRAY_ENTRY_OVERHEAD: u64 = 8;
+    let ncpu = aya::util::nr_cpus().unwrap_or(1).max(1) as u64;
+    let (k, v, n) = (u64::from(key), u64::from(value), u64::from(max_entries));
+    match ty {
+        aya::maps::MapType::PerCpuArray | aya::maps::MapType::PerCpuHash => {
+            n.saturating_mul(k + v.saturating_mul(ncpu) + HASH_ENTRY_OVERHEAD)
+        }
+        aya::maps::MapType::Hash => n.saturating_mul(k + v + HASH_ENTRY_OVERHEAD),
+        aya::maps::MapType::LpmTrie => n.saturating_mul(k + v + LPM_ENTRY_OVERHEAD),
+        // Ring buffers reserve their declared byte size plus a couple of
+        // bookkeeping pages; key/value sizes are zero.
+        aya::maps::MapType::RingBuf => n.saturating_add(2 * 4096),
+        _ => n.saturating_mul(k + v + ARRAY_ENTRY_OVERHEAD),
+    }
+}
+
 /// EN-16 kernel-BPF ledger: worst-case pinned kernel memory for every map in
 /// the object. Hash entries are charged `key + value + 64B` of htab
 /// bookkeeping (measured on kernel 7.0 within ~10% of memlock); per-CPU maps
 /// multiply the value by the possible-CPU count; LPM tries allocate lazily
 /// but are still bounded at their worst case.
 pub(crate) fn projected_bpf_map_bytes(config: &XdpConfig) -> u64 {
-    const HASH_ENTRY_OVERHEAD: u64 = 64;
-    const LPM_ENTRY_OVERHEAD: u64 = 48;
-    const ARRAY_ENTRY_OVERHEAD: u64 = 8;
-    let ncpu = aya::util::nr_cpus().unwrap_or(1).max(1) as u64;
     let mut total = 0u64;
     for (_name, ty, key, value, max_entries) in bpf_map_specs(config) {
-        let (k, v, n) = (u64::from(key), u64::from(value), u64::from(max_entries));
-        let bytes = match ty {
-            aya::maps::MapType::PerCpuArray | aya::maps::MapType::PerCpuHash => {
-                n.saturating_mul(k + v.saturating_mul(ncpu) + HASH_ENTRY_OVERHEAD)
-            }
-            aya::maps::MapType::Hash => n.saturating_mul(k + v + HASH_ENTRY_OVERHEAD),
-            aya::maps::MapType::LpmTrie => n.saturating_mul(k + v + LPM_ENTRY_OVERHEAD),
-            // Ring buffers reserve their declared byte size plus a couple of
-            // bookkeeping pages; key/value sizes are zero.
-            aya::maps::MapType::RingBuf => n.saturating_add(2 * 4096),
-            _ => n.saturating_mul(k + v + ARRAY_ENTRY_OVERHEAD),
-        };
-        total = total.saturating_add(bytes);
+        total = total.saturating_add(map_spec_bytes(ty, key, value, max_entries));
     }
     total
+}
+
+/// Auto-size the sizeable state tables to the kernel-BPF budget when the
+/// operator gave no explicit `xdp.stateTables`. Without this a default
+/// configuration exceeds the budget on small nodes (e.g. 2 GiB VPS) and
+/// attach would fail outright. The scale-down is proportional across the
+/// scalable tables with a per-table floor; if even floored tables do not
+/// fit, the node is too small and attach fails explicitly.
+fn auto_scale_state_tables(config: &XdpConfig, budget: u64) -> anyhow::Result<Option<XdpStateTables>> {
+    let projected = projected_bpf_map_bytes(config);
+    if projected <= budget {
+        return Ok(None);
+    }
+    const STATE_TABLE_FLOOR: u32 = 1_024;
+    // Fixed cost = maps not covered by state_table_override. `config` here
+    // always carries the default table sizes (this runs only when the
+    // operator left `stateTables` unset).
+    let mut fixed = 0u64;
+    let mut scalable: Vec<(&'static str, u64, u32, aya::maps::MapType, u32, u32)> = Vec::new();
+    for (name, ty, key, value, max) in bpf_map_specs(config) {
+        let bytes = map_spec_bytes(ty, key, value, max);
+        if state_table_override_scalable(name) {
+            scalable.push((name, bytes / u64::from(max).max(1), max, ty, key, value));
+        } else {
+            fixed = fixed.saturating_add(bytes);
+        }
+    }
+    let headroom = budget.saturating_sub(fixed);
+    // Scale factor in milli-units to keep integer math.
+    let scalable_total: u64 = scalable
+        .iter()
+        .map(|(_, per_entry, max, ..)| per_entry.saturating_mul(u64::from(*max)))
+        .sum();
+    if scalable_total == 0 {
+        return Ok(None);
+    }
+    let scale_milli = headroom.saturating_mul(1000) / scalable_total;
+    // Per-map candidate sizes. Prefer an existing spec-compatible pin: the
+    // stale-pin gate refuses any max mismatch, so adopting the pinned size
+    // keeps restarts stable when this boot's scale factor drifts. Pins that
+    // no longer fit the headroom fail the capacity check below explicitly.
+    let mut candidates: Vec<(&'static str, &'static str, u64, u32)> =
+        Vec::with_capacity(scalable.len());
+    for (name, per_entry, default_max, ty, key, value) in &scalable {
+        let pinned_max = pinned_map_max_entries(name, *ty, *key, *value);
+        let scaled_max = u64::from(*default_max)
+            .saturating_mul(scale_milli)
+            / 1000;
+        let candidate = match pinned_max {
+            Some(pin_max) => pin_max.min(*default_max),
+            None => (scaled_max as u32).max(STATE_TABLE_FLOOR).min(*default_max),
+        };
+        candidates.push((state_table_knob(name), name, *per_entry, candidate));
+    }
+    // A stateTables knob covers every map in its group with ONE value, so
+    // the charged size must be the group minimum — a member charged at its
+    // own larger candidate would make the real projection exceed the
+    // accounted total. Members whose pin exceeds the chosen value trip the
+    // stale-pin gate later: an explicit refusal, not silent state loss.
+    let mut knob_values: Vec<(&'static str, u32)> = Vec::new();
+    for (knob, _name, _per_entry, candidate) in &candidates {
+        match knob_values.iter_mut().find(|(k, _)| k == knob) {
+            Some((_, v)) => *v = (*v).min(*candidate),
+            None => knob_values.push((knob, *candidate)),
+        }
+    }
+    let mut scaled_total = 0u64;
+    for (knob, _name, per_entry, candidate) in &candidates {
+        let chosen = knob_values
+            .iter()
+            .find(|(k, _)| k == knob)
+            .map(|(_, v)| *v)
+            .unwrap_or(*candidate);
+        scaled_total =
+            scaled_total.saturating_add(per_entry.saturating_mul(u64::from(chosen)));
+    }
+    anyhow::ensure!(
+        scaled_total <= headroom,
+        "eBPF state tables cannot fit kernel-bpf budget {budget} even at the {STATE_TABLE_FLOOR}-entry floor (fixed={fixed}, need={scaled_total})"
+    );
+    let get = |knob: &str| -> Option<u32> {
+        knob_values
+            .iter()
+            .find(|(k, _)| *k == knob)
+            .map(|(_, m)| *m)
+    };
+    let ct = get("ct");
+    let pending = get("pending");
+    let snat_rev = get("snat_rev");
+    let flow_acct = get("flow_acct");
+    let rate_v6 = get("rate_v6");
+    let quic_dcid = get("quic_dcid");
+    let acl_blocked = get("acl_blocked");
+    let acl_allowed = get("acl_allowed");
+    let rate_v4 = get("rate_v4");
+    tracing::warn!(
+        "eBPF state tables auto-scaled to fit kernel-bpf budget {budget}B (projected {projected}B): ct={ct:?} pending={pending:?} snatRev={snat_rev:?} flowAcct={flow_acct:?} rateV4={rate_v4:?} rateV6={rate_v6:?} quicDcid={quic_dcid:?} aclBlocked={acl_blocked:?} aclAllowed={acl_allowed:?}"
+    );
+    Ok(Some(XdpStateTables {
+        ct_max_entries: ct,
+        pending_max_entries: pending,
+        snat_rev_max_entries: snat_rev,
+        flow_acct_max_entries: flow_acct,
+        rate_v6_max_entries: rate_v6,
+        quic_dcid_max_entries: quic_dcid,
+        acl_blocked_max_entries: acl_blocked,
+        acl_allowed_max_entries: acl_allowed,
+        rate_v4_max_entries: rate_v4,
+    }))
+}
+
+/// True for maps whose max_entries `xdp.stateTables` can size.
+fn state_table_override_scalable(name: &str) -> bool {
+    state_table_knob(name) != "fixed"
+}
+
+/// The `xdp.stateTables` field that sizes a given map. One knob covers a
+/// whole group (e.g. `aclBlocked` sizes all four block-list maps), so the
+/// auto-scaler must pick a single value per group, not per map.
+fn state_table_knob(name: &str) -> &'static str {
+    match name {
+        "XDP_TCP_CT" | "XDP_UDP_CT" => "ct",
+        "XDP_PENDING" => "pending",
+        "XDP_SNAT_REV" => "snat_rev",
+        "XDP_FLOW_ACCT" => "flow_acct",
+        "XDP_RATE_V6" => "rate_v6",
+        "XDP_QUIC_DCID" => "quic_dcid",
+        "XDP_BLOCKED_V4" | "XDP_BLOCKED_V6" | "XDP_BLOCKED_V4_LPM"
+        | "XDP_BLOCKED_V6_LPM" => "acl_blocked",
+        "XDP_ALLOWED_V4" | "XDP_ALLOWED_V6" | "XDP_ALLOWED_V4_LPM"
+        | "XDP_ALLOWED_V6_LPM" => "acl_allowed",
+        "XDP_RATE_V4" => "rate_v4",
+        _ => "fixed",
+    }
 }
 
 /// Ensure the object's projected map memory fits the kernel-BPF ledger.
 /// Called before load: map memory is preallocated and non-reclaimable, so
 /// over-budget objects must fail attach explicitly rather than silently
-/// pinning unbounded kernel memory.
-fn ensure_bpf_map_budget(config: &XdpConfig) -> anyhow::Result<()> {
+/// pinning unbounded kernel memory. `budget` is a single caller-supplied
+/// snapshot — the governor's budget moves with live free memory, and
+/// sizing against one snapshot while enforcing another races (a shrinking
+/// snapshot can reject tables that were scaled to fit the earlier one).
+fn ensure_bpf_map_budget(config: &XdpConfig, budget: u64) -> anyhow::Result<()> {
     let projected = projected_bpf_map_bytes(config);
-    let budget = crate::memory_governor::MEMORY_GOVERNOR
-        .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
-        .kernel_bpf_budget_bytes;
     anyhow::ensure!(
         projected <= budget,
         "eBPF map projected memory {projected} exceeds kernel-bpf budget {budget}"
@@ -2247,6 +2438,24 @@ pub fn open_pinned_flow_events() -> anyhow::Result<Option<aya::maps::RingBuf<aya
     aya::maps::RingBuf::try_from(map)
         .map(Some)
         .map_err(|err| anyhow::anyhow!("pinned XDP_FLOW_EVENTS is not a ring buffer: {err}"))
+}
+
+/// Max entries of a pinned map whose type/key/value match the object spec —
+/// used by auto-scaling to prefer the live pinned size so restart sizing is
+/// stable. Returns `None` when the pin is absent, unreadable, or has an
+/// ABI-different layout (in which case the stale-pin gate still applies).
+fn pinned_map_max_entries(
+    name: &str,
+    spec_ty: aya::maps::MapType,
+    spec_key: u32,
+    spec_value: u32,
+) -> Option<u32> {
+    let path = Path::new(xdp_bpf_pin_dir()).join(name);
+    let info = aya::maps::MapInfo::from_pin(&path).ok()?;
+    (info.map_type().ok() == Some(spec_ty)
+        && info.key_size() == spec_key
+        && info.value_size() == spec_value)
+        .then(|| info.max_entries())
 }
 
 /// Pinned maps whose kernel-reported spec differs from the object's spec

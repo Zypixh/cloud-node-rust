@@ -116,7 +116,14 @@ proxy 模式命中端口后内核 socket 不再收到该包；未命中、降级
 - **Pinned state map ABI 不兼容**：attach 拒绝并列出具体 map 名，旧数据面保持运行；不会删除 pin 后声称无损升级。确认接受状态丢失时执行 `cloud-node xdp detach --purge-state`（显式删除全部 pinned state map 并打 warn 日志），再 attach。
 - **reload**：旧 manager 的 kernel links 与 AF_XDP socket 在新代 prepare 期间保持服务；新代 commit 完成后再释放旧代句柄，新 socket 绑定同一队列（socket 创建自带重试，吸收旧 worker 退出窗口）。prepare 失败则恢复旧 manager 继续服务；commit 中途失败则清理半成品 pin 并让旧代重新 attach。
 - **AF_XDP 流在 reload 时的语义**：smoltcp 会话绑定在旧 socket 上，无法迁移到内核路径，也无法跨 socket 迁移到新代——handover 时旧 socket 关闭、会话终止（有显式日志与状态记录）。同一（ifindex, queue）上两个 XSK socket 无法共存，这是 AF_XDP 的硬约束；排空不是把旧流"改成 PASS"——活跃 smoltcp TCP 不能透明移交内核。
-- 接口从配置中移除时，detach 会扫描 pin 目录下所有 `link-*`，旧代遗留 link 不会挂在已不受管理的接口上。
+- 接口从配置中移除时，detach 会扫描 pin 目录下所有 `link-*`，旧代遗留 pin 不会挂在已不受管理的接口上。
+
+### 状态表容量（`xdp.stateTables`）
+
+- attach 在 prepare 阶段先算 eBPF map 的**预占内核内存投影**（hash 条目按 key+value+64B、per-CPU 值乘可能 CPU 数、LPM/ringbuf 按最坏情形），超过 `memory_governor` 的 kernel-BPF 预算即显式拒绝——不静默超配。
+- **`stateTables` 缺省时自动缩放**：若默认表规模超预算（小内存节点），按同一比例收缩全部可缩表（CT/pending/SNAT/计费/限流/QUIC DCID/ACL），每表下限 1024 条，缩放值与 knob 语义一致（`ctMaxEntries` 同时约束 TCP/UDP CT，`aclBlocked` 同时约束 4 张 block 表——组内取最小值）。缩放结果打 warn 日志并记录在 status 的实际投影中；已有同构 pin 时优先沿用 pin 尺寸，保证重启后规模稳定。下限都放不下时 attach 显式报错，说明节点过小。
+- **显式 `stateTables` 永不静默收缩**：超出预算即 attach 失败——运维的显式选择必须响地失败。
+- commit 阶段摘除旧 link 后内核 link 销毁存在 RCU 宽限，`bpf_link_create` 遇 `EBUSY` 有界重试（20×50ms），重试耗尽仍失败则走 commit 失败回滚。
 
 ## QUIC 终止 vs 透传
 

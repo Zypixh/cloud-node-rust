@@ -262,10 +262,33 @@ async fn proxy_reload_smoke_inner(
     wait_for_proxy_smoke_ready(&old_manager, duration, &old_bridge).await?;
     let before_reload = old_manager.status();
 
+    // Force a real generation replacement: with an identical config the
+    // reload fast-path returns early and proves nothing about the
+    // prepare→commit→handover path. Pinning the auto-scaled state tables
+    // as explicit config keeps the loaded map specs identical to the live
+    // pins while making the config differ, so reload builds a full second
+    // generation — the strongest no-downtime check available in-process.
+    let mut runtime = crate::runtime_mode::RuntimeConfig::current().unwrap_or_default();
+    if let Some(tables) = old_manager.effective_state_tables.read().clone() {
+        runtime.xdp.state_tables = Some(tables);
+    }
+    if runtime.xdp == old_manager.config {
+        // Config still identical (tables were already explicit, or the
+        // node fit defaults without scaling): materialize the default
+        // admission contract — semantically identical to None but a real
+        // config change that forces a generation replacement.
+        runtime.xdp.admission = Some(crate::runtime_mode::XdpAdmissionSettings::default());
+    }
+    crate::runtime_mode::RuntimeConfig::set_current(runtime);
     reload_from_runtime().await?;
     let after_manager = manager_from_runtime();
-    let bridge_preserved =
-        std::sync::Arc::ptr_eq(&old_manager, &after_manager) && !old_bridge.is_finished();
+    anyhow::ensure!(
+        !std::sync::Arc::ptr_eq(&old_manager, &after_manager),
+        "reload did not replace the XDP manager generation"
+    );
+    // The bridge supervisor is generation-aware: it must stay alive across
+    // the handover and re-serve the new manager's workers. Per-generation
+    // workers exit inside `run_proxy_bridge` when their manager goes stale.
     let result = async {
         wait_for_proxy_smoke_ready(&after_manager, duration, &old_bridge).await?;
         write_ready_file(ready_file.as_ref())?;
@@ -290,9 +313,8 @@ async fn proxy_reload_smoke_inner(
         );
         Ok(serde_json::json!({
             "durationMillis": duration.as_millis(),
-            "oldBridgeExited": false,
-            "bridgePreserved": bridge_preserved,
-            "managerReplaced": !std::sync::Arc::ptr_eq(&old_manager, &after_manager),
+            "bridgeSupervisorAlive": !old_bridge.is_finished(),
+            "managerReplaced": true,
             "beforeReload": {
                 "proxyReady": before_reload.proxy_ready,
                 "proxyRedirectEnabled": before_reload.proxy_redirect_enabled,
