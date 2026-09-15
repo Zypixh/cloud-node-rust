@@ -70,7 +70,27 @@ const AF_XDP_TCP_MAX_SESSION_LIMIT: usize = 16_384;
 #[cfg(any(test, target_os = "linux"))]
 const AF_XDP_TCP_IDLE_PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(any(test, target_os = "linux"))]
-const AF_XDP_TCP_RECV_SCRATCH_BYTES: usize = 16 * 1024;
+pub(crate) const AF_XDP_TCP_RECV_SCRATCH_BYTES: usize = 16 * 1024;
+/// EN-17: bound on sessions pumped per poll round — a large session table
+/// cannot starve TX/timers under RX flood.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_PUMP_BUDGET: usize = 512;
+/// EN-17: smoltcp ingress packets processed per poll round; the remainder
+/// stays queued for the next round (queue itself is bounded separately).
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_INGRESS_BUDGET: usize = 512;
+/// EN-17: bound on queued-but-unprocessed ingress packets per reactor.
+/// Overflow is an explicit, counted refusal — never silent memory growth.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_INGRESS_QUEUE_MAX: usize = 4096;
+/// EN-17: egress wake signals drained per round (unbounded channel).
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_WAKE_DRAIN_BUDGET: usize = 8192;
+/// EN-17: amortized full-session sweep cadence — backstop for sessions
+/// whose progress signal (packet or egress wake) was not observed, and
+/// the reap/idle-timeout granularity.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -92,6 +112,12 @@ static AF_XDP_TCP_DIAG_STREAM_INGRESS_BYTES: AtomicU64 = AtomicU64::new(0);
 static AF_XDP_TCP_DIAG_STREAM_EGRESS_BYTES: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_EGRESS_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// EN-17: ingress packets refused because the per-reactor queue was full.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// EN-17: egress wake signals received from proxy tasks.
+#[cfg(target_os = "linux")]
+static AF_XDP_TCP_DIAG_WAKE_SIGNALS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
 pub(crate) fn reset_tcp_diag() {
@@ -104,6 +130,8 @@ pub(crate) fn reset_tcp_diag() {
     AF_XDP_TCP_DIAG_STREAM_INGRESS_BYTES.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_STREAM_EGRESS_BYTES.store(0, Ordering::Relaxed);
     AF_XDP_TCP_DIAG_EGRESS_FRAMES.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.store(0, Ordering::Relaxed);
+    AF_XDP_TCP_DIAG_WAKE_SIGNALS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(target_os = "linux")]
@@ -118,6 +146,8 @@ pub(crate) fn tcp_diag_snapshot() -> serde_json::Value {
         "streamIngressBytes": AF_XDP_TCP_DIAG_STREAM_INGRESS_BYTES.load(Ordering::Relaxed),
         "streamEgressBytes": AF_XDP_TCP_DIAG_STREAM_EGRESS_BYTES.load(Ordering::Relaxed),
         "egressFrames": AF_XDP_TCP_DIAG_EGRESS_FRAMES.load(Ordering::Relaxed),
+        "ingressQueueDropped": AF_XDP_TCP_DIAG_INGRESS_QUEUE_DROPPED.load(Ordering::Relaxed),
+        "wakeSignals": AF_XDP_TCP_DIAG_WAKE_SIGNALS.load(Ordering::Relaxed),
     })
 }
 
@@ -244,7 +274,9 @@ pub struct AfXdpTcpFlowKey {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AfXdpRouteMeta {
-    pub interface: String,
+    /// EN-17: shared string — cloning a route meta bumps a refcount instead
+    /// of allocating per packet.
+    pub interface: Arc<str>,
     pub queue: u32,
     pub link: AfXdpLinkMeta,
 }

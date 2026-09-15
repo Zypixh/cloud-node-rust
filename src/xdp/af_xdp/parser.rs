@@ -10,11 +10,17 @@ pub fn parse_l4_packet(frame: &[u8]) -> Option<AfXdpL4Packet> {
     }
 }
 
-pub fn parse_proxy_frame(interface: &str, queue: u32, frame: &[u8]) -> Option<AfXdpProxyFrame> {
+/// `interface` is `Into<Arc<str>>` so the RX path can pass an already-shared
+/// name (refcount bump) while tests keep passing plain `&str` literals.
+pub fn parse_proxy_frame(
+    interface: impl Into<Arc<str>>,
+    queue: u32,
+    frame: &[u8],
+) -> Option<AfXdpProxyFrame> {
     let (link, l3_offset) = parse_link_meta(frame)?;
     let protocol = transport_protocol_from_frame(frame, l3_offset, link.ethertype)?;
     let route = AfXdpRouteMeta {
-        interface: interface.to_string(),
+        interface: interface.into(),
         queue,
         link,
     };

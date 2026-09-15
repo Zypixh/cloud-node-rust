@@ -199,3 +199,32 @@ Known gaps carried forward: EN-14 IPv6 challenge unimplemented (v6 rules
 reject `challenge` at config sync — explicit, not silent); cookie key
 rotation API pending (install-on-attach works); third-ACK payload not
 forwarded (documented limitation); EN-12 zero-copy needs real NIC.
+
+## 2026-09-15 (EN-17 first slice) — AF_XDP TCP reactor scheduling + copy elim
+
+EN-17 first verified slice (userspace only; eBPF object unchanged `3b8549a9`):
+
+- Hot-set session scheduling: per-poll full-table scan replaced by dedup'd
+  `hot_sessions` queue (ingress `mark_hot` + proxy→reactor wake channel),
+  budgets `AF_XDP_TCP_PUMP_BUDGET=512` / `INGRESS_BUDGET=512` /
+  `WAKE_DRAIN_BUDGET=8192`; 250ms `SWEEP_INTERVAL` full sweep as backstop.
+- Bounded ingress: `device.ingress` cap 4096; overflow → explicit
+  `IngressQueueFull` status, `ingressQueueDropped` diag, counts toward
+  consecutive-admission-refusal fault containment. `wakeSignals` diag added.
+- Session reaping cadence-gated at the same interval (independent
+  `last_retain`); reapable sessions leave the hot set immediately.
+- Copy/alloc eliminations: smoltcp `recv` closure → `Bytes` directly
+  (`rx_scratch` removed); per-packet `interface.to_string()` removed on RX;
+  `AfXdpRouteMeta.interface` → `Arc<str>` (route clone = refcount);
+  same-interface TCP egress encodes into bridge `encode_scratch` — no
+  per-frame `tx_scratch.clone()` (cross-interface forward keeps owned frame).
+
+Validation (.110, VPS-only): `cargo check --all-targets` clean;
+`cargo test --lib` **693 pass / 0 fail**; 4 new scheduler tests + reap
+test updated for cadence gating (assertion tightened, not loosened).
+
+Evidence: docs/edge-node-evidence/EN-17/report.md.
+
+Status: EN-17 IN_PROGRESS — scheduler slice verified at unit level; T05/T06/T07
+throughput/flood acceptance needs real-NIC evidence; wake channel is
+`UnboundedSender` (documented limitation, drain-budgeted + dedup'd).
