@@ -1,0 +1,411 @@
+xdp-smoke: building eBPF object
+xdp-smoke: building smoke binaries
+xdp-smoke: creating veth/netns cn-xdp-smoke
+xdp-smoke: running doctor
+CloudNode XDP doctor
+  enabled:       yes
+  attach mode:   skb
+  fallback:      fail-start
+  L4 engine:     active
+  kernel backend: xdp (fallback: nftables/iptables/noop)
+  protocols:     http,https,tcp,udp,h3
+  proxy ports:   5
+  eBPF object:   embedded
+  platform:      linux
+  bpffs pin dir: /sys/fs/bpf/cloud-node-xdp
+  bpffs exists:  yes
+  interface:     cnxdp0 mode=protect queues=[0] frameSize=2048 localIps=2
+  netdev tune:  ethtool=yes profile=aggressive
+  tune summary: profile=aggressive dryRun=no ethtool=yes changed=6 failed=0 skipped=8 actions=28
+  tune iface:   cnxdp0 driver=veth lro=off
+xdp-smoke: checking dataplane exposes all configured proxy protocols
+{
+  "allowedIps": [],
+  "allowedNetworks": [],
+  "allowedRanges": [],
+  "blockedIps": [],
+  "blockedNetworks": [],
+  "blockedRanges": [],
+  "counters": null,
+  "flowFeedback": {
+    "eventsEvicted": 0,
+    "eventsReceived": 0,
+    "eventsStale": 0,
+    "importedFlows": 0,
+    "ownerEpoch": 0
+  },
+  "interfaces": [
+    {
+      "frameSize": 2048,
+      "localIpFilter": true,
+      "localIps": [
+        "10.200.0.1",
+        "fd00:200::1"
+      ],
+      "mode": "protect",
+      "name": "cnxdp0",
+      "queues": [
+        0
+      ]
+    }
+  ],
+  "kernelBpfBudget": {
+    "budgetBytes": 135297761,
+    "projectedBytes": 321773728
+  },
+  "proxyPortSummary": {
+    "redirectEnabled": false,
+    "supported": 5,
+    "total": 5,
+    "unsupported": 0
+  },
+  "proxyPorts": [
+    {
+      "dataplaneSupported": true,
+      "port": 9080,
+      "portBeBytes": [
+        35,
+        120
+      ],
+      "proto": 6,
+      "protocol": "http"
+    },
+    {
+      "dataplaneSupported": true,
+      "port": 443,
+      "portBeBytes": [
+        1,
+        187
+      ],
+      "proto": 17,
+      "protocol": "udp"
+    },
+    {
+      "dataplaneSupported": true,
+      "port": 8443,
+      "portBeBytes": [
+        32,
+        251
+      ],
+      "proto": 17,
+      "protocol": "h3"
+    },
+    {
+      "dataplaneSupported": true,
+      "port": 9443,
+      "portBeBytes": [
+        36,
+        227
+      ],
+      "proto": 6,
+      "protocol": "tcp"
+    },
+    {
+      "dataplaneSupported": true,
+      "port": 9444,
+      "portBeBytes": [
+        36,
+        228
+      ],
+      "proto": 6,
+      "protocol": "https"
+    }
+  ],
+  "tcpDataplane": {
+    "detail": "",
+    "ready": true
+  },
+  "xskQueues": []
+}
+xdp-smoke: running proxy doctor
+CloudNode XDP doctor
+  enabled:       yes
+  attach mode:   skb
+  fallback:      fail-start
+  L4 engine:     active
+  kernel backend: xdp (fallback: nftables/iptables/noop)
+  protocols:     http,https,tcp,udp,h3
+  proxy ports:   5
+  eBPF object:   embedded
+  platform:      linux
+  bpffs pin dir: /sys/fs/bpf/cloud-node-xdp
+  bpffs exists:  yes
+  dataplane:     AF_XDP proxy ports supported=5 total=5
+  interface:     cnxdp0 mode=proxy queues=[0] frameSize=2048 localIps=2
+  netdev tune:  ethtool=yes profile=aggressive
+  tune summary: profile=aggressive dryRun=no ethtool=yes changed=6 failed=0 skipped=8 actions=28
+  tune iface:   cnxdp0 driver=veth lro=off
+xdp-smoke: running AF_XDP proxy reload smoke: owner-respecting reload replaces the manager generation while the bridge supervisor re-serves it
+{
+  "afterReload": {
+    "drop": 0,
+    "fallbackReason": "",
+    "mapMiss": 0,
+    "packets": 1,
+    "parseErrors": 0,
+    "pass": 1,
+    "proxyFallbackReason": "",
+    "proxyReady": true,
+    "proxyRedirectEnabled": true,
+    "redirect": 0,
+    "tcpDataplaneDetail": "",
+    "tcpDataplaneReady": true,
+    "xskDrops": 0,
+    "xskReadyQueues": 1
+  },
+  "beforeReload": {
+    "fallbackReason": "",
+    "proxyFallbackReason": "",
+    "proxyReady": true,
+    "proxyRedirectEnabled": true,
+    "redirect": 0,
+    "tcpDataplaneReady": true,
+    "xskDrops": 0,
+    "xskReadyQueues": 1
+  },
+  "bridgeSupervisorAlive": true,
+  "durationMillis": 3000,
+  "managerReplaced": true
+}
+xdp-smoke: running raw AF_XDP dataplane smoke: default full proxy dataplane
+{
+  "aclBlocked": 0,
+  "drop": 0,
+  "durationMillis": 5000,
+  "frames": 4,
+  "mapMiss": 0,
+  "packets": 6,
+  "parseErrors": 0,
+  "pass": 2,
+  "proxyReady": true,
+  "rateLimited": 0,
+  "ratelimitMapFull": 0,
+  "redirect": 4,
+  "samples": [
+    {
+      "interface": "cnxdp0",
+      "local": "10.200.0.1:443",
+      "payloadBytes": 24,
+      "peer": "10.200.0.2:33689",
+      "protocol": "udp",
+      "queue": 0
+    },
+    {
+      "interface": "cnxdp0",
+      "ipPacketBytes": 60,
+      "local": "10.200.0.1:9443",
+      "peer": "10.200.0.2:35534",
+      "protocol": "tcp",
+      "queue": 0
+    },
+    {
+      "interface": "cnxdp0",
+      "local": "[fd00:200::1]:443",
+      "payloadBytes": 24,
+      "peer": "[fd00:200::2]:33769",
+      "protocol": "udp",
+      "queue": 0
+    },
+    {
+      "interface": "cnxdp0",
+      "ipPacketBytes": 80,
+      "local": "[fd00:200::1]:9443",
+      "peer": "[fd00:200::2]:41402",
+      "protocol": "tcp",
+      "queue": 0
+    }
+  ],
+  "snatAllocFail": 0,
+  "snatBound": 0,
+  "snatReplyTx": 0,
+  "tcp": 2,
+  "tcpDataplaneDetail": "",
+  "tcpDataplaneReady": true,
+  "tcpFwdMapFull": 0,
+  "tcpFwdTx": 0,
+  "tx": 0,
+  "udp": 2,
+  "udpFwdMapFull": 0,
+  "udpFwdTx": 0,
+  "unparseable": 0,
+  "xskDrops": 0,
+  "xskReadyQueues": 1
+}
+xdp-smoke: running raw AF_XDP dataplane smoke: localIps bypass keeps unlisted destination on socket path
+{
+  "aclBlocked": 0,
+  "drop": 0,
+  "durationMillis": 5000,
+  "frames": 0,
+  "mapMiss": 0,
+  "packets": 4,
+  "parseErrors": 0,
+  "pass": 4,
+  "proxyReady": true,
+  "rateLimited": 0,
+  "ratelimitMapFull": 0,
+  "redirect": 0,
+  "samples": [],
+  "snatAllocFail": 0,
+  "snatBound": 0,
+  "snatReplyTx": 0,
+  "tcp": 0,
+  "tcpDataplaneDetail": "",
+  "tcpDataplaneReady": true,
+  "tcpFwdMapFull": 0,
+  "tcpFwdTx": 0,
+  "tx": 0,
+  "udp": 0,
+  "udpFwdMapFull": 0,
+  "udpFwdTx": 0,
+  "unparseable": 0,
+  "xskDrops": 0,
+  "xskReadyQueues": 1
+}
+xdp-smoke: running AF_XDP application proxy smoke: HTTP HTTPS TCP UDP SNI QUIC H3 application proxy dataplane
+requests=1 ok=1 failed=0 seconds=0.605 rps=1.65 bytes=13 connections=1 concurrency=1
+requests=1 ok=1 failed=0 seconds=0.136 rps=7.37 bytes=15 connections=1 concurrency=1
+requests=1 ok=1 failed=0 seconds=0.355 rps=2.82 bytes=13 connections=1 concurrency=1
+requests=1 ok=1 failed=0 seconds=0.143 rps=7.00 bytes=15 connections=1 concurrency=1
+h2(10.200.0.1): 2
+h2(fd00:200::1): 2
+{
+  "app": {
+    "h3Requests": 2,
+    "httpRequests": 2,
+    "httpsRequests": 4,
+    "quicRequests": 2,
+    "sniConnections": 2,
+    "tcpConnections": 2,
+    "udpDatagrams": 2
+  },
+  "backends": {
+    "h3": "127.0.0.1:37035",
+    "http": "127.0.0.1:37595",
+    "https": "127.0.0.1:41805",
+    "quic": "127.0.0.1:55615",
+    "sni": "127.0.0.1:35263",
+    "tcp": "127.0.0.1:42553",
+    "udp": "127.0.0.1:45950"
+  },
+  "drop": 0,
+  "durationMillis": 25000,
+  "mapMiss": 0,
+  "packets": 131,
+  "parseErrors": 0,
+  "pass": 12,
+  "ports": {
+    "h3": 8443,
+    "http": 9080,
+    "https": 9444,
+    "tcp": 9443,
+    "udp": 443
+  },
+  "proxyReady": true,
+  "proxyRedirectEnabled": true,
+  "redirect": 119,
+  "tcpDataplaneDetail": "",
+  "tcpDataplaneReady": true,
+  "tcpDiag": {
+    "accepted": 76,
+    "egressFrames": 53,
+    "ignoredUnknown": 0,
+    "ingressQueueDropped": 0,
+    "preProxyTimeout": 0,
+    "proxyStarted": 10,
+    "refusedAtCapacity": 0,
+    "socketRecvBytes": 4606,
+    "streamEgressBytes": 8080,
+    "streamIngressBytes": 4606,
+    "wakeSignals": 22
+  },
+  "tcpProxyDiag": {
+    "backendConnectFail": 0,
+    "backendConnectOk": 2,
+    "backendConnectStart": 2,
+    "contextOk": 2,
+    "entered": 0,
+    "prepared": 2,
+    "relayBytesReceived": 60,
+    "relayBytesSent": 88,
+    "relayDone": 2,
+    "relayErrors": 0,
+    "relayStart": 2
+  },
+  "xskDrops": 0,
+  "xskReadyQueues": 1
+}
+xdp-smoke: attaching XDP
+XDP netdev tuning
+  summary: profile=aggressive dryRun=no ethtool=yes changed=6 failed=0 skipped=8 actions=28
+  interface: cnxdp0 driver=veth required_lro_off=no
+  iface="cnxdp0" key="feature.scatter-gather" old="on" target="off" final="off" status=applied reason="feature updated" command="ethtool -K cnxdp0 sg off"
+  iface="cnxdp0" key="feature.rx-vlan-offload" old="on" target="off" final="off" status=applied reason="feature updated" command="ethtool -K cnxdp0 rxvlan off"
+  iface="cnxdp0" key="feature.tx-vlan-offload" old="on" target="off" final="off" status=applied reason="feature updated" command="ethtool -K cnxdp0 txvlan off"
+  iface="cnxdp0" key="ip.link.txqueuelen" old="1000" target="10000" final="10000" status=applied reason="link setting updated" command="ip link set dev cnxdp0 txqueuelen 10000"
+  iface="cnxdp0" key="queue.rx-0.rps_cpus" old="0" target="3" final="3" status=applied reason="setting updated" command="write /sys/class/net/cnxdp0/queues/rx-0/rps_cpus 3"
+  iface="cnxdp0" key="queue.tx-0.xps_cpus" old="0" target="3" final="3" status=applied reason="setting updated" command="write /sys/class/net/cnxdp0/queues/tx-0/xps_cpus 3"
+CloudNode XDP status
+  enabled:       yes
+  available:     yes
+  attached:      yes
+  attach mode:   skb
+  fallback:      fail-start
+  fallback why:  -
+  proxy ports:   5 supported=5 unsupported=0
+  proxy ready:   no
+  redirect:      no
+  tcp dataplane: no
+  tcp why:       -
+  proxy why:     -
+  xsk queues:    configured=0 ready=0
+  eBPF object:   embedded
+  maps:          block_v4=0 block_v6=0 allow_v4=0 allow_v6=0 block_nets=0 allow_nets=0 block_ranges=0 allow_ranges=0
+  counters:      packets=0 pass=0 drop=0 redirect=0 parse_errors=0 map_miss=0 xsk_drops=0
+  interface:     cnxdp0 mode=protect queues=[0] attached=yes xsk_ready=no frameSize=2048 detail=attached
+  netdev tune:  profile=aggressive dryRun=no ethtool=yes changed=6 failed=0 skipped=8 actions=28
+  tune report:  /root/cloud-node-dev/data/xdp-netdev-tuning.json
+xdp-smoke: reloading XDP attachment
+CloudNode XDP status
+  enabled:       yes
+  available:     yes
+  attached:      yes
+  attach mode:   skb
+  fallback:      fail-start
+  fallback why:  -
+  proxy ports:   5 supported=5 unsupported=0
+  proxy ready:   no
+  redirect:      no
+  tcp dataplane: no
+  tcp why:       -
+  proxy why:     -
+  xsk queues:    configured=0 ready=0
+  eBPF object:   embedded
+  maps:          block_v4=0 block_v6=0 allow_v4=0 allow_v6=0 block_nets=0 allow_nets=0 block_ranges=0 allow_ranges=0
+  counters:      packets=0 pass=0 drop=0 redirect=0 parse_errors=0 map_miss=0 xsk_drops=0
+  interface:     cnxdp0 mode=protect queues=[0] attached=yes xsk_ready=no frameSize=2048 detail=attached
+  netdev tune:  profile=aggressive dryRun=no ethtool=yes changed=6 failed=0 skipped=8 actions=28
+  tune report:  /root/cloud-node-dev/data/xdp-netdev-tuning.json
+xdp-smoke: verifying veth connectivity remains available for unmatched traffic
+xdp-smoke: detaching XDP
+CloudNode XDP status
+  enabled:       no
+  available:     no
+  attached:      no
+  attach mode:   skb
+  fallback:      fail-start
+  fallback why:  -
+  proxy ports:   5 supported=5 unsupported=0
+  proxy ready:   no
+  redirect:      no
+  tcp dataplane: no
+  tcp why:       -
+  proxy why:     -
+  xsk queues:    configured=0 ready=0
+  eBPF object:   embedded
+  maps:          block_v4=0 block_v6=0 allow_v4=0 allow_v6=0 block_nets=0 allow_nets=0 block_ranges=0 allow_ranges=0
+  counters:      packets=0 pass=0 drop=0 redirect=0 parse_errors=0 map_miss=0 xsk_drops=0
+  interface:     cnxdp0 mode=protect queues=[0] attached=no xsk_ready=no frameSize=2048 detail=not attached
+  netdev tune:  profile=aggressive dryRun=no ethtool=yes changed=6 failed=0 skipped=8 actions=28
+  tune report:  /root/cloud-node-dev/data/xdp-netdev-tuning.json
+xdp-smoke: smoke completed
