@@ -87,12 +87,12 @@ memmap2 = "0.9.11"
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = "0.14.0"
 neli = "0.7.4"
-smoltcp = { version = "0.14.0", default-features = false, features = ["std", "async", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "async", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "socket-udp"] }
 xsk-rs = "0.9.0"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }
-smoltcp = { version = "0.14.0", default-features = false, features = ["std", "async", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "async", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "socket-udp"] }
 
 [[bench]]
 name = "template_bench"

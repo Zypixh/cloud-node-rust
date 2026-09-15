@@ -65,6 +65,12 @@ pub struct XdpQueueStatus {
     /// queue can drain instead of collapsing (EN-05).
     #[serde(default)]
     pub congested_drops: u64,
+    /// TCP sessions refused at the reactor session/ingress limits. These
+    /// are capacity refusals, not faults: the worker keeps serving existing
+    /// sessions and new admissions resume automatically once capacity is
+    /// released (F2 — refusal must never escalate to queue teardown).
+    #[serde(default)]
+    pub admission_refusals: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -109,6 +115,10 @@ pub struct XdpStatusSnapshot {
     pub proxy_fallback_reason: String,
     pub tcp_dataplane_ready: bool,
     pub tcp_dataplane_detail: String,
+    /// F8: congestion controller the AF_XDP TCP dataplane runs ("cubic"),
+    /// empty when the TCP dataplane is not supported/configured.
+    #[serde(default)]
+    pub tcp_congestion_control: String,
     pub xsk_configured_queues: usize,
     pub xsk_ready_queues: usize,
     pub packets: u64,
@@ -1111,6 +1121,16 @@ impl XdpManager {
                 && proxy_ready
                 && tcp_dataplane_detail.is_empty(),
             tcp_dataplane_detail,
+            // F8: the AF_XDP TCP dataplane always runs an explicit smoltcp
+            // congestion controller — expose which one so `xdp status` can
+            // prove no session silently runs NoControl.
+            tcp_congestion_control: if xdp_proxy_has_tcp_like_ports(&self.config)
+                && xdp_tcp_dataplane_supported()
+            {
+                "cubic".to_string()
+            } else {
+                String::new()
+            },
             xsk_configured_queues,
             xsk_ready_queues,
             packets: self.packets.load(Ordering::Relaxed),
@@ -1268,6 +1288,7 @@ impl XdpManager {
                 .find(|prev| prev.interface == status.interface && prev.queue == status.queue)
             {
                 status.congested_drops = prev.congested_drops;
+                status.admission_refusals = prev.admission_refusals;
                 if prev.faulted {
                     status.faulted = true;
                     status.registered = false;
@@ -2268,12 +2289,19 @@ pub async fn ensure_current_xdp_auto_config() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut derived = crate::xdp_auto_config::derive_xdp_config_from_live_node(&runtime).await?;
-    // Explicit file-level knobs that auto derivation cannot infer stay
-    // authoritative; the derived part covers interfaces/queues/ports only.
-    derived.attach_mode = runtime.xdp.attach_mode;
-    derived.fallback = runtime.xdp.fallback;
-    derived.rate_limit = runtime.xdp.rate_limit.clone().or(derived.rate_limit);
+    // Derive only the missing pieces: explicit file-level knobs (interfaces,
+    // budget, admission, ebpfObject, stateTables, rateLimit, proxy
+    // ports/protocols) stay authoritative inside the derive call itself.
+    let derived = crate::xdp_auto_config::derive_xdp_config_from_live_node_with_options(
+        &runtime,
+        crate::xdp_auto_config::XdpAutoConfigOptions {
+            interfaces: Vec::new(),
+            mode: crate::runtime_mode::XdpRuntimeMode::Proxy,
+            attach_mode: runtime.xdp.attach_mode,
+            fallback: runtime.xdp.fallback,
+        },
+    )
+    .await?;
     runtime.xdp = derived;
     RuntimeConfig::set_current(runtime);
     Ok(())

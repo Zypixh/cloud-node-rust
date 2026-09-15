@@ -98,6 +98,9 @@ pub struct GovernorSnapshot {
     pub zero_copy_relay_budget_bytes: u64,
     pub udp_queued_bytes: u64,
     pub udp_queued_bytes_budget: u64,
+    /// EN-17/F3: AF_XDP TCP queued-byte ledger and its node budget.
+    pub tcp_queue_bytes: u64,
+    pub tcp_queue_bytes_budget: u64,
     pub admission_rejects: AdmissionRejectSnapshot,
     pub keepalive_budget_bytes: u64,
     pub estimated_http_connections: u64,
@@ -384,6 +387,11 @@ const MAX_UDP_ROUTE_LIMIT_PER_PORT: usize = 100_000_000;
 const MAX_UDP_SESSION_QUEUE_SIZE: usize = 2_048;
 const MIN_UDP_QUEUED_BYTES_BUDGET: u64 = 8 * 1024 * 1024;
 const MAX_UDP_QUEUED_BYTES_BUDGET: u64 = 512 * 1024 * 1024;
+/// EN-17/F3: AF_XDP TCP queued-byte budget bounds. The floor must cover a
+/// few fully-queued streams (channel depth × write chunk ≈ 4 MiB each) so
+/// backpressure does not stall the dataplane on small nodes.
+const MIN_TCP_QUEUE_BYTES_BUDGET: u64 = 16 * 1024 * 1024;
+const MAX_TCP_QUEUE_BYTES_BUDGET: u64 = 1024 * 1024 * 1024;
 const MAX_H3_DATAGRAM_QUEUE_SIZE: usize = 65_536;
 const MAX_QUIC_PENDING_ROUTE_LIMIT_PER_PORT: usize = 2_048;
 const MIN_QUIC_PENDING_ROUTE_LIMIT_PER_PORT: usize = 128;
@@ -514,6 +522,11 @@ pub struct MemoryGovernor {
     zero_copy_relays: AtomicU64,
     zero_copy_relay_bytes: AtomicU64,
     udp_queued_bytes: AtomicU64,
+    /// EN-17/F3: node-wide ledger for bytes queued inside the AF_XDP TCP
+    /// dataplane (stream channels, reactor pendings, device ingress frames).
+    /// Distinct from the UDP ledger so a TCP queue storm cannot silently
+    /// consume the datagram budget (or vice versa).
+    tcp_queue_bytes: AtomicU64,
     background_work: AtomicU64,
     request_body_waf: AtomicU64,
     response_body_waf: AtomicU64,
@@ -582,6 +595,14 @@ pub struct UdpQueueBytePermit<'a> {
 }
 
 pub type StaticUdpQueueBytePermit = UdpQueueBytePermit<'static>;
+
+/// EN-17/F3: RAII charge against `tcp_queue_bytes` — released on drop.
+pub struct TcpQueueBytePermit<'a> {
+    governor: &'a MemoryGovernor,
+    bytes: u64,
+}
+
+pub type StaticTcpQueueBytePermit = TcpQueueBytePermit<'static>;
 
 /// EN-16 RAII listener-pool slot. Dropping releases the slot and frees
 /// the pool entry once it reaches zero.
@@ -665,6 +686,7 @@ impl MemoryGovernor {
             zero_copy_relays: AtomicU64::new(0),
             zero_copy_relay_bytes: AtomicU64::new(0),
             udp_queued_bytes: AtomicU64::new(0),
+            tcp_queue_bytes: AtomicU64::new(0),
             background_work: AtomicU64::new(0),
             request_body_waf: AtomicU64::new(0),
             response_body_waf: AtomicU64::new(0),
@@ -801,6 +823,36 @@ impl MemoryGovernor {
             ) {
                 Ok(_) => {
                     return Some(UdpQueueBytePermit {
+                        governor: self,
+                        bytes,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// EN-17/F3: reserve bytes in the node-wide AF_XDP TCP queue ledger.
+    /// Returns `None` when the budget is exhausted — callers must apply
+    /// explicit backpressure (stop draining, suspend writes), never drop
+    /// silently.
+    pub fn try_reserve_tcp_queue_bytes(&self, bytes: usize) -> Option<TcpQueueBytePermit<'_>> {
+        let bytes = bytes.max(1) as u64;
+        let budget = self.tcp_queue_bytes_budget().max(1);
+        let mut current = self.tcp_queue_bytes.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_add(bytes);
+            if next > budget {
+                return None;
+            }
+            match self.tcp_queue_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(TcpQueueBytePermit {
                         governor: self,
                         bytes,
                     });
@@ -1258,6 +1310,20 @@ impl MemoryGovernor {
             .saturating_div(self.udp_queued_bytes_budget().max(1))
     }
 
+    pub fn tcp_queue_bytes(&self) -> u64 {
+        self.tcp_queue_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn tcp_queue_bytes_budget(&self) -> u64 {
+        tcp_queue_bytes_budget(&self.memory_snapshot())
+    }
+
+    pub fn tcp_queue_utilization_pct(&self) -> u64 {
+        self.tcp_queue_bytes()
+            .saturating_mul(100)
+            .saturating_div(self.tcp_queue_bytes_budget().max(1))
+    }
+
     pub fn h3_datagram_queue_size(&self) -> usize {
         h3_datagram_queue_size(&self.memory_snapshot())
     }
@@ -1679,6 +1745,8 @@ impl MemoryGovernor {
             zero_copy_relay_budget_bytes: self.zero_copy_relay_budget_bytes(),
             udp_queued_bytes: self.udp_queued_bytes(),
             udp_queued_bytes_budget: self.udp_queued_bytes_budget(),
+            tcp_queue_bytes: self.tcp_queue_bytes(),
+            tcp_queue_bytes_budget: self.tcp_queue_bytes_budget(),
             admission_rejects: self.admission_reject_snapshot(),
             keepalive_budget_bytes: mem.keepalive_budget_bytes,
             estimated_http_connections: self.http_connections.load(Ordering::Relaxed),
@@ -1991,6 +2059,14 @@ impl Drop for UdpQueueBytePermit<'_> {
     fn drop(&mut self) {
         self.governor
             .udp_queued_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+impl Drop for TcpQueueBytePermit<'_> {
+    fn drop(&mut self) {
+        self.governor
+            .tcp_queue_bytes
             .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
@@ -2709,6 +2785,22 @@ fn udp_queued_bytes_budget(snapshot: &BudgetedMemorySnapshot) -> u64 {
         .min(snapshot.available_bytes.max(1))
 }
 
+/// EN-17/F3: node-wide budget for bytes queued inside the AF_XDP TCP
+/// dataplane (per-session stream channels + reactor pendings + device
+/// ingress frames). Sized as a fraction of the connection budget — TCP
+/// queues are the dominant dataplane allocation — and shrunk under memory
+/// pressure so queue drain pressure never exceeds the node envelope.
+fn tcp_queue_bytes_budget(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    let target = if memory_pressure_high(snapshot) {
+        snapshot.connection_budget_bytes / 16
+    } else {
+        snapshot.connection_budget_bytes / 4
+    };
+    target
+        .clamp(MIN_TCP_QUEUE_BYTES_BUDGET, MAX_TCP_QUEUE_BYTES_BUDGET)
+        .min(snapshot.available_bytes.max(1))
+}
+
 fn zero_copy_relay_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
     let target = if memory_pressure_high(snapshot) {
         snapshot.connection_budget_bytes / 64
@@ -3381,6 +3473,24 @@ mod tests {
             .store(budget.saturating_sub(10), Ordering::Release);
         assert!(governor.try_reserve_udp_queue_bytes(11).is_none());
         assert_eq!(governor.udp_queued_bytes(), budget.saturating_sub(10));
+    }
+
+    #[test]
+    fn tcp_queue_byte_permit_tracks_budget_and_releases() {
+        let governor = MemoryGovernor::new();
+        let permit = governor
+            .try_reserve_tcp_queue_bytes(4096)
+            .expect("TCP queue byte reservation should fit");
+        assert_eq!(governor.tcp_queue_bytes(), 4096);
+        drop(permit);
+        assert_eq!(governor.tcp_queue_bytes(), 0);
+
+        let budget = governor.tcp_queue_bytes_budget();
+        governor
+            .tcp_queue_bytes
+            .store(budget.saturating_sub(10), Ordering::Release);
+        assert!(governor.try_reserve_tcp_queue_bytes(11).is_none());
+        assert_eq!(governor.tcp_queue_bytes(), budget.saturating_sub(10));
     }
 
     #[test]
