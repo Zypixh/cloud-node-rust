@@ -251,11 +251,6 @@ pub fn compute_xdp_budget(
         FullBehavior::Fallback
     );
     push!(
-        "xdp_quic_dcid",
-        131_072,
-        hash_map_bytes(131_072, size_of::<XdpQuicDcidKey>() as u64, 4)
-    );
-    push!(
         "xdp_udp_fwd",
         4_096,
         hash_map_bytes(4_096, fwd_key, fwd_rule)

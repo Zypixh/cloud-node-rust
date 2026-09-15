@@ -34,10 +34,6 @@ pub(crate) struct AfXdpQueueCtx {
     /// answered by the demux/H3 endpoint on queue B's channel, so lookups
     /// must see every queue's learned L2 routes.
     pub(crate) udp_routes: Arc<DashMap<(SocketAddr, SocketAddr), AfXdpUdpRouteEntry>>,
-    /// QUIC DCIDs this bridge has pinned to an XSK queue, mirrored from the
-    /// eBPF XDP_QUIC_DCID map for idle-expiry sweeping.
-    pub(crate) quic_dcid_steers:
-        Arc<DashMap<cloud_node_xdp_common::XdpQuicDcidKey, u64>>,
     /// First channel per interface for cross-interface forwarding.
     pub(crate) iface_fwd: Arc<HashMap<String, mpsc::Sender<AfXdpForward>>>,
 }
@@ -243,7 +239,6 @@ pub(crate) async fn spawn_queue_reactors(
 
     let online_cpus = num_cpus::get().max(1);
     let udp_routes = Arc::new(DashMap::new());
-    let quic_dcid_steers = Arc::new(DashMap::new());
     // One forwarding channel per queue; the first sender per interface is
     // the cross-interface forward target.
     let mut iface_fwd: HashMap<String, mpsc::Sender<AfXdpForward>> = HashMap::new();
@@ -262,7 +257,6 @@ pub(crate) async fn spawn_queue_reactors(
             downstream_rx,
             fwd_rx,
             udp_routes: udp_routes.clone(),
-            quic_dcid_steers: quic_dcid_steers.clone(),
             iface_fwd: Arc::new(HashMap::new()),
         });
     }
@@ -521,12 +515,9 @@ pub(crate) async fn run_queue_bridge_loop(
         mut downstream_rx,
         mut fwd_rx,
         udp_routes,
-        quic_dcid_steers,
         iface_fwd,
     } = ctx;
     let own_interface: Arc<str> = Arc::from(queue_handle.interface.as_str());
-    let own_ifindex = linux::ifindex_from_name(&own_interface).unwrap_or(0);
-    let mut quic_dcid_map_unavailable = false;
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut idle_backoff = AF_XDP_IDLE_BACKOFF_MIN;
     let mut last_route_cache_sweep_ms = crate::udp_proxy::udp_activity_now_ms();
@@ -633,19 +624,6 @@ pub(crate) async fn run_queue_bridge_loop(
                 AF_XDP_ROUTE_CACHE_MAX,
                 AF_XDP_ROUTE_CACHE_EVICT_BATCH,
             );
-            let mut expired_dcids = Vec::new();
-            quic_dcid_steers.retain(|key, last_seen_ms| {
-                if now_ms.saturating_sub(*last_seen_ms)
-                    >= AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT.as_millis() as u64
-                {
-                    expired_dcids.push(*key);
-                    return false;
-                }
-                true
-            });
-            for key in expired_dcids {
-                manager.remove_quic_dcid(&key);
-            }
             last_route_cache_sweep_ms = now_ms;
         }
 
@@ -683,37 +661,11 @@ pub(crate) async fn run_queue_bridge_loop(
                             last_seen_ms: now_ms,
                         },
                     );
-                    // Long-header QUIC packets encode their DCID length,
-                    // so the eBPF program can steer them. Pin this flow's
-                    // DCID to this queue's XSK so retransmissions and
-                    // handshake traffic stay on the owning reactor.
-                    if own_ifindex != 0
-                        && packet.payload.first().is_some_and(|b| b & 0x80 != 0)
-                        && let Some(cids) =
-                            crate::quic_probe::quic_packet_cids(&packet.payload, 0)
-                        && let Some(dkey) =
-                            cloud_node_xdp_common::XdpQuicDcidKey::new(&cids.dcid)
-                    {
-                        match quic_dcid_steers.get_mut(&dkey) {
-                            Some(mut seen) => *seen = now_ms,
-                            None => {
-                                if manager.upsert_quic_dcid(
-                                    &cids.dcid,
-                                    own_ifindex,
-                                    queue_handle.queue,
-                                ) {
-                                    quic_dcid_steers.insert(dkey, now_ms);
-                                } else if !quic_dcid_map_unavailable {
-                                    quic_dcid_map_unavailable = true;
-                                    tracing::warn!(
-                                        "AF_XDP QUIC DCID steering unavailable (eBPF object lacks XDP_QUIC_DCID or XSK index for {} queue {}); RSS queue affinity remains the fallback",
-                                        own_interface.as_ref(),
-                                        queue_handle.queue
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    // F7: no eBPF DCID steering — an XSK redirect is only
+                    // valid for the current ingress queue, so every packet
+                    // arrives on this queue's socket and the shared
+                    // userspace demux routes it to the CID's owning
+                    // session regardless of which queue received it.
                     let Some(datagram) = packet.into_udp_datagram() else {
                         continue;
                     };

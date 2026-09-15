@@ -1693,63 +1693,6 @@ impl XdpManager {
         }
     }
 
-    /// Pin a QUIC long-header DCID to the XSK queue owning the session, so
-    /// retransmitted Initials and handshake datagrams keep landing on the
-    /// reactor that holds the connection state instead of following RSS.
-    /// Returns false when the eBPF object lacks the maps (stale object build);
-    /// callers log that once and keep RSS affinity as the explicit fallback.
-    #[cfg(target_os = "linux")]
-    fn upsert_quic_dcid(&self, dcid: &[u8], ifindex: u32, queue: u32) -> bool {
-        let Some(dcid_key) = cloud_node_xdp_common::XdpQuicDcidKey::new(dcid) else {
-            return false;
-        };
-        let mut guard = self.ebpf.lock();
-        let Some(ebpf) = guard.as_mut() else {
-            return false;
-        };
-        let xsk_index = {
-            let Some(map) = ebpf.map("XDP_XSK_INDEX") else {
-                return false;
-            };
-            let Ok(map) =
-                aya::maps::HashMap::<_, cloud_node_xdp_common::XdpQueueKey, u32>::try_from(map)
-            else {
-                return false;
-            };
-            map.get(&cloud_node_xdp_common::XdpQueueKey::new(ifindex, queue), 0)
-                .ok()
-        };
-        let Some(xsk_index) = xsk_index else {
-            return false;
-        };
-        let Some(map) = ebpf.map_mut("XDP_QUIC_DCID") else {
-            return false;
-        };
-        let Ok(mut map) =
-            aya::maps::HashMap::<_, cloud_node_xdp_common::XdpQuicDcidKey, u32>::try_from(map)
-        else {
-            return false;
-        };
-        map.insert(dcid_key, xsk_index, 0).is_ok()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn remove_quic_dcid(&self, dcid_key: &cloud_node_xdp_common::XdpQuicDcidKey) {
-        let mut guard = self.ebpf.lock();
-        let Some(ebpf) = guard.as_mut() else {
-            return;
-        };
-        let Some(map) = ebpf.map_mut("XDP_QUIC_DCID") else {
-            return;
-        };
-        let Ok(mut map) =
-            aya::maps::HashMap::<_, cloud_node_xdp_common::XdpQuicDcidKey, u32>::try_from(map)
-        else {
-            return;
-        };
-        let _ = map.remove(dcid_key);
-    }
-
     /// GC direct-forward conntrack entries and fold per-CPU flow accounting
     /// into billing. No-op unless the dataplane is attached and forwards are
     /// configured.
