@@ -137,36 +137,52 @@ pub fn refresh_xdp_interface_queues(config: &mut XdpConfig) {
 }
 
 fn derive_xdp_config_with_ports(
-    _runtime: &RuntimeConfig,
+    runtime: &RuntimeConfig,
     ports: Vec<XdpProxyPortConfig>,
 ) -> anyhow::Result<XdpConfig> {
-    derive_xdp_config_with_ports_and_options(_runtime, ports, XdpAutoConfigOptions::default())
+    derive_xdp_config_with_ports_and_options(runtime, ports, XdpAutoConfigOptions::default())
 }
 
 fn derive_xdp_config_with_ports_and_options(
-    _runtime: &RuntimeConfig,
+    runtime: &RuntimeConfig,
     ports: Vec<XdpProxyPortConfig>,
     options: XdpAutoConfigOptions,
 ) -> anyhow::Result<XdpConfig> {
-    let interfaces = detect_xdp_interfaces_with_options(&options)?;
-    if interfaces.is_empty() {
-        anyhow::bail!("no Linux network interfaces are eligible for XDP automatic takeover");
+    // Derive on top of the configured xdp section: only missing pieces are
+    // filled in. Explicit operator settings — interfaces, budget, admission,
+    // ebpf_object, state_tables, rate_limit, proxy ports/protocols — stay
+    // authoritative; discarding them here previously turned an explicit
+    // over-budget stateTables into a silent auto-scale.
+    let interfaces = if runtime.xdp.interfaces.is_empty() {
+        detect_xdp_interfaces_with_options(&options)?
+    } else {
+        runtime.xdp.interfaces.clone()
+    };
+    merge_derived_xdp_config(runtime, interfaces, ports, options)
+}
+
+fn merge_derived_xdp_config(
+    runtime: &RuntimeConfig,
+    interfaces: Vec<XdpInterfaceConfig>,
+    ports: Vec<XdpProxyPortConfig>,
+    options: XdpAutoConfigOptions,
+) -> anyhow::Result<XdpConfig> {
+    let mut config = runtime.xdp.clone();
+    config.enabled = true;
+    config.attach_mode = options.attach_mode;
+    config.fallback = options.fallback;
+    if config.interfaces.is_empty() {
+        config.interfaces = interfaces;
     }
-    Ok(XdpConfig {
-        enabled: true,
-        attach_mode: options.attach_mode,
-        fallback: options.fallback,
-        interfaces,
-        proxy: XdpProxyConfig {
-            protocols: default_xdp_proxy_protocols(),
-            ports,
-        },
-        rate_limit: None,
-        budget: None,
-        admission: None,
-        ebpf_object: None,
-        state_tables: None,
-    })
+    if config.proxy.ports.is_empty() {
+        config.proxy.ports = ports;
+    } else {
+        config.proxy.ports = dedupe_proxy_ports(std::mem::take(&mut config.proxy.ports))?;
+    }
+    if config.proxy.protocols.is_empty() {
+        config.proxy.protocols = default_xdp_proxy_protocols();
+    }
+    Ok(config)
 }
 
 fn add_listen_ports(
@@ -444,5 +460,103 @@ mod tests {
                 ("h3", 443),
             ]
         );
+    }
+
+    #[test]
+    fn derive_preserves_explicit_security_and_resource_knobs() {
+        // F5: auto-derived interfaces/ports must not drop explicit
+        // budget/admission/ebpfObject/stateTables/rateLimit/proxy settings.
+        let mut runtime = RuntimeConfig::default();
+        runtime.xdp.enabled = true;
+        runtime.xdp.attach_mode = XdpAttachMode::Skb;
+        runtime.xdp.state_tables = Some(crate::runtime_mode::XdpStateTables {
+            ct_max_entries: Some(1234),
+            ..Default::default()
+        });
+        runtime.xdp.ebpf_object = Some("/opt/xdp/custom.o".to_string());
+        runtime.xdp.budget = Some(crate::runtime_mode::XdpBudgetSettings::default());
+        runtime.xdp.admission = Some(crate::runtime_mode::XdpAdmissionSettings::default());
+        runtime.xdp.rate_limit = Some(crate::runtime_mode::XdpRateLimitSettings::default());
+
+        let derived_ports = vec![XdpProxyPortConfig {
+            protocol: XdpProxyProtocol::Http,
+            port: 80,
+        }];
+        let merged = merge_derived_xdp_config(
+            &runtime,
+            vec![XdpInterfaceConfig {
+                name: "eth9".to_string(),
+                queues: vec![0],
+                ..Default::default()
+            }],
+            derived_ports.clone(),
+            XdpAutoConfigOptions {
+                attach_mode: XdpAttachMode::Skb,
+                fallback: XdpFallbackMode::FailStart,
+                ..Default::default()
+            },
+        )
+        .expect("merge");
+
+        assert!(merged.enabled);
+        assert_eq!(merged.attach_mode, XdpAttachMode::Skb);
+        assert_eq!(merged.state_tables, runtime.xdp.state_tables);
+        assert_eq!(merged.ebpf_object, runtime.xdp.ebpf_object);
+        assert!(merged.budget.is_some());
+        assert!(merged.admission.is_some());
+        assert_eq!(merged.rate_limit, runtime.xdp.rate_limit);
+        assert_eq!(merged.interfaces.len(), 1);
+        assert_eq!(merged.interfaces[0].name, "eth9");
+        assert_eq!(merged.proxy.ports, derived_ports);
+        assert!(!merged.proxy.protocols.is_empty());
+    }
+
+    #[test]
+    fn derive_keeps_explicit_interfaces_ports_and_protocols() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.xdp.enabled = true;
+        runtime.xdp.interfaces = vec![XdpInterfaceConfig {
+            name: "eth5".to_string(),
+            queues: vec![0, 1],
+            ..Default::default()
+        }];
+        runtime.xdp.proxy.ports = vec![
+            XdpProxyPortConfig {
+                protocol: XdpProxyProtocol::Https,
+                port: 443,
+            },
+            XdpProxyPortConfig {
+                protocol: XdpProxyProtocol::Https,
+                port: 443,
+            },
+        ];
+        runtime.xdp.proxy.protocols = vec![XdpProxyProtocol::Https];
+
+        let merged = merge_derived_xdp_config(
+            &runtime,
+            vec![XdpInterfaceConfig {
+                name: "eth9".to_string(),
+                queues: vec![0],
+                ..Default::default()
+            }],
+            vec![XdpProxyPortConfig {
+                protocol: XdpProxyProtocol::Http,
+                port: 80,
+            }],
+            XdpAutoConfigOptions::default(),
+        )
+        .expect("merge");
+
+        assert_eq!(merged.interfaces.len(), 1);
+        assert_eq!(merged.interfaces[0].name, "eth5");
+        assert_eq!(merged.interfaces[0].queues, vec![0, 1]);
+        assert_eq!(
+            merged.proxy.ports,
+            vec![XdpProxyPortConfig {
+                protocol: XdpProxyProtocol::Https,
+                port: 443,
+            }]
+        );
+        assert_eq!(merged.proxy.protocols, vec![XdpProxyProtocol::Https]);
     }
 }
