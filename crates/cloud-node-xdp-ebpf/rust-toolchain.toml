@@ -1,0 +1,9 @@
+# Pinned eBPF build toolchain. This file is the single source of truth for
+# the dated nightly used to build the eBPF object: xtask `build-ebpf`,
+# build.rs's nested eBPF build, and the release workflow all resolve the
+# channel from here (CLOUD_NODE_EBPF_TOOLCHAIN may override it). Bumping the
+# channel or bpf-linker requires re-running the XDP/AF_XDP smoke matrix.
+[toolchain]
+channel = "nightly-2026-09-13"
+components = ["rust-src"]
+profile = "minimal"

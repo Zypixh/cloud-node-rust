@@ -100,6 +100,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Resolve the pinned eBPF toolchain. `crates/cloud-node-xdp-ebpf/
+/// rust-toolchain.toml` is the single source of truth for the dated nightly
+/// (shared with xtask `build-ebpf` and the release workflow);
+/// CLOUD_NODE_EBPF_TOOLCHAIN may override it. Never a bare `nightly` name —
+/// the embedded object must come from the same verified dated toolchain that
+/// CI installed.
+fn ebpf_toolchain() -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(name) = std::env::var("CLOUD_NODE_EBPF_TOOLCHAIN") {
+        let name = name.trim().to_string();
+        if !name.is_empty() {
+            return Ok(name);
+        }
+    }
+    let toml_path = Path::new("crates")
+        .join("cloud-node-xdp-ebpf")
+        .join("rust-toolchain.toml");
+    let toml = fs::read_to_string(&toml_path)
+        .map_err(|err| format!("failed to read {}: {err}", toml_path.display()))?;
+    toolchain_channel(&toml)
+        .ok_or_else(|| format!("{} does not declare toolchain.channel", toml_path.display()).into())
+}
+
+/// Minimal `[toolchain] channel = "..."` extraction; keeps the build script
+/// free of a TOML dependency for a single scalar.
+fn toolchain_channel(toml: &str) -> Option<String> {
+    let mut in_toolchain = false;
+    for raw in toml.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            in_toolchain = line.trim_start_matches('[').starts_with("toolchain");
+            continue;
+        }
+        if in_toolchain {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim() == "channel" {
+                    return Some(value.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The XDP program must ship inside the main binary: the kernel only accepts
 /// eBPF bytecode at the XDP hook, and keeping the object as a separate runtime
 /// file invites binary/object version skew. Build the eBPF crate for Linux
@@ -118,10 +161,12 @@ fn embed_xdp_ebpf_object() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=crates/cloud-node-xdp-ebpf/src");
     println!("cargo:rerun-if-changed=crates/cloud-node-xdp-ebpf/Cargo.toml");
+    println!("cargo:rerun-if-changed=crates/cloud-node-xdp-ebpf/rust-toolchain.toml");
     println!("cargo:rerun-if-changed=crates/cloud-node-xdp-common/src");
     println!("cargo:rerun-if-changed=crates/cloud-node-xdp-common/Cargo.toml");
     println!("cargo:rerun-if-env-changed=CLOUD_NODE_XDP_EBPF_SOURCE");
     println!("cargo:rerun-if-env-changed=CLOUD_NODE_XDP_EBPF_SHA256");
+    println!("cargo:rerun-if-env-changed=CLOUD_NODE_EBPF_TOOLCHAIN");
 
     // Release builds embed a caller-designated object so the embedded bytes
     // are provably identical to the packaged data/cloud-node-xdp-ebpf.o:
@@ -161,14 +206,15 @@ fn embed_xdp_ebpf_object() -> Result<(), Box<dyn std::error::Error>> {
 
     let ebpf_target = "bpfel-unknown-none";
     let manifest = "crates/cloud-node-xdp-ebpf/Cargo.toml";
-    // Spawn via `rustup run` so the nested build resolves the nightly
-    // sysroot even though the parent cargo exports RUSTUP_TOOLCHAIN=<stable>
-    // (an env leak that would make `cargo +nightly` look for rust-src under
-    // the stable toolchain dir and fail).
+    let toolchain = ebpf_toolchain()?;
+    // Spawn via `rustup run` so the nested build resolves the pinned dated
+    // toolchain's sysroot even though the parent cargo exports
+    // RUSTUP_TOOLCHAIN=<stable> (an env leak that would make the child cargo
+    // look for rust-src under the stable toolchain dir and fail).
     let mut cmd = Command::new("rustup");
     cmd.args([
         "run",
-        "nightly",
+        &toolchain,
         "cargo",
         "build",
         "--manifest-path",
@@ -227,12 +273,13 @@ fn embed_xdp_ebpf_object() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let Some(source) = source else {
-        return Err(
-            "cannot build embedded XDP eBPF object: nightly toolchain with rust-src is required \
-             (rustup toolchain install nightly --profile minimal -c rust-src), or provide a \
-             prebuilt data/cloud-node-xdp-ebpf.o via `cargo xtask build-ebpf`"
-                .into(),
-        );
+        return Err(format!(
+            "cannot build embedded XDP eBPF object: the pinned toolchain {toolchain} with \
+             rust-src is required (rustup toolchain install {toolchain} --profile minimal \
+             -c rust-src), or provide a prebuilt data/cloud-node-xdp-ebpf.o via \
+             `cargo xtask build-ebpf`"
+        )
+        .into());
     };
     fs::copy(&source, &dest)?;
     println!("cargo:rustc-env=CLOUD_NODE_XDP_EBPF_OBJECT={}", dest.display());
