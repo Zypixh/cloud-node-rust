@@ -991,6 +991,14 @@ impl ConfigStore {
         Self::pick_global_policy(&lock.http3_policies, cluster_id)
     }
 
+    /// Test-only policy injection for exercises of the production H3
+    /// accept path (run_endpoint reads the policy through the same
+    /// get_global_http3_policy_sync call as production).
+    #[cfg(test)]
+    pub fn test_set_http3_policy(&self, policy: HTTP3Policy) {
+        self.inner.write().http3_policies.insert(0, policy);
+    }
+
     pub fn get_global_http_pages_policy_sync(&self) -> Option<HTTPPagesPolicy> {
         let lock = self.inner.read();
         let cluster_id = lock.node_cluster_id;

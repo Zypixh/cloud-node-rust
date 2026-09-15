@@ -1,5 +1,12 @@
 # EN-14: TCP 无状态 cookie 挑战 + 序号拼接（挑战规则不落盘未验证状态）
 
+> **2026-09-15 验收更新**（REVIEW-2026-09-15）：当前 ABI **v16**。
+> 复验工件：eBPF 对象 `3b8549a9c1ea9c2107db834aeb76b627c03df10bca9b1ef53bee9660297423ba`，
+> 节点二进制 `3bda83370ccf7132c58e6a4e5fb6fb328a16e161cbe13a567b87ca035419d1b0`（.120）。
+> 升级探针 16 阶段全过：零 key fail-closed、forge 故障回滚、MSS=536 回退、
+> 真实内核 TCP 端到端（echo+FIN+RST）。下方原始记录保留工件旧值不溯改。
+> 详见 `../REVIEW-2026-09-15/R1-R3-validation.md`。
+
 Base: 工作树（EN-13 ADR-001 实现），ABI v15
 eBPF 对象 sha256: `e549c8352a5d6ba7329ec6b5467d9f2f67a79732518db7ebd2389d3a8f501338`
 节点二进制 sha256: `b8c0ab7c45b2f13bca1e237f9b9f236fe5ea4aa8e268d4a7c4df7b2ecbee3532`

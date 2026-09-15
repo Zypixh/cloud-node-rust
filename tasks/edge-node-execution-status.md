@@ -3,6 +3,10 @@
 Single-implementer tracker for the EN-00..33 productionization plan.
 Status vocabulary: TODO / IN_PROGRESS / IMPLEMENTED / VERIFIED only.
 
+## Current review override — 2026-09-15, baseline e3fb282
+
+Static review only; no local build/test or VPS execution by the reviewer. Next manual Devin input: [review and repair plan](devin-next-round-2026-09-15.md). Execute R0–R4 before EN-17. Current task statuses are in the production plan: EN-13 IN_PROGRESS, EN-14/15 IMPLEMENTED, EN-16 IN_PROGRESS. Preserve historical run records below, but their VERIFIED/close-out wording does not supersede these outstanding findings. Local cargo tests violated the remote-only instruction and recreated build artifacts; execution must return to the authorized VPSs.
+
 ## Active milestone: M0 (VPS migration) → M1/M2
 
 ### Environment
@@ -43,14 +47,52 @@ Status vocabulary: TODO / IN_PROGRESS / IMPLEMENTED / VERIFIED only.
 
 ### Known gaps being worked
 
-- EN-14 eBPF verifier acceptance on kernel 6.1 — pending probe run on .120.
 - EN-14 IPv6 challenge path: not implemented (bounded admission only;
   rule sync rejects challenge on v6 explicitly).
 - EN-14 cookie key rotation API: install-on-first-attach done; rotation
   (cur→prev) pending.
+- EN-14 R2.4 deep variants (out-of-order, mid-flow key rotation, third-ACK
+  data) not yet individually exercised — core handshake/data/FIN/RST proven.
 - EN-16: BLOCKED/ALLOWED ACL maps now size-configurable via
   `xdp.stateTables.aclBlocked/aclAllowed/rateV4` (see night section below).
 - EN-12 zero-copy success path: needs real NIC — external acceptance.
+
+## 2026-09-15 (validation) — R0–R4 acceptance round on authorized VPSs
+
+Round executed per `devin-next-round-2026-09-15.md`. Mac edited/transferred
+only; all builds, tests, eBPF builds and probes ran on `.110`/`.120`
+(Debian 12, kernel 6.1.0-10-amd64, 2c/2GiB). Evidence:
+`docs/edge-node-evidence/REVIEW-2026-09-15/`.
+
+- R0: sync/build scripts rewritten — single manifest drives
+  rsync+checksums+remote sweep; ownership/registration markers; flock;
+  real exit codes. Negative paths verified: lock rc=75, unowned dir rc=3,
+  corrupted file rc=4, build failure rc=101 (no false success marker).
+- R1+R2: EN-14 eBPF fixes verified by the upgraded probe
+  (en14-probe-r6.json, 16 phases PASS):
+  - R1.1 zero-key fail-closed (keyless SYN rejected; zero-key forged
+    cookie rejected; established splice flow keeps forwarding).
+  - R1.2 forge scratch `tb[16..20]` cleared; forged frames pass
+    independent checksum validation; FAIL_FORGE → explicit failure.
+  - R2.2 worker `Err` → XDP_DROP + pending/SNAT rollback +
+    `challenge_worker_err` counter + `INTERNAL_ERR` flow event; all four
+    fault-injection points exercised (I/J/K phases).
+  - R2.3 absent/malformed MSS → idx 0 = 536 fallback (M phase).
+  - R2.4 real kernel TCP end-to-end in the probe netns: real ISNs,
+    challenge admission, bidirectional echo, FIN and RST teardown (R phase).
+  - Probe-side fix (not an eBPF regression): crafted frames now carry a
+    genuine TCP checksum so incremental dataplane updates stay valid.
+- R3: EN-15 `retryPps` aggregate budget + explicit `ignore()`/`refuse()`
+  wire semantics; attempted/issued/limited counters to perf-monitor;
+  production `run_endpoint` accept-loop test. `.110` full
+  `cargo test`: 753 passed / 0 failed (test.log preserved remotely).
+- R4: this review round archived; statuses normalized below.
+
+Status after this round (unchanged vocabulary, no premature VERIFIED):
+EN-12 IMPLEMENTED (veth/copy verified; real-NIC zero-copy external),
+EN-13 IN_PROGRESS, EN-14 IMPLEMENTED (probe-verified incl. real kernel
+TCP; deep-variant coverage and IPv6 remain), EN-15 IMPLEMENTED,
+EN-16 IN_PROGRESS.
 
 ## 2026-09-15 (night) — EN-16 hysteresis + ACL sizing, EN-15 QUIC Retry
 

@@ -1,0 +1,236 @@
+{
+  "phases": {
+    "0_isolation": {
+      "state": {
+        "pending": 0,
+        "ct": 0,
+        "snat": 0
+      },
+      "pass": true
+    },
+    "A_challenge_synack": {
+      "cookie": 255058403,
+      "ack": 1001,
+      "doff": 24,
+      "state": {
+        "pending": 0,
+        "ct": 0,
+        "snat": 0
+      },
+      "pass": true
+    },
+    "F_syn_retx": {
+      "same_cookie": true,
+      "cookie2": 255058403,
+      "pass": true
+    },
+    "B_bad_cookie": {
+      "state": {
+        "pending": 0,
+        "ct": 0,
+        "snat": 0
+      },
+      "pass": true
+    },
+    "C_cookie_admit_replay": {
+      "snat_port": 48478,
+      "replay_seq": 1000,
+      "pending": {
+        "state": 2,
+        "snat_port": 48478,
+        "server_id": 42,
+        "expect_seq": 1001,
+        "expect_ack": 0,
+        "splice_isn": 255058403,
+        "seq_delta": 0,
+        "splice_state": 1
+      },
+      "pass": true
+    },
+    "D_splice_anchor": {
+      "ct": {
+        "state": 0,
+        "snat_port": 48478,
+        "server_id": 42,
+        "expect_seq": 1001,
+        "expect_ack": 2001,
+        "splice_isn": 255058403,
+        "seq_delta": 255056403,
+        "splice_state": 2
+      },
+      "forged_ack": {
+        "src": "10.99.0.5",
+        "dst": "10.99.0.6",
+        "sport": 48478,
+        "dport": 9443,
+        "seq": 1001,
+        "ack": 2001,
+        "flags": 16,
+        "win": 65535,
+        "doff": 20,
+        "payload_len": 0,
+        "ip_csum_ok": true,
+        "tcp_csum_ok": true,
+        "raw": "020bdb3ee6a3fa983d6e950f08004500002800004000400626000a6300050a630006bd5e24e3000003e9000007d15010ffffad080000"
+      },
+      "pass": true
+    },
+    "E_raw_c2b": [
+      {
+        "src": "10.99.0.5",
+        "dst": "10.99.0.6",
+        "sport": 48478,
+        "dport": 9443,
+        "seq": 1001,
+        "ack": 2001,
+        "flags": 16,
+        "win": 65535,
+        "doff": 20,
+        "payload_len": 9,
+        "ip_csum_ok": true,
+        "tcp_csum_ok": true,
+        "raw": "66cd6b042197fa983d6e950f0800450000311e230000400647d40a6300050a630006bd5e24e3000003e9000007d15010ffff26840000656e31342d64617461"
+      },
+      {
+        "src": "10.99.0.5",
+        "dst": "10.99.0.9",
+        "sport": 8443,
+        "dport": 40000,
+        "seq": 255058404,
+        "ack": 0,
+        "flags": 4,
+        "win": 0,
+        "doff": 20,
+        "payload_len": 0,
+        "ip_csum_ok": true,
+        "tcp_csum_ok": true,
+        "raw": "020b696499e2fa983d6e950f08004500002800004000400625fd0a6300050a63000920fb9c400f33e1e40000000050040000ecb90000"
+      }
+    ],
+    "E_sent_c2b": [
+      "fa983d6e950f020b877795430800450000311e230000400647d10a6300090a6300059c4020fb000003e90f33e1e45010ffff62400000656e31342d64617461"
+    ],
+    "E_raw_c2b_2": [
+      {
+        "src": "10.99.0.5",
+        "dst": "10.99.0.6",
+        "sport": 48478,
+        "dport": 9443,
+        "seq": 1001,
+        "ack": 3025,
+        "flags": 16,
+        "win": 65535,
+        "doff": 20,
+        "payload_len": 9,
+        "ip_csum_ok": true,
+        "tcp_csum_ok": true,
+        "raw": "66cd6b042197fa983d6e950f0800450000314e7d00004006177a0a6300050a630006bd5e24e3000003e900000bd15010ffff4bc40000656e31342d44415458"
+      },
+      {
+        "src": "10.99.0.5",
+        "dst": "10.99.0.9",
+        "sport": 8443,
+        "dport": 40000,
+        "seq": 255059428,
+        "ack": 0,
+        "flags": 4,
+        "win": 0,
+        "doff": 20,
+        "payload_len": 0,
+        "ip_csum_ok": true,
+        "tcp_csum_ok": true,
+        "raw": "020b696499e2fa983d6e950f08004500002800004000400625fd0a6300050a63000920fb9c400f33e5e40000000050040000e8b90000"
+      }
+    ],
+    "E_sent_c2b_2": [
+      "fa983d6e950f020b68ae7fbd0800450000314e7d0000400617770a6300090a6300059c4020fb000003e90f33e5e45010ffff87800000656e31342d44415458"
+    ],
+    "E_raw_b2c": [
+      {
+        "src": "10.99.0.5",
+        "dst": "10.99.0.9",
+        "sport": 8443,
+        "dport": 40000,
+        "seq": 255058404,
+        "ack": 1011,
+        "flags": 16,
+        "win": 65535,
+        "doff": 20,
+        "payload_len": 10,
+        "ip_csum_ok": true,
+        "tcp_csum_ok": true,
+        "raw": "020b696499e2fa983d6e950f080045000032d714000040068ede0a6300050a63000920fb9c400f33e1e4000003f35010ffff52b20000656e31342d7265706c79"
+      }
+    ],
+    "E_sent_b2c": [
+      "fa983d6e950f020ba8cd9d8e080045000032d714000040068ee10a6300060a63000524e3bd5e000007d1000003f35010ffff16f60000656e31342d7265706c79"
+    ],
+    "E_data_translation": {
+      "fwd_ack": 2001,
+      "reply_seq": 255058404,
+      "pass": true
+    },
+    "M_mss_fallback": {
+      "nomss_idx": 0,
+      "nomss_doff": 20,
+      "badmss_idx": 0,
+      "badmss_reply_mss": 536,
+      "pass": true
+    },
+    "G_key_removed_failclosed": {
+      "rejected_delta": 2,
+      "zero_key_cookie_rejected": true,
+      "live_flow_forwarded": true,
+      "pass": true
+    },
+    "I_forge_fault_rollback": {
+      "worker_err_counted": true,
+      "no_state_leak": true,
+      "readmit_recovered": true,
+      "pass": true
+    },
+    "J_splice_fault_recovery": {
+      "no_partial_splice": true,
+      "retrans_anchored": true,
+      "pass": true
+    },
+    "K_alloc_fault_points": {
+      "pending_insert": {
+        "leaks": 0,
+        "counted": true
+      },
+      "snat_alloc": {
+        "leaks": 0,
+        "counted": true
+      },
+      "ct_insert": {
+        "no_partial": true,
+        "recovered": true
+      },
+      "pass": true
+    },
+    "H_syn_flood_bounded": {
+      "challengeSent": 40,
+      "challengeRejected": 260,
+      "budgetPps": 40,
+      "refill_challenge": true,
+      "state": {
+        "pending": 0,
+        "ct": 3,
+        "snat": 3
+      },
+      "pass": true
+    },
+    "R_real_kernel_tcp": {
+      "client_port": 49525,
+      "reply": "echo:en14-real",
+      "backend_peer_snat_port": 48205,
+      "rst_conn_port": 47165,
+      "pass": true
+    }
+  },
+  "commit": "worktree",
+  "dirty": true,
+  "result": "PASS",
+  "prod_pin_dir_untouched": true
+}
