@@ -49,13 +49,63 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Resolve the pinned eBPF toolchain. `crates/cloud-node-xdp-ebpf/
+/// rust-toolchain.toml` is the single source of truth for the dated nightly;
+/// CLOUD_NODE_EBPF_TOOLCHAIN may override it. Never a bare `nightly` name:
+/// the release chain must build with the same verified dated toolchain that
+/// CI installed, not whatever `nightly` happens to resolve to.
+fn ebpf_toolchain() -> anyhow::Result<String> {
+    if let Ok(name) = std::env::var("CLOUD_NODE_EBPF_TOOLCHAIN") {
+        let name = name.trim().to_string();
+        if !name.is_empty() {
+            return Ok(name);
+        }
+    }
+    let manifest_dir = PathBuf::from("crates").join("cloud-node-xdp-ebpf");
+    let toml_path = manifest_dir.join("rust-toolchain.toml");
+    let toml = std::fs::read_to_string(&toml_path)
+        .with_context(|| format!("failed to read {}", toml_path.display()))?;
+    toolchain_channel(&toml).with_context(|| {
+        format!(
+            "{} does not declare toolchain.channel",
+            toml_path.display()
+        )
+    })
+}
+
+/// Minimal `[toolchain] channel = "..."` extraction; keeps xtask free of a
+/// TOML dependency for a single scalar.
+fn toolchain_channel(toml: &str) -> Option<String> {
+    let mut in_toolchain = false;
+    for raw in toml.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            in_toolchain = line.trim_start_matches('[').starts_with("toolchain");
+            continue;
+        }
+        if in_toolchain {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim() == "channel" {
+                    return Some(value.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn build_ebpf(profile: &str) -> anyhow::Result<()> {
-    ensure_nightly_bpf_toolchain()?;
+    let toolchain = ebpf_toolchain()?;
+    ensure_bpf_toolchain(&toolchain)?;
     let target = "bpfel-unknown-none";
     let crate_dir = PathBuf::from("crates").join("cloud-node-xdp-ebpf");
-    let mut cmd = Command::new("cargo");
+    // Spawn via `rustup run` so the nested build resolves the pinned sysroot
+    // even when a parent cargo leaked RUSTUP_TOOLCHAIN/RUSTC into the env.
+    let mut cmd = Command::new("rustup");
     cmd.args([
-        "+nightly",
+        "run",
+        &toolchain,
+        "cargo",
         "build",
         "--manifest-path",
         "crates/cloud-node-xdp-ebpf/Cargo.toml",
@@ -64,6 +114,8 @@ fn build_ebpf(profile: &str) -> anyhow::Result<()> {
         "-Z",
         "build-std=core",
     ]);
+    cmd.env_remove("RUSTC");
+    cmd.env_remove("RUSTUP_TOOLCHAIN");
     if profile == "release" {
         cmd.arg("--release");
     }
@@ -119,23 +171,23 @@ fn build_ebpf(profile: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensure_nightly_bpf_toolchain() -> anyhow::Result<()> {
+fn ensure_bpf_toolchain(toolchain: &str) -> anyhow::Result<()> {
     let rustc = Command::new("rustup")
-        .args(["run", "nightly", "rustc", "--version"])
+        .args(["run", toolchain, "rustc", "--version"])
         .output()
-        .context("failed to inspect nightly toolchain with rustup")?;
+        .context("failed to inspect eBPF toolchain with rustup")?;
     if !rustc.status.success() {
         let stderr = String::from_utf8_lossy(&rustc.stderr);
         anyhow::bail!(
-            "nightly toolchain is unavailable or incomplete: {}. Install it with: rustup toolchain install nightly --profile minimal -c rust-src",
+            "eBPF toolchain {toolchain} is unavailable or incomplete: {}. Install it with: rustup toolchain install {toolchain} --profile minimal -c rust-src",
             stderr.trim()
         );
     }
 
     let components = Command::new("rustup")
-        .args(["component", "list", "--toolchain", "nightly", "--installed"])
+        .args(["component", "list", "--toolchain", toolchain, "--installed"])
         .output()
-        .context("failed to inspect nightly components with rustup")?;
+        .context("failed to inspect eBPF toolchain components with rustup")?;
     if components.status.success() {
         let stdout = String::from_utf8_lossy(&components.stdout);
         if !stdout
@@ -143,7 +195,7 @@ fn ensure_nightly_bpf_toolchain() -> anyhow::Result<()> {
             .any(|line| line == "rust-src" || line.starts_with("rust-src "))
         {
             anyhow::bail!(
-                "nightly rust-src component is required. Install it with: rustup component add rust-src --toolchain nightly"
+                "rust-src component is required for {toolchain}. Install it with: rustup component add rust-src --toolchain {toolchain}"
             );
         }
     }

@@ -2,7 +2,8 @@
 # Remote build script — run ON an authorized VPS inside /root/cloud-node-dev.
 # Constrained: CARGO_BUILD_JOBS=1, debuginfo=0, one build at a time (flock).
 # Prereqs on the build host (.110):
-#   - rustup stable + nightly (rust-src component)
+#   - rustup stable + the dated nightly pinned in
+#     crates/cloud-node-xdp-ebpf/rust-toolchain.toml (rust-src component)
 #   - bpf-linker prebuilt binary in ~/.cargo/bin (v0.11.1 musl, LLVM 23.1.1)
 #     cargo install bpf-linker FAILS: llvm-sys needs LLVM==23, Debian has 14.
 #
@@ -40,7 +41,8 @@ export RUSTFLAGS="-C debuginfo=0"
 
 echo "=== build $(date -u +%FT%TZ) host=$(hostname) dir=$TASK_DIR ==="
 rustc --version
-rustc +nightly --version
+EBPF_NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/cloud-node-xdp-ebpf/rust-toolchain.toml | head -1)"
+rustc "+${EBPF_NIGHTLY:-nightly}" --version
 bpf-linker --version 2>/dev/null | head -1
 free -m | head -2
 

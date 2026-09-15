@@ -175,19 +175,20 @@ jobs:
       - name: Install eBPF Toolchain
         shell: bash
         env:
-          # Pinned to the combination verified in validation; bumping either
-          # requires re-running the XDP/AF_XDP smoke matrix.
-          EBPF_NIGHTLY: "nightly-2026-09-13"
+          # bpf-linker is pinned to the combination verified in validation;
+          # bumping it requires re-running the XDP/AF_XDP smoke matrix.
           BPF_LINKER_VERSION: "0.11.1"
         run: |
           set -euo pipefail
+          # The dated nightly lives in one place only: the eBPF crate's
+          # rust-toolchain.toml. xtask `build-ebpf` and build.rs resolve the
+          # same channel, so the toolchain installed here is provably the one
+          # every downstream consumer uses.
+          EBPF_NIGHTLY="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' crates/cloud-node-xdp-ebpf/rust-toolchain.toml | head -1)"
+          test -n "$EBPF_NIGHTLY"
+          echo "EBPF_NIGHTLY=$EBPF_NIGHTLY" >> "$GITHUB_ENV"
           rustup toolchain install "$EBPF_NIGHTLY" --profile minimal -c rust-src
           rustup run "$EBPF_NIGHTLY" rustc --version
-          # xtask/build.rs invoke `rustup run nightly`; alias the pinned
-          # dated toolchain under that name so every consumer resolves the
-          # same verified compiler.
-          rustup toolchain remove nightly 2>/dev/null || true
-          rustup toolchain link nightly "$(rustup which --toolchain "$EBPF_NIGHTLY" rustc | xargs dirname | xargs dirname)"
           cargo +"$EBPF_NIGHTLY" install bpf-linker --version "$BPF_LINKER_VERSION" --locked
           bpf-linker --version
 
@@ -251,7 +252,7 @@ jobs:
             echo "binary=$(basename "$TARGET_BINARY") target=${{ matrix.target }} variant=${{ matrix.name }}"
             echo "binary_sha256=$(sha256sum "dist/$TARGET_BINARY" | awk '{print $1}')"
             echo "ebpf_sha256=$(cat ebpf-sha256.txt)"
-            echo "ebpf_toolchain=nightly-2026-09-13 bpf-linker=0.11.1"
+            echo "ebpf_toolchain=${EBPF_NIGHTLY} bpf-linker=0.11.1"
           } > dist/SHA256SUMS.txt
           cd dist
           tar -czf ../$PACKAGE_NAME.tar.gz $TARGET_BINARY data/cloud-node-xdp-ebpf.o SHA256SUMS.txt
