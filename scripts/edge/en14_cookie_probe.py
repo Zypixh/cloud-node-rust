@@ -86,6 +86,7 @@ WINDOW_MS = 500
 # "a SYN-ACK arrived".
 KNOWN_KEY = bytes(range(0xA0, 0xB0))
 KNOWN_KEY2 = bytes(range(0xC0, 0xD0))
+KNOWN_KEY3 = bytes(range(0xE0, 0xF0))
 ZERO_KEY = b"\x00" * 16
 # XDP_PENDING_CAP.flags fault-injection bits (ABI v16).
 FAIL_CT_INSERT = 1 << 0
@@ -301,6 +302,21 @@ def pending_cap_flags(set_to=None, or_mask=None):
         "key", "hex", "00", "00", "00", "00",
         "value", "hex"] + [f"{b:02x}" for b in newv])
     return flags
+
+
+def pending_cap_ttl(ns):
+    """Set XDP_PENDING_CAP.pending_ttl_ns (absolute half-open deadline).
+    Returns the previous value so the probe can restore it."""
+    mid = map_id("XDP_PENDING_CAP")
+    out = sh([bpftool(), "map", "dump", "-j", "id", str(mid)]).stdout
+    val = bytes(int(b, 16) for b in json.loads(out)[0]["value"])
+    assert len(val) == 24, f"XDP_PENDING_CAP value {len(val)}B != 24"
+    maxp, ttl, flags = struct.unpack("<QQQ", val)
+    newv = struct.pack("<QQQ", maxp, ns, flags)
+    sh([bpftool(), "map", "update", "id", str(mid),
+        "key", "hex", "00", "00", "00", "00",
+        "value", "hex"] + [f"{b:02x}" for b in newv])
+    return ttl
 
 
 # --- cookie model: mirrors siphash24_16/cookie_pack/cookie_slot in the
@@ -542,6 +558,26 @@ def run_sender(mode, dst_mac, a):
                             CLIENT_PORT, TCP_LISTEN, ACK,
                             seq=C_ISN + 1, ackno=a + 0x401,
                             payload=b"en14-DATX")]
+    elif mode == "data_p":
+        # a = (client_port << 32) | cookie — parameterized-tuple data ACK
+        # carrying a valid cookie proof in ackno. Triple duty: the same
+        # wire shape serves as (a) the admitting ACK *with payload*,
+        # (b) a client data packet arriving while the splice is in flight
+        # (must be consumed), and (c) post-splice client data.
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            a >> 32, TCP_LISTEN, ACK,
+                            seq=C_ISN + 1, ackno=(a & 0xFFFFFFFF) + 1,
+                            payload=b"en14-pdat")]
+    elif mode == "data_ooo":
+        # a = (seq_off << 32) | cookie — out-of-order client data on the
+        # MAIN spliced tuple: seq is offset past the anchored position so
+        # the stateless splice delta is exercised on a non-in-order
+        # segment (duplicates reuse data_client with the same seq).
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            CLIENT_PORT, TCP_LISTEN, ACK,
+                            seq=C_ISN + 1 + (a >> 32),
+                            ackno=(a & 0xFFFFFFFF) + 1,
+                            payload=b"en14-ooo")]
     elif mode == "data_backend":
         # a = claimed SNAT port; backend -> client data in backend space
         frames = [tcp_frame(dst_mac, PEER_IP, VIP1,
@@ -1171,6 +1207,190 @@ def main():
             "budgetPps": CHALLENGE_PPS,
             "refill_challenge": True,
             "state": st, "pass": True}
+
+        # --- N: third-ACK-with-data admit --------------------------------
+        # A real client's completing ACK may carry payload (the kernel can
+        # merge the first send into it). The admit path must still create
+        # the splice; the payload itself is consumed and recovered by the
+        # client's own retransmit once the splice is anchored.
+        port = CLIENT_PORT + 20
+        r = send(self_path, "syn_p", dst_mac, port)
+        ch = [x for x in r["replies"]
+              if x["flags"] & 0x12 == 0x12 and x["dport"] == port]
+        assert ch and (
+            cookie_matches(ch[0]["seq"], KNOWN_KEY2, port)
+            or cookie_matches(ch[0]["seq"], KNOWN_KEY, port)), \
+            f"N no valid challenge: {r['replies']}"
+        ck_n = ch[0]["seq"]
+        r = send(self_path, "data_p", dst_mac, (port << 32) | ck_n)
+        time.sleep(0.2)
+        pe_n = pending_entry(port)
+        assert pe_n is not None and pe_n["splice_state"] == 1, \
+            f"data-carrying admit ACK not admitted: {pe_n}"
+        replay_n = [x for x in r["replies"]
+                    if x["flags"] & 0x02 and not x["flags"] & 0x10
+                    and x["dport"] == TCP_BACKEND]
+        assert replay_n, "no SYN replay for data-carrying admit"
+        # The admit packet itself must not reach the backend: the only
+        # emitted frame is the forged SYN replay (payload_len == 0).
+        leaked = [x for x in r["replies"]
+                  if x["dport"] == TCP_BACKEND and x["payload_len"] > 0]
+        assert not leaked, f"admit-ACK payload leaked to backend: {leaked}"
+        # While the splice is in flight client data is consumed — never
+        # forwarded to a SYN-RECV backend with un-anchored seq space.
+        r = send(self_path, "data_p", dst_mac, (port << 32) | ck_n)
+        consumed = [x for x in r["replies"]
+                    if x["dport"] == TCP_BACKEND and x["payload_len"] > 0]
+        assert not consumed, \
+            f"data forwarded during SPLICE_WAIT: {consumed}"
+        send(self_path, "synack_backend", dst_mac, pe_n["snat_port"])
+        time.sleep(0.3)
+        ce_n = ct_entry(port)
+        assert ce_n is not None and ce_n["splice_state"] == 2, \
+            f"splice did not anchor after data-admit: {ce_n}"
+        # The client's retransmitted payload now flows through the splice.
+        r = send(self_path, "data_p", dst_mac, (port << 32) | ck_n)
+        fwd_n = [x for x in r["replies"]
+                 if x["dport"] == TCP_BACKEND and x["payload_len"] > 0]
+        assert fwd_n and fwd_n[0]["tcp_csum_ok"], \
+            f"retransmitted admit payload not forwarded: {r['replies']}"
+        report["phases"]["N_ack_with_data"] = {
+            "admitted": True, "payload_consumed_during_splice": True,
+            "payload_forwarded_post_splice": True, "pass": True}
+
+        # --- O: duplicate admit ACK is idempotent ------------------------
+        # A retransmitted admitting ACK hits the existing pending record
+        # (PENDING_SPLICING -> consume): no second SNAT port, no second
+        # SYN replay, no second pending entry.
+        port = CLIENT_PORT + 21
+        r = send(self_path, "syn_p", dst_mac, port)
+        ch = [x for x in r["replies"]
+              if x["flags"] & 0x12 == 0x12 and x["dport"] == port]
+        assert ch, f"O no challenge: {r['replies']}"
+        ck_o = ch[0]["seq"]
+        send(self_path, "ack_cookie_p", dst_mac, (port << 32) | ck_o)
+        time.sleep(0.2)
+        pe_o = pending_entry(port)
+        assert pe_o is not None and pe_o["splice_state"] == 1, \
+            f"O admit failed: {pe_o}"
+        snat0 = map_entries("XDP_SNAT_REV")
+        r = send(self_path, "ack_cookie_p", dst_mac, (port << 32) | ck_o)
+        time.sleep(0.2)
+        dup_replay = [x for x in r["replies"]
+                      if x["flags"] & 0x02 and not x["flags"] & 0x10
+                      and x["dport"] == TCP_BACKEND]
+        assert not dup_replay, \
+            f"duplicate admit ACK produced a second SYN replay: {dup_replay}"
+        assert map_entries("XDP_SNAT_REV") == snat0, \
+            "duplicate admit ACK allocated a second SNAT port"
+        assert pending_entry(port) is not None, "dup admit removed pending"
+        send(self_path, "synack_backend", dst_mac, pe_o["snat_port"])
+        time.sleep(0.3)
+        assert ct_entry(port) is not None, "O splice did not anchor"
+        report["phases"]["O_dup_admit_idempotent"] = {
+            "snat_ports_stable": True, "no_dup_replay": True, "pass": True}
+
+        # --- P: backend-handshake loss -> TTL-bounded re-admit ------------
+        # If the replayed SYN or the backend SYN-ACK is lost, the pending
+        # entry sits in SPLICE_WAIT with an absolute deadline. A client
+        # packet arriving after the deadline expires the stale entry, the
+        # still-valid cookie re-admits, and a fresh SYN is replayed — the
+        # splice then completes. Recovery is bounded by pending_ttl_ns,
+        # not by an unbounded retransmit loop.
+        port = CLIENT_PORT + 22
+        old_ttl = pending_cap_ttl(600_000_000)
+        try:
+            r = send(self_path, "syn_p", dst_mac, port)
+            ch = [x for x in r["replies"]
+                  if x["flags"] & 0x12 == 0x12 and x["dport"] == port]
+            assert ch, f"P no challenge: {r['replies']}"
+            ck_p = ch[0]["seq"]
+            send(self_path, "ack_cookie_p", dst_mac, (port << 32) | ck_p)
+            time.sleep(0.2)
+            pe_p = pending_entry(port)
+            assert pe_p is not None and pe_p["splice_state"] == 1, \
+                f"P admit failed: {pe_p}"
+            # Backend SYN-ACK is deliberately never sent (handshake lost).
+            time.sleep(1.0)  # past the 600 ms absolute deadline
+            r = send(self_path, "data_p", dst_mac, (port << 32) | ck_p)
+            time.sleep(0.2)
+            pe_p2 = pending_entry(port)
+            assert pe_p2 is not None and pe_p2["splice_state"] == 1, \
+                f"post-TTL re-admit failed: {pe_p2}"
+            replay_p = [x for x in r["replies"]
+                        if x["flags"] & 0x02 and not x["flags"] & 0x10
+                        and x["dport"] == TCP_BACKEND]
+            assert replay_p, "no fresh SYN replay after TTL re-admit"
+            send(self_path, "synack_backend", dst_mac, pe_p2["snat_port"])
+            time.sleep(0.3)
+            ce_p = ct_entry(port)
+            assert ce_p is not None and ce_p["splice_state"] == 2, \
+                f"P splice did not anchor after re-admit: {ce_p}"
+            r = send(self_path, "data_p", dst_mac, (port << 32) | ck_p)
+            fwd_p = [x for x in r["replies"]
+                     if x["dport"] == TCP_BACKEND and x["payload_len"] > 0]
+            assert fwd_p, "P data not forwarded after recovery"
+        finally:
+            pending_cap_ttl(old_ttl)
+        report["phases"]["P_handshake_loss_ttl_recovery"] = {
+            "readmitted_after_ttl": True, "splice_completed": True,
+            "pass": True}
+
+        # --- Q: key rotation — in-flight proof + established flows -------
+        # H left the ring at cur=K2, prev=K1. Mint a challenge under K2,
+        # rotate the ring to cur=K3/prev=K2, then prove the K2 cookie still
+        # admits via the prev slot. Established splices (main tuple, minted
+        # under K1 — now out of the ring) keep forwarding: CT state is
+        # key-independent.
+        port = CLIENT_PORT + 23
+        r = send(self_path, "syn_p", dst_mac, port)
+        ch = [x for x in r["replies"]
+              if x["flags"] & 0x12 == 0x12 and x["dport"] == port]
+        assert ch and cookie_matches(ch[0]["seq"], KNOWN_KEY2, port), \
+            f"Q challenge not minted under K2: {r['replies']}"
+        ck_q = ch[0]["seq"]
+        set_cookie_key(KNOWN_KEY3, KNOWN_KEY2)
+        send(self_path, "ack_cookie_p", dst_mac, (port << 32) | ck_q)
+        time.sleep(0.2)
+        pe_q = pending_entry(port)
+        assert pe_q is not None and pe_q["splice_state"] == 1, \
+            f"prev-key cookie not admitted after rotation: {pe_q}"
+        r = send(self_path, "data_client", dst_mac, cookie)
+        fwd_q = [x for x in r["replies"]
+                 if x["dport"] == TCP_BACKEND and x["payload_len"] > 0]
+        assert fwd_q, \
+            "established flow stopped forwarding after key rotation"
+        r = send(self_path, "syn_p", dst_mac, CLIENT_PORT + 24)
+        ch = [x for x in r["replies"]
+              if x["flags"] & 0x12 == 0x12
+              and x["dport"] == CLIENT_PORT + 24]
+        assert ch and cookie_matches(ch[0]["seq"], KNOWN_KEY3,
+                                     CLIENT_PORT + 24), \
+            f"post-rotation challenge not minted under K3: {r['replies']}"
+        report["phases"]["Q_key_rotation"] = {
+            "prev_key_admit": True, "live_flow_forwarded": True,
+            "new_key_mints": True, "pass": True}
+
+        # --- S: duplicate / out-of-order data on the spliced flow --------
+        # Splice translation is a stateless seq/ack delta: reordered and
+        # duplicated segments must forward with correct translation —
+        # reordering is the peer stacks' problem, not the dataplane's.
+        r = send(self_path, "data_client", dst_mac, cookie)
+        dup = [x for x in r["replies"]
+               if x["dport"] == TCP_BACKEND and x["payload_len"] > 0]
+        assert dup and dup[0]["tcp_csum_ok"], \
+            f"duplicate segment not forwarded: {r['replies']}"
+        r = send(self_path, "data_ooo", dst_mac, (20 << 32) | cookie)
+        ooo = [x for x in r["replies"]
+               if x["dport"] == TCP_BACKEND and x["payload_len"] > 0]
+        assert ooo, f"out-of-order segment not forwarded: {r['replies']}"
+        assert ooo[0]["seq"] == C_ISN + 21 \
+            and ooo[0]["ack"] == B_ISN + 1 and ooo[0]["tcp_csum_ok"], \
+            f"ooo translation wrong: {ooo[0]}"
+        report["phases"]["S_dup_ooo_data"] = {
+            "dup_forwarded": True, "ooo_forwarded": True,
+            "ooo_seq": ooo[0]["seq"], "ooo_ack": ooo[0]["ack"],
+            "pass": True}
 
         # --- R: real kernel TCP end-to-end -------------------------------
         # A real client socket + real backend listener in the netns drive
