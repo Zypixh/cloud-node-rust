@@ -167,13 +167,52 @@ jobs:
         shell: bash
         run: cargo clean --target ${{ matrix.target }}
 
+      # The eBPF toolchain and object MUST be ready before the node build:
+      # build.rs embeds the object designated by CLOUD_NODE_XDP_EBPF_SOURCE,
+      # so the embedded bytes are byte-identical to the packaged object by
+      # construction, and CLOUD_NODE_XDP_EBPF_SHA256 makes any stale or
+      # foreign object a hard build failure rather than a silent embed.
+      - name: Install eBPF Toolchain
+        shell: bash
+        env:
+          # Pinned to the combination verified in validation; bumping either
+          # requires re-running the XDP/AF_XDP smoke matrix.
+          EBPF_NIGHTLY: "nightly-2026-09-13"
+          BPF_LINKER_VERSION: "0.11.1"
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$EBPF_NIGHTLY" --profile minimal -c rust-src
+          rustup run "$EBPF_NIGHTLY" rustc --version
+          # xtask/build.rs invoke `rustup run nightly`; alias the pinned
+          # dated toolchain under that name so every consumer resolves the
+          # same verified compiler.
+          rustup toolchain remove nightly 2>/dev/null || true
+          rustup toolchain link nightly "$(rustup which --toolchain "$EBPF_NIGHTLY" rustc | xargs dirname | xargs dirname)"
+          cargo +"$EBPF_NIGHTLY" install bpf-linker --version "$BPF_LINKER_VERSION" --locked
+          bpf-linker --version
+
+      - name: Build XDP eBPF Object
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Never let a stale object survive into the package: remove any
+          # checked-in or cached artifact before rebuilding from source.
+          rm -f data/cloud-node-xdp-ebpf.o
+          cargo xtask build-ebpf
+          test -s data/cloud-node-xdp-ebpf.o
+          sha256sum data/cloud-node-xdp-ebpf.o
+          sha256sum data/cloud-node-xdp-ebpf.o | awk '{print $1}' > ebpf-sha256.txt
+
       - name: Build
         shell: bash
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           CXXFLAGS: ${{ matrix.cxxflags }}
           CFLAGS: ${{ matrix.cxxflags }}
+          CLOUD_NODE_XDP_EBPF_SOURCE: data/cloud-node-xdp-ebpf.o
         run: |
+          set -euo pipefail
+          export CLOUD_NODE_XDP_EBPF_SHA256="$(cat ebpf-sha256.txt)"
           # 1. Handle ARM Linkers
           if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
@@ -190,24 +229,8 @@ jobs:
             export PKG_CONFIG_ALLOW_CROSS=1
             export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
           fi
-          
+
           cargo build --release --target ${{ matrix.target }}
-
-      - name: Install eBPF Toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup toolchain install nightly --profile minimal -c rust-src
-          rustup run nightly rustc --version
-          cargo +nightly install bpf-linker --version 0.10.3 --locked
-          bpf-linker --version
-
-      - name: Build XDP eBPF Object
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo xtask build-ebpf
-          test -s data/cloud-node-xdp-ebpf.o
 
       - name: Package
         shell: bash
@@ -216,12 +239,22 @@ jobs:
           ORIGINAL_BINARY="cloud-node-rust"
           TARGET_BINARY="cloud-node"
           PACKAGE_NAME="cloud-node-rust-${{ matrix.name }}"
-          
+
+          # Re-verify the packaged object still matches what build.rs
+          # embedded (same file by construction; belt-and-suspenders).
+          test "$(sha256sum data/cloud-node-xdp-ebpf.o | awk '{print $1}')" = "$(cat ebpf-sha256.txt)"
+
           mkdir -p dist/data
           cp target/${{ matrix.target }}/release/$ORIGINAL_BINARY dist/$TARGET_BINARY
           cp data/cloud-node-xdp-ebpf.o dist/data/cloud-node-xdp-ebpf.o
+          {
+            echo "binary=$(basename "$TARGET_BINARY") target=${{ matrix.target }} variant=${{ matrix.name }}"
+            echo "binary_sha256=$(sha256sum "dist/$TARGET_BINARY" | awk '{print $1}')"
+            echo "ebpf_sha256=$(cat ebpf-sha256.txt)"
+            echo "ebpf_toolchain=nightly-2026-09-13 bpf-linker=0.11.1"
+          } > dist/SHA256SUMS.txt
           cd dist
-          tar -czf ../$PACKAGE_NAME.tar.gz $TARGET_BINARY data/cloud-node-xdp-ebpf.o
+          tar -czf ../$PACKAGE_NAME.tar.gz $TARGET_BINARY data/cloud-node-xdp-ebpf.o SHA256SUMS.txt
           cd ..
 
       - name: Upload Artifacts
@@ -282,6 +315,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body_path: .github/release-body/body.md
+          # RC/beta/alpha tags are published as prereleases — they are
+          # validation artifacts, not production releases.
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
           files: |
             artifacts/**/*.tar.gz
             cloud-node-rust-toa-main-source.tar.gz

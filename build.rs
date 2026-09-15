@@ -24,6 +24,43 @@ fn find_protos(dir: &str) -> Result<Vec<String>, std::io::Error> {
     Ok(protos)
 }
 
+/// SHA-256 hex of `bytes` via the platform tool — build scripts avoid
+/// pulling a crypto dependency; release environments guarantee coreutils.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::io::Write;
+    for cmd in ["sha256sum", "shasum"] {
+        let mut command = Command::new(cmd);
+        if cmd == "shasum" {
+            command.args(["-a", "256"]);
+        }
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let Ok(mut child) = command.spawn() else {
+            continue;
+        };
+        if child
+            .stdin
+            .as_mut()
+            .and_then(|stdin| stdin.write_all(bytes).ok())
+            .is_none()
+        {
+            let _ = child.kill();
+            continue;
+        }
+        if let Ok(output) = child.wait_with_output() {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout);
+                if let Some(hex) = text.split_whitespace().next() {
+                    return hex.to_ascii_lowercase();
+                }
+            }
+        }
+    }
+    panic!("sha256sum/shasum is required to verify CLOUD_NODE_XDP_EBPF_SOURCE");
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
@@ -83,6 +120,44 @@ fn embed_xdp_ebpf_object() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=crates/cloud-node-xdp-ebpf/Cargo.toml");
     println!("cargo:rerun-if-changed=crates/cloud-node-xdp-common/src");
     println!("cargo:rerun-if-changed=crates/cloud-node-xdp-common/Cargo.toml");
+    println!("cargo:rerun-if-env-changed=CLOUD_NODE_XDP_EBPF_SOURCE");
+    println!("cargo:rerun-if-env-changed=CLOUD_NODE_XDP_EBPF_SHA256");
+
+    // Release builds embed a caller-designated object so the embedded bytes
+    // are provably identical to the packaged data/cloud-node-xdp-ebpf.o:
+    // CI builds the object first, records its SHA256, then builds the node
+    // with both env vars set. When CLOUD_NODE_XDP_EBPF_SHA256 is present the
+    // file must match — a stale or foreign object fails the build loudly
+    // instead of being embedded silently.
+    if let Ok(source) = std::env::var("CLOUD_NODE_XDP_EBPF_SOURCE") {
+        let source_path = PathBuf::from(&source);
+        let bytes = fs::read(&source_path).map_err(|err| {
+            format!(
+                "CLOUD_NODE_XDP_EBPF_SOURCE={source} is not readable: {err}"
+            )
+        })?;
+        if bytes.is_empty() {
+            return Err(format!(
+                "CLOUD_NODE_XDP_EBPF_SOURCE={source} is empty"
+            )
+            .into());
+        }
+        if let Ok(expected) = std::env::var("CLOUD_NODE_XDP_EBPF_SHA256") {
+            let expected = expected.trim().to_ascii_lowercase();
+            if !expected.is_empty() {
+                let actual = sha256_hex(&bytes);
+                if actual != expected {
+                    return Err(format!(
+                        "CLOUD_NODE_XDP_EBPF_SOURCE={source} sha256 mismatch: expected {expected}, got {actual}"
+                    )
+                    .into());
+                }
+            }
+        }
+        fs::copy(&source_path, &dest)?;
+        println!("cargo:rustc-env=CLOUD_NODE_XDP_EBPF_OBJECT={}", dest.display());
+        return Ok(());
+    }
 
     let ebpf_target = "bpfel-unknown-none";
     let manifest = "crates/cloud-node-xdp-ebpf/Cargo.toml";
