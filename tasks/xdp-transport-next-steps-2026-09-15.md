@@ -1,564 +1,450 @@
-# XDP 全协议接管的传输层下一步：双向拥塞控制 / AccECN / 用户态队列调度 —— 任务规划与 Devin 提示词
+# XDP 全协议接管的传输层：统一拥塞控制 EdgeCC / AccECN / 用户态队列调度 —— 规划 v3 与 Devin 提示词
 
-基线：HEAD `d13f77c`（仅在 `315af04` 上追加文档脱敏提交，代码与发布前静态审阅一致）。
+规划基线：`d13f77c`（静态审阅基线 `315af04` + 文档脱敏）。
+进度快照（2026-09-15 暂停时）：T0 各项与 T1 已提交（`8172ac6` F6、`b17a5d6` F5、`be75083` F2/F3/F4/F8、`1b742c0` F7、`da21e7a` T1 时钟）；T2 在工作区未提交：`crates/cloud-node-transport/`（RateSample、RttState、TransportInstant、`CongestionController` trait、NewReno+PRR、Cubic+HyStart++、确定性模拟器、三组测试）与 `Cargo.toml` workspace 声明。
 上游输入：`tasks/xdp-final-static-review-2026-09-15.md`（F1–F8）与 `docs/xdp-transport-performance-design.md`（PROPOSED）。
 
-本文只做静态阅读与依赖源码核对（`~/.cargo/registry` 中 Cargo.lock 锁定的 smoltcp 0.14.0、quinn-proto 0.11.17），未编译、未运行、未连接 VPS。所有编译/测试/压测仍按既有约束在授权 VPS .110/.120 执行。
+本文只做静态阅读与依赖源码核对，未编译、未运行、未连接 VPS。所有编译/测试/压测仍按既有约束在授权 VPS .110/.120 执行。
 
-## 范围声明（用户决策 2026-09-15）
+## 范围声明
 
 1. 目标是 **XDP/AF_XDP 完全接管协议数据面**：客户端方向（被动打开）与回源方向（主动打开）都由 `smoltcp-edge` 在 AF_XDP 上承载。内核 TCP/UDP 不再参与业务数据面。
-2. **非 XDP 模式（XDP 关闭的 socket 代理路径）不做任何传输改造**：内核拥有 TCP，6.1 上只有 BBRv1 谱系、无 AccECN、fq 只管内核 TX。它只在 T9 作为同环境对照基线存在。
-3. 因此本文所有传输机制——RateSample、BBRv3、NewReno/Cubic、AccECN、pacing、时间轮调度、节点出口治理、AQM——只实现在我们拥有线格式的 AF_XDP 路径上，并且是**双向**的。
-4. 控制面（配置、RPC、DNS 解析、健康检查、日志上报）保留内核 socket，不属于数据面接管范围。
+2. **非 XDP 模式不做任何传输改造**，只在 T10 作为同环境对照基线。
+3. 拥塞控制交付物是 **一个控制器（工作名 EdgeCC）**，不是多个算法并列。Reno/Cubic/BBRv1/BBRv3 在本文里只以两种身份出现：(a) 被拆出来的**部件**（PRR、HyStart++、模型滤波器、`inflight_hi` 包络、`lt_bw` policer 判定等）；(b) 同一份代码钉死参数后得到的**校验模式**，用于证明记账正确、并作为同栈内对照。它们不是生产可选项。
+4. 控制面（配置、RPC、DNS、健康检查、日志上报）保留内核 socket。
 
-## 0. 本次核对出的硬约束（决定架构的事实）
+## v3 相对 v2 的改动
+
+- 第 2 节整体重写：从"三个控制器 + 策略叠加层"改为统一控制器 EdgeCC 的分层设计（路径模型 → 多信号推断 → 决策 → 安全包络 → 聚合协调 → 接收侧控制）。
+- 补入 v2 遗漏的 BBRv1（丢包盲响应、`lt_bw` policer 判定）以及 BBR 家族之外的机制来源：PCC-Vivace 的效用梯度、Copa/Swift 的时延目标控制、GCC 的时延梯度滤波、Veno 的队列占用判据、RFC 3124 Congestion Manager 与 RFC 8382 共享瓶颈检测、DCTCP/RFC 8257 的 alpha、接收窗口驱动控制。
+- 路径质量表并入路径模型的长期存储；路径选择（原 T4b）与聚合协调合并为 T6。
+- 任务 T2 之后全部重排；提供暂停后的"继续提示词"。
+
+## 0. 硬约束（决定架构的事实，保留自 v2）
 
 | # | 事实 | 证据 | 影响 |
 |---|---|---|---|
-| C1 | smoltcp 0.14.0 的 `Controller` trait 是 `pub(super)`，`on_ack(now, len, in_flight, rtt)` 没有 per-segment 发送时间、delivered 计数、app-limited、SACK 范围 | `smoltcp-0.14.0/src/socket/tcp/congestion.rs:14-37` | 任何 BBR 系（依赖 delivery-rate 采样）**不能以外部 Controller 注入**，必须受控 fork |
-| C2 | RTT 估计一窗一样本（Karn 风格 `rtte.on_send` 仅在 `timestamp.is_none()` 时记录），socket 层不使用 TCP Timestamps 选项做 RTT；`RttEstimator` 精度 ms | `socket/tcp.rs:163-242`, `:2143` | BBR 的 min_rtt / 每 ACK 交付率采样质量不足 |
-| C3 | 发送侧没有 SACK 记分板、RACK-TLP、PRR；丢失判定只有 3 dupack 与 RTO；SACK 仅用于接收端生成 SACK 块 | `socket/tcp.rs:512-523, 2106-2137, 1497-1525` | BBR 需要准确的 lost/delivered 记账；无 RACK 的 BBR 在乱序/尾丢包下表现错误 |
-| C4 | socket 层不处理 ECN：`TcpRepr` 无 ECE/CWR/AE 字段，`Ipv4Repr` 无 ECN 字段（wire 层有 `ecn()/set_ecn()` 但未上提） | `wire/tcp.rs:856-869`, `wire/ipv4.rs:533-539` | 经典 ECN 与 AccECN 都要在 fork 里贯通 IP/TCP repr |
-| C5 | 无 pacing 钩子：`cwnd_remaining = window - flight_size`，dispatch 允许多少就立刻发多少 | `socket/tcp.rs:1400-1405` | 发送节奏必须在 fork 的 dispatch 或 reactor 层加“最早发送时间”门 |
-| C6 | reactor 用 `now_timestamp_millis()`（系统时间 + 偏移，ms）构造 `SmoltcpInstant` | `src/xdp/af_xdp/tcp_reactor.rs:668, 775` | 墙钟可跳变、ms 粒度：pacing/RTT/RateSample 前置必须换单调 µs 时钟 |
-| C7 | bridge 对 reactor 产出的每个 egress 帧立即 `send_raw_frame`，无节奏、无队列选择；连续 256 次 TX backpressure 直接撤销队列 redirect 并 `return` | `src/xdp/af_xdp/bridge.rs:992-1073, 511` | 调度器接入点在这里；TX 背压退出与 F2 同类，需并入过载合同 |
-| C8 | quinn-proto 0.11.17 `congestion::Controller` 为公开 trait，`on_ack(now, sent, bytes, app_limited, rtt)` / `on_sent` / `on_end_acks` / `on_congestion_event(lost_bytes=0 表示 ECN)` | `quinn-proto-0.11.17/src/congestion.rs:17-85` | QUIC 侧 BBRv3 可作为自定义 Controller **不 fork** 实现 |
-| C9 | quinn 的 Pacer 是 `window/srtt` 令牌桶；Controller 的 `metrics().pacing_rate` 只进 qlog，不驱动 Pacer | `connection/pacing.rs`, `connection/paths.rs:198-278` | BBRv3 的 pacing_gain ≠ cwnd_gain 无法直接表达；是否 patch quinn 需测后决定 |
-| C10 | quinn 内置 `Bbr` 是 quiche 派生的 BBRv1，源码标注 “Experimental! Use at your own risk” | `congestion/bbr/mod.rs:19-24` | 不得把它当 “BBR/BBRv3” 启用 |
-| C11 | H3 共享 UDP 套接字丢弃 ECN：`try_send` 不传 `transmit.ecn`，`poll_recv` 填 `ecn: None` | `src/quic_udp_demux.rs:163-180, 717` | quinn 的 RFC 9000 ECN 验证必然失败并自禁；这是**已存在的静默降级**，先报告 |
-| C12 | **AF_XDP reactor 只有被动打开**：`ensure_session_at` 对每个新流 `socket.listen(...)`；`src/xdp` 下没有 `connect`/active open。回源当前走内核 TCP（pingora/`tcp_proxy` 的 relay socket，`tcp_proxy.rs:1849-1863` 对其设置 `TCP_CONGESTION=bbr` 并忽略返回值） | `src/xdp/af_xdp/tcp_reactor.rs:779-840`；grep `src/xdp` 无 active open | 回源接管需要新增：smoltcp-edge 主动打开、源端口分配、邻居解析、出接口选择、eBPF 出向流表、内核 RST 防护 |
-| C13 | AccECN 已成 RFC 9768；Linux 于 6.18/6.19 系列合入，7.0 默认启用（LWN 1058666）；目标内核 6.1 不具备 | 上游依据见文末 | 我们的 smoltcp-edge 双向都可实现 AccECN；对端（客户端/源站）是否支持取决于其内核版本，命中率要实测 |
-| C14 | Linux 6.1 AF_XDP copy TX 走 `xsk_generic_xmit → __dev_direct_xmit`，绕过 netdev egress qdisc | 设计提案已引用 | fq/CAKE/FQ-PIE 对 AF_XDP 发包无效；队列设计必须在用户态 TX 路径实现 |
-| C15 | eBPF `tcp_sanity` 只检查 `flags & 0x3f`，不触碰 ECE/CWR/AE；SYN-cookie challenge 路径 SYN-ACK 仅带 MSS（ADR-001） | `crates/cloud-node-xdp-ebpf/src/main.rs:1369-1390, 4940` | smoltcp 终止路径可协商 ECN/AccECN；challenge 路径当前无法协商，需显式限定 |
-| C16 | `send_window=32MiB` 为每连接（源码注释写成 per-stream 不准确），`stream_receive_window=4MiB` 为每 stream | `src/quic_transport.rs:13-19` | 联合计费进 F3 预算；注释修正 |
-| C17 | 内核对到达无监听端口的 SYN-ACK/数据会回 RST；XDP 程序 detach（reload prepare 窗口）期间入包会漏到内核栈 | Linux TCP 语义 | 回源 active open 的源端口范围必须让内核既不分配也不响应（`ip_local_reserved_ports` + netfilter DROP 守卫），否则一次 reload 就会让源站收到 RST |
+| C1 | smoltcp 0.14.0 `Controller` 为 `pub(super)`，`on_ack(now, len, in_flight, rtt)` 无 per-segment 发送时间/delivered/app-limited/SACK | `smoltcp-0.14.0/src/socket/tcp/congestion.rs:14-37` | 交付率模型无法外部注入，必须受控 fork |
+| C2 | RTT 一窗一样本，不用 TS 选项，ms 精度 | `socket/tcp.rs:163-242, :2143` | 需要 TS 每 ACK RTT 与 µs 时钟 |
+| C3 | 发送侧无 SACK 记分板/RACK-TLP/PRR；丢失只靠 3 dupack 与 RTO | `socket/tcp.rs:512-523, 2106-2137` | 交付/丢失记账不可信，任何模型型 CC 都会被误导 |
+| C4 | socket 层无 ECN；`TcpRepr`/`Ipv4Repr` 未上提 ECN 字段 | `wire/tcp.rs:856-869`, `wire/ipv4.rs:533-539` | 经典 ECN 与 AccECN 都要 fork 贯通 |
+| C5 | 无 pacing 钩子：`cwnd_remaining = window - flight_size` | `socket/tcp.rs:1400-1405` | 发送时间门必须加在 dispatch |
+| C6 | reactor 曾用墙钟 ms（T1 已改为单调 µs `TransportClock`） | `da21e7a` | 已闭合 |
+| C7 | bridge 对每个 egress 帧立即 `send_raw_frame`；TX 背压 256 次退出 | `src/xdp/af_xdp/bridge.rs:992-1073, 511` | 调度器接入点；退出并入过载合同 |
+| C8 | quinn-proto 0.11.17 `Controller` 公开：`on_ack(now, sent, bytes, app_limited, rtt)` 等 | `quinn-proto-0.11.17/src/congestion.rs:17-85` | QUIC 侧 EdgeCC 不 fork 即可接入 |
+| C9 | quinn Pacer 为 `window/srtt` 令牌桶，忽略 `pacing_rate` | `connection/pacing.rs` | pacing_gain ≠ cwnd_gain 无法表达；是否 patch 按 D-C1 先度量 |
+| C10 | quinn 内置 `Bbr` 为 quiche 派生 BBRv1，标注 Experimental | `congestion/bbr/mod.rs:19-24` | 不用；与我们的模型层不能共享状态 |
+| C11 | H3 共享 UDP 套接字丢弃 ECN | `src/quic_udp_demux.rs:163-180, 717` | 既有静默降级，先报告 |
+| C12 | AF_XDP reactor 只有被动打开；回源走内核 TCP | `tcp_reactor.rs:779-840`；`tcp_proxy.rs:1849-1863` | 回源接管需新增 active open、出向流表、RST 防护 |
+| C13 | AccECN = RFC 9768；Linux 6.18/6.19 合入，7.0 默认开；目标内核 6.1 无 | LWN 1058666 | 只有我们的栈能双向实现；对端支持率要实测 |
+| C14 | 6.1 AF_XDP copy TX 绕过 egress qdisc | `xsk.c` | fq/CAKE/FQ-PIE 必须在用户态 TX 路径重做 |
+| C15 | eBPF `tcp_sanity` 不动 ECE/CWR/AE；challenge 路径 SYN-ACK 仅 MSS | `ebpf/main.rs:1369-1390, 4940` | challenge 路径不协商 ECN，显式限定 |
+| C16 | quinn `send_window=32MiB` 为每连接 | `src/quic_transport.rs:13-19` | 进 F3 预算，修注释 |
+| C17 | 内核对无监听端口的 SYN-ACK 回 RST；XDP detach 窗口漏包到内核 | Linux TCP 语义 | 回源源端口需 `ip_local_reserved_ports` + netfilter DROP 守卫 |
 
-上游版本钉住（后续所有实现与测试引用这两个标识，不写“BBRv3”泛称）：
-
-- 算法参考实现：google/bbr 分支 `v3`，commit `90210de4b779d40496dee0b89081780eeddf2a60`（`net/ipv4/tcp_bbr.c`）。
-- 规范文本：`draft-ietf-ccwg-bbr-06`（2026-07-06，Experimental）。两者冲突时以源码行为为准并记录差异。
-- AccECN：RFC 9768。经典 ECN：RFC 3168。RACK-TLP：RFC 8985。PRR：RFC 6937。CUBIC：RFC 9438 + HyStart++ RFC 9406。NewReno：RFC 5681/6582。TCP TS：RFC 7323。
+上游版本钉住：google/bbr `v3` @ `90210de4b779d40496dee0b89081780eeddf2a60`；`draft-ietf-ccwg-bbr-06`；RFC 9768（AccECN）、3168、8985（RACK-TLP）、6937（PRR）、9438（CUBIC）、9406（HyStart++）、7323（TS）、2883（DSACK）、3522（Eifel）、8257（DCTCP）、8382（共享瓶颈检测）、3124（Congestion Manager）、8305（Happy Eyeballs）。BBRv1 参考 Linux 6.1 `net/ipv4/tcp_bbr.c`（含 `lt_bw` 长期带宽/policer 判定）。PCC-Vivace（NSDI'18）、Copa（NSDI'18）、Swift（SIGCOMM'20）、GCC（RMCAT）、Veno（JSAC'03）为机制来源，不是实现对象。
 
 ## 1. 目标架构
 
 ```mermaid
 flowchart LR
-    subgraph transport["crates/cloud-node-transport（纯算法，无 tokio，可确定性测试，双向共用）"]
-        CLK[clock: 单调 µs TransportInstant]
-        RS[rate_sample: 每段 TxRecord → RateSample]
-        CC[cc: CongestionController trait<br/>NewReno / Cubic / Bbr3 / 策略叠加层]
-        ECN[ecn: Off / Classic3168 / AccEcn9768<br/>被动方 + 主动方状态机, ACE/Option 编解码]
-        REC[recovery: SACK 记分板 + RACK-TLP + PRR]
-        PACE[pacer: 每连接 next_send_at + 有界突发]
-        SCHED[sched: 最小堆参考 + 分层时间轮 + 业务分层 DRR + 节点出口租约]
-        AQM[aqm: CoDel / PIE（仅转发队列，ECN 标记优先于丢弃）]
-        SIM[sim: 确定性网络模拟器]
+    subgraph transport["crates/cloud-node-transport（纯算法，无 tokio，确定性可测，双向共用）"]
+        CLK[clock / RateSample / RttState（已存在）]
+        PM[PathModel：bw 估计+不确定度、base_rtt、qdelay 与梯度、<br/>丢包过程（随机基线/拥塞证据/伪重传）、CE 比例、policer、ACK 聚合]
+        INF[Inference：多信号 log-odds → congestion_belief、queue_estimate、p_rand]
+        DEC[Decision：先验启动、不确定度驱动探测、时延目标/平台期双模、<br/>效用梯度微调、按 belief 比例响应]
+        ENV[Envelope：inflight_hi 硬包络（强证据驱动，任何层不得越过）]
+        AGG[Aggregate：共享瓶颈检测、按业务分层分配、探测协调、base_rtt 共享]
+        RX[Receiver-side：rwnd 右尺寸、BDP 上限、与配对连接耦合]
+        REC[Recovery：RACK-TLP + PRR + DSACK/Eifel]
+        REF[Reference modes：Bbr3Ref / CubicRef / NewRenoRef / LossBlindRef（校验用）]
+        SCHED[sched：时间轮 + 分层 + 节点出口租约]
+        AQM[aqm：CoDel/PIE（仅转发队列）]
+        SIM[sim：多流、共享瓶颈、抖动、路由切换、policer、ECN]
+        PT[path_table：前缀级长期先验 + 拨号选择]
     end
-    subgraph tcpfork["vendor/smoltcp-edge（受控 fork，[patch.crates-io]）"]
-        SOCK[socket/tcp.rs: 段记录、TS RTT、SACK 记分板、ECN repr、发送时间门、可插拔 CC<br/>listen（客户端侧）+ connect（回源侧）]
-        NEIGH[邻居/路由: 默认网关 ARP/NDP、出接口与本地 IP 选择、PMTU]
+    subgraph tcpfork["vendor/smoltcp-edge"]
+        SOCK[段记录、TS、SACK 记分板、ECN repr、发送时间门、app-limited 标记、rwnd 钩子<br/>listen + connect]
     end
-    subgraph ebpf["eBPF"]
-        INMAP[入向: 监听端口/流表 → XSK]
-        OUTMAP[出向流表: 我们主动打开的 5 元组 → 归属 XSK<br/>ICMP 错误按内层 5 元组投递]
+    subgraph dp["src/xdp/af_xdp"]
+        REACT[tcp_reactor：accepted/dialed 会话]
+        BRIDGE[bridge：min(cwnd,rwnd,pacer,租约,XSK) → TX]
+        EBPF[eBPF：入向流表 + 出向流表 + ICMP]
     end
-    subgraph dp["src/xdp/af_xdp 数据面"]
-        REACT[tcp_reactor: 两类会话（accepted / dialed），按调度器选择 dispatch]
-        BRIDGE[bridge: min(cwnd,rwnd,pacer,租约,XSK slots) → TX]
-        UPCONN[upstream connector: pingora 上游 L4 = 虚拟流（复用 virtual_l4_stream）]
-    end
-    subgraph quic["quinn 适配"]
-        QCC[Bbr3 impl quinn_proto::congestion::Controller]
-        QECN[quic_udp_demux ECN 贯通]
-    end
-    CLK --> RS --> CC --> PACE --> SCHED --> BRIDGE
-    ECN --> CC
-    REC --> RS
-    SOCK --> RS
-    SOCK --> ECN
-    SOCK --> REC
-    NEIGH --> SOCK
+    QUIC[quinn：EdgeCC impl Controller；ECN 贯通]
+    CLK --> PM --> INF --> DEC --> ENV --> SCHED --> BRIDGE
+    AGG --> DEC
+    PT --> DEC
+    PT --> AGG
+    RX --> SOCK
+    REC --> PM
+    SOCK --> PM
     REACT --> SOCK
-    UPCONN --> REACT
-    SCHED --> REACT
-    AQM --> BRIDGE
-    OUTMAP --> BRIDGE
-    QCC --> CC
-    QECN --> QCC
-    SIM -.测试.- CC
-    SIM -.测试.- SCHED
+    EBPF --> BRIDGE
+    QUIC --> PM
+    SIM -.测试.- DEC
+    REF -.同一代码钉参数.- DEC
 ```
 
-边界原则：
+## 2. EdgeCC：统一拥塞控制设计
 
-- 拥塞控制只输出 pacing rate / cwnd / 状态与原因，不分配应用队列，不越过 TX 资源额度。
-- TCP 与 QUIC 各自保留序号、ACK、重传、加密、流控；共享的是 `RateSample → CongestionController` 接口与节点出口治理。
-- 客户端侧会话与回源侧会话是同一个 reactor/调度器里的两类会话（`accepted` / `dialed`），共用 CC、pacer、预算与分层，只是打开方向与 ECN 协商角色不同。
-- 业务优先级只在“已满足协议发送条件”的工作中选择。
-- 应用层（pingora / tcp_proxy / udp_proxy）不得绑定 smoltcp 类型；上下游都通过虚拟 L4 流接入。
+### 2.1 设计原则
 
-## 2. 拥塞控制模块设计
+1. **拥塞是路径的属性，不是连接的属性。** 模型与包络在瓶颈聚合上维护；连接是聚合额度的消费者。一个 CDN 节点对同一客户端前缀/同一源站常有几十条并发流，各自独立探测会把共享瓶颈超冲 N 倍——这是我们相对端点 CC 最大的结构性优势。
+2. **用后验做决策，不用单个事件做决策。** 丢包、RTT、交付率平台期、CE、ACK 聚合都只是证据，更新一个连续的拥塞置信度；响应强度与置信度成比例，而不是"丢一个包就减半"或"完全无视丢包"。
+3. **所有探索都在安全包络内。** 强证据（CE、伴随 RTT 抬升的丢包、RTO、policer）设定 `inflight_hi` 硬上限；推断错误最多导致包络内的次优，不会失控。
+4. **目标函数显式。** 业务有效吞吐与完成时间为正项，自身排队时延与拥塞丢包为代价项，权重由业务分层给出；同一函数既用于探测决策也用于 T10 评估。
+5. **用代理知道而端点不知道的一切：** 两侧速率、同路径的历史与并发流、业务优先级、我们是接收方时的窗口控制权。
+6. **可审计。** 每次模式/包络/分配变化带原因码；同一事件轨迹可确定性重放；每个机制有消融开关（用于度量，不是生产可选项）。
 
-### 2.1 统一输入：RateSample（对齐 Linux `tcp_rate.c` 语义）
+### 2.2 路径模型（PathModel）
 
-每个已发送段记录 `TxRecord { sent_at, delivered_at_send, delivered_snapshot, first_tx_at, is_app_limited, is_retransmit, size }`。每次 ACK/SACK 处理后生成：
+每个聚合一份，流级只保留 RateSample 累计与 app-limited 状态。
 
-```
-RateSample {
-  delivered: u64,          // 本次新确认字节（含 SACK）
-  lost: u64,               // 本次新判丢字节（RACK/dupack/RTO）
-  delivered_ce: u64,       // AccECN: ACE/CEB 增量；经典 ECN: 0/1 事件
-  interval: Duration,      // max(send_elapsed, ack_elapsed)，RFC 语义
-  rtt: Option<Duration>,   // 本次样本 RTT（TS 或段时间）
-  is_app_limited: bool,
-  prior_in_flight: u64,
-  acked_sacked: u64,
-  now: TransportInstant,
-}
-```
-
-必须处理：ACK 压缩、延迟 ACK、重传段不产生 RTT 样本、app-limited 标记随段传递、`interval` 取发送/确认区间的较大者。不得用“本次 ACK 字节 / 两次 ACK 间隔”。
-
-### 2.2 `CongestionController` trait（transport crate 公开）
-
-```
-trait CongestionController {
-  fn on_sent(&mut self, now, bytes, in_flight, is_app_limited);
-  fn on_rate_sample(&mut self, rs: &RateSample, in_flight, rtt: &RttState);
-  fn on_loss_event(&mut self, now, lost_bytes, in_flight, persistent: bool);
-  fn on_ecn_ce(&mut self, now, ce_bytes_or_events, delivered, in_flight);
-  fn on_rto(&mut self, now, in_flight);
-  fn on_idle_restart(&mut self, now, idle_for);
-  fn on_mss_update(&mut self, mss);
-  fn cwnd(&self) -> u64;
-  fn pacing_rate(&self) -> Option<u64>;       // bytes/s；Reno/Cubic 也给出 cwnd/srtt 派生值
-  fn state(&self) -> CcSnapshot;               // 算法名+版本钉、mode、bw_hi/lo、inflight_hi/lo、min_rtt、extra_acked、ecn_alpha、原因码
-}
-```
-
-`CcSnapshot` 直接进 `/status` 与日志，F8 的“对已连接 socket 断言算法不为 None”落到这里，且对 accepted 与 dialed 两类会话都成立。
-
-### 2.3 三个控制器 + 策略叠加层
-
-| 控制器 | 角色 | 说明 |
+| 量 | 估计方法 | 来源 |
 |---|---|---|
-| `NewReno`（RFC 5681/6582 + PRR 6937） | 基线、对照、最小依赖回退 | 也是模拟器与记账正确性的“金标准”；ECN 响应按 RFC 3168 每 RTT 一次减半并置 CWR |
-| `Cubic`（RFC 9438 + HyStart++ 9406） | 阶段 0 即时对照 | 与 smoltcp 自带 `socket-tcp-cubic` 行为对比，验证 fork 记账没有改变已有语义 |
-| `Bbr3`（pinned） | 主控制器（双向） | 先忠实复现：STARTUP（full-bw 三轮 1.25× 判定 + 基于丢包的提前退出）、DRAIN、ProbeBW 四态 DOWN/CRUISE/REFILL/UP、`bw_hi/bw_lo`、`inflight_hi/inflight_lo`、headroom、ProbeRTT（5s/200ms）、ack aggregation `extra_acked`、丢包响应 `inflight_lo = (1-beta)·inflight`、ECN 响应 `ecn_alpha` EWMA、`ecn_max_rtt_us` 门限。所有常数以 pinned `tcp_bbr.c` 的 `bbr_*` 为准，不在文档里抄写 |
+| `bw_max` | 交付率窗口最大值滤波（窗口 ≈ 2 个探测周期） | BBR |
+| `bw_est`, `bw_sigma` | 非 app-limited 交付样本的 EWMA 与偏差 EWMA → 置信区间；样本年龄与数量进置信度 | 新增；不确定度驱动探测 |
+| `bw_hi` / `bw_lo` | 剂量-响应试验（提升 inflight 后交付率是否随之增长）与响应事件更新 | BBRv3 概念，更新规则由 belief 驱动 |
+| `base_rtt` | 长窗口最小值 + 漂移检测（全部流长期高于底线且 inflight 低 → 路由变化，允许底线上移） | BBR + 新增 |
+| `qdelay`, `qdelay_grad` | `srtt − base_rtt`；梯度用 Kalman/EWMA 滤波 | Copa/Swift/GCC |
+| `extra_acked` | ACK 聚合补偿 | BBRv3 |
+| 丢包过程 | 两列丢包率（伴随 qdelay 抬升 / 无抬升）、突发长度、**因果检验**（丢包率是否在我们提速后上升）、伪重传比例（DSACK/Eifel） | Veno 队列占用判据 + 新增 |
+| `p_rand` | 由"无 qdelay 抬升、无 CE、非提速期"的丢包样本估计的随机丢包基线，带置信度 | 新增；对高丢包国际链路关键 |
+| `alpha` | CE 字节比例 EWMA（AccECN 精确；经典 ECN 为事件） | DCTCP/BBRv3 |
+| `lt_bw` / policer | 持续丢包 + 交付率平坦 → 令牌桶 policer，长期带宽上限 | BBRv1 |
+| `delay_signal_quality` | 低 inflight 时 RTT 方差；决定时延信号是否可用 | 新增 |
 
-**关于 “魔改 BBR”**：所有偏离都以“策略叠加层”实现，每项独立开关、默认关闭、默认行为 = 参考 BBRv3。每项策略必须声明：触发条件、期望效果、度量指标、回退条件。候选：
+长期存储 `path_table`：按 `(egress_iface, local_ip, af, dst_prefix)` / `(ingress_iface, local_ip, af, client_prefix)` 保存聚合摘要（`bw_est`、`base_rtt`、`p_rand`、`alpha`、乱序度、connect_rtt、失败率），TTL 与置信度；供暖启动与拨号选择。
 
-1. `path_prior`：同类路径（同 /24 或 /48 + 同接口 + TTL 60s + 置信度）为新连接提供有界 `bw_hi`/`min_rtt` 先验，缩短 STARTUP；不得据此跳过 STARTUP 的 full-bw 判定。回源方向对同一源站集群天然适用，先验命中率预期高于客户端方向。
-2. `probe_up_policy`：在“额外注入确实带来额外交付”且节点 CPU/出口租约允许时，延长 ProbeBW_UP 或提高增益；必须有探测额度和结束条件。
-3. `loss_tolerance`：仅在 RTT 未升、交付率未降、无 ECN CE、非 RTO 的多信号一致时，放宽 `loss_thresh` 一档；任一信号缺失即回参考值。**不是**“忽略丢包”。
-4. `egress_plateau`：节点级观察 sum(delivery_rate) 平台期 + 与注入相关的丢弃，收紧节点出口租约；不把各连接 bw 估计相加当物理带宽。
-5. `probe_stagger`：同节点连接的 ProbeBW_UP 错峰（哈希到 slot），仅在证明共享瓶颈（同接口出口）时启用。
-6. `ecn_public_policy`：BBRv3 上游只在 `min_rtt ≤ ecn_max_rtt_us`（DC/L4S）响应 ECN；公网 RTT 上收到的 CE 来自经典 AQM。本策略决定：公网 CE 按 RFC 3168 语义（一次/RTT，作用于 `inflight_lo`）还是沿用上游忽略。默认沿用上游，开启需审批。
-7. `path_loss_floor`：从路径质量表（第 6.5 节）取该路径的基线随机丢包率（置信度加权），把 BBRv3 的 `loss_thresh` 从固定 2% 改为 `max(2%, floor + margin)`，只把高于基线的丢包视为拥塞信号。守卫：交付率随 inflight 增长停滞、RTT 抬升或 CE 出现时立即回参考值；基线只能由无 RTT 抬升的丢包样本贡献。这是针对“高丢包但带宽充足”的国际链路的唯一 CC 侧调整，其余靠路径选择避开。
+### 2.3 多信号推断（Inference）
 
-**Reno 的定位**：不是主控制器，而是（a）算法与记账正确性的对照；（b）`NoControl` 的最小替代；（c）短流/小响应在有先验时的候选。是否在业务上使用由 T9 实验决定。
+- `congestion_belief ∈ [0,1]`：有界 log-odds 累加器，每 RTT 衰减。证据权重从强到弱：CE（AccECN 比例 > 经典事件）> `qdelay` 超出该分层预算且梯度为正 > 伴随 qdelay 抬升的丢包 > inflight 上升而交付率平台期 > 无抬升的丢包（权重为 `(loss_rate − p_rand)+`）；DSACK 判定的伪重传为负证据。
+- `queue_estimate ≈ qdelay × bw_est`：我们在瓶颈里堆的字节。
+- 共享瓶颈检测（RFC 8382 思路）：同候选聚合内各流的 qdelay 变化与丢包时刻相关性；相关则合并，去相关则拆分——防止错误分组造成的欠利用。
+- 所有推断为每 ACK O(1) 的滤波器更新，不含在线学习。
 
-### 2.4 ECN 响应与 AccECN 的关系（双向）
+### 2.4 决策（Decision，聚合级 → 流级）
 
-- 经典 ECN 只能每 RTT 反馈一次 CE，`delivered_ce` 只能是事件；BBRv3 的 `ecn_alpha` 需要 AccECN 的 ACE/CEB 精确计数才有意义。
-- **客户端方向（我们是服务端/主要发送方）**：客户端请求 AccECN → 我们的响应数据以 ECT(0) 发送 → 路径 AQM 打 CE → 客户端 ACE 精确回报 → 我们的 `Bbr3.on_ecn_ce` 得到字节级比例。
-- **回源方向（我们是客户端/主要接收方）**：我们在 SYN 请求 AccECN → 源站（Linux 7.0+ 默认支持）以 ECT(0) 发送 → 我们作为接收方精确回报 ACE/CEB → 源站的 CC 受益；我们向源站的上行（请求体/上传）由我们的 `Bbr3` 控制。
-- 命中率取决于对端内核版本，T9 用真实客户端与源站分布测量，不预设收益。不做 L4S/ECT(1)/Prague。
+- **工作点**：`inflight_target = bw_est × base_rtt + Q_budget(tier)`；`pacing = bw_est × g`。`Q_budget` 是我们接受的自排队量，由业务分层给出（完成时间敏感层小，大流层大）。
+- **双模控制**：`delay_signal_quality` 高 → 时延目标控制（Copa/Swift 式：速率按 `(d_target − qdelay)/d_target` 的有界比例调整）；时延信号被抖动淹没 → 平台期驱动探测（BBR 式）。切换带迟滞并记录原因。
+- **不确定度驱动探测**：探测触发 = `bw_sigma/bw_est` 高、或距上次剂量-响应试验超过与 RTT 成比例的随机化 horizon、或先验显示更高容量；探测幅度与不确定度成比例（有上下限），时长 ≥1 RTT；用交付率增量/inflight 增量判定接受或回退。**同一聚合同时只有一个流在探测**，其余保持。
+- **效用梯度微调**（PCC-Vivace 思路，受限使用）：模型收敛后，在 `[0.9×target, envelope]` 内做成对小幅试验（±ε，一个监测区间），按效用 `U = goodput^a − b·(rate·qdelay_grad)+ − c·rate·loss_congestion` 的梯度方向有界步进。只对非 app-limited、寿命 ≥5 RTT 的流启用；作用是找到 policer/浅缓冲上"稍低速率换更低丢包"的点，而不是替代模型。
+- **按置信度比例响应**：`inflight_lo = inflight × (1 − β·belief)`，`β_max` 取 BBRv3 值；PRR 平滑削减；CE 按 `alpha/2` 每 RTT 削减（DCTCP）；RTO 后从模型恢复而不是从 1 MSS 重来；`belief≈0` 的随机丢包不改模型，只由 RACK/TLP 修复——这就是 BBRv1 的丢包盲行为，但只在证据支持时出现。
+- **启动**：有置信先验 → paced start：以约 0.5×先验带宽起步、cwnd = 先验 BDP × 1.5、立即做剂量-响应确认，不走指数增长；无先验 → 2.77 增益指数启动，退出条件为平台期（3 轮）、HyStart++ 式时延抬升（base_rtt 可来自聚合）、伴随抬升的丢包、CE。IW 由先验有界推导（无先验 10 MSS），在约半个 RTT 内 pace 发出。
+- **base_rtt 刷新**：优先用聚合内其他流的低 inflight 样本与自然空闲期；仅当 horizon 内无新鲜样本时，聚合内**一个**流做 0.5×BDP 的短暂下探（BBRv3 参数），其余不动。
+- **app-limited**：样本不下拉 `bw_est`，不触发探测；代理场景下客户端侧流在源站侧供给不足时必须被正确标记（第 2.7 节）。
 
-## 3. AccECN（RFC 9768）双角色设计（smoltcp-edge 内）
+### 2.5 安全包络（Envelope）
 
-### 3.1 被动方（客户端方向）
+- `inflight_hi` 由强证据设定：一轮内伴随 qdelay 抬升的丢包 ≥ 阈值、CE 比例 ≥ 阈值、RTO、policer 判定 → `inflight_hi = 当时 inflight × (1 − headroom)`。
+- 只有 belief 连续 K 轮低于阈值才允许 REFILL → 上探（BBRv3 语义）。
+- 决策层与效用微调层输出一律 `min(·, inflight_hi)`；节点出口租约再叠一层。
+- 包络的存在使"推断把拥塞丢包误判为随机丢包"的最坏后果被限制为包络内的次优，而不是 BBRv1 式的顶死队列。
 
-1. **协商**（SYN 的 AE,CWR,ECE）：`(1,1,1)` → AccECN；`(0,1,1)` → 经典 RFC 3168；其他 → 无 ECN。SYN-ACK 用 (AE,CWR,ECE) 回报收到 SYN 的 IP-ECN：`(0,1,0)` Not-ECT、`(0,1,1)` ECT(1)、`(1,0,0)` ECT(0)、`(1,1,0)` CE；经典 ECN 回 `(0,0,1)`。
-2. challenge 路径（ADR-001 MSS-only SYN-ACK）无法协商 ECN，本轮显式限定 AccECN 仅对 smoltcp 终止路径生效；若未来需要，参考 Linux AccECN 系列对 `syncookies.c` 的做法把 ECN 模式编码进 cookie。
+### 2.6 聚合协调（Aggregate，RFC 3124 思路）
 
-### 3.2 主动方（回源方向）
+- 候选键 `(egress_iface, local_ip, af, dst_prefix, port_class)`；新流先加入候选，共享瓶颈检测确认后共享模型与包络，否则退化为单流聚合。
+- 分配：聚合 `rate_total`/`inflight_total` 按业务分层权重分配（T0 控制推进与 T1 完成时间敏感有最低保证），工作保持，未用份额每 RTT 再分配。
+- 协调：一次一个探测者、错峰；`base_rtt` 共享；Σ聚合 ≤ 节点出口治理上限。
+- 收益预期：N 条同路径流从"N 次独立探测、N 倍超冲"变为"一次探测、按优先级分配"。这是 T10 必须单独度量的项。
 
-1. SYN 置 (AE,CWR,ECE)=(1,1,1)，可携带 AccECN 选项请求对方回带选项。
-2. SYN-ACK `(0,1,0)/(0,1,1)/(1,0,0)/(1,1,0)` → AccECN 并据此得知 SYN 的 IP-ECN 是否被改写；`(1,0,1)`（保留“Nonce”组合）按 §3.1.3 视为 AccECN；`(0,0,1)` → 经典；`(0,0,0)` → 无 ECN。
-3. SYN 超时重传按 §3.1.5 与 Linux `tcp_ecn_fallback` 语义退回 Not-ECN SYN，并记录原因码（这是规范行为，需可观测）。
-4. 首个 ACK 携带 AccECN 选项回报 SYN-ACK 的 IP-ECN。
+### 2.7 接收侧控制与配对连接耦合（代理特有）
 
-### 3.3 共同部分
+- 我们是接收方（源站→节点、客户端上传）时：`rwnd = clamp(consumer_drain_rate × (srtt + margin) + Q_budget_rx, min, F3 份额)`，且 `rwnd ≤ BDP_est(path) + Q_budget_rx`，防止源站的 CC 把源站→节点路径灌成 bufferbloat，也防止 F3 内存被单流占满。
+- 配对耦合：客户端侧交付率是源站侧 rwnd 的上限（不拉得比推得快）；源站侧到达速率不足时客户端侧 RateSample 标记 app-limited，模型不被污染；cache 命中路径以缓存读取背压标记。
+- ACK 策略默认不变（每 2 段或定时器），CPU 影响进 T10 度量。
 
-1. **ACE 字段**：三比特 (AE,CWR,ECE) 作为收到 CE 报文计数 mod 8，初值 5；字节计数 `e0b/ceb/e1b` 初值 1。
-2. **AccECN 选项**：Kind 172（AccECN0：EE0B, CEB, EE1B）/ Kind 174（AccECN1：EE1B, CEB, EE0B），24-bit 计数；发送策略按 §3.2.6（计数变化时携带 + 每 RTT 最少信标），与 SACK/TS 的选项空间裁剪有明确优先级。
-3. **发送侧**：协商后数据段 IP-ECN 置 ECT(0)；纯 ACK 保持 Not-ECT；从 ACK 的 ACE/CEB 增量推 `delivered_ce`；ACE 回绕按 §3.2.2.5 的最小回绕假设，有选项时优先用 CEB。
-4. **接收侧**：解析入包 IP-ECN，CE 递增 ACE 与 CEB；ECT(0)/ECT(1) 递增 EE0B/EE1B；反馈随每个 ACK。
-5. **失效处理**（§3.2.x，属于规范要求的协议行为）：中间盒清零 AE、对端不再携带选项、ACE 不变但 CE 已知等，按规范转入经典 ECN 或关闭 ECN，并在 `CcSnapshot.ecn_mode` 与计数器中记录原因；不得伪装成正常状态。
-6. **测试**：移植 Linux selftests `tcp_accecn_*.pkt` 的用例语义为 Rust 报文脚本测试，被动方与主动方各一组。
+### 2.8 恢复
 
-## 4. 用户态队列调度（AF_XDP TX 的 “fq / CAKE / FQ-PIE”）
+RACK-TLP（`reo_wnd` 自适应）+ PRR + DSACK/Eifel 撤销；在 `p_rand` 高且乱序低的路径收紧 `reo_wnd` 加快修复；TLP 参数对长 RTT 调整。
 
-C14 决定所有队列机制在 `bridge` 的 TX 提交前实现。回源接管后，同一个调度器同时管理客户端方向与回源方向的发送。
+### 2.9 校验模式（不是交付物）
 
-### 4.1 取自 fq：每流发送时间 + 时间结构
+同一份代码通过参数钉死得到：`Bbr3Ref`（belief 规则 = v3 loss/CE、无效用微调、无聚合、v3 探测周期）、`CubicRef`、`NewRenoRef`（现有实现）、`LossBlindRef`（belief 钉 0 → BBRv1 丢包盲）。用途：记账一致性回归；同栈内对照（EdgeCC 必须在 T10 同环境下优于 `Bbr3Ref`，否则不切默认）；随机丢包场景下 EdgeCC 应逼近 `LossBlindRef` 吞吐、真拥塞场景下应逼近 `Bbr3Ref` 的排队与重传。
 
-- 每条有待发数据的连接持有 `next_send_at`；由 `pacing_rate`、本次发送字节数和有界初始突发（类 fq `initial_quantum`/`quantum`：10×MSS 起步、稳态 2×MSS）更新。
-- 时间结构：**参考实现**为 `BinaryHeap<(next_send_at, generation, flow)>` 惰性删除；**目标实现**为 3 层分层时间轮（示例：64µs×256 / 16ms×256 / 4s×256，粒度由基准决定）+ 溢出堆。每流至多一个有效条目，`generation` 防旧事件推进新连接。
-- 线程等待 `min(时间轮最近到期, smoltcp poll_delay, RX 就绪)`；不为报文创建 tokio sleep；临近到期 ≤50µs 才允许短忙等，并纳入 CPU 预算。
-- 长暂停后追赶：`next_send_at` 落后于 now 时只补发一个有界突发，不把暂停期间的额度一次性倾泻。
+### 2.10 明确不采用
 
-### 4.2 取自 CAKE：时间基整形、分层、开销补偿
+- 数据面内在线学习/强化学习（Remy/Aurora/Orca 类）：不可审计、CPU 不可控。T10 数据允许离线参数拟合（D-G1），但任何拟合结果要进数据面仍需走 T10 同环境验证。
+- L4S/ECT(1)/Prague；MPTCP；通用 TCP 上的 FEC。
+- quinn 内置 `Bbr`。
 
-- **节点/接口出口整形**：CAKE 式 deficit 整形（`time_next_packet += len·8/rate`，`overhead` 补偿以太/VLAN/QinQ 头，突发 ≤ 1ms×rate）。rate 来源优先级：显式配置的 vNIC 出口 → `egress_plateau` 策略测量值 → 无（不整形，只保留 XSK slot 约束）。**不**用各连接 BBR 带宽估计求和。
-- **分层（tin）→ 业务优先级**，有界、工作保持、不均分：
-  - T0 控制推进：ACK、握手、关闭、丢失恢复重传（两方向）；保证份额（如 ≤20%）但不能被饿死，也不能无限置顶。
-  - T1 完成时间敏感：首字节、小响应、交互流；**有客户端等待的 cache-miss 回源请求**默认也在此层（是否保留由 T9 决定）。
-  - T2 大流：客户端方向大响应与回源预取/大文件；消费剩余。
-  - 已知剩余长度的响应可评估 SRPT；未知长度、透传流不伪造剩余量。
-- **不采纳**：ack-filter、per-host 公平、固定哈希桶、GSO 拆分。
+### 2.11 风险（如实）
 
-### 4.3 取自 CoDel/PIE：只用于我们真正“转发”的队列
+- EdgeCC 没有上游参考可"符合"，只能靠模拟器不变量 + 真实矩阵度量；校验模式是唯一的锚。
+- 效用微调在 300ms RTT 上每步至少一个 RTT，收敛慢；因此它只做微调，工作点由模型给出。
+- 共享瓶颈误分组会欠利用；拆分规则必须有测试。
+- 每 ACK 增加滤波与 log-odds 更新；2c2g 上要度量每 ACK 纳秒级开销。
 
-- 适用对象：UDP/QUIC 透传队列、跨接口 `AfXdpForward` 通道、任何“我们不是端点”的排队点。
-- 行为：以入队时间计算逗留时间；CoDel `target=5ms / interval=100ms` 或 PIE 15ms 周期概率更新；超阈值时 **ECT 报文打 CE**（合法转发跳），Not-ECT 报文丢弃并计数。二选一由基准决定，只交付一个。
-- **不适用于我们终止的 TCP**：自己的负载不能丢。回源接管后背压机制变得直接：客户端方向发送缓冲逗留时间超 target → **收窄我们向源站通告的接收窗口**（同一 reactor 内的 dialed 会话 rwnd），源站按其 CC 自然减速；不再依赖内核 socket 的读取速率。
-- 自适应每连接发送缓冲：`clamp(2×BDP_est, 32KiB, per_conn_cap)`，两方向会话都在 F3 全局字节预算内申请；预算不足时缩窗而不是拒绝已建连接。
+## 3. AccECN（RFC 9768）双角色设计
 
-### 4.4 合法发送条件（bridge 层单一裁决点）
+（保留 v2 内容）被动方：SYN (1,1,1)→AccECN，(0,1,1)→经典；SYN-ACK 按 SYN 的 IP-ECN 编码 (0,1,0)/(0,1,1)/(1,0,0)/(1,1,0)。主动方：SYN 置 (1,1,1) 可带选项；(1,0,1) 按 §3.1.3 视为 AccECN；SYN 超时按 §3.1.5 回退并记录。ACE 初值 5，字节计数初值 1；选项 Kind 172/174；数据段 ECT(0)，纯 ACK Not-ECT；ACE 回绕按 §3.2.2.5；失效处理按 §3.2.x 并可观测。challenge 路径不协商，显式限定。AccECN 的价值在 EdgeCC 里是 `alpha` 的精确输入与最强的拥塞证据。
 
-```
-send_bytes = min(cwnd_remaining, rwnd_remaining, pacer_allowance(now), worker_lease, xsk_tx_slots × frame)
-```
+## 4. 用户态队列调度（fq/CAKE/FQ-PIE 的用户态重做）
 
-- `worker_lease`：节点出口治理向每个 XSK worker 批量租用（如 250µs 的额度），租约耗尽才碰全局原子。
-- 批量 TX 只聚合已到期且已获额度的报文；限制单批序列化时间。
-- QUIC：quinn 自己 pace，公共层只叠加租约与分层选择，`poll_transmit` 的期限接入时间轮。
-
-### 4.5 复杂度与 CPU 边界
-
-- 堆 O(log N) 与时间轮平均 O(1) 必须用同一事件轨迹对比发送顺序一致。
-- 回源接管使每个代理连接对应两个 smoltcp 会话；2c2g 上调度器自身开销（每包 ns、每轮 µs、P99）与会话数上限是验收指标。
+（保留 v2 内容）fq：每流 `next_send_at` + 分层时间轮（最小堆参考，等价测试）；CAKE：时间基 deficit 整形、overhead 补偿、有界不均分的业务分层 T0/T1/T2；CoDel/PIE：只用于我们不是端点的转发队列，ECT 打 CE、Not-ECT 丢弃；合法发送条件 `min(cwnd, rwnd, pacer, worker_lease, xsk_slots)` 在 bridge 单点裁决。与 EdgeCC 的关系：聚合分配决定每流 `cwnd/pacing`，调度器决定何时把已允许的字节放上线；分层权重两处共用同一配置。
 
 ## 5. QUIC 路径
 
-1. `Bbr3` 实现 `quinn_proto::congestion::Controller` + `ControllerFactory`，映射 `on_sent/on_ack/on_end_acks/on_congestion_event` 到 RateSample。
-2. Pacing：先接受 quinn `window/srtt` 令牌桶；T5 测量 ProbeBW_UP/DOWN 的实际发送速率偏差；若影响模型，再以 `[patch.crates-io]` 小 patch 让 `Pacer::delay` 读取 `metrics().pacing_rate`。需审批。
-3. ECN：修 C11 —— `SharedQuinnUdpSocket::try_send` 把 `transmit.ecn` 传给 `UdpDownstreamSender` 并在 AF_XDP 编码路径写 IP TOS/TC；`poll_recv` 从 IP 头填 `RecvMeta.ecn`。只声称 ECT(0)。
-4. 不启用 quinn 内置 `Bbr`（C10）。修正 `quic_transport.rs` 的 per-stream 注释（C16），把 `send_window` 计入 F3 预算。
+EdgeCC 实现 `quinn_proto::congestion::Controller`（C8）；quinn Pacer 偏差先度量再决定是否 patch（C9）；修 C11 的 ECN 贯通；不用内置 `Bbr`（C10）；`send_window` 进 F3 预算（C16）。
 
-## 6. 回源方向由 XDP 接管：active open 设计
+## 6. 回源方向由 XDP 接管
 
-### 6.1 smoltcp-edge 主动打开
+（保留 v2 内容）smoltcp-edge 主动打开、保留源端口范围、网关 ARP/NDP、ICMP 驱动 PMTU、复用 `virtual_l4_stream` 接 pingora 上游连接器；eBPF 出向流表（多队列复用 F7 方案）；`ip_local_reserved_ports` + netfilter DROP 守卫（C17）；`xdp.upstream = kernel|afxdp` 迁移期开关，接管完成后默认 `afxdp`；每代理连接两个会话进 F3 预算。
 
-- 增加 `dialed` 会话类型：`socket.connect(local, remote)`；客户端侧 TCP 选项：MSS、SACK-permitted、TS、窗口缩放、AccECN 请求（§3.2）。
-- 本地端点：出接口上的本地 IP（配置或从接口地址表选择）+ 保留端口范围内分配的源端口（每 (local_ip, remote) 对做端口去重，回收有 TIME-WAIT 等价保护）。
-- 邻居与路由：默认网关 IPv4/IPv6 由配置或运行时读取内核路由表得到；网关 MAC 由 smoltcp 自身 ARP/NDP（Ethernet medium 已启用）解析，首次解析期间的 SYN 排队而不是丢弃；可选以内核 `ip neigh` 结果作为预热。
-- PMTU：eBPF 把内层 5 元组匹配我们出向流的 ICMP Frag-Needed / ICMPv6 PTB 投递到归属 XSK，smoltcp-edge 据此调整 MSS；未收到 ICMP 时使用接口 MTU 派生 MSS，不做黑洞探测以外的猜测。
-- 复用现有 `virtual_l4_stream`：pingora 上游连接器与 `tcp_proxy` 后端连接改为通过 reactor 请求 dialed 会话并拿到虚拟 L4 流；TLS 到源站在该流上完成（已是 pingora 的 VirtualSocket 路径）。连接池复用、空闲超时、半关闭必须驱动 smoltcp 会话生命周期。
-- UDP 回源：同理走 AF_XDP 出向流表，与现有 UDP 透传路由缓存合并。
+### 6.5 国际网络：路径多样性与选择
 
-### 6.2 eBPF 出向流表
+（保留 v2 内容，数据结构改为第 2.2 节的 `path_table`）杠杆：L1 源站候选按测得质量选择 + Happy Eyeballs 有界竞速；L2 源 IP/出接口/源端口重掷（仅在证明 ECMP 多样性时）；L3 父节点中转（仓库已有 `level`/`parentNodes`，`lb_factory.rs:244-246` 目前忽略）；L4 路径先验进 EdgeCC 启动与 `p_rand`；L5 幂等 cache-fill 传输中换路（默认关）；L6 客户端方向无换路能力，只导出前缀级质量给控制面。被动测量为主，主动 SYN 探测限速为辅，不用 ICMP；ε-greedy 探索 + 迟滞；连接池键含路径。
 
-- 用户态在发送 SYN 前把 (proto, local_ip, local_port, remote_ip, remote_port) → XSK 索引写入出向流表；eBPF 入向对匹配的返回报文 redirect 到该 XSK，优先级高于内核栈；关闭后删除。
-- 多队列约束与 F7 同类：返回流量的 RSS 队列可能不是归属 XSK 的队列，必须复用 F7 的解决方案（先投递到当前 ingress 的有效 XSK，再有界用户态交接），不能跨队列 XSKMAP 直投。
-- ICMP 错误报文按内层 5 元组查同一张表。
+## 7. 验证策略
 
-### 6.3 内核 RST 防护（C17）
+1. 模拟器扩展：多流共享瓶颈、RTT 抖动/噪声、路由切换（base_rtt 漂移）、policer、随机丢包 1–5% 叠加/不叠加拥塞、ACK 压缩、app-limited 发送方、长 RTT 300ms、双候选路径。
+2. 不变量：任何层输出 ≤ `inflight_hi`；聚合内同时探测者 ≤1；分配之和 = 聚合额度；启动退出在界内；belief 随证据单调；随机丢包场景吞吐 ≥ `LossBlindRef` 的 x%，拥塞场景排队 ≤ `Bbr3Ref` 的 y%（x、y 在 T5 由基线测出后固定为回归阈值）。
+3. 报文脚本测试（smoltcp-edge）、调度器等价测试、回源接管专项、路径选择测试（同 v2）。
+4. 远程矩阵（同 v2，加国际多路径矩阵与共享瓶颈 N 流矩阵）；对照：`Bbr3Ref`（同栈）与 XDP 关闭路径（内核）。
+5. 消融：每个机制单独关闭度量贡献（不确定度探测、效用微调、聚合、先验启动、接收侧控制、`p_rand`）。
 
-- `net.ipv4.ip_local_reserved_ports` 预留我们的源端口范围，内核不再分配。
-- netfilter 对入向目标端口在该范围内的 TCP/UDP 加 DROP（fail-closed 守卫），保证 XDP detach 窗口内漏到内核的报文不会引发 RST/ICMP port unreachable。这是安全策略意义上的 fail-closed，需记录、可观测、有回归测试。
-- reload/prepare 期间 dialed 会话与 accepted 会话遵守同一 F1 生命周期合同。
-
-### 6.4 分阶段接入
-
-- 配置键 `xdp.upstream = kernel | afxdp`。开发与验收期间默认 `kernel` 仅为分阶段验证，**接管完成后默认 `afxdp`**，且 `kernel` 仅在 XDP 关闭模式下有意义。这不是降级开关，是迁移期开关，迁移完成后是否删除由用户决定。
-- 每个 dialed 会话进 F3 三级预算；会话上限估算按“每代理连接两个会话”重算。
-
-### 6.5 国际网络：路径多样性、质量测量与选择
-
-前提事实：单条 TCP/QUIC 连接的拥塞控制只能适应它所在的那条路径，不能替我们换路。国际链路上同一目的地经不同出口 IP、不同地址族、不同 ECMP 哈希、不同源站/父节点到达，丢包与 RTT 可能相差一个数量级。因此“高丢包路径 vs 零丢包路径”是**路径选择问题**，第 2 节的 CC 只负责在被选中的路径上尽量高效。回源接管让我们在拨号时拥有全部选择权；客户端方向我们没有换路能力。
-
-#### 我们实际拥有的杠杆（按成本与确定性排序）
-
-| 杠杆 | 作用点 | 说明 |
-|---|---|---|
-| L1 源站候选选择 | dialed 会话的目的地址 | `primaryOrigins/backupOrigins` 的多个地址、A/AAAA 双栈、同一源站的多 IP：按测得路径质量选，而不只按 weight 轮询；Happy Eyeballs（RFC 8305）式有界竞速拨号，保留先完成/更优的一条，其余 RST |
-| L2 源侧多样性 | dialed 会话的本地端点 | 多公网 IP / 多出接口时选择源 IP 与出接口；**源端口重掷**与 IPv6 flow label 变化以改变中转 AS 的 ECMP 哈希。只有探测证明存在哈希多样性（不同源端口的 RTT/丢包分布显著不同）时才启用，避免无意义的 SYN 放大 |
-| L3 父节点中转 | 分级 CDN 的 node → parent 跳 | 仓库已有 `level` 与 `parentNodes`（`ParentNodeConfig { addrs, lnAddrs, weight, isBackup }`）；父节点按测得路径质量选择。node↔parent 两端都是我们的栈，是唯一可以启用 FEC/私有封装的受控隧道（设计提案的可行性边界） |
-| L4 路径感知的 CC 参数 | 被选路径上的连接 | `path_prior`（暖启动 `bw_hi/min_rtt`，长 RTT 国际链路上 STARTUP 可省数秒）与 `path_loss_floor`（第 2.3 节第 7 项），都从路径表取值，都有守卫 |
-| L5 传输中重选路 | 幂等 cache-fill | 当前连接交付率相对候选路径塌陷（如 <30% 且持续 ≥2 RTT 窗口）时，中止并以 Range 从另一候选续拉；只对幂等 GET、有 `Accept-Ranges`/强校验器的对象；计入重复字节成本；默认关闭 |
-| L6 客户端方向 | 无换路能力 | 只能：(a) CC/恢复对观测路径鲁棒；(b) 按客户端前缀导出路径质量（丢包、RTT、交付率）给控制面，由 DNS/GSLB 决定把客户端调度到路径更好的节点；(c) QUIC 客户端迁移由 quinn 现有能力支持 |
-
-#### 路径质量表（transport crate `path_table`）
-
-- 键：dialed 侧 `(egress_iface, local_ip, af, dst_prefix /24 或 /48, dst_port_class)`；accepted 侧 `(ingress_iface, local_ip, af, client_prefix)`。父节点与源站条目共用同一结构。
-- 值（全部 EWMA + 样本数 + 最后更新时间 + 置信度）：`connect_rtt`、`connect_fail_rate`、`min_rtt`、`srtt`、`jitter`、`bw_hi`、`loss_rate` 分成“伴随 RTT 抬升的丢包”与“无 RTT 抬升的丢包”两列（后者是随机丢包基线的依据）、`ce_rate`、`retrans_ratio`、`spurious_retrans_ratio`（DSACK/TS 判定，乱序指标）。
-- 数据来源：**被动为主**，直接消费活跃连接的 RateSample 与 RttState（零额外流量）；**主动探测为辅**，只在候选 ≥2 且条目陈旧/缺失时，以真实服务端口的 TCP SYN（测握手 RTT 与成功率）按目的地限速探测，不依赖 ICMP。
-- 衰减与恢复：时间衰减；ε-greedy 探索（默认 ≤5% 的新拨号走非最优候选）保证坏路径恢复后能被发现、好路径劣化后能被替换。
-- 选择：按请求类别估算完成时间——小对象由 `connect_rtt + srtt` 主导，大对象由该路径的实测 `bw_hi` 与丢包/RTT 下的可达交付率主导；切换需迟滞（连续两个窗口优于当前 >20%）并对连接池友好（池键包含路径选择，避免复用到已判劣的路径）。
-- 边界：不覆盖健康检查的“不可用”判定；不把所有路径的 `bw_hi` 相加当出口带宽；探测与探索有节点级额度。
-
-#### 恢复机制对国际链路的补充（进入 T3）
-
-- 乱序：RACK 的 `reo_wnd` 自适应 + DSACK（RFC 2883）识别伪重传 + 基于 TS 的 Eifel（RFC 3522）撤销错误的 cwnd 削减；否则 ECMP/LAG 乱序会被当成丢包。
-- 尾丢包：TLP 必备；长 RTT 上 RTO 代价极高。
-- 长 RTT 的 BDP：100Mbit × 300ms ≈ 3.75MB/连接，不能给每条连接无条件预留；按路径表的 BDP 估计与分层（T1 优先）在 F3 预算内分配，向源站通告的 rwnd 才能覆盖 BDP。
-
-#### 明确不做
-
-- 不在 smoltcp-edge 实现 MPTCP：客户端普遍不启用，收益不可预期。
-- 不在通用 TCP/HTTP 上做 FEC/私有封装；只允许在 node↔parent 受控隧道评估（T10）。
-- 不用 ICMP 结果作为路径选择依据。
-
-## 7. 前置：时钟与字节记账
-
-- `TransportInstant`：基于 `std::time::Instant` 的单调 µs 时钟，映射到 `SmoltcpInstant::from_micros`；reactor、pacer、RateSample、时间轮统一使用；测试可注入。替换 `tcp_reactor.rs:668/775` 的墙钟。
-- F3 字节预算：每连接/每队列/节点三级许可随 `Bytes` 生命周期转移，覆盖 accepted 与 dialed 两类会话；RateSample 的 `in_flight` 与预算的 `queued` 分别暴露。
-- F4 sweep 计时修正是调度器正确性的前提。
-
-## 8. 验证策略
-
-1. **确定性模拟器**（`cloud-node-transport::sim`）：事件驱动；链路 `{rate, delay, buffer_bytes, aqm: none|droptail|codel_ecn, policer, random_loss p, reorder}`；运行 NewReno/Cubic/Bbr3 并断言 STARTUP 退出时机、稳态排队 ≤1.5×BDP、丢包率上界、ProbeRTT 周期、ECN 响应；golden trace 回归。
-2. **报文脚本测试**（smoltcp-edge）：被动/主动两角色的 AccECN 协商、经典 ECN、SACK/RACK/TLP、TS/PAWS、窗口缩放、选项裁剪、active open 三次握手/同时打开/SYN 重传回退。
-3. **调度器等价测试**：同一事件轨迹下堆与时间轮发送顺序一致；generation；长暂停追赶有界。
-3b. **路径选择测试**：模拟器双候选路径的选择收敛与互换后重新收敛；VPS 上源站经两条 veth 路径、不同 netem 的拨号分布、迟滞、恢复发现、SYN 竞速无泄漏。
-4. **回源接管专项**（VPS veth/netns）：源站在另一 netns；验证 SYN 经 AF_XDP 发出、SYN-ACK 被 eBPF 出向流表捕获、内核 `ss` 无对应 socket、无 RST 外泄（tcpdump 断言）；XDP detach 窗口注入源站报文，断言 netfilter 守卫丢弃且计数增长；多队列限定声明。
-5. **远程弱网矩阵**（netem 施加在报文真实经过的链路，确认 impairment 计数增长）：RTT {5,50,150,300}ms × 丢包 {0,0.1,1,3}% × 带宽 {10,100,1000}Mbit × 缓冲 {0.25,1,4}×BDP × policer 有/无 × 并发 {1,10,100}，客户端侧与回源侧分别施加。指标：成功业务字节/秒、完成时间、P99、重传字节比例、CPU/Gbit、RSS、出口队列时间、过载恢复时间、算法状态轨迹。对照组：XDP 关闭的 socket 代理路径（内核 TCP，不改造）。
-6. 不以无损低 RTT echo 通过代替；缺乏基线不写提升百分比。
-
-## 9. 分阶段任务与 Devin 提示词
+## 8. 分阶段任务与 Devin 提示词
 
 通用约束（每个提示词都包含）：
 
-- 遵守 `.cursor/rules/no-unapproved-degradation.mdc`：不得为让测试通过而静默禁用、旁路、吞错、缩短超时或改语义；发现已有降级先报告。
+- 遵守 `.cursor/rules/no-unapproved-degradation.mdc`；发现已有降级先报告。
 - 本机只编辑与静态阅读；编译/测试/eBPF 构建/压测在授权 VPS .110/.120 的隔离目录与 netns/veth，禁止清理生产 bpffs；不新增 B 组/TC 后端；不 tag/push/部署。
-- 范围：只改造 XDP/AF_XDP 数据面；非 XDP 模式不做传输改造，只作 T9 基线。
-- 引用固定版本：smoltcp 0.14.0、quinn-proto 0.11.17、google/bbr v3 `90210de4`、draft-ietf-ccwg-bbr-06、RFC 9768/8985/6937/9438/9406/7323/3168。
-- 每个任务单独提交，证据（命令、SHA、内核/网卡/队列/copy 模式、结果、未测范围）写入 `docs/edge-node-evidence/` 与单一状态入口。
-- 最终报告区分：已修复、仍存在、设计限制、经审批的降级。
+- 范围：只改造 XDP/AF_XDP 数据面；非 XDP 模式不做传输改造。
+- 拥塞控制交付物是 EdgeCC 一个控制器；Reno/Cubic/BBRv1/BBRv3 只作为部件与校验模式，不作为生产可选算法，不新增"算法选择"配置项。
+- 引用固定版本见第 0 节。
+- 每个任务单独提交，证据写入 `docs/edge-node-evidence/` 与单一状态入口；最终报告区分：已修复、仍存在、设计限制、经审批的降级。
 
-### T0 · 前置闭合（沿用发布审阅顺序，不重复规划）
+### 继续提示词（暂停后第一条）
 
-F6 → F5 → F4 → F2 → F8 止血（启用 `socket-tcp-cubic`，`set_congestion_control(Cubic)`，`/status` 暴露实际算法，断言不为 `None`）→ F3 → F1 → F7。T1 起的任务从 T0 落地后的提交分支。
-
-总顺序：T1 时钟 → T2 transport crate → T3 fork 钩子 → T4 回源 active open → **T4b 路径质量表与拨号选择** → T5 BBRv3 → T6 AccECN → T7 调度器 → T8 AQM/背压 → T9 矩阵与决策 →（可选）T10 父节点隧道。T4b 放在 BBRv3 之前，是因为 `path_prior`/`path_loss_floor` 都依赖路径表，且路径选择本身不依赖具体拥塞算法。
-
-### T1 · 单调传输时钟与传输可观测骨架
+第 9 节决策已全部批准（D-* 编号），提示词中引用 D-* 即对应结论，不再等待审批。
 
 ```
-任务：为 AF_XDP TCP reactor 引入单调 µs 传输时钟，并建立传输层可观测骨架。
-基线：<填写 T0 完成后的 commit>。先核对 HEAD，若已有并行修改逐条核销。
-范围：只改造 XDP/AF_XDP 数据面；非 XDP 模式不做传输改造。
-背景：src/xdp/af_xdp/tcp_reactor.rs:668 与 :775 用 crate::utils::time::now_timestamp_millis()（系统时间+偏移，ms）构造 SmoltcpInstant；pacing/RTT/交付率采样需要单调 µs 时钟。
+任务：按 tasks/xdp-transport-next-steps-2026-09-15.md v3 重新对齐 T2，把工作区未提交的 crates/cloud-node-transport 收敛为 EdgeCC 的基础层并提交。
+现状：T0/T1 已提交（HEAD da21e7a）；工作区有未提交的 crates/cloud-node-transport/（rate_sample.rs、rtt.rs、instant.rs、cc.rs 及 cc/{new_reno,cubic,prr}.rs、sim.rs、tests/）与 Cargo.toml 的 workspace 声明。先 git status/diff 核对，不要丢弃任何已有工作。
+方向变更：拥塞控制交付物改为统一控制器 EdgeCC（文档第 2 节），NewReno/Cubic 不再是交付物。
 要求：
-1. 新增 TransportClock（基于 std::time::Instant 锚点，输出 µs，可在测试中注入/推进），reactor、bridge 的所有协议时间改用它；SmoltcpInstant 用 from_micros。
-2. 保留 utils::time 的业务时间用途不变。
-3. /status 与 tracing 增加每会话快照：会话方向（accepted/dialed，当前只有 accepted）、算法名与版本钉、cwnd、in_flight、srtt/min_rtt、pacing_rate、delivered/lost 累计、ecn_mode、队列字节；先填 smoltcp 现有可得字段，缺失标记 None 而不是伪造。
-4. 测试：时钟单调性与注入推进；reactor 现有测试改为注入时钟后全部保持通过；F4 的 1ms 连续 poll 测试基于新时钟重跑。
-验收：VPS release 构建 + 目标测试通过；提交 SHA 与命令记录到证据目录。不改变任何发送/接收语义。
-```
-
-### T2 · `crates/cloud-node-transport`：RateSample、CC trait、NewReno/Cubic、模拟器
-
-```
-任务：创建 crates/cloud-node-transport（纯算法 crate，不依赖 tokio/smoltcp/quinn），实现 RateSample、CongestionController trait、NewReno（RFC 5681/6582 + PRR RFC 6937）、Cubic（RFC 9438 + HyStart++ RFC 9406）与确定性网络模拟器。接口按双向（发送方/接收方角色无关）设计。
-基线：T1 完成后的 commit。
-设计输入：tasks/xdp-transport-next-steps-2026-09-15.md 第 2.1–2.3、8.1 节。
-要求：
-1. RateSample 对齐 Linux net/ipv4/tcp_rate.c 语义：每段 TxRecord（sent_at、delivered_at_send、delivered 快照、first_tx_at、is_app_limited、is_retransmit）；interval=max(send_elapsed, ack_elapsed)；重传段不产生 RTT 样本；app-limited 随段传递。
-2. trait 接口按文档 2.2；CcSnapshot 含算法名+版本钉与原因码。
-3. 模拟器：事件驱动，链路 {rate, delay, buffer_bytes, aqm none|droptail|codel_ecn, policer 令牌桶, random_loss, reorder}；发送端由 trait 驱动；输出 trace。
-4. 测试：NewReno/Cubic 在 {RTT 10/100ms × bw 10/100Mbit × buffer 0.5/2×BDP × loss 0/1%} 的锯齿、PRR、HyStart++ 退出；golden trace 回归；RateSample 对 ACK 压缩、延迟 ACK、SACK 的单元用例。
-5. 本 crate 加入 workspace；根 crate 暂不接入数据面（T3 做）。
-验收：VPS 上 cargo test -p cloud-node-transport 通过；trace 文件与命令记录进证据目录。不修改 src/xdp。
+1. 保留并继续使用：TransportInstant、RateSample/RateSampler、RttState、CongestionController trait、PRR、HyStart++、模拟器与全部现有测试。
+2. 把 cc/new_reno.rs 与 cc/cubic.rs 移到 cc/reference/ 下，改名为 NewRenoRef/CubicRef，文档注释明确"校验模式，不是生产算法"；PRR 与 HyStart++ 提升为 cc/parts/ 下可复用部件（EdgeCC 将复用）。
+3. 新增 model.rs（PathModel，第 2.2 节）：bw_max 窗口最大值滤波、bw_est/bw_sigma EWMA 与置信度、base_rtt 长窗口最小值 + 漂移检测、qdelay 与 Kalman/EWMA 梯度、extra_acked、两列丢包率与突发长度与因果检验、p_rand 估计、alpha EWMA、lt_bw policer 判定、delay_signal_quality。全部为每 ACK O(1) 更新；每个量有单元测试与文档注释写明来源（BBR/BBRv1 lt_bw/Veno/DCTCP/GCC/新增）。
+4. 新增 inference.rs（第 2.3 节）：有界 log-odds congestion_belief（证据权重表为常量并注明），queue_estimate，负证据（DSACK 伪重传）。共享瓶颈检测本任务只定义接口与统计量，判定实现留 T6。
+5. 新增 envelope.rs（第 2.5 节）：inflight_hi 设定/保持/REFILL 规则，任何调用方通过 clamp() 取上限；测试断言不可越过。
+6. CcSnapshot 扩展：belief_milli、queue_estimate_bytes、p_rand_milli、bw_sigma_bps、envelope_bytes、mode 与 reason_code 的 EdgeCC 取值集合；不能提供的字段保持 None。
+7. 模拟器扩展（第 7.1 节）：多流共享同一瓶颈、RTT 抖动、路由切换（中途改变 delay）、随机丢包与拥塞叠加、app-limited 发送方、300ms RTT；输出多流 trace。
+8. Cargo workspace 声明保留（含对 cloud-node-xdp-ebpf 与 pingora-main 的 exclude 说明）。
+测试：现有测试全部通过；PathModel/Inference/Envelope 单元测试；golden trace 回归。
+验收：VPS 上 cargo test -p cloud-node-transport 与根 crate cargo check 通过；单独提交，提交信息说明"T2 基础层：模型/推断/包络 + 参考模式重命名"。不实现 EdgeCC 决策层（T5），不修改 src/xdp。
 ```
 
 ### T3 · `vendor/smoltcp-edge`：受控 fork 与传输钩子（被动方）
 
 ```
-任务：以 Cargo.lock 锁定的 smoltcp 0.14.0 建立受控 fork vendor/smoltcp-edge，通过 [patch.crates-io] 覆盖 Cargo.toml:90 与 :95 两处声明；在 socket/tcp.rs 增加传输钩子，并把 AF_XDP reactor 的 accepted 会话接到 cloud-node-transport 的 CongestionController。
-基线：T2 完成后的 commit。
-必须补齐（对照文档第 0 节 C1–C5）：
-1. 每段 TxRecord 记录与 RateSample 生成（复用 transport crate），替换 pub(super) Controller 为 transport crate 的公开 trait；保留 smoltcp 自带 NoControl/Reno/Cubic 作为 feature 对照。
-2. TCP Timestamps（RFC 7323）用于每 ACK RTT 样本与 PAWS；窗口缩放保持现有实现。
-3. 发送侧 SACK 记分板 + RACK-TLP（RFC 8985，含 reo_wnd 自适应）+ PRR + DSACK（RFC 2883）伪重传识别 + 基于 TS 的 Eifel 撤销（RFC 3522）；保留 3-dupack/RTO 路径并在测试中对比。乱序场景（ECMP/LAG）必须有专门用例，断言不产生伪重传导致的 cwnd 削减。
-4. IP/TCP repr 贯通 ECN 字段（Ipv4Repr/Ipv6Repr ecn、TcpRepr ae/cwr/ece），本任务只贯通不协商（协商在 T6）。
-5. dispatch 增加“最早发送时间”门：socket 暴露 next_send_at 与 pacing_rate；poll_egress 只发已到期段（调度器在 T7 接管选择）。
-6. 写 vendor/smoltcp-edge/DIVERGENCE.md 列出每处与上游 0.14.0 的差异与原因。
-7. reactor：生产 socket 创建处显式选择控制器（默认 Cubic，保持 F8 止血行为），CcSnapshot 进 /status。
-测试：smoltcp 自带 tcp 测试全部保留通过；新增报文脚本测试覆盖 SACK/RACK/TLP/TS/PAWS；同一 ACK 轨迹下 fork 的 Cubic 与上游 Cubic cwnd 曲线一致。
-验收：VPS release 构建；veth 双栈协议矩阵重跑无回归；证据入库。禁止在此任务中改 BBR、ECN 协商或 active open。
+任务：以 Cargo.lock 锁定的 smoltcp 0.14.0 建立受控 fork vendor/smoltcp-edge，通过 [patch.crates-io] 覆盖 Cargo.toml 两处声明；在 socket/tcp.rs 增加传输钩子，并把 AF_XDP reactor 的 accepted 会话接到 cloud-node-transport 的 CongestionController（本任务生产控制器仍为 CubicRef，保持 F8 止血行为；EdgeCC 在 T5 接入）。
+基线：T2 提交后的 commit。
+必须补齐（C1–C5）：
+1. 每段 TxRecord 记录与 RateSample 生成（复用 transport crate），替换 pub(super) Controller 为公开 trait；保留上游 NoControl/Reno/Cubic feature 作为对照。
+2. TCP Timestamps（RFC 7323）每 ACK RTT 与 PAWS；窗口缩放保持。
+3. 发送侧 SACK 记分板 + RACK-TLP（reo_wnd 自适应）+ PRR + DSACK 伪重传识别 + Eifel 撤销；乱序专项用例断言无伪重传削减。
+4. IP/TCP repr 贯通 ECN 字段（只贯通不协商）。
+5. dispatch 发送时间门：socket 暴露 next_send_at 与 pacing_rate；poll_egress 只发已到期段。
+6. app-limited 标记：发送缓冲耗尽时标记后续段；供第 2.7 节耦合使用。
+7. rwnd 钩子：允许上层按第 2.7 节动态设定通告窗口上限（本任务只提供钩子）。
+8. DIVERGENCE.md 逐项记录与上游差异。
+9. reactor：生产 socket 创建处显式选择控制器，CcSnapshot 进 /status。
+测试：上游 tcp 测试全部保留通过；报文脚本测试覆盖 SACK/RACK/TLP/TS/PAWS/DSACK；同一 ACK 轨迹下 fork 的 CubicRef 与上游 Cubic cwnd 曲线一致。
+验收：VPS release 构建；veth 双栈协议矩阵无回归；证据入库。禁止在此任务中实现 ECN 协商或 active open。
 ```
 
-### T4 · 回源方向由 AF_XDP 接管：active open、eBPF 出向流表、内核 RST 防护
+### T4 · 回源方向由 AF_XDP 接管
 
 ```
 任务：让回源连接（TCP 与 UDP）经 smoltcp-edge 在 AF_XDP 上主动打开，替代 pingora/tcp_proxy 的内核 socket；新增 eBPF 出向流表与内核 RST 防护。
-基线：T3 完成后的 commit。
-设计输入：文档第 6 节；C12、C17；F1/F3/F7 合同。
+基线：T3 完成后的 commit。设计输入：文档第 6 节与附录 A（接入点分析）；C12、C17；F1/F3/F7 合同。
+回源连接面共四处，全部覆盖：toa::connect_with_toa（L4 唯一漏斗）、vendored pingora l4_connect（HTTP/HTTPS）、udp_proxy.rs 内核 UdpSocket、origin_h3.rs quinn Endpoint（见附录 A.4 边界决定）。
+TOA：smoltcp 主动打开时内核模块不会经过 NF_INET_LOCAL_OUT，必须由我们在 SYN 里直接写 option 254（v4 8B / v6 20B）；客户端地址在拨号时已知，genl 映射与端口分配器在此路径上不再需要；v6 + TOA + AccECN 的 SYN 选项预算可能超过 40B，裁剪优先级按 T7 规则。
 要求：
-1. smoltcp-edge：dialed 会话（connect），客户端侧选项 MSS/SACK-permitted/TS/窗口缩放（AccECN 请求留 T6）；源端口从保留范围分配并按 (local_ip, remote) 去重回收；默认网关 ARP/NDP 由 smoltcp 解析，解析期间 SYN 排队；PMTU 由投递到 XSK 的 ICMP Frag-Needed/PTB 驱动，否则用接口 MTU 派生 MSS。
-2. reactor：accepted/dialed 两类会话共用 pump/sweep/reaper/预算；dialed 会话通过 virtual_l4_stream 暴露给 pingora 上游连接器与 tcp_proxy 后端连接；连接池复用、空闲超时、半关闭驱动 smoltcp 生命周期；UDP 回源并入出向流表。
-3. eBPF：出向流表 (proto, local_ip, local_port, remote_ip, remote_port) → XSK；返回报文与匹配内层 5 元组的 ICMP 错误 redirect 到归属 XSK；多队列下复用 F7 方案，不跨队列直投；关闭即删。
-4. 内核守卫：启动时设置 net.ipv4.ip_local_reserved_ports 预留范围，并对入向目标端口在范围内的 TCP/UDP 加 netfilter DROP；两者失败为显式启动错误，不静默继续。守卫计数进 /status。
-5. 配置键 xdp.upstream = kernel|afxdp；本任务默认 kernel 仅用于分阶段验收，报告中明确接管完成后默认 afxdp。
-6. tcp_proxy.rs:1849-1863 对内核 relay socket 的 TCP_CONGESTION 设置在 afxdp 模式下不再执行；kernel 模式保持原样并在报告中列为“随接管退役”。
-测试：报文脚本测试覆盖三次握手、SYN 重传、同时关闭、RST；VPS veth/netns：源站在另一 netns，断言 SYN 经 AF_XDP 发出、SYN-ACK 被出向流表捕获、`ss` 无内核 socket、tcpdump 无 RST 外泄；XDP detach 窗口注入源站报文，断言守卫丢弃且计数增长；HTTP/HTTPS/TCP/UDP 回源矩阵双栈通过；带活跃回源连接的 reload 遵守 F1。
-验收：VPS release 构建 + 上述测试；证据记录实际内核、队列数、copy 模式、保留端口范围与守卫规则。
+1. dialed 会话（connect），客户端侧选项 MSS/SACK-permitted/TS/窗口缩放（AccECN 请求留 T7）；源端口从保留范围分配并按 (local_ip, remote) 去重回收，保留范围默认 40000–49999、可配置、须落在 `ip_local_port_range` 内（D-B1）；网关 MAC 由 smoltcp ARP/NDP 自解析 + 缓存 + 失败计数可观测（D-B2），解析期间 SYN 排队；PMTU 由投递到 XSK 的 ICMP 驱动并带 RFC 4821 式黑洞检测回退，否则接口 MTU 派生（D-B3）。
+2. reactor：accepted/dialed 共用 pump/sweep/reaper/预算；dialed 会话通过 virtual_l4_stream 暴露给 pingora 上游连接器与 tcp_proxy 后端；连接池/空闲超时/半关闭驱动 smoltcp 生命周期；UDP 回源并入出向流表。
+3. eBPF 出向流表 (proto, local_ip, local_port, remote_ip, remote_port) → XSK；返回报文与匹配内层 5 元组的 ICMP 错误 redirect；多队列复用 F7 方案；关闭即删。
+4. 内核守卫（D-B1）：`ip_local_reserved_ports` 标记保留范围 + 入向目标端口在范围内的 TCP/UDP netfilter DROP；守卫规则安装失败为显式启动错误；守卫命中计数进 /status。
+5. 配置键 xdp.upstream = kernel|afxdp；本任务默认 kernel 仅用于分阶段验收，报告明确接管完成后默认 afxdp。
+6. 配对耦合的最小实现：客户端侧流在源站侧供给不足时标记 app-limited（用 T3 的钩子）。
+测试：报文脚本（三次握手、SYN 重传、同时关闭、RST）；VPS veth/netns 源站在另一 netns：SYN 经 AF_XDP 发出、SYN-ACK 被出向流表捕获、ss 无内核 socket、tcpdump 无 RST 外泄；XDP detach 窗口注入源站报文，守卫丢弃且计数增长；HTTP/HTTPS/TCP/UDP 回源矩阵双栈；带活跃回源连接的 reload 遵守 F1。
+验收：VPS release 构建 + 上述测试；证据记录内核、队列数、copy 模式、保留端口范围与守卫规则。
 ```
 
-### T4b · 路径质量表与拨号路径选择（国际网络）
+### T5 · EdgeCC 决策层（单流）与 QUIC 适配
 
 ```
-任务：在 cloud-node-transport 实现 path_table（路径质量表），并在 dialed 会话的拨号点实现候选选择：源站/父节点多地址、A/AAAA 双栈、源 IP/出接口、源端口重掷；被动测量为主、有界主动探测为辅。
-基线：T4 完成后的 commit。
-设计输入：文档第 6.5 节；ReverseProxyConfig.primaryOrigins/backupOrigins（config_models.rs:3013-3048）、OriginConfig（:3259）、ParentNodeConfig（:154）与 lb_factory.rs 的现有 LoadBalancer 结构。
-要求：
-1. path_table 键与值按 6.5 节；被动样本来自 accepted/dialed 会话的 RateSample/RttState（零额外流量）；丢包分“伴随 RTT 抬升”与“无 RTT 抬升”两列；DSACK/TS 判定的伪重传比例单列。
-2. 主动探测只在候选 ≥2 且条目陈旧/缺失时进行：真实服务端口 TCP SYN 测握手 RTT 与成功率，按目的地限速，节点级额度；不用 ICMP。
-3. 拨号选择：按请求类别估算完成时间（小对象 connect_rtt+srtt 主导，大对象实测 bw_hi 与丢包/RTT 下可达交付率主导）；Happy Eyeballs（RFC 8305）式有界竞速（最多 2 路），落选方 RST；ε-greedy 探索默认 ≤5%；迟滞：连续两个窗口优于当前 >20% 才切换；连接池键包含路径选择。
-4. 源端口重掷/flow label 变化只在探测证明 ECMP 哈希多样性（不同源端口 RTT/丢包分布显著不同，给出统计判据）时启用，否则不放大 SYN。
-5. 与现有 LoadBalancer/健康检查的关系：健康检查的“不可用”优先级最高；weight 作为先验，不再是唯一依据；lb_factory 中未使用的 level/parent_nodes 参数（:244-246）在本任务里接通到父节点候选。
-6. 传输中重选路（L5）只建接口与计数，默认关闭，实现留 T9 实验后决定。
-7. 按客户端前缀的路径质量导出：通过现有 rpc/stats 通道上报聚合值（丢包、RTT、交付率、样本数），供控制面 DNS/GSLB 调度；不在节点内做客户端换路。
-8. /status 暴露每候选路径的质量条目、当前选择、探索比例、探测额度使用。
-测试：transport crate 单元测试（EWMA/衰减/置信度/迟滞/探索比例）；模拟器中两条候选路径 {loss 3% + 低 RTT, loss 0% + 高 RTT} 与 {同 RTT, loss 5% vs 0%} 的选择收敛、路径质量互换后的重新收敛时间；VPS veth：源站 netns 经两条 veth 路径可达，netem 分别施加不同丢包，断言拨号分布、切换迟滞、坏路径恢复后的重新发现、SYN 竞速无泄漏 socket。
-验收：VPS release 构建 + 上述测试 + 双向协议矩阵无回归；证据记录选择分布与探测流量占比。
-```
-
-### T5 · BBRv3 参考实现与 QUIC 适配
-
-```
-任务：在 cloud-node-transport 实现 Bbr3（参考 google/bbr v3 commit 90210de4b779d40496dee0b89081780eeddf2a60 的 net/ipv4/tcp_bbr.c，规范文本 draft-ietf-ccwg-bbr-06），并实现 quinn_proto::congestion::Controller 适配器；接入 accepted 与 dialed 两类会话（默认仍 Cubic）。
+任务：在 cloud-node-transport 实现 EdgeCC 决策层（文档第 2.4、2.5、2.8、2.9 节）：先验启动、双模控制、不确定度驱动探测、效用梯度微调、按 belief 比例响应、包络、base_rtt 刷新、policer 响应；实现校验模式 Bbr3Ref 与 LossBlindRef；实现 quinn_proto::congestion::Controller 适配；接入 accepted 与 dialed 会话（受 flag 控制，默认仍 CubicRef，切换在 T10 决定）。
 基线：T4 完成后的 commit。
 要求：
-1. 忠实复现：STARTUP/DRAIN/ProbeBW(DOWN/CRUISE/REFILL/UP)/ProbeRTT、bw_hi/bw_lo、inflight_hi/inflight_lo、headroom、extra_acked、丢包响应、ecn_alpha 与 ecn_max_rtt_us 门限、idle restart。常数从 pinned 源码取值并注明来源行号；与 draft 差异逐条注释。
-2. CcSnapshot 暴露 mode、bw_hi/lo、inflight_hi/lo、min_rtt、extra_acked、ecn_alpha、full_bw_reached、原因码。
-3. 模拟器验证：{RTT 10/50/150ms × bw 10/100/1000Mbit × buffer 0.25/1/4×BDP × loss 0/0.1/1% × policer 有/无}，断言 STARTUP 退出时机、稳态排队 ≤1.5×BDP、ProbeRTT 周期、丢包响应后 inflight_lo 行为；与 NewReno/Cubic 同轨迹对照。
-4. quinn 适配：Bbr3 实现 Controller + ControllerFactory；不启用 quinn 内置 Bbr。测量 quinn window/srtt pacer 与 Bbr3 pacing_rate 的偏差并报告；是否 patch quinn Pacer 列为待审批决策，不在本任务实施。
-5. 策略叠加层只建骨架（trait + 全部默认关闭），不实现任何策略。
-验收：VPS cargo test 通过；模拟器 trace 入库。不把 Bbr3 设为生产默认，生产切换在 T9 依据实验决定。
+1. 决策层只消费 PathModel/Inference 输出与 Envelope；每个决策点（探测开始/结束/接受/回退、模式切换、响应、启动退出、base_rtt 下探）写原因码进 CcSnapshot。
+2. 先验启动：path_table 有置信先验时 paced start（0.5×先验 bw、cwnd=先验 BDP×1.5、立即剂量-响应确认）；无先验 2.77 增益 + 平台期/HyStart++/伴随抬升丢包/CE 退出；IW 由先验有界推导，默认 10 MSS。本任务 path_table 只做单机内存版（T6 完成前缀级共享与 TTL）。
+3. 双模：delay_signal_quality 高 → 时延目标控制；低 → 平台期探测；迟滞与原因码。
+4. 探测：不确定度/horizon/先验触发，幅度 ∝ 不确定度（上下限常量注明），≥1 RTT，剂量-响应判定。
+5. 效用微调：成对 ±ε 试验，U = goodput^a − b·(rate·qdelay_grad)+ − c·rate·loss_congestion，有界步进；仅非 app-limited、寿命 ≥5 RTT；可消融。
+6. 响应：inflight_lo = inflight×(1−β·belief)，PRR 平滑；CE 按 alpha/2；RTO 从模型恢复；belief≈0 不改模型。
+7. 包络：强证据设定 inflight_hi，K 轮低 belief 才 REFILL；所有输出 clamp。
+8. Bbr3Ref：同一代码钉参数复现 google/bbr v3 @90210de4 的 STARTUP/DRAIN/ProbeBW/ProbeRTT/inflight_hi/lo/ECN 行为（常数来源行号注明）；LossBlindRef：belief 钉 0。
+9. quinn 适配：EdgeCC 实现 Controller + ControllerFactory；按 D-C1 先度量 quinn Pacer 与 pacing_rate 的偏差并报告，仅当偏差使探测幅度无法表达时才 patch，patch 面限 `connection/pacing.rs`。
+测试：模拟器矩阵 {RTT 10/50/150/300ms × bw 10/100/1000Mbit × buffer 0.25/1/4×BDP × 随机丢包 0/1/3/5% × policer 有/无 × 抖动有/无}；断言第 7.2 节不变量；EdgeCC vs Bbr3Ref vs LossBlindRef vs CubicRef 同轨迹对照并把 x/y 阈值固定为回归；消融矩阵（关掉每个机制）。
+验收：VPS cargo test 通过；trace 与对照表入库；报告 EdgeCC 在哪些格优于/劣于 Bbr3Ref 及原因。不切生产默认。
 ```
 
-### T6 · AccECN（RFC 9768）双角色 + 经典 ECN + QUIC ECN 贯通
+### T6 · 聚合协调、共享瓶颈检测、path_table 与拨号路径选择
 
 ```
-任务：在 vendor/smoltcp-edge 实现 AccECN（RFC 9768）被动方（客户端方向）与主动方（回源方向）协商/反馈，以及经典 ECN（RFC 3168）；修复 H3 共享 UDP 套接字丢弃 ECN 的问题。
+任务：实现第 2.6 节聚合协调与第 6.5 节路径选择：共享瓶颈检测、聚合级模型/包络、按业务分层分配、探测协调、base_rtt 共享；path_table 前缀级长期先验（TTL/置信度/被动更新）；dialed 会话拨号时的候选选择（源站多地址、A/AAAA、源 IP/出接口、源端口重掷）与有界 SYN 竞速；父节点候选接通 lb_factory.rs:244-246 被忽略的 level/parent_nodes。
 基线：T5 完成后的 commit。
-设计输入：文档第 3 节；C11/C15。
 要求：
-1. 被动方：SYN (1,1,1)→AccECN，(0,1,1)→经典，其余无 ECN；SYN-ACK 按收到 SYN 的 IP-ECN 编码 (0,1,0)/(0,1,1)/(1,0,0)/(1,1,0)，经典回 (0,0,1)。
-2. 主动方：SYN 置 (1,1,1) 并可带 AccECN 选项；SYN-ACK 四种 AccECN 编码与 (1,0,1) 按 §3.1.3 处理；(0,0,1) 经典；(0,0,0) 无 ECN；SYN 超时按 §3.1.5 退回 Not-ECN SYN 并记录原因码。
-3. ACE 三比特计数（初值 5）、e0b/ceb/e1b（初值 1）、选项 Kind 172/174 编解码与发送策略、与 SACK/TS 的裁剪优先级。
-4. 发送侧：协商后数据段 ECT(0)，纯 ACK Not-ECT；从 ACE/CEB 增量推 delivered_ce 进 RateSample；ACE 回绕按 §3.2.2.5。
-5. 失效处理按 §3.2.x，模式变更写入 CcSnapshot.ecn_mode 与计数器并记录原因；不得伪装成正常状态。
-6. 显式限定：eBPF challenge 路径（ADR-001）不协商 ECN，文档与 /status 标注。
-7. QUIC：src/quic_udp_demux.rs 的 try_send 传递 transmit.ecn 到 UdpDownstreamSender 并在 AF_XDP 编码路径写 IP TOS/TC；poll_recv 填 RecvMeta.ecn。只声称 ECT(0)。
-8. eBPF：核对 tcp_sanity 与任何头部改写不清零 AE 位；补 SYN (1,1,1) 变体测试（参照 src/xdp/tests.rs:1517）；出向流表对返回 SYN-ACK 的 AE 位不做归一化。
-测试：移植 Linux selftests tcp_accecn_*.pkt 用例语义为 Rust 报文脚本测试（两角色）；经典 ECN CE→CWR 一次/RTT；veth 上源站 netns 以支持 AccECN 的内核（≥6.18，或用户态模拟）验证主动方协商；QUIC ECN 在 veth 上打 CE 验证 quinn 不再报 “ECN not acknowledged by peer”。
-验收：VPS release 构建 + 上述测试 + 双向协议矩阵；证据记录两方向协商成功率与失效原因分布。默认是否开启 ECN 通告作为待审批项在报告中列出。
+1. 候选聚合键与共享瓶颈判定（RFC 8382 思路：qdelay 变化与丢包时刻相关性），合并/拆分带迟滞与原因码；拆分规则必须有欠利用回归测试。
+2. 分配：分层权重、T0/T1 最低保证、工作保持、每 RTT 再分配；探测者一次一个、错峰；base_rtt 共享；Σ聚合受节点出口治理上限（T8 接入前先以配置上限占位）。
+3. path_table：键值按第 2.2 节；被动更新为主；主动 SYN 探测仅候选 ≥2 且条目陈旧时、限速、不用 ICMP；导出前缀级质量到现有 rpc/stats 通道。
+4. 拨号选择：按请求类别估算完成时间；Happy Eyeballs 最多 2 路竞速，落选 RST；ε-greedy ≤5%；迟滞连续两个窗口 >20%；连接池键含路径；健康检查"不可用"优先级最高；weight 为先验。
+5. 源端口重掷/flow label 仅在统计判据证明 ECMP 多样性时启用。
+6. 传输中换路（L5）只建接口与计数，默认关。
+7. /status 暴露聚合成员、分配、探测者、候选路径质量与选择。
+测试：模拟器 N 流共享瓶颈（对比独立探测的超冲/排队/重传）、错误分组的拆分；双候选路径选择收敛与互换后重新收敛；VPS veth 源站经两条路径不同 netem 的拨号分布/迟滞/恢复发现/SYN 竞速无泄漏。
+验收：VPS release 构建 + 双向协议矩阵无回归；证据记录聚合收益与选择分布。
 ```
 
-### T7 · 用户态出口调度器（fq/CAKE 派生）与节点出口治理
+### T7 · AccECN 双角色 + 经典 ECN + QUIC ECN 贯通
 
 ```
-任务：在 cloud-node-transport 实现每连接发送时间调度（最小堆参考 + 分层时间轮）、有界业务分层选择、节点出口租约，并接入 src/xdp/af_xdp/bridge.rs 的 TX 提交与 tcp_reactor 的会话选择；同时管理 accepted 与 dialed 会话。
-基线：T6 完成后的 commit。
-设计输入：文档第 4.1、4.2、4.4、4.5 节；C7。
-要求：
-1. 参考调度器：BinaryHeap<(next_send_at, generation, flow)> 惰性删除；目标调度器：3 层时间轮 + 溢出堆；两者同一 trait，同一事件轨迹下发送顺序一致（测试断言）。
-2. 合法发送条件在 bridge 单点裁决：min(cwnd_remaining, rwnd_remaining, pacer_allowance, worker_lease, xsk_tx_slots)。
-3. 分层：T0 控制推进（保证份额、不可无限置顶）/T1 完成时间敏感（含有客户端等待的 cache-miss 回源请求）/T2 大流；工作保持；不均分。
-4. 节点出口治理：rate 来源优先级 = 配置 vNIC 出口 → 无；worker 按 250µs 级租约批量领取；CAKE 式 time_next_packet 整形含 overhead 补偿；突发 ≤1ms×rate。
-5. 线程等待 min(时间轮最近到期, smoltcp poll_delay, RX)；忙等窗口 ≤50µs；长暂停追赶有界。
-6. AF_XDP_MAX_CONSECUTIVE_TX_FAILURES=256 的退出行为并入 F2 过载合同：TX 背压只背压、计数、继续处理存量，不退出线程。
-7. QUIC：quinn poll_transmit 期限接入时间轮，不叠加第二个连接级整形器。
-测试：等价性测试；generation；热桶/回绕/过期条目；CPU 微基准（每包 ns、每轮 µs、P99）；bridge 现有测试与双向协议矩阵无回归。
-验收：VPS release 构建；单队列 veth 上 1/10/100 并发（每并发两方向会话）下发送节奏轨迹与 CPU 记录入库。无配置时不整形，只启用 pacing 与分层。
+任务：在 vendor/smoltcp-edge 实现 AccECN（RFC 9768）被动方与主动方协商/反馈与经典 ECN；把 CE 计数喂入 PathModel.alpha 与 Inference；修复 src/quic_udp_demux.rs 丢弃 ECN 的问题。
+基线：T6 完成后的 commit。设计输入：文档第 3 节；C11/C15。
+要求：被动方/主动方协商编码、ACE（初值 5）与字节计数（初值 1）、选项 Kind 172/174 与裁剪优先级、数据段 ECT(0)/纯 ACK Not-ECT、ACE 回绕 §3.2.2.5、失效处理 §3.2.x 可观测、SYN 超时回退 §3.1.5；challenge 路径显式限定；quic_udp_demux try_send 传递 transmit.ecn 并在 AF_XDP 编码路径写 IP TOS/TC，poll_recv 填 RecvMeta.ecn；eBPF 核对 AE 位不被清零，出向流表对返回 SYN-ACK 不归一化。
+测试：移植 Linux selftests tcp_accecn_*.pkt 用例语义（两角色）；经典 ECN 一次/RTT；veth 上 ≥6.18 内核或用户态模拟的源站验证主动方协商；QUIC 打 CE 验证 quinn 不再自禁 ECN；模拟器 CodelEcn 场景下 EdgeCC 的 alpha 响应优于丢包响应。
+验收：VPS release 构建 + 双向协议矩阵；证据记录两方向协商成功率与失效原因分布。默认通告策略按 D-D1 落地：客户端方向被动响应常开（对端发起才用），回源方向主动通告由配置门控灰度、本任务默认关；公网 CE 按 D-D2 权重受限并封顶 belief 贡献，受控链路满权重。
 ```
 
-### T8 · 转发队列 AQM、终止 TCP 的 rwnd 背压与自适应缓冲
+### T8 · 用户态出口调度器与节点出口治理
 
 ```
-任务：为 UDP/QUIC 透传与跨接口转发队列实现 CoDel 或 PIE（ECN 标记优先于丢弃）；为我们终止的 TCP 实现基于逗留时间的接收窗口背压（客户端方向发送缓冲逗留 → 收窄向源站通告的 rwnd）与 F3 预算内的自适应发送缓冲。
-基线：T7 完成后的 commit。
-设计输入：文档第 4.3 节；F3。
-要求：
-1. AQM 只作用于我们不是端点的队列；ECT 报文置 CE，Not-ECT 丢弃并计数；CoDel(target 5ms, interval 100ms) 与 PIE(15ms 周期) 各实现一版做基准，只交付其一并写明理由。
-2. 终止 TCP：accepted 会话发送缓冲逗留时间超 target → 收窄对应 dialed 会话通告的接收窗口（不丢自己负载）；反向（源站慢、客户端上传）对称处理。
-3. 自适应发送缓冲 clamp(2×BDP_est, 32KiB, per_conn_cap)，两类会话都从 F3 三级预算申请；预算不足缩窗而不拒绝已建连接；关闭/取消/错误路径释放。
-4. AF_XDP_TCP_SESSION_ESTIMATED_BYTES 与会话上限估算改为“每代理连接两个会话”的真实最坏保留量。
-测试：模拟器中 AQM 的排队延迟与吞吐曲线；慢读/零窗口/慢源站下 TCP queued bytes、RSS、预算释放、rwnd 轨迹；透传 UDP 在拥塞下的 CE 标记与丢弃计数。
-验收：VPS release 多连接慢读矩阵；资源回到可解释基线；证据入库。
+任务：实现每连接发送时间调度（最小堆参考 + 分层时间轮）、有界业务分层、节点出口租约，接入 bridge.rs 的 TX 提交与 tcp_reactor 的会话选择；聚合分配与调度器共用分层配置；Σ聚合接入节点出口治理。
+基线：T7 完成后的 commit。设计输入：文档第 4 节；C7。
+要求：等价性测试；合法发送条件单点裁决；T0/T1/T2 分层（T1 含有客户端等待的 cache-miss 回源）；CAKE 式整形含 overhead 补偿、突发 ≤1ms×rate、配置键 `xdp.egress_rate_bps`、无配置不整形（D-G2）；线程等待 min(时间轮, poll_delay, RX)，忙等 ≤50µs；TX 背压 256 次退出并入 F2 过载合同；quinn poll_transmit 期限接入时间轮。
+测试：等价性、generation、热桶/回绕、CPU 微基准；veth 1/10/100 并发（两方向）发送节奏与 CPU。
+验收：VPS release 构建；证据入库。
 ```
 
-### T9 · 弱网矩阵、策略实验与生产默认决策
+### T9 · 接收侧控制、配对耦合、转发队列 AQM、自适应缓冲
 
 ```
-任务：在 VPS 私有 netns/veth 与云 vNIC 上执行弱网矩阵，比较 Cubic / NewReno / Bbr3 / Bbr3+单项策略，客户端方向与回源方向分别施加损伤，形成生产默认算法、策略开关与 xdp.upstream 默认值的决策建议。
+任务：实现第 2.7 节接收侧控制（rwnd 右尺寸与 BDP 上限、配对连接耦合）；为 UDP/QUIC 透传与跨接口转发队列实现 CoDel 或 PIE（ECT 打 CE，Not-ECT 丢弃）；F3 预算内的自适应发送缓冲。
 基线：T8 完成后的 commit。
 要求：
-1. netem/整形施加在报文真实经过的链路，先确认 impairment 计数增长；记录内核、网卡、队列数、copy 模式、二进制 SHA（release）。
-2. 矩阵：RTT {5,50,150,300}ms × 丢包 {0,0.1,1,3}% × 带宽 {10,100,1000}Mbit × 缓冲 {0.25,1,4}×BDP × policer 有/无 × 并发 {1,10,100} × 方向 {客户端侧,回源侧,双侧}；每格记录成功业务字节/秒、完成时间、P99、重传字节比例、CPU/Gbit、RSS、出口队列时间、算法状态轨迹。
-2b. 国际多路径矩阵：源站经 ≥2 条路径可达（不同出口 IP / v4 vs v6 / 不同父节点），路径质量组合 {3% 随机丢包+150ms vs 0%+250ms}、{5% vs 0% 同 RTT}、{乱序 1%/5ms 抖动 vs 无乱序}、{中途质量互换}、{一条路径间歇性黑洞 30s}；记录拨号选择分布、切换时延、完成时间、探测/探索流量占比、伪重传比例、path_loss_floor 开启前后的吞吐与丢包。
-3. 策略逐项单独开启：path_prior、probe_up_policy、loss_tolerance、egress_plateau、probe_stagger、ecn_public_policy、path_loss_floor、传输中重选路（L5）；每项给出触发条件、效果、回退条件与是否建议保留。
-4. 客户端与源站的 ECN/AccECN 支持比例用真实样本测量，不预设收益。
-5. 对照组只用 XDP 关闭的 socket 代理路径（内核 TCP，不改造）。
-6. 报告：不写提升百分比除非有同环境基线；发生器或 2c2g 达到极限如实标注；提出生产默认建议（含 xdp.upstream=afxdp）但不自行切换默认，等待审批。
+1. rwnd = clamp(consumer_drain_rate×(srtt+margin)+Q_budget_rx, min, F3 份额) 且 ≤ BDP_est+Q_budget_rx；客户端侧发送缓冲逗留超阈值 → 收窄 dialed 会话 rwnd；反向对称。
+2. 配对耦合：客户端侧交付率上限源站侧 rwnd；app-limited 标记的正确性用 RateSample 轨迹验证。
+3. AQM 默认交付 CoDel（D-AQM）；PIE 仅在基准数据表明 CoDel 不满足时替换，替换需写明理由。
+4. 自适应发送缓冲 clamp(2×BDP_est, 32KiB, per_conn_cap)，两类会话从 F3 三级预算申请；不足缩窗不拒绝已建连接；会话上限估算按"每代理连接两个会话"重算。
+测试：模拟器 AQM 曲线；慢读/零窗口/慢源站下 queued bytes、RSS、预算释放、rwnd 轨迹；源站 bufferbloat 场景下 rwnd 上限的效果；透传 UDP 拥塞下 CE/丢弃计数。
+验收：VPS release 多连接慢读矩阵；资源回到可解释基线。
 ```
 
-### T10（可选，需单独审批）· node↔parent 受控隧道
+### T10 · 矩阵、消融与生产默认决策
 
 ```
-任务：评估并实现 node → parent node 的受控传输隧道：两端都运行本项目栈，父节点按 path_table 选择；在隧道内评估 FEC 与 AccECN 双端启用对高丢包国际段的收益。
-前提：T4b 完成；用户确认部署中存在多级节点（level>0 且 parentNodes 非空）且父节点可升级到同一版本。
+任务：在 VPS netns/veth 与云 vNIC 上执行弱网矩阵、国际多路径矩阵、共享瓶颈 N 流矩阵与机制消融，比较 EdgeCC / Bbr3Ref / LossBlindRef / CubicRef（同栈）与 XDP 关闭路径（内核），形成生产默认（EdgeCC 是否替代 CubicRef、xdp.upstream=afxdp、ECN 通告）的决策建议。
+基线：T9 完成后的 commit。
 要求：
-1. 隧道承载现有 node→parent 回源语义（缓存穿透、Range、请求头透传、secretHash 鉴权）不变；不引入新的明文协议。
-2. 传输：复用 smoltcp-edge dialed 会话 + Bbr3 + AccECN 主动方；或 QUIC（quinn + Bbr3 适配）——两者在同一矩阵对比后二选一。
-3. FEC 只在隧道内、只对高丢包路径（path_table 基线随机丢包 ≥ 阈值）按需开启；记录冗余字节比例与 CPU；有效吞吐（去冗余后）必须优于无 FEC，否则不保留。
-4. 父节点选择与 T4b 共用 path_table 与迟滞/探索规则；父节点全部劣化时回直连源站的条件与可观测性明确。
-测试：两节点 netns 拓扑（node、parent、origin），netem 在 node↔parent 段施加 {1,3,5}% 随机丢包与 {150,250}ms RTT；对比直连 vs 经父节点、FEC 开/关的完成时间、有效吞吐、CPU、冗余比。
-验收：只在 VPS 双节点验证；报告给出是否建议在生产启用的条件，不自行启用。
+1. netem 施加在真实经过的链路并确认计数增长；记录内核、网卡、队列数、copy 模式、release SHA。
+2. 矩阵：RTT {5,50,150,300}ms × 丢包 {0,0.1,1,3,5}% × 带宽 {10,100,1000}Mbit × 缓冲 {0.25,1,4}×BDP × policer 有/无 × 抖动有/无 × 并发 {1,10,100} × 方向 {客户端侧,回源侧,双侧}；国际多路径矩阵（两条路径 {3%+150ms vs 0%+250ms}、{5% vs 0% 同 RTT}、乱序、中途互换、间歇黑洞）；共享瓶颈 N∈{10,100} 流对比聚合开/关。
+3. 消融：不确定度探测、效用微调、聚合、先验启动、接收侧控制、p_rand、双模各自关闭。
+4. 指标：成功业务字节/秒、完成时间分布、P99、重传字节比例、伪重传比例、自排队时延、CPU/Gbit 与每 ACK 开销、RSS、算法状态轨迹、路径选择分布。
+5. 客户端与源站 ECN/AccECN 支持比例用真实样本测量。
+6. 报告：无同环境基线不写百分比；极限如实标注；给出默认建议但不自行切换，等待审批。
 ```
 
-## 10. 需要用户明确审批的决策点
+### T11（可选，启动前提见 D-F2：确认多级节点部署且父节点可同版本升级）· node↔parent 受控隧道
 
-1. smoltcp 受控 fork（`vendor/smoltcp-edge` + `[patch.crates-io]`）作为长期方案，还是过渡后评估替换 TCP 栈。
-2. 回源源端口保留范围与 netfilter DROP 守卫（内核配置变更，fail-closed）。
-3. 默认网关 MAC 的来源：仅 smoltcp ARP/NDP，还是允许内核邻居表预热。
-4. PMTU 策略：仅 ICMP 驱动 + 接口 MTU 派生，是否补黑洞探测。
-5. 是否允许对 quinn-proto 打小 patch 让 Pacer 读取 `pacing_rate`（T5 报告偏差后决定）。
-6. 默认是否在两方向通告 ECN/AccECN（RFC 3168 黑洞风险 vs 反馈质量）。
-7. 节点出口整形 rate 的配置键与默认（无配置时不整形）。
-8. `ecn_public_policy`：公网 RTT 下的 CE 是否作为 BBRv3 模型输入。
-9. 转发队列 AQM 选 CoDel 还是 PIE（T8 基准后）。
-10. eBPF challenge 路径是否要把 ECN 模式编码进 cookie 以支持 AccECN。
-11. `xdp.upstream` 迁移期开关在接管完成后是否删除。
-12. 路径选择的默认探索比例（ε）、迟滞阈值、主动探测节点级额度；SYN 竞速最大并行数。
-13. 源端口重掷/flow label 变化是否允许（涉及对源站的 SYN 放大与安全设备误判风险）。
-14. `path_loss_floor` 的 margin 与最大允许 `loss_thresh` 上限。
-15. 传输中重选路（L5）是否实现，及允许的重复字节成本上限。
-16. 是否启动 T10 node↔parent 受控隧道（含 FEC）评估。
-17. 按客户端前缀导出路径质量给控制面的字段与上报频率。
+（保留 v2 内容）两端都是我们的栈；父节点按 path_table 选择；FEC 只在隧道内、只对 `p_rand` 高的路径按需开启，去冗余后有效吞吐必须优于无 FEC；两节点 netns 拓扑验证；不自行启用。
 
-## 11. 已发现的既有降级（按仓库规则先报告，不在未审批下扩展）
+## 9. 决策记录（2026-09-15 全部批准，按建议执行）
 
-- `src/quic_udp_demux.rs:163-180, 717`：H3 共享 UDP 套接字静默丢弃 ECN，导致 quinn 自禁 ECN；无日志、无指标。
-- `src/xdp/af_xdp/bridge.rs:511, 1042-1050`：TX 背压 256 次后退出 worker（与 F2 同类，属于用退出代替削减）。
-- `Cargo.toml:90, 95`：未启用任何 smoltcp 拥塞控制 feature → `NoControl`（F8）。
-- 现状记录，随回源接管退役而非修复：`src/tcp_proxy.rs:1855-1861` 对内核 relay socket 的 `TCP_CONGESTION=bbr` 忽略返回值；`src/kernel_tuning.rs:275-276` 的 `bbr`/`fq` 为 optional 且不核对运行中 qdisc。在 XDP 关闭模式下它们仍存在且不可观测，报告中如实列出。
+| 编号 | 决策 | 结论 | 落实位置 |
+|---|---|---|---|
+| D-A1 | 接受 EdgeCC 无上游参考的前提 | **批准**。保留 Bbr3Ref/CubicRef/LossBlindRef 作同栈内锚点；EdgeCC 不在 T10 同环境下优于 Bbr3Ref 则不切默认 | §2.9、T5、T10 |
+| D-A2 | 聚合共享瓶颈的误判倾向 | **宁可误拆不可误并**：合并需强相关证据+迟滞，拆分门槛低；拆分规则配欠利用回归测试 | §2.6、T6 |
+| D-A3 | smoltcp fork 为长期方案 | **批准**。纪律：只改 `socket/tcp.rs` 与 wire repr 最小面，DIVERGENCE.md 逐项记录，不 fork 其它模块 | T3 |
+| D-B1 | 源端口保留 + netfilter DROP 守卫 | **批准**。默认保留 40000–49999（可配置，须落在 `ip_local_port_range` 内并由 `ip_local_reserved_ports` 标记）；守卫失败为显式启动错误，计数进 /status | T4 |
+| D-B2 | 网关 MAC 来源 | smoltcp ARP/NDP 自解析 + 缓存 + 失败计数可观测，不用静态配置 | T4 |
+| D-B3 | PMTU 策略 | ICMP 驱动 + RFC 4821 式黑洞检测回退 | T4 |
+| D-B4 | `xdp.upstream` 开关 | 接管完成后**保留一个发布周期再删** | T4、T10 |
+| D-C1 | quinn Pacer patch | T5 先度量偏差；偏差影响探测幅度表达时才 patch，patch 面限 `connection/pacing.rs` | T5 |
+| D-D1 | ECN/AccECN 默认通告 | 客户端方向**被动响应常开**（对端发起才用）；回源方向主动通告由配置门控灰度、默认关，T10 实测后定最终默认 | T7、T10 |
+| D-D2 | 公网 CE 作为拥塞证据 | 作为证据但**权重受限 + belief 贡献封顶**；受控链路（回源到自有 infra）给满权重 | §2.3、T5 |
+| D-D3 | eBPF SYN-cookie 编码 ECN | **不需要**，challenge 路径已显式不协商 ECN；本项关闭 | — |
+| D-E1 | 效用权重 (a,b,c) 与分层 `Q_budget`/`d_target` 初值 | T5 用模拟器扫参给建议表，T10 实测后可调 | T5、T10 |
+| D-E2 | 效用梯度微调 | 实现并做消融；默认倾向开、带开关；T10 数据定最终默认 | §2.4、T5、T10 |
+| D-E3 | 探索/选路参数 | ε-greedy ≤5%；连续两窗 >20% 才切换；SYN 竞速 ≤2 路；主动探测限速；源端口重掷仅在统计证明 ECMP 多样性后启用 | T6 |
+| D-F1 | L5 传输中换路 | 只建接口与计数，默认关；T10 数据证明值得再开 | T6 |
+| D-F2 | T11 隧道 | 启动前提：确认部署存在多级节点且父节点可同版本升级；未确认前不启动 | T11 |
+| D-G1 | T10 数据离线参数拟合 | **允许**（仅离线分析，不进数据面） | T10 |
+| D-G2 | 节点出口整形 | 加配置键 `xdp.egress_rate_bps`，**默认不整形**（无配置=现状） | T8 |
+| D-AQM | 转发队列 AQM 选型 | 默认交付 CoDel；PIE 仅在基准数据表明 CoDel 不满足时替换 | T9 |
 
-## 12. 明确的非目标与设计限制
+## 10. 已发现的既有降级
 
-- 非 XDP 模式（XDP 关闭的 socket 代理路径）不做任何传输改造，只作对照基线。
+- `src/quic_udp_demux.rs:163-180, 717`：静默丢弃 ECN。
+- `src/xdp/af_xdp/bridge.rs:511, 1042-1050`：TX 背压退出 worker。
+- 现状记录、随回源接管退役：`tcp_proxy.rs:1855-1861` 忽略 `TCP_CONGESTION` 返回值；`kernel_tuning.rs:275-276` optional 且不核对 qdisc。
+- F8 的 `NoControl` 已由 `be75083` 止血为 Cubic。
+
+## 11. 明确的非目标与设计限制
+
+- 非 XDP 模式不做传输改造。
 - 不做跨流均分带宽或对其他算法的公平性优化。
-- 不做 L4S/ECT(1)/TCP Prague；不做自定义 FEC 或私有封装。
-- 不把 fq/CAKE/FQ-PIE 的 sysctl/tc 配置当作 AF_XDP 发包的队列管理。
-- 不用 quinn 内置 `Bbr` 充当 BBR/BBRv3。
-- 回源接管的多队列场景受 F7 同样约束；无硬件时显式限定支持范围。
-- generic + AF_XDP copy 路径不据此宣称比 socket 代理更快；所有性能结论来自 T9 的同环境对照。
+- 不做 L4S/ECT(1)/Prague、MPTCP、通用 TCP 上的 FEC、数据面在线学习。
+- 不用 quinn 内置 `Bbr`。
+- 不把 fq/CAKE/FQ-PIE 的 sysctl/tc 当作 AF_XDP 发包的队列管理。
+- EdgeCC 没有上游一致性可声称；所有性能结论来自 T10 同环境对照，缺基线不写提升百分比。
 
 ## 上游依据
 
-- [google/bbr v3 分支（commit 90210de4）](https://github.com/google/bbr/tree/v3)
-- [draft-ietf-ccwg-bbr-06](https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/06/)
-- [RFC 9768 Accurate ECN](https://www.rfc-editor.org/rfc/rfc9768)
-- [LWN: More accurate congestion notification for TCP（7.0 默认启用 AccECN）](https://lwn.net/Articles/1058666/)
-- [Linux AccECN 协议系列合入（6.18/6.19）](https://github.com/gregkh/linux/commit/667539f6dce27aa7db0a711375f94e14e714a698)
-- [RFC 8985 RACK-TLP](https://www.rfc-editor.org/rfc/rfc8985) · [RFC 6937 PRR](https://www.rfc-editor.org/rfc/rfc6937) · [RFC 9438 CUBIC](https://www.rfc-editor.org/rfc/rfc9438) · [RFC 9406 HyStart++](https://www.rfc-editor.org/rfc/rfc9406) · [RFC 7323 TCP Extensions](https://www.rfc-editor.org/rfc/rfc7323) · [RFC 3168 ECN](https://www.rfc-editor.org/rfc/rfc3168)
-- [Linux AF_XDP 文档：XSKMAP 绑定约束](https://docs.kernel.org/networking/af_xdp.html)
-- [Linux 6.1 AF_XDP copy TX](https://github.com/torvalds/linux/blob/v6.1/net/xdp/xsk.c#L514-L577)
-- 本地依赖源码：`smoltcp-0.14.0/src/socket/tcp/congestion.rs`、`socket/tcp.rs`、`wire/{tcp,ipv4}.rs`；`quinn-proto-0.11.17/src/congestion.rs`、`congestion/bbr/mod.rs`、`connection/pacing.rs`
+- [google/bbr v3（90210de4）](https://github.com/google/bbr/tree/v3) · [draft-ietf-ccwg-bbr-06](https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/06/) · Linux 6.1 `net/ipv4/tcp_bbr.c`（BBRv1，`lt_bw`）
+- [RFC 9768 AccECN](https://www.rfc-editor.org/rfc/rfc9768) · [LWN 1058666](https://lwn.net/Articles/1058666/) · [RFC 8257 DCTCP](https://www.rfc-editor.org/rfc/rfc8257)
+- [RFC 8985 RACK-TLP](https://www.rfc-editor.org/rfc/rfc8985) · [RFC 6937 PRR](https://www.rfc-editor.org/rfc/rfc6937) · [RFC 2883 DSACK](https://www.rfc-editor.org/rfc/rfc2883) · [RFC 3522 Eifel](https://www.rfc-editor.org/rfc/rfc3522) · [RFC 9438 CUBIC](https://www.rfc-editor.org/rfc/rfc9438) · [RFC 9406 HyStart++](https://www.rfc-editor.org/rfc/rfc9406) · [RFC 7323](https://www.rfc-editor.org/rfc/rfc7323) · [RFC 3168](https://www.rfc-editor.org/rfc/rfc3168)
+- [RFC 3124 Congestion Manager](https://www.rfc-editor.org/rfc/rfc3124) · [RFC 8382 Shared Bottleneck Detection](https://www.rfc-editor.org/rfc/rfc8382) · [RFC 8305 Happy Eyeballs v2](https://www.rfc-editor.org/rfc/rfc8305)
+- PCC-Vivace（Dong et al., NSDI 2018）· Copa（Arun & Balakrishnan, NSDI 2018）· Swift（Kumar et al., SIGCOMM 2020）· GCC（Carlucci et al., RMCAT）· Veno（Fu & Liew, JSAC 2003）
+- [Linux AF_XDP 文档](https://docs.kernel.org/networking/af_xdp.html) · [Linux 6.1 AF_XDP copy TX](https://github.com/torvalds/linux/blob/v6.1/net/xdp/xsk.c#L514-L577)
+- 本地依赖源码：`smoltcp-0.14.0/src/socket/tcp/{congestion.rs,tcp.rs}`、`wire/{tcp,ipv4}.rs`；`quinn-proto-0.11.17/src/{congestion.rs,congestion/bbr/mod.rs,connection/pacing.rs}`
+
+## 附录 A：接入点分析（v3.1，T2 进行期间补充）
+
+### A.1 回源连接面共四处
+
+| 连接面 | 位置 | 接管方式 |
+|---|---|---|
+| L4 TCP 回源唯一漏斗 | `src/toa.rs:522/627` `connect_with_toa`：非 TOA = `TcpStream::connect`；TOA = 绑定分配端口 + genl 注册映射 | 替换为 reactor dialed 会话 + `virtual_l4_stream` 包装 |
+| HTTP/HTTPS 回源 | vendored pingora `connectors/mod.rs:351` `do_connect_inner → l4_connect(peer, bind_to)` → `l4/ext.rs:564` → `TcpStream` | patch `l4_connect` 产出 AF_XDP dialed `Stream`；连接池 `reuse_hash` 在此层之上，T6 须把路径键并入 reuse_hash |
+| UDP 回源 | `src/udp_proxy.rs:114` `UdpSocket::bind`、`:1589` `connect` | smoltcp-edge UDP socket + 出向流表 |
+| H3 回源 | `src/origin_h3.rs` `OriginH3Connector` → quinn `Endpoint` → 内核 UDP socket | 见 A.4：CC 已由 quinn 适配获得，AF_XDP UDP 非必需 |
+
+### A.2 TOA 发现（影响 T4 设计）
+
+- TOA 发送端是内核模块 `toa-sender/kernel/cloud_toa_sender_main.c`：netfilter `NF_INET_LOCAL_OUT` 钩子拦截首 SYN（`syn && !ack && !rst && !fin`），按本地端口查 genl 映射，注入 TCP 选项 **kind 254**（v4 8B `{opcode,opsize,port,ip}`；v6 20B）。
+- AF_XDP TX 不经过 LOCAL_OUT → **smoltcp 必须在 SYN 里自行写 option 254**。客户端地址在拨号时直接可知，`KernelClient`/genl 映射/端口分配器在此路径上全部不需要。
+- SYN 选项预算（40B）：v4 MSS4+SACKOK2+TS10+WS3+TOA8 = 27B 可行；v6 = 39B 恰好贴满；再叠加 AccECN 选项（kind 172/174）会超——T7 的裁剪优先级因此必须含 TOA。
+- TOA 端口范围已有 `configured_port_range` + 分配器模式可复用（复用模式而非内核模块）。
+
+### A.3 eBPF 数据面是双人格（影响出向流表设计）
+
+- `xdp_nat_*` 程序族：**NAT 转发面**。入向 client SYN 建 CT 项（`XDP_PENDING` → `XDP_TCP_CT`），报文改写后 `XDP_TX` 直发后端；后端回复按反转 CT 键（`client_addr=dst, backend_addr=src`）匹配后改写发往客户端；还有 SNAT 反查绑定与 splice 卸载。**这条面从不过 smoltcp。**
+- `dispatch_local`（main.rs:1001）：**终结面**。`local_flags`（目的 ∈ 受保护 VIP 集）+ `policy.mode==2` → 按 proto tail-call 到 TCP/UDP worker，slot 空则 `redirect_from_scratch` → `XDP_XSKS.redirect`。
+- dialed 流回包现状：SYN-ACK 目的 IP 是本地 → 过 `local_flags` → TCP worker 按反转键查 FWD/CT → 无匹配 → PASS → 内核 → RST（即 C17）。因此出向流表 `XDP_OUT_CT`（`(proto, local_ip, local_port, remote_ip, remote_port)` → XSK/queue）必须在 TCP worker 落到 PASS **之前**被查；ICMP 错误按内层五元组匹配同表。
+- `AfXdpRouteMeta`（af_xdp/mod.rs:373）= `{interface, queue, link{src_mac,dst_mac}}`，目前只从入向帧学到（对端 MAC 即回复 MAC）。dialed 流需要主动解析 dst_mac（网关或直连对端）+ 多出口接口时的路由选择——D-B2 的落实点。
+
+### A.4 QUIC 适配与边界
+
+- 接入点：`TransportConfig::congestion_controller_factory`（`config/transport.rs:326`），默认 `CubicConfig`（:393）。
+- **控制器是每路径构建**：`connection/paths.rs:67,145` 调 `congestion_controller_factory.build(now, mtu)`——多路径 QUIC 连接会有多个 EdgeCC 实例；factory 单例可以把每个实例注册进聚合（T6 的对接点）。
+- 服务端配置点 `src/quic_transport.rs`；客户端配置点 `src/origin_h3.rs`（回源 H3 的 quinn `ClientConfig` 同机制）。
+- 边界决定：H3 回源走内核 UDP socket 时 **EdgeCC 依然生效**（CC 在 quinn 内部）；AF_XDP UDP 只额外提供调度器管辖与收包路径统一——列为可选项而非 T4 阻塞项。
+
+### A.5 其余确认
+
+- `virtual_l4_stream`（tcp_reactor.rs:167）包装 AsyncRead+Write → pingora `Stream` + `SocketDigest(peer_addr)`；dialed 方向复用同一包装（改填 local/peer 角色）。
+- `lb_factory.rs:241-262` `build_lb` 确认忽略 `_level`/`_parent_nodes`/`_tiered_origin_bypass`；T6 的父节点候选从这里接入。
+- `build_origin_pool` 已有 primary/backup 两级池与健康检查钩子，path_table 驱动的选择加在候选展开处而非重建池。

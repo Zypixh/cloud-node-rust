@@ -169,6 +169,16 @@ harness = false
 [build-dependencies]
 tonic-prost-build = "0.14.6"
 
+# crates/cloud-node-xdp-ebpf stays outside: it pins a dated nightly via its
+# own rust-toolchain.toml and builds for the bpfeb target — it must not join
+# this workspace's resolution.
+[workspace]
+members = ["crates/cloud-node-transport"]
+# cloud-node-xdp-ebpf pins its own dated nightly/bpfeb toolchain;
+# pingora-main is a vendored checkout with its own workspace root —
+# both must stay outside this workspace's auto-membership.
+exclude = ["crates/cloud-node-xdp-ebpf", "pingora-main"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
