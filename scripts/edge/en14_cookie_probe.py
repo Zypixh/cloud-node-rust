@@ -9,7 +9,8 @@ snat+challenge enabled.
 Phases:
   A SYN -> challenge SYN-ACK: forged reply captured on the peer interface
     (SYN|ACK, ack = c_isn+1, ISN = cookie); challengeSent increments and
-    NO state is created (pending/CT/SNAT all stay empty).
+    NO state is created (pending/CT/SNAT all stay empty). The cookie is
+    verified against a locally computed SipHash under the installed key.
   B bad-cookie ACK -> rejected: challengeRejected increments, no state.
   C valid-cookie ACK -> bounded admission: pending entry in SPLICE_WAIT,
     SNAT port claimed, forged SYN replayed to the backend (seq = c_isn,
@@ -21,10 +22,19 @@ Phases:
     translated out of challenge space; the backend reply's seq is
     translated back into challenge space for the client.
   F retransmitted SYN -> another challenge, still no extra state.
-  G key removed -> proving ACK fails closed (challengeRejected), the
-    splice state created earlier is untouched.
-  H random SYN flood -> challenges are emitted but bounded and no state
-    is allocated for unverified SYNs.
+  G key removed -> fresh SYN gets no challenge, an ACK carrying a cookie
+    forged under the KNOWN-ZERO key is still rejected (fail-closed), and
+    the established splice flow keeps transferring data.
+  I forge fault injection (XDP_PENDING_CAP_FAIL_FORGE): challenge-path
+    SYN and admit-path ACK are dropped with challengeWorkerErr counted,
+    no pending/SNAT state leaks; clearing the flag lets the same ACK
+    re-admit (bounded recovery).
+  J splice-anchor forge fault: backend SYN-ACK under FAIL_FORGE is
+    dropped with pending SPLICE_WAIT untouched (no partial splice);
+    retransmitted SYN-ACK anchors once the flag clears.
+  H random SYN flood under a restored key and an explicit small dim3
+    budget -> challenges bounded by the budget, excess counted rejected,
+    refill restores challenges, no state allocated for unverified SYNs.
 
 Usage (root, Linux):
     sudo python3 scripts/edge/en14_cookie_probe.py \
@@ -47,7 +57,16 @@ PEER_IF = "en14-b"
 VIP1 = "10.99.0.5"
 PEER_IP = "10.99.0.6"
 CLIENT_IP = "10.99.0.9"
-PIN_DIR = "/sys/fs/bpf/cloud-node-xdp"
+# Separate address for the real-kernel-TCP client: replies crafted to
+# CLIENT_IP must NOT resolve to a local socket (or the kernel RSTs them
+# and disturbs the raw-frame phases' CT state).
+REAL_CLIENT_IP = "10.99.0.10"
+# bpffs is NOT isolated by netns: the production default pin dir must
+# never be cleaned by a probe. This task pins under a unique per-run
+# root via CLOUD_NODE_XDP_PIN_DIR and only that exact dir is removed.
+BPF_PIN_ROOT = "/sys/fs/bpf"
+PROD_PIN_DIR = "/sys/fs/bpf/cloud-node-xdp"
+PIN_DIR = f"{BPF_PIN_ROOT}/en14-probe-{os.getpid()}"
 BPFTOOL_CANDIDATES = [
     "/usr/lib/linux-tools-5.15.0-191/bpftool",
     "bpftool",
@@ -58,6 +77,21 @@ CLIENT_PORT = 40000
 C_ISN = 1000
 B_ISN = 2000
 PENDING_MS = 4000
+# Explicit dim3 challenge budget for phase H (per-second ceiling applied
+# over WINDOW_MS accounting windows; per-CPU shared by userspace).
+CHALLENGE_PPS = 40
+WINDOW_MS = 500
+# Known keys installed by the probe itself so captured cookies can be
+# verified against a local SipHash — end-to-end crypto check, not just
+# "a SYN-ACK arrived".
+KNOWN_KEY = bytes(range(0xA0, 0xB0))
+KNOWN_KEY2 = bytes(range(0xC0, 0xD0))
+ZERO_KEY = b"\x00" * 16
+# XDP_PENDING_CAP.flags fault-injection bits (ABI v16).
+FAIL_CT_INSERT = 1 << 0
+FAIL_PENDING_INSERT = 1 << 1
+FAIL_SNAT_ALLOC = 1 << 2
+FAIL_FORGE = 1 << 3
 
 SYN, ACK, FIN, RST, SYNACK = 0x02, 0x10, 0x01, 0x04, 0x12
 
@@ -91,6 +125,12 @@ def setup_netns():
     sh(["ip", "link", "set", HOST_IF, "up"])
     sh(["ip", "netns", "exec", NS, "ip", "addr", "add", f"{PEER_IP}/24",
         "dev", PEER_IF])
+    # Client address for the real-kernel-TCP phase: a real socket needs a
+    # local address to bind. It is deliberately NOT CLIENT_IP so raw
+    # crafted frames never match a local socket (which would trigger
+    # kernel RSTs that disturb splice state).
+    sh(["ip", "netns", "exec", NS, "ip", "addr", "add",
+        f"{REAL_CLIENT_IP}/24", "dev", PEER_IF])
     sh(["ip", "netns", "exec", NS, "ip", "link", "set", PEER_IF, "up"])
     sh(["ip", "netns", "exec", NS, "ip", "link", "set", "lo", "up"])
     for iface, ns in ((HOST_IF, None), (PEER_IF, NS)):
@@ -142,6 +182,11 @@ xdp:
         port: 443
   admission:
     tcpPendingMs: {PENDING_MS}
+  # Explicit small dim3 budget so phase H can assert challenge limiting
+  # against a known ceiling instead of a merged counter.
+  budget:
+    challengePps: {CHALLENGE_PPS}
+    windowMs: {WINDOW_MS}
   # EN-16: the 2GiB probe host cannot hold production-size state tables
   # (projected ~321MiB > kernel-bpf budget ~136MiB); size them explicitly.
   stateTables:
@@ -170,7 +215,8 @@ def write_api_config(path):
 
 
 def dump_maps(node_bin, cwd):
-    out = sh([node_bin, "xdp", "dump-maps"], cwd=cwd).stdout
+    out = sh([os.path.abspath(node_bin), "xdp", "dump-maps"],
+             cwd=cwd).stdout
     return json.loads(out)
 
 
@@ -224,12 +270,114 @@ def decode_ct_value(val):
             "splice_state": val[64]}
 
 
-def zero_cookie_key():
-    """Zero the pinned cookie key ring (cur==0 => fail-closed)."""
+def set_cookie_key(cur, prev=b"\x00" * 16):
+    """Write the cookie key ring (XdpCookieKey: cur[16] prev[16])."""
+    assert len(cur) == 16 and len(prev) == 16
     mid = map_id("XDP_COOKIE_KEY")
     sh([bpftool(), "map", "update", "id", str(mid),
         "key", "hex", "00", "00", "00", "00",
-        "value", "hex"] + ["00"] * 32)
+        "value", "hex"] + [f"{b:02x}" for b in cur + prev])
+
+
+def zero_cookie_key():
+    """Zero the pinned cookie key ring (cur==0 => fail-closed)."""
+    set_cookie_key(ZERO_KEY)
+
+
+def pending_cap_flags(set_to=None, or_mask=None):
+    """Read-modify-write XDP_PENDING_CAP.flags preserving the capacity
+    fields the node synced (max_pending u64, ttl u64, flags u64)."""
+    mid = map_id("XDP_PENDING_CAP")
+    out = sh([bpftool(), "map", "dump", "-j", "id", str(mid)]).stdout
+    val = bytes(int(b, 16) for b in json.loads(out)[0]["value"])
+    assert len(val) == 24, f"XDP_PENDING_CAP value {len(val)}B != 24"
+    maxp, ttl, flags = struct.unpack("<QQQ", val)
+    if set_to is not None:
+        flags = set_to
+    elif or_mask is not None:
+        flags |= or_mask
+    newv = struct.pack("<QQQ", maxp, ttl, flags)
+    sh([bpftool(), "map", "update", "id", str(mid),
+        "key", "hex", "00", "00", "00", "00",
+        "value", "hex"] + [f"{b:02x}" for b in newv])
+    return flags
+
+
+# --- cookie model: mirrors siphash24_16/cookie_pack/cookie_slot in the
+# eBPF source so captured cookies can be verified against the keyring ---
+M64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _rotl(x, b):
+    return ((x << b) | (x >> (64 - b))) & M64
+
+
+def siphash24_16(key16, w0, w1):
+    k0 = int.from_bytes(key16[:8], "little")
+    k1 = int.from_bytes(key16[8:], "little")
+    v = [k0 ^ 0x736f6d6570736575, k1 ^ 0x646f72616e646f6d,
+         k0 ^ 0x6c7967656e657261, k1 ^ 0x7465646279746573]
+
+    def sip():
+        v[0] = (v[0] + v[1]) & M64
+        v[1] = _rotl(v[1], 13)
+        v[1] ^= v[0]
+        v[0] = _rotl(v[0], 32)
+        v[2] = (v[2] + v[3]) & M64
+        v[3] = _rotl(v[3], 16)
+        v[3] ^= v[2]
+        v[0] = (v[0] + v[3]) & M64
+        v[3] = _rotl(v[3], 21)
+        v[3] ^= v[0]
+        v[2] = (v[2] + v[1]) & M64
+        v[1] = _rotl(v[1], 17)
+        v[1] ^= v[2]
+        v[2] = _rotl(v[2], 32)
+
+    v[3] ^= w0
+    sip(); sip()
+    v[0] ^= w0
+    v[3] ^= w1
+    sip(); sip()
+    v[0] ^= w1
+    b = 16 << 56
+    v[3] ^= b
+    sip(); sip()
+    v[0] ^= b
+    v[2] ^= 0xFF
+    sip(); sip(); sip(); sip()
+    return v[0] ^ v[1] ^ v[2] ^ v[3]
+
+
+def cookie_slot(now_ns):
+    # matches cookie_slot(): ~4.3s slots
+    return (now_ns >> 32) & 0xFFFFFFFF
+
+
+def cookie_expected(key16, client_ip, client_port, listen_ip, listen_port,
+                    slot):
+    client_be = int.from_bytes(socket.inet_aton(client_ip), "big")
+    listen_be = int.from_bytes(socket.inet_aton(listen_ip), "big")
+    # eBPF cookie_pack(client_be, src_port.to_be(), dst_port): src_port
+    # round-trips to the host port number; dst_port keeps the wire
+    # (network-order) value re-read in native order — the byte swap.
+    listen_port_swapped = int.from_bytes(
+        struct.pack(">H", listen_port), "little")
+    tup = (client_be << 32) | (client_port << 16) | listen_port_swapped
+    w1 = (listen_be << 32) | slot
+    return siphash24_16(key16, tup, w1) & 0xFFFFFFFF
+
+
+def cookie_matches(cookie_val, key16, client_port):
+    """Validate a captured cookie against the current or previous slot —
+    validation accepts both, so the probe must too."""
+    slot = cookie_slot(time.monotonic_ns())
+    for s in (slot, (slot - 1) & 0xFFFFFFFF):
+        exp = cookie_expected(key16, CLIENT_IP, client_port, VIP1,
+                              TCP_LISTEN, s)
+        if (cookie_val & ~7) == (exp & ~7):
+            return True
+    return False
 
 
 def csum16(data):
@@ -255,20 +403,34 @@ def ip_frame(dst_mac, proto, src_ip, dst_ip, l4):
 
 
 def tcp_frame(dst_mac, src_ip, dst_ip, sport, dport, flags, seq=C_ISN,
-              ackno=0, payload=b"", mss=None):
-    opts = b""
-    if mss is not None:
+              ackno=0, payload=b"", mss=None, raw_opts=None):
+    if raw_opts is not None:
+        opts = raw_opts
+    elif mss is not None:
         opts = struct.pack(">BBH", 2, 4, mss)
+    else:
+        opts = b""
     doff = 5 + (len(opts) + 3) // 4
     opts = opts + b"\x01" * (doff * 4 - 20 - len(opts))
     offset_flags = (doff << 12) | flags
     tcp = struct.pack(">HHIIBBHHH", sport, dport, seq, ackno,
                       offset_flags >> 8, offset_flags & 0xFF, 65535, 0, 0)
-    return ip_frame(dst_mac, 6, src_ip, dst_ip, tcp + opts + payload)
+    seg = tcp + opts + payload
+    # A real client transmits a valid checksum; the dataplane maintains it
+    # incrementally across rewrites, so the input field must be genuine —
+    # csum16() returns the complement value to store.
+    pseudo = socket.inet_aton(src_ip) + socket.inet_aton(dst_ip) + \
+        struct.pack(">BBH", 0, 6, len(seg))
+    seg = seg[:16] + struct.pack(">H", csum16(pseudo + seg)) + seg[18:]
+    return ip_frame(dst_mac, 6, src_ip, dst_ip, seg)
 
 
 def decode_tcp(frame):
-    """Decode a captured TCP/IPv4 frame -> dict or None."""
+    """Decode a captured TCP/IPv4 frame -> dict or None. Independently
+    recomputes the IP and TCP checksums so a forge-path checksum defect
+    (e.g. stale scratch bytes folded in) fails the probe — the raw-socket
+    sender never needs a real TCP stack to accept the replies, so field
+    assertions alone cannot catch it."""
     if len(frame) < 54 or frame[12:14] != b"\x08\x00":
         return None
     ihl = (frame[14] & 0x0F) * 4
@@ -281,8 +443,16 @@ def decode_tcp(frame):
     sport, dport, seq, ack, off_flags, win, _cs, _up = struct.unpack(
         ">HHIIHHHH", frame[tcp_off:tcp_off + 20])
     doff = (off_flags >> 12) * 4
-    payload = frame[tcp_off + doff:]
-    return {
+    ip_tot = struct.unpack(">H", ip[2:4])[0]
+    seg = frame[tcp_off:14 + ip_tot]
+    payload = frame[tcp_off + doff:14 + ip_tot]
+    # IP header checksum over the header as received (field included):
+    # a valid header sums to 0.
+    ip_ok = csum16(ip) == 0
+    # TCP checksum = pseudo-header + segment as received; valid => 0.
+    pseudo = ip[12:20] + struct.pack(">BBH", 0, 6, len(seg))
+    tcp_ok = csum16(pseudo + seg) == 0
+    out = {
         "src": socket.inet_ntoa(ip[12:16]),
         "dst": socket.inet_ntoa(ip[16:20]),
         "sport": sport,
@@ -293,7 +463,11 @@ def decode_tcp(frame):
         "win": win,
         "doff": doff,
         "payload_len": len(payload),
+        "ip_csum_ok": ip_ok,
+        "tcp_csum_ok": tcp_ok,
     }
+    out["raw"] = frame[:14 + ihl + doff + len(payload)].hex()
+    return out
 
 
 def run_sender(mode, dst_mac, a):
@@ -305,6 +479,18 @@ def run_sender(mode, dst_mac, a):
         frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
                             CLIENT_PORT, TCP_LISTEN, SYN,
                             seq=C_ISN, mss=1460)]
+    elif mode == "syn_p":
+        # a = client port — parameterized fresh-tuple SYN so isolated
+        # phases never disturb the primary flow.
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            a, TCP_LISTEN, SYN,
+                            seq=C_ISN, mss=1460)]
+    elif mode == "ack_cookie_p":
+        # a = (client_port << 32) | cookie — proving ACK on an explicit
+        # fresh tuple.
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            a >> 32, TCP_LISTEN, ACK,
+                            seq=C_ISN + 1, ackno=(a & 0xFFFFFFFF) + 1)]
     elif mode == "syn_flood":
         frames = [tcp_frame(dst_mac, f"10.99.1.{i % 250}", VIP1,
                             30000 + i, TCP_LISTEN, SYN,
@@ -332,18 +518,94 @@ def run_sender(mode, dst_mac, a):
         frames = [tcp_frame(dst_mac, PEER_IP, VIP1,
                             TCP_BACKEND, a, SYNACK,
                             seq=B_ISN, ackno=C_ISN + 1)]
+    elif mode == "syn_nomss":
+        # a = client port — SYN with NO options (doff=5): parser must take
+        # the conservative 536 fallback (cookie idx 0), not a default 1460.
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            a, TCP_LISTEN, SYN, seq=C_ISN)]
+    elif mode == "syn_badmss":
+        # a = client port — SYN with a malformed MSS option (kind=2, len=3
+        # truncated): parser must reject it and fall back to idx 0 (536).
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            a, TCP_LISTEN, SYN, seq=C_ISN,
+                            raw_opts=b"\x02\x03\xff\xbe")]
     elif mode == "data_client":
         # a = cookie; client data ACK in challenge space
         frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
                             CLIENT_PORT, TCP_LISTEN, ACK,
                             seq=C_ISN + 1, ackno=a + 1,
                             payload=b"en14-data")]
+    elif mode == "data_client_b":
+        # Checksum-differential variant: different ack arg + payload so the
+        # ack-translation diff term changes while addr/port terms stay fixed.
+        frames = [tcp_frame(dst_mac, CLIENT_IP, VIP1,
+                            CLIENT_PORT, TCP_LISTEN, ACK,
+                            seq=C_ISN + 1, ackno=a + 0x401,
+                            payload=b"en14-DATX")]
     elif mode == "data_backend":
         # a = claimed SNAT port; backend -> client data in backend space
         frames = [tcp_frame(dst_mac, PEER_IP, VIP1,
                             TCP_BACKEND, a, ACK,
                             seq=B_ISN + 1, ackno=C_ISN + 11,
                             payload=b"en14-reply")]
+    elif mode == "real_tcp":
+        # Real kernel TCP on BOTH ends: a listening socket on the backend
+        # tuple and a real client socket bound to the client address.
+        # Exercises the full challenge -> admit -> splice -> translate
+        # path through actual TCP stacks (real ISNs, retransmission,
+        # FIN teardown), not crafted frames.
+        import threading
+        result = {"mode": "real_tcp"}
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((PEER_IP, TCP_BACKEND))
+        srv.listen(4)
+        srv.settimeout(15)
+        seen = {}
+
+        def serve():
+            try:
+                conn, addr = srv.accept()
+                seen["peer"] = addr[1]
+                data = conn.recv(64)
+                conn.sendall(b"echo:" + data)
+                # Wait for the peer to close so the FIN exchange runs
+                # through the splice in both directions.
+                conn.settimeout(10)
+                try:
+                    conn.recv(64)
+                except socket.timeout:
+                    pass
+                conn.close()
+                seen["served"] = True
+            except Exception as e:  # noqa: BLE001 — surface in report
+                seen["error"] = repr(e)
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        c.settimeout(15)
+        c.bind((REAL_CLIENT_IP, 0))
+        c.connect((VIP1, TCP_LISTEN))
+        result["client_port"] = c.getsockname()[1]
+        c.sendall(b"en14-real")
+        result["reply"] = c.recv(64).decode(errors="replace")
+        c.close()
+        t.join(timeout=10)
+        result["backend"] = seen
+        # Second connection closed with RST (SO_LINGER=0): exercises the
+        # abortive teardown path against live splice state.
+        c2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        c2.settimeout(15)
+        c2.bind((REAL_CLIENT_IP, 0))
+        c2.connect((VIP1, TCP_LISTEN))
+        result["client_port2"] = c2.getsockname()[1]
+        c2.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                      struct.pack("ii", 1, 0))
+        c2.close()
+        srv.close()
+        print(json.dumps(result))
+        return
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
                       socket.htons(3))
     s.bind((PEER_IF, 0))
@@ -363,7 +625,8 @@ def run_sender(mode, dst_mac, a):
         # or backend IP) is skipped.
         if d and d["src"] == VIP1:
             replies.append(d)
-    print(json.dumps({"sent": len(frames), "replies": replies}))
+    print(json.dumps({"sent": len(frames), "replies": replies,
+                      "sent_hex": [f.hex() for f in frames[:4]]}))
 
 
 def send(script, mode, dst_mac, a=0):
@@ -373,6 +636,12 @@ def send(script, mode, dst_mac, a=0):
 
 
 def clean_pins():
+    # Remove ONLY this run's unique pin dir. The production default
+    # (/sys/fs/bpf/cloud-node-xdp) and anything not created by this run
+    # are never touched — bpffs is shared across netns boundaries.
+    if not PIN_DIR.startswith(f"{BPF_PIN_ROOT}/en14-probe-") \
+            or PIN_DIR == PROD_PIN_DIR:
+        raise RuntimeError(f"refusing to clean unexpected pin dir {PIN_DIR}")
     subprocess.run(["rm", "-rf", PIN_DIR], capture_output=True)
 
 
@@ -391,7 +660,8 @@ def start_node(node_bin, home, cwd, ebpf_object):
         import shutil
         shutil.copyfile(obj_src,
                         os.path.join(home, "data", "cloud-node-xdp-ebpf.o"))
-    env = dict(os.environ, CLOUD_NODE_HOME=home, RUST_LOG="info")
+    env = dict(os.environ, CLOUD_NODE_HOME=home, RUST_LOG="info",
+               CLOUD_NODE_XDP_PIN_DIR=PIN_DIR)
     log = open(os.path.join(cwd, "node.log"), "w")
     proc = subprocess.Popen([os.path.abspath(node_bin)],
                             cwd=cwd, env=env, stdout=log, stderr=log,
@@ -438,6 +708,13 @@ def main():
         return
 
     assert os.geteuid() == 0, "must run as root"
+    assert PIN_DIR != PROD_PIN_DIR \
+        and PIN_DIR.startswith(f"{BPF_PIN_ROOT}/en14-probe-"), \
+        f"pin dir isolation violated: {PIN_DIR}"
+    # All children (node, xdp dump-maps, senders) inherit the task pin
+    # root so nothing under the production default dir is read or written.
+    os.environ["CLOUD_NODE_XDP_PIN_DIR"] = PIN_DIR
+    prod_pins_before = os.path.exists(PROD_PIN_DIR)
     setup_netns()
     clean_pins()
     dst_mac = sh(["ip", "-o", "link", "show", "dev", HOST_IF]).stdout \
@@ -459,6 +736,17 @@ def main():
                 time.sleep(0.2)
             return r
 
+        # --- phase isolation: dataplane must start with zero flow state --
+        st0 = {"pending": map_entries("XDP_PENDING"),
+               "ct": map_entries("XDP_TCP_CT"),
+               "snat": map_entries("XDP_SNAT_REV")}
+        assert st0 == {"pending": 0, "ct": 0, "snat": 0}, \
+            f"pre-run state not isolated: {st0}"
+        report["phases"]["0_isolation"] = {"state": st0, "pass": True}
+        # Install a KNOWN key so every captured cookie is verified against
+        # a local SipHash — not merely "some SYN-ACK arrived".
+        set_cookie_key(KNOWN_KEY)
+
         # --- A: SYN -> challenge SYN-ACK, no state -------------------------
         r = settle()
         synacks = [x for x in r["replies"]
@@ -467,6 +755,14 @@ def main():
         assert synacks, f"no challenge SYN-ACK captured: {r}"
         ch = synacks[0]
         assert ch["ack"] == C_ISN + 1, f"bad challenge ack {ch}"
+        assert ch["ip_csum_ok"] and ch["tcp_csum_ok"], \
+            f"challenge frame checksum invalid: {ch}"
+        # The cookie must be exactly SipHash(key, tuple, slot) — verified
+        # end-to-end under the probe-installed key.
+        assert cookie_matches(ch["seq"], KNOWN_KEY, CLIENT_PORT), \
+            f"challenge cookie {ch['seq']} does not match keyed hash"
+        assert ch["seq"] & 7 == 3, \
+            f"mss idx {ch['seq'] & 7} != 3 (mss=1460)"
         cookie = ch["seq"]
         st = {"pending": map_entries("XDP_PENDING"),
               "ct": map_entries("XDP_TCP_CT"),
@@ -490,6 +786,9 @@ def main():
                  and x["dst"] == CLIENT_IP and x["ack"] == C_ISN + 1]
         assert chal2, \
             f"retransmitted SYN got no challenge: replies={r['replies']}"
+        assert chal2[0]["tcp_csum_ok"], f"rechallenge csum: {chal2[0]}"
+        assert cookie_matches(chal2[0]["seq"], KNOWN_KEY, CLIENT_PORT), \
+            f"rechallenge cookie {chal2[0]['seq']} not keyed-valid"
         report["phases"]["F_syn_retx"] = {
             "same_cookie": chal2[0]["seq"] == cookie,
             "cookie2": chal2[0]["seq"], "pass": True}
@@ -524,6 +823,8 @@ def main():
         assert replayed[0]["seq"] == C_ISN, \
             f"replay seq {replayed[0]['seq']} != c_isn {C_ISN}"
         assert replayed[0]["dst"] == PEER_IP, "replay not backend-directed"
+        assert replayed[0]["ip_csum_ok"] and replayed[0]["tcp_csum_ok"], \
+            f"replay checksum invalid: {replayed[0]}"
         report["phases"]["C_cookie_admit_replay"] = {
             "snat_port": snat_port, "replay_seq": replayed[0]["seq"],
             "pending": pe, "pass": True}
@@ -544,31 +845,78 @@ def main():
         assert forged, f"no forged ACK to backend: {r['replies']}"
         assert forged[0]["seq"] == C_ISN + 1, forged[0]
         assert forged[0]["ack"] == B_ISN + 1, forged[0]
+        assert forged[0]["ip_csum_ok"] and forged[0]["tcp_csum_ok"], \
+            f"forged ACK checksum invalid: {forged[0]}"
         report["phases"]["D_splice_anchor"] = {
             "ct": ce, "forged_ack": forged[0], "pass": True}
 
         # --- E: data path, sequence translation both ways -----------------
         r = send(self_path, "data_client", dst_mac, cookie)
+        report["phases"]["E_raw_c2b"] = r["replies"]
+        report["phases"]["E_sent_c2b"] = r.get("sent_hex")
         fwd = [x for x in r["replies"] if x["dport"] == TCP_BACKEND
                and x["sport"] == snat_port and x["payload_len"] > 0]
-        assert fwd, f"client data not forwarded: {r['replies']}"
+        # Second c->b frame + b->c reply captured BEFORE assertions so the
+        # checksum differential isolates which field's diff is wrong.
+        r = send(self_path, "data_client_b", dst_mac, cookie)
+        report["phases"]["E_raw_c2b_2"] = r["replies"]
+        report["phases"]["E_sent_c2b_2"] = r.get("sent_hex")
+        r = send(self_path, "data_backend", dst_mac, snat_port)
+        report["phases"]["E_raw_b2c"] = r["replies"]
+        report["phases"]["E_sent_b2c"] = r.get("sent_hex")
+        assert fwd, f"client data not forwarded: {report['phases']['E_raw_c2b']}"
         assert fwd[0]["ack"] == B_ISN + 1, \
             f"ack not translated out of challenge space: {fwd[0]}"
         assert fwd[0]["seq"] == C_ISN + 1, fwd[0]
-        r = send(self_path, "data_backend", dst_mac, snat_port)
+        assert fwd[0]["tcp_csum_ok"], f"translated data csum: {fwd[0]}"
         back = [x for x in r["replies"] if x["dport"] == CLIENT_PORT
                 and x["dst"] == CLIENT_IP and x["payload_len"] > 0]
         assert back, f"backend data not forwarded: {r['replies']}"
+        assert back[0]["tcp_csum_ok"], f"reply csum: {back[0]}"
         assert back[0]["seq"] == cookie + 1, \
             f"backend seq not translated into challenge space: {back[0]}"
         report["phases"]["E_data_translation"] = {
             "fwd_ack": fwd[0]["ack"], "reply_seq": back[0]["seq"],
             "pass": True}
 
+        # --- M: malformed/absent MSS -> conservative 536 fallback ----------
+        # R2.3: the cookie's low 3 bits carry the negotiated MSS index;
+        # index 0 == 536. Absent options (doff=5) and a malformed MSS
+        # option (kind=2, len=3) must both land on the fallback — never on
+        # the previous oversized 1460 default.
+        m_out = {}
+        r = send(self_path, "syn_nomss", dst_mac, CLIENT_PORT + 10)
+        sa = [x for x in r["replies"]
+              if x["flags"] & 0x12 == 0x12 and x["dport"] == CLIENT_PORT + 10]
+        assert sa, f"nomss SYN got no challenge: {r['replies']}"
+        assert sa[0]["seq"] & 7 == 0, \
+            f"nomss cookie mss idx {sa[0]['seq'] & 7} != 0: {sa[0]}"
+        m_out["nomss_idx"] = sa[0]["seq"] & 7
+        m_out["nomss_doff"] = sa[0]["doff"]
+        r = send(self_path, "syn_badmss", dst_mac, CLIENT_PORT + 11)
+        sa = [x for x in r["replies"]
+              if x["flags"] & 0x12 == 0x12 and x["dport"] == CLIENT_PORT + 11]
+        assert sa, f"badmss SYN got no challenge: {r['replies']}"
+        assert sa[0]["seq"] & 7 == 0, \
+            f"badmss cookie mss idx {sa[0]['seq'] & 7} != 0: {sa[0]}"
+        m_out["badmss_idx"] = sa[0]["seq"] & 7
+        # The forged SYN-ACK echoes the fallback MSS (536 = 0x0218) in its
+        # option bytes when the ingress frame carried an option field.
+        if sa[0]["doff"] == 24:
+            raw = bytes.fromhex(sa[0]["raw"])
+            ihl = (raw[14] & 0x0F) * 4
+            opt = raw[14 + ihl + 20:14 + ihl + 24]
+            assert opt == b"\x02\x04\x02\x18", \
+                f"forged SYN-ACK MSS option {opt.hex()} != 536"
+            m_out["badmss_reply_mss"] = 536
+        report["phases"]["M_mss_fallback"] = {**m_out, "pass": True}
+
         # --- G: key removed -> challenge fails closed ----------------------
-        # With the keyring zeroed a fresh SYN must NOT get a challenge
-        # (cookie_make is fail-closed) and must be counted rejected; the
-        # already-established splice flow must be unaffected.
+        # With the keyring zeroed: (a) a fresh SYN must NOT get a challenge
+        # (cookie_make is fail-closed); (b) an ACK carrying a cookie forged
+        # under the KNOWN-ZERO key must still be rejected — an absent key
+        # is not a valid key; (c) the established splice flow keeps
+        # transferring data (existing CT state is unaffected by key loss).
         d0 = counters(dump_maps(args.node_bin, cwd))
         zero_cookie_key()
         r = send(self_path, "syn_fresh", dst_mac)
@@ -581,28 +929,276 @@ def main():
         assert d1.get("challengeRejected", 0) > d0.get("challengeRejected", 0), \
             "keyless SYN not counted rejected"
         assert ct_entry(CLIENT_PORT) is not None, "live splice flow lost"
+        # (b) zero-key forged cookie counterexample: the attacker knows
+        # the all-zero key and computes a perfectly-shaped proof for a
+        # FRESH tuple. It must still be rejected.
+        slot = cookie_slot(time.monotonic_ns())
+        forged_cookie = cookie_expected(
+            ZERO_KEY, CLIENT_IP, CLIENT_PORT + 1, VIP1, TCP_LISTEN, slot)
+        send(self_path, "ack_cookie_p", dst_mac,
+             ((CLIENT_PORT + 1) << 32) | forged_cookie)
+        time.sleep(0.2)
+        d2 = counters(dump_maps(args.node_bin, cwd))
+        assert d2.get("challengeRejected", 0) > d1.get("challengeRejected", 0), \
+            "zero-key forged cookie was not rejected"
+        assert pending_entry(CLIENT_PORT + 1) is None, \
+            "zero-key cookie created pending state"
+        # (c) the spliced flow still carries data while the keyring is empty.
+        r = send(self_path, "data_client", dst_mac, cookie)
+        fwd = [x for x in r["replies"] if x["dport"] == TCP_BACKEND
+               and x["sport"] == snat_port and x["payload_len"] > 0]
+        assert fwd, "established flow stopped forwarding while keyless"
         report["phases"]["G_key_removed_failclosed"] = {
             "rejected_delta":
-                d1.get("challengeRejected", 0) - d0.get("challengeRejected", 0),
+                d2.get("challengeRejected", 0) - d0.get("challengeRejected", 0),
+            "zero_key_cookie_rejected": True,
+            "live_flow_forwarded": True,
             "pass": True}
 
-        # --- H: random SYN flood -> bounded, stateless ---------------------
+        # --- I: forge fault injection — explicit DROP + rollback -----------
+        # Restore the keyring first: G left it zeroed, and I's challenge
+        # must be issued normally so the forge fault — not keyless
+        # rejection — is what gets exercised.
+        set_cookie_key(KNOWN_KEY)
+        # XDP_PENDING_CAP_FAIL_FORGE makes the forge helpers fail; the
+        # worker must emit a counted DROP (never PASS a half-forged frame)
+        # and roll back admission state.
+        flags0 = pending_cap_flags()
+        pending_cap_flags(or_mask=FAIL_FORGE)
+        d0 = counters(dump_maps(args.node_bin, cwd))
+        r = send(self_path, "syn_p", dst_mac, CLIENT_PORT + 2)
+        time.sleep(0.2)
+        d1 = counters(dump_maps(args.node_bin, cwd))
+        forge_synack = [x for x in r["replies"]
+                        if x["flags"] & 0x12 == 0x12]
+        assert not forge_synack, \
+            f"SYN-ACK emitted despite injected forge fault: {forge_synack}"
+        assert d1.get("challengeWorkerErr", 0) > \
+            d0.get("challengeWorkerErr", 0), \
+            "challenge-path forge fault not counted as worker error"
+        # Admit path: get a valid cookie for a fresh tuple first (fault
+        # cleared), then prove the rollback.
+        pending_cap_flags(set_to=flags0)
+        r = send(self_path, "syn_p", dst_mac, CLIENT_PORT + 3)
+        ch3 = [x for x in r["replies"]
+               if x["flags"] & 0x12 == 0x12 and x["dport"] == CLIENT_PORT + 3]
+        assert ch3 and cookie_matches(ch3[0]["seq"], KNOWN_KEY,
+                                      CLIENT_PORT + 3), \
+            f"no valid challenge for admit-path test: {r['replies']}"
+        cookie3 = ch3[0]["seq"]
+        snat_before = map_entries("XDP_SNAT_REV")
+        pending_cap_flags(or_mask=FAIL_FORGE)
+        d0 = counters(dump_maps(args.node_bin, cwd))
+        send(self_path, "ack_cookie_p", dst_mac,
+             ((CLIENT_PORT + 3) << 32) | cookie3)
+        time.sleep(0.2)
+        d1 = counters(dump_maps(args.node_bin, cwd))
+        assert d1.get("challengeWorkerErr", 0) > \
+            d0.get("challengeWorkerErr", 0), \
+            "admit-path forge fault not counted as worker error"
+        assert pending_entry(CLIENT_PORT + 3) is None, \
+            "forge fault leaked a pending record"
+        assert map_entries("XDP_SNAT_REV") == snat_before, \
+            "forge fault leaked a SNAT binding"
+        # Recovery: clearing the flag lets the same proof re-admit.
+        pending_cap_flags(set_to=flags0)
+        send(self_path, "ack_cookie_p", dst_mac,
+             ((CLIENT_PORT + 3) << 32) | cookie3)
+        time.sleep(0.2)
+        pe3 = pending_entry(CLIENT_PORT + 3)
+        assert pe3 is not None and pe3["splice_state"] == 1, \
+            f"re-admission after fault did not recover: {pe3}"
+        snat3 = pe3["snat_port"]
+        report["phases"]["I_forge_fault_rollback"] = {
+            "worker_err_counted": True,
+            "no_state_leak": True,
+            "readmit_recovered": True,
+            "pass": True}
+
+        # --- J: splice-anchor forge fault -> no partial splice, retried ---
+        pending_cap_flags(or_mask=FAIL_FORGE)
+        d0 = counters(dump_maps(args.node_bin, cwd))
+        send(self_path, "synack_backend", dst_mac, snat3)
+        time.sleep(0.2)
+        d1 = counters(dump_maps(args.node_bin, cwd))
+        assert d1.get("challengeWorkerErr", 0) > \
+            d0.get("challengeWorkerErr", 0), \
+            "splice forge fault not counted as worker error"
+        pe3 = pending_entry(CLIENT_PORT + 3)
+        assert pe3 is not None and pe3["splice_state"] == 1, \
+            f"forge fault left partial splice state: {pe3}"
+        assert ct_entry(CLIENT_PORT + 3) is None, \
+            "forge fault promoted CT without an emitted ACK"
+        # Backend retransmission after the fault clears anchors cleanly.
+        pending_cap_flags(set_to=flags0)
+        send(self_path, "synack_backend", dst_mac, snat3)
+        time.sleep(0.3)
+        ce3 = ct_entry(CLIENT_PORT + 3)
+        assert ce3 is not None and ce3["splice_state"] == 2, \
+            f"splice did not recover on SYN-ACK retransmit: {ce3}"
+        report["phases"]["J_splice_fault_recovery"] = {
+            "no_partial_splice": True, "retrans_anchored": True,
+            "pass": True}
+
+        # --- K: remaining allocation fault points ------------------------
+        # Each XDP_PENDING_CAP flag is exercised independently: the
+        # failing allocation must leak no state and must be recoverable
+        # once the flag clears.
+        k = {}
+
+        # K1 pending-insert fault: valid cookie proof, pending insert
+        # forced to fail -> pending_limited++, SNAT binding rolled back,
+        # no pending record.
+        port = CLIENT_PORT + 11
+        r = send(self_path, "syn_p", dst_mac, port)
+        ch = [x for x in r["replies"]
+              if x["flags"] & 0x12 == 0x12 and x["dport"] == port]
+        assert ch and cookie_matches(ch[0]["seq"], KNOWN_KEY, port), \
+            f"K1 no valid challenge: {r['replies']}"
+        ck = ch[0]["seq"]
+        snat0 = map_entries("XDP_SNAT_REV")
+        pending_cap_flags(set_to=flags0 | FAIL_PENDING_INSERT)
+        d0 = counters(dump_maps(args.node_bin, cwd))
+        send(self_path, "ack_cookie_p", dst_mac, (port << 32) | ck)
+        time.sleep(0.2)
+        d1 = counters(dump_maps(args.node_bin, cwd))
+        assert d1.get("pendingLimited", 0) > d0.get("pendingLimited", 0), \
+            "pending-insert fault not counted"
+        assert pending_entry(port) is None, "pending-insert fault leaked pending"
+        assert map_entries("XDP_SNAT_REV") == snat0, \
+            "pending-insert fault leaked SNAT binding"
+        k["pending_insert"] = {"leaks": 0, "counted": True}
+
+        # K2 snat-alloc fault: the SNAT claim is forced to fail -> the
+        # proof ACK is not admitted, no pending record appears, and the
+        # alloc failure is counted.
+        port = CLIENT_PORT + 12
+        pending_cap_flags(set_to=flags0)
+        r = send(self_path, "syn_p", dst_mac, port)
+        ch = [x for x in r["replies"]
+              if x["flags"] & 0x12 == 0x12 and x["dport"] == port]
+        assert ch, f"K2 no challenge: {r['replies']}"
+        ck = ch[0]["seq"]
+        pending_cap_flags(set_to=flags0 | FAIL_SNAT_ALLOC)
+        d0 = counters(dump_maps(args.node_bin, cwd))
+        send(self_path, "ack_cookie_p", dst_mac, (port << 32) | ck)
+        time.sleep(0.2)
+        d1 = counters(dump_maps(args.node_bin, cwd))
+        assert d1.get("snatAllocFail", 0) > d0.get("snatAllocFail", 0), \
+            "snat-alloc fault not counted"
+        assert pending_entry(port) is None, "snat-alloc fault leaked pending"
+        k["snat_alloc"] = {"leaks": 0, "counted": True}
+
+        # K3 ct-insert fault at splice anchor: admit cleanly first, then
+        # force the authoritative CT insert to fail -> the forged ACK is
+        # dropped, pending stays SPLICE_WAIT, no CT entry; after clearing,
+        # a backend SYN-ACK retransmit anchors.
+        port = CLIENT_PORT + 13
+        pending_cap_flags(set_to=flags0)
+        r = send(self_path, "syn_p", dst_mac, port)
+        ch = [x for x in r["replies"]
+              if x["flags"] & 0x12 == 0x12 and x["dport"] == port]
+        assert ch, f"K3 no challenge: {r['replies']}"
+        ck = ch[0]["seq"]
+        send(self_path, "ack_cookie_p", dst_mac, (port << 32) | ck)
+        time.sleep(0.2)
+        pe = pending_entry(port)
+        assert pe is not None and pe["splice_state"] == 1, \
+            f"K3 admit failed: {pe}"
+        pending_cap_flags(set_to=flags0 | FAIL_CT_INSERT)
+        d0 = counters(dump_maps(args.node_bin, cwd))
+        send(self_path, "synack_backend", dst_mac, pe["snat_port"])
+        time.sleep(0.2)
+        d1 = counters(dump_maps(args.node_bin, cwd))
+        assert d1.get("tcpFwdMapFull", 0) > d0.get("tcpFwdMapFull", 0), \
+            "ct-insert fault not counted"
+        assert ct_entry(port) is None, "ct-insert fault promoted CT"
+        pe = pending_entry(port)
+        assert pe is not None and pe["splice_state"] == 1, \
+            f"ct-insert fault corrupted pending: {pe}"
+        pending_cap_flags(set_to=flags0)
+        send(self_path, "synack_backend", dst_mac, pe["snat_port"])
+        time.sleep(0.3)
+        ce = ct_entry(port)
+        assert ce is not None and ce["splice_state"] == 2, \
+            f"K3 splice did not recover: {ce}"
+        k["ct_insert"] = {"no_partial": True, "recovered": True}
+        report["phases"]["K_alloc_fault_points"] = {**k, "pass": True}
+
+        # --- H: SYN flood under a valid key and an explicit small budget ---
+        # Restore a valid keyring (rotation shape: cur=KNOWN_KEY2,
+        # prev=KNOWN_KEY) then flood: challenges must be bounded by the
+        # configured dim3 budget, the excess counted rejected, and the
+        # next window must refill the allowance.
+        set_cookie_key(KNOWN_KEY2, KNOWN_KEY)
+        d0 = counters(dump_maps(args.node_bin, cwd))
         send(self_path, "syn_flood", dst_mac, 300)
         time.sleep(0.3)
         d2 = counters(dump_maps(args.node_bin, cwd))
+        sent_delta = d2.get("challengeSent", 0) - d0.get("challengeSent", 0)
+        rej_delta = d2.get("challengeRejected", 0) \
+            - d0.get("challengeRejected", 0)
+        # Per-CPU share = ceil(40/ncpu); the burst can straddle at most two
+        # windows. Generous bound keeps the assertion about the limit, not
+        # about CPU scheduling.
+        budget_max = CHALLENGE_PPS * 2
+        assert sent_delta >= 1, "no challenges emitted under valid key"
+        assert sent_delta <= budget_max, \
+            f"flood challenges {sent_delta} exceeded budget {budget_max}"
+        assert rej_delta >= 300 - sent_delta, \
+            f"excess flood SYNs not counted rejected: {rej_delta}"
         st = {"pending": map_entries("XDP_PENDING"),
               "ct": map_entries("XDP_TCP_CT"),
               "snat": map_entries("XDP_SNAT_REV")}
-        # The established splice CT from phase D stays; nothing new.
+        # The established CTs (main splice + phase J + phase K3) stay;
+        # the flood must not grow any table.
         assert st["pending"] == 0, f"flood created pending state: {st}"
-        assert st["ct"] == 1, f"flood created CT state: {st}"
-        assert st["snat"] == 1, f"flood created SNAT state: {st}"
-        report["phases"]["H_syn_flood_stateless"] = {
-            "challengeSent": d2.get("challengeSent"),
-            "challengeRejected": d2.get("challengeRejected"),
+        assert st["ct"] == 3, f"flood created CT state: {st}"
+        assert st["snat"] == 3, f"flood created SNAT state: {st}"
+        # Refill: after a fresh accounting window a new SYN is challenged.
+        time.sleep(WINDOW_MS / 1000 + 0.3)
+        r = send(self_path, "syn_p", dst_mac, CLIENT_PORT + 9)
+        refill = [x for x in r["replies"]
+                  if x["flags"] & 0x12 == 0x12
+                  and x["dport"] == CLIENT_PORT + 9]
+        assert refill, "challenge budget did not refill after the window"
+        assert cookie_matches(refill[0]["seq"], KNOWN_KEY2, CLIENT_PORT + 9) \
+            or cookie_matches(refill[0]["seq"], KNOWN_KEY, CLIENT_PORT + 9), \
+            f"refill cookie not keyed-valid: {refill[0]}"
+        report["phases"]["H_syn_flood_bounded"] = {
+            "challengeSent": sent_delta,
+            "challengeRejected": rej_delta,
+            "budgetPps": CHALLENGE_PPS,
+            "refill_challenge": True,
             "state": st, "pass": True}
 
+        # --- R: real kernel TCP end-to-end -------------------------------
+        # A real client socket + real backend listener in the netns drive
+        # the complete path: challenge, cookie proof, SYN replay, splice
+        # anchor, bidirectional byte translation, FIN teardown, plus an
+        # RST-closed connection. This is the kernel-TCP acceptance the
+        # raw-frame phases cannot provide (real ISNs, real retransmit and
+        # checksum enforcement on both ends).
+        out = sh(["python3", self_path, "--send", "real_tcp", dst_mac, "0"],
+                 netns=NS).stdout.strip()
+        rt = json.loads(out)
+        assert rt.get("reply") == "echo:en14-real", \
+            f"real TCP echo failed: {rt}"
+        assert rt.get("backend", {}).get("served"), \
+            f"backend did not serve the real connection: {rt}"
+        ce_rt = ct_entry(rt["client_port"])
+        assert ce_rt is not None and ce_rt["splice_state"] == 2, \
+            f"real client flow not spliced: {ce_rt}"
+        report["phases"]["R_real_kernel_tcp"] = {
+            "client_port": rt["client_port"],
+            "reply": rt["reply"],
+            "backend_peer_snat_port": rt["backend"].get("peer"),
+            "rst_conn_port": rt.get("client_port2"),
+            "pass": True}
+
         report["result"] = "PASS"
+        report["prod_pin_dir_untouched"] = \
+            os.path.exists(PROD_PIN_DIR) == prod_pins_before
     except BaseException as e:
         # Capture dataplane state before teardown so failures are
         # diagnosable from the report alone.

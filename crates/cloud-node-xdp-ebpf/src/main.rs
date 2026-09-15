@@ -17,10 +17,12 @@ use aya_ebpf::{
 use cloud_node_xdp_common::{
     XDP_CLASS_MALFORMED, XDP_CLASS_UNSUPPORTED, XDP_CT_STATE_CLOSING, XDP_CT_STATE_OPEN,
     XDP_CT_STATE_PENDING, XDP_CT_STATE_PENDING_ACKED, XDP_DECISION_FLOW_TABLE_FULL,
-    XDP_DECISION_NAT_CONFLICT, XDP_DECISION_PASS, XDP_FLOW_EVENT_ADMITTED, XDP_FLOW_EVENT_CLOSED,
+    XDP_DECISION_INTERNAL_ERR, XDP_DECISION_NAT_CONFLICT, XDP_DECISION_PASS,
+    XDP_FLOW_EVENT_ADMITTED, XDP_FLOW_EVENT_CLOSED,
     XDP_FLOW_EVENT_EXPIRED, XDP_FLOW_EVENT_REJECTED, XDP_FLOW_EVENT_VALIDATED, XDP_FRAGMENT_DROP,
     XDP_FRAGMENT_PASS, XDP_LOCAL_FRAG_DROP, XDP_LOCAL_FRAG_PASS, XDP_LOCAL_PRESENT,
-    XDP_LOCAL_REDIRECT, XDP_PENDING_CAP_FAIL_CT_INSERT, XDP_PENDING_CAP_FAIL_PENDING_INSERT,
+    XDP_LOCAL_REDIRECT, XDP_PENDING_CAP_FAIL_CT_INSERT, XDP_PENDING_CAP_FAIL_FORGE,
+    XDP_PENDING_CAP_FAIL_PENDING_INSERT,
     XDP_SPLICE_DONE, XDP_SPLICE_NONE, XDP_SPLICE_WAIT,
     XDP_PENDING_CAP_FAIL_SNAT_ALLOC, XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN, XdpBudgetBucket,
     XdpBudgetConfig, XdpCookieKey, XdpCounters, XdpFlowAcct, XdpFlowEvent, XdpInterfacePolicy,
@@ -597,8 +599,12 @@ pub fn xdp_tcp4_challenge(ctx: XdpContext) -> u32 {
             action
         }
         Err(_) => {
-            counter_parse_error();
-            xdp_action::XDP_PASS
+            // The forge helpers may have already rewritten parts of the
+            // frame before failing — passing it to the kernel stack would
+            // deliver a corrupted packet as if it were normal traffic.
+            // Explicit verdict: counted and dropped.
+            counter_challenge_worker_err();
+            xdp_action::XDP_DROP
         }
     }
 }
@@ -4719,15 +4725,21 @@ fn cookie_check_v4(
     let key = XDP_COOKIE_KEY.get(0)?;
     let slot = cookie_slot(now_mono_ns);
     let masked = cookie & !7u32;
-    if (cookie_hash(&key.cur, tuple, listen_be, slot) as u32) & !7 == masked
-        || (key.prev != [0u8; 16]
+    // A zeroed key is "absent", never a valid key: an all-zero cur must not
+    // participate in validation — an attacker could compute its SipHash
+    // outputs offline and forge admission proofs. With no usable key every
+    // comparison is disabled and the check fails closed.
+    let cur_ok = key.cur != [0u8; 16];
+    let prev_ok = key.prev != [0u8; 16];
+    if (cur_ok && (cookie_hash(&key.cur, tuple, listen_be, slot) as u32) & !7 == masked)
+        || (prev_ok
             && (cookie_hash(&key.prev, tuple, listen_be, slot) as u32) & !7 == masked)
     {
         return Some((cookie & 7) as u8);
     }
     let prev_slot = slot.wrapping_sub(1);
-    if (cookie_hash(&key.cur, tuple, listen_be, prev_slot) as u32) & !7 == masked
-        || (key.prev != [0u8; 16]
+    if (cur_ok && (cookie_hash(&key.cur, tuple, listen_be, prev_slot) as u32) & !7 == masked)
+        || (prev_ok
             && (cookie_hash(&key.prev, tuple, listen_be, prev_slot) as u32) & !7 == masked)
     {
         return Some((cookie & 7) as u8);
@@ -4810,20 +4822,27 @@ fn pkt_store_n(ctx: &XdpContext, off: usize, buf: &[u8], len: usize) -> Result<(
     Ok(())
 }
 
+/// Conservative fallback for an absent or malformed MSS option — the
+/// smallest table entry (536, the IPv4 minimum-MTU default). A parse
+/// failure must never forge a value larger than what the client may
+/// have advertised: the previous 1460 default could exceed it.
+const MSS_IDX_FALLBACK: u8 = 0;
+
 /// Parse the client MSS option out of a SYN and map it to a table index.
 /// Straight-line probe of the first three option slots (MSS, NOP+MSS,
-/// NOP+NOP+MSS covers every mainstream TCP stack); a deeper or absent MSS
-/// falls back to the 1460 index — a sane default, never a parse failure.
+/// NOP+NOP+MSS covers every mainstream TCP stack); a deeper, absent, or
+/// malformed MSS falls back to MSS_IDX_FALLBACK — a conservative default,
+/// never a parse failure and never an expansion of the advertised value.
 /// A bounded loop would need either per-byte helper calls (jump-sequence
 /// budget) or variable-offset stack reads (rejected by strict kernels).
 #[inline(never)]
 fn tcp_syn_mss_idx(ctx: &XdpContext, l4_offset: usize) -> u8 {
     let doff = match pkt_u8(ctx, l4_offset + 12) {
         Ok(b) => (b >> 4) as usize,
-        Err(()) => return 3,
+        Err(()) => return MSS_IDX_FALLBACK,
     };
     if doff <= 5 {
-        return 3;
+        return MSS_IDX_FALLBACK;
     }
     // Probe option slots at fixed offsets 0/1/2 past the header, skipping
     // leading NOPs (kind 1). kind==2 && len==4 is an MSS option.
@@ -4832,7 +4851,7 @@ fn tcp_syn_mss_idx(ctx: &XdpContext, l4_offset: usize) -> u8 {
     loop {
         let kind = match pkt_u8(ctx, l4_offset + 20 + i) {
             Ok(k) => k,
-            Err(()) => return 3,
+            Err(()) => return MSS_IDX_FALLBACK,
         };
         if kind == 1 && probes < 2 {
             i += 1;
@@ -4840,21 +4859,21 @@ fn tcp_syn_mss_idx(ctx: &XdpContext, l4_offset: usize) -> u8 {
             continue;
         }
         if kind != 2 {
-            return 3;
+            return MSS_IDX_FALLBACK;
         }
         if doff * 4 < 20 + i + 4 {
-            return 3;
+            return MSS_IDX_FALLBACK;
         }
         let len = match pkt_u8(ctx, l4_offset + 20 + i + 1) {
             Ok(l) => l,
-            Err(()) => return 3,
+            Err(()) => return MSS_IDX_FALLBACK,
         };
         if len != 4 {
-            return 3;
+            return MSS_IDX_FALLBACK;
         }
         return match pkt_u16be(ctx, l4_offset + 20 + i + 2) {
             Ok(mss) => mss_to_idx(mss),
-            Err(()) => 3,
+            Err(()) => MSS_IDX_FALLBACK,
         };
     }
 }
@@ -4930,6 +4949,11 @@ fn forge_challenge_synack_v4(
     let ip_offset = offsets & 0xffff;
     let l4_offset = (offsets >> 16) & 0x3fff;
     let s = nat_scratch()?;
+    // Test-only fault injection: act as if the first write helper failed
+    // so the worker error/rollback path is exercised on demand.
+    if unsafe { (*s).debug_flags } & XDP_PENDING_CAP_FAIL_FORGE != 0 {
+        return Err(());
+    }
     let eth = ptr_at_mut::<EthHdr>(ctx, 0)?;
     unsafe {
         core::mem::swap(&mut (*eth).src_addr, &mut (*eth).dst_addr);
@@ -4956,7 +4980,7 @@ fn forge_challenge_synack_v4(
     let ip_check = csum_fold(unsafe {
         bpf_csum_diff(core::ptr::null_mut(), 0, ipb.as_mut_ptr() as *mut u32, 20, 0) as u64
     });
-    ipb[10..12].copy_from_slice(&ip_check.to_be_bytes());
+    ipb[10..12].copy_from_slice(&ip_check.to_ne_bytes()); // __sum16 is already wire order
     pkt_store(ctx, ip_offset, ipb)?;
     // Client ports into tb[0..4] then swapped in place: forged source =
     // original dest, and vice versa. tmp[0..8] keeps the orig addrs for
@@ -4973,6 +4997,10 @@ fn forge_challenge_synack_v4(
     tb[12] = ((tcp_len / 4) as u8) << 4;
     tb[13] = 0x12; // SYN|ACK
     tb[14..16].copy_from_slice(&unsafe { (*s).forge_win }.to_be_bytes());
+    // forge_tb is per-CPU scratch reused across packets: the checksum and
+    // urgent-pointer bytes must be cleared before summing or a previous
+    // frame's leftovers fold into this checksum.
+    tb[16..20].copy_from_slice(&[0, 0, 0, 0]);
     if tcp_len == 24 {
         tb[20..24].copy_from_slice(&(0x0204_0000u32 | f_mss as u32).to_be_bytes());
     }
@@ -4980,7 +5008,7 @@ fn forge_challenge_synack_v4(
     let src_ne = u32::from_ne_bytes([tmp[4], tmp[5], tmp[6], tmp[7]]);
     let dst_ne = u32::from_ne_bytes([tmp[0], tmp[1], tmp[2], tmp[3]]);
     let tcp_check = csum_fold(tcp_pseudo_csum(src_ne, dst_ne, tb, tcp_len));
-    tb[16..18].copy_from_slice(&tcp_check.to_be_bytes());
+    tb[16..18].copy_from_slice(&tcp_check.to_ne_bytes()); // __sum16 is already wire order
     pkt_store_n(ctx, l4_offset, tb, tcp_len)?;
     let new_len = (14 + 20 + tcp_len) as i64;
     let delta = new_len - packet_len_of(ctx) as i64;
@@ -5007,6 +5035,11 @@ fn forge_to_backend_v4(
     let ip_offset = offsets & 0xffff;
     let l4_offset = (offsets >> 16) & 0x3fff;
     let s = nat_scratch()?;
+    // Test-only fault injection: forge fails before touching the frame so
+    // callers' rollback paths are exercised without a helper fault.
+    if unsafe { (*s).debug_flags } & XDP_PENDING_CAP_FAIL_FORGE != 0 {
+        return Err(());
+    }
     // Backend endpoint: replay SYN (client->VIP frame) or handshake ACK
     // (backend->VIP frame) — the backend address is always the CT tuple's
     // backend_addr; the forged source is the packet's destination (VIP).
@@ -5039,7 +5072,7 @@ fn forge_to_backend_v4(
     let ip_check = csum_fold(unsafe {
         bpf_csum_diff(core::ptr::null_mut(), 0, ipb.as_mut_ptr() as *mut u32, 20, 0) as u64
     });
-    ipb[10..12].copy_from_slice(&ip_check.to_be_bytes());
+    ipb[10..12].copy_from_slice(&ip_check.to_ne_bytes()); // __sum16 is already wire order
     pkt_store(ctx, ip_offset, ipb)?;
     let tb = unsafe { &mut (*s).forge_tb };
     tb[0..2].copy_from_slice(&unsafe { (*s).forge_src_port }.to_ne_bytes());
@@ -5049,13 +5082,16 @@ fn forge_to_backend_v4(
     tb[12] = ((tcp_len / 4) as u8) << 4;
     tb[13] = unsafe { (*s).forge_flags };
     tb[14..16].copy_from_slice(&unsafe { (*s).forge_win }.to_be_bytes());
+    // Same scratch-reuse hazard as forge_challenge_synack_v4: clear the
+    // checksum + urgent-pointer bytes before summing.
+    tb[16..20].copy_from_slice(&[0, 0, 0, 0]);
     if tcp_len == 24 {
         tb[20..24].copy_from_slice(&(0x0204_0000u32 | f_mss as u32).to_be_bytes());
     }
     let src_ne = u32::from_ne_bytes([tmp[0], tmp[1], tmp[2], tmp[3]]);
     let dst_ne = u32::from_ne_bytes([tmp[4], tmp[5], tmp[6], tmp[7]]);
     let tcp_check = csum_fold(tcp_pseudo_csum(src_ne, dst_ne, tb, tcp_len));
-    tb[16..18].copy_from_slice(&tcp_check.to_be_bytes());
+    tb[16..18].copy_from_slice(&tcp_check.to_ne_bytes()); // __sum16 is already wire order
     pkt_store_n(ctx, l4_offset, tb, tcp_len)?;
     let new_len = (14 + 20 + tcp_len) as i64;
     let delta = new_len - packet_len_of(ctx) as i64;
@@ -5100,6 +5136,13 @@ fn counter_challenge_sent() {
 fn counter_challenge_rejected() {
     if let Some(counters) = counters() {
         counters.challenge_rejected = counters.challenge_rejected.saturating_add(1);
+    }
+}
+
+fn counter_challenge_worker_err() {
+    if let Some(counters) = counters() {
+        counters.challenge_worker_err =
+            counters.challenge_worker_err.saturating_add(1);
     }
 }
 
@@ -5261,7 +5304,24 @@ fn tcp_challenge_v4(
             // forge_next_hop was staged by the caller from the rule —
             // map pointers cannot cross the tail-call boundary.
         }
-        forge_to_backend_v4(ctx, ip_offset | l4_offset << 16, have_opt)?;
+        if forge_to_backend_v4(ctx, ip_offset | l4_offset << 16, have_opt).is_err() {
+            // Forge fault after admission: roll back every allocation so
+            // no pending record or SNAT port leaks for a replay that was
+            // never emitted. The worker maps Err to a counted DROP.
+            let _ = XDP_PENDING.remove(unsafe { &(*scratch).ct_key });
+            if snat_port != 0 {
+                snat_release(scratch);
+            }
+            // Balance the ADMITTED event above so the feedback ledger
+            // never carries a flow the dataplane dropped.
+            emit_flow_event(
+                unsafe { &(*scratch).ct_value },
+                XDP_FLOW_EVENT_REJECTED,
+                XDP_DECISION_INTERNAL_ERR,
+                now_mono_ns,
+            );
+            return Err(());
+        }
         counter_tcp_fwd_tx();
         return Ok(Some(xdp_action::XDP_TX));
     }
@@ -5308,15 +5368,35 @@ fn tcp_splice_anchor_v4(
         return Ok(Some(xdp_action::XDP_DROP));
     }
     let (splice_isn, expect_seq, snat_port) = (p.splice_isn, p.expect_seq, p.snat_port_be);
+    // Forge the handshake-completing ACK to the backend BEFORE mutating
+    // flow state: seq = c_isn+1 (the client seq space the replay
+    // established), ack = b_isn+1. If the forge fails the packet is
+    // dropped un-emitted with pending state untouched — the backend
+    // retransmits the SYN-ACK and the anchor retries cleanly. Promoting
+    // first would commit the splice while the ACK was never sent; a
+    // retransmit would then hit SPLICE_DONE and stall the flow.
+    let eth = ptr_at::<EthHdr>(ctx, 0)?;
+    let backend_mac = unsafe { (*eth).src_addr };
+    unsafe {
+        (*scratch).forge_seq = expect_seq;
+        (*scratch).forge_ack = b_isn.wrapping_add(1);
+        (*scratch).forge_flags = 0x10; // ACK
+        (*scratch).forge_win = 65535;
+        (*scratch).forge_mss = 0;
+        (*scratch).forge_src_port = snat_port;
+        (*scratch).forge_next_hop = backend_mac;
+    }
+    forge_to_backend_v4(ctx, offsets, false)?;
     let ct_insert_ok =
         unsafe { (*scratch).debug_flags } & XDP_PENDING_CAP_FAIL_CT_INSERT == 0
             && XDP_TCP_CT
                 .insert(unsafe { &(*scratch).ct_key }, &*p, 0)
                 .is_ok();
     if !ct_insert_ok {
-        // Authoritative table full: the pending record is untouched and the
-        // consumed SYN-ACK is simply retransmitted by the backend — the next
-        // arrival retries the anchor. Counted, never a partial splice.
+        // Authoritative table full: the pending record is untouched and
+        // the forged ACK is dropped un-emitted — the backend retransmits
+        // and the next arrival retries the anchor. Counted, never a
+        // partial splice.
         counter_tcp_fwd_map_full();
         return Ok(Some(xdp_action::XDP_DROP));
     }
@@ -5330,20 +5410,6 @@ fn tcp_splice_anchor_v4(
         emit_flow_event(ct, XDP_FLOW_EVENT_VALIDATED, XDP_DECISION_PASS, now_mono_ns);
     }
     let _ = XDP_PENDING.remove(unsafe { &(*scratch).ct_key });
-    // Forge the handshake-completing ACK to the backend: seq = c_isn+1
-    // (the client seq space the replay established), ack = b_isn+1.
-    let eth = ptr_at::<EthHdr>(ctx, 0)?;
-    let backend_mac = unsafe { (*eth).src_addr };
-    unsafe {
-        (*scratch).forge_seq = expect_seq;
-        (*scratch).forge_ack = b_isn.wrapping_add(1);
-        (*scratch).forge_flags = 0x10; // ACK
-        (*scratch).forge_win = 65535;
-        (*scratch).forge_mss = 0;
-        (*scratch).forge_src_port = snat_port;
-        (*scratch).forge_next_hop = backend_mac;
-    }
-    forge_to_backend_v4(ctx, offsets, false)?;
     Ok(Some(xdp_action::XDP_TX))
 }
 

@@ -15,6 +15,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const XDP_EBPF_EMBEDDED: &[u8] = aya::include_bytes_aligned!(env!("CLOUD_NODE_XDP_EBPF_OBJECT"));
 #[cfg(target_os = "linux")]
 const XDP_BPF_PIN_DIR: &str = "/sys/fs/bpf/cloud-node-xdp";
+
+/// Resolved bpffs pin root. `CLOUD_NODE_XDP_PIN_DIR` gives an isolated
+/// task/probe its own pin space; unset keeps the production default.
+#[cfg(target_os = "linux")]
+fn xdp_bpf_pin_dir() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::var("CLOUD_NODE_XDP_PIN_DIR")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| XDP_BPF_PIN_DIR.to_string())
+    })
+    .as_str()
+}
 const XDP_STATE_WRITE_INTERVAL_SECS: u64 = 10;
 const XDP_RULE_SWEEP_INTERVAL_SECS: u64 = 5;
 // Coalescing window for rule-map writes: bursts of block/unblock events under an
@@ -181,6 +195,10 @@ pub struct XdpStatusSnapshot {
     /// bad cookie) — explicit fail-closed accounting.
     #[serde(default)]
     pub challenge_rejected: u64,
+    /// EN-14: challenge/splice worker faults — the frame was dropped,
+    /// never passed half-forged. Distinct from policy rejections.
+    #[serde(default)]
+    pub challenge_worker_err: u64,
     /// EN-10: lifecycle events dropped in-kernel because XDP_FLOW_EVENTS was
     /// full (consumer too slow). Feedback is advisory — loss never blocks or
     /// alters the dataplane, but is always accounted.
@@ -293,6 +311,7 @@ pub(crate) struct XdpManager {
     svc_budget_full: AtomicU64,
     challenge_sent: AtomicU64,
     challenge_rejected: AtomicU64,
+    challenge_worker_err: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     /// EN-10: owner generation written to XDP_OWNER_EPOCH at attach.
@@ -395,6 +414,7 @@ impl XdpManager {
             svc_budget_full: AtomicU64::new(0),
             challenge_sent: AtomicU64::new(0),
             challenge_rejected: AtomicU64::new(0),
+            challenge_worker_err: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             owner_epoch: AtomicU64::new(0),
@@ -1081,6 +1101,7 @@ impl XdpManager {
             svc_budget_full: self.svc_budget_full.load(Ordering::Relaxed),
             challenge_sent: self.challenge_sent.load(Ordering::Relaxed),
             challenge_rejected: self.challenge_rejected.load(Ordering::Relaxed),
+            challenge_worker_err: self.challenge_worker_err.load(Ordering::Relaxed),
             flow_event_lost: self.flow_event_lost.load(Ordering::Relaxed),
             flow_events_received: self.flow_events_received.load(Ordering::Relaxed),
             flow_events_stale: self.flow_events_stale.load(Ordering::Relaxed),
@@ -1833,6 +1854,8 @@ impl XdpManager {
                     .store(counters.challenge_sent, Ordering::Relaxed);
                 self.challenge_rejected
                     .store(counters.challenge_rejected, Ordering::Relaxed);
+                self.challenge_worker_err
+                    .store(counters.challenge_worker_err, Ordering::Relaxed);
                 self.flow_event_lost
                     .store(counters.flow_event_lost, Ordering::Relaxed);
             }
@@ -1912,6 +1935,7 @@ impl XdpManager {
                     "svcBudgetFull": c.svc_budget_full,
                     "challengeSent": c.challenge_sent,
                     "challengeRejected": c.challenge_rejected,
+                    "challengeWorkerErr": c.challenge_worker_err,
                     "flowEventLost": c.flow_event_lost,
                 })
             })
@@ -2603,10 +2627,10 @@ fn doctor_report_for_config(config: &XdpConfig) -> String {
     lines.push(format!("  platform:      {}", std::env::consts::OS));
     #[cfg(target_os = "linux")]
     {
-        lines.push(format!("  bpffs pin dir: {}", XDP_BPF_PIN_DIR));
+        lines.push(format!("  bpffs pin dir: {}", xdp_bpf_pin_dir()));
         lines.push(format!(
             "  bpffs exists:  {}",
-            yes_no(std::path::Path::new(XDP_BPF_PIN_DIR).is_dir())
+            yes_no(std::path::Path::new(xdp_bpf_pin_dir()).is_dir())
         ));
     }
     if config.enabled && config.interfaces.is_empty() {

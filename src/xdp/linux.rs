@@ -583,14 +583,16 @@ pub async fn attach(
     config: &XdpConfig,
     object_path: Option<&Path>,
 ) -> anyhow::Result<AttachedProgram> {
-    std::fs::create_dir_all(XDP_BPF_PIN_DIR)
-        .map_err(|err| anyhow::anyhow!("create bpffs pin dir {XDP_BPF_PIN_DIR}: {err}"))?;
+    std::fs::create_dir_all(xdp_bpf_pin_dir())
+        .map_err(|err| {
+            anyhow::anyhow!("create bpffs pin dir {}: {err}", xdp_bpf_pin_dir())
+        })?;
     detach(config).await?;
     drop_stale_pinned_maps(config);
     ensure_bpf_map_budget(config)?;
     let mut attached = BTreeSet::new();
     let mut loader = aya::EbpfLoader::new();
-    loader.default_map_pin_directory(XDP_BPF_PIN_DIR);
+    loader.default_map_pin_directory(xdp_bpf_pin_dir());
     // EN-16: apply operator-sized state tables before load; the ledger above
     // already rejected the attach when the configured total exceeds the node
     // budget, so these sizes are guaranteed to fit.
@@ -604,14 +606,14 @@ pub async fn attach(
     // it, and without a pin the tail-call targets die with the process.
     loader.map_pin_path(
         "XDP_DISPATCH",
-        Path::new(XDP_BPF_PIN_DIR).join("XDP_DISPATCH"),
+        Path::new(xdp_bpf_pin_dir()).join("XDP_DISPATCH"),
     );
     // Counters are pinned so verdict accounting stays readable by other
     // processes (`xdp dump-maps` while a daemon owns the attachment) and
     // survives process exit. The spec check above still guards layout.
     loader.map_pin_path(
         "XDP_COUNTERS",
-        Path::new(XDP_BPF_PIN_DIR).join("XDP_COUNTERS"),
+        Path::new(xdp_bpf_pin_dir()).join("XDP_COUNTERS"),
     );
     // EN-10 takeover contract: flow state and the lifecycle feedback channel
     // are pinned so a reload/restart adopts existing flows instead of
@@ -629,7 +631,7 @@ pub async fn attach(
         "XDP_FLOW_SEQ",
         "XDP_COOKIE_KEY",
     ] {
-        loader.map_pin_path(name, Path::new(XDP_BPF_PIN_DIR).join(name));
+        loader.map_pin_path(name, Path::new(xdp_bpf_pin_dir()).join(name));
     }
     let mut ebpf = match object_path {
         Some(path) => loader.load_file(path)?,
@@ -665,7 +667,7 @@ pub async fn attach(
     // redirect/PASS path explicitly.
     // Pinned programs keep a kernel reference independent of our fds, so
     // the tail-call chain stays live after a one-shot `xdp attach` exits.
-    let prog_pin_dir = Path::new(XDP_BPF_PIN_DIR).join("progs");
+    let prog_pin_dir = Path::new(xdp_bpf_pin_dir()).join("progs");
     std::fs::create_dir_all(&prog_pin_dir)
         .map_err(|err| anyhow::anyhow!("create prog pin dir {}: {err}", prog_pin_dir.display()))?;
     let mut dispatch_fds: Vec<(u32, Option<aya::programs::ProgramFd>)> = Vec::new();
@@ -797,7 +799,7 @@ pub fn detach_blocking(config: &XdpConfig) -> anyhow::Result<()> {
     // Drop the extra kernel references taken at attach: pinned tail-call
     // subprograms and the pinned dispatch table. Unlink order is
     // irrelevant — each pin only removes one reference.
-    let prog_pin_dir = Path::new(XDP_BPF_PIN_DIR).join("progs");
+    let prog_pin_dir = Path::new(xdp_bpf_pin_dir()).join("progs");
     if let Ok(entries) = std::fs::read_dir(&prog_pin_dir) {
         for entry in entries.flatten() {
             if let Err(err) = std::fs::remove_file(entry.path()) {
@@ -810,7 +812,7 @@ pub fn detach_blocking(config: &XdpConfig) -> anyhow::Result<()> {
         }
         let _ = std::fs::remove_dir(&prog_pin_dir);
     }
-    let dispatch_pin = Path::new(XDP_BPF_PIN_DIR).join("XDP_DISPATCH");
+    let dispatch_pin = Path::new(xdp_bpf_pin_dir()).join("XDP_DISPATCH");
     if dispatch_pin.exists() {
         if let Err(err) = std::fs::remove_file(&dispatch_pin) {
             tracing::warn!("failed to unpin XDP_DISPATCH map: {err}");
@@ -984,7 +986,8 @@ pub(crate) fn sum_percpu_counters<'a>(
             service_limited,
             svc_budget_full,
             challenge_sent,
-            challenge_rejected
+            challenge_rejected,
+            challenge_worker_err
         );
     }
     total
@@ -1003,7 +1006,7 @@ pub fn read_counters(ebpf: &aya::Ebpf) -> anyhow::Result<XdpCounters> {
 /// `xdp dump-maps` so test tooling can observe fresh verdict counters
 /// while a separate daemon/smoke process owns the attachment.
 pub fn read_pinned_counters() -> anyhow::Result<XdpCounters> {
-    let path = std::path::Path::new(XDP_BPF_PIN_DIR).join("XDP_COUNTERS");
+    let path = std::path::Path::new(xdp_bpf_pin_dir()).join("XDP_COUNTERS");
     let data = aya::maps::MapData::from_pin(&path)
         .map_err(|err| anyhow::anyhow!("open pinned XDP_COUNTERS {}: {err}", path.display()))?;
     let map = aya::maps::Map::PerCpuArray(data);
@@ -1727,7 +1730,7 @@ fn clear_xsk_map(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
 }
 
 fn clear_pinned_xsk_map() -> anyhow::Result<()> {
-    let path = Path::new(XDP_BPF_PIN_DIR).join("XDP_XSKS");
+    let path = Path::new(xdp_bpf_pin_dir()).join("XDP_XSKS");
     if !path.exists() {
         return Ok(());
     }
@@ -2105,7 +2108,7 @@ fn adopt_flow_state(ebpf: &mut aya::Ebpf) -> anyhow::Result<(u64, u64)> {
 /// survives across generations, so `xdp dump-maps` can report which
 /// generation currently owns emitted feedback even from a CLI process.
 pub fn read_pinned_owner_epoch() -> Option<u64> {
-    let path = Path::new(XDP_BPF_PIN_DIR).join("XDP_OWNER_EPOCH");
+    let path = Path::new(xdp_bpf_pin_dir()).join("XDP_OWNER_EPOCH");
     if !path.exists() {
         return None;
     }
@@ -2120,7 +2123,7 @@ pub fn read_pinned_owner_epoch() -> Option<u64> {
 /// is absent (older object or attach failed before pinning) — callers treat
 /// that as an explicit "feedback channel unavailable" state, not success.
 pub fn open_pinned_flow_events() -> anyhow::Result<Option<aya::maps::RingBuf<aya::maps::MapData>>> {
-    let path = Path::new(XDP_BPF_PIN_DIR).join("XDP_FLOW_EVENTS");
+    let path = Path::new(xdp_bpf_pin_dir()).join("XDP_FLOW_EVENTS");
     if !path.exists() {
         return Ok(None);
     }
@@ -2135,7 +2138,7 @@ pub fn open_pinned_flow_events() -> anyhow::Result<Option<aya::maps::RingBuf<aya
 fn drop_stale_pinned_maps(config: &XdpConfig) {
     let specs = bpf_map_specs(config);
 
-    let Ok(dir) = std::fs::read_dir(XDP_BPF_PIN_DIR) else {
+    let Ok(dir) = std::fs::read_dir(xdp_bpf_pin_dir()) else {
         return;
     };
     for entry in dir.flatten() {
@@ -2698,5 +2701,5 @@ fn link_pin_path(interface: &str) -> PathBuf {
             }
         })
         .collect::<String>();
-    Path::new(XDP_BPF_PIN_DIR).join(format!("link-{safe_name}"))
+    Path::new(xdp_bpf_pin_dir()).join(format!("link-{safe_name}"))
 }
