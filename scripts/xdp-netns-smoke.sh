@@ -11,8 +11,12 @@ HOST_ADDR="${XDP_SMOKE_HOST_ADDR:-10.200.0.1/24}"
 HOST_BYPASS_ADDR="${XDP_SMOKE_HOST_BYPASS_ADDR:-10.200.0.3/24}"
 PEER_ADDR="${XDP_SMOKE_PEER_ADDR:-10.200.0.2/24}"
 PING_ADDR="${XDP_SMOKE_PING_ADDR:-10.200.0.2}"
+HOST_ADDR6="${XDP_SMOKE_HOST_ADDR6:-fd00:200::1/64}"
+PEER_ADDR6="${XDP_SMOKE_PEER_ADDR6:-fd00:200::2/64}"
+PING_ADDR6="${XDP_SMOKE_PING_ADDR6:-fd00:200::2}"
 HOST_IP="${HOST_ADDR%/*}"
 HOST_BYPASS_IP="${HOST_BYPASS_ADDR%/*}"
+HOST_IP6="${HOST_ADDR6%/*}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 NODE_BIN="$TARGET_DIR/debug/cloud-node-rust"
 H3_PROBE_BIN="$TARGET_DIR/debug/h3_probe"
@@ -95,25 +99,31 @@ run_raw_smoke() {
     done
     [[ -f "$raw_ready_file" ]] || die "raw smoke did not become ready: $label"
 
-    ip netns exec "$NS_NAME" python3 - "$target_ip" <<'PY'
+    local v6_target=""
+    if [[ "$expect_redirect" == "yes" ]]; then
+        v6_target="${HOST_IP6:-}"
+    fi
+    ip netns exec "$NS_NAME" python3 - "$target_ip" "$v6_target" <<'PY'
 import socket
 import sys
 import time
 
-target = sys.argv[1]
+targets = [sys.argv[1]] + ([sys.argv[2]] if len(sys.argv) > 2 and sys.argv[2] else [])
 
-udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp.sendto(b"cloud-node-xdp-udp-smoke", (target, 443))
-udp.close()
+for target in targets:
+    family = socket.AF_INET6 if ":" in target else socket.AF_INET
+    udp = socket.socket(family, socket.SOCK_DGRAM)
+    udp.sendto(b"cloud-node-xdp-udp-smoke", (target, 443))
+    udp.close()
 
-tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-tcp.settimeout(0.2)
-try:
-    tcp.connect((target, 9443))
-except OSError:
-    pass
-finally:
-    tcp.close()
+    tcp = socket.socket(family, socket.SOCK_STREAM)
+    tcp.settimeout(0.2)
+    try:
+        tcp.connect((target, 9443))
+    except OSError:
+        pass
+    finally:
+        tcp.close()
 PY
 
     if ! wait "$raw_pid"; then
@@ -169,7 +179,7 @@ run_proxy_smoke() {
     proxy_output_file="$(mktemp)"
     proxy_ready_file="$(mktemp)"
     rm -f "$proxy_ready_file"
-    setsid "$NODE_BIN" xdp proxy-smoke --duration-ms 15000 --ready-file "$proxy_ready_file" >"$proxy_output_file" 2>&1 &
+    setsid "$NODE_BIN" xdp proxy-smoke --duration-ms 25000 --ready-file "$proxy_ready_file" >"$proxy_output_file" 2>&1 &
     proxy_pid=$!
     PIDS_TO_KILL+=("$proxy_pid")
     for _ in $(seq 1 160); do
@@ -186,13 +196,13 @@ run_proxy_smoke() {
     done
     [[ -f "$proxy_ready_file" ]] || die "proxy smoke did not become ready: $label"
 
-    ip netns exec "$NS_NAME" python3 - "$target_ip" <<'PY'
+    ip netns exec "$NS_NAME" python3 - "$target_ip" "${HOST_IP6:-}" <<'PY'
 import socket
 import ssl
 import sys
 import time
 
-target = sys.argv[1]
+targets = [sys.argv[1]] + ([sys.argv[2]] if len(sys.argv) > 2 and sys.argv[2] else [])
 
 def recv_all(sock):
     chunks = []
@@ -215,97 +225,124 @@ def recv_until(sock, needle):
             return joined
     return b"".join(chunks)
 
-tcp_payload = b"cloud-node-xdp-tcp-proxy-smoke"
-expected_tcp = b"xdp-tcp-smoke:" + tcp_payload
-tcp_response = b""
-last_error = None
-for attempt in range(1, 6):
-    try:
-        tcp = socket.create_connection((target, 9443), timeout=3)
-        tcp.settimeout(3)
-        tcp.sendall(tcp_payload)
-        tcp.shutdown(socket.SHUT_WR)
-        tcp_response = recv_all(tcp)
-        tcp.close()
-    except OSError as err:
-        last_error = err
-        tcp_response = b""
-    if expected_tcp in tcp_response:
-        break
-    time.sleep(1.0)
-else:
-    raise SystemExit(
-        f"TCP AF_XDP proxy response mismatch: {tcp_response!r} last_error={last_error!r}"
-    )
-time.sleep(2.0)
+def connect(target, port, timeout=3):
+    family = socket.AF_INET6 if ":" in target else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect((target, port))
+    return sock
 
 tls_context = ssl.create_default_context()
 tls_context.check_hostname = False
 tls_context.verify_mode = ssl.CERT_NONE
-https_raw = socket.create_connection((target, 9444), timeout=3)
-https_raw.settimeout(3)
-https = tls_context.wrap_socket(https_raw, server_hostname="xdp-smoke-https.local")
-https.settimeout(3)
-https.sendall(
-    b"GET /xdp-proxy-smoke HTTP/1.1\r\n"
-    b"Host: xdp-smoke-https.local\r\n"
-    b"Connection: close\r\n\r\n"
-)
-https_response = recv_all(https)
-https.close()
-if b"xdp-https-smoke" not in https_response:
-    raise SystemExit(f"HTTPS AF_XDP proxy response missing smoke body: {https_response!r}")
-time.sleep(2.0)
 
-sni_raw = socket.create_connection((target, 9444), timeout=3)
-sni_raw.settimeout(3)
-sni = tls_context.wrap_socket(sni_raw, server_hostname="xdp-smoke-sni.local")
-sni.settimeout(3)
-sni.sendall(
-    b"GET /xdp-sni-smoke HTTP/1.1\r\n"
-    b"Host: xdp-smoke-sni.local\r\n"
-    b"Connection: close\r\n\r\n"
-)
-sni_response = recv_until(sni, b"xdp-sni-smoke")
-sni.close()
-if b"xdp-sni-smoke" not in sni_response:
-    raise SystemExit(f"SNI AF_XDP passthrough response missing smoke body: {sni_response!r}")
-time.sleep(2.0)
+for target in targets:
+    fam = "v6" if ":" in target else "v4"
+    tcp_payload = b"cloud-node-xdp-tcp-proxy-smoke"
+    expected_tcp = b"xdp-tcp-smoke:" + tcp_payload
+    tcp_response = b""
+    last_error = None
+    for attempt in range(1, 6):
+        try:
+            tcp = connect(target, 9443)
+            tcp.sendall(tcp_payload)
+            tcp.shutdown(socket.SHUT_WR)
+            tcp_response = recv_all(tcp)
+            tcp.close()
+        except OSError as err:
+            last_error = err
+            tcp_response = b""
+        if expected_tcp in tcp_response:
+            break
+        time.sleep(1.0)
+    else:
+        raise SystemExit(
+            f"TCP/{fam} AF_XDP proxy response mismatch: {tcp_response!r} last_error={last_error!r}"
+        )
+    time.sleep(2.0)
 
-http = socket.create_connection((target, 9080), timeout=3)
-http.settimeout(3)
-http.sendall(
-    b"GET /xdp-proxy-smoke HTTP/1.1\r\n"
-    b"Host: xdp-smoke-http.local\r\n"
-    b"Connection: close\r\n\r\n"
-)
-http_response = recv_all(http)
-http.close()
-if b"xdp-http-smoke" not in http_response:
-    raise SystemExit(f"HTTP AF_XDP proxy response missing smoke body: {http_response!r}")
+    https_raw = connect(target, 9444)
+    https = tls_context.wrap_socket(https_raw, server_hostname="xdp-smoke-https.local")
+    https.settimeout(3)
+    https.sendall(
+        b"GET /xdp-proxy-smoke HTTP/1.1\r\n"
+        b"Host: xdp-smoke-https.local\r\n"
+        b"Connection: close\r\n\r\n"
+    )
+    https_response = recv_all(https)
+    https.close()
+    if b"xdp-https-smoke" not in https_response:
+        raise SystemExit(f"HTTPS/{fam} AF_XDP proxy response missing smoke body: {https_response!r}")
+    time.sleep(2.0)
 
-udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp.settimeout(3)
-udp_payload = b"cloud-node-xdp-udp-proxy-smoke"
-udp.sendto(udp_payload, (target, 443))
-udp_response, _ = udp.recvfrom(4096)
-udp.close()
-expected_udp = b"xdp-udp-smoke:" + udp_payload
-if udp_response != expected_udp:
-    raise SystemExit(f"UDP AF_XDP proxy response mismatch: {udp_response!r}")
+    sni_raw = connect(target, 9444)
+    sni = tls_context.wrap_socket(sni_raw, server_hostname="xdp-smoke-sni.local")
+    sni.settimeout(3)
+    sni.sendall(
+        b"GET /xdp-sni-smoke HTTP/1.1\r\n"
+        b"Host: xdp-smoke-sni.local\r\n"
+        b"Connection: close\r\n\r\n"
+    )
+    sni_response = recv_until(sni, b"xdp-sni-smoke")
+    sni.close()
+    if b"xdp-sni-smoke" not in sni_response:
+        raise SystemExit(f"SNI/{fam} AF_XDP passthrough response missing smoke body: {sni_response!r}")
+    time.sleep(2.0)
+
+    http = connect(target, 9080)
+    http.sendall(
+        b"GET /xdp-proxy-smoke HTTP/1.1\r\n"
+        b"Host: xdp-smoke-http.local\r\n"
+        b"Connection: close\r\n\r\n"
+    )
+    http_response = recv_all(http)
+    http.close()
+    if b"xdp-http-smoke" not in http_response:
+        raise SystemExit(f"HTTP/{fam} AF_XDP proxy response missing smoke body: {http_response!r}")
+
+    family = socket.AF_INET6 if ":" in target else socket.AF_INET
+    udp = socket.socket(family, socket.SOCK_DGRAM)
+    udp.settimeout(3)
+    udp_payload = b"cloud-node-xdp-udp-proxy-smoke"
+    udp.sendto(udp_payload, (target, 443))
+    udp_response, _ = udp.recvfrom(4096)
+    udp.close()
+    expected_udp = b"xdp-udp-smoke:" + udp_payload
+    if udp_response != expected_udp:
+        raise SystemExit(f"UDP/{fam} AF_XDP proxy response mismatch: {udp_response!r}")
 PY
 
-    h3_output="$(ip netns exec "$NS_NAME" "$H3_PROBE_BIN" 1 "$target_ip:8443" \
-        xdp-smoke-h3.local https://xdp-smoke-h3.local/xdp-proxy-smoke 1 1)"
-    printf '%s\n' "$h3_output"
-    grep -q 'ok=1 failed=0' <<<"$h3_output" \
-        || die "H3 AF_XDP proxy smoke failed: $h3_output"
+    for h3_target in "$target_ip" ${HOST_IP6:+"[$HOST_IP6]"}; do
+        h3_output="$(ip netns exec "$NS_NAME" "$H3_PROBE_BIN" 1 "$h3_target:8443" \
+            xdp-smoke-h3.local https://xdp-smoke-h3.local/xdp-proxy-smoke 1 1)"
+        printf '%s\n' "$h3_output"
+        grep -q 'ok=1 failed=0' <<<"$h3_output" \
+            || die "H3 AF_XDP proxy smoke failed for $h3_target: $h3_output"
 
-    quic_output="$(ip netns exec "$NS_NAME" "$H3_PROBE_BIN" 1 "$target_ip:8443" \
-        xdp-smoke-quic.local https://xdp-smoke-quic.local/xdp-quic-smoke 1 1)"
-    printf '%s\n' "$quic_output"
-    grep -q 'ok=1 failed=0' <<<"$quic_output" \
-        || die "QUIC AF_XDP passthrough smoke failed: $quic_output"
+        quic_output="$(ip netns exec "$NS_NAME" "$H3_PROBE_BIN" 1 "$h3_target:8443" \
+            xdp-smoke-quic.local https://xdp-smoke-quic.local/xdp-quic-smoke 1 1)"
+        printf '%s\n' "$quic_output"
+        grep -q 'ok=1 failed=0' <<<"$quic_output" \
+            || die "QUIC AF_XDP passthrough smoke failed for $h3_target: $quic_output"
+    done
+
+    # HTTP/2 through the TLS listener: ALPN "h2" must negotiate and the h2
+    # stream must carry the smoke body. Requires a curl built with nghttp2.
+    if command -v curl >/dev/null 2>&1 && curl --version | grep -q nghttp2; then
+        for h2_ip in "$target_ip" ${HOST_IP6:+"$HOST_IP6"}; do
+            h2_body="$(ip netns exec "$NS_NAME" curl -sk --http2 --max-time 10 \
+                --resolve "xdp-smoke-https.local:9444:[$h2_ip]" \
+                "https://xdp-smoke-https.local:9444/xdp-proxy-smoke" \
+                -w '\n%{http_version}')" || die "h2 curl failed for $h2_ip"
+            printf 'h2(%s): %s\n' "$h2_ip" "$(tail -1 <<<"$h2_body")"
+            grep -q 'xdp-https-smoke' <<<"$h2_body" \
+                || die "h2 AF_XDP proxy response missing body for $h2_ip"
+            tail -1 <<<"$h2_body" | grep -q '^2' \
+                || die "ALPN did not negotiate h2 for $h2_ip: $(tail -1 <<<"$h2_body")"
+        done
+    else
+        log "curl without nghttp2 — skipping HTTP/2 dataplane check"
+    fi
 
     if ! wait "$proxy_pid"; then
         proxy_output="$(cat "$proxy_output_file" 2>/dev/null || true)"
@@ -426,9 +463,11 @@ ip link add "$HOST_IF" type veth peer name "$PEER_IF"
 ip link set "$PEER_IF" netns "$NS_NAME"
 ip addr add "$HOST_ADDR" dev "$HOST_IF"
 ip addr add "$HOST_BYPASS_ADDR" dev "$HOST_IF"
+ip -6 addr add "$HOST_ADDR6" dev "$HOST_IF" nodad
 disable_offloads "$HOST_IF"
 ip link set "$HOST_IF" up
 ip netns exec "$NS_NAME" ip addr add "$PEER_ADDR" dev "$PEER_IF"
+ip netns exec "$NS_NAME" ip -6 addr add "$PEER_ADDR6" dev "$PEER_IF" nodad
 disable_netns_offloads "$PEER_IF"
 ip netns exec "$NS_NAME" ip link set "$PEER_IF" up
 ip netns exec "$NS_NAME" ip link set lo up
@@ -447,6 +486,7 @@ xdp:
       mode: protect
       localIps:
         - $HOST_IP
+        - $HOST_IP6
       frameSize: 2048
   proxy:
     protocols: ["http", "https", "tcp", "udp", "h3"]
@@ -492,6 +532,7 @@ xdp:
       mode: proxy
       localIps:
         - $HOST_IP
+        - $HOST_IP6
       frameSize: 2048
   proxy:
     protocols: ["http", "https", "tcp", "udp", "h3"]
@@ -535,6 +576,7 @@ xdp:
       mode: protect
       localIps:
         - $HOST_IP
+        - $HOST_IP6
       frameSize: 2048
   proxy:
     protocols: ["http", "https", "tcp", "udp", "h3"]
