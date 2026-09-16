@@ -18,8 +18,9 @@ HOST_IP="${HOST_ADDR%/*}"
 HOST_BYPASS_IP="${HOST_BYPASS_ADDR%/*}"
 HOST_IP6="${HOST_ADDR6%/*}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
-NODE_BIN="$TARGET_DIR/debug/cloud-node-rust"
-H3_PROBE_BIN="$TARGET_DIR/debug/h3_probe"
+XDP_SMOKE_PROFILE="${XDP_SMOKE_PROFILE:-debug}"
+NODE_BIN="$TARGET_DIR/$XDP_SMOKE_PROFILE/cloud-node-rust"
+H3_PROBE_BIN="$TARGET_DIR/$XDP_SMOKE_PROFILE/h3_probe"
 PIDS_TO_KILL=()
 
 log() {
@@ -446,12 +447,18 @@ fi
 BACKUP_FILE="$(mktemp)"
 cp "$CONFIG_FILE" "$BACKUP_FILE"
 
-log "building eBPF object"
-cargo xtask build-ebpf
-[[ -f "$ROOT_DIR/data/cloud-node-xdp-ebpf.o" ]] || die "missing data/cloud-node-xdp-ebpf.o"
+if [[ "${XDP_SMOKE_SKIP_BUILD:-0}" != "1" ]]; then
+    log "building eBPF object"
+    cargo xtask build-ebpf
+    [[ -f "$ROOT_DIR/data/cloud-node-xdp-ebpf.o" ]] || die "missing data/cloud-node-xdp-ebpf.o"
 
-log "building smoke binaries"
-cargo build -q --bin cloud-node-rust --bin h3_probe
+    log "building smoke binaries"
+    if [[ "$XDP_SMOKE_PROFILE" == "release" ]]; then
+        cargo build -q --release --bin cloud-node-rust --bin h3_probe
+    else
+        cargo build -q --bin cloud-node-rust --bin h3_probe
+    fi
+fi
 [[ -x "$NODE_BIN" ]] || die "missing node binary: $NODE_BIN"
 [[ -x "$H3_PROBE_BIN" ]] || die "missing H3 smoke client: $H3_PROBE_BIN"
 
