@@ -1768,12 +1768,17 @@ fn af_xdp_dial_registry_udp_owner_demuxes_payload() {
     let owner = registry.owner(&flow).expect("owner");
     assert_eq!(owner.proto, cloud_node_xdp_common::XDP_PROTO_UDP);
     let tx = owner.udp_tx.clone().expect("udp owner carries its channel");
-    tx.try_send(af_xdp::AfXdpUdpDatagram {
-        payload: bytes::Bytes::from_static(b"pong"),
-        ecn: Some(0b10),
-    })
+    tx.try_send(af_xdp::AfXdpUdpIngress::Datagram(
+        af_xdp::AfXdpUdpDatagram {
+            payload: bytes::Bytes::from_static(b"pong"),
+            ecn: Some(0b10),
+        },
+    ))
     .expect("deliver");
-    let datagram = udp_rx.try_recv().expect("reply payload");
+    let af_xdp::AfXdpUdpIngress::Datagram(datagram) = udp_rx.try_recv().expect("reply payload")
+    else {
+        panic!("expected datagram");
+    };
     assert_eq!(datagram.payload, bytes::Bytes::from_static(b"pong"));
     assert_eq!(datagram.ecn, Some(0b10));
     registry.release(&flow);
@@ -3885,4 +3890,236 @@ fn flow_event_ledger_capacity_evicts_terminal_first() {
         .count();
     assert_eq!(closed_before - closed_after, 1);
     assert_eq!(admitted_after, FlowEventLedger::CAPACITY / 2 + 1);
+}
+
+// ---------------------------------------------------------------------------
+// T4-7: userspace ICMP error parser — the authoritative gate behind the
+// eBPF XDP_OUT_CT redirect for PMTU/error delivery to dialed flows.
+// ---------------------------------------------------------------------------
+
+fn inner_ipv4_udp_packet(local_port: u16, peer_port: u16) -> Vec<u8> {
+    // The quoted *outbound* datagram: source = our dialed endpoint,
+    // destination = upstream peer.
+    let mut packet = vec![
+        0x45, 0, 0, 28, 0, 1, 0, 0, 64, 17, 0, 0, 203, 0, 113, 7, 198, 51, 100, 5,
+    ];
+    packet.extend_from_slice(&local_port.to_be_bytes());
+    packet.extend_from_slice(&peer_port.to_be_bytes());
+    packet.extend_from_slice(&[0, 8, 0, 0]);
+    packet
+}
+
+fn icmpv4_error_frame(icmp_type: u8, code: u8, mtu: u16, inner: &[u8]) -> Vec<u8> {
+    let mut frame = ethernet_header(0x0800, false);
+    let total_len = 20 + 8 + inner.len();
+    frame.extend_from_slice(&[
+        0x45,
+        0,
+        (total_len >> 8) as u8,
+        total_len as u8,
+        0,
+        1,
+        0,
+        0,
+        64,
+        1,
+        0,
+        0,
+        // ICMP sender is some router; we are the destination.
+        192,
+        0,
+        2,
+        1,
+        203,
+        0,
+        113,
+        7,
+    ]);
+    frame.extend_from_slice(&[icmp_type, code, 0, 0, 0, 0]);
+    frame.extend_from_slice(&mtu.to_be_bytes());
+    frame.extend_from_slice(inner);
+    frame
+}
+
+#[test]
+fn af_xdp_icmpv4_frag_needed_extracts_quoted_tuple_and_mtu() {
+    let inner = inner_ipv4_udp_packet(42_001, 443);
+    let frame = icmpv4_error_frame(3, 4, 1400, &inner);
+    let error = af_xdp::parse_icmp_error_frame(&frame).expect("frag-needed parses");
+    assert_eq!(error.proto, 17);
+    assert_eq!(error.mtu, Some(1400));
+    assert_eq!(error.flow.local_addr, "203.0.113.7:42001".parse().unwrap());
+    assert_eq!(error.flow.peer_addr, "198.51.100.5:443".parse().unwrap());
+}
+
+#[test]
+fn af_xdp_icmpv4_other_errors_parse_without_mtu() {
+    let inner = inner_ipv4_udp_packet(42_001, 443);
+    for (ty, code) in [(3, 1), (11, 0), (12, 0), (4, 0), (5, 1)] {
+        let frame = icmpv4_error_frame(ty, code, 0, &inner);
+        let error =
+            af_xdp::parse_icmp_error_frame(&frame).unwrap_or_else(|| panic!("type {ty} parses"));
+        assert_eq!(error.mtu, None, "type {ty} carries no MTU");
+    }
+}
+
+#[test]
+fn af_xdp_icmpv4_echo_and_malformed_rejected() {
+    let inner = inner_ipv4_udp_packet(42_001, 443);
+    // Echo request/reply and other info messages never quote a packet.
+    for ty in [0u8, 8, 9, 10, 13, 14] {
+        let frame = icmpv4_error_frame(ty, 0, 0, &inner);
+        assert!(
+            af_xdp::parse_icmp_error_frame(&frame).is_none(),
+            "type {ty} is not an error"
+        );
+    }
+    // Truncated quoted packet (ports cut off) → no tuple.
+    let frame = icmpv4_error_frame(3, 4, 1400, &inner[..21]);
+    assert!(af_xdp::parse_icmp_error_frame(&frame).is_none());
+    // Wrong inner IP version → rejected.
+    let mut bad_inner = inner.clone();
+    bad_inner[0] = 0x65;
+    let frame = icmpv4_error_frame(3, 4, 1400, &bad_inner);
+    assert!(af_xdp::parse_icmp_error_frame(&frame).is_none());
+    // Frag-needed with mtu=0 reports no MTU but still parses the tuple.
+    let frame = icmpv4_error_frame(3, 4, 0, &inner);
+    let error = af_xdp::parse_icmp_error_frame(&frame).expect("zero MTU still parses");
+    assert_eq!(error.mtu, None);
+}
+
+fn inner_ipv6_udp_packet(local_port: u16, peer_port: u16, ext_chain: &[u8]) -> Vec<u8> {
+    let next = if ext_chain.is_empty() { 17 } else { 0 };
+    let payload_len = ext_chain.len() + 8;
+    let mut packet = vec![
+        0x60,
+        0,
+        0,
+        0,
+        (payload_len >> 8) as u8,
+        payload_len as u8,
+        next,
+        64,
+    ];
+    packet.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+    packet.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    packet.extend_from_slice(ext_chain);
+    packet.extend_from_slice(&local_port.to_be_bytes());
+    packet.extend_from_slice(&peer_port.to_be_bytes());
+    packet.extend_from_slice(&[0, 8, 0, 0]);
+    packet
+}
+
+fn icmpv6_error_frame(icmp_type: u8, mtu: u32, inner: &[u8]) -> Vec<u8> {
+    let mut frame = ethernet_header(0x86dd, false);
+    let payload_len = 8 + inner.len();
+    frame.extend_from_slice(&[
+        0x60,
+        0,
+        0,
+        0,
+        (payload_len >> 8) as u8,
+        payload_len as u8,
+        58,
+        64,
+    ]);
+    frame.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa]);
+    frame.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+    frame.extend_from_slice(&[icmp_type, 0, 0, 0]);
+    frame.extend_from_slice(&mtu.to_be_bytes());
+    frame.extend_from_slice(inner);
+    frame
+}
+
+#[test]
+fn af_xdp_icmpv6_packet_too_big_extracts_quoted_tuple_and_mtu() {
+    let inner = inner_ipv6_udp_packet(43_002, 443, &[]);
+    let frame = icmpv6_error_frame(2, 1280, &inner);
+    let error = af_xdp::parse_icmp_error_frame(&frame).expect("PTB parses");
+    assert_eq!(error.proto, 17);
+    assert_eq!(error.mtu, Some(1280));
+    assert_eq!(
+        error.flow.local_addr,
+        "[2001:db8::9]:43002".parse().unwrap()
+    );
+    assert_eq!(error.flow.peer_addr, "[2001:db8::3]:443".parse().unwrap());
+}
+
+#[test]
+fn af_xdp_icmpv6_error_walks_quoted_extension_headers() {
+    // Inner packet carries a hop-by-hop header before UDP — the quoted
+    // tuple is still extractable.
+    let mut hbh = vec![17u8, 0]; // next=UDP, len=0 (8 bytes total)
+    hbh.extend_from_slice(&[1, 0, 0, 0, 0, 0]); // pad
+    let inner = inner_ipv6_udp_packet(43_002, 443, &hbh);
+    let frame = icmpv6_error_frame(2, 1400, &inner);
+    let error = af_xdp::parse_icmp_error_frame(&frame).expect("PTB with ext parses");
+    assert_eq!(error.proto, 17);
+    assert_eq!(error.mtu, Some(1400));
+    assert_eq!(error.flow.local_addr.port(), 43_002);
+}
+
+#[test]
+fn af_xdp_icmpv6_non_error_and_malformed_rejected() {
+    let inner = inner_ipv6_udp_packet(43_002, 443, &[]);
+    // Echo request/reply, RS/RA/NS/NA are not errors.
+    for ty in [128u8, 129, 133, 134, 135, 136] {
+        let frame = icmpv6_error_frame(ty, 0, &inner);
+        assert!(
+            af_xdp::parse_icmp_error_frame(&frame).is_none(),
+            "type {ty} is not an error"
+        );
+    }
+    // Truncated quoted packet → no tuple.
+    let frame = icmpv6_error_frame(2, 1280, &inner[..41]);
+    assert!(af_xdp::parse_icmp_error_frame(&frame).is_none());
+}
+
+/// T4-7: `apply_pmtu` routes the ICMP-derived cap into the owning
+/// session's smoltcp socket; non-PTB (None) and unknown flows are
+/// explicit no-ops that never disturb live sessions.
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_apply_pmtu_clamps_dialed_session() {
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    reactor.dial(af_xdp::AfXdpTcpDialRequest {
+        remote,
+        local,
+        route: af_xdp_dial_route_meta(),
+        syn_extra_options: Vec::new(),
+        reply: reply_tx,
+    });
+    let egress = reactor.poll();
+    let tcp = &egress[0].1[20..];
+    let our_seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let syn_ack = ipv4_tcp_control_reply_frame(39000, 1_000, our_seq.wrapping_add(1), 0x12);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &syn_ack).expect("valid SYN-ACK frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    reactor.ingest(route, flow, ip_packet);
+    let _ = reactor.poll();
+    assert!(reply_rx.try_recv().is_ok(), "dial must resolve");
+    assert_eq!(reactor.session_path_mtu(&flow), Some(None));
+
+    // PTB → cap installed; a non-PTB report leaves it untouched.
+    reactor.apply_pmtu(&flow, Some(1200));
+    assert_eq!(reactor.session_path_mtu(&flow), Some(Some(1200)));
+    reactor.apply_pmtu(&flow, None);
+    assert_eq!(reactor.session_path_mtu(&flow), Some(Some(1200)));
+
+    // Unknown flow: no session, no panic, no state created.
+    let unknown = af_xdp::AfXdpTcpFlowKey {
+        local_addr: "198.51.100.5:1".parse().unwrap(),
+        peer_addr: remote,
+    };
+    reactor.apply_pmtu(&unknown, Some(900));
+    assert_eq!(reactor.session_path_mtu(&unknown), None);
 }

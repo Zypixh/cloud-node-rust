@@ -1326,6 +1326,57 @@ impl AfXdpTcpReactor {
         }
     }
 
+    /// T4-7: apply an ICMP-reported path MTU to a dialed session's
+    /// socket. `None` (non-PTB error kinds) is ignored — unreachable
+    /// reports never kill a live session; the retransmit timers own
+    /// stalls. A `Some(mtu)` clamps every new segment's effective MSS
+    /// via `set_path_mtu` until another report updates it.
+    pub(crate) fn apply_pmtu(&mut self, flow: &AfXdpTcpFlowKey, mtu: Option<u32>) {
+        let Some(mtu) = mtu else {
+            // Non-PTB ICMP error (unreachable, time-exceeded…): the
+            // session stays alive — retransmission/timeout logic owns
+            // stall detection, matching kernel TCP behavior.
+            tracing::debug!(
+                "AF_XDP session {} -> {} received non-PTB ICMP error; session continues",
+                flow.local_addr,
+                flow.peer_addr
+            );
+            return;
+        };
+        let Some(session) = self.sessions.get(flow) else {
+            tracing::debug!(
+                "AF_XDP PMTU update {} -> {} arrived after session teardown; ignored",
+                flow.local_addr,
+                flow.peer_addr
+            );
+            return;
+        };
+        let socket = self
+            .sockets
+            .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
+        socket.set_path_mtu(mtu as usize);
+        tracing::debug!(
+            "AF_XDP session {} -> {} path MTU clamped to {mtu}",
+            flow.local_addr,
+            flow.peer_addr
+        );
+    }
+
+    /// Test hook: the session's installed path-MTU cap (outer None =
+    /// unknown flow, inner None = uncapped).
+    #[cfg(test)]
+    pub(crate) fn session_path_mtu(
+        &self,
+        flow: &AfXdpTcpFlowKey,
+    ) -> Option<Option<usize>> {
+        let session = self.sessions.get(flow)?;
+        Some(
+            self.sockets
+                .get::<SmoltcpTcp::Socket<'static>>(session.socket)
+                .path_mtu(),
+        )
+    }
+
     /// EN-17: bounded session scheduling. Each poll round pumps only the
     /// "hot" set — sessions with an observed work signal (ingress packet
     /// via `enqueue_ingress`, egress write via the stream wake channel, or

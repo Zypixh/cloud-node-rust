@@ -89,6 +89,35 @@ tests at the end of `socket::tcp::test`.
 - New tests `test_external_transport_controller` and
   `test_external_transport_loss_event_shrinks_cwnd` (end of test mod).
 
+### T4 additions (T4-2 dial options / T4-7 PMTU)
+
+- `syn_extra_options: Option<Vec<u8>>` + `set_syn_extra_options` (T4-2)
+  — raw option bytes (validated kind/len walk + SYN option-budget
+  check, rejection is explicit `SynOptionsError`) appended verbatim to
+  emitted SYNs. `wire/tcp.rs` `Repr` gains `extra_options: &'a [u8]`;
+  emit caps the copy at the option area.
+- `connect()` (T4-3) — active-open path producing
+  SYN/SYN-ACK/Established through the normal state machine (used by the
+  AF_XDP reactor's dialed sessions).
+- `path_mtu_cap: Option<usize>` + `set_path_mtu`/`path_mtu` (T4-7) — ICMP
+  PTB reports install a per-socket IP-datagram-size cap; the stored
+  value floors at headers + `MIN_REMOTE_MSS` so a bogus small report
+  cannot wedge the flow. Installing a cap disarms the blackhole probe
+  and forwards the new effective MSS to the ext controller via
+  `on_mss_update`.
+- `pmtu_probe_floor` + `rto_no_progress` — RFC 4821-style blackhole
+  recovery: `PMTU_BLACKHOLE_RTO_THRESHOLD` (2) consecutive RTOs without
+  cumulative-ACK progress arm the probe (`PMTU_PROBE_MSS` = 512 floor);
+  any cumulative-ACK advance disarms it.
+- `effective_send_mss(interface_mss)` — send-side segment size is now
+  `min(interface_mss, remote_mss, pmtu_cap - headers, probe_floor)`;
+  the cap term floors at `MIN_REMOTE_MSS` but the final result does
+  not (a deliberately small `remote_mss` stays honored).
+- New tests `test_set_path_mtu_clamps_segment_size`,
+  `test_set_path_mtu_floors_bogus_small_values`,
+  `test_pmtu_report_disarms_blackhole_probe`,
+  `test_rto_blackhole_probe_arms_and_ack_disarms`.
+
 ## `src/socket/tcp/congestion.rs`
 
 - `trait Controller`, `AnyController`, and the builtin `Reno`/`Cubic`

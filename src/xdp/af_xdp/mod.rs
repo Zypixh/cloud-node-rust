@@ -51,6 +51,9 @@ const ETHERTYPE_QINQ_9200: u16 = 0x9200;
 const ETHERTYPE_QINQ_9300: u16 = 0x9300;
 const IP_PROTO_TCP: u8 = cloud_node_xdp_common::XDP_PROTO_TCP;
 const IP_PROTO_UDP: u8 = cloud_node_xdp_common::XDP_PROTO_UDP;
+/// T4-7: ICMPv4/ICMPv6 next-header values for the PMTU error parser.
+const IP_PROTO_ICMP: u8 = 1;
+const IP_PROTO_ICMPV6: u8 = 58;
 const IP_PROTO_HOP_BY_HOP: u8 = 0;
 const IP_PROTO_ROUTING: u8 = 43;
 const IP_PROTO_FRAGMENT: u8 = 44;

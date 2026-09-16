@@ -311,6 +311,11 @@ pub struct XdpCounters {
     /// flows) and were redirected to the ingress queue's XSK for the
     /// userspace dial-flow demux.
     pub out_ct_hit: u64,
+    /// T4-7: ICMP/ICMPv6 errors whose quoted inner 5-tuple hit
+    /// XDP_OUT_CT — redirected to the XSK for PMTU/error delivery.
+    /// Counted separately from `out_ct_hit` so the PMTU path stays
+    /// observable on its own.
+    pub out_ct_icmp: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -1014,7 +1019,7 @@ const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 72);
 const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 96);
 const _: () = assert!(core::mem::size_of::<XdpSvcBucket>() == 16);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 24);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 304);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 312);
 const _: () = assert!(core::mem::size_of::<XdpOutCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpOutCtValue>() == 8);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);

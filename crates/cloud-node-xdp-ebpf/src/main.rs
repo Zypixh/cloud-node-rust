@@ -989,6 +989,14 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
                 counter_control_limited();
                 return Ok(xdp_action::XDP_DROP);
             }
+            // T4-7: an ICMP error quoting a node-dialed flow redirects
+            // to this queue's XSK for PMTU/error delivery; a miss keeps
+            // the kernel path.
+            if let Ok(Some(action)) =
+                try_out_ct_icmp_v4(ctx, l4_offset, packet_end, policy)
+            {
+                return Ok(action);
+            }
             return Ok(control_pass());
         }
         L4Class::Unsupported => return Ok(unsupported_pass()),
@@ -1241,6 +1249,14 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
             if !budget_charge(5, unsafe { bpf_ktime_get_ns() }) {
                 counter_control_limited();
                 return Ok(xdp_action::XDP_DROP);
+            }
+            // T4-7: an ICMPv6 error quoting a node-dialed flow redirects
+            // to this queue's XSK for PMTU/error delivery; a miss keeps
+            // the kernel path.
+            if let Ok(Some(action)) =
+                try_out_ct_icmp_v6(ctx, l4_offset, packet_end, policy)
+            {
+                return Ok(action);
             }
             return Ok(control_pass());
         }
@@ -1739,6 +1755,128 @@ fn try_out_ct_v6(
         return Ok(None);
     }
     counter_out_ct_hit();
+    Ok(Some(xsk_redirect_current(ctx, policy)))
+}
+
+/// T4-7: ICMPv4 error quoting a node-dialed outbound packet. Error
+/// types that embed the offending datagram get a bounded inner-IP +
+/// inner-L4-ports parse; an XDP_OUT_CT match redirects the frame to the
+/// ingress queue's XSK so userspace delivers PMTU/error reports to the
+/// flow's owner. Any parse gap or map miss returns None — the caller
+/// passes the frame to the kernel unchanged.
+fn try_out_ct_icmp_v4(
+    ctx: &XdpContext,
+    l4_offset: usize,
+    packet_end: usize,
+    policy: Option<&XdpInterfacePolicy>,
+) -> Result<Option<u32>, ()> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if policy.mode != 2 {
+        return Ok(None);
+    }
+    let icmp_type = unsafe { *ptr_at::<u8>(ctx, l4_offset)? };
+    // Errors that quote the offending datagram: dest-unreach (3),
+    // source-quench (4), redirect (5), time-exceeded (11),
+    // parameter-problem (12).
+    if !matches!(icmp_type, 3 | 4 | 5 | 11 | 12) {
+        return Ok(None);
+    }
+    let inner_off = match l4_offset.checked_add(8) {
+        Some(off) => off,
+        None => return Ok(None),
+    };
+    if inner_off + mem::size_of::<Ipv4Hdr>() > packet_end {
+        return Ok(None);
+    }
+    let inner = ptr_at::<Ipv4Hdr>(ctx, inner_off)?;
+    let ihl = unsafe { (*inner).ihl() as usize };
+    let proto = unsafe { (*inner).proto };
+    if ihl < mem::size_of::<Ipv4Hdr>()
+        || (proto != IpProto::Tcp as u8 && proto != IpProto::Udp as u8)
+        || inner_off + ihl + 4 > packet_end
+    {
+        return Ok(None);
+    }
+    let ports = ptr_at::<L4Ports>(ctx, inner_off + ihl)?;
+    // The quoted packet is *outbound*: its source is our dialed local
+    // endpoint — the reverse mapping of the reply-path check.
+    let key = XdpOutCtKey {
+        local_addr: v4_embed(u32::from_be_bytes(unsafe { (*inner).src_addr })),
+        remote_addr: v4_embed(u32::from_be_bytes(unsafe { (*inner).dst_addr })),
+        local_port_be: unsafe { u16::from_ne_bytes((*ports).source) },
+        remote_port_be: unsafe { u16::from_ne_bytes((*ports).dest) },
+        family: 4,
+        proto,
+        _pad: [0; 2],
+    };
+    if unsafe { XDP_OUT_CT.get(&key) }.is_none() {
+        return Ok(None);
+    }
+    counter_out_ct_icmp();
+    Ok(Some(xsk_redirect_current(ctx, policy)))
+}
+
+/// T4-7: ICMPv6 error quoting a node-dialed outbound packet — same
+/// contract as the v4 helper; quoted extension headers are walked with
+/// the same bounded loop as live traffic.
+fn try_out_ct_icmp_v6(
+    ctx: &XdpContext,
+    l4_offset: usize,
+    packet_end: usize,
+    policy: Option<&XdpInterfacePolicy>,
+) -> Result<Option<u32>, ()> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if policy.mode != 2 {
+        return Ok(None);
+    }
+    let icmp_type = unsafe { *ptr_at::<u8>(ctx, l4_offset)? };
+    // ICMPv6 errors 1–4 (dest-unreach, packet-too-big, time-exceeded,
+    // parameter-problem) all quote the offending packet.
+    if !(1..=4).contains(&icmp_type) {
+        return Ok(None);
+    }
+    let inner_off = match l4_offset.checked_add(8) {
+        Some(off) => off,
+        None => return Ok(None),
+    };
+    if inner_off + mem::size_of::<Ipv6Hdr>() > packet_end {
+        return Ok(None);
+    }
+    let inner = ptr_at::<Ipv6Hdr>(ctx, inner_off)?;
+    let next_header = unsafe { (*inner).next_hdr };
+    let packed = match ipv6_transport_offset(ctx, next_header, inner_off + 40, packet_end) {
+        Ok(packed) => packed,
+        Err(()) => return Ok(None),
+    };
+    if packed & V6N_FLAG != 0 {
+        return Ok(None);
+    }
+    let proto = (packed >> 32) as u8;
+    if proto != IpProto::Tcp as u8 && proto != IpProto::Udp as u8 {
+        return Ok(None);
+    }
+    let ports_off = (packed & 0xffff_ffff) as usize;
+    if ports_off + 4 > packet_end {
+        return Ok(None);
+    }
+    let ports = ptr_at::<L4Ports>(ctx, ports_off)?;
+    let key = XdpOutCtKey {
+        local_addr: unsafe { (*inner).src_addr },
+        remote_addr: unsafe { (*inner).dst_addr },
+        local_port_be: unsafe { u16::from_ne_bytes((*ports).source) },
+        remote_port_be: unsafe { u16::from_ne_bytes((*ports).dest) },
+        family: 6,
+        proto,
+        _pad: [0; 2],
+    };
+    if unsafe { XDP_OUT_CT.get(&key) }.is_none() {
+        return Ok(None);
+    }
+    counter_out_ct_icmp();
     Ok(Some(xsk_redirect_current(ctx, policy)))
 }
 
@@ -5518,6 +5656,14 @@ fn counter_map_miss() {
 fn counter_out_ct_hit() {
     if let Some(counters) = counters() {
         counters.out_ct_hit = counters.out_ct_hit.saturating_add(1);
+    }
+}
+
+/// T4-7: ICMP errors claimed by XDP_OUT_CT on the quoted inner tuple —
+/// PMTU/error delivery to the dialed flow's owner.
+fn counter_out_ct_icmp() {
+    if let Some(counters) = counters() {
+        counters.out_ct_icmp = counters.out_ct_icmp.saturating_add(1);
     }
 }
 

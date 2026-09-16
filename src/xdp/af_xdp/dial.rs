@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 
 /// T4: requests delivered to a queue reactor on its bounded channel.
 /// `Dial` carries a fully prepared outbound connect (route, source port,
@@ -27,6 +27,13 @@ pub(crate) enum AfXdpReactorRequest {
         /// packets; plain UDP proxy traffic passes `None`.
         ecn: Option<u8>,
     },
+    /// T4-7: an ICMP error quoting this flow arrived on some queue's
+    /// XSK — deliver the reported next-hop MTU to the owning session's
+    /// smoltcp socket (`None` for error kinds without an MTU field).
+    PmtuUpdate {
+        flow: AfXdpTcpFlowKey,
+        mtu: Option<u32>,
+    },
 }
 
 /// T4: owner record for a node-dialed flow — the queue reactor holding
@@ -38,9 +45,10 @@ pub(crate) struct AfXdpDialOwner {
     pub(crate) interface: Arc<str>,
     pub(crate) queue: u32,
     pub(crate) proto: u8,
-    /// UDP dialed flows deliver reply payloads straight into the owning
-    /// socket's channel — no reactor session exists for them.
-    pub(crate) udp_tx: Option<mpsc::Sender<AfXdpUdpDatagram>>,
+    /// UDP dialed flows deliver reply payloads and quoted ICMP errors
+    /// straight into the owning socket's channel — no reactor session
+    /// exists for them.
+    pub(crate) udp_tx: Option<mpsc::Sender<AfXdpUdpIngress>>,
 }
 
 /// T4: bridge between async upstream dialers and the per-queue AF_XDP
@@ -138,6 +146,58 @@ impl AfXdpDialRegistry {
                 AfXdpDialInjectError::OwnerGone
             }
         })
+    }
+
+    /// T4-7: deliver a quoted ICMP error to a dialed flow's owner. TCP
+    /// owners get a `PmtuUpdate` on the reactor channel; UDP owners get
+    /// the error on the socket's ingress channel. A full channel sheds
+    /// the report (the next RTO/timeout retries the path anyway);
+    /// a closed channel tears the owner down like `inject`.
+    pub(crate) fn notify_icmp(&self, flow: &AfXdpTcpFlowKey, mtu: Option<u32>) {
+        let Some(owner) = self.owner(flow) else {
+            return;
+        };
+        if owner.proto == IP_PROTO_UDP {
+            if let Some(tx) = &owner.udp_tx {
+                match tx.try_send(AfXdpUdpIngress::IcmpError { mtu }) {
+                    Ok(()) => {}
+                    // Bounded channel full — the socket is already
+                    // overloaded; the error is dropped but stays
+                    // observable instead of vanishing silently.
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            "AF_XDP UDP ingress queue full; ICMP error (mtu={mtu:?}) dropped for {} -> {}",
+                            flow.local_addr,
+                            flow.peer_addr
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => self.release(flow),
+                }
+            }
+            return;
+        }
+        let key = (owner.interface.to_string(), owner.queue);
+        let Some(tx) = self.queues.get(&key) else {
+            self.owners.remove(flow);
+            return;
+        };
+        match tx.try_send(AfXdpReactorRequest::PmtuUpdate {
+            flow: *flow,
+            mtu,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    "AF_XDP reactor queue full; PmtuUpdate (mtu={mtu:?}) dropped for {} -> {}",
+                    flow.local_addr,
+                    flow.peer_addr
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.queues.remove(&key);
+                self.owners.remove(flow);
+            }
+        }
     }
 
     /// Pick the owning queue for a new flow on `interface`: stable hash
@@ -440,6 +500,7 @@ impl AfXdpDialRegistry {
             egress_tx,
             ingress_rx: std::sync::Mutex::new(ingress_rx),
             registry: self.clone(),
+            path_mtu: AtomicUsize::new(0),
         })
     }
 
@@ -524,6 +585,18 @@ pub(crate) struct AfXdpUdpDatagram {
     pub ecn: Option<u8>,
 }
 
+/// T4-7: one message on a dialed UDP socket's ingress channel. ICMP
+/// errors quoting the flow's outbound datagrams arrive here (eBPF
+/// `XDP_OUT_CT` redirect); they surface as one-shot transient receive
+/// errors — kernel error-queue semantics — and a PTB's MTU is cached
+/// on the socket so oversized sends fail `MessageTooLarge`.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) enum AfXdpUdpIngress {
+    Datagram(AfXdpUdpDatagram),
+    IcmpError { mtu: Option<u32> },
+}
+
 /// T4-6: node-dialed UDP socket over the AF_XDP dataplane. UDP has no
 /// handshake — the reserved source port, XDP_OUT_CT row and demux
 /// ownership are established by `dial_udp` before this handle exists,
@@ -535,8 +608,13 @@ pub struct AfXdpUdpSocket {
     egress_tx: mpsc::Sender<AfXdpReactorRequest>,
     // `Mutex` (not `&mut self` access) so quinn's `AsyncUdpSocket`
     // adapter can poll receives through `&self`.
-    ingress_rx: std::sync::Mutex<mpsc::Receiver<AfXdpUdpDatagram>>,
+    ingress_rx: std::sync::Mutex<mpsc::Receiver<AfXdpUdpIngress>>,
     registry: Arc<AfXdpDialRegistry>,
+    /// T4-7: path-MTU learned from ICMP PTB errors — max IP datagram
+    /// size, 0 = uncapped. Mirroring a kernel connected-socket's cached
+    /// PMTU, oversized sends fail `MessageTooLarge` instead of being
+    /// fragmented (the dataplane never emits fragments).
+    path_mtu: AtomicUsize,
 }
 
 #[cfg(target_os = "linux")]
@@ -559,6 +637,35 @@ impl AfXdpUdpSocket {
         }
     }
 
+    /// Payload cap from the learned path MTU — `None` while uncapped.
+    fn payload_cap(&self) -> Option<usize> {
+        let mtu = self.path_mtu.load(Ordering::Relaxed);
+        if mtu == 0 {
+            return None;
+        }
+        let ip_header = if self.flow.local_addr.is_ipv4() {
+            20
+        } else {
+            40
+        };
+        Some(mtu.saturating_sub(ip_header + 8))
+    }
+
+    /// Kernel-equivalent send check: beyond the learned path MTU the
+    /// datagram would have to be fragmented, which the dataplane never
+    /// does — report `MessageTooLarge` so callers (QUIC DPLPMTUD)
+    /// shrink and retry.
+    fn check_payload_cap(&self, len: usize) -> io::Result<()> {
+        if let Some(cap) = self.payload_cap()
+            && len > cap
+        {
+            // EMSGSIZE — the same errno a kernel socket returns past the
+            // cached PMTU; quinn's DPLPMTUD keys on this raw code.
+            return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+        }
+        Ok(())
+    }
+
     /// Queue a datagram for egress through the owning queue's XSK TX
     /// ring. The bounded request channel applies backpressure — a full
     /// queue awaits instead of shedding silently.
@@ -569,6 +676,7 @@ impl AfXdpUdpSocket {
     /// Same as `send`, with an explicit ECN codepoint (QUIC marking).
     pub async fn send_with_ecn(&self, payload: &[u8], ecn: Option<u8>) -> io::Result<usize> {
         let len = payload.len();
+        self.check_payload_cap(len)?;
         self.egress_tx
             .send(self.egress_request(payload, ecn))
             .await
@@ -581,6 +689,7 @@ impl AfXdpUdpSocket {
     /// writability via the poller before retrying.
     pub fn try_send(&self, payload: &[u8], ecn: Option<u8>) -> io::Result<usize> {
         let len = payload.len();
+        self.check_payload_cap(len)?;
         match self.egress_tx.try_send(self.egress_request(payload, ecn)) {
             Ok(()) => Ok(len),
             Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::new(
@@ -615,10 +724,13 @@ impl AfXdpUdpSocket {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         match rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(datagram)) => {
+            std::task::Poll::Ready(Some(AfXdpUdpIngress::Datagram(datagram))) => {
                 let len = datagram.payload.len().min(buf.len());
                 buf[..len].copy_from_slice(&datagram.payload[..len]);
                 std::task::Poll::Ready(Ok((len, datagram.ecn)))
+            }
+            std::task::Poll::Ready(Some(AfXdpUdpIngress::IcmpError { mtu })) => {
+                std::task::Poll::Ready(Err(self.icmp_error(mtu)))
             }
             std::task::Poll::Ready(None) => {
                 std::task::Poll::Ready(Err(self.ingress_closed_error()))
@@ -631,13 +743,23 @@ impl AfXdpUdpSocket {
     /// when the owning demux entry is torn down (registry release,
     /// generation drain), which surfaces as `UnexpectedEof`.
     pub async fn recv(&mut self) -> io::Result<Bytes> {
-        self.ingress_rx
-            .get_mut()
-            .unwrap_or_else(|err| err.into_inner())
-            .recv()
-            .await
-            .map(|datagram| datagram.payload)
-            .ok_or_else(|| self.ingress_closed_error())
+        loop {
+            match self
+                .ingress_rx
+                .get_mut()
+                .unwrap_or_else(|err| err.into_inner())
+                .recv()
+                .await
+            {
+                // ICMP errors surface once, kernel error-queue style;
+                // the loop continues so the next item is the payload.
+                Some(AfXdpUdpIngress::IcmpError { mtu }) => {
+                    return Err(self.icmp_error(mtu));
+                }
+                Some(AfXdpUdpIngress::Datagram(datagram)) => return Ok(datagram.payload),
+                None => return Err(self.ingress_closed_error()),
+            }
+        }
     }
 
     /// True once either direction's channel is closed — the flow can
@@ -649,6 +771,34 @@ impl AfXdpUdpSocket {
             .unwrap_or_else(|err| err.into_inner())
             .is_closed()
             || self.egress_tx.is_closed()
+    }
+
+    /// Kernel error-queue semantics: a PTB updates the cached path MTU
+    /// and reports `MessageTooLarge` once; other ICMP errors report
+    /// `HostUnreachable` once. Both are transient — the socket lives on.
+    /// The reported MTU is clamped to the protocol floor (576 v4 /
+    /// 1280 v6, the minimums every path must carry) so a bogus small
+    /// PTB cannot wedge the flow below the guaranteed size.
+    fn icmp_error(&self, mtu: Option<u32>) -> io::Error {
+        if let Some(mtu) = mtu {
+            let floor: u32 = if self.flow.local_addr.is_ipv4() {
+                576
+            } else {
+                1280
+            };
+            let mtu = mtu.max(floor);
+            self.path_mtu
+                .store(mtu as usize, Ordering::Relaxed);
+            // EMSGSIZE once, kernel error-queue style.
+            return io::Error::from_raw_os_error(libc::EMSGSIZE);
+        }
+        io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            format!(
+                "AF_XDP UDP ICMP error for {} -> {}",
+                self.flow.local_addr, self.flow.peer_addr
+            ),
+        )
     }
 
     fn egress_closed_error(&self) -> io::Error {
@@ -685,5 +835,177 @@ impl std::fmt::Debug for AfXdpUdpSocket {
 impl Drop for AfXdpUdpSocket {
     fn drop(&mut self) {
         self.registry.release(&self.flow);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn test_registry() -> Arc<AfXdpDialRegistry> {
+        Arc::new(AfXdpDialRegistry::new(Arc::new(XdpManager::new(
+            crate::runtime_mode::XdpConfig::default(),
+        ))))
+    }
+
+    fn test_flow() -> AfXdpTcpFlowKey {
+        AfXdpTcpFlowKey {
+            local_addr: "203.0.113.7:42001".parse().unwrap(),
+            peer_addr: "198.51.100.5:443".parse().unwrap(),
+        }
+    }
+
+    fn test_socket(
+        registry: &Arc<AfXdpDialRegistry>,
+    ) -> (
+        AfXdpUdpSocket,
+        mpsc::Sender<AfXdpUdpIngress>,
+        mpsc::Receiver<AfXdpReactorRequest>,
+    ) {
+        let (egress_tx, egress_rx) = mpsc::channel(8);
+        let (udp_tx, ingress_rx) = mpsc::channel(AF_XDP_UDP_DIAL_INGRESS_QUEUE);
+        (
+            AfXdpUdpSocket {
+                flow: test_flow(),
+                link: AfXdpLinkMeta {
+                    destination_mac: [0x02, 0, 0, 0, 0, 1],
+                    source_mac: [0x02, 0, 0, 0, 0, 2],
+                    vlan_tags: [AfXdpVlanTag { tpid: 0, tci: 0 }; 2],
+                    vlan_tag_count: 0,
+                    ethertype: ETHERTYPE_IPV4,
+                },
+                egress_tx,
+                ingress_rx: std::sync::Mutex::new(ingress_rx),
+                registry: registry.clone(),
+                path_mtu: AtomicUsize::new(0),
+            },
+            udp_tx,
+            egress_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn udp_socket_ptb_caches_mtu_and_caps_sends() {
+        let registry = test_registry();
+        let (mut socket, udp_tx, mut egress_rx) = test_socket(&registry);
+        assert_eq!(socket.path_mtu.load(Ordering::Relaxed), 0);
+
+        udp_tx
+            .try_send(AfXdpUdpIngress::IcmpError { mtu: Some(1400) })
+            .unwrap();
+        let err = socket.recv().await.expect_err("PTB surfaces once");
+        assert_eq!(err.raw_os_error(), Some(libc::EMSGSIZE));
+        assert_eq!(socket.path_mtu.load(Ordering::Relaxed), 1400);
+
+        // Payload beyond the learned cap is rejected before queueing.
+        let cap = 1400 - 20 - 8;
+        let err = socket
+            .try_send(&vec![0u8; cap + 1], None)
+            .expect_err("oversized datagram");
+        assert_eq!(err.raw_os_error(), Some(libc::EMSGSIZE));
+        assert!(egress_rx.try_recv().is_err(), "rejected send never queued");
+
+        // Within cap queues the egress request.
+        socket.try_send(&vec![0u8; cap], None).expect("in-cap send");
+        assert!(matches!(
+            egress_rx.try_recv(),
+            Ok(AfXdpReactorRequest::UdpEgress { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn udp_socket_tiny_ptb_clamps_to_family_floor() {
+        let registry = test_registry();
+        let (mut socket, udp_tx, _egress_rx) = test_socket(&registry);
+        udp_tx
+            .try_send(AfXdpUdpIngress::IcmpError { mtu: Some(64) })
+            .unwrap();
+        let _ = socket.recv().await;
+        assert_eq!(socket.path_mtu.load(Ordering::Relaxed), 576);
+    }
+
+    #[tokio::test]
+    async fn udp_socket_icmp_error_is_one_shot_and_flow_stays_live() {
+        let registry = test_registry();
+        let (mut socket, udp_tx, _egress_rx) = test_socket(&registry);
+        udp_tx
+            .try_send(AfXdpUdpIngress::IcmpError { mtu: None })
+            .unwrap();
+        udp_tx
+            .try_send(AfXdpUdpIngress::Datagram(AfXdpUdpDatagram {
+                payload: Bytes::from_static(b"pong"),
+                ecn: Some(0b10),
+            }))
+            .unwrap();
+        let err = socket.recv().await.expect_err("ICMP error surfaces");
+        assert_eq!(err.kind(), io::ErrorKind::HostUnreachable);
+        let payload = socket.recv().await.expect("next datagram still arrives");
+        assert_eq!(&payload[..], b"pong");
+    }
+
+    #[tokio::test]
+    async fn udp_socket_closed_channels_are_explicit() {
+        let registry = test_registry();
+        let (mut socket, udp_tx, egress_rx) = test_socket(&registry);
+        drop(udp_tx);
+        let err = socket.recv().await.expect_err("closed ingress");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(socket.defunct());
+        drop(egress_rx);
+        assert!(socket.try_send(b"x", None).is_err());
+        assert!(socket.send(b"x").await.is_err());
+    }
+
+    #[test]
+    fn notify_icmp_routes_udp_error_to_socket_and_tcp_to_reactor() {
+        let registry = test_registry();
+        let (queue_tx, mut queue_rx) = mpsc::channel(8);
+        registry.register_queue("eth0", 0, queue_tx);
+        let remote: SocketAddr = "198.51.100.5:443".parse().unwrap();
+        let source: IpAddr = "203.0.113.7".parse().unwrap();
+
+        // UDP owner: ICMP lands on the socket's ingress channel.
+        let (udp_tx, mut udp_rx) = mpsc::channel(AF_XDP_UDP_DIAL_INGRESS_QUEUE);
+        let udp_owner = AfXdpDialOwner {
+            interface: Arc::from("eth0"),
+            queue: 0,
+            proto: IP_PROTO_UDP,
+            udp_tx: Some(udp_tx),
+        };
+        let udp_flow = registry
+            .claim_flow(source, remote, &udp_owner, None)
+            .expect("udp claim");
+        registry.notify_icmp(&udp_flow, Some(1400));
+        assert!(matches!(
+            udp_rx.try_recv(),
+            Ok(AfXdpUdpIngress::IcmpError { mtu: Some(1400) })
+        ));
+
+        // TCP owner: ICMP becomes a PmtuUpdate on the reactor channel.
+        let tcp_owner = AfXdpDialOwner {
+            interface: Arc::from("eth0"),
+            queue: 0,
+            proto: IP_PROTO_TCP,
+            udp_tx: None,
+        };
+        let tcp_flow = registry
+            .claim_flow(source, "198.51.100.6:443".parse().unwrap(), &tcp_owner, None)
+            .expect("tcp claim");
+        registry.notify_icmp(&tcp_flow, Some(1280));
+        assert!(matches!(
+            queue_rx.try_recv(),
+            Ok(AfXdpReactorRequest::PmtuUpdate { flow, mtu: Some(1280) }) if flow == tcp_flow
+        ));
+
+        // Unknown tuple is a no-op (ICMP stays on the kernel path).
+        registry.notify_icmp(
+            &AfXdpTcpFlowKey {
+                local_addr: "203.0.113.7:9".parse().unwrap(),
+                peer_addr: remote,
+            },
+            Some(1400),
+        );
+        assert!(udp_rx.try_recv().is_err());
+        assert!(queue_rx.try_recv().is_err());
     }
 }
