@@ -686,6 +686,28 @@ pub(crate) async fn run_queue_bridge_loop(
                         admission_refusals = admission_refusals.saturating_add(1);
                     }
                 }
+                Ok(AfXdpReactorRequest::UdpEgress {
+                    link,
+                    local,
+                    remote,
+                    payload,
+                    ecn,
+                }) => {
+                    match queue_handle.send_udp_datagram(&link, local, remote, &payload, ecn) {
+                        Ok(true) => {}
+                        // TX ring exhaustion sheds the datagram — UDP is
+                        // lossy by contract; the socket's bounded channel
+                        // still applies backpressure upstream of this.
+                        Ok(false) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                "AF_XDP UDP egress failed for {} -> {}: {err}",
+                                local,
+                                remote
+                            );
+                        }
+                    }
+                }
                 Err(mpsc::error::TryRecvError::Empty)
                 | Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
@@ -721,6 +743,34 @@ pub(crate) async fn run_queue_bridge_loop(
             }
             match parse_proxy_frame(own_interface.clone(), queue_handle.queue, &frame) {
                 Some(AfXdpProxyFrame::Udp { route, packet }) => {
+                    // T4-6: replies to node-dialed UDP flows are owned by
+                    // the dial registry — deliver the payload straight to
+                    // the socket's channel regardless of which queue
+                    // received it (XSK redirect is ingress-queue local).
+                    let dialed_flow = AfXdpTcpFlowKey {
+                        local_addr: packet.local_addr,
+                        peer_addr: packet.peer_addr,
+                    };
+                    if let Some(owner) = dial_registry.owner(&dialed_flow)
+                        && owner.proto == IP_PROTO_UDP
+                    {
+                        if let Some(tx) = &owner.udp_tx {
+                            match tx.try_send(AfXdpUdpDatagram {
+                                payload: packet.payload.clone(),
+                                ecn: packet.ecn,
+                            }) {
+                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // A full socket channel sheds the
+                                    // datagram — UDP loss semantics, the
+                                    // queue stays healthy.
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    dial_registry.release(&dialed_flow);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // Congestion gate: refuse new flow-route admission while
                     // this queue is TX-backpressured; known flows still get
                     // their route refreshed and packet demuxed.
@@ -950,6 +1000,7 @@ pub(crate) async fn run_queue_bridge_loop(
                 datagram.listen_addr,
                 datagram.peer_addr,
                 datagram.payload.as_ref(),
+                None,
             );
             match sent {
                 Ok(true) => {
@@ -1029,6 +1080,7 @@ pub(crate) async fn run_queue_bridge_loop(
                         datagram.listen_addr,
                         datagram.peer_addr,
                         datagram.payload.as_ref(),
+                        None,
                     )
                 }
                 AfXdpForward::TcpFrame(frame) => queue_handle.send_raw_frame(&frame),

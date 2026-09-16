@@ -1,6 +1,7 @@
 use super::*;
 use bytes::Bytes;
-#[cfg(any(test, target_os = "linux"))]
+// Ungated: `AfXdpTcpStream` is compiled on all targets and its
+// shared wake/stall fields name `DashMap` through `use super::*`.
 use dashmap::DashMap;
 #[cfg(any(test, target_os = "linux"))]
 use smoltcp::iface::{
@@ -65,7 +66,6 @@ const AF_XDP_TCP_SESSION_ESTIMATED_BYTES: u64 =
     (AF_XDP_TCP_SOCKET_BUFFER_BYTES as u64 * 2) + 16 * 1024;
 #[cfg(any(test, target_os = "linux"))]
 const AF_XDP_TCP_MIN_SESSION_LIMIT: usize = 512;
-#[cfg(any(test, target_os = "linux"))]
 const AF_XDP_TCP_MAX_SESSION_LIMIT: usize = 16_384;
 #[cfg(any(test, target_os = "linux"))]
 const AF_XDP_TCP_IDLE_PROFILE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -97,7 +97,6 @@ pub(crate) const AF_XDP_TCP_SWEEP_BATCH_BUDGET: usize = 256;
 /// suspended writer task (re-registered on each wake), so the bound is
 /// defensive — beyond it a writer stays parked until a peer's wake frees
 /// budget and the next poll re-registers.
-#[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_BUDGET_STALL_MAX: usize = 2 * AF_XDP_TCP_MAX_SESSION_LIMIT;
 /// EN-17: amortized full-session sweep cadence — backstop for sessions
 /// whose progress signal (packet or egress wake) was not observed, and
@@ -118,8 +117,6 @@ pub(crate) const AF_XDP_TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(4);
 /// `xdp.upstream.dialPortRange`.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_DIAL_PORT_BASE: u16 = 40_000;
-#[cfg(any(test, target_os = "linux"))]
-pub(crate) const AF_XDP_DIAL_PORT_SPAN: u16 = 10_000;
 
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_ACCEPTED: AtomicU64 = AtomicU64::new(0);
@@ -358,6 +355,9 @@ pub struct AfXdpL4Packet {
     pub peer_addr: SocketAddr,
     pub payload: Bytes,
     pub link: AfXdpLinkMeta,
+    /// IP-header ECN codepoint bits (0–3) — QUIC receivers report them
+    /// for congestion feedback; plain UDP relay ignores the field.
+    pub ecn: Option<u8>,
 }
 
 impl AfXdpL4Packet {
@@ -411,11 +411,11 @@ mod dial;
 mod parser;
 mod tcp_reactor;
 
-#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub use bridge::{AfXdpRuntime, runtime, start_proxy_bridge, start_udp_bridge};
+#[cfg(test)]
 pub(crate) use bridge::*;
 #[cfg(target_os = "linux")]
 pub(crate) use dial::*;
-pub use bridge::{AfXdpRuntime, runtime, start_proxy_bridge, start_udp_bridge};
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub(crate) use parser::*;
 pub use parser::{

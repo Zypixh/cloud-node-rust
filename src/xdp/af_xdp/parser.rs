@@ -70,11 +70,14 @@ pub fn encode_ip_reply_frame(
     Some(())
 }
 
+/// `ecn` carries the IPv4 TOS / IPv6 Traffic-Class ECN bits (0–3) so
+/// QUIC senders can mark packets; `None` emits an unmarked header.
 pub fn encode_udp_reply_frame(
     link: &AfXdpLinkMeta,
     listen_addr: SocketAddr,
     peer_addr: SocketAddr,
     payload: &[u8],
+    ecn: Option<u8>,
     out: &mut Vec<u8>,
 ) -> Option<()> {
     if listen_addr.is_ipv4() != peer_addr.is_ipv4() {
@@ -108,11 +111,12 @@ pub fn encode_udp_reply_frame(
     out.reserve(total_len);
     encode_reply_eth_header(link, ethertype, out);
     let ip_offset = out.len();
+    let ecn_bits = ecn.unwrap_or(0) & 0b11;
     match (listen_addr.ip(), peer_addr.ip()) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
             out.extend_from_slice(&[
                 0x45,
-                0,
+                ecn_bits,
                 (ip_total_len >> 8) as u8,
                 ip_total_len as u8,
                 0,
@@ -132,7 +136,7 @@ pub fn encode_udp_reply_frame(
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
             out.extend_from_slice(&[
                 0x60,
-                0,
+                ecn_bits << 4,
                 0,
                 0,
                 (ip_payload_len >> 8) as u8,
@@ -296,6 +300,7 @@ pub(crate) fn parse_ipv4_l4(
         return None;
     }
     let protocol = base[9];
+    let ecn = base[1] & 0b11;
     let source = IpAddr::V4(Ipv4Addr::new(base[12], base[13], base[14], base[15]));
     let destination = IpAddr::V4(Ipv4Addr::new(base[16], base[17], base[18], base[19]));
     parse_transport(
@@ -306,6 +311,7 @@ pub(crate) fn parse_ipv4_l4(
         source,
         destination,
         link,
+        Some(ecn),
     )
 }
 
@@ -325,6 +331,8 @@ pub(crate) fn parse_ipv6_l4(
     destination_octets.copy_from_slice(&base[24..40]);
     let source = IpAddr::V6(Ipv6Addr::from(source_octets));
     let destination = IpAddr::V6(Ipv6Addr::from(destination_octets));
+    // Traffic Class spans byte0[3:0]|byte1[7:4]; ECN = TC[1:0] → byte1[5:4].
+    let ecn = (base[1] >> 4) & 0b11;
     let (protocol, l4_offset) =
         ipv6_transport_offset(frame, base[6], ip_offset + IPV6_HEADER_LEN, packet_end)?;
     parse_transport(
@@ -335,6 +343,7 @@ pub(crate) fn parse_ipv6_l4(
         source,
         destination,
         link,
+        Some(ecn),
     )
 }
 
@@ -450,6 +459,7 @@ pub(crate) fn parse_transport(
     source: IpAddr,
     destination: IpAddr,
     link: AfXdpLinkMeta,
+    ecn: Option<u8>,
 ) -> Option<AfXdpL4Packet> {
     match protocol {
         IP_PROTO_TCP => {
@@ -466,6 +476,7 @@ pub(crate) fn parse_transport(
                 peer_addr: SocketAddr::new(source, source_port),
                 payload: Bytes::copy_from_slice(&frame[l4_offset + tcp_header_len..packet_end]),
                 link,
+                ecn,
             })
         }
         IP_PROTO_UDP => {
@@ -484,6 +495,7 @@ pub(crate) fn parse_transport(
                     &frame[l4_offset + UDP_HEADER_LEN..l4_offset + udp_len],
                 ),
                 link,
+                ecn,
             })
         }
         _ => None,

@@ -1,5 +1,6 @@
 use super::*;
 use crate::memory_governor::{MEMORY_GOVERNOR, StaticTcpQueueBytePermit};
+#[cfg(any(test, target_os = "linux"))]
 use crate::transport_clock::TransportClock;
 
 /// EN-17/F3: payload bytes charged against the node-wide AF_XDP TCP queue
@@ -91,6 +92,9 @@ pub struct AfXdpTcpStream {
     budget_stall: AfXdpTcpBudgetStallSet,
     read_buf: AfXdpTcpChargedBytes,
     write_permit: Option<TcpWritePermitFuture>,
+    /// T4-6: flow endpoints for upstream-facing callers that need
+    /// `local_addr`/`peer_addr` (e.g. `toa::connect_upstream`).
+    flow: Option<AfXdpTcpFlowKey>,
 }
 
 pub struct AfXdpTcpStreamParts {
@@ -548,6 +552,7 @@ pub(crate) struct AfXdpTcpReactor {
     /// T4: shared dial-flow registry — set by the bridge before the loop
     /// runs. Reaping a dialed session releases its demux entry, source
     /// port and XDP_OUT_CT row through this handle.
+    #[cfg(target_os = "linux")]
     dial_registry: Option<Arc<AfXdpDialRegistry>>,
     #[cfg(test)]
     test_auto_start_proxy: bool,
@@ -613,6 +618,7 @@ impl AfXdpTcpReactor {
             cached_pressure_level: crate::l4_defense::L4PressureLevel::Normal,
             cached_proxy_idle_timeout: AF_XDP_TCP_SESSION_IDLE_TIMEOUT,
             idle_profile_refreshed_at: SmoltcpInstant::from_millis(0),
+            #[cfg(target_os = "linux")]
             dial_registry: None,
             #[cfg(test)]
             test_auto_start_proxy: false,
@@ -1056,6 +1062,7 @@ impl AfXdpTcpReactor {
     /// T4: the bridge installs the generation's dial registry before the
     /// loop runs so dialed-session reaping can release the demux entry,
     /// source port and out-CT row.
+    #[cfg(target_os = "linux")]
     pub(crate) fn set_dial_registry(&mut self, registry: Arc<AfXdpDialRegistry>) {
         self.dial_registry = Some(registry);
     }
@@ -1797,6 +1804,7 @@ impl AfXdpTcpReactor {
                             ),
                         )));
                     }
+                    #[cfg(target_os = "linux")]
                     if let Some(registry) = self.dial_registry.clone() {
                         registry.release(&flow);
                     }
@@ -2028,6 +2036,7 @@ impl AfXdpTcpStream {
                 budget_stall: budget_stall.clone(),
                 read_buf: AfXdpTcpChargedBytes::empty(),
                 write_permit: None,
+                flow: None,
             },
             ingress_tx,
             egress_rx,
@@ -2047,7 +2056,24 @@ impl AfXdpTcpStream {
     ) -> AfXdpTcpStreamParts {
         let mut parts = Self::channel_pair_with_budget(buffer, budget_stall);
         parts.stream.wake = Some((flow, wake_set));
+        parts.stream.flow = Some(flow);
         parts
+    }
+
+    /// Local endpoint of the underlying flow — dialed streams report the
+    /// allocated reserved-range source port.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.flow.map(|flow| flow.local_addr).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "AF_XDP stream has no flow endpoints")
+        })
+    }
+
+    /// Remote endpoint of the underlying flow — for dialed streams this
+    /// is the upstream server.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.flow.map(|flow| flow.peer_addr).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "AF_XDP stream has no flow endpoints")
+        })
     }
 
     pub fn default_channel_pair() -> AfXdpTcpStreamParts {

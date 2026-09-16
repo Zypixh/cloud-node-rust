@@ -81,6 +81,7 @@ async-compression = { version = "0.4.43", features = ["tokio", "zstd"] }
 arc-swap = "1.9.2"
 ahash = "0.8.12"
 cloud-node-xdp-common = { path = "crates/cloud-node-xdp-common", features = ["aya"] }
+cloud-node-transport = { path = "crates/cloud-node-transport" }
 mimalloc = "0.1.52"
 memmap2 = "0.9.11"
 
@@ -89,7 +90,6 @@ aya = "0.14.0"
 neli = "0.7.4"
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "async", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "socket-udp"] }
 xsk-rs = "0.9.0"
-cloud-node-transport = { path = "crates/cloud-node-transport" }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports", "async_tokio"] }

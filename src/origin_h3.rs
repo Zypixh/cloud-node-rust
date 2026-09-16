@@ -96,6 +96,211 @@ impl OriginH3ClientSession {
     }
 }
 
+/// T4-6: build the H3 endpoint on the selected upstream path. Kernel
+/// mode keeps the existing bound `std::net::UdpSocket`; `afxdp` mode
+/// dials a node-originated AF_XDP UDP flow and hands quinn an abstract
+/// socket over it — an explicit failure surfaces as `ConnectError`
+/// (never a silent kernel fallback).
+async fn create_h3_endpoint(server_addr: StdSocketAddr) -> PingoraResult<Endpoint> {
+    #[cfg(target_os = "linux")]
+    if crate::xdp::afxdp_upstream_selected() {
+        let socket = crate::xdp::af_xdp_dial_udp(server_addr, None)
+            .await
+            .map_err(|err| {
+                Error::explain(
+                    ErrorType::ConnectError,
+                    format!("AF_XDP H3 UDP dial to {server_addr}: {err}"),
+                )
+            })?;
+        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        return Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            Arc::new(af_xdp_quinn::AfXdpQuinnUdpSocket { socket }),
+            runtime,
+        )
+        .map_err(|err| {
+            Error::explain(
+                ErrorType::ConnectError,
+                format!("creating AF_XDP H3 endpoint to {server_addr}: {err}"),
+            )
+        });
+    }
+
+    let bind_addr = match server_addr.ip() {
+        IpAddr::V4(_) => StdSocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        IpAddr::V6(_) => StdSocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
+    };
+    Endpoint::client(bind_addr).map_err(|err| {
+        Error::explain(
+            ErrorType::ConnectError,
+            format!("creating H3 endpoint: {err}"),
+        )
+    })
+}
+
+/// T4-6: quinn `AsyncUdpSocket` over a node-dialed AF_XDP UDP flow.
+/// Sends and receives ride the flow's bounded channels — a full egress
+/// queue reports `WouldBlock` and the poller awaits channel capacity,
+/// so quinn's pacing keeps its semantics without silent drops.
+#[cfg(target_os = "linux")]
+mod af_xdp_quinn {
+    use std::future::Future;
+    use std::io::{self, IoSliceMut};
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use quinn::udp::{RecvMeta, Transmit};
+    use quinn::{AsyncUdpSocket, UdpPoller};
+
+    use crate::xdp::af_xdp::{AfXdpReactorRequest, AfXdpUdpSocket};
+
+    pub(super) struct AfXdpQuinnUdpSocket {
+        pub(super) socket: AfXdpUdpSocket,
+    }
+
+    impl std::fmt::Debug for AfXdpQuinnUdpSocket {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AfXdpQuinnUdpSocket")
+                .field("socket", &self.socket)
+                .finish()
+        }
+    }
+
+    /// Writable poller over the flow's bounded egress channel. Capacity
+    /// is awaited via `reserve_owned`; the returned permit is dropped
+    /// immediately — it only proves a slot existed, and quinn retries
+    /// `try_send` which re-registers here if the slot was reclaimed.
+    struct AfXdpUdpPoller {
+        tx: tokio::sync::mpsc::Sender<AfXdpReactorRequest>,
+        // `Mutex` keeps the poller `Sync` (`UdpPoller` requires it);
+        // `poll_writable` only ever holds the guard while polling.
+        pending: std::sync::Mutex<
+            Option<
+                Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    tokio::sync::mpsc::OwnedPermit<AfXdpReactorRequest>,
+                                    tokio::sync::mpsc::error::SendError<()>,
+                                >,
+                            > + Send,
+                    >,
+                >,
+            >,
+        >,
+    }
+
+    impl std::fmt::Debug for AfXdpUdpPoller {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AfXdpUdpPoller").finish_non_exhaustive()
+        }
+    }
+
+    impl UdpPoller for AfXdpUdpPoller {
+        fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let mut pending = this
+                .pending
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if pending.is_none() {
+                let tx = this.tx.clone();
+                *pending = Some(Box::pin(async move { tx.reserve_owned().await }));
+            }
+            match pending
+                .as_mut()
+                .expect("pending future")
+                .as_mut()
+                .poll(cx)
+            {
+                Poll::Ready(Ok(_permit)) => {
+                    *pending = None;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "AF_XDP UDP egress queue closed",
+                ))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncUdpSocket for AfXdpQuinnUdpSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            Box::pin(AfXdpUdpPoller {
+                tx: self.socket.egress_sender(),
+                pending: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+            if transmit.destination != self.socket.peer_addr() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "AF_XDP QUIC transmit destination {} mismatches dialed peer {}",
+                        transmit.destination,
+                        self.socket.peer_addr()
+                    ),
+                ));
+            }
+            if transmit.segment_size.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "AF_XDP QUIC socket does not support GSO segmentation",
+                ));
+            }
+            self.socket
+                .try_send(transmit.contents, transmit.ecn.map(|ecn| ecn as u8))
+                .map(|_| ())
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context<'_>,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            if bufs.is_empty() || meta.is_empty() {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "AF_XDP QUIC recv requires at least one buffer",
+                )));
+            }
+            match self.socket.poll_recv(cx, &mut bufs[0]) {
+                Poll::Ready(Ok((len, ecn))) => {
+                    meta[0] = RecvMeta {
+                        addr: self.socket.peer_addr(),
+                        len,
+                        stride: len,
+                        // IP-header ECN bits parsed by the AF_XDP
+                        // demux — QUIC keeps its congestion feedback.
+                        ecn: ecn.and_then(quinn::udp::EcnCodepoint::from_bits),
+                        dst_ip: Some(self.socket.local_addr().ip()),
+                    };
+                    Poll::Ready(Ok(1))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.socket.local_addr())
+        }
+
+        // The userspace dataplane never IP-fragments egress frames, so
+        // quinn keeps path-MTU discovery armed.
+        fn may_fragment(&self) -> bool {
+            false
+        }
+    }
+}
+
 async fn connect_h3<P: Peer + Send + Sync + 'static>(
     peer: &P,
     key: OriginH3Key,
@@ -111,16 +316,7 @@ async fn connect_h3<P: Peer + Send + Sync + 'static>(
         );
     };
 
-    let bind_addr = match server_addr.ip() {
-        IpAddr::V4(_) => StdSocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        IpAddr::V6(_) => StdSocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
-    };
-    let mut endpoint = Endpoint::client(bind_addr).map_err(|err| {
-        Error::explain(
-            ErrorType::ConnectError,
-            format!("creating H3 endpoint: {err}"),
-        )
-    })?;
+    let mut endpoint = create_h3_endpoint(server_addr).await?;
     endpoint.set_default_client_config(client_config(peer.verify_cert())?);
 
     let sni = peer.sni();

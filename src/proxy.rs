@@ -9,7 +9,7 @@ use pingora_core::connectors::L4Connect;
 use pingora_core::protocols::l4::socket::SocketAddr as PingoraSocketAddr;
 use pingora_core::protocols::l4::stream::Stream as PingoraL4Stream;
 use pingora_core::protocols::tls::CustomALPN;
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_core::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_proxy::{
     DownstreamParseErrorAction, DownstreamParseErrorLogLevel, FailToProxy, ProxyHttp, PurgeStatus,
@@ -120,45 +120,55 @@ pub struct LazyResponseHeaders(Option<HashMap<String, String>>);
 
 static EMPTY_RESPONSE_HEADERS: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
 
+/// T4-6: single funnel for all Pingora TCP upstream dials. The kernel
+/// path is byte-for-byte the previous behavior (`connect_upstream`
+/// with no TOA config is a plain timed `TcpStream::connect`); when
+/// `xdp.upstream.mode=afxdp` the same call dials through the AF_XDP
+/// dataplane and returns a virtual stream. A missing AF_XDP registry
+/// is an explicit connect error, never a silent kernel fallback.
 #[derive(Debug)]
-struct ProxyProtocolL4Connector {
+struct UpstreamL4Connector {
     client_addr: SocketAddr,
-    config: ProxyProtocolConfig,
+    proxy_protocol: ProxyProtocolConfig,
     connection_timeout: Duration,
 }
 
 #[async_trait]
-impl L4Connect for ProxyProtocolL4Connector {
+impl L4Connect for UpstreamL4Connector {
     async fn connect(&self, addr: &PingoraSocketAddr) -> pingora_core::Result<PingoraL4Stream> {
         let PingoraSocketAddr::Inet(destination_addr) = addr else {
             return Err(pingora_core::Error::explain(
                 ConnectError,
-                "PROXY Protocol to Unix socket origins is not supported",
+                "upstream connector only supports inet origins",
             ));
         };
-        let mut stream = match tokio::time::timeout(
+        let mut stream = crate::toa::connect_upstream(
+            &destination_addr.to_string(),
+            self.client_addr,
+            None,
             self.connection_timeout,
-            tokio::net::TcpStream::connect(destination_addr),
         )
         .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => {
-                return Err(pingora_core::Error::because(
-                    ConnectError,
-                    "failed to connect origin for PROXY Protocol",
-                    err,
-                ));
-            }
-            Err(_) => {
-                return Err(pingora_core::Error::explain(
+        .map_err(|err| {
+            let timed_out = err
+                .chain()
+                .any(|cause| cause.downcast_ref::<tokio::time::error::Elapsed>().is_some());
+            if timed_out {
+                pingora_core::Error::because(
                     ConnectTimedout,
-                    "timed out connecting origin for PROXY Protocol",
-                ));
+                    "timed out connecting upstream",
+                    err,
+                )
+            } else {
+                pingora_core::Error::because(
+                    ConnectError,
+                    "failed to connect upstream",
+                    err,
+                )
             }
-        };
+        })?;
         if let Some(header) = crate::proxy_protocol::build_header(
-            self.config,
+            self.proxy_protocol,
             self.client_addr,
             Some(*destination_addr),
         ) {
@@ -177,7 +187,7 @@ impl L4Connect for ProxyProtocolL4Connector {
                 )
             })?;
         }
-        Ok(PingoraL4Stream::from(stream))
+        Ok(stream.into_pingora_stream(*destination_addr))
     }
 }
 
@@ -9075,15 +9085,20 @@ impl ProxyHttp for EdgeProxy {
             peer_obj.options.read_timeout = backend_ext.and_then(|e| e.read_timeout);
             peer_obj.options.write_timeout = backend_ext.and_then(|e| e.write_timeout);
             peer_obj.options.connection_timeout = Some(connection_timeout);
-            if proxy_protocol_to_origin.enabled() {
+            if peer_obj.address().as_inet().is_some() {
+                // T4-6: all inet upstream dials funnel through
+                // `connect_upstream` — kernel mode is unchanged, afxdp
+                // mode dials through the AF_XDP dataplane.
                 let downstream_addr = Self::downstream_client_socket_addr(session, ctx);
-                peer_obj.group_key = Self::proxy_protocol_origin_group_key(
-                    downstream_addr,
-                    proxy_protocol_to_origin,
-                );
-                peer_obj.options.custom_l4 = Some(Arc::new(ProxyProtocolL4Connector {
+                if proxy_protocol_to_origin.enabled() {
+                    peer_obj.group_key = Self::proxy_protocol_origin_group_key(
+                        downstream_addr,
+                        proxy_protocol_to_origin,
+                    );
+                }
+                peer_obj.options.custom_l4 = Some(Arc::new(UpstreamL4Connector {
                     client_addr: downstream_addr,
-                    config: proxy_protocol_to_origin,
+                    proxy_protocol: proxy_protocol_to_origin,
                     connection_timeout,
                 }));
             }
