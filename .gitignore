@@ -26,3 +26,4 @@ __pycache__/
 !.cargo/
 !.cargo/**
 crates/cloud-node-xdp-common/target/
+xtask/target/

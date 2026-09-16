@@ -294,6 +294,10 @@ struct NatScratch {
     /// Transient copies of the original addrs/ports while building.
     forge_tmp: [u8; 8],
     forge_pad3: u32,
+    /// Quoted-packet offset + containing packet_end parked before the
+    /// ICMPv6 out-CT inner tail call (slot 16).
+    icmp_inner_off: u32,
+    icmp_inner_end: u32,
 }
 
 #[map(name = "XDP_NAT_SCRATCH")]
@@ -303,7 +307,7 @@ static XDP_NAT_SCRATCH: PerCpuArray<NatScratch> = PerCpuArray::<NatScratch>::wit
 /// 512-byte stack and instruction budget, so they run as a separate XDP
 /// program; slot 0 = `xdp_nat_dispatch`.
 #[map(name = "XDP_DISPATCH")]
-static XDP_DISPATCH: ProgramArray = ProgramArray::with_max_entries(16, 0);
+static XDP_DISPATCH: ProgramArray = ProgramArray::with_max_entries(20, 0);
 
 const XDP_DISPATCH_NAT: u32 = 0;
 const XDP_DISPATCH_NAT_TCP: u32 = 2;
@@ -325,6 +329,23 @@ const XDP_DISPATCH_NAT_TCP6_WORK: u32 = 10;
 /// as its own program reached by tail call — the call boundary resets the
 /// stack budget. All cross-program state is parked in NatScratch.
 const XDP_DISPATCH_TCP4_CHALLENGE: u32 = 11;
+/// Family-split main dataplane: cloud_node_xdp tail-calls one of these so
+/// each family's pipeline verifies under its own 1M-insn budget.
+const XDP_DISPATCH_MAIN_V4_WORK: u32 = 12;
+const XDP_DISPATCH_MAIN_V6_WORK: u32 = 13;
+// T4-7: ICMP out-CT claim workers — the quoted-packet re-parse doubles the
+// caller's verifier state space, so each family runs behind its own tail
+// call with its own 1M-insn budget.
+const XDP_DISPATCH_ICMP_CT_V4: u32 = 14;
+const XDP_DISPATCH_ICMP_CT_V6: u32 = 15;
+/// Quoted-packet half of the ICMPv6 claim — the inner ext-header walk is a
+/// second verifier-expensive callsite, so it runs behind one more tail
+/// call with its own 1M-insn budget.
+const XDP_DISPATCH_ICMP_CT_V6_INNER: u32 = 16;
+/// Sentinel action returned by the Control branches so the tail call to the
+/// ICMP out-CT worker fires at program scope — kernel 6.1 rejects
+/// tail_call inside bpf2bpf subprogs without BTF. Never a real action.
+const ACTION_TAIL_ICMP_CT: u32 = u32::MAX;
 /// forge_op values staged in NatScratch. The tail call itself must happen
 /// at program scope — kernel 6.1 rejects tail_call inside bpf2bpf subprogs
 /// without BTF — so the deep call sites park the opcode and return None;
@@ -347,7 +368,53 @@ static XDP_FLOW_ACCT: PerCpuHashMap<XdpUdpCtKey, XdpFlowAcct> =
 
 #[xdp]
 pub fn cloud_node_xdp(ctx: XdpContext) -> u32 {
-    match try_cloud_node_xdp(ctx) {
+    counter_packet();
+    let eth_proto = match parse_eth_payload(&ctx) {
+        Ok((proto, _)) => proto,
+        Err(XDP_CLASS_MALFORMED) => {
+            let action = malformed_drop();
+            count_action(action);
+            return action;
+        }
+        Err(_) => {
+            let action = unsupported_pass();
+            count_action(action);
+            return action;
+        }
+    };
+    // The per-family dataplane lives in tail-call programs: a single program
+    // containing both pipelines multiplies verifier states past the 1M-insn
+    // budget on pre-6.6 kernels (same reason the NAT work progs exist).
+    let slot = if eth_proto == EtherType::Ipv4 as u16 {
+        XDP_DISPATCH_MAIN_V4_WORK
+    } else if eth_proto == EtherType::Ipv6 as u16 {
+        XDP_DISPATCH_MAIN_V6_WORK
+    } else {
+        count_action(xdp_action::XDP_PASS);
+        return xdp_action::XDP_PASS;
+    };
+    unsafe { XDP_DISPATCH.tail_call(&ctx, slot) };
+    // The loader always populates the family slots; a miss means the attach
+    // is misconfigured. Pass to the kernel — counted like any other pass so
+    // the fallback stays observable in /status.
+    count_action(xdp_action::XDP_PASS);
+    xdp_action::XDP_PASS
+}
+
+/// IPv4 half of the main dataplane, entered via tail call from
+/// cloud_node_xdp. Re-parses the frame so offsets carry fresh packet-range
+/// bounds — values parked in scratch would arrive as unbounded scalars.
+#[xdp]
+pub fn xdp_main_v4_work(ctx: XdpContext) -> u32 {
+    match try_main_family_work::<4>(&ctx) {
+        Ok(ACTION_TAIL_ICMP_CT) => {
+            unsafe { XDP_DISPATCH.tail_call(&ctx, XDP_DISPATCH_ICMP_CT_V4) };
+            // Empty slot (stale object): the claim worker is absent, so the
+            // frame takes the kernel path exactly as a claim miss would.
+            let action = control_pass();
+            count_action(action);
+            action
+        }
         Ok(action) => {
             count_action(action);
             action
@@ -357,6 +424,203 @@ pub fn cloud_node_xdp(ctx: XdpContext) -> u32 {
             xdp_action::XDP_PASS
         }
     }
+}
+
+/// IPv6 half of the main dataplane, entered via tail call from
+/// cloud_node_xdp. See xdp_main_v4_work.
+#[xdp]
+pub fn xdp_main_v6_work(ctx: XdpContext) -> u32 {
+    match try_main_family_work::<6>(&ctx) {
+        Ok(ACTION_TAIL_ICMP_CT) => {
+            unsafe { XDP_DISPATCH.tail_call(&ctx, XDP_DISPATCH_ICMP_CT_V6) };
+            let action = control_pass();
+            count_action(action);
+            action
+        }
+        Ok(action) => {
+            count_action(action);
+            action
+        }
+        Err(_) => {
+            counter_parse_error();
+            xdp_action::XDP_PASS
+        }
+    }
+}
+
+/// T4-7 ICMPv4 out-CT claim worker. Re-parses the frame so offsets carry
+/// fresh packet-range bounds; on any parse gap or claim miss the frame
+/// takes the same kernel path the caller's control branch used.
+#[xdp]
+pub fn xdp_icmp_ct_v4(ctx: XdpContext) -> u32 {
+    let action = icmp_ct_work::<4>(&ctx);
+    count_action(action);
+    action
+}
+
+/// T4-7 ICMPv6 out-CT claim worker. See xdp_icmp_ct_v4.
+#[xdp]
+pub fn xdp_icmp_ct_v6(ctx: XdpContext) -> u32 {
+    let action = icmp_ct_work::<6>(&ctx);
+    count_action(action);
+    action
+}
+
+/// Re-parse the control frame and run the out-CT claim. The parent's
+/// Control branch already charged the control budget before tail-calling,
+/// so this worker must not charge again. Parse failures reproduce the
+/// parent's verdict: malformed drops, everything else passes to the kernel.
+#[inline(always)]
+fn icmp_ct_work<const F: u8>(ctx: &XdpContext) -> u32 {
+    let Ok((eth_proto, ip_offset)) = parse_eth_payload(ctx) else {
+        return control_pass();
+    };
+    let ifindex = ctx.ingress_ifindex() as u32;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
+    if F == 4 {
+        if eth_proto != EtherType::Ipv4 as u16 {
+            return control_pass();
+        }
+        let Ok(ip) = ptr_at::<Ipv4Hdr>(ctx, ip_offset) else {
+            return control_pass();
+        };
+        let ihl = unsafe { (*ip).ihl() as usize };
+        let total_len = unsafe { (*ip).tot_len() as usize };
+        let frame_len = pkt_data_end(ctx).saturating_sub(pkt_data(ctx));
+        let Some(packet_end) = ip_offset.checked_add(total_len) else {
+            return malformed_drop();
+        };
+        if unsafe { (*ip).version() } != 4
+            || ihl < mem::size_of::<Ipv4Hdr>()
+            || ihl > 15 * 4
+            || total_len < ihl
+            || packet_end > frame_len
+        {
+            return malformed_drop();
+        }
+        if unsafe { (*ip).proto } != IP_PROTO_ICMP {
+            return control_pass();
+        }
+        let claimed = try_out_ct_icmp_v4(ctx, ip_offset + ihl, packet_end, policy);
+        if claimed != OUT_CT_ICMP_NONE {
+            return claimed;
+        }
+        return control_pass();
+    }
+    if eth_proto != EtherType::Ipv6 as u16 {
+        return control_pass();
+    }
+    let Ok(ip) = ptr_at::<Ipv6Hdr>(ctx, ip_offset) else {
+        return control_pass();
+    };
+    if unsafe { (*ip).version() } != 6 {
+        return malformed_drop();
+    }
+    let payload_len = unsafe { u16::from_be_bytes((*ip).payload_len) as usize };
+    let Some(packet_end) = ip_offset
+        .checked_add(mem::size_of::<Ipv6Hdr>())
+        .and_then(|offset| offset.checked_add(payload_len))
+    else {
+        return malformed_drop();
+    };
+    if packet_end > pkt_data_end(ctx).saturating_sub(pkt_data(ctx)) {
+        return malformed_drop();
+    }
+    let mut l4_offset: usize = 0;
+    let packed_v6 = ipv6_transport_offset(
+        ctx,
+        unsafe { (*ip).next_hdr },
+        ip_offset + mem::size_of::<Ipv6Hdr>(),
+        packet_end,
+        &mut l4_offset,
+    );
+    if packed_v6 & V6N_FLAG != 0 {
+        return control_pass();
+    }
+    if packed_v6 as u8 != IP_PROTO_ICMPV6 {
+        return control_pass();
+    }
+    // Cheap gates first: only ICMPv6 errors (1-4) quote a datagram, and
+    // only proxy mode claims them — anything else never burns the inner
+    // tail-call hop.
+    let Some(policy) = policy else {
+        return control_pass();
+    };
+    if policy.mode != 2 {
+        return control_pass();
+    }
+    let Ok(icmp_type) = read_u8(ctx, l4_offset) else {
+        return control_pass();
+    };
+    if !(1..=4).contains(&icmp_type) {
+        return control_pass();
+    }
+    let Some(inner_off) = l4_offset.checked_add(8) else {
+        return control_pass();
+    };
+    let Ok(scratch) = nat_scratch() else {
+        return control_pass();
+    };
+    unsafe {
+        (*scratch).icmp_inner_off = inner_off as u32;
+        (*scratch).icmp_inner_end = packet_end as u32;
+    }
+    // The quoted packet's ext-header walk is a second verifier-expensive
+    // callsite; it runs in the slot-16 worker with its own budget. An
+    // empty slot (stale object) falls through to the kernel path — the
+    // same verdict a claim miss produces.
+    unsafe { XDP_DISPATCH.tail_call(ctx, XDP_DISPATCH_ICMP_CT_V6_INNER) };
+    control_pass()
+}
+
+/// T4-7 ICMPv6 out-CT inner claim worker: parses the quoted datagram and
+/// matches its tuple against XDP_OUT_CT. Reached via tail call with the
+/// quoted-header offset parked in NatScratch; both scalars are re-bounded
+/// before any packet access.
+#[xdp]
+pub fn xdp_icmp_ct_v6_inner(ctx: XdpContext) -> u32 {
+    let action = icmp_ct_v6_inner_work(&ctx);
+    count_action(action);
+    action
+}
+
+#[inline(always)]
+fn icmp_ct_v6_inner_work(ctx: &XdpContext) -> u32 {
+    let ifindex = ctx.ingress_ifindex() as u32;
+    let policy = unsafe { XDP_INTERFACE_POLICY.get(&ifindex) };
+    let Some(policy) = policy else {
+        return control_pass();
+    };
+    if policy.mode != 2 {
+        return control_pass();
+    }
+    let Ok(scratch) = nat_scratch() else {
+        return control_pass();
+    };
+    // Parked scalars reload unbounded — mask the packet offset to a
+    // constant domain (same trick as bound_work_offsets): a quoted-header
+    // offset cannot exceed ~16KiB in a real chain, and every packet access
+    // re-checks bounds anyway. The 0x3ffff domain was still too wide —
+    // kernel 6.1 learns no packet range above a certain var_off.umax.
+    // packet_end only feeds scalar compares, so it needs no mask.
+    let inner_off = (unsafe { (*scratch).icmp_inner_off } as usize) & 0x7fff;
+    let packet_end = unsafe { (*scratch).icmp_inner_end } as usize;
+    match try_out_ct_icmp_v6_inner(ctx, inner_off, packet_end, policy) {
+        OUT_CT_ICMP_NONE => control_pass(),
+        action => action,
+    }
+}
+
+#[inline(always)]
+fn try_main_family_work<const F: u8>(ctx: &XdpContext) -> Result<u32, ()> {
+    let (eth_proto, ip_offset) = parse_eth_payload(ctx).map_err(|_| ())?;
+    if F == 4 && eth_proto == EtherType::Ipv4 as u16 {
+        return handle_ipv4(ctx, ip_offset);
+    }
+    if F == 6 && eth_proto == EtherType::Ipv6 as u16 {
+        return handle_ipv6(ctx, ip_offset);
+    }
+    Err(())
 }
 
 /// NAT subprogram entered via tail call. Runs the configured direct-forward
@@ -436,19 +700,24 @@ fn parse_frame<const F: u8>(
             .checked_add(mem::size_of::<Ipv6Hdr>())
             .and_then(|offset| offset.checked_add(payload_len))
             .ok_or(())?;
-        if packet_end > ctx.data_end().saturating_sub(ctx.data()) {
+        if packet_end > pkt_data_end(ctx).saturating_sub(pkt_data(ctx)) {
             return Err(());
         }
         let next = unsafe { (*ip).next_hdr };
-        let (proto, l4_offset) = match unpack_v6_next(ipv6_transport_offset(
+        let mut l4_offset: usize = 0;
+        let packed_v6 = ipv6_transport_offset(
             ctx,
             next,
             ip_offset + mem::size_of::<Ipv6Hdr>(),
             packet_end,
-        )?) {
-            Some(bounds) => bounds,
-            None => return Err(()),
-        };
+            &mut l4_offset,
+        );
+        // V6N_ERR and any other flagged class both collapse to Err here:
+        // this caller has no fragment/unsupported distinction.
+        if packed_v6 & V6N_FLAG != 0 {
+            return Err(());
+        }
+        let proto = packed_v6 as u8;
         (
             6u8,
             proto,
@@ -886,21 +1155,6 @@ pub fn xdp_nat_tcp6_work(ctx: XdpContext) -> u32 {
     }
 }
 
-fn try_cloud_node_xdp(ctx: XdpContext) -> Result<u32, ()> {
-    counter_packet();
-    let (eth_proto, ip_offset) = match parse_eth_payload(&ctx) {
-        Ok(bounds) => bounds,
-        Err(XDP_CLASS_MALFORMED) => return Ok(malformed_drop()),
-        Err(_) => return Ok(unsupported_pass()),
-    };
-    let action = match eth_proto {
-        value if value == EtherType::Ipv4 as u16 => handle_ipv4(&ctx, ip_offset)?,
-        value if value == EtherType::Ipv6 as u16 => handle_ipv6(&ctx, ip_offset)?,
-        _ => xdp_action::XDP_PASS,
-    };
-    Ok(action)
-}
-
 /// Parse the Ethernet (+ up to two VLAN tags) boundary. `Err(class)` carries
 /// an XDP_CLASS_* parse verdict: MALFORMED for deterministic-illegal frames
 /// (truncated headers), UNSUPPORTED for legal-but-unparseable encapsulations
@@ -948,7 +1202,7 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     let version = unsafe { (*ip).version() };
     let ihl = unsafe { (*ip).ihl() as usize };
     let total_len = unsafe { (*ip).tot_len() as usize };
-    let frame_len = ctx.data_end().saturating_sub(ctx.data());
+    let frame_len = pkt_data_end(ctx).saturating_sub(pkt_data(ctx));
     let packet_end = match ip_offset.checked_add(total_len) {
         Some(end) => end,
         None => return Ok(malformed_drop()),
@@ -990,14 +1244,10 @@ fn handle_ipv4(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
                 return Ok(xdp_action::XDP_DROP);
             }
             // T4-7: an ICMP error quoting a node-dialed flow redirects
-            // to this queue's XSK for PMTU/error delivery; a miss keeps
-            // the kernel path.
-            if let Ok(Some(action)) =
-                try_out_ct_icmp_v4(ctx, l4_offset, packet_end, policy)
-            {
-                return Ok(action);
-            }
-            return Ok(control_pass());
+            // to this queue's XSK for PMTU/error delivery. The claim runs
+            // in its own tail-call worker (own verifier budget); the
+            // sentinel defers the hop to program scope.
+            return Ok(ACTION_TAIL_ICMP_CT);
         }
         L4Class::Unsupported => return Ok(unsupported_pass()),
     }
@@ -1215,30 +1465,28 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
         Some(end) => end,
         None => return Ok(malformed_drop()),
     };
-    if packet_end > ctx.data_end().saturating_sub(ctx.data()) {
+    if packet_end > pkt_data_end(ctx).saturating_sub(pkt_data(ctx)) {
         return Ok(malformed_drop());
     }
     // Same ordering as handle_ipv4: fragment bounds precede the whitelist.
     let local_flags = local_flags_v6(policy, ifindex, destination);
     let protocol = unsafe { (*ip).next_hdr };
-    let (protocol, l4_offset) = match ipv6_transport_offset(
+    let mut l4_offset: usize = 0;
+    let packed_v6 = ipv6_transport_offset(
         ctx,
         protocol,
         ip_offset + mem::size_of::<Ipv6Hdr>(),
         packet_end,
-    ) {
-        Ok(packed) if packed & V6N_FLAG == 0 => (
-            (packed >> 32) as u8,
-            // black_box defeats store narrowing: without it LLVM can spill
-            // only the low 32 bits of the masked value, and the verifier then
-            // rejects the 64-bit reload as a partially-initialized read.
-            core::hint::black_box(packed & 0xffff_ffff) as usize,
-        ),
-        Ok(packed) if packed & 0xff == V6N_FRAGMENTED => {
-            return Ok(fragmented_action(fragment_policy(policy, local_flags)));
-        }
-        Ok(_) => return Ok(unsupported_pass()),
-        Err(()) => return Ok(malformed_drop()),
+        &mut l4_offset,
+    );
+    let protocol = if packed_v6 & V6N_FLAG == 0 {
+        packed_v6 as u8
+    } else if packed_v6 & 0xff == V6N_ERR {
+        return Ok(malformed_drop());
+    } else if packed_v6 & 0xff == V6N_FRAGMENTED {
+        return Ok(fragmented_action(fragment_policy(policy, local_flags)));
+    } else {
+        return Ok(unsupported_pass());
     };
     match l4_sanity(ctx, protocol, l4_offset, packet_end) {
         L4Class::Ok => {}
@@ -1251,14 +1499,10 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
                 return Ok(xdp_action::XDP_DROP);
             }
             // T4-7: an ICMPv6 error quoting a node-dialed flow redirects
-            // to this queue's XSK for PMTU/error delivery; a miss keeps
-            // the kernel path.
-            if let Ok(Some(action)) =
-                try_out_ct_icmp_v6(ctx, l4_offset, packet_end, policy)
-            {
-                return Ok(action);
-            }
-            return Ok(control_pass());
+            // to this queue's XSK for PMTU/error delivery. The claim runs
+            // in its own tail-call worker (own verifier budget); the
+            // sentinel defers the hop to program scope.
+            return Ok(ACTION_TAIL_ICMP_CT);
         }
         L4Class::Unsupported => return Ok(unsupported_pass()),
     }
@@ -1308,82 +1552,127 @@ fn handle_ipv6(ctx: &XdpContext, ip_offset: usize) -> Result<u32, ()> {
     )
 }
 
-/// IPv6 extension-chain walk, packed into a single u64 so the return value
-/// stays in registers (a fat enum spills partially-written stack slots that
-/// the verifier rejects). Non-fragment L4: `(proto << 32) | l4_offset`.
-/// With V6N_FLAG set the low byte is a V6N_* class instead.
+/// IPv6 extension-chain walk. Returns the L4 protocol number, or
+/// `V6N_FLAG | V6N_*` for the flagged classes; on success the L4 offset is
+/// written to `out_offset`. The offset goes through memory (not packed into
+/// the return value) so the verifier keeps the callee's tight scalar bound —
+/// extracting `packed & 0xffff_ffff` would widen it to u32::MAX, and the
+/// range learned from `data + off + N > data_end` then overflows u32.
 const V6N_FLAG: u64 = 1 << 63;
 const V6N_FRAGMENTED: u64 = 1;
 const V6N_UNSUPPORTED: u64 = 2;
+/// Malformed/bounds-failed — distinct from UNSUPPORTED because callers
+/// drop malformed frames but pass unsupported ones.
+const V6N_ERR: u64 = 4;
 
-/// Decode for call sites that only care whether an L4 header was found.
-#[inline(always)]
-fn unpack_v6_next(packed: u64) -> Option<(u8, usize)> {
-    if packed & V6N_FLAG != 0 {
-        return None;
-    }
-    // See handle_ipv6: black_box keeps the masked low word a full-width store.
-    Some((
-        (packed >> 32) as u8,
-        core::hint::black_box(packed & 0xffff_ffff) as usize,
-    ))
+/// Two-byte prefix shared by hop-by-hop, routing, destination-options and
+/// AH extension headers: next-header plus the hdr-ext-len field.
+#[repr(C, packed)]
+struct V6ExtPrefix {
+    next: u8,
+    len: u8,
 }
 
-#[inline(always)]
-fn ipv6_transport_offset(
+/// Fixed eight-byte IPv6 fragment header.
+#[repr(C, packed)]
+struct V6FragHdr {
+    next: u8,
+    _reserved: u8,
+    frag_off: [u8; 2],
+    _ident: [u8; 4],
+}
+
+// Subprogram: the bounded ext-header loop inlined per callsite explodes
+// verifier states past the 1M-insn budget; a call is verified once.
+// Returns u64 — a wider `Result<u64, ()>` would be returned across the
+// subprogram boundary in multiple registers, which the verifier rejects
+// as reads of caller-clobbered r1-r5. Errors use the V6N_ERR class.
+#[inline(never)]
+pub fn ipv6_transport_offset(
     ctx: &XdpContext,
     mut next_header: u8,
     mut offset: usize,
     packet_end: usize,
-) -> Result<u64, ()> {
+    out_offset: *mut usize,
+) -> u64 {
     for _ in 0..8 {
         match next_header {
             value if value == IpProto::Tcp as u8 || value == IpProto::Udp as u8 => {
-                return Ok(((next_header as u64) << 32) | offset as u64);
+                unsafe { *out_offset = offset };
+                return next_header as u64;
             }
-            IP_PROTO_ICMPV6 => return Ok(((next_header as u64) << 32) | offset as u64),
-            IP_PROTO_NO_NEXT => return Ok(V6N_FLAG | V6N_UNSUPPORTED),
+            IP_PROTO_ICMPV6 => {
+                unsafe { *out_offset = offset };
+                return next_header as u64;
+            }
+            IP_PROTO_NO_NEXT => return V6N_FLAG | V6N_UNSUPPORTED,
             IP_PROTO_HOP_BY_HOP | IP_PROTO_ROUTING | IP_PROTO_DEST_OPTS => {
                 if offset + 2 > packet_end {
-                    return Err(());
+                    return V6N_FLAG | V6N_ERR;
                 }
-                let current = read_u8(ctx, offset)?;
-                let len = (read_u8(ctx, offset + 1)? as usize + 1) * 8;
-                next_header = current;
-                offset = offset.checked_add(len).ok_or(())?;
+                // One packed read per iteration: two guarded `read_u8`s
+                // each cost the verifier a separate range deduction, and
+                // eight iterations of that exhaust the 1M-insn budget.
+                let Ok(hdr) = ptr_at::<V6ExtPrefix>(ctx, offset) else {
+                    return V6N_FLAG | V6N_ERR;
+                };
+                let len = (unsafe { (*hdr).len } as usize + 1) * 8;
+                next_header = unsafe { (*hdr).next };
+                offset = match offset.checked_add(len) {
+                    Some(off) => off,
+                    None => return V6N_FLAG | V6N_ERR,
+                };
             }
             IP_PROTO_AH => {
                 if offset + 2 > packet_end {
-                    return Err(());
+                    return V6N_FLAG | V6N_ERR;
                 }
-                let current = read_u8(ctx, offset)?;
-                let len = (read_u8(ctx, offset + 1)? as usize + 2) * 4;
-                next_header = current;
-                offset = offset.checked_add(len).ok_or(())?;
+                let Ok(hdr) = ptr_at::<V6ExtPrefix>(ctx, offset) else {
+                    return V6N_FLAG | V6N_ERR;
+                };
+                let len = (unsafe { (*hdr).len } as usize + 2) * 4;
+                next_header = unsafe { (*hdr).next };
+                offset = match offset.checked_add(len) {
+                    Some(off) => off,
+                    None => return V6N_FLAG | V6N_ERR,
+                };
             }
             IP_PROTO_FRAGMENT => {
                 if offset + 8 > packet_end {
-                    return Err(());
+                    return V6N_FLAG | V6N_ERR;
                 }
-                let current = read_u8(ctx, offset)?;
-                let frag_hi = read_u8(ctx, offset + 2)?;
-                let frag_lo = read_u8(ctx, offset + 3)?;
-                let fragment = u16::from_be_bytes([frag_hi, frag_lo]);
+                let Ok(hdr) = ptr_at::<V6FragHdr>(ctx, offset) else {
+                    return V6N_FLAG | V6N_ERR;
+                };
+                let fragment = u16::from_be_bytes(unsafe { (*hdr).frag_off });
                 // Non-atomic fragment (offset != 0 or M set): leave the chain
                 // — first fragments never reach the L4 path either.
                 if fragment & 0xfff9 != 0 {
-                    return Ok(V6N_FLAG | V6N_FRAGMENTED);
+                    return V6N_FLAG | V6N_FRAGMENTED;
                 }
-                next_header = current;
-                offset = offset.checked_add(8).ok_or(())?;
+                next_header = unsafe { (*hdr).next };
+                offset = match offset.checked_add(8) {
+                    Some(off) => off,
+                    None => return V6N_FLAG | V6N_ERR,
+                };
             }
-            _ => return Ok(V6N_FLAG | V6N_UNSUPPORTED),
+            _ => return V6N_FLAG | V6N_UNSUPPORTED,
         }
         if offset > packet_end {
-            return Err(());
+            return V6N_FLAG | V6N_ERR;
         }
+        // Pin the loop-head state for the verifier: a bare `min` folds to
+        // the identity (offset <= packet_end was just proven), so use an
+        // AND mask — one ALU op LLVM cannot fold — bounding offset to
+        // 256KiB. That is strictly the identity on every live path: the
+        // check above already killed offset > packet_end and packet_end
+        // cannot exceed ~66KiB (u16 payload length plus fixed headers).
+        // Without the bound, offset's umin rises every hop, the back-edge
+        // state never matches a prior state, and kernel 6.1 explores all
+        // eight unrolled iterations past the 1M-insn verifier budget.
+        offset &= 0x3ffff;
     }
-    Ok(V6N_FLAG | V6N_UNSUPPORTED)
+    V6N_FLAG | V6N_UNSUPPORTED
 }
 
 /// L4-level verdict after the transport header offset is known. Malformed is
@@ -1764,42 +2053,53 @@ fn try_out_ct_v6(
 /// ingress queue's XSK so userspace delivers PMTU/error reports to the
 /// flow's owner. Any parse gap or map miss returns None — the caller
 /// passes the frame to the kernel unchanged.
-fn try_out_ct_icmp_v4(
+/// No-claim sentinel for the ICMP out-CT helpers: a subprogram's return
+/// must fit r0, so `Result<Option<u32>, ()>` collapses to a single u32.
+const OUT_CT_ICMP_NONE: u32 = u32::MAX;
+
+#[inline(never)]
+pub fn try_out_ct_icmp_v4(
     ctx: &XdpContext,
     l4_offset: usize,
     packet_end: usize,
     policy: Option<&XdpInterfacePolicy>,
-) -> Result<Option<u32>, ()> {
+) -> u32 {
     let Some(policy) = policy else {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     };
     if policy.mode != 2 {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
-    let icmp_type = unsafe { *ptr_at::<u8>(ctx, l4_offset)? };
+    let Ok(icmp_type) = read_u8(ctx, l4_offset) else {
+        return OUT_CT_ICMP_NONE;
+    };
     // Errors that quote the offending datagram: dest-unreach (3),
     // source-quench (4), redirect (5), time-exceeded (11),
     // parameter-problem (12).
     if !matches!(icmp_type, 3 | 4 | 5 | 11 | 12) {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
     let inner_off = match l4_offset.checked_add(8) {
         Some(off) => off,
-        None => return Ok(None),
+        None => return OUT_CT_ICMP_NONE,
     };
     if inner_off + mem::size_of::<Ipv4Hdr>() > packet_end {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
-    let inner = ptr_at::<Ipv4Hdr>(ctx, inner_off)?;
+    let Ok(inner) = ptr_at::<Ipv4Hdr>(ctx, inner_off) else {
+        return OUT_CT_ICMP_NONE;
+    };
     let ihl = unsafe { (*inner).ihl() as usize };
     let proto = unsafe { (*inner).proto };
     if ihl < mem::size_of::<Ipv4Hdr>()
         || (proto != IpProto::Tcp as u8 && proto != IpProto::Udp as u8)
         || inner_off + ihl + 4 > packet_end
     {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
-    let ports = ptr_at::<L4Ports>(ctx, inner_off + ihl)?;
+    let Ok(ports) = ptr_at::<L4Ports>(ctx, inner_off + ihl) else {
+        return OUT_CT_ICMP_NONE;
+    };
     // The quoted packet is *outbound*: its source is our dialed local
     // endpoint — the reverse mapping of the reply-path check.
     let key = XdpOutCtKey {
@@ -1812,58 +2112,53 @@ fn try_out_ct_icmp_v4(
         _pad: [0; 2],
     };
     if unsafe { XDP_OUT_CT.get(&key) }.is_none() {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
     counter_out_ct_icmp();
-    Ok(Some(xsk_redirect_current(ctx, policy)))
+    xsk_redirect_current(ctx, policy)
 }
 
-/// T4-7: ICMPv6 error quoting a node-dialed outbound packet — same
-/// contract as the v4 helper; quoted extension headers are walked with
-/// the same bounded loop as live traffic.
-fn try_out_ct_icmp_v6(
+/// T4-7: the quoted-packet half of an ICMPv6 out-CT claim — reached via the
+/// slot-16 tail call. `inner_off` points at the quoted IPv6 header and
+/// `packet_end` bounds the containing frame; both were parked in NatScratch
+/// and re-masked by the worker. The error-type and proxy-mode gates run in
+/// the outer worker so non-error ICMPv6 never burns this hop.
+#[inline(never)]
+fn try_out_ct_icmp_v6_inner(
     ctx: &XdpContext,
-    l4_offset: usize,
+    inner_off: usize,
     packet_end: usize,
-    policy: Option<&XdpInterfacePolicy>,
-) -> Result<Option<u32>, ()> {
-    let Some(policy) = policy else {
-        return Ok(None);
-    };
-    if policy.mode != 2 {
-        return Ok(None);
-    }
-    let icmp_type = unsafe { *ptr_at::<u8>(ctx, l4_offset)? };
-    // ICMPv6 errors 1–4 (dest-unreach, packet-too-big, time-exceeded,
-    // parameter-problem) all quote the offending packet.
-    if !(1..=4).contains(&icmp_type) {
-        return Ok(None);
-    }
-    let inner_off = match l4_offset.checked_add(8) {
-        Some(off) => off,
-        None => return Ok(None),
-    };
+    policy: &XdpInterfacePolicy,
+) -> u32 {
     if inner_off + mem::size_of::<Ipv6Hdr>() > packet_end {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
-    let inner = ptr_at::<Ipv6Hdr>(ctx, inner_off)?;
-    let next_header = unsafe { (*inner).next_hdr };
-    let packed = match ipv6_transport_offset(ctx, next_header, inner_off + 40, packet_end) {
-        Ok(packed) => packed,
-        Err(()) => return Ok(None),
+    let Ok(inner) = ptr_at::<Ipv6Hdr>(ctx, inner_off) else {
+        return OUT_CT_ICMP_NONE;
     };
+    let next_header = unsafe { (*inner).next_hdr };
+    // Flagged results (error, fragmented, unsupported) all mean no claim.
+    let mut ports_off: usize = 0;
+    let packed = ipv6_transport_offset(
+        ctx,
+        next_header,
+        inner_off + 40,
+        packet_end,
+        &mut ports_off,
+    );
     if packed & V6N_FLAG != 0 {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
-    let proto = (packed >> 32) as u8;
+    let proto = packed as u8;
     if proto != IpProto::Tcp as u8 && proto != IpProto::Udp as u8 {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
-    let ports_off = (packed & 0xffff_ffff) as usize;
     if ports_off + 4 > packet_end {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
-    let ports = ptr_at::<L4Ports>(ctx, ports_off)?;
+    let Ok(ports) = ptr_at::<L4Ports>(ctx, ports_off) else {
+        return OUT_CT_ICMP_NONE;
+    };
     let key = XdpOutCtKey {
         local_addr: unsafe { (*inner).src_addr },
         remote_addr: unsafe { (*inner).dst_addr },
@@ -1874,10 +2169,10 @@ fn try_out_ct_icmp_v6(
         _pad: [0; 2],
     };
     if unsafe { XDP_OUT_CT.get(&key) }.is_none() {
-        return Ok(None);
+        return OUT_CT_ICMP_NONE;
     }
     counter_out_ct_icmp();
-    Ok(Some(xsk_redirect_current(ctx, policy)))
+    xsk_redirect_current(ctx, policy)
 }
 
 /// Per-IP fixed-window pps limiter. Only UDP datagrams and TCP SYN-without-ACK
@@ -2006,15 +2301,33 @@ fn csum_diff_u32(old: &mut u32, new: &mut u32) -> i64 {
     unsafe { bpf_csum_diff(old as *mut u32, 4, new as *mut u32, 4, 0) }
 }
 
+/// Volatile packet-window reads. LLVM's argument promotion lifts a callee's
+/// `(*ctx).data`/`data_end` loads into the caller and re-materializes the
+/// 32-bit field inside the callee as `<< 32; >> 32` — a shift the verifier
+/// forbids on packet-typed registers. Volatile loads cannot be promoted, so
+/// every subprogram dereferences ctx itself and gets a plain u32 load.
+#[inline(always)]
+fn pkt_data(ctx: &XdpContext) -> usize {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*ctx.ctx).data)) as usize }
+}
+
+#[inline(always)]
+fn pkt_data_end(ctx: &XdpContext) -> usize {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*ctx.ctx).data_end)) as usize }
+}
+
 #[inline(always)]
 fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
-    let len = mem::size_of::<T>();
-    if start + offset + len > end {
+    let start = pkt_data(ctx);
+    let end = pkt_data_end(ctx);
+    let size = mem::size_of::<T>();
+    // `black_box` keeps the `+ size` bound check unfolded — see
+    // `ptr_at` for why the folded form fails the 6.1 verifier.
+    let ptr = start + offset;
+    if core::hint::black_box(ptr + size) > end {
         return Err(());
     }
-    Ok((start + offset) as *mut T)
+    Ok(ptr as *mut T)
 }
 
 fn v4_embed(addr_be: u32) -> [u8; 16] {
@@ -2039,20 +2352,29 @@ fn ipv4_csum_update(ctx: &XdpContext, ip_offset: usize, old: u32, new: u32) -> R
 /// optional port change. `old_port`/`new_port` are raw memory-order u16s
 /// (`u16::from_ne_bytes` of the port field). A zero checksum (v4 only) is
 /// left alone.
-#[allow(clippy::too_many_arguments)]
-fn udp_csum_update(
+/// The checksum word arrays travel through `scratch` (a per-CPU map pointer)
+/// instead of `&mut [u32; 4]` params: LLVM lowers small reference-to-array
+/// arguments as byval copies on the caller's stack, and the callee touches
+/// them through r11 — an illegal register the 6.1 verifier rejects. The
+/// `#[inline(always)]` wrapper restores `?` ergonomics for callers.
+fn udp_csum_update_i(
     ctx: &XdpContext,
+    scratch: *mut NatScratch,
     l4_offset: usize,
-    old_addr_words: &mut [u32; 4],
-    new_addr_words: &mut [u32; 4],
-    addr_word_count: usize,
-    old_port: u16,
-    new_port: u16,
-) -> Result<(), ()> {
-    let udp = ptr_at_mut::<UdpHdr>(ctx, l4_offset)?;
+    aux: u64,
+) -> u32 {
+    let addr_word_count = (aux >> 32) as usize;
+    let old_port = (aux >> 16) as u16;
+    let new_port = aux as u16;
+    let old_addr_words = unsafe { &mut (*scratch).csum_old };
+    let new_addr_words = unsafe { &mut (*scratch).csum_new };
+    let udp = match ptr_at_mut::<UdpHdr>(ctx, l4_offset) {
+        Ok(udp) => udp,
+        Err(()) => return 1,
+    };
     let old_check = unsafe { u16::from_ne_bytes((*udp).check) };
     if old_check == 0 {
-        return Ok(());
+        return 0;
     }
     // `addr_word_count` is 1 (IPv4) or 4 (IPv6) at the call sites; constant
     // indices keep the verifier's stack-slot tracking straight-line instead
@@ -2111,6 +2433,19 @@ fn udp_csum_update(
         };
     }
     unsafe { (*udp).check = csum_apply_diff(old_check, diff).to_ne_bytes() };
+    0
+}
+
+#[inline(always)]
+fn udp_csum_update(
+    ctx: &XdpContext,
+    scratch: *mut NatScratch,
+    l4_offset: usize,
+    aux: u64,
+) -> Result<(), ()> {
+    if udp_csum_update_i(ctx, scratch, l4_offset, aux) != 0 {
+        return Err(());
+    }
     Ok(())
 }
 
@@ -2462,12 +2797,9 @@ fn try_udp_nat_v4(
         unsafe { (*udp_hdr).src = listen_port.to_ne_bytes() };
         udp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            1,
-            src_port,
-            listen_port,
+            csum_aux(1, src_port, listen_port),
         )?;
         eth_rewrite(ctx, ct.client_mac)?;
         acct_flow(
@@ -2548,12 +2880,9 @@ fn try_udp_nat_v4(
         }
         udp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            1,
-            src_port,
-            listen_port,
+            csum_aux(1, src_port, listen_port),
         )?;
         let ip_hdr = ptr_at_mut::<Ipv4Hdr>(ctx, ip_offset)?;
         unsafe { (*ip_hdr).dst_addr = client_be.to_be_bytes() };
@@ -2571,12 +2900,9 @@ fn try_udp_nat_v4(
         }
         udp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            1,
-            dst_port,
-            client_port,
+            csum_aux(1, dst_port, client_port),
         )?;
         eth_rewrite(ctx, client_mac)?;
         if let Some(ct) = XDP_UDP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
@@ -2748,12 +3074,9 @@ fn try_udp_nat_v4(
     unsafe { (*udp_hdr).dst = rule.backend_port_be.to_ne_bytes() };
     udp_csum_update(
         ctx,
+        scratch,
         l4_offset,
-        unsafe { &mut (*scratch).csum_old },
-        unsafe { &mut (*scratch).csum_new },
-        1,
-        dst_port,
-        rule.backend_port_be,
+        csum_aux(1, dst_port, rule.backend_port_be),
     )?;
     if snat_port != 0 {
         // Rewrite source -> (listen addr, allocated node port) so the frame
@@ -2774,12 +3097,9 @@ fn try_udp_nat_v4(
         unsafe { (*udp_hdr).src = snat_port.to_ne_bytes() };
         udp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            1,
-            src_port,
-            snat_port,
+            csum_aux(1, src_port, snat_port),
         )?;
     }
     eth_rewrite(ctx, rule.next_hop_mac)?;
@@ -2843,12 +3163,9 @@ fn try_udp_nat_v6(
         unsafe { (*udp_hdr).src = listen_port.to_ne_bytes() };
         udp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            4,
-            src_port,
-            listen_port,
+            csum_aux(4, src_port, listen_port),
         )?;
         eth_rewrite(ctx, ct.client_mac)?;
         acct_flow(
@@ -2905,12 +3222,9 @@ fn try_udp_nat_v6(
         unsafe { (*udp_hdr).src = listen_port.to_ne_bytes() };
         udp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            4,
-            src_port,
-            listen_port,
+            csum_aux(4, src_port, listen_port),
         )?;
         unsafe {
             words16_into(&(*scratch).pkt_dst, &mut (*scratch).csum_old);
@@ -2930,12 +3244,9 @@ fn try_udp_nat_v6(
         unsafe { (*udp_hdr).dst = client_port.to_ne_bytes() };
         udp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            4,
-            dst_port,
-            client_port,
+            csum_aux(4, dst_port, client_port),
         )?;
         eth_rewrite(ctx, client_mac)?;
         if let Some(ct) = XDP_UDP_CT.get_ptr_mut(unsafe { &(*scratch).ct_key }) {
@@ -3108,12 +3419,9 @@ fn try_udp_nat_v6_fwd(
     unsafe { (*udp_hdr).dst = rule.backend_port_be.to_ne_bytes() };
     udp_csum_update(
         ctx,
+        scratch,
         l4_offset,
-        unsafe { &mut (*scratch).csum_old },
-        unsafe { &mut (*scratch).csum_new },
-        4,
-        dst_port,
-        rule.backend_port_be,
+        csum_aux(4, dst_port, rule.backend_port_be),
     )?;
     if snat_port != 0 {
         unsafe {
@@ -3126,12 +3434,9 @@ fn try_udp_nat_v6_fwd(
         unsafe { (*udp_hdr).src = snat_port.to_ne_bytes() };
         udp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            4,
-            src_port,
-            snat_port,
+            csum_aux(4, src_port, snat_port),
         )?;
     }
     eth_rewrite(ctx, rule.next_hop_mac)?;
@@ -3146,20 +3451,33 @@ fn try_udp_nat_v6_fwd(
     Ok(Some(xdp_action::XDP_TX))
 }
 
+/// Pack the csum-update tail args (word count + both ports) into one u64 so
+/// the helpers stay at four plain parameters — every extra argument risks
+/// stack passing and the r11 access the 6.1 verifier rejects.
+const fn csum_aux(addr_word_count: usize, old_port: u16, new_port: u16) -> u64 {
+    ((addr_word_count as u64) << 32) | ((old_port as u64) << 16) | new_port as u64
+}
+
 /// Update the TCP checksum after a pseudo-header address change plus an
 /// optional port change. Unlike UDP the checksum is mandatory (both families),
 /// so a zero stored value is still corrected rather than left alone.
-#[allow(clippy::too_many_arguments)]
-fn tcp_csum_update(
+/// Scratch-passed word arrays for the same byval/r11 reason as
+/// udp_csum_update_i.
+fn tcp_csum_update_i(
     ctx: &XdpContext,
+    scratch: *mut NatScratch,
     l4_offset: usize,
-    old_addr_words: &mut [u32; 4],
-    new_addr_words: &mut [u32; 4],
-    addr_word_count: usize,
-    old_port: u16,
-    new_port: u16,
-) -> Result<(), ()> {
-    let tcp = ptr_at_mut::<TcpHdr>(ctx, l4_offset)?;
+    aux: u64,
+) -> u32 {
+    let addr_word_count = (aux >> 32) as usize;
+    let old_port = (aux >> 16) as u16;
+    let new_port = aux as u16;
+    let old_addr_words = unsafe { &mut (*scratch).csum_old };
+    let new_addr_words = unsafe { &mut (*scratch).csum_new };
+    let tcp = match ptr_at_mut::<TcpHdr>(ctx, l4_offset) {
+        Ok(tcp) => tcp,
+        Err(()) => return 1,
+    };
     let old_check = unsafe { u16::from_ne_bytes((*tcp).check) };
     // `addr_word_count` is 1 (IPv4) or 4 (IPv6) at the call sites; constant
     // indices keep the verifier's stack-slot tracking straight-line instead
@@ -3216,6 +3534,19 @@ fn tcp_csum_update(
         };
     }
     unsafe { (*tcp).check = csum_apply_diff(old_check, diff).to_ne_bytes() };
+    0
+}
+
+#[inline(always)]
+fn tcp_csum_update(
+    ctx: &XdpContext,
+    scratch: *mut NatScratch,
+    l4_offset: usize,
+    aux: u64,
+) -> Result<(), ()> {
+    if tcp_csum_update_i(ctx, scratch, l4_offset, aux) != 0 {
+        return Err(());
+    }
     Ok(())
 }
 
@@ -3309,12 +3640,9 @@ fn try_tcp_nat_v4(
         unsafe { (*tcp_hdr).source = listen_port.to_ne_bytes() };
         tcp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            1,
-            src_port,
-            listen_port,
+            csum_aux(1, src_port, listen_port),
         )?;
         eth_rewrite(ctx, ct.client_mac)?;
         acct_flow(
@@ -3418,12 +3746,9 @@ fn try_tcp_nat_v4(
         }
         tcp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            1,
-            src_port,
-            listen_port,
+            csum_aux(1, src_port, listen_port),
         )?;
         unsafe {
             (*scratch).csum_old = [u32::from_ne_bytes(dst_addr), 0, 0, 0];
@@ -3441,12 +3766,9 @@ fn try_tcp_nat_v4(
         unsafe { (*tcp_hdr).dest = client_port.to_ne_bytes() };
         tcp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            1,
-            dst_port,
-            client_port,
+            csum_aux(1, dst_port, client_port),
         )?;
         eth_rewrite(ctx, client_mac)?;
         if let Some(ct) = XDP_TCP_CT
@@ -3707,12 +4029,9 @@ fn try_tcp_nat_v4(
     unsafe { (*tcp_hdr).dest = rule.backend_port_be.to_ne_bytes() };
     tcp_csum_update(
         ctx,
+        scratch,
         l4_offset,
-        unsafe { &mut (*scratch).csum_old },
-        unsafe { &mut (*scratch).csum_new },
-        1,
-        dst_port,
-        rule.backend_port_be,
+        csum_aux(1, dst_port, rule.backend_port_be),
     )?;
     if snat_port != 0 {
         unsafe {
@@ -3731,12 +4050,9 @@ fn try_tcp_nat_v4(
         unsafe { (*tcp_hdr).source = snat_port.to_ne_bytes() };
         tcp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            1,
-            src_port,
-            snat_port,
+            csum_aux(1, src_port, snat_port),
         )?;
     }
     if splice_delta != 0 {
@@ -3824,12 +4140,9 @@ fn try_tcp_nat_v6(
         unsafe { (*tcp_hdr).source = listen_port.to_ne_bytes() };
         tcp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            4,
-            src_port,
-            listen_port,
+            csum_aux(4, src_port, listen_port),
         )?;
         eth_rewrite(ctx, ct.client_mac)?;
         acct_flow(
@@ -3886,12 +4199,9 @@ fn try_tcp_nat_v6(
         unsafe { (*tcp_hdr).source = listen_port.to_ne_bytes() };
         tcp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            4,
-            src_port,
-            listen_port,
+            csum_aux(4, src_port, listen_port),
         )?;
         unsafe {
             words16_into(&(*scratch).pkt_dst, &mut (*scratch).csum_old);
@@ -3911,12 +4221,9 @@ fn try_tcp_nat_v6(
         unsafe { (*tcp_hdr).dest = client_port.to_ne_bytes() };
         tcp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            4,
-            dst_port,
-            client_port,
+            csum_aux(4, dst_port, client_port),
         )?;
         eth_rewrite(ctx, client_mac)?;
         if let Some(ct) = XDP_TCP_CT
@@ -4136,12 +4443,9 @@ fn try_tcp_nat_v6_fwd(
     unsafe { (*tcp_hdr).dest = rule.backend_port_be.to_ne_bytes() };
     tcp_csum_update(
         ctx,
+        scratch,
         l4_offset,
-        unsafe { &mut (*scratch).csum_old },
-        unsafe { &mut (*scratch).csum_new },
-        4,
-        dst_port,
-        rule.backend_port_be,
+        csum_aux(4, dst_port, rule.backend_port_be),
     )?;
     if snat_port != 0 {
         unsafe {
@@ -4154,12 +4458,9 @@ fn try_tcp_nat_v6_fwd(
         unsafe { (*tcp_hdr).source = snat_port.to_ne_bytes() };
         tcp_csum_update(
             ctx,
+            scratch,
             l4_offset,
-            unsafe { &mut (*scratch).csum_old },
-            unsafe { &mut (*scratch).csum_new },
-            4,
-            src_port,
-            snat_port,
+            csum_aux(4, src_port, snat_port),
         )?;
     }
     eth_rewrite(ctx, rule.next_hop_mac)?;
@@ -4200,8 +4501,8 @@ unsafe fn copy16(dst: *mut [u8; 16], src: *const [u8; 16]) {
 }
 
 fn copy_v6_addrs(ctx: &XdpContext, ip_offset: usize, scratch: *mut NatScratch) -> Result<(), ()> {
-    let base = ctx.data() + ip_offset + 8; // Ipv6Hdr::src_addr
-    let end = ctx.data_end();
+    let base = pkt_data(ctx) + ip_offset + 8; // Ipv6Hdr::src_addr
+    let end = pkt_data_end(ctx);
     if base + 32 > end {
         return Err(());
     }
@@ -4360,18 +4661,22 @@ fn proxy_port_enabled(port_be: u16, protocol: u8) -> bool {
 }
 
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
-    let len = mem::size_of::<T>();
-    if start + offset + len > end {
+    let start = pkt_data(ctx);
+    let end = pkt_data_end(ctx);
+    let size = mem::size_of::<T>();
+    let ptr = start + offset;
+    // `black_box` keeps `ptr + size` a distinct checked register: LLVM
+    // folds `ptr + 1 > end` into `ptr >= end`, and a bare `ptr < end`
+    // leaves variable-offset packet pointers with a zero range on the
+    // 6.1 verifier. The checked register shares `ptr`'s var_off chain,
+    // so the verifier back-derives `ptr`'s range as `size`.
+    if core::hint::black_box(ptr + size) > end {
         return Err(());
     }
-    Ok((start + offset) as *const T)
+    Ok(ptr as *const T)
 }
 
 fn read_u8(ctx: &XdpContext, offset: usize) -> Result<u8, ()> {
-    // `ptr + 1 > end` via ptr_at is the bound shape this kernel's verifier
-    // marks reliably on variable-offset packet pointers.
     let byte: *const u8 = ptr_at(ctx, offset)?;
     Ok(unsafe { *byte })
 }
@@ -5231,7 +5536,7 @@ fn forge_challenge_synack_v4(
 
 #[inline(always)]
 fn packet_len_of(ctx: &XdpContext) -> usize {
-    ctx.data_end() - ctx.data()
+    pkt_data_end(ctx) - pkt_data(ctx)
 }
 
 /// Forge a backend-directed TCP packet in place of the incoming frame
@@ -5393,7 +5698,7 @@ fn tcp_challenge_v4(
     // current frame (adjust_tail can shrink but not expose new bytes).
     // Scalar-length compare: a `data + off <= data_end` pointer compare
     // gets folded into prohibited 32-bit pointer shifts by LLVM here.
-    let have_opt = l4_offset + 24 <= ctx.data_end().saturating_sub(ctx.data());
+    let have_opt = l4_offset + 24 <= pkt_data_end(ctx).saturating_sub(pkt_data(ctx));
 
     if syn && !ack {
         // Stateless challenge — dim3 budget first, no state on miss.
