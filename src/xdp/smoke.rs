@@ -363,6 +363,7 @@ pub async fn dial_smoke(
     ready_file: Option<std::path::PathBuf>,
     payload: Vec<u8>,
     send_interval: std::time::Duration,
+    reload_at: Option<std::time::Duration>,
 ) -> anyhow::Result<serde_json::Value> {
     af_xdp::reset_tcp_diag();
     let manager = manager_from_runtime();
@@ -396,9 +397,17 @@ pub async fn dial_smoke(
         tcp_manager,
         http_manager,
     ));
-    let result =
-        dial_smoke_inner(manager, target, duration, ready_file, payload, send_interval, &bridge)
-            .await;
+    let result = dial_smoke_inner(
+        manager,
+        target,
+        duration,
+        ready_file,
+        payload,
+        send_interval,
+        reload_at,
+        &bridge,
+    )
+    .await;
     bridge.abort();
     let _ = bridge.await;
     services.abort();
@@ -416,6 +425,7 @@ async fn dial_smoke_inner(
     ready_file: Option<std::path::PathBuf>,
     payload: Vec<u8>,
     send_interval: std::time::Duration,
+    reload_at: Option<std::time::Duration>,
     bridge: &tokio::task::JoinHandle<()>,
 ) -> anyhow::Result<serde_json::Value> {
     use anyhow::Context as _;
@@ -430,6 +440,7 @@ async fn dial_smoke_inner(
     let local = stream
         .local_addr()
         .map_err(|err| anyhow::anyhow!("AF_XDP stream has no local addr: {err}"))?;
+    let session_established = tokio::time::Instant::now();
     if let Some(path) = ready_file.as_ref() {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -448,6 +459,21 @@ async fn dial_smoke_inner(
     let mut sent = 0u64;
     let mut received = 0u64;
     let mut io_error: Option<String> = None;
+    let mut io_error_at_ms: Option<u64> = None;
+    // T4-8/F1: optional in-process manager reload while the dialed session
+    // is live. The reload task is spawned at `reload_at` after session
+    // establishment; the send loop keeps probing the old session through
+    // the whole prepare→commit window so the report can timestamp exactly
+    // when (if) the session broke relative to the generation swap.
+    let mut reload_fut: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>>>>,
+    > = None;
+    let mut reload_started_ms: Option<u64> = None;
+    let mut reload_finished_ms: Option<u64> = None;
+    let mut reload_outcome: Option<serde_json::Value> = None;
+    let mut sent_at_reload: Option<u64> = None;
+    let mut received_at_reload: Option<u64> = None;
+    let mut io_error_before_reload_end = false;
     let mut send_tick = if send_interval.is_zero() {
         None
     } else {
@@ -460,16 +486,76 @@ async fn dial_smoke_inner(
     let mut send_once = !payload.is_empty();
     let deadline = tokio::time::Instant::now() + duration;
     let mut buf = vec![0u8; 8192];
-    while tokio::time::Instant::now() < deadline && io_error.is_none() {
+    while tokio::time::Instant::now() < deadline {
+        // Trigger the scheduled in-process reload exactly once.
+        if let Some(at) = reload_at
+            && reload_started_ms.is_none()
+            && session_established.elapsed() >= at
+        {
+            // Force a real generation replacement — an identical config
+            // takes the reload fast-path and proves nothing about the
+            // prepare→commit→handover contract (same trick as
+            // proxy_reload_smoke).
+            let mut runtime =
+                crate::runtime_mode::RuntimeConfig::current().unwrap_or_default();
+            if let Some(tables) = manager.effective_state_tables.read().clone() {
+                runtime.xdp.state_tables = Some(tables);
+            }
+            if runtime.xdp == manager.config {
+                runtime.xdp.admission =
+                    Some(crate::runtime_mode::XdpAdmissionSettings::default());
+            }
+            crate::runtime_mode::RuntimeConfig::set_current(runtime);
+            reload_started_ms = Some(session_established.elapsed().as_millis() as u64);
+            sent_at_reload = Some(sent);
+            received_at_reload = Some(received);
+            // Polled manually each loop round — no Send/spawn needed, and
+            // the session's send/read probes keep running through the
+            // whole prepare→commit window.
+            reload_fut = Some(Box::pin(reload_from_runtime()));
+        }
+        // Advance the in-process reload without stalling session traffic.
+        if let Some(fut) = reload_fut.as_mut()
+            && reload_finished_ms.is_none()
+            && let std::task::Poll::Ready(res) = futures_util::poll!(fut)
+        {
+            reload_finished_ms = Some(session_established.elapsed().as_millis() as u64);
+            match res {
+                Ok(()) => {
+                    let after = manager_from_runtime();
+                    let status = after.status();
+                    reload_outcome = Some(serde_json::json!({
+                        "ok": true,
+                        "managerReplaced": !std::sync::Arc::ptr_eq(&manager, &after),
+                        "postReloadProxyReady": status.proxy_ready,
+                        "postReloadRedirectEnabled": status.proxy_redirect_enabled,
+                        "postReloadXskReadyQueues": status.xsk_ready_queues,
+                        "postReloadFallbackReason": status.fallback_reason,
+                        "postReloadDialGuardInstalled": status.dial_guard_installed,
+                    }));
+                }
+                Err(err) => {
+                    reload_outcome = Some(serde_json::json!({
+                        "ok": false,
+                        "error": format!("{err}"),
+                    }));
+                }
+            }
+        }
         let due = send_once
             || send_tick
                 .as_mut()
                 .map(|tick| tick.tick().now_or_never().is_some())
                 .unwrap_or(false);
-        if due && !payload.is_empty() {
+        if due && !payload.is_empty() && io_error.is_none() {
             match stream.write_all(&payload).await {
                 Ok(()) => sent = sent.saturating_add(payload.len() as u64),
-                Err(err) => io_error = Some(err.to_string()),
+                Err(err) => {
+                    io_error = Some(err.to_string());
+                    io_error_at_ms = Some(session_established.elapsed().as_millis() as u64);
+                    io_error_before_reload_end =
+                        reload_started_ms.is_some() && reload_finished_ms.is_none();
+                }
             }
             send_once = false;
             continue;
@@ -486,9 +572,28 @@ async fn dial_smoke_inner(
         {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => received = received.saturating_add(n as u64),
-            Ok(Err(err)) => io_error = Some(err.to_string()),
+            Ok(Err(err)) => {
+                if io_error.is_none() {
+                    io_error = Some(err.to_string());
+                    io_error_at_ms =
+                        Some(session_established.elapsed().as_millis() as u64);
+                    io_error_before_reload_end =
+                        reload_started_ms.is_some() && reload_finished_ms.is_none();
+                }
+            }
             Err(_) => {}
         }
+    }
+    // Give a reload that is still running at the deadline one last poll.
+    if let Some(fut) = reload_fut.as_mut()
+        && reload_finished_ms.is_none()
+        && let std::task::Poll::Ready(res) = futures_util::poll!(fut)
+    {
+        reload_finished_ms = Some(session_established.elapsed().as_millis() as u64);
+        reload_outcome = Some(serde_json::json!({
+            "ok": res.is_ok(),
+            "error": res.err().map(|err| format!("{err}")).unwrap_or_default(),
+        }));
     }
     let status = manager.status();
     Ok(serde_json::json!({
@@ -498,6 +603,14 @@ async fn dial_smoke_inner(
         "sent": sent,
         "received": received,
         "ioError": io_error,
+        "ioErrorAtMs": io_error_at_ms,
+        "ioErrorBeforeReloadFinished": io_error_before_reload_end,
+        "sentAtReloadStart": sent_at_reload,
+        "receivedAtReloadStart": received_at_reload,
+        "reloadAtMs": reload_at.map(|at| at.as_millis() as u64),
+        "reloadStartedMs": reload_started_ms,
+        "reloadFinishedMs": reload_finished_ms,
+        "reload": reload_outcome,
         "proxyReady": status.proxy_ready,
         "proxyRedirectEnabled": status.proxy_redirect_enabled,
         "tcpDataplaneReady": status.tcp_dataplane_ready,
@@ -509,6 +622,8 @@ async fn dial_smoke_inner(
         "outCtHit": status.out_ct_hit,
         "outCtIcmp": status.out_ct_icmp,
         "xskDrops": status.xsk_drops,
+        "dialGuardInstalled": status.dial_guard_installed,
+        "dialGuardHits": status.dial_guard_hits,
         "tcpDiag": af_xdp::tcp_diag_snapshot(),
     }))
 }

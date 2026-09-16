@@ -465,6 +465,10 @@ enum XdpCommands {
         /// Milliseconds between payload sends (0 = send once at start)
         #[arg(long, default_value_t = 0)]
         send_interval_ms: u64,
+        /// Trigger an in-process XDP manager reload this many milliseconds
+        /// after session establishment (F1 lifecycle validation)
+        #[arg(long)]
+        reload_at_ms: Option<u64>,
     },
 
     /// Interactive XDP configuration wizard / XDP 交互式配置向导
@@ -1106,6 +1110,7 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             ready_file,
             payload_bytes,
             send_interval_ms,
+            reload_at_ms,
         } => {
             let runtime_config = RuntimeConfig::load_default()?;
             RuntimeConfig::set_current(runtime_config);
@@ -1115,12 +1120,14 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             let duration = Duration::from_millis(duration_ms.max(1));
             let payload = vec![0x5au8; payload_bytes];
             let send_interval = Duration::from_millis(send_interval_ms);
+            let reload_at = reload_at_ms.map(Duration::from_millis);
             let report = rt.block_on(cloud_node_rust::xdp::dial_smoke(
                 target,
                 duration,
                 ready_file,
                 payload,
                 send_interval,
+                reload_at,
             ))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
