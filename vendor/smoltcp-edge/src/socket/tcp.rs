@@ -63,6 +63,31 @@ impl Display for ConnectError {
 
 impl core::error::Error for ConnectError {}
 
+/// Error returned by [`Socket::set_syn_extra_options`]
+/// (smoltcp-edge, T4): the option fragment is rejected rather than
+/// truncated — emitting a SYN with malformed or over-budget options
+/// would silently corrupt the handshake.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum SynOptionsError {
+    /// Not a well-formed `[kind, len, data...]` option list.
+    Malformed,
+    /// Does not fit the 40-byte TCP options budget together with the
+    /// negotiated SYN options.
+    TooLarge,
+}
+
+impl Display for SynOptionsError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            SynOptionsError::Malformed => write!(f, "malformed TCP option list"),
+            SynOptionsError::TooLarge => write!(f, "TCP options exceed the 40-byte budget"),
+        }
+    }
+}
+
+impl core::error::Error for SynOptionsError {}
+
 /// Error returned by [`Socket::send`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -544,6 +569,13 @@ pub struct Socket<'a> {
     /// first SACK block for DSACK (RFC 2883) when a duplicate arrives.
     last_rx_duplicate_range: Option<(u32, u32)>,
 
+    /// smoltcp-edge (T4): verbatim TCP option bytes appended to emitted
+    /// SYNs (TOA kind 254 for AF_XDP-dialed origin connections — the
+    /// NF_INET_LOCAL_OUT path is bypassed, so the userspace stack must
+    /// carry the option itself). Caller owns kind/length encoding and
+    /// the 40-byte options budget.
+    syn_extra_options: Option<Box<[u8]>>,
+
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
     /// Delayed ack timer. If set, packets containing exclusively
@@ -637,6 +669,7 @@ impl<'a> Socket<'a> {
             ext_transport: None,
             rx_window_cap: None,
             last_rx_duplicate_range: None,
+            syn_extra_options: None,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -713,6 +746,57 @@ impl<'a> Socket<'a> {
     /// upper layer apply backpressure without reallocating buffers.
     pub fn set_rx_window_cap(&mut self, cap: Option<usize>) {
         self.rx_window_cap = cap;
+    }
+
+    /// smoltcp-edge (T4): install verbatim TCP option bytes appended to
+    /// every emitted SYN (both the initial SYN and its retransmits).
+    ///
+    /// The bytes must be a well-formed option list fragment
+    /// (`[kind, len, data...]`, kind/len included; kind 0 terminates,
+    /// kind 1 is a single-byte NOP) and must fit the 40-byte TCP options
+    /// budget together with the negotiated options (MSS, SACK-permitted,
+    /// window-scale, and timestamp when `socket-tcp-timestamp` is
+    /// enabled). Anything else is rejected — extra options are never
+    /// silently truncated at emit time.
+    pub fn set_syn_extra_options(&mut self, options: &[u8]) -> Result<(), SynOptionsError> {
+        if options.is_empty() {
+            self.syn_extra_options = None;
+            return Ok(());
+        }
+        // Walk the option list once: each option must be well-formed and
+        // the walk must terminate exactly at the end of the buffer or at
+        // an explicit EOL.
+        let mut pos = 0;
+        while pos < options.len() {
+            match options[pos] {
+                0 => break,
+                1 => pos += 1,
+                _ => {
+                    if pos + 1 >= options.len() {
+                        return Err(SynOptionsError::Malformed);
+                    }
+                    let len = options[pos + 1] as usize;
+                    if len < 2 || pos + len > options.len() {
+                        return Err(SynOptionsError::Malformed);
+                    }
+                    pos += len;
+                }
+            }
+        }
+        // SYN base options: MSS (4) + window-scale (3) + SACK-permitted
+        // (2); timestamp adds 10 when enabled. header_len() rounds the
+        // total up to a 4-byte boundary — reject when it exceeds the
+        // 40-byte options ceiling.
+        let base = 9 + if cfg!(feature = "socket-tcp-timestamp") {
+            10
+        } else {
+            0
+        };
+        if (base + options.len()).div_ceil(4) * 4 > 40 {
+            return Err(SynOptionsError::TooLarge);
+        }
+        self.syn_extra_options = Some(options.into());
+        Ok(())
     }
 
     /// Set an algorithm for congestion control.
@@ -1535,6 +1619,7 @@ impl<'a> Socket<'a> {
             timestamp: None,
             ecn_echo: false,
             cwr: false,
+            extra_options: &[],
             payload: &[],
         };
         let ip_reply_repr = IpRepr::new(
@@ -2783,6 +2868,7 @@ impl<'a> Socket<'a> {
             ),
             ecn_echo: false,
             cwr: false,
+            extra_options: &[],
             payload: &[],
         };
 
@@ -2821,6 +2907,10 @@ impl<'a> Socket<'a> {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
                     repr.sack_permitted = true;
+                    // smoltcp-edge (T4): verbatim options (TOA etc).
+                    if let Some(extra) = &self.syn_extra_options {
+                        repr.extra_options = extra.as_ref();
+                    }
                 } else {
                     repr.sack_permitted = self.remote_has_sack;
                     repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
@@ -3320,6 +3410,7 @@ mod test {
         timestamp: None,
         ecn_echo: false,
         cwr: false,
+        extra_options: &[],
         payload: &[],
     };
     const _RECV_IP_TEMPL: IpRepr = IpReprIpvX(IpvXRepr {
@@ -3344,6 +3435,7 @@ mod test {
         timestamp: None,
         ecn_echo: false,
         cwr: false,
+        extra_options: &[],
         payload: &[],
     };
 
@@ -4552,6 +4644,75 @@ mod test {
             }
         );
         assert_eq!(s.state, State::SynSent);
+    }
+
+    #[test]
+    fn test_syn_extra_options_emitted() {
+        let mut s = socket_syn_sent();
+        // TOA-style verbatim option: kind 254, len 6, 4 data bytes.
+        s.set_syn_extra_options(&[254, 6, 0xAA, 0xBB, 0xCC, 0xDD])
+            .unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                extra_options: &[254, 6, 0xAA, 0xBB, 0xCC, 0xDD],
+                ..RECV_TEMPL
+            }]
+        );
+        // Clearing restores a plain SYN on the next retransmit
+        // (initial RTO is 1000 ms).
+        s.set_syn_extra_options(&[]).unwrap();
+        recv!(
+            s,
+            time 1100,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_syn_extra_options_rejected() {
+        let mut s = socket_syn_sent();
+        // Truncated option header (kind without len byte).
+        assert_eq!(
+            s.set_syn_extra_options(&[254]),
+            Err(SynOptionsError::Malformed)
+        );
+        // len < 2 is invalid.
+        assert_eq!(
+            s.set_syn_extra_options(&[254, 1]),
+            Err(SynOptionsError::Malformed)
+        );
+        // len overruns the buffer.
+        assert_eq!(
+            s.set_syn_extra_options(&[254, 9, 0, 0]),
+            Err(SynOptionsError::Malformed)
+        );
+        // A well-formed 32-byte fragment exceeds the 40-byte SYN options
+        // budget with or without the timestamp feature — must be
+        // rejected, never silently truncated.
+        let mut big = [0u8; 32];
+        big[0] = 254;
+        big[1] = 32;
+        assert_eq!(
+            s.set_syn_extra_options(&big),
+            Err(SynOptionsError::TooLarge)
+        );
+        // NOP + well-formed option is accepted.
+        assert_eq!(s.set_syn_extra_options(&[1, 254, 6, 1, 2, 3, 4]), Ok(()));
     }
 
     #[test]

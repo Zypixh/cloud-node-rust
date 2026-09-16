@@ -176,9 +176,10 @@ tonic-prost-build = "0.14.6"
 [workspace]
 members = ["crates/cloud-node-transport"]
 # cloud-node-xdp-ebpf pins its own dated nightly/bpfeb toolchain;
-# pingora-main is a vendored checkout with its own workspace root —
-# both must stay outside this workspace's auto-membership.
-exclude = ["crates/cloud-node-xdp-ebpf", "pingora-main"]
+# pingora-main is a vendored checkout with its own workspace root;
+# xtask is a standalone tool manifest — all three must stay outside
+# this workspace's auto-membership.
+exclude = ["crates/cloud-node-xdp-ebpf", "pingora-main", "xtask"]
 
 # smoltcp-edge is a controlled fork of smoltcp 0.14.0 (T3): transport
 # hooks in socket/tcp.rs + minimal wire repr surface, every divergence

@@ -1,5 +1,7 @@
 use crate::firewall::kernel::{KernelFilter, KernelFilterSnapshot, KernelFilterStatus};
-use crate::runtime_mode::{RuntimeConfig, XdpConfig, XdpProxyProtocol, XdpRuntimeMode};
+use crate::runtime_mode::{
+    RuntimeConfig, XdpConfig, XdpProxyProtocol, XdpRuntimeMode, XdpUpstreamMode,
+};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -209,6 +211,27 @@ pub struct XdpStatusSnapshot {
     /// never passed half-forged. Distinct from policy rejections.
     #[serde(default)]
     pub challenge_worker_err: u64,
+    /// T4: replies claimed by XDP_OUT_CT (node-dialed outbound flows)
+    /// and redirected to the ingress queue's XSK for the userspace
+    /// dial-flow demux.
+    #[serde(default)]
+    pub out_ct_hit: u64,
+    /// T4 (D-B1): configured upstream dataplane ("kernel" / "afxdp").
+    #[serde(default)]
+    pub upstream_mode: String,
+    /// T4-5: reserved AF_XDP dial source-port span ("40000-49999"),
+    /// empty when upstream mode is not afxdp.
+    #[serde(default)]
+    pub dial_port_range: String,
+    /// T4-5: kernel guard installed (reserved-ports pin + nft DROP).
+    #[serde(default)]
+    pub dial_guard_installed: bool,
+    /// T4-5: packets the guard's nft counter has dropped.
+    #[serde(default)]
+    pub dial_guard_hits: u64,
+    /// T4-5: last guard install failure, empty when healthy/absent.
+    #[serde(default)]
+    pub dial_guard_detail: String,
     /// EN-10: lifecycle events dropped in-kernel because XDP_FLOW_EVENTS was
     /// full (consumer too slow). Feedback is advisory — loss never blocks or
     /// alters the dataplane, but is always accounted.
@@ -290,6 +313,24 @@ pub(crate) struct XdpManager {
     ebpf: parking_lot::Mutex<Option<aya::Ebpf>>,
     #[cfg(target_os = "linux")]
     af_xdp: parking_lot::Mutex<Option<linux::AfXdpRuntimeHandle>>,
+    /// T4: outbound dial registry for the current bridge generation —
+    /// populated by `spawn_queue_reactors`, replaced wholesale on manager
+    /// swap so stale generations cannot admit new dials.
+    #[cfg(target_os = "linux")]
+    dial_registry: parking_lot::Mutex<Option<std::sync::Arc<af_xdp::AfXdpDialRegistry>>>,
+    /// T4-5 (D-B1): kernel guard state — set once the reserved-port
+    /// sysctl pin and netfilter DROP rules are confirmed installed. The
+    /// registry is only published while a guard report exists.
+    #[cfg(target_os = "linux")]
+    dial_guard: parking_lot::Mutex<Option<std::sync::Arc<dial_guard::DialGuardReport>>>,
+    /// T4-5: packets dropped by the guard's named nft counter (cached —
+    /// refreshed by the rule sweeper tick, not per status read).
+    #[cfg(target_os = "linux")]
+    dial_guard_hits: AtomicU64,
+    /// T4-5: last guard install failure — keeps a refused registry
+    /// explainable in /status.
+    #[cfg(target_os = "linux")]
+    dial_guard_detail: parking_lot::Mutex<String>,
     packets: AtomicU64,
     pass: AtomicU64,
     drop: AtomicU64,
@@ -327,6 +368,7 @@ pub(crate) struct XdpManager {
     challenge_sent: AtomicU64,
     challenge_rejected: AtomicU64,
     challenge_worker_err: AtomicU64,
+    out_ct_hit: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     /// EN-10: owner generation written to XDP_OWNER_EPOCH at attach.
@@ -401,6 +443,14 @@ impl XdpManager {
             ebpf: parking_lot::Mutex::new(None),
             #[cfg(target_os = "linux")]
             af_xdp: parking_lot::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            dial_registry: parking_lot::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            dial_guard: parking_lot::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            dial_guard_hits: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            dial_guard_detail: parking_lot::Mutex::new(String::new()),
             packets: AtomicU64::new(0),
             pass: AtomicU64::new(0),
             drop: AtomicU64::new(0),
@@ -437,6 +487,7 @@ impl XdpManager {
             challenge_sent: AtomicU64::new(0),
             challenge_rejected: AtomicU64::new(0),
             challenge_worker_err: AtomicU64::new(0),
+            out_ct_hit: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             owner_epoch: AtomicU64::new(0),
@@ -600,6 +651,7 @@ impl XdpManager {
         self.proxy_redirect_enabled.store(false, Ordering::Relaxed);
         #[cfg(target_os = "linux")]
         {
+            self.release_dial_guard().await;
             *self.af_xdp.lock() = None;
             *self.ebpf.lock() = None;
             if !self.config.interfaces.is_empty() {
@@ -791,6 +843,36 @@ impl XdpManager {
             return;
         }
         self.persist_status_now();
+    }
+
+    /// T4: register a node-dialed outbound flow in XDP_OUT_CT so its
+    /// replies redirect into AF_XDP instead of passing to the kernel
+    /// (which would RST the handshake). The caller must fail the dial on
+    /// error — proceeding unregistered would blackhole the flow.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn register_out_flow(
+        &self,
+        key: cloud_node_xdp_common::XdpOutCtKey,
+    ) -> anyhow::Result<()> {
+        let mut ebpf = self.ebpf.lock();
+        match ebpf.as_mut() {
+            Some(ebpf) => linux::upsert_out_ct(ebpf, key),
+            None => anyhow::bail!("XDP eBPF object is not attached"),
+        }
+    }
+
+    /// T4: remove a dialed flow's out-CT entry at close. A missing eBPF
+    /// object means the map is gone already — nothing left to remove.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn remove_out_flow(
+        &self,
+        key: &cloud_node_xdp_common::XdpOutCtKey,
+    ) -> anyhow::Result<()> {
+        let mut ebpf = self.ebpf.lock();
+        match ebpf.as_mut() {
+            Some(ebpf) => linux::remove_out_ct(ebpf, key),
+            None => Ok(()),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1169,6 +1251,30 @@ impl XdpManager {
             challenge_sent: self.challenge_sent.load(Ordering::Relaxed),
             challenge_rejected: self.challenge_rejected.load(Ordering::Relaxed),
             challenge_worker_err: self.challenge_worker_err.load(Ordering::Relaxed),
+            out_ct_hit: self.out_ct_hit.load(Ordering::Relaxed),
+            upstream_mode: match self.config.upstream_mode() {
+                XdpUpstreamMode::Kernel => "kernel".to_string(),
+                XdpUpstreamMode::Afxdp => "afxdp".to_string(),
+            },
+            #[cfg(target_os = "linux")]
+            dial_port_range: {
+                let (start, end) = self.config.dial_port_range();
+                format!("{start}-{end}")
+            },
+            #[cfg(not(target_os = "linux"))]
+            dial_port_range: String::new(),
+            #[cfg(target_os = "linux")]
+            dial_guard_installed: self.dial_guard.lock().is_some(),
+            #[cfg(not(target_os = "linux"))]
+            dial_guard_installed: false,
+            #[cfg(target_os = "linux")]
+            dial_guard_hits: self.dial_guard_hits.load(Ordering::Relaxed),
+            #[cfg(not(target_os = "linux"))]
+            dial_guard_hits: 0,
+            #[cfg(target_os = "linux")]
+            dial_guard_detail: self.dial_guard_detail.lock().clone(),
+            #[cfg(not(target_os = "linux"))]
+            dial_guard_detail: String::new(),
             flow_event_lost: self.flow_event_lost.load(Ordering::Relaxed),
             flow_events_received: self.flow_events_received.load(Ordering::Relaxed),
             flow_events_stale: self.flow_events_stale.load(Ordering::Relaxed),
@@ -1765,6 +1871,143 @@ impl XdpManager {
     #[cfg(not(target_os = "linux"))]
     fn flush_maps_full_blocking(&self, _proxy_dataplane_active: bool) {}
 
+    /// T4: insert a node-dialed flow into XDP_OUT_CT so its replies
+    /// redirect to the ingress queue's XSK. Fails when eBPF is not loaded
+    /// — a dial must never proceed unregistered.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn upsert_out_ct(
+        &self,
+        key: cloud_node_xdp_common::XdpOutCtKey,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.ebpf.lock();
+        match guard.as_mut() {
+            Some(ebpf) => linux::upsert_out_ct(ebpf, key),
+            None => anyhow::bail!("XDP eBPF program is not loaded"),
+        }
+    }
+
+    /// T4: remove a node-dialed flow's XDP_OUT_CT row at close.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn remove_out_ct(
+        &self,
+        key: &cloud_node_xdp_common::XdpOutCtKey,
+    ) -> anyhow::Result<()> {
+        let mut guard = self.ebpf.lock();
+        match guard.as_mut() {
+            Some(ebpf) => linux::remove_out_ct(ebpf, key),
+            None => anyhow::bail!("XDP eBPF program is not loaded"),
+        }
+    }
+
+    /// T4: the dial registry of the live bridge generation — `None` when
+    /// no AF_XDP proxy bridge is running.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn dial_registry(&self) -> Option<std::sync::Arc<af_xdp::AfXdpDialRegistry>> {
+        self.dial_registry.lock().clone()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_dial_registry(&self, registry: Option<std::sync::Arc<af_xdp::AfXdpDialRegistry>>) {
+        // Replacing/clearing the registry drains the previous
+        // generation's XDP_OUT_CT rows so stale entries can never steer
+        // replies into queues whose XSKs are gone.
+        let old = std::mem::replace(&mut *self.dial_registry.lock(), registry);
+        if let Some(old) = old {
+            old.drain();
+        }
+    }
+
+    /// T4-5: install the outbound-dial kernel guard (reserved-ports
+    /// sysctl pin + nftables DROP) for the configured dial span. Failure
+    /// is explicit — the bridge must not publish the dial registry
+    /// without a guard report.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn ensure_dial_guard(
+        &self,
+    ) -> anyhow::Result<std::sync::Arc<dial_guard::DialGuardReport>> {
+        let (start, end) = self.config.dial_port_range();
+        match dial_guard::ensure_dial_port_guard(
+            &crate::kernel_syn_defense::ProcSysctlStore,
+            &crate::kernel_syn_defense::SystemCommandRunner,
+            start,
+            end,
+        )
+        .await
+        {
+            Ok(report) => {
+                *self.dial_guard_detail.lock() = String::new();
+                let report = std::sync::Arc::new(report);
+                *self.dial_guard.lock() = Some(report.clone());
+                Ok(report)
+            }
+            Err(err) => {
+                *self.dial_guard_detail.lock() = format!("{err}");
+                Err(err)
+            }
+        }
+    }
+
+    /// T4-5: currently installed guard report (None = guard absent).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn dial_guard_report(
+        &self,
+    ) -> Option<std::sync::Arc<dial_guard::DialGuardReport>> {
+        self.dial_guard.lock().clone()
+    }
+
+    /// T4-5: async teardown — clears guard state and removes nft rules +
+    /// sysctl pin. Preferred in async contexts.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn release_dial_guard(&self) {
+        let report = self.dial_guard.lock().take();
+        if let Some(report) = report {
+            let (start, end) = report.port_range;
+            if let Err(err) = dial_guard::remove_dial_port_guard(
+                &crate::kernel_syn_defense::ProcSysctlStore,
+                &crate::kernel_syn_defense::SystemCommandRunner,
+                start,
+                end,
+            )
+            .await
+            {
+                tracing::warn!("XDP dial guard removal failed (span {start}-{end}): {err}");
+            }
+        }
+        self.dial_guard_hits.store(0, Ordering::Relaxed);
+    }
+
+    /// T4-5: synchronous teardown for call sites without an async
+    /// context (manager swap, disable path). Uses std::process for nft;
+    /// nftables invocations are one-shot and fast.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn release_dial_guard_blocking(&self) {
+        let report = self.dial_guard.lock().take();
+        if let Some(report) = report {
+            let (start, end) = report.port_range;
+            if let Err(err) = dial_guard::remove_dial_port_guard_blocking(
+                &crate::kernel_syn_defense::ProcSysctlStore,
+                start,
+                end,
+            ) {
+                tracing::warn!("XDP dial guard removal failed (span {start}-{end}): {err}");
+            }
+        }
+        self.dial_guard_hits.store(0, Ordering::Relaxed);
+    }
+
+    /// T4-5: refresh the cached guard-hit counter — called on the rule
+    /// sweeper tick so /status never shells out per read.
+    #[cfg(target_os = "linux")]
+    async fn refresh_dial_guard_hits(&self) {
+        if self.dial_guard.lock().is_none() {
+            return;
+        }
+        match dial_guard::dial_guard_hits(&crate::kernel_syn_defense::SystemCommandRunner).await {
+            Ok(hits) => self.dial_guard_hits.store(hits, Ordering::Relaxed),
+            Err(err) => tracing::debug!("XDP dial guard hit counter read failed: {err}"),
+        }
+    }
+
     /// EN-16: projected pinned kernel memory of the loaded eBPF object's
     /// maps (0 on non-Linux where no eBPF object is loaded).
     #[cfg(target_os = "linux")]
@@ -1871,6 +2114,8 @@ impl XdpManager {
                     .store(counters.challenge_rejected, Ordering::Relaxed);
                 self.challenge_worker_err
                     .store(counters.challenge_worker_err, Ordering::Relaxed);
+                self.out_ct_hit
+                    .store(counters.out_ct_hit, Ordering::Relaxed);
                 self.flow_event_lost
                     .store(counters.flow_event_lost, Ordering::Relaxed);
             }
@@ -1951,6 +2196,7 @@ impl XdpManager {
                     "challengeSent": c.challenge_sent,
                     "challengeRejected": c.challenge_rejected,
                     "challengeWorkerErr": c.challenge_worker_err,
+                    "outCtHit": c.out_ct_hit,
                     "flowEventLost": c.flow_event_lost,
                 })
             })
@@ -2196,8 +2442,22 @@ fn manager_from_runtime() -> std::sync::Arc<XdpManager> {
         previous.stop_rule_sweeper();
         previous.stop_map_sync_worker();
         previous.stop_flow_event_consumer();
+        #[cfg(target_os = "linux")]
+        {
+            previous.set_dial_registry(None);
+            previous.release_dial_guard_blocking();
+        }
     }
     current.clone()
+}
+
+/// T4: front door for upstream connect paths that want an AF_XDP
+/// outbound dial. `None` means no live AF_XDP bridge — the caller takes
+/// its own explicit non-XDP path; the dial itself never falls back
+/// silently.
+#[cfg(target_os = "linux")]
+pub(crate) fn af_xdp_dial_registry() -> Option<std::sync::Arc<af_xdp::AfXdpDialRegistry>> {
+    manager_from_runtime().dial_registry()
 }
 
 fn replace_manager_from_runtime() -> std::sync::Arc<XdpManager> {
@@ -2213,6 +2473,11 @@ fn replace_manager_from_runtime() -> std::sync::Arc<XdpManager> {
     previous.stop_rule_sweeper();
     previous.stop_map_sync_worker();
     previous.stop_flow_event_consumer();
+    #[cfg(target_os = "linux")]
+    {
+        previous.set_dial_registry(None);
+        previous.release_dial_guard_blocking();
+    }
     current.clone()
 }
 
@@ -2498,6 +2763,7 @@ fn start_rule_sweeper(manager: &std::sync::Arc<XdpManager>) {
             {
                 manager.sweep_nat_maps();
                 manager.sweep_rate_buckets();
+                manager.refresh_dial_guard_hits().await;
             }
         }
     });
@@ -3014,6 +3280,8 @@ impl KernelFilter for XdpKernelFilter {
 }
 
 pub mod af_xdp;
+#[cfg(target_os = "linux")]
+pub(crate) mod dial_guard;
 #[cfg(target_os = "linux")]
 mod linux;
 mod policy;

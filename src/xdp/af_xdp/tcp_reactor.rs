@@ -228,6 +228,36 @@ pub(crate) struct AfXdpTcpSession {
     /// EN-17: queued in `hot_sessions` — dedup flag so each flow key is in
     /// the hot queue at most once.
     pub(crate) hot: bool,
+    /// T4: this session was node-dialed (outbound connect through the
+    /// AF_XDP stack) rather than accepted. Dialed sessions skip the
+    /// proxy-class machinery: on Established the stream is delivered to
+    /// the dialer's `dial_reply` oneshot; on RST/timeout the dial fails
+    /// explicitly.
+    pub(crate) dialed: bool,
+    pub(crate) dial_reply: Option<tokio::sync::oneshot::Sender<io::Result<AfXdpTcpStream>>>,
+    /// Absolute connect deadline (transport clock): a SynSent session
+    /// that outlives it is aborted and the dial answered with a timeout
+    /// error — a dialed flow must never linger unbounded.
+    pub(crate) dial_deadline: Option<SmoltcpInstant>,
+}
+
+/// T4: a dial request delivered to the owning queue's reactor loop. All
+/// caller-side preparation (route resolution, port allocation, out-CT
+/// registration, demux table entry) has already succeeded; the reactor
+/// only has to build the socket and answer `reply` once the handshake
+/// resolves — Ok(stream) on Established, Err on RST/timeout/refusal.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) struct AfXdpTcpDialRequest {
+    /// Upstream peer (remote endpoint).
+    pub(crate) remote: SocketAddr,
+    /// Resolved egress endpoint: interface source address + allocated
+    /// reserved-range port.
+    pub(crate) local: SocketAddr,
+    /// L2 route for egress frames — the resolved next-hop MAC.
+    pub(crate) route: AfXdpRouteMeta,
+    /// Verbatim SYN option bytes (TOA etc.); empty for a plain SYN.
+    pub(crate) syn_extra_options: Vec<u8>,
+    pub(crate) reply: tokio::sync::oneshot::Sender<io::Result<AfXdpTcpStream>>,
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -515,6 +545,10 @@ pub(crate) struct AfXdpTcpReactor {
     cached_pressure_level: crate::l4_defense::L4PressureLevel,
     cached_proxy_idle_timeout: Duration,
     idle_profile_refreshed_at: SmoltcpInstant,
+    /// T4: shared dial-flow registry — set by the bridge before the loop
+    /// runs. Reaping a dialed session releases its demux entry, source
+    /// port and XDP_OUT_CT row through this handle.
+    dial_registry: Option<Arc<AfXdpDialRegistry>>,
     #[cfg(test)]
     test_auto_start_proxy: bool,
 }
@@ -579,6 +613,7 @@ impl AfXdpTcpReactor {
             cached_pressure_level: crate::l4_defense::L4PressureLevel::Normal,
             cached_proxy_idle_timeout: AF_XDP_TCP_SESSION_IDLE_TIMEOUT,
             idle_profile_refreshed_at: SmoltcpInstant::from_millis(0),
+            dial_registry: None,
             #[cfg(test)]
             test_auto_start_proxy: false,
         }
@@ -1006,6 +1041,9 @@ impl AfXdpTcpReactor {
             closing: false,
             egress_closed: false,
             hot: false,
+            dialed: false,
+            dial_reply: None,
+            dial_deadline: None,
         };
         self.sessions.insert(flow, session);
         #[cfg(target_os = "linux")]
@@ -1013,6 +1051,104 @@ impl AfXdpTcpReactor {
             self.publish_session_snapshot(&flow, session);
         }
         true
+    }
+
+    /// T4: the bridge installs the generation's dial registry before the
+    /// loop runs so dialed-session reaping can release the demux entry,
+    /// source port and out-CT row.
+    pub(crate) fn set_dial_registry(&mut self, registry: Arc<AfXdpDialRegistry>) {
+        self.dial_registry = Some(registry);
+    }
+
+    /// T4: open an outbound connection through this reactor. The caller
+    /// (the dial registry's `dial_tcp`) has already resolved the route,
+    /// allocated the reserved-range source port, registered XDP_OUT_CT
+    /// and the cross-queue demux entry — everything after this point is
+    /// smoltcp session lifecycle, identical to the accepted path minus
+    /// the proxy-class machinery.
+    ///
+    /// Any refusal answers `req.reply` with an explicit error and creates
+    /// no state; the caller unwinds the pre-registered maps on Err.
+    pub(crate) fn dial(&mut self, req: AfXdpTcpDialRequest) {
+        let flow = AfXdpTcpFlowKey {
+            local_addr: req.local,
+            peer_addr: req.remote,
+        };
+        if self.sessions.contains_key(&flow) {
+            let _ = req.reply.send(Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("AF_XDP dialed flow {} -> {} already exists", req.local, req.remote),
+            )));
+            return;
+        }
+        if self.sessions.len() >= self.session_limit {
+            let _ = req.reply.send(Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!(
+                    "AF_XDP dialed flow refused at session limit {}",
+                    self.session_limit
+                ),
+            )));
+            return;
+        }
+        self.ensure_local_ip(req.local.ip());
+        let rx_buffer =
+            SmoltcpTcp::SocketBuffer::new(vec![0; AF_XDP_TCP_SOCKET_BUFFER_BYTES]);
+        let tx_buffer =
+            SmoltcpTcp::SocketBuffer::new(vec![0; AF_XDP_TCP_SOCKET_BUFFER_BYTES]);
+        let mut socket = SmoltcpTcp::Socket::new(rx_buffer, tx_buffer);
+        socket.set_nagle_enabled(false);
+        // F8/T3: dialed sessions run the same external controller as
+        // accepted ones — never NoControl.
+        socket.set_congestion_control(SmoltcpTcp::CongestionControl::Cubic);
+        socket.set_transport_controller(Box::new(
+            cloud_node_transport::cc::CubicRef::new(536),
+        ));
+        if !req.syn_extra_options.is_empty()
+            && let Err(err) = socket.set_syn_extra_options(&req.syn_extra_options)
+        {
+            let _ = req.reply.send(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("AF_XDP dial SYN options rejected: {err}"),
+            )));
+            return;
+        }
+        if let Err(err) = socket.connect(self.iface.context(), req.remote, req.local) {
+            let _ = req.reply.send(Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("AF_XDP dial connect {} -> {} failed: {err}", req.local, req.remote),
+            )));
+            return;
+        }
+        let socket = self.sockets.add(socket);
+        let now = SmoltcpInstant::from_micros(self.clock.now_micros());
+        let session = AfXdpTcpSession {
+            flow,
+            route: req.route,
+            // The proxy class is a placeholder — a dialed session never
+            // spawns a proxy task; `dialed` gates its lifecycle.
+            proxy_class: AfXdpTcpProxyClass::TcpPlain,
+            socket,
+            ingress_tx: None,
+            egress_rx: None,
+            pending_ingress: AfXdpTcpChargedBytes::empty(),
+            pending_egress: AfXdpTcpChargedBytes::empty(),
+            created_at: now,
+            last_activity: now,
+            proxy_started: false,
+            closing: false,
+            egress_closed: false,
+            hot: false,
+            dialed: true,
+            dial_reply: Some(req.reply),
+            dial_deadline: Some(now + SmolDuration::from(AF_XDP_TCP_DIAL_TIMEOUT)),
+        };
+        self.sessions.insert(flow, session);
+        self.mark_hot(flow);
+        #[cfg(target_os = "linux")]
+        if let Some(session) = self.sessions.get(&flow) {
+            self.publish_session_snapshot(&flow, session);
+        }
     }
 
     /// T1: publish this session's transport snapshot into the shared
@@ -1312,6 +1448,69 @@ impl AfXdpTcpReactor {
                 .sockets
                 .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
 
+            // T4: dialed-session handshake resolution runs before the
+            // proxy-start gate — a dialed session never spawns a proxy
+            // task; Established delivers the stream to the dialer, a
+            // refused/closed socket or an expired deadline fails the
+            // dial explicitly.
+            if session.dialed && session.dial_reply.is_some() {
+                match socket.state() {
+                    SmoltcpTcp::State::Established | SmoltcpTcp::State::CloseWait => {
+                        let AfXdpTcpStreamParts {
+                            stream,
+                            ingress_tx,
+                            egress_rx,
+                            ..
+                        } = AfXdpTcpStream::channel_pair_with_wake(
+                            AF_XDP_TCP_STREAM_CHANNEL_DEPTH,
+                            session.flow,
+                            self.wake_set.clone(),
+                            self.budget_stall.clone(),
+                        );
+                        session.ingress_tx = Some(ingress_tx);
+                        session.egress_rx = Some(egress_rx);
+                        session.proxy_started = true;
+                        if let Some(reply) = session.dial_reply.take() {
+                            let _ = reply.send(Ok(stream));
+                        }
+                    }
+                    SmoltcpTcp::State::Closed | SmoltcpTcp::State::Listen => {
+                        if let Some(reply) = session.dial_reply.take() {
+                            let _ = reply.send(Err(io::Error::new(
+                                io::ErrorKind::ConnectionRefused,
+                                format!(
+                                    "AF_XDP dial {} -> {} refused or reset",
+                                    flow.local_addr, flow.peer_addr
+                                ),
+                            )));
+                        }
+                        session.closing = true;
+                        return;
+                    }
+                    _ => {
+                        if let Some(deadline) = session.dial_deadline
+                            && now >= deadline
+                        {
+                            socket.abort();
+                            if let Some(reply) = session.dial_reply.take() {
+                                let _ = reply.send(Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    format!(
+                                        "AF_XDP dial {} -> {} timed out after {}ms",
+                                        flow.local_addr,
+                                        flow.peer_addr,
+                                        AF_XDP_TCP_DIAL_TIMEOUT.as_millis()
+                                    ),
+                                )));
+                            }
+                            session.closing = true;
+                        }
+                        // Still handshaking — no data-plane work yet.
+                        return;
+                    }
+                }
+            }
+
             if !session.proxy_started {
                 if af_xdp_tcp_proxy_ready(session.proxy_class, socket) {
                     // F8: a connected socket must never run NoControl — the
@@ -1583,7 +1782,25 @@ impl AfXdpTcpReactor {
             self.ingress_stalled.remove(&flow);
             #[cfg(target_os = "linux")]
             self.drop_session_snapshot(&flow);
-            if let Some(session) = self.sessions.remove(&flow) {
+            if let Some(mut session) = self.sessions.remove(&flow) {
+                if session.dialed {
+                    // T4: every terminal reap of a dialed flow releases
+                    // its registry state (source port, demux entry,
+                    // XDP_OUT_CT row); a still-pending dial is failed
+                    // explicitly rather than left to time out.
+                    if let Some(reply) = session.dial_reply.take() {
+                        let _ = reply.send(Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!(
+                                "AF_XDP dial {} -> {} aborted during handshake",
+                                flow.local_addr, flow.peer_addr
+                            ),
+                        )));
+                    }
+                    if let Some(registry) = self.dial_registry.clone() {
+                        registry.release(&flow);
+                    }
+                }
                 let socket = self
                     .sockets
                     .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
@@ -1960,6 +2177,27 @@ impl AsyncWrite for AfXdpTcpStream {
 impl Drop for AfXdpTcpReactor {
     fn drop(&mut self) {
         purge_tcp_session_snapshots(&self.label);
+        // T4: reactor teardown fails every unresolved dial and releases
+        // each dialed flow's registry state — no source port, demux
+        // entry, or XDP_OUT_CT row may outlive its owner.
+        let registry = self.dial_registry.clone();
+        for (flow, session) in self.sessions.iter_mut() {
+            if !session.dialed {
+                continue;
+            }
+            if let Some(reply) = session.dial_reply.take() {
+                let _ = reply.send(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!(
+                        "AF_XDP reactor {} shut down during dial {} -> {}",
+                        self.label, flow.local_addr, flow.peer_addr
+                    ),
+                )));
+            }
+            if let Some(registry) = &registry {
+                registry.release(flow);
+            }
+        }
     }
 }
 

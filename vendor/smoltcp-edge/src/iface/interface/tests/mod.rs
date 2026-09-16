@@ -176,6 +176,7 @@ pub fn tcp_not_accepted() {
         timestamp: None,
         ecn_echo: false,
         cwr: false,
+        extra_options: &[],
         payload: &[],
     };
 
@@ -225,6 +226,7 @@ pub fn tcp_not_accepted() {
                 timestamp: None,
                 ecn_echo: false,
                 cwr: false,
+                extra_options: &[],
                 payload: &[],
             })
         ))
@@ -283,6 +285,7 @@ pub fn tcp_listen_drops_unspecified_src() {
         timestamp: None,
         ecn_echo: false,
         cwr: false,
+        extra_options: &[],
         payload: &[],
     };
 

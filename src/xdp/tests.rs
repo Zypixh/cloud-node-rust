@@ -1435,6 +1435,341 @@ fn af_xdp_tcp_reactor_resolves_egress_route_before_reaping_session() {
     assert_eq!(reactor.session_count(), 0);
 }
 
+/// T4: build a TCP control reply (SYN-ACK / RST-ACK) as seen on the wire
+/// for a node-dialed flow — src = upstream peer, dst = the dialed local
+/// endpoint.
+#[cfg(any(test, target_os = "linux"))]
+fn ipv4_tcp_control_reply_frame(local_port: u16, seq: u32, ack: u32, flags: u8) -> Vec<u8> {
+    let mut frame = ethernet_header(0x0800, false);
+    let total_len = 20 + 20;
+    frame.extend_from_slice(&[
+        0x45, 0, (total_len >> 8) as u8, total_len as u8, 0, 1, 0, 0, 64, 6, 0, 0, 192, 0, 2, 10,
+        198, 51, 100, 5,
+    ]);
+    let [port_hi, port_lo] = local_port.to_be_bytes();
+    frame.extend_from_slice(&[
+        0x01, 0xbb, port_hi, port_lo, (seq >> 24) as u8, (seq >> 16) as u8, (seq >> 8) as u8,
+        seq as u8, (ack >> 24) as u8, (ack >> 16) as u8, (ack >> 8) as u8, ack as u8, 0x50, flags,
+        0xff, 0xff, 0, 0, 0, 0,
+    ]);
+    write_ipv4_checksum(&mut frame, ethernet_header_len(false));
+    write_tcp4_checksum(&mut frame, ethernet_header_len(false));
+    frame
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn af_xdp_dial_route_meta() -> af_xdp::AfXdpRouteMeta {
+    af_xdp::AfXdpRouteMeta {
+        interface: std::sync::Arc::from("eth0"),
+        queue: 0,
+        link: test_link_meta(false),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_dial_emits_syn_and_resolves_on_syn_ack() {
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    reactor.dial(af_xdp::AfXdpTcpDialRequest {
+        remote,
+        local,
+        route: af_xdp_dial_route_meta(),
+        // TOA-shaped option: kind 254, len 4.
+        syn_extra_options: vec![0xfe, 0x04, 0x12, 0x34],
+        reply: reply_tx,
+    });
+    assert_eq!(reactor.session_count(), 1);
+
+    let egress = reactor.poll();
+    assert_eq!(egress.len(), 1);
+    let syn = &egress[0].1;
+    assert_eq!(syn[0] >> 4, 4);
+    assert_eq!(&syn[12..16], &[198, 51, 100, 5]);
+    assert_eq!(&syn[16..20], &[192, 0, 2, 10]);
+    let tcp = &syn[20..];
+    assert_eq!(u16::from_be_bytes([tcp[2], tcp[3]]), 443);
+    assert_eq!(tcp[13] & 0x17, 0x02, "expected a bare SYN");
+    let our_seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    // The extra option bytes must appear verbatim in the SYN option area.
+    let header_len = usize::from(tcp[12] >> 4) * 4;
+    let options = &tcp[20..header_len];
+    assert!(
+        options
+            .windows(4)
+            .any(|window| window == [0xfe, 0x04, 0x12, 0x34]),
+        "SYN options missing extra bytes: {options:?}"
+    );
+
+    // SYN-ACK reply — the socket goes Established and the dial resolves.
+    let syn_ack = ipv4_tcp_control_reply_frame(39000, 1_000, our_seq.wrapping_add(1), 0x12);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &syn_ack).expect("valid SYN-ACK frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    assert_eq!(flow.local_addr, local);
+    assert_eq!(flow.peer_addr, remote);
+    assert_eq!(
+        reactor.ingest(route, flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+    let _ = reactor.poll();
+    match reply_rx.try_recv() {
+        Ok(Ok(_stream)) => {}
+        Ok(Err(err)) => panic!("dial failed: {err}"),
+        Err(_) => panic!("dial reply channel closed without an answer"),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_dial_fails_explicitly_on_rst() {
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    reactor.dial(af_xdp::AfXdpTcpDialRequest {
+        remote,
+        local,
+        route: af_xdp_dial_route_meta(),
+        syn_extra_options: Vec::new(),
+        reply: reply_tx,
+    });
+    let egress = reactor.poll();
+    assert_eq!(egress.len(), 1);
+    let tcp = &egress[0].1[20..];
+    let our_seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+
+    // RST+ACK to a SYN — the dial must fail, not hang or succeed.
+    let rst = ipv4_tcp_control_reply_frame(39000, 1_000, our_seq.wrapping_add(1), 0x14);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &rst).expect("valid RST frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let _ = reactor.ingest(route, flow, ip_packet);
+    let _ = reactor.poll();
+    match reply_rx.try_recv() {
+        Ok(Err(err)) => assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused),
+        _ => panic!("RST must fail the dial explicitly"),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_dial_times_out_past_deadline() {
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    reactor.dial(af_xdp::AfXdpTcpDialRequest {
+        remote,
+        local,
+        route: af_xdp_dial_route_meta(),
+        syn_extra_options: Vec::new(),
+        reply: reply_tx,
+    });
+    let _ = reactor.poll();
+
+    // No reply ever arrives: the dial deadline must fire with TimedOut.
+    let past_deadline = smoltcp::time::Instant::from_millis(
+        crate::utils::time::now_timestamp_millis()
+            + af_xdp::AF_XDP_TCP_DIAL_TIMEOUT.as_millis() as i64
+            + 1,
+    );
+    let _ = reactor.poll_at_for_test(past_deadline);
+    match reply_rx.try_recv() {
+        Ok(Err(err)) => assert_eq!(err.kind(), std::io::ErrorKind::TimedOut),
+        _ => panic!("dial deadline must fail with TimedOut"),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_dial_refuses_duplicate_flow() {
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
+    for expect_err in [false, true] {
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        reactor.dial(af_xdp::AfXdpTcpDialRequest {
+            remote,
+            local,
+            route: af_xdp_dial_route_meta(),
+            syn_extra_options: Vec::new(),
+            reply: reply_tx,
+        });
+        match reply_rx.try_recv() {
+            Ok(Err(err)) => {
+                assert!(expect_err);
+                assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+            }
+            Ok(Ok(_)) => panic!("dial must not resolve before a reply"),
+            Err(_) => assert!(!expect_err, "first dial should stay pending"),
+        }
+    }
+    assert_eq!(reactor.session_count(), 1);
+}
+
+#[cfg(target_os = "linux")]
+fn af_xdp_test_dial_registry() -> std::sync::Arc<af_xdp::AfXdpDialRegistry> {
+    std::sync::Arc::new(af_xdp::AfXdpDialRegistry::new(std::sync::Arc::new(
+        XdpManager::new(test_proxy_config("eth0")),
+    )))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn af_xdp_dial_registry_claim_release_and_demux() {
+    let registry = af_xdp_test_dial_registry();
+    let (tx, mut request_rx) = tokio::sync::mpsc::channel(8);
+    registry.register_queue("eth0", 0, tx);
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let owner = af_xdp::AfXdpDialOwner {
+        interface: std::sync::Arc::from("eth0"),
+        queue: 0,
+        proto: cloud_node_xdp_common::XDP_PROTO_TCP,
+    };
+
+    // Claim reserves the tuple and records the owner.
+    let flow = registry
+        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner)
+        .expect("first claim must succeed");
+    assert_eq!(flow.peer_addr, remote);
+    assert!(registry.owner(&flow).is_some());
+
+    // An inject lands on the owner queue's request channel.
+    registry
+        .inject(&owner, af_xdp_dial_route_meta(), flow, bytes::Bytes::new())
+        .expect("inject to live queue");
+    assert!(matches!(
+        request_rx.try_recv(),
+        Ok(af_xdp::AfXdpReactorRequest::InjectTcp { flow: f, .. }) if f == flow
+    ));
+
+    // Release clears the owner; a fresh claim on the same (source,
+    // remote) pair succeeds again — the cursor may land on another free
+    // port, only the released tuple's entry must be gone.
+    registry.release(&flow);
+    assert!(registry.owner(&flow).is_none());
+    registry
+        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner)
+        .expect("released span must admit a new claim");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn af_xdp_dial_registry_port_span_exhaustion_is_explicit() {
+    let registry = af_xdp_test_dial_registry();
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let owner = af_xdp::AfXdpDialOwner {
+        interface: std::sync::Arc::from("eth0"),
+        queue: 0,
+        proto: cloud_node_xdp_common::XDP_PROTO_TCP,
+    };
+    let source: IpAddr = "198.51.100.5".parse().unwrap();
+    let mut claimed = Vec::new();
+    for _ in 0..registry.port_span {
+        claimed.push(
+            registry
+                .claim_flow(source, remote, &owner)
+                .expect("span must admit SPAN distinct flows"),
+        );
+    }
+    // Every claim landed on a distinct port inside the reserved span.
+    let ports: std::collections::HashSet<u16> =
+        claimed.iter().map(|f| f.local_addr.port()).collect();
+    assert_eq!(ports.len(), registry.port_span as usize);
+    assert!(ports
+        .iter()
+        .all(|p| *p >= registry.port_base && *p < registry.port_base + registry.port_span));
+    // The span is exhausted — the next claim fails, never wraps onto a
+    // live tuple.
+    assert!(registry.claim_flow(source, remote, &owner).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn af_xdp_dial_registry_inject_to_dead_owner_cleans_up() {
+    let registry = af_xdp_test_dial_registry();
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let owner = af_xdp::AfXdpDialOwner {
+        interface: std::sync::Arc::from("eth0"),
+        queue: 7,
+        proto: cloud_node_xdp_common::XDP_PROTO_TCP,
+    };
+    let flow = registry
+        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner)
+        .expect("claim");
+    // No queue 7 registered → owner is dead; inject must fail and drop
+    // the registration so the flow cannot pin a port forever.
+    assert_eq!(
+        registry.inject(&owner, af_xdp_dial_route_meta(), flow, bytes::Bytes::new()),
+        Err(af_xdp::AfXdpDialInjectError::OwnerGone)
+    );
+    assert!(registry.owner(&flow).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn af_xdp_dial_registry_inject_backpressure_is_explicit() {
+    let registry = af_xdp_test_dial_registry();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    registry.register_queue("eth0", 0, tx);
+    let remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let owner = af_xdp::AfXdpDialOwner {
+        interface: std::sync::Arc::from("eth0"),
+        queue: 0,
+        proto: cloud_node_xdp_common::XDP_PROTO_TCP,
+    };
+    let flow = registry
+        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner)
+        .expect("claim");
+    registry
+        .inject(&owner, af_xdp_dial_route_meta(), flow, bytes::Bytes::new())
+        .expect("first inject fills the channel");
+    assert_eq!(
+        registry.inject(&owner, af_xdp_dial_route_meta(), flow, bytes::Bytes::new()),
+        Err(af_xdp::AfXdpDialInjectError::QueueFull)
+    );
+    // Backpressure is a drop — the registration must survive.
+    assert!(registry.owner(&flow).is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn xdp_out_ct_key_builds_family_correct_tuples() {
+    let v4_local: std::net::SocketAddr = "198.51.100.5:39000".parse().unwrap();
+    let v4_remote: std::net::SocketAddr = "192.0.2.10:443".parse().unwrap();
+    let key = linux::out_ct_key(v4_local, v4_remote, cloud_node_xdp_common::XDP_PROTO_TCP)
+        .expect("v4 pair");
+    assert_eq!(key.family, 4);
+    assert_eq!(key.proto, cloud_node_xdp_common::XDP_PROTO_TCP);
+    assert_eq!(&key.local_addr[..4], &[198, 51, 100, 5]);
+    assert_eq!(&key.remote_addr[..4], &[192, 0, 2, 10]);
+    assert_eq!(u16::from_be(key.local_port_be), 39000);
+    assert_eq!(u16::from_be(key.remote_port_be), 443);
+
+    let v6_local: std::net::SocketAddr = "[2001:db8::5]:39000".parse().unwrap();
+    let v6_remote: std::net::SocketAddr = "[2001:db8::10]:443".parse().unwrap();
+    let key = linux::out_ct_key(v6_local, v6_remote, cloud_node_xdp_common::XDP_PROTO_TCP)
+        .expect("v6 pair");
+    assert_eq!(key.family, 6);
+    assert_eq!(key.local_addr, "2001:db8::5".parse::<Ipv6Addr>().unwrap().octets());
+
+    // Mixed families can never be a wire flow — refused, not truncated.
+    assert!(linux::out_ct_key(v4_local, v6_remote, cloud_node_xdp_common::XDP_PROTO_TCP).is_none());
+}
+
 #[cfg(any(test, target_os = "linux"))]
 #[test]
 fn af_xdp_tcp_reactor_keeps_stream_read_side_open_during_half_close() {
@@ -1861,6 +2196,9 @@ async fn af_xdp_tcp_stream_chunks_large_writes_with_backpressure() {
 async fn af_xdp_ingress_delivery_preserves_backpressured_chunk() {
     use bytes::Bytes;
 
+    // The charged() helper reserves from the node-wide TCP queue ledger —
+    // serialize against other budget tests so reservations cannot race.
+    let _ledger_lock = tcp_queue_budget_test_lock().lock().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let mut pending = af_xdp::AfXdpTcpChargedBytes::empty();
     let charged = |data: &'static [u8]| {

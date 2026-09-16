@@ -307,6 +307,10 @@ pub struct XdpCounters {
     /// after a packet entered the slot-11 worker. Dropped, never passed:
     /// a half-forged frame must not reach the kernel stack.
     pub challenge_worker_err: u64,
+    /// T4: packets that hit XDP_OUT_CT (replies to node-dialed outbound
+    /// flows) and were redirected to the ingress queue's XSK for the
+    /// userspace dial-flow demux.
+    pub out_ct_hit: u64,
 }
 
 /// Per-IP fixed-window rate limit configuration written by userspace.
@@ -505,6 +509,40 @@ pub const XDP_SPLICE_NONE: u8 = 0;
 pub const XDP_SPLICE_WAIT: u8 = 1;
 /// EN-14: backend handshake complete; seq_delta translation active.
 pub const XDP_SPLICE_DONE: u8 = 2;
+
+/// T4 outbound-CT key: a flow the node itself dialed through an AF_XDP
+/// userspace socket (upstream/origin connections). Replies arrive with
+/// dst = the node's dialed local endpoint, so the key matches the
+/// packet's dst (local) + src (remote) tuple — the reverse direction
+/// from `XdpUdpCtKey`, whose `client_addr` is the downstream peer.
+///
+/// A hit redirects to the *current* queue's XSK: an XSKMAP redirect is
+/// only valid for the ingress queue the packet arrived on (F7), so the
+/// value carries no steering target — the userspace dial-flow demux owns
+/// cross-queue delivery to the reactor that dialed the flow.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct XdpOutCtKey {
+    /// Our dialed local endpoint address (reply dst).
+    pub local_addr: [u8; 16],
+    /// Upstream peer address (reply src).
+    pub remote_addr: [u8; 16],
+    pub local_port_be: u16,
+    pub remote_port_be: u16,
+    pub family: u8,
+    /// IP protocol number (6 = TCP, 17 = UDP).
+    pub proto: u8,
+    pub _pad: [u8; 2],
+}
+
+/// T4 outbound-CT value: presence is the steering decision (redirect to
+/// this queue's XSK); `created_ns` exists for observability/debug dumps
+/// only and is never consulted by the datapath.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct XdpOutCtValue {
+    pub created_ns: u64,
+}
 
 /// EN-14 cookie key ring: `cur` signs new challenges; `prev` still
 /// validates challenges issued before the last rotation. Userspace rotates
@@ -976,7 +1014,9 @@ const _: () = assert!(core::mem::size_of::<XdpBudgetConfig>() == 72);
 const _: () = assert!(core::mem::size_of::<XdpBudgetBucket>() == 96);
 const _: () = assert!(core::mem::size_of::<XdpSvcBucket>() == 16);
 const _: () = assert!(core::mem::size_of::<XdpPendingCap>() == 24);
-const _: () = assert!(core::mem::size_of::<XdpCounters>() == 296);
+const _: () = assert!(core::mem::size_of::<XdpCounters>() == 304);
+const _: () = assert!(core::mem::size_of::<XdpOutCtKey>() == 40);
+const _: () = assert!(core::mem::size_of::<XdpOutCtValue>() == 8);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtKey>() == 40);
 const _: () = assert!(core::mem::size_of::<XdpUdpCtValue>() == 72);
 const _: () = assert!(core::mem::size_of::<XdpUdpFwdRule>() == 48);
@@ -1018,6 +1058,8 @@ unsafe_impl_aya_pod!(
     XdpCookieKey,
     XdpUdpCtKey,
     XdpUdpCtValue,
+    XdpOutCtKey,
+    XdpOutCtValue,
     XdpSnatRevKey,
     XdpSnatRevValue,
     XdpFlowAcct,

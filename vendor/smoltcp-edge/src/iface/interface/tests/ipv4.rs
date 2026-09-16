@@ -995,6 +995,7 @@ fn test_raw_socket_no_reply_tcp(#[case] medium: Medium) {
         timestamp: None,
         ecn_echo: false,
         cwr: false,
+        extra_options: &[],
         payload: &PAYLOAD,
     };
     let ipv4_repr = Ipv4Repr {
