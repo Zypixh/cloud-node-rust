@@ -1,7 +1,7 @@
 # XDP 全协议接管的传输层：统一拥塞控制 EdgeCC / AccECN / 用户态队列调度 —— 规划 v3 与 Devin 提示词
 
-规划基线：`d13f77c`（静态审阅基线 `315af04` + 文档脱敏）。
-进度快照（2026-09-15 暂停时）：T0 各项与 T1 已提交（`8172ac6` F6、`b17a5d6` F5、`be75083` F2/F3/F4/F8、`1b742c0` F7、`da21e7a` T1 时钟）；T2 在工作区未提交：`crates/cloud-node-transport/`（RateSample、RttState、TransportInstant、`CongestionController` trait、NewReno+PRR、Cubic+HyStart++、确定性模拟器、三组测试）与 `Cargo.toml` workspace 声明。
+规划基线：`0edcee0`（静态审阅基线 `a26b15c` + 文档脱敏）。
+进度快照（2026-09-15 暂停时）：T0 各项与 T1 已提交（`d010877` F6、`6263d97` F5、`433ee5c` F2/F3/F4/F8、`1904456` F7、`621b728` T1 时钟）；T2 在工作区未提交：`crates/cloud-node-transport/`（RateSample、RttState、TransportInstant、`CongestionController` trait、NewReno+PRR、Cubic+HyStart++、确定性模拟器、三组测试）与 `Cargo.toml` workspace 声明。
 上游输入：`tasks/xdp-final-static-review-2026-09-15.md`（F1–F8）与 `docs/xdp-transport-performance-design.md`（PROPOSED）。
 
 本文只做静态阅读与依赖源码核对，未编译、未运行、未连接 VPS。所有编译/测试/压测仍按既有约束在授权 VPS 执行。
@@ -31,7 +31,7 @@
 | C3 | 发送侧无 SACK 记分板/RACK-TLP/PRR；丢失只靠 3 dupack 与 RTO | `socket/tcp.rs:512-523, 2106-2137` | 交付/丢失记账不可信，任何模型型 CC 都会被误导 |
 | C4 | socket 层无 ECN；`TcpRepr`/`Ipv4Repr` 未上提 ECN 字段 | `wire/tcp.rs:856-869`, `wire/ipv4.rs:533-539` | 经典 ECN 与 AccECN 都要 fork 贯通 |
 | C5 | 无 pacing 钩子：`cwnd_remaining = window - flight_size` | `socket/tcp.rs:1400-1405` | 发送时间门必须加在 dispatch |
-| C6 | reactor 曾用墙钟 ms（T1 已改为单调 µs `TransportClock`） | `da21e7a` | 已闭合 |
+| C6 | reactor 曾用墙钟 ms（T1 已改为单调 µs `TransportClock`） | `621b728` | 已闭合 |
 | C7 | bridge 对每个 egress 帧立即 `send_raw_frame`；TX 背压 256 次退出 | `src/xdp/af_xdp/bridge.rs:992-1073, 511` | 调度器接入点；退出并入过载合同 |
 | C8 | quinn-proto 0.11.17 `Controller` 公开：`on_ack(now, sent, bytes, app_limited, rtt)` 等 | `quinn-proto-0.11.17/src/congestion.rs:17-85` | QUIC 侧 EdgeCC 不 fork 即可接入 |
 | C9 | quinn Pacer 为 `window/srtt` 令牌桶，忽略 `pacing_rate` | `connection/pacing.rs` | pacing_gain ≠ cwnd_gain 无法表达；是否 patch 按 D-C1 先度量 |
@@ -278,8 +278,8 @@ TOA：smoltcp 主动打开时内核模块不会经过 NF_INET_LOCAL_OUT，必须
 ### T4-8 · 回源接管端到端流量验证（先做，与 T5 可并行）
 
 ```
-任务：补齐 T4 欠下的端到端流量验证（EN-20/21/22 只覆盖编译+单元/集成测试）。已有工具：commit a55fae0 的 `xdp dial-smoke`（AF_XDP 真实外拨 + PTB/out-CT 在线验证），commit b7db772 已实测 eBPF 过 kernel 6.1 verifier + native drv attach。
-基线：a55fae0。环境：devin-build-90（netns/veth/nft/tcpdump 已装）。
+任务：补齐 T4 欠下的端到端流量验证（EN-20/21/22 只覆盖编译+单元/集成测试）。已有工具：commit 9f168f0 的 `xdp dial-smoke`（AF_XDP 真实外拨 + PTB/out-CT 在线验证），commit a5a0252 已实测 eBPF 过 kernel 6.1 verifier + native drv attach。
+基线：9f168f0。环境：devin-build-90（netns/veth/nft/tcpdump 已装）。
 要求：
 1. netns 拓扑：veth 对，源站命名空间跑 TCP/UDP echo + HTTP 服务；本端 afxdp 模式启动节点。
 2. 验证项：dial-smoke 外拨成功且 SYN 走 AF_XDP（源站侧 tcpdump 看到 SYN 带预期选项，回程 SYN-ACK 被 XDP_OUT_CT 捕获 → out_ct_hit 增长）；`ss -tn` 在源站 netns 内确认连接两端，本端 netns 内 `ss` 无对应内核 socket；tcpdump 全程无本端发出的 RST；XDP detach/reattach 窗口注入源站报文，nft 守卫丢弃且计数增长；非 PTB ICMP error 不杀会话；PTB 触发 set_path_mtu 后 MSS 收敛。
@@ -407,7 +407,7 @@ TOA：smoltcp 主动打开时内核模块不会经过 NF_INET_LOCAL_OUT，必须
 - `src/quic_udp_demux.rs:163-180, 717`：静默丢弃 ECN。
 - `src/xdp/af_xdp/bridge.rs:511, 1042-1050`：TX 背压退出 worker。
 - 现状记录、随回源接管退役：`tcp_proxy.rs:1855-1861` 忽略 `TCP_CONGESTION` 返回值；`kernel_tuning.rs:275-276` optional 且不核对 qdisc。
-- F8 的 `NoControl` 已由 `be75083` 止血为 Cubic。
+- F8 的 `NoControl` 已由 `433ee5c` 止血为 Cubic。
 
 ## 11. 明确的非目标与设计限制
 
