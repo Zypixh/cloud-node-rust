@@ -119,6 +119,84 @@ async fn bind_backend_socket(
     UdpSocket::bind(fallback_addr).await
 }
 
+/// T4-6: upstream UDP socket — kernel `UdpSocket` on the default path,
+/// node-dialed AF_XDP flow when `xdp.upstream.mode=afxdp`.
+enum UpstreamUdpSocket {
+    Kernel(UdpSocket),
+    #[cfg(target_os = "linux")]
+    AfXdp(crate::xdp::af_xdp::AfXdpUdpSocket),
+}
+
+impl UpstreamUdpSocket {
+    async fn send(&self, data: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Kernel(socket) => socket.send(data).await,
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(socket) => socket.send(data).await,
+        }
+    }
+
+    async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Kernel(socket) => socket.recv(buf).await,
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(socket) => {
+                let payload = socket.recv().await?;
+                let len = payload.len().min(buf.len());
+                buf[..len].copy_from_slice(&payload[..len]);
+                Ok(len)
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Kernel(socket) => socket.local_addr(),
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(socket) => Ok(socket.local_addr()),
+        }
+    }
+
+    /// True once the transport can never deliver again — kernel sockets
+    /// can always recover (transient ICMP), a dead AF_XDP channel cannot.
+    fn defunct(&self) -> bool {
+        match self {
+            Self::Kernel(_) => false,
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(socket) => socket.defunct(),
+        }
+    }
+}
+
+/// T4-6: establish the upstream UDP socket. AF_XDP mode dials through
+/// the dataplane registry (fail-closed — an unavailable registry is an
+/// explicit session error); kernel mode is the pre-existing bind+connect.
+async fn connect_backend_udp_socket(
+    backend_addr: SocketAddr,
+    preferred: Option<SocketAddr>,
+    fallback_addr: &str,
+    session_id: u64,
+) -> io::Result<UpstreamUdpSocket> {
+    #[cfg(target_os = "linux")]
+    {
+        if crate::xdp::afxdp_upstream_selected() {
+            let socket =
+                crate::xdp::af_xdp_dial_udp(backend_addr, preferred.map(|addr| addr.port()))
+                    .await?;
+            debug!(
+                "UDP session {} dialed AF_XDP upstream {} from {}",
+                session_id,
+                backend_addr,
+                socket.local_addr()
+            );
+            return Ok(UpstreamUdpSocket::AfXdp(socket));
+        }
+    }
+    let socket = bind_backend_socket(preferred, fallback_addr, session_id).await?;
+    socket.connect(backend_addr).await?;
+    Ok(UpstreamUdpSocket::Kernel(socket))
+}
+
 pub(crate) fn udp_session_queue_full_event_due(session: &UdpSession) -> bool {
     let now = udp_activity_now_ms();
     let last = session.queue_full_event_at_ms.load(Ordering::Relaxed);
@@ -1550,7 +1628,8 @@ impl UdpProxyManager {
         } else {
             "0.0.0.0:0"
         };
-        let backend_socket = match bind_backend_socket(
+        let mut backend_socket = match connect_backend_udp_socket(
+            backend_addr,
             preferred_backend_bind,
             backend_bind_addr,
             session_id,
@@ -1586,14 +1665,10 @@ impl UdpProxyManager {
                 return Err(err.into());
             }
         };
-        if let Err(err) = backend_socket.connect(backend_addr).await {
-            crate::origin_state::ORIGIN_STATE_MANAGER.record_failure(origin_id);
-            return Err(err.into());
-        }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(origin_id);
         let mut transfer_metrics = UdpTransferAccumulator::new(Instant::now());
         let mut buf = vec![0u8; 65535];
-        loop {
+        'session_relay: loop {
             let idle_deadline =
                 udp_session_idle_deadline(&last_activity_ms, UDP_SESSION_IDLE_TIMEOUT);
             let metrics_flush_after = transfer_metrics.next_flush_after(Instant::now());
@@ -1635,6 +1710,9 @@ impl UdpProxyManager {
                                 "UDP session {} upstream send to {} failed, dropping datagram: {}",
                                 session_id, backend_addr, err
                             );
+                            if backend_socket.defunct() {
+                                break 'session_relay;
+                            }
                             break;
                         }
                         last_activity_ms.store(udp_activity_now_ms(), Ordering::Relaxed);
@@ -1655,6 +1733,12 @@ impl UdpProxyManager {
                     let len = match recv {
                         Ok(packet) => packet,
                         Err(err) => {
+                            if backend_socket.defunct() {
+                                // The AF_XDP dataplane channel closed —
+                                // the flow is permanently dead, not a
+                                // transient loss.
+                                break;
+                            }
                             // Connected UDP sockets report ICMP errors (port or
                             // host unreachable) through recv; treat them as a
                             // dropped reply and keep the session alive.

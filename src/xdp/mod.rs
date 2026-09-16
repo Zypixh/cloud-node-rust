@@ -847,34 +847,6 @@ impl XdpManager {
 
     /// T4: register a node-dialed outbound flow in XDP_OUT_CT so its
     /// replies redirect into AF_XDP instead of passing to the kernel
-    /// (which would RST the handshake). The caller must fail the dial on
-    /// error — proceeding unregistered would blackhole the flow.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn register_out_flow(
-        &self,
-        key: cloud_node_xdp_common::XdpOutCtKey,
-    ) -> anyhow::Result<()> {
-        let mut ebpf = self.ebpf.lock();
-        match ebpf.as_mut() {
-            Some(ebpf) => linux::upsert_out_ct(ebpf, key),
-            None => anyhow::bail!("XDP eBPF object is not attached"),
-        }
-    }
-
-    /// T4: remove a dialed flow's out-CT entry at close. A missing eBPF
-    /// object means the map is gone already — nothing left to remove.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn remove_out_flow(
-        &self,
-        key: &cloud_node_xdp_common::XdpOutCtKey,
-    ) -> anyhow::Result<()> {
-        let mut ebpf = self.ebpf.lock();
-        match ebpf.as_mut() {
-            Some(ebpf) => linux::remove_out_ct(ebpf, key),
-            None => Ok(()),
-        }
-    }
-
     #[cfg(target_os = "linux")]
     fn configure_af_xdp_runtime(&self) -> anyhow::Result<()> {
         if !self
@@ -1947,14 +1919,6 @@ impl XdpManager {
         }
     }
 
-    /// T4-5: currently installed guard report (None = guard absent).
-    #[cfg(target_os = "linux")]
-    pub(crate) fn dial_guard_report(
-        &self,
-    ) -> Option<std::sync::Arc<dial_guard::DialGuardReport>> {
-        self.dial_guard.lock().clone()
-    }
-
     /// T4-5: async teardown — clears guard state and removes nft rules +
     /// sysctl pin. Preferred in async contexts.
     #[cfg(target_os = "linux")]
@@ -2460,6 +2424,60 @@ pub(crate) fn af_xdp_dial_registry() -> Option<std::sync::Arc<af_xdp::AfXdpDialR
     manager_from_runtime().dial_registry()
 }
 
+/// T4-6: whether `xdp.upstream.mode=afxdp` is selected in the live
+/// runtime config. Always false off-Linux — every upstream surface then
+/// takes its kernel path unchanged.
+pub(crate) fn afxdp_upstream_selected() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return RuntimeConfig::current()
+            .map(|runtime| {
+                runtime.xdp.upstream_mode() == crate::runtime_mode::XdpUpstreamMode::Afxdp
+            })
+            .unwrap_or(false);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// T4-6: node-originated TCP connect through the AF_XDP dataplane.
+/// Callers must have explicitly selected `xdp.upstream.mode=afxdp`; a
+/// missing registry is an explicit error, never a silent kernel
+/// fallback.
+#[cfg(target_os = "linux")]
+pub(crate) async fn af_xdp_dial_tcp(
+    remote: std::net::SocketAddr,
+    syn_extra_options: Vec<u8>,
+) -> std::io::Result<af_xdp::AfXdpTcpStream> {
+    let registry = af_xdp_dial_registry().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "xdp.upstream.mode=afxdp but no live AF_XDP dial registry \
+             (bridge not started or dial guard install failed — see xdp status dialGuardDetail)",
+        )
+    })?;
+    registry.dial_tcp(remote, syn_extra_options).await
+}
+
+/// T4-6: node-originated UDP "connect" through the AF_XDP dataplane —
+/// same fail-closed registry contract as `af_xdp_dial_tcp`.
+#[cfg(target_os = "linux")]
+pub(crate) async fn af_xdp_dial_udp(
+    remote: std::net::SocketAddr,
+    preferred_port: Option<u16>,
+) -> std::io::Result<af_xdp::AfXdpUdpSocket> {
+    let registry = af_xdp_dial_registry().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "xdp.upstream.mode=afxdp but no live AF_XDP dial registry \
+             (bridge not started or dial guard install failed — see xdp status dialGuardDetail)",
+        )
+    })?;
+    registry.dial_udp(remote, preferred_port).await
+}
+
 fn replace_manager_from_runtime() -> std::sync::Arc<XdpManager> {
     let config = RuntimeConfig::current()
         .map(|runtime| runtime.xdp)
@@ -2918,6 +2936,7 @@ pub async fn reload_from_runtime() -> anyhow::Result<()> {
                     );
                 }
                 old_manager.attached.write().clear();
+                #[cfg(target_os = "linux")]
                 old_manager.ebpf.lock().take();
                 if let Err(reattach_err) = old_manager.initialize().await {
                     tracing::warn!(

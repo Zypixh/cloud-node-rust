@@ -110,7 +110,7 @@ impl AfXdpRuntimeHandle {
 }
 
 #[derive(Debug)]
-pub(super) struct AfXdpQueueHandle {
+pub(crate) struct AfXdpQueueHandle {
     pub(super) interface: String,
     pub(super) queue: u32,
     tx: TxQueue,
@@ -221,6 +221,7 @@ impl AfXdpQueueHandle {
         listen_addr: std::net::SocketAddr,
         peer_addr: std::net::SocketAddr,
         payload: &[u8],
+        ecn: Option<u8>,
     ) -> anyhow::Result<bool> {
         self.reclaim_tx_completions();
         let Some(mut desc) = self.free_frames.pop() else {
@@ -232,6 +233,7 @@ impl AfXdpQueueHandle {
             listen_addr,
             peer_addr,
             payload,
+            ecn,
             &mut self.tx_scratch,
         )
         .is_none()

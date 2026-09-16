@@ -1998,12 +1998,10 @@ impl HttpProxyManager {
         };
 
         let toa_local_port = backend_stream
-            .local_addr()
-            .ok()
-            .map(|addr| addr.port())
+            .kernel_toa_port()
             .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
 
-        configure_passthrough_socket(&backend_stream);
+        backend_stream.configure_relay_socket();
         if proxy_protocol_to_origin.enabled() {
             let destination_addr = backend_stream.peer_addr().ok();
             if let Some(header) = proxy_protocol::build_header(
@@ -2141,11 +2139,11 @@ impl HttpProxyManager {
 
         let result = match client_stream {
             SniPassthroughClient::Tcp(client_stream) => {
-                crate::tcp_proxy::stream_sni_passthrough_bidirectional_with_metrics_cancelable(
+                crate::tcp_proxy::stream_tcp_backend_bidirectional_with_metrics_options(
                     server_id,
                     client_stream,
                     backend_stream,
-                    cancel_rx,
+                    crate::tcp_proxy::RelayOptions::sni_passthrough().with_cancel(cancel_rx),
                 )
                 .await
             }
@@ -2686,11 +2684,11 @@ async fn connect_passthrough_backend_with_retry(
     backend_addr: &str,
     client_addr: SocketAddr,
     toa_config: Option<crate::config_models::TOAConfig>,
-) -> anyhow::Result<TcpStream> {
+) -> anyhow::Result<crate::toa::UpstreamL4Stream> {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     const RETRY_DELAY: Duration = Duration::from_millis(100);
 
-    match crate::toa::connect_with_toa(
+    match crate::toa::connect_upstream(
         backend_addr,
         client_addr,
         toa_config.clone(),
@@ -2701,7 +2699,7 @@ async fn connect_passthrough_backend_with_retry(
         Ok(stream) => Ok(stream),
         Err(first_err) => {
             tokio::time::sleep(RETRY_DELAY).await;
-            crate::toa::connect_with_toa(backend_addr, client_addr, toa_config, CONNECT_TIMEOUT)
+            crate::toa::connect_upstream(backend_addr, client_addr, toa_config, CONNECT_TIMEOUT)
                 .await
                 .map_err(|second_err| {
                     second_err.context(format!(

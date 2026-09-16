@@ -1638,11 +1638,12 @@ fn af_xdp_dial_registry_claim_release_and_demux() {
         interface: std::sync::Arc::from("eth0"),
         queue: 0,
         proto: cloud_node_xdp_common::XDP_PROTO_TCP,
+        udp_tx: None,
     };
 
     // Claim reserves the tuple and records the owner.
     let flow = registry
-        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner)
+        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner, None)
         .expect("first claim must succeed");
     assert_eq!(flow.peer_addr, remote);
     assert!(registry.owner(&flow).is_some());
@@ -1662,7 +1663,7 @@ fn af_xdp_dial_registry_claim_release_and_demux() {
     registry.release(&flow);
     assert!(registry.owner(&flow).is_none());
     registry
-        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner)
+        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner, None)
         .expect("released span must admit a new claim");
 }
 
@@ -1675,13 +1676,14 @@ fn af_xdp_dial_registry_port_span_exhaustion_is_explicit() {
         interface: std::sync::Arc::from("eth0"),
         queue: 0,
         proto: cloud_node_xdp_common::XDP_PROTO_TCP,
+        udp_tx: None,
     };
     let source: IpAddr = "198.51.100.5".parse().unwrap();
     let mut claimed = Vec::new();
     for _ in 0..registry.port_span {
         claimed.push(
             registry
-                .claim_flow(source, remote, &owner)
+                .claim_flow(source, remote, &owner, None)
                 .expect("span must admit SPAN distinct flows"),
         );
     }
@@ -1694,7 +1696,7 @@ fn af_xdp_dial_registry_port_span_exhaustion_is_explicit() {
         .all(|p| *p >= registry.port_base && *p < registry.port_base + registry.port_span));
     // The span is exhausted — the next claim fails, never wraps onto a
     // live tuple.
-    assert!(registry.claim_flow(source, remote, &owner).is_none());
+    assert!(registry.claim_flow(source, remote, &owner, None).is_none());
 }
 
 #[cfg(target_os = "linux")]
@@ -1706,9 +1708,10 @@ fn af_xdp_dial_registry_inject_to_dead_owner_cleans_up() {
         interface: std::sync::Arc::from("eth0"),
         queue: 7,
         proto: cloud_node_xdp_common::XDP_PROTO_TCP,
+        udp_tx: None,
     };
     let flow = registry
-        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner)
+        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner, None)
         .expect("claim");
     // No queue 7 registered → owner is dead; inject must fail and drop
     // the registration so the flow cannot pin a port forever.
@@ -1730,9 +1733,10 @@ fn af_xdp_dial_registry_inject_backpressure_is_explicit() {
         interface: std::sync::Arc::from("eth0"),
         queue: 0,
         proto: cloud_node_xdp_common::XDP_PROTO_TCP,
+        udp_tx: None,
     };
     let flow = registry
-        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner)
+        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner, None)
         .expect("claim");
     registry
         .inject(&owner, af_xdp_dial_route_meta(), flow, bytes::Bytes::new())
@@ -1743,6 +1747,77 @@ fn af_xdp_dial_registry_inject_backpressure_is_explicit() {
     );
     // Backpressure is a drop — the registration must survive.
     assert!(registry.owner(&flow).is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn af_xdp_dial_registry_udp_owner_demuxes_payload() {
+    let registry = af_xdp_test_dial_registry();
+    let remote: std::net::SocketAddr = "192.0.2.10:53".parse().unwrap();
+    let (udp_tx, mut udp_rx) = tokio::sync::mpsc::channel(8);
+    let owner = af_xdp::AfXdpDialOwner {
+        interface: std::sync::Arc::from("eth0"),
+        queue: 0,
+        proto: cloud_node_xdp_common::XDP_PROTO_UDP,
+        udp_tx: Some(udp_tx),
+    };
+    let flow = registry
+        .claim_flow("198.51.100.5".parse().unwrap(), remote, &owner, None)
+        .expect("claim");
+    // Bridge demux: owner lookup by reply tuple → payload into udp_tx.
+    let owner = registry.owner(&flow).expect("owner");
+    assert_eq!(owner.proto, cloud_node_xdp_common::XDP_PROTO_UDP);
+    let tx = owner.udp_tx.clone().expect("udp owner carries its channel");
+    tx.try_send(af_xdp::AfXdpUdpDatagram {
+        payload: bytes::Bytes::from_static(b"pong"),
+        ecn: Some(0b10),
+    })
+    .expect("deliver");
+    let datagram = udp_rx.try_recv().expect("reply payload");
+    assert_eq!(datagram.payload, bytes::Bytes::from_static(b"pong"));
+    assert_eq!(datagram.ecn, Some(0b10));
+    registry.release(&flow);
+    assert!(registry.owner(&flow).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn af_xdp_dial_registry_preferred_port_pinning() {
+    let registry = af_xdp_test_dial_registry();
+    let remote: std::net::SocketAddr = "192.0.2.10:53".parse().unwrap();
+    let owner = af_xdp::AfXdpDialOwner {
+        interface: std::sync::Arc::from("eth0"),
+        queue: 0,
+        proto: cloud_node_xdp_common::XDP_PROTO_UDP,
+        udp_tx: None,
+    };
+    let source: IpAddr = "198.51.100.5".parse().unwrap();
+    let preferred = registry.port_base + 7;
+    let flow = registry
+        .claim_flow(source, remote, &owner, Some(preferred))
+        .expect("preferred in-span port must be claimed");
+    assert_eq!(flow.local_addr.port(), preferred);
+    // The same preferred port on a different remote is a distinct tuple —
+    // it is honored, not treated as occupied.
+    let flow2 = registry
+        .claim_flow(source, "192.0.2.11:53".parse().unwrap(), &owner, Some(preferred))
+        .expect("distinct tuple may share the preferred port");
+    assert_eq!(flow2.local_addr.port(), preferred);
+    // Occupied preferred tuple (same source, same remote) falls through
+    // to the span scan.
+    let flow2b = registry
+        .claim_flow(source, remote, &owner, Some(preferred))
+        .expect("scan fallback must still claim");
+    assert_ne!(flow2b.local_addr.port(), preferred);
+    registry.release(&flow2b);
+    // Out-of-span preferred port is ignored entirely.
+    let flow3 = registry
+        .claim_flow(source, "192.0.2.12:53".parse().unwrap(), &owner, Some(1))
+        .expect("out-of-span preference falls to scan");
+    assert!(flow3.local_addr.port() >= registry.port_base);
+    registry.release(&flow);
+    registry.release(&flow2);
+    registry.release(&flow3);
 }
 
 #[cfg(target_os = "linux")]
@@ -1959,6 +2034,7 @@ fn af_xdp_udp_packet_converts_to_datagram_only_for_udp() {
         peer_addr: "127.0.0.1:53000".parse().unwrap(),
         payload: bytes::Bytes::from_static(b"hello"),
         link: test_link_meta(false),
+        ecn: None,
     };
     assert!(udp.into_udp_datagram().is_some());
 
@@ -1968,6 +2044,7 @@ fn af_xdp_udp_packet_converts_to_datagram_only_for_udp() {
         peer_addr: "127.0.0.1:53000".parse().unwrap(),
         payload: bytes::Bytes::from_static(b"hello"),
         link: test_link_meta(false),
+        ecn: None,
     };
     assert!(tcp.into_udp_datagram().is_none());
 }
@@ -2846,6 +2923,7 @@ fn af_xdp_encodes_ipv4_udp_reply_frame_with_reversed_l2() {
         "198.51.100.5:443".parse().unwrap(),
         "192.0.2.10:53000".parse().unwrap(),
         b"pong",
+        None,
         &mut frame,
     )
     .expect("reply frame");

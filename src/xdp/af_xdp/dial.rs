@@ -15,6 +15,18 @@ pub(crate) enum AfXdpReactorRequest {
         flow: AfXdpTcpFlowKey,
         ip_packet: Bytes,
     },
+    /// T4-6: node-dialed UDP egress — the socket crafts L3-less output by
+    /// handing (link, endpoints, payload) to the owning queue, which
+    /// emits a full frame through its XSK TX ring.
+    UdpEgress {
+        link: AfXdpLinkMeta,
+        local: SocketAddr,
+        remote: SocketAddr,
+        payload: Bytes,
+        /// ECN codepoint bits (0–3) requested by the sender — QUIC marks
+        /// packets; plain UDP proxy traffic passes `None`.
+        ecn: Option<u8>,
+    },
 }
 
 /// T4: owner record for a node-dialed flow — the queue reactor holding
@@ -26,6 +38,9 @@ pub(crate) struct AfXdpDialOwner {
     pub(crate) interface: Arc<str>,
     pub(crate) queue: u32,
     pub(crate) proto: u8,
+    /// UDP dialed flows deliver reply payloads straight into the owning
+    /// socket's channel — no reactor session exists for them.
+    pub(crate) udp_tx: Option<mpsc::Sender<AfXdpUdpDatagram>>,
 }
 
 /// T4: bridge between async upstream dialers and the per-queue AF_XDP
@@ -153,13 +168,29 @@ impl AfXdpDialRegistry {
 
     /// Claim a source port in the reserved span by inserting the flow
     /// into the owner table — the claim is the allocation, so a tuple can
-    /// never be handed out twice.
+    /// never be handed out twice. `preferred_port` (in-span) is tried
+    /// first: UDP callers use it to preserve the kernel path's
+    /// recent-upstream-port pinning semantics.
     pub(crate) fn claim_flow(
         &self,
         source: IpAddr,
         remote: SocketAddr,
         owner: &AfXdpDialOwner,
+        preferred_port: Option<u16>,
     ) -> Option<AfXdpTcpFlowKey> {
+        if let Some(port) = preferred_port
+            && port >= self.port_base
+            && port < self.port_base + self.port_span
+        {
+            let flow = AfXdpTcpFlowKey {
+                local_addr: SocketAddr::new(source, port),
+                peer_addr: remote,
+            };
+            if let dashmap::mapref::entry::Entry::Vacant(vacant) = self.owners.entry(flow) {
+                vacant.insert(owner.clone());
+                return Some(flow);
+            }
+        }
         let span = u32::from(self.port_span);
         let start = self.port_cursor.fetch_add(1, Ordering::Relaxed) % span;
         for i in 0..span {
@@ -222,8 +253,9 @@ impl AfXdpDialRegistry {
             interface: interface.clone(),
             queue,
             proto: IP_PROTO_TCP,
+            udp_tx: None,
         };
-        let Some(flow) = self.claim_flow(route.source, remote, &owner) else {
+        let Some(flow) = self.claim_flow(route.source, remote, &owner, None) else {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!(
@@ -316,6 +348,101 @@ impl AfXdpDialRegistry {
         }
     }
 
+    /// T4-6: node-originated UDP "connect" through the AF_XDP dataplane.
+    /// No handshake exists, so the returned socket is live immediately:
+    /// egress frames are emitted by the owning queue via `UdpEgress`
+    /// requests, and replies are delivered through `udp_tx` on the owner
+    /// record by whichever queue received them. Same explicit-failure
+    /// contract as `dial_tcp` — no silent kernel fallback.
+    pub(crate) async fn dial_udp(
+        self: &std::sync::Arc<Self>,
+        remote: SocketAddr,
+        preferred_port: Option<u16>,
+    ) -> io::Result<AfXdpUdpSocket> {
+        let target = remote.ip();
+        let route = tokio::task::spawn_blocking(move || linux::resolve_outbound_route(target))
+            .await
+            .map_err(|err| {
+                io::Error::other(format!("AF_XDP UDP route resolution task failed: {err}"))
+            })?
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("AF_XDP UDP dial to {remote}: route resolution failed: {err}"),
+                )
+            })?;
+        if route.source.is_ipv4() != remote.is_ipv4() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!(
+                    "AF_XDP UDP dial to {remote}: resolved source {} has a different address family",
+                    route.source
+                ),
+            ));
+        }
+        let interface: Arc<str> = Arc::from(route.interface.as_str());
+        let (queue, egress_tx) = self.pick_queue(&interface, remote).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!(
+                    "AF_XDP UDP dial to {remote}: no live reactor queue on interface {interface}"
+                ),
+            )
+        })?;
+        let (udp_tx, ingress_rx) = mpsc::channel(AF_XDP_UDP_DIAL_INGRESS_QUEUE);
+        let owner = AfXdpDialOwner {
+            interface,
+            queue,
+            proto: IP_PROTO_UDP,
+            udp_tx: Some(udp_tx),
+        };
+        let Some(flow) = self.claim_flow(route.source, remote, &owner, preferred_port) else {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "AF_XDP UDP dial to {remote}: reserved source-port span {}..{} exhausted",
+                    self.port_base,
+                    self.port_base + self.port_span - 1
+                ),
+            ));
+        };
+        let Some(ct_key) = linux::out_ct_key(flow.local_addr, flow.peer_addr, IP_PROTO_UDP) else {
+            self.rollback(&flow);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "AF_XDP UDP dial {} -> {}: address-family mismatch",
+                    flow.local_addr, flow.peer_addr
+                ),
+            ));
+        };
+        if let Err(err) = self.manager.upsert_out_ct(ct_key) {
+            self.rollback(&flow);
+            return Err(io::Error::other(format!(
+                "AF_XDP UDP dial {} -> {}: XDP_OUT_CT insert failed: {err}",
+                flow.local_addr, flow.peer_addr
+            )));
+        }
+        Ok(AfXdpUdpSocket {
+            flow,
+            link: AfXdpLinkMeta {
+                // Same wire-direction convention as the TCP dial path.
+                destination_mac: route.source_mac,
+                source_mac: route.destination_mac,
+                vlan_tags: [AfXdpVlanTag { tpid: 0, tci: 0 }; 2],
+                vlan_tag_count: 0,
+                ethertype: if remote.is_ipv4() {
+                    ETHERTYPE_IPV4
+                } else {
+                    ETHERTYPE_IPV6
+                },
+            },
+            egress_tx,
+            ingress_rx: std::sync::Mutex::new(ingress_rx),
+            registry: self.clone(),
+        })
+    }
+
     /// Reap-time cleanup: drop the owner claim and the XDP_OUT_CT row so
     /// post-close replies fall back to the kernel path. Removal failure
     /// is logged — the row expires with the map, and replies to it simply
@@ -380,5 +507,183 @@ impl std::fmt::Debug for AfXdpDialRegistry {
             .field("flows", &self.owners.len())
             .field("queues", &self.queues.len())
             .finish()
+    }
+}
+
+/// T4-6: bounded per-socket reply channel for node-dialed UDP flows.
+#[cfg(target_os = "linux")]
+pub(crate) const AF_XDP_UDP_DIAL_INGRESS_QUEUE: usize = 256;
+
+/// T4-6: inbound datagram delivered to a node-dialed UDP socket —
+/// payload plus the IP-header ECN bits so QUIC consumers keep their
+/// congestion-feedback marks instead of silently losing them.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct AfXdpUdpDatagram {
+    pub payload: Bytes,
+    pub ecn: Option<u8>,
+}
+
+/// T4-6: node-dialed UDP socket over the AF_XDP dataplane. UDP has no
+/// handshake — the reserved source port, XDP_OUT_CT row and demux
+/// ownership are established by `dial_udp` before this handle exists,
+/// and `Drop` releases them through the registry.
+#[cfg(target_os = "linux")]
+pub struct AfXdpUdpSocket {
+    flow: AfXdpTcpFlowKey,
+    link: AfXdpLinkMeta,
+    egress_tx: mpsc::Sender<AfXdpReactorRequest>,
+    // `Mutex` (not `&mut self` access) so quinn's `AsyncUdpSocket`
+    // adapter can poll receives through `&self`.
+    ingress_rx: std::sync::Mutex<mpsc::Receiver<AfXdpUdpDatagram>>,
+    registry: Arc<AfXdpDialRegistry>,
+}
+
+#[cfg(target_os = "linux")]
+impl AfXdpUdpSocket {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.flow.local_addr
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.flow.peer_addr
+    }
+
+    fn egress_request(&self, payload: &[u8], ecn: Option<u8>) -> AfXdpReactorRequest {
+        AfXdpReactorRequest::UdpEgress {
+            link: self.link.clone(),
+            local: self.flow.local_addr,
+            remote: self.flow.peer_addr,
+            payload: Bytes::copy_from_slice(payload),
+            ecn,
+        }
+    }
+
+    /// Queue a datagram for egress through the owning queue's XSK TX
+    /// ring. The bounded request channel applies backpressure — a full
+    /// queue awaits instead of shedding silently.
+    pub async fn send(&self, payload: &[u8]) -> io::Result<usize> {
+        self.send_with_ecn(payload, None).await
+    }
+
+    /// Same as `send`, with an explicit ECN codepoint (QUIC marking).
+    pub async fn send_with_ecn(&self, payload: &[u8], ecn: Option<u8>) -> io::Result<usize> {
+        let len = payload.len();
+        self.egress_tx
+            .send(self.egress_request(payload, ecn))
+            .await
+            .map_err(|_| self.egress_closed_error())?;
+        Ok(len)
+    }
+
+    /// Non-blocking variant for poll-style consumers (quinn). A full
+    /// bounded queue reports `WouldBlock`; the caller must await
+    /// writability via the poller before retrying.
+    pub fn try_send(&self, payload: &[u8], ecn: Option<u8>) -> io::Result<usize> {
+        let len = payload.len();
+        match self.egress_tx.try_send(self.egress_request(payload, ecn)) {
+            Ok(()) => Ok(len),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "AF_XDP UDP egress queue full for {} -> {}",
+                    self.flow.local_addr, self.flow.peer_addr
+                ),
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(self.egress_closed_error()),
+        }
+    }
+
+    /// Clone of the egress channel for the writable poller — callers
+    /// `poll_reserve` on it to await queue capacity after a
+    /// `WouldBlock`.
+    pub(crate) fn egress_sender(&self) -> mpsc::Sender<AfXdpReactorRequest> {
+        self.egress_tx.clone()
+    }
+
+    /// Poll-style receive for `&self` consumers (quinn). The bounded
+    /// channel registers `cx` for wake-up; a closed channel reports
+    /// `UnexpectedEof` because AF_XDP flows never recover. Returns the
+    /// copied length and the datagram's ECN bits.
+    pub fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<io::Result<(usize, Option<u8>)>> {
+        let mut rx = self
+            .ingress_rx
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        match rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(datagram)) => {
+                let len = datagram.payload.len().min(buf.len());
+                buf[..len].copy_from_slice(&datagram.payload[..len]);
+                std::task::Poll::Ready(Ok((len, datagram.ecn)))
+            }
+            std::task::Poll::Ready(None) => {
+                std::task::Poll::Ready(Err(self.ingress_closed_error()))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    /// Next reply payload from the upstream peer. The channel closes
+    /// when the owning demux entry is torn down (registry release,
+    /// generation drain), which surfaces as `UnexpectedEof`.
+    pub async fn recv(&mut self) -> io::Result<Bytes> {
+        self.ingress_rx
+            .get_mut()
+            .unwrap_or_else(|err| err.into_inner())
+            .recv()
+            .await
+            .map(|datagram| datagram.payload)
+            .ok_or_else(|| self.ingress_closed_error())
+    }
+
+    /// True once either direction's channel is closed — the flow can
+    /// never deliver again (unlike kernel UDP, where errors are
+    /// transient).
+    pub fn defunct(&self) -> bool {
+        self.ingress_rx
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .is_closed()
+            || self.egress_tx.is_closed()
+    }
+
+    fn egress_closed_error(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!(
+                "AF_XDP UDP egress queue closed for {} -> {}",
+                self.flow.local_addr, self.flow.peer_addr
+            ),
+        )
+    }
+
+    fn ingress_closed_error(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "AF_XDP UDP ingress closed for {} -> {}",
+                self.flow.local_addr, self.flow.peer_addr
+            ),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for AfXdpUdpSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AfXdpUdpSocket")
+            .field("flow", &self.flow)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for AfXdpUdpSocket {
+    fn drop(&mut self) {
+        self.registry.release(&self.flow);
     }
 }

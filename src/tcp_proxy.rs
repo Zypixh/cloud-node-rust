@@ -1398,7 +1398,7 @@ impl TcpProxyManager {
 
             self.record_request_start(client_addr, &mut context);
             let toa_config = self.config_store.get_toa_config_sync();
-            let mut backend_stream = match crate::toa::connect_with_toa(
+            let mut backend_stream = match crate::toa::connect_upstream(
                 &context.backend_addr,
                 client_addr,
                 toa_config.clone(),
@@ -1416,27 +1416,32 @@ impl TcpProxyManager {
                 crate::metrics::ShadowTransportKind::UpstreamTcp,
             );
             let toa_local_port = backend_stream
-                .local_addr()
-                .ok()
-                .map(|addr| addr.port())
+                .kernel_toa_port()
                 .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
+            let backend_peer_addr = backend_stream.peer_addr().ok();
 
-            configure_backend_tcp_socket(&backend_stream);
+            backend_stream.configure_relay_socket();
             let proxy_protocol = context
                 .backend_ext
                 .as_ref()
                 .map(|ext| ext.proxy_protocol)
                 .unwrap_or_default();
             if proxy_protocol.enabled()
-                && let Err(err) =
-                    write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol)
-                        .await
+                && let Err(err) = write_proxy_protocol_header(
+                    &mut backend_stream,
+                    client_addr,
+                    backend_peer_addr,
+                    proxy_protocol,
+                )
+                .await
             {
                 release_toa_port(toa_config, toa_local_port).await;
                 self.record_backend_connect_failure(client_addr, &server, &mut context);
                 return Err(err.into());
             }
-            let backend_stream = pingora_core::protocols::l4::stream::Stream::from(backend_stream);
+            let backend_stream = backend_stream.into_pingora_stream(
+                backend_peer_addr.unwrap_or(client_addr),
+            );
             let backend_stream = pingora_core::protocols::tls::client::handshake(
                 &tls_connector,
                 &host,
@@ -1496,7 +1501,7 @@ impl TcpProxyManager {
         let toa_config = self.config_store.get_toa_config_sync();
         #[cfg(target_os = "linux")]
         AF_XDP_TCP_PROXY_DIAG_BACKEND_CONNECT_START.fetch_add(1, Ordering::Relaxed);
-        let mut backend_stream = match crate::toa::connect_with_toa(
+        let mut backend_stream = match crate::toa::connect_upstream(
             &context.backend_addr,
             client_addr,
             toa_config.clone(),
@@ -1518,20 +1523,24 @@ impl TcpProxyManager {
             crate::metrics::ShadowTransportKind::UpstreamTcp,
         );
         let toa_local_port = backend_stream
-            .local_addr()
-            .ok()
-            .map(|addr| addr.port())
+            .kernel_toa_port()
             .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
+        let backend_peer_addr = backend_stream.peer_addr().ok();
 
-        configure_backend_tcp_socket(&backend_stream);
+        backend_stream.configure_relay_socket();
         let proxy_protocol = context
             .backend_ext
             .as_ref()
             .map(|ext| ext.proxy_protocol)
             .unwrap_or_default();
         if proxy_protocol.enabled()
-            && let Err(err) =
-                write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol).await
+            && let Err(err) = write_proxy_protocol_header(
+                &mut backend_stream,
+                client_addr,
+                backend_peer_addr,
+                proxy_protocol,
+            )
+            .await
         {
             release_toa_port(toa_config, toa_local_port).await;
             self.record_backend_connect_failure(client_addr, &server, &mut context);
@@ -1583,7 +1592,7 @@ impl TcpProxyManager {
             .ok_or_else(|| anyhow::anyhow!("origin connect memory admission rejected"))?;
         self.record_request_start(client_addr, &mut context);
         let toa_config = self.config_store.get_toa_config_sync();
-        let mut backend_stream = match crate::toa::connect_with_toa(
+        let mut backend_stream = match crate::toa::connect_upstream(
             &context.backend_addr,
             client_addr,
             toa_config.clone(),
@@ -1601,20 +1610,24 @@ impl TcpProxyManager {
             crate::metrics::ShadowTransportKind::UpstreamTcp,
         );
         let toa_local_port = backend_stream
-            .local_addr()
-            .ok()
-            .map(|addr| addr.port())
+            .kernel_toa_port()
             .filter(|_| toa_config.as_ref().map(|cfg| cfg.is_on).unwrap_or(false));
+        let backend_peer_addr = backend_stream.peer_addr().ok();
 
-        configure_backend_tcp_socket(&backend_stream);
+        backend_stream.configure_relay_socket();
         let proxy_protocol = context
             .backend_ext
             .as_ref()
             .map(|ext| ext.proxy_protocol)
             .unwrap_or_default();
         if proxy_protocol.enabled()
-            && let Err(err) =
-                write_proxy_protocol_header(&mut backend_stream, client_addr, proxy_protocol).await
+            && let Err(err) = write_proxy_protocol_header(
+                &mut backend_stream,
+                client_addr,
+                backend_peer_addr,
+                proxy_protocol,
+            )
+            .await
         {
             release_toa_port(toa_config, toa_local_port).await;
             self.record_backend_connect_failure(client_addr, &server, &mut context);
@@ -1622,7 +1635,7 @@ impl TcpProxyManager {
         }
         crate::origin_state::ORIGIN_STATE_MANAGER.record_success(context.origin_id);
         drop(origin_connect_permit);
-        let res = stream_tcp_bidirectional_with_metrics_options(
+        let res = stream_tcp_backend_bidirectional_with_metrics_options(
             context.sid,
             client_stream,
             backend_stream,
@@ -1801,10 +1814,6 @@ impl TcpProxyManager {
             "tcp_tls_handshake_failure",
         );
     }
-}
-
-fn configure_backend_tcp_socket(stream: &TcpStream) {
-    configure_relay_tcp_socket(stream);
 }
 
 /// Apply TCP relay socket tuning for passthrough and backend connections.
@@ -2070,7 +2079,7 @@ pub(crate) enum RelayIoPhase {
 }
 
 #[derive(Debug, Clone)]
-struct RelayOptions {
+pub(crate) struct RelayOptions {
     strict_close_on_eof: bool,
     enforce_pressure_idle_timeout: bool,
     cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
@@ -2087,7 +2096,7 @@ impl Default for RelayOptions {
 }
 
 impl RelayOptions {
-    fn sni_passthrough() -> Self {
+    pub(crate) fn sni_passthrough() -> Self {
         Self {
             strict_close_on_eof: true,
             enforce_pressure_idle_timeout: false,
@@ -2103,7 +2112,7 @@ impl RelayOptions {
         }
     }
 
-    fn with_cancel(
+    pub(crate) fn with_cancel(
         mut self,
         cancel_rx: Option<watch::Receiver<crate::l4_connection_registry::ConnectionCancelReason>>,
     ) -> Self {
@@ -2256,6 +2265,27 @@ where
         RelayOptions::sni_passthrough().with_cancel(cancel_rx),
     )
     .await
+}
+
+/// T4-6: bidirectional relay dispatch on the upstream transport.
+/// Kernel backends keep the splice-based zero-copy fast path; an AF_XDP
+/// backend has no kernel fd so it takes the userspace relay path —
+/// structural, not a silent fallback.
+pub(crate) async fn stream_tcp_backend_bidirectional_with_metrics_options(
+    server_id: i64,
+    client: TcpStream,
+    backend: crate::toa::UpstreamL4Stream,
+    options: RelayOptions,
+) -> Result<RelayOutcome, BidirectionalStreamError> {
+    match backend {
+        crate::toa::UpstreamL4Stream::Kernel(backend) => {
+            stream_tcp_bidirectional_with_metrics_options(server_id, client, backend, options).await
+        }
+        #[cfg(target_os = "linux")]
+        crate::toa::UpstreamL4Stream::AfXdp(backend) => {
+            stream_bidirectional_with_metrics_options(server_id, client, backend, options).await
+        }
+    }
 }
 
 async fn stream_tcp_bidirectional_with_metrics_options(
@@ -3252,12 +3282,15 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-async fn write_proxy_protocol_header(
-    backend_stream: &mut TcpStream,
+async fn write_proxy_protocol_header<S>(
+    backend_stream: &mut S,
     client_addr: SocketAddr,
+    destination_addr: Option<SocketAddr>,
     config: ProxyProtocolConfig,
-) -> io::Result<()> {
-    let destination_addr = backend_stream.peer_addr().ok();
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     if let Some(header) = proxy_protocol::build_header(config, client_addr, destination_addr) {
         backend_stream.write_all(&header).await?;
         backend_stream.flush().await?;

@@ -645,3 +645,291 @@ mod imp {
 }
 
 pub use imp::{connect_with_toa, maybe_prepare_runtime, unregister_toa_port};
+
+// ---------------------------------------------------------------------------
+// T4-6: upstream connect surface — kernel socket vs AF_XDP dataplane.
+// ---------------------------------------------------------------------------
+
+/// TOA TCP option bytes for the AF_XDP upstream path — the same wire
+/// format `cloud_toa_sender.ko` writes into SYNs (kind 254):
+/// v4 = `[254, 8, port_be16, ip_be32]` (8B), v6 = `[254, 20, port_be16,
+/// ip6]` (20B). Injected verbatim via smoltcp SYN extra options; the
+/// genl mapping/port allocator is bypassed entirely on this path.
+pub fn toa_syn_option_bytes(client: SocketAddr) -> Vec<u8> {
+    let mut option = Vec::with_capacity(20);
+    match client.ip() {
+        std::net::IpAddr::V4(ip) => {
+            option.extend_from_slice(&[254, 8]);
+            option.extend_from_slice(&client.port().to_be_bytes());
+            option.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            option.extend_from_slice(&[254, 20]);
+            option.extend_from_slice(&client.port().to_be_bytes());
+            option.extend_from_slice(&ip.octets());
+        }
+    }
+    option
+}
+
+/// T4-6: upstream TCP stream returned by [`connect_upstream`]. The
+/// kernel variant is the pre-existing path; `AfXdp` is a node-dialed
+/// smoltcp-edge flow whose lifecycle (source port, XDP_OUT_CT row) is
+/// owned by the AF_XDP dial registry and released on session reap.
+pub enum UpstreamL4Stream {
+    Kernel(TcpStream),
+    #[cfg(target_os = "linux")]
+    AfXdp(crate::xdp::af_xdp::AfXdpTcpStream),
+}
+
+impl UpstreamL4Stream {
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Kernel(stream) => stream.local_addr(),
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(stream) => stream.local_addr(),
+        }
+    }
+
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Kernel(stream) => stream.peer_addr(),
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(stream) => stream.peer_addr(),
+        }
+    }
+
+    /// Kernel-TOA local port to release via `unregister_toa_port` —
+    /// `None` on the AF_XDP path, whose source port is owned by the dial
+    /// registry, never by the kernel TOA allocator.
+    pub fn kernel_toa_port(&self) -> Option<u16> {
+        match self {
+            Self::Kernel(stream) => stream.local_addr().ok().map(|addr| addr.port()),
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(_) => None,
+        }
+    }
+
+    /// Relay socket tuning. Kernel sockets get the sysctl-level options;
+    /// AF_XDP flows already run nodelay at the smoltcp socket and are
+    /// buffer-bounded by the reactor/memory governor instead of
+    /// SO_*BUF setsockopts.
+    pub fn configure_relay_socket(&self) {
+        match self {
+            Self::Kernel(stream) => crate::tcp_proxy::configure_relay_tcp_socket(stream),
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(_) => {}
+        }
+    }
+
+    /// Wrap into a pingora L4 stream. The AF_XDP variant reuses the same
+    /// `virtual_l4_stream` bridge as the inbound dataplane; `peer_addr`
+    /// (the upstream endpoint) is stamped into the socket digest.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    pub fn into_pingora_stream(
+        self,
+        peer_addr: SocketAddr,
+    ) -> pingora_core::protocols::l4::stream::Stream {
+        match self {
+            Self::Kernel(stream) => {
+                pingora_core::protocols::l4::stream::Stream::from(stream)
+            }
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(stream) => {
+                crate::xdp::af_xdp::virtual_l4_stream(stream, peer_addr)
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for UpstreamL4Stream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Kernel(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for UpstreamL4Stream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Kernel(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Kernel(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Kernel(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            #[cfg(target_os = "linux")]
+            Self::AfXdp(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+/// T4-6: unified upstream connect. When `xdp.upstream.mode=afxdp` the
+/// dial runs through the AF_XDP registry (explicit error when it is not
+/// armed — never a silent kernel fallback); otherwise this is the
+/// existing kernel/TOA path.
+pub async fn connect_upstream(
+    backend_addr: &str,
+    remote_addr: SocketAddr,
+    toa_config: Option<TOAConfig>,
+    connect_timeout: Duration,
+) -> Result<UpstreamL4Stream> {
+    #[cfg(target_os = "linux")]
+    {
+        if crate::xdp::afxdp_upstream_selected() {
+            return connect_upstream_afxdp(
+                backend_addr,
+                remote_addr,
+                toa_config,
+                connect_timeout,
+            )
+            .await;
+        }
+    }
+    connect_with_toa(backend_addr, remote_addr, toa_config, connect_timeout)
+        .await
+        .map(UpstreamL4Stream::Kernel)
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_upstream_afxdp(
+    backend_addr: &str,
+    remote_addr: SocketAddr,
+    toa_config: Option<TOAConfig>,
+    connect_timeout: Duration,
+) -> Result<UpstreamL4Stream> {
+    let backend = tokio::net::lookup_host(backend_addr)
+        .await
+        .with_context(|| format!("failed to resolve AF_XDP upstream {}", backend_addr))?
+        .next()
+        .ok_or_else(|| anyhow!("no socket address resolved for AF_XDP upstream {backend_addr}"))?;
+    let toa_enabled = toa_config.map(|cfg| cfg.is_on).unwrap_or(false);
+    // TOA on the AF_XDP path is a SYN option we write ourselves — the
+    // cloud_toa_sender kernel module never sees these packets (no
+    // LOCAL_OUT traversal), and its port allocator is not involved.
+    let syn_extra_options = if toa_enabled {
+        toa_syn_option_bytes(remote_addr)
+    } else {
+        Vec::new()
+    };
+    let stream = timeout(
+        connect_timeout,
+        crate::xdp::af_xdp_dial_tcp(backend, syn_extra_options),
+    )
+    .await
+    .with_context(|| format!("timed out connecting AF_XDP upstream {}", backend_addr))?
+    .with_context(|| format!("failed to connect AF_XDP upstream {}", backend_addr))?;
+    Ok(UpstreamL4Stream::AfXdp(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toa_syn_option_bytes_v4_wire_format() {
+        let client: SocketAddr = "203.0.113.7:54321".parse().unwrap();
+        let bytes = toa_syn_option_bytes(client);
+        assert_eq!(
+            bytes,
+            vec![
+                254, 8, // kind + length
+                0xD4, 0x31, // 54321 be16
+                203, 0, 113, 7, // client IPv4
+            ]
+        );
+    }
+
+    #[test]
+    fn toa_syn_option_bytes_v6_wire_format() {
+        let client: SocketAddr = "[2001:db8::1]:4321".parse().unwrap();
+        let bytes = toa_syn_option_bytes(client);
+        let mut expected = vec![254, 20];
+        expected.extend_from_slice(&4321u16.to_be_bytes());
+        expected.extend_from_slice(&"2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert_eq!(bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn connect_upstream_kernel_mode_returns_kernel_stream() {
+        let _guard = crate::runtime_mode::runtime_config_test_guard();
+        crate::runtime_mode::RuntimeConfig::set_current(
+            crate::runtime_mode::RuntimeConfig::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = listener.local_addr().unwrap().to_string();
+        let client: SocketAddr = "198.51.100.9:4444".parse().unwrap();
+        let stream = connect_upstream(
+            &backend_addr,
+            client,
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let expected: SocketAddr = backend_addr.parse().unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), expected);
+        // Kernel streams keep the kernel TOA port contract — the caller
+        // releases it via `unregister_toa_port` (a no-op when TOA is off).
+        assert!(stream.kernel_toa_port().is_some());
+        // Kernel streams still wrap into a plain pingora stream.
+        let _pingora = stream.into_pingora_stream(expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connect_upstream_afxdp_mode_without_registry_is_explicit_error() {
+        let _guard = crate::runtime_mode::runtime_config_test_guard();
+        let mut config = crate::runtime_mode::RuntimeConfig::default();
+        config.xdp.upstream = Some(crate::runtime_mode::XdpUpstreamSettings {
+            mode: crate::runtime_mode::XdpUpstreamMode::Afxdp,
+            ..Default::default()
+        });
+        crate::runtime_mode::RuntimeConfig::set_current(config);
+        let client: SocketAddr = "198.51.100.9:4444".parse().unwrap();
+        let err = match connect_upstream(
+            "127.0.0.1:1",
+            client,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            Ok(_) => panic!("afxdp mode without a live registry must fail closed"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("failed to connect AF_XDP upstream"),
+            "unexpected error: {message}"
+        );
+    }
+}
