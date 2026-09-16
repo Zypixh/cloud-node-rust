@@ -1160,7 +1160,8 @@ pub(crate) fn sum_percpu_counters<'a>(
             challenge_sent,
             challenge_rejected,
             challenge_worker_err,
-            out_ct_hit
+            out_ct_hit,
+            out_ct_icmp
         );
     }
     total

@@ -708,6 +708,11 @@ pub(crate) async fn run_queue_bridge_loop(
                         }
                     }
                 }
+                Ok(AfXdpReactorRequest::PmtuUpdate { flow, mtu }) => {
+                    // T4-7: ICMP error quoting a dialed flow — clamp the
+                    // session's send MSS to the reported next-hop MTU.
+                    tcp_reactor.apply_pmtu(&flow, mtu);
+                }
                 Err(mpsc::error::TryRecvError::Empty)
                 | Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
@@ -755,10 +760,10 @@ pub(crate) async fn run_queue_bridge_loop(
                         && owner.proto == IP_PROTO_UDP
                     {
                         if let Some(tx) = &owner.udp_tx {
-                            match tx.try_send(AfXdpUdpDatagram {
+                            match tx.try_send(AfXdpUdpIngress::Datagram(AfXdpUdpDatagram {
                                 payload: packet.payload.clone(),
                                 ecn: packet.ecn,
-                            }) {
+                            })) {
                                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
                                     // A full socket channel sheds the
                                     // datagram — UDP loss semantics, the
@@ -920,6 +925,14 @@ pub(crate) async fn run_queue_bridge_loop(
                     }
                 }
                 None => {
+                    // T4-7: eBPF redirects ICMP errors whose quoted inner
+                    // tuple matches XDP_OUT_CT — hand them to the dialed
+                    // flow's owner (TCP: reactor PmtuUpdate; UDP: socket
+                    // ingress channel). Non-matching frames stay unhandled.
+                    if let Some(icmp) = parse_icmp_error_frame(&frame) {
+                        dial_registry.notify_icmp(&icmp.flow, icmp.mtu);
+                        continue;
+                    }
                     tracing::debug!(
                         "AF_XDP proxy bridge received unparseable redirected frame interface={} queue={} bytes={}",
                         own_interface.as_ref(),

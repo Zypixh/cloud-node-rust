@@ -195,15 +195,18 @@ struct PassthroughBackendTarget {
     proxy_protocol: ProxyProtocolConfig,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 trait SniPassthroughStream: AsyncRead + AsyncWrite + Unpin {}
 
 impl<T> SniPassthroughStream for T where T: AsyncRead + AsyncWrite + Unpin {}
 
 enum SniPassthroughClient {
     Tcp(TcpStream),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Stream(Box<dyn SniPassthroughStream + Send>),
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn af_xdp_virtual_stream<S>(stream: S, client_addr: SocketAddr) -> L4Stream
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -211,11 +214,13 @@ where
     crate::xdp::af_xdp::virtual_l4_stream(stream, client_addr)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct PrefixedStream<S> {
     prefix: io::Cursor<Vec<u8>>,
     inner: S,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl<S> PrefixedStream<S> {
     fn new(prefix: Vec<u8>, inner: S) -> Self {
         Self {
@@ -1843,7 +1848,7 @@ impl HttpProxyManager {
         .await
     }
 
-    async fn handle_sni_passthrough_stream<S>(
+        async fn handle_sni_passthrough_stream<S>(
         &self,
         client_stream: S,
         client_addr: SocketAddr,

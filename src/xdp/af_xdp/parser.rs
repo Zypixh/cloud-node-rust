@@ -176,6 +176,126 @@ pub(crate) fn encode_reply_eth_header(link: &AfXdpLinkMeta, ethertype: u16, out:
     out.extend_from_slice(&ethertype.to_be_bytes());
 }
 
+/// T4-7: parsed ICMP error quoting a node-dialed outbound packet. The
+/// inner IP/L4 header supplies the dialed 5-tuple — `flow.local` is the
+/// *inner* source (our dialed endpoint) and `flow.peer` the inner
+/// destination (the upstream peer); `mtu` carries the reported
+/// next-hop/PTB MTU where the error type provides one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AfXdpIcmpError {
+    pub flow: AfXdpTcpFlowKey,
+    pub proto: u8,
+    pub mtu: Option<u32>,
+}
+
+/// Parse a redirected ICMPv4/ICMPv6 error into the dialed-flow key it
+/// quotes. Only error types that embed the offending packet are
+/// accepted; echo/info messages return `None` and stay on the kernel
+/// path (eBPF only redirects inner-tuple matches, but the userspace
+/// parse is the authoritative gate).
+pub fn parse_icmp_error_frame(frame: &[u8]) -> Option<AfXdpIcmpError> {
+    let (link, l3_offset) = parse_link_meta(frame)?;
+    match link.ethertype {
+        ETHERTYPE_IPV4 => parse_icmpv4_error(frame, l3_offset),
+        ETHERTYPE_IPV6 => parse_icmpv6_error(frame, l3_offset),
+        _ => None,
+    }
+}
+
+fn parse_icmpv4_error(frame: &[u8], ip_offset: usize) -> Option<AfXdpIcmpError> {
+    let base = frame.get(ip_offset..ip_offset + IPV4_MIN_HEADER_LEN)?;
+    if base[0] >> 4 != 4 || base[9] != IP_PROTO_ICMP {
+        return None;
+    }
+    let ihl = usize::from(base[0] & 0x0f) * 4;
+    if ihl < IPV4_MIN_HEADER_LEN {
+        return None;
+    }
+    let packet_end = ipv4_packet_end(frame, ip_offset)?;
+    let icmp = frame.get(ip_offset + ihl..packet_end)?;
+    let icmp_type = icmp[0];
+    let icmp_code = icmp[1];
+    // Errors that quote the offending datagram: dest-unreach (3),
+    // source-quench (4, deprecated but quoted), redirect (5),
+    // time-exceeded (11), parameter-problem (12).
+    if !matches!(icmp_type, 3 | 4 | 5 | 11 | 12) {
+        return None;
+    }
+    let mtu = (icmp_type == 3 && icmp_code == 4)
+        .then(|| u32::from(u16::from_be_bytes([icmp[6], icmp[7]])))
+        .filter(|mtu| *mtu > 0);
+    let inner = icmp.get(8..)?;
+    let (flow, proto) = parse_quoted_tuple(inner, 4)?;
+    Some(AfXdpIcmpError { flow, proto, mtu })
+}
+
+fn parse_icmpv6_error(frame: &[u8], ip_offset: usize) -> Option<AfXdpIcmpError> {
+    let base = frame.get(ip_offset..ip_offset + IPV6_HEADER_LEN)?;
+    if base[0] >> 4 != 6 || base[6] != IP_PROTO_ICMPV6 {
+        return None;
+    }
+    let packet_end = ipv6_packet_end(frame, ip_offset)?;
+    let icmp = frame.get(ip_offset + IPV6_HEADER_LEN..packet_end)?;
+    if icmp.len() < 8 {
+        return None;
+    }
+    let icmp_type = icmp[0];
+    // ICMPv6 errors 1–4 (dest-unreach, packet-too-big, time-exceeded,
+    // parameter-problem) all quote the offending packet.
+    if !(1..=4).contains(&icmp_type) {
+        return None;
+    }
+    let mtu = (icmp_type == 2)
+        .then(|| u32::from_be_bytes([icmp[4], icmp[5], icmp[6], icmp[7]]))
+        .filter(|mtu| *mtu > 0);
+    let inner = icmp.get(8..)?;
+    let (flow, proto) = parse_quoted_tuple(inner, 6)?;
+    Some(AfXdpIcmpError { flow, proto, mtu })
+}
+
+/// Extract the dialed 5-tuple from a quoted inner IP datagram.
+/// `family` is 4 or 6; extension headers in a quoted IPv6 packet are
+/// walked the same way as live traffic.
+fn parse_quoted_tuple(inner: &[u8], family: u8) -> Option<(AfXdpTcpFlowKey, u8)> {
+    let (proto, source, destination, l4_offset, l4_end) = if family == 4 {
+        let base = inner.get(..IPV4_MIN_HEADER_LEN)?;
+        if base[0] >> 4 != 4 {
+            return None;
+        }
+        let ihl = usize::from(base[0] & 0x0f) * 4;
+        if ihl < IPV4_MIN_HEADER_LEN || inner.len() < ihl + 4 {
+            return None;
+        }
+        (
+            base[9],
+            IpAddr::V4(Ipv4Addr::new(base[12], base[13], base[14], base[15])),
+            IpAddr::V4(Ipv4Addr::new(base[16], base[17], base[18], base[19])),
+            ihl,
+            inner.len(),
+        )
+    } else {
+        let base = inner.get(..IPV6_HEADER_LEN)?;
+        if base[0] >> 4 != 6 {
+            return None;
+        }
+        let source = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&base[8..24]).ok()?));
+        let destination =
+            IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&base[24..40]).ok()?));
+        let (proto, l4_offset) =
+            ipv6_transport_offset(inner, base[6], IPV6_HEADER_LEN, inner.len())?;
+        (proto, source, destination, l4_offset, inner.len())
+    };
+    if !matches!(proto, IP_PROTO_TCP | IP_PROTO_UDP) || l4_offset + 4 > l4_end {
+        return None;
+    }
+    let ports = &inner[l4_offset..l4_offset + 4];
+    let flow = AfXdpTcpFlowKey {
+        local_addr: SocketAddr::new(source, u16::from_be_bytes([ports[0], ports[1]])),
+        peer_addr: SocketAddr::new(destination, u16::from_be_bytes([ports[2], ports[3]])),
+    };
+    Some((flow, proto))
+}
+
 pub(crate) fn udp_checksum(source: IpAddr, destination: IpAddr, udp_packet: &[u8]) -> Option<u16> {
     let pseudo_sum = match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
@@ -696,11 +816,6 @@ pub(crate) fn read_u16(buf: &[u8], offset: usize) -> Option<u16> {
 // parse parity (T01) — the proxy dataplane itself still uses the Option-based
 // parsers above; classification is additive observability.
 // ---------------------------------------------------------------------------
-
-#[cfg(test)]
-const IP_PROTO_ICMP: u8 = 1;
-#[cfg(test)]
-const IP_PROTO_ICMPV6: u8 = 58;
 
 /// Mirror of the eBPF parse classes (XDP_CLASS_* in cloud-node-xdp-common),
 /// plus NonIp for frames the kernel program passes without classifying.

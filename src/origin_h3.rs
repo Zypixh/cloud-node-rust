@@ -220,10 +220,15 @@ mod af_xdp_quinn {
                     *pending = None;
                     Poll::Ready(Ok(()))
                 }
-                Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "AF_XDP UDP egress queue closed",
-                ))),
+                Poll::Ready(Err(_)) => {
+                    // Clear the resolved future — a completed
+                    // `reserve_owned` must never be polled again.
+                    *pending = None;
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "AF_XDP UDP egress queue closed",
+                    )))
+                }
                 Poll::Pending => Poll::Pending,
             }
         }

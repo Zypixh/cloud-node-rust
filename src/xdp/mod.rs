@@ -216,6 +216,10 @@ pub struct XdpStatusSnapshot {
     /// dial-flow demux.
     #[serde(default)]
     pub out_ct_hit: u64,
+    /// T4-7: ICMP errors claimed by XDP_OUT_CT on the quoted inner
+    /// tuple — the PMTU/error delivery path to dialed flows.
+    #[serde(default)]
+    pub out_ct_icmp: u64,
     /// T4 (D-B1): configured upstream dataplane ("kernel" / "afxdp").
     #[serde(default)]
     pub upstream_mode: String,
@@ -369,6 +373,7 @@ pub(crate) struct XdpManager {
     challenge_rejected: AtomicU64,
     challenge_worker_err: AtomicU64,
     out_ct_hit: AtomicU64,
+    out_ct_icmp: AtomicU64,
     rate_limit_active: AtomicU64,
     rate_limit_detail: parking_lot::Mutex<String>,
     /// EN-10: owner generation written to XDP_OWNER_EPOCH at attach.
@@ -488,6 +493,7 @@ impl XdpManager {
             challenge_rejected: AtomicU64::new(0),
             challenge_worker_err: AtomicU64::new(0),
             out_ct_hit: AtomicU64::new(0),
+            out_ct_icmp: AtomicU64::new(0),
             rate_limit_active: AtomicU64::new(0),
             rate_limit_detail: parking_lot::Mutex::new(String::new()),
             owner_epoch: AtomicU64::new(0),
@@ -1224,6 +1230,7 @@ impl XdpManager {
             challenge_rejected: self.challenge_rejected.load(Ordering::Relaxed),
             challenge_worker_err: self.challenge_worker_err.load(Ordering::Relaxed),
             out_ct_hit: self.out_ct_hit.load(Ordering::Relaxed),
+            out_ct_icmp: self.out_ct_icmp.load(Ordering::Relaxed),
             upstream_mode: match self.config.upstream_mode() {
                 XdpUpstreamMode::Kernel => "kernel".to_string(),
                 XdpUpstreamMode::Afxdp => "afxdp".to_string(),
@@ -2080,6 +2087,8 @@ impl XdpManager {
                     .store(counters.challenge_worker_err, Ordering::Relaxed);
                 self.out_ct_hit
                     .store(counters.out_ct_hit, Ordering::Relaxed);
+                self.out_ct_icmp
+                    .store(counters.out_ct_icmp, Ordering::Relaxed);
                 self.flow_event_lost
                     .store(counters.flow_event_lost, Ordering::Relaxed);
             }
@@ -2161,6 +2170,7 @@ impl XdpManager {
                     "challengeRejected": c.challenge_rejected,
                     "challengeWorkerErr": c.challenge_worker_err,
                     "outCtHit": c.out_ct_hit,
+                    "outCtIcmp": c.out_ct_icmp,
                     "flowEventLost": c.flow_event_lost,
                 })
             })

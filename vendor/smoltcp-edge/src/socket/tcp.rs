@@ -559,6 +559,17 @@ pub struct Socket<'a> {
     /// `congestion_controller` is left installed but unused.
     ext_transport: Option<transport_ext::ExtTransport>,
 
+    /// smoltcp-edge (T4-7): ICMP-driven path-MTU cap — the largest IP
+    /// datagram size the path to the peer accepts, as reported by PTB
+    /// errors delivered through the AF_XDP dial registry. `None` = the
+    /// interface MTU governs.
+    path_mtu_cap: Option<usize>,
+    /// RFC 4821-style blackhole recovery: repeated RTOs without
+    /// cumulative-ACK progress arm probing at `PMTU_PROBE_MSS`; any ACK
+    /// advance or explicit `set_path_mtu` disarms it.
+    pmtu_probe_floor: bool,
+    rto_no_progress: u8,
+
     /// smoltcp-edge (T3): dynamic advertised-window cap, applied to the
     /// receive window before scaling. Lets the upper layer shrink rwnd
     /// for backpressure without shrinking the buffer.
@@ -618,6 +629,15 @@ const DEFAULT_MSS: usize = 536;
 /// timestamps) so that every segment carries some payload.
 const MIN_REMOTE_MSS: usize = 48;
 
+/// smoltcp-edge (T4-7): RFC 4821 search-low probe payload. 512 bytes of
+/// TCP data plus headers stays under the IPv4 576 / IPv6 1280 minimum
+/// MTUs on any conforming path.
+const PMTU_PROBE_MSS: usize = 512;
+
+/// Consecutive RTOs without cumulative-ACK progress before the
+/// blackhole probe arms — one strike can still be ordinary loss.
+const PMTU_BLACKHOLE_RTO_THRESHOLD: u8 = 2;
+
 impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
@@ -667,6 +687,9 @@ impl<'a> Socket<'a> {
             local_rx_dup_acks: 0,
             pending_fast_retransmit: false,
             ext_transport: None,
+            path_mtu_cap: None,
+            pmtu_probe_floor: false,
+            rto_no_progress: 0,
             rx_window_cap: None,
             last_rx_duplicate_range: None,
             syn_extra_options: None,
@@ -797,6 +820,71 @@ impl<'a> Socket<'a> {
         }
         self.syn_extra_options = Some(options.into());
         Ok(())
+    }
+
+    /// smoltcp-edge (T4-7): install an ICMP-driven path-MTU cap. `mtu`
+    /// is the maximum IP datagram size from the PTB error; the cap
+    /// clamps every new segment's effective MSS and disarms the RFC
+    /// 4821 blackhole probe (an explicit report supersedes search-low).
+    /// The stored cap is floored at headers + `MIN_REMOTE_MSS` so a
+    /// bogus small report can never wedge the connection below the
+    /// minimum legal segment.
+    pub fn set_path_mtu(&mut self, mtu: usize) {
+        let ip_header_len = match self.tuple.map(|t| t.local.addr) {
+            #[cfg(feature = "proto-ipv4")]
+            Some(IpAddress::Ipv4(_)) => crate::wire::IPV4_HEADER_LEN,
+            #[cfg(feature = "proto-ipv6")]
+            Some(IpAddress::Ipv6(_)) => crate::wire::IPV6_HEADER_LEN,
+            _ => crate::wire::IPV4_HEADER_LEN,
+        };
+        self.path_mtu_cap = Some(mtu.max(ip_header_len + TCP_HEADER_LEN + MIN_REMOTE_MSS));
+        self.pmtu_probe_floor = false;
+        self.rto_no_progress = 0;
+        if self.ext_transport.is_some() {
+            // The controller sizes its cwnd in MSS units — hand it the
+            // new effective value (`usize::MAX` drops the interface
+            // term; remote MSS and the fresh cap still bind).
+            let mss = self.effective_send_mss(usize::MAX) as u64;
+            if let Some(ext) = &mut self.ext_transport {
+                ext.cc.on_mss_update(mss);
+            }
+        }
+    }
+
+    /// The installed ICMP path-MTU cap, if any.
+    pub fn path_mtu(&self) -> Option<usize> {
+        self.path_mtu_cap
+    }
+
+    /// Effective send-side MSS: interface MTU and remote MSS as before,
+    /// additionally clamped by the ICMP path-MTU cap and the RFC 4821
+    /// blackhole-probe floor. `interface_mss` is the caller's resolved
+    /// `cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN`.
+    fn effective_send_mss(&self, interface_mss: usize) -> usize {
+        // `remote_mss` is already floored at MIN_REMOTE_MSS when the
+        // peer's option is accepted — do not re-floor the result here,
+        // or a deliberately small remote MSS (tests, tiny-path links)
+        // would be silently widened.
+        let mut mss = interface_mss.min(self.remote_mss);
+        if let Some(cap) = self.path_mtu_cap {
+            // `cap` is an IP datagram size — subtract the same headers,
+            // floored so a bogus report still leaves a legal segment.
+            let ip_header_len = match self.tuple.map(|t| t.local.addr) {
+                #[cfg(feature = "proto-ipv4")]
+                Some(IpAddress::Ipv4(_)) => crate::wire::IPV4_HEADER_LEN,
+                #[cfg(feature = "proto-ipv6")]
+                Some(IpAddress::Ipv6(_)) => crate::wire::IPV6_HEADER_LEN,
+                _ => crate::wire::IPV4_HEADER_LEN,
+            };
+            mss = mss.min(
+                cap.saturating_sub(ip_header_len + TCP_HEADER_LEN)
+                    .max(MIN_REMOTE_MSS),
+            );
+        }
+        if self.pmtu_probe_floor {
+            mss = mss.min(PMTU_PROBE_MSS);
+        }
+        mss
     }
 
     /// Set an algorithm for congestion control.
@@ -2411,7 +2499,14 @@ impl<'a> Socket<'a> {
 
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
+            let progressed = ack_number > self.local_seq_no;
             self.local_seq_no = ack_number;
+            // smoltcp-edge (T4-7): cumulative progress ends blackhole
+            // probing — the path forwards full-size segments again.
+            if progressed {
+                self.rto_no_progress = 0;
+                self.pmtu_probe_floor = false;
+            }
 
             // During retransmission, if an earlier segment got lost but later was
             // successfully received, self.local_seq_no can move past self.remote_last_seq.
@@ -2591,7 +2686,9 @@ impl<'a> Socket<'a> {
         };
 
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
-        let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+        // smoltcp-edge (T4-7): path-MTU cap and blackhole-probe floor
+        // clamp the segment size on top of interface MTU and remote MSS.
+        let effective_mss = self.effective_send_mss(local_mss).saturating_sub(options_len);
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
@@ -2755,6 +2852,18 @@ impl<'a> Socket<'a> {
             if let Timer::Retransmit { .. } = self.timer {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
                 net_debug!("retransmitting after rto");
+
+                // smoltcp-edge (T4-7): RFC 4821 blackhole recovery —
+                // repeated RTOs without cumulative-ACK progress arm the
+                // search-low probe so the next segments go out at
+                // PMTU_PROBE_MSS. Skipped while an ICMP cap is installed:
+                // a reported PTB already carries the path's answer.
+                self.rto_no_progress = self.rto_no_progress.saturating_add(1);
+                if self.rto_no_progress >= PMTU_BLACKHOLE_RTO_THRESHOLD
+                    && self.path_mtu_cap.is_none()
+                {
+                    self.pmtu_probe_floor = true;
+                }
 
                 if let Some(ext) = &mut self.ext_transport {
                     // smoltcp-edge: scoreboard-driven recovery. Mark
@@ -2934,7 +3043,8 @@ impl<'a> Socket<'a> {
                 // 4. Our congestion window
                 let options_len = repr.header_len() - TCP_HEADER_LEN;
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
-                let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+                let effective_mss =
+                    self.effective_send_mss(local_mss).saturating_sub(options_len);
 
                 let offset = if self.pending_fast_retransmit {
                     let size = effective_mss.min(self.tx_buffer.len());
@@ -10495,6 +10605,103 @@ mod test {
         let snap = s.transport_snapshot().unwrap();
         // Loss event cut cwnd toward beta*cwnd (0.7*4096 = 2867).
         assert!(snap.cwnd_bytes < 4 * 1024);
+    }
+
+    // =================================================================//
+    // T4-7: ICMP path-MTU clamping and RFC 4821 blackhole probing
+    // =================================================================//
+
+    #[test]
+    fn test_set_path_mtu_clamps_segment_size() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.remote_mss = 1460;
+        s.remote_win_len = 65535;
+        // PTB reports an IP datagram size; the effective MSS subtracts
+        // IP + TCP headers (v4: 1200 - 40 = 1160, v6: 1200 - 60 = 1140).
+        s.set_path_mtu(1200);
+        assert_eq!(s.path_mtu(), Some(1200));
+        let mss = if matches!(LOCAL_END.addr, IpAddress::Ipv4(_)) {
+            1160usize
+        } else {
+            1140usize
+        };
+        let data = [b'x'; 4096];
+        s.send_slice(&data[..]).unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &data[..mss],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_set_path_mtu_floors_bogus_small_values() {
+        let mut s = socket_established();
+        // A PTB below the header budget must not wedge the connection:
+        // the cap floors at headers + MIN_REMOTE_MSS.
+        s.set_path_mtu(10);
+        let floor = if matches!(LOCAL_END.addr, IpAddress::Ipv4(_)) {
+            20 + 20 + MIN_REMOTE_MSS
+        } else {
+            40 + 20 + MIN_REMOTE_MSS
+        };
+        assert_eq!(s.path_mtu(), Some(floor));
+        assert_eq!(s.effective_send_mss(usize::MAX), MIN_REMOTE_MSS);
+    }
+
+    #[test]
+    fn test_pmtu_report_disarms_blackhole_probe() {
+        let mut s = socket_established();
+        s.rto_no_progress = PMTU_BLACKHOLE_RTO_THRESHOLD;
+        s.pmtu_probe_floor = true;
+        s.set_path_mtu(1400);
+        assert!(!s.pmtu_probe_floor);
+        assert_eq!(s.rto_no_progress, 0);
+    }
+
+    #[test]
+    fn test_rto_blackhole_probe_arms_and_ack_disarms() {
+        let mut s = socket_established();
+        s.send_slice(b"abcdef").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+
+        // First RTO without ACK progress: probe not yet armed.
+        let rto = s.rtte.retransmission_timeout().total_millis() as i64;
+        recv!(s, time rto, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(!s.pmtu_probe_floor);
+
+        // Second consecutive RTO (exponential backoff lands at 3*rto):
+        // the RFC 4821 search-low probe arms.
+        recv!(s, time 3 * rto, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abcdef"[..],
+            ..RECV_TEMPL
+        }));
+        assert!(s.pmtu_probe_floor);
+        assert_eq!(s.effective_send_mss(usize::MAX), PMTU_PROBE_MSS);
+
+        // Cumulative ACK progress ends probing — the path forwards
+        // full-size segments again.
+        send!(s, time 3 * rto + 1, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            window_len: 65535,
+            ..SEND_TEMPL
+        });
+        assert!(!s.pmtu_probe_floor);
+        assert_eq!(s.rto_no_progress, 0);
     }
 }
 
