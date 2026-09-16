@@ -350,6 +350,169 @@ async fn proxy_reload_smoke_inner(
     result
 }
 
+/// T4-8: attach AF_XDP and open a real userspace-TCP dial to an on-wire
+/// target, then hold the session for `duration` so the out-CT / ICMP PMTU
+/// path can be exercised with live traffic. The ready file carries the
+/// dialed flow's local endpoint so an orchestrator can quote that exact
+/// tuple in crafted ICMP errors. Failure to dial is an explicit error —
+/// never a kernel fallback.
+#[cfg(target_os = "linux")]
+pub async fn dial_smoke(
+    target: std::net::SocketAddr,
+    duration: std::time::Duration,
+    ready_file: Option<std::path::PathBuf>,
+    payload: Vec<u8>,
+    send_interval: std::time::Duration,
+) -> anyhow::Result<serde_json::Value> {
+    af_xdp::reset_tcp_diag();
+    let manager = manager_from_runtime();
+    let ports = xdp_proxy_smoke_ports(&manager.config)?;
+    manager.initialize().await?;
+    start_rule_sweeper(&manager);
+    let services = match XdpProxySmokeServices::start().await {
+        Ok(services) => services,
+        Err(err) => {
+            if let Err(detach_err) = detach(false).await {
+                tracing::warn!("failed to detach XDP after dial smoke setup error: {detach_err}");
+            }
+            return Err(err);
+        }
+    };
+    let (quic_demux, tcp_manager, http_manager) =
+        match xdp_proxy_smoke_managers(&services, &ports).await {
+            Ok(managers) => managers,
+            Err(err) => {
+                services.abort();
+                if let Err(detach_err) = detach(false).await {
+                    tracing::warn!(
+                        "failed to detach XDP after dial smoke manager setup error: {detach_err}"
+                    );
+                }
+                return Err(err);
+            }
+        };
+    let bridge = tokio::spawn(af_xdp::start_proxy_bridge(
+        quic_demux,
+        tcp_manager,
+        http_manager,
+    ));
+    let result =
+        dial_smoke_inner(manager, target, duration, ready_file, payload, send_interval, &bridge)
+            .await;
+    bridge.abort();
+    let _ = bridge.await;
+    services.abort();
+    if let Err(err) = detach(false).await {
+        tracing::warn!("failed to detach XDP after dial smoke: {}", err);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+async fn dial_smoke_inner(
+    manager: std::sync::Arc<XdpManager>,
+    target: std::net::SocketAddr,
+    duration: std::time::Duration,
+    ready_file: Option<std::path::PathBuf>,
+    payload: Vec<u8>,
+    send_interval: std::time::Duration,
+    bridge: &tokio::task::JoinHandle<()>,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    use futures_util::FutureExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    wait_for_proxy_smoke_ready(&manager, duration, bridge).await?;
+    let dial_timeout = duration.min(std::time::Duration::from_secs(15));
+    let mut stream = tokio::time::timeout(dial_timeout, af_xdp_dial_tcp(target, Vec::new()))
+        .await
+        .with_context(|| format!("timed out AF_XDP dialing {target}"))?
+        .map_err(|err| anyhow::anyhow!("AF_XDP dial {target} failed: {err}"))?;
+    let local = stream
+        .local_addr()
+        .map_err(|err| anyhow::anyhow!("AF_XDP stream has no local addr: {err}"))?;
+    if let Some(path) = ready_file.as_ref() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "ready": true,
+                "local": local.to_string(),
+                "peer": target.to_string(),
+            }))?,
+        )?;
+    }
+    let mut sent = 0u64;
+    let mut received = 0u64;
+    let mut io_error: Option<String> = None;
+    let mut send_tick = if send_interval.is_zero() {
+        None
+    } else {
+        let mut tick =
+            tokio::time::interval_at(tokio::time::Instant::now(), send_interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Some(tick)
+    };
+    // A zero interval still sends the payload once at session start.
+    let mut send_once = !payload.is_empty();
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut buf = vec![0u8; 8192];
+    while tokio::time::Instant::now() < deadline && io_error.is_none() {
+        let due = send_once
+            || send_tick
+                .as_mut()
+                .map(|tick| tick.tick().now_or_never().is_some())
+                .unwrap_or(false);
+        if due && !payload.is_empty() {
+            match stream.write_all(&payload).await {
+                Ok(()) => sent = sent.saturating_add(payload.len() as u64),
+                Err(err) => io_error = Some(err.to_string()),
+            }
+            send_once = false;
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(
+            remaining.min(std::time::Duration::from_millis(100)),
+            stream.read(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => received = received.saturating_add(n as u64),
+            Ok(Err(err)) => io_error = Some(err.to_string()),
+            Err(_) => {}
+        }
+    }
+    let status = manager.status();
+    Ok(serde_json::json!({
+        "durationMillis": duration.as_millis(),
+        "target": target.to_string(),
+        "local": local.to_string(),
+        "sent": sent,
+        "received": received,
+        "ioError": io_error,
+        "proxyReady": status.proxy_ready,
+        "proxyRedirectEnabled": status.proxy_redirect_enabled,
+        "tcpDataplaneReady": status.tcp_dataplane_ready,
+        "xskReadyQueues": status.xsk_ready_queues,
+        "packets": status.packets,
+        "pass": status.pass,
+        "drop": status.drop,
+        "redirect": status.redirect,
+        "outCtHit": status.out_ct_hit,
+        "outCtIcmp": status.out_ct_icmp,
+        "xskDrops": status.xsk_drops,
+        "tcpDiag": af_xdp::tcp_diag_snapshot(),
+    }))
+}
+
 #[cfg(target_os = "linux")]
 async fn proxy_smoke_inner(
     manager: std::sync::Arc<XdpManager>,
@@ -1234,4 +1397,15 @@ pub async fn proxy_reload_smoke(
     _ready_file: Option<std::path::PathBuf>,
 ) -> anyhow::Result<serde_json::Value> {
     anyhow::bail!("XDP proxy reload smoke is supported on Linux only")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn dial_smoke(
+    _target: std::net::SocketAddr,
+    _duration: std::time::Duration,
+    _ready_file: Option<std::path::PathBuf>,
+    _payload: Vec<u8>,
+    _send_interval: std::time::Duration,
+) -> anyhow::Result<serde_json::Value> {
+    anyhow::bail!("XDP dial smoke is supported on Linux only")
 }
