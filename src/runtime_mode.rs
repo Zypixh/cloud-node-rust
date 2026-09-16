@@ -472,6 +472,61 @@ impl Default for XdpRateLimitSettings {
     }
 }
 
+/// T4 (D-B1): node-originated upstream dataplane selection. `kernel`
+/// keeps the existing connect() path; `afxdp` routes upstream TCP through
+/// the AF_XDP reactor (dial registry + XDP_OUT_CT). The kernel guard and
+/// reserved source-port range only apply in `afxdp` mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum XdpUpstreamMode {
+    #[default]
+    Kernel,
+    Afxdp,
+}
+
+/// T4 (D-B1): outbound-dial settings. `dialPortStart`/`dialPortEnd`
+/// (inclusive) define the reserved source-port span — default
+/// 40000-49999. The range must lie inside `ip_local_port_range`; it is
+/// pinned via `ip_local_reserved_ports` and guarded by a netfilter DROP
+/// so the kernel can neither allocate the ports nor RST steered flows.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpUpstreamSettings {
+    #[serde(default)]
+    pub mode: XdpUpstreamMode,
+    #[serde(rename = "dialPortStart", default)]
+    pub dial_port_start: Option<u16>,
+    #[serde(rename = "dialPortEnd", default)]
+    pub dial_port_end: Option<u16>,
+}
+
+impl XdpUpstreamSettings {
+    /// Resolved reserved span (start, end inclusive), applying defaults.
+    pub fn dial_port_range(&self) -> (u16, u16) {
+        (
+            self.dial_port_start.unwrap_or(40_000),
+            self.dial_port_end.unwrap_or(49_999),
+        )
+    }
+
+    /// The span is valid when non-empty and inside the kernel ephemeral
+    /// range — validated again at guard-install time against the live
+    /// `ip_local_port_range` value.
+    pub fn dial_port_range_valid(&self) -> bool {
+        let (start, end) = self.dial_port_range();
+        start <= end
+    }
+}
+
+impl Default for XdpUpstreamSettings {
+    fn default() -> Self {
+        Self {
+            mode: XdpUpstreamMode::Kernel,
+            dial_port_start: None,
+            dial_port_end: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct XdpConfig {
     #[serde(default)]
@@ -504,6 +559,25 @@ pub struct XdpConfig {
     /// attach when the projected total exceeds the node budget.
     #[serde(rename = "stateTables", default)]
     pub state_tables: Option<XdpStateTables>,
+    /// T4 (D-B1): node-originated upstream dataplane — `kernel` (default)
+    /// or `afxdp`. See `XdpUpstreamSettings`.
+    #[serde(rename = "upstream", default)]
+    pub upstream: Option<XdpUpstreamSettings>,
+}
+
+impl XdpConfig {
+    /// Resolved upstream dataplane mode (`kernel` when unconfigured).
+    pub fn upstream_mode(&self) -> XdpUpstreamMode {
+        self.upstream.as_ref().map(|u| u.mode).unwrap_or_default()
+    }
+
+    /// Resolved reserved source-port span for AF_XDP dials.
+    pub fn dial_port_range(&self) -> (u16, u16) {
+        self.upstream
+            .as_ref()
+            .map(|u| u.dial_port_range())
+            .unwrap_or((40_000, 49_999))
+    }
 }
 
 /// Operator-sized eBPF state tables (EN-16). Absent = built-in production
@@ -886,6 +960,15 @@ impl RuntimeConfig {
                     port.port
                 );
             }
+        }
+        if let Some(upstream) = &self.xdp.upstream {
+            if !upstream.dial_port_range_valid() {
+                let (start, end) = upstream.dial_port_range();
+                anyhow::bail!("xdp.upstream dialPortRange is empty: {start}-{end}");
+            }
+            // The span must additionally lie inside the live
+            // ip_local_port_range — that check runs at guard-install
+            // time against the kernel value.
         }
         Ok(())
     }

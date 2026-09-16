@@ -871,6 +871,11 @@ pub struct Repr<'a> {
     /// smoltcp-edge (T3): Congestion Window Reduced flag, plumbed
     /// through the repr for the same reason as `ecn_echo`.
     pub cwr: bool,
+    /// smoltcp-edge (T4): raw option bytes emitted verbatim after the
+    /// standard options (TOA kind 254 on dialed SYNs). Emit-only —
+    /// `parse` never populates it; unknown incoming options are
+    /// already tolerated as `TcpOption::Unknown`.
+    pub extra_options: &'a [u8],
     pub payload: &'a [u8],
 }
 
@@ -990,6 +995,7 @@ impl<'a> Repr<'a> {
             window_len: packet.window_len(),
             window_scale: window_scale,
             max_seg_size: max_seg_size,
+            extra_options: &[],
             sack_permitted: sack_permitted,
             sack_ranges: sack_ranges,
             timestamp: timestamp,
@@ -1017,6 +1023,7 @@ impl<'a> Repr<'a> {
         if self.timestamp.is_some() {
             length += 10;
         }
+        length += self.extra_options.len();
         let sack_range_len: usize = self
             .sack_ranges
             .iter()
@@ -1088,6 +1095,14 @@ impl<'a> Repr<'a> {
                     tsecr: timestamp.tsecr,
                 }
                 .emit(tmp);
+            }
+            // smoltcp-edge (T4): verbatim option bytes (e.g. TOA kind
+            // 254) — the caller is responsible for kind/length
+            // encoding and the 40-byte options budget.
+            if !self.extra_options.is_empty() {
+                let n = self.extra_options.len().min(options.len());
+                options[..n].copy_from_slice(&self.extra_options[..n]);
+                options = &mut options[n..];
             }
 
             if !options.is_empty() {
@@ -1350,6 +1365,7 @@ mod test {
             timestamp: None,
             ecn_echo: false,
             cwr: false,
+            extra_options: &[],
             payload: &PAYLOAD_BYTES,
         }
     }

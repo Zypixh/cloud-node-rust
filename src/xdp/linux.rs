@@ -7,12 +7,13 @@ use aya::maps::{Array, HashMap as AyaHashMap, LpmTrie, PerCpuArray, XskMap};
 use aya::programs::links::PinnedLink;
 use cloud_node_xdp_common::{
     XdpBudgetConfig, XdpCounters, XdpFlowAcct, XdpInterfacePolicy, XdpIpv4Key,
-    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey, XdpQueueKey,
-    XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey, XdpSnatRevValue, XdpUdpCtKey,
-    XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
+    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpOutCtKey, XdpOutCtValue, XdpPendingCap,
+    XdpPortProtoKey, XdpQueueKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
+    XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
 };
 use ipnet::IpNet;
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::ffi::CString;
 use std::io::Write;
 use std::num::NonZeroU32;
@@ -673,6 +674,7 @@ pub async fn attach(
         "XDP_TCP_CT",
         "XDP_UDP_CT",
         "XDP_PENDING",
+        "XDP_OUT_CT",
         "XDP_SNAT_REV",
         "XDP_FLOW_ACCT",
         "XDP_FLOW_EVENTS",
@@ -1155,7 +1157,8 @@ pub(crate) fn sum_percpu_counters<'a>(
             svc_budget_full,
             challenge_sent,
             challenge_rejected,
-            challenge_worker_err
+            challenge_worker_err,
+            out_ct_hit
         );
     }
     total
@@ -1455,6 +1458,68 @@ pub fn disable_queue_redirect(
     Ok(true)
 }
 
+/// T4: build the XDP_OUT_CT key for a node-dialed flow. IPv4 addresses
+/// live in the first 4 bytes of the 16-byte field — the same encoding
+/// the eBPF lookup applies (`v4_embed`), not the ::ffff: mapped form.
+/// Returns None for a mismatched-family pair (v4 local + v6 remote or
+/// vice versa) — that pair can never exist on the wire, so the caller
+/// fails the dial instead of inserting a dead entry.
+pub fn out_ct_key(
+    local: SocketAddr,
+    remote: SocketAddr,
+    proto: u8,
+) -> Option<XdpOutCtKey> {
+    let (local_addr, remote_addr, family) = match (local, remote) {
+        (SocketAddr::V4(local), SocketAddr::V4(remote)) => (
+            v4_embed(*local.ip()),
+            v4_embed(*remote.ip()),
+            4u8,
+        ),
+        (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+            (local.ip().octets(), remote.ip().octets(), 6u8)
+        }
+        _ => return None,
+    };
+    Some(XdpOutCtKey {
+        local_addr,
+        remote_addr,
+        local_port_be: local.port().to_be(),
+        remote_port_be: remote.port().to_be(),
+        family,
+        proto,
+        _pad: [0; 2],
+    })
+}
+
+/// T4: register a node-dialed flow so its replies redirect to the
+/// ingress queue's XSK instead of passing to the kernel (which would
+/// RST the handshake). Insert happens before the SYN leaves so no reply
+/// window exists where the tuple is unclaimed.
+pub fn upsert_out_ct(ebpf: &mut aya::Ebpf, key: XdpOutCtKey) -> anyhow::Result<()> {
+    let map = ebpf
+        .map_mut("XDP_OUT_CT")
+        .ok_or_else(|| anyhow::anyhow!("missing map XDP_OUT_CT"))?;
+    let mut map = AyaHashMap::<_, XdpOutCtKey, XdpOutCtValue>::try_from(map)?;
+    // Observability-only timestamp; the datapath never reads the value.
+    let created_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    map.insert(key, XdpOutCtValue { created_ns }, 0)?;
+    Ok(())
+}
+
+/// T4: delete a dialed flow at close — replies arriving after deletion
+/// fall back to the kernel path, which is correct (the flow is gone).
+pub fn remove_out_ct(ebpf: &mut aya::Ebpf, key: &XdpOutCtKey) -> anyhow::Result<()> {
+    let map = ebpf
+        .map_mut("XDP_OUT_CT")
+        .ok_or_else(|| anyhow::anyhow!("missing map XDP_OUT_CT"))?;
+    let mut map = AyaHashMap::<_, XdpOutCtKey, XdpOutCtValue>::try_from(map)?;
+    map.remove(key)?;
+    Ok(())
+}
+
 /// Program explicit UDP direct-forward rules. Each entry needs a resolved
 /// backend address and a next-hop MAC (from config or the neighbor table).
 /// Unresolvable entries are skipped with a warning so the listen tuple
@@ -1639,7 +1704,15 @@ fn resolve_next_hop_mac(target: IpAddr) -> anyhow::Result<[u8; 6]> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| target.to_string());
-    let neigh = run_ip_json(&["neigh", "show", "to", &next_hop])?;
+    resolve_neighbor_mac(&next_hop)
+        .map_err(|err| anyhow::anyhow!("{err} (route to {target})"))
+}
+
+/// T4: link-layer address of a resolved next hop — refuses entries whose
+/// neighbor state is failed/incomplete so a dial never emits frames to a
+/// black-hole MAC.
+fn resolve_neighbor_mac(next_hop: &str) -> anyhow::Result<[u8; 6]> {
+    let neigh = run_ip_json(&["neigh", "show", "to", next_hop])?;
     for entry in &neigh {
         let Some(lladdr) = entry.get("lladdr").and_then(|v| v.as_str()) else {
             continue;
@@ -1661,7 +1734,65 @@ fn resolve_next_hop_mac(target: IpAddr) -> anyhow::Result<[u8; 6]> {
                 .map_err(|err| anyhow::anyhow!("neighbor {next_hop} lladdr {lladdr}: {err}"));
         }
     }
-    anyhow::bail!("no usable neighbor entry for {next_hop} (route to {target})")
+    anyhow::bail!("no usable neighbor entry for {next_hop}")
+}
+
+/// T4: fully resolved outbound route for a node-dialed flow.
+pub(crate) struct XdpOutboundRoute {
+    /// Egress interface name from the routing table — must match an
+    /// AF_XDP proxy interface; the registry refuses the dial otherwise.
+    pub interface: String,
+    /// Kernel-selected source address (`prefsrc`) for the target.
+    pub source: IpAddr,
+    /// Next-hop destination MAC (gateway, or the on-link target itself).
+    pub destination_mac: [u8; 6],
+    /// Egress interface source MAC.
+    pub source_mac: [u8; 6],
+}
+
+/// T4: resolve the egress interface, source address and both MACs for a
+/// node-dialed flow in one pass. Every failure is explicit — a dial that
+/// cannot resolve a real route/neighbor fails rather than emitting
+/// frames with a guessed L2 header.
+pub(crate) fn resolve_outbound_route(target: IpAddr) -> anyhow::Result<XdpOutboundRoute> {
+    let route = run_ip_json(&["route", "get", &target.to_string()])?;
+    let entry = route
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no route to {target}"))?;
+    let interface = entry
+        .get("dev")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("route to {target} has no egress device"))?
+        .to_string();
+    let source: IpAddr = entry
+        .get("prefsrc")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("route to {target} has no prefsrc"))?
+        .parse()
+        .map_err(|err| anyhow::anyhow!("route to {target} prefsrc parse failed: {err}"))?;
+    let next_hop = entry
+        .get("gateway")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| target.to_string());
+    let destination_mac = resolve_neighbor_mac(&next_hop)
+        .map_err(|err| anyhow::anyhow!("{err} (route to {target})"))?;
+    let links = run_ip_json(&["link", "show", "dev", &interface])?;
+    let source_mac = links
+        .first()
+        .and_then(|link| link.get("address"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("interface {interface} has no MAC address"))
+        .and_then(|text| {
+            parse_mac(text)
+                .map_err(|err| anyhow::anyhow!("interface {interface} MAC {text}: {err}"))
+        })?;
+    Ok(XdpOutboundRoute {
+        interface,
+        source,
+        destination_mac,
+        source_mac,
+    })
 }
 
 fn run_ip_json(args: &[&str]) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -1941,7 +2072,7 @@ fn state_table_override(name: &str, config: &XdpConfig) -> Option<u32> {
 
 fn bpf_map_specs(
     config: &XdpConfig,
-) -> [(&'static str, aya::maps::MapType, u32, u32, u32); 36] {
+) -> [(&'static str, aya::maps::MapType, u32, u32, u32); 37] {
     use aya::maps::MapType;
     use cloud_node_xdp_common::*;
     use core::mem::size_of;
@@ -2053,6 +2184,14 @@ fn bpf_map_specs(
         ("XDP_UDP_CT", MapType::Hash, ct_key, ct_value, 262_144),
         ("XDP_TCP_CT", MapType::Hash, ct_key, ct_value, 262_144),
         ("XDP_PENDING", MapType::Hash, ct_key, ct_value, 65_536),
+        // T4: node-dialed outbound flows (AF_XDP userspace connect).
+        (
+            "XDP_OUT_CT",
+            MapType::Hash,
+            size_of::<XdpOutCtKey>() as u32,
+            size_of::<XdpOutCtValue>() as u32,
+            65_536,
+        ),
         (
             "XDP_PENDING_CAP",
             MapType::Array,
@@ -2501,6 +2640,7 @@ fn is_state_map_pin(name: &str) -> bool {
         "XDP_TCP_CT"
             | "XDP_UDP_CT"
             | "XDP_PENDING"
+            | "XDP_OUT_CT"
             | "XDP_SNAT_REV"
             | "XDP_FLOW_ACCT"
             | "XDP_FLOW_EVENTS"

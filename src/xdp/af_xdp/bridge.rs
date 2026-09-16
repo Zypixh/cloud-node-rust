@@ -30,6 +30,12 @@ pub(crate) struct AfXdpQueueCtx {
     pub(crate) downstream_tx: mpsc::Sender<crate::udp_proxy::DownstreamUdpDatagram>,
     pub(crate) downstream_rx: mpsc::Receiver<crate::udp_proxy::DownstreamUdpDatagram>,
     pub(crate) fwd_rx: mpsc::Receiver<AfXdpForward>,
+    /// T4: dial requests and cross-queue reply injects for this queue's
+    /// TCP reactor — drained once per poll round under a bounded budget.
+    pub(crate) request_rx: mpsc::Receiver<AfXdpReactorRequest>,
+    /// T4: shared dial registry — reply demux lookups plus the reactor's
+    /// release-on-reap hook.
+    pub(crate) dial_registry: Arc<AfXdpDialRegistry>,
     /// Route cache shared by all queue threads: ingress on queue A may be
     /// answered by the demux/H3 endpoint on queue B's channel, so lookups
     /// must see every queue's learned L2 routes.
@@ -236,9 +242,17 @@ pub(crate) async fn spawn_queue_reactors(
 ) {
     pub(crate) const AF_XDP_DOWNSTREAM_QUEUE: usize = 4096;
     pub(crate) const AF_XDP_WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+    /// T4: per-queue dial/inject request channel depth — bounded like
+    /// every other queue crossing so a dial burst or demux flood cannot
+    /// grow memory unboundedly.
+    pub(crate) const AF_XDP_REACTOR_REQUEST_QUEUE: usize = 1024;
 
     let online_cpus = num_cpus::get().max(1);
     let udp_routes = Arc::new(DashMap::new());
+    // T4: one dial registry per bridge generation. Queues register their
+    // request senders up-front so no dial window exists between redirect
+    // opening and a queue becoming dialable.
+    let dial_registry = Arc::new(AfXdpDialRegistry::new(manager.clone()));
     // One forwarding channel per queue; the first sender per interface is
     // the cross-interface forward target.
     let mut iface_fwd: HashMap<String, mpsc::Sender<AfXdpForward>> = HashMap::new();
@@ -249,6 +263,9 @@ pub(crate) async fn spawn_queue_reactors(
                 AF_XDP_DOWNSTREAM_QUEUE,
             );
         let (fwd_tx, fwd_rx) = mpsc::channel::<AfXdpForward>(AF_XDP_DOWNSTREAM_QUEUE);
+        let (request_tx, request_rx) =
+            mpsc::channel::<AfXdpReactorRequest>(AF_XDP_REACTOR_REQUEST_QUEUE);
+        dial_registry.register_queue(&queue_handle.interface, queue_handle.queue, request_tx);
         iface_fwd
             .entry(queue_handle.interface.clone())
             .or_insert(fwd_tx);
@@ -256,9 +273,38 @@ pub(crate) async fn spawn_queue_reactors(
             downstream_tx,
             downstream_rx,
             fwd_rx,
+            request_rx,
+            dial_registry: dial_registry.clone(),
             udp_routes: udp_routes.clone(),
             iface_fwd: Arc::new(HashMap::new()),
         });
+    }
+    // Publish only after every queue is registered — and only when the
+    // upstream-dial feature is actually armed. `afxdp` mode requires the
+    // T4-5 kernel guard to be installed first; a failed guard means the
+    // registry is never published and `af_xdp_dial_tcp` errors explicitly
+    // instead of dialing into an unguarded port span. `kernel` mode never
+    // publishes — upstream dials keep the kernel connect() path.
+    let dial_publishable =
+        manager.config.upstream_mode() == crate::runtime_mode::XdpUpstreamMode::Afxdp;
+    if dial_publishable {
+        match manager.ensure_dial_guard().await {
+            Ok(report) => {
+                tracing::info!(
+                    "AF_XDP dial guard installed: reserved ports {:?} pinned, nft DROP armed",
+                    report.port_range
+                );
+                manager.set_dial_registry(Some(dial_registry.clone()));
+            }
+            Err(err) => {
+                let detail = format!(
+                    "xdp.upstream.mode=afxdp but dial guard install failed: {err}; \
+                     AF_XDP upstream dials are disabled (kernel path is NOT used silently)"
+                );
+                tracing::error!("{detail}");
+                manager.set_proxy_fallback_reason(detail);
+            }
+        }
     }
     let iface_fwd = Arc::new(iface_fwd);
     for ctx in &mut contexts {
@@ -497,6 +543,9 @@ pub(crate) async fn run_queue_bridge_loop(
     tcp_session_limit: usize,
 ) {
     pub(crate) const AF_XDP_DOWNSTREAM_DRAIN_BUDGET: usize = 1024;
+    /// T4: per-round cap on dial/inject request processing so a burst
+    /// cannot starve frame RX.
+    pub(crate) const AF_XDP_REACTOR_REQUEST_BUDGET: usize = 256;
     pub(crate) const AF_XDP_ROUTE_CACHE_MAX: usize = 65_536;
     pub(crate) const AF_XDP_ROUTE_CACHE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
     pub(crate) const AF_XDP_ROUTE_CACHE_EVICT_BATCH: usize = 1024;
@@ -514,6 +563,8 @@ pub(crate) async fn run_queue_bridge_loop(
         downstream_tx,
         mut downstream_rx,
         mut fwd_rx,
+        mut request_rx,
+        dial_registry,
         udp_routes,
         iface_fwd,
     } = ctx;
@@ -526,6 +577,9 @@ pub(crate) async fn run_queue_bridge_loop(
     // T1: label the reactor so per-session /status snapshots are keyed by
     // the owning queue (the same 4-tuple may exist on multiple queues).
     tcp_reactor.set_label(format!("{own_interface}:{}", queue_handle.queue));
+    // T4: the reactor releases demux/CT/port state itself when a dialed
+    // session reaps — never leave it to the caller.
+    tcp_reactor.set_dial_registry(dial_registry.clone());
     let mut consecutive_poll_errors = 0u32;
     let mut tx_failures = AfXdpTxFailureTracker::new(AF_XDP_MAX_CONSECUTIVE_TX_FAILURES);
     let mut udp_ingress_failures =
@@ -613,6 +667,30 @@ pub(crate) async fn run_queue_bridge_loop(
                 continue;
             }
         };
+        // T4: drain reactor requests before parsing frames so a queued
+        // Dial lands before any same-round injects for its flow.
+        for _ in 0..AF_XDP_REACTOR_REQUEST_BUDGET {
+            match request_rx.try_recv() {
+                Ok(AfXdpReactorRequest::Dial(req)) => tcp_reactor.dial(req),
+                Ok(AfXdpReactorRequest::InjectTcp {
+                    route,
+                    flow,
+                    ip_packet,
+                }) => {
+                    let status = tcp_reactor.ingest(route, flow, ip_packet);
+                    if matches!(
+                        status,
+                        AfXdpTcpIngestStatus::RefusedAtCapacity
+                            | AfXdpTcpIngestStatus::IngressQueueFull
+                    ) {
+                        admission_refusals = admission_refusals.saturating_add(1);
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty)
+                | Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
         let parsed_frames = frames.len();
         let now_ms = crate::udp_proxy::udp_activity_now_ms();
         if udp_route_cache_sweep_due(
@@ -633,6 +711,10 @@ pub(crate) async fn run_queue_bridge_loop(
         for frame in frames.drain(..) {
             if let Some((flow, flags)) = parse_tcp_flow_flags_from_frame(&frame)
                 && tcp_reactor.should_ignore_unknown_non_syn(&flow, flags)
+                // T4: replies to node-dialed flows are demuxed below even
+                // though this queue owns no session for them — never let
+                // the unknown-flow filter drop them.
+                && dial_registry.owner(&flow).is_none()
             {
                 tcp_reactor.record_ignored_unknown_non_syn(flow, frame.len());
                 continue;
@@ -734,6 +816,32 @@ pub(crate) async fn run_queue_bridge_loop(
                     flow,
                     ip_packet,
                 }) => {
+                    // T4 reply demux: the tuple is a registered outbound
+                    // flow but this queue owns no session for it — the
+                    // reply arrived on the wrong queue (or the dial is
+                    // still queued on this one). Injecting through the
+                    // owner channel preserves Dial→packet ordering; a
+                    // failed inject means the flow is being torn down.
+                    if !tcp_reactor.has_session(&flow)
+                        && let Some(owner) = dial_registry.owner(&flow)
+                    {
+                        match dial_registry.inject(&owner, route, flow, ip_packet) {
+                            Ok(()) => {}
+                            Err(AfXdpDialInjectError::QueueFull) => {
+                                // Owner channel full is backpressure — the
+                                // sender retransmits; shed this packet.
+                                congested_drops = congested_drops.saturating_add(1);
+                            }
+                            Err(AfXdpDialInjectError::OwnerGone) => {
+                                tracing::debug!(
+                                    "AF_XDP reply demux dropped packet for torn-down flow local={} peer={}",
+                                    flow.local_addr,
+                                    flow.peer_addr
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     // Congestion gate: unknown non-SYN packets were already
                     // dropped above, so reaching here without a session means
                     // a new SYN — refuse it while the queue is backpressured.

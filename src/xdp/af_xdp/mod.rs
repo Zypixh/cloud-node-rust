@@ -14,7 +14,7 @@ use smoltcp::phy::{
 #[cfg(any(test, target_os = "linux"))]
 use smoltcp::socket::tcp as SmoltcpTcp;
 #[cfg(any(test, target_os = "linux"))]
-use smoltcp::time::Instant as SmoltcpInstant;
+use smoltcp::time::{Duration as SmolDuration, Instant as SmoltcpInstant};
 #[cfg(any(test, target_os = "linux"))]
 use smoltcp::wire::{
     HardwareAddress, IpAddress as SmoltcpIpAddress, IpCidr as SmoltcpIpCidr, IpEndpoint,
@@ -106,6 +106,20 @@ pub(crate) const AF_XDP_TCP_BUDGET_STALL_MAX: usize = 2 * AF_XDP_TCP_MAX_SESSION
 pub(crate) const AF_XDP_TCP_SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const AF_XDP_TCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// T4: absolute connect deadline for node-dialed flows — covers the full
+/// SYN retrain sequence; a session still not Established past it is
+/// aborted and the dial answered with a timeout, never left lingering.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(4);
+/// T4/T4-5 (D-B1): default reserved source-port span for node-dialed
+/// AF_XDP flows. The kernel guard carves this range out of
+/// `ip_local_reserved_ports` so no kernel socket can claim a tuple that
+/// XDP_OUT_CT steers into AF_XDP; configurable via
+/// `xdp.upstream.dialPortRange`.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_DIAL_PORT_BASE: u16 = 40_000;
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const AF_XDP_DIAL_PORT_SPAN: u16 = 10_000;
 
 #[cfg(target_os = "linux")]
 static AF_XDP_TCP_DIAG_ACCEPTED: AtomicU64 = AtomicU64::new(0);
@@ -392,11 +406,15 @@ pub enum AfXdpProxyFrame {
 }
 
 mod bridge;
+#[cfg(target_os = "linux")]
+mod dial;
 mod parser;
 mod tcp_reactor;
 
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub(crate) use bridge::*;
+#[cfg(target_os = "linux")]
+pub(crate) use dial::*;
 pub use bridge::{AfXdpRuntime, runtime, start_proxy_bridge, start_udp_bridge};
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub(crate) use parser::*;

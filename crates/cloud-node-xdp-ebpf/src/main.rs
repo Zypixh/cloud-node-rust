@@ -27,7 +27,8 @@ use cloud_node_xdp_common::{
     XDP_PENDING_CAP_FAIL_SNAT_ALLOC, XDP_SNAT_PORT_BASE, XDP_SNAT_PORT_SPAN, XdpBudgetBucket,
     XdpBudgetConfig, XdpCookieKey, XdpCounters, XdpFlowAcct, XdpFlowEvent, XdpInterfacePolicy,
     XdpIpv4Key, XdpSvcBucket,
-    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpPendingCap, XdpPortProtoKey, XdpQueueKey,
+    XdpIpv6Key, XdpLocalIpv4Key, XdpLocalIpv6Key, XdpOutCtKey, XdpOutCtValue, XdpPendingCap,
+    XdpPortProtoKey, XdpQueueKey,
     XdpQuicDcidKey, XdpRateBucket, XdpRateLimitConfig, XdpRuleValue, XdpSnatRevKey,
     XdpSnatRevValue, XdpUdpCtKey, XdpUdpCtValue, XdpUdpFwdKey, XdpUdpFwdRule,
 };
@@ -192,6 +193,18 @@ static XDP_PENDING: HashMap<XdpUdpCtKey, XdpUdpCtValue> =
 /// (pending_ttl_ns) written by userspace.
 #[map(name = "XDP_PENDING_CAP")]
 static XDP_PENDING_CAP: Array<XdpPendingCap> = Array::with_max_entries(1, 0);
+
+/// T4 outbound-CT: flows the node itself dialed through the AF_XDP
+/// userspace stack (upstream/origin connections). Presence is the whole
+/// steering decision — a reply matching (dst, dst_port, src, src_port)
+/// redirects to the *current* queue's XSK; the userspace dial-flow demux
+/// owns cross-queue delivery because an XSKMAP redirect is only valid
+/// for the ingress queue the packet arrived on (F7). Userspace inserts
+/// at dial and deletes at close; the map is pinned for reload continuity
+/// so an eBPF reload does not sever live dialed flows.
+#[map(name = "XDP_OUT_CT")]
+static XDP_OUT_CT: HashMap<XdpOutCtKey, XdpOutCtValue> =
+    HashMap::<XdpOutCtKey, XdpOutCtValue>::with_max_entries(65_536, 0);
 
 /// EN-10 lifecycle feedback channel: a bounded ring of `XdpFlowEvent`
 /// records published to userspace. Emission is advisory — a full ring only
@@ -492,6 +505,13 @@ fn try_nat_udp4_work(ctx: &XdpContext) -> Result<u32, ()> {
     if let Some(action) = try_udp_nat_v4(ctx, ip_offset, l4_offset, packet_len, now_ns)? {
         return Ok(action);
     }
+    // T4: dialed-flow replies (upstream datagrams to a reserved local
+    // port) are claimed by XDP_OUT_CT before the VIP path sees them.
+    if let Some(action) =
+        try_out_ct_v4(ctx, ip_offset, l4_offset, policy, IpProto::Udp as u8)?
+    {
+        return Ok(action);
+    }
     Ok(maybe_redirect_scratch(
         ctx,
         policy,
@@ -552,6 +572,14 @@ fn try_nat_udp6_fwd(ctx: &XdpContext) -> Result<u32, ()> {
         None
     };
     if let Some(action) = action {
+        return Ok(action);
+    }
+    // T4: replies to node-dialed flows are claimed by XDP_OUT_CT before
+    // the VIP redirect path (see the v4 worker for the contract).
+    if proto == IpProto::Udp as u8
+        && let Some(action) =
+            try_out_ct_v6(ctx, ip_offset, l4_offset, policy, IpProto::Udp as u8)?
+    {
         return Ok(action);
     }
     Ok(maybe_redirect_scratch(
@@ -664,6 +692,15 @@ fn try_nat_tcp4_work(ctx: &XdpContext) -> Result<u32, ()> {
         counter_challenge_rejected();
         return Ok(xdp_action::XDP_DROP);
     }
+    // T4: no inbound path claimed this packet — it may be a reply to a
+    // node-dialed flow (SYN-ACK/data to a reserved local port). A hit
+    // redirects to this queue's XSK; the userspace demux routes it to
+    // the owning reactor.
+    if let Some(action) =
+        try_out_ct_v4(ctx, ip_offset, l4_offset, policy, IpProto::Tcp as u8)?
+    {
+        return Ok(action);
+    }
     Ok(maybe_redirect_scratch(
         ctx,
         policy,
@@ -718,6 +755,14 @@ fn try_nat_tcp6_fwd(ctx: &XdpContext) -> Result<u32, ()> {
         None
     };
     if let Some(action) = action {
+        return Ok(action);
+    }
+    // T4: replies to node-dialed flows are claimed by XDP_OUT_CT before
+    // the VIP redirect path (see the v4 worker for the contract).
+    if proto == IpProto::Tcp as u8
+        && let Some(action) =
+            try_out_ct_v6(ctx, ip_offset, l4_offset, policy, IpProto::Tcp as u8)?
+    {
         return Ok(action);
     }
     Ok(maybe_redirect_scratch(
@@ -1533,8 +1578,6 @@ fn maybe_redirect(
     let Some(policy) = policy else {
         return xdp_action::XDP_PASS;
     };
-    let queue = ctx.rx_queue_index();
-    let ifindex = ctx.ingress_ifindex() as u32;
     if policy.mode != 2 {
         return xdp_action::XDP_PASS;
     }
@@ -1573,9 +1616,18 @@ fn maybe_redirect(
         _ => return xdp_action::XDP_PASS,
     }
 
+    xsk_redirect_current(ctx, policy)
+}
+
+/// Redirect to the XSK bound to this ingress queue. Shared by the
+/// VIP-proxy path (`maybe_redirect`) and the T4 dialed-flow reply path:
+/// both can only ever target the current queue — an XSKMAP redirect to
+/// another queue's socket is silently dropped by the kernel, so
+/// cross-queue delivery always belongs to the userspace demux (F7).
+fn xsk_redirect_current(ctx: &XdpContext, policy: &XdpInterfacePolicy) -> u32 {
     let xsk_key = XdpQueueKey {
-        ifindex,
-        queue_id: queue,
+        ifindex: ctx.ingress_ifindex() as u32,
+        queue_id: ctx.rx_queue_index(),
     };
     let xsk_index = match unsafe { XDP_XSK_INDEX.get(&xsk_key) }.copied() {
         Some(index) => index,
@@ -1608,6 +1660,86 @@ fn maybe_redirect(
             }
         }
     }
+}
+
+/// Source/destination ports occupy the first four bytes of both the TCP
+/// and UDP headers — one packed read serves both protocols on the
+/// dialed-flow reply check.
+#[repr(C, packed)]
+struct L4Ports {
+    source: [u8; 2],
+    dest: [u8; 2],
+}
+
+/// T4 dialed-flow reply check (IPv4): runs after the inbound CT/SNAT
+/// paths declined the packet. An exact XDP_OUT_CT match on (dst,
+/// dst_port, src, src_port) identifies a reply to a flow this node
+/// dialed; the packet redirects to this queue's XSK and the userspace
+/// demux hands it to the owning reactor. A miss is a plain None — the
+/// caller falls through to the normal VIP redirect/PASS path, so
+/// non-dialed traffic is unaffected.
+fn try_out_ct_v4(
+    ctx: &XdpContext,
+    ip_offset: usize,
+    l4_offset: usize,
+    policy: Option<&XdpInterfacePolicy>,
+    proto: u8,
+) -> Result<Option<u32>, ()> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if policy.mode != 2 {
+        return Ok(None);
+    }
+    let ip = ptr_at::<Ipv4Hdr>(ctx, ip_offset)?;
+    let ports = ptr_at::<L4Ports>(ctx, l4_offset)?;
+    let key = XdpOutCtKey {
+        local_addr: v4_embed(u32::from_be_bytes(unsafe { (*ip).dst_addr })),
+        remote_addr: v4_embed(u32::from_be_bytes(unsafe { (*ip).src_addr })),
+        local_port_be: unsafe { u16::from_ne_bytes((*ports).dest) },
+        remote_port_be: unsafe { u16::from_ne_bytes((*ports).source) },
+        family: 4,
+        proto,
+        _pad: [0; 2],
+    };
+    if unsafe { XDP_OUT_CT.get(&key) }.is_none() {
+        return Ok(None);
+    }
+    counter_out_ct_hit();
+    Ok(Some(xsk_redirect_current(ctx, policy)))
+}
+
+/// T4 dialed-flow reply check (IPv6): same contract as the v4 helper —
+/// the reply tuple matches on the full 16-byte addresses.
+fn try_out_ct_v6(
+    ctx: &XdpContext,
+    ip_offset: usize,
+    l4_offset: usize,
+    policy: Option<&XdpInterfacePolicy>,
+    proto: u8,
+) -> Result<Option<u32>, ()> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if policy.mode != 2 {
+        return Ok(None);
+    }
+    let ip = ptr_at::<Ipv6Hdr>(ctx, ip_offset)?;
+    let ports = ptr_at::<L4Ports>(ctx, l4_offset)?;
+    let key = XdpOutCtKey {
+        local_addr: unsafe { (*ip).dst_addr },
+        remote_addr: unsafe { (*ip).src_addr },
+        local_port_be: unsafe { u16::from_ne_bytes((*ports).dest) },
+        remote_port_be: unsafe { u16::from_ne_bytes((*ports).source) },
+        family: 6,
+        proto,
+        _pad: [0; 2],
+    };
+    if unsafe { XDP_OUT_CT.get(&key) }.is_none() {
+        return Ok(None);
+    }
+    counter_out_ct_hit();
+    Ok(Some(xsk_redirect_current(ctx, policy)))
 }
 
 /// Per-IP fixed-window pps limiter. Only UDP datagrams and TCP SYN-without-ACK
@@ -5378,6 +5510,14 @@ fn counter_pending_limited() {
 fn counter_map_miss() {
     if let Some(counters) = counters() {
         counters.map_miss = counters.map_miss.saturating_add(1);
+    }
+}
+
+/// T4: replies claimed by XDP_OUT_CT and redirected to the ingress
+/// queue's XSK for the userspace dial-flow demux.
+fn counter_out_ct_hit() {
+    if let Some(counters) = counters() {
+        counters.out_ct_hit = counters.out_ct_hit.saturating_add(1);
     }
 }
 
