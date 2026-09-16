@@ -4,7 +4,9 @@
 进度快照（2026-09-15 暂停时）：T0 各项与 T1 已提交（`8172ac6` F6、`b17a5d6` F5、`be75083` F2/F3/F4/F8、`1b742c0` F7、`da21e7a` T1 时钟）；T2 在工作区未提交：`crates/cloud-node-transport/`（RateSample、RttState、TransportInstant、`CongestionController` trait、NewReno+PRR、Cubic+HyStart++、确定性模拟器、三组测试）与 `Cargo.toml` workspace 声明。
 上游输入：`tasks/xdp-final-static-review-2026-09-15.md`（F1–F8）与 `docs/xdp-transport-performance-design.md`（PROPOSED）。
 
-本文只做静态阅读与依赖源码核对，未编译、未运行、未连接 VPS。所有编译/测试/压测仍按既有约束在授权 VPS .110/.120 执行。
+本文只做静态阅读与依赖源码核对，未编译、未运行、未连接 VPS。所有编译/测试/压测仍按既有约束在授权 VPS 执行。
+
+**开发/编译主机（2026-09-16 用户提供）**：`devin-build-90`（103.79.184.90，root，本机 `~/.ssh/config` 已配别名；已启用 PubkeyAuthentication + key 认证，密码认证仍开）。Debian 12 / kernel 6.1.0-41（与目标同代）/ 8c / 15GB / 56G 盘。已装：stable 1.98.1 + pinned `nightly-2026-09-13`（rust-src）、mold+clang 链接、mold+target-cpu=native（`~/.cargo/config.toml`）、nftables/iproute2/tcpdump 等。代码树在 `/root/cloud-node-rust`（含 .git 的完整 rsync；eBPF 用 `bpfel-unknown-none` + rust-lld，**不需要 bpf-linker**）。`cargo test -p cloud-node-transport` 已在此机全绿。此后"授权 VPS"含此机；vps-110/.120 仍可用于对照。.110 的 2GB 内存瓶颈由本机替代。
 
 ## 范围声明
 
@@ -209,7 +211,7 @@ EdgeCC 实现 `quinn_proto::congestion::Controller`（C8）；quinn Pacer 偏差
 通用约束（每个提示词都包含）：
 
 - 遵守 `.cursor/rules/no-unapproved-degradation.mdc`；发现已有降级先报告。
-- 本机只编辑与静态阅读；编译/测试/eBPF 构建/压测在授权 VPS .110/.120 的隔离目录与 netns/veth，禁止清理生产 bpffs；不新增 B 组/TC 后端；不 tag/push/部署。
+- 本机只编辑与静态阅读；编译/测试/eBPF 构建/压测在授权机器 `devin-build-90`（103.79.184.90，root，ssh 别名已配；代码树 `/root/cloud-node-rust`）或 vps-.110/.120 的隔离目录与 netns/veth，禁止清理生产 bpffs；不新增 B 组/TC 后端；不 tag/push/部署。
 - 范围：只改造 XDP/AF_XDP 数据面；非 XDP 模式不做传输改造。
 - 拥塞控制交付物是 EdgeCC 一个控制器；Reno/Cubic/BBRv1/BBRv3 只作为部件与校验模式，不作为生产可选算法，不新增"算法选择"配置项。
 - 引用固定版本见第 0 节。
@@ -271,6 +273,21 @@ TOA：smoltcp 主动打开时内核模块不会经过 NF_INET_LOCAL_OUT，必须
 6. 配对耦合的最小实现：客户端侧流在源站侧供给不足时标记 app-limited（用 T3 的钩子）。
 测试：报文脚本（三次握手、SYN 重传、同时关闭、RST）；VPS veth/netns 源站在另一 netns：SYN 经 AF_XDP 发出、SYN-ACK 被出向流表捕获、ss 无内核 socket、tcpdump 无 RST 外泄；XDP detach 窗口注入源站报文，守卫丢弃且计数增长；HTTP/HTTPS/TCP/UDP 回源矩阵双栈；带活跃回源连接的 reload 遵守 F1。
 验收：VPS release 构建 + 上述测试；证据记录内核、队列数、copy 模式、保留端口范围与守卫规则。
+```
+
+### T4-8 · 回源接管端到端流量验证（先做，与 T5 可并行）
+
+```
+任务：补齐 T4 欠下的端到端流量验证（EN-20/21/22 只覆盖编译+单元/集成测试）。已有工具：commit a55fae0 的 `xdp dial-smoke`（AF_XDP 真实外拨 + PTB/out-CT 在线验证），commit b7db772 已实测 eBPF 过 kernel 6.1 verifier + native drv attach。
+基线：a55fae0。环境：devin-build-90（netns/veth/nft/tcpdump 已装）。
+要求：
+1. netns 拓扑：veth 对，源站命名空间跑 TCP/UDP echo + HTTP 服务；本端 afxdp 模式启动节点。
+2. 验证项：dial-smoke 外拨成功且 SYN 走 AF_XDP（源站侧 tcpdump 看到 SYN 带预期选项，回程 SYN-ACK 被 XDP_OUT_CT 捕获 → out_ct_hit 增长）；`ss -tn` 在源站 netns 内确认连接两端，本端 netns 内 `ss` 无对应内核 socket；tcpdump 全程无本端发出的 RST；XDP detach/reattach 窗口注入源站报文，nft 守卫丢弃且计数增长；非 PTB ICMP error 不杀会话；PTB 触发 set_path_mtu 后 MSS 收敛。
+3. 带活跃回源连接执行 reload，验证 F1 合同（旧 worker 不被提前停）。
+4. nft/sysctl 守卫的端到端安装与拆除（dial_guard ensure/unpin），重装幂等。
+5. 顺带补 T3-10 债务：veth 双栈协议矩阵 + CubicRef 与上游 Cubic 同 ACK 轨迹 cwnd 对照。
+测试：全部为真实流量/真实 netns，不是单元测试。
+验收：每项有 tcpdump/ss/计数器证据；写入 EN-24 报告；发现问题按合同显式报告，不静默降级。
 ```
 
 ### T5 · EdgeCC 决策层（单流）与 QUIC 适配
