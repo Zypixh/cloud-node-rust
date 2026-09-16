@@ -447,6 +447,25 @@ enum XdpCommands {
         #[arg(long)]
         ready_file: Option<PathBuf>,
     },
+    /// Attach AF_XDP and hold a real userspace-TCP dial to an on-wire target (PTB/out-CT validation)
+    #[command(name = "dial-smoke")]
+    DialSmoke {
+        /// On-wire target to dial through the AF_XDP dataplane, e.g. 162.251.92.110:18080
+        #[arg(long)]
+        target: std::net::SocketAddr,
+        /// Hold duration in milliseconds after the session is established
+        #[arg(long, default_value_t = 8000)]
+        duration_ms: u64,
+        /// Write the dialed flow's local endpoint JSON here once the session is up
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
+        /// Bytes sent per send cycle (0 = no payload, session only held open)
+        #[arg(long, default_value_t = 0)]
+        payload_bytes: usize,
+        /// Milliseconds between payload sends (0 = send once at start)
+        #[arg(long, default_value_t = 0)]
+        send_interval_ms: u64,
+    },
 
     /// Interactive XDP configuration wizard / XDP 交互式配置向导
     #[command(name = "configure")]
@@ -1078,6 +1097,30 @@ fn run_xdp_command(command: XdpCommands) -> anyhow::Result<()> {
             let duration = Duration::from_millis(duration_ms.max(1));
             let report = rt.block_on(cloud_node_rust::xdp::proxy_reload_smoke(
                 duration, ready_file,
+            ))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        XdpCommands::DialSmoke {
+            target,
+            duration_ms,
+            ready_file,
+            payload_bytes,
+            send_interval_ms,
+        } => {
+            let runtime_config = RuntimeConfig::load_default()?;
+            RuntimeConfig::set_current(runtime_config);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let duration = Duration::from_millis(duration_ms.max(1));
+            let payload = vec![0x5au8; payload_bytes];
+            let send_interval = Duration::from_millis(send_interval_ms);
+            let report = rt.block_on(cloud_node_rust::xdp::dial_smoke(
+                target,
+                duration,
+                ready_file,
+                payload,
+                send_interval,
             ))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
