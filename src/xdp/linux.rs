@@ -733,6 +733,18 @@ pub async fn attach(
         // fail closed (counted drop) rather than forwarding unverified
         // challenge traffic.
         (11, "xdp_tcp4_challenge"),
+        // Family-split main dataplane: cloud_node_xdp tail-calls one of
+        // these so each pipeline gets its own 1M-insn verifier budget.
+        // Missing slots degrade to kernel pass inside the entry program.
+        (12, "xdp_main_v4_work"),
+        (13, "xdp_main_v6_work"),
+        // T4-7 ICMP out-CT claim workers — own verifier budget each; an
+        // empty slot returns the frame to the kernel path.
+        (14, "xdp_icmp_ct_v4"),
+        (15, "xdp_icmp_ct_v6"),
+        // The ICMPv6 worker's quoted-packet half — a second ext-header
+        // walk callsite would double the outer worker's verifier budget.
+        (16, "xdp_icmp_ct_v6_inner"),
     ] {
         let fd = match ebpf.program_mut(name) {
             Some(sub_program) => {
@@ -780,6 +792,11 @@ pub async fn attach(
         (9, "xdp_nat_udp6_work"),
         (10, "xdp_nat_tcp6_work"),
         (11, "xdp_tcp4_challenge"),
+        (12, "xdp_main_v4_work"),
+        (13, "xdp_main_v6_work"),
+        (14, "xdp_icmp_ct_v4"),
+        (15, "xdp_icmp_ct_v6"),
+        (16, "xdp_icmp_ct_v6_inner"),
     ] {
         let Some(sub_program) = ebpf.program_mut(name) else {
             continue;
@@ -2223,7 +2240,7 @@ fn bpf_map_specs(
             size_of::<NatScratch>() as u32,
             1,
         ),
-        ("XDP_DISPATCH", MapType::ProgramArray, u, u, 16),
+        ("XDP_DISPATCH", MapType::ProgramArray, u, u, 20),
         // Compiler-generated constant pool (EN-14 cookie compare/MSS table):
         // counted like every other map — it is kernel memory too.
         (".rodata.cst16", MapType::Array, u, 16, 1),

@@ -722,6 +722,11 @@ pub struct NatScratch {
     /// Transient copies of the original addrs/ports while building.
     pub forge_tmp: [u8; 8],
     pub forge_pad3: u32,
+    /// T4-7: quoted-packet offset + containing packet_end parked before the
+    /// ICMPv6 out-CT inner tail call — the quoted ext-header walk doubles
+    /// the caller's verifier budget, so the claim runs in its own program.
+    pub icmp_inner_off: u32,
+    pub icmp_inner_end: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -774,7 +779,11 @@ pub struct NatScratch {
 /// stack-init checks; layout stays 24B).
 /// v16: EN-14 review hardening — XdpCounters +challenge_worker_err
 /// (288->296B); XdpPendingCap.flags gains XDP_PENDING_CAP_FAIL_FORGE.
-pub const XDP_ABI_VERSION: u32 = 16;
+/// v17: T4-8 kernel-6.1 verifier conformance — NatScratch +icmp_inner_off/
+/// icmp_inner_end staging (440->448B), XDP_DISPATCH max_entries 16->20 for
+/// the ICMPv6 inner-claim worker (slot 16); xdp_main_v4/v6_work (slots
+/// 12/13) and xdp_icmp_ct_v4/v6 (slots 14/15) tail-call programs added.
+pub const XDP_ABI_VERSION: u32 = 17;
 
 /// Path that owns a flow's transport state (architecture §4.4 PathBinding).
 /// A flow has exactly one owner for its lifetime; packets may not migrate a
@@ -1031,7 +1040,7 @@ const _: () = assert!(core::mem::size_of::<XdpSnatRevValue>() == 56);
 const _: () = assert!(core::mem::size_of::<XdpInterfacePolicy>() == 8);
 const _: () = assert!(core::mem::size_of::<XdpRateBucket>() == 16);
 const _: () = assert!(core::mem::size_of::<XdpRateLimitConfig>() == 32);
-const _: () = assert!(core::mem::size_of::<NatScratch>() == 440);
+const _: () = assert!(core::mem::size_of::<NatScratch>() == 448);
 
 #[cfg(all(feature = "aya", target_os = "linux"))]
 macro_rules! unsafe_impl_aya_pod {
