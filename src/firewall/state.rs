@@ -834,15 +834,14 @@ impl WafStateManager {
         server_id: i64,
         now: i64,
     ) -> bool {
-        snapshots
-            .load()
+        let snapshot = snapshots.load();
+        snapshot
             .get(&0)
-            .is_some_and(|snapshot| snapshot.overlaps(net, now))
+            .is_some_and(|s| s.overlaps(net, now))
             || (server_id != 0
-                && snapshots
-                    .load()
+                && snapshot
                     .get(&server_id)
-                    .is_some_and(|snapshot| snapshot.overlaps(net, now)))
+                    .is_some_and(|s| s.overlaps(net, now)))
     }
 
     pub fn is_blocked(&self, ip: IpAddr, server_id: i64) -> bool {
@@ -2143,21 +2142,16 @@ impl WafStateManager {
         server_id: i64,
         now: i64,
     ) -> bool {
-        Self::contains_scoped_network_for(snapshots, 0, ip, now)
-            || (server_id != 0 && Self::contains_scoped_network_for(snapshots, server_id, ip, now))
-    }
-
-    fn contains_scoped_network_for(
-        snapshots: &ArcSwap<NetworkSnapshot>,
-        server_id: i64,
-        ip: IpAddr,
-        now: i64,
-    ) -> bool {
+        // One ArcSwap load serves both scopes; loading per scope doubles the
+        // hot-path atomic reads for no benefit.
         let snapshot = snapshots.load();
-        let Some(networks) = snapshot.get(&server_id) else {
-            return false;
-        };
-        networks.contains(ip, now)
+        snapshot
+            .get(&0)
+            .is_some_and(|networks| networks.contains(ip, now))
+            || (server_id != 0
+                && snapshot
+                    .get(&server_id)
+                    .is_some_and(|networks| networks.contains(ip, now)))
     }
 
     fn contains_any_scoped_network(
