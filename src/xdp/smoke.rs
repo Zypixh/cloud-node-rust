@@ -144,11 +144,16 @@ async fn raw_smoke_inner(
 pub async fn proxy_smoke(
     duration: std::time::Duration,
     ready_file: Option<std::path::PathBuf>,
+    kernel_mode: bool,
 ) -> anyhow::Result<serde_json::Value> {
     af_xdp::reset_tcp_diag();
     crate::tcp_proxy::reset_af_xdp_tcp_proxy_diag();
     let manager = manager_from_runtime();
     let ports = xdp_proxy_smoke_ports(&manager.config)?;
+
+    if kernel_mode {
+        return proxy_smoke_kernel(ports, duration, ready_file).await;
+    }
 
     manager.initialize().await?;
     start_rule_sweeper(&manager);
@@ -690,6 +695,95 @@ async fn proxy_smoke_inner(
         "tcpProxyDiag": crate::tcp_proxy::af_xdp_tcp_proxy_diag_snapshot(),
     });
     services.abort();
+    Ok(report)
+}
+
+/// Kernel-socket counterpart of `proxy_smoke`: identical site set, backends
+/// and proxy managers, but ingress is the kernel TCP/UDP stack instead of
+/// AF_XDP. Used as the XDP-off arm of dataplane A/B benchmarks — both arms
+/// serve `xdp-smoke-*.local` through the same EdgeProxy pipeline, so the only
+/// changed variable is the packet path.
+#[cfg(target_os = "linux")]
+async fn proxy_smoke_kernel(
+    ports: XdpProxySmokePorts,
+    duration: std::time::Duration,
+    ready_file: Option<std::path::PathBuf>,
+) -> anyhow::Result<serde_json::Value> {
+    let services = XdpProxySmokeServices::start().await?;
+    let (quic_demux, tcp_manager, http_manager) =
+        xdp_proxy_smoke_managers(&services, &ports).await?;
+    let listener_tasks: Vec<tokio::task::JoinHandle<()>> = {
+        let quic_demux = quic_demux.clone();
+        let tcp_manager = tcp_manager.clone();
+        let http_manager = http_manager.clone();
+        vec![
+            tokio::spawn(async move { quic_demux.start_listeners().await }),
+            tokio::spawn(async move { tcp_manager.start_listeners().await }),
+            tokio::spawn(async move { http_manager.start_listeners().await }),
+        ]
+    };
+
+    // Readiness = the TCP listeners actually accepting. UDP binds land in the
+    // same reconcile pass, so a live TCP accept implies the set is up.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut ready = false;
+    while tokio::time::Instant::now() < deadline {
+        if listener_tasks.iter().any(|task| task.is_finished()) {
+            anyhow::bail!("kernel proxy-smoke listener task exited before ready");
+        }
+        if tokio::net::TcpStream::connect(("127.0.0.1", ports.http))
+            .await
+            .is_ok()
+            && tokio::net::TcpStream::connect(("127.0.0.1", ports.tcp))
+                .await
+                .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    if !ready {
+        anyhow::bail!("timed out waiting for kernel proxy-smoke listeners");
+    }
+    write_ready_file(ready_file.as_ref())?;
+
+    tokio::time::sleep(duration).await;
+    let report = serde_json::json!({
+        "durationMillis": duration.as_millis(),
+        "dataplane": "kernel",
+        "proxyReady": true,
+        "ports": {
+            "http": ports.http,
+            "https": ports.https,
+            "tcp": ports.tcp,
+            "udp": ports.udp,
+            "h3": ports.h3,
+        },
+        "backends": {
+            "http": services.http_addr.to_string(),
+            "https": services.https_addr.to_string(),
+            "tcp": services.tcp_addr.to_string(),
+            "udp": services.udp_addr.to_string(),
+            "h3": services.h3_addr.to_string(),
+            "sni": services.sni_addr.to_string(),
+            "quic": services.quic_addr.to_string(),
+        },
+        "app": {
+            "httpRequests": services.http_requests.load(Ordering::Relaxed),
+            "httpsRequests": services.https_requests.load(Ordering::Relaxed),
+            "tcpConnections": services.tcp_connections.load(Ordering::Relaxed),
+            "udpDatagrams": services.udp_datagrams.load(Ordering::Relaxed),
+            "h3Requests": services.h3_requests.load(Ordering::Relaxed),
+            "sniConnections": services.sni_connections.load(Ordering::Relaxed),
+            "quicRequests": services.quic_requests.load(Ordering::Relaxed),
+        },
+        "tcpProxyDiag": crate::tcp_proxy::af_xdp_tcp_proxy_diag_snapshot(),
+    });
+    services.abort();
+    for task in &listener_tasks {
+        task.abort();
+    }
     Ok(report)
 }
 
@@ -1507,6 +1601,7 @@ pub async fn raw_smoke(
 pub async fn proxy_smoke(
     _duration: std::time::Duration,
     _ready_file: Option<std::path::PathBuf>,
+    _kernel_mode: bool,
 ) -> anyhow::Result<serde_json::Value> {
     anyhow::bail!("XDP proxy smoke is supported on Linux only")
 }
