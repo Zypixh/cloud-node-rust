@@ -265,18 +265,32 @@ Mace storage capacity is selected cgroup-first: `memory.max`, then
 `memory.high`, then host total. A small cgroup limit can no longer pick a
 host-sized storage tier.
 
-## Hot-Path Contention (Sharded Counters + RCU WAF Reads)
+## Hot-Path Contention (Derived Ledgers + RCU WAF Reads)
 
-Admission counters and the shared byte ledgers (`shared_connection_bytes`,
-`cache_read_memory_bytes`, `zero_copy_relay_bytes`) are 64-way
-cacheline-sharded (`ShardedU64`): each thread mutates its own cacheline, so
-per-request admission is an uncontended `fetch_add` plus a 64-lane relaxed
-sum instead of a shared CAS loop. Permits record their shard and subtract
-from it on drop, keeping totals exact at quiescence. The settled count still
-never exceeds the class limit — the add→sum→rollback protocol may
-transiently read up to `limit + in-flight adders` but grants never exceed
-the limit. `udp_queued_bytes`/`tcp_queue_bytes` keep strict CAS because
-their never-exceed-semantics contract is load-bearing for queue budgets.
+Admission uses per-class counters on **dedicated cache lines**
+(`PaddedAtomicU64`) with an add→check→rollback protocol — one `fetch_add`
+plus one `load`, no CAS retry loop, and floods on different classes never
+false-share a line. The counter may transiently read
+`limit + in-flight adders`, but a grant is issued only while the settled
+count is below the limit, and every overflow path rolls its add back.
+The shared connection byte ledger is **derived**, not stored:
+`Σ(count_class × per-class charge)` over the eight connection-level classes
+is recomputed on read — the seven quiet class lines stay Shared in local
+cache, so the read costs only the flooded line's ownership transfer. This
+removes two shared-cacheline RMWs from every connection admission compared
+with a real ledger. Each admission also fetches the budgeted memory
+snapshot once (`limit_for_in`) instead of once per budget check.
+`cache_read_memory_bytes` and `zero_copy_relay_bytes` remain plain
+`fetch_add` byte ledgers (one padded line each); `udp_queued_bytes`/
+`tcp_queue_bytes` keep strict CAS because their never-exceed-semantics
+contract is load-bearing for queue budgets.
+
+A 64-way cacheline-sharded counter (`ShardedU64`) was implemented and
+measured on this workload — it was **reverted** because every admission
+needs the aggregate total, and summing 64 remote cachelines per operation
+(~2.9× slower than the shared-CAS baseline in the 8-thread×2M admission
+bench) costs more than the write contention it avoids. Per-CPU-style
+counters only pay off when totals are aggregated out-of-band, not per op.
 
 WAF scoped-IP reads (`is_blocked`/`is_whitelisted`/`is_graylisted`) go
 through an RCU read path: an immutable per-kind union snapshot

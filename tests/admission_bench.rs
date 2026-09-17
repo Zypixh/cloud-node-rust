@@ -26,21 +26,41 @@ fn bench_admission_throughput() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1_000_000);
+    // Class selection ablation: HttpConnection exercises the shared-connection
+    // byte budget; RequestBodyWaf exercises only the per-class count path;
+    // "mixed" rotates classes per thread to expose cross-class false sharing.
+    let class_sel = std::env::var("BENCH_ADMISSION_CLASS").unwrap_or_else(|_| "http".into());
+    let class_for = |i: usize| match class_sel.as_str() {
+        "waf" => AdmissionClass::RequestBodyWaf,
+        "tcp" => AdmissionClass::TcpConnection,
+        "mixed" => [
+            AdmissionClass::HttpConnection,
+            AdmissionClass::RequestBodyWaf,
+            AdmissionClass::TcpConnection,
+            AdmissionClass::ResponseTransform,
+            AdmissionClass::UdpSession,
+            AdmissionClass::CacheRevalidate,
+            AdmissionClass::Http2Stream,
+            AdmissionClass::OriginConnect,
+        ][i % 8],
+        _ => AdmissionClass::HttpConnection,
+    };
 
     let granted = Arc::new(AtomicU64::new(0));
     let rejected = Arc::new(AtomicU64::new(0));
     let go = Arc::new(AtomicBool::new(false));
     let handles: Vec<_> = (0..threads)
-        .map(|_| {
+        .map(|i| {
             let granted = Arc::clone(&granted);
             let rejected = Arc::clone(&rejected);
             let go = Arc::clone(&go);
+            let class = class_for(i);
             std::thread::spawn(move || {
                 while !go.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
                 for _ in 0..iters {
-                    if let Some(permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::HttpConnection) {
+                    if let Some(permit) = MEMORY_GOVERNOR.try_admit(class) {
                         granted.fetch_add(1, Ordering::Relaxed);
                         drop(permit);
                     } else {
