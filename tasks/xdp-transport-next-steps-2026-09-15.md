@@ -221,7 +221,10 @@ EdgeCC 实现 `quinn_proto::congestion::Controller`（C8）；quinn Pacer 偏差
 
 第 9 节决策已全部批准（D-* 编号），提示词中引用 D-* 即对应结论，不再等待审批。
 
+**进度速查（2026-09-17，HEAD `1ef0798`）**：T0–T4-8 全部完成并验证（EN-18/19/20/21/22/24）；T3-10 债务已清（EN-24 §7/§8）。**下一个任务 = T4-9（F1 跨代移交修复，EN-24 发现的阻塞缺陷，用户已批准移交方案）→ T5 → T6 → T7 → T8 → T9 → T10**。T2/T3/T4/T4-8 的提示词保留作历史记录，不要再执行。
+
 ```
+（历史记录——T2 已完成于 066ed26，勿再执行）
 任务：按 tasks/xdp-transport-next-steps-2026-09-15.md v3 重新对齐 T2，把工作区未提交的 crates/cloud-node-transport 收敛为 EdgeCC 的基础层并提交。
 现状：T0/T1 已提交（HEAD da21e7a）；工作区有未提交的 crates/cloud-node-transport/（rate_sample.rs、rtt.rs、instant.rs、cc.rs 及 cc/{new_reno,cubic,prr}.rs、sim.rs、tests/）与 Cargo.toml 的 workspace 声明。先 git status/diff 核对，不要丢弃任何已有工作。
 方向变更：拥塞控制交付物改为统一控制器 EdgeCC（文档第 2 节），NewReno/Cubic 不再是交付物。
@@ -290,11 +293,31 @@ TOA：smoltcp 主动打开时内核模块不会经过 NF_INET_LOCAL_OUT，必须
 验收：每项有 tcpdump/ss/计数器证据；写入 EN-24 报告；发现问题按合同显式报告，不静默降级。
 ```
 
+### T4-9 · F1 修复：存量 AF_XDP 会话跨代移交（先做，阻塞 T5）
+
+```
+任务：修复 EN-24 报告的 F1 阻塞缺陷——`xdp reload` 换代时存量 AF_XDP 会话被冻结成僵尸（冻结在 publish 点、无 FIN/RST、无 ioError）。采用"跨代移交"方案：存量 userspace 流从旧代迁移到新代，连接不断。
+基线：1ef0798（EN-24 之后）。环境：devin-build-90。先读 docs/edge-node-evidence/EN-24/report.md 的"发现的缺陷"一节与 src/xdp 的 replace_manager_from_runtime / release_for_handover / manager_is_current 实现。
+机制事实（EN-24 已定位）：reload 是同进程换代；`replace_manager_from_runtime` 在 `initialize_inner` commit 前就 publish 新 manager；旧 worker 的 `manager_is_current` staleness 检查在 publish 即退出 → AF_XDP 轮询停 → TX 不排空 → 僵尸。`release_for_handover` 在 commit 时才释放旧 XSK。eBPF maps（XDP_OUT_CT、CT、NAT 表）是 pin 共享的，跨代自动存活，不需要迁移。
+设计要求：
+1. 代际转移协议显式化：preparing → committed → handover → drained 四态；旧 worker 轮询循环不得因 publish 退出，只能因"移交完成"或"排空超时"退出；publish 与 commit 的顺序必须保证旧代在新代接管 XSKMAP 前持续收发包。
+2. socket 迁移：smoltcp 的 TCB（seq/ack、SACK 记分板、RTT 估计、CC 状态、pacing、app buffer）与 device 解耦——把 SocketSet/会话容器从旧 worker 移交到新 worker，新 Interface 在新 XSK 上收养。在 smoltcp-edge 加受控的迁移 API（记录进 DIVERGENCE.md）；如果当前结构是 Interface 持有 SocketSet，先重构为 reactor 持有。
+3. XSK 生命周期：commit 时 XSKMAP 原子切到新 XSK；旧 RX/TX ring 排空残余帧后再 release（release_for_handover 移到 handover 完成之后）；移交间隙落在旧 ring 的帧允许丢，由 TCP 重传覆盖（上界：一个 ring 深度）。
+4. UDP/H3：AfXdpQuinnUdpSocket 与 quinn Endpoint 随 socket 一并移交（endpoint 状态在对象内）。
+5. 失败兜底（fail-closed）：移交失败或 worker 异常时，对该会话主动发 RST 并向调用方上报 ioError + 计数器——任何路径都不允许静默冻结。
+6. 进程退出路径（xdp stop / 进程死亡）无法跨代移交：主动 RST 终止存量 AF_XDP 流（干净的快速失败），并保证不依赖新进程清理。
+7. 可观测：handover_attempted/succeeded/failed、sessions_migrated、handover_duration_ms 计数器进 /status；关键事件打日志。
+8. F1 合同文本更新为"reload 通过跨代 socket 迁移保留存量 AF_XDP 会话"。
+9. 顺带：守卫孤儿——加 `xdp guard-clean` 子命令或文档化孤儿后再认领语义（EN-24 遗留项，小活）。
+测试：单元测试覆盖 socket 迁移 API 与四态转移；netns 回归——`xdp dial-smoke --reload-at-ms 6000` 的 received 必须在 reloadFinishedMs 之后持续增长（不再是冻结值）；新增回归测试断言"会话在 reload 后要么继续要么收到 ioError/RST，绝不静默停 >2s"；v4+v6 各跑一次；proxy-reload-smoke 全量回归。
+验收：devin-build-90 上真实 reload 实测通过并写入 EN-25 报告（含 dial-reload 前后计数器、wire 上无 RST/FIN 意外、会话持续证据）；cargo test --lib 全绿。
+```
+
 ### T5 · EdgeCC 决策层（单流）与 QUIC 适配
 
 ```
 任务：在 cloud-node-transport 实现 EdgeCC 决策层（文档第 2.4、2.5、2.8、2.9 节）：先验启动、双模控制、不确定度驱动探测、效用梯度微调、按 belief 比例响应、包络、base_rtt 刷新、policer 响应；实现校验模式 Bbr3Ref 与 LossBlindRef；实现 quinn_proto::congestion::Controller 适配；接入 accepted 与 dialed 会话（受 flag 控制，默认仍 CubicRef，切换在 T10 决定）。
-基线：T4 完成后的 commit。
+基线：T4-9 完成后的 commit（T4-9 修 reload 生命周期，T5 不动它，但接入会话安装点时要在移交路径上保持 CC 状态随 TCB 迁移）。
 要求：
 1. 决策层只消费 PathModel/Inference 输出与 Envelope；每个决策点（探测开始/结束/接受/回退、模式切换、响应、启动退出、base_rtt 下探）写原因码进 CcSnapshot。
 2. 先验启动：path_table 有置信先验时 paced start（0.5×先验 bw、cwnd=先验 BDP×1.5、立即剂量-响应确认）；无先验 2.77 增益 + 平台期/HyStart++/伴随抬升丢包/CE 退出；IW 由先验有界推导，默认 10 MSS。本任务 path_table 只做单机内存版（T6 完成前缀级共享与 TTL）。
