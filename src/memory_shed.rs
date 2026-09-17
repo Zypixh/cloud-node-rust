@@ -140,17 +140,17 @@ pub fn observe_pressure(level: MemoryPressureLevel) {
 mod tests {
     use super::*;
     use crate::l4_connection_registry::{self, L4ConnectionProtocol};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn ip(last: u8) -> IpAddr {
-        IpAddr::V4(Ipv4Addr::new(198, 51, 100, last))
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, last)), 41000 + last as u16)
     }
 
     #[test]
     fn high_pressure_suppresses_keepalive_without_draining() {
         let _serial = l4_connection_registry::REGISTRY_TEST_LOCK.lock().unwrap();
         observe_pressure(MemoryPressureLevel::Normal); // clear residual state
-        let guard = l4_connection_registry::register(ip(1), L4ConnectionProtocol::Http1);
+        let guard = l4_connection_registry::register(addr(1), L4ConnectionProtocol::Http1);
         let mut rx = guard.cancel_receiver();
 
         observe_pressure(MemoryPressureLevel::High);
@@ -171,7 +171,7 @@ mod tests {
         observe_pressure(MemoryPressureLevel::Normal); // clear residual state
         // The ladder's first rung (300s) spares every test connection, so the
         // first Critical observation drains nothing.
-        let g1 = l4_connection_registry::register(ip(2), L4ConnectionProtocol::Http1);
+        let g1 = l4_connection_registry::register(addr(2), L4ConnectionProtocol::Http1);
         let mut rx1 = g1.cancel_receiver();
 
         observe_pressure(MemoryPressureLevel::Critical);
@@ -199,7 +199,7 @@ mod tests {
     fn deescalation_resets_ladder() {
         let _serial = l4_connection_registry::REGISTRY_TEST_LOCK.lock().unwrap();
         observe_pressure(MemoryPressureLevel::Normal); // clear residual state
-        let g = l4_connection_registry::register(ip(3), L4ConnectionProtocol::Http2);
+        let g = l4_connection_registry::register(addr(3), L4ConnectionProtocol::Http2);
         let mut rx = g.cancel_receiver();
 
         observe_pressure(MemoryPressureLevel::Critical);

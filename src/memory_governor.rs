@@ -138,6 +138,9 @@ pub struct GovernorSnapshot {
     pub rpc_stream_command_limit: usize,
     pub cache_read_memory_used_bytes: u64,
     pub cache_read_memory_budget_bytes: u64,
+    /// Bytes checked out to per-connection admission ticket buckets
+    /// (`memory_ticket`) — pooled request-scoped charges.
+    pub request_workspace_used_bytes: u64,
     pub cache_read_memory_object_limit_bytes: u64,
     pub cache_budget_bytes: u64,
     pub bloom_budget_bytes: u64,
@@ -634,6 +637,12 @@ struct GovernorLimits {
     zero_copy_relay_budget_bytes: u64,
     udp_queue_budget_bytes: u64,
     tcp_queue_budget_bytes: u64,
+    /// Budget for the per-connection workspace pool (`memory_ticket`).
+    /// Request-scoped classes that draw from a connection's ticket charge
+    /// this ledger instead of their class counter; it intentionally shares
+    /// the shared-connection budget's scale because pooled bytes play the
+    /// same role class charges did.
+    request_workspace_budget_bytes: u64,
     /// Snapshot-derived pressure signals so hot paths never re-run the
     /// classification chain (PSI ratios, budget fractions) per call.
     fd_soft_limit: u64,
@@ -678,6 +687,10 @@ pub struct MemoryGovernor {
     rpc_stream_commands: PaddedAtomicU64,
     sni_relays: PaddedAtomicU64,
     cache_read_memory_bytes: PaddedAtomicU64,
+    /// Per-connection ticket pool ledger (`memory_ticket`): bytes currently
+    /// checked out to connection ticket buckets. Bounded by
+    /// `request_workspace_budget_bytes` in the materialized limits table.
+    request_workspace_bytes: PaddedAtomicU64,
     /// Observational gauge for metrics trackers (aggregators, top-IP, daily
     /// domain, unique-IP sets) that live outside the resident ledger. Kept
     /// out of `resident.total` on purpose: the ledger enforces cache budgets,
@@ -848,6 +861,7 @@ impl MemoryGovernor {
             rpc_stream_commands: PaddedAtomicU64::new(0),
             sni_relays: PaddedAtomicU64::new(0),
             cache_read_memory_bytes: PaddedAtomicU64::new(0),
+            request_workspace_bytes: PaddedAtomicU64::new(0),
             metrics_aggregator_bytes: AtomicU64::new(0),
             admission_rejects: std::array::from_fn(|_| PaddedAtomicU64::new(0)),
             cached_total_bytes: AtomicU64::new(0),
@@ -895,6 +909,7 @@ impl MemoryGovernor {
                 zero_copy_relay_budget_bytes: 0,
                 udp_queue_budget_bytes: 0,
                 tcp_queue_budget_bytes: 0,
+                request_workspace_budget_bytes: 0,
                 fd_soft_limit: 0,
                 // Fail-closed until the first real snapshot lands.
                 memory_pressure_high: true,
@@ -934,6 +949,59 @@ impl MemoryGovernor {
             return None;
         }
         self.try_admit_with_charges(AdmissionClass::CacheReadMemory, bytes)
+    }
+
+    /// Charge `bytes` against the shared request-workspace ledger that backs
+    /// per-connection ticket buckets (`memory_ticket`). Add-then-check with
+    /// rollback — same bounded-overshoot contract as the class counters.
+    pub(crate) fn try_admit_workspace(&self, bytes: u64) -> bool {
+        let budget = self.limits().request_workspace_budget_bytes;
+        let used = self
+            .request_workspace_bytes
+            .fetch_add(bytes, Ordering::AcqRel)
+            .saturating_add(bytes);
+        if used > budget {
+            self.request_workspace_bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn workspace_refund(&self, bytes: u64) {
+        self.request_workspace_bytes
+            .fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// Workspace ledger bytes currently checked out to ticket buckets.
+    pub fn request_workspace_used_bytes(&self) -> u64 {
+        self.request_workspace_bytes.load(Ordering::Acquire)
+    }
+
+    /// Test-only seeding of the cached memory inputs (bumps the generation
+    /// so the limits table rebuilds). Shared by governor tests and
+    /// `memory_ticket` bucket tests.
+    #[cfg(test)]
+    pub(crate) fn seed_cached_for_test(
+        &self,
+        total_bytes: u64,
+        available_bytes: u64,
+        fd_soft_limit: u64,
+        fd_used: u64,
+        now_ms: u64,
+    ) {
+        self.cached_total_bytes.store(total_bytes, Ordering::Release);
+        self.cached_used_bytes
+            .store(total_bytes.saturating_sub(available_bytes), Ordering::Release);
+        self.cached_available_bytes
+            .store(available_bytes, Ordering::Release);
+        self.cached_fd_soft_limit
+            .store(fd_soft_limit, Ordering::Release);
+        self.cached_fd_used.store(fd_used, Ordering::Release);
+        self.cached_fd_used_at_millis
+            .store(now_ms, Ordering::Release);
+        self.cached_at_millis.store(now_ms, Ordering::Release);
+        self.cached_generation.fetch_add(1, Ordering::Release);
     }
 
     pub fn try_admit_zero_copy_relay(&self) -> Option<ZeroCopyRelayPermit<'_>> {
@@ -2048,6 +2116,7 @@ impl MemoryGovernor {
             .saturating_add(self.udp_queued_bytes())
             .saturating_add(self.tcp_queue_bytes())
             .saturating_add(self.cache_read_memory_bytes.load(Ordering::Relaxed))
+            .saturating_add(self.request_workspace_bytes.load(Ordering::Relaxed))
             .saturating_add(self.metrics_aggregator_bytes.load(Ordering::Relaxed));
         process_rss_bytes.saturating_sub(tracked)
     }
@@ -2127,6 +2196,7 @@ impl MemoryGovernor {
                 .limit_for(AdmissionClass::ClusterInternalConnection),
             rpc_stream_command_limit: self.limit_for(AdmissionClass::RpcStreamCommand),
             cache_read_memory_used_bytes: self.cache_read_memory_bytes.load(Ordering::Relaxed),
+            request_workspace_used_bytes: self.request_workspace_used_bytes(),
             cache_read_memory_budget_bytes: cache_read_memory_budget_bytes(&mem),
             cache_read_memory_object_limit_bytes: cache_read_memory_object_limit_bytes(&mem),
             cache_budget_bytes: mem.cache_budget_bytes,
@@ -2231,6 +2301,7 @@ impl MemoryGovernor {
             zero_copy_relay_budget_bytes: zero_copy_relay_budget_bytes(&snapshot),
             udp_queue_budget_bytes: udp_queued_bytes_budget(&snapshot),
             tcp_queue_budget_bytes: tcp_queue_bytes_budget(&snapshot),
+            request_workspace_budget_bytes: request_workspace_budget_bytes(&snapshot),
             fd_soft_limit: snapshot.fd_soft_limit,
             memory_pressure_high: memory_pressure_high(&snapshot),
             memory_pressure_level: memory_pressure_level(&snapshot),
@@ -2264,7 +2335,7 @@ impl MemoryGovernor {
         &self.admission_rejects[class_index(class)].0
     }
 
-    fn record_reject(&self, class: AdmissionClass) {
+    pub(crate) fn record_reject(&self, class: AdmissionClass) {
         self.reject_counter(class).fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3014,6 +3085,25 @@ fn cache_read_memory_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
     budget.max(floor).min(snapshot.available_bytes.max(1))
 }
 
+/// Workspace pool bound for per-connection admission tickets
+/// (`memory_ticket`). Each pooled class was individually bounded at
+/// ~`available/8` worth of estimated bytes before pooling; the shared pool
+/// intentionally sits below their sum (the approved isolation trade —
+/// classes on one connection share fate) while staying large enough that
+/// ordinary multi-feature requests never feel the pool. Collapses to
+/// `available/16` under High+ pressure like the other hot ledgers.
+fn request_workspace_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
+    let budget = if memory_pressure_high(snapshot) {
+        snapshot.available_bytes / 16
+    } else {
+        snapshot.available_bytes / 4
+    };
+    // Floor: at least one worst-case transform charge so a single feature
+    // can always run when any memory is available.
+    let floor = RESPONSE_TRANSFORM_ESTIMATED_BYTES.min(snapshot.available_bytes.max(1));
+    budget.max(floor).min(snapshot.available_bytes.max(1))
+}
+
 fn cache_read_memory_object_limit_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
     if memory_pressure_high(snapshot) {
         return CACHE_READ_MEMORY_PRESSURE_OBJECT_BYTES;
@@ -3548,6 +3638,33 @@ fn shared_connection_charge_bytes(class: AdmissionClass) -> u64 {
     }
 }
 
+/// Estimated per-object byte cost of an admission class — what a pooled
+/// ticket spend charges the workspace ledger so the pooled bound is
+/// equivalent to the class's previous count-limit × estimate bound.
+pub fn class_estimated_bytes(class: AdmissionClass) -> u64 {
+    match class {
+        AdmissionClass::HttpConnection => HTTP_CONN_ESTIMATED_BYTES,
+        AdmissionClass::TcpConnection => TCP_CONN_ESTIMATED_BYTES,
+        AdmissionClass::Http3Connection => H3_CONN_ESTIMATED_BYTES,
+        AdmissionClass::UdpSession => UDP_SESSION_ESTIMATED_BYTES,
+        AdmissionClass::Http2Stream => H2_STREAM_ESTIMATED_BYTES,
+        AdmissionClass::Http3Request => H3_REQUEST_ESTIMATED_BYTES,
+        AdmissionClass::OriginConnect => ORIGIN_CONNECT_ESTIMATED_BYTES,
+        AdmissionClass::BackgroundWork => BACKGROUND_WORK_ESTIMATED_BYTES,
+        AdmissionClass::RequestBodyWaf => REQUEST_BODY_WAF_ESTIMATED_BYTES,
+        AdmissionClass::ResponseBodyWaf => RESPONSE_BODY_WAF_ESTIMATED_BYTES,
+        AdmissionClass::ResponseTransform => RESPONSE_TRANSFORM_ESTIMATED_BYTES,
+        AdmissionClass::CacheRevalidate => CACHE_REVALIDATE_ESTIMATED_BYTES,
+        AdmissionClass::CacheWrite => CACHE_WRITE_ESTIMATED_BYTES,
+        AdmissionClass::CacheReadMemory => CACHE_READ_MEMORY_ESTIMATED_BYTES,
+        AdmissionClass::ClusterInternalConnection => {
+            CLUSTER_INTERNAL_CONNECTION_ESTIMATED_BYTES
+        }
+        AdmissionClass::RpcStreamCommand => RPC_STREAM_COMMAND_ESTIMATED_BYTES,
+        AdmissionClass::SniRelay => SNI_RELAY_ESTIMATED_BYTES,
+    }
+}
+
 /// All admission classes in `class_index` order — used to build the
 /// materialized `GovernorLimits` table once per snapshot generation.
 const ALL_ADMISSION_CLASSES: [AdmissionClass; N_ADMISSION_CLASSES] = [
@@ -3935,29 +4052,7 @@ mod tests {
         fd_used: u64,
     ) {
         let now = crate::utils::time::system_timestamp_millis().max(0) as u64;
-        governor
-            .cached_total_bytes
-            .store(total_bytes, Ordering::Release);
-        governor.cached_used_bytes.store(
-            total_bytes.saturating_sub(available_bytes),
-            Ordering::Release,
-        );
-        governor
-            .cached_available_bytes
-            .store(available_bytes, Ordering::Release);
-        governor
-            .cached_fd_soft_limit
-            .store(fd_soft_limit, Ordering::Release);
-        governor.cached_fd_used.store(fd_used, Ordering::Release);
-        governor
-            .cached_fd_used_at_millis
-            .store(now, Ordering::Release);
-        governor.cached_at_millis.store(now, Ordering::Release);
-        // Seeded inputs change every derived limit; force the materialized
-        // table to rebuild on next use (same-millis reseeds included).
-        governor
-            .cached_generation
-            .fetch_add(1, Ordering::Release);
+        governor.seed_cached_for_test(total_bytes, available_bytes, fd_soft_limit, fd_used, now);
     }
 
     fn synthetic_snapshot(

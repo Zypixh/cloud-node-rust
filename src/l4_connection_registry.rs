@@ -1,6 +1,8 @@
 use dashmap::DashMap;
-use std::net::IpAddr;
-use std::sync::LazyLock;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, LazyLock};
+
+use crate::memory_ticket::TicketBucket;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -72,6 +74,7 @@ impl RegisteredConnection {
 pub struct L4ConnectionGuard {
     id: u64,
     ip: IpAddr,
+    addr: SocketAddr,
     protocol: L4ConnectionProtocol,
     active: AtomicBool,
 }
@@ -101,9 +104,10 @@ impl L4ConnectionGuard {
     ) -> (L4ConnectionGuard, watch::Receiver<ConnectionCancelReason>) {
         let old_rx = self.cancel_receiver();
         let ip = self.ip;
+        let addr = self.addr;
         drop(self);
         let pending = *old_rx.borrow();
-        let new_guard = L4_CONNECTION_REGISTRY.register(ip, new_protocol);
+        let new_guard = L4_CONNECTION_REGISTRY.register(addr, new_protocol);
         let new_rx = new_guard.cancel_receiver();
         if pending != ConnectionCancelReason::None
             && let Some(conn) = L4_CONNECTION_REGISTRY.get(ip, new_protocol, new_guard.id)
@@ -117,7 +121,7 @@ impl L4ConnectionGuard {
 impl Drop for L4ConnectionGuard {
     fn drop(&mut self) {
         if self.active.swap(false, Ordering::AcqRel) {
-            L4_CONNECTION_REGISTRY.unregister(self.ip, self.protocol, self.id);
+            L4_CONNECTION_REGISTRY.unregister(self.ip, self.addr, self.protocol, self.id);
         }
     }
 }
@@ -132,17 +136,31 @@ pub struct L4ConnectionRegistrySnapshot {
 
 pub struct L4ConnectionRegistry {
     by_key: DashMap<(IpAddr, L4ConnectionProtocol, u64), RegisteredConnection>,
+    /// Secondary index for the request-hot path: a connection's admission
+    /// ticket bucket is looked up by peer socket address so proxy code can
+    /// reach it without knowing the registry id. The `u64` is the
+    /// connection id — a guard for same-addr port reuse so a stale
+    /// unregister cannot evict the newer connection's bucket.
+    by_addr: DashMap<SocketAddr, (u64, Arc<TicketBucket>)>,
 }
 
 impl L4ConnectionRegistry {
     fn new() -> Self {
         Self {
             by_key: DashMap::new(),
+            by_addr: DashMap::new(),
         }
     }
 
-    pub fn register(&self, ip: IpAddr, protocol: L4ConnectionProtocol) -> L4ConnectionGuard {
+    pub fn register(
+        &self,
+        addr: SocketAddr,
+        protocol: L4ConnectionProtocol,
+    ) -> L4ConnectionGuard {
+        let ip = addr.ip();
         let id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        self.by_addr
+            .insert(addr, (id, Arc::new(TicketBucket::new(std::sync::LazyLock::force(&crate::memory_governor::MEMORY_GOVERNOR)))));
         let (cancel_tx, cancel_rx) = watch::channel(ConnectionCancelReason::None);
         self.by_key.insert(
             (ip, protocol, id),
@@ -158,6 +176,7 @@ impl L4ConnectionRegistry {
         L4ConnectionGuard {
             id,
             ip,
+            addr,
             protocol,
             active: AtomicBool::new(true),
         }
@@ -174,8 +193,18 @@ impl L4ConnectionRegistry {
             .map(|entry| entry.value().clone())
     }
 
-    fn unregister(&self, ip: IpAddr, protocol: L4ConnectionProtocol, id: u64) {
+    fn unregister(&self, ip: IpAddr, addr: SocketAddr, protocol: L4ConnectionProtocol, id: u64) {
         self.by_key.remove(&(ip, protocol, id));
+        // Port reuse: only remove when the entry still belongs to this
+        // connection id — a newer connection may already hold the addr.
+        self.by_addr.remove_if(&addr, |_, v| v.0 == id);
+    }
+
+    /// Connection's admission ticket bucket for the request hot path.
+    /// `None` for unregistered transports (e.g. H3) — callers fall back to
+    /// direct per-class admission with identical semantics.
+    pub fn ticket_for(&self, addr: &SocketAddr) -> Option<Arc<TicketBucket>> {
+        self.by_addr.get(addr).map(|e| e.value().1.clone())
     }
 
     pub fn drain_ip(&self, ip: IpAddr) -> usize {
@@ -242,8 +271,13 @@ impl L4ConnectionRegistry {
     }
 }
 
-pub fn register(ip: IpAddr, protocol: L4ConnectionProtocol) -> L4ConnectionGuard {
-    L4_CONNECTION_REGISTRY.register(ip, protocol)
+pub fn register(addr: SocketAddr, protocol: L4ConnectionProtocol) -> L4ConnectionGuard {
+    L4_CONNECTION_REGISTRY.register(addr, protocol)
+}
+
+/// Hot-path accessor for the connection's admission ticket bucket.
+pub fn ticket_for(addr: &SocketAddr) -> Option<Arc<TicketBucket>> {
+    L4_CONNECTION_REGISTRY.ticket_for(addr)
 }
 
 pub fn drain_ip(ip: IpAddr) -> usize {
@@ -270,8 +304,9 @@ mod tests {
         let _serial = REGISTRY_TEST_LOCK.lock().unwrap();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
         let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
-        let guard = register(ip, L4ConnectionProtocol::Http2);
-        let _other_guard = register(other, L4ConnectionProtocol::Http2);
+        let guard = register(SocketAddr::new(ip, 40001), L4ConnectionProtocol::Http2);
+        let _other_guard =
+            register(SocketAddr::new(other, 40002), L4ConnectionProtocol::Http2);
         let mut rx = guard.cancel_receiver();
 
         assert_eq!(drain_ip(ip), 1);
@@ -287,7 +322,7 @@ mod tests {
     fn switch_protocol_carries_cancel_that_raced_before_the_swap() {
         let _serial = REGISTRY_TEST_LOCK.lock().unwrap();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
-        let guard = register(ip, L4ConnectionProtocol::Http1);
+        let guard = register(SocketAddr::new(ip, 40011), L4ConnectionProtocol::Http1);
 
         assert_eq!(drain_ip(ip), 1);
         let (_new_guard, mut new_rx) = guard.switch_protocol(L4ConnectionProtocol::Http2);
@@ -301,8 +336,8 @@ mod tests {
     fn switch_protocol_keeps_new_entry_cancellable_and_noop_without_cancel() {
         let _serial = REGISTRY_TEST_LOCK.lock().unwrap();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 12));
-        let (guard, mut rx) =
-            register(ip, L4ConnectionProtocol::Http1).switch_protocol(L4ConnectionProtocol::SniTcp);
+        let (guard, mut rx) = register(SocketAddr::new(ip, 40012), L4ConnectionProtocol::Http1)
+            .switch_protocol(L4ConnectionProtocol::SniTcp);
 
         assert_eq!(*rx.borrow(), ConnectionCancelReason::None);
         assert_eq!(drain_ip(ip), 1);

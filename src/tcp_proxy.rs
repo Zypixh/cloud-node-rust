@@ -447,7 +447,7 @@ impl TcpProxyManager {
         }
 
         let connection_guard =
-            l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::SniTcp);
+            l4_connection_registry::register(client_addr, L4ConnectionProtocol::SniTcp);
         let downstream_transport = crate::metrics::transport_metrics_guard(
             crate::metrics::ShadowTransportKind::DownstreamTcp,
         );
@@ -1122,7 +1122,7 @@ impl TcpProxyManager {
             return Ok(());
         }
         let connection_guard =
-            l4_connection_registry::register(client_addr.ip(), L4ConnectionProtocol::SniTcp);
+            l4_connection_registry::register(client_addr, L4ConnectionProtocol::SniTcp);
         let _downstream_transport = crate::metrics::transport_metrics_guard(
             crate::metrics::ShadowTransportKind::DownstreamTcp,
         );

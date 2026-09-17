@@ -36,6 +36,7 @@ pub mod memory_governor;
 pub mod memory_plan;
 pub mod memory_reclaim;
 pub mod memory_shed;
+pub mod memory_ticket;
 pub mod metrics;
 pub mod net_bind;
 pub mod origin_h3;

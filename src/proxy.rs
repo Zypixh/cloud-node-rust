@@ -290,9 +290,13 @@ pub struct ProxyCTX {
     pub origin_address: String,
     pub origin_id: i64,
     pub origin_connect_permit: Option<StaticAdmissionPermit>,
-    pub request_body_waf_permit: Option<StaticAdmissionPermit>,
-    pub response_body_waf_permit: Option<StaticAdmissionPermit>,
-    pub response_transform_permit: Option<StaticAdmissionPermit>,
+    /// Connection's admission ticket bucket (`memory_ticket`), resolved once
+    /// per request in `early_request_filter`. Pooled classes draw from it;
+    /// `None` on unregistered transports falls back to direct admission.
+    pub ticket_bucket: Option<Arc<crate::memory_ticket::TicketBucket>>,
+    pub request_body_waf_permit: Option<crate::memory_ticket::WorkspacePermit>,
+    pub response_body_waf_permit: Option<crate::memory_ticket::WorkspacePermit>,
+    pub response_transform_permit: Option<crate::memory_ticket::WorkspacePermit>,
     pub upstream_retries: u8,
     pub origin_status: i32,
     pub is_on: bool,
@@ -441,6 +445,7 @@ impl Default for ProxyCTX {
             origin_address: String::new(),
             origin_id: 0,
             origin_connect_permit: None,
+            ticket_bucket: None,
             request_body_waf_permit: None,
             response_body_waf_permit: None,
             response_transform_permit: None,
@@ -2463,6 +2468,20 @@ impl EdgeProxy {
         crate::client_ip::peer_socket_endpoints(session)
     }
 
+    /// Pooled admission for request-scoped classes: spend from the
+    /// connection's ticket bucket (resolved in `early_request_filter`) when
+    /// present, else a direct class admission — identical Option semantics.
+    fn admit_workspace(
+        ctx: &ProxyCTX,
+        class: AdmissionClass,
+    ) -> Option<crate::memory_ticket::WorkspacePermit> {
+        crate::memory_ticket::admit_pooled(
+            ctx.ticket_bucket.as_ref(),
+            class,
+            crate::memory_governor::class_estimated_bytes(class),
+        )
+    }
+
     fn downstream_client_socket_addr(session: &Session, ctx: &ProxyCTX) -> SocketAddr {
         session
             .downstream_session
@@ -4015,7 +4034,7 @@ impl EdgeProxy {
         else {
             return;
         };
-        let Some(transform_permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseTransform)
+        let Some(transform_permit) = Self::admit_workspace(ctx, AdmissionClass::ResponseTransform)
         else {
             return;
         };
@@ -6685,7 +6704,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
 
         if let Some(kind) = kind {
             let Some(transform_permit) =
-                MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseTransform)
+                Self::admit_workspace(ctx, AdmissionClass::ResponseTransform)
             else {
                 return;
             };
@@ -6748,7 +6767,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 return;
             }
             let Some(transform_permit) =
-                MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseTransform)
+                Self::admit_workspace(ctx, AdmissionClass::ResponseTransform)
             else {
                 return;
             };
@@ -6775,7 +6794,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
                 return;
             }
             let Some(transform_permit) =
-                MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseTransform)
+                Self::admit_workspace(ctx, AdmissionClass::ResponseTransform)
             else {
                 return;
             };
@@ -7780,7 +7799,7 @@ p {{ margin: 0; color: #475569; font-size: 17px; line-height: 1.7; }}
 
         if request_body_needed && ctx.request_body.is_empty() {
             if ctx.request_body_waf_permit.is_none() {
-                let Some(permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::RequestBodyWaf) else {
+                let Some(permit) = Self::admit_workspace(ctx, AdmissionClass::RequestBodyWaf) else {
                     ctx.response_status = 503;
                     ctx.errors
                         .get_or_insert_with(Vec::new)
@@ -8662,8 +8681,16 @@ impl ProxyHttp for EdgeProxy {
     async fn early_request_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Resolve the connection's admission ticket once per request: the
+        // registry indexes buckets by the transport peer address, which is
+        // exactly what `client_addr()` returns.
+        ctx.ticket_bucket = session
+            .downstream_session
+            .client_addr()
+            .and_then(|addr| addr.as_inet().copied())
+            .and_then(|addr| crate::l4_connection_registry::ticket_for(&addr));
         let global_http = self.config.get_global_http_config_sync();
         let read_timeout = global_http
             .auto_read_timeout
@@ -10243,7 +10270,7 @@ impl ProxyHttp for EdgeProxy {
 
         ctx.has_outbound_waf_body_rules = Self::request_has_outbound_waf_body_rules(ctx);
         if ctx.has_outbound_waf_body_rules {
-            if let Some(permit) = MEMORY_GOVERNOR.try_admit(AdmissionClass::ResponseBodyWaf) {
+            if let Some(permit) = Self::admit_workspace(ctx, AdmissionClass::ResponseBodyWaf) {
                 ctx.response_body_waf_permit = Some(permit);
             } else {
                 ctx.has_outbound_waf_body_rules = false;

@@ -29,11 +29,13 @@ fn bench_admission_throughput() {
     // Class selection ablation: HttpConnection exercises the shared-connection
     // byte budget; RequestBodyWaf exercises only the per-class count path;
     // "mixed" rotates classes per thread to expose cross-class false sharing.
+    // "pooled" draws per-thread from a per-connection ticket bucket (the
+    // memory_ticket path) instead of the global counter per op.
     let class_sel = std::env::var("BENCH_ADMISSION_CLASS").unwrap_or_else(|_| "http".into());
     let class_for = |i: usize| match class_sel.as_str() {
         "waf" => AdmissionClass::RequestBodyWaf,
         "tcp" => AdmissionClass::TcpConnection,
-        "mixed" => [
+        "pooled" | "mixed" => [
             AdmissionClass::HttpConnection,
             AdmissionClass::RequestBodyWaf,
             AdmissionClass::TcpConnection,
@@ -45,6 +47,7 @@ fn bench_admission_throughput() {
         ][i % 8],
         _ => AdmissionClass::HttpConnection,
     };
+    let pooled = class_sel == "pooled";
 
     let granted = Arc::new(AtomicU64::new(0));
     let rejected = Arc::new(AtomicU64::new(0));
@@ -56,11 +59,25 @@ fn bench_admission_throughput() {
             let go = Arc::clone(&go);
             let class = class_for(i);
             std::thread::spawn(move || {
+                // One bucket per thread models one connection's pool; pooled
+                // spends stay on a thread-private line.
+                let bucket = Arc::new(cloud_node_rust::memory_ticket::TicketBucket::new(
+                    std::sync::LazyLock::force(&MEMORY_GOVERNOR),
+                ));
                 while !go.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
                 for _ in 0..iters {
-                    if let Some(permit) = MEMORY_GOVERNOR.try_admit(class) {
+                    let permit = if pooled {
+                        bucket
+                            .spend(class, cloud_node_rust::memory_governor::class_estimated_bytes(class))
+                            .map(|p| cloud_node_rust::memory_ticket::WorkspacePermit::Pooled(p))
+                    } else {
+                        MEMORY_GOVERNOR
+                            .try_admit(class)
+                            .map(|p| cloud_node_rust::memory_ticket::WorkspacePermit::Direct(p))
+                    };
+                    if let Some(permit) = permit {
                         granted.fetch_add(1, Ordering::Relaxed);
                         drop(permit);
                     } else {

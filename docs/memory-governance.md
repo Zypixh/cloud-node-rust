@@ -191,6 +191,34 @@ exported on the node-status `resourceGovernor.shed` object
 (`drainedConnectionsTotal`, `keepaliveMarkedTotal`, `criticalStreak`,
 `lastDrainAgeMs`, `keepaliveShedActive`).
 
+### Per-connection admission tickets (`memory_ticket`)
+
+Request-scoped classes (`RequestBodyWaf`, `ResponseBodyWaf`,
+`ResponseTransform`, `Http2Stream`) previously ran a global padded-counter
+RMW per admission — ~4 shared-line ops per request. Each registered L4
+connection now owns a `TicketBucket` (indexed by peer socket address in
+`L4ConnectionRegistry::by_addr`, looked up once per request in
+`early_request_filter` and once per connection in the H2 stream loop). A
+bucket refills from the `request_workspace` ledger in `need + 256KiB`
+chunks; spends are an uncontended CAS on a connection-private line.
+
+- Ledger bound: `available/4` normally, `available/16` under High+
+  pressure, floored at one transform charge — intentionally below the sum
+  of the old per-class implied bounds (**approved isolation change**:
+  classes on one connection share the pool; a WAF-heavy request can starve
+  the same connection's transform budget, never another connection's).
+- `release` returns bytes to the bucket and refunds the global ledger once
+  the idle balance exceeds `1MiB`, so a 16MiB transform charge is not held
+  for the connection's lifetime; bucket drop (connection close) refunds the
+  rest. Spend failure returns `None` and bumps the class reject counter —
+  identical fail-closed contract to `try_admit`.
+- Unregistered transports (e.g. H3, non-registry paths) take the
+  `WorkspacePermit::Direct` fallback — `try_admit` semantics unchanged.
+- Microbench (debug, 8×2M, same mixed-class rotation): pooled 3.99M ops/s
+  vs direct 2.83M ops/s (+41%).
+- `requestWorkspaceUsedBytes` is exported on node status and folded into
+  the `unaccountedRssBytes` tracked set like the other estimate ledgers.
+
 ### Bounded scoped-IP state (`firewall::bounded_map`)
 
 The seven attacker-driven scoped-IP maps (`blocks`, `kernel_blocks`,
