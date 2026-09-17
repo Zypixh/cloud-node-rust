@@ -274,8 +274,10 @@ pub use self::mld::{
 pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket, Repr as UdpRepr};
 
 pub use self::tcp::{
-    Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, Packet as TcpPacket, Repr as TcpRepr,
-    SeqNumber as TcpSeqNumber, TcpOption, TcpTimestampGenerator, TcpTimestampRepr,
+    AccEcnCounters, Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN,
+    OPT_ACCECN0 as TCP_OPT_ACCECN0, OPT_ACCECN1 as TCP_OPT_ACCECN1, Packet as TcpPacket,
+    Repr as TcpRepr, SeqNumber as TcpSeqNumber, TcpOption, TcpTimestampGenerator,
+    TcpTimestampRepr,
 };
 
 #[cfg(feature = "proto-dhcpv4")]

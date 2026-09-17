@@ -14,9 +14,10 @@ use crate::socket::{Context, PollAt};
 use crate::storage::{Assembler, RingBuffer};
 use crate::time::{Duration, Instant};
 use crate::wire::{
-    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TCP_HEADER_LEN, TcpControl,
-    TcpRepr, TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr,
+    AccEcnCounters, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TCP_HEADER_LEN,
+    TcpControl, TcpRepr, TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr,
 };
+use cloud_node_transport::accecn::{AccEcn, EcnMode, Flags as AccEcnFlags};
 
 pub mod congestion;
 mod transport_ext;
@@ -587,6 +588,43 @@ pub struct Socket<'a> {
     /// the 40-byte options budget.
     syn_extra_options: Option<Box<[u8]>>,
 
+    /// smoltcp-edge (T7): AccECN dual-role state machine (RFC 9768).
+    /// Responder side is passive-always-on (D-D1); the initiator side
+    /// only offers ECN when `ecn_active_offered` was set before
+    /// `connect()` — unoffered sockets emit SYN (0,0,0) and run Not-ECT,
+    /// which is the stock smoltcp behavior for non-opted paths.
+    acc_ecn: AccEcn,
+    /// Initiator gate: advertise AccECN on outgoing SYNs. Set via
+    /// `set_ecn_active_offered` before `connect()`; the dial layer
+    /// maps `xdp.transport.trusted_ecn` here.
+    ecn_active_offered: bool,
+    /// Responder gate: when set, answer an AccECN SYN offer with the
+    /// classic-ECN response instead (per-listener pinning, Table 2).
+    ecn_listener_classic: bool,
+    /// SYN-ACK (AE,CWR,ECE) computed by `answer_syn` — replayed verbatim
+    /// on SYN-ACK retransmits (§3.1.4.2: retransmitted SYN/ACKs repeat
+    /// the same encoding).
+    syn_reply_ecn: AccEcnFlags,
+    /// True once a SYN has been emitted — retransmissions pass
+    /// `retried` to `syn_flags` (§3.1.4.1 bookkeeping is explicit).
+    syn_emitted: bool,
+    /// Receiver-side feedback trigger: a CE mark (or wrap-risk
+    /// threshold) requires an ACK outside the delayed-ACK policy
+    /// (RFC 9768 §3.2.5 delta-CEP rule).
+    accecn_ack_needed: bool,
+    /// Counters last emitted in the AccECN option — emit the option
+    /// only when a counter moved (bounded option chatter). Updated
+    /// only after the carrier segment is actually emitted.
+    acc_opt_last: Option<(u64, u64, u64)>,
+    /// Classic-ECN sender bookkeeping (RFC 3168 §6.1.2): true while
+    /// the current ECE streak has already produced one congestion
+    /// response — prevents per-ACK over-reporting while ECE stays
+    /// latched for a window. Cleared when an ACK arrives without ECE.
+    classic_ece_streak: bool,
+    /// Classic-ECN sender bookkeeping: set after responding to an ECE
+    /// streak — the next outgoing segment carries CWR once (§6.1.2).
+    cwr_pending: bool,
+
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
     /// Delayed ack timer. If set, packets containing exclusively
@@ -693,6 +731,19 @@ impl<'a> Socket<'a> {
             rx_window_cap: None,
             last_rx_duplicate_range: None,
             syn_extra_options: None,
+
+            // smoltcp-edge (T7): a fresh socket is a potential
+            // responder — passive ECN acceptance always on.
+            acc_ecn: AccEcn::new(false, true),
+            ecn_active_offered: false,
+            ecn_listener_classic: false,
+            syn_reply_ecn: AccEcnFlags::new(false, false, false),
+            syn_emitted: false,
+            accecn_ack_needed: false,
+            acc_opt_last: None,
+            classic_ece_streak: false,
+            cwr_pending: false,
+
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -820,6 +871,27 @@ impl<'a> Socket<'a> {
         }
         self.syn_extra_options = Some(options.into());
         Ok(())
+    }
+
+    /// smoltcp-edge (T7): offer ECN/AccECN on outgoing SYNs. Must be
+    /// called before `connect()` — `connect` snapshots the flag into
+    /// the initiator `AccEcn` role. Default off: unconfigured dials
+    /// keep the stock non-ECN handshake.
+    pub fn set_ecn_active_offered(&mut self, offered: bool) {
+        self.ecn_active_offered = offered;
+    }
+
+    /// smoltcp-edge (T7): pin this socket's responder side to the
+    /// classic-ECN handshake answer (RFC 9768 Table 2) instead of the
+    /// full AccECN response. Only meaningful before a SYN arrives.
+    pub fn set_ecn_listener_classic(&mut self, classic: bool) {
+        self.ecn_listener_classic = classic;
+    }
+
+    /// smoltcp-edge (T7): negotiated ECN mode — `EcnMode::Pending`
+    /// until the handshake completes on this socket.
+    pub fn ecn_mode(&self) -> EcnMode {
+        self.acc_ecn.mode
     }
 
     /// smoltcp-edge (T4-7): install an ICMP-driven path-MTU cap. `mtu`
@@ -1177,6 +1249,15 @@ impl<'a> Socket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
+        // smoltcp-edge (T7): reset returns the socket to responder
+        // posture; `connect` re-arms the initiator role below.
+        self.acc_ecn = AccEcn::new(false, true);
+        self.syn_reply_ecn = AccEcnFlags::new(false, false, false);
+        self.syn_emitted = false;
+        self.accecn_ack_needed = false;
+        self.acc_opt_last = None;
+        self.classic_ece_streak = false;
+        self.cwr_pending = false;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -1307,6 +1388,10 @@ impl<'a> Socket<'a> {
         }
 
         self.reset();
+        // smoltcp-edge (T7): active open — ECN is offered only when the
+        // caller opted in via `set_ecn_active_offered` (default off;
+        // stock non-ECN SYN otherwise).
+        self.acc_ecn = AccEcn::new(true, self.ecn_active_offered);
         self.tuple = Some(Tuple {
             local: local_endpoint,
             remote: remote_endpoint,
@@ -1706,6 +1791,8 @@ impl<'a> Socket<'a> {
             sack_ranges: [None, None, None],
             timestamp: None,
             ecn_echo: false,
+            ae: false,
+            acc_ecn_counters: None,
             cwr: false,
             extra_options: &[],
             payload: &[],
@@ -1808,6 +1895,29 @@ impl<'a> Socket<'a> {
 
         // Since the sACK option may have changed the length of the payload, update that.
         ip_reply_repr.set_payload_len(reply_repr.buffer_len());
+
+        // smoltcp-edge (T7): elicited ACKs carry the same feedback
+        // encoding `dispatch` applies — ACE counter under AccECN,
+        // ECE latch under classic. A pending classic CWR also rides
+        // here: this ACK *is* "the next segment" (RFC 3168 §6.1.2).
+        match self.acc_ecn.mode {
+            EcnMode::AccEcn => {
+                let ace = self.acc_ecn.make_ack();
+                reply_repr.ae = ace & 4 != 0;
+                reply_repr.cwr = ace & 2 != 0;
+                reply_repr.ecn_echo = ace & 1 != 0;
+            }
+            EcnMode::ClassicEcn => {
+                reply_repr.ecn_echo = self.acc_ecn.ece_echo_pending();
+                if self.cwr_pending {
+                    reply_repr.cwr = true;
+                    self.cwr_pending = false;
+                }
+                self.acc_ecn.make_ack();
+            }
+            _ => {}
+        }
+        self.accecn_ack_needed = false;
         (ip_reply_repr, reply_repr)
     }
 
@@ -2001,6 +2111,24 @@ impl<'a> Socket<'a> {
                 self.last_remote_tsval
             );
             return None;
+        }
+
+        // smoltcp-edge (T7): receiver-side CE accounting — every segment
+        // that passed the header/ack/PAWS validation feeds the mark
+        // counters; the delta-CEP rule may demand an immediate ACK.
+        // Inactive while the handshake is still negotiating (the flag
+        // bits then carry the Table 2/3 encoding, not feedback).
+        if self
+            .acc_ecn
+            .on_segment(ip_repr.ecn(), repr.payload.len() as u64, 0)
+        {
+            self.accecn_ack_needed = true;
+        }
+        // smoltcp-edge (T7): the peer's CWR releases our receiver-side
+        // classic ECE latch (RFC 3168 §6.1.3) — receiver bookkeeping,
+        // independent of whether an external controller is installed.
+        if repr.cwr && self.acc_ecn.mode == EcnMode::ClassicEcn {
+            self.acc_ecn.take_ece_latch();
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
@@ -2242,6 +2370,13 @@ impl<'a> Socket<'a> {
                 if repr.timestamp.is_none() {
                     self.tsval_generator = None;
                 }
+                // smoltcp-edge (T7): RFC 9768 Table 2 — decode the SYN's
+                // (AE,CWR,ECE) offer and fix the SYN-ACK reply encoding.
+                // A non-ECN SYN produces Not-Ect and stock behavior.
+                self.syn_reply_ecn = self.acc_ecn.answer_syn(
+                    AccEcnFlags::new(repr.ae, repr.cwr, repr.ecn_echo),
+                    self.ecn_listener_classic,
+                );
                 self.set_state(State::SynReceived);
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
@@ -2265,8 +2400,19 @@ impl<'a> Socket<'a> {
             (State::SynSent, TcpControl::Syn) => {
                 if repr.ack_number.is_some() {
                     tcp_trace!("received SYN|ACK");
+                    // smoltcp-edge (T7): Table 3 — decode the responder's
+                    // (AE,CWR,ECE) into the negotiated mode.
+                    self.acc_ecn
+                        .on_syn_ack(AccEcnFlags::new(repr.ae, repr.cwr, repr.ecn_echo));
                 } else {
                     tcp_trace!("received SYN");
+                    // Simultaneous open: the peer initiated too — answer
+                    // its offer per Table 2; the reply flags ride our
+                    // SYN-ACK below.
+                    self.syn_reply_ecn = self.acc_ecn.answer_syn(
+                        AccEcnFlags::new(repr.ae, repr.cwr, repr.ecn_echo),
+                        false,
+                    );
                 }
                 if let Some(max_seg_size) = repr.max_seg_size {
                     // Treat a zero MSS as if the option were absent, like Linux does.
@@ -2426,15 +2572,72 @@ impl<'a> Socket<'a> {
                     self.rtte.retransmission_timeout(),
                 );
                 self.local_rx_last_ack = Some(ack_number);
-                // ECN-ECE: the controller receives one CE event per
-                // ACK bearing ECE (classic ECN; AccECN is T7).
-                if repr.ecn_echo {
-                    ext.cc.on_ecn_ce(
-                        transport_ext::ti(cx.now()),
-                        repr.payload.len() as u64,
-                        ext.sampler.delivered_marker(),
-                        ext.pipe as u64,
-                    );
+                // smoltcp-edge (T7): ECN feedback decode — negotiated
+                // mode selects the wire meaning of (AE,CWR,ECE):
+                //  - AccEcn: the bits are the peer's 3-bit ACE counter;
+                //    the delta counts CE-marked *packets*, and the
+                //    byte-counters option (when present) gives the
+                //    exact CE-byte delta. Without the option, estimate
+                //    bytes as packets × RMSS (RFC 9768 App. A.3).
+                //  - ClassicEcn: ECE carries one congestion signal per
+                //    window — suppress repeat ECE within the same
+                //    response epoch (the latch in `acc_ecn` tracks it;
+                //    feeding once per ECE-flagged ACK would over-
+                //    report, so gate on the latch edge).
+                //  - else: flags carry no feedback.
+                //
+                // `delivered` is this ACK's newly-acked bytes — NOT the
+                // cumulative marker the pre-T7 call passed (that made
+                // the controller's ce/delivered fraction checks inert).
+                //
+                // Segments with SYN set (the SYN/ACK that completed our
+                // handshake) carry the Table-3 negotiation encoding in
+                // these bits, not feedback — never feed them into the
+                // ACE/ECE decoders.
+                if repr.control != TcpControl::Syn {
+                    match self.acc_ecn.mode {
+                        EcnMode::AccEcn => {
+                            let ace = ((repr.ae as u8) << 2)
+                                | ((repr.cwr as u8) << 1)
+                                | repr.ecn_echo as u8;
+                            let ce_pkts = self.acc_ecn.on_ack_ace(ace);
+                            let ce_bytes = if let Some(c) = repr.acc_ecn_counters {
+                                self.acc_ecn.on_ack_option(
+                                    c.e0b.map(u64::from),
+                                    c.e1b.map(u64::from),
+                                    c.ceb.map(u64::from),
+                                )
+                            } else {
+                                ce_pkts.saturating_mul(self.remote_mss as u64)
+                            };
+                            if ce_bytes > 0 {
+                                ext.cc.on_ecn_ce(
+                                    transport_ext::ti(cx.now()),
+                                    ce_bytes,
+                                    ack_len.max(1) as u64,
+                                    ext.pipe as u64,
+                                );
+                            }
+                        }
+                        EcnMode::ClassicEcn => {
+                            // RFC 3168: ECE persists for ~a window —
+                            // respond once per streak (rising edge),
+                            // then signal CWR on our next segment.
+                            if repr.ecn_echo && !self.classic_ece_streak {
+                                self.classic_ece_streak = true;
+                                self.cwr_pending = true;
+                                ext.cc.on_ecn_ce(
+                                    transport_ext::ti(cx.now()),
+                                    self.remote_mss as u64,
+                                    ack_len.max(1) as u64,
+                                    ext.pipe as u64,
+                                );
+                            } else if !repr.ecn_echo {
+                                self.classic_ece_streak = false;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             } else {
             match self.local_rx_last_ack {
@@ -2928,6 +3131,11 @@ impl<'a> Socket<'a> {
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
             // If we have data to acknowledge, do it.
             tcp_trace!("outgoing segment will acknowledge");
+        } else if self.accecn_ack_needed {
+            // smoltcp-edge (T7): RFC 9768 §3.2.5 — a CE mark (or wrap
+            // risk) must be fed back now, outside the delayed-ACK and
+            // ack-number-advance policies.
+            tcp_trace!("outgoing segment will feed back ECN marks");
         } else if self.window_to_update() {
             // If we have window length increase to advertise, do it.
             tcp_trace!("outgoing segment will update window");
@@ -2976,6 +3184,8 @@ impl<'a> Socket<'a> {
                 self.last_remote_tsval,
             ),
             ecn_echo: false,
+            ae: false,
+            acc_ecn_counters: None,
             cwr: false,
             extra_options: &[],
             payload: &[],
@@ -3239,6 +3449,95 @@ impl<'a> Socket<'a> {
             repr.max_seg_size = Some(max_segment_size as u16);
         }
 
+        // smoltcp-edge (T7): ECN encoding on outgoing segments.
+        //  - Handshake: SYN carries the initiator's offer, SYN|ACK the
+        //    fixed Table-2 answer (identical on every retransmit).
+        //  - Established+: the (AE,CWR,ECE) bits are the 3-bit ACE CE
+        //    counter under AccECN, or the ECE latch under classic ECN;
+        //    the byte-counters option rides along when a counter moved.
+        //  - Payload segments leave ECT(0) only when ECN negotiated;
+        //    SYNs/pure-ACKs/RSTs stay Not-ECT (no ECN++).
+        let mut acc_opt_buf = [0u8; 11];
+        // Feedback encoding is computed with non-consuming peeks; the
+        // state commit happens only after `emit` succeeds below so a
+        // device-level failure cannot silently lose CE reports.
+        let mut commit_feedback = false;
+        let mut emitted_acc_counters = None;
+        match self.state {
+            State::SynSent if repr.control == TcpControl::Syn => {
+                let f = self.acc_ecn.syn_flags(self.syn_emitted);
+                repr.ae = f.ae;
+                repr.cwr = f.cwr;
+                repr.ecn_echo = f.ece;
+            }
+            State::SynReceived if repr.control == TcpControl::Syn => {
+                repr.ae = self.syn_reply_ecn.ae;
+                repr.cwr = self.syn_reply_ecn.cwr;
+                repr.ecn_echo = self.syn_reply_ecn.ece;
+                // RFC 9768 §3.2.3.2: probe option traversal with the
+                // empty Order-0 option on the SYN/ACK.
+                if self.acc_ecn.mode == EcnMode::AccEcn {
+                    acc_opt_buf[0] = crate::wire::TCP_OPT_ACCECN0;
+                    acc_opt_buf[1] = 2;
+                    repr.extra_options = &acc_opt_buf[..2];
+                }
+            }
+            _ if repr.ack_number.is_some() && repr.control != TcpControl::Rst => {
+                match self.acc_ecn.mode {
+                    EcnMode::AccEcn => {
+                        let ace = self.acc_ecn.peek_ace();
+                        repr.ae = ace & 4 != 0;
+                        repr.cwr = ace & 2 != 0;
+                        repr.ecn_echo = ace & 1 != 0;
+                        let (e0b, e1b, ceb) = self.acc_ecn.byte_counters();
+                        if self.acc_opt_last != Some((e0b, e1b, ceb)) {
+                            acc_opt_buf[0] = crate::wire::TCP_OPT_ACCECN0;
+                            acc_opt_buf[1] = 11;
+                            // Order 0: EE0B, ECEB, EE1B — 24-bit each.
+                            acc_opt_buf[2..5]
+                                .copy_from_slice(&(e0b as u32).to_be_bytes()[1..]);
+                            acc_opt_buf[5..8]
+                                .copy_from_slice(&(ceb as u32).to_be_bytes()[1..]);
+                            acc_opt_buf[8..11]
+                                .copy_from_slice(&(e1b as u32).to_be_bytes()[1..]);
+                            repr.extra_options = &acc_opt_buf;
+                            emitted_acc_counters = Some((e0b, e1b, ceb));
+                        }
+                        commit_feedback = true;
+                    }
+                    EcnMode::ClassicEcn => {
+                        // RFC 3168: echo ECE while marks are pending or
+                        // the response latch is held; the post-emit
+                        // commit clears the pending count and arms the
+                        // latch.
+                        repr.ecn_echo = self.acc_ecn.ece_echo_pending();
+                        commit_feedback = true;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        // smoltcp-edge (T7): classic-ECN sender side — after responding
+        // to an ECE streak, flag CWR on the next segment (RFC 3168
+        // §6.1.2), exactly once. Gated to classic mode: under AccECN
+        // the CWR bit is part of the ACE counter and must not be
+        // forced independently.
+        if self.cwr_pending
+            && self.acc_ecn.mode == EcnMode::ClassicEcn
+            && repr.ack_number.is_some()
+            && repr.control != TcpControl::Rst
+            && repr.control != TcpControl::Syn
+        {
+            repr.cwr = true;
+            self.cwr_pending = false;
+        }
+        if !repr.payload.is_empty()
+            && matches!(self.acc_ecn.mode, EcnMode::AccEcn | EcnMode::ClassicEcn)
+        {
+            ip_repr.set_ecn(2); // ECT(0)
+        }
+
         // Actually send the packet. If this succeeds, it means the packet is in
         // the device buffer, and its transmission is imminent. If not, we might have
         // a number of problems, e.g. we need neighbor discovery.
@@ -3248,6 +3547,23 @@ impl<'a> Socket<'a> {
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
         emit(cx, packet_meta, (ip_repr, repr))?;
+
+        // smoltcp-edge (T7): post-emit commit — fold pending CE marks
+        // into the ACE counter / arm the classic latch, remember the
+        // counters we just emitted, and clear the forced-ACK flag.
+        if commit_feedback {
+            self.acc_ecn.make_ack();
+            if let Some(c) = emitted_acc_counters {
+                self.acc_opt_last = Some(c);
+            }
+            self.accecn_ack_needed = false;
+        }
+
+        // smoltcp-edge (T7): a SYN is now on the wire — later retries
+        // tell the handshake encoder they are retransmissions.
+        if self.state == State::SynSent && repr.control == TcpControl::Syn {
+            self.syn_emitted = true;
+        }
 
         // smoltcp-edge (T3): record every emitted payload byte on the
         // scoreboard — including the zero-window probe's single byte,
@@ -3356,6 +3672,10 @@ impl<'a> Socket<'a> {
             PollAt::Now
         } else if self.state == State::Closed {
             // Socket was aborted, we have an RST packet to transmit.
+            PollAt::Now
+        } else if self.accecn_ack_needed {
+            // smoltcp-edge (T7): pending CE feedback — dispatch now,
+            // ahead of pacing/delayed-ACK policy (RFC 9768 §3.2.5).
             PollAt::Now
         } else if self.seq_to_transmit(cx) {
             // We have a data or flag packet to transmit — unless the
@@ -3519,6 +3839,8 @@ mod test {
         sack_ranges: [None, None, None],
         timestamp: None,
         ecn_echo: false,
+        ae: false,
+        acc_ecn_counters: None,
         cwr: false,
         extra_options: &[],
         payload: &[],
@@ -3544,6 +3866,8 @@ mod test {
         sack_ranges: [None, None, None],
         timestamp: None,
         ecn_echo: false,
+        ae: false,
+        acc_ecn_counters: None,
         cwr: false,
         extra_options: &[],
         payload: &[],
@@ -10702,6 +11026,471 @@ mod test {
         });
         assert!(!s.pmtu_probe_floor);
         assert_eq!(s.rto_no_progress, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // AccECN (RFC 9768) — negotiation, feedback encoding, wire options.
+    // -------------------------------------------------------------------
+
+    /// `send` variant that injects an explicit IP ECN codepoint — the
+    /// stock helper hardcodes Not-ECT.
+    #[track_caller]
+    fn send_ip_ecn(
+        socket: &mut TestSocket,
+        timestamp: Instant,
+        ecn: u8,
+        repr: &TcpRepr,
+    ) -> Option<TcpRepr<'static>> {
+        socket.cx.set_now(timestamp);
+        let ip_repr = IpReprIpvX(IpvXRepr {
+            src_addr: REMOTE_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: repr.buffer_len(),
+            ecn,
+            hop_limit: 64,
+        });
+        assert!(socket.socket.accepts(&mut socket.cx, &ip_repr, repr));
+        socket
+            .socket
+            .process(&mut socket.cx, &ip_repr, repr)
+            .map(|(_, r)| r)
+    }
+
+    #[test]
+    fn test_accecn_responder_accepts_offer() {
+        // AccECN offer (AE,CWR,ECE)=(1,1,1) → SYN-ACK (0,1,0) plus the
+        // empty Order-0 option probing option traversal (§3.2.3.2).
+        let mut s = socket_listen();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ae: true,
+                cwr: true,
+                ecn_echo: true,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.ecn_mode(), EcnMode::AccEcn);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                cwr: true,
+                extra_options: &[crate::wire::TCP_OPT_ACCECN0, 2],
+                ..RECV_TEMPL
+            }]
+        );
+        // Retransmitted SYN-ACKs repeat the same encoding (§3.1.4.2).
+        s.timer
+            .set_for_retransmit(Instant::from_millis(0), Duration::from_millis(1));
+        recv!(
+            s,
+            time 10,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                cwr: true,
+                extra_options: &[crate::wire::TCP_OPT_ACCECN0, 2],
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_accecn_responder_classic_and_none() {
+        // Classic offer (0,1,1) → SYN-ACK (0,0,1), no AccECN option.
+        let mut s = socket_listen();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                cwr: true,
+                ecn_echo: true,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.ecn_mode(), EcnMode::ClassicEcn);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ecn_echo: true,
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Non-ECN SYN (0,0,0) → SYN-ACK (0,0,0); stock behavior.
+        let mut s = socket_listen();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.ecn_mode(), EcnMode::NotEct);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_accecn_responder_pinned_classic() {
+        // Listener pinned classic answers an AccECN offer with (0,0,1).
+        let mut s = socket_listen();
+        s.set_ecn_listener_classic(true);
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ae: true,
+                cwr: true,
+                ecn_echo: true,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.ecn_mode(), EcnMode::ClassicEcn);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ecn_echo: true,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_accecn_initiator_offer_and_decode() {
+        let mut s = socket();
+        s.local_seq_no = LOCAL_SEQ;
+        s.set_ecn_active_offered(true);
+        s.socket
+            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+            .unwrap();
+        // SYN carries the AccECN offer (1,1,1).
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ae: true,
+                cwr: true,
+                ecn_echo: true,
+                ..RECV_TEMPL
+            }]
+        );
+        // SYN-ACK (0,1,0) → AccECN negotiated. Its flag bits are the
+        // Table-3 encoding, NOT an ACE field — no CE packets may be
+        // counted from it.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(BASE_MSS - 80),
+                window_scale: Some(0),
+                cwr: true,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.ecn_mode(), EcnMode::AccEcn);
+        assert_eq!(s.acc_ecn.peer_cep(), 0);
+    }
+
+    #[test]
+    fn test_accecn_initiator_unoffered_stock_syn() {
+        // Without the offer gate the SYN is stock non-ECN (0,0,0).
+        let mut s = socket();
+        s.local_seq_no = LOCAL_SEQ;
+        s.socket
+            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
+            .unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+        // An unoffered initiator never negotiates — Not-ECT from the
+        // start and after any SYN-ACK.
+        assert_eq!(s.ecn_mode(), EcnMode::NotEct);
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(BASE_MSS - 80),
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.ecn_mode(), EcnMode::NotEct);
+    }
+
+    #[test]
+    fn test_accecn_ce_marks_force_ack_with_counters() {
+        let mut s = socket_established();
+        s.acc_ecn.mode = EcnMode::AccEcn;
+        // Three CE-marked pure-ACK segments hit the delta-CEP trigger
+        // (§3.2.5) — an ACK is owed outside delayed-ACK policy.
+        for i in 0..3 {
+            assert_eq!(
+                send_ip_ecn(
+                    &mut s,
+                    Instant::from_millis(i),
+                    3,
+                    &TcpRepr {
+                        seq_number: REMOTE_SEQ + 1,
+                        ack_number: Some(LOCAL_SEQ + 1),
+                        window_len: 64,
+                        ..SEND_TEMPL
+                    },
+                ),
+                None
+            );
+        }
+        assert!(s.accecn_ack_needed);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+        // The ACK carries ACE=3 (AE=0,CWR=1,ECE=1) and, on its first
+        // emission, the (all-zero) byte-counters option.
+        recv!(
+            s,
+            time 10,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 64,
+                cwr: true,
+                ecn_echo: true,
+                extra_options: &[
+                    crate::wire::TCP_OPT_ACCECN0,
+                    11,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+                ..RECV_TEMPL
+            }]
+        );
+        assert!(!s.accecn_ack_needed);
+    }
+
+    #[test]
+    fn test_accecn_ce_marked_data_counts_bytes() {
+        let mut s = socket_established();
+        s.acc_ecn.mode = EcnMode::AccEcn;
+        // CE-marked data: the CE byte counter advances by the payload.
+        send_ip_ecn(
+            &mut s,
+            Instant::from_millis(0),
+            3,
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 64,
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            },
+        );
+        assert_eq!(s.acc_ecn.byte_counters(), (0, 0, 6));
+        // A single mark is below delta-CEP, but the elicited data ACK
+        // still carries ACE=1 and the updated CEB counter option.
+        recv!(
+            s,
+            time 1,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                ecn_echo: true, // ACE=1
+                extra_options: &[
+                    crate::wire::TCP_OPT_ACCECN0,
+                    11,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    6,
+                    0,
+                    0,
+                    0
+                ],
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_accecn_ace_decode_feeds_controller_once() {
+        let mut s = socket_established();
+        s.acc_ecn.mode = EcnMode::AccEcn;
+        s.set_transport_controller(Box::new(
+            cloud_node_transport::cc::reference::CubicRef::new(536),
+        ));
+        s.send_slice(b"abcdef").unwrap();
+        // The first emitted segment also carries the (zero) counters
+        // option — option-traversal probing applies to any carrier.
+        recv!(
+            s,
+            time 0,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                extra_options: &[
+                    crate::wire::TCP_OPT_ACCECN0,
+                    11,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+                ..RECV_TEMPL
+            })
+        );
+        // ACK carrying ACE=2 (AE=0,CWR=1,ECE=0) reports two CE-marked
+        // packets; a repeat of the same ACE value reports no delta.
+        send!(
+            s,
+            time 1,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 6),
+                window_len: 64,
+                cwr: true,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.acc_ecn.peer_cep(), 2);
+        send!(
+            s,
+            time 2,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 6),
+                window_len: 64,
+                cwr: true,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.acc_ecn.peer_cep(), 2);
+    }
+
+    #[test]
+    fn test_classic_ecn_sender_single_response_per_streak() {
+        let mut s = socket_established();
+        s.acc_ecn.mode = EcnMode::ClassicEcn;
+        s.set_transport_controller(Box::new(
+            cloud_node_transport::cc::reference::CubicRef::new(536),
+        ));
+        s.send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            time 0,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..RECV_TEMPL
+            })
+        );
+        // Two consecutive ECE-flagged ACKs = one congestion signal —
+        // only the rising edge responds; CWR is armed exactly once.
+        for t in 1..=2 {
+            send!(
+                s,
+                time t,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    window_len: 64,
+                    ecn_echo: true,
+                    ..SEND_TEMPL
+                }
+            );
+        }
+        assert!(s.classic_ece_streak);
+        assert!(s.cwr_pending);
+        // The next segment — here the delayed ACK elicited by inbound
+        // data — carries CWR exactly once. Our own ECE echo stays
+        // clear (no CE seen on inbound data).
+        send!(
+            s,
+            time 3,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 6),
+                window_len: 64,
+                payload: &b"xy"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            time 3,
+            Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + 6,
+                ack_number: Some(REMOTE_SEQ + 1 + 2),
+                window_len: 62,
+                cwr: true,
+                ecn_echo: false,
+                ..RECV_TEMPL
+            })
+        );
+        assert!(!s.cwr_pending);
     }
 }
 

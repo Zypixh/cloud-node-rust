@@ -994,6 +994,8 @@ fn test_raw_socket_no_reply_tcp(#[case] medium: Medium) {
         sack_ranges: [None, None, None],
         timestamp: None,
         ecn_echo: false,
+        ae: false,
+        acc_ecn_counters: None,
         cwr: false,
         extra_options: &[],
         payload: &PAYLOAD,

@@ -643,6 +643,20 @@ impl Repr {
         }
     }
 
+    /// smoltcp-edge (T7): set the ECN codepoint on the outgoing repr —
+    /// ECT marking is only applied after the connection negotiated
+    /// ECN (AccECN or classic); unnegotiated flows stay Not-ECT.
+    pub fn set_ecn(&mut self, ecn: u8) {
+        match *self {
+            #[cfg(feature = "proto-ipv4")]
+            Repr::Ipv4(ref mut repr) => repr.ecn = ecn,
+            #[cfg(feature = "proto-ipv6")]
+            Repr::Ipv6(ref mut repr) => repr.ecn = ecn,
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+
     /// Parse an Internet Protocol packet and return an [`IpRepr`](Repr) containing either an Internet
     /// Protocol version 4 or Internet Protocol version 6 packet. Delegates the parsing to the
     /// specific Internet Protocol parsing function. Includes [ChecksumCapabilities] to handle

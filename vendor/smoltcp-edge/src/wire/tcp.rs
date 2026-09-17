@@ -124,9 +124,19 @@ mod field {
     pub const OPT_SACKPERM: u8 = 0x04;
     pub const OPT_SACKRNG: u8 = 0x05;
     pub const OPT_TSTAMP: u8 = 0x08;
+    /// smoltcp-edge (T7): AccECN option kinds (RFC 9768 §7) —
+    /// Order 0 carries EE0B/ECEB/EE1B, Order 1 the reverse.
+    pub const OPT_ACCECN0: u8 = 172;
+    pub const OPT_ACCECN1: u8 = 174;
 }
 
 pub const HEADER_LEN: usize = field::URGENT.end;
+
+/// smoltcp-edge (T7): AccECN option kinds (RFC 9768 §7), re-exported
+/// at module scope so callers can format the option into
+/// `Repr::extra_options` without reaching into `mod field`.
+pub const OPT_ACCECN0: u8 = field::OPT_ACCECN0;
+pub const OPT_ACCECN1: u8 = field::OPT_ACCECN1;
 
 impl<T: AsRef<[u8]>> Packet<T> {
     /// Imbue a raw octet buffer with TCP packet structure.
@@ -358,6 +368,7 @@ impl<T: AsRef<[u8]>> Packet<T> {
                 TcpOption::SackPermitted => summary.sack_permitted = true,
                 TcpOption::SackRange(ranges) => summary.sack_ranges = ranges,
                 TcpOption::TimeStamp { tsval, tsecr } => summary.timestamp = Some((tsval, tsecr)),
+                TcpOption::AccEcn(counters) => summary.acc_ecn_counters = Some(counters),
                 TcpOption::Unknown { .. } => {}
             }
             options = next_options;
@@ -658,6 +669,8 @@ pub struct TcpOptionSummary {
     pub sack_permitted: bool,
     pub sack_ranges: [Option<(u32, u32)>; 3],
     pub timestamp: Option<(u32, u32)>,
+    /// smoltcp-edge (T7): AccECN option contents when present.
+    pub acc_ecn_counters: Option<AccEcnCounters>,
 }
 
 /// A representation of a single TCP option.
@@ -671,6 +684,10 @@ pub enum TcpOption<'a> {
     SackPermitted,
     SackRange([Option<(u32, u32)>; 3]),
     TimeStamp { tsval: u32, tsecr: u32 },
+    /// smoltcp-edge (T7): AccECN feedback option (kinds 172/174,
+    /// RFC 9768 §3.2.3). Counters normalized to identity order;
+    /// `None` = field omitted from the option tail = unchanged.
+    AccEcn(AccEcnCounters),
     Unknown { kind: u8, data: &'a [u8] },
 }
 
@@ -739,6 +756,31 @@ impl<'a> TcpOption<'a> {
                         let tsecr = NetworkEndian::read_u32(&data[4..8]);
                         option = TcpOption::TimeStamp { tsval, tsecr };
                     }
+                    (field::OPT_ACCECN0, _) | (field::OPT_ACCECN1, _) => {
+                        // RFC 9768 §3.2.3: read the whole 3-octet fields
+                        // that fit; the tail may be omitted or padded.
+                        // A length below the kind+len minimum is junk.
+                        if length < 2 {
+                            return Err(Error);
+                        }
+                        let mut counters = AccEcnCounters::default();
+                        let nfields = data.len() / 3;
+                        for (i, chunk) in data.chunks_exact(3).enumerate().take(nfields.min(3)) {
+                            let value = NetworkEndian::read_u24(chunk);
+                            // Order 0: EE0B, ECEB, EE1B; Order 1 reversed.
+                            let slot = if kind == field::OPT_ACCECN0 {
+                                i
+                            } else {
+                                2 - i
+                            };
+                            match slot {
+                                0 => counters.e0b = Some(value),
+                                1 => counters.ceb = Some(value),
+                                _ => counters.e1b = Some(value),
+                            }
+                        }
+                        option = TcpOption::AccEcn(counters);
+                    }
                     (_, _) => option = TcpOption::Unknown { kind, data },
                 }
             }
@@ -755,6 +797,19 @@ impl<'a> TcpOption<'a> {
             TcpOption::SackPermitted => 2,
             TcpOption::SackRange(s) => s.iter().filter(|s| s.is_some()).count() * 8 + 2,
             TcpOption::TimeStamp { tsval: _, tsecr: _ } => 10,
+            // Order-0 field sequence EE0B/ECEB/EE1B — length covers up
+            // to the last present field (RFC 9768 Table 5).
+            TcpOption::AccEcn(c) => {
+                2 + 3 * if c.e1b.is_some() {
+                    3
+                } else if c.ceb.is_some() {
+                    2
+                } else if c.e0b.is_some() {
+                    1
+                } else {
+                    0
+                }
+            }
             TcpOption::Unknown { data, .. } => 2 + data.len(),
         }
     }
@@ -807,6 +862,27 @@ impl<'a> TcpOption<'a> {
                         NetworkEndian::write_u32(&mut buffer[2..], tsval);
                         NetworkEndian::write_u32(&mut buffer[6..], tsecr);
                     }
+                    &TcpOption::AccEcn(counters) => {
+                        // Emit Order 0 (kind 172): EE0B, ECEB, EE1B —
+                        // trailing absent fields are omitted per
+                        // RFC 9768 §3.2.3.3 Table 5. `buffer_len` covers
+                        // up to the last present field; absent slots
+                        // inside that span serialize as 0 (a prefix
+                        // hole can't be expressed on the wire — the
+                        // socket always emits the full counter set).
+                        buffer[0] = field::OPT_ACCECN0;
+                        let nfields = (length - 2) / 3;
+                        for (i, field) in [counters.e0b, counters.ceb, counters.e1b]
+                            .iter()
+                            .enumerate()
+                            .take(nfields)
+                        {
+                            NetworkEndian::write_u24(
+                                &mut buffer[2 + i * 3..],
+                                field.unwrap_or(0),
+                            );
+                        }
+                    }
                     &TcpOption::Unknown {
                         kind,
                         data: provided,
@@ -851,6 +927,20 @@ impl Control {
     }
 }
 
+/// smoltcp-edge (T7): counters carried by an AccECN option, normalized
+/// to counter identity regardless of wire order (kind 172 = Order 0
+/// EE0B/ECEB/EE1B, kind 174 = Order 1 EE1B/ECEB/EE0B). Only the low 24
+/// bits of each counter appear on the wire.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub struct AccEcnCounters {
+    /// EE0B — ECT(0)-marked bytes received (24-bit, mod 2^24).
+    pub e0b: Option<u32>,
+    /// EE1B — ECT(1)-marked bytes received (24-bit, mod 2^24).
+    pub e1b: Option<u32>,
+    /// ECEB — CE-marked bytes received (24-bit, mod 2^24).
+    pub ceb: Option<u32>,
+}
+
 /// A high-level representation of a Transmission Control Protocol packet.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Repr<'a> {
@@ -871,6 +961,15 @@ pub struct Repr<'a> {
     /// smoltcp-edge (T3): Congestion Window Reduced flag, plumbed
     /// through the repr for the same reason as `ecn_echo`.
     pub cwr: bool,
+    /// smoltcp-edge (T7): AccECN AE flag — the TCP header bit formerly
+    /// assigned to the ECN nonce (RFC 3540, reclassified Historic by
+    /// RFC 8311) and renamed AE by RFC 9768. Together with `cwr` and
+    /// `ecn_echo` it forms the 3-bit ACE feedback field.
+    pub ae: bool,
+    /// smoltcp-edge (T7): counters decoded from an AccECN option
+    /// (kinds 172/174, RFC 9768 §3.2.3) — `None` fields were omitted
+    /// from the option tail and mean "unchanged".
+    pub acc_ecn_counters: Option<AccEcnCounters>,
     /// smoltcp-edge (T4): raw option bytes emitted verbatim after the
     /// standard options (TOA kind 254 on dialed SYNs). Emit-only —
     /// `parse` never populates it; unknown incoming options are
@@ -952,6 +1051,7 @@ impl<'a> Repr<'a> {
         let mut sack_permitted = false;
         let mut sack_ranges = [None, None, None];
         let mut timestamp = None;
+        let mut acc_ecn_counters = None;
         while !options.is_empty() {
             let (next_options, option) = TcpOption::parse(options)?;
             match option {
@@ -981,6 +1081,9 @@ impl<'a> Repr<'a> {
                 TcpOption::TimeStamp { tsval, tsecr } => {
                     timestamp = Some(TcpTimestampRepr::new(tsval, tsecr));
                 }
+                // smoltcp-edge (T7): last AccECN option wins — peers
+                // send at most one per segment.
+                TcpOption::AccEcn(c) => acc_ecn_counters = Some(c),
                 _ => (),
             }
             options = next_options;
@@ -1001,6 +1104,9 @@ impl<'a> Repr<'a> {
             timestamp: timestamp,
             ecn_echo: packet.ece(),
             cwr: packet.cwr(),
+            // smoltcp-edge (T7): AE shares the former NS bit.
+            ae: packet.ns(),
+            acc_ecn_counters,
             payload: packet.payload(),
         })
     }
@@ -1071,6 +1177,8 @@ impl<'a> Repr<'a> {
         // smoltcp-edge (T3): plumb ECE/CWR through — no negotiation.
         packet.set_ece(self.ecn_echo);
         packet.set_cwr(self.cwr);
+        // smoltcp-edge (T7): AE shares the former NS bit.
+        packet.set_ns(self.ae);
         {
             let mut options = packet.options_mut();
             if let Some(value) = self.max_seg_size {
@@ -1187,6 +1295,7 @@ impl<T: AsRef<[u8]> + ?Sized> fmt::Display for Packet<&T> {
                 TcpOption::TimeStamp { tsval, tsecr } => {
                     write!(f, " tsval {tsval:08x} tsecr {tsecr:08x}")?
                 }
+                TcpOption::AccEcn(c) => write!(f, " accecn{c:?}")?,
                 TcpOption::Unknown { kind, .. } => write!(f, " opt({kind})")?,
             }
             options = next_options;
@@ -1364,6 +1473,8 @@ mod test {
             sack_ranges: [None, None, None],
             timestamp: None,
             ecn_echo: false,
+            ae: false,
+            acc_ecn_counters: None,
             cwr: false,
             extra_options: &[],
             payload: &PAYLOAD_BYTES,
@@ -1467,6 +1578,70 @@ mod test {
     }
 
     #[test]
+    fn test_accecn_tcp_options() {
+        // RFC 9768 Table 5: Order-0 option (kind 172), all counters —
+        // field sequence EE0B / ECEB / EE1B.
+        assert_option_parses!(
+            TcpOption::AccEcn(AccEcnCounters {
+                e0b: Some(0x010203),
+                ceb: Some(0x040506),
+                e1b: Some(0x070809),
+            }),
+            &[
+                0xac, 0x0b, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09
+            ]
+        );
+        // Trailing fields may be omitted — len 5 carries EE0B only.
+        assert_option_parses!(
+            TcpOption::AccEcn(AccEcnCounters {
+                e0b: Some(0x0a0b0c),
+                ceb: None,
+                e1b: None,
+            }),
+            &[0xac, 0x05, 0x0a, 0x0b, 0x0c]
+        );
+        // Empty option (SYN/ACK traversal probe, §3.2.3.2).
+        assert_option_parses!(TcpOption::AccEcn(AccEcnCounters::default()), &[0xac, 0x02]);
+        // Order 1 (kind 174) carries the same counters in reverse wire
+        // order — parsed to counter identity; emit always uses Order 0.
+        assert_eq!(
+            TcpOption::parse(&[
+                0xae, 0x0b, 0x07, 0x08, 0x09, 0x04, 0x05, 0x06, 0x01, 0x02, 0x03
+            ]),
+            Ok((
+                &[][..],
+                TcpOption::AccEcn(AccEcnCounters {
+                    e0b: Some(0x010203),
+                    ceb: Some(0x040506),
+                    e1b: Some(0x070809),
+                })
+            ))
+        );
+        // A hole inside the emitted span serializes as zero bytes —
+        // on parse those slots come back as Some(0), not None (the
+        // wire cannot distinguish "absent" from "zero" mid-option).
+        let holey = TcpOption::AccEcn(AccEcnCounters {
+            e0b: None,
+            ceb: None,
+            e1b: Some(0x070809),
+        });
+        let mut buf = [0u8; 40];
+        assert_eq!(holey.buffer_len(), 11);
+        holey.emit(&mut buf);
+        assert_eq!(
+            TcpOption::parse(&buf[..11]),
+            Ok((
+                &[][..],
+                TcpOption::AccEcn(AccEcnCounters {
+                    e0b: Some(0),
+                    ceb: Some(0),
+                    e1b: Some(0x070809),
+                })
+            ))
+        );
+    }
+
+    #[test]
     fn test_malformed_tcp_options() {
         assert_eq!(TcpOption::parse(&[]), Err(Error));
         assert_eq!(TcpOption::parse(&[0xc]), Err(Error));
@@ -1474,6 +1649,9 @@ mod test {
         assert_eq!(TcpOption::parse(&[0xc, 0x01]), Err(Error));
         assert_eq!(TcpOption::parse(&[0x2, 0x02]), Err(Error));
         assert_eq!(TcpOption::parse(&[0x3, 0x02]), Err(Error));
+        // AccECN kinds with a sub-minimal length must not parse.
+        assert_eq!(TcpOption::parse(&[0xac, 0x01]), Err(Error));
+        assert_eq!(TcpOption::parse(&[0xae, 0x00]), Err(Error));
     }
 
     #[test]
