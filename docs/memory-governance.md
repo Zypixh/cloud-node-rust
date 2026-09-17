@@ -220,8 +220,10 @@ mint one entry per IP. All scoped insertions now run through
 `governor.firewall_state_map_capacity()` (pressure-aware: ~1M normal,
 ~131k under pressure). When a map is full, expired entries are swept first,
 then earliest-`expires_at` live entries are evicted in batches
-(`over.max(capacity/16).min(512)`) — approved policy: evict-soonest-expiring
-rather than refuse the new block. Evictions increment `wafStateEvicted`,
+(`over.max(capacity/16)`, clamped to 262144) — approved policy:
+evict-soonest-expiring rather than refuse the new block. The batch scales
+with capacity because each victim scan is O(map): a fixed small batch would
+rescan the whole map every few hundred inserts under a sustained storm. Evictions increment `wafStateEvicted`,
 emit a rate-limited warning, and reconcile paired kernel-mirror maps plus
 range/network snapshots so enforcement stays coherent. Existing-key updates
 never evict. Approved tradeoff: under extreme cardinality pressure the
