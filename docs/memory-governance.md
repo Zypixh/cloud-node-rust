@@ -130,6 +130,29 @@ glibc-only `malloc_trim`:
 `ReclaimStats` records process RSS before and after each reclaim pass, so the
 effectiveness of a reclaim cycle is observable instead of assumed.
 
+### Reclaim robustness (unwind builds)
+
+The reclaim machinery is panic-hardened so a single faulting pass cannot
+silently disable the whole subsystem:
+
+- `RECLAIM_IN_FLIGHT`, the thread-local `RECLAIM_IN_PROGRESS`, and the
+  ledger's `RESIDENT_OWNER_UPDATE_IN_PROGRESS` are all cleared by RAII guards
+  during unwinding, so a panic can never wedge a flag permanently.
+- `request_reclaim` contains unwind panics with `catch_unwind`: the pass is
+  logged as an error, the panic still hits the default panic hook, and the
+  call returns `None` so the coordinator rolls the trigger back and the
+  pressure level is re-observed on the next cycle instead of being lost. The
+  cooldown is armed even on panic so a deterministically faulting path cannot
+  hot-loop.
+- The reclaim-monitor loop and the kernel pressure-event watcher each wrap
+  their iteration body in `catch_unwind`, so neither dedicated thread dies on
+  a faulting iteration — the pending-level slot and unpark target keep working.
+- The cooldown's `last == 0` state means "never reclaimed", so the first
+  reclaim of a fresh process is not suppressed, and the cooldown is measured
+  from reclaim completion rather than reclaim start. Release builds use
+  `panic = "abort"`, where containment is moot; these guards protect debug
+  builds and tests.
+
 ## Resident Ledger Consistency
 
 Every map that charges the resident ledger refunds its owner on every removal

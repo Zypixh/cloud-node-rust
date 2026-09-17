@@ -88,6 +88,14 @@ thread_local! {
     static RECLAIM_IN_PROGRESS: Cell<bool> = const { Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only panic injection: set on the current thread to make the next
+    /// `reclaim_for_level` call panic inside the guarded region. Thread-local
+    /// so parallel tests cannot consume each other's injection.
+    static FORCE_RECLAIM_PANIC: Cell<bool> = const { Cell::new(false) };
+}
+
 const RECLAIM_COOLDOWN_MS: u64 = 5_000;
 const ESCALATION_SAMPLES_REQUIRED: u8 = 2;
 const RECOVERY_STABILITY_MS: u64 = 30_000;
@@ -265,6 +273,11 @@ pub fn reclaim_for_level(level: MemoryPressureLevel) -> ReclaimStats {
     }
     let _in_progress_reset = ReclaimInProgressReset;
 
+    #[cfg(test)]
+    if FORCE_RECLAIM_PANIC.with(|flag| flag.replace(false)) {
+        panic!("forced reclaim panic for unwind-safety test");
+    }
+
     let mut stats = ReclaimStats::default();
     stats.process_rss_before_bytes = current_process_rss_bytes();
     match level {
@@ -348,7 +361,10 @@ pub fn request_reclaim(level: MemoryPressureLevel) -> Option<ReclaimStats> {
     }
     let now = monotonic_elapsed_ms();
     let last = LAST_RECLAIM_AT_MS.load(Ordering::Acquire);
-    if now.saturating_sub(last) < RECLAIM_COOLDOWN_MS {
+    // `last == 0` means "never reclaimed" — a bare `now - 0 < cooldown` would
+    // wrongly suppress the first reclaim of a fresh process (e.g. a Critical
+    // spike during startup config load) for up to RECLAIM_COOLDOWN_MS.
+    if last != 0 && now.saturating_sub(last) < RECLAIM_COOLDOWN_MS {
         RECLAIM_IN_FLIGHT.store(false, Ordering::Release);
         return None;
     }
@@ -362,17 +378,56 @@ pub fn request_reclaim(level: MemoryPressureLevel) -> Option<ReclaimStats> {
         }
     }
     let _reset = InFlightReset;
-    let result = reclaim_for_level(level);
-    LAST_RECLAIM_AT_MS.store(now, Ordering::Release);
-    drop(_reset);
-    Some(result)
+    // Contain unwind panics to this call (release builds abort before this
+    // runs). Returning None lets the coordinator roll back so the consumed
+    // trigger is re-observed on the next cycle instead of being lost, and the
+    // monitor thread keeps driving future reclaims. The panic is still
+    // reported by the default panic hook; we additionally log it as an error
+    // so it cannot be mistaken for a normal cooldown skip.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reclaim_for_level(level)
+    }));
+    // Cooldown is measured from reclaim completion, not start — a slow pass
+    // must not leave the window already expired when it finishes. `.max(1)`
+    // keeps 0 reserved for "never reclaimed".
+    LAST_RECLAIM_AT_MS.store(monotonic_elapsed_ms().max(1), Ordering::Release);
+    match outcome {
+        Ok(stats) => {
+            drop(_reset);
+            Some(stats)
+        }
+        Err(payload) => {
+            tracing::error!(
+                target: "memory_reclaim",
+                level = level.as_str(),
+                panic = panic_message(&*payload),
+                "reclaim panicked; trigger preserved for retry"
+            );
+            None
+        }
+    }
+}
+
+/// Extract a human-readable message from a panic payload for logging.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "non-string panic payload"
+    }
 }
 
 pub fn on_memory_pressure_observed(level: MemoryPressureLevel) {
     let now = monotonic_elapsed_ms();
+    // A panic while holding this lock poisons it; the coordinator is a Copy
+    // state machine whose partially-updated value is still valid input, so
+    // recovering the guard keeps pressure observations flowing instead of
+    // panicking every subsequent call on the monitor thread.
     let mut coordinator = reclaim_coordinator()
         .lock()
-        .expect("reclaim coordinator lock poisoned");
+        .unwrap_or_else(|e| e.into_inner());
     // The coordinator is Copy: if the trigger cannot be executed (cooldown or a
     // reclaim already in flight), roll the state machine back so the same
     // pressure level is re-observed and re-triggered later instead of being
@@ -533,12 +588,27 @@ pub fn start_reclaim_monitor() {
                 // coordinator's sample hysteresis and retry backoff.
                 std::thread::park_timeout(Duration::from_secs(5));
                 let pending = drain_pending_pressure();
-                if pending >= MemoryPressureLevel::Elevated {
-                    on_memory_pressure_observed(pending);
-                } else {
-                    periodic_reclaim_check();
+                // In unwind builds a panic anywhere in this iteration
+                // (reclaim, collect, reconcile, a poisoned lock) must not
+                // kill the monitor: the pending-level slot and
+                // RECLAIM_MONITOR_THREAD keep pointing at this thread, so its
+                // death would silently disable every future reclaim while the
+                // rest of the process looks healthy.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if pending >= MemoryPressureLevel::Elevated {
+                        on_memory_pressure_observed(pending);
+                    } else {
+                        periodic_reclaim_check();
+                    }
+                    maybe_reconcile_resident_ledgers();
+                }));
+                if let Err(payload) = outcome {
+                    tracing::error!(
+                        target: "memory_reclaim",
+                        panic = panic_message(&*payload),
+                        "reclaim monitor iteration panicked; monitor stays alive"
+                    );
                 }
-                maybe_reconcile_resident_ledgers();
             }
         });
     if let Err(err) = spawn_result {
@@ -780,7 +850,19 @@ mod pressure_events {
                         ("memory.events", floor)
                     }
                 };
-                on_pressure_event_wake(name, floor);
+                // Keep the watcher alive across a wake panic (e.g. a poisoned
+                // lock inside the snapshot re-read): without this the thread
+                // dies and all event-driven escalation is silently lost.
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || on_pressure_event_wake(name, floor),
+                )) {
+                    tracing::error!(
+                        target: "memory_reclaim",
+                        source = name,
+                        panic = super::panic_message(&*payload),
+                        "pressure event wake panicked; watcher stays alive"
+                    );
+                }
             }
         }
     }
@@ -1092,5 +1174,64 @@ mod tests {
     fn pressure_event_watcher_start_is_idempotent() {
         start_pressure_event_watcher();
         start_pressure_event_watcher();
+    }
+
+    #[test]
+    fn reclaim_panic_resets_in_progress_flag() {
+        // Force a panic inside the guarded region; the RAII reset must clear
+        // the thread-local re-entrancy flag or this thread could never
+        // reclaim again.
+        FORCE_RECLAIM_PANIC.with(|flag| flag.set(true));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reclaim_for_level(MemoryPressureLevel::Critical);
+        }));
+        assert!(outcome.is_err(), "forced panic must propagate to the caller");
+        RECLAIM_IN_PROGRESS.with(|flag| {
+            assert!(
+                !flag.get(),
+                "RECLAIM_IN_PROGRESS must be cleared after a reclaim panic"
+            );
+        });
+    }
+
+    #[test]
+    fn request_reclaim_panic_returns_none_and_resets_in_flight() {
+        // This test doubles as the `last == 0` cooldown-bypass regression:
+        // the thread-local injection is only consumed if the request passes
+        // the cooldown gate, so "injection consumed" deterministically proves
+        // a first-ever reclaim is not suppressed by the never-reclaimed state.
+        for _ in 0..200 {
+            LAST_RECLAIM_AT_MS.store(0, Ordering::Release);
+            FORCE_RECLAIM_PANIC.with(|flag| flag.set(true));
+            let stats = request_reclaim(MemoryPressureLevel::Critical);
+            if stats.is_none() && FORCE_RECLAIM_PANIC.with(|flag| flag.get()) {
+                // Rejected before the guarded region — a concurrent test
+                // holds the in-flight flag. It releases on completion; retry.
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            assert!(
+                stats.is_none(),
+                "a panicking reclaim must report None so the coordinator rolls back"
+            );
+            break;
+        }
+        assert!(
+            !FORCE_RECLAIM_PANIC.with(|flag| flag.get()),
+            "reclaim must reach the guarded region despite `last == 0` (no startup suppression)"
+        );
+        RECLAIM_IN_PROGRESS.with(|flag| assert!(!flag.get()));
+        // Wait for any concurrent reclaim to drain, then assert our panic did
+        // not wedge the flag (a real wedge never clears).
+        for _ in 0..200 {
+            if !RECLAIM_IN_FLIGHT.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !RECLAIM_IN_FLIGHT.load(Ordering::Acquire),
+            "RECLAIM_IN_FLIGHT must be cleared after a reclaim panic"
+        );
     }
 }
