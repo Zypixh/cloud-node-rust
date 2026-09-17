@@ -51,14 +51,29 @@ impl MaceMemoryTier {
     }
 }
 
+fn select_mace_capacity_bytes(cgroup_max: u64, cgroup_high: u64, host_total: u64) -> u64 {
+    if cgroup_max > 0 {
+        cgroup_max
+    } else if cgroup_high > 0 {
+        cgroup_high
+    } else {
+        host_total
+    }
+}
+
 fn stable_mace_capacity_bytes() -> u64 {
     static STABLE_CAPACITY: OnceLock<u64> = OnceLock::new();
     *STABLE_CAPACITY.get_or_init(|| {
         let snapshot = crate::memory_governor::MEMORY_GOVERNOR
             .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads());
-        snapshot
-            .cgroup_memory_max_bytes
-            .max(snapshot.memory_total_bytes)
+        // Persistent store allocations must respect the container ceiling:
+        // prefer the hard memory.max, then the memory.high throttle boundary,
+        // and only fall back to host memory when the node is not limited.
+        select_mace_capacity_bytes(
+            snapshot.cgroup_memory_max_bytes,
+            snapshot.cgroup_memory_high_bytes,
+            snapshot.memory_total_bytes,
+        )
     })
 }
 
@@ -1996,6 +2011,32 @@ pub(crate) fn cache_meta_tombstone_version(hash: &str) -> Option<u64> {
     cache_meta_tombstone_version_for(&STORAGE, hash)
 }
 
+/// Reconcile the cache-metadata and access-log ledger categories against
+/// the live maps. Owner formats: metadata entries are keyed by their hash,
+/// tombstones carry a `cache-meta-tombstone:` prefix.
+pub fn reconcile_cache_meta_resident_ledger(
+) -> crate::memory_governor::ResidentReconcileStats {
+    let gov = &crate::memory_governor::MEMORY_GOVERNOR;
+    let mut total = gov.reconcile_resident_category(
+        crate::memory_governor::ResidentCategory::CacheMetadata,
+        crate::memory_governor::RESIDENT_RECONCILE_MAX_OWNERS,
+        &mut |owner| {
+            if let Some(hash) = owner.strip_prefix("cache-meta-tombstone:") {
+                CACHE_META_TOMBSTONES.contains_key(hash)
+            } else {
+                CACHE_META_INDEX.contains_key(owner)
+            }
+        },
+    );
+    let access = gov.reconcile_resident_category(
+        crate::memory_governor::ResidentCategory::CacheAccessLog,
+        crate::memory_governor::RESIDENT_RECONCILE_MAX_OWNERS,
+        &mut |owner| CACHE_ACCESS_LOG.contains_key(owner),
+    );
+    total.merge(access);
+    total
+}
+
 pub fn record_cache_access_memory(hash: &str) {
     if !CACHE_META_INDEX.contains_key(hash) {
         return;
@@ -2006,16 +2047,25 @@ pub fn record_cache_access_memory(hash: &str) {
         return;
     }
     let now = crate::utils::time::now_timestamp();
-    let entry = CACHE_ACCESS_LOG.entry(hash.to_string()).or_insert_with(|| {
-        let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
-            crate::memory_governor::ResidentCategory::CacheAccessLog,
-            hash,
-            128 + hash.len() as u64,
-        );
-        (AtomicI64::new(now), AtomicU64::new(0))
-    });
-    entry.0.store(now, Ordering::Relaxed);
-    entry.1.fetch_add(1, Ordering::Relaxed);
+    match CACHE_ACCESS_LOG.entry(hash.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => {
+            let entry = entry.into_ref();
+            entry.0.store(now, Ordering::Relaxed);
+            entry.1.fetch_add(1, Ordering::Relaxed);
+        }
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            // Fail-closed: a rejected charge must not leave an unaccounted
+            // entry in the map (same rule as the entry-count cap above).
+            if !crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+                crate::memory_governor::ResidentCategory::CacheAccessLog,
+                hash,
+                128 + hash.len() as u64,
+            ) {
+                return;
+            }
+            slot.insert((AtomicI64::new(now), AtomicU64::new(1)));
+        }
+    }
 }
 
 fn restore_cache_access_memory(hash: &str, access_time: i64, access_count: u64) {
@@ -2027,14 +2077,19 @@ fn restore_cache_access_memory(hash: &str, access_time: i64, access_count: u64) 
     {
         return;
     }
-    let entry = CACHE_ACCESS_LOG.entry(hash.to_string()).or_insert_with(|| {
-        let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
-            crate::memory_governor::ResidentCategory::CacheAccessLog,
-            hash,
-            128 + hash.len() as u64,
-        );
-        (AtomicI64::new(access_time), AtomicU64::new(0))
-    });
+    let entry = match CACHE_ACCESS_LOG.entry(hash.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => entry.into_ref(),
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            if !crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+                crate::memory_governor::ResidentCategory::CacheAccessLog,
+                hash,
+                128 + hash.len() as u64,
+            ) {
+                return;
+            }
+            slot.insert((AtomicI64::new(access_time), AtomicU64::new(0)))
+        }
+    };
     let mut current = entry.0.load(Ordering::Relaxed);
     while current < access_time {
         match entry.0.compare_exchange_weak(
@@ -2393,6 +2448,42 @@ mod tests {
     use serde_json::json;
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicI64, AtomicU64};
+
+    #[test]
+    fn mace_capacity_prefers_cgroup_ceiling_over_host_memory() {
+        let host = 64u64 << 30;
+        assert_eq!(
+            select_mace_capacity_bytes(512 << 20, 0, host),
+            512 << 20,
+            "hard memory.max must win over host total"
+        );
+        assert_eq!(
+            select_mace_capacity_bytes(0, 2 << 30, host),
+            2 << 30,
+            "memory.high-only cgroup must size the store to the throttle boundary"
+        );
+        assert_eq!(
+            select_mace_capacity_bytes(0, 0, host),
+            host,
+            "unmanaged node falls back to host memory"
+        );
+    }
+
+    #[test]
+    fn mace_tier_boundaries_select_smaller_footprint_on_small_nodes() {
+        assert_eq!(
+            MaceMemoryTier::from_stable_capacity_bytes(512 << 20),
+            MaceMemoryTier::MiB512
+        );
+        assert_eq!(
+            MaceMemoryTier::from_stable_capacity_bytes(1 << 30),
+            MaceMemoryTier::GiB1
+        );
+        assert_eq!(
+            MaceMemoryTier::from_stable_capacity_bytes(64 << 30),
+            MaceMemoryTier::GiB2
+        );
+    }
 
     #[test]
     fn server_period_parser_uses_numeric_period_not_key_order() {
@@ -2964,5 +3055,52 @@ mod tests {
         assert_eq!(cache_meta_tombstone_memory(&hash), None);
 
         delete_cache_meta_for_test(&hash);
+    }
+
+    #[test]
+    fn cache_access_log_charge_is_symmetric_with_removal() {
+        let gov = &crate::memory_governor::MEMORY_GOVERNOR;
+        let cache_key = format!(
+            "https://cache.example.test/access-ledger-{}",
+            uuid::Uuid::new_v4()
+        );
+        let hash = format!("{:x}", md5_legacy::compute(cache_key.as_bytes()));
+        let now = crate::utils::time::now_timestamp();
+        let meta = CacheMetaEntry {
+            cache_key,
+            size: 4,
+            expires: now + 86_400,
+            access_time: now,
+            access_count: 1,
+            status: 200,
+            headers: Vec::new(),
+            event_version: Some(next_cache_meta_event_version()),
+            updated_at: now,
+            created_at: now,
+            ..Default::default()
+        };
+        assert!(apply_cache_meta_memory(&hash, meta.clone()));
+        reconcile_cache_meta_upsert_result(&hash, &meta, true);
+
+        record_cache_access_memory(&hash);
+        assert!(CACHE_ACCESS_LOG.contains_key(&hash));
+        assert!(
+            gov.resident_owner_bytes(
+                crate::memory_governor::ResidentCategory::CacheAccessLog,
+                &hash
+            ) > 0,
+            "a recorded access-log entry must carry a resident charge"
+        );
+
+        remove_cache_meta_memory(&hash);
+        assert!(!CACHE_ACCESS_LOG.contains_key(&hash));
+        assert_eq!(
+            gov.resident_owner_bytes(
+                crate::memory_governor::ResidentCategory::CacheAccessLog,
+                &hash
+            ),
+            0,
+            "metadata removal must refund the access-log charge"
+        );
     }
 }

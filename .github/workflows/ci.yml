@@ -143,5 +143,8 @@ jobs:
       - name: cargo test
         run: cargo test --lib --bins
 
+      - name: cargo test (integration)
+        run: cargo test --no-fail-fast --test '*'
+
       - name: cargo test (vendored pingora)
         run: cargo test --manifest-path pingora-main/Cargo.toml -p pingora-core -p pingora-http -p pingora-cache --lib

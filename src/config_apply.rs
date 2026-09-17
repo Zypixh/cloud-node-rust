@@ -110,7 +110,25 @@ pub struct ConfigApplyStats {
     pub admission_retries: u32,
     pub admitted: bool,
     pub elapsed: Duration,
+    /// Raw bytes of the config payload that produced this generation, when
+    /// the caller knows it (the RPC sync path does). Used for the
+    /// `configInstalledJsonBytes` observability gauge.
     pub json_bytes: u64,
+}
+
+/// JSON byte size of the last admitted config generation. The materialized
+/// `RuntimeServerMaps` themselves are not ledger-charged (they are live
+/// serving state, not reclaimable cache), but their size is the cheapest
+/// honest signal of how large the installed generation is.
+static CONFIG_INSTALLED_JSON_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn record_installed_config_bytes(json_bytes: u64) {
+    CONFIG_INSTALLED_JSON_BYTES.store(json_bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn installed_config_json_bytes() -> u64 {
+    CONFIG_INSTALLED_JSON_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Clone, Default)]
@@ -155,14 +173,59 @@ pub fn parse_node_config_json(
 pub fn parse_node_config_from_reader<R: Read>(
     reader: R,
 ) -> Result<(crate::config_models::NodeConfigPayload, String, u64), serde_json::Error> {
+    parse_node_config_from_reader_budgeted(reader, u64::MAX)
+}
+
+/// Same as [`parse_node_config_from_reader`] but aborts the stream once the
+/// decompressed byte count exceeds `max_decoded_bytes`. Compressed payloads
+/// are tiny relative to their decoded size, so without a byte cap a small
+/// gzip/brotli blob can still decode into an oversized structure while the
+/// node is already under memory pressure.
+pub fn parse_node_config_from_reader_budgeted<R: Read>(
+    reader: R,
+    max_decoded_bytes: u64,
+) -> Result<(crate::config_models::NodeConfigPayload, String, u64), serde_json::Error> {
     let mut reader = HashingReader {
-        inner: reader,
+        inner: BudgetedReader {
+            inner: reader,
+            remaining: max_decoded_bytes,
+        },
         ctx: md5_legacy::Context::new(),
         bytes: 0,
     };
     let payload = serde_json::from_reader(&mut reader)?;
     let hash = format!("{:x}", reader.ctx.finalize());
     Ok((payload, hash, reader.bytes))
+}
+
+/// Read adapter that fails with `ErrorKind::InvalidData` once the cumulative
+/// byte count crosses the budget, aborting the JSON decode instead of letting
+/// the decoded payload grow without bound.
+struct BudgetedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for BudgetedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            // Probe for EOF so a payload that fits the budget exactly still
+            // parses; any additional byte means the budget was exceeded.
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe) {
+                Ok(0) => Ok(0),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "node config decode budget exceeded",
+                )),
+                Err(err) => Err(err),
+            };
+        }
+        let limit = (self.remaining as usize).min(buf.len());
+        let n = self.inner.read(&mut buf[..limit])?;
+        self.remaining = self.remaining.saturating_sub(n as u64);
+        Ok(n)
+    }
 }
 
 pub fn hash_waf_snapshot(
@@ -376,9 +439,6 @@ pub async fn materialize_runtime_servers(
     }
 }
 
-/// Drop the currently installed site generation (maps, compiled plans, LBs)
-/// before materializing a replacement snapshot. Callers must only do this
-/// under High/Critical pressure — it briefly makes new host lookups miss.
 /// Apply a full site snapshot onto `store`, replacing previous servers while
 /// keeping unrelated global fields. Used by tests and by incremental RPC
 /// helpers that already parsed `Vec<ServerConfig>`.
@@ -414,6 +474,13 @@ pub async fn apply_server_snapshot(
                 maps.id_to_lb.clone(),
             )
             .await;
+        // `replace_all_servers` just dropped the previous generation on this
+        // thread. Under elevated pressure, purge the freed segments now —
+        // mimalloc only returns a thread's retained pages when that thread
+        // collects, and the next sync may not run on this worker.
+        if limits.pressure >= MemoryPressureLevel::High {
+            crate::memory_reclaim::trim_released_heap();
+        }
     }
     maps
 }
@@ -526,6 +593,27 @@ mod tests {
         let limits = ConfigApplyLimits::synthetic(512 * 1024 * 1024, 96 * 1024 * 1024);
         assert!(limits.decode_budget_bytes() <= 96 * 1024 * 1024);
         assert!(limits.decode_budget_bytes() >= MIN_DECODE_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn budgeted_reader_aborts_decode_past_budget() {
+        let json = br#"{"id":1,"version":7,"isOn":true,"servers":[]}"#;
+        // Under budget: parses fine and reports the full byte count.
+        let (payload, _, decoded) =
+            parse_node_config_from_reader_budgeted(&json[..], json.len() as u64 + 8)
+                .expect("under-budget decode must succeed");
+        assert_eq!(decoded, json.len() as u64);
+        drop(payload);
+        // Exact fit: the EOF probe must still let the parse complete.
+        let (_, _, decoded) =
+            parse_node_config_from_reader_budgeted(&json[..], json.len() as u64)
+                .expect("exact-fit decode must succeed");
+        assert_eq!(decoded, json.len() as u64);
+        // Over budget: the stream aborts instead of decoding further.
+        assert!(
+            parse_node_config_from_reader_budgeted(&json[..], json.len() as u64 - 1).is_err(),
+            "over-budget decode must fail"
+        );
     }
 
     #[test]

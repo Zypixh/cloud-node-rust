@@ -86,6 +86,117 @@ Inbound PROXY Protocol is trusted only from loopback, private, or link-local imm
 
 `enableSendfile` is tracked and exposed in runtime stats. The current Pingora cache `HandleHit` interface returns `Bytes` chunks and supports seek, but it does not expose the downstream socket to storage handlers. Because of that, this node cannot safely call Linux `sendfile(2)` inside the existing storage handler. The current implementation uses larger disk HIT chunks when sendfile is requested and implements Pingora `seek` for memory HIT handlers so range responses avoid extra filtering and over-read. True kernel sendfile would require a larger Pingora serving-path extension or a custom response path that owns both the file descriptor and downstream connection.
 
+## Pressure Detection and Reclaim
+
+Pressure classification still comes from the governor snapshot (thresholds
+unchanged), but detection no longer relies on the 2s snapshot TTL alone. On
+Linux, `start_reclaim_monitor` also starts an idempotent event watcher that
+polls two kernel sources and, on wakeup, invalidates the snapshot cache so the
+next snapshot re-reads cgroup state immediately:
+
+- PSI `/proc/pressure/memory` trigger `some 200000 1000000` (any-task memory
+  stall ≥200ms per 1s window). Works on cgroup v1 and v2.
+- cgroup v2 `memory.events`, resolved by walking the process cgroup upward
+  until a readable file is found (delegated hierarchies often only expose it
+  on an ancestor). Rising `high` counters floor the observation at `High`;
+  `max`, `oom`, or `oom_kill` increments floor it at `Critical`. Events are
+  coalesced to 250ms and never lower the pressure level — the snapshot-derived
+  classifier remains the single source of truth.
+- The classifier additionally folds in PSI avg10 stall ratios (oomd-style):
+  `some` ≥10% floors the level at `Elevated`; `some` ≥30% or `full` ≥5%
+  floors it at `High`. Ratio thresholds measure how much memory is *left*;
+  PSI measures how much tasks are *already stalling* — a host in reclaim
+  congestion can thrash while still reporting free bytes. PSI floors only
+  ever escalate; `Critical` stays byte-threshold/event-driven so a transient
+  stall cannot trigger the most destructive reclaim. Both ratios are exported
+  as `psiMemorySomeAvg10PctX100`/`psiMemoryFullAvg10PctX100`.
+
+Reclaim actions target the allocator that actually owns the heap. The global
+allocator is mimalloc, so heap return uses `mi_collect` instead of the
+glibc-only `malloc_trim`:
+
+- `Elevated`: non-forced `mi_collect(false)` on a rotating thread basis via the
+  60s cache-janitor cycle (the janitor task migrates across Tokio workers, so
+  repeated cycles eventually collect each worker's heap; `mi_collect` only
+  affects the calling thread).
+- `High`/`Critical`: forced `mi_collect(true)` in the reclaim monitor.
+- After `ConfigStore::replace_all_servers` under High/Critical: forced collect
+  on the same thread that dropped the previous generation, so its segments
+  are purged before reuse.
+- moka-backed caches (L1, regex cache, WAF regex cache) call
+  `run_pending_tasks()` after `invalidate_all()` so evictions actually release
+  memory instead of waiting for moka's lazy janitor.
+
+`ReclaimStats` records process RSS before and after each reclaim pass, so the
+effectiveness of a reclaim cycle is observable instead of assumed.
+
+## Resident Ledger Consistency
+
+Every map that charges the resident ledger refunds its owner on every removal
+path: per-key delete, expiry cleanup, capacity eviction, and bulk drain.
+Negative-cache inserts charge the ledger *before* writing the entry, so a
+rejected charge can never leave an uncharged entry behind (the rejection
+increments `negativeCacheAdmissionRejected`). The same charge-before-insert
+rule applies to the cache access log (`CACHE_ACCESS_LOG` uses the `Entry`
+API so a rejected charge skips the insert) and to surrogate index members
+(a rejected member charge degrades the tag to a saturated mark, which purge
+handles via the authoritative metadata scan).
+
+Attacker-driven maps are hard-bounded regardless of TTL sweeping:
+`HTTP_REQUEST_PARSE_MARKS` (client-address keyed) caps at 262k entries
+(65k under High+ pressure) with a force-sweep plus a rate-limited warning;
+a dropped mark only means the connection is treated as having no parsed
+request — the fail-closed direction for the L4 early-close signal.
+
+Three mechanisms bound residual drift:
+
+- Saturated surrogate marks are bounded by `surrogate_index_capacity()` and
+  ledger-charged like index members, so origin-controlled `Surrogate-Key`
+  headers cannot grow them without limit.
+- `reclaim_caches_critical` additionally drops the whole surrogate reverse
+  index (`surrogateIndexTagsRemoved` in `lastReclaim`). Purge stays correct
+  because the purge path always merges the authoritative metadata scan; the
+  index is only an accelerator.
+- Every 5 minutes the reclaim monitor runs a ledger-vs-map reconciliation
+  (skipped above Elevated pressure) that refunds owners whose key no longer
+  exists. Cumulative `ledgerReconcileStaleOwners`/`ledgerReconcileBytesRefunded`
+  are exported in `resourceGovernor`; a nonzero counter indicates a missed
+  refund somewhere and should be investigated rather than accepted.
+- The ledger's own owner map is bounded (`RESIDENT_LEDGER_MAX_OWNERS`):
+  brand-new owner charges are refused at the cap — every call site already
+  treats charge failure as fail-closed — while updates/refunds of tracked
+  owners always proceed so accounting stays exact. Refusals are exported as
+  `ledgerOwnerCapRejections` and current rows as `ledgerTrackedOwners`.
+- High-pressure reclaim also trims the surrogate reverse index down to
+  `SURROGATE_INDEX_MAX_TAGS_PRESSURE`, dropping the largest membership sets
+  first and refunding every member owner; saturated marks are retained
+  because they are cheap and keep degraded-purge semantics.
+
+Other formerly insert-only maps are now bounded or self-cleaning:
+`ORIGIN_HEALTH_MAP` (stale-check GC in the reporter plus a 65k backstop),
+`APPLIED_PURGE_IDS` (65k cap; beyond it dedup degrades to re-applying an
+idempotent purge), `REPLICA_STATS` (the 30s staleness filter now also
+removes dead rows), and `HEADER_NAME_CACHE` (65k).
+
+## Metrics Memory Observability
+
+Metrics tracker memory (metric aggregators, top-IP tracker, daily-domain and
+unique-IP trackers) is estimated every 30s and published as
+`metrics_aggregator_bytes` on the governor snapshot. It is an observational
+gauge: these maps are not charged into the resident ledger, which is
+deliberately scoped to cache categories. A rate-limited `METRICS_MEMORY`
+warning fires when the estimate exceeds max(1/8 of node memory, 64MiB); no
+samples are dropped — cardinality caps are a separate policy decision.
+
+Mace storage capacity is selected cgroup-first: `memory.max`, then
+`memory.high`, then host total. A small cgroup limit can no longer pick a
+host-sized storage tier.
+
+The node pressure signal propagated over `X-Cloud-Node-Pressure` now includes
+a memory component (elevated memory pressure raises the score alongside the
+existing connection/CPU mix), so L1/L2 peers see memory stress instead of an
+idle-looking node.
+
 ## API Compatibility
 
 The node does not require new control-plane configuration fields for this feature. Control-plane-visible memory totals use the same governor snapshot as admission decisions, including cgroup working-set accounting. Runtime visibility is local through logs, `memory_plan`, admission reject counters, and local performance samples. Node status also includes best-effort `resourceGovernor` and `l4Defense` JSON sections with FD pressure, zero-copy permits, UDP queued bytes, L4 pressure, top event kind, top prefix, prefix pressure, aggregate drops, and exact-counter saturation. This keeps configuration compatibility while allowing newer control planes to display the richer runtime snapshot.

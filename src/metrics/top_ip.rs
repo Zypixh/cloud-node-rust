@@ -35,6 +35,12 @@ impl TopIpTracker {
         *entry += 1;
     }
 
+    /// Rough heap estimate for the governor's metrics gauge. Entry cost is
+    /// ~(i64 + IpAddr + u64) plus DashMap slot overhead.
+    pub fn approximate_bytes(&self) -> u64 {
+        (self.counts.len() as u64).saturating_mul(112)
+    }
+
     pub fn flush(&self) -> Vec<(i64, String, u64)> {
         let keys: Vec<(i64, IpAddr)> = self.counts.iter().map(|entry| *entry.key()).collect();
         let mut rows = Vec::with_capacity(keys.len());
@@ -85,5 +91,16 @@ mod tests {
         assert_eq!(restored[0].0, 7);
         assert_eq!(restored[0].1, "192.0.2.1");
         assert_eq!(restored[0].2, 2);
+    }
+
+    #[test]
+    fn approximate_bytes_tracks_live_entries() {
+        let tracker = TopIpTracker::new();
+        assert_eq!(tracker.approximate_bytes(), 0);
+        tracker.record_addr(7, "192.0.2.1".parse().unwrap());
+        tracker.record_addr(7, "2001:db8::1".parse().unwrap());
+        assert_eq!(tracker.approximate_bytes(), 2 * 112);
+        let _ = tracker.flush();
+        assert_eq!(tracker.approximate_bytes(), 0);
     }
 }

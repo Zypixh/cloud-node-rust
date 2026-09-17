@@ -24,8 +24,43 @@ const MAX_PURGE_ID_BYTES: usize = 256;
 static APPLIED_PURGE_IDS: LazyLock<dashmap::DashMap<String, u64>> =
     LazyLock::new(dashmap::DashMap::new);
 
+/// Dedup is a best-effort retransmit filter: beyond this bound new purge ids
+/// are not remembered, so a re-sent request may apply twice — purges are
+/// idempotent, so that is safe.
+const APPLIED_PURGE_IDS_MAX: usize = 65_536;
+
 fn purge_request_is_duplicate(purge_id: &str) -> bool {
     APPLIED_PURGE_IDS.contains_key(purge_id)
+}
+
+fn record_applied_purge_id(purge_id: String, leader_epoch: u64) {
+    record_applied_purge_id_with_capacity(purge_id, leader_epoch, APPLIED_PURGE_IDS_MAX);
+}
+
+fn record_applied_purge_id_with_capacity(purge_id: String, leader_epoch: u64, max: usize) {
+    if APPLIED_PURGE_IDS.len() >= max {
+        static PURGE_ID_FULL_WARN: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(0);
+        let now = crate::utils::time::now_timestamp();
+        let last = PURGE_ID_FULL_WARN.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) >= 600
+            && PURGE_ID_FULL_WARN
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            tracing::warn!(
+                entries = APPLIED_PURGE_IDS.len(),
+                "applied purge id map at capacity — duplicate detection degrades to re-apply (idempotent)"
+            );
+        }
+        return;
+    }
+    APPLIED_PURGE_IDS.insert(purge_id, leader_epoch);
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,7 +456,7 @@ async fn handle_purge(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()>
         return Ok(());
     }
 
-    APPLIED_PURGE_IDS.insert(request.purge_id, request.leader_epoch);
+    record_applied_purge_id(request.purge_id, request.leader_epoch);
     write_response(stream, 200, json!({"ok":true})).await
 }
 
@@ -672,7 +707,10 @@ async fn write_response(
 
 #[cfg(test)]
 mod tests {
-    use super::valid_metadata_event;
+    use super::{
+        APPLIED_PURGE_IDS, purge_request_is_duplicate,
+        record_applied_purge_id_with_capacity, valid_metadata_event,
+    };
     use crate::cluster::metadata::{CacheMetaEvent, CacheMetaEventType};
 
     fn event(event_type: CacheMetaEventType) -> CacheMetaEvent {
@@ -745,5 +783,20 @@ mod tests {
             ("Content-Length".to_string(), "42".to_string()),
         ];
         assert!(valid_metadata_event(&repeated));
+    }
+
+    #[test]
+    fn applied_purge_ids_respect_capacity_and_dedup() {
+        let unique = format!("test-purge-{}", std::process::id());
+        let id_a = format!("{unique}-a");
+        let id_b = format!("{unique}-b");
+        record_applied_purge_id_with_capacity(id_a.clone(), 7, usize::MAX);
+        assert!(purge_request_is_duplicate(&id_a));
+        // cap = 0: any new id is refused, but recorded ids still dedup.
+        record_applied_purge_id_with_capacity(id_b.clone(), 7, 0);
+        assert!(!purge_request_is_duplicate(&id_b));
+        assert!(purge_request_is_duplicate(&id_a));
+        APPLIED_PURGE_IDS.remove(&id_a);
+        APPLIED_PURGE_IDS.remove(&id_b);
     }
 }

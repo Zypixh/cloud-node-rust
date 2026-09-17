@@ -470,16 +470,33 @@ where
                     is_compressed
                 );
 
+                // Gate the decode on the governor's decode budget: the parsed
+                // payload allocates several times the input size, so decoding
+                // must be admitted like the materialization that follows it.
+                // A rejected decode keeps the previous generation serving.
+                let decode_budget =
+                    crate::config_apply::ConfigApplyLimits::from_governor().decode_budget_bytes();
                 let parsed = if is_compressed {
                     let compressed = node_json;
                     tokio::task::spawn_blocking(move || {
                         let decompressor = brotli::Decompressor::new(&compressed[..], 4096);
-                        crate::config_apply::parse_node_config_from_reader(decompressor)
+                        crate::config_apply::parse_node_config_from_reader_budgeted(
+                            decompressor,
+                            decode_budget,
+                        )
                     })
                     .await
                 } else {
                     if node_json.len() <= 4 * 1024 * 1024 {
                         log_raw_json_hints("node_json", &node_json);
+                    }
+                    if node_json.len() as u64 > decode_budget {
+                        warn!(
+                            "RPC_NODE: node_json ({} bytes) exceeds the decode budget ({} bytes) under memory pressure — keeping the current configuration",
+                            node_json.len(),
+                            decode_budget
+                        );
+                        return false;
                     }
                     let json = node_json;
                     tokio::task::spawn_blocking(move || {
@@ -976,7 +993,7 @@ where
                     // once built. Releasing the installed generation up front
                     // opens an empty-route window for every new request during
                     // the whole materialization.
-                    let runtime_maps = crate::config_apply::materialize_runtime_servers(
+                    let mut runtime_maps = crate::config_apply::materialize_runtime_servers(
                         crate::config_apply::MaterializeRuntimeServersArgs {
                             servers: payload_servers,
                             health_manager,
@@ -989,6 +1006,7 @@ where
                         },
                     )
                     .await;
+                    runtime_maps.stats.json_bytes = decoded_bytes;
                     if !runtime_maps.stats.admitted {
                         // Governor refused admission: keep the previous
                         // generation serving and retry the sync later. The
@@ -1152,6 +1170,9 @@ where
                                 .and_then(|g| g.http_access_log.clone()),
                         )
                         .await;
+                    crate::config_apply::record_installed_config_bytes(
+                        runtime_maps.stats.json_bytes,
+                    );
                     *config_version = next_config_cursor;
                     {
                         let mut last_hash = LAST_CONFIG_HASH.write();
@@ -1401,6 +1422,8 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "processRssBytes": governor_snapshot.process_rss_bytes,
             "processPssBytes": governor_snapshot.process_pss_bytes,
             "processAnonRssBytes": governor_snapshot.process_anon_rss_bytes,
+            "psiMemorySomeAvg10PctX100": governor_snapshot.psi_some_avg10_x100,
+            "psiMemoryFullAvg10PctX100": governor_snapshot.psi_full_avg10_x100,
             "residentUsedBytes": governor_snapshot.resident_memory.total_used_bytes,
             "residentBudgetBytes": governor_snapshot.resident_memory.total_budget_bytes,
             "mace": {
@@ -1413,6 +1436,26 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
                 "bucketPoolCapacityBytes": mace_memory.bucket_pool_capacity_bytes,
                 "bucketCheckpointSizeBytes": mace_memory.bucket_checkpoint_size_bytes
             },
+        });
+        // The json! macro hits the recursion limit past ~50 fields; merge a
+        // second object for the slower-changing observability fields.
+        let resource_governor_extra = serde_json::json!({
+            "metricsAggregatorBytes": governor_snapshot.metrics_aggregator_bytes,
+            "pressureEventWakeups": crate::memory_reclaim::pressure_event_wakeups(),
+            "ledgerReconcileStaleOwners": crate::memory_reclaim::ledger_reconcile_stale_owners(),
+            "ledgerReconcileBytesRefunded": crate::memory_reclaim::ledger_reconcile_bytes_refunded(),
+            "ledgerOwnerCapRejections": governor_snapshot.resident_memory.owner_cap_rejections,
+            "ledgerTrackedOwners": governor_snapshot.resident_memory.tracked_owners,
+            "lastReclaim": crate::memory_reclaim::last_reclaim_stats().map(|s| serde_json::json!({
+                "entriesRemoved": s.total_entries_removed(),
+                "l1BytesFreedEstimate": s.l1_bytes_freed_estimate,
+                "surrogateIndexTagsRemoved": s.surrogate_index_tags_removed,
+                "rssBeforeBytes": s.process_rss_before_bytes,
+                "rssAfterBytes": s.process_rss_after_bytes
+            })),
+            "configReloadGeneration": config_store.runtime_reload_generation(),
+            "configServers": config_store.get_all_servers_sync().len(),
+            "configInstalledJsonBytes": crate::config_apply::installed_config_json_bytes(),
             "geoip": {
                 "cityLoaded": geoip_memory.city_loaded,
                 "cityBytes": geoip_memory.city_bytes,
@@ -1421,6 +1464,15 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
                 "asnBytes": geoip_memory.asn_bytes
             },
         });
+        let mut resource_governor = resource_governor;
+        if let (Some(target), Some(extra)) = (
+            resource_governor.as_object_mut(),
+            resource_governor_extra.as_object(),
+        ) {
+            for (key, value) in extra {
+                target.insert(key.clone(), value.clone());
+            }
+        }
         let l4_defense = serde_json::json!({
             "eventsTotal": l4_metrics.events_total,
             "blockedTotal": l4_metrics.blocked_total,
@@ -1463,6 +1515,8 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "configTaskCommitRejected": pipeline_metrics.config_task_commit_rejected,
             "configTaskAckFailed": pipeline_metrics.config_task_ack_failed,
             "configTaskDeferred": pipeline_metrics.config_task_deferred,
+            "tcpRelayBufferShrunk": pipeline_metrics.tcp_relay_buffer_shrunk,
+            "negativeCacheAdmissionRejected": pipeline_metrics.negative_cache_admission_rejected,
         });
 
         let status = serde_json::json!({

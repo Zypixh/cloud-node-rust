@@ -609,7 +609,19 @@ static HTTP_REQUEST_PARSE_MARKS: Lazy<DashMap<String, i64>> =
     Lazy::new(|| DashMap::with_shard_amount(64));
 static HTTP_REQUEST_PARSE_MARK_SWEEP_AT_MS: LazyLock<std::sync::atomic::AtomicI64> =
     LazyLock::new(|| std::sync::atomic::AtomicI64::new(0));
+static HTTP_REQUEST_PARSE_MARK_WARN_AT_MS: LazyLock<std::sync::atomic::AtomicI64> =
+    LazyLock::new(|| std::sync::atomic::AtomicI64::new(0));
 const HTTP_REQUEST_PARSE_MARK_TTL_MS: i64 = 30_000;
+const HTTP_REQUEST_PARSE_MARK_MAX_NORMAL: usize = 262_144;
+const HTTP_REQUEST_PARSE_MARK_MAX_PRESSURE: usize = 65_536;
+
+fn http_request_parse_mark_capacity() -> usize {
+    if crate::memory_governor::MEMORY_GOVERNOR.is_memory_pressure_high() {
+        HTTP_REQUEST_PARSE_MARK_MAX_PRESSURE
+    } else {
+        HTTP_REQUEST_PARSE_MARK_MAX_NORMAL
+    }
+}
 
 fn http_request_parse_mark_key(client_addr: impl ToString) -> String {
     client_addr.to_string()
@@ -630,13 +642,55 @@ fn sweep_http_request_parse_marks() {
     }
 }
 
-pub(crate) fn mark_http_request_parsed(session: &Session) {
+/// Insert a parse mark behind a hard capacity bound — keys are client
+/// addresses and therefore attacker-driven, so the 30s TTL sweep alone is
+/// not enough. On a full table we force-sweep once, then drop the mark:
+/// `take_http_request_parse_mark` simply treats the connection as having no
+/// parsed request, which errs toward recording an early-close L4 event
+/// (fail-closed for the defense signal).
+fn insert_http_request_parse_mark(client_addr: impl ToString) {
+    insert_http_request_parse_mark_with_capacity(
+        client_addr,
+        http_request_parse_mark_capacity(),
+    );
+}
+
+fn insert_http_request_parse_mark_with_capacity(
+    client_addr: impl ToString,
+    capacity: usize,
+) {
     sweep_http_request_parse_marks();
+    let key = http_request_parse_mark_key(client_addr);
+    if !HTTP_REQUEST_PARSE_MARKS.contains_key(&key)
+        && HTTP_REQUEST_PARSE_MARKS.len() >= capacity
+    {
+        HTTP_REQUEST_PARSE_MARKS.retain(|_, ts| {
+            crate::utils::time::now_timestamp_millis().saturating_sub(*ts)
+                <= HTTP_REQUEST_PARSE_MARK_TTL_MS
+        });
+        if HTTP_REQUEST_PARSE_MARKS.len() >= capacity {
+            let now = crate::utils::time::now_timestamp_millis();
+            let last = HTTP_REQUEST_PARSE_MARK_WARN_AT_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= HTTP_REQUEST_PARSE_MARK_TTL_MS
+                && HTTP_REQUEST_PARSE_MARK_WARN_AT_MS
+                    .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                tracing::warn!(
+                    "HTTP request parse marks at capacity; len={} capacity={}, dropping mark",
+                    HTTP_REQUEST_PARSE_MARKS.len(),
+                    http_request_parse_mark_capacity()
+                );
+            }
+            return;
+        }
+    }
+    HTTP_REQUEST_PARSE_MARKS.insert(key, crate::utils::time::now_timestamp_millis());
+}
+
+pub(crate) fn mark_http_request_parsed(session: &Session) {
     if let Some(client_addr) = session.downstream_session.client_addr() {
-        HTTP_REQUEST_PARSE_MARKS.insert(
-            http_request_parse_mark_key(client_addr),
-            crate::utils::time::now_timestamp_millis(),
-        );
+        insert_http_request_parse_mark(client_addr);
     }
 }
 
@@ -8514,10 +8568,7 @@ impl ProxyHttp for EdgeProxy {
         _ctx: &mut Self::CTX,
     ) -> DownstreamParseErrorAction {
         if let Some(client_addr) = session.client_addr() {
-            HTTP_REQUEST_PARSE_MARKS.insert(
-                http_request_parse_mark_key(client_addr),
-                crate::utils::time::now_timestamp_millis(),
-            );
+            insert_http_request_parse_mark(client_addr);
         }
         let (reason, defense) = Self::classify_downstream_parse_error(error);
         if matches!(error.etype(), ReadTimedout) {
@@ -12077,5 +12128,43 @@ mod tests {
             EdgeProxy::decode_waf_pass_cookie_value(&encoded),
             Some(("captcha".to_string(), "abc123".to_string()))
         );
+    }
+
+    #[test]
+    fn http_request_parse_marks_respect_capacity_bound() {
+        let base = super::HTTP_REQUEST_PARSE_MARKS.len();
+        let capacity = base + 4;
+        super::insert_http_request_parse_mark_with_capacity(
+            "203.0.113.10:50001",
+            capacity,
+        );
+        super::insert_http_request_parse_mark_with_capacity(
+            "203.0.113.11:50002",
+            capacity,
+        );
+        assert!(super::HTTP_REQUEST_PARSE_MARKS.len() <= capacity);
+        // Once the table is at capacity, new keys are dropped (the force
+        // sweep finds nothing stale since all entries are fresh).
+        let before = super::HTTP_REQUEST_PARSE_MARKS.len();
+        super::insert_http_request_parse_mark_with_capacity(
+            "203.0.113.12:50003",
+            before.min(capacity),
+        );
+        assert!(
+            super::HTTP_REQUEST_PARSE_MARKS.len() <= before.min(capacity),
+            "parse-mark table must stay under its capacity bound"
+        );
+        // Existing keys still refresh in place even at capacity.
+        super::insert_http_request_parse_mark_with_capacity(
+            "203.0.113.10:50001",
+            capacity,
+        );
+        assert!(
+            super::HTTP_REQUEST_PARSE_MARKS.contains_key("203.0.113.10:50001"),
+        );
+        // Cleanup so the global table does not leak into other tests.
+        super::HTTP_REQUEST_PARSE_MARKS.remove("203.0.113.10:50001");
+        super::HTTP_REQUEST_PARSE_MARKS.remove("203.0.113.11:50002");
+        super::HTTP_REQUEST_PARSE_MARKS.remove("203.0.113.12:50003");
     }
 }

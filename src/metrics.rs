@@ -183,7 +183,22 @@ fn compute_node_pressure(sys: &mut sysinfo::System) -> f32 {
     sys.refresh_cpu_usage();
     let cpu_load = sys.global_cpu_usage() as f64 / 100.0;
 
-    ((conn_pressure * 0.7 + cpu_load * 0.3).min(1.0)) as f32
+    // Memory was the missing term: an L2 node under governor-classified
+    // memory pressure must look pressured to L1 peers and to the local
+    // transform gate even when CPU/connections are idle. The floor values
+    // map to `limit_for_pressure` steps (0.55→3/4, 0.75→1/2, 0.90→1) so
+    // memory pressure can only raise the signal, never lower it.
+    let memory_component = match crate::memory_governor::MEMORY_GOVERNOR
+        .snapshot(crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads())
+        .memory_pressure_level
+    {
+        crate::memory_governor::MemoryPressureLevel::Normal => 0.0_f64,
+        crate::memory_governor::MemoryPressureLevel::Elevated => 0.55,
+        crate::memory_governor::MemoryPressureLevel::High => 0.75,
+        crate::memory_governor::MemoryPressureLevel::Critical => 0.90,
+    };
+
+    ((conn_pressure * 0.7 + cpu_load * 0.3).min(1.0).max(memory_component)) as f32
 }
 
 pub mod aggregator;
@@ -1384,6 +1399,39 @@ pub async fn start_persistence_flusher() {
 
     loop {
         interval.tick().await;
+        let metrics_state_bytes = crate::metrics::aggregator::METRIC_STAT_AGGREGATOR
+            .approximate_bytes()
+            .saturating_add(
+                crate::metrics::aggregator::HTTP_REQUEST_STAT_AGGREGATOR.approximate_bytes(),
+            )
+            .saturating_add(crate::metrics::top_ip::TOP_IP_TRACKER.approximate_bytes())
+            .saturating_add(crate::metrics::daily::DAILY_DOMAIN_TRACKER.approximate_bytes())
+            .saturating_add(crate::metrics::daily::UNIQUE_IP_TRACKER.approximate_bytes());
+        crate::memory_governor::MEMORY_GOVERNOR
+            .set_metrics_aggregator_bytes(metrics_state_bytes);
+        // Observability-only guard: the metrics maps are unbounded by design
+        // today, so surface a rate-limited warning when their estimated
+        // footprint becomes a material share of the node budget. No samples
+        // are dropped here — capping requires an explicit policy decision.
+        {
+            static LAST_METRICS_WARN: AtomicI64 = AtomicI64::new(0);
+            let snap = crate::memory_governor::MEMORY_GOVERNOR.snapshot(
+                crate::memory_governor::MEMORY_GOVERNOR.pingora_worker_threads(),
+            );
+            let floor = 64u64 * 1024 * 1024;
+            let limit = (snap.memory_total_bytes / 8).max(floor);
+            let now = crate::utils::time::now_timestamp();
+            let last = LAST_METRICS_WARN.load(std::sync::atomic::Ordering::Relaxed);
+            if metrics_state_bytes > limit && now.saturating_sub(last) >= 600 {
+                LAST_METRICS_WARN.store(now, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    metrics_state_bytes,
+                    limit,
+                    memory_total_bytes = snap.memory_total_bytes,
+                    "METRICS_MEMORY: estimated metrics tracker footprint exceeds 1/8 of node memory budget; consider cardinality caps"
+                );
+            }
+        }
         let mut updates = Vec::new();
         // Baselines are only committed after the Mace write succeeds; on a
         // failed write the next round recomputes the same deltas instead of

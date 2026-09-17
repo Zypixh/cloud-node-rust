@@ -27,6 +27,7 @@ pub struct PipelineMetricsSnapshot {
     pub config_task_ack_failed: u64,
     pub config_task_deferred: u64,
     pub tcp_relay_buffer_shrunk: u64,
+    pub negative_cache_admission_rejected: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,7 @@ pub enum PipelineCounter {
     ConfigTaskAckFailed,
     ConfigTaskDeferred,
     TcpRelayBufferShrunk,
+    NegativeCacheAdmissionRejected,
 }
 
 struct PipelineMetrics {
@@ -84,6 +86,7 @@ struct PipelineMetrics {
     config_task_ack_failed: AtomicU64,
     config_task_deferred: AtomicU64,
     tcp_relay_buffer_shrunk: AtomicU64,
+    negative_cache_admission_rejected: AtomicU64,
 }
 
 impl PipelineMetrics {
@@ -114,6 +117,7 @@ impl PipelineMetrics {
             config_task_ack_failed: AtomicU64::new(0),
             config_task_deferred: AtomicU64::new(0),
             tcp_relay_buffer_shrunk: AtomicU64::new(0),
+            negative_cache_admission_rejected: AtomicU64::new(0),
         }
     }
 
@@ -144,6 +148,9 @@ impl PipelineMetrics {
             PipelineCounter::ConfigTaskAckFailed => &self.config_task_ack_failed,
             PipelineCounter::ConfigTaskDeferred => &self.config_task_deferred,
             PipelineCounter::TcpRelayBufferShrunk => &self.tcp_relay_buffer_shrunk,
+            PipelineCounter::NegativeCacheAdmissionRejected => {
+                &self.negative_cache_admission_rejected
+            }
         }
     }
 
@@ -178,6 +185,9 @@ impl PipelineMetrics {
             config_task_ack_failed: self.config_task_ack_failed.load(Ordering::Relaxed),
             config_task_deferred: self.config_task_deferred.load(Ordering::Relaxed),
             tcp_relay_buffer_shrunk: self.tcp_relay_buffer_shrunk.load(Ordering::Relaxed),
+            negative_cache_admission_rejected: self
+                .negative_cache_admission_rejected
+                .load(Ordering::Relaxed),
         }
     }
 }

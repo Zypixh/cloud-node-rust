@@ -184,6 +184,9 @@ pub struct GovernorSnapshot {
     pub disk_rejects: u64,
     pub pingora_keepalive_pool_size: usize,
     pub resident_memory: ResidentMemorySnapshot,
+    /// Estimated bytes held by metrics trackers that are not covered by the
+    /// resident ledger (aggregator maps, top-IP, daily domain, unique IP).
+    pub metrics_aggregator_bytes: u64,
     pub cgroup_managed: bool,
     pub cgroup_memory_max_bytes: u64,
     pub cgroup_memory_high_bytes: u64,
@@ -191,6 +194,10 @@ pub struct GovernorSnapshot {
     pub process_rss_bytes: u64,
     pub process_pss_bytes: u64,
     pub process_anon_rss_bytes: u64,
+    /// PSI memory stall ratios in hundredths of a percent (avg10=10.00 →
+    /// 1000); 0 when PSI is unavailable.
+    pub psi_some_avg10_x100: u32,
+    pub psi_full_avg10_x100: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -211,6 +218,10 @@ pub struct ResidentMemorySnapshot {
     pub bloom_filter_used_bytes: u64,
     pub negative_cache_used_bytes: u64,
     pub pressure_level: MemoryPressureLevel,
+    /// New-owner charges refused at `RESIDENT_LEDGER_MAX_OWNERS`.
+    pub owner_cap_rejections: u64,
+    /// Currently tracked owner rows.
+    pub tracked_owners: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -235,11 +246,48 @@ impl ResidentCategory {
     }
 }
 
+/// Outcome of one ledger-vs-map reconciliation pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResidentReconcileStats {
+    pub owners_scanned: usize,
+    pub stale_owners_removed: usize,
+    pub bytes_refunded: u64,
+    /// True when the category had more owners than the per-pass cap — the
+    /// remainder is covered by subsequent passes.
+    pub truncated: bool,
+}
+
+impl ResidentReconcileStats {
+    pub fn merge(&mut self, other: ResidentReconcileStats) {
+        self.owners_scanned = self.owners_scanned.saturating_add(other.owners_scanned);
+        self.stale_owners_removed = self
+            .stale_owners_removed
+            .saturating_add(other.stale_owners_removed);
+        self.bytes_refunded = self.bytes_refunded.saturating_add(other.bytes_refunded);
+        self.truncated |= other.truncated;
+    }
+}
+
+/// Owner keys cloned per reconciliation pass. Bounds the transient spike:
+/// at ~100 B/owner this caps the snapshot near 64 MiB.
+pub const RESIDENT_RECONCILE_MAX_OWNERS: usize = 655_360;
+
+/// Hard bound on tracked resident-ledger owners. Every charge-bearing map
+/// already has its own bound, so this only refuses new owners once total
+/// tracked owners reach the cap — a second-order bound so the ledger itself
+/// cannot grow without limit if a caller ever leaks owners. Existing-owner
+/// updates and refunds always proceed.
+pub const RESIDENT_LEDGER_MAX_OWNERS: usize = 4_000_000;
+
 #[derive(Debug)]
 struct ResidentMemoryAccounting {
     used: [AtomicU64; ResidentCategory::COUNT],
     total: AtomicU64,
     owners: Mutex<HashMap<(ResidentCategory, String), u64>>,
+    /// New-owner insertions refused because `owners` hit its cap. Charging
+    /// failure already drives fail-closed handling at every call site, so a
+    /// refused owner charge never becomes an unaccounted map entry.
+    owner_cap_rejections: AtomicU64,
     mutation: Mutex<()>,
 }
 
@@ -255,6 +303,7 @@ impl ResidentMemoryAccounting {
             ],
             total: AtomicU64::new(0),
             owners: Mutex::new(HashMap::new()),
+            owner_cap_rejections: AtomicU64::new(0),
             mutation: Mutex::new(()),
         }
     }
@@ -275,6 +324,11 @@ struct MemorySnapshot {
     process_rss_bytes: u64,
     process_pss_bytes: u64,
     process_anon_rss_bytes: u64,
+    /// PSI `/proc/pressure/memory` `some`/`full` avg10 values in hundredths of
+    /// a percent (avg10=10.00 → 1000). Zero on non-Linux or when PSI is
+    /// unavailable — ratio thresholds remain the only signal then.
+    psi_some_avg10_x100: u32,
+    psi_full_avg10_x100: u32,
 }
 
 pub static MEMORY_GOVERNOR: LazyLock<MemoryGovernor> = LazyLock::new(MemoryGovernor::new);
@@ -538,6 +592,12 @@ pub struct MemoryGovernor {
     rpc_stream_commands: AtomicU64,
     sni_relays: AtomicU64,
     cache_read_memory_bytes: AtomicU64,
+    /// Observational gauge for metrics trackers (aggregators, top-IP, daily
+    /// domain, unique-IP sets) that live outside the resident ledger. Kept
+    /// out of `resident.total` on purpose: the ledger enforces cache budgets,
+    /// and letting unbudgeted metrics maps share that total would starve the
+    /// cache categories it protects.
+    metrics_aggregator_bytes: AtomicU64,
     admission_rejects: [AtomicU64; ADMISSION_CLASS_COUNT],
     cached_total_bytes: AtomicU64,
     cached_used_bytes: AtomicU64,
@@ -549,6 +609,9 @@ pub struct MemoryGovernor {
     cached_fd_used: AtomicU64,
     cached_fd_used_at_millis: AtomicU64,
     cached_at_millis: AtomicU64,
+    /// Serializes cache refreshers; readers use `cached_at_millis` as a
+    /// seqlock version (0 = update in progress).
+    snapshot_update: Mutex<()>,
     cached_cgroup_managed: AtomicU64,
     cached_cgroup_memory_max_bytes: AtomicU64,
     cached_cgroup_memory_high_bytes: AtomicU64,
@@ -556,6 +619,8 @@ pub struct MemoryGovernor {
     cached_process_rss_bytes: AtomicU64,
     cached_process_pss_bytes: AtomicU64,
     cached_process_anon_rss_bytes: AtomicU64,
+    cached_psi_some_avg10_x100: AtomicU64,
+    cached_psi_full_avg10_x100: AtomicU64,
     resident: ResidentMemoryAccounting,
     /// EN-16 listener pools: (bind addr, class) -> in-flight slots held.
     listener_pools: Mutex<HashMap<(SocketAddr, u8), u64>>,
@@ -698,6 +763,7 @@ impl MemoryGovernor {
             rpc_stream_commands: AtomicU64::new(0),
             sni_relays: AtomicU64::new(0),
             cache_read_memory_bytes: AtomicU64::new(0),
+            metrics_aggregator_bytes: AtomicU64::new(0),
             admission_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             cached_total_bytes: AtomicU64::new(0),
             cached_used_bytes: AtomicU64::new(0),
@@ -709,6 +775,7 @@ impl MemoryGovernor {
             cached_fd_used: AtomicU64::new(0),
             cached_fd_used_at_millis: AtomicU64::new(0),
             cached_at_millis: AtomicU64::new(0),
+            snapshot_update: Mutex::new(()),
             cached_cgroup_managed: AtomicU64::new(0),
             cached_cgroup_memory_max_bytes: AtomicU64::new(0),
             cached_cgroup_memory_high_bytes: AtomicU64::new(0),
@@ -716,6 +783,8 @@ impl MemoryGovernor {
             cached_process_rss_bytes: AtomicU64::new(0),
             cached_process_pss_bytes: AtomicU64::new(0),
             cached_process_anon_rss_bytes: AtomicU64::new(0),
+            cached_psi_some_avg10_x100: AtomicU64::new(0),
+            cached_psi_full_avg10_x100: AtomicU64::new(0),
             resident: ResidentMemoryAccounting::new(),
             listener_pools: Mutex::new(HashMap::new()),
             listener_class_active: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1606,6 +1675,19 @@ impl MemoryGovernor {
         firewall_candidate_stats_capacity(&self.memory_snapshot())
     }
 
+    pub fn set_metrics_aggregator_bytes(&self, bytes: u64) {
+        self.metrics_aggregator_bytes
+            .store(bytes, Ordering::Relaxed);
+    }
+
+    /// Drop the snapshot TTL so the next `memory_snapshot()` re-reads
+    /// cgroup/proc counters instead of serving values up to `SNAPSHOT_TTL_MS`
+    /// old. The kernel pressure watcher calls this on memory.events/PSI
+    /// wakes so classification sees the real level immediately.
+    pub fn invalidate_snapshot_cache(&self) {
+        self.cached_at_millis.store(0, Ordering::Relaxed);
+    }
+
     pub fn resident_memory_snapshot(&self) -> ResidentMemorySnapshot {
         let used = |category: ResidentCategory| {
             self.resident.used[category.index()].load(Ordering::Acquire)
@@ -1637,6 +1719,16 @@ impl MemoryGovernor {
             bloom_filter_used_bytes: used(ResidentCategory::BloomFilter),
             negative_cache_used_bytes: used(ResidentCategory::NegativeCache),
             pressure_level,
+            owner_cap_rejections: self
+                .resident
+                .owner_cap_rejections
+                .load(Ordering::Relaxed),
+            tracked_owners: self
+                .resident
+                .owners
+                .lock()
+                .map(|owners| owners.len())
+                .unwrap_or(0),
         }
     }
 
@@ -1686,10 +1778,35 @@ impl MemoryGovernor {
         owner: &str,
         new_bytes: u64,
     ) -> bool {
+        self.resident_memory_replace_owned_with_cap(
+            category,
+            owner,
+            new_bytes,
+            RESIDENT_LEDGER_MAX_OWNERS,
+        )
+    }
+
+    fn resident_memory_replace_owned_with_cap(
+        &self,
+        category: ResidentCategory,
+        owner: &str,
+        new_bytes: u64,
+        max_owners: usize,
+    ) -> bool {
         RESIDENT_OWNER_UPDATE_IN_PROGRESS.with(|in_progress| {
             if in_progress.replace(true) {
                 return false;
             }
+            // Reset on unwind too: a panic in the charge path must not wedge
+            // the flag and silently refuse every later owner update on this
+            // thread.
+            struct InProgressReset<'a>(&'a std::cell::Cell<bool>);
+            impl Drop for InProgressReset<'_> {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            let _reset = InProgressReset(in_progress);
             let result = (|| {
                 let mut owners = self
                     .resident
@@ -1698,6 +1815,16 @@ impl MemoryGovernor {
                     .expect("resident accounting lock poisoned");
                 let key = (category, owner.to_string());
                 let old_bytes = owners.get(&key).copied().unwrap_or(0);
+                // The owners map itself is charge-bearing memory; bound it.
+                // New owners at the cap are refused — every caller treats a
+                // false return as fail-closed — while updates and refunds of
+                // tracked owners always proceed so accounting stays exact.
+                if old_bytes == 0 && new_bytes > 0 && owners.len() >= max_owners {
+                    self.resident
+                        .owner_cap_rejections
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
                 if !self.resident_memory_replace(category, old_bytes, new_bytes) {
                     return false;
                 }
@@ -1708,13 +1835,81 @@ impl MemoryGovernor {
                 }
                 true
             })();
-            in_progress.set(false);
             result
         })
     }
 
     pub fn resident_memory_remove(&self, category: ResidentCategory, bytes: u64) {
         let _ = self.resident_memory_replace(category, bytes, 0);
+    }
+
+    /// Per-owner lookup used by tests and by the periodic ledger
+    /// reconciliation sweep.
+    pub fn resident_owner_bytes(&self, category: ResidentCategory, owner: &str) -> u64 {
+        self.resident
+            .owners
+            .lock()
+            .expect("resident accounting lock poisoned")
+            .get(&(category, owner.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Refund ledger owners in `category` whose key fails `is_live` against
+    /// the live map. Owner enumeration is capped per pass so the sweep stays
+    /// bounded even for the largest categories; each candidate is probed
+    /// twice so a key reinserted and recharged between the snapshot and the
+    /// refund keeps its fresh charge.
+    pub fn reconcile_resident_category(
+        &self,
+        category: ResidentCategory,
+        max_owners: usize,
+        is_live: &mut dyn FnMut(&str) -> bool,
+    ) -> ResidentReconcileStats {
+        let (owners, truncated) = {
+            let guard = self
+                .resident
+                .owners
+                .lock()
+                .expect("resident accounting lock poisoned");
+            let mut collected = Vec::new();
+            let mut truncated = false;
+            for (cat, owner) in guard.keys() {
+                if *cat != category {
+                    continue;
+                }
+                if collected.len() >= max_owners {
+                    truncated = true;
+                    break;
+                }
+                collected.push(owner.clone());
+            }
+            (collected, truncated)
+        };
+        let mut stats = ResidentReconcileStats {
+            owners_scanned: owners.len(),
+            truncated,
+            ..Default::default()
+        };
+        for owner in owners {
+            if is_live(&owner) {
+                continue;
+            }
+            let bytes = self.resident_owner_bytes(category, &owner);
+            if bytes == 0 {
+                continue;
+            }
+            // Re-probe right before refunding: a concurrent insert may have
+            // recreated the entry and its charge after our owner snapshot.
+            if is_live(&owner) {
+                continue;
+            }
+            if self.resident_memory_replace_owned(category, &owner, 0) {
+                stats.stale_owners_removed += 1;
+                stats.bytes_refunded = stats.bytes_refunded.saturating_add(bytes);
+            }
+        }
+        stats
     }
 
     pub fn snapshot(&self, pingora_threads: usize) -> GovernorSnapshot {
@@ -1823,6 +2018,7 @@ impl MemoryGovernor {
             disk_rejects: self.disk_rejects.load(Ordering::Relaxed),
             pingora_keepalive_pool_size: self.pingora_keepalive_pool_size(pingora_threads),
             resident_memory: self.resident_memory_snapshot(),
+            metrics_aggregator_bytes: self.metrics_aggregator_bytes.load(Ordering::Relaxed),
             cgroup_managed: mem.cgroup_managed,
             cgroup_memory_max_bytes: mem.cgroup_memory_max_bytes,
             cgroup_memory_high_bytes: mem.cgroup_memory_high_bytes,
@@ -1830,6 +2026,8 @@ impl MemoryGovernor {
             process_rss_bytes: mem.process_rss_bytes,
             process_pss_bytes: mem.process_pss_bytes,
             process_anon_rss_bytes: mem.process_anon_rss_bytes,
+            psi_some_avg10_x100: mem.psi_some_avg10_x100,
+            psi_full_avg10_x100: mem.psi_full_avg10_x100,
         }
     }
 
@@ -1921,14 +2119,36 @@ impl MemoryGovernor {
 
     fn memory_snapshot(&self) -> BudgetedMemorySnapshot {
         let now = crate::utils::time::system_timestamp_millis();
+        let cached_at = self.cached_at_millis.load(Ordering::Acquire) as i64;
+        if cached_at > 0 && now.saturating_sub(cached_at) < SNAPSHOT_TTL_MS {
+            let mem = self.budgeted_from_cached();
+            // Seqlock validation: a writer marks the timestamp 0 while it
+            // updates the fields, so if it changed mid-read this snapshot is
+            // torn — take the refresh path instead of returning it.
+            if self.cached_at_millis.load(Ordering::Acquire) as i64 == cached_at {
+                notify_pressure_reclaim(memory_pressure_level(&mem));
+                return mem;
+            }
+        }
+
+        // Serialize refreshers: without this lock, two readers that both see
+        // an expired TTL can interleave their per-field stores and leave a
+        // permanently torn cached snapshot until the next refresh.
+        let _update = self
+            .snapshot_update
+            .lock()
+            .expect("memory snapshot update lock poisoned");
+        let now = crate::utils::time::system_timestamp_millis();
         let cached_at = self.cached_at_millis.load(Ordering::Relaxed) as i64;
         if cached_at > 0 && now.saturating_sub(cached_at) < SNAPSHOT_TTL_MS {
             let mem = self.budgeted_from_cached();
             notify_pressure_reclaim(memory_pressure_level(&mem));
             return mem;
         }
-
         let snapshot = read_memory_snapshot();
+        // Mark the update in progress before storing fields so concurrent
+        // seqlock readers detect the tear and retry.
+        self.cached_at_millis.store(0, Ordering::Relaxed);
         self.cached_total_bytes
             .store(snapshot.total_bytes, Ordering::Relaxed);
         self.cached_used_bytes
@@ -1963,6 +2183,10 @@ impl MemoryGovernor {
             .store(snapshot.process_pss_bytes, Ordering::Relaxed);
         self.cached_process_anon_rss_bytes
             .store(snapshot.process_anon_rss_bytes, Ordering::Relaxed);
+        self.cached_psi_some_avg10_x100
+            .store(snapshot.psi_some_avg10_x100 as u64, Ordering::Relaxed);
+        self.cached_psi_full_avg10_x100
+            .store(snapshot.psi_full_avg10_x100 as u64, Ordering::Relaxed);
         self.cached_at_millis.store(now as u64, Ordering::Relaxed);
         let mem = self.budgeted_from_cached();
         notify_pressure_reclaim(memory_pressure_level(&mem));
@@ -2013,6 +2237,8 @@ impl MemoryGovernor {
             process_rss_bytes: self.cached_process_rss_bytes.load(Ordering::Relaxed),
             process_pss_bytes: self.cached_process_pss_bytes.load(Ordering::Relaxed),
             process_anon_rss_bytes: self.cached_process_anon_rss_bytes.load(Ordering::Relaxed),
+            psi_some_avg10_x100: self.cached_psi_some_avg10_x100.load(Ordering::Relaxed) as u32,
+            psi_full_avg10_x100: self.cached_psi_full_avg10_x100.load(Ordering::Relaxed) as u32,
         }
     }
 }
@@ -2090,6 +2316,8 @@ struct BudgetedMemorySnapshot {
     process_rss_bytes: u64,
     process_pss_bytes: u64,
     process_anon_rss_bytes: u64,
+    psi_some_avg10_x100: u32,
+    psi_full_avg10_x100: u32,
 }
 
 impl Default for BudgetedMemorySnapshot {
@@ -2113,6 +2341,8 @@ impl Default for BudgetedMemorySnapshot {
             process_rss_bytes: 0,
             process_pss_bytes: 0,
             process_anon_rss_bytes: 0,
+            psi_some_avg10_x100: 0,
+            psi_full_avg10_x100: 0,
         }
     }
 }
@@ -2194,6 +2424,12 @@ fn read_memory_snapshot() -> MemorySnapshot {
         availability = MemoryAvailability::Degraded;
     }
 
+    #[cfg(target_os = "linux")]
+    let (psi_some_avg10_x100, psi_full_avg10_x100) =
+        linux_read_psi_memory().unwrap_or((0, 0));
+    #[cfg(not(target_os = "linux"))]
+    let (psi_some_avg10_x100, psi_full_avg10_x100) = (0, 0);
+
     MemorySnapshot {
         total_bytes,
         used_bytes,
@@ -2211,6 +2447,8 @@ fn read_memory_snapshot() -> MemorySnapshot {
         process_rss_bytes: rss.rss_bytes,
         process_pss_bytes: rss.pss_bytes,
         process_anon_rss_bytes: rss.anon_bytes,
+        psi_some_avg10_x100,
+        psi_full_avg10_x100,
     }
 }
 
@@ -2424,6 +2662,36 @@ fn linux_mem_available_bytes() -> Option<u64> {
         return Some(kib.saturating_mul(1024));
     }
     None
+}
+
+/// Parse `/proc/pressure/memory` avg10 stall ratios as hundredths of a
+/// percent (`avg10=10.00` → 1000). `some` = at least one task stalled on
+/// memory; `full` = all non-idle tasks stalled. Returns None when PSI is
+/// unavailable (kernel without CONFIG_PSI, or the file vanished).
+#[cfg(target_os = "linux")]
+fn linux_read_psi_memory() -> Option<(u32, u32)> {
+    let psi = std::fs::read_to_string("/proc/pressure/memory").ok()?;
+    let mut some_avg10 = None;
+    let mut full_avg10 = None;
+    for line in psi.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(kind) = parts.next() else {
+            continue;
+        };
+        let Some(avg10) = parts.find_map(|part| part.strip_prefix("avg10=")) else {
+            continue;
+        };
+        // avg10 is a fixed-point percentage like "12.34"; keep hundredths.
+        let Ok(value) = avg10.parse::<f64>() else {
+            continue;
+        };
+        match kind {
+            "some" => some_avg10 = Some((value * 100.0).round() as u32),
+            "full" => full_avg10 = Some((value * 100.0).round() as u32),
+            _ => {}
+        }
+    }
+    Some((some_avg10?, full_avg10?))
 }
 
 #[cfg(target_os = "linux")]
@@ -2964,6 +3232,17 @@ fn memory_pressure_level(snapshot: &BudgetedMemorySnapshot) -> MemoryPressureLev
         && snapshot.process_rss_bytes >= snapshot.cgroup_memory_max_bytes
     {
         level = MemoryPressureLevel::Critical;
+    }
+    // PSI floors (oomd-style): ratio thresholds measure how much memory is
+    // *left*; PSI measures how much tasks are *already stalling*. A host in
+    // reclaim congestion or a refault storm can thrash while still reporting
+    // free bytes — some avg10 ≥30% or full avg10 ≥5% means real stalls, so
+    // escalate. Floors never de-escalate: recovery still flows through the
+    // ratio path and the coordinator's stability window.
+    if snapshot.psi_full_avg10_x100 >= 500 || snapshot.psi_some_avg10_x100 >= 3000 {
+        level = level.max(MemoryPressureLevel::High);
+    } else if snapshot.psi_some_avg10_x100 >= 1000 {
+        level = level.max(MemoryPressureLevel::Elevated);
     }
     level
 }
@@ -3682,6 +3961,30 @@ mod tests {
     }
 
     #[test]
+    fn psi_stall_ratios_escalate_pressure_level() {
+        // Plenty of free bytes — the ratio path alone stays Normal; PSI is
+        // the only signal that tasks are already stalling on memory.
+        let mut snapshot = synthetic_snapshot(16, 12, 1_048_576, 8);
+        assert_eq!(
+            memory_pressure_level(&snapshot),
+            MemoryPressureLevel::Normal
+        );
+        snapshot.psi_some_avg10_x100 = 1_000;
+        assert_eq!(
+            memory_pressure_level(&snapshot),
+            MemoryPressureLevel::Elevated
+        );
+        snapshot.psi_some_avg10_x100 = 3_000;
+        assert_eq!(memory_pressure_level(&snapshot), MemoryPressureLevel::High);
+        snapshot.psi_some_avg10_x100 = 0;
+        snapshot.psi_full_avg10_x100 = 500;
+        assert_eq!(memory_pressure_level(&snapshot), MemoryPressureLevel::High);
+        // PSI floors never force Critical — that remains byte-threshold-only.
+        snapshot.psi_full_avg10_x100 = 10_000;
+        assert_eq!(memory_pressure_level(&snapshot), MemoryPressureLevel::High);
+    }
+
+    #[test]
     fn udp_direct_workers_match_demux_snapshot_bounds() {
         let small = synthetic_snapshot(2, 1, 65_535, 2);
         let normal = synthetic_snapshot(16, 12, 1_048_576, 8);
@@ -4068,11 +4371,16 @@ mod tests {
                                 <= limit as u64,
                             "live HTTP admission counter must never exceed the hard limit"
                         );
+                        // Drop order matters: tuple fields drop left-to-right,
+                        // so the guard must precede the permit. Otherwise the
+                        // permit releases the counter before `active` is
+                        // decremented, letting sibling threads observe a peak
+                        // that transiently exceeds the true live count.
                         permits.push((
-                            permit,
                             ActiveGuard {
                                 active: Arc::clone(&active),
                             },
+                            permit,
                         ));
                     }
                 }
@@ -4218,6 +4526,17 @@ mod resident_memory_tests {
         assert!(governor.resident_memory_replace_owned(category, "a", 0));
         assert_eq!(governor.resident_memory_snapshot().total_used_bytes, 0);
     }
+
+    #[test]
+    fn metrics_aggregator_gauge_is_exposed_in_snapshot_without_budget_pressure() {
+        let governor = MemoryGovernor::new();
+        governor.set_metrics_aggregator_bytes(123_456);
+        let snapshot = governor.snapshot(1);
+        assert_eq!(snapshot.metrics_aggregator_bytes, 123_456);
+        // The gauge is informational only: it must not enter the resident
+        // ledger's enforced total.
+        assert_eq!(snapshot.resident_memory.total_used_bytes, 0);
+    }
 }
 
 #[cfg(test)]
@@ -4348,5 +4667,87 @@ mod en16_pool_tests {
         governor.report_disk_committed(DiskLedgerClass::NodeState, 60);
         let (_, committed) = governor.disk_totals();
         assert_eq!(committed, 60, "absolute report must overwrite, not add");
+    }
+
+    #[test]
+    fn reconcile_resident_category_refunds_dead_owners_only() {
+        let governor = MemoryGovernor::new();
+        let cat = super::ResidentCategory::NegativeCache;
+        // Three owners; the "dead" one is the only key missing from the map.
+        for owner in ["live-a", "live-b", "dead-c"] {
+            assert!(governor.resident_memory_replace_owned(cat, owner, 128));
+        }
+        let before = governor.resident_memory_snapshot().negative_cache_used_bytes;
+        assert_eq!(before, 384);
+
+        let live: std::collections::HashSet<&str> =
+            ["live-a", "live-b"].into_iter().collect();
+        let stats = governor.reconcile_resident_category(cat, 1024, &mut |key| {
+            live.contains(key)
+        });
+        assert_eq!(stats.owners_scanned, 3);
+        assert_eq!(stats.stale_owners_removed, 1);
+        assert_eq!(stats.bytes_refunded, 128);
+        assert!(!stats.truncated);
+        assert_eq!(
+            governor
+                .resident_memory_snapshot()
+                .negative_cache_used_bytes,
+            256
+        );
+        // Idempotent: a second pass finds nothing.
+        let stats = governor.reconcile_resident_category(cat, 1024, &mut |key| {
+            live.contains(key)
+        });
+        assert_eq!(stats.stale_owners_removed, 0);
+        assert_eq!(stats.bytes_refunded, 0);
+    }
+
+    #[test]
+    fn reconcile_resident_category_respects_owner_cap() {
+        let governor = MemoryGovernor::new();
+        let cat = super::ResidentCategory::SurrogateIndex;
+        for i in 0..8 {
+            let owner = format!("owner-{i}");
+            assert!(governor.resident_memory_replace_owned(cat, &owner, 64));
+        }
+        // Cap below owner count: exactly `cap` owners are scanned, all dead.
+        let stats = governor.reconcile_resident_category(cat, 5, &mut |_: &str| false);
+        assert_eq!(stats.owners_scanned, 5);
+        assert_eq!(stats.stale_owners_removed, 5);
+        assert!(stats.truncated);
+        assert_eq!(
+            governor
+                .resident_memory_snapshot()
+                .surrogate_index_used_bytes,
+            3 * 64
+        );
+    }
+
+    #[test]
+    fn resident_ledger_owner_cap_refuses_new_owners_only() {
+        let governor = MemoryGovernor::new();
+        let cat = super::ResidentCategory::NegativeCache;
+        let snap = governor.resident_memory_snapshot();
+        assert_eq!(snap.tracked_owners, 0);
+
+        assert!(governor.resident_memory_replace_owned_with_cap(cat, "a", 64, 2));
+        assert!(governor.resident_memory_replace_owned_with_cap(cat, "b", 64, 2));
+        // Third distinct owner is refused at the cap — caller treats false as
+        // fail-closed, and no bytes were charged.
+        assert!(!governor.resident_memory_replace_owned_with_cap(cat, "c", 64, 2));
+        let snap = governor.resident_memory_snapshot();
+        assert_eq!(snap.tracked_owners, 2);
+        assert_eq!(snap.negative_cache_used_bytes, 128);
+        assert_eq!(snap.owner_cap_rejections, 1);
+
+        // Updates and refunds of tracked owners are unaffected by the cap.
+        assert!(governor.resident_memory_replace_owned_with_cap(cat, "a", 128, 2));
+        assert!(governor.resident_memory_replace_owned_with_cap(cat, "a", 0, 2));
+        let snap = governor.resident_memory_snapshot();
+        assert_eq!(snap.tracked_owners, 1);
+        assert_eq!(snap.negative_cache_used_bytes, 64);
+        // Freed capacity admits new owners again.
+        assert!(governor.resident_memory_replace_owned_with_cap(cat, "c", 64, 2));
     }
 }

@@ -2631,20 +2631,47 @@ pub(crate) fn index_surrogate_keys(headers: &[(String, String)], hash: &str) {
             mark_surrogate_tag_saturated(tag);
             continue;
         }
+        if entry.contains(hash) {
+            continue;
+        }
+        // Charge before inserting: a rejected charge must not leave an
+        // unaccounted member in the index — degrade the tag to a saturated
+        // mark so purge falls back to the authoritative metadata scan.
+        let owner = format!("{tag}\0{hash}");
+        let bytes = SURROGATE_TAG_ENTRY_OVERHEAD + tag.len() as u64 + hash.len() as u64;
+        if !MEMORY_GOVERNOR.resident_memory_replace_owned(
+            crate::memory_governor::ResidentCategory::SurrogateIndex,
+            &owner,
+            bytes,
+        ) {
+            mark_surrogate_tag_saturated(tag);
+            continue;
+        }
         if entry.insert(hash.to_string()) {
             SURROGATE_MEMBERSHIPS.fetch_add(1, Ordering::Relaxed);
-            let owner = format!("{tag}\0{hash}");
-            let bytes = SURROGATE_TAG_ENTRY_OVERHEAD + tag.len() as u64 + hash.len() as u64;
-            let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(
-                crate::memory_governor::ResidentCategory::SurrogateIndex,
-                &owner,
-                bytes,
-            );
         }
     }
 }
 
 fn mark_surrogate_tag_saturated(tag: &str) {
+    // Saturated marks are origin-driven (Surrogate-Key response header), so
+    // the set must be bounded and ledger-charged like the index itself.
+    if SURROGATE_SATURATED_TAGS.contains_key(tag)
+        || SURROGATE_SATURATED_TAGS.len() >= surrogate_index_capacity()
+    {
+        return;
+    }
+    // A leading NUL keeps saturated-mark owners disjoint from member owners
+    // (`{tag}\0{hash}`): tags are non-empty, so no member owner can start
+    // with NUL — a literal "sat" tag can never collide with this prefix.
+    let owner = format!("\0sat\0{tag}");
+    if !MEMORY_GOVERNOR.resident_memory_replace_owned(
+        crate::memory_governor::ResidentCategory::SurrogateIndex,
+        &owner,
+        SURROGATE_TAG_ENTRY_OVERHEAD + tag.len() as u64,
+    ) {
+        return;
+    }
     SURROGATE_SATURATED_TAGS.insert(tag.to_string(), ());
 }
 
@@ -2665,6 +2692,130 @@ pub(crate) fn remove_hash_from_surrogate_index(hash: &str) {
         }
         !set.is_empty()
     });
+}
+
+/// Drop a whole tag's membership set AND refund each member's resident
+/// charge — a bare `SURROGATE_KEY_INDEX.remove(tag)` would strand every
+/// `{tag}\0{hash}` owner entry in the ledger.
+fn remove_surrogate_tag_set(tag: &str) {
+    if let Some((_, set)) = SURROGATE_KEY_INDEX.remove(tag) {
+        let members = set.len() as u64;
+        for hash in set.iter() {
+            let owner = format!("{tag}\0{}", &*hash);
+            let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(
+                crate::memory_governor::ResidentCategory::SurrogateIndex,
+                &owner,
+                0,
+            );
+        }
+        SURROGATE_MEMBERSHIPS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(members))
+            })
+            .ok();
+    }
+    if SURROGATE_SATURATED_TAGS.remove(tag).is_some() {
+        let owner = format!("\0sat\0{tag}");
+        let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(
+            crate::memory_governor::ResidentCategory::SurrogateIndex,
+            &owner,
+            0,
+        );
+    }
+}
+
+/// Drop the entire surrogate reverse index and all saturated marks,
+/// refunding every charged owner. Purge correctness is unaffected: the
+/// purge path always merges the authoritative metadata scan, so the index
+/// is only an accelerator and can be rebuilt on subsequent upserts.
+fn reclaim_surrogate_index() -> usize {
+    let tags: Vec<String> = SURROGATE_KEY_INDEX
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    let removed = tags.len();
+    for tag in tags {
+        remove_surrogate_tag_set(&tag);
+    }
+    let saturated: Vec<String> = SURROGATE_SATURATED_TAGS
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    for tag in saturated {
+        if SURROGATE_SATURATED_TAGS.remove(&tag).is_some() {
+            let owner = format!("\0sat\0{tag}");
+            let _ = MEMORY_GOVERNOR.resident_memory_replace_owned(
+                crate::memory_governor::ResidentCategory::SurrogateIndex,
+                &owner,
+                0,
+            );
+        }
+    }
+    removed
+}
+
+/// Shrink the surrogate reverse index to `cap` tags under sustained High
+/// pressure. Tags with the largest membership sets are dropped first —
+/// they hold the most memory, and purge still finds their keys through the
+/// authoritative metadata scan. Saturated marks stay: they are the
+/// cheap, already-degraded form of the same information.
+fn trim_surrogate_index_to_capacity(cap: usize) -> usize {
+    let current = SURROGATE_KEY_INDEX.len();
+    if current <= cap {
+        return 0;
+    }
+    let mut tags: Vec<(String, usize)> = SURROGATE_KEY_INDEX
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().len()))
+        .collect();
+    // Largest membership sets first: maximum bytes freed per dropped tag.
+    tags.sort_by_key(|(_, members)| std::cmp::Reverse(*members));
+    let to_drop = current - cap;
+    let mut removed = 0usize;
+    for (tag, _) in tags.into_iter().take(to_drop) {
+        if SURROGATE_KEY_INDEX.contains_key(&tag) {
+            remove_surrogate_tag_set(&tag);
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Live check for SurrogateIndex ledger owners: member owners are
+/// `{tag}\0{hash}`, saturated-mark owners are `\0sat\0{tag}`.
+fn surrogate_owner_is_live(owner: &str) -> bool {
+    if let Some(mark) = owner.strip_prefix('\0') {
+        return mark
+            .strip_prefix("sat\0")
+            .is_some_and(|tag| SURROGATE_SATURATED_TAGS.contains_key(tag));
+    }
+    let Some((tag, hash)) = owner.split_once('\0') else {
+        return false;
+    };
+    SURROGATE_KEY_INDEX
+        .get(tag)
+        .is_some_and(|set| set.contains(hash))
+}
+
+/// Reconcile the resident ledger against the live maps: refund owners whose
+/// key no longer exists. Individual charge/refund paths are symmetric, so
+/// this sweep only repairs residual drift — it runs on a slow cadence from
+/// the reclaim monitor as a safety net, not as the primary mechanism.
+pub fn reconcile_resident_ledgers() -> crate::memory_governor::ResidentReconcileStats {
+    let mut total = MEMORY_GOVERNOR.reconcile_resident_category(
+        crate::memory_governor::ResidentCategory::NegativeCache,
+        crate::memory_governor::RESIDENT_RECONCILE_MAX_OWNERS,
+        &mut |key| NEGATIVE_CACHE.contains_key(key),
+    );
+    let surrogate = MEMORY_GOVERNOR.reconcile_resident_category(
+        crate::memory_governor::ResidentCategory::SurrogateIndex,
+        crate::memory_governor::RESIDENT_RECONCILE_MAX_OWNERS,
+        &mut surrogate_owner_is_live,
+    );
+    total.merge(surrogate);
+    let meta = crate::metrics::storage::reconcile_cache_meta_resident_ledger();
+    total.merge(meta);
+    total
 }
 
 pub(crate) fn meta_headers_contain_surrogate_tag(headers: &[(String, String)], tag: &str) -> bool {
@@ -2873,11 +3024,9 @@ impl TinyUfoL1 {
         if !Self::should_rebuild_for_budget_change(old, resolved) {
             return;
         }
-        let new_cache = Arc::new(Self::build_cache(resolved));
-        self.current_weight.store(0, Ordering::Relaxed);
-        let mut guard = self.inner.write().expect("TinyUfoL1 lock poisoned");
-        *guard = new_cache;
-        self.keys.clear();
+        // Reuse the salvage path: a budget change should shrink the cache to
+        // what fits, not wipe it.
+        self.force_rebuild_with_limit(resolved);
     }
 
     fn refresh_auto_budget(&self) {
@@ -2887,19 +3036,85 @@ impl TinyUfoL1 {
         self.set_max_bytes(0);
     }
 
-    fn force_rebuild_with_limit(&self, bytes: u64) {
-        let resolved = bytes.max(1024);
+    fn rebuild_empty(&self, resolved: u64) {
         self.max_bytes.store(resolved, Ordering::Relaxed);
         let new_cache = Arc::new(Self::build_cache(resolved));
         self.current_weight.store(0, Ordering::Relaxed);
-        let mut guard = self.inner.write().expect("TinyUfoL1 lock poisoned");
-        *guard = new_cache;
-        self.keys.clear();
+        {
+            let mut guard = self.inner.write().expect("TinyUfoL1 lock poisoned");
+            *guard = new_cache.clone();
+        }
+        // Keys inserted between the swap and this retain resolve against the
+        // new (empty) cache and are kept only if their entry is actually
+        // live there — a clear() would drop index entries for fresh puts.
+        self.keys
+            .retain(|key| new_cache.get_stale(key).0.is_some());
+    }
+
+    fn force_rebuild_with_limit(&self, bytes: u64) {
+        let resolved = bytes.max(1024);
+        let target_weight = Self::weight_limit_for_bytes(resolved);
+        let now = crate::utils::time::now_timestamp();
+        // Salvage live entries newest-first until the smaller budget is
+        // full — a plain rebuild would drop 100% of L1 when High reclaim
+        // only needs to shed the overshoot.
+        let candidates: Vec<String> = self.keys.iter().map(|key| key.clone()).collect();
+        let mut live: Vec<(String, Arc<TinyUfoL1Entry>)> = Vec::new();
+        for key in candidates {
+            if let Some((entry, _status)) = self.get_stale(&key) {
+                live.push((key, entry));
+            } else {
+                self.keys.remove(&key);
+            }
+        }
+        live.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.created_at));
+        let new_cache = Arc::new(Self::build_cache(resolved));
+        let mut weight = 0usize;
+        let mut kept: Vec<String> = Vec::new();
+        for (key, entry) in live {
+            let entry_weight = (entry.data.len().div_ceil(1024)).clamp(1, u16::MAX as usize);
+            if weight.saturating_add(entry_weight) > target_weight {
+                continue;
+            }
+            let stale_window = entry
+                .stale_while_revalidate_secs
+                .max(entry.stale_if_error_secs);
+            let fresh_ttl = entry.fresh_until.saturating_sub(now).max(0) as u64;
+            let retention = std::time::Duration::from_secs(fresh_ttl.saturating_add(stale_window));
+            if retention.is_zero() {
+                continue;
+            }
+            new_cache.put(&key, entry, Some(retention), entry_weight as u16);
+            kept.push(key);
+            weight += entry_weight;
+        }
+        self.max_bytes.store(resolved, Ordering::Relaxed);
+        self.current_weight.store(0, Ordering::Relaxed);
+        {
+            let mut guard = self.inner.write().expect("TinyUfoL1 lock poisoned");
+            *guard = new_cache.clone();
+        }
+        // Sync the key index against the NEW cache instead of clear+reinsert:
+        // a `put` landing between the swap and a plain `keys.clear()` would
+        // have its index entry wiped while the value stays live in the new
+        // cache — unreachable by every prefix/surrogate purge scan. With
+        // retain-after-swap, keys inserted mid-rebuild resolve against the
+        // new cache and survive; keys whose entries died with the old cache
+        // are dropped.
+        self.keys
+            .retain(|key| new_cache.get_stale(key).0.is_some());
+        for key in kept {
+            if new_cache.get_stale(&key).0.is_some() {
+                self.keys.insert(key);
+            }
+        }
+        self.refresh_stats(&new_cache);
     }
 
     fn force_clear(&self) {
+        // Critical reclaim means "drop everything" — no salvage.
         let limit = self.max_bytes.load(Ordering::Relaxed).max(1024);
-        self.force_rebuild_with_limit(limit);
+        self.rebuild_empty(limit);
     }
 
     fn stats(&self) -> (usize, u64) {
@@ -3103,19 +3318,23 @@ impl AdaptiveBloomFilter {
         removed_layers
     }
 
-    fn reset_to_minimal(&self) {
+    fn reset_to_minimal(&self) -> u64 {
         let per_shard = (1_000_000usize / self.shards.len().max(1)).max(1) as u32;
         let mut total_capacity = 0u64;
         let mut total_bytes = 0u64;
+        let mut removed = 0u64;
         for shard in &self.shards {
             let layer = Self::build_layer(per_shard);
             total_capacity = total_capacity.saturating_add(layer.capacity);
             total_bytes = total_bytes.saturating_add(Self::estimated_layer_bytes(layer.capacity));
-            *shard.layers.write() = vec![layer];
+            let mut layers = shard.layers.write();
+            removed = removed.saturating_add(layers.len().saturating_sub(1) as u64);
+            *layers = vec![layer];
         }
         self.total_capacity.store(total_capacity, Ordering::Relaxed);
         self.current_size.store(0, Ordering::Relaxed);
         self.estimated_bytes.store(total_bytes, Ordering::Relaxed);
+        removed
     }
 }
 
@@ -3233,11 +3452,12 @@ impl DualGenerationBloom {
         removed
     }
 
-    fn reset_to_minimal(&self) {
+    fn reset_to_minimal(&self) -> u64 {
         let live = self.live.load();
-        live.reset_to_minimal();
+        let removed = live.reset_to_minimal();
         *self.stale.lock() = None;
         self.sync_bloom_charge();
+        removed
     }
 }
 
@@ -3340,12 +3560,19 @@ fn negative_cache_insert_with_capacity(key: &str, now: i64, capacity: usize) {
             return;
         }
     }
-    NEGATIVE_CACHE.insert(key.to_string(), now + NEGATIVE_CACHE_TTL_SECS);
-    let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+    // Charge before inserting: if the byte budget rejects the entry the map
+    // must not silently keep it uncharged.
+    if !crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
         crate::memory_governor::ResidentCategory::NegativeCache,
         key,
         160 + key.len() as u64,
-    );
+    ) {
+        crate::pipeline_metrics::increment(
+            crate::pipeline_metrics::PipelineCounter::NegativeCacheAdmissionRejected,
+        );
+        return;
+    }
+    NEGATIVE_CACHE.insert(key.to_string(), now + NEGATIVE_CACHE_TTL_SECS);
 }
 
 fn negative_cache_remove(key: &str) {
@@ -3362,7 +3589,37 @@ fn negative_cache_stats() -> (usize, usize) {
 }
 
 fn negative_cache_cleanup(now: i64) {
-    NEGATIVE_CACHE.retain(|_, &mut expires| expires > now);
+    // Refund each expired key's resident charge — a bare `retain` would drop
+    // the entry while its owner entry in the ledger stays charged forever.
+    let expired: Vec<String> = NEGATIVE_CACHE
+        .iter()
+        .filter_map(|entry| (*entry.value() <= now).then(|| entry.key().clone()))
+        .collect();
+    for key in expired {
+        // Re-check expiry under remove_if: the entry may have been refreshed
+        // between the scan and the removal.
+        if NEGATIVE_CACHE
+            .remove_if(&key, |_, expiry| *expiry <= now)
+            .is_some()
+        {
+            let _ = crate::memory_governor::MEMORY_GOVERNOR.resident_memory_replace_owned(
+                crate::memory_governor::ResidentCategory::NegativeCache,
+                &key,
+                0,
+            );
+        }
+    }
+}
+
+/// Remove every negative-cache entry and refund each resident charge.
+fn negative_cache_drain() {
+    let keys: Vec<String> = NEGATIVE_CACHE
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    for key in keys {
+        negative_cache_remove(&key);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3371,6 +3628,7 @@ pub struct CacheReclaimStats {
     pub l1_bytes_freed_estimate: u64,
     pub bloom_layers_removed: u64,
     pub negative_cache_entries_removed: usize,
+    pub surrogate_index_tags_removed: usize,
 }
 
 fn reclaim_l1_from_storage(storage: &HybridStorage, shrink_to_bytes: Option<u64>) -> (usize, u64) {
@@ -3412,12 +3670,15 @@ pub fn reclaim_caches_high() -> CacheReclaimStats {
     let (l1_removed, l1_freed) =
         reclaim_l1_from_storage(crate::cache_manager::CACHE.storage, Some(target));
     let before = NEGATIVE_CACHE.len();
-    NEGATIVE_CACHE.clear();
+    negative_cache_drain();
+    let surrogate_tags_removed =
+        trim_surrogate_index_to_capacity(SURROGATE_INDEX_MAX_TAGS_PRESSURE);
     let stats = CacheReclaimStats {
         l1_entries_removed: l1_removed,
         l1_bytes_freed_estimate: l1_freed,
         bloom_layers_removed: CACHE_BLOOM.shrink_layers(1),
         negative_cache_entries_removed: before,
+        surrogate_index_tags_removed: surrogate_tags_removed,
     };
     CACHE_RECLAIM_IN_PROGRESS.with(|in_progress| in_progress.set(false));
     stats
@@ -3429,13 +3690,15 @@ pub fn reclaim_caches_critical() -> CacheReclaimStats {
     }
     let (l1_removed, l1_freed) = reclaim_l1_from_storage(crate::cache_manager::CACHE.storage, None);
     let before = NEGATIVE_CACHE.len();
-    NEGATIVE_CACHE.clear();
-    CACHE_BLOOM.reset_to_minimal();
+    negative_cache_drain();
+    let bloom_layers_removed = CACHE_BLOOM.reset_to_minimal();
+    let surrogate_tags_removed = reclaim_surrogate_index();
     let stats = CacheReclaimStats {
         l1_entries_removed: l1_removed,
         l1_bytes_freed_estimate: l1_freed,
-        bloom_layers_removed: 0,
+        bloom_layers_removed,
         negative_cache_entries_removed: before,
+        surrogate_index_tags_removed: surrogate_tags_removed,
     };
     CACHE_RECLAIM_IN_PROGRESS.with(|in_progress| in_progress.set(false));
     stats
@@ -4109,8 +4372,7 @@ impl HybridStorage {
                     partial_deleted, tag
                 );
             }
-            SURROGATE_KEY_INDEX.remove(tag);
-            SURROGATE_SATURATED_TAGS.remove(tag);
+            remove_surrogate_tag_set(tag);
             return fence_persisted;
         }
         let deleted_count = keys_to_purge.len();
@@ -4120,8 +4382,7 @@ impl HybridStorage {
                 .purge_exact_stored_key_at_version(&key, Some(purge_version))
                 .await;
         }
-        SURROGATE_KEY_INDEX.remove(tag);
-        SURROGATE_SATURATED_TAGS.remove(tag);
+        remove_surrogate_tag_set(tag);
         info!(
             "RPC_CACHE: Purged {} entries and {} partial entries by surrogate tag: {}",
             deleted_count, partial_deleted, tag
@@ -5042,9 +5303,11 @@ pub fn start_cache_janitor() {
             crate::cache_manager::CACHE.storage.l1.refresh_auto_budget();
             crate::memory_reclaim::periodic_reclaim_check();
 
-            // Clean expired negative cache entries
+            // Clean expired negative cache entries — must go through the
+            // refunding cleanup, not a bare retain, or the resident ledger
+            // keeps charges for entries that no longer exist.
             let now = crate::utils::time::now_timestamp();
-            NEGATIVE_CACHE.retain(|_, &mut expires| expires > now);
+            negative_cache_cleanup(now);
         }
     });
 }
@@ -6508,44 +6771,64 @@ mod tests {
             )
         };
 
-        let first_key = CacheKey::new("edge", unique.as_str(), "");
-        let mut first = storage
-            .memory_miss_handler(&first_key, &make_meta(), false)
-            .await
-            .expect("first memory miss handler");
-        first
-            .write_body(bytes::Bytes::from_static(b"first"), true)
-            .await
-            .expect("first body");
-
-        let second_key = CacheKey::new("edge", unique.as_str(), "");
-        let second = tokio::spawn(async move {
-            storage
-                .memory_miss_handler(&second_key, &make_meta(), false)
+        // The L1 invalidation generation is process-wide: a sibling test
+        // writing cache metadata can bump it mid-flight and legitimately
+        // discard this fill (finish returns Created(0)). Retry the whole
+        // scenario on that interference instead of weakening the assertion.
+        for attempt in 0..8 {
+            let attempt_key = format!("{unique}-{attempt}");
+            let first_key = CacheKey::new("edge", attempt_key.as_str(), "");
+            let mut first = storage
+                .memory_miss_handler(&first_key, &make_meta(), false)
                 .await
-        });
+                .expect("first memory miss handler");
+            first
+                .write_body(bytes::Bytes::from_static(b"first"), true)
+                .await
+                .expect("first body");
 
-        let first_result = first.finish().await.expect("finish first fill");
-        assert!(matches!(first_result, MissFinishType::Created(5)));
+            let second_key = CacheKey::new("edge", attempt_key.as_str(), "");
+            let second = tokio::spawn(async move {
+                storage
+                    .memory_miss_handler(&second_key, &make_meta(), false)
+                    .await
+            });
 
-        let mut second = tokio::time::timeout(std::time::Duration::from_secs(1), second)
-            .await
-            .expect("second miss handler should not remain blocked")
-            .expect("second miss task")
-            .expect("second memory miss handler");
-        second
-            .write_body(bytes::Bytes::from_static(b"second"), true)
-            .await
-            .expect("second body");
-        assert!(matches!(
-            second.finish().await.expect("finish second fill"),
-            MissFinishType::Created(0)
-        ));
-
-        let entry = storage.l1.get(&unique).expect("first fill should remain");
-        assert_eq!(entry.data.as_ref(), b"first");
-        storage.l1.remove(&unique);
-        let _ = tokio::fs::remove_dir_all(root).await;
+            let first_result = first.finish().await.expect("finish first fill");
+            let mut second = match tokio::time::timeout(std::time::Duration::from_secs(1), second)
+                .await
+            {
+                Ok(Ok(Ok(handler))) => handler,
+                Ok(Ok(Err(err))) => panic!("second memory miss handler: {err}"),
+                Ok(Err(err)) => panic!("second miss task: {err}"),
+                Err(_) => panic!("second miss handler should not remain blocked"),
+            };
+            if matches!(first_result, MissFinishType::Created(0)) {
+                // A concurrent invalidation discarded the first fill — retry.
+                continue;
+            }
+            assert!(matches!(first_result, MissFinishType::Created(5)));
+            second
+                .write_body(bytes::Bytes::from_static(b"second"), true)
+                .await
+                .expect("second body");
+            if matches!(
+                second.finish().await.expect("finish second fill"),
+                MissFinishType::Created(0)
+            ) {
+                let entry = storage
+                    .l1
+                    .get(&attempt_key)
+                    .expect("first fill should remain");
+                assert_eq!(entry.data.as_ref(), b"first");
+                storage.l1.remove(&attempt_key);
+                let _ = tokio::fs::remove_dir_all(&root).await;
+                return;
+            }
+            // The second fill was itself invalidated or saw a stale-miss —
+            // either way this attempt cannot prove the ordering; retry.
+        }
+        panic!("invalidation interference prevented a clean double-fill check");
     }
 
     #[tokio::test]
@@ -6644,6 +6927,66 @@ mod tests {
     }
 
     #[test]
+    fn negative_cache_cleanup_and_drain_refund_resident_ledger() {
+        let now = crate::utils::time::now_timestamp();
+        let unique = unique_test_suffix("neg-refund");
+        let gov = &crate::memory_governor::MEMORY_GOVERNOR;
+        // Per-owner asserts isolate this test from other tests' charges on
+        // the shared global ledger.
+        let owner_bytes = |key: &str| {
+            gov.resident_owner_bytes(
+                crate::memory_governor::ResidentCategory::NegativeCache,
+                key,
+            )
+        };
+        let charged_keys: Vec<String> = (0..8)
+            .map(|i| format!("{unique}-charged-{i}"))
+            .collect();
+        // Charge exactly like negative_cache_insert_with_capacity, but
+        // bypass its pressure gate so the test does not depend on the host's
+        // live memory level.
+        let charge_insert = |key: &String| {
+            NEGATIVE_CACHE.insert(key.clone(), now + NEGATIVE_CACHE_TTL_SECS);
+            let _ = gov.resident_memory_replace_owned(
+                crate::memory_governor::ResidentCategory::NegativeCache,
+                key,
+                160 + key.len() as u64,
+            );
+        };
+        for key in &charged_keys {
+            charge_insert(key);
+        }
+        for key in &charged_keys {
+            assert!(
+                owner_bytes(key) > 0,
+                "insert must charge the resident ledger for {key}"
+            );
+        }
+        // Expire all of them: cleanup must refund each owner's charge.
+        negative_cache_cleanup(now + NEGATIVE_CACHE_TTL_SECS + 1);
+        for key in &charged_keys {
+            assert_eq!(
+                owner_bytes(key),
+                0,
+                "expiry cleanup must refund the resident charge for {key}"
+            );
+        }
+        // Drain path (used by High/Critical reclaim) must also refund.
+        for key in &charged_keys {
+            charge_insert(key);
+        }
+        negative_cache_drain();
+        for key in &charged_keys {
+            assert_eq!(
+                owner_bytes(key),
+                0,
+                "reclaim drain must refund the resident charge for {key}"
+            );
+        }
+        NEGATIVE_CACHE.retain(|key, _| !key.starts_with(&unique));
+    }
+
+    #[test]
     fn negative_cache_does_not_pollute_positive_bloom() {
         let now = crate::utils::time::now_timestamp();
         let unique = unique_test_suffix("neg-no-bloom");
@@ -6672,6 +7015,182 @@ mod tests {
             "beta"
         ));
         assert!(bloom_generation() >= 1);
+    }
+
+    #[test]
+    fn surrogate_index_reclaim_refunds_ledger() {
+        let _state_guard = CACHE_GLOBAL_STATE_LOCK.blocking_lock();
+        let unique = unique_test_suffix("surrogate-reclaim");
+        let tag = format!("{unique}-tag");
+        let sat_tag = format!("{unique}-sat");
+        let hash = format!("{unique}-hash");
+        let gov = &crate::memory_governor::MEMORY_GOVERNOR;
+        let owner_bytes = |owner: &str| {
+            gov.resident_owner_bytes(
+                crate::memory_governor::ResidentCategory::SurrogateIndex,
+                owner,
+            )
+        };
+
+        index_surrogate_keys(
+            &[("Surrogate-Key".to_string(), tag.clone())],
+            &hash,
+        );
+        let member_owner = format!("{tag}\0{hash}");
+        // The indexer may legitimately skip under pressure/capacity; only
+        // assert the refund when the membership was actually created.
+        let tag_inserted = SURROGATE_KEY_INDEX.contains_key(&tag);
+        if tag_inserted {
+            assert!(
+                owner_bytes(&member_owner) > 0,
+                "membership must be charged to the resident ledger"
+            );
+        }
+
+        mark_surrogate_tag_saturated(&sat_tag);
+        let sat_owner = format!("\0sat\0{sat_tag}");
+        if SURROGATE_SATURATED_TAGS.contains_key(&sat_tag) {
+            assert!(
+                owner_bytes(&sat_owner) > 0,
+                "saturated mark must be charged to the resident ledger"
+            );
+        }
+
+        let removed = reclaim_surrogate_index();
+        assert!(!SURROGATE_KEY_INDEX.contains_key(&tag));
+        assert!(!SURROGATE_SATURATED_TAGS.contains_key(&sat_tag));
+        assert_eq!(owner_bytes(&member_owner), 0, "member charge refunded");
+        assert_eq!(owner_bytes(&sat_owner), 0, "saturated mark charge refunded");
+        if tag_inserted {
+            assert!(removed >= 1, "reclaim reports the dropped tag sets");
+        }
+    }
+
+    #[test]
+    fn surrogate_index_high_trim_drops_largest_first_and_refunds() {
+        let _state_guard = CACHE_GLOBAL_STATE_LOCK.blocking_lock();
+        let unique = unique_test_suffix("surrogate-trim");
+        let gov = &crate::memory_governor::MEMORY_GOVERNOR;
+        let owner_bytes = |owner: &str| {
+            gov.resident_owner_bytes(
+                crate::memory_governor::ResidentCategory::SurrogateIndex,
+                owner,
+            )
+        };
+
+        // One fat tag with many members, one slim tag with a single
+        // member — the fat tag must be trimmed first. 32 members makes our
+        // tag the largest set by a wide margin even with other tests sharing
+        // the global index.
+        let fat_tag = format!("{unique}-fat");
+        let slim_tag = format!("{unique}-slim");
+        let headers = |tags: &str| vec![("Surrogate-Key".to_string(), tags.to_string())];
+        for i in 0..32 {
+            index_surrogate_keys(&headers(&fat_tag), &format!("{unique}-fat-hash-{i}"));
+        }
+        index_surrogate_keys(&headers(&slim_tag), &format!("{unique}-slim-hash"));
+
+        if !SURROGATE_KEY_INDEX.contains_key(&fat_tag)
+            || !SURROGATE_KEY_INDEX.contains_key(&slim_tag)
+        {
+            // Admission may legitimately skip under host pressure.
+            remove_surrogate_tag_set(&fat_tag);
+            remove_surrogate_tag_set(&slim_tag);
+            return;
+        }
+
+        // Cap just below the current size: exactly one tag — the largest
+        // membership set — must be dropped.
+        let cap = SURROGATE_KEY_INDEX.len().saturating_sub(1);
+        let removed = trim_surrogate_index_to_capacity(cap);
+        assert!(removed >= 1, "trim must drop at least one tag set");
+        assert!(!SURROGATE_KEY_INDEX.contains_key(&fat_tag));
+        assert!(SURROGATE_KEY_INDEX.contains_key(&slim_tag));
+        for i in 0..32 {
+            assert_eq!(
+                owner_bytes(&format!("{fat_tag}\0{unique}-fat-hash-{i}")),
+                0,
+                "trimmed members refund their owner charge"
+            );
+        }
+        assert!(
+            owner_bytes(&format!("{slim_tag}\0{unique}-slim-hash")) > 0,
+            "surviving tag keeps its member charge"
+        );
+
+        remove_surrogate_tag_set(&slim_tag);
+    }
+
+    #[test]
+    fn l1_rebuild_with_limit_salvages_newest_entries() {
+        let l1 = TinyUfoL1::new(64 * 1024);
+        let now = crate::utils::time::now_timestamp();
+        let mk_entry = |suffix: &str, created: i64| TinyUfoL1Entry {
+            cache_key: format!("salvage-{suffix}"),
+            data: bytes::Bytes::from(vec![b'x'; 600]),
+            response_header: Arc::new(
+                pingora_http::ResponseHeader::build(200, None).unwrap(),
+            ),
+            fresh_until: now + 60,
+            created_at: created,
+            stale_while_revalidate_secs: 0,
+            stale_if_error_secs: 0,
+            error_status_allowed: false,
+            metadata_updated_at: now,
+            cache_state_version: 0,
+            purge_generation: 0,
+            metadata_required: false,
+        };
+        // Each 600B entry weighs 1 unit; the 2KiB rebuild keeps weight<=2.
+        for (suffix, created) in [
+            ("oldest", now - 30),
+            ("older", now - 20),
+            ("newer", now - 10),
+            ("newest", now),
+        ] {
+            let key = format!("salvage-{suffix}");
+            l1.put(&key, mk_entry(suffix, created), std::time::Duration::from_secs(60));
+        }
+        assert_eq!(l1.stats().0, 4);
+
+        l1.force_rebuild_with_limit(2048);
+
+        let (count, _) = l1.stats();
+        assert_eq!(count, 2, "only what fits the smaller budget survives");
+        assert!(l1.get("salvage-newest").is_some());
+        assert!(l1.get("salvage-newer").is_some());
+        assert!(l1.get("salvage-oldest").is_none());
+        assert!(l1.get("salvage-older").is_none());
+        assert_eq!(l1.max_bytes.load(Ordering::Relaxed), 2048);
+    }
+
+    #[test]
+    fn l1_force_clear_drops_everything() {
+        let l1 = TinyUfoL1::new(64 * 1024);
+        let now = crate::utils::time::now_timestamp();
+        l1.put(
+            "clear-me",
+            TinyUfoL1Entry {
+                cache_key: "clear-me".to_string(),
+                data: bytes::Bytes::from_static(b"payload"),
+                response_header: Arc::new(
+                    pingora_http::ResponseHeader::build(200, None).unwrap(),
+                ),
+                fresh_until: now + 60,
+                created_at: now,
+                stale_while_revalidate_secs: 0,
+                stale_if_error_secs: 0,
+                error_status_allowed: false,
+                metadata_updated_at: now,
+                cache_state_version: 0,
+                purge_generation: 0,
+                metadata_required: false,
+            },
+            std::time::Duration::from_secs(60),
+        );
+        l1.force_clear();
+        assert!(l1.get("clear-me").is_none());
+        assert_eq!(l1.stats().0, 0);
     }
 
     #[test]

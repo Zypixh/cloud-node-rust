@@ -69,6 +69,12 @@ impl DailyDomainTracker {
         entry.attack_bytes += attack_bytes;
     }
 
+    /// Rough heap estimate: DomainKey carries a heap String (<=127 bytes)
+    /// plus six counters and map overhead.
+    pub fn approximate_bytes(&self) -> u64 {
+        (self.domains.len() as u64).saturating_mul(192)
+    }
+
     pub fn flush_older_than(
         &self,
         current_created_at: i64,
@@ -127,6 +133,11 @@ impl UniqueIpTracker {
             .count() as i64
     }
 
+    /// Rough heap estimate: (i64, day String, IpAddr) per set entry.
+    pub fn approximate_bytes(&self) -> u64 {
+        (self.ips.len() as u64).saturating_mul(96)
+    }
+
     pub fn cleanup_before(&self, min_day: &str) {
         let keys: Vec<_> = self
             .ips
@@ -146,3 +157,17 @@ pub static DAILY_DOMAIN_TRACKER: Lazy<Arc<DailyDomainTracker>> =
 
 pub static UNIQUE_IP_TRACKER: Lazy<Arc<UniqueIpTracker>> =
     Lazy::new(|| Arc::new(UniqueIpTracker::new()));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daily_domain_approximate_bytes_tracks_live_entries() {
+        let tracker = DailyDomainTracker::new();
+        assert_eq!(tracker.approximate_bytes(), 0);
+        tracker.record(1, 100, "example.com", 10, 5, 1, 1, 0, 0);
+        tracker.record(1, 100, "cdn.example.com", 20, 0, 1, 0, 0, 0);
+        assert_eq!(tracker.approximate_bytes(), 2 * 192);
+    }
+}

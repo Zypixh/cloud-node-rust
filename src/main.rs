@@ -2837,6 +2837,10 @@ WorkingDirectory='/opt/cloud-node'
 }
 
 fn main() -> anyhow::Result<()> {
+    // Must run before any worker/runtime threads spawn: enables mimalloc's
+    // abandoned-page purge on thread termination so RSS does not plateau on
+    // pages owned by dead heaps.
+    cloud_node_rust::memory_reclaim::configure_allocator();
     let cli = Cli::parse();
     Language::set_current(Language::detect());
 
