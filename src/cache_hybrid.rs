@@ -7326,4 +7326,31 @@ mod tests {
         let removed = bloom.shrink_layers(1);
         let _ = removed;
     }
+
+    #[test]
+    fn reconcile_resident_ledgers_refunds_orphaned_negative_cache_owner() {
+        let _state_guard = CACHE_GLOBAL_STATE_LOCK.blocking_lock();
+        let key = unique_test_suffix("reconcile-neg");
+        let now = crate::utils::time::now_timestamp();
+        negative_cache_insert(&key, now);
+        if !NEGATIVE_CACHE.contains_key(&key) {
+            // Insert was refused under a pressure snapshot — nothing to
+            // reconcile for this key.
+            return;
+        }
+        // Simulate a leaked charge: remove the map entry directly instead of
+        // via negative_cache_remove, so the ledger owner stays charged with
+        // nothing backing it.
+        NEGATIVE_CACHE.remove(&key);
+        let stats = super::reconcile_resident_ledgers();
+        assert!(
+            stats.stale_owners_removed >= 1,
+            "reconcile must detect the orphaned owner charge"
+        );
+        assert!(
+            stats.bytes_refunded >= 160 + key.len() as u64,
+            "reconcile must refund the orphaned charge, got {}",
+            stats.bytes_refunded
+        );
+    }
 }
