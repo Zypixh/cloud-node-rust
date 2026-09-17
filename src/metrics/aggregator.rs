@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(total, 25);
 
         // Restoring flushed rows beyond the cap merges into survivors only.
-        let mut surplus = MetricAggregator::new();
+        let surplus = MetricAggregator::new();
         surplus.record_with_capacity(test_key(1, "x"), 1, 0, false, 2);
         surplus.record_with_capacity(test_key(1, "y"), 1, 0, false, 2);
         surplus.restore_with_capacity(
