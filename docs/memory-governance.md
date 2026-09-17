@@ -152,6 +152,10 @@ silently disable the whole subsystem:
 - The reclaim-monitor loop and the kernel pressure-event watcher each wrap
   their iteration body in `catch_unwind`, so neither dedicated thread dies on
   a faulting iteration — the pending-level slot and unpark target keep working.
+- `start_reclaim_monitor` is idempotent (`RECLAIM_MONITOR_STARTED` guard);
+  a repeated call can no longer spawn a duplicate monitor thread that would
+  drain the same pending level. A failed spawn clears the flag so a later
+  call can retry.
 - The cooldown's `last == 0` state means "never reclaimed", so the first
   reclaim of a fresh process is not suppressed, and the cooldown is measured
   from reclaim completion rather than reclaim start. Release builds use
