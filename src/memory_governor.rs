@@ -684,7 +684,9 @@ pub struct MemoryGovernor {
     /// and letting unbudgeted metrics maps share that total would starve the
     /// cache categories it protects.
     metrics_aggregator_bytes: AtomicU64,
-    admission_rejects: [AtomicU64; ADMISSION_CLASS_COUNT],
+    /// Reject counters get their own lines too: rejects only happen under
+    /// floods, which is exactly when an unpadded array would false-share.
+    admission_rejects: [PaddedAtomicU64; ADMISSION_CLASS_COUNT],
     cached_total_bytes: AtomicU64,
     cached_used_bytes: AtomicU64,
     cached_available_bytes: AtomicU64,
@@ -847,7 +849,7 @@ impl MemoryGovernor {
             sni_relays: PaddedAtomicU64::new(0),
             cache_read_memory_bytes: PaddedAtomicU64::new(0),
             metrics_aggregator_bytes: AtomicU64::new(0),
-            admission_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
+            admission_rejects: std::array::from_fn(|_| PaddedAtomicU64::new(0)),
             cached_total_bytes: AtomicU64::new(0),
             cached_used_bytes: AtomicU64::new(0),
             cached_available_bytes: AtomicU64::new(0),
@@ -2259,7 +2261,7 @@ impl MemoryGovernor {
     }
 
     fn reject_counter(&self, class: AdmissionClass) -> &AtomicU64 {
-        &self.admission_rejects[class_index(class)]
+        &self.admission_rejects[class_index(class)].0
     }
 
     fn record_reject(&self, class: AdmissionClass) {
