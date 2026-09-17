@@ -375,6 +375,11 @@ struct ScoreEntry {
     /// before that copy lands would double-count the pipe and churn
     /// retransmits — the sim's stand-in for RACK's time-based test.
     retx_out: bool,
+    /// RTT already sampled at SACK-confirmation time. Without this the
+    /// cum-drain would re-sample `now − first_tx_at`, which spans the
+    /// whole loss-recovery period of lower seqs (tens of seconds on a
+    /// massacre path) and inflates srtt/RTO far beyond the wire RTT.
+    rtt_taken: bool,
 }
 
 /// Per-flow state (sender + receiver halves).
@@ -427,6 +432,15 @@ struct Sim<'a> {
     flows: Vec<Flow<'a>>,
     /// O(1) all-done check (was a full scan after every event).
     completed_count: usize,
+    /// Pacing prefetch quantum (µs): one MSS service time on the
+    /// configured link. Sends due within a quantum are released
+    /// immediately — pacing faster than line rate is unobservable
+    /// through the serializing queue anyway, and without this each
+    /// sub-quantum paced packet costs a whole SendDue event (storm).
+    pace_quantum_us: u64,
+    /// `SIM_EVENT_STATS` diagnostics: per-kind event counts.
+    event_stats: bool,
+    event_hist: [u64; 5],
 }
 
 impl<'a> Flow<'a> {
@@ -515,6 +529,9 @@ impl<'a> Sim<'a> {
                 .map(|s| Flow::new(s, cfg.collect_trace))
                 .collect(),
             completed_count: 0,
+            pace_quantum_us: (cfg.mss.saturating_mul(1_000_000) / cfg.rate_bps.max(1)).max(1),
+            event_stats: std::env::var_os("SIM_EVENT_STATS").is_some(),
+            event_hist: [0; 5],
         }
     }
 
@@ -664,6 +681,14 @@ impl<'a> Sim<'a> {
                 if let Some((seq, len, first_tx_at)) = next_lost {
                     if f.in_flight + len > f.cc.cwnd() {
                         Work::Blocked
+                    } else if self.now_us + self.pace_quantum_us < f.next_send_due {
+                        // Retransmits pay the same pacing toll as new
+                        // data. They MUST be gated: the send below
+                        // advances `next_send_due`, so an ungated retx
+                        // train (one per ACK) pushes the due clock
+                        // unboundedly ahead of `now` and starves new
+                        // data past the simulation deadline.
+                        Work::Blocked
                     } else {
                         Work::Retx { seq, len, first_tx_at }
                     }
@@ -673,7 +698,7 @@ impl<'a> Sim<'a> {
                     let len = cfg.mss.min(cfg.total_bytes - f.next_seq);
                     if f.in_flight + len > f.cc.cwnd() {
                         Work::Blocked
-                    } else if self.now_us < f.next_send_due {
+                    } else if self.now_us + self.pace_quantum_us < f.next_send_due {
                         Work::Blocked
                     } else {
                         match f.app_rate_bps {
@@ -782,6 +807,7 @@ impl<'a> Sim<'a> {
                             sacked: false,
                             lost: false,
                             retx_out: false,
+                            rtt_taken: false,
                         },
                     );
                     f.cc.on_sent(now, len, f.in_flight, app_limited);
@@ -807,12 +833,14 @@ impl<'a> Sim<'a> {
                     }
                 }
             }
-            // Pacing: next send due after len/rate (or immediately when
-            // the controller doesn't pace).
+            // Pacing: accumulate the due clock per segment (max(due,now)
+            // discards stale credit — no unbounded catch-up burst) so a
+            // run of prefetch-eligible sends still honors the rate.
             let f = &mut self.flows[fi];
             match f.cc.pacing_rate() {
                 Some(rate) if rate > 0 => {
-                    f.next_send_due = self.now_us + (sent_len * 1_000_000).div_ceil(rate);
+                    let spacing = (sent_len * 1_000_000).div_ceil(rate);
+                    f.next_send_due = f.next_send_due.max(self.now_us) + spacing;
                 }
                 _ => {
                     f.next_send_due = self.now_us;
@@ -958,13 +986,22 @@ impl<'a> Sim<'a> {
                 f.lost_unsacked -= 1;
                 f.lost_pending.remove(&seq);
             }
-            newly_acked.push(e.rec);
+            let mut rec = e.rec;
+            if e.rtt_taken {
+                // Suppress a second RTT sample for this record inside the
+                // sampler (its `is_retransmit` flag is the Karn gate):
+                // the wire RTT was measured when the SACK arrived, and
+                // `now − first_tx_at` here would be the recovery delay.
+                rec.is_retransmit = true;
+            }
+            newly_acked.push(rec);
         }
         let progressed = cum > f.cum_acked;
         f.cum_acked = f.cum_acked.max(cum);
         // SACK markings: receiver-confirmed out-of-order arrivals leave
         // the pipe (Linux: sacked_out excluded from packets_in_flight).
         let mut newly_sacked = 0u64;
+        let mut sack_rtts = Vec::new();
         for (s, _l) in &sacked {
             if let Some(e) = f.scoreboard.get_mut(s)
                 && !e.sacked
@@ -981,8 +1018,20 @@ impl<'a> Sim<'a> {
                 e.lost = false;
                 e.retx_out = false;
                 f.lost_pending.remove(s);
+                // Wire RTT is measured at first confirmation — now, at
+                // SACK arrival. Deferring to cum-drain would add the
+                // recovery delay of every lower seq (the srtt/RTO
+                // inflation this flag prevents below).
+                if !e.rec.is_retransmit {
+                    sack_rtts.push(now.duration_since(e.rec.first_tx_at));
+                    e.rtt_taken = true;
+                }
                 newly_sacked += e.rec.len();
             }
+        }
+        for r in sack_rtts {
+            f.rtt.sample(r);
+            f.result.rtt_samples_us.push(r.as_micros() as u64);
         }
         if progressed {
             f.dupacks = 0;
@@ -1087,6 +1136,11 @@ impl<'a> Sim<'a> {
         // (on_loss_event → on_rto internally).
         f.cc.on_loss_event(now, lost_bytes, in_flight, true);
         f.rto_backoff += 1;
+        // The RTO timer restarts when the retransmission is sent — i.e.
+        // now. Leaving the base at the stale last-ACK time would compute
+        // an already-expired deadline and `arm_rto` would push a same-tick
+        // event that re-pops forever without advancing `now_us`.
+        f.last_ack_progress_us = self.now_us;
         f.rto_armed = false;
         f.result.rto_events += 1;
         f.trace(TraceKind::Rto, f.cum_acked, self.now_us, flow_id);
@@ -1105,6 +1159,30 @@ impl<'a> Sim<'a> {
             }
             self.now_us = at;
             let fi = flow_id as usize;
+            if self.event_stats {
+                let idx = match &ev {
+                    Event::SendDue => 0,
+                    Event::DataArrive { .. } => 1,
+                    Event::AckArrive { .. } => 2,
+                    Event::AckFlush => 3,
+                    Event::Rto => 4,
+                };
+                self.event_hist[idx] += 1;
+                let total = self.event_hist.iter().sum::<u64>();
+                if total % 2_000_000 == 0 {
+                    eprintln!(
+                        "sim>{}M t={}us heap={} senddue={} data={} ack={} flush={} rto={}",
+                        total / 1_000_000,
+                        self.now_us,
+                        self.events.len(),
+                        self.event_hist[0],
+                        self.event_hist[1],
+                        self.event_hist[2],
+                        self.event_hist[3],
+                        self.event_hist[4]
+                    );
+                }
+            }
             match ev {
                 Event::SendDue => {
                     self.flows[fi].send_due_armed = false;
@@ -1139,13 +1217,41 @@ impl<'a> Sim<'a> {
             let has_work = f.next_seq < self.cfg.total_bytes || has_lost;
             if has_work
                 && f.in_flight < f.cc.cwnd()
-                && (has_lost || (!f.send_due_armed && self.now_us >= f.next_send_due))
+                && (has_lost
+                    || (!f.send_due_armed
+                        && self.now_us + self.pace_quantum_us >= f.next_send_due))
             {
                 self.try_send(fi);
             }
         }
         for f in &mut self.flows {
             f.result.delivered_bytes = f.sampler.delivered_total();
+        }
+        if self.event_stats {
+            for (i, f) in self.flows.iter().enumerate() {
+                if !f.completed {
+                    eprintln!(
+                        "sim-dump flow={i} t={} cum={} next_seq={} total={} inflight={} cwnd={} lost_unsacked={} lost_pending={} scoreboard={} due={} armed={} rto_armed={} rto_due={} last_prog={} backoff={} rx_next={} rx_sacked={}",
+                        self.now_us,
+                        f.cum_acked,
+                        f.next_seq,
+                        self.cfg.total_bytes,
+                        f.in_flight,
+                        f.cc.cwnd(),
+                        f.lost_unsacked,
+                        f.lost_pending.len(),
+                        f.scoreboard.len(),
+                        f.next_send_due,
+                        f.send_due_armed,
+                        f.rto_armed,
+                        f.rto_due,
+                        f.last_ack_progress_us,
+                        f.rto_backoff,
+                        f.rx_next,
+                        f.rx_sacked.len(),
+                    );
+                }
+            }
         }
     }
 }

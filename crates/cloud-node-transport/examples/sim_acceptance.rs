@@ -155,7 +155,22 @@ fn seed_for(cell_id: u64, replica: u32) -> u64 {
     x
 }
 
+/// Optional `SIM_ONLY=cell:variant[:replica]` filter for ad-hoc
+/// profiling runs; unset = full matrix.
+fn selected(cell: &str, variant: &str, replica: u32) -> bool {
+    let Ok(f) = std::env::var("SIM_ONLY") else {
+        return true;
+    };
+    let mut it = f.splitn(3, ':');
+    it.next() == Some(cell)
+        && it.next() == Some(variant)
+        && it.next().map_or(true, |r| r == replica.to_string())
+}
+
 fn run_cell(v: &Variant, cfg: &SimConfig, flows: u32, cell: &str, replica: u32) {
+    if !selected(cell, v.name, replica) {
+        return;
+    }
     let mut cfg = *cfg;
     cfg.seed = seed_for(cfg.seed, replica);
     // Multi-flow runs don't need the event trace — metrics come from
@@ -166,6 +181,14 @@ fn run_cell(v: &Variant, cfg: &SimConfig, flows: u32, cell: &str, replica: u32) 
     if flows <= 1 {
         let mut cc = build(v, &cfg);
         let res = run(&mut *cc, &cfg);
+        if std::env::var("SIM_DEBUG").is_ok() {
+            eprintln!(
+                "dbg {cell}/{}/{replica}: trace_rows={} rtt_samples={}",
+                v.name,
+                res.trace.len(),
+                res.rtt_samples_us.len()
+            );
+        }
         let fct = fct_us(&res, cfg.total_bytes, cfg.duration.as_micros() as u64);
         let elapsed = fct.max(1);
         let goodput = res.delivered_bytes * 1_000_000 / elapsed;
