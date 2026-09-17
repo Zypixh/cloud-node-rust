@@ -577,7 +577,15 @@ fn maybe_reconcile_resident_ledgers() {
     }
 }
 
+/// Re-entrant guard for `start_reclaim_monitor`: a second spawn would
+/// silently succeed (RECLAIM_MONITOR_THREAD.set just fails after storing
+/// nothing) and leave a duplicate monitor draining the same pending level.
+static RECLAIM_MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
+
 pub fn start_reclaim_monitor() {
+    if RECLAIM_MONITOR_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let spawn_result = std::thread::Builder::new()
         .name("memory-reclaim".to_string())
         .spawn(|| {
@@ -613,6 +621,9 @@ pub fn start_reclaim_monitor() {
         });
     if let Err(err) = spawn_result {
         tracing::warn!("failed to spawn memory reclaim monitor: {err}");
+        // Spawn failed — allow a later call to retry instead of permanently
+        // marking the monitor as started.
+        RECLAIM_MONITOR_STARTED.store(false, Ordering::Release);
     }
     start_pressure_event_watcher();
 }
