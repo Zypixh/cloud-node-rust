@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -73,6 +75,12 @@ pub struct XdpQueueStatus {
     /// released (F2 — refusal must never escalate to queue teardown).
     #[serde(default)]
     pub admission_refusals: u64,
+    /// T9/D-AQM: CoDel drops on the deferred TX queue (Not-ECT units only).
+    #[serde(default)]
+    pub aqm_drops: u64,
+    /// T9/D-AQM: CE marks applied to ECT-capable deferred units (RFC 3168).
+    #[serde(default)]
+    pub aqm_ce_marks: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -440,6 +448,11 @@ fn dataplane_shape_compatible(old: &XdpManager, new: &XdpConfig) -> Result<(), S
     if old_cfg.upstream != new.upstream {
         return Err("upstream dataplane settings changed".to_string());
     }
+    if old_cfg.transport != new.transport {
+        // Controller/ECN-trust changes mid-generation would silently
+        // diverge the congestion semantics of adopted flows.
+        return Err("transport policy changed (controller/ECN trust)".to_string());
+    }
     let shape = |interfaces: &[crate::runtime_mode::XdpInterfaceConfig]| {
         interfaces
             .iter()
@@ -458,7 +471,10 @@ fn dataplane_shape_compatible(old: &XdpManager, new: &XdpConfig) -> Result<(), S
 
 #[derive(Debug)]
 pub(crate) struct XdpManager {
-    config: XdpConfig,
+    /// F1/T5: `pub(crate)` — the lease owner hands the resolved transport
+    /// policy to adopted workers; same-generation mutation never happens
+    /// (the struct is behind `Arc` once live).
+    pub(crate) config: XdpConfig,
     /// State-table sizes actually loaded — set by attach when no explicit
     /// `xdp.stateTables` was configured and the defaults were auto-scaled
     /// to fit this node's kernel-BPF budget. Status reports the real
@@ -1614,6 +1630,8 @@ impl XdpManager {
                 .find(|prev| prev.interface == status.interface && prev.queue == status.queue)
             {
                 status.congested_drops = prev.congested_drops;
+                status.aqm_drops = prev.aqm_drops;
+                status.aqm_ce_marks = prev.aqm_ce_marks;
                 status.admission_refusals = prev.admission_refusals;
                 if prev.faulted {
                     status.faulted = true;
@@ -2807,6 +2825,22 @@ pub(crate) fn afxdp_upstream_selected() -> bool {
     {
         false
     }
+}
+
+/// T5: resolved transport policy for QUIC endpoints that are AF_XDP
+/// scoped (demux-fed H3 server, AF_XDP H3 upstream). Returns `None`
+/// when the selection is the cubic default — the caller keeps quinn's
+/// stock controller and the non-XDP contract is unchanged.
+#[cfg(target_os = "linux")]
+pub(crate) fn xdp_quic_cc_factory(
+) -> Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>> {
+    let settings = RuntimeConfig::current()
+        .and_then(|runtime| runtime.xdp.transport.clone())
+        .unwrap_or_default();
+    (settings.controller != crate::runtime_mode::XdpTransportController::Cubic).then(|| {
+        Arc::new(crate::quic_cc::XdpTransportControllerFactory::new(settings))
+            as Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>
+    })
 }
 
 /// T4-6: node-originated TCP connect through the AF_XDP dataplane.

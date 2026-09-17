@@ -47,6 +47,10 @@ struct H3Datagram {
     from: SocketAddr,
     data: Bytes,
     queued_bytes: Option<Arc<AtomicUsize>>,
+    /// C11: IP-header ECN codepoint bits (0–3) from the received frame —
+    /// Quinn reports CE marks for congestion feedback; `None` on the
+    /// kernel-socket path (unchanged contract).
+    ecn: Option<u8>,
 }
 
 impl Drop for H3Datagram {
@@ -202,7 +206,10 @@ impl AsyncUdpSocket for SharedQuinnUdpSocket {
                     datagram.data.len(),
                     datagram.from
                 );
-                Poll::Ready(copy_datagram(datagram, &mut bufs[0], &mut meta[0]).map(|_| 1))
+                Poll::Ready(
+                    copy_datagram(datagram, self.local_addr.ip(), &mut bufs[0], &mut meta[0])
+                        .map(|_| 1),
+                )
             }
             Poll::Ready(None) => Poll::Ready(Ok(0)),
             Poll::Pending => Poll::Pending,
@@ -666,6 +673,7 @@ fn try_queue_h3_datagram(
     h3_queued_bytes: &Arc<AtomicUsize>,
     client_addr: SocketAddr,
     data: Bytes,
+    ecn: Option<u8>,
     byte_budget: usize,
 ) -> H3QueueStatus {
     let data_len = data.len();
@@ -691,6 +699,7 @@ fn try_queue_h3_datagram(
         from: client_addr,
         data,
         queued_bytes: Some(Arc::clone(h3_queued_bytes)),
+        ecn,
     }) {
         Ok(()) => H3QueueStatus::Sent,
         Err(mpsc::error::TrySendError::Full(_)) => H3QueueStatus::Full,
@@ -700,6 +709,7 @@ fn try_queue_h3_datagram(
 
 fn copy_datagram(
     datagram: H3Datagram,
+    local_ip: StdIpAddr,
     buf: &mut IoSliceMut<'_>,
     meta: &mut quinn::udp::RecvMeta,
 ) -> io::Result<()> {
@@ -714,8 +724,11 @@ fn copy_datagram(
         addr: datagram.from,
         len: datagram.data.len(),
         stride: datagram.data.len(),
-        ecn: None,
-        dst_ip: None,
+        // C11: carry the frame's ECN bits through to Quinn — receivers
+        // count CE marks for congestion feedback. Invalid bit patterns
+        // degrade to None (quinn ignores them) rather than fabricating.
+        ecn: datagram.ecn.and_then(quinn::udp::EcnCodepoint::from_bits),
+        dst_ip: Some(local_ip),
     };
     Ok(())
 }
@@ -777,6 +790,8 @@ struct ProcessDatagramArgs<'a> {
     port: u16,
     client_addr: SocketAddr,
     data: Bytes,
+    /// C11: frame ECN bits on the AF_XDP path; `None` on kernel sockets.
+    ecn: Option<u8>,
     downstream_sender: UdpDownstreamSender,
     shared: &'a UdpDemuxSharedState,
     http3_enabled: bool,
@@ -787,6 +802,8 @@ struct ClassifyRouteArgs<'a> {
     port: u16,
     client_addr: SocketAddr,
     data: Bytes,
+    /// C11: frame ECN bits — forwarded into the H3 queue on Terminated.
+    ecn: Option<u8>,
     pending_routes: &'a DashMap<SocketAddr, PendingQuicRoute>,
     pending_reassembly_bytes: &'a AtomicUsize,
     new_route_windows: &'a DashMap<StdIpAddr, VecDeque<Instant>>,
@@ -815,6 +832,8 @@ struct DispatchRouteArgs<'a> {
     route: RouteKind,
     client_addr: SocketAddr,
     data: Bytes,
+    /// C11: frame ECN bits forwarded to the H3 queue on Terminated routes.
+    ecn: Option<u8>,
     h3_tx: &'a mpsc::Sender<H3Datagram>,
     h3_queued_bytes: &'a Arc<AtomicUsize>,
     http3_enabled: bool,
@@ -1041,6 +1060,7 @@ impl QuicUdpDemuxManager {
             port,
             client_addr: datagram.peer_addr,
             data: datagram.payload,
+            ecn: datagram.ecn,
             downstream_sender: UdpDownstreamSender::channel(datagram.listen_addr, downstream_tx),
             shared: &handle.shared,
             http3_enabled: handle.http3_enabled,
@@ -1185,7 +1205,7 @@ impl QuicUdpDemuxManager {
     ) -> Result<()> {
         let server_config = self
             .http3_manager
-            .build_quinn_server_config()
+            .build_quinn_server_config_scoped(true)
             .await
             .context("build shared HTTP/3 Quinn server config")?;
         let runtime = quinn::default_runtime().context("no Quinn runtime available")?;
@@ -1290,6 +1310,9 @@ impl QuicUdpDemuxManager {
                     port,
                     client_addr,
                     data,
+                    // C11: kernel-socket path — no ECN metadata; contract
+                    // unchanged.
+                    ecn: None,
                     downstream_sender: downstream_sender.clone(),
                     shared: &shared,
                     http3_enabled,
@@ -1307,6 +1330,7 @@ impl QuicUdpDemuxManager {
             port,
             client_addr,
             data,
+            ecn,
             downstream_sender,
             shared,
             http3_enabled,
@@ -1348,6 +1372,7 @@ impl QuicUdpDemuxManager {
                     route: route.clone(),
                     client_addr,
                     data,
+                    ecn,
                     h3_tx: &shared.h3_tx,
                     h3_queued_bytes: &shared.h3_queued_bytes,
                     http3_enabled,
@@ -1363,6 +1388,7 @@ impl QuicUdpDemuxManager {
                     route: route.clone(),
                     client_addr,
                     data,
+                    ecn,
                     h3_tx: &shared.h3_tx,
                     h3_queued_bytes: &shared.h3_queued_bytes,
                     http3_enabled,
@@ -1437,6 +1463,7 @@ impl QuicUdpDemuxManager {
                 port,
                 client_addr,
                 data,
+                ecn,
                 pending_routes: &shared.pending_routes,
                 pending_reassembly_bytes: &shared.pending_reassembly_bytes,
                 new_route_windows: &shared.new_route_windows,
@@ -1470,6 +1497,7 @@ impl QuicUdpDemuxManager {
                     route: route.clone(),
                     client_addr,
                     data: datagram,
+                    ecn,
                     h3_tx: &shared.h3_tx,
                     h3_queued_bytes: &shared.h3_queued_bytes,
                     http3_enabled,
@@ -1589,6 +1617,7 @@ impl QuicUdpDemuxManager {
             port,
             client_addr,
             data,
+            ecn,
             pending_routes,
             pending_reassembly_bytes,
             new_route_windows,
@@ -1867,6 +1896,7 @@ impl QuicUdpDemuxManager {
                         h3_queued_bytes,
                         client_addr,
                         data,
+                        ecn,
                         MEMORY_GOVERNOR.h3_datagram_queue_budget_bytes(),
                     ) {
                         H3QueueStatus::Sent => {}
@@ -2127,6 +2157,7 @@ impl QuicUdpDemuxManager {
             route,
             client_addr,
             data,
+            ecn,
             h3_tx,
             h3_queued_bytes,
             http3_enabled,
@@ -2142,6 +2173,7 @@ impl QuicUdpDemuxManager {
                     h3_queued_bytes,
                     client_addr,
                     data,
+                    ecn,
                     MEMORY_GOVERNOR.h3_datagram_queue_budget_bytes(),
                 ) {
                     H3QueueStatus::Sent => {
@@ -2481,6 +2513,7 @@ mod tests {
                 &queued_bytes,
                 client_addr,
                 Bytes::from_static(b"abcdef"),
+                None,
                 5,
             ),
             H3QueueStatus::ByteLimited
@@ -2493,6 +2526,7 @@ mod tests {
                 &queued_bytes,
                 client_addr,
                 Bytes::from_static(b"abcdef"),
+                None,
                 16,
             ),
             H3QueueStatus::Sent
@@ -2545,6 +2579,7 @@ mod tests {
                 from: peer_addr,
                 data: Bytes::from_static(b"h3!"),
                 queued_bytes: Some(queued_bytes.clone()),
+                ecn: None,
             })
             .await
             .unwrap();
@@ -2578,6 +2613,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_quinn_udp_socket_propagates_ecn_and_dst_ip() {
+        let listen_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let peer_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+        let (downstream_tx, _downstream_rx) = mpsc::channel(2);
+        let (h3_tx, h3_rx) = mpsc::channel(2);
+        let queued_bytes = Arc::new(AtomicUsize::new(6));
+        for (data, ecn) in [
+            (Bytes::from_static(b"ce!"), Some(0b11u8)),
+            (Bytes::from_static(b"bad"), Some(4u8)),
+        ] {
+            h3_tx
+                .send(H3Datagram {
+                    from: peer_addr,
+                    data,
+                    queued_bytes: Some(queued_bytes.clone()),
+                    ecn,
+                })
+                .await
+                .unwrap();
+        }
+        let socket = SharedQuinnUdpSocket::new(
+            UdpDownstreamSender::channel(listen_addr, downstream_tx),
+            listen_addr,
+            h3_rx,
+        );
+        let mut buf = [0u8; 16];
+        let mut bufs = [IoSliceMut::new(&mut buf)];
+        let mut meta = [quinn::udp::RecvMeta {
+            addr: listen_addr,
+            len: 0,
+            stride: 0,
+            ecn: None,
+            dst_ip: None,
+        }];
+
+        assert_eq!(
+            std::future::poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            meta[0].ecn,
+            Some(quinn::udp::EcnCodepoint::Ce),
+            "C11: AF_XDP frame ECN bits must reach Quinn"
+        );
+        assert_eq!(meta[0].dst_ip, Some(listen_addr.ip()));
+
+        assert_eq!(
+            std::future::poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            meta[0].ecn, None,
+            "invalid ECN bit patterns must not be fabricated into a codepoint"
+        );
+    }
+
+    #[tokio::test]
     async fn shared_quinn_udp_socket_releases_budget_when_recv_buffer_is_too_small() {
         let listen_addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
         let peer_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
@@ -2589,6 +2685,7 @@ mod tests {
                 from: peer_addr,
                 data: Bytes::from_static(b"too-wide"),
                 queued_bytes: Some(queued_bytes.clone()),
+                ecn: None,
             })
             .await
             .unwrap();
@@ -2630,6 +2727,7 @@ mod tests {
                     listen_addr,
                     peer_addr,
                     payload: Bytes::from_static(b"probe"),
+                    ecn: None,
                 },
                 downstream_tx,
                 fallback_shutdown_rx,

@@ -499,6 +499,57 @@ pub struct XdpUpstreamSettings {
     pub dial_port_end: Option<u16>,
 }
 
+/// T5: congestion-controller selection for AF_XDP-terminated TCP.
+/// `cubic` is the validated production default; `edgecc` is the
+/// decision-layer controller under acceptance; `bbr3`, `new-reno` and
+/// `loss-blind` exist only for deterministic validation/ablation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XdpTransportController {
+    #[default]
+    Cubic,
+    Edgecc,
+    Bbr3,
+    NewReno,
+    LossBlind,
+}
+
+impl XdpTransportController {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cubic => "cubic",
+            Self::Edgecc => "edgecc",
+            Self::Bbr3 => "bbr3",
+            Self::NewReno => "new-reno",
+            Self::LossBlind => "loss-blind",
+        }
+    }
+}
+
+/// T5: transport policy for AF_XDP-terminated TCP flows.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct XdpTransportSettings {
+    #[serde(rename = "controller", default)]
+    pub controller: XdpTransportController,
+    /// D-D2 controlled-link flag: on own-infrastructure paths CE marks
+    /// carry full weight; on the public Internet they are capped and
+    /// downweighted. Default false (public).
+    #[serde(rename = "trustedEcn", default)]
+    pub trusted_ecn: bool,
+    /// Worker-local shared-bottleneck aggregation (EdgeCC only). On by
+    /// default when EdgeCC is selected; the aggregate is worker-local
+    /// (`Rc<RefCell>`), never a cross-worker lock.
+    #[serde(rename = "aggregation", default = "default_true")]
+    pub aggregation: bool,
+}
+
+impl XdpTransportSettings {
+    /// Resolved aggregation flag — only meaningful under EdgeCC.
+    pub fn aggregation_enabled(&self) -> bool {
+        self.controller == XdpTransportController::Edgecc && self.aggregation
+    }
+}
+
 impl XdpUpstreamSettings {
     /// Resolved reserved span (start, end inclusive), applying defaults.
     pub fn dial_port_range(&self) -> (u16, u16) {
@@ -563,6 +614,17 @@ pub struct XdpConfig {
     /// or `afxdp`. See `XdpUpstreamSettings`.
     #[serde(rename = "upstream", default)]
     pub upstream: Option<XdpUpstreamSettings>,
+    /// T5: transport-controller selection for AF_XDP-terminated TCP
+    /// flows. Absent = `cubic` (validated production default). `edgecc`
+    /// enables the EdgeCC decision layer; `bbr3`/`new-reno`/`loss-blind`
+    /// are validation-only ablations — never a production menu.
+    #[serde(rename = "transport", default)]
+    pub transport: Option<XdpTransportSettings>,
+    /// T8 (D-G2): node egress shaping budget in bytes/s, split evenly
+    /// across AF_XDP workers as a token bucket (~1ms batch target,
+    /// CAKE-style 38B/frame overhead). Absent = no shaping (现状).
+    #[serde(rename = "egressRateBps", default)]
+    pub egress_rate_bps: Option<u64>,
 }
 
 impl XdpConfig {

@@ -35,6 +35,9 @@ regex = "1.13.1"
 aho-corasick = "1.1.5"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "http2"] }
 quinn = "0.11.11"
+# Direct pin to the lockfile version so `congestion::Controller` impls
+# can name `RttEstimator` (quinn does not re-export it).
+quinn-proto = "=0.11.17"
 rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "std"] }
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"

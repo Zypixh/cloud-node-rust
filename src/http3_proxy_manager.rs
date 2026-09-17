@@ -401,6 +401,16 @@ impl Http3ProxyManager {
     }
 
     pub async fn build_quinn_server_config(&self) -> Result<quinn::ServerConfig> {
+        self.build_quinn_server_config_scoped(false).await
+    }
+
+    /// `af_xdp_scoped` — the endpoint is fed exclusively by the AF_XDP
+    /// UDP demux (SharedQuinnUdpSocket); only then does the XDP
+    /// transport policy apply to its connections.
+    pub async fn build_quinn_server_config_scoped(
+        &self,
+        af_xdp_scoped: bool,
+    ) -> Result<quinn::ServerConfig> {
         let mut rustls_config = crate::ssl::build_rustls_server_config(
             Arc::clone(&self.cert_selector),
             vec![b"h3".to_vec()],
@@ -415,6 +425,16 @@ impl Http3ProxyManager {
         let per_conn_limit = MEMORY_GOVERNOR.h3_request_limit_per_connection();
         if let Some(transport_config) = Arc::get_mut(&mut server_config.transport) {
             *transport_config = crate::quic_transport::tuned_transport_config(None);
+            // T5: an AF_XDP-scoped endpoint (demux-fed only) runs the
+            // policy-selected controller; the kernel-socket listener
+            // keeps quinn's stock controller — non-XDP contract
+            // unchanged (§A.4).
+            #[cfg(target_os = "linux")]
+            if af_xdp_scoped
+                && let Some(factory) = crate::xdp::xdp_quic_cc_factory()
+            {
+                transport_config.congestion_controller_factory(factory);
+            }
             let stream_cap = per_conn_limit.min(u32::MAX as usize) as u32;
             let uni_cap = stream_cap.clamp(32, 256);
             transport_config.max_concurrent_bidi_streams(stream_cap.into());

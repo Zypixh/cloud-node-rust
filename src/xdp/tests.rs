@@ -2095,9 +2095,10 @@ fn af_xdp_udp_packet_converts_to_datagram_only_for_udp() {
         peer_addr: "127.0.0.1:53000".parse().unwrap(),
         payload: bytes::Bytes::from_static(b"hello"),
         link: test_link_meta(false),
-        ecn: None,
+        ecn: Some(0b11),
     };
-    assert!(udp.into_udp_datagram().is_some());
+    let datagram = udp.into_udp_datagram().expect("udp datagram");
+    assert_eq!(datagram.ecn, Some(0b11));
 
     let tcp = af_xdp::AfXdpL4Packet {
         protocol: af_xdp::AfXdpTransportProtocol::Tcp,
@@ -4198,6 +4199,19 @@ fn inner_ipv6_udp_packet(local_port: u16, peer_port: u16, ext_chain: &[u8]) -> V
     packet
 }
 
+fn inner_ipv6_tcp_packet(local_port: u16, peer_port: u16) -> Vec<u8> {
+    // Quoted outbound TCP segment — the PTB path needs only the
+    // tuple; quoted inner checksums are never re-verified (routers
+    // may truncate the quote).
+    let mut packet = vec![0x60, 0, 0, 0, 0, 20, 6, 64];
+    packet.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+    packet.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    packet.extend_from_slice(&local_port.to_be_bytes());
+    packet.extend_from_slice(&peer_port.to_be_bytes());
+    packet.extend_from_slice(&[0; 16]);
+    packet
+}
+
 fn icmpv6_error_frame(icmp_type: u8, mtu: u32, inner: &[u8]) -> Vec<u8> {
     let mut frame = ethernet_header(0x86dd, false);
     let payload_len = 8 + inner.len();
@@ -4427,6 +4441,51 @@ fn af_xdp_tcp_reactor_apply_pmtu_clamps_dialed_session() {
     assert_eq!(reactor.session_path_mtu(&unknown), None);
 }
 
+/// T4-7 (IPv6): the full PTB chain on a v6 dialed session — ICMPv6
+/// Packet-Too-Big frame → quoted v6 TCP tuple → `apply_pmtu` clamps
+/// the session's send MSS; non-PTB v6 errors are explicit no-ops.
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_icmpv6_ptb_clamps_dialed_session() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let mut reactor = af_xdp::AfXdpTcpReactor::new_with_session_limit(None, None, 1024);
+    let remote: std::net::SocketAddr = "[2001:db8::3]:443".parse().unwrap();
+    let local: std::net::SocketAddr = "[2001:db8::9]:43002".parse().unwrap();
+    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+    reactor.dial(af_xdp::AfXdpTcpDialRequest {
+        remote,
+        local,
+        route: af_xdp_dial_route_meta(),
+        syn_extra_options: Vec::new(),
+        reply: reply_tx,
+    });
+    let flow = af_xdp::AfXdpTcpFlowKey {
+        local_addr: local,
+        peer_addr: remote,
+    };
+    assert_eq!(reactor.session_path_mtu(&flow), Some(None));
+
+    // PTB quoting our outbound segment → cap installed.
+    let inner = inner_ipv6_tcp_packet(43002, 443);
+    let frame = icmpv6_error_frame(2, 1280, &inner);
+    let error = af_xdp::parse_icmp_error_frame(&frame).expect("ICMPv6 PTB parses");
+    assert_eq!(error.mtu, Some(1280));
+    assert_eq!(error.flow, flow);
+    reactor.apply_pmtu(&error.flow, error.mtu);
+    assert_eq!(reactor.session_path_mtu(&flow), Some(Some(1280)));
+
+    // Non-PTB ICMPv6 error (time-exceeded, type 3): parsed for its
+    // quoted tuple but carries no MTU — the session cap is untouched.
+    let frame = icmpv6_error_frame(3, 0, &inner);
+    let error = af_xdp::parse_icmp_error_frame(&frame).expect("TE parses");
+    assert_eq!(error.mtu, None);
+    reactor.apply_pmtu(&error.flow, error.mtu);
+    assert_eq!(reactor.session_path_mtu(&flow), Some(Some(1280)));
+}
+
 #[test]
 fn xdp_f1_shape_gate_accepts_compatible_reload() {
     let manager = XdpManager::new(test_proxy_config("eth0"));
@@ -4517,4 +4576,245 @@ fn xdp_f1_lease_worker_drain_tracks_exit() {
     lease.worker_exited();
     lease.worker_exited();
     assert_eq!(lease.live_workers.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn xdp_transport_shape_gate_rejects_policy_change() {
+    let manager = XdpManager::new(test_proxy_config("eth0"));
+    // Controller change mid-generation alters congestion semantics for
+    // adopted flows — must be an explicit rejection, not a silent swap.
+    let mut ctl_change = manager.config.clone();
+    ctl_change.transport = Some(crate::runtime_mode::XdpTransportSettings {
+        controller: crate::runtime_mode::XdpTransportController::Edgecc,
+        ..Default::default()
+    });
+    assert!(dataplane_shape_compatible(&manager, &ctl_change).is_err());
+
+    let mut ecn_change = manager.config.clone();
+    ecn_change.transport = Some(crate::runtime_mode::XdpTransportSettings {
+        trusted_ecn: true,
+        ..Default::default()
+    });
+    assert!(dataplane_shape_compatible(&manager, &ecn_change).is_err());
+}
+
+#[test]
+fn xdp_transport_controller_selection_matches_policy() {
+    use crate::runtime_mode::{XdpTransportController, XdpTransportSettings};
+    let peer: IpAddr = "203.0.113.7".parse().unwrap();
+    let local: IpAddr = "192.0.2.10".parse().unwrap();
+    let cases = [
+        (XdpTransportController::Cubic, "cubic_ref"),
+        (XdpTransportController::NewReno, "newreno_ref"),
+        (XdpTransportController::Bbr3, "bbr3_ref"),
+        (XdpTransportController::LossBlind, "loss_blind_ref"),
+        (XdpTransportController::Edgecc, "edgecc"),
+    ];
+    for (controller, algo) in cases {
+        let mut reactor =
+            af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 64);
+        reactor.set_transport_policy(&XdpTransportSettings {
+            controller,
+            ..Default::default()
+        });
+        let cc = reactor.make_transport_controller(peer, local);
+        assert_eq!(cc.snapshot().algo, algo, "{controller:?}");
+    }
+}
+
+#[test]
+fn xdp_transport_edgecc_joins_worker_aggregate() {
+    use crate::runtime_mode::{XdpTransportController, XdpTransportSettings};
+    let peer: IpAddr = "203.0.113.7".parse().unwrap();
+    let local: IpAddr = "192.0.2.10".parse().unwrap();
+
+    let mut reactor =
+        af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 64);
+    let _ = (peer, local); // addresses document the member key shape
+    // Cubic policy: no aggregate is created.
+    assert!(reactor.aggregate_periods().is_none());
+
+    reactor.set_transport_policy(&XdpTransportSettings {
+        controller: XdpTransportController::Edgecc,
+        aggregation: true,
+        ..Default::default()
+    });
+    // Aggregation enabled → worker-local aggregate exists; the controller
+    // build joins it (membership is visible via the stats counter after a
+    // tick — join itself is asserted through `Aggregate::join` returning
+    // Some inside make_transport_controller; a second reactor share would
+    // observe members>0 only on a shared Rc, which per-worker design
+    // forbids. Here we verify the tick actually advances periods).
+    reactor.tick_aggregate(smoltcp::time::Instant::from_millis(0));
+    assert_eq!(reactor.aggregate_periods(), Some(0)); // t=0 < 100ms watermark
+    reactor.tick_aggregate(smoltcp::time::Instant::from_millis(150));
+    assert_eq!(reactor.aggregate_periods(), Some(1));
+    // 50ms later: below the 100ms cadence — skipped.
+    reactor.tick_aggregate(smoltcp::time::Instant::from_millis(200));
+    assert_eq!(reactor.aggregate_periods(), Some(1));
+    reactor.tick_aggregate(smoltcp::time::Instant::from_millis(260));
+    assert_eq!(reactor.aggregate_periods(), Some(2));
+}
+
+#[test]
+fn xdp_transport_path_prior_round_trip() {
+    let peer: IpAddr = "203.0.113.7".parse().unwrap();
+    // Same /24 but different host — the prior must hit the prefix key.
+    let peer2: IpAddr = "203.0.113.200".parse().unwrap();
+    let local: IpAddr = "192.0.2.10".parse().unwrap();
+
+    let reactor =
+        af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 64);
+    assert!(reactor.path_prior(peer, local).is_none());
+
+    // Simulate a completed flow's terminal snapshot recorded through the
+    // same path the reap pass uses.
+    let snap = cloud_node_transport::CcSnapshot {
+        algo: "edgecc",
+        version_pin: "test",
+        mode: "steady",
+        cwnd_bytes: 64 * 1024,
+        ssthresh_bytes: u64::MAX,
+        pacing_rate_bps: Some(9_000_000),
+        min_rtt: Some(std::time::Duration::from_millis(45)),
+        bandwidth_hi_bps: Some(10_000_000),
+        bandwidth_lo_bps: Some(8_000_000),
+        inflight_hi_bytes: None,
+        inflight_lo_bytes: None,
+        extra_acked_bytes: None,
+        ecn_alpha_milli: Some(0),
+        belief_milli: None,
+        queue_estimate_bytes: None,
+        p_rand_milli: Some(5),
+        bw_sigma_bps: None,
+        envelope_bytes: None,
+        reason_code: "test",
+    };
+    let table = reactor.path_table();
+    af_xdp::AfXdpTcpReactor::record_path_sample(
+        &table,
+        reactor.clock_now_micros(),
+        peer,
+        local,
+        &snap,
+        false,
+    );
+    let p = reactor
+        .path_prior(peer, local)
+        .expect("fresh sample must seed a prior");
+    assert_eq!(p.bw_bps, 8_000_000); // bandwidth_lo preferred over hi
+    assert_eq!(p.base_rtt, std::time::Duration::from_millis(45));
+    // Cross-host same-/24 shares the prior (key is the masked prefix).
+    assert!(reactor.path_prior(peer2, local).is_some());
+    // Different prefix does not.
+    let other: IpAddr = "203.0.114.7".parse().unwrap();
+    assert!(reactor.path_prior(other, local).is_none());
+}
+
+#[test]
+fn xdp_socket_buffer_sizing_uses_bdp_prior_and_budget_cap() {
+    let peer: IpAddr = "203.0.113.7".parse().unwrap();
+    let local: IpAddr = "192.0.2.10".parse().unwrap();
+    let reactor =
+        af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 64);
+
+    // No prior → 32KiB floor candidate.
+    assert_eq!(reactor.socket_buffer_bytes(peer, local), 32 * 1024);
+
+    // Seed a prior: bw 10MB/s, base_rtt 50ms → 2×BDP = 1MB.
+    let snap = cloud_node_transport::CcSnapshot {
+        algo: "edgecc",
+        version_pin: "test",
+        mode: "steady",
+        cwnd_bytes: 64 * 1024,
+        ssthresh_bytes: u64::MAX,
+        pacing_rate_bps: Some(10_000_000),
+        min_rtt: Some(std::time::Duration::from_millis(50)),
+        bandwidth_hi_bps: None,
+        bandwidth_lo_bps: Some(10_000_000),
+        inflight_hi_bytes: None,
+        inflight_lo_bytes: None,
+        extra_acked_bytes: None,
+        ecn_alpha_milli: Some(0),
+        belief_milli: None,
+        queue_estimate_bytes: None,
+        p_rand_milli: Some(0),
+        bw_sigma_bps: None,
+        envelope_bytes: None,
+        reason_code: "test",
+    };
+    let table = reactor.path_table();
+    af_xdp::AfXdpTcpReactor::record_path_sample(
+        &table,
+        reactor.clock_now_micros(),
+        peer,
+        local,
+        &snap,
+        false,
+    );
+    // 2 × 10MB/s × 50ms = 1MB — bounded by the per-conn budget share.
+    let budget_share = (crate::memory_governor::MEMORY_GOVERNOR
+        .tcp_queue_bytes_budget()
+        / (64 * 2))
+    .min(usize::MAX as u64) as usize;
+    let expect = (1_000_000usize).min(budget_share.max(4 * 1024));
+    assert_eq!(reactor.socket_buffer_bytes(peer, local), expect);
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[test]
+fn af_xdp_tcp_reactor_reap_persists_terminal_sample() {
+    let _budget_guard = tcp_queue_budget_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    // T6: a session reaped at idle timeout must leave a terminal sample
+    // in the worker path table — while never fabricating bw/rtt priors
+    // it never measured.
+    let frame = ipv4_tcp_syn_frame(false);
+    let af_xdp::AfXdpProxyFrame::Tcp {
+        route,
+        flow,
+        ip_packet,
+    } = af_xdp::parse_proxy_frame("eth0", 0, &frame).expect("valid TCP SYN frame")
+    else {
+        panic!("expected TCP proxy frame");
+    };
+    let mut reactor =
+        af_xdp::AfXdpTcpReactor::new_with_session_limit_for_test(None, None, 1024);
+    assert_eq!(
+        reactor.ingest(route, flow, ip_packet),
+        af_xdp::AfXdpTcpIngestStatus::Accepted
+    );
+
+    let reap_at = smoltcp::time::Instant::from_millis(
+        crate::utils::time::now_timestamp_millis()
+            + af_xdp::AF_XDP_TCP_SESSION_IDLE_TIMEOUT.as_millis() as i64
+            + 1,
+    );
+    let _ = reactor.poll_at_for_test(reap_at);
+    assert_eq!(reactor.session_count(), 0);
+
+    // The peer's masked /24 key must hold a failed sample.
+    let peer_ip = match flow.peer_addr.ip() {
+        IpAddr::V4(v4) => std::net::Ipv4Addr::from(u32::from(v4) & 0xffff_ff00),
+        IpAddr::V6(_) => panic!("v4 frame"),
+    };
+    let key = cloud_node_transport::PathKey {
+        egress_ifindex: 0,
+        local_ip: flow.local_addr.ip(),
+        dst_prefix: IpAddr::V4(peer_ip),
+        prefix_len: 24,
+    };
+    let table = reactor.path_table();
+    let table = table.borrow();
+    let entry = table
+        .entry(&key)
+        .expect("reaped session must record a terminal sample");
+    // Proxy-idle reap is a clean close, not a failed dial.
+    assert_eq!(entry.fail_rate, 0.0);
+    // No fabricated prior: the flow never measured bw/rtt, so the entry
+    // must not seed future startups on this prefix.
+    assert_eq!(entry.bw_bps, 0.0);
+    assert_eq!(entry.base_rtt_us, 0.0);
 }

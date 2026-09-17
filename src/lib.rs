@@ -49,6 +49,7 @@ pub mod pipeline_metrics;
 pub mod process_log_policy;
 pub mod proxy;
 pub mod proxy_protocol;
+pub mod quic_cc;
 pub mod quic_probe;
 pub mod quic_transport;
 pub mod quic_udp_demux;

@@ -414,7 +414,20 @@ fn client_config(verify_cert: bool) -> PingoraResult<ClientConfig> {
             format!("building H3 TLS config: {err}"),
         )
     })?;
-    Ok(ClientConfig::new(Arc::new(quic)))
+    let mut config = ClientConfig::new(Arc::new(quic));
+    // T5: when this client will run over the AF_XDP upstream path,
+    // apply the policy-selected transport controller. The stock
+    // controller stays for kernel-socket H3 (non-XDP contract
+    // unchanged) and for the cubic default.
+    #[cfg(target_os = "linux")]
+    if crate::xdp::afxdp_upstream_selected()
+        && let Some(factory) = crate::xdp::xdp_quic_cc_factory()
+    {
+        let mut transport = crate::quic_transport::tuned_transport_config(None);
+        transport.congestion_controller_factory(factory);
+        config.transport_config(Arc::new(transport));
+    }
+    Ok(config)
 }
 
 #[derive(Debug)]

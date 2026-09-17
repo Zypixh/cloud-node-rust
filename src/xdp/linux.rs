@@ -804,6 +804,8 @@ fn create_af_xdp_queue(
         faulted: false,
         congested_drops: 0,
         admission_refusals: 0,
+        aqm_drops: 0,
+        aqm_ce_marks: 0,
     };
     Ok((
         AfXdpQueueHandle {

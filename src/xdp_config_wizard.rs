@@ -328,6 +328,8 @@ mod tests {
             ebpf_object: None,
             state_tables: None,
             upstream: None,
+            transport: None,
+            egress_rate_bps: None,
         };
 
         let yaml = serde_yaml::to_string(&xdp).unwrap();

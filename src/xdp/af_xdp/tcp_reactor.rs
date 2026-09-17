@@ -559,6 +559,22 @@ pub(crate) struct AfXdpTcpReactor {
     /// port and XDP_OUT_CT row through this handle.
     #[cfg(target_os = "linux")]
     dial_registry: Option<Arc<AfXdpDialRegistry>>,
+    /// T5: transport-controller selection for AF_XDP-terminated flows —
+    /// `cubic` is the validated default; `edgecc` installs the decision
+    /// layer (with worker-local aggregate + path priors when enabled).
+    transport_controller: crate::runtime_mode::XdpTransportController,
+    /// D-D2: CE marks trusted at full weight on controlled links.
+    trusted_ecn: bool,
+    /// T6: worker-local shared-bottleneck aggregate (EdgeCC only).
+    /// `Rc<RefCell>` — never a cross-worker lock, never on the ACK path.
+    aggregate: Option<
+        std::rc::Rc<std::cell::RefCell<cloud_node_transport::Aggregate>>,
+    >,
+    /// T6: worker-local bounded path-prior table (§2.2 长期先验).
+    path_table:
+        std::rc::Rc<std::cell::RefCell<cloud_node_transport::PathTable>>,
+    /// Aggregate arbitration tick watermark (~100ms periods).
+    last_agg_period: SmoltcpInstant,
     #[cfg(test)]
     test_auto_start_proxy: bool,
 }
@@ -625,9 +641,216 @@ impl AfXdpTcpReactor {
             idle_profile_refreshed_at: SmoltcpInstant::from_millis(0),
             #[cfg(target_os = "linux")]
             dial_registry: None,
+            transport_controller: crate::runtime_mode::XdpTransportController::default(),
+            trusted_ecn: false,
+            aggregate: None,
+            path_table: std::rc::Rc::new(std::cell::RefCell::new(
+                cloud_node_transport::PathTable::new(
+                    cloud_node_transport::path_table::DEFAULT_CAPACITY,
+                    cloud_node_transport::path_table::DEFAULT_TTL,
+                ),
+            )),
+            last_agg_period: SmoltcpInstant::from_millis(0),
             #[cfg(test)]
             test_auto_start_proxy: false,
         }
+    }
+
+    /// T5/T6: install the dataplane's transport policy. Called by the
+    /// worker before the loop runs; absent config keeps `cubic`.
+    pub(crate) fn set_transport_policy(
+        &mut self,
+        policy: &crate::runtime_mode::XdpTransportSettings,
+    ) {
+        self.transport_controller = policy.controller;
+        self.trusted_ecn = policy.trusted_ecn;
+        if policy.aggregation_enabled() && self.aggregate.is_none() {
+            self.aggregate = Some(cloud_node_transport::Aggregate::shared());
+        }
+    }
+
+    /// §2.6 arbitration tick — one `on_period` per ~100ms while an
+    /// aggregate exists (merge/split hysteresis, probe leasing, tiered
+    /// allocation). Bounded O(members); never per-ACK.
+    pub(crate) fn tick_aggregate(&mut self, now: SmoltcpInstant) {
+        let Some(agg) = self.aggregate.as_ref() else {
+            return;
+        };
+        if session_idle_for(now, self.last_agg_period) < Duration::from_millis(100) {
+            return;
+        }
+        self.last_agg_period = now;
+        agg.borrow_mut().on_period();
+    }
+
+    /// Tests only: arbitration periods run so far (tick-cadence audit).
+    #[cfg(test)]
+    pub(crate) fn aggregate_periods(&self) -> Option<u64> {
+        self.aggregate.as_ref().map(|a| a.borrow().stats().periods)
+    }
+
+    /// Tests only: the worker-local path table handle (prior audit).
+    #[cfg(test)]
+    pub(crate) fn path_table(
+        &self,
+    ) -> std::rc::Rc<std::cell::RefCell<cloud_node_transport::PathTable>> {
+        std::rc::Rc::clone(&self.path_table)
+    }
+
+    /// Tests only: current clock reading so recorded samples line up
+    /// with `path_prior`'s lookup instant.
+    #[cfg(test)]
+    pub(crate) fn clock_now_micros(&self) -> i64 {
+        self.clock.now_micros()
+    }
+
+    /// §2.2 prior lookup: client/peer prefix (/24 v4, /64 v6) anchored
+    /// on the local address. Exact-key; prefix masking is done here.
+    pub(crate) fn path_prior(
+        &self,
+        peer: IpAddr,
+        local: IpAddr,
+    ) -> Option<cloud_node_transport::PathPrior> {
+        let (dst_prefix, prefix_len) = match peer {
+            IpAddr::V4(v4) => (
+                IpAddr::V4(std::net::Ipv4Addr::from(
+                    u32::from(v4) & 0xffff_ff00,
+                )),
+                24,
+            ),
+            IpAddr::V6(v6) => (
+                IpAddr::V6(std::net::Ipv6Addr::from(
+                    u128::from(v6) & !0xffff_ffff_ffff_ffffu128,
+                )),
+                64,
+            ),
+        };
+        let key = cloud_node_transport::PathKey {
+            egress_ifindex: 0,
+            local_ip: local,
+            dst_prefix,
+            prefix_len,
+        };
+        let now = cloud_node_transport::TransportInstant::from_micros(
+            self.clock.now_micros().max(0) as u64,
+        );
+        self.path_table.borrow_mut().lookup(&key, now)
+    }
+
+    /// T9 (§2.7): adaptive per-socket buffer sizing — `2×BDP` from the
+    /// path prior when one exists (32KiB floor otherwise), hard-capped by
+    /// the per-connection share of the *real* TCP queue budget. The cap
+    /// is never exceeded by the floor: under extreme pressure the share
+    /// wins and the socket simply advertises a smaller rwnd — no
+    /// oversubscription against the ledger.
+    pub(crate) fn socket_buffer_bytes(&self, peer: IpAddr, local: IpAddr) -> usize {
+        /// Candidate lower bound from the plan (§2.7): 32KiB.
+        const FLOOR: usize = 32 * 1024;
+        /// Viability floor — below ~3 MSS the connection cannot make
+        /// progress at all; only reachable when the real share is this
+        /// small, in which case the share itself is the bound.
+        const MIN_VIABLE: usize = 4 * 1024;
+        let est = self
+            .path_prior(peer, local)
+            .filter(|p| p.confidence > 0.0 && p.bw_bps > 0)
+            .map(|p| {
+                (p.bw_bps as f64 * p.base_rtt.as_secs_f64() * 2.0) as usize
+            })
+            .unwrap_or(FLOOR);
+        let per_conn_dir = (MEMORY_GOVERNOR.tcp_queue_bytes_budget()
+            / (self.session_limit.max(1) as u64 * 2))
+            .min(usize::MAX as u64) as usize;
+        est.clamp(
+            per_conn_dir.min(MIN_VIABLE),
+            per_conn_dir.max(MIN_VIABLE),
+        )
+    }
+
+    /// T5: build the session's congestion controller per policy.
+    /// Reference controllers are validation-only selections.
+    pub(crate) fn make_transport_controller(
+        &self,
+        peer: IpAddr,
+        local: IpAddr,
+    ) -> Box<dyn cloud_node_transport::cc::CongestionController> {
+        use crate::runtime_mode::XdpTransportController as Ctl;
+        use cloud_node_transport::cc as tcc;
+        match self.transport_controller {
+            Ctl::Cubic => Box::new(tcc::CubicRef::new(536)),
+            Ctl::NewReno => Box::new(tcc::NewRenoRef::new(536)),
+            Ctl::Bbr3 => Box::new(tcc::Bbr3Ref::new(536)),
+            Ctl::LossBlind => Box::new(tcc::LossBlindRef::new(
+                536,
+                cloud_node_transport::Tier::T1,
+                None,
+                self.trusted_ecn,
+            )),
+            Ctl::Edgecc => {
+                let mut cc = cloud_node_transport::EdgeCc::new(
+                    536,
+                    cloud_node_transport::Tier::T1,
+                    self.path_prior(peer, local),
+                    self.trusted_ecn,
+                );
+                if let Some(agg) = self.aggregate.as_ref()
+                    && let Some(lease) = cloud_node_transport::Aggregate::join(agg)
+                {
+                    cc.set_aggregate(Box::new(lease));
+                }
+                Box::new(cc)
+            }
+        }
+    }
+
+    /// T6: fold a closed flow's controller snapshot into the path table
+    /// (fresh samples validate priors — §2.2 fresh-sample contract).
+    /// Static: the reap path calls this while `self.sockets` is borrowed.
+    pub(crate) fn record_path_sample(
+        table: &std::rc::Rc<
+            std::cell::RefCell<cloud_node_transport::PathTable>,
+        >,
+        clock_us: i64,
+        peer: IpAddr,
+        local: IpAddr,
+        snap: &cloud_node_transport::cc::CcSnapshot,
+        failed: bool,
+    ) {
+        let (dst_prefix, prefix_len) = match peer {
+            IpAddr::V4(v4) => (
+                IpAddr::V4(std::net::Ipv4Addr::from(
+                    u32::from(v4) & 0xffff_ff00,
+                )),
+                24,
+            ),
+            IpAddr::V6(v6) => (
+                IpAddr::V6(std::net::Ipv6Addr::from(
+                    u128::from(v6) & !0xffff_ffff_ffff_ffffu128,
+                )),
+                64,
+            ),
+        };
+        let key = cloud_node_transport::PathKey {
+            egress_ifindex: 0,
+            local_ip: local,
+            dst_prefix,
+            prefix_len,
+        };
+        let now = cloud_node_transport::TransportInstant::from_micros(
+            clock_us.max(0) as u64,
+        );
+        table.borrow_mut().record(
+            key,
+            cloud_node_transport::PathSample {
+                bw_bps: snap.bandwidth_lo_bps.or(snap.bandwidth_hi_bps).unwrap_or(0),
+                base_rtt: snap.min_rtt.unwrap_or_default(),
+                p_rand: snap.p_rand_milli.unwrap_or(0) as f64 / 1000.0,
+                alpha: snap.ecn_alpha_milli.unwrap_or(0) as f64 / 1000.0,
+                reorder: 0.0,
+                connect_rtt: None,
+                failed,
+            },
+            now,
+        );
     }
 
     pub(crate) fn proxy_class_for_port(&self, port: u16) -> Option<AfXdpTcpProxyClass> {
@@ -891,6 +1114,9 @@ impl AfXdpTcpReactor {
     }
 
     pub(crate) fn poll_at(&mut self, now: SmoltcpInstant) -> Vec<(AfXdpRouteMeta, Vec<u8>)> {
+        // §2.6: arbitration tick — merge/split hysteresis, probe leasing,
+        // tiered allocation. No-op when aggregation isn't configured.
+        self.tick_aggregate(now);
         // EN-17: bounded ingress processing per round — an RX flood cannot
         // postpone session pumping, egress TX or timer work indefinitely.
         // Leftover packets stay in the bounded queue for the next round.
@@ -1016,24 +1242,23 @@ impl AfXdpTcpReactor {
         }
 
         self.ensure_local_ip(flow.local_addr.ip());
-        let rx_buffer = SmoltcpTcp::SocketBuffer::new(vec![0; AF_XDP_TCP_SOCKET_BUFFER_BYTES]);
-        let tx_buffer = SmoltcpTcp::SocketBuffer::new(vec![0; AF_XDP_TCP_SOCKET_BUFFER_BYTES]);
+        let buf_bytes = self.socket_buffer_bytes(flow.peer_addr.ip(), flow.local_addr.ip());
+        let rx_buffer = SmoltcpTcp::SocketBuffer::new(vec![0; buf_bytes]);
+        let tx_buffer = SmoltcpTcp::SocketBuffer::new(vec![0; buf_bytes]);
         let mut socket = SmoltcpTcp::Socket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
         // F8: AF_XDP TCP must run a real congestion controller — without an
         // explicit selection smoltcp silently falls back to NoControl
         // (window = usize::MAX), which XDP pps budgets cannot replace.
         socket.set_congestion_control(SmoltcpTcp::CongestionControl::Cubic);
-        // T3: production accepted sessions run the external transport
-        // controller — CubicRef from cloud-node-transport, driven by the
-        // fork's scoreboard (per-segment records, SACK/RACK-TLP/DSACK,
-        // Eifel undo, pacing gate). The builtin Cubic remains installed
-        // as the comparison path but is not consulted while ext is set.
-        socket.set_transport_controller(Box::new(
-            // Initial MSS is the conservative default; the socket calls
-            // on_mss_update with the peer's MSS at handshake time.
-            cloud_node_transport::cc::CubicRef::new(536),
-        ));
+        // T3/T5: the external transport controller is policy-selected —
+        // CubicRef (default, validated) or EdgeCc with a worker-local
+        // aggregate lease and a path-table prior when enabled. The
+        // builtin Cubic stays installed but is not consulted while ext
+        // is set. Initial MSS is conservative; `on_mss_update` refines.
+        socket.set_transport_controller(
+            self.make_transport_controller(flow.peer_addr.ip(), flow.local_addr.ip()),
+        );
         if let Err(err) =
             socket.listen(IpListenEndpoint::from(IpEndpoint::from(flow.local_addr)))
         {
@@ -1123,18 +1348,21 @@ impl AfXdpTcpReactor {
             return;
         }
         self.ensure_local_ip(req.local.ip());
-        let rx_buffer =
-            SmoltcpTcp::SocketBuffer::new(vec![0; AF_XDP_TCP_SOCKET_BUFFER_BYTES]);
-        let tx_buffer =
-            SmoltcpTcp::SocketBuffer::new(vec![0; AF_XDP_TCP_SOCKET_BUFFER_BYTES]);
+        let buf_bytes = self.socket_buffer_bytes(req.remote.ip(), req.local.ip());
+        let rx_buffer = SmoltcpTcp::SocketBuffer::new(vec![0; buf_bytes]);
+        let tx_buffer = SmoltcpTcp::SocketBuffer::new(vec![0; buf_bytes]);
         let mut socket = SmoltcpTcp::Socket::new(rx_buffer, tx_buffer);
         socket.set_nagle_enabled(false);
-        // F8/T3: dialed sessions run the same external controller as
-        // accepted ones — never NoControl.
+        // F8/T3/T5: dialed sessions run the same policy-selected external
+        // controller as accepted ones — never NoControl.
         socket.set_congestion_control(SmoltcpTcp::CongestionControl::Cubic);
-        socket.set_transport_controller(Box::new(
-            cloud_node_transport::cc::CubicRef::new(536),
-        ));
+        socket.set_transport_controller(
+            self.make_transport_controller(req.remote.ip(), req.local.ip()),
+        );
+        // T7: actively offer AccECN on dialed flows only when the
+        // path is a controlled link (xdp.transport.trusted_ecn —
+        // D-D2); public-internet dials keep the stock non-ECN SYN.
+        socket.set_ecn_active_offered(self.trusted_ecn);
         if !req.syn_extra_options.is_empty()
             && let Err(err) = socket.set_syn_extra_options(&req.syn_extra_options)
         {
@@ -1844,6 +2072,8 @@ impl AfXdpTcpReactor {
                 finished.push(*flow);
             }
         }
+        let pre_proxy_timed_out: std::collections::HashSet<AfXdpTcpFlowKey> =
+            pre_proxy_timeouts.iter().map(|(f, ..)| *f).collect();
         for (flow, kind, idle_for, idle_timeout) in pre_proxy_timeouts {
             #[cfg(target_os = "linux")]
             AF_XDP_TCP_DIAG_PRE_PROXY_TIMEOUT.fetch_add(1, Ordering::Relaxed);
@@ -1884,9 +2114,26 @@ impl AfXdpTcpReactor {
                         registry.release(&flow);
                     }
                 }
+                // T6 inputs are cloned before the socket borrow so the
+                // path-table write does not tangle the borrow graph.
+                let path_table = std::rc::Rc::clone(&self.path_table);
+                let clock_us = self.clock.now_micros();
                 let socket = self
                     .sockets
                     .get_mut::<SmoltcpTcp::Socket<'static>>(session.socket);
+                // T6: fold the closed flow's transport evidence into the
+                // worker-local path table before the socket drops.
+                if let Some(snap) = socket.transport_snapshot() {
+                    let failed = pre_proxy_timed_out.contains(&flow);
+                    Self::record_path_sample(
+                        &path_table,
+                        clock_us,
+                        flow.peer_addr.ip(),
+                        flow.local_addr.ip(),
+                        &snap,
+                        failed,
+                    );
+                }
                 // T1: final transport snapshot to tracing — per-session
                 // lifecycle is observable even when the flow was never
                 // scraped through /status.

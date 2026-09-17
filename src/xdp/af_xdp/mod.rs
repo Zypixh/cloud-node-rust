@@ -343,6 +343,9 @@ pub struct AfXdpDatagram {
     pub listen_addr: SocketAddr,
     pub peer_addr: SocketAddr,
     pub payload: Bytes,
+    /// C11: IP-header ECN codepoint bits (0–3) carried from the parsed
+    /// frame — QUIC receivers report them for congestion feedback.
+    pub ecn: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,6 +379,7 @@ impl AfXdpL4Packet {
             listen_addr: self.local_addr,
             peer_addr: self.peer_addr,
             payload: self.payload,
+            ecn: self.ecn,
         })
     }
 }
