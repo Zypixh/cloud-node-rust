@@ -93,6 +93,10 @@ pub struct SimConfig {
     pub duration: Duration,
     /// SplitMix64 seed.
     pub seed: u64,
+    /// Collect the full per-event trace (needed for trace_text/digest
+    /// and seq-level post-analysis). Disable for large multi-flow runs
+    /// where the trace dominates memory; rtt/fct are still recorded.
+    pub collect_trace: bool,
 }
 
 impl Default for SimConfig {
@@ -116,6 +120,7 @@ impl Default for SimConfig {
             app_rate_bps: None,
             duration: Duration::from_secs(30),
             seed: 0x9e3779b97f4a7c15,
+            collect_trace: true,
         }
     }
 }
@@ -173,6 +178,12 @@ pub struct SimResult {
     pub ce_marks: u64,
     /// All bytes delivered before `duration` elapsed.
     pub completed: bool,
+    /// Per-ACK RTT samples (µs, Karn-filtered) — the queue-delay input
+    /// that does not require the event trace.
+    pub rtt_samples_us: Vec<u64>,
+    /// Time (µs, sim clock) at which `cum_acked` reached `total_bytes`;
+    /// 0 when the flow did not complete within `duration`.
+    pub fct_us: u64,
 }
 
 /// Result of a multi-flow run — one [`SimResult`] per flow plus a
@@ -379,6 +390,13 @@ struct Flow<'a> {
     cum_acked: u64,
     in_flight: u64,
     scoreboard: BTreeMap<u64, ScoreEntry>,
+    /// Seq set of records needing retransmission (lost, not sacked, no
+    /// retx outstanding) — keeps `try_send`'s next-loss pick O(1)
+    /// instead of rescanning the whole scoreboard per segment.
+    lost_pending: std::collections::BTreeSet<u64>,
+    /// Count of `lost && !sacked` records (retx'd-but-lost stays
+    /// counted) — feeds the per-event liveness check.
+    lost_unsacked: u64,
     dupacks: u32,
     next_send_due: u64,
     send_due_armed: bool,
@@ -395,6 +413,7 @@ struct Flow<'a> {
     rx_unacked_count: u32,
     ack_flush_due: u64,
     completed: bool,
+    collect_trace: bool,
     result: SimResult,
 }
 
@@ -406,10 +425,12 @@ struct Sim<'a> {
     event_ord: u64,
     link: Link,
     flows: Vec<Flow<'a>>,
+    /// O(1) all-done check (was a full scan after every event).
+    completed_count: usize,
 }
 
 impl<'a> Flow<'a> {
-    fn new(spec: FlowSpec<'a>) -> Self {
+    fn new(spec: FlowSpec<'a>, collect_trace: bool) -> Self {
         Self {
             cc: spec.cc,
             sampler: RateSampler::new(),
@@ -421,6 +442,8 @@ impl<'a> Flow<'a> {
             cum_acked: 0,
             in_flight: 0,
             scoreboard: BTreeMap::new(),
+            lost_pending: std::collections::BTreeSet::new(),
+            lost_unsacked: 0,
             dupacks: 0,
             next_send_due: spec.start_at.as_micros() as u64,
             send_due_armed: false,
@@ -436,6 +459,7 @@ impl<'a> Flow<'a> {
             rx_unacked_count: 0,
             ack_flush_due: u64::MAX,
             completed: false,
+            collect_trace,
             result: SimResult::default(),
         }
     }
@@ -453,6 +477,9 @@ impl<'a> Flow<'a> {
     }
 
     fn trace(&mut self, kind: TraceKind, seq: u64, now_us: u64, flow: u32) {
+        if !self.collect_trace {
+            return;
+        }
         self.result.trace.push(TraceRow {
             t_us: now_us,
             flow,
@@ -483,7 +510,11 @@ impl<'a> Sim<'a> {
                     .unwrap_or(0.0),
                 policer_last_us: 0,
             },
-            flows: specs.into_iter().map(Flow::new).collect(),
+            flows: specs
+                .into_iter()
+                .map(|s| Flow::new(s, cfg.collect_trace))
+                .collect(),
+            completed_count: 0,
         }
     }
 
@@ -625,10 +656,11 @@ impl<'a> Sim<'a> {
                 // merely delayed) — retransmitting it would inject a dup
                 // and leak in_flight (cum-drain never un-counts sacked).
                 let next_lost = f
-                    .scoreboard
+                    .lost_pending
                     .iter()
-                    .find(|(_, e)| e.lost && !e.sacked && !e.retx_out)
-                    .map(|(&s, e)| (s, e.rec.len(), e.rec.first_tx_at));
+                    .next()
+                    .and_then(|&s| f.scoreboard.get(&s).map(|e| (s, e)))
+                    .map(|(s, e)| (s, e.rec.len(), e.rec.first_tx_at));
                 if let Some((seq, len, first_tx_at)) = next_lost {
                     if f.in_flight + len > f.cc.cwnd() {
                         Work::Blocked
@@ -697,6 +729,9 @@ impl<'a> Sim<'a> {
                     if let Some(e) = f.scoreboard.get_mut(&seq) {
                         e.lost = false;
                         e.retx_out = true;
+                    }
+                    if f.lost_pending.remove(&seq) {
+                        f.lost_unsacked -= 1;
                     }
                     f.sent_total += len;
                     f.in_flight += len;
@@ -789,8 +824,7 @@ impl<'a> Sim<'a> {
         // re-arming a due-now SendDue would spin the event loop.
         let f = &mut self.flows[fi];
         let due = f.next_send_due;
-        let has_work =
-            f.next_seq < cfg.total_bytes || f.scoreboard.values().any(|e| e.lost && !e.sacked);
+        let has_work = f.next_seq < cfg.total_bytes || f.lost_unsacked > 0;
         if has_work && !f.send_due_armed && due > self.now_us {
             self.push(due, flow_id, Event::SendDue);
             self.flows[fi].send_due_armed = true;
@@ -920,6 +954,10 @@ impl<'a> Sim<'a> {
             if in_pipe {
                 f.in_flight = f.in_flight.saturating_sub(len);
             }
+            if e.lost && !e.sacked {
+                f.lost_unsacked -= 1;
+                f.lost_pending.remove(&seq);
+            }
             newly_acked.push(e.rec);
         }
         let progressed = cum > f.cum_acked;
@@ -934,12 +972,15 @@ impl<'a> Sim<'a> {
                 e.sacked = true;
                 if !e.lost {
                     f.in_flight = f.in_flight.saturating_sub(e.rec.len());
+                } else {
+                    f.lost_unsacked -= 1;
                 }
                 // Arrival evidence cancels the lost mark — keeps a
                 // delayed (reordered) original from being retx'd as a
                 // spurious retransmission later.
                 e.lost = false;
                 e.retx_out = false;
+                f.lost_pending.remove(s);
                 newly_sacked += e.rec.len();
             }
         }
@@ -969,6 +1010,8 @@ impl<'a> Sim<'a> {
                     gap_head = Some(seq);
                 }
                 e.lost = true;
+                f.lost_pending.insert(seq);
+                f.lost_unsacked += 1;
                 lost_now += e.rec.len();
             }
             if lost_now > 0 {
@@ -992,6 +1035,7 @@ impl<'a> Sim<'a> {
                 .on_ack(now, &newly_acked, lost_now, ce_now, prior_in_flight, cum);
         if let Some(r) = rs.rtt {
             f.rtt.sample(r);
+            f.result.rtt_samples_us.push(r.as_micros() as u64);
         }
         if ce_now > 0 {
             f.cc.on_ecn_ce(now, ce_now, rs.delivered, f.in_flight);
@@ -1025,12 +1069,14 @@ impl<'a> Sim<'a> {
         // normal send path.
         let mut lost_bytes = 0u64;
         let mut freed = 0u64;
-        for e in f.scoreboard.values_mut() {
+        for (&seq, e) in f.scoreboard.iter_mut() {
             if e.sacked || e.lost {
                 continue;
             }
             e.lost = true;
             e.retx_out = false;
+            f.lost_pending.insert(seq);
+            f.lost_unsacked += 1;
             lost_bytes += e.rec.len();
             freed += e.rec.len();
         }
@@ -1077,8 +1123,10 @@ impl<'a> Sim<'a> {
             if !f.completed && f.cum_acked >= self.cfg.total_bytes {
                 f.completed = true;
                 f.result.completed = true;
+                f.result.fct_us = self.now_us;
+                self.completed_count += 1;
             }
-            if self.flows.iter().all(|f| f.completed) {
+            if self.completed_count == self.flows.len() {
                 break;
             }
             // After each event, a freed window may allow immediate sends
@@ -1087,7 +1135,7 @@ impl<'a> Sim<'a> {
             // pending SendDue (or a next_send_due in the future, e.g. a
             // stale srtt under Karn's rule) must not suppress them.
             let f = &self.flows[fi];
-            let has_lost = f.scoreboard.values().any(|e| e.lost && !e.sacked);
+            let has_lost = f.lost_unsacked > 0;
             let has_work = f.next_seq < self.cfg.total_bytes || has_lost;
             if has_work
                 && f.in_flight < f.cc.cwnd()

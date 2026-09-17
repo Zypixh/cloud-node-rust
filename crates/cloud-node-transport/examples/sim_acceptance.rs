@@ -13,9 +13,8 @@ use cloud_node_transport::cc::reference::{
 use cloud_node_transport::cc::CongestionController;
 use cloud_node_transport::edgecc::{Ablations, EdgeCc, PathPrior, Tier};
 use cloud_node_transport::sim::{
-    run, run_multi, Aqm, FlowSpec, Policer, RouteSwitch, SimConfig, SimResult, TraceKind,
+    run, run_multi, Aqm, FlowSpec, Policer, RouteSwitch, SimConfig, SimResult,
 };
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 const MSS: u64 = 1460;
@@ -121,48 +120,30 @@ fn base_cell(rtt_ms: u64, mbps: u64, loss_pct: f64) -> SimConfig {
     }
 }
 
-/// Per-ACK RTT samples → queue-delay distribution. A packet's send time
-/// is the latest send attempt (Send or Retransmit) at or below the acked
-/// edge, keyed per flow; qdelay is the excess over the configured
-/// propagation floor. First-flight seqs only would conflate queueing
-/// with loss-recovery stalls, so retransmits update the timestamp.
+/// Queue-delay distribution from the sim's Karn-filtered per-ACK RTT
+/// samples minus the configured propagation floor. Using send→ack edge
+/// reconstruction from the trace conflates queueing with loss-recovery
+/// stalls, so the harness records clean RTT samples directly.
 fn qdelay_quantiles(res: &SimResult, base_rtt_us: u64) -> (u64, u64, u64) {
-    let mut send_at: BTreeMap<(u32, u64), u64> = BTreeMap::new();
-    for row in &res.trace {
-        if row.kind == TraceKind::Send || row.kind == TraceKind::Retransmit {
-            send_at.insert((row.flow, row.seq), row.t_us);
-        }
-    }
-    let mut samples: Vec<u64> = Vec::new();
-    for row in &res.trace {
-        if row.kind != TraceKind::Ack {
-            continue;
-        }
-        // The acked edge's last send at seq <= cum, within this flow.
-        let send_t = send_at
-            .range((row.flow, 0)..=(row.flow, row.seq))
-            .next_back()
-            .map(|(_, t)| *t);
-        if let Some(t) = send_t {
-            let rtt = row.t_us.saturating_sub(t);
-            samples.push(rtt.saturating_sub(base_rtt_us));
-        }
-    }
-    if samples.is_empty() {
+    if res.rtt_samples_us.is_empty() {
         return (0, 0, 0);
     }
+    let mut samples: Vec<u64> = res
+        .rtt_samples_us
+        .iter()
+        .map(|r| r.saturating_sub(base_rtt_us))
+        .collect();
     samples.sort_unstable();
     let q = |p: f64| samples[((samples.len() - 1) as f64 * p) as usize];
     (q(0.5), q(0.95), q(0.99))
 }
 
-fn fct_us(res: &SimResult, total: u64, cap_us: u64) -> u64 {
-    for row in &res.trace {
-        if row.kind == TraceKind::Ack && row.delivered_total >= total {
-            return row.t_us;
-        }
+fn fct_us(res: &SimResult, _total: u64, cap_us: u64) -> u64 {
+    if res.fct_us > 0 {
+        res.fct_us
+    } else {
+        cap_us
     }
-    cap_us
 }
 
 fn seed_for(cell_id: u64, replica: u32) -> u64 {
@@ -177,6 +158,10 @@ fn seed_for(cell_id: u64, replica: u32) -> u64 {
 fn run_cell(v: &Variant, cfg: &SimConfig, flows: u32, cell: &str, replica: u32) {
     let mut cfg = *cfg;
     cfg.seed = seed_for(cfg.seed, replica);
+    // Multi-flow runs don't need the event trace — metrics come from
+    // rtt_samples/fct_us/result counters — and the merged trace is the
+    // dominant memory cost at concur100 scale.
+    cfg.collect_trace = flows <= 1;
     let base_rtt_us = (cfg.delay + cfg.ack_delay_prop).as_micros() as u64;
     if flows <= 1 {
         let mut cc = build(v, &cfg);
