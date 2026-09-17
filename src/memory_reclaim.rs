@@ -1167,6 +1167,7 @@ mod tests {
         assert_eq!(stats.process_rss_after_bytes, 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn pressure_event_wakes_are_coalesced_inside_the_min_interval() {
         let before = pressure_event_wakeups();

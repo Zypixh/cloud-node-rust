@@ -210,6 +210,33 @@ Other formerly insert-only maps are now bounded or self-cleaning:
 idempotent purge), `REPLICA_STATS` (the 30s staleness filter now also
 removes dead rows), and `HEADER_NAME_CACHE` (65k).
 
+## WAF Scoped-State and Persistence Bounds
+
+`WafStateManager` scoped maps (`blocks`, `kernel_blocks`, `block_networks`,
+`kernel_block_networks`, `list_blocks`, `list_whitelists`, `graylists`, and
+their network/range mirrors) are attacker-driven — a spoofed-source flood can
+mint one entry per IP. All scoped insertions now run through
+`apply_scoped_ip_with_capacity`-style paths bounded by
+`governor.firewall_state_map_capacity()` (pressure-aware: ~1M normal,
+~131k under pressure). When a map is full, expired entries are swept first,
+then earliest-`expires_at` live entries are evicted in batches
+(`over.max(capacity/16).min(512)`) — approved policy: evict-soonest-expiring
+rather than refuse the new block. Evictions increment `wafStateEvicted`,
+emit a rate-limited warning, and reconcile paired kernel-mirror maps plus
+range/network snapshots so enforcement stays coherent. Existing-key updates
+never evict. Approved tradeoff: under extreme cardinality pressure the
+soonest-expiring blocks can be released early; the new block always takes
+effect.
+
+`firewall::persistence::PENDING` (coalesced upserts + delete tombstones held
+while storage is unavailable) is bounded at
+`firewall_state_map_capacity() / 4`, clamped to [4096, 2M]. Full upserts
+evict earliest-expiring records; full tombstone sets drop arbitrary excess
+deletes. Drops increment `firewallPendingDropped` and warn rate-limited.
+Approved tradeoff: a dropped tombstone can let a deleted block resurrect on
+restart (expiry cleanup is the backstop); a dropped upsert loses persistence
+for that record while in-memory enforcement remains.
+
 ## Metrics Memory Observability
 
 Metrics tracker memory (metric aggregators, top-IP tracker, daily-domain and
@@ -217,8 +244,20 @@ unique-IP trackers) is estimated every 30s and published as
 `metrics_aggregator_bytes` on the governor snapshot. It is an observational
 gauge: these maps are not charged into the resident ledger, which is
 deliberately scoped to cache categories. A rate-limited `METRICS_MEMORY`
-warning fires when the estimate exceeds max(1/8 of node memory, 64MiB); no
-samples are dropped — cardinality caps are a separate policy decision.
+warning fires when the estimate exceeds max(1/8 of node memory, 64MiB).
+
+Tracker cardinality is additionally hard-bounded: each tracker
+(`MetricAggregator` x2 incl. nested `request_samples`, `TopIpTracker`,
+`DailyDomainTracker`, `UniqueIpTracker`) admits new keys only while below
+`governor.metrics_cardinality_capacity()` — `state_budget_bytes / 40`
+divided by a 256-byte entry estimate, clamped between
+`MIN_METRIC_CARDINALITY_ENTRIES` and `MAX_METRIC_CARDINALITY_ENTRIES`, so the
+limit scales with node memory and shrinks under pressure. New keys beyond the
+cap are dropped with `metricsCardinalityDropped` incremented and a
+rate-limited warning; existing keys always keep accumulating so tracked
+totals stay exact. `restore`/seed-load paths honor the same cap — persisted
+state cannot bypass it. Dropped unique keys are also not persisted, so the
+observed cardinality floor equals the cap.
 
 Mace storage capacity is selected cgroup-first: `memory.max`, then
 `memory.high`, then host total. A small cgroup limit can no longer pick a

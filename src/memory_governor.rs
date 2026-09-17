@@ -516,6 +516,10 @@ const MAX_FIREWALL_CANDIDATE_STATS: usize = 2_000_000;
 const FIREWALL_STATE_ENTRY_ESTIMATED_BYTES: u64 = 96;
 const MIN_FIREWALL_STATE_ENTRIES: usize = 65_536;
 const MAX_FIREWALL_STATE_ENTRIES: usize = 8_000_000;
+/// One metrics-tracker row (aggregation key + counters + DashMap overhead).
+const METRIC_CARDINALITY_ENTRY_ESTIMATED_BYTES: u64 = 256;
+const MIN_METRIC_CARDINALITY_ENTRIES: usize = 65_536;
+const MAX_METRIC_CARDINALITY_ENTRIES: usize = 4_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConfigSyncBudget {
@@ -1685,6 +1689,13 @@ impl MemoryGovernor {
     /// graylists, and their list-/kernel-/network-keyed siblings).
     pub fn firewall_state_map_capacity(&self) -> usize {
         firewall_state_map_capacity(&self.memory_snapshot())
+    }
+
+    /// Per-tracker cardinality cap for the in-memory metrics maps. New keys
+    /// are dropped past the cap (`metricsCardinalityDropped`); existing keys
+    /// keep accumulating so totals already tracked stay exact.
+    pub fn metrics_cardinality_capacity(&self) -> usize {
+        metrics_cardinality_capacity(&self.memory_snapshot())
     }
 
     pub fn set_metrics_aggregator_bytes(&self, bytes: u64) {
@@ -3152,6 +3163,17 @@ fn firewall_state_map_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
         FIREWALL_STATE_ENTRY_ESTIMATED_BYTES,
         MIN_FIREWALL_STATE_ENTRIES,
         MAX_FIREWALL_STATE_ENTRIES,
+    )
+}
+
+fn metrics_cardinality_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
+    connection_limit(
+        // The cardinality slice is `state_budget_bytes / 8`; the five
+        // trackers share it evenly.
+        state_budget_bytes(snapshot) / 40,
+        METRIC_CARDINALITY_ENTRY_ESTIMATED_BYTES,
+        MIN_METRIC_CARDINALITY_ENTRIES,
+        MAX_METRIC_CARDINALITY_ENTRIES,
     )
 }
 

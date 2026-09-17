@@ -1517,6 +1517,9 @@ pub async fn start_metrics_reporter(config_store: Arc<ConfigStore>, api_config: 
             "configTaskDeferred": pipeline_metrics.config_task_deferred,
             "tcpRelayBufferShrunk": pipeline_metrics.tcp_relay_buffer_shrunk,
             "negativeCacheAdmissionRejected": pipeline_metrics.negative_cache_admission_rejected,
+            "wafStateEvicted": pipeline_metrics.waf_state_evicted,
+            "firewallPendingDropped": pipeline_metrics.firewall_pending_dropped,
+            "metricsCardinalityDropped": pipeline_metrics.metrics_cardinality_dropped,
         });
 
         let status = serde_json::json!({

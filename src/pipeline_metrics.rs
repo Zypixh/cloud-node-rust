@@ -231,3 +231,21 @@ pub fn add(counter: PipelineCounter, value: u64) -> u64 {
 pub fn snapshot() -> PipelineMetricsSnapshot {
     PIPELINE_METRICS.snapshot()
 }
+
+/// Bump `MetricsCardinalityDropped` and emit a rate-limited warning naming the
+/// tracker that refused a new key.
+pub fn note_cardinality_drop(tracker: &'static str, len: usize, capacity: usize) {
+    add(PipelineCounter::MetricsCardinalityDropped, 1);
+    static LAST_WARN: AtomicU64 = AtomicU64::new(0);
+    let now = crate::utils::time::now_timestamp() as u64;
+    let last = LAST_WARN.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 60
+        && LAST_WARN
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        tracing::warn!(
+            "metrics cardinality full for {tracker}; len={len} capacity={capacity}, new keys dropped"
+        );
+    }
+}
