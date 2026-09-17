@@ -86,7 +86,9 @@ run_raw_smoke() {
     setsid "$NODE_BIN" xdp raw-smoke --duration-ms 5000 --ready-file "$raw_ready_file" >"$raw_output_file" 2>&1 &
     raw_pid=$!
     PIDS_TO_KILL+=("$raw_pid")
-    for _ in $(seq 1 100); do
+    # Readiness = eBPF load + verifier + AF_XDP bind; allow headroom for
+    # shared build hosts under parallel load (observed >5s at 100% CPU).
+    for _ in $(seq 1 "${XDP_SMOKE_READY_TICKS:-400}"); do
         if [[ -f "$raw_ready_file" ]]; then
             break
         fi
@@ -183,7 +185,7 @@ run_proxy_smoke() {
     setsid "$NODE_BIN" xdp proxy-smoke --duration-ms 25000 --ready-file "$proxy_ready_file" >"$proxy_output_file" 2>&1 &
     proxy_pid=$!
     PIDS_TO_KILL+=("$proxy_pid")
-    for _ in $(seq 1 160); do
+    for _ in $(seq 1 "${XDP_SMOKE_READY_TICKS:-400}"); do
         if [[ -f "$proxy_ready_file" ]]; then
             break
         fi
