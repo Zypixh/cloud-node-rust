@@ -614,7 +614,33 @@ impl std::ops::Deref for PaddedAtomicU64 {
     }
 }
 
+const N_ADMISSION_CLASSES: usize = 17;
+
+/// Materialized per-snapshot-epoch admission view: every class limit and
+/// byte budget is a pure function of the `cached_*` snapshot fields, so the
+/// whole computation is done once per generation instead of once per admit.
+/// Hot path = generation compare + ArcSwap load (~2 atomic ops) versus the
+/// previous ~15 loads + ~30 arithmetic ops per check.
+struct GovernorLimits {
+    /// Value of `cached_generation` this table was built from. A table whose
+    /// generation differs from the counter is stale and rebuilt on demand.
+    generation: u64,
+    /// `limit_for` output per class, indexed by `class_index`.
+    class_limit: [u64; N_ADMISSION_CLASSES],
+    shared_connection_budget_bytes: u64,
+    cache_read_memory_budget_bytes: u64,
+    cache_read_memory_object_limit_bytes: u64,
+    zero_copy_relay_limit: u64,
+    zero_copy_relay_budget_bytes: u64,
+    udp_queue_budget_bytes: u64,
+    tcp_queue_budget_bytes: u64,
+}
+
 pub struct MemoryGovernor {
+    /// Bumped whenever any `cached_*` memory input changes (snapshot refresh,
+    /// invalidation, or test seeding); `GovernorLimits` stale-checks against it.
+    cached_generation: AtomicU64,
+    cached_limits: arc_swap::ArcSwap<GovernorLimits>,
     // One counter line per admission class: RMWs on different classes can
     // never contend, and the derived shared-connection ledger reads seven
     // quiet lines for free while paying for only the flooded one.
@@ -847,6 +873,22 @@ impl MemoryGovernor {
                 AtomicU64::new(DEFAULT_DISK_CLASS_BUDGET[i])
             }),
             disk_rejects: AtomicU64::new(0),
+            cached_generation: AtomicU64::new(0),
+            // generation=0 can never match a real snapshot generation (the
+            // counter starts at 1 after the first refresh), so the empty
+            // table is rebuilt on first use — zero is also the "everything
+            // denied" state, which is the correct pre-snapshot posture.
+            cached_limits: arc_swap::ArcSwap::from_pointee(GovernorLimits {
+                generation: 0,
+                class_limit: [0; N_ADMISSION_CLASSES],
+                shared_connection_budget_bytes: 0,
+                cache_read_memory_budget_bytes: 0,
+                cache_read_memory_object_limit_bytes: 0,
+                zero_copy_relay_limit: 0,
+                zero_copy_relay_budget_bytes: 0,
+                udp_queue_budget_bytes: 0,
+                tcp_queue_budget_bytes: 0,
+            }),
             #[cfg(test)]
             fd_count_reads: AtomicU64::new(0),
         }
@@ -876,7 +918,7 @@ impl MemoryGovernor {
 
     pub fn try_admit_cache_read(&self, bytes: u64) -> Option<AdmissionPermit<'_>> {
         let bytes = bytes.max(1);
-        if bytes > self.cache_read_memory_object_limit_bytes() {
+        if bytes > self.limits().cache_read_memory_object_limit_bytes {
             self.record_reject(AdmissionClass::CacheReadMemory);
             return None;
         }
@@ -891,8 +933,10 @@ impl MemoryGovernor {
         }
 
         // CAS admission so the relay counter never exceeds the limit even
-        // transiently (see try_admit_with_charges).
-        let limit = self.zero_copy_relay_limit() as u64;
+        // transiently (see try_admit_with_charges). Limit and byte budget
+        // come from the materialized table (same values, no recompute).
+        let limits = self.limits();
+        let limit = limits.zero_copy_relay_limit;
         let mut current = self.zero_copy_relays.load(Ordering::Acquire);
         loop {
             if current >= limit {
@@ -909,7 +953,7 @@ impl MemoryGovernor {
             }
         }
 
-        let budget = self.zero_copy_relay_budget_bytes().max(1);
+        let budget = limits.zero_copy_relay_budget_bytes.max(1);
         let used = self
             .zero_copy_relay_bytes
             .fetch_add(ZERO_COPY_RELAY_ESTIMATED_BYTES, Ordering::AcqRel)
@@ -929,7 +973,7 @@ impl MemoryGovernor {
 
     pub fn try_reserve_udp_queue_bytes(&self, bytes: usize) -> Option<UdpQueueBytePermit<'_>> {
         let bytes = bytes.max(1) as u64;
-        let budget = self.udp_queued_bytes_budget().max(1);
+        let budget = self.limits().udp_queue_budget_bytes.max(1);
         let mut current = self.udp_queued_bytes.load(Ordering::Acquire);
         loop {
             let next = current.saturating_add(bytes);
@@ -959,7 +1003,7 @@ impl MemoryGovernor {
     /// silently.
     pub fn try_reserve_tcp_queue_bytes(&self, bytes: usize) -> Option<TcpQueueBytePermit<'_>> {
         let bytes = bytes.max(1) as u64;
-        let budget = self.tcp_queue_bytes_budget().max(1);
+        let budget = self.limits().tcp_queue_budget_bytes.max(1);
         let mut current = self.tcp_queue_bytes.load(Ordering::Acquire);
         loop {
             let next = current.saturating_add(bytes);
@@ -993,12 +1037,11 @@ impl MemoryGovernor {
         // grant is issued only while the settled count is below the limit —
         // the same bounded-overshoot contract the byte ledgers already had.
         // Cheaper than a CAS loop: one fetch_add plus one load, no retries.
-        // One snapshot fetch serves the limit check and every budget check —
-        // the snapshot is TTL-cached so this is a handful of atomic loads,
-        // not a syscall, but doing it once still halves the per-admit work.
-        let snapshot = self.memory_snapshot();
+        // Materialized limits table: one generation compare + one ArcSwap
+        // guard replaces a snapshot fetch plus the whole limit computation.
+        let limits = self.limits();
         let counter = self.counter(class);
-        let limit = self.limit_for_in(class, &snapshot) as u64;
+        let limit = limits.class_limit[class_index(class)];
         if counter.fetch_add(1, Ordering::AcqRel) >= limit {
             counter.fetch_sub(1, Ordering::AcqRel);
             self.record_reject(class);
@@ -1008,8 +1051,7 @@ impl MemoryGovernor {
         if shared_connection_charge_bytes(class) > 0 {
             // The shared ledger is derived from the class counters: my count
             // add above already moved the derived total by this charge.
-            let budget = shared_connection_admission_budget(&snapshot);
-            if self.shared_connection_used_bytes() > budget {
+            if self.shared_connection_used_bytes() > limits.shared_connection_budget_bytes {
                 counter.fetch_sub(1, Ordering::AcqRel);
                 self.record_reject(class);
                 return None;
@@ -1017,7 +1059,7 @@ impl MemoryGovernor {
         }
 
         if cache_read_memory_charge_bytes > 0 {
-            let budget = cache_read_memory_budget_bytes(&snapshot);
+            let budget = limits.cache_read_memory_budget_bytes;
             let used = self
                 .cache_read_memory_bytes
                 .fetch_add(cache_read_memory_charge_bytes, Ordering::AcqRel)
@@ -1629,23 +1671,7 @@ impl MemoryGovernor {
     }
 
     pub fn zero_copy_relay_limit(&self) -> usize {
-        let snapshot = self.memory_snapshot();
-        let memory_target = connection_limit(
-            zero_copy_relay_budget_bytes(&snapshot),
-            ZERO_COPY_RELAY_ESTIMATED_BYTES,
-            1,
-            MAX_TCP_CONNECTION_LIMIT,
-        );
-        let fd_target = fd_budget(&snapshot, TCP_FD_BUDGET_PCT)
-            .saturating_div(ZERO_COPY_RELAY_FD_EQUIVALENT.max(1))
-            .max(1) as usize;
-        let blocking_target = snapshot
-            .cpu_parallelism
-            .max(1)
-            .saturating_mul(128)
-            .saturating_div(ZERO_COPY_RELAY_BLOCKING_TASKS as usize)
-            .max(1);
-        memory_target.min(fd_target).min(blocking_target).max(1)
+        zero_copy_relay_limit(&self.memory_snapshot())
     }
 
     pub fn zero_copy_relay_active(&self) -> u64 {
@@ -1779,6 +1805,7 @@ impl MemoryGovernor {
     /// wakes so classification sees the real level immediately.
     pub fn invalidate_snapshot_cache(&self) {
         self.cached_at_millis.store(0, Ordering::Relaxed);
+        self.cached_generation.fetch_add(1, Ordering::Release);
     }
 
     pub fn resident_memory_snapshot(&self) -> ResidentMemorySnapshot {
@@ -2133,6 +2160,51 @@ impl MemoryGovernor {
         }
     }
 
+    /// Hot-path accessor for the materialized limits table. Two atomic ops on
+    /// the common path (generation load + ArcSwap guard); a rebuild happens at
+    /// most once per snapshot generation.
+    fn limits(&self) -> arc_swap::Guard<std::sync::Arc<GovernorLimits>> {
+        let generation = self.cached_generation.load(Ordering::Acquire);
+        let lim = self.cached_limits.load();
+        // generation 0 means no snapshot refresh has ever completed; the
+        // placeholder table also carries 0, so require nonzero to force the
+        // first refresh instead of matching two zeros.
+        if generation != 0 && lim.generation == generation {
+            return lim;
+        }
+        drop(lim);
+        self.refresh_limits()
+    }
+
+    /// Rebuild is idempotent: concurrent rebuilds may race to store, last one
+    /// wins, and a table built from an equal-or-newer snapshot is always
+    /// correct for its generation stamp. The generation is sampled *before*
+    /// the snapshot so an input write mid-refresh bumps to a newer
+    /// generation and this table is discarded on the next call — a
+    /// mixed-input table is never accepted as current.
+    fn refresh_limits(&self) -> arc_swap::Guard<std::sync::Arc<GovernorLimits>> {
+        let generation = self.cached_generation.load(Ordering::Acquire);
+        let snapshot = self.memory_snapshot();
+        let mut class_limit = [0u64; N_ADMISSION_CLASSES];
+        for class in ALL_ADMISSION_CLASSES {
+            class_limit[class_index(class)] = self.limit_for_in(class, &snapshot) as u64;
+        }
+        self.cached_limits.store(std::sync::Arc::new(GovernorLimits {
+            generation,
+            class_limit,
+            shared_connection_budget_bytes: shared_connection_admission_budget(&snapshot),
+            cache_read_memory_budget_bytes: cache_read_memory_budget_bytes(&snapshot),
+            cache_read_memory_object_limit_bytes: cache_read_memory_object_limit_bytes(
+                &snapshot,
+            ),
+            zero_copy_relay_limit: zero_copy_relay_limit(&snapshot) as u64,
+            zero_copy_relay_budget_bytes: zero_copy_relay_budget_bytes(&snapshot),
+            udp_queue_budget_bytes: udp_queued_bytes_budget(&snapshot),
+            tcp_queue_budget_bytes: tcp_queue_bytes_budget(&snapshot),
+        }));
+        self.cached_limits.load()
+    }
+
     fn counter(&self, class: AdmissionClass) -> &AtomicU64 {
         match class {
             AdmissionClass::HttpConnection => &self.http_connections.0,
@@ -2287,6 +2359,10 @@ impl MemoryGovernor {
         self.cached_psi_full_avg10_x100
             .store(snapshot.psi_full_avg10_x100 as u64, Ordering::Relaxed);
         self.cached_at_millis.store(now as u64, Ordering::Relaxed);
+        // New inputs → new limits epoch. Acquirers pair this with the
+        // Acquire load in `limits()` so a rebuilt table is never stamped
+        // with a generation older than its inputs.
+        self.cached_generation.fetch_add(1, Ordering::Release);
         let mem = self.budgeted_from_cached();
         notify_pressure_reclaim(memory_pressure_level(&mem));
         mem
@@ -3163,6 +3239,25 @@ fn tcp_queue_bytes_budget(snapshot: &BudgetedMemorySnapshot) -> u64 {
         .min(snapshot.available_bytes.max(1))
 }
 
+fn zero_copy_relay_limit(snapshot: &BudgetedMemorySnapshot) -> usize {
+    let memory_target = connection_limit(
+        zero_copy_relay_budget_bytes(snapshot),
+        ZERO_COPY_RELAY_ESTIMATED_BYTES,
+        1,
+        MAX_TCP_CONNECTION_LIMIT,
+    );
+    let fd_target = fd_budget(snapshot, TCP_FD_BUDGET_PCT)
+        .saturating_div(ZERO_COPY_RELAY_FD_EQUIVALENT.max(1))
+        .max(1) as usize;
+    let blocking_target = snapshot
+        .cpu_parallelism
+        .max(1)
+        .saturating_mul(128)
+        .saturating_div(ZERO_COPY_RELAY_BLOCKING_TASKS as usize)
+        .max(1);
+    memory_target.min(fd_target).min(blocking_target).max(1)
+}
+
 fn zero_copy_relay_budget_bytes(snapshot: &BudgetedMemorySnapshot) -> u64 {
     let target = if memory_pressure_high(snapshot) {
         snapshot.connection_budget_bytes / 64
@@ -3420,6 +3515,28 @@ fn shared_connection_charge_bytes(class: AdmissionClass) -> u64 {
     }
 }
 
+/// All admission classes in `class_index` order — used to build the
+/// materialized `GovernorLimits` table once per snapshot generation.
+const ALL_ADMISSION_CLASSES: [AdmissionClass; N_ADMISSION_CLASSES] = [
+    AdmissionClass::HttpConnection,
+    AdmissionClass::TcpConnection,
+    AdmissionClass::Http3Connection,
+    AdmissionClass::UdpSession,
+    AdmissionClass::Http2Stream,
+    AdmissionClass::Http3Request,
+    AdmissionClass::OriginConnect,
+    AdmissionClass::BackgroundWork,
+    AdmissionClass::RequestBodyWaf,
+    AdmissionClass::ResponseBodyWaf,
+    AdmissionClass::ResponseTransform,
+    AdmissionClass::CacheRevalidate,
+    AdmissionClass::CacheWrite,
+    AdmissionClass::CacheReadMemory,
+    AdmissionClass::ClusterInternalConnection,
+    AdmissionClass::RpcStreamCommand,
+    AdmissionClass::SniRelay,
+];
+
 fn class_index(class: AdmissionClass) -> usize {
     match class {
         AdmissionClass::HttpConnection => 0,
@@ -3666,6 +3783,34 @@ mod tests {
         );
     }
 
+    /// The materialized limits table must track every generation bump —
+    /// including same-millisecond reseeds — and must always equal the live
+    /// `limit_for` computation, or a tightened budget would silently keep
+    /// serving the stale limit.
+    #[test]
+    fn limits_table_tracks_reseeded_memory() {
+        let governor = MemoryGovernor::new();
+        seed_governor_memory(&governor, 64 << 30, 60 << 30, 1 << 20, 0);
+        let big_table = governor.limits().class_limit[class_index(AdmissionClass::HttpConnection)];
+        let big_live = governor.limit_for(AdmissionClass::HttpConnection) as u64;
+        assert_eq!(big_table, big_live, "table must equal live computation");
+
+        seed_governor_memory(&governor, 2 << 30, 1 << 30, 1 << 10, 0);
+        let small_table =
+            governor.limits().class_limit[class_index(AdmissionClass::HttpConnection)];
+        let small_live = governor.limit_for(AdmissionClass::HttpConnection) as u64;
+        assert_eq!(small_table, small_live);
+        assert!(
+            small_table < big_table,
+            "limits table must rebuild after reseed: small={small_table} big={big_table}"
+        );
+        // The small-machine limit must actually bind.
+        governor
+            .counter(AdmissionClass::HttpConnection)
+            .store(small_table, Ordering::Release);
+        assert!(governor.try_admit(AdmissionClass::HttpConnection).is_none());
+    }
+
     /// Deterministic bound: after the class counter reaches its limit, the
     /// next try_admit must reject; dropping one permit admits exactly one.
     #[test]
@@ -3750,6 +3895,11 @@ mod tests {
             .cached_fd_used_at_millis
             .store(now, Ordering::Release);
         governor.cached_at_millis.store(now, Ordering::Release);
+        // Seeded inputs change every derived limit; force the materialized
+        // table to rebuild on next use (same-millis reseeds included).
+        governor
+            .cached_generation
+            .fetch_add(1, Ordering::Release);
     }
 
     fn synthetic_snapshot(
@@ -3956,6 +4106,9 @@ mod tests {
             crate::utils::time::system_timestamp_millis() as u64,
             Ordering::Release,
         );
+        governor
+            .cached_generation
+            .fetch_add(1, Ordering::Release);
         let permit = governor
             .try_admit_zero_copy_relay()
             .expect("zero-copy relay should fit in a fresh governor");

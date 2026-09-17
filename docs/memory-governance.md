@@ -278,8 +278,19 @@ The shared connection byte ledger is **derived**, not stored:
 is recomputed on read — the seven quiet class lines stay Shared in local
 cache, so the read costs only the flooded line's ownership transfer. This
 removes two shared-cacheline RMWs from every connection admission compared
-with a real ledger. Each admission also fetches the budgeted memory
-snapshot once (`limit_for_in`) instead of once per budget check.
+with a real ledger.
+
+All admission budgets/limits are **materialized**, not recomputed per op:
+`GovernorLimits` (17 class limits + shared/cache-read/zero-copy/queue
+budgets) is built once per generation and published through `ArcSwap`. A
+`cached_generation` counter is bumped on every write to the cached memory
+inputs (snapshot refresh, invalidation, test reseeds); the hot path loads
+one `Arc` and reads fields — zero snapshot reads, zero division/clamp
+recomputation. Stale generations trigger an idempotent rebuild (concurrent
+rebuilds race, last store wins; the generation is sampled before the
+snapshot read so a mid-refresh input write invalidates the result rather
+than publishing a mixed-input table). A test pins the table to always
+equal the live `limit_for` computation.
 `cache_read_memory_bytes` and `zero_copy_relay_bytes` remain plain
 `fetch_add` byte ledgers (one padded line each); `udp_queued_bytes`/
 `tcp_queue_bytes` keep strict CAS because their never-exceed-semantics
