@@ -155,6 +155,7 @@ pub struct GovernorSnapshot {
     pub firewall_rolling_counter_capacity: usize,
     pub firewall_ip_bw_counter_capacity: usize,
     pub firewall_candidate_stats_capacity: usize,
+    pub firewall_state_map_capacity: usize,
     pub l4_aggregate_state_budget_bytes: u64,
     pub kernel_sync_queue_budget_bytes: u64,
     pub cardinality_state_budget_bytes: u64,
@@ -509,6 +510,12 @@ const MIN_FIREWALL_IP_BW_COUNTERS: usize = 32_768;
 const MAX_FIREWALL_IP_BW_COUNTERS: usize = 16_000_000;
 const MIN_FIREWALL_CANDIDATE_STATS: usize = 4_096;
 const MAX_FIREWALL_CANDIDATE_STATS: usize = 2_000_000;
+/// Scoped WAF state entries (blocks/whitelists/graylists, IP and network
+/// keyed): each row is a small key tuple + i64 expiry inside a sharded
+/// DashMap — ~96B including shard overhead.
+const FIREWALL_STATE_ENTRY_ESTIMATED_BYTES: u64 = 96;
+const MIN_FIREWALL_STATE_ENTRIES: usize = 65_536;
+const MAX_FIREWALL_STATE_ENTRIES: usize = 8_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConfigSyncBudget {
@@ -1674,6 +1681,12 @@ impl MemoryGovernor {
         firewall_candidate_stats_capacity(&self.memory_snapshot())
     }
 
+    /// Per-map capacity for scoped WAF state maps (blocks, whitelists,
+    /// graylists, and their list-/kernel-/network-keyed siblings).
+    pub fn firewall_state_map_capacity(&self) -> usize {
+        firewall_state_map_capacity(&self.memory_snapshot())
+    }
+
     pub fn set_metrics_aggregator_bytes(&self, bytes: u64) {
         self.metrics_aggregator_bytes
             .store(bytes, Ordering::Relaxed);
@@ -1984,6 +1997,7 @@ impl MemoryGovernor {
             firewall_rolling_counter_capacity: firewall_rolling_counter_capacity(&mem),
             firewall_ip_bw_counter_capacity: firewall_ip_bw_counter_capacity(&mem),
             firewall_candidate_stats_capacity: firewall_candidate_stats_capacity(&mem),
+            firewall_state_map_capacity: firewall_state_map_capacity(&mem),
             l4_aggregate_state_budget_bytes: state_budget_bytes(&mem) / 8,
             kernel_sync_queue_budget_bytes: state_budget_bytes(&mem) / 16,
             cardinality_state_budget_bytes: state_budget_bytes(&mem) / 8,
@@ -3129,6 +3143,15 @@ fn firewall_candidate_stats_capacity(snapshot: &BudgetedMemorySnapshot) -> usize
         FIREWALL_CANDIDATE_STATS_ESTIMATED_BYTES,
         MIN_FIREWALL_CANDIDATE_STATS,
         MAX_FIREWALL_CANDIDATE_STATS,
+    )
+}
+
+fn firewall_state_map_capacity(snapshot: &BudgetedMemorySnapshot) -> usize {
+    connection_limit(
+        state_budget_bytes(snapshot) / 8,
+        FIREWALL_STATE_ENTRY_ESTIMATED_BYTES,
+        MIN_FIREWALL_STATE_ENTRIES,
+        MAX_FIREWALL_STATE_ENTRIES,
     )
 }
 
